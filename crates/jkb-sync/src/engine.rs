@@ -335,10 +335,21 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
     let filter = Filter::build(&read_globs(db, mount_ns)?)?;
     let mut relevant: Vec<PathBuf> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut bound: Option<BTreeSet<PathBuf>> = None;
     for path in paths {
-        if filter.accepts(&ctx.dir, path) && seen.insert(path.clone()) {
-            relevant.push(path.clone());
+        if !filter.accepts(&ctx.dir, path) || seen.contains(path) {
+            continue;
         }
+        if through_link(&ctx.dir, path) {
+            if bound.is_none() {
+                bound = Some(bound_paths(db, &ctx)?);
+            }
+            if !bound.as_ref().is_some_and(|b| b.contains(path)) {
+                continue;
+            }
+        }
+        seen.insert(path.clone());
+        relevant.push(path.clone());
     }
     reconcile_all(db, &ctx, relevant)
 }
@@ -707,50 +718,52 @@ impl Filter {
 
     /// Whether an absolute `path` under `dir` is in scope.
     fn accepts(&self, dir: &Path, path: &Path) -> bool {
-        if !path.starts_with(dir) || !syncable(dir, path) {
+        if !path.starts_with(dir) {
             return false;
         }
         let rel = rel_str(dir, path);
         self.include.as_ref().is_none_or(|m| m.is_match(&rel))
             && !self.exclude.as_ref().is_some_and(|m| m.is_match(&rel))
+            && !is_temp(path)
     }
 
     /// Like [`Self::accepts`] but ignoring `include` — for already-bound files.
     fn accepts_bound(&self, dir: &Path, path: &Path) -> bool {
         path.starts_with(dir)
-            && syncable(dir, path)
             && !self
                 .exclude
                 .as_ref()
                 .is_some_and(|m| m.is_match(rel_str(dir, path)))
+            && !is_temp(path)
     }
 }
 
-/// Whether `path` (under `dir`) is a file sync may take up at all: not one of `nofollow::write`'s
-/// temporary files — an interrupted write leaves one, and importing it duplicates every task in the
-/// file it was replacing — and not reached through a symlink below the mount directory. The watcher
-/// no longer follows links, but an event or a binding can still name such a path, and reconciling it
-/// only to have `nofollow` refuse it wrote a `needs_attention` row per event for files outside the
-/// mount.
-fn syncable(dir: &Path, path: &Path) -> bool {
-    if path
-        .file_name()
+/// Whether `path` is one of `nofollow::write`'s temporary files, which sync never takes up: an
+/// interrupted write leaves one, and importing it duplicated every task in the file it was replacing.
+fn is_temp(path: &Path) -> bool {
+    path.file_name()
         .is_some_and(jkb_core::nofollow::is_temp_name)
-    {
-        return false;
-    }
+}
+
+/// Whether `path` (under `dir`) is reached through a symlink below the mount directory.
+///
+/// Asked only of a watch event's path that nothing is bound to: the watcher no longer follows links,
+/// but an event can still name such a path, and reconciling one only to have `nofollow` refuse it
+/// wrote a `needs_attention` row per event for files outside the mount. A **bound** file reached
+/// through a link is reconciled, never skipped — `nofollow` refuses it and the journal names the link,
+/// where skipping it had the full sync's out-of-scope sweep settle its row to `ok` and the file stop
+/// syncing with nothing reported. A full sync's walk needs no such check: `WalkDir` does not follow
+/// links, so every path it yields is link-free below the (canonical) mount directory.
+fn through_link(dir: &Path, path: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(dir) else {
         return false;
     };
     let mut at = dir.to_path_buf();
-    for component in rel.components() {
+    rel.components().any(|component| {
         at.push(component);
         // A component that does not exist yet (a file about to be created) is not a link.
-        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
-            return false;
-        }
-    }
-    true
+        std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink())
+    })
 }
 
 /// The set of files to reconcile: those on disk matching the globs, unioned with the
@@ -793,11 +806,9 @@ fn bound_paths(db: &Db, ctx: &Ctx) -> Result<BTreeSet<PathBuf>> {
     let uris = db.read(move |conn| binding::synced_uris_under(conn, &mount_ns))?;
     let mut out = BTreeSet::new();
     for uri in uris {
-        let Some(raw) = uri.strip_prefix("file://") else {
-            continue;
-        };
-        let bare = raw.split_once('#').map_or(raw, |(p, _)| p);
-        out.insert(PathBuf::from(bare));
+        if let Some(path) = binding::file_path(&uri) {
+            out.insert(PathBuf::from(path));
+        }
     }
     Ok(out)
 }

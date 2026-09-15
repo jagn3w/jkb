@@ -2657,6 +2657,53 @@ fn sync_never_writes_through_a_symlink_planted_at_a_bound_file() {
     );
 }
 
+/// A bound file whose directory is swapped for a link is refused and the refusal kept on its journal
+/// row — never skipped as out of scope, which settled the row to `ok` and stopped the file syncing
+/// with nothing reported.
+#[cfg(unix)]
+#[test]
+fn a_bound_file_reached_through_a_link_stays_flagged_naming_the_link() {
+    let dir = real_tempdir();
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let file = dir.path().join("sub/tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    kb_set_status(&db, &format!("{uri}#setup"), "done");
+    fs::rename(dir.path().join("sub"), dir.path().join("sub.real")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("sub.real"), dir.path().join("sub")).unwrap();
+
+    for pass in 0..2 {
+        let report = sync(&db, "docs/plan").unwrap();
+        let refused = report
+            .results
+            .iter()
+            .find(|f| f.path == file)
+            .unwrap_or_else(|| panic!("pass {pass}: the bound file is reconciled: {report:?}"));
+        assert_eq!(refused.outcome, Outcome::Failed, "pass {pass}: {report:?}");
+        assert!(
+            refused
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("symbolic link")),
+            "pass {pass}: {refused:?}"
+        );
+        assert_eq!(
+            journal(&db, &uri).map(|(status, _)| status).as_deref(),
+            Some("needs_attention"),
+            "pass {pass}: still flagged"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("sub.real/tasks.md")).unwrap(),
+        TASKS_MD,
+        "nothing written through the link"
+    );
+}
+
 /// An interrupted write's temporary file is never imported as a second copy of the file, and a
 /// directory reached through a link below the mount is not taken up.
 #[cfg(unix)]
@@ -2702,4 +2749,37 @@ fn sync_skips_its_own_temp_files_and_paths_through_a_link() {
         journal(&db, &uri_for(&dir.path().join("linked/elsewhere/tasks.md"))).is_none(),
         "not even reconciled far enough to be journalled as needing attention"
     );
+}
+
+/// A document whose own name has a `#` in it is one file, not a file named up to the `#` with a
+/// fragment: splitting `C#.md` there had the second sync export the note to a new file `C`.
+#[test]
+fn a_document_named_with_a_hash_syncs_as_itself() {
+    let dir = real_tempdir();
+    let file = dir.path().join("C#.md");
+    fs::write(&file, "notes on C#").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/notes",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Created), 1);
+    let report = sync(&db, "docs/notes").unwrap();
+    assert_eq!(report.count(Outcome::UpToDate), 1, "{report:?}");
+    assert_eq!(report.count(Outcome::Exported), 0, "{report:?}");
+    assert!(
+        report.results.iter().all(|r| r.path == file),
+        "no file `C` is even visited: {report:?}"
+    );
+    assert!(!dir.path().join("C").exists(), "no stray file `C`");
+    kb_edit(&db, &uri_for(&file), "edited in kb");
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Exported), 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "edited in kb");
+    assert!(!dir.path().join("C").exists());
 }

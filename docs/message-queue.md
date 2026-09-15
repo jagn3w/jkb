@@ -140,9 +140,13 @@ Two decisions in it:
   (`item::edit_content`): an item in a tasks file — decided by the serializer owning its binding
   (`binding::serializer_for`), not by a `#` in its uri — refuses a result the tasks serializer would
   not read back as written (`jkb_sync::task_content_problem` renders it as a one-task file and parses
-  it again), so a blank or whitespace-only line, a checkbox line in the body, or trailing
-  `^id`/`@due`/`#tag` tokens are refused, judged on the result rather than the text sent. `task.add`
-  holds a task it files into a tasks.md to the same round trip. Tags and due dates are bounded in the
+  it again), so a blank or whitespace-only line, a checkbox line in the body, trailing
+  `^id`/`@due`/`#tag`/`+ns`/`!p` tokens, and a title the parser would normalize (quotes dropped,
+  runs of spaces or tabs closed up) are refused, judged on the result rather than the text sent, and
+  the refusal names which of these it is. `task.add`
+  holds a task it files into a tasks.md to the same round trip, and so does `task.bind` for a task it
+  binds into one (host-only: the daemon refuses file bindings). The size cap is checked before the
+  probe, which parses inside the writer's transaction, and the parse is linear in duplicate lines. Tags and due dates are bounded in the
   core writers every path shares (`tag::MAX_TAG_BYTES`, `task::MAX_DUE_BYTES`), so `tag rm` can always
   remove one, and `ns mv` checks every path it would write.
   `task.add`'s global-backlog question is answered by running the whole create and rolling it back, so

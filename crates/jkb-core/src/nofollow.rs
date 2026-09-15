@@ -26,11 +26,19 @@ use std::path::Path;
 fn refusal(path: &Path, at: &Path, why: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!(
-            "refusing {}: {} {why} — sync does not follow symbolic links; if the directory really \
-             moved, re-create its mount at the real path",
-            path.display(),
-            at.display()
+        format!("refusing {}: {} {why}", path.display(), at.display()),
+    )
+}
+
+/// A [`refusal`] for a link on the path, with what to do about one. Only a link gets the remedy: a
+/// file refused for its size or type sent the user to re-create a mount that was fine.
+fn link_refusal(path: &Path, at: &Path, why: &str) -> io::Error {
+    refusal(
+        path,
+        at,
+        &format!(
+            "{why} — sync does not follow symbolic links; if the directory really moved, re-create \
+             its mount at the real path"
         ),
     )
 }
@@ -74,7 +82,7 @@ mod imp {
     use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
     use rustix::io::Errno;
 
-    use super::refusal;
+    use super::{link_refusal, refusal};
 
     /// The directory `dir`, walked from `/` without following a link; with `create`, missing
     /// directories are made on the way. `Ok(None)` when it does not exist and `create` is false.
@@ -115,7 +123,7 @@ mod imp {
     fn judge(path: &Path, at: &Path, e: Errno) -> io::Error {
         match e {
             Errno::LOOP | Errno::NOTDIR => {
-                refusal(path, at, "is a symbolic link, or not a directory")
+                link_refusal(path, at, "is a symbolic link, or not a directory")
             }
             other => other.into(),
         }
@@ -143,7 +151,16 @@ mod imp {
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             return Err(refusal(path, path, "is not a regular file"));
         }
-        let too_big = || refusal(path, path, "is larger than a synced file may be");
+        let too_big = || {
+            refusal(
+                path,
+                path,
+                &format!(
+                    "is larger than the {} MiB a synced file may be",
+                    super::MAX_READ_BYTES / (1024 * 1024)
+                ),
+            )
+        };
         if u64::try_from(stat.st_size).unwrap_or(u64::MAX) > super::MAX_READ_BYTES {
             return Err(too_big());
         }
@@ -168,7 +185,7 @@ mod imp {
             Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
                 FileType::RegularFile => Some(Mode::from_raw_mode(stat.st_mode & 0o7777)),
                 FileType::Symlink => {
-                    return Err(refusal(path, path, "is a symbolic link"));
+                    return Err(link_refusal(path, path, "is a symbolic link"));
                 }
                 _ => return Err(refusal(path, path, "is not a regular file")),
             },
@@ -271,10 +288,9 @@ mod tests {
         // The file itself replaced by a link.
         symlink(outside.join("zshrc"), mount.join("tasks.md")).unwrap();
         let path = mount.join("tasks.md");
-        assert_eq!(
-            read(&path).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
-        );
+        let e = read(&path).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("symbolic link"), "named a link: {e}");
         assert_eq!(
             write(&path, b"curl | sh").unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
@@ -325,19 +341,45 @@ mod tests {
         let path = root.join("tasks.md");
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(super::MAX_READ_BYTES + 1).unwrap(); // sparse: no disk, no time
-        assert_eq!(
-            read(&path).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
+        let e = read(&path).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("64 MiB"), "names the limit: {e}");
+        assert!(
+            !e.to_string().contains("symbolic link"),
+            "and is not a link: {e}"
         );
     }
 
+    /// Run in a child process under `umask 077` — the umask is process-wide, so setting it here would
+    /// race every other test creating a file — where a file created `0o644` and left so would be
+    /// readable by everyone.
     #[test]
     fn a_new_file_is_created_under_the_umask_and_its_temp_name_is_recognised() {
-        let (_keep, root) = real_tempdir();
-        let path = root.join("new.md");
-        write(&path, b"x").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode & 0o111, 0, "not executable");
+        const CHILD: &str = "JKB_NOFOLLOW_UMASK_CHILD";
+        const NAME: &str =
+            "nofollow::tests::a_new_file_is_created_under_the_umask_and_its_temp_name_is_recognised";
+        if std::env::var_os(CHILD).is_some() {
+            let (_keep, root) = real_tempdir();
+            let path = root.join("new.md");
+            write(&path, b"x").unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "0o666 less the umask 077");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", "umask 077 && exec \"$0\" \"$@\""])
+            .arg(exe)
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the child ran the check and passed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(super::is_temp_name(std::ffi::OsStr::new(
             ".tasks.md.jkb-sync-123-456.tmp"
         )));

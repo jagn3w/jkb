@@ -1846,6 +1846,121 @@ fn an_edit_is_judged_by_the_body_it_leaves_and_bounded() {
     assert_eq!(e.code, ErrorCode::Invalid);
 }
 
+/// The round-trip probe parses the whole edit inside the single writer's transaction, so an edit is
+/// held to its size before the probe, and the parse is linear in lines that mint the same id: 16k
+/// identical checkbox lines took 11 s to judge.
+#[test]
+fn an_edit_to_a_tasks_md_task_is_sized_before_it_is_parsed_and_parses_in_linear_time() {
+    let (db, inside, _outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    let over = format!(
+        "t{}",
+        "\n- [ ] x".repeat(super::tasks::MAX_CONTENT_BYTES / 8 + 1)
+    );
+    let e = call(
+        &b,
+        json!({ "op": "task.edit", "uid": inside, "text": over }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("bytes"), "refused on its size: {e:?}");
+    let under = format!(
+        "t{}",
+        "\n- [ ] x".repeat(super::tasks::MAX_CONTENT_BYTES / 8 - 1)
+    );
+    let started = std::time::Instant::now();
+    let e = call(
+        &b,
+        json!({ "op": "task.edit", "uid": inside, "text": under }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("a task of its own"), "{e:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "32k duplicate lines judged in {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_due_date_is_bounded_on_add_and_a_tag_over_the_limit_can_still_be_removed() {
+    let (db, _inside, _outside, managed) = mutate_fixture();
+    let b = rooted(&db);
+    let items = || {
+        db.read(|c| Ok(c.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let before = items();
+    let due = "9".repeat(jkb_core::task::MAX_DUE_BYTES + 1);
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": format!("t @{due}"), "managed": true }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert_eq!(items(), before, "nothing written");
+
+    // A tag stored before the limit existed is removed like any other.
+    let over = "v".repeat(jkb_core::tag::MAX_TAG_BYTES);
+    let uid = managed.clone();
+    let value = over.clone();
+    db.write_txn("t", move |c, _| {
+        let id = jkb_core::task::resolve_ref(c, &uid)?.expect("task");
+        c.execute(
+            "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, 'f', ?2)",
+            rusqlite::params![id.get(), value],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    call(
+        &b,
+        json!({ "op": "task.tag", "uid": managed, "facet_value": format!("f={over}"), "mode": "rm" }),
+    )
+    .expect("an over-limit tag is removable");
+    let Response::Task { task, .. } =
+        call(&b, json!({ "op": "task.show", "uid": managed })).unwrap()
+    else {
+        panic!("task")
+    };
+    assert!(!format!("{task:?}").contains(&over), "the tag is gone");
+}
+
+#[test]
+fn binding_a_task_into_a_tasks_md_holds_its_text_to_the_round_trip() {
+    let (db, _inside, _outside, managed) = mutate_fixture();
+    let host = LocalBackend::new(db.clone());
+    call(
+        &host,
+        json!({ "op": "task.edit", "uid": managed, "text": "managed\n\nsecond paragraph" }),
+    )
+    .expect("a managed task's body is free-form");
+    let e = call(
+        &host,
+        json!({ "op": "task.bind", "uid": managed, "sync": "file:///Users/u/Documents/out/tasks.md#m" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert!(e.message.contains("section prose"), "{e:?}");
+    let uid = managed.clone();
+    let binding = db
+        .read(move |c| {
+            let id = jkb_core::task::resolve_ref(c, &uid)?.expect("task");
+            Ok(jkb_core::binding::get(c, id)?.map(|b| b.uri))
+        })
+        .unwrap();
+    assert_eq!(binding.as_deref(), Some("managed:"), "still unbound");
+    call(
+        &host,
+        json!({ "op": "task.edit", "uid": managed, "text": "managed" }),
+    )
+    .unwrap();
+    call(
+        &host,
+        json!({ "op": "task.bind", "uid": managed, "sync": "file:///Users/u/Documents/out/tasks.md#m" }),
+    )
+    .expect("a task that round-trips is bound");
+}
+
 #[test]
 fn a_quick_add_line_is_bounded_in_what_it_fans_out_to() {
     let (db, _inside, _outside, _managed) = mutate_fixture();

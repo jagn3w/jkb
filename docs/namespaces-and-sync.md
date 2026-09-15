@@ -193,17 +193,25 @@ Around it, the same threat is closed at the other ways in (a third review): a re
 64 MiB (`nofollow::MAX_READ_BYTES` — a sparse file planted at a bound path costs the container nothing
 and allocated its whole apparent size on the host); the watcher is built with
 `with_follow_symlinks(false)`, since a directory link planted in a mount made the recursive watch
-subscribe to the host directories behind it; discovery and event paths skip anything reached through
-a link below the mount directory, and `nofollow::write`'s own temporary files, which an interrupted
-write leaves behind and a full sync would otherwise import as a second copy of every task; and a new
-file is created under the user's umask, with an existing file keeping its mode.
+subscribe to the host directories behind it; a watch event for an unbound path reached through a link
+below the mount directory is dropped, and sync never takes up `nofollow::write`'s own temporary files,
+which an interrupted write leaves behind and a full sync would otherwise import as a second copy of
+every task; and a new file is created under the user's umask, with an existing file keeping its mode.
+
+A **bound** file reached through a link is not skipped (a fourth review): it is reconciled, `nofollow`
+refuses it, and its journal row stays `needs_attention` naming the link. Skipping it at discovery, as
+the third review's fix did, let the full sync's out-of-scope sweep settle the row to `ok`, so the file
+stopped syncing with `jkb doctor` reporting nothing. A size or type refusal carries no link remedy, and
+names the 64 MiB limit.
 
 What it costs: a synced path may not contain a link at all. `jkb mount create` stores a mount's
 directory canonical, so real mounts qualify; a test that mounts a raw temp directory must canonicalize
 it first (on macOS `/var` is a link), which `jkb-sync`'s tests now do. Pinned by
-`jkb-core`'s `nofollow` tests (a link at the file, above it, dangling; a FIFO; mode kept) and
-`sync_never_writes_through_a_symlink_planted_at_a_bound_file`, which fails when the engine goes back
-to following links. Not verified on macOS here — the tests ran on Linux.
+`jkb-core`'s `nofollow` tests (a link at the file, above it, dangling; a FIFO; mode kept; the umask, in
+a child process) and, because a bound path is no longer filtered before it is read,
+`sync_never_writes_through_a_symlink_planted_at_a_bound_file` and
+`a_bound_file_reached_through_a_link_stays_flagged_naming_the_link`, which fail when the engine goes
+back to following links. Not verified on macOS here — the tests ran on Linux.
 
 ## A file's document lives on its journal row, not in the namespace tree (D45)
 

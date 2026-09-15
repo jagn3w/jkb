@@ -299,16 +299,10 @@ pub fn add(
 
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
-    // A task filed into a tasks.md is held to the edit rule's round trip too: a quoted title can carry
-    // newlines, and `first\n\nsecond` came back from the file as a task and a paragraph of prose.
+    // A quoted title can carry newlines, and `first\n\nsecond` came back from the file as a task and a
+    // paragraph of prose.
     if synced.is_some() {
-        if let Some(problem) = jkb_sync::task_content_problem(&spec.title) {
-            return Err(invalid(format!(
-                "this task is filed into a tasks.md, and its text would not come back from the file \
-                 as written: {problem}"
-            ))
-            .into());
-        }
+        check_filed(&spec.title)?;
     }
 
     let id = task::create(conn, meta, &spec)?;
@@ -616,10 +610,34 @@ pub fn bind(
     }
     let id = writable(conn, reference, roots)?;
     match sync {
-        Some(uri) => binding::set(conn, meta, id, uri, Some(SyncMode::Bidirectional), None)?,
+        Some(uri) => {
+            binding::set(conn, meta, id, uri, Some(SyncMode::Bidirectional), None)?;
+            // A managed task's body may hold what a tasks.md cannot: bound into one unchecked, a second
+            // paragraph came back from the next sync as section prose.
+            if item::in_tasks_file(conn, id)? {
+                check_filed(&item::get_content(conn, id)?.unwrap_or_default())?;
+            }
+        }
         None => binding::set(conn, meta, id, task::MANAGED_BINDING, None, None)?,
     }
     Ok(())
+}
+
+/// Refuse a task's text that its tasks.md would not give back as written — the edit rule's round trip
+/// (`jkb_sync::task_content_problem`), asked wherever a task *becomes* written into a tasks file: a
+/// task `task.add` files, and one `task.bind` binds. `task.edit` asks it through
+/// `item::edit_content`.
+fn check_filed(content: &str) -> Result<(), ApiError> {
+    match jkb_sync::task_content_problem(content) {
+        Some(problem) => Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!(
+                "this task is filed into a tasks.md, and its text would not come back from the file \
+                 as written: {problem}"
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// `task.claim`'s answer: whether the claim was taken, and the lifecycle's reason when it was not.

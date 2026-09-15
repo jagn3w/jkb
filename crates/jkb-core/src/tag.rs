@@ -55,9 +55,9 @@ pub fn apply(
     facet: &str,
     value: &str,
 ) -> Result<()> {
-    // Every writer of a tag comes through here — a quick-add line, a synced tasks.md, `task tag`, the
-    // MCP server — so the bound is here, and not on `remove`, which must be able to take away any tag
-    // that exists.
+    // Every writer of a new tag comes through here — a quick-add line, a synced tasks.md, `task tag`,
+    // the MCP server — so the bound is here (and [`rename_facet`] holds a renamed facet's tags to it),
+    // and not on `remove`, which must be able to take away any tag that exists.
     if facet.len() + value.len() > MAX_TAG_BYTES {
         return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
             "a tag of at most {MAX_TAG_BYTES} bytes"
@@ -254,10 +254,27 @@ pub fn items_with(conn: &Connection, facet: &str, value: &str) -> Result<Vec<Ite
 /// this defect, one entry naming the root's old path, and the fix was to log what actually
 /// changed rather than to hand-write an inverse.
 ///
+/// A rename that would make any of the facet's tags longer than [`MAX_TAG_BYTES`] is refused: the
+/// tag would outgrow what [`apply`] stores, and re-applying it — a tasks.md reconcile of the line
+/// carrying it — would then fail the whole file.
+///
 /// # Errors
-/// Returns an error if a statement fails (e.g. the new facet collides with an
-/// existing application on the same item and value).
+/// A validation error for a rename past [`MAX_TAG_BYTES`], or an error if a statement fails (e.g. the
+/// new facet collides with an existing application on the same item and value).
 pub fn rename_facet(conn: &Connection, meta: &WriteMeta, old: &str, new: &str) -> Result<usize> {
+    let longest_value: i64 = conn
+        .prepare_cached(
+            "SELECT coalesce(max(length(CAST(value AS BLOB))), 0) FROM tag_applications WHERE facet = ?1",
+        )?
+        .query_row(params![old], |r| r.get(0))?;
+    if new.len() + usize::try_from(longest_value).unwrap_or(usize::MAX) > MAX_TAG_BYTES {
+        return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
+            "a tag of at most {MAX_TAG_BYTES} bytes: renamed to `{}`, the facet's longest tag would be \
+             {} bytes",
+            new.chars().take(64).collect::<String>(),
+            new.len() + usize::try_from(longest_value).unwrap_or(usize::MAX)
+        ))));
+    }
     // Read the row ids BEFORE the update: afterwards nothing selects them by `old`.
     let rowids = |table: &str| -> Result<Vec<i64>> {
         let sql = if table == "tag_defs" {
@@ -331,7 +348,23 @@ mod tests {
             )?;
             assert!(super::apply(c, m, id, "f", &"v".repeat(super::MAX_TAG_BYTES)).is_err());
             super::apply(c, m, id, "f", "short")?;
+            // Renamed so the facet's longest tag would be one byte over, refused, and nothing renamed.
+            let over = "g".repeat(super::MAX_TAG_BYTES - "short".len() + 1);
+            assert!(super::rename_facet(c, m, "f", &over).is_err());
+            assert_eq!(
+                super::rename_facet(c, m, "f", &over[1..])?,
+                1,
+                "at the limit it renames"
+            );
+            super::rename_facet(c, m, &over[1..], "f")?;
+            // A tag stored before the limit, as an older version or a rename could leave one.
+            c.execute(
+                "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, 'f', ?2)",
+                rusqlite::params![id.get(), "v".repeat(super::MAX_TAG_BYTES)],
+            )?;
+            super::remove(c, m, id, "f", &"v".repeat(super::MAX_TAG_BYTES))?;
             super::remove(c, m, id, "f", "short")?;
+            assert!(super::applications(c, id)?.is_empty());
             Ok(())
         })
         .unwrap();

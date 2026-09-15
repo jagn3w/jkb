@@ -537,11 +537,6 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
         return Err(TypeError::Validation(format!("target '{to}' already exists")).into());
     }
 
-    let new_parent: Option<i64> = match to.rsplit_once('/') {
-        Some((parent, _)) => Some(ensure(conn, parent)?.get()),
-        None => None,
-    };
-
     let rows = subtree(conn, &from)?;
     // Every path the move would write, judged before any is: a move to a near-limit target lengthens
     // each descendant by the same amount, and a stored path `normalize` refuses can never be named.
@@ -553,6 +548,12 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
             ))
         })?;
     }
+    // Only once every path is known to be nameable: `ensure` writes the target's ancestors.
+    let new_parent: Option<i64> = match to.rsplit_once('/') {
+        Some((parent, _)) => Some(ensure(conn, parent)?.get()),
+        None => None,
+    };
+
     // ONE ENTRY PER ROW THIS MOVES. It used to log a single entry naming the root's old `path`,
     // which describes a fraction of what changed: `undo` restoring that one row would leave every
     // descendant under the new path, so the move was not reversible at all and `jkb undo` after a
@@ -676,6 +677,10 @@ mod tests {
             let target = vec!["x"; super::MAX_DEPTH - 1].join("/");
             assert!(super::move_subtree(c, m, "notes", &target).is_err());
             assert!(super::get(c, "notes/a/b")?.is_some(), "nothing moved");
+            assert!(
+                super::get(c, "x")?.is_none(),
+                "not even the target's ancestors, which a caller handling the error would commit"
+            );
             Ok(())
         })
         .unwrap();

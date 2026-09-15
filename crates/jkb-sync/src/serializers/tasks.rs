@@ -88,9 +88,9 @@ fn parse_text(text: &str) -> Result<SyncDoc> {
 struct ParseState {
     doc: SyncDoc,
     /// Every minted/claimed `local_id` (tasks and text), so none collide.
-    used_ids: HashSet<String>,
+    used_ids: Taken,
     /// Every section slug path, so none collide.
-    used_sections: HashSet<String>,
+    used_sections: Taken,
     /// `(header level, slug path)` of the open section ancestry.
     sec_stack: Vec<(usize, String)>,
     /// The current section's slug path (`None` before the first header).
@@ -159,7 +159,7 @@ impl ParseState {
             Some(p) => format!("{p}/{}", section_slug(header_text)),
             None => section_slug(header_text),
         };
-        let path = uniquify(base, &mut self.used_sections);
+        let path = self.used_sections.unique(base);
         self.sec_stack.push((level, path.clone()));
         self.current_section = Some(path.clone());
         self.doc.layout.push(SyncBlock::Section(path.clone()));
@@ -177,7 +177,7 @@ impl ParseState {
             // `classify` already guaranteed uri-safety; only a duplicate id (two lines
             // claiming the same identity) is a genuine error.
             Some(id) => {
-                if !self.used_ids.insert(id.clone()) {
+                if !self.used_ids.claim(&id) {
                     return Err(bad(&format!("duplicate task id `^{id}`")));
                 }
                 id
@@ -500,19 +500,54 @@ pub fn task_content_problem(content: &str) -> Option<String> {
     let Ok(back) = TasksSerializer.parse(&bytes) else {
         return Some("the task line it makes does not parse".to_owned());
     };
-    let whole = back.items.len() == 1
-        && back.edges.is_empty()
-        && back.items[0].local_id == PROBE
-        && back.items[0].content == content
-        && back.items[0].priority.is_none()
-        && back.items[0].due.is_none()
-        && back.items[0].tags.is_empty()
-        && back.items[0].mirrors.is_empty()
-        && back.layout.iter().all(|b| matches!(b, SyncBlock::Item(_)));
-    (!whole).then(|| {
-        "part of it would be read back as something else — a blank line ending the body, a line \
-         that is a checkbox, or trailing `^id`/`@due`/`#tag`/`+ns`/`!p` tokens"
-            .to_owned()
+    if back.items.len() > 1 {
+        return Some(
+            "a line of it would be read back as a task of its own (a checkbox line)".to_owned(),
+        );
+    }
+    let Some(task) = back.items.iter().find(|i| i.local_id == PROBE) else {
+        return Some("a trailing `^id` would be read back as the task's identity".to_owned());
+    };
+    if back.layout.iter().any(|b| !matches!(b, SyncBlock::Item(_))) {
+        return Some(
+            "a blank line (or one of only whitespace) would end the task's body, and what follows would be \
+             read back as section prose"
+                .to_owned(),
+        );
+    }
+    let mut trailing = Vec::new();
+    if task.priority.is_some() {
+        trailing.push("`!p` priority");
+    }
+    if task.due.is_some() {
+        trailing.push("`@due` date");
+    }
+    if !task.tags.is_empty() {
+        trailing.push("`#f=v` tag");
+    }
+    if !task.mirrors.is_empty() {
+        trailing.push("`+ns` placement");
+    }
+    if !back.edges.is_empty() {
+        trailing.push("`needs:^id` dependency");
+    }
+    if !trailing.is_empty() {
+        return Some(format!(
+            "trailing tokens would be read back as a {} rather than as text",
+            trailing.join(", ")
+        ));
+    }
+    (task.content != content).then(|| {
+        const SHOWN: usize = 200;
+        let mut shown: String = task.content.chars().take(SHOWN).collect();
+        if task.content.chars().nth(SHOWN).is_some() {
+            shown.push('…');
+        }
+        format!(
+            "it would be read back as {shown:?} (quotes are dropped, runs of spaces and tabs close \
+             up, and a trailing `^id` becomes the task's identity) — `task edit` with the text \
+             as it should read replaces it"
+        )
     })
 }
 
@@ -692,7 +727,7 @@ fn section_slug(text: &str) -> String {
 /// within the file with a numeric suffix. Pure — no RNG or clock. The base is the shared
 /// [`slug`] (so a task synced from a file and one added via the CLI derive the same slug
 /// from the same title), capped at 24 characters with a `"task"` fallback.
-fn mint_id(title: &str, used: &mut HashSet<String>) -> String {
+fn mint_id(title: &str, used: &mut Taken) -> String {
     let base: String = slug(title).chars().take(24).collect();
     let trimmed = base.trim_matches('-');
     let base = if trimmed.is_empty() {
@@ -701,29 +736,41 @@ fn mint_id(title: &str, used: &mut HashSet<String>) -> String {
         trimmed.to_owned()
     };
     let short = &blob::hash_bytes(title.as_bytes())[..6];
-    let candidate = format!("{base}-{short}");
-    let mut id = candidate.clone();
-    let mut n = 2;
-    while used.contains(&id) {
-        id = format!("{candidate}-{n}");
-        n += 1;
-    }
-    used.insert(id.clone());
-    id
+    used.unique(format!("{base}-{short}"))
 }
 
-/// Ensure a section path is unique within the file, suffixing `-2`, `-3`, … on clash.
-fn uniquify(base: String, used: &mut HashSet<String>) -> String {
-    if used.insert(base.clone()) {
-        return base;
+/// The names taken within one file, where a clashing name is suffixed `-2`, `-3`, … to the first
+/// free one.
+///
+/// The next suffix to try is kept per base, so a file of N identical lines costs N probes rather
+/// than N²/2: counting up from `-2` for every clash made 16k duplicate checkbox lines (128 KiB)
+/// take 11 s, and the round-trip probe parses edit text inside the single writer's transaction.
+/// Names are only ever added, so resuming from the kept suffix finds the same first free name.
+#[derive(Default)]
+struct Taken {
+    names: HashSet<String>,
+    next: HashMap<String, usize>,
+}
+
+impl Taken {
+    /// Take `name` as it is, reporting `false` when it was already taken.
+    fn claim(&mut self, name: &str) -> bool {
+        self.names.insert(name.to_owned())
     }
-    let mut n = 2;
-    loop {
-        let candidate = format!("{base}-{n}");
-        if used.insert(candidate.clone()) {
-            return candidate;
+
+    /// Take `base`, or its first free suffixed form when `base` is taken.
+    fn unique(&mut self, base: String) -> String {
+        if self.names.insert(base.clone()) {
+            return base;
         }
-        n += 1;
+        let n = self.next.entry(base.clone()).or_insert(2);
+        loop {
+            let candidate = format!("{base}-{n}");
+            *n += 1;
+            if self.names.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
     }
 }
 
@@ -741,17 +788,26 @@ mod tests {
         use super::task_content_problem;
         assert_eq!(task_content_problem("Fix login"), None);
         assert_eq!(task_content_problem("Fix login\nstep one\nstep two"), None);
-        for reshaped in [
-            "Fix login\n\nsecond paragraph",
-            "Fix login\n   \nafter a whitespace line",
-            "Fix login\n- [ ] also check logout",
-            "Refactor ^parser",
-            "Ship it #size=small",
-            "Ship it !p1",
+        for (reshaped, named) in [
+            ("Fix login\n\nsecond paragraph", "section prose"),
+            ("Fix login\n   \nafter a whitespace line", "section prose"),
+            ("Fix login\n- [ ] also check logout", "a task of its own"),
+            ("Refactor ^parser", "identity"),
+            ("Ship it #size=small", "`#f=v` tag"),
+            ("Ship it !p1", "`!p` priority"),
+            ("Ship it @friday", "`@due` date"),
+            ("Ship it +repos/app", "`+ns` placement"),
+            (
+                "Handle \"Retry-After\" header",
+                "read back as \"Handle Retry-After header\"",
+            ),
+            ("Fix  login", "read back as \"Fix login\""),
+            ("Ping\tteam", "read back as \"Ping team\""),
         ] {
+            let problem = task_content_problem(reshaped);
             assert!(
-                task_content_problem(reshaped).is_some(),
-                "{reshaped:?} would not come back as written"
+                problem.as_deref().is_some_and(|p| p.contains(named)),
+                "{reshaped:?} would not come back as written, and the reason names {named:?}: {problem:?}"
             );
         }
     }

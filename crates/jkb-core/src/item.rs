@@ -276,20 +276,21 @@ pub fn edit_content(
     } else {
         text.to_owned()
     };
-    if tasks_file {
-        if let Some(problem) = tasks_problem(&content) {
-            return Err(TypeError::Validation(format!(
-                "this task is written into a tasks.md, and its text would not come back from the file \
-                 as written: {problem}"
-            ))
-            .into());
-        }
-    }
+    // The size first: the round-trip probe parses the whole text, inside the writer's transaction.
     if let Some(max) = max_bytes {
         if content.len() > max {
             return Err(TypeError::Validation(format!(
                 "an item's content of at most {max} bytes ({} after this edit)",
                 content.len()
+            ))
+            .into());
+        }
+    }
+    if tasks_file {
+        if let Some(problem) = tasks_problem(&content) {
+            return Err(TypeError::Validation(format!(
+                "this task is written into a tasks.md, and its text would not come back from the file \
+                 as written: {problem}"
             ))
             .into());
         }

@@ -154,9 +154,15 @@ pub fn synced_uris_for_file(conn: &Connection, bare_uri: &str) -> Result<Vec<Str
     let rows = stmt.query_map(params![bare_uri, fragment_like], |row| {
         row.get::<_, String>(0)
     })?;
+    let file = bare_uri.strip_prefix("file://");
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        let uri = row?;
+        // `LIKE '<uri>#%'` also matches a document whose own name continues past a `#` (`C#.md` for
+        // the file `C`); only a uri whose fragment [`file_path`] takes off belongs to this file.
+        if uri == bare_uri || file_path(&uri) == file {
+            out.push(uri);
+        }
     }
     Ok(out)
 }
@@ -198,24 +204,37 @@ pub fn mark_synced(conn: &Connection, meta: &WriteMeta, item: ItemId, hash: &str
 
 /// Fetch an item's binding, if one is set.
 ///
-/// The file a `file://` binding uri names: the path, less a trailing `#<local id>` fragment (one
-/// whose text has no `/` — a `#` earlier in the uri is part of the path). `None` for any other uri.
-/// A `#` in a filename is indistinguishable from a fragment by spelling, so this may shorten the last
-/// component — never a directory, which is all its callers judge by.
-/// The one parse of a binding's fragment: `jkb_api::tasks::FileRoots` judges the path it returns, and
-/// [`serializer_for`] finds the mount covering it.
+/// The file a `file://` binding uri names: the path, less a trailing `#<local id>` fragment. `None` for
+/// any other uri.
+///
+/// The one parse of a binding's fragment — the sync engine gathers a file's bindings by it
+/// ([`synced_uris_for_file`], and the bound files it walks), `jkb_api::tasks::FileRoots` judges the path
+/// it returns, and [`serializer_for`] finds the file's journal row and mount by it. A `#` in a filename
+/// is indistinguishable from a fragment by spelling alone, so a fragment is only text a local id can
+/// be: non-empty, with no `/` (a `#` in a directory name is path) and no `.` (a minted id slugs a `.`
+/// to `-`, and a `^id` is letters, digits and dashes — while a document's filename after a `#` almost
+/// always carries its extension). Splitting `C#.md` at the `#` had the second sync of a note of that
+/// name export it to a new file `C`. What stays ambiguous is a dotless name such as `Makefile#x`.
 #[must_use]
 pub fn file_path(uri: &str) -> Option<&str> {
     let rest = uri.strip_prefix("file://")?;
     Some(match rest.rsplit_once('#') {
-        Some((path, fragment)) if !fragment.contains('/') => path,
+        Some((path, fragment)) if !fragment.is_empty() && !fragment.contains(['/', '.']) => path,
         _ => rest,
     })
 }
 
 /// The serializer that owns an item's file binding: the binding's own override, else the serializer
-/// of the mount whose directory covers the file most closely. `None` for an item bound to no file, or
-/// to a file no mount covers.
+/// the sync journal says last produced the file, else — for a file not synced yet — the serializer of
+/// the mount whose directory covers it most closely. `None` for an item bound to no file, or to a file
+/// no mount covers.
+///
+/// The journal comes before the mounts because it records what the engine actually used, and the
+/// engine syncs a file with the serializer of the mount *doing the sync*: under a `document` mount
+/// over a directory with a nested `tasks` mount, `jkb sync` of the outer one imports the nested
+/// `tasks.md` as one whole-file document, which the closest mount would have misjudged as a task. The
+/// journal is keyed by the bare file uri, so a document's own uri is tried as it is before the
+/// fragment is taken off it.
 ///
 /// # Errors
 /// Returns an error if a read fails.
@@ -228,6 +247,11 @@ pub fn serializer_for(conn: &Connection, item: ItemId) -> Result<Option<String>>
     };
     if let Some(own) = bound.serializer {
         return Ok(Some(own));
+    }
+    for uri in [bound.uri.clone(), format!("file://{path}")] {
+        if let Some(journal) = crate::sync_state::get(conn, &uri)? {
+            return Ok(Some(journal.serializer));
+        }
     }
     let mut stmt = conn.prepare_cached(
         "SELECT backing_uri, serializer FROM mounts WHERE backing_uri LIKE 'file://%'",
@@ -273,16 +297,17 @@ mod tests {
     /// The serializer owning a binding decides whether it is a tasks file, not a `#` in its uri: a
     /// document named `C#.md` is a whole-file note.
     #[test]
-    fn a_binding_s_serializer_is_its_override_else_its_closest_mount_s() {
+    fn a_binding_s_serializer_is_its_override_else_its_journal_s_else_its_closest_mount_s() {
         use crate::{mount, ns};
         use jkb_types::{ConflictPolicy, SyncMode};
-        // By spelling alone `C#.md` cannot be told from `C` with a fragment — which is why whether an
-        // item is in a tasks file is asked of its serializer, below. What the parse guarantees is that
-        // it only ever shortens the last component, so the directory a root or a mount is judged by
-        // is the file's own.
+        // A fragment is only text a local id can be, so a document's own `#` stays in its path, while
+        // a minted id keeps its (lowercased, possibly non-ASCII) letters. Whether an item is in a
+        // tasks file is still asked of its serializer, below, never of the spelling.
+        assert_eq!(super::file_path("file:///n/C#.md"), Some("/n/C#.md"));
+        assert_eq!(super::file_path("file:///n/C#"), Some("/n/C#"));
         assert_eq!(
-            super::file_path("file:///n/C#.md").map(|p| std::path::Path::new(p).parent()),
-            Some(Some(std::path::Path::new("/n")))
+            super::file_path("file:///n/tasks.md#fix-é-0a1b2c"),
+            Some("/n/tasks.md")
         );
         assert_eq!(
             super::file_path("file:///n/tasks.md#t1"),
@@ -312,49 +337,27 @@ mod tests {
                     ConflictPolicy::Manual,
                 )?;
             }
-            let note = upsert(
-                c,
-                m,
-                &NewItem {
-                    uid: "n1".into(),
-                    kind: "document".into(),
-                    content: None,
-                    content_hash: None,
-                    mime: None,
-                },
-            )?;
-            set(c, m, note, "file:///n/C#.md", None, None)?;
-            let task = upsert(
-                c,
-                m,
-                &NewItem {
-                    uid: "t1".into(),
-                    kind: "task".into(),
-                    content: None,
-                    content_hash: None,
-                    mime: None,
-                },
-            )?;
-            set(c, m, task, "file:///n/plan/tasks.md#t1", None, None)?;
-            let forced = upsert(
-                c,
-                m,
-                &NewItem {
-                    uid: "f1".into(),
-                    kind: "document".into(),
-                    content: None,
-                    content_hash: None,
-                    mime: None,
-                },
-            )?;
-            set(
-                c,
-                m,
-                forced,
-                "file:///n/plan/notes.md",
-                None,
-                Some("document"),
-            )?;
+            let bound = |uid: &str,
+                         uri: &str,
+                         serializer: Option<&str>|
+             -> crate::Result<jkb_types::ItemId> {
+                let item = upsert(
+                    c,
+                    m,
+                    &NewItem {
+                        uid: uid.into(),
+                        kind: "document".into(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                set(c, m, item, uri, None, serializer)?;
+                Ok(item)
+            };
+            let note = bound("n1", "file:///n/C#.md", None)?;
+            let task = bound("t1", "file:///n/plan/tasks.md#t1", None)?;
+            let forced = bound("f1", "file:///n/plan/notes.md", Some("document"))?;
             assert_eq!(super::serializer_for(c, note)?.as_deref(), Some("document"));
             assert_eq!(super::serializer_for(c, task)?.as_deref(), Some("tasks"));
             assert_eq!(
@@ -363,6 +366,36 @@ mod tests {
                 "the override wins"
             );
             assert!(!crate::item::in_tasks_file(c, note)?);
+            // The outer `document` mount synced the nested tasks.md as one whole-file note: the journal
+            // says so, and it is not judged a task because a `tasks` mount covers it more closely.
+            let whole = bound("w1", "file:///n/plan/tasks.md", None)?;
+            assert_eq!(super::serializer_for(c, whole)?.as_deref(), Some("tasks"));
+            let journal = |uri, serializer| crate::sync_state::SyncStateWrite {
+                uri,
+                serializer,
+                status: "ok",
+                last_synced_hash: None,
+                base_blob_hash: None,
+                parse_error: None,
+                quarantine_blob_hash: None,
+                document: None,
+            };
+            crate::sync_state::upsert(c, m, &journal("file:///n/plan/tasks.md", "document"))?;
+            assert_eq!(
+                super::serializer_for(c, whole)?.as_deref(),
+                Some("document")
+            );
+            assert_eq!(
+                super::serializer_for(c, task)?.as_deref(),
+                Some("document"),
+                "a fragment is taken off to find the file's journal row"
+            );
+            crate::sync_state::upsert(c, m, &journal("file:///n/C#.md", "tasks"))?;
+            assert_eq!(
+                super::serializer_for(c, note)?.as_deref(),
+                Some("tasks"),
+                "a document's own uri is looked up as it is"
+            );
             Ok(())
         })
         .unwrap();
@@ -383,6 +416,7 @@ mod tests {
                 ("a", "file:///repo/a_b.md#one"),
                 ("b", "file:///repo/a_b.md#two"),
                 ("c", "file:///repo/axb.md#three"), // sibling: `x` where the other has `_`
+                ("d", "file:///repo/a_b.md#.bak"),  // a document named `a_b.md#.bak`, no fragment
             ] {
                 let item = upsert(
                     conn,
