@@ -363,10 +363,15 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
 ///
 /// A flagged file's knowledge-base side cannot be judged against its last-synced hash — the refusal or
 /// failure that flagged it is why that hash is stale — so it was reconciled on every pass: re-archived,
-/// refused again, re-flagged with a changelog row holding its whole document twice, and logged, about
-/// once a second for as long as a fleet kept writing (stage-6.3a review 2). Keyed by what the pass saw
-/// — the render's hash, or the check's error — so the remedy, which changes one of them, is still
-/// re-judged. Kept by the watcher for as long as it runs; a fresh one re-judges every flagged file once.
+/// refused again and logged, about once a second for as long as a fleet kept writing (stage-6.3a review
+/// 2). Keyed on everything a refusal reads from the database — the render's hash (or the check's error),
+/// each bound item with whether it has a primary placement, and the mount's direction — so any remedy
+/// is re-judged: restoring the placement, unbinding or removing the item it names, or switching the
+/// mount (review 3; the render alone missed the last two). An entry is kept only for a file the pass left
+/// flagged, so it never stands in for a flag raised later by another process. Kept by the watcher for as
+/// long as it runs; a fresh one re-judges every flagged file once. Other routes that re-judge a flag —
+/// the watcher's backed-off full-sync retry — still reconcile it; `sync_state::upsert` makes their
+/// unchanged re-flag write nothing.
 #[derive(Debug, Default)]
 pub struct FlaggedJudgements {
     seen: HashMap<PathBuf, String>,
@@ -438,7 +443,17 @@ pub fn sync_kb_changes(
     if changed.is_empty() {
         return Ok(SyncReport::default());
     }
-    reconcile_all(db, &ctx, changed)
+    let report = reconcile_all(db, &ctx, changed)?;
+    for result in &report.results {
+        let still_flagged = matches!(
+            result.outcome,
+            Outcome::Failed | Outcome::Refused | Outcome::Conflict | Outcome::Quarantined
+        );
+        if !still_flagged {
+            judged.seen.remove(&result.path);
+        }
+    }
+    Ok(report)
 }
 
 /// What a database pass concludes about one bound file's knowledge-base side.
@@ -459,9 +474,29 @@ fn judge_kb_side(conn: &Connection, ctx: &Ctx, path: &Path) -> KbSide {
         let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal)?;
         Ok(hash(&serializer.render(&kb_doc)?))
     };
-    let key = |rendered: Result<String>| match rendered {
-        Ok(hash) => format!("render {hash}"),
-        Err(e) => format!("error {e}"),
+    let key = |rendered: Result<String>| {
+        let judged = match rendered {
+            Ok(hash) => format!("render {hash}"),
+            Err(e) => format!("error {e}"),
+        };
+        // What else a refusal reads from the database: which items are bound to the file, whether each
+        // still has a primary placement, and which way the mount syncs.
+        let bindings = (|| -> Result<String> {
+            let uris = binding::synced_uris_for_file(conn, &bare_uri)?;
+            let ids = binding::items_for_uris(conn, &uris)?;
+            let items: Vec<ItemId> = ids.values().copied().collect();
+            let placed = primary_placements_for(conn, &items)?;
+            Ok(uris
+                .iter()
+                .map(|uri| {
+                    let homed = ids.get(uri).is_some_and(|id| placed.contains_key(id));
+                    format!("{uri}={homed}")
+                })
+                .collect::<Vec<_>>()
+                .join(" "))
+        })()
+        .unwrap_or_else(|e| format!("error {e}"));
+        format!("{judged} | {bindings} | {}", ctx.sync_mode)
     };
     let journal = match sync_state::get(conn, &bare_uri) {
         Ok(journal) => journal,

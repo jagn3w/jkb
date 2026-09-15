@@ -228,9 +228,13 @@ to their last-synced hash (`engine::sync_kb_changes`) — read-only to decide, o
 writers interleave, so a write elsewhere costs a render per bound file, not an archive and a transaction
 each. Judged by `FileState::from_journal`: a never-synced file is reconciled; a `Blocked` one (a refusal,
 whose remedy is a database write, or a failure) and a file whose check fails are reconciled when what
-they are judged on — the render's hash or the error — differs from the watcher's record of the last time
-(`FlaggedJudgements`), so a flag stays standing without a reconcile, a changelog row and a log line on
-every pass (review 2), yet clears when its remedy lands. Left to the disk: a `conflict` and a quarantined
+they are judged on differs from the watcher's record of the last time (`FlaggedJudgements`) — the
+render's hash or the error, each bound item with whether it has a primary placement, and the mount's
+direction — so a flag stays standing without a reconcile and a log line on every pass (review 2), yet
+clears when any remedy lands: restoring the placement, unbinding the item, switching the mount (review 3:
+keyed on the render alone, the last two never cleared). Only a file the pass left flagged keeps an entry.
+And `sync_state::upsert` writes nothing when the row would not change, so no route — the backed-off
+full-sync retry included — leaves a changelog row per re-flag of a standing flag. Left to the disk: a `conflict` and a quarantined
 parse failure. An import-only mount is skipped. The spacing between passes is measured from when the
 last one ended. Read-only filesystem events (open, read, close after reading) are dropped in the watcher's
 callback, and one burst of events is coalesced for at most ten debounces.
@@ -258,8 +262,10 @@ next pass. Pinned by `writes_since_counts_what_others_wrote_and_passes_sync_s_ow
 and writing another file under the mount faster still, while it waits), `a_read_only_access_is_not_a_change`,
 `a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync`,
 `a_refused_file_is_re_judged_after_its_database_remedy` (and not before),
-`a_file_whose_check_fails_is_flagged_once_and_does_not_stop_the_pass` and
-`database_passes_are_spaced_and_a_write_between_them_is_kept`. Not verified on macOS here.
+`a_file_whose_check_fails_is_flagged_once_and_does_not_stop_the_pass`,
+`every_remedy_is_re_judged_and_a_settled_file_holds_no_judgement`, `an_unchanged_row_is_not_rewritten` and
+`database_passes_are_spaced_and_a_write_between_them_is_kept`. Untested: a mount-direction switch as the
+remedy (the direction is in the key). Not verified on macOS here.
 
 ## A task's `^id` is read in the alphabet `slug` mints it in
 

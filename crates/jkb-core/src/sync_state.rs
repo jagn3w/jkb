@@ -96,6 +96,12 @@ pub fn get(conn: &Connection, uri: &str) -> Result<Option<SyncState>> {
 /// Insert or replace the journal row for a file (the single write point), stamping
 /// `updated_at` and recording the change in the changelog.
 ///
+/// **A write that changes nothing is not made.** Every route that re-judges a standing flag — the
+/// watcher's backed-off full-sync retry, a startup pass, a database pass — re-flagged the same file with
+/// the same reason, and each wrote a changelog row holding the whole document twice and restamped
+/// `updated_at`, so a flag that stood for a day left thousands of identical rows behind it and `jkb
+/// doctor` could not say how long it had stood.
+///
 /// # Errors
 /// Returns an error if a statement or the changelog append fails.
 pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result<()> {
@@ -104,7 +110,19 @@ pub fn upsert(conn: &Connection, meta: &WriteMeta, w: &SyncStateWrite) -> Result
     // `last_synced_hash` describing bytes that no longer had any, after which the next
     // reconcile read "KB changed, disk did not" and exported an item-less render over the
     // file. Same rule `mount::create` and `containment::contain` follow.
-    let before = get(conn, w.uri)?.map(|row| {
+    let existing = get(conn, w.uri)?;
+    if existing.as_ref().is_some_and(|row| {
+        row.serializer == w.serializer
+            && row.status == w.status
+            && row.last_synced_hash.as_deref() == w.last_synced_hash
+            && row.base_blob_hash.as_deref() == w.base_blob_hash
+            && row.parse_error.as_deref() == w.parse_error
+            && row.quarantine_blob_hash.as_deref() == w.quarantine_blob_hash
+            && row.document.as_deref() == w.document
+    }) {
+        return Ok(());
+    }
+    let before = existing.map(|row| {
         json!({
             "status": row.status,
             "serializer": row.serializer,
@@ -445,5 +463,55 @@ mod tests {
                 by_others: false
             }
         );
+    }
+
+    /// Writing a row identical to the stored one writes nothing: no changelog row, `updated_at` kept.
+    #[test]
+    fn an_unchanged_row_is_not_rewritten() {
+        let db = Db::open_in_memory().unwrap();
+        let row = SyncStateWrite {
+            uri: "file:///r/tasks.md",
+            serializer: "tasks",
+            status: "needs_attention",
+            last_synced_hash: Some("h"),
+            base_blob_hash: None,
+            parse_error: Some("refused"),
+            quarantine_blob_hash: None,
+            document: None,
+        };
+        let entries = |db: &Db| {
+            db.read(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM changelog WHERE entity_type = 'sync_state'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap()
+        };
+        db.write_txn("t", move |c, m| upsert(c, m, &row)).unwrap();
+        let first = entries(&db);
+        let stamp = db
+            .read(|c| get(c, "file:///r/tasks.md"))
+            .unwrap()
+            .unwrap()
+            .updated_at;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        db.write_txn("t", move |c, m| upsert(c, m, &row)).unwrap();
+        assert_eq!(entries(&db), first, "no second changelog row");
+        assert_eq!(
+            db.read(|c| get(c, "file:///r/tasks.md"))
+                .unwrap()
+                .unwrap()
+                .updated_at,
+            stamp
+        );
+        let changed = SyncStateWrite {
+            parse_error: Some("refused again, differently"),
+            ..row
+        };
+        db.write_txn("t", move |c, m| upsert(c, m, &changed))
+            .unwrap();
+        assert_eq!(entries(&db), first + 1, "a change is still written");
     }
 }

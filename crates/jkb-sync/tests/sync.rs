@@ -3166,3 +3166,76 @@ fn a_file_whose_check_fails_is_flagged_once_and_does_not_stop_the_pass() {
         "not reconciled again while the same failure stands"
     );
 }
+
+/// A refused file is re-judged after ANY remedy the refusal reads from the database, not only one that
+/// changes the render: unbinding the item it names leaves the render as it was. And a file a pass settled
+/// holds no judgement, so a flag another process raises on it later is re-judged by the next pass.
+#[test]
+fn every_remedy_is_re_judged_and_a_settled_file_holds_no_judgement() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(
+        &tasks,
+        "## Plan\n\n- [ ] keep me !p1 ^keep\n- [ ] and me !p2 ^and\n",
+    )
+    .unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    db.write_txn("t", |conn, _| {
+        conn.execute(
+            "DELETE FROM placements WHERE role = 'primary'
+               AND item_id = (SELECT id FROM items WHERE content = 'keep me')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    kb_set_status(&db, &format!("{}#and", uri_for(&tasks)), "done");
+    assert_eq!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .count(Outcome::Refused),
+        1
+    );
+
+    // The remedy that detaches the item: its binding goes, and the render — which already left it out
+    // — does not change.
+    let keep = format!("{}#keep", uri_for(&tasks));
+    db.write_txn("cli", move |conn, meta| {
+        let id = item::id_for_uid(conn, &keep)?.expect("task");
+        binding::set(conn, meta, id, "managed:", None, None)
+    })
+    .unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert_eq!(
+        journal(&db, &uri_for(&tasks)).unwrap().0,
+        "ok",
+        "unbinding the item the refusal named clears it"
+    );
+
+    // Settled by that pass, the file holds no judgement: flagged afterwards by someone else with nothing
+    // in the database changed, the next pass re-judges and settles it.
+    let uri = uri_for(&tasks);
+    db.write_txn("other-process", move |conn, meta| {
+        let row = jkb_core::sync_state::get(conn, &uri)?.expect("row");
+        jkb_core::sync_state::upsert(
+            conn,
+            meta,
+            &jkb_core::sync_state::SyncStateWrite {
+                uri: &uri,
+                serializer: &row.serializer,
+                status: "needs_attention",
+                last_synced_hash: row.last_synced_hash.as_deref(),
+                base_blob_hash: row.base_blob_hash.as_deref(),
+                parse_error: Some("could not archive: database is locked"),
+                quarantine_blob_hash: None,
+                document: row.document.as_deref(),
+            },
+        )
+    })
+    .unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert_eq!(journal(&db, &uri_for(&tasks)).unwrap().0, "ok");
+}
