@@ -1931,6 +1931,10 @@ refuse_shared_db() {
     done
     for at in "${asks[@]}"; do
         if ! magic="$(stat -f -c %t -- "$at" 2>/dev/null)"; then
+            # A file listed a moment ago and gone now was deleted by SQLite as another process closed
+            # its last connection; its directory, asked first, still judges. Only a file that is still
+            # there, or the directory itself, failing to answer refuses — as shared_fs.rs does.
+            if [ "$at" != "$dir" ] && [ ! -e "$at" ]; then continue; fi
             printf 'refusing to open %s: cannot tell what filesystem %s is on\n' "$db" "$at" >&2
             return 2
         fi

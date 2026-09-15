@@ -322,6 +322,14 @@ pub fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// A poll's `max`, held to [`MAX_BATCH`] — one check for [`poll`] and [`poll_needed`].
+fn check_batch(max: usize) -> Result<()> {
+    if max > MAX_BATCH {
+        return Err(invalid("max", format!("at most {MAX_BATCH} messages")).into());
+    }
+    Ok(())
+}
+
 fn invalid(what: &'static str, why: impl Into<String>) -> QueueError {
     QueueError::Invalid {
         what,
@@ -690,9 +698,7 @@ pub fn poll(
     after: Option<i64>,
     now: i64,
 ) -> Result<Vec<Delivered>> {
-    if max > MAX_BATCH {
-        return Err(invalid("max", format!("at most {MAX_BATCH} messages")).into());
-    }
+    check_batch(max)?;
     let (topic_id, _) = topic_row(conn, topic)?;
     let position = group_position(conn, topic, topic_id, group)?.max(after.unwrap_or(0));
     conn.prepare_cached(
@@ -814,15 +820,19 @@ pub const POLL_TOUCH_MS: i64 = 60 * 60 * 1000;
 /// callers skip the (writing) poll when it answers `false`.
 ///
 /// # Errors
-/// [`QueueError::NoSuchTopic`], [`QueueError::NoSuchGroup`], or a database error — the same refusals
-/// the poll itself would give.
+/// [`QueueError::Invalid`] for a `max` over [`MAX_BATCH`], [`QueueError::NoSuchTopic`],
+/// [`QueueError::NoSuchGroup`], or a database error — the same refusals the poll itself would give,
+/// so a batch too large is refused on its first poll rather than served while the topic is idle and
+/// refused when the first message arrives.
 pub fn poll_needed(
     conn: &Connection,
     topic: &str,
     group: &str,
+    max: usize,
     after: Option<i64>,
     now: i64,
 ) -> Result<bool> {
+    check_batch(max)?;
     let (topic_id, spec) = topic_row(conn, topic)?;
     let (position, last_poll_at): (i64, Option<i64>) = conn
         .prepare_cached(

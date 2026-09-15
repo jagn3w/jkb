@@ -1036,7 +1036,7 @@ impl Backend for LocalBackend {
                 // Asked with a read first: an idle subscriber polls several times a second, and a
                 // poll that hands nothing over and has no touch due must not take the write lock.
                 let (t, g) = (topic.clone(), group.clone());
-                if !db.read(move |c| mq::poll_needed(c, &t, &g, after, now))? {
+                if !db.read(move |c| mq::poll_needed(c, &t, &g, max, after, now))? {
                     return Ok(Response::Messages {
                         messages: Vec::new(),
                     });

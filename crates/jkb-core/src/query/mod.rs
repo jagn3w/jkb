@@ -159,6 +159,9 @@ const SUBTASK_CLAUSE: &str = "
                        AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
                  )";
 
+/// The most `tag:`/`-tag:` terms one query evaluates ([`Query::evaluate`]).
+pub const MAX_TAG_TERMS: usize = 64;
+
 impl Query {
     /// Evaluate the structured filter (plus any FTS `match`) and return the matching
     /// item ids, ordered by id. The `~"…"` vector term is ignored here (see the
@@ -167,6 +170,15 @@ impl Query {
     /// # Errors
     /// Returns an error if a scope path is malformed or a statement fails.
     pub fn evaluate(&self, conn: &Connection) -> Result<Vec<ItemId>> {
+        // Each tag term is its own subquery, and SQLite refuses an expression deeper than 1000 — a
+        // query a client wrote with ~1000 `tag:` terms (8 KiB) came back an internal error. A tag term
+        // is not a list to bind as one parameter, so the count is what is bounded.
+        let tag_terms = self.tags.len() + self.exclude_tags.len();
+        if tag_terms > MAX_TAG_TERMS {
+            return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
+                "a query of at most {MAX_TAG_TERMS} tag terms ({tag_terms} given)"
+            ))));
+        }
         let mut clauses: Vec<String> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 

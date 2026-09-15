@@ -622,7 +622,7 @@ fn an_idle_poll_needs_no_write_until_its_touch_is_due() {
     let db = db_with_topic(spec);
     do_group(&db, "g", Start::FromStart, T0);
     let needed = |now: i64, after: Option<i64>| {
-        db.read(move |c| poll_needed(c, "t", "g", after, now))
+        db.read(move |c| poll_needed(c, "t", "g", 10, after, now))
             .unwrap()
     };
     assert!(
@@ -640,7 +640,7 @@ fn an_idle_poll_needs_no_write_until_its_touch_is_due() {
     assert!(needed(T0 + 3, None), "a message to hand over");
     assert!(!needed(T0 + 3, Some(s)), "…but not past the fetch position");
     let err = db
-        .read(|c| poll_needed(c, "t", "ghost", None, T0))
+        .read(|c| poll_needed(c, "t", "ghost", 10, None, T0))
         .unwrap_err();
     assert!(matches!(queue_err(err), QueueError::NoSuchGroup { .. }));
 }
@@ -927,6 +927,13 @@ fn a_batch_is_bounded_whatever_it_asks_for() {
         do_send(&db, draft("k", n), 1_000).unwrap();
     }
     do_group(&db, "g", Start::FromStart, 1_000);
+    let idle = db
+        .read(|c| poll_needed(c, "t", "g", MAX_BATCH + 1, Some(i64::MAX), 1_000))
+        .unwrap_err();
+    assert!(
+        matches!(queue_err(idle), QueueError::Invalid { what: "max", .. }),
+        "refused on the first poll, idle topic or not — not first when a message arrives"
+    );
     let refused = db
         .write_txn("t", |c, m| poll(c, m, "t", "g", MAX_BATCH + 1, None, 1_000))
         .unwrap_err();

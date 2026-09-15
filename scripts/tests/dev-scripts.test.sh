@@ -1667,8 +1667,10 @@ shell opens as a URI while the guard judged the working directory"
     mkdir -p "$work/statstub" "$work/filebind"
     cat > "$work/statstub/stat" <<'STUB'
 #!/bin/sh
-[ -n "${STAT_FAILS:-}" ] && exit 1
 for last; do :; done
+# STAT_VANISHES: the file is deleted under the guard, as SQLite deletes -shm when a connection closes.
+if [ -n "${STAT_VANISHES:-}" ] && [ "$last" != "${last%-shm}" ]; then rm -f -- "$last"; exit 1; fi
+[ -n "${STAT_FAILS:-}" ] && exit 1
 case "$last" in
     */jkb.db) echo 65735546 ;;
     *) echo ef53 ;;
@@ -1688,6 +1690,12 @@ per-file assertion above proves nothing if this refuses too"
     (PATH="$work/statstub:$PATH" STAT_FAILS=1 refuse_shared_db "$work/filebind/jkb.db" 2>/dev/null); rc=$?
     [ "$rc" = 2 ] && ok "an unanswerable stat refuses rather than reading as local" \
         || fail "shared-db: fail-open" "refuse_shared_db returned $rc when stat could not answer"
+    : > "$work/filebind/other.db"
+    : > "$work/filebind/other.db-shm"
+    (PATH="$work/statstub:$PATH" STAT_VANISHES=1 refuse_shared_db "$work/filebind/other.db" 2>/dev/null); rc=$?
+    [ "$rc" = 0 ] && ok "a -shm deleted between listing and asking is skipped, as shared_fs.rs skips it" \
+        || fail "shared-db: vanished sibling" "refuse_shared_db returned $rc when -shm was deleted under \
+it — another process closing its last connection made every open beside it refuse"
 
     probe_dir="$work/local-db"
     mkdir -p "$probe_dir"

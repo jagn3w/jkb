@@ -149,6 +149,8 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   variables. The other bounds are on
   work rather than answer size: `kb.search` takes at most 1000 hits (the hybrid route, served only
   where there is an embedder, fuses from twice the limit) and 50 chunks of context either side;
+  a query evaluates at most 64 `tag:`/`-tag:` terms (`query::MAX_TAG_TERMS`) — each is a subquery, and
+  ~1000 of them from an 8 KiB request exceeded SQLite's expression depth as an internal error;
   `kb.grep` refuses an empty pattern and reads items one at a time (`item::grep_each`), counting
   past the budget, and `-c`/`-l` ask for no lines; `jkb recent` orders and limits on the server
   (`order: updated_desc`); `kb.tree` descends at most 48 levels (each is two levels of JSON, and

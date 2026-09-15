@@ -153,8 +153,24 @@ fn refuse_shared(path: &Path) -> Result<()> {
         reason,
     };
     let asks = paths_to_ask(path).map_err(|reason| unknown(path, reason))?;
-    for at in asks {
-        let stat = rustix::fs::statfs(&at).map_err(|e| unknown(&at, e.to_string()))?;
+    judge(asks, unknown)
+}
+
+/// Judge each of `asks` — the directory first, then the files ([`paths_to_ask`]).
+///
+/// **A file that is gone by the time it is asked is skipped, not refused.** The files are listed
+/// because they existed a moment earlier, and `SQLite` deletes `-wal`/`-shm` when another process
+/// closes its last connection — so a host `jkb` opening beside one that was just exiting was refused
+/// as "cannot tell what filesystem" (a CLI test met it under a parallel run). Its directory, always
+/// asked first, is still judged; only the directory's own disappearance, or any other failure, refuses.
+#[cfg(target_os = "linux")]
+fn judge(asks: Vec<PathBuf>, unknown: impl Fn(&Path, String) -> Error) -> Result<()> {
+    for (i, at) in asks.into_iter().enumerate() {
+        let stat = match rustix::fs::statfs(&at) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) if i > 0 => continue,
+            Err(e) => return Err(unknown(&at, e.to_string())),
+        };
         // `f_type` is a kernel long: i64 on 64-bit targets, i32 on 32-bit ones, and the SMB magics
         // do not fit in an i32. The magic is the low 32 bits either way. The widening is a no-op
         // on 64-bit, which is what the lint sees; it is not one on the 32-bit targets.
@@ -208,6 +224,28 @@ mod tests {
         assert_eq!(
             paths_to_ask(&fresh).unwrap(),
             vec![std::fs::canonicalize(tmp.path()).unwrap()]
+        );
+    }
+
+    /// A database file listed and then deleted — another process closing its last connection removes
+    /// `-shm` — is skipped; the directory vanishing is still a refusal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_gone_before_it_is_asked_is_skipped_but_its_directory_is_not() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let unknown = |at: &std::path::Path, reason: String| crate::Error::FilesystemUnknown {
+            path: at.to_path_buf(),
+            reason,
+        };
+        let gone = dir.join("jkb.db-shm");
+        assert!(super::judge(vec![dir.clone(), gone.clone()], unknown).is_ok());
+        assert!(
+            matches!(
+                super::judge(vec![dir.join("no-such-dir"), gone], unknown),
+                Err(crate::Error::FilesystemUnknown { .. })
+            ),
+            "the directory is the one thing that must answer"
         );
     }
 

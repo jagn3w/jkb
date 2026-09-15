@@ -1013,11 +1013,18 @@ fn an_unread_answer_holds_its_permit_until_the_write_deadline() {
     // the unwritten body rather than the read still running. Then never read again.
     {
         use std::io::BufRead as _;
-        let mut head = std::io::BufReader::new(stalled.try_clone().unwrap());
+        let reader = stalled.try_clone().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut head = std::io::BufReader::new(reader);
         let mut line = String::new();
         loop {
             line.clear();
-            head.read_line(&mut line).unwrap();
+            let read = head
+                .read_line(&mut line)
+                .expect("the response head arrives within 10 s");
+            assert_ne!(read, 0, "the daemon closed the connection before its head");
             if line == "\r\n" {
                 break;
             }

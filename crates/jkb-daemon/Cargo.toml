@@ -31,3 +31,5 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "macros", "t
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `test-util` for a paused clock in the write-deadline test; a feature of the tokio already locked.
+tokio = { version = "1.52.3", features = ["test-util"] }

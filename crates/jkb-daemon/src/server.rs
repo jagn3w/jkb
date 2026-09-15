@@ -1009,8 +1009,11 @@ mod tests {
     fn a_write_deadline_is_reset_by_progress_and_fires_on_a_stall() {
         use std::sync::atomic::Ordering;
         use std::task::Poll;
+        // Paused: the sleeps below advance a test clock exactly, so the margins are not at the mercy of a
+        // loaded machine.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .start_paused(true)
             .build()
             .unwrap();
         runtime.block_on(async {

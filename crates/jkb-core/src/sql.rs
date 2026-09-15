@@ -27,7 +27,9 @@ pub fn like_escape(s: &str) -> String {
 /// an internal error — and a statement whose text grows with its list defeats `prepare_cached`, one
 /// cached statement per length. Only a list bounded by construction — a path's ancestors — may still
 /// use placeholders; anything a client's text can lengthen may not (a query's kinds were exempted once,
-/// and `kind:a,a,…` from a request body refused its statement).
+/// and `kind:a,a,…` from a request body refused its statement). Terms that are clauses rather than
+/// list elements — a query's tags — cannot be bound this way and are bounded by count instead
+/// (`query::MAX_TAG_TERMS`).
 #[must_use]
 pub fn json_ids(ids: impl IntoIterator<Item = i64>) -> String {
     let ids: Vec<i64> = ids.into_iter().collect();
@@ -72,6 +74,18 @@ mod tests {
                 ..crate::query::Query::default()
             };
             assert!(q.evaluate(c)?.is_empty());
+            let tags = (0..1000)
+                .map(|i| format!("tag:f{i}=v"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let refused = crate::query::parse(&tags)?.evaluate(c).unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    crate::Error::Types(jkb_types::Error::Validation(_))
+                ),
+                "too many tag terms is a refusal, not SQLite's expression-depth error: {refused}"
+            );
             Ok(())
         })
         .unwrap();

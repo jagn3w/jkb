@@ -780,7 +780,11 @@ What is asked: the directory the files will be created in (symlinks followed, da
 included, since SQLite creates the database at a dangling link's target; the nearest existing
 ancestor for a path that does not exist yet), **and** the database file and its `-wal`/`-shm`/
 `-journal` when they exist, because a single file bind-mounted into a local directory is invisible
-to statfs of that directory. A statfs that cannot answer refuses. Every script's database read goes
+to statfs of that directory. A statfs that cannot answer refuses — except for a file that is gone by
+the time it is asked, which is skipped while its directory still judges: SQLite deletes `-wal`/`-shm`
+when another process closes its last connection, and an open beside one that was just exiting was
+refused as "cannot tell what filesystem" (met by a CLI test under a parallel run, 2026-09-15; both the
+Rust and the shell copy skip it, each pinned by a test). Every script's database read goes
 through `jkb_sqlite` in
 `scripts/lib.sh`, which applies the same magic set — `scripts/tests/dev-scripts.test.sh` case11 fails
 on a bare call, on the two sets drifting, and inside the container on the live bind not being

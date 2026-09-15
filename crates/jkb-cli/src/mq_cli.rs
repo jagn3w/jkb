@@ -1003,6 +1003,23 @@ mod tests {
         assert!(batch_size(&(max + 1).to_string()).is_err());
         assert!(batch_size("0").is_err());
         assert!(batch_size("many").is_err());
+        // Through argv too: the parser attribute is the guard, not the function alone.
+        for batch in ["0", &(max + 1).to_string()] {
+            assert!(
+                <crate::Cli as clap::Parser>::try_parse_from([
+                    "jkb",
+                    "mq",
+                    "subscribe",
+                    "t",
+                    "--group",
+                    "g",
+                    "--batch",
+                    batch,
+                ])
+                .is_err(),
+                "--batch {batch} parsed"
+            );
+        }
     }
 
     fn backend_with(n: usize) -> LocalBackend {
