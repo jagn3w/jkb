@@ -3776,9 +3776,9 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = remote(&["task", "add", "x"], &client_repo);
+    let out = remote(&["task", "reclaim"], &client_repo);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("jkb task add: not available"),
+        String::from_utf8_lossy(&out.stderr).contains("jkb task reclaim: not available"),
         "a partly served group names the verb it refused: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -3794,6 +3794,244 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
         "no read opened a database of its own"
     );
     serve.stop();
+}
+
+/// The task-mutate set (tasks S6.2) through `jkb serve`, from a client with the container's home and
+/// working directory: the writes land in the host's database and print what the host CLI prints, and
+/// the ones that would have the host's sync write a file outside `~/repos` — the only host directory
+/// the container sees — are refused.
+#[test]
+#[allow(clippy::too_many_lines)] // one walk: fixture, writes, their effects, refusals
+fn the_task_writes_go_through_the_daemon_and_stop_at_the_container_s_view() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let host_home = root.join("host-home");
+    let client_home = root.join("container-home");
+    let host_repo = host_home.join("repos/proj");
+    let client_repo = client_home.join("repos/proj");
+    let notes = host_home.join("Documents/notes");
+    for dir in [&host_repo, &client_repo, &notes] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let db = root.join("host.db");
+    let token = root.join("daemon/token");
+    let host = |args: &[&str], cwd: &Path| {
+        jkb(&db)
+            .args(args)
+            .env("HOME", &host_home)
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+    let text = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).into_owned();
+    let ok = |out: std::process::Output, what: &str| {
+        assert!(
+            out.status.success(),
+            "{what}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    for (ns, dir) in [("repos/proj", &host_repo), ("docs/notes", &notes)] {
+        ok(
+            host(
+                &[
+                    "mount",
+                    "create",
+                    ns,
+                    dir.to_str().unwrap(),
+                    "--serializer",
+                    "tasks",
+                ],
+                &root,
+            ),
+            "mount",
+        );
+    }
+    let uid_of = |out: &std::process::Output| -> String {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["uid"].as_str().unwrap().to_owned()
+    };
+    let outside = uid_of(&ok(
+        host(&["--json", "task", "add", "a note +docs/notes"], &root),
+        "host add outside",
+    ));
+    let dep = uid_of(&ok(
+        host(&["--json", "task", "add", "a dependency"], &host_repo),
+        "host add dep",
+    ));
+
+    let (mut serve, url) = Daemon::spawn({
+        let mut cmd = jkb(&db);
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(&token)
+            .env("HOME", &host_home);
+        cmd
+    });
+    let remote = |args: &[&str]| {
+        jkb_bare()
+            .args(args)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env_remove("JKB_DB")
+            .current_dir(&client_repo)
+            .output()
+            .unwrap()
+    };
+
+    // A task added from the container with no placement is homed by the container's directory, as on
+    // the host.
+    let ambient = ok(
+        remote(&["--json", "task", "add", "captured here"]),
+        "remote add",
+    );
+    let v: serde_json::Value = serde_json::from_slice(&ambient.stdout).unwrap();
+    assert_eq!(v["home"], "tasks/repos/proj/inbox", "{v}");
+    // One placed in the repo's namespace is filed in its tasks.md — under ~/repos, so served.
+    let added = ok(
+        remote(&["--json", "task", "add", "remote work !p3 +repos/proj"]),
+        "remote add filed",
+    );
+    let v: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    assert_eq!(v["home"], "repos/proj", "{v}");
+    assert_eq!(
+        v["binding"],
+        format!("file://{}/tasks.md", host_repo.display()),
+        "{v}"
+    );
+    let uid = v["uid"].as_str().unwrap().to_owned();
+
+    // Each write prints what the host CLI prints for the same write.
+    for args in [
+        vec!["task", "set", &uid, "--priority", "1"],
+        vec!["task", "tag", "add", &uid, "size=s"],
+        vec!["--json", "task", "tag", "add", &uid, "area=api"],
+        vec!["task", "edit", &uid, "--append", "more", "detail"],
+        vec!["task", "depend", &uid, &dep],
+        vec!["--json", "task", "place", &uid, "views/mine"],
+    ] {
+        let from_client = ok(remote(&args), &format!("remote {args:?}"));
+        let from_host = ok(host(&args, &host_repo), &format!("host {args:?}"));
+        assert_eq!(text(&from_client), text(&from_host), "{args:?}");
+    }
+    // Unplacing twice is not the same write twice — the second removes nothing — so it is checked
+    // on its own.
+    let unplaced = ok(remote(&["task", "unplace", &uid, "views/mine"]), "unplace");
+    assert!(
+        text(&unplaced).contains("(1 mirror(s) removed)"),
+        "{}",
+        text(&unplaced)
+    );
+    let claimed = ok(
+        remote(&[
+            "--json",
+            "task",
+            "claim",
+            &uid,
+            "--owner",
+            "agent:container",
+        ]),
+        "claim",
+    );
+    let v: serde_json::Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    assert_eq!(v["acquired"], true, "{v}");
+    let refused = remote(&["--json", "task", "claim", &uid, "--owner", "agent:other"]);
+    let v: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(v["acquired"], false, "a held task is not taken: {v}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("agent:container"),
+        "the lifecycle's reason names the holder: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let why = ok(remote(&["--json", "task", "why", &uid]), "why");
+    assert_eq!(
+        text(&why),
+        text(&ok(
+            host(&["--json", "task", "why", &uid], &host_repo),
+            "host why"
+        ))
+    );
+    ok(
+        remote(&["task", "release", &uid, "--owner", "agent:container"]),
+        "release",
+    );
+
+    // The host sees every write.
+    let shown: serde_json::Value = serde_json::from_slice(
+        &ok(host(&["--json", "task", "show", &uid], &host_repo), "show").stdout,
+    )
+    .unwrap();
+    assert_eq!(shown["priority"], 1, "{shown}");
+    assert!(
+        shown["content"].as_str().unwrap().ends_with("more detail"),
+        "{shown}"
+    );
+    let tags: Vec<String> = shown["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            format!(
+                "{}={}",
+                t["facet"].as_str().unwrap(),
+                t["value"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert!(
+        tags.contains(&"size=s".to_owned()) && tags.contains(&"area=api".to_owned()),
+        "{tags:?}"
+    );
+
+    // What would have the host's sync write outside ~/repos is refused, before anything changes.
+    let refusals: Vec<Vec<&str>> = vec![
+        vec!["task", "set", &outside, "--priority", "1"],
+        vec!["task", "edit", &outside, "rewritten"],
+        vec!["task", "claim", &outside, "--owner", "agent:container"],
+        vec!["task", "add", "into the notes +docs/notes"],
+        vec!["task", "bind", &uid, "--sync", "file:///etc/tasks.md#x"],
+    ];
+    for args in &refusals {
+        let out = remote(args);
+        assert!(!out.status.success(), "{args:?} was served");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("host files to be written") || err.contains("refused through the daemon"),
+            "{args:?}: {err}"
+        );
+    }
+    let untouched: serde_json::Value = serde_json::from_slice(
+        &ok(
+            host(&["--json", "task", "show", &outside], &root),
+            "show outside",
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert!(untouched["priority"].is_null(), "{untouched}");
+    // The same task added --managed files nothing, so it is served.
+    ok(
+        remote(&["task", "add", "into the notes +docs/notes", "--managed"]),
+        "managed add outside",
+    );
+    serve.stop();
+    // The audit trail says where each write came from: the container's through the daemon, the host's
+    // from its command line.
+    let actors = jkb_core::Db::open(&db)
+        .unwrap()
+        .read(move |c| {
+            let mut stmt = c.prepare("SELECT DISTINCT actor FROM changelog")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert!(
+        actors.contains(&"serve".to_owned()) && actors.contains(&"cli".to_owned()),
+        "{actors:?}"
+    );
 }
 
 /// The dev container's path to the knowledge base, end to end through real binaries: `jkb serve` on
@@ -3844,7 +4082,7 @@ fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
     assert_eq!(tail[0]["seq"].to_string(), seq.trim());
 
     for refused in [
-        &["task", "add", "x"][..],
+        &["task", "reclaim"][..],
         &["sync"],
         &["ingest", "/etc/hostname"],
         &["serve"],

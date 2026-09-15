@@ -174,6 +174,32 @@ pub fn all(conn: &Connection) -> Result<Vec<(String, Mount)>> {
     Ok(out)
 }
 
+/// The `tasks.md` a task homed at `home_ns` is written to: the nearest mount at or above that
+/// namespace, when it is a `file://` mount with the `tasks` serializer. `None` when the nearest mount
+/// is anything else, or there is none. The one copy — `jkb-sync`'s `tasks_mount_file` and `jkb-api`'s
+/// `task.add` both ask it.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn tasks_file_for(conn: &Connection, home_ns: &str) -> Result<Option<String>> {
+    let mut cur = Some(home_ns.to_owned());
+    while let Some(path) = cur {
+        if let Some(ns_id) = crate::ns::get(conn, &path)? {
+            if let Some(m) = get(conn, ns_id)? {
+                if m.serializer == "tasks" {
+                    if let Some(dir) = m.backing_uri.strip_prefix("file://") {
+                        let dir = dir.trim_end_matches('/');
+                        return Ok(Some(format!("file://{dir}/tasks.md")));
+                    }
+                }
+                return Ok(None);
+            }
+        }
+        cur = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+    }
+    Ok(None)
+}
+
 /// Resolve the ambient namespace for a filesystem path: the mirror namespace of the
 /// most specific `file://` mount whose backing directory contains `fs_path` (design
 /// D-shared / task 8.5). Returns `None` if `fs_path` is under no mount.

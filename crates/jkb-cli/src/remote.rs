@@ -44,8 +44,8 @@ pub const fn support(command: &Command) -> Support {
         | Command::Mount { .. }
         | Command::Sync { .. }
         | Command::Service { .. } => Support::Refused(HOST_ONLY),
-        // The queue, and the agent read set (tasks S6.1). `read_cli::handles` names the same reads for
-        // dispatch; `the_ported_reads_are_the_ones_read_cli_handles` holds the two together.
+        // The queue, and the agent read set (tasks S6.1). `ops_cli::handles` names the same reads for
+        // dispatch; `the_ported_reads_are_the_ones_ops_cli_handles` holds the two together.
         Command::Mq { .. }
         | Command::Query { .. }
         | Command::Search { .. }
@@ -56,7 +56,24 @@ pub const fn support(command: &Command) -> Support {
         | Command::Grep { .. }
         | Command::Cat { .. }
         | Command::Task {
-            cmd: TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Subtasks { .. },
+            cmd:
+                TaskCmd::Next { .. }
+                | TaskCmd::Show { .. }
+                | TaskCmd::Subtasks { .. }
+                | TaskCmd::Why { .. }
+                // The task-mutate set (tasks S6.2); `jkb_api::tasks` refuses the writes that would
+                // have this host's sync write a file outside the container's view.
+                | TaskCmd::Add { .. }
+                | TaskCmd::Set { .. }
+                | TaskCmd::Edit { .. }
+                | TaskCmd::Tag { .. }
+                | TaskCmd::Depend { .. }
+                | TaskCmd::Undepend { .. }
+                | TaskCmd::Place { .. }
+                | TaskCmd::Unplace { .. }
+                | TaskCmd::Bind { .. }
+                | TaskCmd::Claim { .. }
+                | TaskCmd::Release { .. },
         } => Support::Ported,
         Command::Ns { .. }
         | Command::Tag { .. }
@@ -238,8 +255,8 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
             };
             match cli.command {
                 Command::Mq { cmd } => super::mq_cli::run(&backend, cmd, cli.json),
-                command if super::read_cli::handles(&command) => {
-                    super::read_cli::Reads::new(&backend, cli.global, cli.json, true).run(command)
+                command if super::ops_cli::handles(&command) => {
+                    super::ops_cli::Ops::new(&backend, cli.global, cli.json, true).run(command)
                 }
                 _ => bail!("internal: a Ported command with no remote dispatch"),
             }
@@ -318,7 +335,7 @@ mod tests {
             );
         }
         assert!(matches!(
-            support(&parse(&["task", "add", "x"]).command),
+            support(&parse(&["task", "reclaim"]).command),
             Support::Refused(_)
         ));
     }
@@ -340,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ported_reads_are_the_ones_read_cli_handles() {
+    fn the_ported_reads_are_the_ones_ops_cli_handles() {
         for args in [
             vec!["query", "kind:task"],
             vec!["search", "x"],
@@ -356,6 +373,11 @@ mod tests {
             vec!["task", "add", "x"],
             vec!["task", "set", "u", "--priority", "1"],
             vec!["task", "why", "u"],
+            vec!["task", "claim", "u"],
+            vec!["task", "bind", "u", "--managed"],
+            vec!["task", "start", "u"],
+            vec!["task", "reclaim"],
+            vec!["task", "mirror"],
             vec!["stat", "u"],
             vec!["ns", "ls"],
             vec!["item", "show", "u"],
@@ -366,7 +388,7 @@ mod tests {
             let is_mq = matches!(command, crate::Command::Mq { .. });
             assert_eq!(
                 support(&command) == Support::Ported,
-                is_mq || crate::read_cli::handles(&command),
+                is_mq || crate::ops_cli::handles(&command),
                 "{args:?}: remote mode serves exactly the commands something dispatches"
             );
         }

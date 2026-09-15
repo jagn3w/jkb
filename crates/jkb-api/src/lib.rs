@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod kb;
+pub mod tasks;
 
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -273,6 +274,111 @@ pub enum Request {
         #[serde(default)]
         all: bool,
     },
+    /// A task's whole transition history.
+    #[serde(rename = "task.why")]
+    TaskWhy {
+        /// A task uid or bare slug.
+        uid: String,
+    },
+    /// Create a task from a quick-add line.
+    #[serde(rename = "task.add")]
+    TaskAdd(tasks::AddAsk),
+    /// Set a task's status, priority or due date.
+    #[serde(rename = "task.set")]
+    TaskSet {
+        /// A task uid or bare slug.
+        uid: String,
+        /// `open`/`in_progress`/`needs_review`/`done`/`cancelled`.
+        #[serde(default)]
+        status: Option<String>,
+        /// The priority.
+        #[serde(default)]
+        priority: Option<i64>,
+        /// The due date.
+        #[serde(default)]
+        due: Option<String>,
+    },
+    /// Replace or append to a task's body.
+    #[serde(rename = "task.edit")]
+    TaskEdit {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The text.
+        text: String,
+        /// Append rather than replace.
+        #[serde(default)]
+        append: bool,
+    },
+    /// Add, set or remove a `facet=value` tag.
+    #[serde(rename = "task.tag")]
+    TaskTag {
+        /// A task uid or bare slug.
+        uid: String,
+        /// `facet=value`.
+        facet_value: String,
+        /// Add, set or remove.
+        mode: tasks::TagMode,
+    },
+    /// Make a task depend on another.
+    #[serde(rename = "task.depend")]
+    TaskDepend {
+        /// The dependent task.
+        uid: String,
+        /// What it depends on.
+        dep: String,
+    },
+    /// Remove a dependency.
+    #[serde(rename = "task.undepend")]
+    TaskUndepend {
+        /// The dependent task.
+        uid: String,
+        /// What it depended on.
+        dep: String,
+    },
+    /// Place a task under a namespace.
+    #[serde(rename = "task.place")]
+    TaskPlace {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The namespace.
+        ns: String,
+        /// As its primary home rather than a mirror.
+        #[serde(default)]
+        home: bool,
+    },
+    /// Remove a task's mirror placement.
+    #[serde(rename = "task.unplace")]
+    TaskUnplace {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The namespace.
+        ns: String,
+    },
+    /// Bind a task to `managed:` storage, or to a file.
+    #[serde(rename = "task.bind")]
+    TaskBind {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The file uri; `managed:` when absent.
+        #[serde(default)]
+        sync: Option<String>,
+    },
+    /// Claim a task for an owner.
+    #[serde(rename = "task.claim")]
+    TaskClaim {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The owner id.
+        owner: String,
+    },
+    /// Release an owner's claim.
+    #[serde(rename = "task.release")]
+    TaskRelease {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The owner id.
+        owner: String,
+    },
 }
 
 /// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
@@ -499,6 +605,18 @@ impl Request {
         "task.ready",
         "task.show",
         "task.subtasks",
+        "task.why",
+        "task.add",
+        "task.set",
+        "task.edit",
+        "task.tag",
+        "task.depend",
+        "task.undepend",
+        "task.place",
+        "task.unplace",
+        "task.bind",
+        "task.claim",
+        "task.release",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -528,6 +646,18 @@ impl Request {
             Self::TaskReady { .. } => "task.ready",
             Self::TaskShow { .. } => "task.show",
             Self::TaskSubtasks { .. } => "task.subtasks",
+            Self::TaskWhy { .. } => "task.why",
+            Self::TaskAdd(_) => "task.add",
+            Self::TaskSet { .. } => "task.set",
+            Self::TaskEdit { .. } => "task.edit",
+            Self::TaskTag { .. } => "task.tag",
+            Self::TaskDepend { .. } => "task.depend",
+            Self::TaskUndepend { .. } => "task.undepend",
+            Self::TaskPlace { .. } => "task.place",
+            Self::TaskUnplace { .. } => "task.unplace",
+            Self::TaskBind { .. } => "task.bind",
+            Self::TaskClaim { .. } => "task.claim",
+            Self::TaskRelease { .. } => "task.release",
         }
     }
 
@@ -554,7 +684,8 @@ impl Request {
             | Self::KbSearch { .. }
             | Self::TaskReady { .. }
             | Self::TaskShow { .. }
-            | Self::TaskSubtasks { .. } => true,
+            | Self::TaskSubtasks { .. }
+            | Self::TaskWhy { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -565,7 +696,18 @@ impl Request {
             | Self::MqTail { .. }
             | Self::NotifyEvent { .. }
             | Self::NotifyOpenSessions {}
-            | Self::NotifyGone { .. } => false,
+            | Self::NotifyGone { .. }
+            | Self::TaskAdd(_)
+            | Self::TaskSet { .. }
+            | Self::TaskEdit { .. }
+            | Self::TaskTag { .. }
+            | Self::TaskDepend { .. }
+            | Self::TaskUndepend { .. }
+            | Self::TaskPlace { .. }
+            | Self::TaskUnplace { .. }
+            | Self::TaskBind { .. }
+            | Self::TaskClaim { .. }
+            | Self::TaskRelease { .. } => false,
         }
     }
 }
@@ -693,6 +835,36 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
+    /// A write that answers with nothing but its success (`task.set`, `edit`, `tag`, `depend`,
+    /// `undepend`, `place`, `bind`).
+    Applied {},
+    /// A `task.add`.
+    Added {
+        /// The task created.
+        #[serde(flatten)]
+        added: tasks::Added,
+    },
+    /// A `task.unplace`.
+    Unplaced {
+        /// Mirror placements removed.
+        removed: usize,
+    },
+    /// A `task.claim`.
+    Claimed {
+        /// The answer.
+        #[serde(flatten)]
+        claimed: tasks::Claimed,
+    },
+    /// A `task.release`.
+    Released {
+        /// Whether the owner held the claim and it was dropped.
+        released: bool,
+    },
+    /// A `task.why`.
+    History {
+        /// Oldest first.
+        entries: Vec<tasks::HistoryEntry>,
+    },
     /// A `task.show`.
     Task {
         /// The task.
@@ -727,7 +899,13 @@ impl Response {
             | Self::Sessions { .. }
             | Self::Ambient { .. }
             | Self::Count { .. }
-            | Self::Content { .. } => false,
+            | Self::Content { .. }
+            | Self::Applied {}
+            | Self::Added { .. }
+            | Self::Unplaced { .. }
+            | Self::Claimed { .. }
+            | Self::Released { .. }
+            | Self::History { .. } => false,
         }
     }
 
@@ -757,7 +935,13 @@ impl Response {
             | Self::Content { .. }
             | Self::GrepHits { .. }
             | Self::SearchHits { .. }
-            | Self::Task { .. } => false,
+            | Self::Task { .. }
+            | Self::Applied {}
+            | Self::Added { .. }
+            | Self::Unplaced { .. }
+            | Self::Claimed { .. }
+            | Self::Released { .. }
+            | Self::History { .. } => false,
         }
     }
 }
@@ -812,6 +996,9 @@ pub enum ErrorCode {
     /// A request this backend does not serve in this form (a search route that embeds text, on a
     /// backend with no embedder).
     Unsupported,
+    /// A write this backend's clients may not make: one that would have the host's sync write a file
+    /// outside the directories they may cause host writes in ([`tasks::FileRoots`]).
+    Forbidden,
     /// Anything else: a database or internal failure.
     Internal,
     /// A code this build does not know, from a newer peer. Clients treat it like `internal`.
@@ -921,6 +1108,11 @@ pub struct LocalBackend {
     /// What each read may answer with ([`kb::Budget`]); unlimited unless
     /// [`LocalBackend::with_read_budget`] set one.
     budget: kb::Budget,
+    /// Where a task write may cause the host's sync to write files ([`tasks::FileRoots`]); anywhere
+    /// unless [`LocalBackend::with_file_roots`] set them.
+    file_roots: Option<tasks::FileRoots>,
+    /// Who the changelog records as making this backend's writes.
+    actor: &'static str,
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
 }
 
@@ -933,6 +1125,8 @@ impl LocalBackend {
             reads: db.clone(),
             db,
             budget: kb::Budget::UNLIMITED,
+            file_roots: None,
+            actor: "api",
             embedder: None,
         }
     }
@@ -956,6 +1150,24 @@ impl LocalBackend {
         self
     }
 
+    /// The same backend, recording its writes in the changelog as made by `actor` — `cli` for the host
+    /// CLI, `serve` for the daemon's clients, so the audit trail says whether a change came from this
+    /// host's command line or through `jkb serve`.
+    #[must_use]
+    pub const fn with_actor(mut self, actor: &'static str) -> Self {
+        self.actor = actor;
+        self
+    }
+
+    /// The same backend, refusing task writes that would have the host's sync write a file outside
+    /// `roots` ([`tasks::FileRoots`]). What `jkb serve` sets: its clients are the dev container, which
+    /// sees only `~/repos` of the host.
+    #[must_use]
+    pub fn with_file_roots(mut self, roots: tasks::FileRoots) -> Self {
+        self.file_roots = Some(roots);
+        self
+    }
+
     /// The handle the read set is served on — `db` itself unless [`LocalBackend::with_reader`] was
     /// given one.
     #[must_use]
@@ -971,8 +1183,6 @@ impl LocalBackend {
     }
 }
 
-const ACTOR: &str = "jkb-api";
-
 impl Backend for LocalBackend {
     #[allow(clippy::too_many_lines)] // a flat op dispatcher: one arm per op, as in the CLI's `run`
     fn call(&self, request: Request) -> Result<Response, ApiError> {
@@ -984,13 +1194,14 @@ impl Backend for LocalBackend {
             &self.db
         };
         let mut budget = self.budget;
+        let actor = self.actor;
         let created = |c: Created| Response::Created {
             created: c == Created::New,
         };
         Ok(match request {
             Request::MqTopicCreate { topic, spec } => {
                 let spec = spec.resolve();
-                created(db.write_txn(ACTOR, move |c, m| {
+                created(db.write_txn(actor, move |c, m| {
                     mq::topic_create(c, m, &topic, &spec, now)
                 })?)
             }
@@ -1010,7 +1221,7 @@ impl Backend for LocalBackend {
                     producer,
                 };
                 Response::Sent {
-                    seq: db.write_txn(ACTOR, move |c, m| mq::send(c, m, &topic, &draft, now))?,
+                    seq: db.write_txn(actor, move |c, m| mq::send(c, m, &topic, &draft, now))?,
                 }
             }
             Request::MqGroupCreate {
@@ -1023,7 +1234,7 @@ impl Backend for LocalBackend {
                 } else {
                     Start::FromNow
                 };
-                created(db.write_txn(ACTOR, move |c, m| {
+                created(db.write_txn(actor, move |c, m| {
                     mq::group_create(c, m, &topic, &group, start, now)
                 })?)
             }
@@ -1043,7 +1254,7 @@ impl Backend for LocalBackend {
                 }
                 Response::Messages {
                     messages: db
-                        .write_txn(ACTOR, move |c, m| {
+                        .write_txn(actor, move |c, m| {
                             mq::poll(c, m, &topic, &group, max, after, now)
                         })?
                         .into_iter()
@@ -1053,10 +1264,10 @@ impl Backend for LocalBackend {
             }
             Request::MqAck { topic, group, seq } => Response::Position {
                 position: db
-                    .write_txn(ACTOR, move |c, m| mq::ack(c, m, &topic, &group, seq, now))?,
+                    .write_txn(actor, move |c, m| mq::ack(c, m, &topic, &group, seq, now))?,
             },
             Request::MqCompact { force } => {
-                let r = db.write_txn(ACTOR, move |c, m| mq::compact(c, m, now, force))?;
+                let r = db.write_txn(actor, move |c, m| mq::compact(c, m, now, force))?;
                 Response::Compacted {
                     topics_compacted: r.topics_compacted,
                     topics_skipped: r.topics_skipped,
@@ -1092,7 +1303,7 @@ impl Backend for LocalBackend {
                     owner,
                     instance,
                 };
-                db.write_txn(ACTOR, move |c, m| notify::observe(c, m, &obs, now))?
+                db.write_txn(actor, move |c, m| notify::observe(c, m, &obs, now))?
                     .into()
             }
             Request::NotifyOpenSessions {} => Response::Sessions {
@@ -1113,7 +1324,7 @@ impl Backend for LocalBackend {
                 owner,
                 instance,
             } => db
-                .write_txn(ACTOR, move |c, m| {
+                .write_txn(actor, move |c, m| {
                     notify::gone(c, m, &session, &owner, &instance, now)
                 })?
                 .into(),
@@ -1234,6 +1445,108 @@ impl Backend for LocalBackend {
                 Response::Task {
                     task: Box::new(task),
                     truncated,
+                }
+            }
+            Request::TaskWhy { uid } => Response::History {
+                entries: db.read_with(move |c| tasks::why(c, &uid))?,
+            },
+            Request::TaskAdd(ask) => {
+                let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let roots = self.file_roots.clone();
+                Response::Added {
+                    added: db.write_txn_with(actor, move |c, m| {
+                        tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskSet {
+                uid,
+                status,
+                priority,
+                due,
+            } => {
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    tasks::set(
+                        c,
+                        m,
+                        &uid,
+                        status.as_deref(),
+                        priority,
+                        due.as_deref(),
+                        roots.as_ref(),
+                    )
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskEdit { uid, text, append } => {
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    tasks::edit(c, m, &uid, &text, append, roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskTag {
+                uid,
+                facet_value,
+                mode,
+            } => {
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    tasks::tag(c, m, &uid, &facet_value, mode, roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskDepend { uid, dep } => {
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    tasks::depend(c, m, &uid, &dep, roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskUndepend { uid, dep } => {
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    tasks::undepend(c, m, &uid, &dep, roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskPlace { uid, ns, home } => {
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    tasks::place(c, m, &uid, &ns, home, roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskUnplace { uid, ns } => {
+                let roots = self.file_roots.clone();
+                Response::Unplaced {
+                    removed: db.write_txn_with(actor, move |c, m| {
+                        tasks::unplace(c, m, &uid, &ns, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskBind { uid, sync } => {
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    tasks::bind(c, m, &uid, sync.as_deref(), roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskClaim { uid, owner } => {
+                let roots = self.file_roots.clone();
+                Response::Claimed {
+                    claimed: db.write_txn_with(actor, move |c, m| {
+                        tasks::claim(c, m, &uid, &owner, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskRelease { uid, owner } => {
+                let roots = self.file_roots.clone();
+                Response::Released {
+                    released: db.write_txn_with(actor, move |c, m| {
+                        tasks::release(c, m, &uid, &owner, roots.as_ref())
+                    })?,
                 }
             }
             Request::TaskSubtasks { uid, all } => {

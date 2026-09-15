@@ -475,16 +475,11 @@ pub fn trunk(dir: &Path) -> Result<Option<String>> {
 /// # Errors
 /// Returns an error if `name` cannot be passed to git as an operand.
 pub fn valid_ref(name: &str) -> Result<()> {
-    anyhow::ensure!(
-        !name.is_empty(),
-        "an empty branch or revision name cannot be passed to git"
-    );
-    anyhow::ensure!(
-        !name.starts_with('-'),
-        "`{name}` cannot be used as a branch or revision: git reads a leading `-` as an option, \
-         and no valid ref name begins with one"
-    );
-    Ok(())
+    // The rule and its sentence are `jkb_core::location::ref_problem`'s, shared with the store.
+    match jkb_core::location::ref_problem(name) {
+        Some(why) => Err(anyhow::Error::msg(why)),
+        None => Ok(()),
+    }
 }
 
 /// The commit `reference` resolves to, if any.

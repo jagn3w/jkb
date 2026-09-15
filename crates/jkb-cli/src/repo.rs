@@ -18,10 +18,9 @@ use jkb_types::ItemId;
 
 use crate::gitrepo;
 
-/// The facet recording which branch a task is being done on, and which repo that branch is
-/// in. Plain tags (design D34.1): no migration, and queryable as `tag:branch=<name>`.
-pub(crate) const FACET_BRANCH: &str = "branch";
-pub(crate) const FACET_REPO: &str = "repo";
+pub(crate) use jkb_core::location::{
+    set_facet, set_location_facets, Location, FACET_BRANCH, FACET_REPO,
+};
 
 /// The branch a session's work lands on used to be a facet here (`onto=`). It is now
 /// a label on the task's transition history: it is a statement about a moment, so two tasks told
@@ -58,82 +57,6 @@ pub(crate) fn facet_one<'a>(
     facet: &str,
 ) -> Option<&'a String> {
     facet_values(tags, facet).first()
-}
-
-/// Set a facet to exactly one value, removing any others it already had.
-///
-/// `tag::apply` is additive, which is right for open-ended facets and wrong for the ones that
-/// answer "where is this being worked" — a second value there is not extra information, it is
-/// a contradiction the readers have to guess their way through.
-pub(crate) fn set_facet(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    facet: &str,
-    value: &str,
-) -> jkb_core::Result<()> {
-    for (f, v) in tag::applications(conn, id)? {
-        if f == facet && v != value {
-            tag::remove(conn, meta, id, &f, &v)?;
-        }
-    }
-    tag::apply(conn, meta, id, facet, value)
-}
-
-/// Where a task is being worked. Every field is single-valued by nature: a second `branch=`
-/// is a contradiction, not extra information (design D36.6).
-///
-/// There is deliberately **no cut point** here, and no longer anywhere. It existed so that a
-/// branch adding nothing to trunk could be told apart from one that never started — a question
-/// only the commit-graph inference had to ask, and one a merged pull request answers directly.
-#[derive(Default)]
-pub(crate) struct Location<'a> {
-    pub(crate) branch: Option<&'a str>,
-    pub(crate) repo: Option<&'a str>,
-    /// The branch this one lands on. Recorded as a **label on the transition**, not as a
-    /// property of the branch kept in agreement with git.
-    pub(crate) onto: Option<&'a str>,
-}
-
-/// Whether a branch value joins the ones a task already records, or replaces them.
-#[derive(Clone, Copy)]
-pub(crate) enum BranchWrite {
-    /// The task is being *moved* to this branch — `task work`, `task start`. A second `branch=`
-    /// there is a contradiction (D36.6).
-    Set,
-    /// This branch is *additional*. A task can legitimately record two, and every reader indexes
-    /// both, because deciding a task has landed on the strength of one while the other is live is
-    /// how work gets buried.
-    Add,
-}
-
-/// Put `branch` on the task.
-///
-/// This used to do two things — write the facet **and** measure and store the branch's cut point
-/// — because those two facts written apart is what every incident in this area had in common. The
-/// cut point is gone: it existed only to make the commit-graph inference answerable, and that
-/// inference has been replaced by a pull request lookup. So one write is all that is left, and the
-/// pairing rule it enforced has nothing to pair.
-///
-/// # Errors
-/// Returns an error if the name is not usable as a git ref, or the tag write fails.
-pub(crate) fn record_branch(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    branch: &str,
-    how: BranchWrite,
-) -> jkb_core::Result<()> {
-    // Refuse a name git would read as an option **before it is stored**. A hostile value entered
-    // the store cleanly and then poisoned every later reader — and a reader that refuses is a whole
-    // `close-merged` run failing on one bad row. The store is the boundary worth defending;
-    // `gitrepo::valid_ref` at the git call is the backstop for values that predate this.
-    crate::gitrepo::valid_ref(branch).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
-    match how {
-        BranchWrite::Set => set_facet(conn, meta, id, FACET_BRANCH, branch)?,
-        BranchWrite::Add => tag::apply(conn, meta, id, FACET_BRANCH, branch)?,
-    }
-    Ok(())
 }
 
 /// Which of a task's recorded branches its work is on — the **one** rule, shared by the In Flight
@@ -197,38 +120,6 @@ pub(crate) fn work_for(ctx: &RepoCtx, tags: &BTreeMap<String, Vec<String>>) -> R
     let refs = gitrepo::branch_refs(&ctx.root)?;
     let branch = work_branch(session.as_ref().map(|s| s.branch.as_str()), branches, &refs);
     Ok(Work { session, branch })
-}
-
-/// Record where a task is being worked — `task work` and `task start`.
-///
-/// They had a writer each: `task work` set the facets, `task start` added them with `tag::apply`.
-/// A task that saw both — which the guide encourages, since `start` tags from the ambient repo —
-/// ended up carrying two `branch=` values, and every reader that collapses the multi-map to one
-/// then picked whichever came first.
-///
-/// The **land target is not written here.** It used to be a `branch_records` column that had to
-/// be kept in agreement with git; it is now a label on the `start` transition, written by the
-/// same call that records the transition, so there is nothing to keep in agreement and nothing
-/// for two tasks on one branch to disagree about — they are two entries, with timestamps.
-///
-/// # Errors
-/// Returns an error if a name is not usable as a git ref, or a tag write fails.
-pub(crate) fn set_location_facets(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    loc: &Location<'_>,
-) -> jkb_core::Result<()> {
-    if let Some(onto) = loc.onto {
-        crate::gitrepo::valid_ref(onto).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
-    }
-    if let Some(repo) = loc.repo {
-        set_facet(conn, meta, id, FACET_REPO, repo)?;
-    }
-    if let Some(branch) = loc.branch {
-        record_branch(conn, meta, id, branch, BranchWrite::Set)?;
-    }
-    Ok(())
 }
 
 /// What the session commands need to know about the repo they are running in.

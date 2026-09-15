@@ -22,6 +22,7 @@ pub mod ingestion;
 pub mod investigation;
 pub mod item;
 pub mod lifecycle;
+pub mod location;
 pub mod mount;
 pub mod mq;
 pub mod notify;

@@ -23,5 +23,13 @@ pub mod token;
 /// and fields are otherwise only ever added (see `jkb_api`).
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The directory under the host's `$HOME` that a client's task writes may have this host's sync write
+/// files in (`jkb_api::tasks::FileRoots`): the one host directory the dev container binds, at the
+/// same place under its own home. `.container/check-config.sh` reads this line and requires
+/// `container.json` to bind `${localEnv:HOME}/<it>` at `/home/vscode/<it>` — renamed on one side
+/// alone, every file-backed write from the container would be refused, or admitted for a directory
+/// the container does not see.
+pub const CLIENT_FILE_ROOT: &str = "repos";
+
 /// The default address `jkb serve` binds and a client assumes.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7117";

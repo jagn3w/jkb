@@ -563,6 +563,21 @@ else
     ok "the firewall opens the port jkb serve binds ($fw_port)"
 fi
 
+# 2b. The daemon's file root is the container's bind. A task write from the container may have the
+#    host's sync write a file only under $HOME/<CLIENT_FILE_ROOT> (jkb-daemon), because that is the
+#    host directory the container sees — which is true only while container.json binds exactly that
+#    directory at the same place under the container's home. Read out of the Rust source, not copied.
+client_root="$(grep -oE 'pub const CLIENT_FILE_ROOT: &str = "[^"]+"' "$repo_top/crates/jkb-daemon/src/lib.rs" 2>/dev/null \
+               | head -1 | sed 's/.*"\(.*\)"$/\1/')"
+bind_srcs="$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*$//p')"
+if [ -z "$client_root" ]; then
+    bad "could not read CLIENT_FILE_ROOT from crates/jkb-daemon/src/lib.rs — the check that the daemon admits file-backed writes only where the container can see is checking nothing"
+elif ! grep -qxF "\${localEnv:HOME}/$client_root" <<<"$bind_srcs" || ! grep -qxF "/home/vscode/$client_root" <<<"$mount_targets"; then
+    bad "jkb serve admits a client's file-backed task writes under \$HOME/$client_root (CLIENT_FILE_ROOT), but container.json does not bind \${localEnv:HOME}/$client_root at /home/vscode/$client_root — the daemon would judge a directory the container does not see"
+else
+    ok "the daemon's client file root is the directory the container binds (~/$client_root)"
+fi
+
 # 3. The nested sandbox can reach it: its proxy tunnels only to allowedDomains, and the firewall
 #    keeps that same entry out of the IP allowlist by address, so the one entry serves both layers.
 fw_host="$(grep -oE '^DAEMON_HOST=[A-Za-z0-9.-]+$' "$here/egress-lib.sh" 2>/dev/null | head -1 | cut -d= -f2)"

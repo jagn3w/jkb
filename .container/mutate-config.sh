@@ -370,6 +370,24 @@ run "the notification hook is pointed at a port the firewall does not open" "but
 seed; sub_dc '"JKB_DAEMON_ADDR": "host.docker.internal:7117",' ''
 run "the notification hook is not told where the daemon is" "sets no JKB_DAEMON_ADDR"
 
+seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'pub const CLIENT_FILE_ROOT: &str = "repos";'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'pub const CLIENT_FILE_ROOT: &str = "projects";', 1))
+PYX
+run "the daemon admits file-backed writes under a directory the container does not bind" "does not bind \${localEnv:HOME}/projects"
+
+seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'pub const CLIENT_FILE_ROOT: &str = "repos";'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'pub const CLIENT_FILE_ROOT: &str = concat!("re", "pos");', 1))
+PYX
+run "the daemon's client file root can no longer be read" "could not read CLIENT_FILE_ROOT"
+
 seed; python3 - "$work/t/crates/jkb-cli/src/remote.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -936,7 +954,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=85
+PINNED_BAD_SITES=87
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

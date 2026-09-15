@@ -12,17 +12,18 @@ mod commands;
 mod gitrepo;
 mod mq_cli;
 mod notify;
+mod ops_cli;
 mod output;
 mod owner;
 mod pr;
 mod presence;
-mod read_cli;
 mod remote;
 mod repo;
 mod review;
 mod service;
 mod session;
 mod staging;
+mod task_cli;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,13 +37,12 @@ use jkb_api::kb::SearchRoute;
 use jkb_core::lifecycle;
 use jkb_core::transition::{self, Reclaimed};
 use jkb_core::{
-    binding, blob, claim, edge, investigation, item, mount, ns, nstype, placement, tag, task, undo,
-    view, Db,
+    binding, blob, claim, edge, investigation, item, mount, ns, nstype, tag, task, undo, view, Db,
 };
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_fsm::Fact;
 use jkb_ingest::Pipeline;
-use jkb_types::{ConflictPolicy, EdgeType, Embedder, ItemId, PlacementRole, Resolution, SyncMode};
+use jkb_types::{ConflictPolicy, EdgeType, Embedder, ItemId, Resolution, SyncMode};
 
 /// A local-first, agent-native knowledge base.
 #[derive(Parser)]
@@ -1276,7 +1276,7 @@ fn run(cli: Cli) -> Result<()> {
         // Ahead of every other arm, and asked through the same predicate remote mode dispatches on:
         // a read ported later is then served by its op here too, rather than by an arm below that
         // still compiles.
-        cmd if read_cli::handles(&cmd) => local_reads(&db, cmd, global, json),
+        cmd if ops_cli::handles(&cmd) => local_ops(&db, cmd, global, json),
         Command::Ingest { path, ns } => cmd_ingest(&db, &path, ns.as_deref(), global, json),
         Command::Query { .. }
         | Command::Search { .. }
@@ -1286,7 +1286,7 @@ fn run(cli: Cli) -> Result<()> {
         | Command::Tree { .. }
         | Command::Grep { .. }
         | Command::Cat { .. } => {
-            anyhow::bail!("internal: a read-set command missed read_cli's dispatch")
+            anyhow::bail!("internal: a read-set command missed ops_cli's dispatch")
         }
         Command::Ns { cmd } => cmd_ns(&db, cmd, json),
         Command::Tag { cmd } => cmd_tag(&db, cmd, json),
@@ -1315,7 +1315,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::Index { sweep } => cmd_index(&db, sweep),
         Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
-        Command::Mq { cmd } => mq_cli::run(&jkb_api::LocalBackend::new(db), cmd, json),
+        Command::Mq { cmd } => {
+            mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
+        }
         Command::Serve { .. } | Command::Service { .. } => {
             unreachable!("dispatched before the database is opened")
         }
@@ -1538,15 +1540,15 @@ fn embedder() -> Result<Arc<dyn Embedder + Send + Sync>> {
     Ok(Arc::new(e))
 }
 
-/// The agent read set on this host (`read_cli`): through a `LocalBackend` over `db`, the same op
+/// The agent read set on this host (`ops_cli`): through a `LocalBackend` over `db`, the same op
 /// `jkb serve` answers the dev container with, so the two cannot list different things.
-fn local_reads(db: &Db, command: Command, global: bool, json: bool) -> Result<()> {
-    let mut backend = jkb_api::LocalBackend::new(db.clone());
+fn local_ops(db: &Db, command: Command, global: bool, json: bool) -> Result<()> {
+    let mut backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
     // Only a search embeds; building the embedder is not a cost `ls` should pay.
     if matches!(command, Command::Search { .. }) {
         backend = backend.with_embedder(embedder()?);
     }
-    read_cli::Reads::new(&backend, global, json, false).run(command)
+    ops_cli::Ops::new(&backend, global, json, false).run(command)
 }
 
 /// The ambient namespace for the current directory, unless `--global`.
@@ -3271,220 +3273,26 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     Ok(unhealthy)
 }
 
-/// The `--backlog`/`--sync`/`--managed` flags of `task add`, grouped so the helper
-/// signatures stay under the bool-argument lint.
-struct AddFlags {
-    backlog: bool,
-    sync: bool,
-    managed: bool,
-    /// An explicit home namespace, taken verbatim rather than lexed out of the quick-add
-    /// line — see the `--home` flag.
-    home: Option<String>,
-}
-
-/// Derive a task's home namespace from `--backlog` and the ambient repo (design D26),
-/// mutating `spec.home`/`spec.mirrors`. `had_explicit` is set when an explicit `+<ns>`
-/// already chose the home.
-fn resolve_task_home(
-    db: &Db,
-    spec: &mut task::NewTask,
-    flags: &AddFlags,
-    had_explicit: bool,
-) -> Result<()> {
-    if had_explicit {
-        if flags.backlog {
-            anyhow::bail!(
-                "--backlog conflicts with an explicit placement (`--home`, or a `+<ns>` in the \
-                 task line)"
-            );
-        }
-    } else if flags.backlog {
-        let root = task::DEFAULT_ROOT;
-        match ambient_repo(db)? {
-            Some(repo) => spec.home = format!("{root}/{repo}/.backlog"),
-            None if confirm_global_backlog()? => spec.home = format!("{root}/.backlog"),
-            None => anyhow::bail!(
-                "--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`"
-            ),
-        }
-    } else if let Some(repo) = ambient_repo(db)? {
-        // Inside a repo with no target: home at the per-repo inbox, mirrored into
-        // the global inbox so it stays a complete capture view (D26.3).
-        spec.home = format!("{}/{repo}/inbox", task::DEFAULT_ROOT);
-        spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
-    }
-    // else: outside a repo with no target → the home stays `DEFAULT_HOME`.
-    Ok(())
-}
-
-/// Derive a task's storage binding (design D26.5), setting `spec.binding` and returning
-/// the synced `file://` uri if one applies. `--managed` forces KB-only; `--sync` requires
-/// a covering `tasks` mount.
-fn resolve_task_binding(
-    db: &Db,
-    spec: &mut task::NewTask,
-    flags: &AddFlags,
-    uid: &str,
-) -> Result<Option<String>> {
-    let synced_file = if flags.managed {
-        None
-    } else {
-        jkb_sync::tasks_mount_file(db, &spec.home)?
-    };
-    match &synced_file {
-        Some(bare) => {
-            let local_id = uid.strip_prefix("task:").unwrap_or(uid);
-            spec.binding = format!("{bare}#{local_id}");
-        }
-        None if flags.sync => anyhow::bail!(
-            "--sync: no `tasks`-serializer file mount covers the home `{}`",
-            spec.home
-        ),
-        None => {} // spec.binding stays `managed:` (from_quick_add default)
-    }
-    Ok(synced_file)
-}
-
-/// Handle `task add`: parse the quick-add line, derive the home (design D26 homing) and
-/// the storage binding (D26.5), then create the task through the writer-actor.
-fn cmd_task_add(
-    db: &Db,
-    text: &[String],
-    flags: &AddFlags,
-    under: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    let input = text.join(" ");
-    let qa = task::parse_quick_add(&input)?;
-    // `#branch=` and `#onto=` reach `tag::apply` from here, below the checks the other writers
-    // apply, so this was the one route by which a value git reads as an option could still enter
-    // the store — `#branch=--upload-pack=x`.
-    let mut qa = qa;
-    for (facet, value) in &qa.tags {
-        // A land target is a fact about a *branch* and lives in that branch's record, so a facet
-        // named `onto` reaches no reader at all. Refused rather than stored inert: a user who
-        // typed it expecting effect deserves an answer, not silence. (`base=` needs no such
-        // refusal — nothing reads that name either, and every message about a cut point must
-        // avoid naming a verb that takes a sha, which is how three passes of findings started.)
-        anyhow::ensure!(
-            facet != "onto",
-            "`#onto=` records where a *branch* lands, not where a task is, so it cannot be set \
-             from a task line. Use `jkb task work <uid> --onto <branch>` or `jkb task start \
-             <uid> --branch <b> --onto <branch>`."
-        );
-        if facet == repo::FACET_BRANCH {
-            gitrepo::valid_ref(value)?;
-        }
-    }
-    // `branch=` is lifted out of the quick-add tags and applied afterwards through
-    // `repo::record_branch`, which is what pairs a branch with its cut point. Left here it went
-    // straight to `tag::apply`, so this entry point silently opted out of the pairing CLAUDE.md
-    // calls the architecture of this area.
-    //
-    // The `retain` is routing, not a guard: `tag::apply` is idempotent on `(item, facet, value)`,
-    // so leaving the tag in place would write the same row and change nothing observable. What it
-    // buys is that "`record_branch` is the only writer of `branch=` in this crate" holds without
-    // an exception the next reader has to carry. It is a convention, not an enforced invariant:
-    // `branch=` is an ordinary facet and the store will take one from anyone — `jkb_core::tag`
-    // reserves nothing, deliberately, and says why in its module doc. The cut point is recorded by
-    // the call below either way, and that is the part with a test.
-    let quick_add_branches: Vec<String> = qa
-        .tags
-        .iter()
-        .filter(|(f, _)| f == repo::FACET_BRANCH)
-        .map(|(_, v)| v.clone())
-        .collect();
-    qa.tags.retain(|(f, _)| f != repo::FACET_BRANCH);
-    let mut had_explicit_placement = !qa.placements.is_empty();
-    let uid = task::mint_uid(&qa.title);
-    let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
-
-    // `--home` wins over a `+<ns>` in the line: it is the unambiguous form, and it is the
-    // only one that can carry a path containing whitespace.
-    if let Some(home) = &flags.home {
-        spec.home.clone_from(home);
-        had_explicit_placement = true;
-    }
-
-    // A subtask defaults to living beside its parent: splitting a task should not scatter
-    // the pieces across namespaces, and `--under` is the only signal about where it belongs.
-    let parent = match under {
-        Some(p) => {
-            let pid = resolve_task_uid(db, p)?;
-            if !had_explicit_placement {
-                if let Some(home) = db.read(move |conn| item::primary_namespace(conn, pid))? {
-                    spec.home = home;
-                    had_explicit_placement = true;
-                }
-            }
-            Some(pid)
-        }
-        None => None,
-    };
-
-    resolve_task_home(db, &mut spec, flags, had_explicit_placement)?;
-    let synced_file = resolve_task_binding(db, &mut spec, flags, &uid)?;
-
-    let home = spec.home.clone();
-    let id = db.write_txn("cli", move |conn, meta| {
-        let id = task::create(conn, meta, &spec)?;
-        if let Some(parent) = parent {
-            task::add_subtask(conn, meta, parent, id)?;
-        }
-        Ok(id)
-    })?;
-    // Any `#branch=` from the quick-add line. A second transaction rather than a field on
-    // `NewTask` only because `task::create` has just written the row this reads back.
-    if !quick_add_branches.is_empty() {
-        let branches = quick_add_branches.clone();
-        db.write_txn("cli", move |conn, meta| {
-            for branch in &branches {
-                repo::record_branch(conn, meta, id, branch, repo::BranchWrite::Add)?;
-            }
-            Ok(())
-        })?;
-    }
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"id": id.get(), "uid": uid, "home": home,
-                "binding": synced_file.as_deref().unwrap_or("managed:")})
-        );
-    } else {
-        println!("added task {uid} (item {id}) at {home}");
-        if synced_file.is_some() {
-            println!("  synced binding — run `jkb sync` to write it to the file");
-        }
-    }
-    Ok(())
-}
-
 fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::Add {
-            text,
-            backlog,
-            sync,
-            managed,
-            under,
-            home,
-        } => cmd_task_add(
-            db,
-            &text,
-            &AddFlags {
-                backlog,
-                sync,
-                managed,
-                home,
-            },
-            under.as_deref(),
-            json,
-        )?,
-        TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Subtasks { .. } => {
-            anyhow::bail!("internal: a read-set task verb missed read_cli's dispatch")
+        TaskCmd::Next { .. }
+        | TaskCmd::Show { .. }
+        | TaskCmd::Subtasks { .. }
+        | TaskCmd::Why { .. }
+        | TaskCmd::Add { .. }
+        | TaskCmd::Set { .. }
+        | TaskCmd::Edit { .. }
+        | TaskCmd::Tag { .. }
+        | TaskCmd::Depend { .. }
+        | TaskCmd::Undepend { .. }
+        | TaskCmd::Place { .. }
+        | TaskCmd::Unplace { .. }
+        | TaskCmd::Bind { .. }
+        | TaskCmd::Claim { .. }
+        | TaskCmd::Release { .. } => {
+            anyhow::bail!("internal: a task verb served as an op missed ops_cli's dispatch")
         }
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
-        TaskCmd::Why { uid } => cmd_task_why(db, &uid, json)?,
         TaskCmd::Pr { uid, number } => cmd_task_pr(db, &uid, number, json)?,
         cmd @ (TaskCmd::Work { .. }
         | TaskCmd::Land { .. }
@@ -3513,25 +3321,6 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove a task's reference (mirror) placement under `ns` (inverse of `task place`). A
-/// missing namespace or absent mirror is a no-op that reports `0` removed.
-fn cmd_task_unplace(db: &Db, uid: &str, ns: &str, json: bool) -> Result<()> {
-    let id = resolve_task_uid(db, uid)?;
-    let ns_path = ns.to_owned();
-    let removed = db.write_txn("cli", move |conn, meta| {
-        match jkb_core::ns::get(conn, &ns_path)? {
-            Some(ns_id) => placement::unplace(conn, meta, id, ns_id),
-            None => Ok(0),
-        }
-    })?;
-    if json {
-        println!("{}", serde_json::json!({ "uid": uid, "removed": removed }));
-    } else {
-        println!("unplaced {uid} from {ns} ({removed} mirror(s) removed)");
-    }
-    Ok(())
-}
-
 /// Ensure every task homed outside `tasks/` has a `tasks/…` mirror (the task index).
 /// Idempotent; `jkb sync` does this automatically, so this is a one-shot migration for
 /// tasks created before the mirror existed.
@@ -3550,64 +3339,6 @@ fn cmd_task_mirror(db: &Db, json: bool) -> Result<()> {
 /// existing audited, cycle-checked `jkb-core` seam through the writer-actor.
 fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::Set {
-            uid,
-            status,
-            priority,
-            due,
-        } => cmd_task_set(db, &uid, status, priority, due, json)?,
-        TaskCmd::Edit {
-            uid,
-            text,
-            stdin,
-            append,
-        } => cmd_task_edit(db, &uid, &text, stdin, append, json)?,
-        TaskCmd::Tag { cmd } => cmd_task_tag(db, cmd, json)?,
-        TaskCmd::Depend { uid, dep } => {
-            let id = resolve_task_uid(db, &uid)?;
-            let dep_uid = canonical_task_uid(&dep);
-            db.write_txn("cli", move |conn, meta| {
-                task::add_dependency(conn, meta, id, &dep_uid)
-            })?;
-            report(json, &uid, "depends_on set");
-        }
-        TaskCmd::Undepend { uid, dep } => {
-            let id = resolve_task_uid(db, &uid)?;
-            let dep_id = resolve_task_uid(db, &dep)?;
-            db.write_txn("cli", move |conn, meta| {
-                edge::unlink(conn, meta, id, dep_id, EdgeType::DependsOn)
-            })?;
-            report(json, &uid, "depends_on removed");
-        }
-        TaskCmd::Place { uid, ns, home } => {
-            let id = resolve_task_uid(db, &uid)?;
-            let ns_path = ns.clone();
-            db.write_txn("cli", move |conn, meta| {
-                let ns_id = jkb_core::ns::ensure(conn, &ns_path)?;
-                if home {
-                    task::set_primary_home(conn, meta, id, ns_id, 0)
-                } else {
-                    placement::place(conn, meta, id, ns_id, PlacementRole::Reference, 0)
-                }
-            })?;
-            report(json, &uid, "placed");
-        }
-        TaskCmd::Unplace { uid, ns } => cmd_task_unplace(db, &uid, &ns, json)?,
-        TaskCmd::Bind { uid, managed, sync } => {
-            let (uri, mode) = match (managed, sync) {
-                (_, Some(uri)) => (uri, Some(SyncMode::Bidirectional)),
-                (true, None) => (task::MANAGED_BINDING.to_owned(), None),
-                (false, None) => {
-                    anyhow::bail!("pass --managed or --sync <uri>");
-                }
-            };
-            let id = resolve_task_uid(db, &uid)?;
-            db.write_txn("cli", move |conn, meta| {
-                binding::set(conn, meta, id, &uri, mode, None)
-            })?;
-            report(json, &uid, "bound");
-        }
-        TaskCmd::Claim { uid, owner } => cmd_task_claim(db, &uid, owner, true, json)?,
         TaskCmd::Start {
             uid,
             branch,
@@ -3625,7 +3356,6 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
             },
             json,
         )?,
-        TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
         TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
         other => cmd_task_landing(db, other, json)?,
     }
@@ -3671,85 +3401,6 @@ fn cmd_task_landing(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Release { .. }
         | TaskCmd::Reap { .. }
         | TaskCmd::Reclaim { .. } => unreachable!(),
-    }
-    Ok(())
-}
-
-/// `task why <uid>` — the lifecycle history: what moved this task, who moved it, and on what
-/// evidence.
-///
-/// The history is append-only (`task_transitions`), so a transition later reverted by `jkb undo`
-/// still appears: it did happen, and the undo is its own entry in the changelog. That is the
-/// honest reading of a record of the past, and it is what makes this usable for the question it
-/// exists to answer — *why is this task here?*
-///
-/// # Errors
-/// Errors if the uid does not resolve or the read fails.
-fn cmd_task_why(db: &Db, uid: &str, json: bool) -> Result<()> {
-    let id = resolve_task_uid(db, uid)?;
-    let rows = db.read(move |conn| jkb_core::transition::history(conn, id))?;
-    if json {
-        let arr: Vec<_> = rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "at": r.at,
-                    "txn": r.txn_id,
-                    "event": r.event,
-                    "from": r.from_status,
-                    "to": r.to_status,
-                    "agent": r.agent_id.as_ref().map(jkb_types::AgentId::as_str),
-                    "branch": r.labels.branch,
-                    "onto": r.labels.onto,
-                    "pr": r.labels.pr_number,
-                    "evidence": r.evidence
-                        .as_deref()
-                        .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok()),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::json!({"uid": uid, "history": arr}));
-        return Ok(());
-    }
-    if rows.is_empty() {
-        // Distinguished from "nothing happened": a task created before this history existed has
-        // none, and saying so is not the same as saying it was never touched.
-        println!(
-            "no recorded transitions — this task predates the lifecycle history, or has \
-                  not moved since"
-        );
-        return Ok(());
-    }
-    for r in &rows {
-        let from = r.from_status.as_deref().unwrap_or("?");
-        print!("{}  {from} -> {}  {}", r.at, r.to_status, r.event);
-        if let Some(a) = &r.agent_id {
-            print!("  by {a}");
-        }
-        if let Some(b) = &r.labels.branch {
-            print!("  on {b}");
-        }
-        if let Some(o) = &r.labels.onto {
-            print!("  onto {o}");
-        }
-        if let Some(n) = r.labels.pr_number {
-            print!("  #{n}");
-        }
-        println!();
-        if let Some(e) = &r.evidence {
-            // Only the facts that were actually established are worth printing: a wall of
-            // `unknown` is what a guard was refused *for*, not what it fired on.
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(e) {
-                let shown: Vec<String> = map
-                    .iter()
-                    .filter(|(_, v)| !matches!(v.as_str(), None | Some("unknown")))
-                    .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("?")))
-                    .collect();
-                if !shown.is_empty() {
-                    println!("      {}", shown.join(" "));
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -4309,81 +3960,6 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
     Ok(())
 }
 
-/// `task tag add|rm <uid> <facet>=<value>` — apply or remove one facet tag.
-fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
-    let (uid, facet_value, mode) = match cmd {
-        TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, TagMode::Add),
-        TaskTagCmd::Set { uid, facet_value } => (uid, facet_value, TagMode::Set),
-        TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, TagMode::Rm),
-    };
-    let (facet, value) = facet_value
-        .split_once('=')
-        .context("tag must be `facet=value`, e.g. `size=small`")?;
-    // A land target is a fact about a *branch* and lives in that branch's record, so a facet named
-    // `onto` reaches no reader. Refused rather than stored inert — a user who typed it expecting
-    // effect deserves an answer, not silence.
-    //
-    // `rm` is deliberately **not** refused. The refusal exists to stop a value nothing reads being
-    // *set*; removing one is always safe, and there is a route that still creates them — a synced
-    // `tasks.md` line carrying `#onto=` goes through `tag::reconcile_tags`, which is inert by
-    // design (B3) but real. Refusing `rm` left the only command that could remove such a tag
-    // declining on the grounds that it could not exist.
-    anyhow::ensure!(
-        facet != "onto" || matches!(mode, TagMode::Rm),
-        "`onto` records where a *branch* lands, not where a task is, so it is no longer a tag. \
-         Use `jkb task work <uid> --onto <branch>`, or `jkb task start <uid> --branch <b> \
-         --onto <branch>`."
-    );
-    // The ref-valued facet is read back and handed to git, so the same rule applies here as at
-    // the location writer: a value git would read as an option must not reach the store.
-    if facet == repo::FACET_BRANCH && !matches!(mode, TagMode::Rm) {
-        gitrepo::valid_ref(value)?;
-    }
-    let id = resolve_task_uid(db, &uid)?;
-    // `add` still appends and `set` still replaces: a task can legitimately record two branches
-    // and every reader indexes both, so a command called `add` must not silently delete one.
-    if facet == repo::FACET_BRANCH && !matches!(mode, TagMode::Rm) {
-        let how = match mode {
-            TagMode::Add => repo::BranchWrite::Add,
-            _ => repo::BranchWrite::Set,
-        };
-        let branch = value.to_owned();
-        db.write_txn("cli", move |conn, meta| {
-            repo::record_branch(conn, meta, id, &branch, how)
-        })?;
-        if json {
-            println!("{}", serde_json::json!({"uid": uid, "action": "tagged"}));
-            return Ok(());
-        }
-        println!("tagged: {uid}");
-        return Ok(());
-    }
-    let (facet, value) = (facet.to_owned(), value.to_owned());
-    db.write_txn("cli", move |conn, meta| {
-        match mode {
-            // `add` is additive, honest to its name: an open-ended facet legitimately holds
-            // several values, and a command called `add` must not silently delete one.
-            TagMode::Add => tag::apply(conn, meta, id, &facet, &value),
-            // `set` replaces the facet's other values. Right for the facets answering "where
-            // is this being worked" — `repo=` is the one left here, and a second value for it is
-            // a contradiction, not extra information, which a reader collapsing the multi-map
-            // resolves at random (D36.6). (`onto=` is refused above; `branch=` is routed through
-            // `repo::record_branch`, which honours the same mode.)
-            TagMode::Set => repo::set_facet(conn, meta, id, &facet, &value),
-            TagMode::Rm => tag::remove(conn, meta, id, &facet, &value),
-        }
-    })?;
-    report(
-        json,
-        &uid,
-        match mode {
-            TagMode::Add | TagMode::Set => "tagged",
-            TagMode::Rm => "untagged",
-        },
-    );
-    Ok(())
-}
-
 /// Dispatch the parallel-session subcommands (design D36): open a session, land it, drop it,
 /// list what is in flight, or configure the gate that guards a landing.
 fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
@@ -4416,17 +3992,6 @@ fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result
         TaskCmd::Gate { cmd, clear } => cmd_task_gate(db, cmd.as_deref(), clear, json),
         _ => unreachable!("cmd_task_mutate routes only session subcommands here"),
     }
-}
-
-/// How `task tag` should write a facet.
-#[derive(Clone, Copy)]
-enum TagMode {
-    /// Append a value, keeping any others.
-    Add,
-    /// Make this the facet's only value.
-    Set,
-    /// Remove this value.
-    Rm,
 }
 
 /// `task work` — open (or return) an isolated session for a task (design D36.2).
@@ -5745,7 +5310,10 @@ fn compact_queue(db_path: &Path) -> Compaction {
         Ok(db) => db,
         Err(e) => return Compaction::Failed(format!("not run ({e:#})")),
     };
-    match jkb_api::LocalBackend::new(db).call(jkb_api::Request::MqCompact { force: false }) {
+    match jkb_api::LocalBackend::new(db)
+        .with_actor("reap")
+        .call(jkb_api::Request::MqCompact { force: false })
+    {
         Ok(Response::Compacted {
             messages_reaped,
             groups_removed,
@@ -7001,94 +6569,6 @@ fn report_close_merged(verdicts: &[CloseVerdict], dry_run: bool, json: bool) {
     }
 }
 
-/// `task set`: update any of a task's `--status`/`--priority`/`--due` in one txn.
-fn cmd_task_set(
-    db: &Db,
-    uid: &str,
-    status: Option<String>,
-    priority: Option<i64>,
-    due: Option<String>,
-    json: bool,
-) -> Result<()> {
-    if status.is_none() && priority.is_none() && due.is_none() {
-        anyhow::bail!("nothing to set: pass at least one of --status/--priority/--due");
-    }
-    let id = resolve_task_uid(db, uid)?;
-    db.write_txn("cli", move |conn, meta| {
-        if let Some(s) = &status {
-            task::set_status_str(conn, meta, id, s)?;
-        }
-        if let Some(p) = priority {
-            task::set_priority(conn, meta, id, Some(p))?;
-        }
-        if let Some(d) = &due {
-            task::set_due(conn, meta, id, Some(d))?;
-        }
-        Ok(())
-    })?;
-    report(json, uid, "updated");
-    Ok(())
-}
-
-/// `task edit`: replace (or `--append` to) a task's body text through the audited
-/// `item::set_content` seam. Content comes from `text` or, with `stdin`, from stdin.
-fn cmd_task_edit(
-    db: &Db,
-    uid: &str,
-    text: &[String],
-    stdin: bool,
-    append: bool,
-    json: bool,
-) -> Result<()> {
-    let new_text = if stdin {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-            .context("reading task content from stdin")?;
-        buf.trim_end().to_owned()
-    } else if text.is_empty() {
-        anyhow::bail!("provide new content as arguments, or pass --stdin");
-    } else {
-        text.join(" ")
-    };
-    let id = resolve_task_uid(db, uid)?;
-    // A file-backed task is no longer a single line: the `tasks` serializer renders content
-    // after the first line as the task's indented **body**, so `--append` round-trips. One
-    // limit remains — a BLANK line closes a body on re-parse, so anything after it would
-    // detach from the task and drift into section prose. Refuse that precisely, rather than
-    // refusing every multi-line edit.
-    let file_backed = uid.starts_with("file://");
-    if file_backed && new_text.contains("\n\n") {
-        anyhow::bail!(
-            "`{uid}` is a file-backed task: a blank line ends its body in the source file, so \
-             text after one would detach from the task on sync. Use single newlines, or edit \
-             the source file directly and run `jkb sync`."
-        );
-    }
-    db.write_txn("cli", move |conn, meta| {
-        let content = if append {
-            // A file-backed task's body is contiguous indented lines, so append with a single
-            // newline; a managed task's content is free-form, so keep the blank-line break.
-            let separator = if file_backed { "\n" } else { "\n\n" };
-            match item::get_content(conn, id)? {
-                Some(existing) if !existing.is_empty() => {
-                    format!("{existing}{separator}{new_text}")
-                }
-                _ => new_text,
-            }
-        } else {
-            new_text
-        };
-        item::set_content(conn, meta, id, &content, None)
-    })?;
-    report(json, uid, if append { "appended" } else { "edited" });
-    if file_backed && !json {
-        eprintln!(
-            "note: this is a file-backed task; run `jkb sync` to propagate the edit to its file."
-        );
-    }
-    Ok(())
-}
-
 /// `task reclaim` (design D27.1/D27.6.6b): the deterministic owner-existence scan,
 /// exposed so the coordinator can run it SQL-free. Clears claims whose owner pid is
 /// gone, preserving `keep` owners (the live run passes its own owner so it never
@@ -7116,74 +6596,6 @@ fn cmd_task_reclaim(db: &Db, keep: &[String], json: bool) -> Result<()> {
                  `jkb task release {} --owner {}` if you know it is gone",
                 c.uid, c.owner, c.uid, c.owner
             );
-        }
-    }
-    Ok(())
-}
-
-/// `task claim` / `task release` (design D27.3): CAS-acquire or clear a task's claim
-/// through the 17.2 core seams, so the coordinator never touches SQL. `owner` defaults
-/// to this process's liveness-checkable `host:pid` id. `claim` also flips the task to
-/// `in_progress`.
-fn cmd_task_claim(
-    db: &Db,
-    uid: &str,
-    owner: Option<String>,
-    acquire: bool,
-    json: bool,
-) -> Result<()> {
-    let owner = owner.unwrap_or_else(owner::preferred_owner);
-    let id = resolve_task_uid(db, uid)?;
-    let owner2 = owner.clone();
-    // Acquiring goes through the machine, like `task work` and `task start`. It is the **third**
-    // claim verb and the busiest — `/task-swarm` runs it on every task in every group — so a
-    // bare `claim::claim` here meant swarm work had no `start` entry in its history at all, and
-    // meant this verb and `jkb task start` answered `needs_review` oppositely: one flipped it to
-    // `in_progress`, the other refused.
-    //
-    // Releasing stays owner-scoped and outside the machine: giving up a claim you hold is not a
-    // lifecycle move, and `release` is deliberately a CAS on the owner so one agent cannot drop
-    // another's.
-    let ok = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        if !acquire {
-            return Ok(claim::release(conn, meta, id, &owner2)?);
-        }
-        let facts = lifecycle::TaskFacts {
-            actor: Some(jkb_types::AgentId::parse(&owner2)),
-            ..task::observe(conn, id)?
-        };
-        let outcome = jkb_core::transition::perform(
-            conn,
-            meta,
-            id,
-            &facts,
-            lifecycle::TaskEvent::Start,
-            &jkb_core::transition::Labels::default(),
-        )?;
-        match outcome.refusal() {
-            // A refusal is reported, not raised: the caller asked whether it could have the
-            // task, and "no, because …" is an answer. The swarm reads the boolean.
-            Some(why) => {
-                eprintln!("{why}");
-                Ok(false)
-            }
-            None => Ok(true),
-        }
-    })?;
-    let key = if acquire { "acquired" } else { "released" };
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"uid": uid, "owner": owner, key: ok})
-        );
-    } else {
-        match (acquire, ok) {
-            (true, true) => println!("claimed {uid} for {owner} (now in_progress)"),
-            // The machine's own sentence has already gone to stderr, so this does not restate a
-            // reason it does not know: the refusal may be a live owner, or a terminal task.
-            (true, false) => println!("{uid} was not claimed (see above)"),
-            (false, true) => println!("released {uid} (was held by {owner})"),
-            (false, false) => println!("{uid} was not claimed by {owner}"),
         }
     }
     Ok(())
@@ -7254,11 +6666,6 @@ fn orphaned_claims(held: Vec<claim::ClaimInfo>, keep: &[String]) -> Reclaimed {
         }
     }
     out
-}
-
-/// Canonicalize a task uid: leave a `:`-bearing uid alone, else prefix `task:`.
-fn canonical_task_uid(uid: &str) -> String {
-    task::canonical_uid(uid)
 }
 
 /// Resolve a task reference (full `task:<slug>` uid or bare slug) to its item id.

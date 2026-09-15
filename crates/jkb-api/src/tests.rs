@@ -148,6 +148,63 @@ fn samples() -> Vec<Request> {
             uid: "u".into(),
             all: false,
         },
+        Request::TaskWhy { uid: "u".into() },
+        Request::TaskAdd(super::tasks::AddAsk {
+            text: "t".into(),
+            home: None,
+            under: None,
+            backlog: false,
+            global_backlog: false,
+            sync: false,
+            managed: false,
+            cwd: String::new(),
+            client_home: String::new(),
+        }),
+        Request::TaskSet {
+            uid: "u".into(),
+            status: None,
+            priority: Some(1),
+            due: None,
+        },
+        Request::TaskEdit {
+            uid: "u".into(),
+            text: "t".into(),
+            append: false,
+        },
+        Request::TaskTag {
+            uid: "u".into(),
+            facet_value: "a=b".into(),
+            mode: super::tasks::TagMode::Add,
+        },
+        Request::TaskDepend {
+            uid: "u".into(),
+            dep: "d".into(),
+        },
+        Request::TaskUndepend {
+            uid: "u".into(),
+            dep: "d".into(),
+        },
+        Request::TaskPlace {
+            uid: "u".into(),
+            ns: "n".into(),
+            home: false,
+        },
+        Request::TaskUnplace {
+            uid: "u".into(),
+            ns: "n".into(),
+        },
+        Request::TaskBind {
+            uid: "u".into(),
+            sync: None,
+        },
+        Request::TaskClaim {
+            uid: "u".into(),
+            owner: "agent:x".into(),
+        },
+        Request::TaskRelease {
+            uid: "u".into(),
+            owner: "agent:x".into(),
+        },
     ]
 }
 
@@ -1139,6 +1196,7 @@ const READS: &[&str] = &[
     "task.ready",
     "task.show",
     "task.subtasks",
+    "task.why",
 ];
 
 #[test]
@@ -1268,4 +1326,261 @@ fn a_task_larger_than_the_budget_is_shown_whole_and_not_called_cut() {
     };
     assert_eq!(task.item.content.map(|c| c.len()), Some(10_000));
     assert!(!truncated, "no subtask was dropped, so nothing was cut");
+}
+
+// ---- the task-mutate set (tasks S6.2) ----
+
+/// Two `tasks` mounts, one under the client's file root and one outside it, with a file-backed task in
+/// each (added through an unrooted backend, as the host would) and a managed task.
+fn mutate_fixture() -> (Db, String, String, String) {
+    use jkb_core::{mount, ns};
+    use jkb_types::{ConflictPolicy, SyncMode};
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        for (path, dir) in [
+            ("repos/in", "file:///Users/u/repos/in"),
+            ("docs/out", "file:///Users/u/Documents/out"),
+        ] {
+            let id = ns::ensure(c, path)?;
+            mount::create(
+                c,
+                m,
+                id,
+                dir,
+                SyncMode::Bidirectional,
+                "tasks",
+                None,
+                None,
+                ConflictPolicy::Manual,
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let host = LocalBackend::new(db.clone());
+    let add = |text: &str, managed: bool| match call(
+        &host,
+        json!({ "op": "task.add", "text": text, "managed": managed }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let inside = add("inside +repos/in", false);
+    let outside = add("outside +docs/out", false);
+    let managed = add("managed +docs/out", true);
+    (db, inside, outside, managed)
+}
+
+fn rooted(db: &Db) -> LocalBackend {
+    LocalBackend::new(db.clone()).with_file_roots(super::tasks::FileRoots::new(vec![
+        std::path::PathBuf::from("/Users/u/repos"),
+    ]))
+}
+
+#[test]
+fn a_rooted_backend_refuses_every_write_to_a_task_filed_outside_its_roots() {
+    let (db, inside, outside, managed) = mutate_fixture();
+    let b = rooted(&db);
+    let writes = |uid: &str| {
+        vec![
+            json!({ "op": "task.set", "uid": uid, "priority": 1 }),
+            json!({ "op": "task.edit", "uid": uid, "text": "x", "append": true }),
+            json!({ "op": "task.tag", "uid": uid, "facet_value": "size=s", "mode": "add" }),
+            json!({ "op": "task.depend", "uid": uid, "dep": inside }),
+            json!({ "op": "task.undepend", "uid": uid, "dep": inside }),
+            json!({ "op": "task.place", "uid": uid, "ns": "elsewhere" }),
+            json!({ "op": "task.unplace", "uid": uid, "ns": "elsewhere" }),
+            json!({ "op": "task.bind", "uid": uid }),
+            json!({ "op": "task.claim", "uid": uid, "owner": "agent:a" }),
+            json!({ "op": "task.release", "uid": uid, "owner": "agent:a" }),
+        ]
+    };
+    for request in writes(&outside) {
+        let e = call(&b, request.clone()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Forbidden, "{request}: {e:?}");
+        assert!(
+            e.message.contains("file:///Users/u/Documents/out/tasks.md"),
+            "{e:?}"
+        );
+    }
+    // The same writes to a task filed under the root, and to a managed one, are served.
+    for uid in [&inside, &managed] {
+        for request in writes(uid) {
+            if request["op"] == "task.depend" && *uid == inside {
+                continue; // a task cannot depend on itself
+            }
+            call(&b, request.clone()).unwrap_or_else(|e| panic!("{request}: {e:?}"));
+        }
+    }
+    // And the unrooted host backend is refused nothing.
+    let host = LocalBackend::new(db.clone());
+    call(
+        &host,
+        json!({ "op": "task.set", "uid": outside, "priority": 2 }),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_rooted_backend_neither_files_a_new_task_nor_binds_one_outside_its_roots() {
+    let (db, inside, _outside, managed) = mutate_fixture();
+    let b = rooted(&db);
+    let e = call(&b, json!({ "op": "task.add", "text": "new +docs/out" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+    let Response::Added { added } = call(
+        &b,
+        json!({ "op": "task.add", "text": "new +docs/out", "managed": true }),
+    )
+    .unwrap() else {
+        panic!("added")
+    };
+    assert_eq!(
+        added.binding, None,
+        "--managed files nothing, so it is served"
+    );
+    let Response::Added { added } =
+        call(&b, json!({ "op": "task.add", "text": "new +repos/in" })).unwrap()
+    else {
+        panic!("added")
+    };
+    assert_eq!(
+        added.binding.as_deref(),
+        Some("file:///Users/u/repos/in/tasks.md"),
+        "filed under the root: {added:?}"
+    );
+    // A file binding is refused through a rooted backend whatever the file: the design refuses a row
+    // choosing a host file for sync, under the root or not.
+    for uri in [
+        "file:///Users/u/repos/in/tasks.md#x",
+        "file:///Users/u/.ssh/tasks.md#x",
+    ] {
+        let e = call(
+            &b,
+            json!({ "op": "task.bind", "uid": managed, "sync": uri }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Forbidden, "{uri}: {e:?}");
+    }
+    let host = LocalBackend::new(db);
+    call(
+        &host,
+        json!({ "op": "task.bind", "uid": managed, "sync": "file:///Users/u/repos/in/tasks.md#y" }),
+    )
+    .unwrap();
+    let _ = inside;
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // one walk through every write
+fn the_task_writes_do_what_their_commands_did() {
+    let (db, inside, _outside, managed) = mutate_fixture();
+    let b = rooted(&db);
+    call(
+        &b,
+        json!({ "op": "task.set", "uid": managed, "status": "needs_review", "priority": 2, "due": "2026-10-01" }),
+    )
+    .unwrap();
+    call(
+        &b,
+        json!({ "op": "task.edit", "uid": managed, "text": "more", "append": true }),
+    )
+    .unwrap();
+    call(
+        &b,
+        json!({ "op": "task.tag", "uid": managed, "facet_value": "branch=work", "mode": "add" }),
+    )
+    .unwrap();
+    let e = call(
+        &b,
+        json!({ "op": "task.tag", "uid": managed, "facet_value": "branch=--upload-pack=x", "mode": "add" }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.code,
+        ErrorCode::Invalid,
+        "a ref git reads as an option: {e:?}"
+    );
+    let e = call(
+        &b,
+        json!({ "op": "task.tag", "uid": managed, "facet_value": "onto=main", "mode": "set" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    call(
+        &b,
+        json!({ "op": "task.depend", "uid": managed, "dep": inside }),
+    )
+    .unwrap();
+    let Response::Task { task, .. } =
+        call(&b, json!({ "op": "task.show", "uid": managed })).unwrap()
+    else {
+        panic!("task")
+    };
+    assert_eq!(task.item.status.as_deref(), Some("needs_review"));
+    assert_eq!(task.item.priority, Some(2));
+    assert!(task
+        .item
+        .content
+        .as_deref()
+        .is_some_and(|c| c.ends_with("\n\nmore")));
+    assert!(task
+        .item
+        .tags
+        .iter()
+        .any(|t| t.facet == "branch" && t.value == "work"));
+
+    let Response::Claimed { claimed } = call(
+        &b,
+        json!({ "op": "task.claim", "uid": inside, "owner": "agent:one" }),
+    )
+    .unwrap() else {
+        panic!("claimed")
+    };
+    assert!(claimed.acquired, "{claimed:?}");
+    let Response::Claimed { claimed } = call(
+        &b,
+        json!({ "op": "task.claim", "uid": inside, "owner": "agent:two" }),
+    )
+    .unwrap() else {
+        panic!("claimed")
+    };
+    assert!(
+        !claimed.acquired && claimed.refusal.is_some(),
+        "a held task is refused, with the reason: {claimed:?}"
+    );
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "task.release", "uid": inside, "owner": "agent:two" })
+        )
+        .unwrap(),
+        Response::Released { released: false },
+        "one owner cannot drop another's claim"
+    );
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "task.release", "uid": inside, "owner": "agent:one" })
+        )
+        .unwrap(),
+        Response::Released { released: true }
+    );
+    let Response::History { entries } =
+        call(&b, json!({ "op": "task.why", "uid": inside })).unwrap()
+    else {
+        panic!("history")
+    };
+    assert!(
+        entries.iter().any(|e| e.event == "start"),
+        "the claim went through the lifecycle: {entries:?}"
+    );
+    assert!(
+        serde_json::from_value::<Request>(
+            json!({ "op": "task.add", "text": "t", "owner": "sneaky" })
+        )
+        .is_err(),
+        "task.add refuses a field it does not know, like every op"
+    );
 }

@@ -229,12 +229,27 @@ enum Source {
     Opener(Opener),
 }
 
+/// Where a client's task writes may have this host's sync write files: `$HOME/`[`crate::CLIENT_FILE_ROOT`],
+/// the one host directory the dev container binds. No `$HOME` leaves no root, which refuses every
+/// file-backed write.
+fn client_file_roots() -> jkb_api::tasks::FileRoots {
+    jkb_api::tasks::FileRoots::new(
+        std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join(crate::CLIENT_FILE_ROOT))
+            .into_iter()
+            .collect(),
+    )
+}
+
 /// The backend serving `db`: every read's answer bounded to `read_budget_bytes`, and the read set on a
 /// connection of its own
 /// ([`LocalBackend::with_reader`]), so a client's long read does not hold up the writes behind it — a
 /// notification hook's among them. A reader that will not open costs that separation, not the daemon.
 fn backend_for(db: &Db, read_budget_bytes: usize) -> LocalBackend {
-    let backend = LocalBackend::new(db.clone()).with_read_budget(read_budget_bytes);
+    let backend = LocalBackend::new(db.clone())
+        .with_actor("serve")
+        .with_read_budget(read_budget_bytes)
+        .with_file_roots(client_file_roots());
     match db.reader() {
         Ok(reader) => backend.with_reader(reader),
         Err(e) => {
@@ -413,6 +428,7 @@ pub const fn status_for(code: ErrorCode) -> StatusCode {
             StatusCode::NOT_FOUND
         }
         ErrorCode::Unsupported => StatusCode::NOT_IMPLEMENTED,
+        ErrorCode::Forbidden => StatusCode::FORBIDDEN,
         ErrorCode::TopicConflict => StatusCode::CONFLICT,
         ErrorCode::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ErrorCode::Invalid | ErrorCode::AckBeyondEnd | ErrorCode::CorruptPayload => {

@@ -642,25 +642,7 @@ pub fn backing_dir(db: &Db, mount_ns: &str) -> Result<PathBuf> {
 /// Returns an error if a database read fails.
 pub fn tasks_mount_file(db: &Db, home_ns: &str) -> Result<Option<String>> {
     let home = home_ns.to_owned();
-    let uri = db.read(move |conn| {
-        let mut cur = Some(home);
-        while let Some(path) = cur {
-            if let Some(ns_id) = ns::get(conn, &path)? {
-                if let Some(m) = mount::get(conn, ns_id)? {
-                    if m.serializer == "tasks" {
-                        if let Some(dir) = m.backing_uri.strip_prefix("file://") {
-                            let dir = dir.trim_end_matches('/');
-                            return Ok(Some(format!("file://{dir}/tasks.md")));
-                        }
-                    }
-                    return Ok(None);
-                }
-            }
-            cur = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
-        }
-        Ok(None)
-    })?;
-    Ok(uri)
+    Ok(db.read(move |conn| mount::tasks_file_for(conn, &home))?)
 }
 
 /// Load the mount configuration into an owned [`Ctx`].

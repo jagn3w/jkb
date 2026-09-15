@@ -74,11 +74,52 @@ routinely built from different checkouts.
 | `task.ready` | `dsl`, `default_scope?`, `limit?` | `items` {`items`} |
 | `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
 | `task.subtasks` | `uid`, `all?` | `children` {`children`} |
+| `task.why` | `uid` | `history` {`entries`} |
+| `task.add` | `text`, `home?`, `under?`, `backlog?`, `global_backlog?`, `sync?`, `managed?`, `cwd?`, `client_home?` | `added` {`id`, `uid`, `home`, `binding`} |
+| `task.set` | `uid`, `status?`, `priority?`, `due?` | `applied` |
+| `task.edit` | `uid`, `text`, `append?` | `applied` |
+| `task.tag` | `uid`, `facet_value`, `mode` (`add`\|`set`\|`rm`) | `applied` |
+| `task.depend` / `task.undepend` | `uid`, `dep` | `applied` |
+| `task.place` | `uid`, `ns`, `home?` | `applied` |
+| `task.unplace` | `uid`, `ns` | `unplaced` {`removed`} |
+| `task.bind` | `uid`, `sync?` (`managed:` when absent) | `applied` |
+| `task.claim` | `uid`, `owner` | `claimed` {`acquired`, `refusal`} |
+| `task.release` | `uid`, `owner` | `released` {`released`} |
 
 Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`) and `grep_hits`
 carries `truncated: true` when the read was cut — at its byte budget, or a tree at its node cap — and
 omits the field otherwise. `jkb task show --json` gained a `subtasks` array (`uid`, `title`,
 `status`) with this op, so a cut it reports refers to something in the document.
+
+**The task-mutate set** (`task.add`/`set`/`edit`/`tag`/`depend`/`undepend`/`place`/`unplace`/
+`bind`/`claim`/`release`, and the read `task.why`; tasks S6.2) is in `crates/jkb-api/src/tasks.rs`,
+one implementation each, which the host CLI runs through a `LocalBackend` too
+(`crates/jkb-cli/src/task_cli.rs`). Only what cannot happen on the serving side stays in the client:
+reading stdin (`task edit --stdin`), asking the terminal (`task add --backlog` outside a repo sends
+`global_backlog` once the user agreed), and choosing the claim owner (this process's `host:pid` or
+agent id). The branch and repo facet writers moved into `jkb-core` (`location.rs`) for it, with the
+ref-name check whose sentence the CLI's git calls share; so did the lookup of the `tasks.md` covering
+a home (`mount::tasks_file_for`), which `jkb-sync` now calls too. Every backend names the actor the
+changelog records its writes under — `cli` for the host's command line, `serve` for the daemon's
+clients, `reap` for the reap service's compaction — so the audit trail says where a change came from.
+Two decisions in it:
+
+- **A write that would have the host's sync write a file outside the container's view is refused.**
+  A task bound to a file is written back to it by the host's `jkb sync --watch` (design H4), so a
+  backend given `tasks::FileRoots` refuses, with `forbidden`, every write to a task whose binding is
+  a file outside the roots, creating a task filed in one (`--managed` is served), and binding a task
+  to a file at all. `jkb serve` gives its clients `$HOME/repos` — `jkb_daemon::CLIENT_FILE_ROOT`, which
+  `.container/check-config.sh` holds to the container's `${localEnv:HOME}/repos` bind — because a sync
+  write there is one the container could make itself; the host CLI's backend has no roots. A path is
+  judged by its components without touching the filesystem (`..` or `.` is outside), and symlinks are
+  not followed: bindings come only from mounts the host created, and neither can be made through a
+  rooted backend. Pinned by `a_rooted_backend_refuses_every_write_to_a_task_filed_outside_its_roots`
+  and, through a real daemon, `the_task_writes_go_through_the_daemon_and_stop_at_the_container_s_view`.
+- **What stays on the host.** `task start`/`work`/`land`/`abandon`/`gate`/`sessions` run git, the
+  session record store beside the database and the stored gate command, which a later stage splits
+  into client-side work and ops; `task reclaim` proves owners gone by probing their processes, which
+  only their host can do — a claim held by a live or unestablished owner is refused by `task.claim`
+  from anywhere; and `task mirror` is a sweep over every task.
 
 The `notify.*` ops are the permission-notification machine, which runs in the daemon and sends its
 effects on `claude/notify` as `notify.post` (payload `id`, `session`, `title`, `subtitle`, `body`; TTL
@@ -88,7 +129,7 @@ has a consumer group. [notifications.md](notifications.md) is their record.
 **The agent read set** (`kb.*`, `task.ready`/`show`/`subtasks`; tasks S6.1) is in
 `crates/jkb-api/src/kb.rs`, and each read has **one implementation there**: the host CLI serves `jkb
 query`, `find`, `recent`, `search`, `ls`, `tree`, `grep`, `cat` and `jkb task next`/`show`/`subtasks`
-through a `LocalBackend` too (`crates/jkb-cli/src/read_cli.rs`), so the daemon cannot answer one of
+through a `LocalBackend` too (`crates/jkb-cli/src/ops_cli.rs`), so the daemon cannot answer one of
 them differently from the host — pinned byte-for-byte by `tests/cli.rs`
 `the_read_set_answers_through_the_daemon_exactly_as_on_the_host`. The CLI only renders, and its
 `--json` shapes are unchanged (the UI parses them, D31). The decisions in it:
@@ -165,7 +206,8 @@ on. Without it, a batch of unacked messages comes back from every poll and nothi
 
 Errors carry a stable `code`: `no_such_topic`, `topic_conflict`, `no_such_group`, `queue_full`,
 `too_large`, `invalid`, `not_found` (an item a read names does not exist), `unsupported` (a search
-route this backend does not serve), `ack_beyond_end`, `corrupt_payload` (with `seq`, so a consumer can ack past
+route this backend does not serve), `forbidden` (a write whose host-side effect this client may not
+cause — see the task-mutate set), `ack_beyond_end`, `corrupt_payload` (with `seq`, so a consumer can ack past
 it), `bad_request`, `busy` (transient — retry: another writer held the database lock past the busy
 timeout, or, over HTTP, the daemon is at a concurrency limit or the group already has a long-poll in
 progress), `internal`, and `schema_newer` — a newer `jkb` migrated the database, so this build must
@@ -330,7 +372,7 @@ host.
 **Remote mode.** With `JKB_REMOTE=http://<host>:<port>` set (and `JKB_REMOTE_TOKEN_FILE`, default
 `~/.jkb/daemon/<port>/token` for that URL's port), `jkb`:
 
-- runs `jkb mq …` and the agent read set (above) through the daemon;
+- runs `jkb mq …`, the agent read set and the task-mutate set (above) through the daemon;
 - runs the commands that need no database (`notify`, `guide`, `commands`) as usual;
 - **refuses everything else before it does anything** — with a reason: host-only commands (`sync`,
   `mount`, `ingest`, `service`, `serve`) never go through the daemon, the rest are not ported yet;
@@ -374,9 +416,9 @@ migration's lock),
 - `JKB_REMOTE` set in the container — at the cutover (tasks S6), not before: remote mode refuses
   `JKB_DB` and every unported command, and the container's agents still need both. The network path
   it will take already exists; see `.container/README.md`, "The one opening to the host".
-- Porting the task-mutate command set to operations, and client-side ingest — stages S6.2/S6.3. The
-  read set is done (S6.1); `stat`, `item show`, `related`, `inv`, `view`, `ns`, `tag`, `history` and
-  `blob` are still refused remotely.
+- Client-side ingest and the cutover — stage S6.3. The read set (S6.1) and the task-mutate set (S6.2)
+  are done; `stat`, `item show`/`edit`/`rm`, `related`, `inv`, `view`, `ns`, `tag`, `undo`,
+  `history`, `blob`, and the session verbs (`task start`/`work`/`land`/…) are still refused remotely.
 - The MCP server's read tools (`jkb-mcp/src/logic.rs`) still read the database directly rather than
   through `jkb-api` (design H4 says they should become its callers).
 - `work` (competing consumers) and `compacted` (newest per key) queue types — design Q9.

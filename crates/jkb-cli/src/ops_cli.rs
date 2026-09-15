@@ -1,7 +1,8 @@
-//! The agent read set's commands (tasks S6.1): `query`, `find`, `recent`, `search`, `ls`, `tree`,
-//! `grep`, `cat`, and `task next`/`show`/`subtasks`.
+//! The commands served as typed operations: the agent read set (tasks S6.1) — `query`, `find`,
+//! `recent`, `search`, `ls`, `tree`, `grep`, `cat`, and `task next`/`show`/`subtasks` — and the
+//! task-mutate set (S6.2), rendered in [`super::task_cli`].
 //!
-//! **Every read here goes through a [`Backend`], on the host too.** The host passes a
+//! **Every op here goes through a [`Backend`], on the host too.** The host passes a
 //! `LocalBackend` over its database and remote mode passes the daemon's, so the same op answers
 //! both and this module only renders — `jkb ls` in the dev container and on the host cannot
 //! disagree about what a namespace holds, because there is no second implementation to disagree.
@@ -23,9 +24,9 @@ use super::{first_line, output, output_line, Command, TaskCmd};
 /// any real subtree, shallow enough to bound the output and the per-namespace query fan-out.
 const DEFAULT_TREE_DEPTH: usize = 4;
 
-/// Whether `command` is one of this module's — what remote mode's dispatch routes here. [`Reads::run`]
+/// Whether `command` is one of this module's — what remote mode's dispatch routes here. [`Ops::run`]
 /// refuses anything else. Remote mode's support table names the same commands in its own exhaustive
-/// match; `the_ported_reads_are_the_ones_read_cli_handles` holds the two lists together.
+/// match; `the_ported_reads_are_the_ones_ops_cli_handles` holds the two lists together.
 #[must_use]
 pub const fn handles(command: &Command) -> bool {
     match command {
@@ -39,17 +40,31 @@ pub const fn handles(command: &Command) -> bool {
         | Command::Cat { .. } => true,
         Command::Task { cmd } => matches!(
             cmd,
-            TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Subtasks { .. }
+            TaskCmd::Next { .. }
+                | TaskCmd::Show { .. }
+                | TaskCmd::Subtasks { .. }
+                | TaskCmd::Why { .. }
+                | TaskCmd::Add { .. }
+                | TaskCmd::Set { .. }
+                | TaskCmd::Edit { .. }
+                | TaskCmd::Tag { .. }
+                | TaskCmd::Depend { .. }
+                | TaskCmd::Undepend { .. }
+                | TaskCmd::Place { .. }
+                | TaskCmd::Unplace { .. }
+                | TaskCmd::Bind { .. }
+                | TaskCmd::Claim { .. }
+                | TaskCmd::Release { .. }
         ),
         _ => false,
     }
 }
 
 /// How a read is served.
-pub struct Reads<'a> {
+pub struct Ops<'a> {
     backend: &'a dyn Backend,
     global: bool,
-    json: bool,
+    pub(crate) json: bool,
     /// Served by `jkb serve` rather than in this process: the daemon budgets reads and embeds no
     /// search text.
     remote: bool,
@@ -57,8 +72,8 @@ pub struct Reads<'a> {
     notices: std::cell::RefCell<Vec<String>>,
 }
 
-impl<'a> Reads<'a> {
-    /// Reads through `backend`, which is the daemon's when `remote`.
+impl<'a> Ops<'a> {
+    /// Serves through `backend`, which is the daemon's when `remote`.
     #[must_use]
     pub const fn new(backend: &'a dyn Backend, global: bool, json: bool, remote: bool) -> Self {
         Self {
@@ -144,7 +159,7 @@ impl<'a> Reads<'a> {
                 TaskCmd::Next { terms, limit } => self.task_next(&terms.join(" "), limit),
                 TaskCmd::Show { uid } => self.task_show(&uid),
                 TaskCmd::Subtasks { uid, all } => self.task_subtasks(&uid, all),
-                _ => bail!("internal: a task subcommand the read set does not handle"),
+                cmd => super::task_cli::run(self, cmd),
             },
             _ => bail!("internal: a command the read set does not handle"),
         }
@@ -152,7 +167,7 @@ impl<'a> Reads<'a> {
 
     /// Every op goes through here, so a cut answer is reported here — once, for every command, rather
     /// than in each place an answer is taken apart, where one arm could forget.
-    fn call(&self, request: Request) -> Result<Response> {
+    pub(crate) fn call(&self, request: Request) -> Result<Response> {
         let response = self
             .backend
             .call(request)
@@ -190,7 +205,7 @@ impl<'a> Reads<'a> {
     }
 
     /// The ambient namespace, `--global` or not — task homing always reflects where you are.
-    fn ambient_here(&self) -> Result<Option<String>> {
+    pub(crate) fn ambient_here(&self) -> Result<Option<String>> {
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
         let home = std::env::var("HOME").unwrap_or_default();
         match self.call(Request::KbAmbient { cwd, home })? {
@@ -558,7 +573,7 @@ impl<'a> Reads<'a> {
 }
 
 /// An answer of the wrong shape: a daemon from another build that means something else by the op.
-fn unexpected<T>(op: &str, response: &Response) -> Result<T> {
+pub(crate) fn unexpected<T>(op: &str, response: &Response) -> Result<T> {
     let kind = serde_json::to_value(response)
         .ok()
         .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(str::to_owned))
@@ -835,7 +850,7 @@ mod tests {
     use jkb_api::kb::{GrepAnswer, GrepHit, ItemDetail, TaskDetail};
     use jkb_api::{ApiError, Backend, Request, Response};
 
-    use super::Reads;
+    use super::Ops;
     use crate::Cli;
 
     /// Answers every read with a cut answer of the right shape.
@@ -928,7 +943,7 @@ mod tests {
             for remote in [true, false] {
                 let cli = Cli::try_parse_from(std::iter::once("jkb").chain(args.iter().copied()))
                     .unwrap();
-                let reads = Reads::new(&CutShort, false, false, remote);
+                let reads = Ops::new(&CutShort, false, false, remote);
                 reads
                     .run(cli.command)
                     .unwrap_or_else(|e| panic!("{args:?}: {e:#}"));
