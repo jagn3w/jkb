@@ -27,7 +27,15 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             managed,
             under,
             home,
-        } => add(ops, &text.join(" "), backlog, sync, managed, under, home),
+        } => add(
+            ops,
+            &text.join(" "),
+            backlog,
+            sync,
+            managed,
+            under.as_deref(),
+            home.as_deref(),
+        ),
         TaskCmd::Set {
             uid,
             status,
@@ -172,31 +180,35 @@ fn add(
     backlog: bool,
     sync: bool,
     managed: bool,
-    under: Option<String>,
-    home: Option<String>,
+    under: Option<&str>,
+    home: Option<&str>,
 ) -> Result<()> {
-    // `--backlog` outside any repo homes the task in the global backlog only with the user's assent,
-    // which only this process can ask for. Asked only when nothing else would place the task, as the
-    // op itself decides — a `+ns` in the line, `--home` or `--under` makes `--backlog` a conflict the
-    // op reports instead.
-    let explicit = home.is_some()
-        || under.is_some()
-        || !jkb_core::task::parse_quick_add(text)?.placements.is_empty();
-    let global_backlog =
-        backlog && !explicit && ops.ambient_here()?.is_none() && super::confirm_global_backlog()?;
-    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-    let added = match ops.call(Request::TaskAdd(AddAsk {
-        text: text.to_owned(),
-        home,
-        under,
-        backlog,
-        global_backlog,
-        sync,
-        managed,
-        cwd,
-        client_home: std::env::var("HOME").unwrap_or_default(),
-    }))? {
+    let ask = |global_backlog: bool| -> Result<Response> {
+        ops.call(Request::TaskAdd(AddAsk {
+            text: text.to_owned(),
+            home: home.map(str::to_owned),
+            under: under.map(str::to_owned),
+            backlog,
+            global_backlog,
+            sync,
+            managed,
+            cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
+            client_home: std::env::var("HOME").unwrap_or_default(),
+        }))
+    };
+    // The op decides whether `--backlog` needs the user's assent to use the global backlog, once
+    // everything else about the request has validated; only the asking happens here.
+    let added = match ask(false)? {
         Response::Added { added } => added,
+        Response::NeedsGlobalBacklogAssent {} => {
+            if !super::confirm_global_backlog()? {
+                bail!("--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`");
+            }
+            match ask(true)? {
+                Response::Added { added } => added,
+                other => return unexpected("task.add", &other),
+            }
+        }
         other => return unexpected("task.add", &other),
     };
     if ops.json {
@@ -211,7 +223,11 @@ fn add(
             added.uid, added.id, added.home
         );
         if added.binding.is_some() {
-            println!("  synced binding — run `jkb sync` to write it to the file");
+            if ops.remote {
+                println!("  synced binding — the host's sync writes it to the file");
+            } else {
+                println!("  synced binding — run `jkb sync` to write it to the file");
+            }
         }
     }
     Ok(())
@@ -228,19 +244,23 @@ fn edit(ops: &Ops<'_>, uid: &str, text: &[String], stdin: bool, append: bool) ->
     } else {
         text.join(" ")
     };
-    applied(
-        ops,
-        Request::TaskEdit {
-            uid: uid.to_owned(),
-            text,
-            append,
-        },
-    )?;
+    let file_backed = match ops.call(Request::TaskEdit {
+        uid: uid.to_owned(),
+        text,
+        append,
+    })? {
+        Response::Edited { file_backed } => file_backed,
+        other => return unexpected("task.edit", &other),
+    };
     report(ops.json, uid, if append { "appended" } else { "edited" });
-    if uid.starts_with("file://") && !ops.json {
-        eprintln!(
-            "note: this is a file-backed task; run `jkb sync` to propagate the edit to its file."
-        );
+    if file_backed && !ops.json {
+        if ops.remote {
+            eprintln!("note: this is a file-backed task; the host's sync propagates the edit to its file.");
+        } else {
+            eprintln!(
+                "note: this is a file-backed task; run `jkb sync` to propagate the edit to its file."
+            );
+        }
     }
     Ok(())
 }
@@ -293,7 +313,7 @@ fn why(ops: &Ops<'_>, uid: &str) -> Result<()> {
     let entries = match ops.call(Request::TaskWhy {
         uid: uid.to_owned(),
     })? {
-        Response::History { entries } => entries,
+        Response::History { entries, .. } => entries,
         other => return unexpected("task.why", &other),
     };
     if ops.json {

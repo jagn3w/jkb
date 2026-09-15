@@ -80,17 +80,51 @@ fn writable(
     roots: Option<&FileRoots>,
 ) -> Result<ItemId, ApiError> {
     let id = task::resolve_ref(conn, reference)?.ok_or_else(|| no_item(reference))?;
-    if let (Some(roots), Some(bound)) = (roots, binding::get(conn, id)?) {
+    let Some(roots) = roots else {
+        return Ok(id);
+    };
+    let refuse = |file: &str| {
+        forbidden(format!(
+            "{reference} is filed in {file}, outside the directories this client may cause host \
+             files to be written in — the host's sync would write the change there. Run it on the \
+             host."
+        ))
+    };
+    if let Some(bound) = binding::get(conn, id)? {
         if !roots.admits(&bound.uri) {
-            return Err(forbidden(format!(
-                "{reference} is bound to {}, outside the directories this client may cause host \
-                 files to be written in — the host's sync would write the change there. Run it on \
-                 the host.",
-                bound.uri
-            )));
+            return Err(refuse(&bound.uri));
+        }
+    }
+    // Its uid too: a task taken out of a file is rebound `managed:` but keeps the `file://` uid it was
+    // parsed with, and when the line comes back sync re-attaches it by that uid — carrying whatever
+    // was written to it meanwhile back into the file.
+    if let Some(meta) = item::get(conn, id)? {
+        if !roots.admits(&meta.uid) {
+            return Err(refuse(&meta.uid));
         }
     }
     Ok(id)
+}
+
+/// Whether a task's content is written back to a file — decided by its binding, never by how the
+/// caller spelled its reference: a task `task add` files in a `tasks.md` has a `task:` uid.
+fn file_backed(conn: &Connection, id: ItemId) -> Result<bool, ApiError> {
+    Ok(binding::get(conn, id)?.is_some_and(|b| b.uri.starts_with("file://")))
+}
+
+/// The longest claim owner id a client may send. An owner is stored on the task and on every
+/// transition it takes; unbounded, a request-sized owner claimed and released in a loop grew each
+/// task's history by a megabyte a round.
+pub const MAX_OWNER_BYTES: usize = 512;
+
+fn check_owner(owner: &str) -> Result<(), ApiError> {
+    if owner.is_empty() || owner.len() > MAX_OWNER_BYTES {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!("an owner id of 1 to {MAX_OWNER_BYTES} bytes"),
+        ));
+    }
+    Ok(())
 }
 
 /// How `task.tag` treats the facet's other values.
@@ -138,6 +172,18 @@ pub struct AddAsk {
     pub client_home: String,
 }
 
+/// What `task.add` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// The task was created.
+    Added(Added),
+    /// Nothing was created: `backlog` outside any repo needs the user's assent to home the task in the
+    /// global backlog. Answered only once everything else about the request has validated, so a
+    /// client asks its user a question whose answer can decide the outcome — and the one rule for
+    /// what counts as an explicit placement stays here.
+    NeedsGlobalBacklogAssent,
+}
+
 /// `task.add`'s answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Added {
@@ -164,7 +210,7 @@ pub fn add(
     ask: &AddAsk,
     server_home: Option<&Path>,
     roots: Option<&FileRoots>,
-) -> Result<Added, ApiError> {
+) -> Result<AddOutcome, ApiError> {
     let invalid = |why: String| ApiError::with_code(ErrorCode::Invalid, why);
     let mut qa = task::parse_quick_add(&ask.text)?;
     for (facet, value) in &qa.tags {
@@ -216,8 +262,12 @@ pub fn add(
         None => None,
     };
 
-    settle_home(conn, ask, &mut spec, explicit, server_home)?;
+    let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
+    // The binding is judged for the home the task would get, so a refusal comes before the question.
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
+    if !assented {
+        return Ok(AddOutcome::NeedsGlobalBacklogAssent);
+    }
 
     let id = task::create(conn, meta, &spec)?;
     if let Some(parent) = parent {
@@ -226,24 +276,25 @@ pub fn add(
     for branch in &branches {
         location::record_branch(conn, meta, id, branch, BranchWrite::Add)?;
     }
-    Ok(Added {
+    Ok(AddOutcome::Added(Added {
         id: id.get(),
         uid,
         home: spec.home,
         binding: synced,
-    })
+    }))
 }
 
 /// `task.add`'s homing, for a task with no explicit placement: the ambient repo's backlog with
 /// `backlog` (the global one only when the client confirmed it), else the ambient repo's inbox mirrored
-/// into the global inbox (D26.3), else the default home.
+/// into the global inbox (D26.3), else the default home. `false` when the global backlog is where it
+/// goes and the client has not confirmed it — the home is still set, so the rest can be judged.
 fn settle_home(
     conn: &Connection,
     ask: &AddAsk,
     spec: &mut task::NewTask,
     explicit: bool,
     server_home: Option<&Path>,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let invalid = |why: &str| ApiError::with_code(ErrorCode::Invalid, why);
     let ambient_repo = || crate::kb::ambient(conn, &ask.cwd, &ask.client_home, server_home);
     if explicit {
@@ -255,20 +306,17 @@ fn settle_home(
         }
     } else if ask.backlog {
         let root = task::DEFAULT_ROOT;
-        match ambient_repo()? {
-            Some(repo) => spec.home = format!("{root}/{repo}/.backlog"),
-            None if ask.global_backlog => spec.home = format!("{root}/.backlog"),
-            None => {
-                return Err(invalid(
-                    "--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`",
-                ))
-            }
+        if let Some(repo) = ambient_repo()? {
+            spec.home = format!("{root}/{repo}/.backlog");
+        } else {
+            spec.home = format!("{root}/.backlog");
+            return Ok(ask.global_backlog);
         }
     } else if let Some(repo) = ambient_repo()? {
         spec.home = format!("{}/{repo}/inbox", task::DEFAULT_ROOT);
         spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `task.add`'s binding: the `tasks.md` of a `tasks` mount covering the home unless `managed`, refused
@@ -353,6 +401,8 @@ pub fn set(
 /// a **blank** line ends that body on re-parse — so text after one would detach from the task and
 /// drift into the section's prose. Refused precisely, rather than refusing every multi-line edit.
 ///
+/// Answers whether the task is file-backed, so a client can say its file is written by the host's sync.
+///
 /// # Errors
 /// A blank line in a file-backed task's text, [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`]
 /// under `roots`, or a failed write.
@@ -363,8 +413,9 @@ pub fn edit(
     text: &str,
     append: bool,
     roots: Option<&FileRoots>,
-) -> Result<(), ApiError> {
-    let file_backed = reference.starts_with("file://");
+) -> Result<bool, ApiError> {
+    let id = writable(conn, reference, roots)?;
+    let file_backed = file_backed(conn, id)?;
     if file_backed && text.contains("\n\n") {
         return Err(ApiError::with_code(
             ErrorCode::Invalid,
@@ -375,7 +426,6 @@ pub fn edit(
             ),
         ));
     }
-    let id = writable(conn, reference, roots)?;
     let content = if append {
         // A file-backed task's body is contiguous indented lines, so append with a single newline; a
         // managed task's content is free-form, so keep the blank-line break.
@@ -388,7 +438,7 @@ pub fn edit(
         text.to_owned()
     };
     item::set_content(conn, meta, id, &content, None)?;
-    Ok(())
+    Ok(file_backed)
 }
 
 /// `task.tag`: add, set or remove `facet=value`.
@@ -565,6 +615,7 @@ pub fn claim(
     owner: &str,
     roots: Option<&FileRoots>,
 ) -> Result<Claimed, ApiError> {
+    check_owner(owner)?;
     let id = writable(conn, reference, roots)?;
     let facts = lifecycle::TaskFacts {
         actor: Some(jkb_types::AgentId::parse(owner)),
@@ -597,6 +648,7 @@ pub fn release(
     owner: &str,
     roots: Option<&FileRoots>,
 ) -> Result<bool, ApiError> {
+    check_owner(owner)?;
     let id = writable(conn, reference, roots)?;
     Ok(claim::release(conn, meta, id, owner)?)
 }
@@ -626,11 +678,15 @@ pub struct HistoryEntry {
     pub evidence: Option<String>,
 }
 
-/// `task.why`: a task's whole transition history, oldest first.
+/// `task.why`: a task's transition history, oldest first, as much of it as fits `budget`.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`], or a failed read.
-pub fn why(conn: &Connection, reference: &str) -> Result<Vec<HistoryEntry>, ApiError> {
+pub fn why(
+    conn: &Connection,
+    reference: &str,
+    budget: &mut crate::kb::Budget,
+) -> Result<Vec<HistoryEntry>, ApiError> {
     let id = task::resolve_ref(conn, reference)?.ok_or_else(|| no_item(reference))?;
     Ok(transition::history(conn, id)?
         .into_iter()
@@ -646,6 +702,7 @@ pub fn why(conn: &Connection, reference: &str) -> Result<Vec<HistoryEntry>, ApiE
             pr: r.labels.pr_number,
             evidence: r.evidence,
         })
+        .take_while(|entry| budget.take(entry))
         .collect())
 }
 

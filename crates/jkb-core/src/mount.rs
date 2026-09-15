@@ -182,7 +182,10 @@ pub fn all(conn: &Connection) -> Result<Vec<(String, Mount)>> {
 /// # Errors
 /// Returns an error if a read fails.
 pub fn tasks_file_for(conn: &Connection, home_ns: &str) -> Result<Option<String>> {
-    let mut cur = Some(home_ns.to_owned());
+    // Normalized once and walked by slicing: a refusal for a malformed or oversized home comes from
+    // here rather than from each ancestor's lookup.
+    let normalized = crate::ns::normalize(home_ns)?;
+    let mut cur = Some(normalized);
     while let Some(path) = cur {
         if let Some(ns_id) = crate::ns::get(conn, &path)? {
             if let Some(m) = get(conn, ns_id)? {

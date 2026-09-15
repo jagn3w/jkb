@@ -14,14 +14,39 @@ use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
+/// The longest namespace path, in bytes, and the most segments one may have. [`ensure`] writes a row
+/// for every ancestor, so a path's cost grows with the square of its depth, and a client of `jkb
+/// serve` names namespaces in request bodies up to a megabyte: `a/a/a/…` there was roughly half a
+/// million rows of rising length in one transaction on the writer every other request waits on
+/// (stage-6.2 review). Far past any real layout — a synced directory tree included.
+pub const MAX_PATH_BYTES: usize = 4096;
+/// See [`MAX_PATH_BYTES`].
+pub const MAX_DEPTH: usize = 128;
+
 /// Normalize and validate a logical namespace path: reject empty paths/segments,
-/// `.`/`..` traversal, and control characters; apply Unicode NFC to each segment.
+/// `.`/`..` traversal, control characters, and a path longer than [`MAX_PATH_BYTES`] or deeper than
+/// [`MAX_DEPTH`]; apply Unicode NFC to each segment.
 ///
 /// # Errors
 /// Returns [`crate::Error::Types`] wrapping a validation error for any violation.
 pub fn normalize(path: &str) -> Result<String> {
     if path.is_empty() {
         return Err(TypeError::Validation("namespace path is empty".to_owned()).into());
+    }
+    // Before any per-segment work, so an oversized path costs nothing to refuse.
+    if path.len() > MAX_PATH_BYTES {
+        return Err(TypeError::Validation(format!(
+            "namespace path of {} bytes; at most {MAX_PATH_BYTES}",
+            path.len()
+        ))
+        .into());
+    }
+    let depth = path.split('/').count();
+    if depth > MAX_DEPTH {
+        return Err(TypeError::Validation(format!(
+            "namespace path {depth} segments deep; at most {MAX_DEPTH}"
+        ))
+        .into());
     }
     let mut segments = Vec::new();
     for segment in path.split('/') {
@@ -622,6 +647,15 @@ mod tests {
     use crate::{placement, Db};
     use jkb_types::PlacementRole;
     use serde_json::json;
+
+    #[test]
+    fn a_path_too_long_or_too_deep_is_refused() {
+        let deepest = vec!["a"; super::MAX_DEPTH].join("/");
+        assert!(super::normalize(&deepest).is_ok());
+        assert!(super::normalize(&format!("{deepest}/a")).is_err());
+        assert!(super::normalize(&"x".repeat(super::MAX_PATH_BYTES)).is_ok());
+        assert!(super::normalize(&"x".repeat(super::MAX_PATH_BYTES + 1)).is_err());
+    }
 
     #[test]
     fn subtree_leaf_count_spans_descendants_dedups_and_honours_terminal() {

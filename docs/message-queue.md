@@ -74,17 +74,17 @@ routinely built from different checkouts.
 | `task.ready` | `dsl`, `default_scope?`, `limit?` | `items` {`items`} |
 | `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
 | `task.subtasks` | `uid`, `all?` | `children` {`children`} |
-| `task.why` | `uid` | `history` {`entries`} |
-| `task.add` | `text`, `home?`, `under?`, `backlog?`, `global_backlog?`, `sync?`, `managed?`, `cwd?`, `client_home?` | `added` {`id`, `uid`, `home`, `binding`} |
+| `task.why` | `uid` | `history` {`entries`} (budgeted) |
+| `task.add` | `text`, `home?`, `under?`, `backlog?`, `global_backlog?`, `sync?`, `managed?`, `cwd?`, `client_home?` | `added` {`id`, `uid`, `home`, `binding`}, or `needs_global_backlog_assent` |
 | `task.set` | `uid`, `status?`, `priority?`, `due?` | `applied` |
-| `task.edit` | `uid`, `text`, `append?` | `applied` |
+| `task.edit` | `uid`, `text`, `append?` | `edited` {`file_backed`} |
 | `task.tag` | `uid`, `facet_value`, `mode` (`add`\|`set`\|`rm`) | `applied` |
 | `task.depend` / `task.undepend` | `uid`, `dep` | `applied` |
 | `task.place` | `uid`, `ns`, `home?` | `applied` |
 | `task.unplace` | `uid`, `ns` | `unplaced` {`removed`} |
 | `task.bind` | `uid`, `sync?` (`managed:` when absent) | `applied` |
-| `task.claim` | `uid`, `owner` | `claimed` {`acquired`, `refusal`} |
-| `task.release` | `uid`, `owner` | `released` {`released`} |
+| `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
+| `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
 
 Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`) and `grep_hits`
 carries `truncated: true` when the read was cut — at its byte budget, or a tree at its node cap — and
@@ -95,9 +95,13 @@ omits the field otherwise. `jkb task show --json` gained a `subtasks` array (`ui
 `bind`/`claim`/`release`, and the read `task.why`; tasks S6.2) is in `crates/jkb-api/src/tasks.rs`,
 one implementation each, which the host CLI runs through a `LocalBackend` too
 (`crates/jkb-cli/src/task_cli.rs`). Only what cannot happen on the serving side stays in the client:
-reading stdin (`task edit --stdin`), asking the terminal (`task add --backlog` outside a repo sends
-`global_backlog` once the user agreed), and choosing the claim owner (this process's `host:pid` or
-agent id). The branch and repo facet writers moved into `jkb-core` (`location.rs`) for it, with the
+reading stdin (`task edit --stdin`), asking the terminal, and choosing the claim owner (this process's
+`host:pid` or agent id). The terminal question is the op's to raise: `task add --backlog` outside any
+repo answers `needs_global_backlog_assent` only once everything else about the request has validated
+(a refusal comes before the question), and the client asks and sends it again with
+`global_backlog` — the rule for what counts as an explicit placement is not copied into the client.
+Whether a task is file-backed is decided by its binding, never by how the caller spelled its uid (a
+task `task add` files has a `task:` uid). The branch and repo facet writers moved into `jkb-core` (`location.rs`) for it, with the
 ref-name check whose sentence the CLI's git calls share; so did the lookup of the `tasks.md` covering
 a home (`mount::tasks_file_for`), which `jkb-sync` now calls too. Every backend names the actor the
 changelog records its writes under — `cli` for the host's command line, `serve` for the daemon's
@@ -106,15 +110,24 @@ Two decisions in it:
 
 - **A write that would have the host's sync write a file outside the container's view is refused.**
   A task bound to a file is written back to it by the host's `jkb sync --watch` (design H4), so a
-  backend given `tasks::FileRoots` refuses, with `forbidden`, every write to a task whose binding is
-  a file outside the roots, creating a task filed in one (`--managed` is served), and binding a task
-  to a file at all. `jkb serve` gives its clients `$HOME/repos` — `jkb_daemon::CLIENT_FILE_ROOT`, which
+  backend given `tasks::FileRoots` refuses, with `forbidden`, every write to a task whose binding —
+  or whose uid — is a file outside the roots, creating a task filed in one (`--managed` is served), and
+  binding a task to a file at all. The uid matters because a task taken out of its file is rebound
+  `managed:` but keeps its `file://` uid, and sync re-attaches it by that uid when the line comes back.
+  Only a file binding makes sync write: it gathers a file's items by binding, so a managed task placed
+  under a tasks mount's namespace is not written into its file. The refusal test is driven from the
+  one-sample-per-op list, so a task write added later without the guard fails it. `jkb serve` gives its clients `$HOME/repos` — `jkb_daemon::CLIENT_FILE_ROOT`, which
   `.container/check-config.sh` holds to the container's `${localEnv:HOME}/repos` bind — because a sync
   write there is one the container could make itself; the host CLI's backend has no roots. A path is
   judged by its components without touching the filesystem (`..` or `.` is outside), and symlinks are
   not followed: bindings come only from mounts the host created, and neither can be made through a
   rooted backend. Pinned by `a_rooted_backend_refuses_every_write_to_a_task_filed_outside_its_roots`
   and, through a real daemon, `the_task_writes_go_through_the_daemon_and_stop_at_the_container_s_view`.
+- **What a request can make the writer do is bounded.** A namespace path is at most 4096 bytes and 128
+  segments (`ns::MAX_PATH_BYTES`/`MAX_DEPTH`, in `normalize`, so every entry point has it): `ensure`
+  writes a row per ancestor, and a megabyte `a/a/…` in a request body was half a million rows of rising
+  length in one transaction on the writer. A claim owner is at most 512 bytes, since it is stored on
+  every transition. `task.why` is charged to the read budget like every listing.
 - **What stays on the host.** `task start`/`work`/`land`/`abandon`/`gate`/`sessions` run git, the
   session record store beside the database and the stored gate command, which a later stage splits
   into client-side work and ops; `task reclaim` proves owners gone by probing their processes, which

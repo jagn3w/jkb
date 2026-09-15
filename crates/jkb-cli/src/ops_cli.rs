@@ -67,7 +67,7 @@ pub struct Ops<'a> {
     pub(crate) json: bool,
     /// Served by `jkb serve` rather than in this process: the daemon budgets reads and embeds no
     /// search text.
-    remote: bool,
+    pub(crate) remote: bool,
     /// Notices printed on stderr, kept so a test can see them.
     notices: std::cell::RefCell<Vec<String>>,
 }

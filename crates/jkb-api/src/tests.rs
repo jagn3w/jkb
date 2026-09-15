@@ -1047,6 +1047,26 @@ fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
         Ok(())
     })
     .unwrap();
+    // A history long enough to cut: each claim and release is a transition.
+    let host = LocalBackend::new(db.clone());
+    for round in 0..40 {
+        let owner = format!("agent:{round}");
+        call(
+            &host,
+            json!({ "op": "task.claim", "uid": "big", "owner": owner }),
+        )
+        .unwrap();
+        call(
+            &host,
+            json!({ "op": "task.set", "uid": "big", "status": "open" }),
+        )
+        .unwrap();
+        call(
+            &host,
+            json!({ "op": "task.release", "uid": "big", "owner": owner }),
+        )
+        .unwrap();
+    }
     let b = LocalBackend::new(db).with_read_budget(BUDGET);
     for request in [
         json!({ "op": "kb.query", "dsl": "" }),
@@ -1059,6 +1079,7 @@ fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
         json!({ "op": "kb.search", "dsl": "needle", "route": "fts", "limit": 100, "context": 0 }),
         json!({ "op": "task.show", "uid": "big" }),
         json!({ "op": "task.subtasks", "uid": "big" }),
+        json!({ "op": "task.why", "uid": "big" }),
     ] {
         let response = call(&b, request.clone()).unwrap();
         let wire = serde_json::to_string(&response).unwrap();
@@ -1567,7 +1588,7 @@ fn the_task_writes_do_what_their_commands_did() {
         .unwrap(),
         Response::Released { released: true }
     );
-    let Response::History { entries } =
+    let Response::History { entries, .. } =
         call(&b, json!({ "op": "task.why", "uid": inside })).unwrap()
     else {
         panic!("history")
@@ -1583,4 +1604,190 @@ fn the_task_writes_do_what_their_commands_did() {
         .is_err(),
         "task.add refuses a field it does not know, like every op"
     );
+}
+
+#[test]
+fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_roots() {
+    // Driven by the one-sample-per-op list, not a list of its own: an op added later without the file
+    // guard fails here, because `every_op_names_its_own_wire_tag_and_is_advertised` makes it add a
+    // sample first.
+    let (db, inside, outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    let mut checked = 0;
+    for request in samples() {
+        if !request.op().starts_with("task.") || request.is_agent_read() {
+            continue;
+        }
+        let mut wire = serde_json::to_value(&request).unwrap();
+        if wire.get("uid").is_some() {
+            wire["uid"] = json!(outside);
+        }
+        if wire.get("dep").is_some() {
+            wire["dep"] = json!(inside);
+        }
+        if request.op() == "task.add" {
+            wire["text"] = json!("new +docs/out");
+        }
+        let e = call(&b, wire.clone()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 11, "every task write was asked");
+}
+
+#[test]
+fn a_task_whose_uid_names_a_file_outside_the_roots_is_refused_though_rebound_managed() {
+    // What sync leaves when a line is taken out of its file: rebound `managed:`, its `file://` uid kept,
+    // and re-attached by that uid if the line comes back.
+    let (db, _inside, _outside, _managed) = mutate_fixture();
+    let uid = "file:///Users/u/Documents/out/tasks.md#detached";
+    db.write_txn("t", move |c, m| {
+        let id = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new(uid, "detached"))?;
+        jkb_core::binding::set(c, m, id, jkb_core::task::MANAGED_BINDING, None, None)
+    })
+    .unwrap();
+    let e = call(
+        &rooted(&db),
+        json!({ "op": "task.place", "uid": uid, "ns": "anything" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+}
+
+#[test]
+fn an_edit_is_judged_file_backed_by_the_task_s_binding_not_its_uid() {
+    let (db, inside, _outside, managed) = mutate_fixture();
+    let b = rooted(&db);
+    assert!(
+        inside.starts_with("task:"),
+        "filed by task add, so a task: uid"
+    );
+    let e = call(
+        &b,
+        json!({ "op": "task.edit", "uid": inside, "text": "a\n\nb", "append": true }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.code,
+        ErrorCode::Invalid,
+        "a blank line would detach on sync: {e:?}"
+    );
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "task.edit", "uid": inside, "text": "more", "append": true })
+        )
+        .unwrap(),
+        Response::Edited { file_backed: true }
+    );
+    let Response::Task { task, .. } =
+        call(&b, json!({ "op": "task.show", "uid": inside })).unwrap()
+    else {
+        panic!("task")
+    };
+    assert!(
+        task.item
+            .content
+            .as_deref()
+            .is_some_and(|c| c.ends_with("inside\nmore")),
+        "a file-backed body appends with one newline: {:?}",
+        task.item.content
+    );
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "task.edit", "uid": managed, "text": "a\n\nb" })
+        )
+        .unwrap(),
+        Response::Edited { file_backed: false }
+    );
+}
+
+#[test]
+fn a_namespace_path_too_long_or_too_deep_is_refused_before_any_row_is_written() {
+    let (db, _inside, _outside, managed) = mutate_fixture();
+    let b = rooted(&db);
+    for ns in [
+        vec!["a"; jkb_core::ns::MAX_DEPTH + 1].join("/"),
+        "x".repeat(jkb_core::ns::MAX_PATH_BYTES + 1),
+        vec!["a"; 500_000].join("/"),
+    ] {
+        let started = std::time::Instant::now();
+        let e = call(&b, json!({ "op": "task.place", "uid": managed, "ns": ns })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let e = call(&b, json!({ "op": "task.add", "text": "t", "home": ns })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    }
+    let deepest = vec!["a"; jkb_core::ns::MAX_DEPTH].join("/");
+    call(
+        &b,
+        json!({ "op": "task.place", "uid": managed, "ns": deepest }),
+    )
+    .expect("the deepest allowed path is served");
+}
+
+#[test]
+fn a_claim_owner_is_bounded() {
+    let (db, inside, _outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    for owner in [String::new(), "x".repeat(super::tasks::MAX_OWNER_BYTES + 1)] {
+        for op in ["task.claim", "task.release"] {
+            let e = call(&b, json!({ "op": op, "uid": inside, "owner": owner })).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Invalid, "{op}: {e:?}");
+        }
+    }
+}
+
+#[test]
+fn the_global_backlog_is_asked_about_only_once_everything_else_is_valid() {
+    let (db, _inside, _outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    let before = |b: &LocalBackend| match call(
+        b,
+        json!({ "op": "kb.query", "dsl": "kind:task", "count": true }),
+    )
+    .unwrap()
+    {
+        Response::Count { count } => count,
+        other => panic!("{other:?}"),
+    };
+    let n = before(&b);
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere" })
+        )
+        .unwrap(),
+        Response::NeedsGlobalBacklogAssent {}
+    );
+    assert_eq!(before(&b), n, "nothing created before the user agreed");
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "later #onto=main", "backlog": true, "cwd": "/nowhere" }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.code,
+        ErrorCode::Invalid,
+        "a request that would fail anyway is refused, not asked about: {e:?}"
+    );
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "later", "backlog": true, "sync": true, "cwd": "/nowhere" }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.code,
+        ErrorCode::Invalid,
+        "--sync with no mount is judged before the question: {e:?}"
+    );
+    let Response::Added { added } = call(
+        &b,
+        json!({ "op": "task.add", "text": "later", "backlog": true, "global_backlog": true, "cwd": "/nowhere" }),
+    )
+    .unwrap() else {
+        panic!("added")
+    };
+    assert_eq!(added.home, "tasks/.backlog");
 }

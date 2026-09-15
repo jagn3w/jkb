@@ -864,7 +864,18 @@ pub enum Response {
     History {
         /// Oldest first.
         entries: Vec<tasks::HistoryEntry>,
+        /// Cut short at the read's budget ([`kb::Budget`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
+    /// A `task.edit`.
+    Edited {
+        /// The task's content is written back to a file by the host's sync.
+        file_backed: bool,
+    },
+    /// A `task.add` that created nothing: outside any repo, `backlog` needs the user's assent to use
+    /// the global backlog. Ask, and send the request again with `global_backlog`.
+    NeedsGlobalBacklogAssent {},
     /// A `task.show`.
     Task {
         /// The task.
@@ -887,7 +898,8 @@ impl Response {
             | Self::Tree { truncated, .. }
             | Self::Children { truncated, .. }
             | Self::SearchHits { truncated, .. }
-            | Self::Task { truncated, .. } => *truncated,
+            | Self::Task { truncated, .. }
+            | Self::History { truncated, .. } => *truncated,
             Self::GrepHits { answer } => answer.truncated,
             Self::Created { .. }
             | Self::Sent { .. }
@@ -905,7 +917,8 @@ impl Response {
             | Self::Unplaced { .. }
             | Self::Claimed { .. }
             | Self::Released { .. }
-            | Self::History { .. } => false,
+            | Self::Edited { .. }
+            | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
 
@@ -941,7 +954,9 @@ impl Response {
             | Self::Unplaced { .. }
             | Self::Claimed { .. }
             | Self::Released { .. }
-            | Self::History { .. } => false,
+            | Self::History { .. }
+            | Self::Edited { .. }
+            | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
 }
@@ -1447,16 +1462,23 @@ impl Backend for LocalBackend {
                     truncated,
                 }
             }
-            Request::TaskWhy { uid } => Response::History {
-                entries: db.read_with(move |c| tasks::why(c, &uid))?,
-            },
+            Request::TaskWhy { uid } => {
+                let (entries, truncated) = db.read_with(move |c| {
+                    let entries = tasks::why(c, &uid, &mut budget)?;
+                    Ok::<_, ApiError>((entries, budget.exhausted()))
+                })?;
+                Response::History { entries, truncated }
+            }
             Request::TaskAdd(ask) => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let roots = self.file_roots.clone();
-                Response::Added {
-                    added: db.write_txn_with(actor, move |c, m| {
-                        tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())
-                    })?,
+                match db.write_txn_with(actor, move |c, m| {
+                    tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())
+                })? {
+                    tasks::AddOutcome::Added(added) => Response::Added { added },
+                    tasks::AddOutcome::NeedsGlobalBacklogAssent => {
+                        Response::NeedsGlobalBacklogAssent {}
+                    }
                 }
             }
             Request::TaskSet {
@@ -1481,10 +1503,11 @@ impl Backend for LocalBackend {
             }
             Request::TaskEdit { uid, text, append } => {
                 let roots = self.file_roots.clone();
-                db.write_txn_with(actor, move |c, m| {
-                    tasks::edit(c, m, &uid, &text, append, roots.as_ref())
-                })?;
-                Response::Applied {}
+                Response::Edited {
+                    file_backed: db.write_txn_with(actor, move |c, m| {
+                        tasks::edit(c, m, &uid, &text, append, roots.as_ref())
+                    })?,
+                }
             }
             Request::TaskTag {
                 uid,
