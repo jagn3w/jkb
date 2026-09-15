@@ -61,7 +61,17 @@ pub fn normalize(path: &str) -> Result<String> {
         }
         segments.push(segment.nfc().collect::<String>());
     }
-    Ok(segments.join("/"))
+    let normalized = segments.join("/");
+    // Again after NFC, which can lengthen a segment several-fold: a path accepted here must be one
+    // every later lookup of the stored form accepts too.
+    if normalized.len() > MAX_PATH_BYTES {
+        return Err(TypeError::Validation(format!(
+            "namespace path of {} bytes once normalized; at most {MAX_PATH_BYTES}",
+            normalized.len()
+        ))
+        .into());
+    }
+    Ok(normalized)
 }
 
 /// Whether `path` denotes a system namespace (`_sys` or below).
@@ -655,6 +665,11 @@ mod tests {
         assert!(super::normalize(&format!("{deepest}/a")).is_err());
         assert!(super::normalize(&"x".repeat(super::MAX_PATH_BYTES)).is_ok());
         assert!(super::normalize(&"x".repeat(super::MAX_PATH_BYTES + 1)).is_err());
+        // U+1D160 is four bytes that NFC decomposes into twelve: under the cap as sent, over it as
+        // stored — and a stored path every later lookup refused could never be named again.
+        let expands = "\u{1D160}".repeat(super::MAX_PATH_BYTES / 4);
+        assert_eq!(expands.len(), super::MAX_PATH_BYTES);
+        assert!(super::normalize(&expands).is_err());
     }
 
     #[test]

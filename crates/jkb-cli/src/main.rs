@@ -2682,26 +2682,22 @@ fn cmd_item_edit(
         text.join(" ")
     };
     let u = uid.to_owned();
+    // Through `item::edit_content`, the one edit rule `jkb task edit` uses too: an item in a tasks.md
+    // appends with one newline and refuses a line that would end its body. This command kept its own
+    // copy, which judged by the uid's spelling and always appended after a blank line.
     let found = db.write_txn("cli", move |conn, meta| {
         let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(false);
+            return Ok(None);
         };
-        let content = if append {
-            match item::get_content(conn, id)? {
-                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{new_text}"),
-                _ => new_text,
-            }
-        } else {
-            new_text
-        };
-        item::set_content(conn, meta, id, &content, None)?;
-        Ok(true)
+        Ok(Some(item::edit_content(
+            conn, meta, id, &new_text, append, None,
+        )?))
     })?;
-    if !found {
+    let Some(in_tasks_file) = found else {
         anyhow::bail!("no item with uid `{uid}`");
-    }
+    };
     report(json, uid, if append { "appended" } else { "edited" });
-    if uid.starts_with("file://") && !json {
+    if (in_tasks_file || uid.starts_with("file://")) && !json {
         eprintln!(
             "note: this is a file-backed item; run `jkb sync` to propagate the edit to its file."
         );

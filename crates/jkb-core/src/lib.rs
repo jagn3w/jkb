@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod location;
 pub mod mount;
 pub mod mq;
+pub mod nofollow;
 pub mod notify;
 pub mod ns;
 pub mod nstype;

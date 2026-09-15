@@ -449,10 +449,10 @@ fn archive_current_bytes(db: &Db, path: &Path) -> Result<Option<Vec<u8>>> {
     // permissions, an I/O error — is a failure, because the reconcile is about to overwrite
     // bytes we could not copy. Swallowing every `fs::read` error put the hole back one layer
     // below where the caller just closed it.
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+    // Never through a symlink (`jkb_core::nofollow`): a link planted at a bound file would otherwise
+    // have its target archived here and overwritten below.
+    let Some(bytes) = jkb_core::nofollow::read(path)? else {
+        return Ok(None);
     };
     if bytes.is_empty() {
         return Ok(Some(bytes));
@@ -550,7 +550,8 @@ mod write_seam {
     /// call and cannot be opened deterministically from outside it.
     #[test]
     fn refuses_when_the_file_changed_since_the_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let path = dir.path().join("tasks.md");
         std::fs::write(&path, b"v2").unwrap();
 
@@ -575,7 +576,8 @@ mod write_seam {
     /// would be recoverable from nothing — the archive stored no bytes for it.
     #[test]
     fn refuses_when_an_absent_file_has_appeared() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let path = dir.path().join("restored.md");
         std::fs::write(&path, b"git restored me").unwrap();
 
@@ -1263,7 +1265,10 @@ fn export_blocker(
     // KB and there is no import to recover through, so refusing would wedge it on every run
     // while telling the user to perform an operation the mount's mode forbids.
     let structure_known = journal.and_then(|j| j.document.as_deref()).is_some();
-    let disk_has_content = std::fs::read(path).is_ok_and(|b| !b.trim_ascii().is_empty());
+    let disk_has_content = jkb_core::nofollow::read(path)
+        .ok()
+        .flatten()
+        .is_some_and(|b| !b.trim_ascii().is_empty());
     if ctx.imports() && !structure_known && disk_has_content {
         return Ok(Some(
             "this file has content on disk but no recorded structure, so exporting would write \
@@ -1426,9 +1431,9 @@ fn populate_document(
         Ok(Some(doc)) => Some(doc),
         // A base that will not parse is not a reason to abort the whole run; fall through to the
         // file, and if that fails too the export guard refuses rather than writing.
-        Ok(None) | Err(_) => match std::fs::read(path) {
-            Ok(bytes) => serializer.parse(&bytes).ok(),
-            Err(_) => None,
+        Ok(None) | Err(_) => match jkb_core::nofollow::read(path) {
+            Ok(Some(bytes)) => serializer.parse(&bytes).ok(),
+            Ok(None) | Err(_) => None,
         },
     };
     let Some(doc) = recovered else {
@@ -2667,7 +2672,7 @@ fn hash(bytes: &[u8]) -> String {
     blob::hash_bytes(bytes)
 }
 
-/// Write `bytes` to `path`, creating parent directories as needed.
+/// Write `bytes` to `path`, creating parent directories as needed, never through a symlink.
 fn write_file(path: &Path, bytes: &[u8], snapshot: Option<&[u8]>) -> Result<()> {
     // REFUSE to write if the file is no longer what this pass reconciled.
     //
@@ -2682,11 +2687,10 @@ fn write_file(path: &Path, bytes: &[u8], snapshot: Option<&[u8]>) -> Result<()> 
     // blob archive, so a mismatch costs a retry. `None` means the file was ABSENT when this pass
     // started and nothing was preserved — so a file that has appeared since (a `git restore`,
     // an editor writing late) is the one overwrite that would be recoverable from nothing.
-    let current = match std::fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
+    // Both the read and the write go through `jkb_core::nofollow`: the host's sync writes whatever the
+    // knowledge base says, a dev container can change that through `jkb serve`, and it can also plant
+    // a symlink inside the directories it binds — so no link on the path is ever followed.
+    let current = jkb_core::nofollow::read(path)?;
     if current.as_deref() != snapshot {
         return Err(Error::Types(TypeError::Validation(format!(
             "{} changed on disk while it was being synced; nothing was written. It will be \
@@ -2695,10 +2699,7 @@ fn write_file(path: &Path, bytes: &[u8], snapshot: Option<&[u8]>) -> Result<()> 
         ))));
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, bytes)?;
+    jkb_core::nofollow::write(path, bytes)?;
     Ok(())
 }
 

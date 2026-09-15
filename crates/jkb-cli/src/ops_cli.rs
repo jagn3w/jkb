@@ -909,6 +909,10 @@ mod tests {
                     }),
                     truncated: true,
                 },
+                Request::TaskWhy { .. } => Response::History {
+                    entries: Vec::new(),
+                    truncated: true,
+                },
                 Request::TaskSubtasks { .. } => Response::Children {
                     children: Vec::new(),
                     truncated: true,
@@ -939,6 +943,7 @@ mod tests {
             vec!["task", "next"],
             vec!["task", "show", "t"],
             vec!["task", "subtasks", "t"],
+            vec!["task", "why", "t"],
         ] {
             for remote in [true, false] {
                 let cli = Cli::try_parse_from(std::iter::once("jkb").chain(args.iter().copied()))

@@ -101,7 +101,7 @@ fn uid_of(db: &Db, id: ItemId) -> String {
 #[test]
 fn end_to_end_full_flow() {
     let db = db();
-    let repo = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let guide = repo.path().join("guide.md");
     std::fs::write(&guide, "# Guide\nfile-backed content").unwrap();
 
@@ -276,7 +276,7 @@ fn end_to_end_full_flow() {
 #[test]
 fn ingest_and_sync_are_idempotent_and_audited() {
     let db = db();
-    let repo = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     std::fs::write(repo.path().join("readme.md"), "stable content").unwrap();
 
     let repo_dir = repo.path().to_string_lossy().into_owned();

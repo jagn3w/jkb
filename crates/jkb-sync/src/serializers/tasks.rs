@@ -121,7 +121,7 @@ impl ParseState {
             return false;
         };
         let indent = line.len() - line.trim_start().len();
-        if line.trim().is_empty() || indent <= task_indent {
+        if jkb_core::item::ends_task_body(line) || indent <= task_indent {
             self.open_task = None;
             return false;
         }

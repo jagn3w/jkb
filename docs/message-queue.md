@@ -86,7 +86,7 @@ routinely built from different checkouts.
 | `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
 | `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
 
-Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`) and `grep_hits`
+Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`, `history`) and `grep_hits`
 carries `truncated: true` when the read was cut — at its byte budget, or a tree at its node cap — and
 omits the field otherwise. `jkb task show --json` gained a `subtasks` array (`uid`, `title`,
 `status`) with this op, so a cut it reports refers to something in the document.
@@ -119,15 +119,28 @@ Two decisions in it:
   one-sample-per-op list, so a task write added later without the guard fails it. `jkb serve` gives its clients `$HOME/repos` — `jkb_daemon::CLIENT_FILE_ROOT`, which
   `.container/check-config.sh` holds to the container's `${localEnv:HOME}/repos` bind — because a sync
   write there is one the container could make itself; the host CLI's backend has no roots. A path is
-  judged by its components without touching the filesystem (`..` or `.` is outside), and symlinks are
-  not followed: bindings come only from mounts the host created, and neither can be made through a
-  rooted backend. Pinned by `a_rooted_backend_refuses_every_write_to_a_task_filed_outside_its_roots`
+  judged by its components without touching the filesystem (`..` or `.` is outside; only a trailing
+  `#<id>` is a fragment). That judges the path's *spelling*, which cannot see a symlink — and the
+  container can plant one inside `~/repos` at a bound `tasks.md` or a directory above it. A second
+  review caught it; the fix is in sync itself, which no longer follows a link on any bound file's path
+  ([namespaces-and-sync.md](namespaces-and-sync.md), "Sync never follows a symbolic link"). An earlier
+  version of this paragraph said links were no risk because bindings come only from host-made mounts:
+  true of the binding, false of the directory it names. Pinned by
+  `a_rooted_backend_refuses_every_write_to_a_task_filed_outside_its_roots`,
+  `every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_roots`
   and, through a real daemon, `the_task_writes_go_through_the_daemon_and_stop_at_the_container_s_view`.
 - **What a request can make the writer do is bounded.** A namespace path is at most 4096 bytes and 128
   segments (`ns::MAX_PATH_BYTES`/`MAX_DEPTH`, in `normalize`, so every entry point has it): `ensure`
   writes a row per ancestor, and a megabyte `a/a/…` in a request body was half a million rows of rising
-  length in one transaction on the writer. A claim owner is at most 512 bytes, since it is stored on
-  every transition. `task.why` is charged to the read budget like every listing.
+  length in one transaction on the writer — and it is checked again after NFC, which can lengthen a
+  path, so a stored path stays nameable. A quick-add line carries at most 64 `+ns`/`#tag`/`^dep`
+  modifiers, a task body at most 256 KiB after an edit or append, a tag or due date at most 1024 bytes,
+  a claim owner at most 512 (it is stored on every transition). `task.why` is charged to the read
+  budget like every listing. `task edit` and `jkb item edit` share one edit rule
+  (`item::edit_content`): an item in a `tasks.md` refuses a result with a line that would end its body
+  (`item::ends_task_body`, the serializer's own test), judged on the result rather than the text sent.
+  `task.add`'s global-backlog question is answered by running the whole create and rolling it back, so
+  it is asked only when the add would otherwise succeed.
 - **What stays on the host.** `task start`/`work`/`land`/`abandon`/`gate`/`sessions` run git, the
   session record store beside the database and the stored gate command, which a later stage splits
   into client-side work and ops; `task reclaim` proves owners gone by probing their processes, which

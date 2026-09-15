@@ -1474,11 +1474,12 @@ impl Backend for LocalBackend {
                 let roots = self.file_roots.clone();
                 match db.write_txn_with(actor, move |c, m| {
                     tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())
-                })? {
-                    tasks::AddOutcome::Added(added) => Response::Added { added },
-                    tasks::AddOutcome::NeedsGlobalBacklogAssent => {
+                }) {
+                    Ok(added) => Response::Added { added },
+                    Err(tasks::AddFailure::NeedsGlobalBacklogAssent) => {
                         Response::NeedsGlobalBacklogAssent {}
                     }
+                    Err(tasks::AddFailure::Refused(e)) => return Err(e),
                 }
             }
             Request::TaskSet {

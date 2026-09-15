@@ -226,6 +226,14 @@ pub fn ensure_task_mirror(
     let Some(mirror) = tasks_mirror_ns(home) else {
         return Ok(false);
     };
+    // A home at the namespace limits can leave its mirror one segment or a few bytes past them; say
+    // so, rather than report the user's own path as the one too deep.
+    if let Err(e) = ns::normalize(&mirror) {
+        return Err(TypeError::Validation(format!(
+            "a task homed at `{home}` needs the mirror `{mirror}`, which a namespace cannot be: {e}"
+        ))
+        .into());
+    }
     let ns_id = ns::ensure(conn, &mirror)?;
     let exists = conn
         .prepare_cached(

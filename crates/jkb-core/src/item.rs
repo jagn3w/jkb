@@ -226,6 +226,76 @@ pub struct ItemMeta {
     pub updated_at: String,
 }
 
+/// Whether `line` ends a task's body in a `tasks.md`: blank once trimmed. The one copy — the `tasks`
+/// serializer closes a body on it, and an edit that would put one inside a body is refused by
+/// [`edit_content`], because the text after it would come back from the file as section prose.
+#[must_use]
+pub fn ends_task_body(line: &str) -> bool {
+    line.trim().is_empty()
+}
+
+/// Whether an item's content is written into a `tasks.md` as a line's body: bound to a fragment of a
+/// file (`file://…#id`), the shape the `tasks` serializer binds. A whole-file (`document`) binding has
+/// no fragment, and its content may hold any line.
+///
+/// # Errors
+/// Returns an error if the read fails.
+pub fn in_tasks_file(conn: &Connection, item: ItemId) -> Result<bool> {
+    Ok(crate::binding::get(conn, item)?
+        .is_some_and(|b| b.uri.starts_with("file://") && b.uri.contains('#')))
+}
+
+/// Replace an item's content with `text`, or append it, through [`set_content`] — the one rule for an
+/// edit, shared by `jkb task edit` (`jkb_api::tasks::edit`) and `jkb item edit`. An item in a
+/// `tasks.md` appends with a single newline (its body is contiguous indented lines) and refuses a
+/// result with a line that would end its body early ([`ends_task_body`]) — whitespace-only lines, a
+/// CRLF blank and an append seam included, since the result is what is judged, not the text sent. Any
+/// other item appends after a blank line. With `max_bytes`, a result longer than that is refused.
+/// Answers whether the item is in a tasks file.
+///
+/// # Errors
+/// A validation error for a refused result, [`jkb_types::Error::NotFound`] via [`set_content`], or a
+/// failed read or write.
+pub fn edit_content(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    text: &str,
+    append: bool,
+    max_bytes: Option<usize>,
+) -> Result<bool> {
+    let tasks_file = in_tasks_file(conn, item)?;
+    let content = if append {
+        let separator = if tasks_file { "\n" } else { "\n\n" };
+        match get_content(conn, item)? {
+            Some(existing) if !existing.is_empty() => format!("{existing}{separator}{text}"),
+            _ => text.to_owned(),
+        }
+    } else {
+        text.to_owned()
+    };
+    if tasks_file && content.lines().skip(1).any(ends_task_body) {
+        return Err(TypeError::Validation(
+            "this task is written into a tasks.md, where a blank line ends its body — text after one \
+             would come back from the file as section prose, detached from the task. Use single \
+             newlines, or edit the file itself."
+                .to_owned(),
+        )
+        .into());
+    }
+    if let Some(max) = max_bytes {
+        if content.len() > max {
+            return Err(TypeError::Validation(format!(
+                "an item's content of at most {max} bytes ({} after this edit)",
+                content.len()
+            ))
+            .into());
+        }
+    }
+    set_content(conn, meta, item, &content, None)?;
+    Ok(tasks_file)
+}
+
 /// The first non-blank line of `content`, trimmed and untruncated.
 ///
 /// The **one** copy of this derivation. There were four, at three different truncation

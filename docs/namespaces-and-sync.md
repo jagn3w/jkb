@@ -173,6 +173,29 @@ every synced file. `jkb blob ls --contains "<a line you remember>"` finds the ve
 blob cat <hash>` writes it out. That is how all 62 files were recovered here; the originals
 were the import cohort, distinguishable from the damaged exports by still having headers.
 
+## Sync never follows a symbolic link on a bound file's path
+
+**Decided (stage-6.2 review, 2026-09-15):** every read and write of a synced file goes through
+`jkb_core::nofollow`, which walks the path from `/` a component at a time with `O_NOFOLLOW`, refuses a
+link at the file or any directory above it, reads only a regular file (non-blocking, so a FIFO cannot
+hang the watcher), and writes a temporary file beside the target and `renameat`s it into place — which
+replaces whatever is at the name rather than writing through it, and keeps an existing file's mode.
+
+Why: the host's `jkb sync --watch` writes a bound file whenever the knowledge base changes, and since
+the task-mutate set a dev container can make those changes through `jkb serve`. The container can also
+write inside the host directories it binds. With plain `std::fs::write`, replacing a bound `tasks.md`
+under `~/repos` with a link to `~/.zshrc` and then editing the task turned the next sync into the
+container writing to the host user's shell startup file. `jkb_api::tasks::FileRoots` could not stop it:
+it judges a path's spelling, and a check followed by a write races a link swapped in between. Walking
+by file descriptor is the check and the use in one.
+
+What it costs: a synced path may not contain a link at all. `jkb mount create` stores a mount's
+directory canonical, so real mounts qualify; a test that mounts a raw temp directory must canonicalize
+it first (on macOS `/var` is a link), which `jkb-sync`'s tests now do. Pinned by
+`jkb-core`'s `nofollow` tests (a link at the file, above it, dangling; a FIFO; mode kept) and
+`sync_never_writes_through_a_symlink_planted_at_a_bound_file`, which fails when the engine goes back
+to following links. Not verified on macOS here — the tests ran on Linux.
+
 ## A file's document lives on its journal row, not in the namespace tree (D45)
 
 The root fix for a class of data loss that produced a must-fix in eight of nine review passes.

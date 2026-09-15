@@ -53,7 +53,13 @@ impl FileRoots {
         let Some(rest) = uri.strip_prefix("file://") else {
             return true;
         };
-        let path = Path::new(rest.split('#').next().unwrap_or(rest));
+        // Only a trailing `#<local id>` is a fragment. A `#` anywhere else is in the path itself, and
+        // a path judged by what precedes its first `#` could be under a root while the file is not.
+        let path = match rest.rsplit_once('#') {
+            Some((path, fragment)) if !fragment.contains('/') => path,
+            _ => rest,
+        };
+        let path = Path::new(path);
         if !path.is_absolute()
             || path
                 .components()
@@ -106,10 +112,26 @@ fn writable(
     Ok(id)
 }
 
-/// Whether a task's content is written back to a file — decided by its binding, never by how the
-/// caller spelled its reference: a task `task add` files in a `tasks.md` has a `task:` uid.
-fn file_backed(conn: &Connection, id: ItemId) -> Result<bool, ApiError> {
-    Ok(binding::get(conn, id)?.is_some_and(|b| b.uri.starts_with("file://")))
+/// The largest body a task write may leave. An append loop otherwise grew one item — and its
+/// changelog, which logs the before-state each round — without bound.
+pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
+
+/// The most `+ns`, `#facet=value` and `^dep` modifiers one quick-add line may carry. Each is a
+/// namespace chain, a tag or an edge written in the one transaction; a megabyte line of them was
+/// hundreds of thousands of rows.
+pub const MAX_QUICK_ADD_MODIFIERS: usize = 64;
+
+/// The longest tag (`facet=value`) or due date a client may set.
+pub const MAX_FIELD_BYTES: usize = 1024;
+
+fn check_len(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
+    if value.len() > max {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!("{what} of at most {max} bytes"),
+        ));
+    }
+    Ok(())
 }
 
 /// The longest claim owner id a client may send. An owner is stored on the task and on every
@@ -172,16 +194,28 @@ pub struct AddAsk {
     pub client_home: String,
 }
 
-/// What `task.add` did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AddOutcome {
-    /// The task was created.
-    Added(Added),
-    /// Nothing was created: `backlog` outside any repo needs the user's assent to home the task in the
-    /// global backlog. Answered only once everything else about the request has validated, so a
-    /// client asks its user a question whose answer can decide the outcome — and the one rule for
-    /// what counts as an explicit placement stays here.
+/// Why `task.add` created nothing.
+#[derive(Debug)]
+pub enum AddFailure {
+    /// Refused.
+    Refused(ApiError),
+    /// `backlog` outside any repo needs the user's assent to home the task in the global backlog. The
+    /// whole create ran first and is rolled back, so this is answered only when the request would
+    /// otherwise succeed — a client asks its user a question whose answer decides the outcome — and
+    /// the one rule for what counts as an explicit placement stays here.
     NeedsGlobalBacklogAssent,
+}
+
+impl From<ApiError> for AddFailure {
+    fn from(e: ApiError) -> Self {
+        Self::Refused(e)
+    }
+}
+
+impl From<jkb_core::Error> for AddFailure {
+    fn from(e: jkb_core::Error) -> Self {
+        Self::Refused(e.into())
+    }
 }
 
 /// `task.add`'s answer.
@@ -210,9 +244,17 @@ pub fn add(
     ask: &AddAsk,
     server_home: Option<&Path>,
     roots: Option<&FileRoots>,
-) -> Result<AddOutcome, ApiError> {
+) -> Result<Added, AddFailure> {
     let invalid = |why: String| ApiError::with_code(ErrorCode::Invalid, why);
+    check_len("a task line", &ask.text, MAX_CONTENT_BYTES)?;
     let mut qa = task::parse_quick_add(&ask.text)?;
+    let modifiers = qa.placements.len() + qa.tags.len() + qa.depends_on.len();
+    if modifiers > MAX_QUICK_ADD_MODIFIERS {
+        return Err(invalid(format!(
+            "a task line with at most {MAX_QUICK_ADD_MODIFIERS} `+ns`/`#tag`/`^dep` modifiers ({modifiers} given)"
+        ))
+        .into());
+    }
     for (facet, value) in &qa.tags {
         // A land target is a fact about a *branch* and lives in that branch's record, so a facet
         // named `onto` reaches no reader. Refused rather than stored inert.
@@ -222,7 +264,8 @@ pub fn add(
                  from a task line. Use `jkb task work <uid> --onto <branch>` or `jkb task start \
                  <uid> --branch <b> --onto <branch>`."
                     .to_owned(),
-            ));
+            )
+            .into());
         }
         if facet == location::FACET_BRANCH {
             location::valid_ref(value)?;
@@ -250,7 +293,8 @@ pub fn add(
     // A subtask defaults to living beside its parent.
     let parent = match &ask.under {
         Some(reference) => {
-            let pid = task::resolve_ref(conn, reference)?.ok_or_else(|| no_item(reference))?;
+            let pid = task::resolve_ref(conn, reference)?
+                .ok_or_else(|| AddFailure::Refused(no_item(reference)))?;
             if !explicit {
                 if let Some(home) = item::primary_namespace(conn, pid)? {
                     spec.home = home;
@@ -263,11 +307,7 @@ pub fn add(
     };
 
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
-    // The binding is judged for the home the task would get, so a refusal comes before the question.
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
-    if !assented {
-        return Ok(AddOutcome::NeedsGlobalBacklogAssent);
-    }
 
     let id = task::create(conn, meta, &spec)?;
     if let Some(parent) = parent {
@@ -276,12 +316,18 @@ pub fn add(
     for branch in &branches {
         location::record_branch(conn, meta, id, branch, BranchWrite::Add)?;
     }
-    Ok(AddOutcome::Added(Added {
+    // Asked last, after every write this request makes has succeeded, and answered by failing the
+    // transaction so they are rolled back: a missing `^dep` or a refused placement is the answer,
+    // not a question put to the user first.
+    if !assented {
+        return Err(AddFailure::NeedsGlobalBacklogAssent);
+    }
+    Ok(Added {
         id: id.get(),
         uid,
         home: spec.home,
         binding: synced,
-    }))
+    })
 }
 
 /// `task.add`'s homing, for a task with no explicit placement: the ambient repo's backlog with
@@ -382,6 +428,9 @@ pub fn set(
             "nothing to set: pass at least one of --status/--priority/--due",
         ));
     }
+    if let Some(d) = due {
+        check_len("a due date", d, MAX_FIELD_BYTES)?;
+    }
     let id = writable(conn, reference, roots)?;
     if let Some(s) = status {
         task::set_status_str(conn, meta, id, s)?;
@@ -395,11 +444,8 @@ pub fn set(
     Ok(())
 }
 
-/// `task.edit`: replace a task's body, or append to it.
-///
-/// A file-backed task is written back to its `tasks.md` as the indented lines under its checkbox, and
-/// a **blank** line ends that body on re-parse — so text after one would detach from the task and
-/// drift into the section's prose. Refused precisely, rather than refusing every multi-line edit.
+/// `task.edit`: replace a task's body, or append to it, by `item::edit_content`'s rule — a task in a
+/// `tasks.md` refuses a result with a line that would end its body — within [`MAX_CONTENT_BYTES`].
 ///
 /// Answers whether the task is file-backed, so a client can say its file is written by the host's sync.
 ///
@@ -415,30 +461,14 @@ pub fn edit(
     roots: Option<&FileRoots>,
 ) -> Result<bool, ApiError> {
     let id = writable(conn, reference, roots)?;
-    let file_backed = file_backed(conn, id)?;
-    if file_backed && text.contains("\n\n") {
-        return Err(ApiError::with_code(
-            ErrorCode::Invalid,
-            format!(
-                "`{reference}` is a file-backed task: a blank line ends its body in the source file, \
-                 so text after one would detach from the task on sync. Use single newlines, or edit \
-                 the source file directly and run `jkb sync`."
-            ),
-        ));
-    }
-    let content = if append {
-        // A file-backed task's body is contiguous indented lines, so append with a single newline; a
-        // managed task's content is free-form, so keep the blank-line break.
-        let separator = if file_backed { "\n" } else { "\n\n" };
-        match item::get_content(conn, id)? {
-            Some(existing) if !existing.is_empty() => format!("{existing}{separator}{text}"),
-            _ => text.to_owned(),
-        }
-    } else {
-        text.to_owned()
-    };
-    item::set_content(conn, meta, id, &content, None)?;
-    Ok(file_backed)
+    Ok(item::edit_content(
+        conn,
+        meta,
+        id,
+        text,
+        append,
+        Some(MAX_CONTENT_BYTES),
+    )?)
 }
 
 /// `task.tag`: add, set or remove `facet=value`.
@@ -455,6 +485,7 @@ pub fn tag(
     roots: Option<&FileRoots>,
 ) -> Result<(), ApiError> {
     let invalid = |why: &str| ApiError::with_code(ErrorCode::Invalid, why);
+    check_len("a tag", facet_value, MAX_FIELD_BYTES)?;
     let (facet, value) = facet_value
         .split_once('=')
         .ok_or_else(|| invalid("tag must be `facet=value`, e.g. `size=small`"))?;
@@ -727,6 +758,15 @@ mod tests {
             "`..` is judged outside, not resolved"
         );
         assert!(!roots.admits("file://relative/tasks.md"));
+        assert!(
+            !roots.admits("file:///Users/u/repos#old/proj/tasks.md#slug"),
+            "a `#` in the path is not a fragment boundary"
+        );
+        assert!(roots.admits("file:///Users/u/repos/proj/tasks.md#slug"));
+        assert!(
+            roots.admits("file:///Users/u/repos/a#b/tasks.md#slug"),
+            "a `#` in a directory under the root is still under it"
+        );
         assert!(
             !FileRoots::new(vec![PathBuf::from("relative")]).admits("file:///relative/x"),
             "a relative root admits nothing"

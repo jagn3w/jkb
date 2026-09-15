@@ -1791,3 +1791,120 @@ fn the_global_backlog_is_asked_about_only_once_everything_else_is_valid() {
     };
     assert_eq!(added.home, "tasks/.backlog");
 }
+
+#[test]
+fn an_edit_is_judged_by_the_body_it_leaves_and_bounded() {
+    let (db, inside, _outside, managed) = mutate_fixture();
+    let b = rooted(&db);
+    for (text, append) in [
+        ("step one\n  \nstep two", false),
+        ("a\r\n\r\nb", false),
+        ("\nmore", true),
+        ("more\n\t\n", true),
+    ] {
+        let e = call(
+            &b,
+            json!({ "op": "task.edit", "uid": inside, "text": text, "append": append }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{text:?}: {e:?}");
+    }
+    // A managed task's content is free-form.
+    call(
+        &b,
+        json!({ "op": "task.edit", "uid": managed, "text": "a\n  \nb" }),
+    )
+    .unwrap();
+    // Growth is bounded: an append loop stops at the cap.
+    let chunk = "x".repeat(64 * 1024);
+    let mut refused = None;
+    for _ in 0..8 {
+        if let Err(e) = call(
+            &b,
+            json!({ "op": "task.edit", "uid": managed, "text": chunk, "append": true }),
+        ) {
+            refused = Some(e);
+            break;
+        }
+    }
+    assert_eq!(
+        refused.map(|e| e.code),
+        Some(ErrorCode::Invalid),
+        "an append past MAX_CONTENT_BYTES is refused"
+    );
+    let e = call(
+        &b,
+        json!({ "op": "task.set", "uid": managed, "due": "9".repeat(super::tasks::MAX_FIELD_BYTES + 1) }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
+    let e = call(
+        &b,
+        json!({ "op": "task.tag", "uid": managed, "facet_value": format!("f={}", "v".repeat(super::tasks::MAX_FIELD_BYTES)), "mode": "add" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
+}
+
+#[test]
+fn a_quick_add_line_is_bounded_in_what_it_fans_out_to() {
+    let (db, _inside, _outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    let line = (0..=super::tasks::MAX_QUICK_ADD_MODIFIERS)
+        .map(|i| format!("#f{i}=v"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": format!("t {line}"), "managed": true }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+}
+
+#[test]
+fn a_task_homed_at_the_namespace_limit_is_refused_naming_its_mirror() {
+    let (db, _inside, _outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    let home = vec!["d"; jkb_core::ns::MAX_DEPTH].join("/");
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "t", "home": home, "managed": true }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert!(e.message.contains("needs the mirror"), "{e:?}");
+}
+
+#[test]
+fn the_global_backlog_question_follows_every_other_refusal_and_writes_nothing() {
+    let (db, _inside, _outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    let count =
+        |b: &LocalBackend| match call(b, json!({ "op": "kb.query", "dsl": "", "count": true }))
+            .unwrap()
+        {
+            Response::Count { count } => count,
+            other => panic!("{other:?}"),
+        };
+    let before = count(&b);
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "later ^task:does-not-exist", "backlog": true, "cwd": "/nowhere" }),
+    )
+    .unwrap_err();
+    assert_ne!(
+        e.code,
+        ErrorCode::Unknown,
+        "a missing dependency is the answer: {e:?}"
+    );
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere" })
+        )
+        .unwrap(),
+        Response::NeedsGlobalBacklogAssent {}
+    );
+    assert_eq!(count(&b), before, "the create ran and was rolled back");
+}
