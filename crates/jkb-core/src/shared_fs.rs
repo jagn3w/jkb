@@ -37,6 +37,7 @@ use crate::{Error, Result};
 /// Every entry is a hex tuple on its own line: `scripts/tests/dev-scripts.test.sh` case11 reads
 /// this block to prove `scripts/lib.sh` refuses the same set, and fails on an entry in any other
 /// shape.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux statfs guard calls it; its tests run everywhere
 const SHARED: &[(u32, &str)] = &[
     (0x6573_5546, "FUSE (virtiofs, gRPC-FUSE, sshfs)"),
     (0x0102_1997, "9p"),
@@ -46,9 +47,11 @@ const SHARED: &[(u32, &str)] = &[
 ];
 
 /// Symlink hops followed before a path is treated as unresolvable (the kernel's own limit).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux statfs guard calls it; its tests run everywhere
 const MAX_LINK_HOPS: usize = 40;
 
 /// The filesystem name if `f_type` is one a database must not live on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux statfs guard calls it; its tests run everywhere
 fn shared_kind(f_type: u32) -> Option<&'static str> {
     SHARED
         .iter()
@@ -59,6 +62,7 @@ fn shared_kind(f_type: u32) -> Option<&'static str> {
 /// Follow `path` through symlinks — including a DANGLING one, which `SQLite` also follows and
 /// creates the database at the far end of — to the path whose directory will hold the files.
 /// `None` when the chain does not end within [`MAX_LINK_HOPS`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux statfs guard calls it; its tests run everywhere
 fn follow_links(path: &Path) -> Option<PathBuf> {
     let mut at = path.to_path_buf();
     for _ in 0..MAX_LINK_HOPS {
@@ -87,6 +91,7 @@ fn follow_links(path: &Path) -> Option<PathBuf> {
 ///
 /// Symlinks are followed first, dangling ones included. An `Err` carries why the path cannot be
 /// judged, which the caller refuses rather than reading as local.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux statfs guard calls it; its tests run everywhere
 fn paths_to_ask(path: &Path) -> std::result::Result<Vec<PathBuf>, String> {
     let target = follow_links(path)
         .ok_or_else(|| format!("its symlinks do not resolve within {MAX_LINK_HOPS} hops"))?;
