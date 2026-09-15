@@ -219,13 +219,17 @@ back to following links. Not verified on macOS here — the tests ran on Linux.
 
 ## The watcher exports a change made in the database, not only one made on disk
 
-**Decided (2026-09-15, after the user saw it on the host):** each mount's watcher polls the changelog on
-its idle tick (`sync_state::writes_since`, reading only entries past its last look). When anyone but
-sync itself (`sync_state::SYNC_ACTOR`) has written, it reconciles the bound files whose knowledge-base
-render no longer hashes to their last-synced hash (`engine::sync_kb_changes`) — read-only to decide,
-so a write elsewhere costs a render per bound file, not an archive and a transaction each. Files flagged
-`conflict`/`needs_attention` are left to the reconcile that settles their flag. Read-only filesystem
-events (open, read, close after reading) are dropped in the watcher's callback.
+**Decided (2026-09-15, after the user saw it on the host):** after each iteration of its loop — at most
+once per debounce — each mount's watcher asks the changelog what was written past its last look
+(`sync_state::writes_since`). When anyone but sync itself (`sync_state::SYNC_ACTOR`) has written, a
+pass is owed, and it runs at most once per three debounces (`DatabaseWrites`, which keeps a write that
+lands between passes owed): it reconciles the bound files whose knowledge-base render no longer hashes
+to their last-synced hash (`engine::sync_kb_changes`) — read-only to decide, so a write elsewhere costs a
+render per bound file, not an archive and a transaction each. Also reconciled: a never-synced bound file,
+a file whose check fails (so the failure lands on it), and one flagged by a refusal, whose remedy is a
+database write. Left to the disk: a `conflict` and a quarantined parse failure. An import-only mount is
+skipped. Read-only filesystem events (open, read, close after reading) are dropped in the watcher's
+callback, and one burst of events is coalesced for at most ten debounces.
 
 Why: the watcher heard only the filesystem, so a task edited through `jkb` — on the host, or since the
 task-mutate set by a dev container through `jkb serve` — stayed out of its file until that file changed
@@ -237,12 +241,20 @@ Linux test — while macOS's FSEvents carry no opens, so the Mac showed the real
 those reads as activity let any reader faster than the debounce (an editor, a grep, a test polling for
 the result) keep the loop from ever going idle.
 
+A first review added what the first version missed: asked only on an idle tick, file churn under a mount
+(a build, git, a task worktree) held the export off for as long as it lasted, and so did an unbounded
+drain of that churn; unspaced, a fleet writing anywhere made every mount render every bound file on each
+tick; skipped, a refusal flag outlived the database write that remedied it.
+
 Sync's own writes do not count, or every pass would trigger the next. What that leaves: a mount's
 `ensure_all_mirrors` (a sync write) that changes another mount's render is not seen until that mount's
 next pass. Pinned by `writes_since_counts_what_others_wrote_and_passes_sync_s_own`,
 `a_database_edit_is_exported_to_its_file_and_to_no_other`,
-`the_watcher_exports_a_database_edit_without_a_file_event` (reading the file faster than the debounce
-while it waits) and `a_read_only_access_is_not_a_change`. Not verified on macOS here.
+`the_watcher_exports_a_database_edit_without_a_file_event` (reading the file faster than the debounce,
+and writing another file under the mount faster still, while it waits), `a_read_only_access_is_not_a_change`,
+`a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync`,
+`a_refused_file_is_re_judged_after_its_database_remedy` and
+`database_passes_are_spaced_and_a_write_between_them_is_kept`. Not verified on macOS here.
 
 ## A task's `^id` is read in the alphabet `slug` mints it in
 

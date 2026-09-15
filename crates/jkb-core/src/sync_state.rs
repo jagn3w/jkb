@@ -270,6 +270,16 @@ pub struct Writes {
     pub by_others: bool,
 }
 
+/// The newest changelog id (`0` for none) — where a watcher starts looking, without reading the log.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn latest_write(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .prepare_cached("SELECT coalesce(max(id), 0) FROM changelog")?
+        .query_row([], |r| r.get(0))?)
+}
+
 /// The changelog past `after` (`0` for all of it), for a file watcher asking whether the knowledge
 /// base changed under a bound file — a task edited by `jkb task` on the host, or by a container
 /// through `jkb serve` — which no filesystem event reports. Sync's own writes do not count: they
@@ -392,7 +402,7 @@ mod tests {
     #[test]
     fn writes_since_counts_what_others_wrote_and_passes_sync_s_own() {
         let db = Db::open_in_memory().unwrap();
-        let start = db.read(|c| super::writes_since(c, 0)).unwrap().latest;
+        let start = db.read(super::latest_write).unwrap();
         let write = |actor: &'static str| {
             db.write_txn(actor, move |c, m| {
                 crate::ns::ensure(c, "a")?;

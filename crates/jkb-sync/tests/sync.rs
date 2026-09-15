@@ -2924,6 +2924,24 @@ fn the_watcher_exports_a_database_edit_without_a_file_event() {
         assert!(std::time::Instant::now() < deadline, "initial reconcile");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // And files under the mount changing faster than the debounce the whole time — a build, git, a task
+    // worktree — which the mount's globs exclude but whose events still arrive: asked only when the
+    // filesystem went quiet, the database never was.
+    let churning = Arc::new(AtomicBool::new(true));
+    let churn = {
+        let noise = dir.path().join("build.log");
+        let churning = Arc::clone(&churning);
+        std::thread::spawn(move || {
+            let mut n = 0_u64;
+            while churning.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                fs::write(&noise, n.to_string()).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    // Well under way before the edit, so the watcher is already inside the churn when it lands.
+    std::thread::sleep(Duration::from_millis(300));
 
     kb_set_status(&db, &uri, "done");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -2940,6 +2958,141 @@ fn the_watcher_exports_a_database_edit_without_a_file_event() {
         // long enough to ask about the database — as with an editor or a grep reading the file.
         std::thread::sleep(Duration::from_millis(5));
     }
+    churning.store(false, std::sync::atomic::Ordering::Relaxed);
+    churn.join().unwrap();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     watcher.join().unwrap().unwrap();
+}
+
+/// A pass over database changes follows the mount's direction: an import-only mount writes nothing, an
+/// export-only mount writes the edit, and a bound file never written yet is created with its line. And
+/// every write the pass makes is sync's own, or each pass would ask for the next.
+#[test]
+fn a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync() {
+    for (mode, writes) in [
+        (SyncMode::Import, false),
+        (SyncMode::Export, true),
+        (SyncMode::Bidirectional, true),
+    ] {
+        let dir = real_tempdir();
+        let file = dir.path().join("tasks.md");
+        fs::write(&file, TASKS_MD).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        mount_dir(
+            &db,
+            "docs/plan",
+            dir.path(),
+            SyncMode::Bidirectional,
+            "tasks",
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+        sync(&db, "docs/plan").unwrap();
+        mount_dir(
+            &db,
+            "docs/plan",
+            dir.path(),
+            mode,
+            "tasks",
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+        kb_set_status(&db, &format!("{}#setup", uri_for(&file)), "done");
+        let before = db.read(jkb_core::sync_state::latest_write).unwrap();
+        let report = jkb_sync::sync_kb_changes(&db, "docs/plan").unwrap();
+        let exported = fs::read_to_string(&file)
+            .unwrap()
+            .contains("- [x] Set up CI ^setup");
+        assert_eq!(exported, writes, "{mode:?}: {report:?}");
+        if !writes {
+            assert!(report.results.is_empty(), "{mode:?}: {report:?}");
+        }
+        let after = db
+            .read(move |c| jkb_core::sync_state::writes_since(c, before))
+            .unwrap();
+        assert!(
+            !after.by_others,
+            "{mode:?}: the pass wrote as someone other than sync"
+        );
+    }
+
+    // A task filed into a tasks.md that is not on disk yet is written out.
+    let dir = real_tempdir();
+    fs::write(dir.path().join("tasks.md"), TASKS_MD).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let fresh = dir.path().join("later/tasks.md");
+    let fresh_uri = format!("{}#born", uri_for(&fresh));
+    db.write_txn("cli", move |conn, meta| {
+        let mut new = task::NewTask::new(&fresh_uri, "Born in the database");
+        new.binding = fresh_uri.clone();
+        new.home = "docs/plan/later/tasks.md".to_owned();
+        task::create(conn, meta, &new).map(|_| ())
+    })
+    .unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan").unwrap();
+    assert!(
+        fs::read_to_string(&fresh).is_ok_and(|t| t.contains("Born in the database ^born")),
+        "{:?}",
+        fs::read_to_string(&fresh)
+    );
+}
+
+/// A file refused into `needs_attention` is re-judged when the database changes, so the remedy the
+/// refusal names — a database write — clears it.
+#[test]
+fn a_refused_file_is_re_judged_after_its_database_remedy() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(
+        &tasks,
+        "## Plan\n\n- [ ] keep me !p1 ^keep\n- [ ] and me !p2 ^and\n",
+    )
+    .unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let placement: (i64, i64, i64) = db
+        .write_txn("t", |conn, _| {
+            let row = conn.query_row(
+                "SELECT p.item_id, p.namespace_id, p.position FROM placements p JOIN items i ON i.id = p.item_id
+                  WHERE i.content = 'keep me' AND p.role = 'primary'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            conn.execute("DELETE FROM placements WHERE item_id = ?1 AND role = 'primary'", [row.0])?;
+            conn.execute("UPDATE items SET status = 'done' WHERE content = 'and me'", [])?;
+            Ok(row)
+        })
+        .unwrap();
+    assert_eq!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan")
+            .unwrap()
+            .count(Outcome::Refused),
+        1
+    );
+    assert_eq!(journal(&db, &uri_for(&tasks)).unwrap().0, "needs_attention");
+
+    // The remedy: put the placement back, in the database.
+    db.write_txn("cli", move |conn, meta| {
+        jkb_core::placement::place(
+            conn,
+            meta,
+            jkb_types::ItemId::new(placement.0),
+            jkb_types::NamespaceId::new(placement.1),
+            jkb_types::PlacementRole::Primary,
+            placement.2,
+        )
+    })
+    .unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan").unwrap();
+    assert_eq!(
+        journal(&db, &uri_for(&tasks)).unwrap().0,
+        "ok",
+        "the flag clears once the remedy is applied"
+    );
+    assert!(fs::read_to_string(&tasks).unwrap().contains("- [x] and me"));
 }

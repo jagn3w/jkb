@@ -371,9 +371,12 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
 /// Which files is decided read-only and exactly as a reconcile would: the file's knowledge-base render
 /// is hashed against the last-synced hash on its journal row, and only a file that differs is
 /// reconciled — so a write elsewhere in the database costs a render per bound file, not an archive and
-/// a write transaction each. A file never synced is reconciled; one flagged `conflict` or
-/// `needs_attention` is left to the reconcile a disk change or a full sync gives it, which is where its
-/// flag is settled.
+/// a write transaction each. Also reconciled: a file never synced; a file whose check fails, so the
+/// reconcile records that failure against it rather than the pass ending before the files after it;
+/// and a file flagged `needs_attention` by a **refusal** — its remedy is a database write (`jkb task
+/// place … --home` after an undo dropped a placement), and skipped, it stayed flagged, and exported
+/// nothing, after the user did what it said. Left to a disk change or a full sync: a `conflict`, and a
+/// quarantined parse failure (a stashed file), whose remedies are on disk.
 ///
 /// # Errors
 /// As [`sync`]. Per-file failures are in the report.
@@ -391,16 +394,7 @@ pub fn sync_kb_changes(db: &Db, mount_ns: &str) -> Result<SyncReport> {
     let changed = db.read_with::<Vec<PathBuf>, Error, _>(move |conn| {
         let mut changed = Vec::new();
         for path in bound {
-            let bare_uri = file_uri(&path);
-            let journal = sync_state::get(conn, &bare_uri)?;
-            let base = match &journal {
-                None => None,
-                Some(j) if j.status != "ok" => continue,
-                Some(j) => j.last_synced_hash.clone(),
-            };
-            let (_, serializer) = resolve_serializer(conn, &judged, &bare_uri)?;
-            let kb_doc = assemble_kb_doc(conn, &judged, &path, &bare_uri, journal.as_ref())?;
-            if base.as_deref() != Some(hash(&serializer.render(&kb_doc)?).as_str()) {
+            if kb_side_changed(conn, &judged, &path).unwrap_or(true) {
                 changed.push(path);
             }
         }
@@ -410,6 +404,22 @@ pub fn sync_kb_changes(db: &Db, mount_ns: &str) -> Result<SyncReport> {
         return Ok(SyncReport::default());
     }
     reconcile_all(db, &ctx, changed)
+}
+
+/// Whether `path`'s knowledge-base side needs reconciling after a database write — see
+/// [`sync_kb_changes`] for which files do.
+fn kb_side_changed(conn: &Connection, ctx: &Ctx, path: &Path) -> Result<bool> {
+    let bare_uri = file_uri(path);
+    let journal = sync_state::get(conn, &bare_uri)?;
+    let base = match &journal {
+        None => return Ok(true),
+        Some(j) if j.status == "conflict" || j.quarantine_blob_hash.is_some() => return Ok(false),
+        Some(j) if j.status != "ok" => return Ok(true),
+        Some(j) => j.last_synced_hash.clone(),
+    };
+    let (_, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
+    let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal.as_ref())?;
+    Ok(base.as_deref() != Some(hash(&serializer.render(&kb_doc)?).as_str()))
 }
 
 /// Reconcile each path in its own audited transaction, collecting the outcomes.

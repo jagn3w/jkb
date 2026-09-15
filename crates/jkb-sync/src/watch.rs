@@ -4,9 +4,10 @@
 //!
 //! Events carry the paths that changed, so a burst reconciles just those files via
 //! [`crate::sync_paths`] rather than re-scanning the whole mount — important once a
-//! mount backs a large tree. A change made in the **database** raises no filesystem event, so each
-//! idle tick also asks the changelog whether anyone but sync has written since the last look, and if so
-//! reconciles the bound files whose knowledge-base side changed ([`crate::sync_kb_changes`]).
+//! mount backs a large tree. A change made in the **database** raises no filesystem event, so after
+//! each iteration the watcher also asks the changelog whether anyone but sync has written since its last
+//! look (at most once per debounce), and if so reconciles the bound files whose knowledge-base side
+//! changed ([`crate::sync_kb_changes`]), at most once per three debounces.
 //! Only two situations fall back to a full [`crate::sync`]:
 //! the initial reconcile on startup (to catch drift from while the watcher was off),
 //! and a watcher error or dropped-events signal (`need_rescan`), where we can no
@@ -66,7 +67,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
     // Read before the first pass, so a write that lands during it is still seen afterwards.
-    let mut seen = db.read(|conn| sync_state::writes_since(conn, 0))?.latest;
+    let mut database = DatabaseWrites::new(db.read(sync_state::latest_write)?);
     let mut debt = RetryDebt::new(
         run_pass(mount_ns, || engine::sync(db, mount_ns)),
         debounce.saturating_mul(RETRY_TICKS),
@@ -78,8 +79,15 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
             Ok(first) => {
                 let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
                 let mut rescan = collect(first, &mut paths);
-                // Coalesce: keep draining until the filesystem is quiet for `debounce`.
-                while let Ok(next) = rx.recv_timeout(debounce) {
+                // Coalesce: keep draining until the filesystem is quiet for `debounce` — or for at
+                // most a burst's worth of it. Under churn that never pauses (a build, git, a task
+                // worktree writing under a repo mount) an unbounded drain never returned, so neither
+                // the paths it had gathered nor anything after this loop ever ran.
+                let burst = Instant::now();
+                while burst.elapsed() < debounce.saturating_mul(BURST_TICKS) {
+                    let Ok(next) = rx.recv_timeout(debounce) else {
+                        break;
+                    };
                     rescan |= collect(next, &mut paths);
                 }
                 // A dropped-event rescan is immediate; a RETRY waits for the backoff. Without
@@ -97,25 +105,7 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
             }
             // An idle tick still settles a debt. Without this the retry only ever fired if a
             // file happened to change, which is the one condition a failed pass cannot rely on.
-            // Otherwise it asks whether the database changed under the bound files: nothing else
-            // reports a task edited through `jkb` rather than in its file.
-            Err(RecvTimeoutError::Timeout) => {
-                if debt.due() {
-                    Some(Work::Full)
-                } else {
-                    let writes = db.read(move |conn| sync_state::writes_since(conn, seen));
-                    match writes {
-                        Ok(writes) => {
-                            seen = writes.latest;
-                            writes.by_others.then_some(Work::KbChanges)
-                        }
-                        Err(e) => {
-                            eprintln!("sync {mount_ns}: could not read the changelog ({e})");
-                            None
-                        }
-                    }
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => debt.due().then_some(Work::Full),
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
@@ -128,10 +118,14 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                     engine::sync_paths(db, mount_ns, &paths)
                 }));
             }
-            Some(Work::KbChanges) => {
-                debt.targeted_pass(run_pass(mount_ns, || engine::sync_kb_changes(db, mount_ns)));
-            }
             None => {}
+        }
+
+        // Then the database, whatever this iteration did: nothing on the filesystem reports a task
+        // edited through `jkb`, and asked only on an idle tick it waited out any file churn.
+        database.poll(db, mount_ns, debounce);
+        if database.pass_due(debounce.saturating_mul(EXPORT_TICKS)) {
+            debt.targeted_pass(run_pass(mount_ns, || engine::sync_kb_changes(db, mount_ns)));
         }
     }
     Ok(())
@@ -194,6 +188,72 @@ impl RetryDebt {
     }
 }
 
+/// What a watcher knows about writes to the database that no filesystem event reports.
+///
+/// The changelog is asked at most once per debounce and a pass is run at most once per spacing, with a
+/// write seen in between kept owed rather than dropped: without the spacing a fleet writing to any part
+/// of the knowledge base had every mount render every bound file on each tick, on the single writer
+/// thread. A changelog that cannot be read is said once per failing stretch, not on every tick.
+struct DatabaseWrites {
+    /// The newest changelog id looked at.
+    seen: i64,
+    /// Something other than sync wrote since the last pass.
+    owed: bool,
+    polled: Instant,
+    passed: Option<Instant>,
+    failing: bool,
+}
+
+impl DatabaseWrites {
+    fn new(seen: i64) -> Self {
+        Self {
+            seen,
+            owed: false,
+            polled: Instant::now(),
+            passed: None,
+            failing: false,
+        }
+    }
+
+    /// Ask the changelog what was written since the last look, if a debounce has passed.
+    fn poll(&mut self, db: &Db, mount_ns: &str, every: Duration) {
+        if self.polled.elapsed() < every {
+            return;
+        }
+        self.polled = Instant::now();
+        let after = self.seen;
+        match db.read(move |conn| sync_state::writes_since(conn, after)) {
+            Ok(writes) => {
+                self.seen = writes.latest;
+                self.owed |= writes.by_others;
+                self.failing = false;
+            }
+            Err(e) => {
+                if !self.failing {
+                    eprintln!("sync {mount_ns}: cannot read the changelog ({e}); retrying");
+                }
+                self.failing = true;
+            }
+        }
+    }
+
+    /// Whether a pass over database changes is owed and `spacing` has passed since the last; taking it
+    /// discharges the debt, so a write during the pass is owed again by the next poll.
+    fn pass_due(&mut self, spacing: Duration) -> bool {
+        if !self.owed || self.passed.is_some_and(|at| at.elapsed() < spacing) {
+            return false;
+        }
+        self.owed = false;
+        self.passed = Some(Instant::now());
+        true
+    }
+}
+
+/// How many debounce intervals one burst of filesystem events is coalesced for, at most.
+const BURST_TICKS: u32 = 10;
+/// How many debounce intervals apart passes over database changes run, at least.
+const EXPORT_TICKS: u32 = 3;
+
 /// How many debounce intervals to wait before retrying a failed pass.
 const RETRY_TICKS: u32 = 10;
 /// Ceiling for the backoff, so a permanently failing mount settles at one attempt a minute
@@ -206,8 +266,6 @@ enum Work {
     Full,
     /// Reconcile exactly these paths.
     Paths(Vec<PathBuf>),
-    /// Reconcile the bound files whose knowledge-base side changed: something other than sync wrote.
-    KbChanges,
 }
 
 /// Run one reconcile pass, reporting whatever happens. **Never returns an error.**
@@ -441,6 +499,22 @@ mod tests {
             AccessMode::Write
         ))));
         assert!(!super::is_read_only(EventKind::Create(CreateKind::File)));
+    }
+
+    /// A database write is owed until a pass takes it, and passes are spaced: a write inside the spacing
+    /// is kept for the next one, not dropped.
+    #[test]
+    fn database_passes_are_spaced_and_a_write_between_them_is_kept() {
+        let mut writes = super::DatabaseWrites::new(0);
+        assert!(!writes.pass_due(BASE), "nothing written, nothing owed");
+        writes.owed = true;
+        assert!(writes.pass_due(BASE), "the first owed pass runs at once");
+        writes.owed = true;
+        assert!(!writes.pass_due(BASE), "a second inside the spacing waits");
+        assert!(writes.owed, "and stays owed");
+        std::thread::sleep(BASE);
+        assert!(writes.pass_due(BASE), "then runs");
+        assert!(!writes.owed);
     }
 
     /// A debt nothing owes is never due, however long the watcher idles.
