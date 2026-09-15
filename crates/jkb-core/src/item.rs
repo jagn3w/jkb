@@ -129,6 +129,27 @@ pub fn grep(
     scope: Option<&str>,
     ignore_case: bool,
 ) -> Result<Vec<GrepRow>> {
+    let mut out = Vec::new();
+    grep_each(conn, pattern, scope, ignore_case, |row| {
+        out.push(row);
+        true
+    })?;
+    Ok(out)
+}
+
+/// [`grep`], handing each matching item to `each` as it is read instead of collecting them, so a
+/// caller that keeps only part of each (the matching lines, a count) never holds every item's content
+/// at once. `each` returns whether to continue.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn grep_each(
+    conn: &Connection,
+    pattern: &str,
+    scope: Option<&str>,
+    ignore_case: bool,
+    mut each: impl FnMut(GrepRow) -> bool,
+) -> Result<()> {
     use rusqlite::types::Value;
     let mut sql = String::from(
         "SELECT i.id, i.uid, i.kind, i.content FROM items i WHERE i.content IS NOT NULL",
@@ -161,7 +182,6 @@ pub fn grep(
             content: r.get(3)?,
         })
     })?;
-    let mut out = Vec::new();
     for row in rows {
         let row = row?;
         // For `-i`, keep only rows that actually contain the needle under a Unicode fold —
@@ -169,9 +189,11 @@ pub fn grep(
         if ignore_case && !row.content.to_lowercase().contains(&needle) {
             continue;
         }
-        out.push(row);
+        if !each(row) {
+            break;
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A full item row (metadata + content) for detail views (`jkb item show`).

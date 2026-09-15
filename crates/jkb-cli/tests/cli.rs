@@ -3719,7 +3719,10 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
         vec!["query", "kind:task", "--count"],
         vec!["--json", "find", "--kind", "task"],
         vec!["--json", "--global", "recent"],
+        vec!["--global", "recent", "--limit", "2"],
         vec!["--json", "--global", "grep", "needle"],
+        vec!["--global", "grep", "-l", "needle"],
+        vec!["--json", "--global", "grep", "-c", "needle"],
         vec!["grep", "-i", "NEEDLE", "tasks"],
         vec!["cat", &parent],
         vec!["--json", "--global", "search", "needle", "--route", "fts"],
@@ -3771,6 +3774,12 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("only --route fts"),
         "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = remote(&["task", "add", "x"], &client_repo);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("jkb task add: not available"),
+        "a partly served group names the verb it refused: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let out = remote(&["cat", "task:nope"], &client_repo);

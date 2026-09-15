@@ -112,6 +112,7 @@ fn every_op_names_its_own_wire_tag_and_is_advertised() {
             default_scope: None,
             limit: None,
             count: false,
+            order: super::kb::QueryOrder::Id,
         },
         Request::KbLs {
             path: None,
@@ -128,6 +129,7 @@ fn every_op_names_its_own_wire_tag_and_is_advertised() {
             pattern: "p".into(),
             scope: None,
             ignore_case: false,
+            mode: super::kb::GrepMode::Lines,
         },
         Request::KbSearch {
             dsl: "x".into(),
@@ -605,14 +607,15 @@ fn a_search_that_would_embed_is_refused_by_a_backend_with_no_embedder() {
 #[test]
 fn grep_answers_with_the_matching_lines_and_cat_with_the_body() {
     let b = read_fixture();
-    let Response::GrepHits { hits } = call(
-        &b,
-        json!({ "op": "kb.grep", "pattern": "needle", "scope": "repos/jkb", "ignore_case": true }),
-    )
-    .unwrap() else {
-        panic!("grep answers with hits")
+    let grep = |q: serde_json::Value| match call(&b, q).unwrap() {
+        Response::GrepHits { answer } => answer,
+        other => panic!("grep answers with hits: {other:?}"),
     };
-    assert_eq!(hits.len(), 1);
+    let answer = grep(
+        json!({ "op": "kb.grep", "pattern": "needle", "scope": "repos/jkb", "ignore_case": true }),
+    );
+    let hits = &answer.hits;
+    assert_eq!((hits.len(), answer.count, answer.truncated), (1, 1, false));
     assert_eq!(
         hits[0]
             .lines
@@ -621,14 +624,26 @@ fn grep_answers_with_the_matching_lines_and_cat_with_the_body() {
             .collect::<Vec<_>>(),
         [(2, "the needle here"), (4, "NEEDLE again")]
     );
-    let Response::GrepHits { hits } = call(
-        &b,
-        json!({ "op": "kb.grep", "pattern": "needle", "scope": "tasks" }),
-    )
-    .unwrap() else {
-        panic!("grep answers with hits")
-    };
-    assert!(hits.is_empty(), "the scope is honoured");
+    let answer = grep(json!({ "op": "kb.grep", "pattern": "needle", "scope": "tasks" }));
+    assert!(
+        answer.hits.is_empty() && answer.count == 0,
+        "the scope is honoured"
+    );
+    let names = grep(json!({ "op": "kb.grep", "pattern": "needle", "mode": "names" }));
+    assert_eq!(names.count, 1);
+    assert!(names.hits[0].lines.is_empty(), "names carry no lines");
+    let count = grep(json!({ "op": "kb.grep", "pattern": "needle", "mode": "count" }));
+    assert_eq!(
+        (count.count, count.hits.len()),
+        (1, 0),
+        "a count carries no hits"
+    );
+    let e = call(&b, json!({ "op": "kb.grep", "pattern": "" })).unwrap_err();
+    assert_eq!(
+        e.code,
+        ErrorCode::Invalid,
+        "an empty pattern matches every line: {e:?}"
+    );
 
     assert_eq!(
         call(&b, json!({ "op": "kb.cat", "uid": "doc:a" })).unwrap(),
@@ -787,42 +802,259 @@ fn a_search_score_crosses_the_wire_exactly() {
     assert_eq!(hits[0], hit);
 }
 
+/// Items and namespaces for the tree guards: `new(uid)` is a document with one chunk, so it expands.
+fn expanding_document(
+    c: &rusqlite::Connection,
+    m: &jkb_core::WriteMeta,
+    uid: &str,
+) -> jkb_core::Result<jkb_types::ItemId> {
+    use jkb_core::item;
+    let new = |uid: String, kind: &str| item::NewItem {
+        content: Some(uid.clone()),
+        uid,
+        kind: kind.into(),
+        content_hash: None,
+        mime: None,
+    };
+    let doc = item::upsert(c, m, &new(uid.to_owned(), "document"))?;
+    let chunk = item::upsert(c, m, &new(format!("{uid}#0"), "chunk"))?;
+    jkb_core::edge::link(c, m, chunk, doc, jkb_types::EdgeType::DerivedFrom, None)?;
+    Ok(doc)
+}
+
+fn count(nodes: &[super::kb::TreeNode]) -> usize {
+    nodes.iter().map(|n| 1 + count(&n.children)).sum()
+}
+
+fn tree_of(b: &LocalBackend, path: &str) -> Vec<super::kb::TreeNode> {
+    match call(b, json!({ "op": "kb.tree", "path": path })).unwrap() {
+        Response::Tree { nodes } => nodes,
+        other => panic!("kb.tree answers with nodes: {other:?}"),
+    }
+}
+
 #[test]
-fn a_tree_over_a_self_listing_node_stops_at_the_cap() {
-    use jkb_core::{item, ns, placement};
+fn a_tree_does_not_descend_into_a_node_that_lists_its_own_ancestor() {
+    use jkb_core::{ns, placement};
     use jkb_types::PlacementRole;
-    // A document whose uid is the path of the namespace it is placed in, with a chunk so it expands:
-    // listing it by reference lists that namespace again.
+    // Namespaces `a` and `b`, and documents with those uids placed in both: listing either document by
+    // its reference lists a namespace holding both again. Measured before the fix: without the ancestor
+    // check this walked to the depth cap with a fan-out of two at every level.
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let loop_ns = ns::ensure(c, "loop")?;
-        let new = |uid: &str, kind: &str| item::NewItem {
-            uid: uid.into(),
-            kind: kind.into(),
-            content: Some(uid.into()),
-            content_hash: None,
-            mime: None,
-        };
-        let doc = item::upsert(c, m, &new("loop", "document"))?;
-        placement::place(c, m, doc, loop_ns, PlacementRole::Primary, 0)?;
-        let chunk = item::upsert(c, m, &new("loop#0", "chunk"))?;
-        jkb_core::edge::link(c, m, chunk, doc, jkb_types::EdgeType::DerivedFrom, None)
+        let spaces = [ns::ensure(c, "a")?, ns::ensure(c, "b")?];
+        for uid in ["a", "b"] {
+            let doc = expanding_document(c, m, uid)?;
+            for (i, space) in spaces.iter().enumerate() {
+                placement::place(
+                    c,
+                    m,
+                    doc,
+                    *space,
+                    PlacementRole::Reference,
+                    i64::try_from(i).unwrap(),
+                )?;
+            }
+        }
+        Ok(())
     })
     .unwrap();
     let b = LocalBackend::new(db);
-    let Response::Tree { nodes } = call(&b, json!({ "op": "kb.tree", "path": "loop" })).unwrap()
-    else {
+    let started = std::time::Instant::now();
+    let nodes = tree_of(&b, "a");
+    assert!(count(&nodes) <= 6, "{} nodes: {nodes:#?}", count(&nodes));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn a_tree_stops_descending_at_its_node_budget() {
+    use jkb_core::ns;
+    // More child namespaces than the budget, each with a namespace of its own under it.
+    let db = Db::open_in_memory().unwrap();
+    let width = super::kb::MAX_TREE_NODES + 50;
+    db.write_txn("t", move |c, _| {
+        for i in 0..width {
+            ns::ensure(c, &format!("w/{i:05}/x"))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let nodes = tree_of(&b, "w");
+    assert_eq!(nodes.len(), width, "every child is still listed");
+    assert!(
+        !nodes[0].children.is_empty(),
+        "the first are descended into"
+    );
+    let last = nodes.last().unwrap();
+    assert!(
+        last.child.has_children && last.children.is_empty(),
+        "past the budget nothing is: {last:?}"
+    );
+}
+
+#[test]
+fn a_tree_at_the_depth_cap_decodes_through_the_wire() {
+    use jkb_core::ns;
+    // Each tree level is two levels of JSON nesting and serde_json refuses past 128; a cap above it
+    // printed on the host and failed to decode through the daemon.
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, _| {
+        ns::ensure(c, &vec!["d"; super::kb::MAX_TREE_DEPTH + 10].join("/"))?;
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let response = call(&b, json!({ "op": "kb.tree", "path": "d" })).unwrap();
+    let Response::Tree { nodes } = &response else {
         panic!("kb.tree answers with nodes")
     };
     let mut depth = 0;
-    let mut level = &nodes;
+    let mut level = nodes;
     while let Some(first) = level.first() {
         depth += 1;
         level = &first.children;
     }
+    assert_eq!(depth, super::kb::MAX_TREE_DEPTH + 1, "the cap ends it");
+    let wire = serde_json::to_string(&response).unwrap();
+    let back: Response = serde_json::from_str(&wire).expect("a capped tree decodes");
+    assert_eq!(back, response);
+}
+
+#[test]
+fn a_search_asking_for_a_whole_document_of_context_is_refused() {
+    let b = read_fixture();
+    let e = call(
+        &b,
+        json!({ "op": "kb.search", "dsl": "needle", "route": "fts", "limit": 5,
+                "context": super::kb::MAX_SEARCH_CONTEXT + 1 }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert!(call(
+        &b,
+        json!({ "op": "kb.search", "dsl": "needle", "route": "fts", "limit": 5,
+                "context": super::kb::MAX_SEARCH_CONTEXT }),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_grep_over_more_than_its_byte_budget_is_cut_short_and_still_counts() {
+    use jkb_core::item;
+    let db = Db::open_in_memory().unwrap();
+    let line = format!("{}\n", "x".repeat(1023));
+    let big = line.repeat(super::kb::MAX_GREP_BYTES / 1023 + 100);
+    db.write_txn("t", move |c, m| {
+        for uid in ["a:1", "a:2"] {
+            item::upsert(
+                c,
+                m,
+                &item::NewItem {
+                    uid: uid.into(),
+                    kind: "note".into(),
+                    content: Some(big.clone()),
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let Response::GrepHits { answer } =
+        call(&b, json!({ "op": "kb.grep", "pattern": "x" })).unwrap()
+    else {
+        panic!("grep answers with hits")
+    };
+    assert!(answer.truncated);
+    assert_eq!(answer.count, 2, "counting goes on past the budget");
+    assert!(answer.hits.is_empty(), "the first item alone is over it");
+}
+
+#[test]
+fn recent_orders_and_limits_on_the_server() {
+    let b = read_fixture();
+    // Touch the task created last, so the newest is not also the lowest id — by id, `doc:a` is first.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    b.db.write_txn("t", |c, m| {
+        let id = jkb_core::item::id_for_uid(c, "task:child")?.unwrap();
+        jkb_core::item::set_content(c, m, id, "fresh", None)
+    })
+    .unwrap();
+    let Response::Items { items } = call(
+        &b,
+        json!({ "op": "kb.query", "dsl": "", "limit": 1, "order": "updated_desc" }),
+    )
+    .unwrap() else {
+        panic!("kb.query answers with items")
+    };
     assert_eq!(
-        depth,
-        super::kb::MAX_TREE_DEPTH + 1,
-        "the cap, not the stack, ends it"
+        items.iter().map(|i| i.uid.as_str()).collect::<Vec<_>>(),
+        ["task:child"]
     );
+}
+
+#[test]
+fn a_task_s_subtasks_carry_their_titles_not_their_bodies() {
+    let b = read_fixture();
+    b.db.write_txn("t", |c, m| {
+        let id = jkb_core::item::id_for_uid(c, "task:child")?.unwrap();
+        jkb_core::item::set_content(c, m, id, "\n\nChild title\nand a long body", None)
+    })
+    .unwrap();
+    let Response::Task { task } = call(&b, json!({ "op": "task.show", "uid": "parent" })).unwrap()
+    else {
+        panic!("task.show answers with a task")
+    };
+    assert_eq!(task.subtasks[0].title, "Child title");
+}
+
+#[test]
+fn a_long_read_on_the_reader_does_not_hold_up_a_write() {
+    // `Db` runs every call on one thread. Measured before `with_reader`: a read holding it made a
+    // `notify.event` wait for the whole read — past the notification hook's 1 s budget.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    let b = LocalBackend::new(db.clone()).with_reader(db.reader().unwrap());
+    call(
+        &b,
+        json!({ "op": "mq.topic_create", "topic": "claude/notify" }),
+    )
+    .unwrap();
+    let reads = b.reads.clone();
+    let (held, holding) = std::sync::mpsc::channel();
+    let long_read = std::thread::spawn(move || {
+        reads
+            .read(move |_| {
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                Ok(())
+            })
+            .unwrap();
+    });
+    holding.recv().unwrap();
+    let started = std::time::Instant::now();
+    call(
+        &b,
+        json!({ "op": "notify.event", "session": "s", "event": "needed" }),
+    )
+    .unwrap();
+    let took = started.elapsed();
+    long_read.join().unwrap();
+    assert!(
+        took < std::time::Duration::from_millis(700),
+        "a write waited {took:?} behind a read"
+    );
+
+    // And the reader cannot write.
+    let e = b
+        .reads
+        .write_txn("t", |c, _| {
+            c.execute("DELETE FROM notify_sessions", [])?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(e.to_string().contains("readonly"), "{e}");
 }

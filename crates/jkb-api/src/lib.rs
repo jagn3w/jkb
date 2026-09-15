@@ -179,6 +179,9 @@ pub enum Request {
         /// Answer how many instead of which.
         #[serde(default)]
         count: bool,
+        /// The order to list in, applied before `limit`.
+        #[serde(default)]
+        order: kb::QueryOrder,
     },
     /// The children of a namespace or container.
     #[serde(rename = "kb.ls")]
@@ -223,6 +226,9 @@ pub enum Request {
         /// Fold case (Unicode).
         #[serde(default)]
         ignore_case: bool,
+        /// Lines, names only, or a count.
+        #[serde(default)]
+        mode: kb::GrepMode,
     },
     /// Ranked search.
     #[serde(rename = "kb.search")]
@@ -234,9 +240,9 @@ pub enum Request {
         default_scope: Option<String>,
         /// The route; a backend without an embedder serves only `fts`.
         route: kb::SearchRoute,
-        /// At most this many hits.
+        /// At most this many hits (at most [`kb::MAX_SEARCH_LIMIT`]).
         limit: usize,
-        /// ±N neighbour chunks per hit.
+        /// ±N neighbour chunks per hit (at most [`kb::MAX_SEARCH_CONTEXT`]).
         #[serde(default)]
         context: Option<usize>,
     },
@@ -622,8 +628,9 @@ pub enum Response {
     },
     /// A `kb.grep`.
     GrepHits {
-        /// By uid.
-        hits: Vec<kb::GrepHit>,
+        /// The answer.
+        #[serde(flatten)]
+        answer: kb::GrepAnswer,
     },
     /// A `kb.search`.
     SearchHits {
@@ -822,6 +829,9 @@ pub trait Backend {
 #[derive(Clone)]
 pub struct LocalBackend {
     db: Db,
+    /// Where the read set (`kb.*`, `task.ready`/`show`/`subtasks`) is served: `db` unless
+    /// [`LocalBackend::with_reader`] gave it a connection of its own.
+    reads: Db,
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
 }
 
@@ -829,8 +839,29 @@ impl LocalBackend {
     /// A backend over `db`, with no embedder: `kb.search` serves only the FTS route. What `jkb serve`
     /// runs, so a client's search never makes the host call a model.
     #[must_use]
-    pub const fn new(db: Db) -> Self {
-        Self { db, embedder: None }
+    pub fn new(db: Db) -> Self {
+        Self {
+            reads: db.clone(),
+            db,
+            embedder: None,
+        }
+    }
+
+    /// The same backend, serving the read set on `reader` — a [`Db::reader`] of the same database.
+    /// `Db` runs every call on one thread, so without this a long read (a wide grep, a deep tree) held
+    /// up every write behind it, the notification hook's 1 s round trip among them. The reader is
+    /// `query_only`, so a read op cannot write through it either.
+    #[must_use]
+    pub fn with_reader(mut self, reader: Db) -> Self {
+        self.reads = reader;
+        self
+    }
+
+    /// The handle the read set is served on — `db` itself unless [`LocalBackend::with_reader`] was
+    /// given one.
+    #[must_use]
+    pub const fn reads(&self) -> &Db {
+        &self.reads
     }
 
     /// The same backend, embedding search text with `embedder` for the vector and hybrid routes.
@@ -1002,7 +1033,7 @@ impl Backend for LocalBackend {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 Response::Ambient {
                     namespace: self
-                        .db
+                        .reads
                         .read(move |c| kb::ambient(c, &cwd, &home, server_home.as_deref()))?,
                 }
             }
@@ -1011,17 +1042,18 @@ impl Backend for LocalBackend {
                 default_scope,
                 limit,
                 count,
+                order,
             } => {
                 if count {
                     Response::Count {
                         count: self
-                            .db
+                            .reads
                             .read(move |c| kb::query_count(c, &dsl, default_scope.as_deref()))?,
                     }
                 } else {
                     Response::Items {
-                        items: self.db.read(move |c| {
-                            kb::query_items(c, &dsl, default_scope.as_deref(), limit)
+                        items: self.reads.read(move |c| {
+                            kb::query_items(c, &dsl, default_scope.as_deref(), limit, order)
                         })?,
                     }
                 }
@@ -1032,25 +1064,26 @@ impl Backend for LocalBackend {
                 recursive,
             } => Response::Listing {
                 rows: self
-                    .db
+                    .reads
                     .read(move |c| kb::ls(c, path.as_deref(), all, recursive))?,
             },
             Request::KbTree { path, all, depth } => Response::Tree {
                 nodes: self
-                    .db
+                    .reads
                     .read(move |c| kb::tree(c, path.as_deref(), all, depth))?,
             },
             Request::KbCat { uid } => Response::Content {
-                content: self.db.read_with(move |c| kb::cat(c, &uid))?,
+                content: self.reads.read_with(move |c| kb::cat(c, &uid))?,
             },
             Request::KbGrep {
                 pattern,
                 scope,
                 ignore_case,
+                mode,
             } => Response::GrepHits {
-                hits: self
-                    .db
-                    .read(move |c| kb::grep(c, &pattern, scope.as_deref(), ignore_case))?,
+                answer: self.reads.read_with(move |c| {
+                    kb::grep(c, &pattern, scope.as_deref(), ignore_case, mode)
+                })?,
             },
             Request::KbSearch {
                 dsl,
@@ -1060,7 +1093,7 @@ impl Backend for LocalBackend {
                 context,
             } => Response::SearchHits {
                 hits: kb::search(
-                    &self.db,
+                    &self.reads,
                     self.embedder.as_ref(),
                     &kb::SearchAsk {
                         dsl,
@@ -1077,14 +1110,14 @@ impl Backend for LocalBackend {
                 limit,
             } => Response::Items {
                 items: self
-                    .db
+                    .reads
                     .read(move |c| kb::ready(c, &dsl, default_scope.as_deref(), limit))?,
             },
             Request::TaskShow { uid } => Response::Task {
-                task: Box::new(self.db.read_with(move |c| kb::task_show(c, &uid))?),
+                task: Box::new(self.reads.read_with(move |c| kb::task_show(c, &uid))?),
             },
             Request::TaskSubtasks { uid, all } => Response::Children {
-                children: self.db.read_with(move |c| kb::subtasks(c, &uid, all))?,
+                children: self.reads.read_with(move |c| kb::subtasks(c, &uid, all))?,
             },
         })
     }

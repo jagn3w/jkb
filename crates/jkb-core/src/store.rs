@@ -128,6 +128,23 @@ impl Db {
         Self { tx, path }
     }
 
+    /// A second handle on this database for reads only, with its own connection and thread, so a
+    /// long read through it does not wait behind — or hold up — this handle's writes. Its connection
+    /// is `query_only` (a `write_txn` through it fails) and runs no migrations. An in-memory database
+    /// has no second connection to open, so there it is this handle.
+    ///
+    /// # Errors
+    /// A failed open (see `db::open_reader`).
+    pub fn reader(&self) -> Result<Self> {
+        match &self.path {
+            None => Ok(self.clone()),
+            Some(path) => Ok(Self::from_connection(
+                db::open_reader(path)?,
+                Some(path.clone()),
+            )),
+        }
+    }
+
     /// Hand `f` to the writer thread and block until it returns.
     fn submit<R, F>(&self, f: F) -> Result<R>
     where

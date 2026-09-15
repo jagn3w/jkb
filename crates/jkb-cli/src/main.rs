@@ -1273,15 +1273,21 @@ fn run(cli: Cli) -> Result<()> {
             notify::run(&cmd);
             Ok(())
         }
+        // Ahead of every other arm, and asked through the same predicate remote mode dispatches on:
+        // a read ported later is then served by its op here too, rather than by an arm below that
+        // still compiles.
+        cmd if read_cli::handles(&cmd) => local_reads(&db, cmd, global, json),
         Command::Ingest { path, ns } => cmd_ingest(&db, &path, ns.as_deref(), global, json),
-        cmd @ (Command::Query { .. }
+        Command::Query { .. }
         | Command::Search { .. }
         | Command::Find { .. }
         | Command::Recent { .. }
         | Command::Ls { .. }
         | Command::Tree { .. }
         | Command::Grep { .. }
-        | Command::Cat { .. }) => local_reads(&db, cmd, global, json),
+        | Command::Cat { .. } => {
+            anyhow::bail!("internal: a read-set command missed read_cli's dispatch")
+        }
         Command::Ns { cmd } => cmd_ns(&db, cmd, json),
         Command::Tag { cmd } => cmd_tag(&db, cmd, json),
         Command::Mount { cmd } => cmd_mount(&db, cmd, json),
@@ -1303,7 +1309,7 @@ fn run(cli: Cli) -> Result<()> {
             CommandsCmd::Uninstall => commands::uninstall(),
             CommandsCmd::List => commands::list(),
         },
-        Command::Task { cmd } => cmd_task(&db, &db_path, cmd, global, json),
+        Command::Task { cmd } => cmd_task(&db, &db_path, cmd, json),
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
         Command::Index { sweep } => cmd_index(&db, sweep),
@@ -3453,7 +3459,7 @@ fn cmd_task_add(
     Ok(())
 }
 
-fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
+fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
         TaskCmd::Add {
             text,
@@ -3474,8 +3480,8 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, global: bool, json: bool) -> 
             under.as_deref(),
             json,
         )?,
-        cmd @ (TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Subtasks { .. }) => {
-            local_reads(db, Command::Task { cmd }, global, json)?;
+        TaskCmd::Next { .. } | TaskCmd::Show { .. } | TaskCmd::Subtasks { .. } => {
+            anyhow::bail!("internal: a read-set task verb missed read_cli's dispatch")
         }
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         TaskCmd::Why { uid } => cmd_task_why(db, &uid, json)?,

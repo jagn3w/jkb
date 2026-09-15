@@ -22,15 +22,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ApiError, ErrorCode};
 
-/// The most hits one `kb.search` may ask for. The hybrid route fuses from twice the limit, so an
-/// unbounded client value is an overflow in the daemon rather than a long answer.
+/// The most hits one `kb.search` may ask for: it bounds the answer, and the hybrid route — served
+/// only where there is an embedder, the host CLI — fuses from twice the limit, which an unbounded
+/// value overflows.
 pub const MAX_SEARCH_LIMIT: usize = 1000;
 
-/// The deepest `kb.tree` descends, whatever it is asked. A node is listed by its reference, and a
-/// reference is looked up as a namespace before an item — so an item whose uid is the path of a
-/// namespace holding it lists that namespace again, forever. The CLI asks for 4 by default; without a
-/// cap a request asking for no limit over such data overflowed the daemon's stack.
-pub const MAX_TREE_DEPTH: usize = 64;
+/// The most neighbour chunks per side `kb.search` expands a hit into. Without it one request could
+/// ask for every hit's whole document.
+pub const MAX_SEARCH_CONTEXT: usize = 50;
+
+/// The deepest `kb.tree` descends, whatever it is asked. Each level is two levels of JSON nesting,
+/// and `serde_json` refuses to decode past 128 — a deeper tree printed on the host and failed to
+/// decode through the daemon.
+pub const MAX_TREE_DEPTH: usize = 48;
+
+/// The most nodes one `kb.tree` lists; past it, nothing more is descended into. A reference is looked
+/// up as a namespace before an item, so data can make nodes list each other, and a walk that only
+/// skips its own ancestors can still grow as a power of its depth.
+pub const MAX_TREE_NODES: usize = 10_000;
+
+/// The most matching-line text `kb.grep` returns; past it the answer is marked truncated, and it
+/// keeps counting. An empty or common pattern over a whole knowledge base otherwise sent every line
+/// of every item in one response.
+pub const MAX_GREP_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many of a task's transitions `task.show` carries — the recent ones; `jkb task why` has all.
 pub const RECENT_TRANSITIONS: usize = 5;
@@ -61,6 +75,31 @@ impl From<SearchRoute> for Route {
             SearchRoute::Hybrid => Self::Hybrid,
         }
     }
+}
+
+/// What `kb.grep` answers with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrepMode {
+    /// Each matched item with its matching lines.
+    #[default]
+    Lines,
+    /// Each matched item, no lines (`grep -l`).
+    Names,
+    /// Only how many items matched (`grep -c`).
+    Count,
+}
+
+/// The order `kb.query` lists items in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryOrder {
+    /// By item id.
+    #[default]
+    Id,
+    /// Most recently updated first, then by id — `jkb recent`, so its limit is applied here rather
+    /// than after every item in scope crossed the wire.
+    UpdatedDesc,
 }
 
 /// A denormalized item row for listings.
@@ -180,6 +219,17 @@ pub struct GrepHit {
     pub lines: Vec<GrepLine>,
 }
 
+/// `kb.grep`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrepAnswer {
+    /// The matched items, by uid — empty for [`GrepMode::Count`], and cut short when `truncated`.
+    pub hits: Vec<GrepHit>,
+    /// How many items matched, whether or not all of them are in `hits`.
+    pub count: usize,
+    /// `hits` stopped at [`MAX_GREP_BYTES`].
+    pub truncated: bool,
+}
+
 /// One chunk of a hit's context window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextLine {
@@ -268,8 +318,8 @@ pub struct TransitionSummary {
 pub struct SubtaskSummary {
     /// Its uid.
     pub uid: String,
-    /// Its content (the title is its first non-blank line).
-    pub title: Option<String>,
+    /// Its title: the first non-blank line of its content, empty when it has none.
+    pub title: String,
     /// Its status.
     pub status: Option<String>,
 }
@@ -344,12 +394,31 @@ pub fn query_items(
     dsl: &str,
     default_scope: Option<&str>,
     limit: Option<usize>,
+    order: QueryOrder,
 ) -> jkb_core::Result<Vec<ItemRow>> {
     let mut q = scoped(dsl, default_scope)?;
-    if let Some(limit) = limit {
-        q.limit = Some(limit);
-    }
-    let ids = q.evaluate(conn)?;
+    let ids = match order {
+        QueryOrder::Id => {
+            q.limit = limit;
+            q.evaluate(conn)?
+        }
+        QueryOrder::UpdatedDesc => {
+            // The matching ids, reordered and cut in one statement — only ids cross into it.
+            let ids: Vec<i64> = q.evaluate(conn)?.iter().map(|i| i.get()).collect();
+            let limit = limit.map_or(-1, |l| i64::try_from(l).unwrap_or(i64::MAX));
+            let mut stmt = conn.prepare_cached(
+                "SELECT id FROM items WHERE id IN (SELECT value FROM json_each(?1))
+                 ORDER BY updated_at DESC, id LIMIT ?2",
+            )?;
+            let ordered = stmt
+                .query_map(
+                    rusqlite::params![serde_json::to_string(&ids).unwrap_or_default(), limit],
+                    |r| Ok(ItemId::new(r.get(0)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ordered
+        }
+    };
     item_rows(conn, &ids)
 }
 
@@ -626,7 +695,9 @@ pub fn ls(
 
 /// `kb.tree`: the subtree under `path`, descending into any container — not only namespaces, or a
 /// subtask de-duplicated out of its namespace listing would be unreachable — to `depth` levels,
-/// never more than [`MAX_TREE_DEPTH`] (`None` asks for that).
+/// never more than [`MAX_TREE_DEPTH`] (`None` asks for that). A node whose reference is one of its
+/// own ancestors' is listed but not descended into, and nothing is descended into once
+/// [`MAX_TREE_NODES`] are listed.
 ///
 /// # Errors
 /// Returns an error if a read fails.
@@ -636,33 +707,51 @@ pub fn tree(
     all: bool,
     depth: Option<usize>,
 ) -> jkb_core::Result<Vec<TreeNode>> {
-    walk_tree(
+    let mut walk = TreeWalk {
         conn,
-        path,
         all,
+        ancestors: path.map(str::to_owned).into_iter().collect(),
+        listed: 0,
+    };
+    walk.level(
+        path,
         depth.map_or(MAX_TREE_DEPTH, |d| d.min(MAX_TREE_DEPTH)),
     )
 }
 
-fn walk_tree(
-    conn: &Connection,
-    path: Option<&str>,
+struct TreeWalk<'c> {
+    conn: &'c Connection,
     all: bool,
-    depth: usize,
-) -> jkb_core::Result<Vec<TreeNode>> {
-    let mut out = Vec::new();
-    for child in children(conn, path, all)? {
-        let nested = if child.has_children && depth > 0 {
-            walk_tree(conn, Some(&child.reference), all, depth - 1)?
-        } else {
-            Vec::new()
-        };
-        out.push(TreeNode {
-            child,
-            children: nested,
-        });
+    /// The references on the path from the root to the level being listed.
+    ancestors: Vec<String>,
+    /// Nodes listed so far.
+    listed: usize,
+}
+
+impl TreeWalk<'_> {
+    fn level(&mut self, path: Option<&str>, depth: usize) -> jkb_core::Result<Vec<TreeNode>> {
+        let mut out = Vec::new();
+        for child in children(self.conn, path, self.all)? {
+            self.listed += 1;
+            let descend = child.has_children
+                && depth > 0
+                && self.listed < MAX_TREE_NODES
+                && !self.ancestors.contains(&child.reference);
+            let nested = if descend {
+                self.ancestors.push(child.reference.clone());
+                let nested = self.level(Some(&child.reference), depth - 1);
+                self.ancestors.pop();
+                nested?
+            } else {
+                Vec::new()
+            };
+            out.push(TreeNode {
+                child,
+                children: nested,
+            });
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// `kb.cat`: an item's full content (empty when it has none).
@@ -676,18 +765,26 @@ pub fn cat(conn: &Connection, uid: &str) -> Result<String, ApiError> {
     Ok(item::get_content(conn, id)?.unwrap_or_default())
 }
 
-/// `kb.grep`: items under `scope` whose content holds `pattern` literally, with the lines that do.
-/// Case folding, when asked, is Unicode — the same fold `item::grep` filters with, so an item is
-/// never matched with no line agreeing.
+/// `kb.grep`: items under `scope` whose content holds `pattern` literally, answered as `mode` asks.
+/// Case folding, when asked, is Unicode — the same fold `item::grep` filters with. Items are read one
+/// at a time and only what the answer keeps is held, up to [`MAX_GREP_BYTES`].
 ///
 /// # Errors
-/// Returns an error if the read fails.
+/// [`ErrorCode::Invalid`] for an empty pattern, which matches every line of every item; else a
+/// failed read.
 pub fn grep(
     conn: &Connection,
     pattern: &str,
     scope: Option<&str>,
     ignore_case: bool,
-) -> jkb_core::Result<Vec<GrepHit>> {
+    mode: GrepMode,
+) -> Result<GrepAnswer, ApiError> {
+    if pattern.is_empty() {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            "an empty pattern matches every line of every item; give grep some text",
+        ));
+    }
     let needle = if ignore_case {
         pattern.to_lowercase()
     } else {
@@ -700,11 +797,19 @@ pub fn grep(
             line.contains(&needle)
         }
     };
-    Ok(item::grep(conn, pattern, scope, ignore_case)?
-        .into_iter()
-        .map(|h| GrepHit {
-            lines: h
-                .content
+    let mut answer = GrepAnswer {
+        hits: Vec::new(),
+        count: 0,
+        truncated: false,
+    };
+    let mut bytes = 0usize;
+    item::grep_each(conn, pattern, scope, ignore_case, |row| {
+        answer.count += 1;
+        if mode == GrepMode::Count || answer.truncated {
+            return true;
+        }
+        let lines: Vec<GrepLine> = if mode == GrepMode::Lines {
+            row.content
                 .lines()
                 .enumerate()
                 .filter(|(_, l)| matches(l))
@@ -712,11 +817,23 @@ pub fn grep(
                     line: i + 1,
                     text: l.to_owned(),
                 })
-                .collect(),
-            uid: h.uid,
-            kind: h.kind,
-        })
-        .collect())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        bytes += row.uid.len() + row.kind.len() + lines.iter().map(|l| l.text.len()).sum::<usize>();
+        if bytes > MAX_GREP_BYTES {
+            answer.truncated = true;
+            return true;
+        }
+        answer.hits.push(GrepHit {
+            uid: row.uid,
+            kind: row.kind,
+            lines,
+        });
+        true
+    })?;
+    Ok(answer)
 }
 
 /// What `kb.search` was asked.
@@ -748,6 +865,12 @@ pub fn search(
         return Err(ApiError::with_code(
             ErrorCode::Invalid,
             format!("a search limit of at most {MAX_SEARCH_LIMIT}"),
+        ));
+    }
+    if ask.context.is_some_and(|n| n > MAX_SEARCH_CONTEXT) {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!("a search context of at most {MAX_SEARCH_CONTEXT} chunks either side"),
         ));
     }
     let query = scoped(&ask.dsl, ask.default_scope.as_deref())?;
@@ -877,8 +1000,13 @@ pub fn task_show(conn: &Connection, reference: &str) -> Result<TaskDetail, ApiEr
         subtasks: task::subtasks(conn, id)?
             .into_iter()
             .map(|t| SubtaskSummary {
+                title: t
+                    .title
+                    .as_deref()
+                    .map(item::first_nonblank)
+                    .unwrap_or_default()
+                    .to_owned(),
                 uid: t.uid,
-                title: t.title,
                 status: t.status,
             })
             .collect(),

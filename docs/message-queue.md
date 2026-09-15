@@ -64,12 +64,12 @@ routinely built from different checkouts.
 | `notify.open_sessions` | — | `sessions` {`sessions`: [{`session`, `tool`, `owner`, `instance`, `updated_at`}]} |
 | `notify.gone` | `session`, `owner`, `instance` (as `notify.open_sessions` reported them) | `notified` {…} |
 | `kb.ambient` | `cwd`, `home?` | `ambient` {`namespace`} |
-| `kb.query` | `dsl`, `default_scope?`, `limit?`, `count?` | `items` {`items`}, or with `count` `count` {`count`} |
+| `kb.query` | `dsl`, `default_scope?`, `limit?`, `count?`, `order?` (`id`\|`updated_desc`) | `items` {`items`}, or with `count` `count` {`count`} |
 | `kb.ls` | `path?`, `all?`, `recursive?` | `listing` {`rows`: [{`parent`, `child`}]} |
-| `kb.tree` | `path?`, `all?`, `depth?` | `tree` {`nodes`: [{`child`, `children`}]} |
+| `kb.tree` | `path?`, `all?`, `depth?` (≤ 48) | `tree` {`nodes`: [{`child`, `children`}]} |
 | `kb.cat` | `uid` | `content` {`content`} |
-| `kb.grep` | `pattern`, `scope?`, `ignore_case?` | `grep_hits` {`hits`: [{`uid`, `kind`, `lines`: [{`line`, `text`}]}]} |
-| `kb.search` | `dsl`, `default_scope?`, `route` (`vector`\|`fts`\|`hybrid`), `limit` (≤ 1000), `context?` | `search_hits` {`hits`} |
+| `kb.grep` | `pattern` (non-empty), `scope?`, `ignore_case?`, `mode?` (`lines`\|`names`\|`count`) | `grep_hits` {`hits`: [{`uid`, `kind`, `lines`: [{`line`, `text`}]}], `count`, `truncated`} |
+| `kb.search` | `dsl`, `default_scope?`, `route` (`vector`\|`fts`\|`hybrid`), `limit` (≤ 1000), `context?` (≤ 50) | `search_hits` {`hits`} |
 | `task.ready` | `dsl`, `default_scope?`, `limit?` | `items` {`items`} |
 | `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
 | `task.subtasks` | `uid`, `all?` | `children` {`children`} |
@@ -85,7 +85,7 @@ query`, `find`, `recent`, `search`, `ls`, `tree`, `grep`, `cat` and `jkb task ne
 through a `LocalBackend` too (`crates/jkb-cli/src/read_cli.rs`), so the daemon cannot answer one of
 them differently from the host — pinned byte-for-byte by `tests/cli.rs`
 `the_read_set_answers_through_the_daemon_exactly_as_on_the_host`. The CLI only renders, and its
-`--json` shapes are unchanged (the UI parses them, D31). Three decisions in it:
+`--json` shapes are unchanged (the UI parses them, D31). The decisions in it:
 
 - **An unscoped read's scope comes from the client's directory, re-rooted.** `kb.ambient` takes the
   client's `cwd` and `$HOME`; a `cwd` under that home is looked up under the serving process's home,
@@ -99,8 +99,22 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   have the host call a model for the container, so a backend with no embedder — what `jkb serve`
   builds — refuses them with `unsupported`, and remote mode's `jkb search` defaults to `--route fts`
   (the host keeps `hybrid`).
-- **`kb.search`'s limit is capped at 1000**, because the hybrid route fuses from twice the limit and an
-  unbounded client value is an overflow in the daemon, not a long answer.
+- **The daemon serves reads on a second, `query_only` connection** (`Db::reader`,
+  `LocalBackend::with_reader`). `Db` runs every call on one thread, so a container's long read — a
+  wide grep, a deep tree — held up every write behind it, the notification hook's 1 s round trip
+  included (pinned by `a_long_read_on_the_reader_does_not_hold_up_a_write`: a 1.5 s read, and the
+  write beside it under 0.7 s). The reader cannot write, so no read op can either. The host CLI keeps
+  one connection: a process there serves one command.
+- **Every read is bounded in what a hand-written request can make the daemon hold**, because the CLI
+  is not the only client: `kb.search` takes at most 1000 hits (the answer's size, and the hybrid
+  route's fusion from twice the limit — which only the host, with an embedder, runs) and 50 chunks of
+  context either side; `kb.grep` refuses an empty pattern, reads items one at a time
+  (`item::grep_each`), and stops collecting at 8 MiB of lines with `truncated` set while it goes on
+  counting — `-c` and `-l` ask for no lines at all; `jkb recent` orders and limits on the server
+  (`order: updated_desc`) rather than fetching the scope; `kb.tree` descends at most 48 levels (each is
+  two levels of JSON, and serde_json refuses past 128), not into a node whose reference is one of its
+  ancestors' (a reference is looked up as a namespace before an item, so data can make nodes list each
+  other), and into nothing once 10,000 nodes are listed. Each guard was checked by removing it.
 
 `after` is the consumer's **fetch position**, separate from its committed one as in Kafka: a consumer
 that has handed messages on but not yet acked them polls with `after` set to the last seq it handed

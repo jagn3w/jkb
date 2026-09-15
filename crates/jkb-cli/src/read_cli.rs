@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use anyhow::{bail, Result};
-use jkb_api::kb::{Child, GrepHit, ItemRow, SearchRoute, TaskDetail, TreeNode};
+use jkb_api::kb::{
+    Child, GrepAnswer, GrepMode, ItemRow, QueryOrder, SearchRoute, TaskDetail, TreeNode,
+};
 use jkb_api::{ApiError, Backend, Request, Response};
 
 use super::{first_line, output, output_line, Command, TaskCmd};
@@ -180,6 +182,7 @@ impl<'a> Reads<'a> {
                 default_scope,
                 limit: None,
                 count: true,
+                order: QueryOrder::Id,
             })? {
                 Response::Count { count } => count,
                 other => return unexpected("kb.query", &other),
@@ -196,6 +199,7 @@ impl<'a> Reads<'a> {
             default_scope,
             limit,
             count: false,
+            order: QueryOrder::Id,
         })?;
         output::print_items(&items, self.json);
         Ok(())
@@ -236,14 +240,13 @@ impl<'a> Reads<'a> {
 
     /// `jkb recent [path]`: the most-recently-updated items in a subtree, newest first.
     fn recent(&self, path: Option<&str>, limit: usize) -> Result<()> {
-        let mut items = self.items(Request::KbQuery {
+        let items = self.items(Request::KbQuery {
             dsl: path.map(|p| format!("ns:{p}/**")).unwrap_or_default(),
             default_scope: self.ambient()?,
-            limit: None,
+            limit: Some(limit),
             count: false,
+            order: QueryOrder::UpdatedDesc,
         })?;
-        items.sort_by(|a, b| b.updated.cmp(&a.updated));
-        items.truncate(limit);
         output::print_items(&items, self.json);
         Ok(())
     }
@@ -388,46 +391,68 @@ impl<'a> Reads<'a> {
             Some(p) => Some(p.to_owned()),
             None => self.ambient()?,
         };
-        let hits: Vec<GrepHit> = match self.call(Request::KbGrep {
+        // `--json` prints the lines, so it wins over `-l`, as it did before the op existed.
+        let mode = if count {
+            GrepMode::Count
+        } else if names_only && !self.json {
+            GrepMode::Names
+        } else {
+            GrepMode::Lines
+        };
+        let answer: GrepAnswer = match self.call(Request::KbGrep {
             pattern: pattern.to_owned(),
             scope,
             ignore_case,
+            mode,
         })? {
-            Response::GrepHits { hits } => hits,
+            Response::GrepHits { answer } => answer,
             other => return unexpected("kb.grep", &other),
         };
-        if count {
-            let n = hits.len();
-            if self.json {
-                println!("{}", serde_json::json!({ "count": n }));
-            } else {
-                println!("{n}");
+        let hits = &answer.hits;
+        match mode {
+            GrepMode::Count => {
+                if self.json {
+                    println!("{}", serde_json::json!({ "count": answer.count }));
+                } else {
+                    println!("{}", answer.count);
+                }
             }
-        } else if self.json {
-            let arr: Vec<_> = hits
-                .iter()
-                .map(|h| {
-                    let lines: Vec<_> = h
-                        .lines
-                        .iter()
-                        .map(|l| serde_json::json!({ "line": l.line, "text": l.text }))
-                        .collect();
-                    serde_json::json!({ "uid": h.uid, "kind": h.kind, "matches": lines })
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&arr)?);
-        } else if names_only {
-            for h in &hits {
-                println!("{}", h.uid);
+            _ if self.json => {
+                let arr: Vec<_> = hits
+                    .iter()
+                    .map(|h| {
+                        let lines: Vec<_> = h
+                            .lines
+                            .iter()
+                            .map(|l| serde_json::json!({ "line": l.line, "text": l.text }))
+                            .collect();
+                        serde_json::json!({ "uid": h.uid, "kind": h.kind, "matches": lines })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
             }
-        } else {
-            for h in &hits {
-                for l in &h.lines {
-                    println!("{}:{}:{}", h.uid, l.line, l.text.trim_end());
+            GrepMode::Names => {
+                for h in hits {
+                    println!("{}", h.uid);
+                }
+            }
+            GrepMode::Lines => {
+                for h in hits {
+                    for l in &h.lines {
+                        println!("{}:{}:{}", h.uid, l.line, l.text.trim_end());
+                    }
                 }
             }
         }
-        if hits.is_empty() {
+        if answer.truncated {
+            eprintln!(
+                "jkb grep: output stopped at {} MiB of matches; {} items matched in all — narrow the \
+                 pattern or give a path",
+                jkb_api::kb::MAX_GREP_BYTES / (1024 * 1024),
+                answer.count
+            );
+        }
+        if answer.count == 0 {
             std::process::exit(1);
         }
         Ok(())
@@ -753,8 +778,7 @@ fn print_task(task: &TaskDetail, json: bool) -> Result<()> {
         println!("\nsubtasks ({open} open of {}):", task.subtasks.len());
         for t in &task.subtasks {
             let status = t.status.as_deref().unwrap_or("?");
-            let title = t.title.as_deref().unwrap_or("");
-            println!("  [{status:^12}] {} — {}", t.uid, first_line(title));
+            println!("  [{status:^12}] {} — {}", t.uid, first_line(&t.title));
         }
         if open > 0 {
             println!("this task is held off the ready frontier until they are done");

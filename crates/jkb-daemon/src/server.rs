@@ -212,10 +212,26 @@ enum Source {
     Opener(Opener),
 }
 
+/// The backend serving `db`: the read set on a connection of its own
+/// ([`LocalBackend::with_reader`]), so a client's long read does not hold up the writes behind it — a
+/// notification hook's among them. A reader that will not open costs that separation, not the daemon.
+fn backend_for(db: &Db) -> LocalBackend {
+    let backend = LocalBackend::new(db.clone());
+    match db.reader() {
+        Ok(reader) => backend.with_reader(reader),
+        Err(e) => {
+            eprintln!(
+                "jkb serve: reads share the writer's connection, which a long read holds up: {e}"
+            );
+            backend
+        }
+    }
+}
+
 /// The first open for [`Source::Opener`]: a failure is served, not returned.
 fn first_open(open: &Opener) -> Serving {
     match open() {
-        Ok(db) => Serving::Ready(LocalBackend::new(db.clone()), db),
+        Ok(db) => Serving::Ready(backend_for(&db), db),
         Err(why) => {
             eprintln!("jkb serve: {}; retrying on requests", why.message);
             Serving::Failed {
@@ -273,7 +289,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         })?;
     let addr = listener.local_addr()?;
     let (serving, opener) = match source {
-        Source::Db(db) => (Serving::Ready(LocalBackend::new(db.clone()), db), None),
+        Source::Db(db) => (Serving::Ready(backend_for(&db), db), None),
         Source::Opener(open) => (first_open(&open), Some(open)),
     };
     let token = token::mint()?;
@@ -516,8 +532,9 @@ async fn ready(state: &Arc<State>) -> Result<(LocalBackend, Db), ApiError> {
         match opened {
             Ok(db) => {
                 eprintln!("jkb serve: the database opened; serving");
-                *serving = Serving::Ready(LocalBackend::new(db.clone()), db.clone());
-                Ok((LocalBackend::new(db.clone()), db))
+                let backend = backend_for(&db);
+                *serving = Serving::Ready(backend.clone(), db.clone());
+                Ok((backend, db))
             }
             Err(why) => {
                 *serving = Serving::Failed {
@@ -678,7 +695,24 @@ async fn serve_op(
 mod tests {
     use rustix::io::Errno;
 
-    use super::{connection_budget, out_of_resources};
+    use super::{backend_for, connection_budget, out_of_resources};
+
+    /// The daemon serves the read set on a connection of its own — the `query_only` one, so a write
+    /// through it is refused — rather than on the writer every notification waits on.
+    #[test]
+    fn the_daemon_s_reads_are_served_apart_from_its_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        let backend = backend_for(&db);
+        let refused = backend
+            .reads()
+            .write_txn("t", |c, _| {
+                c.execute("DELETE FROM notify_sessions", [])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(refused.to_string().contains("readonly"), "{refused}");
+    }
 
     #[test]
     fn only_running_out_of_something_slows_the_accept_loop() {

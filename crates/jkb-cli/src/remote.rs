@@ -157,13 +157,15 @@ fn port_of(url: &str) -> u16 {
         })
 }
 
-/// The subcommand as typed, for the refusal message: the first argument that is not a flag. `--db`,
-/// the one global flag taking a value, is refused before this is asked.
-fn subcommand_name() -> String {
-    std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with('-'))
-        .unwrap_or_else(|| "this command".to_owned())
+/// The command as typed, for the refusal message: its first `words` arguments that are not flags.
+/// `--db`, the one global flag taking a value, is refused before this is asked.
+fn subcommand_name(args: impl Iterator<Item = String>, words: usize) -> String {
+    let name: Vec<String> = args.filter(|a| !a.starts_with('-')).take(words).collect();
+    if name.is_empty() {
+        "this command".to_owned()
+    } else {
+        name.join(" ")
+    }
 }
 
 /// Run `cli` in remote mode against the daemon at `remote`.
@@ -197,10 +199,19 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
         ));
     }
     match support(&cli.command) {
-        Support::Refused(why) => bail!(
-            "jkb {}: not available with JKB_REMOTE set — {why}",
-            subcommand_name()
-        ),
+        Support::Refused(why) => {
+            // `task` is served in part, so a refusal names the verb: "jkb task: not available" read
+            // as if `jkb task next` were refused too.
+            let words = if matches!(cli.command, Command::Task { .. }) {
+                2
+            } else {
+                1
+            };
+            bail!(
+                "jkb {}: not available with JKB_REMOTE set — {why}",
+                subcommand_name(std::env::args().skip(1), words)
+            )
+        }
         Support::NoDatabase => match cli.command {
             Command::Guide => {
                 super::cmd_guide();
@@ -245,7 +256,7 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use super::{daemon_url_from, port_of, support, Support};
+    use super::{daemon_url_from, port_of, subcommand_name, support, Support};
     use crate::Cli;
 
     #[test]
@@ -315,6 +326,22 @@ mod tests {
             support(&parse(&["task", "add", "x"]).command),
             Support::Refused(_)
         ));
+    }
+
+    #[test]
+    fn a_refusal_names_as_many_words_as_it_is_asked_for() {
+        let args = |v: &[&str]| {
+            v.iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert_eq!(
+            subcommand_name(args(&["--json", "task", "add", "x"]), 2),
+            "task add"
+        );
+        assert_eq!(subcommand_name(args(&["sync", "--watch"]), 1), "sync");
+        assert_eq!(subcommand_name(args(&["--json"]), 2), "this command");
     }
 
     #[test]

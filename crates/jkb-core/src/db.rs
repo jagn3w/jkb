@@ -36,6 +36,24 @@ pub fn open<P: AsRef<Path>>(path: P) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open a second connection to an existing, already-migrated database, for reads only: it runs no
+/// migrations, never creates the file, and has `query_only` set, so a write through it fails. What
+/// lets a process serve long reads beside its writer (WAL readers do not wait on the writer) without
+/// a read being able to write — `jkb serve` answers the dev container's reads on one.
+///
+/// # Errors
+/// The shared-filesystem refusal, or a failed open or configuration.
+pub fn open_reader<P: AsRef<Path>>(path: P) -> Result<Connection> {
+    crate::shared_fs::refuse(path.as_ref())?;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    configure(&conn)?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
+    Ok(conn)
+}
+
 /// Open a fresh in-memory database, configured and migrated. Intended for tests.
 ///
 /// # Errors
@@ -206,25 +224,36 @@ mod tests {
         // is asserted rather than assumed: inside `pub fn open`, the refusal comes before the open.
         // Without this, deleting the refusal line left every test green.
         let own = std::fs::read_to_string(&this).unwrap();
-        let body_at = own.find("pub fn open<").expect("db::open exists");
-        let body = &own[body_at
-            ..own[body_at..]
-                .find("\n}\n")
-                .map_or(own.len(), |e| body_at + e)];
-        let refuse_at = body.find("shared_fs::refuse(").expect(
-            "db::open must call shared_fs::refuse — without it a database on a shared filesystem opens",
-        );
-        let open_at = body
-            .find("Connection::open")
-            .expect("db::open opens a connection");
-        assert!(
-            refuse_at < open_at,
-            "db::open must refuse BEFORE it opens, or SQLite has already created files"
-        );
-        assert!(
-            !body.contains("SQLITE_OPEN_URI"),
-            "db::open must not accept a URI, or `file:` paths reach a database refuse did not judge"
-        );
+        // Every file open in db.rs, not only the first: `open_reader` is the second.
+        // At a line start, so this test's own strings are not taken for functions.
+        let opens: Vec<usize> = own
+            .match_indices("\npub fn open")
+            .map(|(at, _)| at + 1)
+            .collect();
+        assert!(opens.len() >= 3, "db.rs's opens were not found: {opens:?}");
+        for body_at in opens {
+            let body = &own[body_at
+                ..own[body_at..]
+                    .find("\n}\n")
+                    .map_or(own.len(), |e| body_at + e)];
+            if body.starts_with("pub fn open_in_memory") {
+                continue;
+            }
+            let refuse_at = body.find("shared_fs::refuse(").expect(
+                "every db.rs open must call shared_fs::refuse — without it a database on a shared filesystem opens",
+            );
+            let open_at = body
+                .find("Connection::open")
+                .expect("a db.rs open opens a connection");
+            assert!(
+                refuse_at < open_at,
+                "a db.rs open must refuse BEFORE it opens, or SQLite has already created files"
+            );
+            assert!(
+                !body.contains("SQLITE_OPEN_URI"),
+                "a db.rs open must not accept a URI, or `file:` paths reach a database refuse did not judge"
+            );
+        }
         let mut strays = Vec::new();
         for file in files {
             if std::fs::canonicalize(&file).unwrap() == this {
