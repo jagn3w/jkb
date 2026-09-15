@@ -69,6 +69,9 @@ routinely built from different checkouts.
 | `kb.tree` | `path?`, `all?`, `depth?` (≤ 48) | `tree` {`nodes`: [{`child`, `children`}]} |
 | `kb.cat` | `uid` | `content` {`content`} |
 | `kb.grep` | `pattern` (non-empty), `scope?`, `ignore_case?`, `mode?` (`lines`\|`names`\|`count`) | `grep_hits` {`hits`: [{`uid`, `kind`, `lines`: [{`line`, `text`}]}], `count`, `truncated`} |
+
+Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`) carries
+`truncated: true` when the read's budget cut it, and omits the field otherwise.
 | `kb.search` | `dsl`, `default_scope?`, `route` (`vector`\|`fts`\|`hybrid`), `limit` (≤ 1000), `context?` (≤ 50) | `search_hits` {`hits`} |
 | `task.ready` | `dsl`, `default_scope?`, `limit?` | `items` {`items`} |
 | `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
@@ -103,18 +106,28 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   `LocalBackend::with_reader`). `Db` runs every call on one thread, so a container's long read — a
   wide grep, a deep tree — held up every write behind it, the notification hook's 1 s round trip
   included (pinned by `a_long_read_on_the_reader_does_not_hold_up_a_write`: a 1.5 s read, and the
-  write beside it under 0.7 s). The reader cannot write, so no read op can either. The host CLI keeps
-  one connection: a process there serves one command.
-- **Every read is bounded in what a hand-written request can make the daemon hold**, because the CLI
-  is not the only client: `kb.search` takes at most 1000 hits (the answer's size, and the hybrid
-  route's fusion from twice the limit — which only the host, with an embedder, runs) and 50 chunks of
-  context either side; `kb.grep` refuses an empty pattern, reads items one at a time
-  (`item::grep_each`), and stops collecting at 8 MiB of lines with `truncated` set while it goes on
-  counting — `-c` and `-l` ask for no lines at all; `jkb recent` orders and limits on the server
-  (`order: updated_desc`) rather than fetching the scope; `kb.tree` descends at most 48 levels (each is
-  two levels of JSON, and serde_json refuses past 128), not into a node whose reference is one of its
-  ancestors' (a reference is looked up as a namespace before an item, so data can make nodes list each
-  other), and into nothing once 10,000 nodes are listed. Each guard was checked by removing it.
+  write beside it under 0.7 s). Which ops are reads is said once, by `Request::is_read`: the backend
+  picks the connection from it — no dispatch arm chooses — and `jkb serve` counts reads against a
+  **third permit budget** (`max_reads`, 16) beside ops and long-polls, since reads queue on the one
+  reader and otherwise held the op permits a hook's write needs. Pinned by
+  `every_op_is_served_on_the_connection_its_class_names` (with the writer held, every read answers;
+  no op is refused as a write to the read-only connection) and `reads_have_their_own_permits_and_a_bounded_answer`.
+- **Every read that lists is bounded by one byte budget** (`kb::Budget`), charged row by row with
+  what each row serializes to, so the answer is a prefix of the full one and says `truncated`. The
+  daemon gives each read 16 MiB (`read_budget_bytes`); the host CLI's is unlimited, and the CLI says
+  on stderr when an answer was cut. It replaced per-op caps, each of which a second review found
+  measured in the wrong unit — chunks of context, while a document hit's context is its whole body;
+  bytes of line text, while each line carries its own JSON — or missing (`kb.query` with no limit).
+  Not bounded, stated: `kb.cat` and `task.show`'s own body are the one item asked for, and a
+  namespace's children are gathered before they are sorted and charged. The other bounds are on
+  work rather than answer size: `kb.search` takes at most 1000 hits (the hybrid route, served only
+  where there is an embedder, fuses from twice the limit) and 50 chunks of context either side;
+  `kb.grep` refuses an empty pattern and reads items one at a time (`item::grep_each`), counting
+  past the budget, and `-c`/`-l` ask for no lines; `jkb recent` orders and limits on the server
+  (`order: updated_desc`); `kb.tree` descends at most 48 levels (each is two levels of JSON, and
+  serde_json refuses past 128), not into a node whose reference is one of its ancestors', and stops
+  after 10,000 nodes. Pinned by `every_listing_read_stays_within_its_budget_and_says_when_it_was_cut`
+  across all ten listing reads; each guard was checked by removing it.
 
 `after` is the consumer's **fetch position**, separate from its committed one as in Kafka: a consumer
 that has handed messages on but not yet acked them polls with `after` set to the last seq it handed

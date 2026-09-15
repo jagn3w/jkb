@@ -36,15 +36,79 @@ pub const MAX_SEARCH_CONTEXT: usize = 50;
 /// decode through the daemon.
 pub const MAX_TREE_DEPTH: usize = 48;
 
-/// The most nodes one `kb.tree` lists; past it, nothing more is descended into. A reference is looked
-/// up as a namespace before an item, so data can make nodes list each other, and a walk that only
-/// skips its own ancestors can still grow as a power of its depth.
+/// The most nodes one `kb.tree` lists, whatever its byte [`Budget`]: past it the tree is cut short
+/// and marked truncated. A reference is looked up as a namespace before an item, so data can make
+/// nodes list each other, and a walk that only skips its own ancestors can still grow as a power of
+/// its depth — this bounds the work, where the budget bounds the answer.
 pub const MAX_TREE_NODES: usize = 10_000;
 
-/// The most matching-line text `kb.grep` returns; past it the answer is marked truncated, and it
-/// keeps counting. An empty or common pattern over a whole knowledge base otherwise sent every line
-/// of every item in one response.
-pub const MAX_GREP_BYTES: usize = 8 * 1024 * 1024;
+/// What one read may put in its answer, in bytes of the JSON the answer is sent as.
+///
+/// **One bound for every read that lists**, charged row by row as the answer is built, rather than a
+/// cap per op: per-op caps were each measured in something other than what reaches the wire — a count
+/// of chunks while a document hit's context is its whole body, a sum of line bytes while each line
+/// carries its own JSON — and one op had none. An answer that stops at the budget is a prefix of the
+/// full one and says so (`truncated`). `jkb serve` gives every read a budget; the host CLI's is
+/// unlimited.
+///
+/// What it does not bound, stated: `kb.cat` and `task.show`'s own body are the one item asked for,
+/// and a namespace's children are gathered before they are sorted and charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    left: usize,
+    exhausted: bool,
+}
+
+impl Budget {
+    /// No bound.
+    pub const UNLIMITED: Self = Self::new(usize::MAX);
+
+    /// A budget of `bytes`.
+    #[must_use]
+    pub const fn new(bytes: usize) -> Self {
+        Self {
+            left: bytes,
+            exhausted: false,
+        }
+    }
+
+    /// Whether `value` fits, charging it when it does. Once something has not fitted nothing does, so
+    /// an answer is always a prefix.
+    pub fn take<T: Serialize>(&mut self, value: &T) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        let mut counted = Counted(0);
+        let cost = serde_json::to_writer(&mut counted, value).map_or(usize::MAX, |()| counted.0);
+        // A separator and some structure per entry, so a million empty rows still cost something.
+        let cost = cost.saturating_add(8);
+        if cost > self.left {
+            self.exhausted = true;
+            return false;
+        }
+        self.left -= cost;
+        true
+    }
+
+    /// Whether something did not fit.
+    #[must_use]
+    pub const fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
+/// Counts bytes written, keeping none.
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// How many of a task's transitions `task.show` carries — the recent ones; `jkb task why` has all.
 pub const RECENT_TRANSITIONS: usize = 5;
@@ -222,11 +286,12 @@ pub struct GrepHit {
 /// `kb.grep`'s answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrepAnswer {
-    /// The matched items, by uid — empty for [`GrepMode::Count`], and cut short when `truncated`.
+    /// The matched items, by uid — empty for [`GrepMode::Count`], and cut short when `truncated`
+    /// (the last one possibly with only some of its lines).
     pub hits: Vec<GrepHit>,
     /// How many items matched, whether or not all of them are in `hits`.
     pub count: usize,
-    /// `hits` stopped at [`MAX_GREP_BYTES`].
+    /// `hits` stopped at the read's [`Budget`].
     pub truncated: bool,
 }
 
@@ -318,7 +383,7 @@ pub struct TransitionSummary {
 pub struct SubtaskSummary {
     /// Its uid.
     pub uid: String,
-    /// Its title: the first non-blank line of its content, empty when it has none.
+    /// Its label: the title rule `kb.ls` labels items by (`item::title_from`, ≤ 80 chars).
     pub title: String,
     /// Its status.
     pub status: Option<String>,
@@ -384,8 +449,8 @@ fn scoped(dsl: &str, default_scope: Option<&str>) -> jkb_core::Result<query::Que
     Ok(q)
 }
 
-/// `kb.query`: the items a DSL query matches, as listing rows; `default_scope` applies when the
-/// query names no scope.
+/// `kb.query`: the items a DSL query matches, as listing rows, within `budget`; `default_scope`
+/// applies when the query names no scope.
 ///
 /// # Errors
 /// A malformed query, or a failed read.
@@ -395,6 +460,7 @@ pub fn query_items(
     default_scope: Option<&str>,
     limit: Option<usize>,
     order: QueryOrder,
+    budget: &mut Budget,
 ) -> jkb_core::Result<Vec<ItemRow>> {
     let mut q = scoped(dsl, default_scope)?;
     let ids = match order {
@@ -419,7 +485,7 @@ pub fn query_items(
             ordered
         }
     };
-    item_rows(conn, &ids)
+    item_rows(conn, &ids, budget)
 }
 
 /// `kb.query` with `count`: how many items it matches, ignoring any limit.
@@ -443,6 +509,7 @@ pub fn ready(
     dsl: &str,
     default_scope: Option<&str>,
     limit: Option<usize>,
+    budget: &mut Budget,
 ) -> jkb_core::Result<Vec<ItemRow>> {
     let q = scoped(dsl, default_scope)?;
     let mut rows = task::ready(conn, q.scope, &q.tags)?;
@@ -450,7 +517,7 @@ pub fn ready(
         rows.truncate(limit);
     }
     let ids: Vec<ItemId> = rows.iter().map(|r| r.id).collect();
-    item_rows(conn, &ids)
+    item_rows(conn, &ids, budget)
 }
 
 /// A one-line snippet: the first non-blank line, trimmed to 80 chars.
@@ -482,11 +549,16 @@ fn primary_namespace(conn: &Connection, id: i64) -> jkb_core::Result<Option<Stri
         .optional()?)
 }
 
-/// Listing rows for `ids`, in their order, skipping any that no longer exist.
+/// Listing rows for `ids`, in their order, skipping any that no longer exist, until one does not fit
+/// `budget`.
 ///
 /// # Errors
 /// Returns an error if a read fails.
-pub fn item_rows(conn: &Connection, ids: &[ItemId]) -> jkb_core::Result<Vec<ItemRow>> {
+pub fn item_rows(
+    conn: &Connection,
+    ids: &[ItemId],
+    budget: &mut Budget,
+) -> jkb_core::Result<Vec<ItemRow>> {
     let mut out = Vec::new();
     for id in ids {
         let row = conn
@@ -511,7 +583,7 @@ pub fn item_rows(conn: &Connection, ids: &[ItemId]) -> jkb_core::Result<Vec<Item
         let Some((id, uid, kind, status, resolution, priority, due, content, updated)) = row else {
             continue;
         };
-        out.push(ItemRow {
+        let row = ItemRow {
             namespace: primary_namespace(conn, id)?,
             id,
             uid,
@@ -522,15 +594,24 @@ pub fn item_rows(conn: &Connection, ids: &[ItemId]) -> jkb_core::Result<Vec<Item
             due,
             snippet: content.as_deref().map(snippet),
             updated: Some(updated),
-        });
+        };
+        if !budget.take(&row) {
+            break;
+        }
+        out.push(row);
     }
     Ok(out)
+}
+
+/// An item's label in a listing: its title (`item::title_from`), at most 80 chars.
+fn label(uid: &str, content: Option<&str>) -> String {
+    truncated(&item::title_from(uid, content), 80)
 }
 
 fn item_child(meta: item::ItemMeta, subtasks: Option<(i64, i64)>, chunks: Option<i64>) -> Child {
     let chunks = chunks.filter(|n| *n > 0);
     Child {
-        label: truncated(&item::title_of(&meta), 80),
+        label: label(&meta.uid, meta.content.as_deref()),
         kind: meta.kind,
         reference: meta.uid,
         // Anything that contains expands: a task into its subtasks, a document into its chunks.
@@ -659,7 +740,7 @@ pub fn children(conn: &Connection, path: Option<&str>, all: bool) -> jkb_core::R
 }
 
 /// `kb.ls`: the children of `path`, and with `recursive` every namespace below it depth-first, each
-/// row naming the namespace it was listed under.
+/// row naming the namespace it was listed under — until a row does not fit `budget`.
 ///
 /// # Errors
 /// Returns an error if a read fails.
@@ -668,6 +749,7 @@ pub fn ls(
     path: Option<&str>,
     all: bool,
     recursive: bool,
+    budget: &mut Budget,
 ) -> jkb_core::Result<Vec<ListRow>> {
     fn walk(
         conn: &Connection,
@@ -675,29 +757,34 @@ pub fn ls(
         all: bool,
         recursive: bool,
         acc: &mut Vec<ListRow>,
+        budget: &mut Budget,
     ) -> jkb_core::Result<()> {
         for child in children(conn, path, all)? {
             let descend = (recursive && child.kind == "namespace").then(|| child.reference.clone());
-            acc.push(ListRow {
+            let row = ListRow {
                 parent: path.map(str::to_owned),
                 child,
-            });
+            };
+            if !budget.take(&row) {
+                return Ok(());
+            }
+            acc.push(row);
             if let Some(ns_path) = descend {
-                walk(conn, Some(&ns_path), all, recursive, acc)?;
+                walk(conn, Some(&ns_path), all, recursive, acc, budget)?;
             }
         }
         Ok(())
     }
     let mut acc = Vec::new();
-    walk(conn, path, all, recursive, &mut acc)?;
+    walk(conn, path, all, recursive, &mut acc, budget)?;
     Ok(acc)
 }
 
 /// `kb.tree`: the subtree under `path`, descending into any container — not only namespaces, or a
 /// subtask de-duplicated out of its namespace listing would be unreachable — to `depth` levels,
 /// never more than [`MAX_TREE_DEPTH`] (`None` asks for that). A node whose reference is one of its
-/// own ancestors' is listed but not descended into, and nothing is descended into once
-/// [`MAX_TREE_NODES`] are listed.
+/// own ancestors' is listed but not descended into. The walk stops, cut short, at a node that does
+/// not fit `budget` or past [`MAX_TREE_NODES`]; the returned flag says whether it did.
 ///
 /// # Errors
 /// Returns an error if a read fails.
@@ -706,37 +793,46 @@ pub fn tree(
     path: Option<&str>,
     all: bool,
     depth: Option<usize>,
-) -> jkb_core::Result<Vec<TreeNode>> {
+    budget: &mut Budget,
+) -> jkb_core::Result<(Vec<TreeNode>, bool)> {
     let mut walk = TreeWalk {
         conn,
         all,
         ancestors: path.map(str::to_owned).into_iter().collect(),
         listed: 0,
+        cut: false,
+        budget,
     };
-    walk.level(
+    let nodes = walk.level(
         path,
         depth.map_or(MAX_TREE_DEPTH, |d| d.min(MAX_TREE_DEPTH)),
-    )
+    )?;
+    Ok((nodes, walk.cut))
 }
 
-struct TreeWalk<'c> {
+struct TreeWalk<'c, 'b> {
     conn: &'c Connection,
     all: bool,
     /// The references on the path from the root to the level being listed.
     ancestors: Vec<String>,
     /// Nodes listed so far.
     listed: usize,
+    /// The walk stopped early.
+    cut: bool,
+    budget: &'b mut Budget,
 }
 
-impl TreeWalk<'_> {
+impl TreeWalk<'_, '_> {
     fn level(&mut self, path: Option<&str>, depth: usize) -> jkb_core::Result<Vec<TreeNode>> {
         let mut out = Vec::new();
         for child in children(self.conn, path, self.all)? {
+            if self.cut || self.listed >= MAX_TREE_NODES || !self.budget.take(&child) {
+                self.cut = true;
+                break;
+            }
             self.listed += 1;
-            let descend = child.has_children
-                && depth > 0
-                && self.listed < MAX_TREE_NODES
-                && !self.ancestors.contains(&child.reference);
+            let descend =
+                child.has_children && depth > 0 && !self.ancestors.contains(&child.reference);
             let nested = if descend {
                 self.ancestors.push(child.reference.clone());
                 let nested = self.level(Some(&child.reference), depth - 1);
@@ -767,7 +863,8 @@ pub fn cat(conn: &Connection, uid: &str) -> Result<String, ApiError> {
 
 /// `kb.grep`: items under `scope` whose content holds `pattern` literally, answered as `mode` asks.
 /// Case folding, when asked, is Unicode — the same fold `item::grep` filters with. Items are read one
-/// at a time and only what the answer keeps is held, up to [`MAX_GREP_BYTES`].
+/// at a time and only what the answer keeps is held, line by line within `budget`; counting goes on
+/// past it.
 ///
 /// # Errors
 /// [`ErrorCode::Invalid`] for an empty pattern, which matches every line of every item; else a
@@ -778,6 +875,7 @@ pub fn grep(
     scope: Option<&str>,
     ignore_case: bool,
     mode: GrepMode,
+    budget: &mut Budget,
 ) -> Result<GrepAnswer, ApiError> {
     if pattern.is_empty() {
         return Err(ApiError::with_code(
@@ -802,37 +900,38 @@ pub fn grep(
         count: 0,
         truncated: false,
     };
-    let mut bytes = 0usize;
     item::grep_each(conn, pattern, scope, ignore_case, |row| {
         answer.count += 1;
-        if mode == GrepMode::Count || answer.truncated {
+        if mode == GrepMode::Count {
             return true;
         }
-        let lines: Vec<GrepLine> = if mode == GrepMode::Lines {
-            row.content
-                .lines()
-                .enumerate()
-                .filter(|(_, l)| matches(l))
-                .map(|(i, l)| GrepLine {
-                    line: i + 1,
-                    text: l.to_owned(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        bytes += row.uid.len() + row.kind.len() + lines.iter().map(|l| l.text.len()).sum::<usize>();
-        if bytes > MAX_GREP_BYTES {
-            answer.truncated = true;
-            return true;
-        }
-        answer.hits.push(GrepHit {
+        let mut hit = GrepHit {
             uid: row.uid,
             kind: row.kind,
-            lines,
-        });
+            lines: Vec::new(),
+        };
+        if !budget.take(&hit) {
+            return true;
+        }
+        if mode == GrepMode::Lines {
+            for (i, text) in row.content.lines().enumerate() {
+                if !matches(text) {
+                    continue;
+                }
+                let line = GrepLine {
+                    line: i + 1,
+                    text: text.to_owned(),
+                };
+                if !budget.take(&line) {
+                    break;
+                }
+                hit.lines.push(line);
+            }
+        }
+        answer.hits.push(hit);
         true
     })?;
+    answer.truncated = budget.exhausted();
     Ok(answer)
 }
 
@@ -860,6 +959,7 @@ pub fn search(
     db: &Db,
     embedder: Option<&Arc<dyn Embedder + Send + Sync>>,
     ask: &SearchAsk,
+    budget: &mut Budget,
 ) -> Result<Vec<SearchHit>, ApiError> {
     if ask.limit > MAX_SEARCH_LIMIT {
         return Err(ApiError::with_code(
@@ -890,6 +990,9 @@ pub fn search(
         .map_err(search_error)?;
     let mut out = Vec::with_capacity(hits.len());
     for hit in hits {
+        if budget.exhausted() {
+            break;
+        }
         let context = match ask.context {
             Some(n) => searcher
                 .get_context(db, hit.item, n)
@@ -907,11 +1010,13 @@ pub fn search(
         let (item, source) = (hit.item, hit.source_document);
         let (row, source_document) = db.read(move |conn| {
             let one = |id: ItemId| -> jkb_core::Result<Option<ItemRow>> {
-                Ok(item_rows(conn, &[id])?.into_iter().next())
+                Ok(item_rows(conn, &[id], &mut Budget::new(usize::MAX))?
+                    .into_iter()
+                    .next())
             };
             Ok((one(item)?, source.map(one).transpose()?.flatten()))
         })?;
-        out.push(SearchHit {
+        let hit = SearchHit {
             item: hit.item.get(),
             row,
             route: hit.route.as_str().to_owned(),
@@ -920,7 +1025,13 @@ pub fn search(
             namespace: hit.namespace_path,
             source_document,
             context,
-        });
+        };
+        // Charged whole: a hit's context is the part that is large — a document hit, which has no
+        // chunks, carries its entire body at any context.
+        if !budget.take(&hit) {
+            break;
+        }
+        out.push(hit);
     }
     Ok(out)
 }
@@ -957,11 +1068,16 @@ impl Embedder for NoEmbedder {
 }
 
 /// `task.show`: a task (or any item a task reference names) in full, with its recent transitions and
-/// its subtasks.
+/// its subtasks — as many as fit `budget` once the task itself is charged. The task is shown whatever
+/// its size: it is what was asked for.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`] when the reference names no item; else a failed read.
-pub fn task_show(conn: &Connection, reference: &str) -> Result<TaskDetail, ApiError> {
+pub fn task_show(
+    conn: &Connection,
+    reference: &str,
+    budget: &mut Budget,
+) -> Result<TaskDetail, ApiError> {
     let Some(id) = task::resolve_ref(conn, reference)? else {
         return Err(not_found(format!("no item with uid {reference}")));
     };
@@ -970,7 +1086,7 @@ pub fn task_show(conn: &Connection, reference: &str) -> Result<TaskDetail, ApiEr
     };
     let history = transition::history(conn, id)?;
     let skip = history.len().saturating_sub(RECENT_TRANSITIONS);
-    Ok(TaskDetail {
+    let mut detail = TaskDetail {
         item: ItemDetail {
             id: id.get(),
             namespace: primary_namespace(conn, id.get())?,
@@ -997,31 +1113,41 @@ pub fn task_show(conn: &Connection, reference: &str) -> Result<TaskDetail, ApiEr
                 pr: r.labels.pr_number,
             })
             .collect(),
-        subtasks: task::subtasks(conn, id)?
-            .into_iter()
-            .map(|t| SubtaskSummary {
-                title: t
-                    .title
-                    .as_deref()
-                    .map(item::first_nonblank)
-                    .unwrap_or_default()
-                    .to_owned(),
-                uid: t.uid,
-                status: t.status,
-            })
-            .collect(),
-    })
+        subtasks: Vec::new(),
+    };
+    let _ = budget.take(&detail.item);
+    for t in task::subtasks(conn, id)? {
+        let summary = SubtaskSummary {
+            title: label(&t.uid, t.title.as_deref()),
+            uid: t.uid,
+            status: t.status,
+        };
+        if !budget.take(&summary) {
+            break;
+        }
+        detail.subtasks.push(summary);
+    }
+    Ok(detail)
 }
 
-/// `task.subtasks`: a task's contained children, shaped like `kb.ls` children.
+/// `task.subtasks`: a task's contained children, shaped like `kb.ls` children, as many as fit
+/// `budget`.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`] when the reference names no item; else a failed read.
-pub fn subtasks(conn: &Connection, reference: &str, all: bool) -> Result<Vec<Child>, ApiError> {
+pub fn subtasks(
+    conn: &Connection,
+    reference: &str,
+    all: bool,
+    budget: &mut Budget,
+) -> Result<Vec<Child>, ApiError> {
     let Some(id) = task::resolve_ref(conn, reference)? else {
         return Err(not_found(format!("no item with uid {reference}")));
     };
-    Ok(contained_children(conn, id, all)?)
+    Ok(contained_children(conn, id, all)?
+        .into_iter()
+        .take_while(|c| budget.take(c))
+        .collect())
 }
 
 #[cfg(test)]

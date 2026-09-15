@@ -50,10 +50,10 @@ fn an_unknown_op_or_field_is_refused_rather_than_ignored() {
     assert!(serde_json::from_value::<Request>(json!({ "op": "mq.inspect" })).is_ok());
 }
 
-#[test]
 #[allow(clippy::too_many_lines)] // one sample per op
-fn every_op_names_its_own_wire_tag_and_is_advertised() {
-    let samples = [
+/// One request per op.
+fn samples() -> Vec<Request> {
+    vec![
         Request::MqTopicCreate {
             topic: "t".into(),
             spec: SpecInput::default(),
@@ -148,7 +148,12 @@ fn every_op_names_its_own_wire_tag_and_is_advertised() {
             uid: "u".into(),
             all: false,
         },
-    ];
+    ]
+}
+
+#[test]
+fn every_op_names_its_own_wire_tag_and_is_advertised() {
+    let samples = samples();
     // OPS against the tags serde actually accepts — read from its unknown-variant error, which lists
     // them all. Without this, a new variant named in `op()` but in neither OPS nor the samples below
     // left every assertion here green: the counts still matched.
@@ -588,7 +593,7 @@ fn a_search_that_would_embed_is_refused_by_a_backend_with_no_embedder() {
         ErrorCode::Invalid,
         "a limit the fusion would overflow on: {e:?}"
     );
-    let Response::SearchHits { hits } = call(
+    let Response::SearchHits { hits, .. } = call(
         &b,
         json!({ "op": "kb.search", "dsl": "needle", "route": "fts", "limit": 5 }),
     )
@@ -660,7 +665,7 @@ fn grep_answers_with_the_matching_lines_and_cat_with_the_body() {
 fn a_query_scopes_by_default_only_when_it_names_no_scope_and_counts_past_its_limit() {
     let b = read_fixture();
     let uids = |r: Response| match r {
-        Response::Items { items } => items.into_iter().map(|i| i.uid).collect::<Vec<_>>(),
+        Response::Items { items, .. } => items.into_iter().map(|i| i.uid).collect::<Vec<_>>(),
         other => panic!("{other:?}"),
     };
     assert_eq!(
@@ -697,7 +702,8 @@ fn a_query_scopes_by_default_only_when_it_names_no_scope_and_counts_past_its_lim
 #[test]
 fn a_task_shows_with_its_subtasks_and_holds_the_parent_off_the_frontier() {
     let b = read_fixture();
-    let Response::Task { task } = call(&b, json!({ "op": "task.show", "uid": "parent" })).unwrap()
+    let Response::Task { task, .. } =
+        call(&b, json!({ "op": "task.show", "uid": "parent" })).unwrap()
     else {
         panic!("task.show answers with a task")
     };
@@ -713,7 +719,7 @@ fn a_task_shows_with_its_subtasks_and_holds_the_parent_off_the_frontier() {
     let e = call(&b, json!({ "op": "task.show", "uid": "nope" })).unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound);
 
-    let Response::Items { items } = call(
+    let Response::Items { items, .. } = call(
         &b,
         json!({ "op": "task.ready", "dsl": "", "default_scope": "tasks/repos/jkb" }),
     )
@@ -725,7 +731,7 @@ fn a_task_shows_with_its_subtasks_and_holds_the_parent_off_the_frontier() {
         ["task:child"]
     );
 
-    let Response::Children { children } =
+    let Response::Children { children, .. } =
         call(&b, json!({ "op": "task.subtasks", "uid": "parent" })).unwrap()
     else {
         panic!("task.subtasks answers with children")
@@ -737,7 +743,7 @@ fn a_task_shows_with_its_subtasks_and_holds_the_parent_off_the_frontier() {
 #[test]
 fn ls_and_tree_list_the_same_children() {
     let b = read_fixture();
-    let Response::Listing { rows } = call(
+    let Response::Listing { rows, .. } = call(
         &b,
         json!({ "op": "kb.ls", "path": "repos", "recursive": true }),
     )
@@ -750,7 +756,7 @@ fn ls_and_tree_list_the_same_children() {
             .collect::<Vec<_>>(),
         [(Some("repos"), "repos/jkb"), (Some("repos/jkb"), "doc:a")]
     );
-    let Response::Tree { nodes } = call(
+    let Response::Tree { nodes, .. } = call(
         &b,
         json!({ "op": "kb.tree", "path": "tasks/repos", "depth": 4 }),
     )
@@ -793,9 +799,10 @@ fn a_search_score_crosses_the_wire_exactly() {
     };
     let wire = serde_json::to_string(&Response::SearchHits {
         hits: vec![hit.clone()],
+        truncated: false,
     })
     .unwrap();
-    let Response::SearchHits { hits } = serde_json::from_str(&wire).unwrap() else {
+    let Response::SearchHits { hits, .. } = serde_json::from_str(&wire).unwrap() else {
         panic!("round-trips as search hits")
     };
     assert_eq!(hits[0].score.to_bits(), score.to_bits(), "{wire}");
@@ -828,7 +835,7 @@ fn count(nodes: &[super::kb::TreeNode]) -> usize {
 
 fn tree_of(b: &LocalBackend, path: &str) -> Vec<super::kb::TreeNode> {
     match call(b, json!({ "op": "kb.tree", "path": path })).unwrap() {
-        Response::Tree { nodes } => nodes,
+        Response::Tree { nodes, .. } => nodes,
         other => panic!("kb.tree answers with nodes: {other:?}"),
     }
 }
@@ -867,9 +874,9 @@ fn a_tree_does_not_descend_into_a_node_that_lists_its_own_ancestor() {
 }
 
 #[test]
-fn a_tree_stops_descending_at_its_node_budget() {
+fn a_tree_stops_at_its_node_cap_and_says_so() {
     use jkb_core::ns;
-    // More child namespaces than the budget, each with a namespace of its own under it.
+    // More child namespaces than the cap, each with a namespace of its own under it.
     let db = Db::open_in_memory().unwrap();
     let width = super::kb::MAX_TREE_NODES + 50;
     db.write_txn("t", move |c, _| {
@@ -880,16 +887,16 @@ fn a_tree_stops_descending_at_its_node_budget() {
     })
     .unwrap();
     let b = LocalBackend::new(db);
-    let nodes = tree_of(&b, "w");
-    assert_eq!(nodes.len(), width, "every child is still listed");
-    assert!(
-        !nodes[0].children.is_empty(),
-        "the first are descended into"
-    );
-    let last = nodes.last().unwrap();
-    assert!(
-        last.child.has_children && last.children.is_empty(),
-        "past the budget nothing is: {last:?}"
+    let Response::Tree { nodes, truncated } =
+        call(&b, json!({ "op": "kb.tree", "path": "w" })).unwrap()
+    else {
+        panic!("kb.tree answers with nodes")
+    };
+    assert!(truncated);
+    assert_eq!(
+        count(&nodes),
+        super::kb::MAX_TREE_NODES,
+        "the cap counts every node listed, siblings included"
     );
 }
 
@@ -906,7 +913,7 @@ fn a_tree_at_the_depth_cap_decodes_through_the_wire() {
     .unwrap();
     let b = LocalBackend::new(db);
     let response = call(&b, json!({ "op": "kb.tree", "path": "d" })).unwrap();
-    let Response::Tree { nodes } = &response else {
+    let Response::Tree { nodes, .. } = &response else {
         panic!("kb.tree answers with nodes")
     };
     let mut depth = 0;
@@ -940,37 +947,84 @@ fn a_search_asking_for_a_whole_document_of_context_is_refused() {
 }
 
 #[test]
-fn a_grep_over_more_than_its_byte_budget_is_cut_short_and_still_counts() {
-    use jkb_core::item;
+fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
+    const BUDGET: usize = 4096;
+    use jkb_core::{item, ns, placement, task};
+    use jkb_types::PlacementRole;
+    // Enough of everything that each read's full answer is well over the budget: many items, a
+    // document of many short matching lines (the grep answer whose per-line JSON outweighs its text),
+    // documents with bodies large enough that one search hit's context is over it on its own, and a
+    // task with many subtasks.
     let db = Db::open_in_memory().unwrap();
-    let line = format!("{}\n", "x".repeat(1023));
-    let big = line.repeat(super::kb::MAX_GREP_BYTES / 1023 + 100);
-    db.write_txn("t", move |c, m| {
-        for uid in ["a:1", "a:2"] {
-            item::upsert(
+    db.write_txn("t", |c, m| {
+        let space = ns::ensure(c, "big")?;
+        for i in 0..200 {
+            let doc = item::upsert(
                 c,
                 m,
                 &item::NewItem {
-                    uid: uid.into(),
-                    kind: "note".into(),
-                    content: Some(big.clone()),
+                    uid: format!("doc:{i:03}"),
+                    kind: "document".into(),
+                    content: Some(format!("needle {i}\n{}", "x\n".repeat(3000))),
                     content_hash: None,
                     mime: None,
                 },
             )?;
+            placement::place(c, m, doc, space, PlacementRole::Primary, i)?;
+        }
+        let mut parent = task::NewTask::new("task:big", "Big");
+        parent.home = "big".into();
+        let parent = task::create(c, m, &parent)?;
+        for i in 0..200 {
+            let mut child = task::NewTask::new(format!("task:sub-{i:03}"), format!("sub {i}"));
+            child.home = "big".into();
+            let child = task::create(c, m, &child)?;
+            task::add_subtask(c, m, parent, child)?;
         }
         Ok(())
     })
     .unwrap();
-    let b = LocalBackend::new(db);
+    let b = LocalBackend::new(db).with_read_budget(BUDGET);
+    for request in [
+        json!({ "op": "kb.query", "dsl": "" }),
+        json!({ "op": "kb.query", "dsl": "", "order": "updated_desc" }),
+        json!({ "op": "task.ready", "dsl": "" }),
+        json!({ "op": "kb.ls", "path": "big", "recursive": true, "all": true }),
+        json!({ "op": "kb.tree", "path": "big", "all": true }),
+        json!({ "op": "kb.grep", "pattern": "x" }),
+        json!({ "op": "kb.grep", "pattern": "needle", "mode": "names" }),
+        json!({ "op": "kb.search", "dsl": "needle", "route": "fts", "limit": 100, "context": 0 }),
+        json!({ "op": "task.show", "uid": "big" }),
+        json!({ "op": "task.subtasks", "uid": "big" }),
+    ] {
+        let response = call(&b, request.clone()).unwrap();
+        let wire = serde_json::to_string(&response).unwrap();
+        // The budget counts what the rows serialize to; the envelope around them is not charged.
+        assert!(
+            wire.len() <= BUDGET + 256,
+            "{request}: {} bytes over a {BUDGET}-byte budget",
+            wire.len()
+        );
+        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            v["truncated"], true,
+            "{request}: cut, and says so: {wire:.300}"
+        );
+    }
     let Response::GrepHits { answer } =
-        call(&b, json!({ "op": "kb.grep", "pattern": "x" })).unwrap()
+        call(&b, json!({ "op": "kb.grep", "pattern": "needle" })).unwrap()
     else {
         panic!("grep answers with hits")
     };
-    assert!(answer.truncated);
-    assert_eq!(answer.count, 2, "counting goes on past the budget");
-    assert!(answer.hits.is_empty(), "the first item alone is over it");
+    assert_eq!(answer.count, 200, "counting goes on past the budget");
+    // Unbounded, the same reads are whole.
+    let whole = LocalBackend::new(b.db.clone());
+    let Response::Items { items, truncated } =
+        call(&whole, json!({ "op": "kb.query", "dsl": "kind:document" })).unwrap()
+    else {
+        panic!("kb.query answers with items")
+    };
+    assert_eq!((items.len(), truncated), (200, false));
 }
 
 #[test]
@@ -983,7 +1037,7 @@ fn recent_orders_and_limits_on_the_server() {
         jkb_core::item::set_content(c, m, id, "fresh", None)
     })
     .unwrap();
-    let Response::Items { items } = call(
+    let Response::Items { items, .. } = call(
         &b,
         json!({ "op": "kb.query", "dsl": "", "limit": 1, "order": "updated_desc" }),
     )
@@ -1004,7 +1058,8 @@ fn a_task_s_subtasks_carry_their_titles_not_their_bodies() {
         jkb_core::item::set_content(c, m, id, "\n\nChild title\nand a long body", None)
     })
     .unwrap();
-    let Response::Task { task } = call(&b, json!({ "op": "task.show", "uid": "parent" })).unwrap()
+    let Response::Task { task, .. } =
+        call(&b, json!({ "op": "task.show", "uid": "parent" })).unwrap()
     else {
         panic!("task.show answers with a task")
     };
@@ -1057,4 +1112,74 @@ fn a_long_read_on_the_reader_does_not_hold_up_a_write() {
         })
         .unwrap_err();
     assert!(e.to_string().contains("readonly"), "{e}");
+}
+
+// Which ops read is stated here, apart from the classification under test: filtering on
+// `is_read` itself dropped a read misclassed as a write from the very loop meant to catch it.
+const READS: &[&str] = &[
+    "kb.ambient",
+    "kb.query",
+    "kb.ls",
+    "kb.tree",
+    "kb.cat",
+    "kb.grep",
+    "kb.search",
+    "task.ready",
+    "task.show",
+    "task.subtasks",
+    "mq.inspect",
+    "mq.tail",
+    "notify.open_sessions",
+];
+
+#[test]
+fn every_op_is_served_on_the_connection_its_class_names() {
+    // `Request::is_read` alone chooses. A read left on the writer waits behind whatever holds it; a
+    // write classed as a read fails on the `query_only` reader. So: no op is refused as a write to a
+    // read-only database, and with the writer's thread held every read still answers at once.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    let b = LocalBackend::new(db.clone()).with_reader(db.reader().unwrap());
+    // Every op, not only those classed as writes: a write misclassed as a read is exactly the one that
+    // would be missed by filtering on the class under test.
+    for request in samples() {
+        if let Err(e) = b.call(request.clone()) {
+            assert!(
+                !e.message.contains("readonly"),
+                "{}: a write served on the reader: {e:?}",
+                request.op()
+            );
+        }
+    }
+    let writer = b.db.clone();
+    let (held, holding) = std::sync::mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        writer
+            .read(move |_| {
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok(())
+            })
+            .unwrap();
+    });
+    holding.recv().unwrap();
+    for request in samples() {
+        assert_eq!(
+            request.is_read(),
+            READS.contains(&request.op()),
+            "{} is classed wrongly",
+            request.op()
+        );
+    }
+    for request in samples().into_iter().filter(|r| READS.contains(&r.op())) {
+        let op = request.op();
+        let at = std::time::Instant::now();
+        let _ = b.call(request);
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(1),
+            "{op} waited {:?} behind the writer",
+            at.elapsed()
+        );
+    }
+    blocker.join().unwrap();
 }

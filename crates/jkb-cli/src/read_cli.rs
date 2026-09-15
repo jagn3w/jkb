@@ -169,7 +169,10 @@ impl<'a> Reads<'a> {
     fn items(&self, request: Request) -> Result<Vec<ItemRow>> {
         let op = request.op();
         match self.call(request)? {
-            Response::Items { items } => Ok(items),
+            Response::Items { items, truncated } => {
+                cut_short(truncated);
+                Ok(items)
+            }
             other => unexpected(op, &other),
         }
     }
@@ -265,7 +268,10 @@ impl<'a> Reads<'a> {
             limit,
             context,
         })? {
-            Response::SearchHits { hits } => hits,
+            Response::SearchHits { hits, truncated } => {
+                cut_short(truncated);
+                hits
+            }
             other => return unexpected("kb.search", &other),
         };
         if self.json {
@@ -333,7 +339,10 @@ impl<'a> Reads<'a> {
             all: opts.all,
             recursive: opts.recursive,
         })? {
-            Response::Listing { rows } => rows,
+            Response::Listing { rows, truncated } => {
+                cut_short(truncated);
+                rows
+            }
             other => return unexpected("kb.ls", &other),
         };
         if opts.time {
@@ -360,7 +369,10 @@ impl<'a> Reads<'a> {
             all,
             depth: Some(depth.unwrap_or(DEFAULT_TREE_DEPTH)),
         })? {
-            Response::Tree { nodes } => nodes,
+            Response::Tree { nodes, truncated } => {
+                cut_short(truncated);
+                nodes
+            }
             other => return unexpected("kb.tree", &other),
         };
         if self.json {
@@ -445,12 +457,8 @@ impl<'a> Reads<'a> {
             }
         }
         if answer.truncated {
-            eprintln!(
-                "jkb grep: output stopped at {} MiB of matches; {} items matched in all — narrow the \
-                 pattern or give a path",
-                jkb_api::kb::MAX_GREP_BYTES / (1024 * 1024),
-                answer.count
-            );
+            cut_short(true);
+            eprintln!("jkb: {} items matched in all", answer.count);
         }
         if answer.count == 0 {
             std::process::exit(1);
@@ -496,7 +504,10 @@ impl<'a> Reads<'a> {
         let task = match self.call(Request::TaskShow {
             uid: uid.to_owned(),
         })? {
-            Response::Task { task } => task,
+            Response::Task { task, truncated } => {
+                cut_short(truncated);
+                task
+            }
             other => return unexpected("task.show", &other),
         };
         print_task(&task, self.json)
@@ -509,7 +520,13 @@ impl<'a> Reads<'a> {
             uid: uid.to_owned(),
             all,
         })? {
-            Response::Children { children } => children,
+            Response::Children {
+                children,
+                truncated,
+            } => {
+                cut_short(truncated);
+                children
+            }
             other => return unexpected("task.subtasks", &other),
         };
         if self.json {
@@ -526,6 +543,17 @@ impl<'a> Reads<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// Say on stderr that an answer is a prefix: the daemon bounds every read (`jkb_api::kb::Budget`), and
+/// an agent reading a listing with no end marker would take it for all there is.
+fn cut_short(truncated: bool) {
+    if truncated {
+        eprintln!(
+            "jkb: this answer was cut short at the daemon's read budget — narrow it (a path, a query, \
+             --limit) or run it on the host"
+        );
     }
 }
 

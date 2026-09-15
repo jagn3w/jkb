@@ -928,3 +928,46 @@ fn a_hook_deadline_bounds_a_daemon_that_accepts_and_never_answers() {
         "a timeout after connecting must not mark the daemon unreachable"
     );
 }
+
+/// Reads wait under a budget of their own, so a burst of them cannot take the op permits a hook's
+/// write needs; and the daemon bounds each read's answer, which says when it was cut.
+#[test]
+fn reads_have_their_own_permits_and_a_bounded_answer() {
+    let f = Fixture::with(|cfg| cfg.max_reads = 0);
+    let c = f.client();
+    let refused = c
+        .call(Request::KbLs {
+            path: None,
+            all: false,
+            recursive: false,
+        })
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Busy, "{refused:?}");
+    assert!(refused.message.contains("read limit"), "{refused:?}");
+    c.call(Request::MqTopicCreate {
+        topic: "claude/notify".into(),
+        spec: SpecInput::default(),
+    })
+    .expect("a write is served while reads are at their limit");
+
+    let f = Fixture::with(|cfg| cfg.read_budget_bytes = 512);
+    f.db.write_txn("t", |c, _| {
+        for i in 0..100 {
+            jkb_core::ns::ensure(c, &format!("n/{i:03}"))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let Response::Listing { rows, truncated } = f
+        .client()
+        .call(Request::KbLs {
+            path: Some("n".into()),
+            all: false,
+            recursive: false,
+        })
+        .unwrap()
+    else {
+        panic!("kb.ls answers with a listing")
+    };
+    assert!(truncated && rows.len() < 100, "{} rows", rows.len());
+}

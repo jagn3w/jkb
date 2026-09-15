@@ -54,6 +54,13 @@ pub struct ServeConfig {
     pub max_ops: usize,
     /// Concurrent long-polls — a separate budget, so subscribers cannot starve a hook's request.
     pub max_polls: usize,
+    /// Concurrent read-set requests (`Request::is_read`) — a third budget. The reads run one at a time
+    /// on the reader connection, so a burst of them otherwise held every op permit while queued and a
+    /// hook's write was refused `busy`.
+    pub max_reads: usize,
+    /// About how many bytes of JSON one read may answer with ([`jkb_api::kb::Budget`]); past it the
+    /// answer is cut short and marked `truncated`.
+    pub read_budget_bytes: usize,
     /// Longest a long-poll is held.
     pub max_wait: Duration,
     /// How often a long-poll re-checks for a message written by another process (the host CLI
@@ -78,6 +85,8 @@ impl ServeConfig {
             max_body_bytes: 1024 * 1024,
             max_ops: 64,
             max_polls: 32,
+            max_reads: 16,
+            read_budget_bytes: 16 * 1024 * 1024,
             max_wait: Duration::from_secs(30),
             poll_floor: Duration::from_millis(250),
             max_connections: 256,
@@ -168,6 +177,8 @@ struct State {
     token: String,
     ops: Arc<Semaphore>,
     polls: Arc<Semaphore>,
+    reads: Arc<Semaphore>,
+    read_budget_bytes: usize,
     /// The `(topic, group)` pairs with a long-poll held right now.
     polling: Mutex<HashSet<(String, String)>>,
     sent: Notify,
@@ -212,11 +223,12 @@ enum Source {
     Opener(Opener),
 }
 
-/// The backend serving `db`: the read set on a connection of its own
+/// The backend serving `db`: every read's answer bounded to `read_budget_bytes`, and the read set on a
+/// connection of its own
 /// ([`LocalBackend::with_reader`]), so a client's long read does not hold up the writes behind it — a
 /// notification hook's among them. A reader that will not open costs that separation, not the daemon.
-fn backend_for(db: &Db) -> LocalBackend {
-    let backend = LocalBackend::new(db.clone());
+fn backend_for(db: &Db, read_budget_bytes: usize) -> LocalBackend {
+    let backend = LocalBackend::new(db.clone()).with_read_budget(read_budget_bytes);
     match db.reader() {
         Ok(reader) => backend.with_reader(reader),
         Err(e) => {
@@ -229,9 +241,9 @@ fn backend_for(db: &Db) -> LocalBackend {
 }
 
 /// The first open for [`Source::Opener`]: a failure is served, not returned.
-fn first_open(open: &Opener) -> Serving {
+fn first_open(open: &Opener, read_budget_bytes: usize) -> Serving {
     match open() {
-        Ok(db) => Serving::Ready(backend_for(&db), db),
+        Ok(db) => Serving::Ready(backend_for(&db, read_budget_bytes), db),
         Err(why) => {
             eprintln!("jkb serve: {}; retrying on requests", why.message);
             Serving::Failed {
@@ -289,8 +301,11 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         })?;
     let addr = listener.local_addr()?;
     let (serving, opener) = match source {
-        Source::Db(db) => (Serving::Ready(backend_for(&db), db), None),
-        Source::Opener(open) => (first_open(&open), Some(open)),
+        Source::Db(db) => (
+            Serving::Ready(backend_for(&db, cfg.read_budget_bytes), db),
+            None,
+        ),
+        Source::Opener(open) => (first_open(&open, cfg.read_budget_bytes), Some(open)),
     };
     let token = token::mint()?;
     token::write(&cfg.token_path, &token)?;
@@ -302,6 +317,8 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         token,
         ops: Arc::new(Semaphore::new(cfg.max_ops)),
         polls: Arc::new(Semaphore::new(cfg.max_polls)),
+        reads: Arc::new(Semaphore::new(cfg.max_reads)),
+        read_budget_bytes: cfg.read_budget_bytes,
         polling: Mutex::new(HashSet::new()),
         sent: Notify::new(),
         max_body: cfg.max_body_bytes,
@@ -532,7 +549,7 @@ async fn ready(state: &Arc<State>) -> Result<(LocalBackend, Db), ApiError> {
         match opened {
             Ok(db) => {
                 eprintln!("jkb serve: the database opened; serving");
-                let backend = backend_for(&db);
+                let backend = backend_for(&db, opener_state.read_budget_bytes);
                 *serving = Serving::Ready(backend.clone(), db.clone());
                 Ok((backend, db))
             }
@@ -623,33 +640,59 @@ async fn handle(
         Ok(r) => r,
         Err(e) => return Ok(refuse(&ApiError::bad_request(e.to_string()))),
     };
-    let (long_poll, wait) = match &request {
-        Request::MqPoll { topic, group, .. } if !asked_wait.is_zero() => {
-            (Some((topic.clone(), group.clone())), asked_wait)
-        }
-        _ => (None, Duration::ZERO),
-    };
-    let mut _permit = op_permit;
-    let _slot = match &long_poll {
-        None => None,
-        Some((topic, group)) => {
-            let Ok(poll_permit) = Arc::clone(&state.polls).try_acquire_owned() else {
-                return Ok(busy("the daemon is at its long-poll limit; retry"));
-            };
-            _permit = poll_permit;
-            let Some(slot) = PollSlot::take(&state.polling, topic, group) else {
-                return Ok(busy(&format!(
-                    "group {group} on {topic} already has a long-poll in progress; one at a time \
-                     per group"
-                )));
-            };
-            Some(slot)
-        }
+    let (_permit, _slot, wait) = match permit_for(&state, &request, asked_wait, op_permit) {
+        Ok(granted) => granted,
+        Err(refusal) => return Ok(refuse(&refusal)),
     };
     Ok(match serve_op(&state, backend, db, request, wait).await {
         Ok(response) => reply(StatusCode::OK, &json!(response)),
         Err(e) => refuse(&e),
     })
+}
+
+/// The permit a parsed request runs under, traded for its `op_permit` once its class is known, with
+/// its long-poll slot and wait: a long-poll waits under the poll budget, one per group; a read
+/// (`Request::is_read`) queues on the one reader connection, so it waits under the read budget rather
+/// than holding an op permit a hook's write needs; anything else keeps the op permit.
+fn permit_for<'s>(
+    state: &'s State,
+    request: &Request,
+    asked_wait: Duration,
+    op_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<
+    (
+        tokio::sync::OwnedSemaphorePermit,
+        Option<PollSlot<'s>>,
+        Duration,
+    ),
+    ApiError,
+> {
+    let busy = |why: String| ApiError::with_code(ErrorCode::Busy, why);
+    match request {
+        Request::MqPoll { topic, group, .. } if !asked_wait.is_zero() => {
+            let Ok(poll_permit) = Arc::clone(&state.polls).try_acquire_owned() else {
+                return Err(busy(
+                    "the daemon is at its long-poll limit; retry".to_owned(),
+                ));
+            };
+            let Some(slot) = PollSlot::take(&state.polling, topic, group) else {
+                return Err(busy(format!(
+                    "group {group} on {topic} already has a long-poll in progress; one at a time \
+                     per group"
+                )));
+            };
+            drop(op_permit);
+            Ok((poll_permit, Some(slot), asked_wait))
+        }
+        _ if request.is_read() => {
+            let Ok(read_permit) = Arc::clone(&state.reads).try_acquire_owned() else {
+                return Err(busy("the daemon is at its read limit; retry".to_owned()));
+            };
+            drop(op_permit);
+            Ok((read_permit, None, Duration::ZERO))
+        }
+        _ => Ok((op_permit, None, Duration::ZERO)),
+    }
 }
 
 async fn call(backend: &LocalBackend, request: Request) -> Result<Response, ApiError> {
@@ -703,7 +746,7 @@ mod tests {
     fn the_daemon_s_reads_are_served_apart_from_its_writes() {
         let dir = tempfile::tempdir().unwrap();
         let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
-        let backend = backend_for(&db);
+        let backend = backend_for(&db, 1024);
         let refused = backend
             .reads()
             .write_txn("t", |c, _| {

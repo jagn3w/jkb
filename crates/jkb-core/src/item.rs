@@ -249,9 +249,15 @@ pub fn first_nonblank(content: &str) -> &str {
 /// with no body. Untruncated — see [`first_nonblank`].
 #[must_use]
 pub fn title_of(meta: &ItemMeta) -> String {
-    match meta.content.as_deref().map(first_nonblank) {
+    title_from(&meta.uid, meta.content.as_deref())
+}
+
+/// [`title_of`] from an item's uid and content, for a caller holding a row other than [`ItemMeta`].
+#[must_use]
+pub fn title_from(uid: &str, content: Option<&str>) -> String {
+    match content.map(first_nonblank) {
         Some(line) if !line.is_empty() => line.to_owned(),
-        _ => meta.uid.clone(),
+        _ => uid.to_owned(),
     }
 }
 

@@ -530,6 +530,38 @@ impl Request {
             Self::TaskSubtasks { .. } => "task.subtasks",
         }
     }
+
+    /// Whether this op only reads — the one place that says so. [`LocalBackend`] serves it on its
+    /// reader and within its read budget, and `jkb serve` counts it against its read permits, from
+    /// this answer; no dispatch arm chooses. Exhaustive, so a new op must say. A write classed as a
+    /// read fails against the daemon's `query_only` reader rather than writing somewhere unguarded
+    /// (`every_op_is_served_on_the_connection_its_class_names`).
+    #[must_use]
+    pub const fn is_read(&self) -> bool {
+        match self {
+            Self::KbAmbient { .. }
+            | Self::KbQuery { .. }
+            | Self::KbLs { .. }
+            | Self::KbTree { .. }
+            | Self::KbCat { .. }
+            | Self::KbGrep { .. }
+            | Self::KbSearch { .. }
+            | Self::TaskReady { .. }
+            | Self::TaskShow { .. }
+            | Self::TaskSubtasks { .. }
+            | Self::MqInspect {}
+            | Self::MqTail { .. }
+            | Self::NotifyOpenSessions {} => true,
+            Self::MqTopicCreate { .. }
+            | Self::MqSend { .. }
+            | Self::MqGroupCreate { .. }
+            | Self::MqPoll { .. }
+            | Self::MqAck { .. }
+            | Self::MqCompact { .. }
+            | Self::NotifyEvent { .. }
+            | Self::NotifyGone { .. } => false,
+        }
+    }
 }
 
 /// The answer to a [`Request`]. Serialized with a `"result"` tag.
@@ -600,6 +632,9 @@ pub enum Response {
     Items {
         /// In the query's order.
         items: Vec<kb::ItemRow>,
+        /// Cut short at the read's budget ([`kb::Budget`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// A `kb.query` with `count`.
     Count {
@@ -610,16 +645,25 @@ pub enum Response {
     Listing {
         /// Depth-first.
         rows: Vec<kb::ListRow>,
+        /// Cut short at the read's budget ([`kb::Budget`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// A `kb.tree`.
     Tree {
         /// The top level.
         nodes: Vec<kb::TreeNode>,
+        /// Cut short at the read's budget ([`kb::Budget`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// A `task.subtasks`.
     Children {
         /// In containment order.
         children: Vec<kb::Child>,
+        /// Cut short at the read's budget ([`kb::Budget`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// A `kb.cat`.
     Content {
@@ -636,11 +680,17 @@ pub enum Response {
     SearchHits {
         /// Best first.
         hits: Vec<kb::SearchHit>,
+        /// Cut short at the read's budget ([`kb::Budget`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// A `task.show`.
     Task {
         /// The task.
         task: Box<kb::TaskDetail>,
+        /// Its subtasks were cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
 }
 
@@ -832,6 +882,9 @@ pub struct LocalBackend {
     /// Where the read set (`kb.*`, `task.ready`/`show`/`subtasks`) is served: `db` unless
     /// [`LocalBackend::with_reader`] gave it a connection of its own.
     reads: Db,
+    /// What each read may answer with ([`kb::Budget`]); unlimited unless
+    /// [`LocalBackend::with_read_budget`] set one.
+    budget: kb::Budget,
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
 }
 
@@ -843,8 +896,18 @@ impl LocalBackend {
         Self {
             reads: db.clone(),
             db,
+            budget: kb::Budget::UNLIMITED,
             embedder: None,
         }
+    }
+
+    /// The same backend, bounding every read's answer to about `bytes` of JSON, cut short and marked
+    /// `truncated` past it. What `jkb serve` sets: a client's request, not the CLI, decides what is
+    /// asked.
+    #[must_use]
+    pub const fn with_read_budget(mut self, bytes: usize) -> Self {
+        self.budget = kb::Budget::new(bytes);
+        self
     }
 
     /// The same backend, serving the read set on `reader` — a [`Db::reader`] of the same database.
@@ -878,13 +941,20 @@ impl Backend for LocalBackend {
     #[allow(clippy::too_many_lines)] // a flat op dispatcher: one arm per op, as in the CLI's `run`
     fn call(&self, request: Request) -> Result<Response, ApiError> {
         let now = mq::now_ms();
+        // Chosen here, once, from the op's class — no arm picks a connection or a budget.
+        let db = if request.is_read() {
+            &self.reads
+        } else {
+            &self.db
+        };
+        let mut budget = self.budget;
         let created = |c: Created| Response::Created {
             created: c == Created::New,
         };
         Ok(match request {
             Request::MqTopicCreate { topic, spec } => {
                 let spec = spec.resolve();
-                created(self.db.write_txn(ACTOR, move |c, m| {
+                created(db.write_txn(ACTOR, move |c, m| {
                     mq::topic_create(c, m, &topic, &spec, now)
                 })?)
             }
@@ -904,9 +974,7 @@ impl Backend for LocalBackend {
                     producer,
                 };
                 Response::Sent {
-                    seq: self
-                        .db
-                        .write_txn(ACTOR, move |c, m| mq::send(c, m, &topic, &draft, now))?,
+                    seq: db.write_txn(ACTOR, move |c, m| mq::send(c, m, &topic, &draft, now))?,
                 }
             }
             Request::MqGroupCreate {
@@ -919,7 +987,7 @@ impl Backend for LocalBackend {
                 } else {
                     Start::FromNow
                 };
-                created(self.db.write_txn(ACTOR, move |c, m| {
+                created(db.write_txn(ACTOR, move |c, m| {
                     mq::group_create(c, m, &topic, &group, start, now)
                 })?)
             }
@@ -932,17 +1000,13 @@ impl Backend for LocalBackend {
                 // Asked with a read first: an idle subscriber polls several times a second, and a
                 // poll that hands nothing over and has no touch due must not take the write lock.
                 let (t, g) = (topic.clone(), group.clone());
-                if !self
-                    .db
-                    .read(move |c| mq::poll_needed(c, &t, &g, after, now))?
-                {
+                if !db.read(move |c| mq::poll_needed(c, &t, &g, after, now))? {
                     return Ok(Response::Messages {
                         messages: Vec::new(),
                     });
                 }
                 Response::Messages {
-                    messages: self
-                        .db
+                    messages: db
                         .write_txn(ACTOR, move |c, m| {
                             mq::poll(c, m, &topic, &group, max, after, now)
                         })?
@@ -952,14 +1016,11 @@ impl Backend for LocalBackend {
                 }
             }
             Request::MqAck { topic, group, seq } => Response::Position {
-                position: self
-                    .db
+                position: db
                     .write_txn(ACTOR, move |c, m| mq::ack(c, m, &topic, &group, seq, now))?,
             },
             Request::MqCompact { force } => {
-                let r = self
-                    .db
-                    .write_txn(ACTOR, move |c, m| mq::compact(c, m, now, force))?;
+                let r = db.write_txn(ACTOR, move |c, m| mq::compact(c, m, now, force))?;
                 Response::Compacted {
                     topics_compacted: r.topics_compacted,
                     topics_skipped: r.topics_skipped,
@@ -968,16 +1029,10 @@ impl Backend for LocalBackend {
                 }
             }
             Request::MqInspect {} => Response::Topics {
-                topics: self
-                    .db
-                    .read(mq::inspect)?
-                    .into_iter()
-                    .map(Topic::from)
-                    .collect(),
+                topics: db.read(mq::inspect)?.into_iter().map(Topic::from).collect(),
             },
             Request::MqTail { topic, limit } => Response::Messages {
-                messages: self
-                    .db
+                messages: db
                     .read(move |c| mq::tail(c, &topic, limit, now))?
                     .into_iter()
                     .map(Message::from)
@@ -1001,13 +1056,11 @@ impl Backend for LocalBackend {
                     owner,
                     instance,
                 };
-                self.db
-                    .write_txn(ACTOR, move |c, m| notify::observe(c, m, &obs, now))?
+                db.write_txn(ACTOR, move |c, m| notify::observe(c, m, &obs, now))?
                     .into()
             }
             Request::NotifyOpenSessions {} => Response::Sessions {
-                sessions: self
-                    .db
+                sessions: db
                     .read(notify::open_sessions)?
                     .into_iter()
                     .map(|r| NotifySession {
@@ -1023,8 +1076,7 @@ impl Backend for LocalBackend {
                 session,
                 owner,
                 instance,
-            } => self
-                .db
+            } => db
                 .write_txn(ACTOR, move |c, m| {
                     notify::gone(c, m, &session, &owner, &instance, now)
                 })?
@@ -1032,8 +1084,7 @@ impl Backend for LocalBackend {
             Request::KbAmbient { cwd, home } => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 Response::Ambient {
-                    namespace: self
-                        .reads
+                    namespace: db
                         .read(move |c| kb::ambient(c, &cwd, &home, server_home.as_deref()))?,
                 }
             }
@@ -1046,34 +1097,42 @@ impl Backend for LocalBackend {
             } => {
                 if count {
                     Response::Count {
-                        count: self
-                            .reads
+                        count: db
                             .read(move |c| kb::query_count(c, &dsl, default_scope.as_deref()))?,
                     }
                 } else {
-                    Response::Items {
-                        items: self.reads.read(move |c| {
-                            kb::query_items(c, &dsl, default_scope.as_deref(), limit, order)
-                        })?,
-                    }
+                    let (items, truncated) = db.read(move |c| {
+                        let items = kb::query_items(
+                            c,
+                            &dsl,
+                            default_scope.as_deref(),
+                            limit,
+                            order,
+                            &mut budget,
+                        )?;
+                        Ok((items, budget.exhausted()))
+                    })?;
+                    Response::Items { items, truncated }
                 }
             }
             Request::KbLs {
                 path,
                 all,
                 recursive,
-            } => Response::Listing {
-                rows: self
-                    .reads
-                    .read(move |c| kb::ls(c, path.as_deref(), all, recursive))?,
-            },
-            Request::KbTree { path, all, depth } => Response::Tree {
-                nodes: self
-                    .reads
-                    .read(move |c| kb::tree(c, path.as_deref(), all, depth))?,
-            },
+            } => {
+                let (rows, truncated) = db.read(move |c| {
+                    let rows = kb::ls(c, path.as_deref(), all, recursive, &mut budget)?;
+                    Ok((rows, budget.exhausted()))
+                })?;
+                Response::Listing { rows, truncated }
+            }
+            Request::KbTree { path, all, depth } => {
+                let (nodes, truncated) =
+                    db.read(move |c| kb::tree(c, path.as_deref(), all, depth, &mut budget))?;
+                Response::Tree { nodes, truncated }
+            }
             Request::KbCat { uid } => Response::Content {
-                content: self.reads.read_with(move |c| kb::cat(c, &uid))?,
+                content: db.read_with(move |c| kb::cat(c, &uid))?,
             },
             Request::KbGrep {
                 pattern,
@@ -1081,8 +1140,15 @@ impl Backend for LocalBackend {
                 ignore_case,
                 mode,
             } => Response::GrepHits {
-                answer: self.reads.read_with(move |c| {
-                    kb::grep(c, &pattern, scope.as_deref(), ignore_case, mode)
+                answer: db.read_with(move |c| {
+                    kb::grep(
+                        c,
+                        &pattern,
+                        scope.as_deref(),
+                        ignore_case,
+                        mode,
+                        &mut budget,
+                    )
                 })?,
             },
             Request::KbSearch {
@@ -1091,9 +1157,9 @@ impl Backend for LocalBackend {
                 route,
                 limit,
                 context,
-            } => Response::SearchHits {
-                hits: kb::search(
-                    &self.reads,
+            } => {
+                let hits = kb::search(
+                    db,
                     self.embedder.as_ref(),
                     &kb::SearchAsk {
                         dsl,
@@ -1102,23 +1168,44 @@ impl Backend for LocalBackend {
                         limit,
                         context,
                     },
-                )?,
-            },
+                    &mut budget,
+                )?;
+                Response::SearchHits {
+                    hits,
+                    truncated: budget.exhausted(),
+                }
+            }
             Request::TaskReady {
                 dsl,
                 default_scope,
                 limit,
-            } => Response::Items {
-                items: self
-                    .reads
-                    .read(move |c| kb::ready(c, &dsl, default_scope.as_deref(), limit))?,
-            },
-            Request::TaskShow { uid } => Response::Task {
-                task: Box::new(self.reads.read_with(move |c| kb::task_show(c, &uid))?),
-            },
-            Request::TaskSubtasks { uid, all } => Response::Children {
-                children: self.reads.read_with(move |c| kb::subtasks(c, &uid, all))?,
-            },
+            } => {
+                let (items, truncated) = db.read(move |c| {
+                    let items = kb::ready(c, &dsl, default_scope.as_deref(), limit, &mut budget)?;
+                    Ok((items, budget.exhausted()))
+                })?;
+                Response::Items { items, truncated }
+            }
+            Request::TaskShow { uid } => {
+                let (task, truncated) = db.read_with(move |c| {
+                    let task = kb::task_show(c, &uid, &mut budget)?;
+                    Ok::<_, ApiError>((task, budget.exhausted()))
+                })?;
+                Response::Task {
+                    task: Box::new(task),
+                    truncated,
+                }
+            }
+            Request::TaskSubtasks { uid, all } => {
+                let (children, truncated) = db.read_with(move |c| {
+                    let children = kb::subtasks(c, &uid, all, &mut budget)?;
+                    Ok::<_, ApiError>((children, budget.exhausted()))
+                })?;
+                Response::Children {
+                    children,
+                    truncated,
+                }
+            }
         })
     }
 }

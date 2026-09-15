@@ -59,7 +59,10 @@ pub(crate) use jkb_core::item::{first_nonblank, title_of};
 /// Returns an error if a read fails.
 pub fn fetch_items(db: &Db, ids: &[ItemId]) -> Result<Vec<DisplayItem>> {
     let ids = ids.to_vec();
-    Ok(db.read(move |conn| jkb_api::kb::item_rows(conn, &ids))?)
+    // The host's own listing: unbounded, like the CLI it serves (only the daemon budgets a read).
+    Ok(db.read(move |conn| {
+        jkb_api::kb::item_rows(conn, &ids, &mut jkb_api::kb::Budget::UNLIMITED.clone())
+    })?)
 }
 
 /// Print items as JSON or human lines.
