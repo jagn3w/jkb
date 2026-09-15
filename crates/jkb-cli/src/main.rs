@@ -1277,7 +1277,6 @@ fn run(cli: Cli) -> Result<()> {
         // a read ported later is then served by its op here too, rather than by an arm below that
         // still compiles.
         cmd if ops_cli::handles(&cmd) => local_ops(&db, cmd, global, json),
-        Command::Ingest { path, ns } => cmd_ingest(&db, &path, ns.as_deref(), global, json),
         Command::Query { .. }
         | Command::Search { .. }
         | Command::Find { .. }
@@ -1285,7 +1284,8 @@ fn run(cli: Cli) -> Result<()> {
         | Command::Ls { .. }
         | Command::Tree { .. }
         | Command::Grep { .. }
-        | Command::Cat { .. } => {
+        | Command::Cat { .. }
+        | Command::Ingest { .. } => {
             anyhow::bail!("internal: a read-set command missed ops_cli's dispatch")
         }
         Command::Ns { cmd } => cmd_ns(&db, cmd, json),
@@ -1544,20 +1544,11 @@ fn embedder() -> Result<Arc<dyn Embedder + Send + Sync>> {
 /// `jkb serve` answers the dev container with, so the two cannot list different things.
 fn local_ops(db: &Db, command: Command, global: bool, json: bool) -> Result<()> {
     let mut backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
-    // Only a search embeds; building the embedder is not a cost `ls` should pay.
-    if matches!(command, Command::Search { .. }) {
+    // Only a search or an ingest embeds; building the embedder is not a cost `ls` should pay.
+    if matches!(command, Command::Search { .. } | Command::Ingest { .. }) {
         backend = backend.with_embedder(embedder()?);
     }
     ops_cli::Ops::new(&backend, global, json, false).run(command)
-}
-
-/// The ambient namespace for the current directory, unless `--global`.
-fn ambient(db: &Db, global: bool) -> Result<Option<String>> {
-    if global {
-        return Ok(None);
-    }
-    let cwd = std::env::current_dir()?;
-    Ok(db.read(move |conn| mount::ambient_namespace(conn, &cwd))?)
 }
 
 /// The ambient repo key: the full namespace path of the `file://` mount covering the
@@ -1586,47 +1577,6 @@ fn confirm_global_backlog() -> Result<bool> {
 }
 
 // ---- commands -------------------------------------------------------------
-
-fn cmd_ingest(db: &Db, path: &str, ns: Option<&str>, global: bool, json: bool) -> Result<()> {
-    let namespace = match ns {
-        Some(n) => n.to_owned(),
-        None => ambient(db, global)?.unwrap_or_else(|| "inbox".to_owned()),
-    };
-    let pipeline = Pipeline::new(embedder()?);
-    let is_url = path.starts_with("http://") || path.starts_with("https://");
-    let outcome = if is_url {
-        pipeline.ingest_url(db, path, &namespace)?
-    } else {
-        pipeline.ingest_path(db, Path::new(path), &namespace)?
-    };
-
-    if json {
-        let v = serde_json::json!({
-            "document": outcome.document.get(),
-            "chunk_count": outcome.chunk_count,
-            "embedded": outcome.embedded,
-            "already_ingested": outcome.already_ingested,
-            "warnings": outcome.warnings,
-        });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else {
-        let state = if outcome.already_ingested {
-            "already ingested"
-        } else if outcome.embedded {
-            "ingested + embedded"
-        } else {
-            "captured (not embedded)"
-        };
-        println!(
-            "{state}: document {} under {namespace} ({} chunks)",
-            outcome.document, outcome.chunk_count
-        );
-        for w in &outcome.warnings {
-            println!("  warning: {w}");
-        }
-    }
-    Ok(())
-}
 
 /// `jkb stat <uid>` — compact metadata for one item (no body).
 fn cmd_stat(db: &Db, uid: &str, json: bool) -> Result<()> {

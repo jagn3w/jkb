@@ -40,8 +40,7 @@ pub const fn support(command: &Command) -> Support {
         Command::Serve { .. } => {
             Support::Refused("the daemon runs on the host, next to the database")
         }
-        Command::Ingest { .. }
-        | Command::Mount { .. }
+        Command::Mount { .. }
         | Command::Sync { .. }
         | Command::Service { .. } => Support::Refused(HOST_ONLY),
         // The queue, and the agent read set (tasks S6.1). `ops_cli::handles` names the same reads for
@@ -55,6 +54,8 @@ pub const fn support(command: &Command) -> Support {
         | Command::Tree { .. }
         | Command::Grep { .. }
         | Command::Cat { .. }
+        // Parsed here, stored there (tasks S6.3): the daemon is sent only the extracted text.
+        | Command::Ingest { .. }
         | Command::Task {
             cmd:
                 TaskCmd::Next { .. }
@@ -325,7 +326,6 @@ mod tests {
         for host_only in [
             vec!["sync"],
             vec!["mount", "ls"],
-            vec!["ingest", "/etc/passwd"],
             vec!["service", "install"],
             vec!["serve"],
         ] {
@@ -367,6 +367,7 @@ mod tests {
             vec!["tree"],
             vec!["grep", "x"],
             vec!["cat", "u"],
+            vec!["ingest", "notes.md"],
             vec!["task", "next"],
             vec!["task", "show", "u"],
             vec!["task", "subtasks", "u"],

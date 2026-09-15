@@ -4127,7 +4127,7 @@ fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
     for refused in [
         &["task", "reclaim"][..],
         &["sync"],
-        &["ingest", "/etc/hostname"],
+        &["mount", "ls"],
         &["serve"],
     ] {
         let out = remote(refused);
@@ -4201,4 +4201,105 @@ fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `jkb ingest` in the container reads and parses its own file and sends the daemon only the text: the
+/// document lands in the host's database, keyword-searchable and unembedded, and a source too large for
+/// one request is refused with where to run it instead.
+#[test]
+fn ingest_through_the_daemon_sends_text_and_the_host_stores_it() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let client_home = root.join("container-home");
+    std::fs::create_dir_all(&client_home).unwrap();
+    let db = root.join("host.db");
+    let token = root.join("daemon/token");
+    let note = client_home.join("notes.md");
+    std::fs::write(
+        &note,
+        "# Heading\n\nOnly the container can read this file: zanzibar.\n",
+    )
+    .unwrap();
+
+    let (mut serve, url) = Daemon::spawn({
+        let mut cmd = jkb(&db);
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(&token)
+            .env("HOME", root.join("host-home"));
+        cmd
+    });
+    let remote = |args: &[&str]| {
+        jkb_bare()
+            .args(args)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env_remove("JKB_DB")
+            .current_dir(&client_home)
+            .output()
+            .unwrap()
+    };
+    let out = remote(&[
+        "--json",
+        "ingest",
+        note.to_str().unwrap(),
+        "--ns",
+        "references/notes",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["embedded"], false, "{v}");
+    assert!(v["warnings"].to_string().contains("index --pending"), "{v}");
+
+    let found = remote(&["search", "--route", "fts", "zanzibar"]);
+    assert!(
+        String::from_utf8_lossy(&found.stdout).contains("references/notes"),
+        "found through the daemon: {}{}",
+        String::from_utf8_lossy(&found.stdout),
+        String::from_utf8_lossy(&found.stderr)
+    );
+
+    let big = client_home.join("big.txt");
+    std::fs::write(&big, "word ".repeat(300_000)).unwrap();
+    let out = remote(&["ingest", big.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("run it on the host"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serve.stop();
+
+    // Stored by the host: the document is there, and nothing of the container's file but its text.
+    let blob_count = || {
+        let out = jkb(&db).args(["--json", "blob", "ls"]).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+        v.as_array().map_or(0, Vec::len)
+    };
+    assert_eq!(blob_count(), 0, "no source blob from the container");
+    let listed = jkb(&db)
+        .args(["--global", "query", "kind:document"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("Heading"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    // The host's own ingest of the file still addresses it by its bytes and keeps them.
+    let out = jkb(&db)
+        .args(["ingest", note.to_str().unwrap(), "--ns", "references/notes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(blob_count(), 1, "the host's ingest stores its source");
 }

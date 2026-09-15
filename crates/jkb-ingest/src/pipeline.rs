@@ -39,6 +39,7 @@ pub struct Pipeline {
     embedder: Arc<dyn Embedder + Send + Sync>,
     chunking: ChunkConfig,
     version: i64,
+    actor: &'static str,
 }
 
 /// The result of ingesting one source.
@@ -80,7 +81,15 @@ impl Pipeline {
             embedder,
             chunking: ChunkConfig::default(),
             version: 1,
+            actor: "ingest",
         }
+    }
+
+    /// Record the capture in the changelog as `actor`'s write (`jkb serve` records `serve`).
+    #[must_use]
+    pub const fn with_actor(mut self, actor: &'static str) -> Self {
+        self.actor = actor;
+        self
     }
 
     /// Override the chunking configuration.
@@ -107,7 +116,7 @@ impl Pipeline {
     pub fn ingest_path(&self, db: &Db, path: &Path, namespace: &str) -> Result<Outcome> {
         let bytes = std::fs::read(path)?;
         let parsed = adapter::parse(path, &bytes)?;
-        self.ingest(db, &bytes, &parsed, namespace)
+        self.ingest(db, Some(&bytes), &parsed, namespace)
     }
 
     /// Ingest a URL (design D18): render it in a headless browser (so client-side
@@ -122,22 +131,27 @@ impl Pipeline {
     pub fn ingest_url(&self, db: &Db, url: &str, namespace: &str) -> Result<Outcome> {
         let html = crate::fetch::render_url(url)?;
         let parsed = adapter::HtmlAdapter.parse(html.as_bytes())?;
-        self.ingest(db, html.as_bytes(), &parsed, namespace)
+        self.ingest(db, Some(html.as_bytes()), &parsed, namespace)
     }
 
-    /// Ingest already-read `raw` bytes with their `parsed` document (the seam
-    /// [`Pipeline::ingest_url`] reuses: fetch → parse → `ingest`).
+    /// Ingest a `parsed` document, with the `raw` bytes it was parsed from when the caller has them
+    /// (the seam [`Pipeline::ingest_url`] and `jkb_api`'s `ingest.text` reuse).
+    ///
+    /// With `raw`, the source is content-addressed by those bytes and they are stored as its blob. Without
+    /// — text parsed by a client that did not send its source, as the dev container's `jkb ingest`
+    /// through `jkb serve` — it is addressed by the text itself and no blob is stored: a hash the client
+    /// named for bytes the host never saw would let it pick which document's uid its text lands on.
     ///
     /// # Errors
     /// See [`Pipeline::ingest_path`].
     pub fn ingest(
         &self,
         db: &Db,
-        raw: &[u8],
+        raw: Option<&[u8]>,
         parsed: &ParsedDocument,
         namespace: &str,
     ) -> Result<Outcome> {
-        let source_hash = blob::hash_bytes(raw);
+        let source_hash = blob::hash_bytes(raw.unwrap_or(parsed.text.as_bytes()));
         let mut warnings = Vec::new();
         if parsed.text.trim().chars().count() < MIN_USABLE_CHARS {
             warnings.push(format!(
@@ -197,13 +211,13 @@ impl Pipeline {
     fn capture(
         &self,
         db: &Db,
-        raw: &[u8],
+        raw: Option<&[u8]>,
         parsed: &ParsedDocument,
         namespace: &str,
         source_hash: &str,
         chunks: Vec<String>,
     ) -> Result<Capture> {
-        let raw = raw.to_vec();
+        let raw = raw.map(<[u8]>::to_vec);
         let text = parsed.text.clone();
         let mime = parsed.mime.clone();
         let namespace = namespace.to_owned();
@@ -212,7 +226,7 @@ impl Pipeline {
         let model = self.embedder.model().to_owned();
         let pipeline_version = self.version;
 
-        db.write_txn_with::<Capture, Error, _>("ingest", move |conn, meta| {
+        db.write_txn_with::<Capture, Error, _>(self.actor, move |conn, meta| {
             let key = ingestion::Key {
                 source_hash: &hash,
                 pipeline_version,
@@ -267,7 +281,9 @@ impl Pipeline {
                     })
                 }
                 None => {
-                    blob::store(conn, &hash, &raw, Some(&mime))?;
+                    if let Some(raw) = &raw {
+                        blob::store(conn, &hash, raw, Some(&mime))?;
+                    }
                     let ns_id = ns::ensure(conn, &namespace)?;
                     let document = item::upsert(
                         conn,

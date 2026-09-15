@@ -205,6 +205,12 @@ fn samples() -> Vec<Request> {
             uid: "u".into(),
             owner: "agent:x".into(),
         },
+        Request::IngestText(super::ingest::IngestAsk {
+            text: "t".into(),
+            mime: "text/plain".into(),
+            namespace: "inbox".into(),
+            raw: None,
+        }),
     ]
 }
 
@@ -2280,4 +2286,112 @@ fn an_edit_or_add_filed_in_a_tasks_md_must_read_back_as_written() {
         ErrorCode::Invalid,
         "a quoted title with a blank line: {e:?}"
     );
+}
+
+/// A client's text is captured without a model: the daemon's backend has no embedder, so the document
+/// is keyword-searchable at once and left for the host's `jkb index --pending`. Addressed by its text,
+/// with no blob, and the same text again is the same document.
+#[test]
+fn ingest_text_captures_a_client_s_text_without_calling_a_model() {
+    let db = Db::open_in_memory().unwrap();
+    let daemon = LocalBackend::new(db.clone()).with_actor("serve");
+    let text = "Ingested from the container. ".repeat(80);
+    let ask = json!({ "op": "ingest.text", "text": text, "mime": "text/markdown", "namespace": "references/notes" });
+    let Response::Ingested { ingested } = call(&daemon, ask.clone()).unwrap() else {
+        panic!("ingested")
+    };
+    assert!(!ingested.embedded);
+    assert!(ingested.chunk_count > 1, "{ingested:?}");
+    assert!(
+        ingested
+            .warnings
+            .iter()
+            .any(|w| w.contains("index --pending")),
+        "{ingested:?}"
+    );
+    let Response::Ingested { ingested: again } = call(&daemon, ask).unwrap() else {
+        panic!("ingested")
+    };
+    assert_eq!(
+        again.document, ingested.document,
+        "the same text is the same document"
+    );
+    let (uid, blobs, actor) = db
+        .read(move |c| {
+            let uid: String = c.query_row(
+                "SELECT uid FROM items WHERE id = ?1",
+                [ingested.document],
+                |r| r.get(0),
+            )?;
+            let blobs: i64 = c.query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))?;
+            let actor: String = c.query_row(
+                "SELECT actor FROM changelog WHERE entity_type = 'items' ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((uid, blobs, actor))
+        })
+        .unwrap();
+    assert_eq!(
+        uid,
+        format!("b3:{}", jkb_ingest::blob::hash_bytes(text.as_bytes()))
+    );
+    assert_eq!(blobs, 0, "no source bytes, so no blob");
+    assert_eq!(actor, "serve");
+    let Response::SearchHits { hits, .. } = call(
+        &daemon,
+        json!({ "op": "kb.search", "dsl": "container", "route": "fts", "limit": 5 }),
+    )
+    .unwrap() else {
+        panic!("hits")
+    };
+    assert!(!hits.is_empty(), "keyword-searchable at once");
+}
+
+/// The source bytes address a document only from the host's own process: they are not a field of the
+/// wire, so a client cannot name the hash its text is filed under.
+#[test]
+fn ingest_text_takes_source_bytes_only_in_process() {
+    let e = serde_json::from_value::<Request>(json!({
+        "op": "ingest.text", "text": "t", "mime": "text/plain", "namespace": "inbox", "raw": [1, 2]
+    }))
+    .unwrap_err();
+    assert!(e.to_string().contains("raw"), "{e}");
+    let db = Db::open_in_memory().unwrap();
+    let host = LocalBackend::new(db.clone());
+    let raw = b"# Title\n\nthe markdown source".to_vec();
+    let Response::Ingested { ingested } = host
+        .call(Request::IngestText(super::ingest::IngestAsk {
+            text: "Title the markdown source".into(),
+            mime: "text/markdown".into(),
+            namespace: "inbox".into(),
+            raw: Some(raw.clone()),
+        }))
+        .unwrap()
+    else {
+        panic!("ingested")
+    };
+    let (uid, blob) = db
+        .read(move |c| {
+            let uid: String = c.query_row(
+                "SELECT uid FROM items WHERE id = ?1",
+                [ingested.document],
+                |r| r.get(0),
+            )?;
+            let blob = jkb_core::blob::load(c, &uid[3..])?;
+            Ok((uid, blob))
+        })
+        .unwrap();
+    assert_eq!(uid, format!("b3:{}", jkb_ingest::blob::hash_bytes(&raw)));
+    assert_eq!(
+        blob.as_deref(),
+        Some(&raw[..]),
+        "stored as the document's blob"
+    );
+    let e = call(
+        &host,
+        json!({ "op": "ingest.text", "text": "t", "mime": "x".repeat(super::ingest::MAX_MIME_BYTES + 1), "namespace": "inbox" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
 }

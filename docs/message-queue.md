@@ -85,6 +85,7 @@ routinely built from different checkouts.
 | `task.bind` | `uid`, `sync?` (`managed:` when absent) | `applied` |
 | `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
 | `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
+| `ingest.text` | `text`, `mime` (≤ 255 bytes), `namespace` | `ingested` {`document`, `namespace`, `chunk_count`, `embedded`, `already_ingested`, `warnings`} |
 
 Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`, `history`) and `grep_hits`
 carries `truncated: true` when the read was cut — at its byte budget, or a tree at its node cap — and
@@ -167,6 +168,29 @@ Two decisions in it:
   into client-side work and ops; `task reclaim` proves owners gone by probing their processes, which
   only their host can do — a claim held by a live or unestablished owner is refused by `task.claim`
   from anywhere; and `task mirror` is a sweep over every task.
+
+**Ingest** (`ingest.text`; tasks S6.3, `crates/jkb-api/src/ingest.rs`). `jkb ingest <file|url>` reads
+and parses its source where it runs (`jkb_ingest::read_source`: a file by its extension, a URL rendered
+in a headless browser) and sends only the extracted text. In the dev container that means the
+container's file, a page fetched through the container's egress firewall, and PDF/HTML parsers running
+on the container's kernel — design H4 refuses a path (the host would read a host path), a URL (the host
+would fetch outside the firewall) and raw bytes (the host's parsers would take the container's input).
+The host chunks the text — character windows, not a format parser — so the chunking strategy stays in
+the ingestion's idempotency key, and captures it through the same `Pipeline::ingest` as ever.
+- **Addressed by what the host saw.** From the host's own process the raw bytes travel with the request
+  (`IngestAsk::raw`, `#[serde(skip)]`, so never on the wire): the document is `b3:<hash of the bytes>`
+  and the bytes are its blob, exactly as a host ingest always was, so re-ingesting a file ingested
+  before this op is still a no-op. Through the daemon there are no bytes, so the document is
+  `b3:<hash of the text>` and no blob is stored — a hash the client named for bytes the host never saw
+  would let it choose which document's uid its text is filed under. The same file ingested from the
+  container and from the host is therefore two documents when its text differs from its bytes.
+- **No model call for a client.** `jkb serve` has no embedder (as for search), so a container's ingest
+  is captured, keyword-searchable at once, and answered `embedded: false` with a warning; it gains vectors
+  when the host runs `jkb index --pending`. The capture is keyed by the host's default model, so where
+  the two address it alike — a plain-text file, whose text is its bytes — the host's own `jkb ingest`
+  resumes it and embeds rather than capturing it again.
+- **Size.** The request is bounded by the daemon's body cap (1 MiB); past it the CLI says to run it on
+  the host.
 
 The `notify.*` ops are the permission-notification machine, which runs in the daemon and sends its
 effects on `claude/notify` as `notify.post` (payload `id`, `session`, `title`, `subtitle`, `body`; TTL
@@ -419,10 +443,10 @@ host.
 **Remote mode.** With `JKB_REMOTE=http://<host>:<port>` set (and `JKB_REMOTE_TOKEN_FILE`, default
 `~/.jkb/daemon/<port>/token` for that URL's port), `jkb`:
 
-- runs `jkb mq …`, the agent read set and the task-mutate set (above) through the daemon;
+- runs `jkb mq …`, the agent read set, the task-mutate set and `jkb ingest` (above) through the daemon;
 - runs the commands that need no database (`notify`, `guide`, `commands`) as usual;
 - **refuses everything else before it does anything** — with a reason: host-only commands (`sync`,
-  `mount`, `ingest`, `service`, `serve`) never go through the daemon, the rest are not ported yet;
+  `mount`, `service`, `serve`) never go through the daemon, the rest are not ported yet;
 - refuses `--db`, and a non-empty `JKB_DB` — a process configured with both names a database two ways
   at once, and silently obeying one hides the other;
 - treats an error body that is not the daemon's (a proxy's `502`, say) as `unavailable`, and re-reads
@@ -460,11 +484,13 @@ migration's lock),
 
 ## Not yet
 
-- `JKB_REMOTE` set in the container — at the cutover (tasks S6), not before: remote mode refuses
-  `JKB_DB` and every unported command, and the container's agents still need both. The network path
+- `JKB_REMOTE` set in the container — at the cutover (tasks S6.5), not before: remote mode refuses
+  `JKB_DB` and every unported command, and the container's agents still need both. Decided with the user
+  (2026-09-15): the cutover waits until nothing the container's agents use is refused — the session
+  verbs above all, since `jkb task work` makes the worktrees agents run in. The network path
   it will take already exists; see `.container/README.md`, "The one opening to the host".
-- Client-side ingest and the cutover — stage S6.3. The read set (S6.1) and the task-mutate set (S6.2)
-  are done; `stat`, `item show`/`edit`/`rm`, `related`, `inv`, `view`, `ns`, `tag`, `undo`,
+- The rest of the container's commands, then the cutover — stages S6.4/S6.5. The read set (S6.1), the
+  task-mutate set (S6.2) and ingest (S6.3) are done; `stat`, `item show`/`edit`/`rm`, `related`, `inv`, `view`, `ns`, `tag`, `undo`,
   `history`, `blob`, and the session verbs (`task start`/`work`/`land`/…) are still refused remotely.
 - The MCP server's read tools (`jkb-mcp/src/logic.rs`) still read the database directly rather than
   through `jkb-api` (design H4 says they should become its callers).

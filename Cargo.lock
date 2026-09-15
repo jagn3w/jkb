@@ -1897,6 +1897,8 @@ name = "jkb-api"
 version = "0.1.0"
 dependencies = [
  "jkb-core",
+ "jkb-embed",
+ "jkb-ingest",
  "jkb-search",
  "jkb-sync",
  "jkb-types",

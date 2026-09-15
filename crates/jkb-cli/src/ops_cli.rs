@@ -16,7 +16,7 @@ use anyhow::{bail, Result};
 use jkb_api::kb::{
     Child, GrepAnswer, GrepMode, ItemRow, QueryOrder, SearchRoute, TaskDetail, TreeNode,
 };
-use jkb_api::{ApiError, Backend, Request, Response};
+use jkb_api::{ApiError, Backend, ErrorCode, Request, Response};
 
 use super::{first_line, output, output_line, Command, TaskCmd};
 
@@ -37,7 +37,8 @@ pub const fn handles(command: &Command) -> bool {
         | Command::Ls { .. }
         | Command::Tree { .. }
         | Command::Grep { .. }
-        | Command::Cat { .. } => true,
+        | Command::Cat { .. }
+        | Command::Ingest { .. } => true,
         Command::Task { cmd } => matches!(
             cmd,
             TaskCmd::Next { .. }
@@ -155,6 +156,7 @@ impl<'a> Ops<'a> {
                 count,
             } => self.grep(&pattern, path.as_deref(), ignore_case, names_only, count),
             Command::Cat { uid } => self.cat(&uid),
+            Command::Ingest { path, ns } => self.ingest(&path, ns.as_deref()),
             Command::Task { cmd } => match cmd {
                 TaskCmd::Next { terms, limit } => self.task_next(&terms.join(" "), limit),
                 TaskCmd::Show { uid } => self.task_show(&uid),
@@ -171,7 +173,14 @@ impl<'a> Ops<'a> {
         let response = self
             .backend
             .call(request)
-            .map_err(|e: ApiError| anyhow::Error::msg(e.message))?;
+            .map_err(|e: ApiError| match e.code {
+                // The daemon's body cap is its own; the host takes the same request whole.
+                ErrorCode::TooLarge if self.remote => anyhow::anyhow!(
+                    "{} — larger than the daemon accepts in one request; run it on the host",
+                    e.message
+                ),
+                _ => anyhow::Error::msg(e.message),
+            })?;
         // What cut it decides what lifts it: the daemon's byte budget is lifted on the host, which has
         // none; a tree's node cap is the same everywhere.
         let notice = match &response {
@@ -194,6 +203,53 @@ impl<'a> Ops<'a> {
             self.notices.borrow_mut().push(notice);
         }
         Ok(response)
+    }
+
+    /// `jkb ingest`: read and parse the source here — in the dev container, the container's file or a
+    /// page fetched through its firewall — and send the host only the text (`ingest.text`). In this
+    /// host's own process the raw bytes go too, so the document is addressed and stored by them as a
+    /// host ingest always was; they never cross the wire.
+    fn ingest(&self, source: &str, ns: Option<&str>) -> Result<()> {
+        let namespace = match ns {
+            Some(n) => n.to_owned(),
+            None => self.ambient()?.unwrap_or_else(|| "inbox".to_owned()),
+        };
+        let (raw, parsed) = jkb_ingest::read_source(source)?;
+        let ingested = match self.call(Request::IngestText(jkb_api::ingest::IngestAsk {
+            text: parsed.text,
+            mime: parsed.mime,
+            namespace,
+            raw: (!self.remote).then_some(raw),
+        }))? {
+            Response::Ingested { ingested } => ingested,
+            other => return unexpected("ingest.text", &other),
+        };
+        if self.json {
+            let v = serde_json::json!({
+                "document": ingested.document,
+                "chunk_count": ingested.chunk_count,
+                "embedded": ingested.embedded,
+                "already_ingested": ingested.already_ingested,
+                "warnings": ingested.warnings,
+            });
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            return Ok(());
+        }
+        let state = if ingested.already_ingested {
+            "already ingested"
+        } else if ingested.embedded {
+            "ingested + embedded"
+        } else {
+            "captured (not embedded)"
+        };
+        println!(
+            "{state}: document {} under {} ({} chunks)",
+            ingested.document, ingested.namespace, ingested.chunk_count
+        );
+        for w in &ingested.warnings {
+            println!("  warning: {w}");
+        }
+        Ok(())
     }
 
     /// The ambient namespace for this process's working directory, unless `--global`.

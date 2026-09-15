@@ -144,7 +144,7 @@ fn ingest_captures_embeds_and_is_searchable() {
     let text = "The Rust programming language emphasizes safety and performance \
                 across systems software without a garbage collector.";
     let outcome = pipeline(true)
-        .ingest(&db, text.as_bytes(), &doc(text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
         .unwrap();
 
     assert!(outcome.embedded);
@@ -173,7 +173,7 @@ fn capture_survives_embedder_down_and_is_keyword_searchable() {
     let db = open_db();
     let text = "Photosynthesis converts light energy into chemical energy in plant chloroplasts.";
     let outcome = pipeline(false)
-        .ingest(&db, text.as_bytes(), &doc(text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
         .unwrap();
 
     assert!(!outcome.embedded, "embedder down => not embedded");
@@ -197,7 +197,7 @@ fn index_pending_embeds_captured_items() {
     let db = open_db();
     let text = "Distributed systems must reason about partial failure and network partitions.";
     pipeline(false)
-        .ingest(&db, text.as_bytes(), &doc(text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
         .unwrap();
     let before = pipeline(true).unembedded_count(&db).unwrap();
     assert!(before >= 1);
@@ -214,20 +214,20 @@ fn resume_embeds_after_embedder_recovers() {
 
     // First ingest with the embedder down: captured, not embedded.
     let down = pipeline(false)
-        .ingest(&db, text.as_bytes(), &doc(text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
         .unwrap();
     assert!(!down.embedded);
 
     // Re-ingest with a healthy embedder: resumes at the embed stage (not a no-op).
     let up = pipeline(true)
-        .ingest(&db, text.as_bytes(), &doc(text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
         .unwrap();
     assert!(up.embedded);
     assert!(!up.already_ingested, "was resumed, not already complete");
 
     // A third ingest is now a true no-op.
     let again = pipeline(true)
-        .ingest(&db, text.as_bytes(), &doc(text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
         .unwrap();
     assert!(again.already_ingested);
     assert_eq!(pipeline(true).unembedded_count(&db).unwrap(), 0);
@@ -238,13 +238,13 @@ fn duplicate_source_is_stored_once() {
     let db = open_db();
     let text = "Idempotent ingestion means re-running is a no-op.";
     pipeline(true)
-        .ingest(&db, text.as_bytes(), &doc(text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
         .unwrap();
     let items_after_first = item_count(&db);
 
     // Same bytes again (as if from a different path): no new items, one blob.
     let second = pipeline(true)
-        .ingest(&db, text.as_bytes(), &doc(text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(text), "docs")
         .unwrap();
     assert!(second.already_ingested);
     assert_eq!(item_count(&db), items_after_first, "no duplicate items");
@@ -284,7 +284,7 @@ fn capture_failure_rolls_back_leaving_no_partial_items() {
     .unwrap();
     let before = item_count(&db);
 
-    let result = pipeline(true).ingest(&db, text.as_bytes(), &doc(&text), "docs");
+    let result = pipeline(true).ingest(&db, Some(text.as_bytes()), &doc(&text), "docs");
     assert!(result.is_err(), "colliding chunk uid must fail the capture");
 
     // Nothing partial: the document was rolled back, only the seeded collider remains.
@@ -313,11 +313,11 @@ proptest! {
     #[test]
     fn reingest_is_a_noop(body in "[a-zA-Z0-9 ]{20,200}") {
         let db = open_db();
-        let first = pipeline(true).ingest(&db, body.as_bytes(), &doc(&body), "docs").unwrap();
+        let first = pipeline(true).ingest(&db, Some(body.as_bytes()), &doc(&body), "docs").unwrap();
         prop_assert!(!first.already_ingested);
         let count_after_first = item_count(&db);
 
-        let second = pipeline(true).ingest(&db, body.as_bytes(), &doc(&body), "docs").unwrap();
+        let second = pipeline(true).ingest(&db, Some(body.as_bytes()), &doc(&body), "docs").unwrap();
         prop_assert!(second.already_ingested);
         prop_assert_eq!(item_count(&db), count_after_first);
     }
@@ -363,7 +363,7 @@ fn index_pending_skips_a_rejected_item_and_keeps_the_rest() {
     // Capture with the embedder down so everything lands in the pending set.
     let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(4);
     pipeline(false)
-        .ingest(&db, text.as_bytes(), &doc(&text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(&text), "docs")
         .unwrap();
     // An oversized non-document item, which has no chunks to fall back on.
     let huge = "x".repeat(500);
@@ -415,7 +415,7 @@ fn a_documents_vector_is_the_centroid_of_its_chunks() {
     let pipe = pipeline(true);
     let text = "one two three four five six seven eight nine ten eleven twelve ".repeat(6);
     let outcome = pipe
-        .ingest(&db, text.as_bytes(), &doc(&text), "docs")
+        .ingest(&db, Some(text.as_bytes()), &doc(&text), "docs")
         .unwrap();
     assert!(outcome.chunk_count > 1, "need several chunks to average");
 

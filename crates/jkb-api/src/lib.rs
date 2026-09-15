@@ -28,6 +28,7 @@ use jkb_types::Embedder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod ingest;
 pub mod kb;
 pub mod tasks;
 
@@ -379,6 +380,9 @@ pub enum Request {
         /// The owner id.
         owner: String,
     },
+    /// Store a document whose text the client extracted, and chunk it.
+    #[serde(rename = "ingest.text")]
+    IngestText(ingest::IngestAsk),
 }
 
 /// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
@@ -617,6 +621,7 @@ impl Request {
         "task.bind",
         "task.claim",
         "task.release",
+        "ingest.text",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -658,6 +663,7 @@ impl Request {
             Self::TaskBind { .. } => "task.bind",
             Self::TaskClaim { .. } => "task.claim",
             Self::TaskRelease { .. } => "task.release",
+            Self::IngestText(_) => "ingest.text",
         }
     }
 
@@ -707,7 +713,8 @@ impl Request {
             | Self::TaskUnplace { .. }
             | Self::TaskBind { .. }
             | Self::TaskClaim { .. }
-            | Self::TaskRelease { .. } => false,
+            | Self::TaskRelease { .. }
+            | Self::IngestText(_) => false,
         }
     }
 }
@@ -876,6 +883,12 @@ pub enum Response {
     /// A `task.add` that created nothing: outside any repo, `backlog` needs the user's assent to use
     /// the global backlog. Ask, and send the request again with `global_backlog`.
     NeedsGlobalBacklogAssent {},
+    /// An `ingest.text`.
+    Ingested {
+        /// What was stored.
+        #[serde(flatten)]
+        ingested: ingest::Ingested,
+    },
     /// A `task.show`.
     Task {
         /// The task.
@@ -918,6 +931,7 @@ impl Response {
             | Self::Claimed { .. }
             | Self::Released { .. }
             | Self::Edited { .. }
+            | Self::Ingested { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -956,6 +970,7 @@ impl Response {
             | Self::Released { .. }
             | Self::History { .. }
             | Self::Edited { .. }
+            | Self::Ingested { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -1600,6 +1615,9 @@ impl Backend for LocalBackend {
                     })?,
                 }
             }
+            Request::IngestText(ask) => Response::Ingested {
+                ingested: ingest::ingest(db, actor, self.embedder.as_ref(), &ask)?,
+            },
             Request::TaskSubtasks { uid, all } => {
                 let (children, truncated) = db.read_with(move |c| {
                     let children = kb::subtasks(c, &uid, all, &mut budget)?;
