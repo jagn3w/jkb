@@ -1009,9 +1009,21 @@ fn an_unread_answer_holds_its_permit_until_the_write_deadline() {
         body.len()
     )
     .unwrap();
-    // Never read. Give the daemon time to finish the call itself, so what holds the permit next is the
-    // unwritten answer rather than the read still running.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Read only the head: it is written after the call returned, so what holds the permit from here is
+    // the unwritten body rather than the read still running. Then never read again.
+    {
+        use std::io::BufRead as _;
+        let mut head = std::io::BufReader::new(stalled.try_clone().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            head.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
 
     let c = f.client();
     let ls = || {

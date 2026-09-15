@@ -919,6 +919,7 @@ fn writer_process() {
 
 /// A poll or tail over a topic holding more than [`MAX_BATCH`] messages reads at most that many: both
 /// run on the daemon's writer beside the notification hook, whatever the topic's creator let it hold.
+/// Asking for more is refused, not served short — a consumer reads a short batch as caught up.
 #[test]
 fn a_batch_is_bounded_whatever_it_asks_for() {
     let db = db_with_topic(TopicSpec::default());
@@ -926,7 +927,14 @@ fn a_batch_is_bounded_whatever_it_asks_for() {
         do_send(&db, draft("k", n), 1_000).unwrap();
     }
     do_group(&db, "g", Start::FromStart, 1_000);
-    assert_eq!(do_poll(&db, "g", usize::MAX, 1_000).len(), MAX_BATCH);
+    let refused = db
+        .write_txn("t", |c, m| poll(c, m, "t", "g", MAX_BATCH + 1, None, 1_000))
+        .unwrap_err();
+    assert!(
+        matches!(queue_err(refused), QueueError::Invalid { what: "max", .. }),
+        "a poll past the batch is refused"
+    );
+    assert_eq!(do_poll(&db, "g", MAX_BATCH, 1_000).len(), MAX_BATCH);
     let refused = db.read(|c| tail(c, "t", MAX_BATCH + 1, 1_000)).unwrap_err();
     assert!(
         matches!(

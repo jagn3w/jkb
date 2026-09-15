@@ -25,8 +25,9 @@ pub fn like_escape(s: &str) -> String {
 /// `SQLite` refuses a statement with more than 32,766 variables, so a placeholder list failed outright
 /// for a namespace or a frontier that large — a read that should have come back cut short came back
 /// an internal error — and a statement whose text grows with its list defeats `prepare_cached`, one
-/// cached statement per length. A list bounded by construction (a path's ancestors, a query's kinds)
-/// may still use placeholders.
+/// cached statement per length. Only a list bounded by construction — a path's ancestors — may still
+/// use placeholders; anything a client's text can lengthen may not (a query's kinds were exempted once,
+/// and `kind:a,a,…` from a request body refused its statement).
 #[must_use]
 pub fn json_ids(ids: impl IntoIterator<Item = i64>) -> String {
     let ids: Vec<i64> = ids.into_iter().collect();
@@ -61,6 +62,13 @@ mod tests {
             assert!(crate::binding::items_for_uris(c, &uris)?.is_empty());
             let q = crate::query::Query {
                 ids: ids.clone(),
+                ..crate::query::Query::default()
+            };
+            assert!(q.evaluate(c)?.is_empty());
+            let kinds: Vec<String> = (1..=40_000).map(|i| format!("k{i}")).collect();
+            let q = crate::query::Query {
+                kinds: kinds.clone(),
+                exclude_kinds: kinds,
                 ..crate::query::Query::default()
             };
             assert!(q.evaluate(c)?.is_empty());

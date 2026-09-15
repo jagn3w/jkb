@@ -206,15 +206,15 @@ impl Query {
             clauses.push("i.kind = ?".to_owned());
             params.push(Value::Text(kind.clone()));
         }
+        // Bound as one list each: a query's kinds come from DSL text a client wrote, so they are as
+        // long as it likes (`sql::json_ids`).
         if !self.kinds.is_empty() {
-            let placeholders = vec!["?"; self.kinds.len()].join(", ");
-            clauses.push(format!("i.kind IN ({placeholders})"));
-            params.extend(self.kinds.iter().cloned().map(Value::Text));
+            clauses.push("i.kind IN (SELECT value FROM json_each(?))".to_owned());
+            params.push(Value::Text(crate::sql::json_strings(&self.kinds)));
         }
         if !self.exclude_kinds.is_empty() {
-            let placeholders = vec!["?"; self.exclude_kinds.len()].join(", ");
-            clauses.push(format!("i.kind NOT IN ({placeholders})"));
-            params.extend(self.exclude_kinds.iter().cloned().map(Value::Text));
+            clauses.push("i.kind NOT IN (SELECT value FROM json_each(?))".to_owned());
+            params.push(Value::Text(crate::sql::json_strings(&self.exclude_kinds)));
         }
         if !self.ids.is_empty() {
             clauses.push("i.id IN (SELECT value FROM json_each(?))".to_owned());

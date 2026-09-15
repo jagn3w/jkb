@@ -66,8 +66,8 @@ pub enum MqCmd {
         /// Commit each message before emitting it: a crash loses it instead of redelivering it.
         #[arg(long)]
         at_most_once: bool,
-        /// Messages fetched per poll.
-        #[arg(long, default_value_t = 50)]
+        /// Messages fetched per poll (1 to 256, the queue's batch limit).
+        #[arg(long, default_value_t = 50, value_parser = batch_size)]
         batch: usize,
         /// How long to wait between polls that found nothing, in milliseconds.
         #[arg(long, default_value_t = 250)]
@@ -441,7 +441,7 @@ fn dispatch(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
                 group,
                 from_start,
                 at_most_once,
-                batch: batch.max(1),
+                batch,
                 interval: Duration::from_millis(interval_ms.max(1)),
                 // Longer than the remote client's 5 s unreachable cache, so a restart fits.
                 eof_ack_wait: Duration::from_secs(10),
@@ -464,6 +464,19 @@ trait ReadToStringChecked {
 impl ReadToStringChecked for std::io::Stdin {
     fn read_to_string_checked(&mut self, buf: &mut String) -> std::io::Result<usize> {
         std::io::Read::read_to_string(self, buf)
+    }
+}
+
+/// `--batch`, held to what a poll serves. Checked here rather than clamped, because the stream reads
+/// a batch shorter than it asked for as caught up: a batch above the queue's limit would announce
+/// `caught_up` after every capped poll of a backlog.
+fn batch_size(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if (1..=jkb_core::mq::MAX_BATCH).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "a batch is 1 to {} messages",
+            jkb_core::mq::MAX_BATCH
+        )),
     }
 }
 
@@ -978,7 +991,19 @@ mod tests {
     use jkb_core::Db;
     use serde_json::{json, Value};
 
-    use super::{parse_input, subscribe, Input, SubscribeOpts};
+    use super::{batch_size, parse_input, subscribe, Input, SubscribeOpts};
+
+    /// `--batch` is held to the queue's batch limit at parse time, because the stream reads a batch
+    /// shorter than it asked for as caught up — a larger one announced `caught_up` after every poll.
+    #[test]
+    fn a_batch_past_the_queue_s_limit_is_refused_when_parsed() {
+        let max = jkb_core::mq::MAX_BATCH;
+        assert_eq!(batch_size(&max.to_string()), Ok(max));
+        assert_eq!(batch_size("1"), Ok(1));
+        assert!(batch_size(&(max + 1).to_string()).is_err());
+        assert!(batch_size("0").is_err());
+        assert!(batch_size("many").is_err());
+    }
 
     fn backend_with(n: usize) -> LocalBackend {
         let b = LocalBackend::new(Db::open_in_memory().unwrap());

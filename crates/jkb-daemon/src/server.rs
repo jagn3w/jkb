@@ -959,7 +959,91 @@ async fn serve_op(
 mod tests {
     use rustix::io::Errno;
 
-    use super::{backend_for, call, connection_budget, out_of_resources, Held};
+    use super::{backend_for, call, connection_budget, out_of_resources, Held, WriteDeadline};
+
+    /// A writer the test opens and shuts.
+    struct Gate(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl tokio::io::AsyncWrite for Gate {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                std::task::Poll::Ready(Ok(buf.len()))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One `poll_write` of a byte, as its `Poll`.
+    async fn write(w: &mut WriteDeadline<Gate>) -> std::task::Poll<std::io::Result<usize>> {
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(tokio::io::AsyncWrite::poll_write(
+                std::pin::Pin::new(&mut *w),
+                cx,
+                b"x",
+            ))
+        })
+        .await
+    }
+
+    /// The write deadline measures one stall, not a connection's life: progress disarms it. Without
+    /// that, a slow reader making progress, or a keep-alive connection whose earlier answer once had
+    /// to wait, was closed the next time a write waited at all.
+    #[test]
+    fn a_write_deadline_is_reset_by_progress_and_fires_on_a_stall() {
+        use std::sync::atomic::Ordering;
+        use std::task::Poll;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut w = WriteDeadline::new(
+                Gate(std::sync::Arc::clone(&open)),
+                std::time::Duration::from_millis(300),
+            );
+            assert!(
+                write(&mut w).await.is_pending(),
+                "a blocked write arms the deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            open.store(true, Ordering::SeqCst);
+            assert!(
+                matches!(write(&mut w).await, Poll::Ready(Ok(1))),
+                "progress"
+            );
+            open.store(false, Ordering::SeqCst);
+            assert!(write(&mut w).await.is_pending());
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // 400 ms since the first stall began, 200 ms into this one.
+            assert!(
+                write(&mut w).await.is_pending(),
+                "the earlier stall's deadline was not carried over"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            match write(&mut w).await {
+                Poll::Ready(Err(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+                other => panic!("a stall past the deadline: {other:?}"),
+            }
+        });
+    }
 
     /// A permit is released only when everything its request started has finished: the call on its
     /// blocking thread, though the client and its handler are gone, and the body hyper writes.

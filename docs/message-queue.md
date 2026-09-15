@@ -137,13 +137,16 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   bytes of line text, while each line carries its own JSON — or missing (`kb.query` with no limit).
   Not bounded, stated: `kb.cat` and `task.show`'s own body are the one item asked for; a namespace's
   children are gathered before they are sorted and charged; and the queue's reads, which stay on the
-  writer, are bounded instead by `mq::MAX_BATCH` (256): a poll hands over at most that many and a
-  tail asking for more is refused, so neither reads more than about 16 MiB of payload however large
-  its topic's creator — a container included — let it grow. The frontier (`task.ready`) is ordered
+  writer, are bounded instead by `mq::MAX_BATCH` (256): a poll or a tail asking for more is refused,
+  and `jkb mq subscribe --batch` is held to it when parsed, so neither reads more than about 16 MiB of
+  payload however large its topic's creator — a container included — let it grow. Refused, not
+  clamped: the subscribe stream reads a batch shorter than it asked for as caught up, and a clamp
+  announced `caught_up` after every capped poll of a backlog (a fifth review caught it). The frontier (`task.ready`) is ordered
   and limited over ids, and a task's subtasks are streamed, so at most one body is held at a time
-  (`task::ready_ids`, `task::subtasks_each`). Every unbounded id or uri list in `jkb-core` is bound
-  as one JSON parameter (`sql::json_ids`), since a placeholder per element failed past `SQLite`'s
-  32,766 variables. The other bounds are on
+  (`task::ready_ids`, `task::subtasks_each`). Every list in `jkb-core` a client can lengthen — ids,
+  uris, and a query's `kind:` values, which come from DSL text — is bound as one JSON parameter
+  (`sql::json_ids`, `json_strings`), since a placeholder per element failed past `SQLite`'s 32,766
+  variables. The other bounds are on
   work rather than answer size: `kb.search` takes at most 1000 hits (the hybrid route, served only
   where there is an embedder, fuses from twice the limit) and 50 chunks of context either side;
   `kb.grep` refuses an empty pattern and reads items one at a time (`item::grep_each`), counting
@@ -187,7 +190,7 @@ write lock, so an idle subscriber does not contend with every other writer sever
 For a daemon in any language: run it as a child process and speak NDJSON.
 
 ```
-jkb mq subscribe <topic> --group <name> [--from-start] [--at-most-once] [--batch N] [--interval-ms N]
+jkb mq subscribe <topic> --group <name> [--from-start] [--at-most-once] [--batch N (1-256)] [--interval-ms N]
 ```
 
 **stdout, one event per line:**

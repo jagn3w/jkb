@@ -1016,6 +1016,12 @@ fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
             v["truncated"], true,
             "{request}: cut, and says so: {wire:.300}"
         );
+        // A budget cut is not the node cap's: the CLI tells them apart, and only the budget's is
+        // lifted on the host.
+        assert!(
+            v.get("at_node_cap").is_none(),
+            "{request}: a budget cut named as the node cap: {wire:.300}"
+        );
     }
     let Response::GrepHits { answer } =
         call(&b, json!({ "op": "kb.grep", "pattern": "needle" })).unwrap()
