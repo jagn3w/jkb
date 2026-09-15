@@ -144,7 +144,9 @@ Two decisions in it:
   that fails on its own. A line that was already unreadable does not block later writes: writers outside
   the typed operations do not ask the file (`jkb task start` recording `repo=My App`, the MCP server's
   `task_update`, `jkb ns mv`, `jkb tag rename`), and refusing every write after one of them left the task
-  unable to be released. Checking only the text let `task set --due "2026-07-15 17:00"`, a tag value or a
+  unable to be released. Except a write that moves the task to another line (`task.bind`), which is
+  judged as a new line: excused by the old line's problem, a bind from an unreadable line onto another
+  task's `#id` put two tasks on one line, and the next export dropped one. Checking only the text let `task set --due "2026-07-15 17:00"`, a tag value or a
   namespace with a space, and `task bind --sync …#Fix_Login` through, and the next import from the file
   cleared the field and rewrote the title. Whether a task is in a tasks file is decided by the
   serializer owning its binding (`binding::serializer_for`: a `#<local id>` binding goes to its mount,

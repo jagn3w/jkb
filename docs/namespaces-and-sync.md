@@ -220,7 +220,8 @@ back to following links. Not verified on macOS here — the tests ran on Linux.
 
 **Decided (stage-6.2 reviews 6 and 7, 2026-09-15):** the `tasks` serializer reads `^id` as an identity
 when every character is a dash or satisfies `jkb_core::dsl::is_slug_char` — a letter or digit already in
-lowercase in any script (including one with no lowercase form, such as `ℝ`), or a combining mark — and
+lowercase in any script (including one with no lowercase form, such as `ℝ`), or U+0307, the one
+combining mark lowercasing produces (review 8: accepting every mark made a trailing `^1️⃣` an id) — and
 `dsl::slug` emits nothing outside that set. One predicate, owned beside the minter.
 
 Why: `mint_id` slugs a title with the Unicode-aware `slug`, so `Café résumé cleanup` mints
@@ -234,7 +235,8 @@ older build had settled changed ids, or was quarantined for a duplicate `^🎉`;
 minter's alphabet fixes both: an id the minter makes always comes back, and anything the old reader took
 as title text and the minter never makes (emoji, punctuation, format characters, uppercase) still is.
 Every stored id is kept, and a churned line heals to its first id by the existing left-most-anchor rule.
-Pinned by `slug_keeps_unicode_alphanumerics`, `a_title_in_any_script_keeps_one_id_across_syncs` and,
+Pinned by `every_alphanumeric_lowercases_into_the_slug_alphabet` (both directions, every `char`),
+`slug_keeps_unicode_alphanumerics`, `a_title_in_any_script_keeps_one_id_across_syncs` and,
 through the ops, `a_task_titled_in_any_script_is_filed_and_written_like_any_other`.
 
 ## A file's document lives on its journal row, not in the namespace tree (D45)

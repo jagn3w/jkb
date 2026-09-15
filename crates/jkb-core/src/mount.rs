@@ -130,9 +130,10 @@ pub fn get(conn: &Connection, namespace: NamespaceId) -> Result<Option<Mount>> {
 /// no mount covers it. The one copy of this lookup: [`ambient_namespace`], `binding::serializer_for` and
 /// `jkb_sync::filed_task_problem` all find a path's mount by it.
 ///
-/// Two mounts may cover one directory (`jkb mount create` allows it, and a repo is commonly mounted as
-/// documents and as tasks). Between those, a mount whose serializer is `prefer` wins, then the lowest
-/// namespace path — the order `jkb mount ls` lists them in. It was the order rows came back from an
+/// With `prefer`, a mount whose serializer it names wins over any that does not, however much closer
+/// that one's directory is: a `#<local id>` line is only ever a `tasks` mount's, and a `document` mount
+/// nested inside the tasks mount's directory had it judged a document, skipping the tasks-file rules.
+/// Then the closest directory, then the lowest namespace path — the order `jkb mount ls` lists them in. It was the order rows came back from an
 /// unordered query, so a `tasks` line could be judged by the `document` mount beside it and skip the
 /// tasks-file rules.
 ///
@@ -165,14 +166,14 @@ pub fn covering(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    // Ranked by (directory length, preferred serializer); ties keep the first by path.
-    let mut best: Option<((usize, bool), String, Mount)> = None;
+    // Ranked by (preferred serializer, directory length); ties keep the first by path.
+    let mut best: Option<((bool, usize), String, Mount)> = None;
     for (ns, mount) in mounts {
         let Some(dir) = mount.backing_uri.strip_prefix("file://") else {
             continue;
         };
         let dir = dir.trim_end_matches('/');
-        let rank = (dir.len(), prefer == Some(mount.serializer.as_str()));
+        let rank = (prefer == Some(mount.serializer.as_str()), dir.len());
         if path.starts_with(dir) && best.as_ref().is_none_or(|(best, _, _)| rank > *best) {
             best = Some((rank, ns, mount));
         }
@@ -315,6 +316,30 @@ mod tests {
                     Some("repos/jkb")
                 );
                 assert_eq!(ambient_namespace(c, file)?.as_deref(), Some("repos/jkb"));
+                // A document mount nested inside does not take a task line from the tasks mount around it.
+                let id = ns::ensure(c, "repos/jkb-openspec")?;
+                create(
+                    c,
+                    m,
+                    id,
+                    "file:///r/jkb/openspec",
+                    SyncMode::Bidirectional,
+                    "document",
+                    None,
+                    None,
+                    ConflictPolicy::Manual,
+                )?;
+                let nested = Path::new("/r/jkb/openspec/changes/x/tasks.md");
+                assert_eq!(
+                    super::covering(c, nested, Some("tasks"))?
+                        .map(|(ns, _)| ns)
+                        .as_deref(),
+                    Some("tasks/jkb")
+                );
+                assert_eq!(
+                    ambient_namespace(c, nested)?.as_deref(),
+                    Some("repos/jkb-openspec")
+                );
                 Ok(())
             })
             .unwrap();

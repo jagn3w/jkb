@@ -1003,6 +1003,8 @@ mod tests {
             "Fix ^Über",
             "Fix ^修复。",
             "Fix ^—",
+            "Rank ^1\u{fe0f}\u{20e3}",
+            "Fix ^e\u{301}",
         ] {
             let doc = TasksSerializer
                 .parse(format!("- [ ] {title}\n").as_bytes())

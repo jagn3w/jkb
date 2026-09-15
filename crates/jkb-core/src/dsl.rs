@@ -162,8 +162,10 @@ pub fn slug(text: &str) -> String {
 }
 
 /// Whether `c` is a character [`slug`] emits other than `-`: a letter or digit already in lowercase —
-/// in any script, and including one with no lowercase form such as `ℝ` — or a combining mark, which
-/// lowercasing can produce (`İ` lowercases to `i` and U+0307).
+/// in any script, and including one with no lowercase form such as `ℝ` — or U+0307, the one combining
+/// mark lowercasing an alphanumeric produces (`İ` lowercases to `i` and U+0307). Any other mark is not
+/// accepted: every mark was, and a title's trailing `^1️⃣` (a digit, a variation selector and a keycap)
+/// became the task's identity. Both directions are checked over every `char`.
 ///
 /// The one definition of a slug's alphabet, so a reader of minted ids — the `tasks` serializer's `^id`
 /// — accepts exactly what the minter makes: ASCII-only, it rejected `café-…` and churned the id on every
@@ -171,8 +173,7 @@ pub fn slug(text: &str) -> String {
 /// with two of them; short of it, it rejected `prove-ℝ-…`.
 #[must_use]
 pub fn is_slug_char(c: char) -> bool {
-    (c.is_alphanumeric() && c.to_lowercase().eq(std::iter::once(c)))
-        || unicode_normalization::char::is_combining_mark(c)
+    (c.is_alphanumeric() && c.to_lowercase().eq(std::iter::once(c))) || c == '\u{307}'
 }
 
 /// Resolve `\"`→`"` and `\\`→`\`; any other `\x` is kept verbatim (a literal backslash
@@ -243,6 +244,14 @@ mod tests {
             .filter(|&(_, l)| !super::is_slug_char(l))
             .collect();
         assert!(outside.is_empty(), "{outside:?}");
+        // And the other way: every character the alphabet accepts is one `slug` emits.
+        let never_emitted: Vec<char> = (0..=u32::from(char::MAX))
+            .filter_map(char::from_u32)
+            .filter(|&c| super::is_slug_char(c) && c != '\u{307}')
+            .filter(|&c| super::slug(&c.to_string()) != c.to_string())
+            .collect();
+        assert!(never_emitted.is_empty(), "{never_emitted:?}");
+        assert_eq!(super::slug("İ"), "i\u{307}");
     }
 
     #[test]

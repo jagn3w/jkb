@@ -649,7 +649,10 @@ pub fn line_problem(conn: &Connection, reference: &str) -> Result<Option<String>
 /// already). Writers outside the typed operations — `jkb task start` recording `repo=My App`, the MCP
 /// server's `task_update`, `jkb ns mv` — do not ask the file, and refusing every later write to a line
 /// one of them had broken left the task unable even to be released. A write that takes the offending
-/// value away passes, like any other.
+/// value away passes, like any other. The exception is a write that moves the task to another line
+/// (`task.bind`): `LocalBackend` judges that as a new line, excused by nothing, because a bind from an
+/// unreadable line onto another task's `#id` put two tasks on one line and the next export dropped one
+/// (pinned by `every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip`).
 ///
 /// # Errors
 /// [`ErrorCode::Invalid`] naming what would change, or a failed read.
