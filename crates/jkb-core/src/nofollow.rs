@@ -35,8 +35,20 @@ fn refusal(path: &Path, at: &Path, why: &str) -> io::Error {
     )
 }
 
+/// The largest synced file [`read`] reads. A sparse file is instant to make and costs no disk, and a
+/// read of one planted at a bound path allocated its whole apparent size on the host's watcher.
+pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether `name` is one of [`write`]'s temporary files. A write interrupted before its rename leaves
+/// one inside the mount, and sync must never import it as a second copy of the file it was replacing.
+#[must_use]
+pub fn is_temp_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') && name.contains(".jkb-sync-") && name.ends_with(".tmp")
+}
+
 /// The file's bytes, or `None` when it does not exist. Refuses a path with a symlink anywhere in it,
-/// and a final component that is not a regular file.
+/// a final component that is not a regular file, and one over [`MAX_READ_BYTES`].
 ///
 /// # Errors
 /// A refusal (`InvalidInput`), or any other I/O failure.
@@ -127,11 +139,22 @@ mod imp {
             Err(Errno::NOENT) => return Ok(None),
             Err(e) => return Err(judge(path, path, e)),
         };
-        if FileType::from_raw_mode(fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+        let stat = fs::fstat(&fd)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             return Err(refusal(path, path, "is not a regular file"));
         }
+        let too_big = || refusal(path, path, "is larger than a synced file may be");
+        if u64::try_from(stat.st_size).unwrap_or(u64::MAX) > super::MAX_READ_BYTES {
+            return Err(too_big());
+        }
         let mut bytes = Vec::new();
-        std::fs::File::from(fd).read_to_end(&mut bytes)?;
+        // Bounded again as it is read: the size can grow between the stat and the read.
+        std::fs::File::from(fd)
+            .take(super::MAX_READ_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > super::MAX_READ_BYTES {
+            return Err(too_big());
+        }
         Ok(Some(bytes))
     }
 
@@ -139,16 +162,17 @@ mod imp {
         let (parent, name) = split(path)?;
         let dir = open_dir(path, parent, true)?
             .ok_or_else(|| refusal(path, parent, "cannot be created"))?;
-        // Keep an existing regular file's permission bits; refuse to replace anything else.
-        let mode = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        // An existing regular file keeps its permission bits; a new one gets what the umask leaves of
+        // 0o666, as a plain create would. Anything but a regular file is refused.
+        let existing = match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
-                FileType::RegularFile => Mode::from_raw_mode(stat.st_mode & 0o7777),
+                FileType::RegularFile => Some(Mode::from_raw_mode(stat.st_mode & 0o7777)),
                 FileType::Symlink => {
                     return Err(refusal(path, path, "is a symbolic link"));
                 }
                 _ => return Err(refusal(path, path, "is not a regular file")),
             },
-            Err(Errno::NOENT) => Mode::from_raw_mode(0o644),
+            Err(Errno::NOENT) => None,
             Err(e) => return Err(e.into()),
         };
         let nanos = std::time::SystemTime::now()
@@ -159,10 +183,12 @@ mod imp {
         temp_name.push(format!(".jkb-sync-{}-{nanos}.tmp", std::process::id()));
         let flags =
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let fd = fs::openat(&dir, &temp_name, flags, mode)?;
+        let fd = fs::openat(&dir, &temp_name, flags, Mode::from_raw_mode(0o666))?;
         let written = (|| -> io::Result<()> {
-            // The umask narrowed the create; the mode asked for is the existing file's.
-            fs::fchmod(&fd, mode)?;
+            if let Some(mode) = existing {
+                // The umask narrowed the create; a replaced file keeps its own mode.
+                fs::fchmod(&fd, mode)?;
+            }
             let mut file = std::fs::File::from(fd);
             file.write_all(bytes)?;
             file.flush()?;
@@ -218,12 +244,13 @@ mod tests {
         assert_eq!(read(&path).unwrap(), None, "absent reads as None");
         write(&path, b"one").unwrap();
         assert_eq!(read(&path).unwrap().as_deref(), Some(&b"one"[..]));
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A mode the umask would narrow on a create, so a replace that only created would lose it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         write(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
+            0o666
         );
         assert_eq!(
             std::fs::read_dir(root.join("a/b")).unwrap().count(),
@@ -280,10 +307,40 @@ mod tests {
             0,
         )
         .unwrap();
+        // On a thread with a deadline: without O_NONBLOCK the open blocks forever on a FIFO with no
+        // writer, and a test that hangs reports nothing.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read(&fifo).map_err(|e| e.kind()));
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("read returned rather than blocking on the FIFO");
+        assert_eq!(answer, Err(std::io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn a_file_larger_than_a_synced_file_may_be_is_refused_before_it_is_read() {
+        let (_keep, root) = real_tempdir();
+        let path = root.join("tasks.md");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(super::MAX_READ_BYTES + 1).unwrap(); // sparse: no disk, no time
         assert_eq!(
-            read(&fifo).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput,
-            "refused, and not blocked on"
+            read(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn a_new_file_is_created_under_the_umask_and_its_temp_name_is_recognised() {
+        let (_keep, root) = real_tempdir();
+        let path = root.join("new.md");
+        write(&path, b"x").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o111, 0, "not executable");
+        assert!(super::is_temp_name(std::ffi::OsStr::new(
+            ".tasks.md.jkb-sync-123-456.tmp"
+        )));
+        assert!(!super::is_temp_name(std::ffi::OsStr::new("tasks.md")));
     }
 }

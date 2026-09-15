@@ -2656,3 +2656,50 @@ fn sync_never_writes_through_a_symlink_planted_at_a_bound_file() {
         "and the link was not replaced by a render either"
     );
 }
+
+/// An interrupted write's temporary file is never imported as a second copy of the file, and a
+/// directory reached through a link below the mount is not taken up.
+#[cfg(unix)]
+#[test]
+fn sync_skips_its_own_temp_files_and_paths_through_a_link() {
+    let dir = real_tempdir();
+    let outside = real_tempdir();
+    fs::write(dir.path().join("tasks.md"), TASKS_MD).unwrap();
+    fs::write(dir.path().join(".tasks.md.jkb-sync-1-2.tmp"), TASKS_MD).unwrap();
+    fs::create_dir_all(outside.path().join("elsewhere")).unwrap();
+    fs::write(outside.path().join("elsewhere/tasks.md"), TASKS_MD).unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/plan",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        task_count(&db),
+        3,
+        "one file's tasks, not the temp copy's or the linked tree's"
+    );
+    let report = sync_paths(
+        &db,
+        "docs/plan",
+        &[dir.path().join("linked/elsewhere/tasks.md")],
+    )
+    .unwrap();
+    assert_eq!(
+        report.count(Outcome::Created),
+        0,
+        "an event through the link is not taken up"
+    );
+    assert_eq!(task_count(&db), 3);
+    assert!(
+        journal(&db, &uri_for(&dir.path().join("linked/elsewhere/tasks.md"))).is_none(),
+        "not even reconciled far enough to be journalled as needing attention"
+    );
+}

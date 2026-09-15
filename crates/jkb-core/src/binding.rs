@@ -198,6 +198,57 @@ pub fn mark_synced(conn: &Connection, meta: &WriteMeta, item: ItemId, hash: &str
 
 /// Fetch an item's binding, if one is set.
 ///
+/// The file a `file://` binding uri names: the path, less a trailing `#<local id>` fragment (one
+/// whose text has no `/` — a `#` earlier in the uri is part of the path). `None` for any other uri.
+/// A `#` in a filename is indistinguishable from a fragment by spelling, so this may shorten the last
+/// component — never a directory, which is all its callers judge by.
+/// The one parse of a binding's fragment: `jkb_api::tasks::FileRoots` judges the path it returns, and
+/// [`serializer_for`] finds the mount covering it.
+#[must_use]
+pub fn file_path(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("file://")?;
+    Some(match rest.rsplit_once('#') {
+        Some((path, fragment)) if !fragment.contains('/') => path,
+        _ => rest,
+    })
+}
+
+/// The serializer that owns an item's file binding: the binding's own override, else the serializer
+/// of the mount whose directory covers the file most closely. `None` for an item bound to no file, or
+/// to a file no mount covers.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn serializer_for(conn: &Connection, item: ItemId) -> Result<Option<String>> {
+    let Some(bound) = get(conn, item)? else {
+        return Ok(None);
+    };
+    let Some(path) = file_path(&bound.uri) else {
+        return Ok(None);
+    };
+    if let Some(own) = bound.serializer {
+        return Ok(Some(own));
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT backing_uri, serializer FROM mounts WHERE backing_uri LIKE 'file://%'",
+    )?;
+    let mounts = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let path = std::path::Path::new(path);
+    Ok(mounts
+        .into_iter()
+        .filter_map(|(uri, serializer)| {
+            let dir = uri
+                .strip_prefix("file://")?
+                .trim_end_matches('/')
+                .to_owned();
+            path.starts_with(&dir).then_some((dir.len(), serializer))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, serializer)| serializer))
+}
+
 /// # Errors
 /// Returns an error if the query fails.
 pub fn get(conn: &Connection, item: ItemId) -> Result<Option<Binding>> {
@@ -219,6 +270,104 @@ pub fn get(conn: &Connection, item: ItemId) -> Result<Option<Binding>> {
 
 #[cfg(test)]
 mod tests {
+    /// The serializer owning a binding decides whether it is a tasks file, not a `#` in its uri: a
+    /// document named `C#.md` is a whole-file note.
+    #[test]
+    fn a_binding_s_serializer_is_its_override_else_its_closest_mount_s() {
+        use crate::{mount, ns};
+        use jkb_types::{ConflictPolicy, SyncMode};
+        // By spelling alone `C#.md` cannot be told from `C` with a fragment — which is why whether an
+        // item is in a tasks file is asked of its serializer, below. What the parse guarantees is that
+        // it only ever shortens the last component, so the directory a root or a mount is judged by
+        // is the file's own.
+        assert_eq!(
+            super::file_path("file:///n/C#.md").map(|p| std::path::Path::new(p).parent()),
+            Some(Some(std::path::Path::new("/n")))
+        );
+        assert_eq!(
+            super::file_path("file:///n/tasks.md#t1"),
+            Some("/n/tasks.md")
+        );
+        assert_eq!(
+            super::file_path("file:///n/a#b/tasks.md#t1"),
+            Some("/n/a#b/tasks.md")
+        );
+        assert_eq!(super::file_path("managed:"), None);
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            for (path, dir, serializer) in [
+                ("notes", "file:///n", "document"),
+                ("notes/plan", "file:///n/plan", "tasks"),
+            ] {
+                let id = ns::ensure(c, path)?;
+                mount::create(
+                    c,
+                    m,
+                    id,
+                    dir,
+                    SyncMode::Bidirectional,
+                    serializer,
+                    None,
+                    None,
+                    ConflictPolicy::Manual,
+                )?;
+            }
+            let note = upsert(
+                c,
+                m,
+                &NewItem {
+                    uid: "n1".into(),
+                    kind: "document".into(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            set(c, m, note, "file:///n/C#.md", None, None)?;
+            let task = upsert(
+                c,
+                m,
+                &NewItem {
+                    uid: "t1".into(),
+                    kind: "task".into(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            set(c, m, task, "file:///n/plan/tasks.md#t1", None, None)?;
+            let forced = upsert(
+                c,
+                m,
+                &NewItem {
+                    uid: "f1".into(),
+                    kind: "document".into(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            set(
+                c,
+                m,
+                forced,
+                "file:///n/plan/notes.md",
+                None,
+                Some("document"),
+            )?;
+            assert_eq!(super::serializer_for(c, note)?.as_deref(), Some("document"));
+            assert_eq!(super::serializer_for(c, task)?.as_deref(), Some("tasks"));
+            assert_eq!(
+                super::serializer_for(c, forced)?.as_deref(),
+                Some("document"),
+                "the override wins"
+            );
+            assert!(!crate::item::in_tasks_file(c, note)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     use super::{get, set, synced_uris_for_file};
     use crate::item::{upsert, NewItem};
     use crate::Db;

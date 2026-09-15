@@ -42,22 +42,16 @@ impl FileRoots {
     }
 
     /// Whether a binding `uri` writes no host file outside these roots: not a `file://` uri at all,
-    /// or one whose path lies under a root. Judged by the path's components, without touching the
-    /// filesystem: a path with `.` or `..` in it, or a relative one, is outside every root.
+    /// or one whose path lies under a root. Judged by the path's components (`binding::file_path`,
+    /// the one fragment parse), without touching the filesystem: a path with `.` or `..` in it, or a
+    /// relative one, is outside every root.
     ///
-    /// Symlinks inside a root are not followed. A binding is only ever made from a mount's directory,
-    /// which the host's user created and `jkb mount create` canonicalized, and neither a mount nor a
-    /// file binding can be made through a backend with roots.
+    /// **This judges spelling only.** It cannot see a symlink, and a dev container can plant one inside
+    /// a root; what stops a sync write from following it is `jkb_core::nofollow`, on the sync side.
     #[must_use]
     pub fn admits(&self, uri: &str) -> bool {
-        let Some(rest) = uri.strip_prefix("file://") else {
+        let Some(path) = binding::file_path(uri) else {
             return true;
-        };
-        // Only a trailing `#<local id>` is a fragment. A `#` anywhere else is in the path itself, and
-        // a path judged by what precedes its first `#` could be under a root while the file is not.
-        let path = match rest.rsplit_once('#') {
-            Some((path, fragment)) if !fragment.contains('/') => path,
-            _ => rest,
         };
         let path = Path::new(path);
         if !path.is_absolute()
@@ -120,9 +114,6 @@ pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
 /// namespace chain, a tag or an edge written in the one transaction; a megabyte line of them was
 /// hundreds of thousands of rows.
 pub const MAX_QUICK_ADD_MODIFIERS: usize = 64;
-
-/// The longest tag (`facet=value`) or due date a client may set.
-pub const MAX_FIELD_BYTES: usize = 1024;
 
 fn check_len(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
     if value.len() > max {
@@ -308,6 +299,17 @@ pub fn add(
 
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
+    // A task filed into a tasks.md is held to the edit rule's round trip too: a quoted title can carry
+    // newlines, and `first\n\nsecond` came back from the file as a task and a paragraph of prose.
+    if synced.is_some() {
+        if let Some(problem) = jkb_sync::task_content_problem(&spec.title) {
+            return Err(invalid(format!(
+                "this task is filed into a tasks.md, and its text would not come back from the file \
+                 as written: {problem}"
+            ))
+            .into());
+        }
+    }
 
     let id = task::create(conn, meta, &spec)?;
     if let Some(parent) = parent {
@@ -428,9 +430,6 @@ pub fn set(
             "nothing to set: pass at least one of --status/--priority/--due",
         ));
     }
-    if let Some(d) = due {
-        check_len("a due date", d, MAX_FIELD_BYTES)?;
-    }
     let id = writable(conn, reference, roots)?;
     if let Some(s) = status {
         task::set_status_str(conn, meta, id, s)?;
@@ -445,13 +444,16 @@ pub fn set(
 }
 
 /// `task.edit`: replace a task's body, or append to it, by `item::edit_content`'s rule — a task in a
-/// `tasks.md` refuses a result with a line that would end its body — within [`MAX_CONTENT_BYTES`].
+/// tasks file refuses a *result* the tasks serializer would not read back as written — within
+/// [`MAX_CONTENT_BYTES`].
 ///
 /// Answers whether the task is file-backed, so a client can say its file is written by the host's sync.
 ///
 /// # Errors
-/// A blank line in a file-backed task's text, [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`]
-/// under `roots`, or a failed write.
+/// For a task in a tasks file, a result that would not round-trip (a blank or whitespace-only line in
+/// the body, a checkbox line, trailing modifier or anchor tokens); a result over
+/// [`MAX_CONTENT_BYTES`]; [`ErrorCode::NotFound`]; [`ErrorCode::Forbidden`] under `roots`; or a failed
+/// write.
 pub fn edit(
     conn: &Connection,
     meta: &jkb_core::WriteMeta,
@@ -468,6 +470,7 @@ pub fn edit(
         text,
         append,
         Some(MAX_CONTENT_BYTES),
+        &jkb_sync::task_content_problem,
     )?)
 }
 
@@ -485,7 +488,6 @@ pub fn tag(
     roots: Option<&FileRoots>,
 ) -> Result<(), ApiError> {
     let invalid = |why: &str| ApiError::with_code(ErrorCode::Invalid, why);
-    check_len("a tag", facet_value, MAX_FIELD_BYTES)?;
     let (facet, value) = facet_value
         .split_once('=')
         .ok_or_else(|| invalid("tag must be `facet=value`, e.g. `size=small`"))?;

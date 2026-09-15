@@ -543,6 +543,16 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
     };
 
     let rows = subtree(conn, &from)?;
+    // Every path the move would write, judged before any is: a move to a near-limit target lengthens
+    // each descendant by the same amount, and a stored path `normalize` refuses can never be named.
+    for (_, path) in &rows {
+        let moved = format!("{to}{}", &path[from.len()..]);
+        normalize(&moved).map_err(|e| {
+            TypeError::Validation(format!(
+                "moving '{from}' to '{to}' would make '{moved}': {e}"
+            ))
+        })?;
+    }
     // ONE ENTRY PER ROW THIS MOVES. It used to log a single entry naming the root's old `path`,
     // which describes a fraction of what changed: `undo` restoring that one row would leave every
     // descendant under the new path, so the move was not reversible at all and `jkb undo` after a
@@ -657,6 +667,19 @@ mod tests {
     use crate::{placement, Db};
     use jkb_types::PlacementRole;
     use serde_json::json;
+
+    #[test]
+    fn a_move_that_would_push_a_descendant_past_the_limits_writes_nothing() {
+        let db = crate::Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            super::ensure(c, "notes/a/b")?;
+            let target = vec!["x"; super::MAX_DEPTH - 1].join("/");
+            assert!(super::move_subtree(c, m, "notes", &target).is_err());
+            assert!(super::get(c, "notes/a/b")?.is_some(), "nothing moved");
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn a_path_too_long_or_too_deep_is_refused() {

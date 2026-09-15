@@ -2690,7 +2690,13 @@ fn cmd_item_edit(
             return Ok(None);
         };
         Ok(Some(item::edit_content(
-            conn, meta, id, &new_text, append, None,
+            conn,
+            meta,
+            id,
+            &new_text,
+            append,
+            None,
+            &jkb_sync::task_content_problem,
         )?))
     })?;
     let Some(in_tasks_file) = found else {

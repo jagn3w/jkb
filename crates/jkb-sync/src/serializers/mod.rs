@@ -18,7 +18,7 @@ mod document;
 mod tasks;
 
 pub use document::DocumentSerializer;
-pub use tasks::TasksSerializer;
+pub use tasks::{task_content_problem, TasksSerializer};
 
 use jkb_types::{EdgeType, Error as TypeError};
 

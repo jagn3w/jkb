@@ -24,7 +24,7 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use serializers::{
-    resolve, DocumentSerializer, SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer,
-    TasksSerializer, AVAILABLE,
+    resolve, task_content_problem, DocumentSerializer, SyncDoc, SyncEdge, SyncItem, SyncSection,
+    SyncSerializer, TasksSerializer, AVAILABLE,
 };
 pub use watch::{watch, watch_all};

@@ -39,6 +39,10 @@ pub fn define_facet(conn: &Connection, facet: &str, value_kind: &str) -> Result<
     Ok(())
 }
 
+/// The longest tag, facet and value together, that [`apply`] stores. A request body or a synced line
+/// could otherwise put a megabyte into a row every listing of the item then carries.
+pub const MAX_TAG_BYTES: usize = 1024;
+
 /// Apply `facet = value` to `item` (auto-declaring the facet as `string` if new).
 /// Idempotent on `(item, facet, value)`.
 ///
@@ -51,6 +55,14 @@ pub fn apply(
     facet: &str,
     value: &str,
 ) -> Result<()> {
+    // Every writer of a tag comes through here — a quick-add line, a synced tasks.md, `task tag`, the
+    // MCP server — so the bound is here, and not on `remove`, which must be able to take away any tag
+    // that exists.
+    if facet.len() + value.len() > MAX_TAG_BYTES {
+        return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
+            "a tag of at most {MAX_TAG_BYTES} bytes"
+        ))));
+    }
     define_facet(conn, facet, "string")?;
     // Idempotent means the second call updates a row that was already there, and logging that as
     // an insert made `jkb undo` remove a tag application the transaction had not created.
@@ -302,6 +314,29 @@ pub fn facets(conn: &Connection) -> Result<Vec<(String, String)>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tag_past_the_limit_is_refused_and_any_tag_can_still_be_removed() {
+        let db = crate::Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            let id = crate::item::upsert(
+                c,
+                m,
+                &crate::item::NewItem {
+                    uid: "i".into(),
+                    kind: "note".into(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            assert!(super::apply(c, m, id, "f", &"v".repeat(super::MAX_TAG_BYTES)).is_err());
+            super::apply(c, m, id, "f", "short")?;
+            super::remove(c, m, id, "f", "short")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
     use super::{applications, apply, facets, items_with, reconcile_tags, rename_facet};
     use crate::item::{upsert, NewItem};
     use crate::Db;

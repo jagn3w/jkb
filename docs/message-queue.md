@@ -137,8 +137,14 @@ Two decisions in it:
   modifiers, a task body at most 256 KiB after an edit or append, a tag or due date at most 1024 bytes,
   a claim owner at most 512 (it is stored on every transition). `task.why` is charged to the read
   budget like every listing. `task edit` and `jkb item edit` share one edit rule
-  (`item::edit_content`): an item in a `tasks.md` refuses a result with a line that would end its body
-  (`item::ends_task_body`, the serializer's own test), judged on the result rather than the text sent.
+  (`item::edit_content`): an item in a tasks file — decided by the serializer owning its binding
+  (`binding::serializer_for`), not by a `#` in its uri — refuses a result the tasks serializer would
+  not read back as written (`jkb_sync::task_content_problem` renders it as a one-task file and parses
+  it again), so a blank or whitespace-only line, a checkbox line in the body, or trailing
+  `^id`/`@due`/`#tag` tokens are refused, judged on the result rather than the text sent. `task.add`
+  holds a task it files into a tasks.md to the same round trip. Tags and due dates are bounded in the
+  core writers every path shares (`tag::MAX_TAG_BYTES`, `task::MAX_DUE_BYTES`), so `tag rm` can always
+  remove one, and `ns mv` checks every path it would write.
   `task.add`'s global-backlog question is answered by running the whole create and rolling it back, so
   it is asked only when the add would otherwise succeed.
 - **What stays on the host.** `task start`/`work`/`land`/`abandon`/`gate`/`sessions` run git, the

@@ -478,6 +478,44 @@ fn classify(token: &str) -> Option<Modifier> {
     None
 }
 
+/// Why a task whose content is `content` would not come back from its `tasks.md` as that content —
+/// `None` when it would. Asked by rendering the task as a one-task file and parsing it back with this
+/// serializer, so the answer is this serializer's own rules rather than a copy of them: a blank line
+/// ending the body, an indented checkbox becoming a child task, a trailing `^x` or `@x` or `#f=v`
+/// becoming an identity, a due date or a tag. Handed to `jkb_core::item::edit_content` and checked by
+/// `jkb_api::tasks::add` for a task it files.
+#[must_use]
+pub fn task_content_problem(content: &str) -> Option<String> {
+    const PROBE: &str = "jkb-content-probe";
+    let mut item = SyncItem::new(PROBE, "task", content);
+    item.status = Some("open".to_owned());
+    let doc = SyncDoc {
+        items: vec![item],
+        layout: vec![SyncBlock::Item(PROBE.to_owned())],
+        ..SyncDoc::default()
+    };
+    let Ok(bytes) = TasksSerializer.render(&doc) else {
+        return Some("it cannot be written as a task line".to_owned());
+    };
+    let Ok(back) = TasksSerializer.parse(&bytes) else {
+        return Some("the task line it makes does not parse".to_owned());
+    };
+    let whole = back.items.len() == 1
+        && back.edges.is_empty()
+        && back.items[0].local_id == PROBE
+        && back.items[0].content == content
+        && back.items[0].priority.is_none()
+        && back.items[0].due.is_none()
+        && back.items[0].tags.is_empty()
+        && back.items[0].mirrors.is_empty()
+        && back.layout.iter().all(|b| matches!(b, SyncBlock::Item(_)));
+    (!whole).then(|| {
+        "part of it would be read back as something else — a blank line ending the body, a line \
+         that is a checkbox, or trailing `^id`/`@due`/`#tag`/`+ns`/`!p` tokens"
+            .to_owned()
+    })
+}
+
 /// Parse the text after a task checkbox: the maximal run of well-formed [`Modifier`]s
 /// at the **end** of the line is metadata; everything before it is the (verbatim)
 /// title. Never fails — malformed or mid-line sigils are treated as ordinary words,
@@ -696,6 +734,28 @@ fn bad(msg: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// What an edit may leave in a task filed in a tasks.md is what this serializer reads back as
+    /// written; each of these came back as something else.
+    #[test]
+    fn task_content_that_would_not_round_trip_is_named() {
+        use super::task_content_problem;
+        assert_eq!(task_content_problem("Fix login"), None);
+        assert_eq!(task_content_problem("Fix login\nstep one\nstep two"), None);
+        for reshaped in [
+            "Fix login\n\nsecond paragraph",
+            "Fix login\n   \nafter a whitespace line",
+            "Fix login\n- [ ] also check logout",
+            "Refactor ^parser",
+            "Ship it #size=small",
+            "Ship it !p1",
+        ] {
+            assert!(
+                task_content_problem(reshaped).is_some(),
+                "{reshaped:?} would not come back as written"
+            );
+        }
+    }
+
     use super::{SyncBlock, SyncDoc, SyncSerializer, TasksSerializer};
 
     /// The document's prose blocks, in order — prose lives inline in the layout.

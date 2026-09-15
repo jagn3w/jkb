@@ -234,24 +234,25 @@ pub fn ends_task_body(line: &str) -> bool {
     line.trim().is_empty()
 }
 
-/// Whether an item's content is written into a `tasks.md` as a line's body: bound to a fragment of a
-/// file (`file://…#id`), the shape the `tasks` serializer binds. A whole-file (`document`) binding has
-/// no fragment, and its content may hold any line.
+/// Whether an item's content is written into a file by the `tasks` serializer — decided by the
+/// serializer that owns its binding ([`crate::binding::serializer_for`]), not by how the uri is
+/// spelled: a `#` in a document's own filename (`C#.md`) made a whole-file note read as a task.
 ///
 /// # Errors
 /// Returns an error if the read fails.
 pub fn in_tasks_file(conn: &Connection, item: ItemId) -> Result<bool> {
-    Ok(crate::binding::get(conn, item)?
-        .is_some_and(|b| b.uri.starts_with("file://") && b.uri.contains('#')))
+    Ok(crate::binding::serializer_for(conn, item)?.as_deref() == Some("tasks"))
 }
 
 /// Replace an item's content with `text`, or append it, through [`set_content`] — the one rule for an
-/// edit, shared by `jkb task edit` (`jkb_api::tasks::edit`) and `jkb item edit`. An item in a
-/// `tasks.md` appends with a single newline (its body is contiguous indented lines) and refuses a
-/// result with a line that would end its body early ([`ends_task_body`]) — whitespace-only lines, a
-/// CRLF blank and an append seam included, since the result is what is judged, not the text sent. Any
-/// other item appends after a blank line. With `max_bytes`, a result longer than that is refused.
-/// Answers whether the item is in a tasks file.
+/// edit, shared by `jkb task edit` (`jkb_api::tasks::edit`) and `jkb item edit`. An item in a tasks
+/// file ([`in_tasks_file`]) appends with a single newline (its body is contiguous indented lines) and
+/// refuses a result `tasks_problem` names — the tasks serializer's own round trip
+/// (`jkb_sync::task_content_problem`), handed in because core does not depend on it: a blank line
+/// ending the body, an indented checkbox becoming a child task, a trailing `^x` or `@x` becoming an
+/// identity or a due date. The *result* is judged, not the text sent. Any other item appends after a
+/// blank line. With `max_bytes`, a result longer than that is refused. Answers whether the item is in
+/// a tasks file.
 ///
 /// # Errors
 /// A validation error for a refused result, [`jkb_types::Error::NotFound`] via [`set_content`], or a
@@ -263,6 +264,7 @@ pub fn edit_content(
     text: &str,
     append: bool,
     max_bytes: Option<usize>,
+    tasks_problem: &dyn Fn(&str) -> Option<String>,
 ) -> Result<bool> {
     let tasks_file = in_tasks_file(conn, item)?;
     let content = if append {
@@ -274,14 +276,14 @@ pub fn edit_content(
     } else {
         text.to_owned()
     };
-    if tasks_file && content.lines().skip(1).any(ends_task_body) {
-        return Err(TypeError::Validation(
-            "this task is written into a tasks.md, where a blank line ends its body — text after one \
-             would come back from the file as section prose, detached from the task. Use single \
-             newlines, or edit the file itself."
-                .to_owned(),
-        )
-        .into());
+    if tasks_file {
+        if let Some(problem) = tasks_problem(&content) {
+            return Err(TypeError::Validation(format!(
+                "this task is written into a tasks.md, and its text would not come back from the file \
+                 as written: {problem}"
+            ))
+            .into());
+        }
     }
     if let Some(max) = max_bytes {
         if content.len() > max {

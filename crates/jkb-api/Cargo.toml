@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 jkb-core = { version = "0.1.0", path = "../jkb-core" }
 jkb-search = { version = "0.1.0", path = "../jkb-search" }
+jkb-sync = { version = "0.1.0", path = "../jkb-sync" }
 jkb-types = { version = "0.1.0", path = "../jkb-types" }
 rusqlite = { workspace = true }
 serde = { workspace = true }

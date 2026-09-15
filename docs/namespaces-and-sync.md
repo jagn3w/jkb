@@ -189,6 +189,15 @@ container writing to the host user's shell startup file. `jkb_api::tasks::FileRo
 it judges a path's spelling, and a check followed by a write races a link swapped in between. Walking
 by file descriptor is the check and the use in one.
 
+Around it, the same threat is closed at the other ways in (a third review): a read is refused past
+64 MiB (`nofollow::MAX_READ_BYTES` — a sparse file planted at a bound path costs the container nothing
+and allocated its whole apparent size on the host); the watcher is built with
+`with_follow_symlinks(false)`, since a directory link planted in a mount made the recursive watch
+subscribe to the host directories behind it; discovery and event paths skip anything reached through
+a link below the mount directory, and `nofollow::write`'s own temporary files, which an interrupted
+write leaves behind and a full sync would otherwise import as a second copy of every task; and a new
+file is created under the user's umask, with an existing file keeping its mode.
+
 What it costs: a synced path may not contain a link at all. `jkb mount create` stores a mount's
 directory canonical, so real mounts qualify; a test that mounts a raw temp directory must canonicalize
 it first (on macOS `/var` is a link), which `jkb-sync`'s tests now do. Pinned by

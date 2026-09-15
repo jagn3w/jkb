@@ -707,7 +707,7 @@ impl Filter {
 
     /// Whether an absolute `path` under `dir` is in scope.
     fn accepts(&self, dir: &Path, path: &Path) -> bool {
-        if !path.starts_with(dir) {
+        if !path.starts_with(dir) || !syncable(dir, path) {
             return false;
         }
         let rel = rel_str(dir, path);
@@ -718,11 +718,39 @@ impl Filter {
     /// Like [`Self::accepts`] but ignoring `include` — for already-bound files.
     fn accepts_bound(&self, dir: &Path, path: &Path) -> bool {
         path.starts_with(dir)
+            && syncable(dir, path)
             && !self
                 .exclude
                 .as_ref()
                 .is_some_and(|m| m.is_match(rel_str(dir, path)))
     }
+}
+
+/// Whether `path` (under `dir`) is a file sync may take up at all: not one of `nofollow::write`'s
+/// temporary files — an interrupted write leaves one, and importing it duplicates every task in the
+/// file it was replacing — and not reached through a symlink below the mount directory. The watcher
+/// no longer follows links, but an event or a binding can still name such a path, and reconciling it
+/// only to have `nofollow` refuse it wrote a `needs_attention` row per event for files outside the
+/// mount.
+fn syncable(dir: &Path, path: &Path) -> bool {
+    if path
+        .file_name()
+        .is_some_and(jkb_core::nofollow::is_temp_name)
+    {
+        return false;
+    }
+    let Ok(rel) = path.strip_prefix(dir) else {
+        return false;
+    };
+    let mut at = dir.to_path_buf();
+    for component in rel.components() {
+        at.push(component);
+        // A component that does not exist yet (a file about to be created) is not a link.
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The set of files to reconcile: those on disk matching the globs, unioned with the

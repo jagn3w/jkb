@@ -41,10 +41,16 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     let dir = engine::backing_dir(db, mount_ns)?;
 
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = notify::recommended_watcher(move |res| {
-        // A closed receiver just means we're shutting down; ignore the send error.
-        let _ = tx.send(res);
-    })?;
+    // Links are not followed: a directory link planted inside a mount — a dev container can write
+    // inside the directories it binds — made the recursive watch walk and subscribe to the host
+    // directories it pointed at, and turned their activity into events under the mount.
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |res| {
+            // A closed receiver just means we're shutting down; ignore the send error.
+            let _ = tx.send(res);
+        },
+        notify::Config::default().with_follow_symlinks(false),
+    )?;
     // Recursive: the OS only lets us subscribe to a directory subtree, not a glob, so
     // relevance filtering happens in `sync_paths` against the mount's include/exclude.
     watcher.watch(&dir, RecursiveMode::Recursive)?;

@@ -1834,13 +1834,13 @@ fn an_edit_is_judged_by_the_body_it_leaves_and_bounded() {
     );
     let e = call(
         &b,
-        json!({ "op": "task.set", "uid": managed, "due": "9".repeat(super::tasks::MAX_FIELD_BYTES + 1) }),
+        json!({ "op": "task.set", "uid": managed, "due": "9".repeat(jkb_core::task::MAX_DUE_BYTES + 1) }),
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
     let e = call(
         &b,
-        json!({ "op": "task.tag", "uid": managed, "facet_value": format!("f={}", "v".repeat(super::tasks::MAX_FIELD_BYTES)), "mode": "add" }),
+        json!({ "op": "task.tag", "uid": managed, "facet_value": format!("f={}", "v".repeat(jkb_core::tag::MAX_TAG_BYTES)), "mode": "add" }),
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
@@ -1907,4 +1907,37 @@ fn the_global_backlog_question_follows_every_other_refusal_and_writes_nothing() 
         Response::NeedsGlobalBacklogAssent {}
     );
     assert_eq!(count(&b), before, "the create ran and was rolled back");
+}
+
+#[test]
+fn an_edit_or_add_filed_in_a_tasks_md_must_read_back_as_written() {
+    let (db, inside, _outside, managed) = mutate_fixture();
+    let b = rooted(&db);
+    for text in [
+        "also\n- [ ] a child",
+        "Refactor ^parser",
+        "Ship #size=small",
+    ] {
+        let e = call(
+            &b,
+            json!({ "op": "task.edit", "uid": inside, "text": text }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{text:?}: {e:?}");
+        call(
+            &b,
+            json!({ "op": "task.edit", "uid": managed, "text": text }),
+        )
+        .unwrap_or_else(|e| panic!("a managed task takes {text:?}: {e:?}"));
+    }
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "\"first\n\nsecond\" +repos/in" }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.code,
+        ErrorCode::Invalid,
+        "a quoted title with a blank line: {e:?}"
+    );
 }

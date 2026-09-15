@@ -1030,6 +1030,49 @@ fn item_show_bounds_the_preview() {
         .stdout(predicate::str::contains("\"preview_truncated\": true"));
 }
 
+/// `jkb item edit` and `jkb task edit` share one edit rule: on an item filed in a tasks.md a result
+/// that would not read back is refused, and an append joins with one newline.
+#[test]
+fn item_edit_holds_a_tasks_md_item_to_the_task_edit_rule() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = dir.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir_all(&repo).unwrap();
+    jkb(&db)
+        .args([
+            "mount",
+            "create",
+            "repos/proj",
+            repo.to_str().unwrap(),
+            "--serializer",
+            "tasks",
+        ])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "filed +repos/proj"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uid = v["uid"].as_str().unwrap().to_owned();
+    assert_cmd::Command::from_std(jkb(&db))
+        .args(["item", "edit", &uid, "--stdin"])
+        .write_stdin("filed\n\ndetached")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("would not come back"));
+    jkb(&db)
+        .args(["item", "edit", &uid, "--append", "more"])
+        .assert()
+        .success();
+    let shown = jkb(&db)
+        .args(["--json", "task", "show", &uid])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(v["content"], "filed\nmore", "{v}");
+}
+
 #[test]
 fn item_edit_replaces_content() {
     let dir = TempDir::new().unwrap();

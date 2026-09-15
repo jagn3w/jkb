@@ -142,13 +142,27 @@ pub struct TaskRow {
     pub due: Option<String>,
 }
 
+/// The longest due date a task stores — every writer (`create`, [`set_due`]) is held to it.
+pub const MAX_DUE_BYTES: usize = 1024;
+
+fn check_due(due: Option<&str>) -> Result<()> {
+    if due.is_some_and(|d| d.len() > MAX_DUE_BYTES) {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "a due date of at most {MAX_DUE_BYTES} bytes"
+        ))));
+    }
+    Ok(())
+}
+
 /// Create a task: insert the item (status `open`), place it under its home (and any
 /// mirrors), set its binding, apply tags, and link its `depends_on` dependencies.
 ///
 /// # Errors
 /// Returns a validation error if a named dependency uid does not exist or a
-/// dependency edge would create a cycle; otherwise a database error.
+/// dependency edge would create a cycle, or the due date is over [`MAX_DUE_BYTES`];
+/// otherwise a database error.
 pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<ItemId> {
+    check_due(task.due.as_deref())?;
     let status = TaskStatus::Open;
     let id: i64 = conn
         .prepare_cached(
@@ -655,6 +669,7 @@ pub fn set_priority(
 /// Returns [`jkb_types::Error::NotFound`] if `task` does not exist; otherwise a
 /// database error.
 pub fn set_due(conn: &Connection, meta: &WriteMeta, task: ItemId, due: Option<&str>) -> Result<()> {
+    check_due(due)?;
     let before: Option<String> = conn
         .prepare_cached("SELECT due FROM items WHERE id = ?1")?
         .query_row([task.get()], |row| row.get::<_, Option<String>>(0))
