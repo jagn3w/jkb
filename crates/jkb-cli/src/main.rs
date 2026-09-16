@@ -74,6 +74,13 @@ enum NotifyCmd {
     /// Print the queue topic notifications are sent on, for `scripts/setup.sh` (which creates it) and
     /// `scripts/build-notifier.sh` (whose agent subscribes to it) — so the name is spelled once.
     Topic,
+    /// List the Claude Code sessions the daemon's registry holds: the live ones, or with `--all`
+    /// the ended ones too. Asked of `jkb serve`, like the hook.
+    Sessions {
+        /// Include ended sessions, most recent first.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1164,8 +1171,7 @@ fn run(cli: Cli) -> Result<()> {
     // mode's refusals (`JKB_DB` beside `JKB_REMOTE`) exit before the hook can log, onto a stderr
     // the shim discards — every notification lost silently (stage-5 review).
     if let Command::Notify { cmd } = &cli.command {
-        notify::run(cmd);
-        return Ok(());
+        return notify::run(cmd, cli.json);
     }
 
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
@@ -1269,10 +1275,7 @@ fn run(cli: Cli) -> Result<()> {
         // that ever stops happening, not a silent fallthrough to the database path. Which of the
         // two runs is pinned by `notify_needs_no_database` in tests/cli.rs, so the fast path is
         // load-bearing rather than an optimisation someone can quietly drop.
-        Command::Notify { cmd } => {
-            notify::run(&cmd);
-            Ok(())
-        }
+        Command::Notify { cmd } => notify::run(&cmd, json),
         // Ahead of every other arm, and asked through the same predicate remote mode dispatches on:
         // a read ported later is then served by its op here too, rather than by an arm below that
         // still compiles.

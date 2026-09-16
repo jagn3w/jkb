@@ -5,9 +5,7 @@
 use std::cell::Cell;
 use std::time::Duration;
 
-use jkb_api::{
-    ApiError, Backend, ErrorCode, HookEvent, LocalBackend, NotifySession, Request, Response,
-};
+use jkb_api::{ApiError, Backend, ErrorCode, HookEvent, LocalBackend, Request, Response};
 use jkb_core::Db;
 use jkb_fsm::Fact;
 use serde_json::json;
@@ -17,8 +15,8 @@ use super::{
     LOG_CAP_BYTES,
 };
 
-/// Exactly one hook event drives the sweep, and every other entry maps to a machine event, so a
-/// name in the table is never inert.
+/// Exactly one hook event drives the sweep, and every entry sends something, so a name in the table
+/// is never inert.
 #[test]
 fn exactly_one_hook_event_drives_the_sweep() {
     let sweepers: Vec<&str> = HOOK_EVENTS
@@ -29,8 +27,64 @@ fn exactly_one_hook_event_drives_the_sweep() {
     assert_eq!(sweepers, ["SessionStart"]);
     for (name, _) in HOOK_EVENTS {
         let raw = json!({ "hook_event_name": name, "session_id": "s1" }).to_string();
-        assert_ne!(ask(&raw, "", "").unwrap(), Ask::Nothing, "{name} is inert");
+        let asked = ask(&raw, "", "").unwrap();
+        assert!(!asked.requests.is_empty(), "{name} is inert");
+        assert_eq!(asked.sweep, *name == "SessionStart", "{name}");
     }
+}
+
+/// **The registry's feed.** A session's start and end reach the registry with the process and the
+/// payload's own word for why, and the end still withdraws the notification — first, since that is
+/// the one a person sees.
+#[test]
+fn a_session_start_and_end_feed_the_registry() {
+    let raw = json!({
+        "hook_event_name": "SessionStart", "session_id": "s1", "source": "resume", "cwd": "/w",
+    })
+    .to_string();
+    assert_eq!(
+        ask(&raw, "4242", "host").unwrap(),
+        Ask {
+            requests: vec![Request::SessionStarted {
+                session: "s1".into(),
+                source: "resume".into(),
+                pid: "4242".into(),
+                instance: "host".into(),
+                cwd: "/w".into(),
+            }],
+            sweep: true,
+        }
+    );
+    let raw = json!({ "hook_event_name": "SessionEnd", "session_id": "s1", "reason": "clear" })
+        .to_string();
+    let asked = ask(&raw, "4242", "host").unwrap();
+    assert!(!asked.sweep);
+    let ops: Vec<&str> = asked.requests.iter().map(Request::op).collect();
+    assert_eq!(ops, ["notify.event", "session.ended"]);
+    assert_eq!(
+        asked.requests[1],
+        Request::SessionEnded {
+            session: "s1".into(),
+            reason: "clear".into(),
+            pid: "4242".into(),
+            instance: "host".into(),
+        }
+    );
+    // A payload without its word still records the event.
+    let raw = json!({ "hook_event_name": "SessionEnd", "session_id": "s1" }).to_string();
+    let Request::SessionEnded { reason, .. } = &ask(&raw, "", "").unwrap().requests[1] else {
+        panic!("expected an end")
+    };
+    assert_eq!(reason, "unknown");
+    // With no session to address, a start still sweeps — the sweep is about other sessions.
+    let raw = json!({ "hook_event_name": "SessionStart" }).to_string();
+    assert_eq!(
+        ask(&raw, "", "").unwrap(),
+        Ask {
+            requests: Vec::new(),
+            sweep: true
+        }
+    );
 }
 
 /// The payload → request layer: every field the daemon needs, the session sanitized, and the
@@ -46,19 +100,23 @@ fn a_payload_becomes_one_notify_event() {
     .to_string();
     assert_eq!(
         ask(&raw, "4242", "host#pid:[1]").unwrap(),
-        Ask::Event(Request::NotifyEvent {
-            session: "___s1".into(),
-            event: HookEvent::Needed,
-            tool: String::new(),
-            message: "Claude needs your permission to use Bash".into(),
-            cwd: "/w/wt".into(),
-            owner: "4242".into(),
-            instance: "host#pid:[1]".into(),
-        })
+        Ask {
+            requests: vec![Request::NotifyEvent {
+                session: "___s1".into(),
+                event: HookEvent::Needed,
+                tool: String::new(),
+                message: "Claude needs your permission to use Bash".into(),
+                cwd: "/w/wt".into(),
+                owner: "4242".into(),
+                instance: "host#pid:[1]".into(),
+            }],
+            sweep: false,
+        }
     );
     let raw = json!({ "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash" })
         .to_string();
-    let Ask::Event(Request::NotifyEvent { event, tool, .. }) = ask(&raw, "", "").unwrap() else {
+    let Some(Request::NotifyEvent { event, tool, .. }) = ask(&raw, "", "").unwrap().requests.pop()
+    else {
         panic!("expected an event")
     };
     assert_eq!((event, tool.as_str()), (HookEvent::ToolFinished, "Bash"));
@@ -74,7 +132,7 @@ fn an_unusable_payload_asks_nothing() {
         r#"{"session_id":"s1"}"#,
         "{}",
     ] {
-        assert_eq!(ask(raw, "", "").unwrap(), Ask::Nothing, "{raw}");
+        assert_eq!(ask(raw, "", "").unwrap(), Ask::default(), "{raw}");
     }
     assert!(ask("not json", "", "").is_err());
 }
@@ -143,16 +201,6 @@ fn the_instance_sent_ends_with_this_process_s_pid_namespace() {
     );
 }
 
-fn record(owner: &str, instance: &str) -> NotifySession {
-    NotifySession {
-        session: "s".into(),
-        tool: String::new(),
-        owner: owner.into(),
-        instance: instance.into(),
-        updated_at: 0,
-    }
-}
-
 /// **Proving a session gone is the one decision here that can take a live prompt off the screen**,
 /// so everything short of proof is `Unknown`.
 #[test]
@@ -162,24 +210,20 @@ fn only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone() {
     let alive = |_| Fact::Yes;
     let unknown = |_| Fact::Unknown;
 
+    assert_eq!(verdict("10", me, me, dead), Fact::No, "a dead pid here");
+    assert_eq!(verdict("10", me, me, alive), Fact::Unknown);
     assert_eq!(
-        verdict(&record("10", me), me, dead),
-        Fact::No,
-        "a dead pid here"
-    );
-    assert_eq!(verdict(&record("10", me), me, alive), Fact::Unknown);
-    assert_eq!(
-        verdict(&record("10", me), me, unknown),
+        verdict("10", me, me, unknown),
         Fact::Unknown,
         "a probe that could not answer proves nothing"
     );
     assert_eq!(
-        verdict(&record("10", "c7b8#pid:[1]/pid:[1]"), me, alive),
+        verdict("10", "c7b8#pid:[1]/pid:[1]", me, alive),
         Fact::No,
         "another boot of this container: its processes are gone, whatever a pid here says"
     );
     assert_eq!(
-        verdict(&record("10", "c7b8#pid:[1]/pid:[9]"), me, alive),
+        verdict("10", "c7b8#pid:[1]/pid:[9]", me, alive),
         Fact::No,
         "...including a nested sandbox of that earlier boot"
     );
@@ -192,24 +236,20 @@ fn only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone() {
             "a nested sandbox of THIS boot: its pids are not this namespace's (the review's case)",
         ),
     ] {
-        assert_eq!(
-            verdict(&record("10", other), me, dead),
-            Fact::Unknown,
-            "{why}"
-        );
+        assert_eq!(verdict("10", other, me, dead), Fact::Unknown, "{why}");
     }
     assert_eq!(
-        verdict(&record("10", "c7b8#pid:[1]/pid:[1]"), "c7b8/pid:[3]", dead),
+        verdict("10", "c7b8#pid:[1]/pid:[1]", "c7b8/pid:[3]", dead),
         Fact::Unknown,
         "a process with no boot of its own cannot call another boot earlier"
     );
     assert_eq!(
-        verdict(&record("10", me), "c7b8#pid:[2]/pid:[9]", dead),
+        verdict("10", me, "c7b8#pid:[2]/pid:[9]", dead),
         Fact::Unknown,
         "and a nested sandbox cannot probe the outer namespace's pids either"
     );
     assert_eq!(
-        verdict(&record("", me), me, dead),
+        verdict("", me, me, dead),
         Fact::Unknown,
         "no owner, no probe"
     );
@@ -347,7 +387,11 @@ fn an_unreachable_daemon_is_a_logged_failure() {
     );
     assert_eq!(
         handle(&session_start(), &edge),
-        ["notify.open_sessions: Unavailable: no daemon"]
+        [
+            "session.started: Unavailable: no daemon",
+            "notify.open_sessions: Unavailable: no daemon",
+            "session.list: Unavailable: no daemon",
+        ]
     );
     assert_eq!(handle("not json", &edge).len(), 1);
     let ignored = json!({ "hook_event_name": "PreToolUse", "session_id": "s1" }).to_string();
@@ -438,4 +482,166 @@ fn a_hook_event_reaches_a_real_daemon_within_the_hook_deadlines() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].kind, jkb_core::notify::KIND_POST);
     handle_.shutdown();
+}
+
+fn register(b: &dyn Backend, session: &str, pid: &str, instance: &str) {
+    b.call(Request::SessionStarted {
+        session: session.into(),
+        source: "startup".into(),
+        pid: pid.into(),
+        instance: instance.into(),
+        cwd: "/w".into(),
+    })
+    .unwrap();
+}
+
+fn live_sessions(b: &dyn Backend) -> Vec<String> {
+    let Response::ClaudeSessions { sessions } =
+        b.call(Request::SessionList { all: false }).unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    let mut ids: Vec<String> = sessions.into_iter().map(|s| s.session).collect();
+    ids.sort();
+    ids
+}
+
+/// The registry half of the sweep: the starting session registers itself, and the live sessions
+/// provably gone — a dead pid here, an earlier boot of this container — are ended; nothing else is.
+#[test]
+fn the_sweep_ends_the_registry_sessions_that_are_provably_gone() {
+    let b = backend();
+    let me = "c7b8#pid:[2]";
+    register(&b, "dead", "10", me);
+    register(&b, "live", "20", me);
+    register(&b, "earlier-boot", "20", "c7b8#pid:[1]");
+    register(&b, "host", "10", "mac");
+    register(&b, "no-pid", "", me);
+
+    let probe = |pid| if pid == 10 { Fact::No } else { Fact::Yes };
+    let failures = handle(
+        &session_start(),
+        &Edge {
+            backend: &b,
+            owner: "30".into(),
+            instance: me.into(),
+            probe: &probe,
+        },
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(live_sessions(&b), ["host", "live", "new", "no-pid"]);
+    let Response::ClaudeSessions { sessions } = b.call(Request::SessionList { all: true }).unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    let gone: Vec<(&str, Option<&str>)> = sessions
+        .iter()
+        .filter(|s| s.ended_at.is_some())
+        .map(|s| (s.session.as_str(), s.end_reason.as_deref()))
+        .collect();
+    assert_eq!(gone.len(), 2, "{gone:?}");
+    assert!(gone.iter().all(|(_, r)| *r == Some("gone")), "{gone:?}");
+}
+
+/// A backend that restarts a session under a new process the moment the sweep has listed the
+/// registry — the `claude --resume` race, on the registry's side.
+struct RegistryResumedMidSweep {
+    inner: LocalBackend,
+    fired: Cell<bool>,
+}
+
+impl Backend for RegistryResumedMidSweep {
+    fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let listing = matches!(request, Request::SessionList { .. });
+        let out = self.inner.call(request);
+        if listing && !self.fired.replace(true) {
+            register(&self.inner, "s1", "99", "host");
+        }
+        out
+    }
+}
+
+/// A session resumed between the sweep's listing and its verdict stays live.
+#[test]
+fn the_sweep_spares_a_registry_session_resumed_after_it_looked() {
+    let inner = backend();
+    register(&inner, "s1", "10", "host");
+    let b = RegistryResumedMidSweep {
+        inner,
+        fired: Cell::new(false),
+    };
+    let failures = handle(
+        &session_start(),
+        &Edge {
+            backend: &b,
+            owner: "30".into(),
+            instance: "host".into(),
+            probe: &|pid| if pid == 30 { Fact::Yes } else { Fact::No },
+        },
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(live_sessions(&b.inner), ["new", "s1"]);
+}
+
+/// A backend whose first answer takes `delay`, recording every op it was asked.
+struct SlowFirst {
+    inner: LocalBackend,
+    delay: Duration,
+    asked: std::cell::RefCell<Vec<&'static str>>,
+}
+
+impl Backend for SlowFirst {
+    fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let mut asked = self.asked.borrow_mut();
+        if asked.is_empty() {
+            std::thread::sleep(self.delay);
+        }
+        asked.push(request.op());
+        drop(asked);
+        self.inner.call(request)
+    }
+}
+
+fn slow_first(delay: Duration) -> SlowFirst {
+    SlowFirst {
+        inner: backend(),
+        delay,
+        asked: std::cell::RefCell::new(Vec::new()),
+    }
+}
+
+/// **The hook stays inside its budget.** A slow first request still goes, but nothing starts after
+/// the event's last start time: at `SessionEnd`, whose hooks get 1.5 s, the registry end is not sent
+/// once half a second has gone; at `SessionStart` the sweep is not begun once the full request
+/// deadline has.
+#[test]
+fn a_slow_first_request_leaves_the_rest_unsent() {
+    let end = json!({ "hook_event_name": "SessionEnd", "session_id": "s1" }).to_string();
+    let b = slow_first(super::SESSION_END_SECOND_REQUEST);
+    let edge = |b| Edge {
+        backend: b,
+        owner: "1".into(),
+        instance: "host".into(),
+        probe: &|_| Fact::Unknown,
+    };
+    assert_eq!(
+        handle(&end, &edge(&b)),
+        ["session.ended: out of time; not sent"]
+    );
+    assert_eq!(*b.asked.borrow(), ["notify.event"]);
+
+    let b = slow_first(Duration::from_millis(1));
+    assert!(handle(&end, &edge(&b)).is_empty());
+    assert_eq!(
+        *b.asked.borrow(),
+        ["notify.event", "session.ended"],
+        "in time, both go"
+    );
+
+    let b = slow_first(super::TOTAL);
+    assert_eq!(
+        handle(&session_start(), &edge(&b)),
+        [format!("notify.open_sessions: {}", super::OUT_OF_TIME)]
+    );
+    assert_eq!(*b.asked.borrow(), ["session.started"]);
 }

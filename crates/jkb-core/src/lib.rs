@@ -15,6 +15,7 @@ mod store;
 pub mod binding;
 pub mod blob;
 pub mod claim;
+pub mod claude_session;
 pub mod containment;
 pub mod dsl;
 pub mod edge;

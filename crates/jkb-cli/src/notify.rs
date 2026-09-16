@@ -23,6 +23,11 @@
 //! (`notify.open_sessions`), decides for each whether its session is provably gone ([`verdict`]), and
 //! tells the daemon (`notify.gone`). That sweep is the only route by which a killed session's
 //! Alerts-style notification — which waits for ever by design — comes down.
+//!
+//! **It also feeds the session registry** (tasks S6.4, [`jkb_core::claude_session`]): `SessionStart`
+//! sends `session.started`, `SessionEnd` sends `session.ended`, and the same sweep ends the live
+//! sessions it proves gone (`session.list`, `session.gone`) — the only way a killed `claude` or a
+//! restarted container, which send no `SessionEnd` (measured), is ever recorded as ended.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -37,16 +42,24 @@ use crate::NotifyCmd;
 /// How long the hook waits to connect to the daemon.
 pub const CONNECT: Duration = Duration::from_millis(200);
 
-/// How long one request may take. The `SessionStart` sweep starts no request once this has passed,
-/// so it is bounded by about twice this (a request started just before the deadline runs its own
-/// full `TOTAL`) — once per session, where every other event is bounded by one.
+/// How long one request may take. A hook invocation starts no request after its first once this has
+/// passed, so `SessionStart` — a start and a sweep — is bounded by about twice this (a request started
+/// just before the deadline runs its own full `TOTAL`), once per session.
 pub const TOTAL: Duration = Duration::from_secs(1);
+
+/// `SessionEnd`'s hooks get 1.5 s by default (Claude Code's hooks documentation), and it sends two
+/// requests: the second starts only this soon after the invocation began, so that a slow first one
+/// cannot carry the second past the budget. A warm round trip is a few milliseconds.
+pub const SESSION_END_SECOND_REQUEST: Duration = Duration::from_millis(500);
 
 /// The log grows to this, then starts again beside its predecessor (`.1`).
 const LOG_CAP_BYTES: u64 = 256 * 1024;
 
-/// Run a `jkb notify` verb. Infallible: `hook` logs its failures rather than returning them.
-pub fn run(cmd: &NotifyCmd) {
+/// Run a `jkb notify` verb. `hook` never fails: it logs its failures rather than returning them.
+///
+/// # Errors
+/// `sessions`: the daemon could not be reached or refused.
+pub fn run(cmd: &NotifyCmd, json: bool) -> Result<()> {
     match cmd {
         NotifyCmd::Events => {
             for (name, _) in HOOK_EVENTS {
@@ -55,7 +68,43 @@ pub fn run(cmd: &NotifyCmd) {
         }
         NotifyCmd::Topic => println!("{}", jkb_core::notify::TOPIC),
         NotifyCmd::Hook => hook(),
+        NotifyCmd::Sessions { all } => sessions(*all, json)?,
     }
+    Ok(())
+}
+
+/// `jkb notify sessions`: the session registry, as the daemon holds it.
+fn sessions(all: bool, json: bool) -> Result<()> {
+    let url = crate::remote::daemon_url();
+    let backend = jkb_daemon::client::RemoteBackend::new(&url, crate::remote::token_file(&url))
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let sessions = match backend.call(Request::SessionList { all }) {
+        Ok(Response::ClaudeSessions { sessions }) => sessions,
+        Ok(other) => anyhow::bail!("session.list: unexpected {other:?}"),
+        Err(e) => anyhow::bail!("session.list: {}", e.message),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
+    for s in &sessions {
+        println!("{}", session_line(s));
+    }
+    Ok(())
+}
+
+/// One session, on one line: id, state, process and where it runs.
+fn session_line(s: &jkb_api::ClaudeSession) -> String {
+    let state = match (&s.end_reason, &s.start_source) {
+        (Some(reason), _) => format!("ended ({reason})"),
+        (None, Some(source)) => format!("live ({source})"),
+        (None, None) => "live".to_owned(),
+    };
+    let pid = if s.pid.is_empty() { "?" } else { &s.pid };
+    format!(
+        "{}  {state}  pid {pid} on {}  {}",
+        s.session, s.instance, s.cwd
+    )
 }
 
 /// The Claude Code hook events this command answers to, and the ONE place they are spelled.
@@ -75,19 +124,19 @@ const HOOK_EVENTS: &[(&str, Option<HookEvent>)] = &[
     ("SessionStart", None),
 ];
 
-/// What a payload asks of the daemon.
-#[derive(Debug, PartialEq)]
-enum Ask {
-    /// Nothing: an event we do not act on, or no session to address.
-    Nothing,
-    /// The `SessionStart` sweep.
-    Sweep,
-    /// One `notify.event`.
-    Event(Request),
+/// What a payload asks of the daemon: requests, in order, and then perhaps the sweep. Nothing at all
+/// for an event we do not act on.
+#[derive(Debug, Default, PartialEq)]
+struct Ask {
+    requests: Vec<Request>,
+    sweep: bool,
 }
 
 /// The payload, read into what it asks for. `owner` and `instance` are handed in, resolved at the
 /// edge, so this is a pure function of its arguments.
+///
+/// A payload that names no session sends nothing addressed to one, but `SessionStart` still sweeps:
+/// the sweep is about other sessions.
 fn ask(raw: &str, owner: &str, instance: &str) -> Result<Ask> {
     let payload: serde_json::Value =
         serde_json::from_str(raw).context("the hook payload is not JSON")?;
@@ -102,24 +151,54 @@ fn ask(raw: &str, owner: &str, instance: &str) -> Result<Ask> {
         .iter()
         .find(|(n, _)| *n == field("hook_event_name"))
     else {
-        return Ok(Ask::Nothing);
-    };
-    let Some(event) = event else {
-        return Ok(Ask::Sweep);
+        return Ok(Ask::default());
     };
     let session = jkb_core::notify::sanitize(&field("session_id"));
+    // Claude Code names these; an absent one is still an event worth recording.
+    let word = |k: &str| {
+        let w = field(k);
+        if w.is_empty() {
+            "unknown".to_owned()
+        } else {
+            w
+        }
+    };
+    let mut out = Ask {
+        requests: Vec::new(),
+        sweep: event.is_none(),
+    };
     if session.is_empty() {
-        return Ok(Ask::Nothing);
+        return Ok(out);
     }
-    Ok(Ask::Event(Request::NotifyEvent {
-        session,
-        event: *event,
-        tool: field("tool_name"),
-        message: field("message"),
-        cwd: field("cwd"),
-        owner: owner.to_owned(),
-        instance: instance.to_owned(),
-    }))
+    match event {
+        None => out.requests.push(Request::SessionStarted {
+            session,
+            source: word("source"),
+            pid: owner.to_owned(),
+            instance: instance.to_owned(),
+            cwd: field("cwd"),
+        }),
+        Some(event) => {
+            out.requests.push(Request::NotifyEvent {
+                session: session.clone(),
+                event: *event,
+                tool: field("tool_name"),
+                message: field("message"),
+                cwd: field("cwd"),
+                owner: owner.to_owned(),
+                instance: instance.to_owned(),
+            });
+            if *event == HookEvent::SessionEnded {
+                out.requests.push(Request::SessionEnded {
+                    session,
+                    reason: word("reason"),
+                    pid: owner.to_owned(),
+                    instance: instance.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The process whose existence answers "is this session still alive?".
@@ -216,7 +295,9 @@ fn host_and_boot(instance: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Whether a notification record's session is provably gone, as seen from this process.
+/// Whether the session a record names — by its `owner` pid and the `instance` that pid belongs to —
+/// is provably gone, as seen from this process. The notification record and the registry row ask the
+/// same question of the same two fields.
 ///
 /// * **The same instance** — same host, boot and pid namespace: its owner pid means the same process
 ///   here, so probe it — by the kernel, with `EPERM` counted as alive ([`crate::owner::pid_alive`]).
@@ -225,17 +306,17 @@ fn host_and_boot(instance: &str) -> (&str, Option<&str>) {
 /// * **Anything else** — the host from a container, another container, a nested sandbox of this
 ///   boot, a record with no owner — is [`Fact::Unknown`]: nothing here can establish it, and
 ///   `Unknown` never withdraws.
-fn verdict(record: &jkb_api::NotifySession, mine: &str, probe: impl Fn(u32) -> Fact) -> Fact {
-    let Ok(pid) = record.owner.parse::<u32>() else {
+fn verdict(owner: &str, instance: &str, mine: &str, probe: impl Fn(u32) -> Fact) -> Fact {
+    let Ok(pid) = owner.parse::<u32>() else {
         return Fact::Unknown;
     };
-    if record.instance == mine {
+    if instance == mine {
         return match probe(pid) {
             Fact::No => Fact::No,
             _ => Fact::Unknown,
         };
     }
-    match (host_and_boot(&record.instance), host_and_boot(mine)) {
+    match (host_and_boot(instance), host_and_boot(mine)) {
         ((their_host, Some(theirs)), (my_host, Some(ours)))
             if their_host == my_host && theirs != ours =>
         {
@@ -256,54 +337,107 @@ struct Edge<'a> {
 /// One hook invocation. Returns the failures to log — never an error, because nothing a hook can
 /// return reaches anyone but the session it would disturb.
 fn handle(raw: &str, edge: &Edge<'_>) -> Vec<String> {
+    let started = Instant::now();
     let ask = match ask(raw, &edge.owner, &edge.instance) {
         Ok(ask) => ask,
         Err(e) => return vec![format!("{e:#}")],
     };
-    match ask {
-        Ask::Nothing => Vec::new(),
-        Ask::Event(request) => match edge.backend.call(request) {
-            Ok(_) => Vec::new(),
-            Err(e) => vec![failure("notify.event", &e)],
-        },
-        Ask::Sweep => sweep(edge),
+    // The first request always goes; a later one only while it can still finish inside the event's
+    // budget.
+    let last_start = if ask.sweep {
+        TOTAL
+    } else {
+        SESSION_END_SECOND_REQUEST
+    };
+    let mut failures = Vec::new();
+    for (i, request) in ask.requests.into_iter().enumerate() {
+        let op = request.op();
+        if i > 0 && started.elapsed() >= last_start {
+            failures.push(format!("{op}: out of time; not sent"));
+            continue;
+        }
+        if let Err(e) = edge.backend.call(request) {
+            failures.push(failure(op, &e));
+        }
     }
+    if ask.sweep {
+        failures.extend(sweep(edge, started));
+    }
+    failures
 }
 
 fn failure(op: &str, e: &ApiError) -> String {
     format!("{op}: {:?}: {}", e.code, e.message)
 }
 
-/// The `SessionStart` sweep: withdraw what provably-gone sessions left on screen. It starts no request
-/// after [`TOTAL`] has passed, so it ends within about twice that; whatever is left is swept by the
-/// next session to start.
-fn sweep(edge: &Edge<'_>) -> Vec<String> {
-    let started = Instant::now();
-    let sessions = match edge.backend.call(Request::NotifyOpenSessions {}) {
-        Ok(Response::Sessions { sessions }) => sessions,
-        Ok(other) => return vec![format!("notify.open_sessions: unexpected {other:?}")],
-        Err(e) => return vec![failure("notify.open_sessions", &e)],
-    };
+const OUT_OF_TIME: &str = "the sweep ran out of time; the next session resumes it";
+
+/// The `SessionStart` sweep, over what provably-gone sessions left: their notifications are withdrawn,
+/// and their registry rows ended. It starts no request once [`TOTAL`] has passed since `started`, so
+/// the invocation ends within about twice that; whatever is left is swept by the next session to
+/// start.
+///
+/// What each verdict was computed from goes back with its request: the daemon acts only if the record
+/// still names that owner in that instance, so a session resumed since the listing is spared.
+fn sweep(edge: &Edge<'_>, started: Instant) -> Vec<String> {
     let mut failures = Vec::new();
-    for record in sessions {
-        if verdict(&record, &edge.instance, edge.probe) != Fact::No {
-            continue;
+    let out_of_time = |failures: &mut Vec<String>, op: &str| {
+        let late = started.elapsed() >= TOTAL;
+        if late {
+            failures.push(format!("{op}: {OUT_OF_TIME}"));
         }
-        if started.elapsed() >= TOTAL {
-            failures
-                .push("notify.gone: the sweep ran out of time; the next session resumes it".into());
-            break;
+        late
+    };
+
+    if out_of_time(&mut failures, "notify.open_sessions") {
+        return failures;
+    }
+    match edge.backend.call(Request::NotifyOpenSessions {}) {
+        Ok(Response::Sessions { sessions }) => {
+            for record in sessions {
+                if verdict(&record.owner, &record.instance, &edge.instance, edge.probe) != Fact::No
+                {
+                    continue;
+                }
+                if out_of_time(&mut failures, "notify.gone") {
+                    return failures;
+                }
+                if let Err(e) = edge.backend.call(Request::NotifyGone {
+                    session: record.session,
+                    owner: record.owner,
+                    instance: record.instance,
+                }) {
+                    failures.push(failure("notify.gone", &e));
+                }
+            }
         }
-        // What the verdict was computed from goes back with the request: the daemon withdraws only if
-        // the record still names that owner in that instance, so a session resumed since
-        // `open_sessions` keeps its prompt.
-        if let Err(e) = edge.backend.call(Request::NotifyGone {
-            session: record.session,
-            owner: record.owner,
-            instance: record.instance,
-        }) {
-            failures.push(failure("notify.gone", &e));
+        Ok(other) => failures.push(format!("notify.open_sessions: unexpected {other:?}")),
+        Err(e) => failures.push(failure("notify.open_sessions", &e)),
+    }
+
+    if out_of_time(&mut failures, "session.list") {
+        return failures;
+    }
+    match edge.backend.call(Request::SessionList { all: false }) {
+        Ok(Response::ClaudeSessions { sessions }) => {
+            for row in sessions {
+                if verdict(&row.pid, &row.instance, &edge.instance, edge.probe) != Fact::No {
+                    continue;
+                }
+                if out_of_time(&mut failures, "session.gone") {
+                    return failures;
+                }
+                if let Err(e) = edge.backend.call(Request::SessionGone {
+                    session: row.session,
+                    pid: row.pid,
+                    instance: row.instance,
+                }) {
+                    failures.push(failure("session.gone", &e));
+                }
+            }
         }
+        Ok(other) => failures.push(format!("session.list: unexpected {other:?}")),
+        Err(e) => failures.push(failure("session.list", &e)),
     }
     failures
 }

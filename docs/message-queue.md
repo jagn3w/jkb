@@ -63,13 +63,16 @@ routinely built from different checkouts.
 | `notify.event` | `session`, `event` (`needed`\|`tool_finished`\|`user_acted`\|`turn_ended`\|`session_ended`), `tool?`, `message?`, `cwd?`, `owner?`, `instance?` | `notified` {`state`, `moved`, `effects`, `refusal?`, `sent`} |
 | `notify.open_sessions` | — | `sessions` {`sessions`: [{`session`, `tool`, `owner`, `instance`, `updated_at`}]} |
 | `notify.gone` | `session`, `owner`, `instance` (as `notify.open_sessions` reported them) | `notified` {…} |
+| `session.started` | `session`, `source`, `pid?`, `instance?`, `cwd?` | `session_start` {`outcome`: `new`\|`restarted`\|`revived`} |
+| `session.ended` | `session`, `reason`, `pid?`, `instance?` | `session_end` {`outcome`: `recorded`\|`already_ended`\|`other_process`} |
+| `session.gone` | `session`, `pid`, `instance` (as `session.list` reported them) | `session_gone` {`ended`} |
+| `session.list` | `all?` | `claude_sessions` {`sessions`: [{`session`, `pid`, `instance`, `cwd`, `started_at?`, `start_source?`, `ended_at?`, `end_reason?`}]} |
 | `kb.ambient` | `cwd`, `home?` | `ambient` {`namespace`} |
 | `kb.query` | `dsl`, `default_scope?`, `limit?`, `count?`, `order?` (`id`\|`updated_desc`) | `items` {`items`}, or with `count` `count` {`count`} |
 | `kb.ls` | `path?`, `all?`, `recursive?` | `listing` {`rows`: [{`parent`, `child`}]} |
 | `kb.tree` | `path?`, `all?`, `depth?` (≤ 48) | `tree` {`nodes`: [{`child`, `children`}]} |
 | `kb.cat` | `uid` | `content` {`content`} |
 | `kb.grep` | `pattern` (non-empty), `scope?`, `ignore_case?`, `mode?` (`lines`\|`names`\|`count`) | `grep_hits` {`hits`: [{`uid`, `kind`, `lines`: [{`line`, `text`}]}], `count`, `truncated`} |
-
 | `kb.search` | `dsl`, `default_scope?`, `route` (`vector`\|`fts`\|`hybrid`), `limit` (≤ 1000), `context?` (≤ 50) | `search_hits` {`hits`} |
 | `task.ready` | `dsl`, `default_scope?`, `limit?` | `items` {`items`} |
 | `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
@@ -234,7 +237,7 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   write beside it under 0.7 s). Which ops go there is said once, by `Request::is_agent_read` — the
   read set (`kb.*`, `task.ready`/`show`/`subtasks`), **not** every op that does not write: the reader
   serves one call at a time behind a client's greps, so the queue's and the hook's own short reads
-  (`mq.inspect`, `mq.tail`, `notify.open_sessions`, whose `SessionStart` sweep has 1 s) stay on the
+  (`mq.inspect`, `mq.tail`, `notify.open_sessions`, `session.list`, whose `SessionStart` sweep has 1 s) stay on the
   writer. Classing by "does not write" put that sweep behind a container's grep, and a third review
   caught it. The backend picks the connection from the class — no dispatch arm chooses — and `jkb
   serve` counts the read set against a **third permit budget** (`max_reads`, 16) beside ops and

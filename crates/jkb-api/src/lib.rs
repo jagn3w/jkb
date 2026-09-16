@@ -16,11 +16,12 @@
 //! added, and an op never changes meaning — a changed meaning is a new op name.
 //!
 //! Stage 2 shipped the message-queue ops (`mq.*`), stage 5 the notification ops (`notify.*`), stage
-//! 6.1 the agent read set (`kb.*`, `task.ready`/`show`/`subtasks`, in [`kb`]); the task-mutate set
-//! follows.
+//! 6.1 the agent read set (`kb.*`, `task.ready`/`show`/`subtasks`, in [`kb`]), 6.2 the task-mutate
+//! set, 6.3 `ingest.text`, and 6.4 the Claude Code session registry (`session.*`), fed by the hook.
 
 use std::sync::Arc;
 
+use jkb_core::claude_session;
 use jkb_core::mq::{self, Created, Draft, QueueError, Start, TopicSpec};
 use jkb_core::notify::{self, NotifEvent, Observation};
 use jkb_core::Db;
@@ -156,6 +157,57 @@ pub enum Request {
         owner: String,
         /// The record's instance, as the producer read it.
         instance: String,
+    },
+    /// A Claude Code session started, resumed, was cleared into or compacted
+    /// ([`jkb_core::claude_session`]): it is live, held by this process.
+    #[serde(rename = "session.started")]
+    SessionStarted {
+        /// The session id, sanitized to `[A-Za-z0-9_-]` (anything else is refused).
+        session: String,
+        /// The payload's `source` (`startup`, `resume`, `clear`, `compact`, …).
+        source: String,
+        /// The `claude` process's pid, or empty when the hook had none it could trust.
+        #[serde(default)]
+        pid: String,
+        /// Where `pid` means something: `host[#boot][/pidns]`.
+        #[serde(default)]
+        instance: String,
+        /// The session's working directory.
+        #[serde(default)]
+        cwd: String,
+    },
+    /// A Claude Code session ended, as its own process reported. Ignored once the session is held by
+    /// another process.
+    #[serde(rename = "session.ended")]
+    SessionEnded {
+        /// The session id.
+        session: String,
+        /// The payload's `reason` (`prompt_input_exit`, `clear`, `resume`, `other`, …).
+        reason: String,
+        /// The reporting `claude` process's pid, or empty.
+        #[serde(default)]
+        pid: String,
+        /// Where `pid` means something.
+        #[serde(default)]
+        instance: String,
+    },
+    /// A producer proved a session's process gone: end the session, but only while it is live and
+    /// still held by that process.
+    #[serde(rename = "session.gone")]
+    SessionGone {
+        /// The session id.
+        session: String,
+        /// The pid the producer probed, as `session.list` reported it.
+        pid: String,
+        /// Its instance, as `session.list` reported it.
+        instance: String,
+    },
+    /// The session registry: the live sessions, oldest first (what a sweep probes), or every one.
+    #[serde(rename = "session.list")]
+    SessionList {
+        /// Include ended sessions, most recent first.
+        #[serde(default)]
+        all: bool,
     },
     /// The namespace of the mount holding a working directory — what an unscoped read defaults to.
     #[serde(rename = "kb.ambient")]
@@ -429,6 +481,46 @@ pub struct NotifySession {
     pub updated_at: i64,
 }
 
+/// A Claude Code session as `session.list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeSession {
+    /// The session id.
+    pub session: String,
+    /// The `claude` process that last started it, or empty.
+    pub pid: String,
+    /// Where `pid` means something: `host[#boot][/pidns]`.
+    pub instance: String,
+    /// Its working directory, as the hook reported it.
+    pub cwd: String,
+    /// When it last started (Unix ms); absent when only its end was seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    /// How it last started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_source: Option<String>,
+    /// When it ended (Unix ms); absent while live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    /// Why it ended (`gone` when a sweep proved it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
+}
+
+impl From<jkb_core::claude_session::SessionRow> for ClaudeSession {
+    fn from(r: jkb_core::claude_session::SessionRow) -> Self {
+        Self {
+            session: r.session,
+            pid: r.pid,
+            instance: r.instance,
+            cwd: r.cwd,
+            started_at: r.started_at,
+            start_source: r.start_source,
+            ended_at: r.ended_at,
+            end_reason: r.end_reason,
+        }
+    }
+}
+
 /// A topic spec as a request carries it: every field optional, defaults from [`TopicSpec`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -599,6 +691,10 @@ impl Request {
         "notify.event",
         "notify.open_sessions",
         "notify.gone",
+        "session.started",
+        "session.ended",
+        "session.gone",
+        "session.list",
         "kb.ambient",
         "kb.query",
         "kb.ls",
@@ -641,6 +737,10 @@ impl Request {
             Self::NotifyEvent { .. } => "notify.event",
             Self::NotifyOpenSessions {} => "notify.open_sessions",
             Self::NotifyGone { .. } => "notify.gone",
+            Self::SessionStarted { .. } => "session.started",
+            Self::SessionEnded { .. } => "session.ended",
+            Self::SessionGone { .. } => "session.gone",
+            Self::SessionList { .. } => "session.list",
             Self::KbAmbient { .. } => "kb.ambient",
             Self::KbQuery { .. } => "kb.query",
             Self::KbLs { .. } => "kb.ls",
@@ -673,7 +773,7 @@ impl Request {
     ///
     /// **Not "every op that does not write".** The reader serves one call at a time, and what queues
     /// there is a client's reads — a grep over the whole knowledge base among them. The queue's and the
-    /// notification hook's own reads (`mq.inspect`, `mq.tail`, `notify.open_sessions`) are short and
+    /// notification hook's own reads (`mq.inspect`, `mq.tail`, `notify.open_sessions`, `session.list`) are short and
     /// latency-bound — a `SessionStart` sweep has 1 s — so they stay on the writer, which otherwise runs
     /// only writes (`ingest.text`, the longest, under the daemon's own small budget); classing them by "does not write" put the sweep behind a container's grep (stage-6.1 review).
     /// Exhaustive, so a new op must say. A write classed here fails against the daemon's `query_only`
@@ -703,6 +803,10 @@ impl Request {
             | Self::NotifyEvent { .. }
             | Self::NotifyOpenSessions {}
             | Self::NotifyGone { .. }
+            | Self::SessionStarted { .. }
+            | Self::SessionEnded { .. }
+            | Self::SessionGone { .. }
+            | Self::SessionList { .. }
             | Self::TaskAdd(_)
             | Self::TaskSet { .. }
             | Self::TaskEdit { .. }
@@ -777,6 +881,28 @@ pub enum Response {
     Sessions {
         /// By session.
         sessions: Vec<NotifySession>,
+    },
+    /// A `session.started`: `new`, `restarted` (it was live under another process) or `revived`
+    /// (it had ended).
+    SessionStart {
+        /// What the start did.
+        outcome: String,
+    },
+    /// A `session.ended`: `recorded`, `already_ended`, or `other_process` (the session is held by
+    /// another process, so nothing changed).
+    SessionEnd {
+        /// What the end did.
+        outcome: String,
+    },
+    /// A `session.gone`.
+    SessionGone {
+        /// Whether the session was ended by it.
+        ended: bool,
+    },
+    /// A `session.list`.
+    ClaudeSessions {
+        /// In the order asked for.
+        sessions: Vec<ClaudeSession>,
     },
     /// A `kb.ambient`.
     Ambient {
@@ -922,6 +1048,10 @@ impl Response {
             | Self::Topics { .. }
             | Self::Notified { .. }
             | Self::Sessions { .. }
+            | Self::SessionStart { .. }
+            | Self::SessionEnd { .. }
+            | Self::SessionGone { .. }
+            | Self::ClaudeSessions { .. }
             | Self::Ambient { .. }
             | Self::Count { .. }
             | Self::Content { .. }
@@ -953,6 +1083,10 @@ impl Response {
             | Self::Compacted { .. }
             | Self::Topics { .. }
             | Self::Sessions { .. }
+            | Self::SessionStart { .. }
+            | Self::SessionEnd { .. }
+            | Self::SessionGone { .. }
+            | Self::ClaudeSessions { .. }
             | Self::Ambient { .. }
             | Self::Items { .. }
             | Self::Count { .. }
@@ -1385,6 +1519,56 @@ impl Backend for LocalBackend {
                     notify::gone(c, m, &session, &owner, &instance, now)
                 })?
                 .into(),
+            Request::SessionStarted {
+                session,
+                source,
+                pid,
+                instance,
+                cwd,
+            } => {
+                let started = db.write_txn(actor, move |c, m| {
+                    let start = claude_session::Start {
+                        session: &session,
+                        pid: &pid,
+                        instance: &instance,
+                        cwd: &cwd,
+                        source: &source,
+                    };
+                    claude_session::started(c, m, &start, now)
+                })?;
+                Response::SessionStart {
+                    outcome: started.as_str().to_owned(),
+                }
+            }
+            Request::SessionEnded {
+                session,
+                reason,
+                pid,
+                instance,
+            } => Response::SessionEnd {
+                outcome: db
+                    .write_txn(actor, move |c, m| {
+                        claude_session::ended(c, m, &session, &pid, &instance, &reason, now)
+                    })?
+                    .as_str()
+                    .to_owned(),
+            },
+            Request::SessionGone {
+                session,
+                pid,
+                instance,
+            } => Response::SessionGone {
+                ended: db.write_txn(actor, move |c, m| {
+                    claude_session::gone(c, m, &session, &pid, &instance, now)
+                })?,
+            },
+            Request::SessionList { all } => Response::ClaudeSessions {
+                sessions: db
+                    .read(move |c| claude_session::list(c, all))?
+                    .into_iter()
+                    .map(ClaudeSession::from)
+                    .collect(),
+            },
             Request::KbAmbient { cwd, home } => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 Response::Ambient {

@@ -1401,11 +1401,18 @@ mod tests {
     ];
     /// `(file, fn)` — spawns that do NOT resolve a repository, listed so that adding one
     /// is a decision rather than an omission.
-    const NOT_REPO_AWARE: &[(&str, &str, &str)] = &[(
-        "src/owner.rs",
-        "a_reaped_child_is_established_dead",
-        "spawns a shell purely to own a pid; it is never asked about a repository",
-    )];
+    const NOT_REPO_AWARE: &[(&str, &str, &str)] = &[
+        (
+            "src/owner.rs",
+            "a_reaped_child_is_established_dead",
+            "spawns a shell purely to own a pid; it is never asked about a repository",
+        ),
+        (
+            "tests/cli.rs",
+            "the_hook_feeds_the_session_registry_that_notify_sessions_lists",
+            "spawns `sleep` purely to own a live pid; it is never asked about a repository",
+        ),
+    ];
 
     /// The function a declaration line declares, or `UNPARSED` when the line declares one
     /// in a shape this scan does not model. `None` when it is not a declaration at all.

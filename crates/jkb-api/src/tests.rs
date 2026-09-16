@@ -103,6 +103,25 @@ fn samples() -> Vec<Request> {
             owner: "1".into(),
             instance: "h".into(),
         },
+        Request::SessionStarted {
+            session: "s".into(),
+            source: "startup".into(),
+            pid: "1".into(),
+            instance: "h".into(),
+            cwd: String::new(),
+        },
+        Request::SessionEnded {
+            session: "s".into(),
+            reason: "other".into(),
+            pid: "1".into(),
+            instance: "h".into(),
+        },
+        Request::SessionGone {
+            session: "s".into(),
+            pid: "1".into(),
+            instance: "h".into(),
+        },
+        Request::SessionList { all: false },
         Request::KbAmbient {
             cwd: "/".into(),
             home: String::new(),
@@ -2409,4 +2428,90 @@ fn ingest_text_takes_source_bytes_only_in_process() {
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+}
+
+/// The session registry through its ops, as the hook drives it: a start, an end from another
+/// process ignored, a sweep verdict, and the listing — with the wire shapes a client in another
+/// version parses.
+#[test]
+fn the_session_ops_drive_the_registry() {
+    let b = backend();
+    let outcome = |r: Response| match r {
+        Response::SessionStart { outcome } | Response::SessionEnd { outcome } => outcome,
+        other => panic!("unexpected {other:?}"),
+    };
+    let started = call(
+        &b,
+        json!({ "op": "session.started", "session": "s1", "source": "startup",
+                "pid": "10", "instance": "h", "cwd": "/w" }),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&started).unwrap(),
+        json!({ "result": "session_start", "outcome": "new" })
+    );
+    assert_eq!(
+        outcome(
+            call(
+                &b,
+                json!({ "op": "session.ended", "session": "s1", "reason": "other",
+                        "pid": "11", "instance": "h" }),
+            )
+            .unwrap()
+        ),
+        "other_process"
+    );
+    let mut listed =
+        serde_json::to_value(call(&b, json!({ "op": "session.list" })).unwrap()).unwrap();
+    let started_at = listed["sessions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("started_at")
+        .unwrap();
+    assert!(started_at.as_i64().is_some_and(|t| t > 0), "{started_at}");
+    assert_eq!(
+        listed,
+        json!({ "result": "claude_sessions", "sessions": [{
+            "session": "s1", "pid": "10", "instance": "h", "cwd": "/w",
+            "start_source": "startup",
+        }]}),
+        "a live session carries no end fields"
+    );
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "session.gone", "session": "s1", "pid": "10", "instance": "h" })
+        )
+        .unwrap(),
+        Response::SessionGone { ended: true }
+    );
+    let Response::ClaudeSessions { sessions } = call(&b, json!({ "op": "session.list" })).unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    assert!(sessions.is_empty(), "no live sessions left");
+    let Response::ClaudeSessions { sessions } =
+        call(&b, json!({ "op": "session.list", "all": true })).unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    assert_eq!(sessions[0].end_reason.as_deref(), Some("gone"));
+    assert_eq!(
+        outcome(
+            call(
+                &b,
+                json!({ "op": "session.started", "session": "s1", "source": "resume",
+                        "pid": "12", "instance": "h" }),
+            )
+            .unwrap()
+        ),
+        "revived"
+    );
+
+    let err = call(
+        &b,
+        json!({ "op": "session.started", "session": "a b", "source": "startup" }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err:?}");
 }

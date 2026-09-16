@@ -124,8 +124,9 @@ mod tests {
         // audit-only contract), V015 the task lifecycle history,
         // V016 drops branch_records (the history holds what it held, as events),
         // V017 the message queue (mq_topics, mq_messages, mq_groups),
-        // V018 the notification record (notify_sessions).
-        assert_eq!(user_version, 18);
+        // V018 the notification record (notify_sessions),
+        // V019 the Claude Code session registry (claude_sessions).
+        assert_eq!(user_version, 19);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -289,7 +290,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 18);
+        assert_eq!(user_version, 19);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

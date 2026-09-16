@@ -3089,6 +3089,86 @@ fn notify_hook_runs_under_remote_mode_s_refusals() {
     assert!(request.contains(r#""op":"notify.event""#), "{request}");
 }
 
+/// **The registry end to end, through the real binaries** (tasks S6.4): the hook, fed a session's
+/// start and end, records both in `jkb serve`'s registry, and `jkb notify sessions` reads it back.
+/// The end's `notify.event` is refused — this database has no `claude/notify` topic — and the
+/// registry end is still sent, so one failing request does not cost the other.
+#[test]
+fn the_hook_feeds_the_session_registry_that_notify_sessions_lists() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = dir.path().join("jkb.db");
+    let token = dir.path().join("daemon/token");
+    let (_serve, url) = Daemon::start(&db, &token);
+    // The owner must be a live process that is neither the hook nor its parent, or the start's own
+    // sweep would end the session it just registered.
+    let mut owner = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn sleep");
+    let owner_pid = owner.id().to_string();
+    let client = || {
+        let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+        cmd.env("HOME", dir.path())
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("JKB_HOOK_OWNER", &owner_pid)
+            .env_remove("JKB_DB");
+        cmd
+    };
+    let hook = |payload: serde_json::Value| {
+        client()
+            .args(["notify", "hook"])
+            .write_stdin(payload.to_string())
+            .assert()
+            .success()
+            .stdout("");
+    };
+    let listed = |all: bool| -> serde_json::Value {
+        let mut cmd = client();
+        cmd.args(["--json", "notify", "sessions"]);
+        if all {
+            cmd.arg("--all");
+        }
+        let out = cmd.assert().success().get_output().stdout.clone();
+        serde_json::from_slice(&out).expect("sessions JSON")
+    };
+
+    hook(serde_json::json!({
+        "hook_event_name": "SessionStart", "session_id": "s-1", "source": "startup", "cwd": "/w",
+    }));
+    let live = listed(false);
+    assert_eq!(live.as_array().map(Vec::len), Some(1), "{live}");
+    assert_eq!(live[0]["session"], "s-1");
+    assert_eq!(live[0]["pid"], owner_pid.as_str());
+    assert_eq!(live[0]["start_source"], "startup");
+    let human = client()
+        .args(["notify", "sessions"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.starts_with("s-1  live (startup)  pid ") && human.trim_end().ends_with("/w"),
+        "{human}"
+    );
+
+    hook(serde_json::json!({
+        "hook_event_name": "SessionEnd", "session_id": "s-1", "reason": "prompt_input_exit",
+    }));
+    assert_eq!(listed(false), serde_json::json!([]));
+    let all = listed(true);
+    assert_eq!(all[0]["end_reason"], "prompt_input_exit", "{all}");
+    let log = std::fs::read_to_string(dir.path().join(".jkb/logs/notify-hook.log"))
+        .expect("the refused notify.event is logged");
+    assert!(log.contains("notify.event: NoSuchTopic"), "{log}");
+    assert!(!log.contains("session."), "{log}");
+
+    let _ = owner.kill();
+    let _ = owner.wait();
+}
+
 /// `subscribe`'s stdout is its event stream, so the `--json` error line every other verb prints is
 /// not added to it — even for its one non-event failure, a backend answering with the wrong response.
 #[test]
