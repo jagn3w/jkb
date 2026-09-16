@@ -111,8 +111,11 @@ fn home_relative(path: &Path, home: Option<&Path>) -> PathBuf {
 /// # Errors
 /// A path that is not UTF-8, which a record cannot carry.
 pub fn shared_path(path: &Path) -> anyhow::Result<String> {
-    let shared = home_relative(path, home().as_deref());
-    shared
+    shared_path_in(path, home().as_deref())
+}
+
+fn shared_path_in(path: &Path, home: Option<&Path>) -> anyhow::Result<String> {
+    home_relative(path, home)
         .to_str()
         .map(str::to_owned)
         .ok_or_else(|| anyhow::anyhow!("{} is not UTF-8", path.display()))
@@ -123,6 +126,12 @@ pub fn shared_path(path: &Path) -> anyhow::Result<String> {
 #[must_use]
 pub fn from_shared_path(path: &str) -> PathBuf {
     resolve_home(Path::new(path), home().as_deref())
+}
+
+/// This process's `~/repos`: the one directory the host and the dev container share.
+#[must_use]
+pub fn shared_root() -> Option<PathBuf> {
+    home().map(|h| h.join(jkb_daemon::CLIENT_FILE_ROOT))
 }
 
 /// `path` with symlinks resolved as far as it exists, and the rest appended unchanged.
@@ -329,6 +338,34 @@ fn liveness_from(probe: Result<(), Errno>) -> Fact {
 
 #[cfg(test)]
 mod tests {
+
+    /// A worktree under one home's `~/repos` is written so another home — the other side of the
+    /// bind — resolves it under its own `~/repos`; a path elsewhere stays as it is.
+    #[test]
+    fn a_shared_path_resolves_under_the_other_home() {
+        use super::{resolve_home, shared_path_in};
+        use std::path::Path;
+        let host = Path::new("/Users/u");
+        let boxed = Path::new("/home/vscode");
+        let wt = boxed.join("repos/proj/.jkb/work/s");
+        let written = shared_path_in(&wt, Some(boxed)).unwrap();
+        assert_eq!(written, "~/repos/proj/.jkb/work/s");
+        assert_eq!(
+            resolve_home(Path::new(&written), Some(host)),
+            host.join("repos/proj/.jkb/work/s")
+        );
+        let elsewhere = Path::new("/home/vscode/src/p/.jkb/work/s");
+        assert_eq!(
+            shared_path_in(elsewhere, Some(boxed)).unwrap(),
+            elsewhere.to_str().unwrap()
+        );
+        assert_eq!(
+            resolve_home(Path::new("~/repos/x"), None),
+            Path::new("~/repos/x"),
+            "no home: still relative, which every reader refuses"
+        );
+    }
+
     use super::{
         alive_in, home_from, home_relative, hostname, is_alive, resolve_home, self_owner,
         session_owner, session_owner_in, session_worktree,

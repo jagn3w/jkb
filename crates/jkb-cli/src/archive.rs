@@ -107,6 +107,12 @@ pub struct Entry {
     /// When it was moved, which is what the retention window is measured from.
     #[serde(default)]
     pub archived_at: Option<u64>,
+    /// The directory this record's repo must resolve under before anything is done to it, when the
+    /// record came from somewhere a dev container could have written it: a row written through
+    /// `jkb serve`, or a file of the old store (`~/.jkb` is bind-mounted read-write). `~/repos`, the one
+    /// directory the container could change anyway. Never stored — the reader decides it.
+    #[serde(skip)]
+    pub confine: Option<PathBuf>,
 }
 
 /// What one sweep did. Every field is something that happened, never something intended.
@@ -222,13 +228,33 @@ pub struct Held {
 pub struct Stores<'a> {
     kb: Kb<'a>,
     legacy: Option<&'a Path>,
+    /// Where a record the dev container could have written must resolve ([`Entry::confine`]).
+    shared_root: Option<&'a Path>,
 }
 
 impl<'a> Stores<'a> {
     /// The records `kb` serves, plus the file store beside `db` when this process has a local database.
     #[must_use]
     pub const fn new(kb: Kb<'a>, db: Option<&'a Path>) -> Self {
-        Self { kb, legacy: db }
+        Self {
+            kb,
+            legacy: db,
+            shared_root: None,
+        }
+    }
+
+    /// Confine records to `root` rather than this process's `~/repos`.
+    #[cfg(test)]
+    const fn with_shared_root(mut self, root: &'a Path) -> Self {
+        self.shared_root = Some(root);
+        self
+    }
+
+    fn confinement(&self) -> PathBuf {
+        self.shared_root
+            .map(Path::to_path_buf)
+            .or_else(crate::owner::shared_root)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent-home/repos"))
     }
 
     fn legacy_dir(&self) -> Option<PathBuf> {
@@ -330,7 +356,56 @@ fn from_row(r: Removal) -> Entry {
         head: r.head,
         archive: r.archive.as_deref().map(crate::owner::from_shared_path),
         archived_at: r.archived_at.map(secs),
+        confine: None,
     }
+}
+
+/// The backends whose records this host wrote itself: its CLI and its reap service. Any other —
+/// `serve`, a client of the daemon — is confined.
+const HOST_WRITERS: &[&str] = &["cli", "reap"];
+
+/// The path `path`, spelled from `repo_root` **resolved now** — the one spelling the sweep's moves and
+/// removals walk, link-free, with [`jkb_core::nofollow`] — after checking that root lies under
+/// `confine`, when there is one.
+///
+/// Resolved at the moment of acting, not once per sweep: a dev container can replace a directory in
+/// `~/repos` with a link at any time, and a root resolved earlier would be walked as spelled then.
+/// A link anywhere below the root is refused by the walk itself.
+fn beneath(repo_root: &Path, path: &Path, confine: Option<&Path>) -> io::Result<PathBuf> {
+    let root = repo_root.canonicalize()?;
+    if let Some(c) = confine {
+        let c = c.canonicalize()?;
+        if !root.starts_with(&c) || root == c {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} resolves to {}, outside {} — the only directory a record from the dev \
+                     container's side may name",
+                    repo_root.display(),
+                    root.display(),
+                    c.display()
+                ),
+            ));
+        }
+    }
+    if let Ok(rest) = path.strip_prefix(repo_root) {
+        return Ok(root.join(rest));
+    }
+    // Spelled another way (git reports physical paths): its parent, resolved, must be under the root.
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no directory", path.display()),
+        ));
+    };
+    let parent = parent.canonicalize()?;
+    let rest = parent.strip_prefix(&root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not under {}", path.display(), root.display()),
+        )
+    })?;
+    Ok(root.join(rest).join(name))
 }
 
 /// Who holds the sweep lease, if anyone — without touching it. The owner id only: the nonce is the
@@ -345,16 +420,40 @@ pub fn lock_holder(stores: &Stores<'_>) -> Result<Option<String>> {
         .map(|h| jkb_core::lease::owner_of(&h).to_owned()))
 }
 
-/// Drop the sweep lease, whoever holds it. Returns the owner id it displaced, if any. Host only: the
-/// daemon refuses it to a client.
+/// Drop the sweep lease, whoever holds it — and an older jkb's lock file on the old store with it.
+/// Returns the owner id it displaced, if any. Host only: the daemon refuses it to a client.
 ///
 /// # Errors
-/// Returns an error if the lease cannot be broken.
+/// Returns an error if the lease cannot be broken, or the lock file cannot be removed.
 pub fn break_lock(stores: &Stores<'_>) -> Result<Option<String>> {
+    let legacy = match stores.legacy_dir().map(|d| d.join(LEGACY_LOCK)) {
+        Some(path) => match fs::read_to_string(&path) {
+            Ok(contents) => {
+                fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+                Some(jkb_core::lease::owner_of(&contents).to_owned())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        },
+        None => None,
+    };
     Ok(stores
         .kb
         .lease_break(SWEEP_LEASE)?
-        .map(|h| jkb_core::lease::owner_of(&h).to_owned()))
+        .map(|h| jkb_core::lease::owner_of(&h).to_owned())
+        .or(legacy))
+}
+
+/// The lock an older jkb takes on the old file store while it sweeps.
+const LEGACY_LOCK: &str = ".sweep.lock";
+
+/// The holder of an older jkb's lock on the old store, unless it is proven gone. While one runs, this
+/// binary leaves the old store's files alone: the two locks do not exclude each other, and two sweeps
+/// of one record lose one's update — an archive nothing tracks.
+fn legacy_sweep(stores: &Stores<'_>) -> Option<String> {
+    let contents = fs::read_to_string(stores.legacy_dir()?.join(LEGACY_LOCK)).ok()?;
+    let holder = jkb_core::lease::owner_of(&contents).to_owned();
+    (!crate::owner::is_alive(&holder).is_no()).then_some(holder)
 }
 
 /// Seconds since the Unix epoch. A clock that cannot be read reads as 0, which makes everything
@@ -486,6 +585,9 @@ pub fn revoke(stores: &Stores<'_>, worktree: &Path) -> Result<bool> {
         .iter()
         .any(|k| matches!(k, Key::File(_)))
     {
+        if let Some(older) = legacy_sweep(stores) {
+            return Err(refused(&format!("an older jkb, {older}")));
+        }
         let lease = SweepLease::acquire(stores)?.map_err(|held| refused(&held.holder))?;
         for key in pending(entries(stores)?) {
             if matches!(key, Key::File(_)) {
@@ -520,7 +622,8 @@ pub fn revoke(stores: &Stores<'_>, worktree: &Path) -> Result<bool> {
 /// listed; an absent directory is the ordinary state and reads as empty.
 pub fn entries(stores: &Stores<'_>) -> Result<Store> {
     let mut store = Store::default();
-    let mut admit = |key: Key, entry: Entry| {
+    let mut admit = |key: Key, mut entry: Entry, confined: bool| {
+        entry.confine = confined.then(|| stores.confinement());
         let uid = entry.uid.clone();
         match Record::parse(entry) {
             Ok(record) => store.records.push((key, record)),
@@ -556,11 +659,13 @@ pub fn entries(stores: &Stores<'_>) -> Result<Store> {
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
+    // Every old-store file is confined: the directory is bind-mounted into the dev container.
     for (path, entry) in files {
-        admit(Key::File(path), entry);
+        admit(Key::File(path), entry, true);
     }
     for row in stores.kb.removals()? {
-        admit(Key::Row(row.id), from_row(row.removal));
+        let confined = !HOST_WRITERS.contains(&row.written_via.as_str());
+        admit(Key::Row(row.id), from_row(row.removal), confined);
     }
     unreadable.sort();
     store.unreadable = unreadable;
@@ -573,8 +678,17 @@ pub fn entries(stores: &Stores<'_>) -> Result<Store> {
 /// Returns the underlying I/O error, including the `PermissionDenied` that a session attempting
 /// to archive its own worktree gets.
 pub fn stow(repo_root: &Path, worktree: &Path, at: u64) -> io::Result<PathBuf> {
+    stow_confined(repo_root, worktree, at, None)
+}
+
+/// [`stow`], refusing unless `repo_root` resolves under `confine`, and never through a link.
+fn stow_confined(
+    repo_root: &Path,
+    worktree: &Path,
+    at: u64,
+    confine: Option<&Path>,
+) -> io::Result<PathBuf> {
     let root = archive_root(repo_root);
-    fs::create_dir_all(&root)?;
     let name = worktree.file_name().map_or_else(
         || "session".to_owned(),
         |n| n.to_string_lossy().into_owned(),
@@ -583,11 +697,25 @@ pub fn stow(repo_root: &Path, worktree: &Path, at: u64) -> io::Result<PathBuf> {
     let mut dest = root.join(format!("{name}-{stamp}"));
     // Two landings in the same second, or a re-archive of a recreated session name.
     let mut n = 2;
-    while dest.exists() {
+    while fs::symlink_metadata(&dest).is_ok() {
         dest = root.join(format!("{name}-{stamp}-{n}"));
         n += 1;
     }
-    fs::rename(worktree, &dest)?;
+    let (Some(dest_name), Some(_)) = (dest.file_name(), worktree.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no directory", worktree.display()),
+        ));
+    };
+    // THROUGH NO LINK. The paths are resolved from the repo root now and walked a component at a
+    // time: a record's paths are the dev container's to plant links under (tasks S6.4 stage 3), and a
+    // `.jkb/archive` linked elsewhere would otherwise carry a host checkout out to where the container
+    // can read it.
+    jkb_core::nofollow::rename_into(
+        &beneath(repo_root, worktree, confine)?,
+        &beneath(repo_root, &root, confine)?,
+        dest_name,
+    )?;
     Ok(dest)
 }
 
@@ -598,6 +726,9 @@ pub struct Deferral {
     pub why: String,
     /// What a later sweep will do with the record — the SAME answer `jkb task reap` executes.
     pub verdict: Verdict,
+    /// Why no record could be written, when none was — `jkb serve` refusing a path outside
+    /// `~/repos`, say. Then nothing will ever sweep the tree, whatever the verdict on it would be.
+    pub unrecorded: Option<String>,
 }
 
 impl Deferral {
@@ -605,6 +736,12 @@ impl Deferral {
     /// something else will finish it, or the reason nothing will and what to do instead.
     #[must_use]
     pub fn outlook(&self) -> String {
+        if let Some(why) = &self.unrecorded {
+            return format!(
+                "no record of it could be written ({why}), so nothing will finish it — remove it \
+                 by hand"
+            );
+        }
         match &self.verdict {
             Verdict::Stow => {
                 "it is recorded for `jkb task reap`, which the watcher service runs".to_owned()
@@ -623,7 +760,7 @@ impl Deferral {
     /// Whether a later sweep will actually act on the record — what a promise may be made about.
     #[must_use]
     pub fn will_be_swept(&self) -> bool {
-        matches!(self.verdict, Verdict::Stow | Verdict::DropRecord)
+        self.unrecorded.is_none() && matches!(self.verdict, Verdict::Stow | Verdict::DropRecord)
     }
 }
 
@@ -684,6 +821,7 @@ pub fn dispose(
         head,
         archive: None,
         archived_at: None,
+        confine: None,
     };
     match stow(repo_root, worktree, entry.recorded_at) {
         Ok(dest) => {
@@ -735,13 +873,9 @@ pub fn dispose(
             // deletion and drops the record. A refusal must leave something worth preserving, and
             // here there is nothing: the checkout can no longer answer git for itself, and the
             // operator has already said `--force`.
-            if let Err(rec) = record(stores, &entry) {
-                eprintln!(
-                    "note: {} could not be archived from here ({e}) and the removal record could \
-                     not be written either ({rec}) — remove the directory by hand",
-                    worktree.display()
-                );
-            }
+            // A record that could not be written is carried into the deferral, so no report
+            // promises a sweep that nothing will run.
+            let unrecorded = record(stores, &entry).err().map(|rec| format!("{rec:#}"));
             // THE VERDICT ON THE RECORD JUST WRITTEN, so the caller's report is derived rather
             // than assumed. Every verb used to print that `jkb task reap` would finish this —
             // and for a tree that could not answer git for itself, no sweep could. A promise
@@ -751,6 +885,7 @@ pub fn dispose(
             Ok(Disposed::Deferred(Deferral {
                 why: e.to_string(),
                 verdict,
+                unrecorded,
             }))
         }
     }
@@ -764,7 +899,7 @@ pub fn dispose(
 /// protected descendant, measured), `DirectoryNotEmpty` means it is permitted. Anything else is
 /// unknown, and unknown holds rather than deletes.
 fn removable(path: &Path) -> Result<(), String> {
-    match fs::remove_dir(path) {
+    match jkb_core::nofollow::remove_empty_dir(path) {
         // It was empty and is now gone. Nothing to walk, and nothing lost.
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
@@ -1641,9 +1776,20 @@ pub fn reap(stores: &Stores<'_>, retain_days: u64, dry_run: bool) -> Result<Repo
     }
 
     let governing = governing_pending(&store.records);
+    let older = legacy_sweep(stores);
 
     for (marker, record) in store.records {
         let mut entry = record.clone_entry();
+        if let (Key::File(_), Some(holder)) = (&marker, &older) {
+            report.held.push((
+                entry.uid.clone(),
+                format!(
+                    "an older jkb's sweep ({holder}) holds the old record store — the record is kept \
+                     until it finishes, or `jkb task reap --break-lock` if it is gone"
+                ),
+            ));
+            continue;
+        }
         if superseded(stores, &governing, &entry, &marker, dry_run, &mut report) {
             continue;
         }
@@ -1731,7 +1877,12 @@ fn sweep_pending(
             .push((entry.uid.clone(), archive_root(&entry.repo_root)));
         return;
     }
-    match stow(&entry.repo_root, &entry.worktree, now) {
+    match stow_confined(
+        &entry.repo_root,
+        &entry.worktree,
+        now,
+        entry.confine.as_deref(),
+    ) {
         Ok(dest) => {
             entry.archive = Some(dest.clone());
             entry.archived_at = Some(now);
@@ -1829,12 +1980,23 @@ fn sweep_archived(
         report.deleted.push(dir.to_path_buf());
         return;
     }
-    if let Err(why) = removable(dir) {
+    // Resolved now, confined, and walked without following a link — see [`beneath`].
+    let resolved = match beneath(&entry.repo_root, dir, entry.confine.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            report.held.push((
+                entry.uid.clone(),
+                format!("{} is not deleted: {e}", dir.display()),
+            ));
+            return;
+        }
+    };
+    if let Err(why) = removable(&resolved) {
         report.held.push((
             entry.uid.clone(),
             format!("{} cannot be deleted from here: {why}", dir.display()),
         ));
-    } else if let Err(e) = fs::remove_dir_all(dir) {
+    } else if let Err(e) = jkb_core::nofollow::remove_tree(&resolved) {
         // The probe proved the unlink permitted, but a walk can still fail — a file
         // appearing mid-sweep, a device error. The record stays and the next sweep
         // tries again.
@@ -1955,15 +2117,26 @@ mod tests {
 
     impl TestKb {
         fn at(db: &Path) -> Self {
+            Self::as_actor(db, "cli")
+        }
+
+        /// Records written as a client of `jkb serve` writes them.
+        fn served(db: &Path) -> Self {
+            Self::as_actor(db, "serve")
+        }
+
+        fn as_actor(db: &Path, actor: &'static str) -> Self {
             Self {
                 backend: jkb_api::LocalBackend::new(jkb_core::Db::open(db).expect("db"))
-                    .with_actor("cli"),
+                    .with_actor(actor),
                 db: db.to_path_buf(),
             }
         }
 
+        /// Records from the dev container's side are confined to the test's directory.
         fn stores(&self) -> Stores<'_> {
             Stores::new(Kb::new(&self.backend), Some(&self.db))
+                .with_shared_root(self.db.parent().expect("a parent"))
         }
     }
 
@@ -1978,6 +2151,7 @@ mod tests {
             head: None,
             archive: None,
             archived_at: None,
+            confine: None,
         }
     }
 
@@ -2078,6 +2252,123 @@ mod tests {
         let mut seen: Vec<&Path> = records.iter().map(|(_, e)| e.worktree.as_path()).collect();
         seen.sort_unstable();
         assert_eq!(seen, vec![b, a]);
+    }
+
+    /// **A record from the dev container's side cannot steer the sweep outside `~/repos`** (stage-3
+    /// review). The container can plant links in the directories a record names, so a `.jkb/archive`
+    /// linked elsewhere must neither receive a checkout nor have its target deleted, and a repo that
+    /// resolves outside the shared directory is not acted on at all.
+    #[test]
+    fn a_planted_link_does_not_steer_the_sweep_outside_the_shared_directory() {
+        use std::os::unix::fs::symlink;
+
+        let t = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let kb = TestKb::served(&db);
+        let s = kb.stores();
+        fs::create_dir_all(outside.path().join("victim")).expect("mk");
+        fs::write(outside.path().join("victim/keep"), "x").expect("write");
+
+        // An archived record whose archive root is a link out: the target survives.
+        let repo = t.path().join("repo");
+        fs::create_dir_all(repo.join(".jkb")).expect("mk");
+        symlink(outside.path(), repo.join(".jkb/archive")).expect("link");
+        record(
+            &s,
+            &Entry {
+                archive: Some(repo.join(".jkb/archive/victim")),
+                archived_at: Some(0),
+                ..entry(&repo.join(".jkb/work/s"), &repo)
+            },
+        )
+        .expect("record");
+        let r = reap(&s, 0, false).expect("reap");
+        assert!(outside.path().join("victim/keep").exists(), "{r:?}");
+        assert!(r.deleted.is_empty(), "{r:?}");
+        assert_eq!(r.held.len(), 1, "{r:?}");
+
+        // A pending record for a real session, the same link in place: nothing is carried out.
+        let (wt, branch, head) = session(&t.path().join("repo2"), "sess");
+        let repo2 = t.path().join("repo2");
+        symlink(outside.path(), repo2.join(".jkb/archive")).expect("link");
+        record(&s, &session_entry(&repo2, &wt, &branch, &head)).expect("record");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
+        assert!(wt.exists(), "not moved: {r:?}");
+        assert_eq!(
+            fs::read_dir(outside.path()).expect("ls").count(),
+            1,
+            "nothing arrived outside: {r:?}"
+        );
+
+        // A repo that is itself a link out of the shared directory is not acted on.
+        let (wt3, branch3, head3) = session(&outside.path().join("private"), "sess");
+        symlink(outside.path().join("private"), t.path().join("repo3")).expect("link");
+        let repo3 = t.path().join("repo3");
+        record(
+            &s,
+            &session_entry(&repo3, &repo3.join(".jkb/work/sess"), &branch3, &head3),
+        )
+        .expect("record");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
+        assert!(wt3.exists(), "{r:?}");
+        assert!(
+            r.held.iter().any(|(_, why)| why.contains("outside")),
+            "{r:?}"
+        );
+
+        // The host's own records are not confined.
+        let host = TestKb::at(&db);
+        let hs = host.stores();
+        for (key, _) in entries(&hs).expect("entries").records {
+            hs.forget(&key).expect("forget");
+        }
+        let (wt4, branch4, head4) = session(&outside.path().join("own"), "sess");
+        record(
+            &hs,
+            &session_entry(&outside.path().join("own"), &wt4, &branch4, &head4),
+        )
+        .expect("record");
+        let r = reap(&hs, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(r.archived.len(), 1, "{r:?}");
+    }
+
+    /// An older jkb sweeping the old file store under its own lock file is not raced: its records
+    /// are held until it finishes, and `--break-lock` clears that lock too.
+    #[test]
+    fn an_older_sweep_of_the_old_store_is_not_raced() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        fs::create_dir_all(store_dir(&db)).expect("mk");
+        record_at(
+            &store_dir(&db).join("old.json"),
+            &session_entry(&repo, &wt, &branch, &head),
+        )
+        .expect("record");
+        fs::write(
+            store_dir(&db).join(LEGACY_LOCK),
+            format!("{} n", crate::owner::self_owner()),
+        )
+        .expect("lock");
+
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
+        assert!(wt.exists(), "{r:?}");
+        assert!(
+            r.held.iter().any(|(_, why)| why.contains("older jkb")),
+            "{r:?}"
+        );
+        assert!(revoke(&s, &wt).is_err(), "nor is it cancelled meanwhile");
+
+        assert_eq!(
+            break_lock(&s).expect("break").as_deref(),
+            Some(crate::owner::self_owner().as_str())
+        );
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
+        assert_eq!(r.archived.len(), 1, "{r:?}");
     }
 
     #[test]
@@ -2383,6 +2674,7 @@ mod tests {
                     uid: "task:t".to_owned(),
                 },
             }),
+            unrecorded: None,
         };
         assert!(!held.will_be_swept(), "nothing will act on it");
         let outlook = held.outlook();
@@ -2399,6 +2691,7 @@ mod tests {
         let owed = Deferral {
             why: "permission denied".to_owned(),
             verdict: Verdict::Stow,
+            unrecorded: None,
         };
         assert!(owed.will_be_swept(), "this one really is in hand");
         assert!(
@@ -2406,6 +2699,14 @@ mod tests {
             "so it may say so: {}",
             owed.outlook()
         );
+
+        // The same tree with no record written: nothing will act on it.
+        let lost = Deferral {
+            unrecorded: Some("forbidden".to_owned()),
+            ..owed
+        };
+        assert!(!lost.will_be_swept());
+        assert!(lost.outlook().contains("by hand"), "{}", lost.outlook());
     }
 
     /// Git's registration decides which remedy is followable — never whether the tree is ours.

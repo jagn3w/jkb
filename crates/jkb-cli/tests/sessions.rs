@@ -3963,9 +3963,10 @@ fn a_container_session_s_deferred_disposal_is_finished_by_the_host() {
     );
 }
 
-/// **A record left in the old file store is still listed, swept and updated where it is** (tasks S6.4
-/// stage 3): the records moved into the database, and a host upgraded with checkouts still owed a
-/// disposal must not forget them.
+/// **A record left in the old file store is still cancelled, listed, swept and updated where it is**
+/// (tasks S6.4 stage 3): the records moved into the database, and a host upgraded with checkouts still
+/// owed a disposal must not forget them. The directory is bind-mounted into the dev container, so a
+/// file there is acted on only when its repo resolves under `~/repos`.
 #[test]
 fn a_record_in_the_old_file_store_is_still_finished() {
     let f = Fixture::new();
@@ -3973,28 +3974,58 @@ fn a_record_in_the_old_file_store_is_still_finished() {
     let s = f.work(&uid);
     let wt = PathBuf::from(s["worktree"].as_str().unwrap());
     let head = git(&wt, &["rev-parse", "HEAD"]);
+    let home = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(f.home.path(), home.path().join("repos")).unwrap();
     let store = f.db.parent().unwrap().join("worktree-removals");
     std::fs::create_dir_all(&store).unwrap();
     let marker = store.join("legacy-0001.json");
-    std::fs::write(
-        &marker,
-        serde_json::to_vec(&serde_json::json!({
-            "worktree": wt, "repo_root": f.repo, "branch": s["branch"], "uid": uid,
-            "recorded_at": 1, "head": head,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let listed = f
-        .jkb()
-        .args(["task", "sessions", "--json"])
-        .output()
+    let plant = || {
+        std::fs::write(
+            &marker,
+            serde_json::to_vec(&serde_json::json!({
+                "worktree": wt, "repo_root": f.repo, "branch": s["branch"], "uid": uid,
+                "recorded_at": 1, "head": head,
+            }))
+            .unwrap(),
+        )
         .unwrap();
+    };
+    let host = |args: &[&str]| {
+        f.jkb()
+            .env("HOME", home.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // A resume cancels it.
+    plant();
+    let resumed = host(&["task", "work", &uid]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert!(!marker.exists(), "the resume cancelled the old record");
+
+    plant();
+    let listed = host(&["task", "sessions", "--json"]);
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(rows[0]["awaiting_archive"], true, "{rows:?}");
 
-    let reaped = f.jkb().args(["--json", "task", "reap"]).output().unwrap();
+    // Seen from a home whose `~/repos` is elsewhere, it is held and nothing is touched.
+    let stranger = TempDir::new().unwrap();
+    std::fs::create_dir(stranger.path().join("repos")).unwrap();
+    let refused = f
+        .jkb()
+        .env("HOME", stranger.path())
+        .args(["--json", "task", "reap"])
+        .output()
+        .unwrap();
+    assert!(refused.status.success(), "{refused:?}");
+    assert!(wt.exists(), "outside ~/repos: not moved");
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("outside"),
+        "{refused:?}"
+    );
+
+    let reaped = host(&["--json", "task", "reap"]);
     assert!(reaped.status.success(), "{reaped:?}");
     assert!(!wt.exists(), "archived");
     let left: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();

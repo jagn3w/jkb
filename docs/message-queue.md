@@ -191,15 +191,23 @@ Two decisions in it:
   the database into `worktree_removals` (V020), and the sweep's lock into the `leases` table. A record
   is acted on by the host's reap service — renamed, later deleted — so every path a client writes, or
   names by id, must be `~/`-relative, of plain segments, and under `~/repos` once resolved against the
-  daemon's home (`FileRoots::admits_home_path`). A client can only point the sweep at directories it
-  could already change itself; what the sweep then does is still judged by the reader
-  (`archive::Record::parse`, the identity check). Clients read every record, the host's absolute
-  paths included. `task work` cancels a pending record with `removal.cancel`, one write that a sweep
+  daemon's home (`FileRoots::admits_home_path`). That check is spelling only, and the container can
+  plant links under `~/repos`, so the **reader** confines too (stage-3 review, must-fix: a linked
+  `.jkb/archive` had the host sweep delete `~/Documents`). A row not written by the host's own CLI or
+  reap service, and every file of the old store (`~/.jkb` is bind-mounted read-write), is acted on
+  only if its repo root, resolved at the moment of acting, lies under `~/repos`; and the sweep's
+  rename and removal walk that resolved path with `O_NOFOLLOW` (`jkb_core::nofollow::rename_into`,
+  `remove_tree`), so a link anywhere below the root is refused rather than followed. What remains
+  is git: the sweep's `git worktree prune`/`branch -D` run with the path as spelled, and a branch is
+  deleted only when its tip is the commit the record names. Clients read every record, the host's
+  absolute paths included. A disposal whose record the daemon refused says nothing will finish it. `task work` cancels a pending record with `removal.cancel`, one write that a sweep
   in flight refuses, rather than by taking the sweep's lease: a container `task work` killed while
   holding it would have left a holder the host cannot probe, and the host's reap service would skip
   every pass until someone broke it. A client can still take `removal-sweep` (or, from stage 4, a
-  land lease) and hold it; that stops the host's sweep, never acts on anything, and
-  `jkb task reap --break-lock` ends it. `task reclaim` proves
+  land lease) and hold it: that stops the host's sweep **and every `task work`** (a cancel is refused
+  while the lease is held, even with nothing to cancel), acts on nothing, and
+  `jkb task reap --break-lock` on the host ends it. An older jkb's `.sweep.lock` on the old store is
+  honoured for that store's files, and broken with the lease. `task reclaim` proves
   owners gone by probing their processes, which only their host can do. A claim held by a live or
   unestablished owner is refused by `task.claim` from anywhere. **But the daemon does not judge
   liveness.** A client that names an owner can drop it (`task.release`), and so can a session op's

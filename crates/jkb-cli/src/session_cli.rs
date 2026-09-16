@@ -609,6 +609,12 @@ pub(crate) fn work(
             )
         })?;
 
+    // ASKED AGAIN after the cancel. The discovery above predates it, and a sweep that finished in
+    // between has already moved the checkout — reporting that as a resume would send the operator to
+    // a directory now under `.jkb/archive` (stage-3 review). Only a checkout PROVEN gone is opened
+    // afresh: one this process cannot stat is still a claim's live checkout, and a failed add would
+    // release that claim.
+    let resumed = resumed && !presence::present_under(&worktree, &ctx.root).fact().is_no();
     if !resumed {
         open_worktree(kb, &facts.uid, &owner, &ctx.root, &worktree, &branch, &onto)?;
     }

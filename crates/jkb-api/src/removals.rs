@@ -8,12 +8,12 @@
 //! **What a client may name.** A record is acted on by the host's reap service, which renames and later
 //! deletes the directories it names. So under `jkb serve`'s [`FileRoots`] every path a client writes
 //! must be `~/`-relative and resolve, against this host's home, to somewhere under those roots — the
-//! directories the dev container sees, and could already change directly
-//! ([`FileRoots::admits_home_path`]). A client can therefore only ever point the sweep at its own view;
-//! what the sweep then does with a record (only a session worktree under `<repo>/.jkb/work`, only an
-//! archive under `<repo>/.jkb/archive`, only on a proven identity) is decided where it always was, by
-//! the reader. A record a client did not write is equally out of its reach: archiving or dropping one
-//! is refused unless the record lies under the roots.
+//! directories the dev container sees ([`FileRoots::admits_home_path`]). That is a check of spelling,
+//! and the container can plant links in those directories, so the reader confines as well: a record
+//! written through `jkb serve` is acted on only while its repo root resolves under `~/repos`, and
+//! through no link (`jkb-cli`'s `archive::beneath`, `jkb_core::nofollow`). A record a client did not
+//! write is out of its reach: archiving or dropping one is refused unless the record lies under the
+//! roots.
 //!
 //! **Departure from decision B as written**, which named a record by *(repo key, slug)*: there is no
 //! registry from a repo key to its root on either side, and the owners of stage 2 already name a

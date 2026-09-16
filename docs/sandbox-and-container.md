@@ -671,7 +671,9 @@ The container follow-up bucket. Design in `.container/README.md`; the container 
   The lock is the `removal-sweep` row of `leases`, with the file lock's rules kept as properties of the
   row: holder `<owner> <nonce>`, takeover and release as compare-and-sets on the exact holder, stale
   only when proven gone. The old file store is still read, swept and cancelled on the host
-  (`archive::Stores`) and nothing new is written there. `jkb task reap` now opens the database each
+  (`archive::Stores`) and nothing new is written there — and since `~/.jkb` is bind-mounted, its
+  files are confined like a container's rows: acted on only under `~/repos`, through no link (the
+  stage-3 review's must-fix; the rules are in message-queue.md). `jkb task reap` now opens the database each
   pass, so a database a newer jkb migrated fails that pass — reported once while unchanged — not the
   service.
 - **Sharing memory through `~/.jkb` widens what sandboxed Bash can reach, and that is a decision,

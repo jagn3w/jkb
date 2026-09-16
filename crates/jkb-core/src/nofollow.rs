@@ -73,6 +73,35 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     imp::write(path, bytes)
 }
 
+/// Move the directory entry `src` to `dest_dir/dest_name` — `dest_dir` created if missing — never
+/// through a symlink on either path. The entry itself is moved as it is, a link included, never what it
+/// points at. The worktree-removal sweep's archive step (tasks S6.4 stage 3): a dev container can plant
+/// links inside the `~/repos` a record names.
+///
+/// # Errors
+/// A refusal (`InvalidInput`), `NotFound` when `src` is not there, or any other I/O failure.
+pub fn rename_into(src: &Path, dest_dir: &Path, dest_name: &std::ffi::OsStr) -> io::Result<()> {
+    imp::rename_into(src, dest_dir, dest_name)
+}
+
+/// Remove `path` if it is an empty directory, never through a symlink — the probe the sweep asks before
+/// a removal: `DirectoryNotEmpty` means an unlink is permitted, `PermissionDenied` that it is not.
+///
+/// # Errors
+/// A refusal (`InvalidInput`), or the I/O failure the removal met.
+pub fn remove_empty_dir(path: &Path) -> io::Result<()> {
+    imp::remove_empty_dir(path)
+}
+
+/// Remove `path` and everything under it, never through a symlink: a link on the way is refused, and a
+/// link inside the tree is removed rather than followed. Nothing at `path` is not an error.
+///
+/// # Errors
+/// A refusal (`InvalidInput`), or the first I/O failure met; what was removed before it stays removed.
+pub fn remove_tree(path: &Path) -> io::Result<()> {
+    imp::remove_tree(path)
+}
+
 #[cfg(unix)]
 mod imp {
     use std::io::{self, Read as _, Write as _};
@@ -175,6 +204,85 @@ mod imp {
         Ok(Some(bytes))
     }
 
+    pub(super) fn rename_into(
+        src: &Path,
+        dest_dir: &Path,
+        dest_name: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        let (parent, name) = split(src)?;
+        let from = open_dir(src, parent, false)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let to = open_dir(dest_dir, dest_dir, true)?
+            .ok_or_else(|| refusal(dest_dir, dest_dir, "cannot be created"))?;
+        if dest_name.is_empty() || Path::new(dest_name).components().count() != 1 {
+            return Err(refusal(
+                dest_dir,
+                dest_dir,
+                "was given a name that is not one component",
+            ));
+        }
+        fs::renameat(&from, name, &to, dest_name)?;
+        Ok(())
+    }
+
+    pub(super) fn remove_empty_dir(path: &Path) -> io::Result<()> {
+        let (parent, name) = split(path)?;
+        let dir = open_dir(path, parent, false)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        match fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) != FileType::Directory => {
+                return Err(link_refusal(path, path, "is not a directory"));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+        fs::unlinkat(&dir, name, AtFlags::REMOVEDIR)?;
+        Ok(())
+    }
+
+    pub(super) fn remove_tree(path: &Path) -> io::Result<()> {
+        let (parent, name) = split(path)?;
+        let Some(dir) = open_dir(path, parent, false)? else {
+            return Ok(());
+        };
+        remove_at(&dir, name)
+    }
+
+    /// Remove `name` inside `dir`: a directory by its contents first, anything else — a link
+    /// included — by unlinking the entry itself.
+    fn remove_at(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let stat = match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return match fs::unlinkat(dir, name, AtFlags::empty()) {
+                Ok(()) | Err(Errno::NOENT) => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
+        let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC;
+        let child = fs::openat(dir, name, flags, Mode::empty())?;
+        // Names first, removals after: a directory stream is not read while it is being changed.
+        let mut names = Vec::new();
+        for entry in fs::Dir::read_from(&child)? {
+            let entry = entry?;
+            let n = entry.file_name().to_bytes();
+            if n != b"." && n != b".." {
+                names.push(std::ffi::OsStr::from_bytes(n).to_owned());
+            }
+        }
+        for n in names {
+            remove_at(&child, &n)?;
+        }
+        match fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let (parent, name) = split(path)?;
         let dir = open_dir(path, parent, true)?
@@ -233,6 +341,26 @@ mod imp {
         }
     }
 
+    pub(super) fn rename_into(
+        src: &Path,
+        dest_dir: &Path,
+        dest_name: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        std::fs::create_dir_all(dest_dir)?;
+        std::fs::rename(src, dest_dir.join(dest_name))
+    }
+
+    pub(super) fn remove_empty_dir(path: &Path) -> io::Result<()> {
+        std::fs::remove_dir(path)
+    }
+
+    pub(super) fn remove_tree(path: &Path) -> io::Result<()> {
+        match std::fs::remove_dir_all(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+
     pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -246,7 +374,58 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
 
-    use super::{read, write};
+    use super::{read, remove_empty_dir, remove_tree, rename_into, write};
+
+    /// The sweep's moves and removals refuse a link on the way, and remove a link inside a tree
+    /// rather than what it points at.
+    #[test]
+    fn moving_and_removing_trees_never_follow_a_link() {
+        let (_keep, root) = real_tempdir();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("d")).unwrap();
+        std::fs::write(outside.join("d/keep"), "x").unwrap();
+
+        // A tree holding a link out: the link goes, the target stays.
+        let tree = root.join("repo/.jkb/archive/s");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub/f"), "y").unwrap();
+        symlink(&outside, tree.join("sub/out")).unwrap();
+        assert_eq!(
+            remove_empty_dir(&tree).unwrap_err().kind(),
+            std::io::ErrorKind::DirectoryNotEmpty
+        );
+        remove_tree(&tree).unwrap();
+        assert!(!tree.exists());
+        assert!(outside.join("d/keep").exists(), "nothing followed");
+        remove_tree(&tree).unwrap();
+
+        // A link on the way is refused, and nothing behind it is touched.
+        std::fs::remove_dir_all(root.join("repo/.jkb/archive")).unwrap();
+        symlink(&outside, root.join("repo/.jkb/archive")).unwrap();
+        let through = root.join("repo/.jkb/archive/d");
+        for e in [
+            remove_tree(&through).unwrap_err(),
+            remove_empty_dir(&through).unwrap_err(),
+            rename_into(&through, &root.join("elsewhere"), "d".as_ref()).unwrap_err(),
+        ] {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        }
+        std::fs::create_dir_all(root.join("repo/.jkb/work/w")).unwrap();
+        let e = rename_into(&root.join("repo/.jkb/work/w"), &through, "w".as_ref()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        assert!(outside.join("d/keep").exists());
+        assert!(!outside.join("w").exists());
+
+        // And a plain move works, creating the destination.
+        std::fs::remove_file(root.join("repo/.jkb/archive")).unwrap();
+        rename_into(
+            &root.join("repo/.jkb/work/w"),
+            &root.join("repo/.jkb/archive"),
+            "w-1".as_ref(),
+        )
+        .unwrap();
+        assert!(root.join("repo/.jkb/archive/w-1").is_dir());
+    }
 
     fn real_tempdir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
