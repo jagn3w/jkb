@@ -591,11 +591,11 @@ fn session_name(
                 .find_map(|b| session::name_from_branch(b))
                 .map(str::to_owned)
         });
-    // A checkout found only through the claim has no land target on record — the run that made it
-    // stopped before recording one — so guessing one here could land its branch somewhere it was not
-    // cut from. The operator names it.
+    // A checkout found only through the claim was never recorded — the run that made it stopped
+    // before its locate — so any land target on the task belongs to an earlier checkout, not this one,
+    // and guessing could land its branch somewhere it was not cut from. The operator names it.
     anyhow::ensure!(
-        claimed.is_none() || facts.land_target.is_some() || onto.is_some(),
+        claimed.is_none() || onto.is_some(),
         "{uid}'s checkout {} was opened but where it lands was never recorded — run `jkb task work \
          {uid} --onto <branch>` naming the branch it was cut from",
         claimed
@@ -1059,6 +1059,7 @@ pub(crate) fn abandon(
     // stated by this caller, which refused one it could not prove clean unless `--force` — the
     // operator supplying the fact.
     let Abandoned {
+        released,
         reopened,
         status: final_status,
     } = kb.abandon(&facts.uid, held.as_deref())?;
@@ -1067,6 +1068,7 @@ pub(crate) fn abandon(
         uid,
         &branch,
         &AbandonOutcome {
+            released,
             reopened,
             final_status: &final_status,
             worktree_removed: sess.is_some() && deferred.is_none(),
@@ -1158,6 +1160,9 @@ fn abandon_session(
 /// What `abandon` actually did, so the report is built from outcomes rather than from the flags
 /// that were asked for.
 struct AbandonOutcome<'a> {
+    /// The claim this command judged was released. `false` when someone else took the task while it
+    /// ran — their claim is left alone, and the task is not reopened under them.
+    released: bool,
     reopened: bool,
     final_status: &'a str,
     /// The checkout is no longer where it was — archived, or there was none.
@@ -1178,6 +1183,7 @@ fn report_abandon(uid: &str, branch: &str, out: &AbandonOutcome<'_>, json: bool)
             "{}",
             serde_json::json!({
                 "uid": uid, "abandoned": true, "branch": branch, "reopened": out.reopened,
+                "claim_released": out.released,
                 "status": out.final_status,
                 // What happened, not what was asked for: `--delete-branch` on a branch that was
                 // already gone deletes nothing.
@@ -1191,6 +1197,12 @@ fn report_abandon(uid: &str, branch: &str, out: &AbandonOutcome<'_>, json: bool)
     } else {
         if out.reopened {
             println!("abandoned {uid}; it is open again");
+        } else if !out.released {
+            println!(
+                "abandoned the session for {uid}, but it was claimed by another worker meanwhile — \
+                 their claim is kept, and it stays {}",
+                out.final_status
+            );
         } else {
             println!(
                 "abandoned the session for {uid}; it stays {}",

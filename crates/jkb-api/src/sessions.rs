@@ -24,7 +24,9 @@ use jkb_types::AgentId;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::tasks::{check_line, check_owner, line_problem, no_item, writable, FileRoots};
+use crate::tasks::{
+    check_line, check_new_owner, check_owner, line_problem, no_item, writable, FileRoots,
+};
 use crate::{ApiError, ErrorCode};
 
 /// The longest branch, repo key or land target a session op accepts, in bytes. Each is stored as a
@@ -259,7 +261,7 @@ pub fn start(
     let labels = ask.place.labels();
     match (&ask.take, &ask.keep) {
         (Some(take), None) => {
-            check_owner(&take.owner)?;
+            check_new_owner(&take.owner)?;
             if !swap(conn, meta, id, take, &labels)? {
                 return Ok(false);
             }
@@ -321,7 +323,7 @@ pub fn take(
     ask: &TakeAsk,
     roots: Option<&FileRoots>,
 ) -> Result<bool, ApiError> {
-    check_owner(&ask.take.owner)?;
+    check_new_owner(&ask.take.owner)?;
     ask.place.check()?;
     if ask.place.onto.is_none() {
         return Err(ApiError::with_code(
@@ -413,6 +415,9 @@ fn locate_id(
 /// What `task.abandon` did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Abandoned {
+    /// Whether the claim the caller observed was released (`true` too when it observed none and there
+    /// is none). `false` means the task is held by someone the caller never judged, and was left alone.
+    pub released: bool,
     /// Whether the task was reopened.
     pub reopened: bool,
     /// Its status afterwards.
@@ -445,16 +450,17 @@ pub fn abandon(
             .and_then(|m| m.status)
             .unwrap_or_default())
     };
-    let unchanged = |conn: &Connection| -> Result<Abandoned, ApiError> {
+    let unchanged = |conn: &Connection, released: bool| -> Result<Abandoned, ApiError> {
         Ok(Abandoned {
+            released,
             reopened: false,
             status: current(conn)?,
         })
     };
     match observed {
         // No claim was observed, but one exists now: its holder was never judged.
-        None if claim::holder(conn, id)?.is_some() => return unchanged(conn),
-        Some(prev) if !claim::clear_if(conn, meta, id, prev)? => return unchanged(conn),
+        None if claim::holder(conn, id)?.is_some() => return unchanged(conn, false),
+        Some(prev) if !claim::clear_if(conn, meta, id, prev)? => return unchanged(conn, false),
         _ => {}
     }
     let facts = lifecycle::TaskFacts {
@@ -475,9 +481,10 @@ pub fn abandon(
         &transition::Labels::default(),
     )?;
     if outcome.refusal().is_some() {
-        return unchanged(conn);
+        return unchanged(conn, true);
     }
     Ok(Abandoned {
+        released: true,
         reopened: true,
         status: current(conn)?,
     })

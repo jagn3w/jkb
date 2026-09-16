@@ -3926,7 +3926,14 @@ fn a_session_whose_location_was_never_recorded_is_resumed_not_forked() {
             .success();
     };
     forget();
-    let again = f.work(&uid);
+    // The checkout is found only through the claim, so where it lands is the operator's to say — even
+    // though the task still carries the land target of the run that made it.
+    f.jkb()
+        .args(["task", "work", &uid])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--onto"));
+    let again = f.work_onto(&uid, first["onto"].as_str().unwrap());
     assert_eq!(again["worktree"], first["worktree"], "the same checkout");
     assert_eq!(again["resumed"], true);
     let shown: serde_json::Value = serde_json::from_slice(

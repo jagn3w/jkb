@@ -139,6 +139,23 @@ pub(crate) fn check_owner(owner: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// An owner a claim is about to be **taken** as: [`check_owner`], and in the spelling the lifecycle
+/// stores (`AgentId`'s). A claim is stored canonically, so an owner sent in another spelling (`agent:a:b`
+/// is stored `agent:a-b`) would never match its own claim again — every later compare-and-set, and its
+/// own release, would miss. An owner that names an *existing* claim is only [`check_owner`]ed: it is
+/// compared with what is stored, which a claim written outside the lifecycle may spell any way.
+pub(crate) fn check_new_owner(owner: &str) -> Result<(), ApiError> {
+    check_owner(owner)?;
+    let canonical = jkb_types::AgentId::parse(owner).as_str();
+    if canonical != owner {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!("owner {owner:?} would be stored as {canonical:?}; send it that way"),
+        ));
+    }
+    Ok(())
+}
+
 /// How `task.tag` treats the facet's other values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -701,7 +718,7 @@ pub fn claim(
     owner: &str,
     roots: Option<&FileRoots>,
 ) -> Result<Claimed, ApiError> {
-    check_owner(owner)?;
+    check_new_owner(owner)?;
     let id = writable(conn, reference, roots)?;
     let facts = lifecycle::TaskFacts {
         actor: Some(jkb_types::AgentId::parse(owner)),

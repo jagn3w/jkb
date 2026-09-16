@@ -166,10 +166,10 @@ fn a_takeover_of_an_owner_that_changed_writes_nothing() {
     assert_eq!(facts(&b, &uid).tags["branch"], ["feat2"]);
 }
 
-/// `task.take` is `task work`'s claim: the start transition carries the branch and land target, a
+/// `task.take` is `task work`'s claim: its start transition carries no branch or land target, a
 /// same-owner retake is not an error — and it writes no location. `task.locate` does, once the
-/// worktree exists, and only for the owner that holds the claim, so a displaced run's late write
-/// changes nothing.
+/// worktree exists, noting the branch and land target, and only for the owner that holds the claim,
+/// so a displaced run's late write changes nothing.
 #[test]
 fn a_take_claims_and_a_locate_records_the_holder_s_place() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
@@ -346,14 +346,20 @@ fn an_abandon_releases_only_the_judged_claim() {
     assert!(start(&b, &uid, "host:1", None).unwrap());
 
     let a = abandon(&b, &uid, Some("host:9"));
-    assert_eq!((a.reopened, a.status.as_str()), (false, "in_progress"));
+    assert_eq!(
+        (a.released, a.reopened, a.status.as_str()),
+        (false, false, "in_progress")
+    );
     assert_eq!(facts(&b, &uid).claim.as_deref(), Some("host:1"));
 
     let a = abandon(&b, &uid, None);
-    assert!(!a.reopened, "a claim nobody judged stays");
+    assert!(!a.released && !a.reopened, "a claim nobody judged stays");
 
     let a = abandon(&b, &uid, Some("host:1"));
-    assert_eq!((a.reopened, a.status.as_str()), (true, "open"));
+    assert_eq!(
+        (a.released, a.reopened, a.status.as_str()),
+        (true, true, "open")
+    );
     let f = facts(&b, &uid);
     assert_eq!((f.claim, f.land_target), (None, None));
 
@@ -365,7 +371,10 @@ fn an_abandon_releases_only_the_judged_claim() {
     )
     .unwrap();
     let a = abandon(&b, &uid, facts(&b, &uid).claim.as_deref());
-    assert_eq!((a.reopened, a.status.as_str()), (false, "done"));
+    assert_eq!(
+        (a.released, a.reopened, a.status.as_str()),
+        (true, false, "done")
+    );
 }
 
 /// The gate is read through the daemon and never written: there is no op that stores one.
@@ -509,4 +518,34 @@ fn a_claim_in_a_non_canonical_spelling_is_compared_as_stored() {
     let a = abandon(&b, &uid, Some("agent:reviewer:G3"));
     assert!(a.reopened, "the stored claim was released: {a:?}");
     assert_eq!(facts(&b, &uid).claim, None);
+}
+
+/// **A claim is taken only in the spelling it is stored in.** `agent:reviewer:G3` is stored
+/// `agent:reviewer-G3`, so a worker that took it under the first spelling could never release or
+/// compare-and-set its own claim again. Each op that takes a claim refuses it, before writing.
+#[test]
+fn a_claim_is_taken_only_in_its_stored_spelling() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "spelled +tasks/x");
+    let odd = "agent:reviewer:G3";
+    let refused = |r: Result<Response, ApiError>| {
+        let e = r.expect_err("a non-canonical owner is refused");
+        assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    };
+    refused(call(
+        &b,
+        json!({ "op": "task.claim", "uid": uid, "owner": odd }),
+    ));
+    refused(call(
+        &b,
+        json!({ "op": "task.start", "uid": uid, "take": { "owner": odd },
+                "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
+    ));
+    refused(call(
+        &b,
+        json!({ "op": "task.take", "uid": uid, "take": { "owner": odd },
+                "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
+    ));
+    assert_eq!(facts(&b, &uid).claim, None, "nothing was taken");
+    assert!(start(&b, &uid, "agent:reviewer-G3", None).unwrap());
 }

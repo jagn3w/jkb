@@ -166,8 +166,13 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     second one, and abandon can still remove it. A `task.locate` that fails keeps the claim for the
     same reason (review, round 4). Both verbs use the one rule, whatever other branches the task
     records. They accept the claimed checkout only when no other task records its branch: names are
-    minted from slugs, so two tasks can reach one path. Such a checkout has no land target on
-    record, so `task work` requires `--onto` for it rather than guessing (round 5).
+    minted from slugs, so two tasks can reach one path. Such a checkout's land target was never
+    recorded — one the task carries belongs to an earlier checkout — so `task work` always requires
+    `--onto` for it rather than guessing (rounds 5 and 6).
+  - An owner a claim is **taken** as (`task.claim`, `task.take`, `task.start`'s `take`) must already
+    be in `AgentId`'s spelling (`tasks::check_new_owner`): the claim is stored that way, so an owner
+    sent in another spelling would never match its own claim again (round 6). `task.abandon`
+    reports `released`, so a caller whose task was taken meanwhile says so instead of "abandoned".
   - Claims are compared **as stored** (`claim::holder`): `task.facts` reports the stored string, so
     an owner in a spelling `AgentId` would render differently still matches when it is sent back.
   - `task.abandon` changes nothing when the claim is no longer the one observed before the git work.
