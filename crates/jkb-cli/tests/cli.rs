@@ -3099,13 +3099,9 @@ fn the_hook_feeds_the_session_registry_that_notify_sessions_lists() {
     let db = dir.path().join("jkb.db");
     let token = dir.path().join("daemon/token");
     let (_serve, url) = Daemon::start(&db, &token);
-    // The owner must be a live process that is neither the hook nor its parent, or the start's own
-    // sweep would end the session it just registered.
-    let mut owner = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("spawn sleep");
-    let owner_pid = owner.id().to_string();
+    // Any pid the hook accepts as an owner: neither the hook itself nor its parent. The start's own
+    // sweep never judges the session that is starting, so it need not be alive.
+    let owner_pid = "4242".to_owned();
     let client = || {
         let mut cmd = assert_cmd::Command::from_std(jkb_bare());
         cmd.env("HOME", dir.path())
@@ -3164,9 +3160,6 @@ fn the_hook_feeds_the_session_registry_that_notify_sessions_lists() {
         .expect("the refused notify.event is logged");
     assert!(log.contains("notify.event: NoSuchTopic"), "{log}");
     assert!(!log.contains("session."), "{log}");
-
-    let _ = owner.kill();
-    let _ = owner.wait();
 }
 
 /// `subscribe`'s stdout is its event stream, so the `--json` error line every other verb prints is

@@ -2568,3 +2568,54 @@ fn a_notify_event_marks_its_process_running_except_at_the_end() {
     event("user_acted");
     assert_eq!(live(), 1, "a later event from the process revives it");
 }
+
+/// A `session.list` page's cursor is an opaque string: sent back as it came it continues the listing,
+/// and anything else is refused rather than read as some other position.
+#[test]
+fn a_session_list_cursor_is_opaque() {
+    let b = backend();
+    for i in 0..=jkb_core::claude_session::LIST_CAP {
+        b.call(Request::SessionStarted {
+            session: format!("s{i:04}"),
+            source: "startup".into(),
+            pid: "1".into(),
+            instance: "h".into(),
+            cwd: String::new(),
+        })
+        .unwrap();
+    }
+    let page = b
+        .call(Request::SessionList {
+            all: false,
+            after: None,
+        })
+        .unwrap();
+    let wire = serde_json::to_value(&page).unwrap();
+    assert!(wire["next"].is_string(), "{}", wire["next"]);
+    let Response::ClaudeSessions { next, .. } = page else {
+        panic!("expected sessions")
+    };
+    let Response::ClaudeSessions { sessions, next } = b
+        .call(Request::SessionList {
+            all: false,
+            after: next,
+        })
+        .unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    assert_eq!((sessions.len(), next), (1, None));
+    for bad in [
+        "",
+        "{}",
+        r#"{"seen_at":1,"session":"s","pid":"1","instance":"h","x":1}"#,
+    ] {
+        let err = b
+            .call(Request::SessionList {
+                all: false,
+                after: Some(bad.into()),
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{bad}: {err:?}");
+    }
+}

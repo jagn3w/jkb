@@ -167,16 +167,18 @@ fn word(w: &str) -> &str {
     }
 }
 
-/// A working directory, cut to [`MAX_CWD_BYTES`] at a character boundary: it is only shown.
-fn cwd(c: &str) -> &str {
-    if c.len() <= MAX_CWD_BYTES {
-        return c;
-    }
-    let mut end = MAX_CWD_BYTES;
+/// A working directory as stored: cut to [`MAX_CWD_BYTES`] at a character boundary, and each control
+/// character replaced by `?`, because it is only shown — one per line, where a newline would forge a row
+/// and an escape would reach the terminal (stage-1 review, round 4).
+fn cwd(c: &str) -> String {
+    let mut end = c.len().min(MAX_CWD_BYTES);
     while !c.is_char_boundary(end) {
         end -= 1;
     }
-    &c[..end]
+    c[..end]
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect()
 }
 
 const COLUMNS: &str =

@@ -11,8 +11,8 @@ use jkb_fsm::Fact;
 use serde_json::json;
 
 use super::{
-    append_log, ask, handle, instance_from, owner_from, owner_in, verdict, Ask, Edge, HOOK_EVENTS,
-    LOG_CAP_BYTES,
+    append_log, ask, handle, instance_from, merge_page, owner_from, owner_in, verdict, Ask, Edge,
+    HOOK_EVENTS, LOG_CAP_BYTES,
 };
 
 /// Exactly one hook event drives the sweep, and every entry sends something, so a name in the table
@@ -276,6 +276,11 @@ fn only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone() {
         "a pid recorded with no instance is nobody's to probe"
     );
     assert_eq!(verdict("10", "Johns-MBP.local", "", dead), Fact::Unknown);
+    assert_eq!(
+        verdict("10", "", "", dead),
+        Fact::Unknown,
+        "two empty instances are not one machine"
+    );
     assert_eq!(
         verdict("", me, me, dead),
         Fact::Unknown,
@@ -902,4 +907,34 @@ fn a_hook_with_no_instance_sends_no_pid() {
     );
     assert_eq!(owner_in("", || "4242".into()), "", "so the hook sends none");
     assert_eq!(owner_in("host", || "4242".into()), "4242");
+}
+
+/// `jkb notify sessions` joins pages keeping one copy of a row that moved between them — the later one.
+#[test]
+fn a_row_repeated_across_pages_is_listed_once() {
+    let row = |session: &str, pid: &str, seen_at: i64| jkb_api::ClaudeSession {
+        session: session.into(),
+        pid: pid.into(),
+        instance: "h".into(),
+        cwd: String::new(),
+        started_at: None,
+        start_source: None,
+        seen_at,
+        ended_at: None,
+        end_reason: None,
+    };
+    let mut rows = Vec::new();
+    merge_page(&mut rows, vec![row("a", "1", 1), row("b", "1", 2)]);
+    merge_page(
+        &mut rows,
+        vec![row("c", "1", 3), row("a", "1", 4), row("a", "2", 4)],
+    );
+    let got: Vec<(&str, &str, i64)> = rows
+        .iter()
+        .map(|r| (r.session.as_str(), r.pid.as_str(), r.seen_at))
+        .collect();
+    assert_eq!(
+        got,
+        [("b", "1", 2), ("c", "1", 3), ("a", "1", 4), ("a", "2", 4)]
+    );
 }

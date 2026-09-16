@@ -245,7 +245,9 @@ end a session.
 **Paged listing.** The sweep follows `session.list`'s `next` cursor within its time limit. The keyset
 is (`seen_at`, session, pid, instance). A row written between two pages moves: in the live order it
 may be returned twice, which is harmless because verdicts are compare-and-set, and in the `--all` order
-it may be skipped, so that listing is not a snapshot. Rows it can
+it may be skipped, so that listing is not a snapshot. `jkb notify sessions` keeps one copy of a
+repeated row. A working directory is stored with its control characters replaced, since each row is
+printed on one line (review round 4). Rows it can
 never judge (another container's, the host's seen from a container, pid-less ones) would otherwise
 fill the single 1000-row page and hide one it could judge. Pinned by
 `the_sweep_pages_past_rows_it_cannot_judge` and `the_listing_is_paged`.

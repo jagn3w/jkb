@@ -139,7 +139,8 @@ pub enum Request {
         /// The session's working directory.
         #[serde(default)]
         cwd: String,
-        /// The `claude` process's pid, or empty when the hook had none it could trust.
+        /// The `claude` process's pid, or empty when the hook had none it could trust. A pid is refused
+        /// without its `instance` (`jkb_core::notify::check_owner_and_instance`).
         #[serde(default)]
         owner: String,
         /// Where `owner` means something: `host[#boot][/pidns]`, built by `jkb notify hook`.
@@ -168,7 +169,8 @@ pub enum Request {
         session: String,
         /// The payload's `source` (`startup`, `resume`, `clear`, `compact`, …).
         source: String,
-        /// The `claude` process's pid, or empty when the hook had none it could trust.
+        /// The `claude` process's pid, or empty when the hook had none it could trust. Refused without
+        /// its `instance`.
         #[serde(default)]
         pid: String,
         /// Where `pid` means something: `host[#boot][/pidns]`.
@@ -210,9 +212,10 @@ pub enum Request {
         /// Include ended rows, most recently seen first.
         #[serde(default)]
         all: bool,
-        /// Continue after this: the `next` of the previous page, asked with the same `all`.
+        /// Continue after this: the `next` of the previous page, sent back as it came, with the same
+        /// `all`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        after: Option<SessionCursor>,
+        after: Option<String>,
     },
     /// The namespace of the mount holding a working directory — what an unscoped read defaults to.
     #[serde(rename = "kb.ambient")]
@@ -529,18 +532,43 @@ impl From<jkb_core::claude_session::HolderRow> for ClaudeSession {
     }
 }
 
-/// Where a `session.list` page ended. Opaque to a client: sent back as it came.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Where a `session.list` page ended, as the daemon encodes it into the opaque `next` string. A string
+/// on the wire, not an object, so a newer daemon can change what it holds without an older client —
+/// which only sends it back — failing to decode the page around it (stage-1 review, round 4).
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SessionCursor {
-    /// The last row's `seen_at`.
-    pub seen_at: i64,
-    /// The last row's session.
-    pub session: String,
-    /// The last row's pid.
-    pub pid: String,
-    /// The last row's instance.
-    pub instance: String,
+struct SessionCursor {
+    seen_at: i64,
+    session: String,
+    pid: String,
+    instance: String,
+}
+
+impl SessionCursor {
+    fn encode(c: &jkb_core::claude_session::Cursor) -> String {
+        serde_json::json!({
+            "seen_at": c.seen_at,
+            "session": c.session,
+            "pid": c.pid,
+            "instance": c.instance,
+        })
+        .to_string()
+    }
+
+    fn decode(s: &str) -> Result<jkb_core::claude_session::Cursor, ApiError> {
+        let c: Self = serde_json::from_str(s).map_err(|e| {
+            ApiError::with_code(
+                ErrorCode::Invalid,
+                format!("`after` is not a cursor this daemon issued: {e}"),
+            )
+        })?;
+        Ok(jkb_core::claude_session::Cursor {
+            seen_at: c.seen_at,
+            session: c.session,
+            pid: c.pid,
+            instance: c.instance,
+        })
+    }
 }
 
 /// A topic spec as a request carries it: every field optional, defaults from [`TopicSpec`].
@@ -924,9 +952,10 @@ pub enum Response {
     ClaudeSessions {
         /// In the order asked for, at most `jkb_core::claude_session::LIST_CAP`.
         sessions: Vec<ClaudeSession>,
-        /// Where the next page starts; absent when this page is the last.
+        /// Where the next page starts — opaque, to be sent back as `after`; absent when this page is the
+        /// last.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        next: Option<SessionCursor>,
+        next: Option<String>,
     },
     /// A `kb.ambient`.
     Ambient {
@@ -1609,21 +1638,11 @@ impl Backend for LocalBackend {
                 })?,
             },
             Request::SessionList { all, after } => {
-                let after = after.map(|c| claude_session::Cursor {
-                    seen_at: c.seen_at,
-                    session: c.session,
-                    pid: c.pid,
-                    instance: c.instance,
-                });
+                let after = after.as_deref().map(SessionCursor::decode).transpose()?;
                 let page = db.read(move |c| claude_session::list(c, all, after.as_ref()))?;
                 Response::ClaudeSessions {
                     sessions: page.rows.into_iter().map(ClaudeSession::from).collect(),
-                    next: page.next.map(|c| SessionCursor {
-                        seen_at: c.seen_at,
-                        session: c.session,
-                        pid: c.pid,
-                        instance: c.instance,
-                    }),
+                    next: page.next.as_ref().map(SessionCursor::encode),
                 }
             }
             Request::KbAmbient { cwd, home } => {

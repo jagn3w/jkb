@@ -461,6 +461,19 @@ fn identity_is_refused_and_the_rest_normalised() {
         assert_eq!(r.cwd.len(), MAX_CWD_BYTES, "cut at a character boundary");
         assert!(r.cwd.chars().all(|c| c == 'é'));
     }
+    try_start(
+        &db,
+        &p("s", "1", "h"),
+        "/w/a\nfake  ended (gone)\u{1b}[2J",
+        "startup",
+        T0,
+    )
+    .unwrap();
+    assert_eq!(
+        one(&db, "s").cwd,
+        "/w/a?fake  ended (gone)?[2J",
+        "control characters replaced"
+    );
     end(&db, &p("s", "1", "h"), "Other!", T0 + 1);
     assert_eq!(one(&db, "s").end_reason.as_deref(), Some(UNKNOWN));
 }

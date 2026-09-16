@@ -84,7 +84,7 @@ fn sessions(all: bool, json: bool) -> Result<()> {
     let url = crate::remote::daemon_url();
     let backend = jkb_daemon::client::RemoteBackend::new(&url, crate::remote::token_file(&url))
         .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let mut sessions = Vec::new();
+    let mut sessions: Vec<jkb_api::ClaudeSession> = Vec::new();
     let mut after = None;
     loop {
         match backend.call(Request::SessionList { all, after }) {
@@ -92,7 +92,7 @@ fn sessions(all: bool, json: bool) -> Result<()> {
                 sessions: page,
                 next,
             }) => {
-                sessions.extend(page);
+                merge_page(&mut sessions, page);
                 match next {
                     Some(next) => after = Some(next),
                     None => break,
@@ -110,6 +110,17 @@ fn sessions(all: bool, json: bool) -> Result<()> {
         println!("{}", session_line(s));
     }
     Ok(())
+}
+
+/// Add a listing page to the rows so far. A row written between two pages can come back on the second
+/// (docs/notifications.md): its later copy is kept, once, in its later place.
+fn merge_page(rows: &mut Vec<jkb_api::ClaudeSession>, page: Vec<jkb_api::ClaudeSession>) {
+    for row in page {
+        rows.retain(|s| {
+            (&s.session, &s.pid, &s.instance) != (&row.session, &row.pid, &row.instance)
+        });
+        rows.push(row);
+    }
 }
 
 /// One process's hold on a session, on one line: id, state, process and where it runs.
@@ -329,12 +340,13 @@ fn is_bare(instance: &str) -> bool {
 
 /// Whether a pid recorded in `theirs` means the same process here, in `mine`.
 ///
-/// Equal instances do. So do two bare ones, even with different names: a bare instance is the machine
+/// Equal instances do — never empty ones, which name nothing. So do two bare ones, even with different
+/// names: a bare instance is the machine
 /// `jkb serve` runs on — its clients are that host and its containers — and that machine's name changes
 /// under it (macOS renames the host on a network change), which would otherwise leave a session that
 /// ended under the new name recorded live for ever (stage-1 review).
 fn same_pid_space(theirs: &str, mine: &str) -> bool {
-    theirs == mine || (is_bare(theirs) && is_bare(mine))
+    !theirs.is_empty() && !mine.is_empty() && (theirs == mine || (is_bare(theirs) && is_bare(mine)))
 }
 
 /// An instance string's host and boot.
