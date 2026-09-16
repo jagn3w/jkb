@@ -561,6 +561,28 @@ pub enum Request {
         /// The lease.
         name: String,
     },
+    /// `jkb task land`'s record ([`sessions::land`]).
+    #[serde(rename = "task.land")]
+    TaskLand {
+        /// The task.
+        uid: String,
+        /// Where it landed.
+        landed: sessions::Landed,
+    },
+    /// A landing the merge queue performed, for one task ([`sessions::landed`]).
+    #[serde(rename = "task.landed")]
+    TaskLanded {
+        /// The task.
+        uid: String,
+        /// Where it landed.
+        landed: sessions::Landed,
+    },
+    /// The findings of a task's recorded reviews ([`sessions::review_findings`]).
+    #[serde(rename = "task.review_findings")]
+    TaskReviewFindings {
+        /// The review namespaces.
+        namespaces: Vec<String>,
+    },
 }
 
 /// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
@@ -925,6 +947,9 @@ impl Request {
         "lease.take",
         "lease.release",
         "lease.break",
+        "task.land",
+        "task.landed",
+        "task.review_findings",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -988,6 +1013,9 @@ impl Request {
             Self::LeaseTake { .. } => "lease.take",
             Self::LeaseRelease { .. } => "lease.release",
             Self::LeaseBreak { .. } => "lease.break",
+            Self::TaskLand { .. } => "task.land",
+            Self::TaskLanded { .. } => "task.landed",
+            Self::TaskReviewFindings { .. } => "task.review_findings",
         }
     }
 
@@ -1019,6 +1047,7 @@ impl Request {
             | Self::TaskWhy { .. }
             | Self::TaskFacts { .. }
             | Self::TaskByBranch { .. }
+            | Self::TaskReviewFindings { .. }
             | Self::RepoGate { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -1061,7 +1090,9 @@ impl Request {
             | Self::RemovalDrop { .. }
             | Self::LeaseTake { .. }
             | Self::LeaseRelease { .. }
-            | Self::LeaseBreak { .. } => false,
+            | Self::LeaseBreak { .. }
+            | Self::TaskLand { .. }
+            | Self::TaskLanded { .. } => false,
         }
     }
 }
@@ -1319,6 +1350,18 @@ pub enum Response {
         #[serde(flatten)]
         cancelled: removals::Cancelled,
     },
+    /// A `task.land` or `task.landed`.
+    Landing {
+        /// What it did.
+        #[serde(flatten)]
+        landing: sessions::Landing,
+    },
+    /// A `task.review_findings`.
+    ReviewFindings {
+        /// What the reviews hold.
+        #[serde(flatten)]
+        findings: sessions::ReviewFindings,
+    },
     /// A `lease.get`.
     Lease {
         /// The lease, if anyone holds it.
@@ -1386,6 +1429,8 @@ impl Response {
             | Self::Removals { .. }
             | Self::Changed { .. }
             | Self::RemovalsCancelled { .. }
+            | Self::Landing { .. }
+            | Self::ReviewFindings { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
@@ -1441,6 +1486,8 @@ impl Response {
             | Self::Removals { .. }
             | Self::Changed { .. }
             | Self::RemovalsCancelled { .. }
+            | Self::Landing { .. }
+            | Self::ReviewFindings { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
@@ -2247,6 +2294,25 @@ impl Backend for LocalBackend {
                     })?,
                 }
             }
+            Request::TaskLand { uid, landed } => {
+                let roots = self.file_roots.clone();
+                Response::Landing {
+                    landing: task_write(db, actor, uid, move |c, m, uid| {
+                        sessions::land(c, m, uid, &landed, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskLanded { uid, landed } => {
+                let roots = self.file_roots.clone();
+                Response::Landing {
+                    landing: task_write(db, actor, uid, move |c, m, uid| {
+                        sessions::landed(c, m, uid, &landed, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskReviewFindings { namespaces } => Response::ReviewFindings {
+                findings: db.read_with(move |c| sessions::review_findings(c, &namespaces))?,
+            },
             Request::RemovalDrop { id } => {
                 let roots = self.file_roots.clone();
                 Response::Changed {

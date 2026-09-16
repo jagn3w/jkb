@@ -3533,23 +3533,29 @@ fn claim_of(db: &Path, uid: &str) -> Option<String> {
 
 /// Hold the removal sweep's lease for `holder` (`None` frees it), as a sweep in flight would.
 fn sweep_lease(db: &Path, holder: Option<&str>) {
+    set_lease(db, jkb_api::removals::SWEEP_LEASE, holder);
+}
+
+/// Hold the lease `name` for `holder` (`None` frees it).
+fn set_lease(db: &Path, name: &str, holder: Option<&str>) {
     let db = jkb_core::Db::open(db).unwrap();
-    let holder = holder.map(str::to_owned);
+    let (name, holder) = (name.to_owned(), holder.map(str::to_owned));
     db.write_txn("t", move |conn, meta| {
-        jkb_core::lease::break_lease(conn, meta, jkb_api::removals::SWEEP_LEASE)?;
+        jkb_core::lease::break_lease(conn, meta, &name)?;
         if let Some(h) = holder {
-            assert!(jkb_core::lease::take(
-                conn,
-                meta,
-                jkb_api::removals::SWEEP_LEASE,
-                &h,
-                None,
-                0
-            )?);
+            assert!(jkb_core::lease::take(conn, meta, &name, &h, None, 0)?);
         }
         Ok(())
     })
     .unwrap();
+}
+
+fn lease_of(db: &Path, name: &str) -> Option<String> {
+    let db = jkb_core::Db::open(db).unwrap();
+    let name = name.to_owned();
+    db.read(move |conn| jkb_core::lease::get(conn, &name))
+        .unwrap()
+        .map(|l| l.holder)
 }
 
 /// Mark a Claude Code session live (or ended) in the registry, as the hook would.
@@ -4033,6 +4039,149 @@ fn a_registered_but_vanished_checkout_is_opened_again() {
     assert!(worktree.join(".git").exists(), "a checkout is there again");
     assert!(claim_of(&f.db, &uid).is_some(), "and the claim is held");
     assert!(admin.exists(), "the other side's registration is untouched");
+}
+
+/// **Landing is serialised by a database lease, freed only when its holder is proven gone** (tasks
+/// S6.4 stage 4, decision D): its process dead on this host, or the Claude Code session it names
+/// ended. A holder nothing can judge is respected until `--break-lock`.
+#[test]
+fn landing_is_serialised_by_a_lease_freed_only_when_its_holder_is_proven_gone() {
+    const SESSION: &str = "0b8f2c1e-1111-4222-8333-444455556666";
+    let f = Fixture::new();
+    let uid = f.add_task("leased landing");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "l.txt",
+        "x\n",
+        "add l",
+    );
+    let land = || {
+        f.jkb()
+            .args(["task", "land", &uid, "--no-gate", "--no-review"])
+            .output()
+            .unwrap()
+    };
+    let refused = |out: &std::process::Output| {
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("another `jkb task land` is running"),
+            "{out:?}"
+        );
+    };
+    let name = "land:proj";
+
+    // pid 1 on this host is alive.
+    set_lease(&f.db, name, Some("host:1 n -"));
+    refused(&land());
+    // Another machine, in a session the registry knows to be live: nothing can say it is gone.
+    registry(&f.db, SESSION, true);
+    set_lease(&f.db, name, Some(&format!("elsewhere:5 n {SESSION}")));
+    refused(&land());
+    // No session to ask either: only the operator can end it.
+    set_lease(&f.db, name, Some("elsewhere:5 n -"));
+    refused(&land());
+    f.jkb()
+        .args(["task", "land", "--break-lock"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("elsewhere:5"));
+    assert_eq!(lease_of(&f.db, name), None);
+
+    // The session it names has ended: taken over, and released once the landing is done.
+    registry(&f.db, SESSION, false);
+    set_lease(&f.db, name, Some(&format!("elsewhere:5 n {SESSION}")));
+    let out = land();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(f.status_of(&uid), "done");
+    assert_eq!(lease_of(&f.db, name), None, "released");
+}
+
+/// **A container session lands through the daemon** (tasks S6.4 stage 4): the graft and the gate run
+/// where the command runs, the record through `task.land`, and a gate given there is run and never
+/// stored — a stored gate is a command the host runs (decision A). The merge queue's `task landed`
+/// goes through too, and breaking a lease does not.
+#[test]
+fn a_container_session_lands_through_the_daemon() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "batch"]);
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env_remove("JKB_DB")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap()
+    };
+    let uid = f.add_task("landed from the container");
+    let opened = remote(&["--json", "task", "work", &uid]);
+    assert!(opened.status.success(), "{opened:?}");
+    let v: serde_json::Value = serde_json::from_slice(&opened.stdout).unwrap();
+    commit_in(
+        Path::new(v["worktree"].as_str().unwrap()),
+        "c.txt",
+        "from the container\n",
+        "add c",
+    );
+
+    let landed = remote(&[
+        "--json",
+        "task",
+        "land",
+        &uid,
+        "--gate",
+        "true",
+        "--no-review",
+    ]);
+    assert!(landed.status.success(), "{landed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&landed.stdout).unwrap();
+    assert!(
+        v["gate_source"]
+            .as_str()
+            .unwrap()
+            .contains("not remembered"),
+        "{v}"
+    );
+    assert_eq!(f.status_of(&uid), "done");
+    let stored: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--json", "task", "gate"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(stored["gate"].is_null(), "no gate was stored: {stored}");
+    assert_eq!(lease_of(&f.db, "land:proj"), None);
+    assert!(git(&f.repo, &["log", "--format=%s", "batch"]).contains("add c"));
+
+    // The merge queue's record, for a task on a branch it grafted itself.
+    let other = f.add_task("queued elsewhere");
+    f.jkb()
+        .args(["task", "tag", "set", &other, "branch=task/queued"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "tag", "set", &other, "repo=proj"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "set", &other, "--status", "in_progress"])
+        .assert()
+        .success();
+    let queued = remote(&["--json", "task", "landed", "task/queued", "--onto", "batch"]);
+    assert!(queued.status.success(), "{queued:?}");
+    let v: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(1), "{v}");
+
+    let broke = remote(&["task", "land", "--break-lock"]);
+    assert!(!broke.status.success(), "{broke:?}");
 }
 
 /// **A session that cannot be opened leaves no claim behind** — and the release is the run's own

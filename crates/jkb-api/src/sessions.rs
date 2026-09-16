@@ -62,6 +62,8 @@ pub struct TaskState {
     pub start_refusal: Option<String>,
     /// Whether its status is terminal (`done`, `cancelled`).
     pub terminal: bool,
+    /// Whether any subtask is unfinished — what holds a landing (D35).
+    pub open_subtasks: bool,
 }
 
 /// `task.facts`: what the session verbs read about a task, in one read.
@@ -85,6 +87,7 @@ pub fn facts(conn: &Connection, reference: &str) -> Result<TaskState, ApiError> 
         tags,
         claim: claim::holder(conn, id)?,
         land_target: transition::land_target(conn, id)?,
+        open_subtasks: !task::subtasks_all_terminal(conn, id)?,
         start_refusal: if terminal {
             lifecycle::apply(&observed, TaskEvent::Start).refusal()
         } else {
@@ -516,6 +519,222 @@ pub fn gate(conn: &Connection, repo: &str) -> Result<Option<String>, ApiError> {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     }))
+}
+
+/// A landing's stated place: the branch that landed, where, and the branch's own tip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Landed {
+    /// The branch that landed.
+    pub branch: String,
+    /// The branch it landed on.
+    pub onto: String,
+    /// The branch's tip at the graft, recorded so a later reader can tell this landing from one of a
+    /// namesake branch.
+    #[serde(default)]
+    pub head: Option<String>,
+}
+
+impl Landed {
+    fn check(&self) -> Result<(), ApiError> {
+        check_name("branch", &self.branch)?;
+        valid_ref(&self.branch)?;
+        check_name("land target", &self.onto)?;
+        valid_ref(&self.onto)?;
+        if let Some(head) = &self.head {
+            if !(4..=64).contains(&head.len()) || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(ApiError::with_code(
+                    ErrorCode::Invalid,
+                    "a head is a commit id: 4 to 64 hex digits",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn labels(&self) -> transition::Labels {
+        transition::Labels {
+            branch: Some(self.branch.clone()),
+            onto: Some(self.onto.clone()),
+            ref_commit: self.head.clone(),
+            ..transition::Labels::default()
+        }
+    }
+}
+
+/// What a landing op did to the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Landing {
+    /// The landing moved the task.
+    pub moved: bool,
+    /// Why not, when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// Its status afterwards.
+    pub status: String,
+}
+
+fn landing(
+    conn: &Connection,
+    id: jkb_types::ItemId,
+    refusal: Option<String>,
+) -> Result<Landing, ApiError> {
+    Ok(Landing {
+        moved: refusal.is_none(),
+        refusal,
+        status: item::get(conn, id)?
+            .and_then(|m| m.status)
+            .unwrap_or_default(),
+    })
+}
+
+/// `task.land`: `jkb task land`'s record — the task is done and its claim free, through the
+/// lifecycle's `land`, labelled with where it landed. The graft, the gate and the disposal are the
+/// caller's, done before this, and the facts they established are **stated** here: that is what the
+/// caller is for, and it grants a client nothing `task.set --status done` does not (6.2). The status
+/// is re-read in this transaction, so a task cancelled while the gate ran stays cancelled — the
+/// refusal says so.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`]/[`ErrorCode::Forbidden`] for the task, [`ErrorCode::Invalid`] for a
+/// malformed place, or a failed write.
+pub fn land(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    landed: &Landed,
+    roots: Option<&FileRoots>,
+) -> Result<Landing, ApiError> {
+    use jkb_fsm::Fact;
+    landed.check()?;
+    let id = writable(conn, uid, roots)?;
+    let facts = lifecycle::TaskFacts {
+        session_exists: Fact::Yes,
+        work_dirty: Fact::No,
+        has_commits: Fact::Yes,
+        target_ready: Fact::Yes,
+        review_waived: Fact::Yes,
+        ..task::observe(conn, id)?
+    };
+    let outcome = transition::perform(conn, meta, id, &facts, TaskEvent::Land, &landed.labels())?;
+    landing(conn, id, outcome.refusal())
+}
+
+/// `task.landed`: a landing somebody else performed — the merge queue's graft — recorded for one task
+/// on the landed branch, through the lifecycle's `observed_landed`.
+///
+/// `landed_elsewhere` is stated by the caller, which performed and gated the graft. **A guard's
+/// refusal still records the landing** (a group task held for an open subtask), as an
+/// `observed_landed` entry that moves nothing: nothing re-runs this, and without it `close-merged`
+/// would find no landing at all. An event the machine does not define from the task's state — an
+/// abandoned task, which keeps `branch=` — records nothing, so an abandoned batch is not revived.
+///
+/// # Errors
+/// As [`land`].
+pub fn landed(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    landed: &Landed,
+    roots: Option<&FileRoots>,
+) -> Result<Landing, ApiError> {
+    use jkb_fsm::Fact;
+    landed.check()?;
+    let id = writable(conn, uid, roots)?;
+    let facts = lifecycle::TaskFacts {
+        landed_elsewhere: Fact::Yes,
+        ..task::observe(conn, id)?
+    };
+    let labels = landed.labels();
+    let outcome = transition::perform(conn, meta, id, &facts, TaskEvent::ObservedLanded, &labels)?;
+    let refusal = outcome.refusal();
+    if refusal.is_some() && matches!(outcome, jkb_fsm::Outcome::Refused { .. }) {
+        transition::observed(conn, meta, id, &facts, TaskEvent::ObservedLanded, &labels)?;
+    }
+    landing(conn, id, refusal)
+}
+
+/// One open must-fix finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFinding {
+    /// Its uid.
+    pub uid: String,
+    /// Its title.
+    pub title: String,
+}
+
+/// What a review's namespaces hold, as the land gate reads them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFindings {
+    /// Every finding item found, whatever its priority or status. Zero means the namespaces resolved
+    /// to nothing — **not** that the review was clean.
+    pub total: usize,
+    /// How many are open and must-fix (priority 1 or higher, not finished).
+    pub open_count: usize,
+    /// The first [`MAX_LISTED_FINDINGS`] of them.
+    pub open_must_fix: Vec<ReviewFinding>,
+}
+
+/// The most namespaces one `task.review_findings` names.
+pub const MAX_REVIEW_NAMESPACES: usize = 64;
+
+/// The most open findings one answer lists.
+pub const MAX_LISTED_FINDINGS: usize = 100;
+
+/// `task.review_findings`: the findings under `namespaces` (every recorded review of a task).
+///
+/// A **typed** scope, never a namespace interpolated into the DSL: a path with `,` in it split into two
+/// scopes that matched nothing, which is indistinguishable from "clean" unless the total is known too
+/// — which is why it is returned. Terminal statuses are filtered here, not by `is:ready`: a
+/// **blocked** must-fix finding must still block.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for too many or malformed namespaces, or a failed read.
+pub fn review_findings(
+    conn: &Connection,
+    namespaces: &[String],
+) -> Result<ReviewFindings, ApiError> {
+    use jkb_core::query::{Query, Scope};
+    if namespaces.len() > MAX_REVIEW_NAMESPACES {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!("at most {MAX_REVIEW_NAMESPACES} review namespaces"),
+        ));
+    }
+    for n in namespaces {
+        check_name("review namespace", n)?;
+    }
+    if namespaces.is_empty() {
+        return Ok(ReviewFindings::default());
+    }
+    let query = Query {
+        kind: Some("task".to_owned()),
+        scope: Scope::Union(namespaces.iter().cloned().map(Scope::Subtree).collect()),
+        ..Query::default()
+    };
+    let ids = query.evaluate(conn)?;
+    let metas = item::get_many(conn, &ids)?;
+    let mut out = ReviewFindings {
+        total: ids.len(),
+        ..ReviewFindings::default()
+    };
+    for id in ids {
+        let Some(m) = metas.get(&id) else { continue };
+        let status = m.status.as_deref().unwrap_or("open");
+        if jkb_types::TaskStatus::is_terminal_str(Some(status))
+            || m.priority.unwrap_or(i64::MAX) > 1
+        {
+            continue;
+        }
+        out.open_count += 1;
+        if out.open_must_fix.len() < MAX_LISTED_FINDINGS {
+            out.open_must_fix.push(ReviewFinding {
+                uid: m.uid.clone(),
+                title: item::title_of(m),
+            });
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -14,29 +14,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use jkb_core::{item, tag, Db};
-use jkb_types::ItemId;
 
 use crate::gitrepo;
 
 pub(crate) use jkb_core::location::{set_facet, FACET_BRANCH};
-
-/// The branch a session's work lands on used to be a facet here (`onto=`). It is now
-/// a label on the task's transition history: it is a statement about a moment, so two tasks told
-/// different targets are two entries with timestamps rather than one row silently keeping
-/// whichever wrote last. See `jkb_core::transition::land_target`.
-/// A task's facet tags, **every** value per facet.
-///
-/// Tags are a multi-map: `tag::apply` adds, so a task can legitimately carry two `branch=`
-/// values — one from `jkb task start` (D34) and one from `task work`. Collapsing them to a
-/// single value silently picks one, and picking the wrong `branch=` makes `task work` mint a
-/// second session for a task that already has one.
-pub(crate) fn task_tags(db: &Db, id: ItemId) -> Result<BTreeMap<String, Vec<String>>> {
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (facet, value) in db.read(move |conn| tag::applications(conn, id))? {
-        out.entry(facet).or_default().push(value);
-    }
-    Ok(out)
-}
 
 /// The values recorded for one facet.
 pub(crate) fn facet_values<'a>(
@@ -201,7 +182,7 @@ pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{facet_values, task_tags, FACET_BRANCH};
+    use super::{facet_values, FACET_BRANCH};
     use jkb_core::item::NewItem;
     use jkb_core::location::{set_location_facets, Location};
     use jkb_core::Db;
@@ -245,7 +226,13 @@ mod tests {
             })
             .unwrap();
 
-        let tags = task_tags(&db, id).unwrap();
+        let mut tags = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for (facet, value) in db
+            .read(move |conn| jkb_core::tag::applications(conn, id))
+            .unwrap()
+        {
+            tags.entry(facet).or_default().push(value);
+        }
         assert_eq!(facet_values(&tags, FACET_BRANCH), ["task/b".to_owned()]);
     }
 }

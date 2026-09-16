@@ -311,6 +311,25 @@ fn samples() -> Vec<Request> {
         Request::LeaseBreak {
             name: "removal-sweep".into(),
         },
+        Request::TaskLand {
+            uid: "u".into(),
+            landed: super::sessions::Landed {
+                branch: "b".into(),
+                onto: "o".into(),
+                head: None,
+            },
+        },
+        Request::TaskLanded {
+            uid: "u".into(),
+            landed: super::sessions::Landed {
+                branch: "b".into(),
+                onto: "o".into(),
+                head: None,
+            },
+        },
+        Request::TaskReviewFindings {
+            namespaces: vec!["reviews/x".into()],
+        },
     ]
 }
 
@@ -1327,6 +1346,7 @@ const READS: &[&str] = &[
     "task.facts",
     "task.by_branch",
     "repo.gate",
+    "task.review_findings",
 ];
 
 #[test]
@@ -1741,7 +1761,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 15, "every task write was asked");
+    assert_eq!(checked, 17, "every task write was asked");
 }
 
 #[test]
@@ -2033,6 +2053,10 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         json!({ "op": "task.locate", "uid": inside, "owner": "agent:c",
                 "place": { "branch": "b2", "repo": "r" } }),
         json!({ "op": "task.abandon", "uid": inside, "observed": "agent:c" }),
+        json!({ "op": "task.landed", "uid": inside,
+                "landed": { "branch": "b2", "onto": "o", "head": "abcd" } }),
+        json!({ "op": "task.land", "uid": inside,
+                "landed": { "branch": "b2", "onto": "o" } }),
     ];
     // Every task write the wire accepts is here; `task.add` checks the task it makes, below.
     let mut covered: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();

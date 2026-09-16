@@ -81,6 +81,9 @@ pub const fn support(command: &Command) -> Support {
                 | TaskCmd::Work { .. }
                 | TaskCmd::Abandon { .. }
                 | TaskCmd::Sessions
+                // The land lock is a lease, and a gate is run, never stored, from here (stage 4).
+                | TaskCmd::Land { .. }
+                | TaskCmd::Landed { .. }
                 | TaskCmd::Gate {
                     cmd: None,
                     clear: false,

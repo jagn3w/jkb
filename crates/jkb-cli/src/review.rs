@@ -14,7 +14,6 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use jkb_core::query::{Query, Scope};
 use jkb_core::{item, tag, task, Db};
 use jkb_types::{ItemId, TaskStatus};
 
@@ -33,56 +32,28 @@ pub(crate) struct OpenFinding {
     pub(crate) title: String,
 }
 
-/// The findings of the review(s) at `review_nss`, split into open must-fix and total seen.
-///
-/// The scope is built as a **typed** [`Query`] rather than by interpolating the namespace
-/// into the DSL. Interpolation made the namespace name re-parseable: a path containing `,`
-/// (which `/review-log` does not rewrite — it only replaces `/`) split into two scopes that
-/// match nothing, and any unresolvable path yields an empty candidate set. That is
-/// indistinguishable from "clean" unless the caller also knows how many findings exist,
-/// which is why this returns the total as well.
-///
-/// Terminal statuses are filtered in Rust: the DSL has `status:<s>` but no `-status:`, and
-/// `is:ready` is the wrong instrument because a **blocked** must-fix finding must still block.
+/// The findings of the review(s) at `review_nss`, split into open must-fix and total seen — the one
+/// query ([`jkb_api::sessions::review_findings`]), read in this process.
 ///
 /// # Errors
 /// Returns an error if the read fails.
 pub(crate) fn findings_in(db: &Db, review_nss: &[String]) -> Result<Findings> {
-    if review_nss.is_empty() {
-        return Ok(Findings::default());
-    }
-    let query = Query {
-        kind: Some("task".to_owned()),
-        // A union over every recorded review: re-running `/review-log` must not retire the
-        // previous run's still-open findings (design D38.5).
-        scope: Scope::Union(review_nss.iter().cloned().map(Scope::Subtree).collect()),
-        ..Query::default()
-    };
-    Ok(db.read(move |conn| {
-        let ids = query.evaluate(conn)?;
-        let metas = item::get_many(conn, &ids)?;
-        let mut out = Findings {
-            total: ids.len(),
-            open_must_fix: Vec::new(),
-        };
-        for id in ids {
-            let Some(m) = metas.get(&id) else { continue };
-            let status = m.status.as_deref().unwrap_or("open");
-            // Through the one spelling of the terminal set. This is the filter that decides
-            // whether a must-fix still blocks a landing, so a divergent copy here is the most
-            // expensive place to have one.
-            if jkb_types::TaskStatus::is_terminal_str(Some(status))
-                || m.priority.unwrap_or(i64::MAX) > 1
-            {
-                continue;
-            }
-            out.open_must_fix.push(OpenFinding {
-                uid: m.uid.clone(),
-                title: crate::output::title_of(m),
-            });
-        }
-        Ok(out)
-    })?)
+    let nss = review_nss.to_vec();
+    Ok(db
+        .read_with(move |conn| jkb_api::sessions::review_findings(conn, &nss))
+        .map_err(|e| anyhow::anyhow!(e.message))?
+        .into())
+}
+
+/// [`findings_in`], through whichever backend serves this command.
+///
+/// # Errors
+/// Returns an error if the op fails.
+pub(crate) fn findings_via(
+    kb: &crate::session_cli::Kb<'_>,
+    review_nss: &[String],
+) -> Result<Findings> {
+    Ok(kb.review_findings(review_nss)?.into())
 }
 
 /// What a review's namespaces actually contain.
@@ -91,7 +62,27 @@ pub(crate) struct Findings {
     /// Every finding item found, whatever its priority or status. Zero here means the
     /// namespace resolved to nothing — **not** that the review was clean.
     pub(crate) total: usize,
+    /// How many are open and must-fix.
+    pub(crate) open_count: usize,
+    /// The first of them, for a refusal to name.
     pub(crate) open_must_fix: Vec<OpenFinding>,
+}
+
+impl From<jkb_api::sessions::ReviewFindings> for Findings {
+    fn from(f: jkb_api::sessions::ReviewFindings) -> Self {
+        Self {
+            total: f.total,
+            open_count: f.open_count,
+            open_must_fix: f
+                .open_must_fix
+                .into_iter()
+                .map(|o| OpenFinding {
+                    uid: o.uid,
+                    title: o.title,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Why a task may not land, if it may not.
@@ -105,8 +96,8 @@ pub(crate) enum GateVerdict {
     /// `tasks.md`, a typo'd `--findings`, a namespace renamed since). Treating it as clean is
     /// the gate failing **open**, which is the one direction a safety check must not fail.
     NoFindingsRecorded(Vec<String>),
-    /// Reviewed, but the review has open must-fix findings.
-    OpenFindings(Vec<OpenFinding>),
+    /// Reviewed, but the review has open must-fix findings: how many, and the first of them.
+    OpenFindings(usize, Vec<OpenFinding>),
 }
 
 impl GateVerdict {
@@ -128,9 +119,8 @@ impl GateVerdict {
                  is not a clean review. Re-run /jkb-review-log.",
                 nss.join(", ")
             )),
-            Self::OpenFindings(open) => Some(format!(
-                "Its review left {} open must-fix finding(s). Fix or cancel each one, then land.",
-                open.len()
+            Self::OpenFindings(count, _) => Some(format!(
+                "Its review left {count} open must-fix finding(s). Fix or cancel each one, then land."
             )),
         }
     }
@@ -147,9 +137,12 @@ impl GateVerdict {
 ///
 /// # Errors
 /// Returns an error if the findings cannot be read.
-pub(crate) fn gate(db: &Db, tags: &BTreeMap<String, Vec<String>>) -> Result<GateVerdict> {
+pub(crate) fn gate(
+    kb: &crate::session_cli::Kb<'_>,
+    tags: &BTreeMap<String, Vec<String>>,
+) -> Result<GateVerdict> {
     let nss = crate::repo::facet_values(tags, FACET_REVIEW).to_vec();
-    Ok(gate_with(&findings_in(db, &nss)?, tags, &nss))
+    Ok(gate_with(&findings_via(kb, &nss)?, tags, &nss))
 }
 
 /// The gate's decision, given findings already read.
@@ -173,10 +166,10 @@ pub(crate) fn gate_with(
     if nss.is_empty() || found.total == 0 {
         return GateVerdict::NoFindingsRecorded(nss.to_vec());
     }
-    if found.open_must_fix.is_empty() {
+    if found.open_count == 0 {
         GateVerdict::Passed
     } else {
-        GateVerdict::OpenFindings(found.open_must_fix.clone())
+        GateVerdict::OpenFindings(found.open_count, found.open_must_fix.clone())
     }
 }
 
@@ -194,13 +187,13 @@ pub(crate) fn gate_with(
 /// Returns an error — the refusal itself — when the task has no recorded review, its review
 /// namespace holds no findings at all, or its review has open must-fix findings.
 pub(crate) fn enforce(
-    db: &Db,
+    kb: &crate::session_cli::Kb<'_>,
     uid: &str,
     tags: &BTreeMap<String, Vec<String>>,
     no_review: bool,
     json: bool,
 ) -> Result<bool> {
-    let verdict = gate(db, tags)?;
+    let verdict = gate(kb, tags)?;
     if matches!(verdict, GateVerdict::Passed) {
         return Ok(false);
     }
@@ -225,12 +218,9 @@ pub(crate) fn enforce(
              --no-review. This is NOT read as a clean review.",
             nss.join(", ")
         ),
-        GateVerdict::OpenFindings(open) => {
+        GateVerdict::OpenFindings(count, open) => {
             use std::fmt::Write as _;
-            let mut msg = format!(
-                "{uid} has {} open must-fix finding(s) from its review:",
-                open.len()
-            );
+            let mut msg = format!("{uid} has {count} open must-fix finding(s) from its review:");
             for f in open.iter().take(10) {
                 let _ = write!(msg, "\n  - {} ({})", f.title, f.uid);
             }

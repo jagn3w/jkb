@@ -606,3 +606,136 @@ fn a_claim_held_in_an_older_spelling_is_refused_with_the_way_out() {
         other => panic!("{other:?}"),
     }
 }
+
+fn landing(r: Result<Response, ApiError>) -> Result<super::Landing, ApiError> {
+    match r? {
+        Response::Landing { landing } => Ok(landing),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `task.land` finishes a task and frees its claim, labelled with where it landed; a task cancelled
+/// meanwhile stays cancelled, and says why; a head that is not a commit is refused.
+#[test]
+fn a_land_finishes_the_task_unless_it_was_cancelled_meanwhile() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "land it +tasks/x");
+    assert!(start(&b, &uid, "host:1", None).unwrap());
+    let land = |uid: &str, head: Option<&str>| {
+        landing(call(
+            &b,
+            json!({ "op": "task.land", "uid": uid,
+                    "landed": { "branch": "feat", "onto": "batch", "head": head } }),
+        ))
+    };
+    let e = land(&uid, Some("not-a-commit")).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
+
+    let l = land(&uid, Some("abcd1234")).unwrap();
+    assert_eq!((l.moved, l.status.as_str()), (true, "done"), "{l:?}");
+    assert_eq!(facts(&b, &uid).claim, None);
+    match call(&b, json!({ "op": "task.why", "uid": uid })).unwrap() {
+        Response::History { entries, .. } => {
+            let last = entries.last().unwrap();
+            assert_eq!(last.event, "land", "{entries:?}");
+            assert_eq!(last.onto.as_deref(), Some("batch"));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let other = add(&b, "dropped meanwhile +tasks/x");
+    assert!(start(&b, &other, "host:1", None).unwrap());
+    call(
+        &b,
+        json!({ "op": "task.set", "uid": other, "status": "cancelled" }),
+    )
+    .unwrap();
+    let l = land(&other, None).unwrap();
+    assert!(!l.moved && l.refusal.is_some(), "{l:?}");
+    assert_eq!(l.status, "cancelled");
+}
+
+/// `task.landed` records the queue's graft: it finishes a task in progress, records a landing a guard
+/// held back without moving the task, and records nothing for a task the event does not apply to.
+#[test]
+fn a_queue_landing_is_recorded_as_the_lifecycle_allows() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let landed = |uid: &str| {
+        landing(call(
+            &b,
+            json!({ "op": "task.landed", "uid": uid,
+                    "landed": { "branch": "feat", "onto": "batch" } }),
+        ))
+        .unwrap()
+    };
+    let events = |uid: &str| match call(&b, json!({ "op": "task.why", "uid": uid })).unwrap() {
+        Response::History { entries, .. } => {
+            entries.into_iter().map(|e| e.event).collect::<Vec<_>>()
+        }
+        other => panic!("{other:?}"),
+    };
+
+    let working = add(&b, "in flight +tasks/x");
+    assert!(start(&b, &working, "host:1", None).unwrap());
+    let l = landed(&working);
+    assert_eq!((l.moved, l.status.as_str()), (true, "done"), "{l:?}");
+
+    // A parent with an open subtask is held — and the landing is still in its history.
+    let parent = add(&b, "parent +tasks/x");
+    assert!(start(&b, &parent, "host:1", None).unwrap());
+    call(
+        &b,
+        json!({ "op": "task.add", "text": "child", "managed": true, "under": parent }),
+    )
+    .unwrap();
+    let l = landed(&parent);
+    assert!(!l.moved && l.refusal.is_some(), "{l:?}");
+    assert_eq!(l.status, "in_progress");
+    assert_eq!(
+        events(&parent).last().map(String::as_str),
+        Some("observed_landed")
+    );
+
+    // An open task: the event does not apply, and nothing is written.
+    let open = add(&b, "never started +tasks/x");
+    let before = events(&open);
+    let l = landed(&open);
+    assert!(!l.moved, "{l:?}");
+    assert_eq!(events(&open), before, "nothing recorded");
+}
+
+/// `task.review_findings` counts every finding, and the open must-fix ones apart, across every named
+/// review; a finished or lower-priority finding does not block.
+#[test]
+fn review_findings_count_what_blocks_a_landing() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    add(&b, "must fix !p1 +reviews/one");
+    add(&b, "must fix too !p0 +reviews/two");
+    add(&b, "a concern !p2 +reviews/one");
+    let done = add(&b, "fixed !p1 +reviews/two");
+    call(
+        &b,
+        json!({ "op": "task.set", "uid": done, "status": "done" }),
+    )
+    .unwrap();
+    let ask = |nss: serde_json::Value| match call(
+        &b,
+        json!({ "op": "task.review_findings", "namespaces": nss }),
+    ) {
+        Ok(Response::ReviewFindings { findings }) => Ok(findings),
+        Ok(other) => panic!("{other:?}"),
+        Err(e) => Err(e),
+    };
+    let f = ask(json!(["reviews/one", "reviews/two"])).unwrap();
+    assert_eq!(
+        (f.total, f.open_count, f.open_must_fix.len()),
+        (4, 2, 2),
+        "{f:?}"
+    );
+    let f = ask(json!(["reviews/nowhere"])).unwrap();
+    assert_eq!((f.total, f.open_count), (0, 0));
+    let many: Vec<String> = (0..=super::MAX_REVIEW_NAMESPACES)
+        .map(|i| format!("r/{i}"))
+        .collect();
+    assert_eq!(ask(json!(many)).unwrap_err().code, ErrorCode::Invalid);
+}

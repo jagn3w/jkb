@@ -59,6 +59,37 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             let stores = crate::archive::Stores::new(kb, ops.db_path);
             crate::session_cli::abandon(&kb, &stores, &uid, force, delete_branch, ops.json)
         }
+        TaskCmd::Land {
+            uid,
+            gate,
+            no_gate,
+            keep_worktree,
+            no_review,
+            break_lock,
+        } => {
+            let kb = crate::session_cli::Kb::from_ops(ops);
+            let stores = crate::archive::Stores::new(kb, ops.db_path);
+            crate::cmd_task_land(
+                &kb,
+                &stores,
+                ops.db,
+                uid.as_deref(),
+                crate::LandFlags {
+                    gate,
+                    no_gate,
+                    keep_worktree,
+                    no_review,
+                    break_lock,
+                },
+                ops.json,
+            )
+        }
+        TaskCmd::Landed { branch, onto } => crate::cmd_task_landed(
+            &crate::session_cli::Kb::from_ops(ops),
+            &branch,
+            &onto,
+            ops.json,
+        ),
         TaskCmd::Sessions => {
             let kb = crate::session_cli::Kb::from_ops(ops);
             let stores = crate::archive::Stores::new(kb, ops.db_path);

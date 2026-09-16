@@ -9,14 +9,19 @@
 //!
 //! `start`, `work`, `abandon`, `sessions` and the gate read run in both modes; the worktree-removal
 //! records and the sweep's lease are ops too (stage 3, `archive::Stores`). Storing a gate stays on the
-//! host (decision A), and `land` is not yet ported (stage 4).
+//! host (decision A). `land` and `landed` are served as ops too (stage 4): their git and gate run
+//! where the command runs, the land lock is the `land:<repo>` lease ([`LandLease`]), and a gate given
+//! or found there is run and never stored.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use jkb_api::removals::{Removal, RemovalRecord};
-use jkb_api::sessions::{Abandoned, BranchTask, Place, StartAsk, Take, TakeAsk, TaskState};
+use jkb_api::sessions::{
+    Abandoned, BranchTask, Landed, Landing, Place, ReviewFindings, StartAsk, Take, TakeAsk,
+    TaskState,
+};
 use jkb_api::{Backend, Request, Response, SessionStateIs};
 use jkb_types::AgentId;
 
@@ -236,6 +241,57 @@ impl<'a> Kb<'a> {
         })? {
             Response::LeaseBroken { holder } => Ok(holder),
             other => unexpected("lease.break", &other),
+        }
+    }
+
+    fn landing(&self, op: &str, request: Request) -> Result<Landing> {
+        match self.call(request)? {
+            Response::Landing { landing } => Ok(landing),
+            other => unexpected(op, &other),
+        }
+    }
+
+    /// `task.land`.
+    pub(crate) fn land(&self, uid: &str, landed: Landed) -> Result<Landing> {
+        self.landing(
+            "task.land",
+            Request::TaskLand {
+                uid: uid.to_owned(),
+                landed,
+            },
+        )
+    }
+
+    /// `task.landed`.
+    pub(crate) fn landed(&self, uid: &str, landed: Landed) -> Result<Landing> {
+        self.landing(
+            "task.landed",
+            Request::TaskLanded {
+                uid: uid.to_owned(),
+                landed,
+            },
+        )
+    }
+
+    /// `task.review_findings`.
+    pub(crate) fn review_findings(&self, namespaces: &[String]) -> Result<ReviewFindings> {
+        match self.call(Request::TaskReviewFindings {
+            namespaces: namespaces.to_vec(),
+        })? {
+            Response::ReviewFindings { findings } => Ok(findings),
+            other => unexpected("task.review_findings", &other),
+        }
+    }
+
+    /// `task.tag` with `set`: make `facet=value` the facet's only value.
+    pub(crate) fn set_facet(&self, uid: &str, facet: &str, value: &str) -> Result<()> {
+        match self.call(Request::TaskTag {
+            uid: uid.to_owned(),
+            facet_value: format!("{facet}={value}"),
+            mode: jkb_api::tasks::TagMode::Set,
+        })? {
+            Response::Applied {} => Ok(()),
+            other => unexpected("task.tag", &other),
         }
     }
 
@@ -1572,6 +1628,113 @@ fn refuse_a_running_opener(kb: &Kb<'_>, uid: &str, held: &str, worktree: &Path) 
          for it to end, or if you are sure it is gone, `jkb task release {uid} --owner {held}`.",
         worktree.display()
     )
+}
+
+/// An exclusive hold on a repo's landing: the `land:<repo>` lease, released on drop (tasks S6.4 stage 4,
+/// decision D).
+///
+/// Landing must be serial: two sessions grafting at once would each run the gate against a tree the
+/// other is about to change, which is exactly the "green alone, red together" case the gate exists to
+/// catch (design D36.4). The lock was a file in the repo holding a pid, which a process on the other
+/// side of the container bind cannot probe — each side would read the other's live lock as stale.
+///
+/// **Stale only when its holder is proven gone:** its process is dead on this host, or the Claude Code
+/// session it names has ended in the registry (a `SessionEnd`, or the sweep's `session.gone`). A holder
+/// on another host in a session nobody has seen end is respected; a land killed there leaves the lease
+/// until that session ends — or an operator runs `jkb task land --break-lock` on the host.
+pub(crate) struct LandLease<'a> {
+    kb: Kb<'a>,
+    name: String,
+    /// `<owner> <nonce> <claude session or ->`, exactly as taken.
+    holder: String,
+}
+
+impl<'a> LandLease<'a> {
+    /// The lease's name for a repo.
+    pub(crate) fn name(repo_key: &str) -> String {
+        format!("{}{repo_key}", jkb_api::removals::LAND_LEASE_PREFIX)
+    }
+
+    /// Take the lease, or fail naming who holds it.
+    pub(crate) fn acquire(kb: &Kb<'a>, repo_key: &str) -> Result<Self> {
+        let name = Self::name(repo_key);
+        let nonce = format!(
+            "{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        let holder = format!(
+            "{} {nonce} {}",
+            owner::self_owner(),
+            owner::claude_session().unwrap_or_else(|| "-".to_owned())
+        );
+        for _ in 0..2 {
+            if kb.lease_take(&name, &holder, None)? {
+                return Ok(Self {
+                    kb: *kb,
+                    name,
+                    holder,
+                });
+            }
+            let Some(current) = kb.lease_holder(&name)? else {
+                continue;
+            };
+            anyhow::ensure!(
+                Self::gone(kb, &current)?,
+                "another `jkb task land` is running for this repo ({}) — landing is serial so its gate \
+                 result stays meaningful; wait for it to finish, or, if it is gone for good, run \
+                 `jkb task land --break-lock` on the host",
+                Self::describe(&current)
+            );
+            if kb.lease_take(&name, &holder, Some(&current))? {
+                return Ok(Self {
+                    kb: *kb,
+                    name,
+                    holder,
+                });
+            }
+        }
+        anyhow::bail!("could not take the land lease {name}; try again")
+    }
+
+    /// Whether the holder is proven gone.
+    fn gone(kb: &Kb<'_>, holder: &str) -> Result<bool> {
+        let mut parts = holder.split_whitespace();
+        let owner_id = parts.next().unwrap_or_default();
+        if owner::is_alive(owner_id).is_no() {
+            return Ok(true);
+        }
+        match parts.nth(1) {
+            Some(session) if session != "-" && jkb_types::is_session_id(session) => {
+                Ok(kb.session_state(session)? == SessionStateIs::Ended)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn describe(holder: &str) -> String {
+        let mut parts = holder.split_whitespace();
+        let owner_id = parts.next().unwrap_or("holder unknown");
+        match parts.nth(1).filter(|s| *s != "-") {
+            Some(session) => format!("{owner_id}, Claude Code session {session}"),
+            None => owner_id.to_owned(),
+        }
+    }
+
+    /// Drop the lease for `repo_key` whoever holds it — the operator's escape; host only.
+    pub(crate) fn break_held(kb: &Kb<'_>, repo_key: &str) -> Result<Option<String>> {
+        Ok(kb
+            .lease_break(&Self::name(repo_key))?
+            .map(|h| Self::describe(&h)))
+    }
+}
+
+impl Drop for LandLease<'_> {
+    fn drop(&mut self) {
+        let _ = self.kb.lease_release(&self.name, &self.holder);
+    }
 }
 
 #[cfg(test)]

@@ -863,7 +863,8 @@ enum TaskCmd {
     /// green mark the task done and clean the session up. Serialized per repo.
     Land {
         /// The task uid.
-        uid: String,
+        #[arg(required_unless_present = "break_lock")]
+        uid: Option<String>,
         /// The command that verifies the integrated result (remembered for this repo).
         #[arg(long)]
         gate: Option<String>,
@@ -877,6 +878,11 @@ enum TaskCmd {
         /// bypass is visible rather than invisible.
         #[arg(long)]
         no_review: bool,
+        /// Drop this repo's land lease, whoever holds it, and land nothing — for a holder that is
+        /// gone for good but cannot be proven so (another machine, a session never seen to end).
+        /// Host only.
+        #[arg(long, conflicts_with_all = ["gate", "no_gate", "keep_worktree", "no_review"])]
+        break_lock: bool,
     },
     /// Record that a code review ran, so `task land` can require one.
     Review {
@@ -1553,7 +1559,7 @@ fn local_ops(db: &Db, db_path: &Path, command: Command, global: bool, json: bool
         backend = backend.with_embedder(embedder()?);
     }
     ops_cli::Ops::new(&backend, global, json, false)
-        .with_db_path(db_path)
+        .with_local(db, db_path)
         .run(command)
 }
 
@@ -3251,12 +3257,14 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Start { .. }
         | TaskCmd::Work { .. }
         | TaskCmd::Abandon { .. }
-        | TaskCmd::Sessions => {
+        | TaskCmd::Sessions
+        | TaskCmd::Land { .. }
+        | TaskCmd::Landed { .. } => {
             anyhow::bail!("internal: a task verb served as an op missed ops_cli's dispatch")
         }
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         TaskCmd::Pr { uid, number } => cmd_task_pr(db, &uid, number, json)?,
-        cmd @ (TaskCmd::Land { .. } | TaskCmd::Gate { .. }) => {
+        cmd @ TaskCmd::Gate { .. } => {
             cmd_task_session(db, db_path, cmd, json)?;
         }
         TaskCmd::Reap {
@@ -3314,7 +3322,6 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
 fn cmd_task_landing(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
         TaskCmd::CloseMerged { repo, dry_run } => cmd_task_close_merged(db, repo, dry_run, json)?,
-        TaskCmd::Landed { branch, onto } => cmd_task_landed(db, &branch, &onto, json)?,
         TaskCmd::Review { cmd } => cmd_task_review(db, cmd, json)?,
         // The read and session subcommands are dispatched by `cmd_task` and never reach here.
         // Listed rather than caught by `_`, so a new variant is a compile error instead of an
@@ -3328,6 +3335,7 @@ fn cmd_task_landing(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Pr { .. }
         | TaskCmd::Work { .. }
         | TaskCmd::Land { .. }
+        | TaskCmd::Landed { .. }
         | TaskCmd::Abandon { .. }
         | TaskCmd::Sessions
         | TaskCmd::Gate { .. }
@@ -3475,7 +3483,12 @@ fn record_pr(db: &Db, id: ItemId, number: i64) -> Result<()> {
 /// # Errors
 /// Errors if either name is not usable as a git ref, if this is not a git repository, or if no
 /// task in it records `branch`.
-fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> {
+pub(crate) fn cmd_task_landed(
+    kb: &session_cli::Kb<'_>,
+    branch: &str,
+    onto: &str,
+    json: bool,
+) -> Result<()> {
     gitrepo::valid_ref(branch)?;
     gitrepo::valid_ref(onto)?;
     let ctx = repo::repo_ctx()?;
@@ -3488,8 +3501,7 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
     // Every task recorded on this branch. The queue lands a whole group at once, so this is
     // many-to-one by nature — and it needs no per-branch record to find them, because a task's
     // own facets say which branch it is on.
-    let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
-    let by_branch = session_cli::Kb::new(&backend).by_branch(&ctx.key)?;
+    let by_branch = kb.by_branch(&ctx.key)?;
     let uids: Vec<String> = by_branch
         .get(branch)
         .into_iter()
@@ -3505,79 +3517,22 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
     let mut recorded = Vec::new();
     let mut not_closed = Vec::new();
     for uid in &uids {
-        let id = resolve_task_uid(db, uid)?;
-        let labels = jkb_core::transition::Labels {
-            branch: Some(branch.to_owned()),
-            onto: Some(onto.to_owned()),
-            ref_commit: head.clone(),
-            ..jkb_core::transition::Labels::default()
-        };
-        let labels_for_note = labels.clone();
-        let outcome = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-            // `landed_elsewhere` is **asserted by the caller**, and the caller is the merge queue
-            // reporting a graft it performed and gated itself (D38: the swarm's REVIEWER is that
-            // gate, and it is stricter than the land gate). That is why this is
-            // `observed_landed` and not `land`: `land`'s guard asks whether jkb *may perform*
-            // the graft — is the checkout clean, did a review pass — and the graft is already
-            // done. Conflating the two would let this verb bypass the review gate on the human
-            // path, since they would be one set of preconditions.
-            let facts = lifecycle::TaskFacts {
-                landed_elsewhere: Fact::Yes,
-                ..task::observe(conn, id)?
-            };
-            Ok(jkb_core::transition::perform(
-                conn,
-                meta,
-                id,
-                &facts,
-                lifecycle::TaskEvent::ObservedLanded,
-                &labels,
-            )?)
-        })?;
-        match outcome.refusal() {
+        // `task.landed` states `landed_elsewhere` — the merge queue performed and gated the graft
+        // itself (D38), which is why this is `observed_landed` and not `land`, whose guard asks
+        // whether jkb may *perform* it. A guard's refusal still records the landing, as an entry
+        // that moves nothing; an event the task's state does not define (an abandoned task, which
+        // keeps `branch=`) records nothing. See `jkb_api::sessions::landed`.
+        let outcome = kb.landed(
+            uid,
+            jkb_api::sessions::Landed {
+                branch: branch.to_owned(),
+                onto: onto.to_owned(),
+                head: head.clone(),
+            },
+        )?;
+        match outcome.refusal {
             None => recorded.push(uid.clone()),
-            Some(why) => {
-                // **The graft still happened, so it is still recorded** — but only when the
-                // refusal was a *guard* denying. `perform` writes a history row only when it
-                // moves, and a group task held for an open subtask would otherwise store nothing
-                // about a landing the queue really performed: the subtask finishes later, nothing
-                // re-runs this verb, and `close-merged` finds no landing and no pull request (the
-                // queue grafts locally, so there is none) — held for ever on "no pull request has
-                // that branch as its head".
-                //
-                // `Undefined` is the other refusal and means the opposite: this machine has no
-                // `observed_landed` from where the task is, so the event did not apply to this
-                // task at all. That is what an **abandoned** task looks like here — `abandon` does
-                // not clear `branch=`, so it is still selected — and recording a landing for it
-                // put an `onto` back into its history, where `land_target` reads the newest one
-                // and would have answered with a target the abandon had just retired. The task
-                // reappears in `jkb staging ls` as live work, and its batch never counts as spent.
-                //
-                // Recorded under the event's own name rather than as a `note`, so it is legible
-                // as a landing: `note` is bookkeeping that asserts nothing, and `jkb task start
-                // --onto` writes one carrying the same labels.
-                if !matches!(outcome, jkb_fsm::Outcome::Refused { .. }) {
-                    not_closed.push((uid.clone(), why));
-                    continue;
-                }
-                let labels = labels_for_note.clone();
-                db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-                    let facts = jkb_core::lifecycle::TaskFacts {
-                        landed_elsewhere: Fact::Yes,
-                        ..task::observe(conn, id)?
-                    };
-                    jkb_core::transition::observed(
-                        conn,
-                        meta,
-                        id,
-                        &facts,
-                        lifecycle::TaskEvent::ObservedLanded,
-                        &labels,
-                    )?;
-                    Ok(())
-                })?;
-                not_closed.push((uid.clone(), why));
-            }
+            Some(why) => not_closed.push((uid.clone(), why)),
         }
     }
 
@@ -3607,30 +3562,13 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
     Ok(())
 }
 
-/// Dispatch the parallel-session subcommands (design D36): open a session, land it, drop it,
-/// list what is in flight, or configure the gate that guards a landing.
+/// Configure the gate that guards a landing (design D36.5). The other session verbs are served as
+/// ops (`task_cli`), in both modes.
 fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
     let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
     let kb = session_cli::Kb::new(&backend);
+    let _ = db_path;
     match cmd {
-        TaskCmd::Land {
-            uid,
-            gate,
-            no_gate,
-            keep_worktree,
-            no_review,
-        } => cmd_task_land(
-            db,
-            db_path,
-            &uid,
-            LandFlags {
-                gate: gate.clone(),
-                no_gate,
-                keep_worktree,
-                no_review,
-            },
-            json,
-        ),
         // Storing a gate is a host command (decision A), so it is done here, against the database,
         // and never through an op. Showing one is served as an op in both modes.
         TaskCmd::Gate { cmd, clear } => {
@@ -3648,11 +3586,13 @@ fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result
 
 /// `task land` — the merge queue for one session (design D36.4).
 /// The flags of `task land`, grouped so the signature stays under the bool-argument lint.
-struct LandFlags {
-    gate: Option<String>,
-    no_gate: bool,
-    keep_worktree: bool,
-    no_review: bool,
+#[allow(clippy::struct_excessive_bools)] // a command's flags, not state
+pub(crate) struct LandFlags {
+    pub(crate) gate: Option<String>,
+    pub(crate) no_gate: bool,
+    pub(crate) keep_worktree: bool,
+    pub(crate) no_review: bool,
+    pub(crate) break_lock: bool,
 }
 
 /// What `land` needs from the task and its session once every precondition has held.
@@ -3675,20 +3615,15 @@ struct Preflight {
 /// dirty check that used to sit on the other side of the lock closed no window and was simply a
 /// second wording of one rule.
 fn land_preflight(
-    db: &Db,
     ctx: &repo::RepoCtx,
     uid: &str,
-    id: ItemId,
-    tags: &BTreeMap<String, Vec<String>>,
+    facts: &jkb_api::sessions::TaskState,
 ) -> Result<Preflight> {
+    let tags = &facts.tags;
     // The task's own pipeline state, mapped by the one function that does that — so the
     // terminal arm of `land_blocker` below is the arm that actually fires here, rather than a
     // second bail beside it saying the same thing in its own words.
-    let state = staging::State::from_status(
-        &db.read(move |conn| item::get(conn, id))?
-            .and_then(|m| m.status)
-            .unwrap_or_default(),
-    );
+    let state = staging::State::from_status(&facts.status);
     anyhow::ensure!(
         !repo::facet_values(tags, repo::FACET_BRANCH).is_empty(),
         "{uid} has no session — run `jkb task work {uid}` first"
@@ -3711,8 +3646,9 @@ fn land_preflight(
     } = repo::work_for(ctx, tags)?;
     let branch = branch.context("this task records no branch")?;
     // Where this task's work lands, from its own history — the last time anybody said so.
-    let onto = db
-        .read(move |conn| jkb_core::transition::land_target(conn, id))?
+    let onto = facts
+        .land_target
+        .clone()
         .context("this session records no land target — re-run `jkb task work` with --onto")?;
     // The same question the session paths ask, and materialised for the same reason: the land
     // path checks the target out, so a target that exists only on `origin/` is usable — refusing
@@ -3778,7 +3714,7 @@ fn land_preflight(
     // The same question the machine's `land` guard asks, asked **before** the graft. Both read
     // `containment`, which is where the answer lives (D35), so the row, the command and the
     // machine cannot disagree about which parents are held.
-    let open_subtasks = !db.read(move |conn| task::subtasks_all_terminal(conn, id))?;
+    let open_subtasks = facts.open_subtasks;
     if let Some(reason) = staging::land_blocker(&staging::LandFacts {
         state,
         open_subtasks,
@@ -3851,17 +3787,37 @@ fn land_preflight(
     })
 }
 
-fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: bool) -> Result<()> {
+///
+/// Served as ops in both modes (tasks S6.4 stage 4): its git work runs here, its database work
+/// through `kb`. `store` is this process's own database, when it has one — the only way a gate is
+/// stored (decision A); a client of `jkb serve` runs the gate it is given or finds, and stores none.
+pub(crate) fn cmd_task_land(
+    kb: &session_cli::Kb<'_>,
+    stores: &archive::Stores<'_>,
+    store: Option<&Db>,
+    uid: Option<&str>,
+    flags: LandFlags,
+    json: bool,
+) -> Result<()> {
     let LandFlags {
         gate: gate_flag,
         no_gate,
         keep_worktree,
         no_review,
+        break_lock,
     } = flags;
     let gate_flag = gate_flag.as_deref();
     let ctx = repo::repo_ctx()?;
-    let id = resolve_task_uid(db, uid)?;
-    let tags = repo::task_tags(db, id)?;
+    if break_lock {
+        match session_cli::LandLease::break_held(kb, &ctx.key)? {
+            Some(holder) => println!("broke {}'s land lease held by {holder}", ctx.key),
+            None => println!("no land lease was held for {}", ctx.key),
+        }
+        return Ok(());
+    }
+    let uid = uid.context("a task to land")?;
+    let facts = kb.facts(uid)?;
+    let tags = facts.tags.clone();
 
     // The lock is taken **before** anything is checked, not just before the graft.
     //
@@ -3881,21 +3837,21 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
     // the user's tree dirty. Excluded first, in `.git/info/exclude` exactly as `task work` does it:
     // local to this clone, never their committed `.gitignore` (D36.2).
     session::ensure_excluded(&ctx.root)?;
-    let _lock = session::LandLock::acquire(&ctx.root)?;
+    let _lock = session_cli::LandLease::acquire(kb, &ctx.key)?;
 
     let Preflight {
         sess,
         branch,
         onto,
         ahead,
-    } = land_preflight(db, &ctx, uid, id, &tags)?;
+    } = land_preflight(&ctx, uid, &facts)?;
 
     // The review gate (design D38.5), before the graft: a refusal must not have moved a
     // branch first. Concerns and nits do not block — only must-fix findings do. A waiver is
     // only *owed* here; it is written after the landing actually happens, so a land that then
     // fails on the graft or the gate build leaves no waiver for something that never occurred.
     let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
-    let waiver_owed = review::enforce(db, uid, &tags, no_review, json)?;
+    let waiver_owed = review::enforce(kb, uid, &tags, no_review, json)?;
 
     let land_dir = land_dir_for(&ctx, &onto)?;
 
@@ -3922,15 +3878,7 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
         ),
     };
 
-    let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
-    let (gate, source) = session::resolve_gate(
-        db,
-        &session_cli::Kb::new(&backend),
-        &ctx.root,
-        &ctx.key,
-        gate_flag,
-        no_gate,
-    )?;
+    let (gate, source) = session::resolve_gate(store, kb, &ctx.root, &ctx.key, gate_flag, no_gate)?;
     if !json {
         println!(
             "gate: {} ({})",
@@ -3955,9 +3903,9 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
     }
 
     settle_landing(
-        db,
-        &archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path)),
-        id,
+        kb,
+        stores,
+        &facts.uid,
         &ctx,
         &sess,
         Landed {
@@ -3973,7 +3921,7 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
             // Only a real commit id: `head` falls back to the literal "unknown" for the waiver
             // string, and a landing event whose `landed_head` is not a commit can never be
             // credited — it would silently mean "never credited" rather than "not recorded".
-            head: Some(head.as_str()),
+            head: (head != "unknown").then_some(head.as_str()),
         },
         json,
     )
@@ -4002,9 +3950,9 @@ struct Landed<'a> {
 
 /// Mark the task done, free the claim, and dispose of the session (design D36.4).
 fn settle_landing(
-    db: &Db,
+    kb: &session_cli::Kb<'_>,
     stores: &archive::Stores<'_>,
-    id: ItemId,
+    task_uid: &str,
     ctx: &repo::RepoCtx,
     sess: &session::Session,
     landed: Landed<'_>,
@@ -4018,10 +3966,7 @@ fn settle_landing(
     // is also recorded for a task somebody finished during the gate: the waived landing is what
     // it describes, not the status.
     if let Some(sha) = landed.waiver {
-        let sha = sha.to_owned();
-        db.write_txn("cli", move |conn, meta| {
-            repo::set_facet(conn, meta, id, review::FACET_REVIEW_WAIVED, &sha)
-        })?;
+        kb.set_facet(task_uid, review::FACET_REVIEW_WAIVED, sha)?;
     }
 
     // Is the session still there at all? `git status` in a directory that no longer exists
@@ -4067,7 +4012,7 @@ fn settle_landing(
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (`LandLock` only excludes a second land). Writing `Done` over a cancellation made
+    // land (the land lease only excludes a second land). Writing `Done` over a cancellation made
     // this the one transition the guard exists to prevent. Same reasoning as `review::record`.
     // Whether the status was left as somebody else set it during the gate. Reported, not
     // returned as an error: the session HAS been disposed of by this point, so bailing left
@@ -4081,7 +4026,7 @@ fn settle_landing(
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (`LandLock` only excludes a second land). The machine has no `land` from `cancelled`,
+    // land (the land lease only excludes a second land). The machine has no `land` from `cancelled`,
     // so a cancellation that arrived during the gate is not overwritten — and it says so rather
     // than being silently skipped.
     //
@@ -4089,41 +4034,22 @@ fn settle_landing(
     // its own second run (`Defect::Unrepeatable`). Nothing is lost by that here — the plan
     // re-asserts the status it already has and re-releases a freed claim — and re-landing is
     // refused far earlier anyway, by `staging::land_blocker`, before any graft happens.
-    let (branch_owned, onto_owned) = (landed.branch.to_owned(), landed.onto.to_owned());
-    let head_owned = landed.head.map(str::to_owned);
-    let kept_status = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        let facts = lifecycle::TaskFacts {
-            // Stated by the caller: this command has just performed the graft and its gate was
-            // green, so it is asserting facts it established rather than re-deriving them.
-            session_exists: Fact::Yes,
-            work_dirty: Fact::No,
-            has_commits: Fact::Yes,
-            target_ready: Fact::Yes,
-            review_waived: Fact::Yes,
-            ..task::observe(conn, id)?
-        };
-        let outcome = jkb_core::transition::perform(
-            conn,
-            meta,
-            id,
-            &facts,
-            lifecycle::TaskEvent::Land,
-            &jkb_core::transition::Labels {
-                branch: Some(branch_owned),
-                onto: Some(onto_owned),
-                ref_commit: head_owned,
-                ..jkb_core::transition::Labels::default()
-            },
-        )?;
-        Ok(outcome.refusal().map(|why| (facts.status, why)))
-    })?;
+    // Through `task.land`, which states the facts this command established — the graft, the green
+    // gate, the disposal — and re-reads the status in its own transaction.
+    let outcome = kb.land(
+        task_uid,
+        jkb_api::sessions::Landed {
+            branch: landed.branch.to_owned(),
+            onto: landed.onto.to_owned(),
+            head: landed.head.map(str::to_owned),
+        },
+    )?;
+    let kept_status = outcome.refusal.map(|why| (outcome.status, why));
     if let Some((status, why)) = &kept_status {
         eprintln!(
-            "note: {} was left `{}` — {why} Its commits are on {}, and its session has been \
+            "note: {} was left `{status}` — {why} Its commits are on {}, and its session has been \
              disposed of.",
-            landed.uid,
-            jkb_fsm::State::name(*status),
-            landed.onto
+            landed.uid, landed.onto
         );
     }
 
@@ -4171,14 +4097,14 @@ fn report_landing(
     sess: &session::Session,
     disposal: &Disposal,
     branch_fate: BranchFate,
-    kept_status: Option<&(jkb_types::TaskStatus, String)>,
+    kept_status: Option<&(String, String)>,
     json: bool,
 ) {
     // Reported from what actually happened, never from what was intended. Two claims here were
     // simply false: `"{uid} is done"` after a status this transaction deliberately left as
     // `cancelled`, and "removed session and its branch" in the arm that only ran
     // `git worktree prune` because somebody else had already removed the directory.
-    let status = kept_status.map_or("done", |(s, _)| jkb_fsm::State::name(*s));
+    let status = kept_status.map_or("done", |(s, _)| s.as_str());
     if json {
         println!(
             "{}",

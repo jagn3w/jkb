@@ -465,7 +465,7 @@ fn stage_task(
         reviewed: facet_one(&t.tags, review::FACET_REVIEWED).cloned(),
         review_nss,
         review_waived: facet_one(&t.tags, review::FACET_REVIEW_WAIVED).cloned(),
-        open_must_fix: found.open_must_fix.len(),
+        open_must_fix: found.open_count,
         review_ok,
         land_blocked,
     })

@@ -88,11 +88,14 @@ routinely built from different checkouts.
 | `task.bind` | `uid`, `sync?` (`managed:` when absent) | `applied` |
 | `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
 | `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
-| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?` (for a finished task only), `terminal`} |
+| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?` (for a finished task only), `terminal`, `open_subtasks`} |
 | `task.by_branch` | `repo` | `branch_tasks` {`tasks`: branch → [{`uid`, `status`, `onto?`}], every task on the branch, in id order} |
 | `task.start` | `uid`, exactly one of `take` {`owner`, `displace?`} and `keep` (the claim kept), `place` {`branch`, `repo`, `onto?`} | `taken` {`taken`} — `false`, nothing written, when the claim is not the one judged (`displace`, `keep`, or none) |
 | `task.take` | `uid`, `take` {`owner`, `displace?`}, `place` {`branch`, `repo`, `onto`} — the claim; the place is judged (written for trial and rolled back), not recorded | `taken` {`taken`} |
 | `task.locate` | `uid`, `owner`, `place` — recorded only while `owner` holds the claim | `taken` {`taken`} |
+| `task.land` | `uid`, `landed` {`branch`, `onto`, `head?`} | `landing` {`moved`, `refusal?`, `status`} — the facts the caller established (graft, green gate, disposal) are stated |
+| `task.landed` | `uid`, `landed` | `landing` — `observed_landed`; a guard's refusal is still recorded, an event the task's state does not define is not |
+| `task.review_findings` | `namespaces` (≤64) | `review_findings` {`total`, `open_count`, `open_must_fix` (≤100 {`uid`, `title`})} |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
 | `session.state` | `session` | `session_is` {`state`: `live`\|`ended`\|`unknown`} (a closed set) |
@@ -185,8 +188,16 @@ Two decisions in it:
   it is asked only when the add would otherwise succeed.
 - **What stays on the host.** The session verbs are being split into client-side git and ops (tasks
   S6.4, `jkb_api::sessions`, `jkb_api::removals`): `task start`, `work`, `abandon`, `sessions` and
-  `task gate` (show) run remotely; `land` is not yet ported; storing a gate never runs remotely (a
-  stored gate is a command the host runs), nor does `task reap` or breaking a lease.
+  `task gate` (show), `task land` and `task landed` run remotely; storing a gate never runs remotely
+  (a stored gate is a command the host runs: a `--gate` or detected gate is run there and not
+  remembered), nor does `task reap` or breaking a lease (`task reap --break-lock`,
+  `task land --break-lock`).
+- **The land lock is the `land:<repo key>` lease** (stage 4, decision D), taken as a compare-and-set
+  with holder `<owner> <nonce> <Claude Code session or ->`. It was `.jkb/land.lock` holding a pid, which
+  the other side of the bind cannot probe. A holder is stale only when proven gone: its process dead on
+  this host, or the session it names ended in the registry. Anything else is respected until
+  `jkb task land --break-lock` on the host. The repo key is a directory's basename, so two repos of
+  one name share a lease: they land one at a time, which costs only waiting.
 - **Worktree-removal records name only the shared directory** (stage 3). They moved from files beside
   the database into `worktree_removals` (V020), and the sweep's lock into the `leases` table. A record
   is acted on by the host's reap service — renamed, later deleted — so every path a client writes, or
@@ -295,7 +306,7 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   wide grep, a deep tree — held up every write behind it, the notification hook's 1 s round trip
   included (pinned by `a_long_read_on_the_reader_does_not_hold_up_a_write`: a 1.5 s read, and the
   write beside it under 0.7 s). Which ops go there is said once, by `Request::is_agent_read` — the
-  read set (`kb.*`, `task.ready`/`show`/`subtasks`/`why`, `task.facts`/`by_branch`, `repo.gate`), **not** every op that does not write: the reader
+  read set (`kb.*`, `task.ready`/`show`/`subtasks`/`why`, `task.facts`/`by_branch`/`review_findings`, `repo.gate`), **not** every op that does not write: the reader
   serves one call at a time behind a client's greps, so the queue's and the hook's own short reads
   (`mq.inspect`, `mq.tail`, `notify.open_sessions`, `session.list`, whose `SessionStart` sweep has 1 s) stay on the
   writer. Classing by "does not write" put that sweep behind a container's grep, and a third review

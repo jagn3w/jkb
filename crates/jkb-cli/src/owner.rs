@@ -190,10 +190,10 @@ pub fn session_worktree(owner: &str) -> Option<PathBuf> {
 }
 
 /// Whether a process with this pid exists — the raw probe, for callers that hold a pid rather
-/// than an owner id (the land lock's stale-holder check).
+/// than an owner id (the notification hook's sweep).
 ///
-/// `Unknown` when liveness could not be established at all. The land lock reads this to decide whether a
-/// holder is stale, and treating "could not ask" as "gone" there breaks a live lock.
+/// `Unknown` when liveness could not be established at all, and treating "could not ask" as "gone"
+/// frees what a live process holds.
 #[must_use]
 pub fn pid_alive(pid: u32) -> Fact {
     pid_exists(pid)

@@ -22,8 +22,6 @@ const JKB_DIR: &str = ".jkb";
 const WORK_DIR: &str = "work";
 /// A checkout of the land target, made only when it is checked out nowhere else.
 const BASE_DIR: &str = "base";
-/// Serializes landing, so two sessions cannot graft onto the same branch at once.
-const LOCK_FILE: &str = "land.lock";
 /// The branch prefix for a session's own branch: `task/<session>`.
 pub const BRANCH_PREFIX: &str = "task/";
 /// Longest session name minted from a task uid — long enough to stay readable in
@@ -227,79 +225,6 @@ pub fn discover(repo_root: &Path) -> Result<Vec<Session>> {
     Ok(out)
 }
 
-/// An exclusive hold on this repo's landing, released on drop.
-///
-/// Landing must be serial: two sessions grafting at once would each run the gate against a
-/// tree the other is about to change, which is exactly the "green alone, red together" case
-/// the gate exists to catch (design D36.4).
-pub struct LandLock {
-    path: PathBuf,
-}
-
-impl LandLock {
-    /// Take the lock, or fail naming the pid that holds it. A lock whose holder no longer
-    /// exists is stale — a crashed land must not wedge the repo — and is taken over.
-    ///
-    /// # Errors
-    /// Returns an error if another **live** land holds the lock, or if the lock file cannot
-    /// be created.
-    pub fn acquire(repo_root: &Path) -> Result<Self> {
-        let dir = jkb_dir(repo_root);
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join(LOCK_FILE);
-        for _ in 0..2 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = write!(f, "{}", std::process::id());
-                    return Ok(Self { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let holder = fs::read_to_string(&path).unwrap_or_default();
-                    // Stale **only when the holder is proven gone**. A pid we could not parse and
-                    // a `ps` we could not run are both unestablished, and breaking a live land
-                    // lock on an unestablished answer runs two grafts at once — the one thing
-                    // this file exists to prevent. So the lock is respected unless the holder is
-                    // provably dead.
-                    let dead = holder
-                        .trim()
-                        .parse::<u32>()
-                        .map_or(jkb_fsm::Fact::Unknown, crate::owner::pid_alive)
-                        .is_no();
-                    anyhow::ensure!(
-                        dead,
-                        "another `jkb task land` is running here (pid {}) — landing is serial \
-                         so its gate result stays meaningful; wait for it to finish",
-                        holder.trim()
-                    );
-                    // Remove the stale lock only while it is still the one we judged. Two lands
-                    // seeing the same dead pid both reached this line, and an unconditional
-                    // unlink let the second delete the lock the FIRST had just created — leaving
-                    // both believing they held it, which is the one thing this file exists to
-                    // prevent. Re-reading narrows that to the instant between this check and the
-                    // unlink; it cannot close it without a real file lock, and the honest note is
-                    // that landing is serialised against ordinary use, not against a race.
-                    if fs::read_to_string(&path).unwrap_or_default() == holder {
-                        let _ = fs::remove_file(&path);
-                    }
-                }
-                Err(e) => return Err(e).context("taking the land lock"),
-            }
-        }
-        anyhow::bail!("could not take the land lock at {}", path.display())
-    }
-}
-
-impl Drop for LandLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The gate (design D36.5)
 // ---------------------------------------------------------------------------
@@ -374,6 +299,11 @@ pub enum GateSource {
     Stored,
     /// Detected from the repo's layout, and remembered.
     Detected,
+    /// Given on the command line, and **not** remembered: this process has no database of its own,
+    /// and only the host stores a gate (decision A).
+    FlagUnstored,
+    /// Detected, and not remembered, for the same reason.
+    DetectedUnstored,
     /// Nothing given, stored, or detected.
     None,
 }
@@ -387,18 +317,22 @@ impl GateSource {
             Self::Flag => "from --gate, remembered for this repo",
             Self::Stored => "remembered for this repo",
             Self::Detected => "autodetected, remembered for this repo",
+            Self::FlagUnstored => "from --gate, not remembered: only the host stores a gate",
+            Self::DetectedUnstored => "autodetected, not remembered: only the host stores a gate",
             Self::None => "none found — landing UNVERIFIED",
         }
     }
 }
 
 /// Resolve the gate command for this land: flag, then stored, then autodetect (design D36.5).
-/// A flag or a detection is remembered, so the answer is decided once per repo.
+/// A flag or a detection is remembered in `store`, so the answer is decided once per repo — when there
+/// is a `store`: a client of `jkb serve` runs the gate it was given or found, and stores none, since a
+/// stored gate is a command the host runs later (decision A).
 ///
 /// # Errors
 /// Returns an error if reading or writing the stored gate fails.
 pub fn resolve_gate(
-    db: &Db,
+    store: Option<&Db>,
     kb: &crate::session_cli::Kb<'_>,
     repo_root: &Path,
     repo_key: &str,
@@ -409,18 +343,22 @@ pub fn resolve_gate(
         return Ok((None, GateSource::Skipped));
     }
     if let Some(cmd) = flag {
+        let Some(db) = store else {
+            return Ok((Some(cmd.to_owned()), GateSource::FlagUnstored));
+        };
         set_gate(db, repo_key, Some(cmd))?;
         return Ok((Some(cmd.to_owned()), GateSource::Flag));
     }
     if let Some(cmd) = kb.gate(repo_key)? {
         return Ok((Some(cmd), GateSource::Stored));
     }
-    match autodetect_gate(repo_root) {
-        Some(cmd) => {
+    match (autodetect_gate(repo_root), store) {
+        (Some(cmd), Some(db)) => {
             set_gate(db, repo_key, Some(&cmd))?;
             Ok((Some(cmd), GateSource::Detected))
         }
-        None => Ok((None, GateSource::None)),
+        (Some(cmd), None) => Ok((Some(cmd), GateSource::DetectedUnstored)),
+        (None, _) => Ok((None, GateSource::None)),
     }
 }
 
@@ -473,7 +411,7 @@ mod tests {
             &[],
         );
     }
-    use super::{branch_for, mint_name, name_from_branch, LandLock};
+    use super::{branch_for, mint_name, name_from_branch};
 
     #[test]
     fn a_session_name_is_the_task_made_readable() {
@@ -500,25 +438,5 @@ mod tests {
         assert_eq!(branch_for("fix-ls"), "task/fix-ls");
         assert_eq!(name_from_branch("task/fix-ls"), Some("fix-ls"));
         assert_eq!(name_from_branch("main"), None);
-    }
-
-    /// Landing is serial (D36.4), but a crashed land must not wedge the repo forever.
-    #[test]
-    fn the_land_lock_is_exclusive_but_not_permanent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let held = LandLock::acquire(tmp.path()).unwrap();
-        assert!(
-            LandLock::acquire(tmp.path()).is_err(),
-            "a live land must block a second one"
-        );
-        drop(held);
-        let after = LandLock::acquire(tmp.path()).unwrap();
-        drop(after);
-
-        // A lock left behind by a process that no longer exists is stale, not fatal.
-        let lock = super::jkb_dir(tmp.path()).join(super::LOCK_FILE);
-        std::fs::write(&lock, "4294967290").unwrap();
-        let taken = LandLock::acquire(tmp.path()).unwrap();
-        drop(taken);
     }
 }

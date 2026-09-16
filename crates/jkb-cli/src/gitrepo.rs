@@ -365,7 +365,7 @@ pub fn root(dir: &Path) -> Result<Option<PathBuf>> {
 /// The **main** working copy's root, even when `dir` is inside a linked worktree.
 ///
 /// [`root`] answers "which checkout am I in", which is the wrong question for anything that
-/// belongs to the repository as a whole: session worktrees and the land lock all live under
+/// belongs to the repository as a whole: session worktrees and archives all live under
 /// the main copy's `.jkb/`, or a session that ran `jkb` from inside another session would
 /// nest its own `.jkb/work` inside a checkout.
 ///

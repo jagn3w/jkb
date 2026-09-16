@@ -60,6 +60,8 @@ pub const fn handles(command: &Command) -> bool {
                 | TaskCmd::Work { .. }
                 | TaskCmd::Abandon { .. }
                 | TaskCmd::Sessions
+                | TaskCmd::Land { .. }
+                | TaskCmd::Landed { .. }
                 | TaskCmd::Gate {
                     cmd: None,
                     clear: false
@@ -79,9 +81,11 @@ pub struct Ops<'a> {
     pub(crate) remote: bool,
     /// Notices printed on stderr, kept so a test can see them.
     notices: std::cell::RefCell<Vec<String>>,
-    /// The local database's path, on the host: the session verbs still read the worktree-removal
-    /// records written beside it before they moved into the database (`archive::Stores`).
+    /// The local database's path, on the host: the session verbs list the old worktree-removal
+    /// records written beside it (`archive::Stores`).
     pub(crate) db_path: Option<&'a std::path::Path>,
+    /// The local database itself, on the host — what `task land` stores a gate in (decision A).
+    pub(crate) db: Option<&'a jkb_core::Db>,
 }
 
 impl<'a> Ops<'a> {
@@ -95,12 +99,14 @@ impl<'a> Ops<'a> {
             remote,
             notices: std::cell::RefCell::new(Vec::new()),
             db_path: None,
+            db: None,
         }
     }
 
-    /// Served in this process, over the database at `path`.
+    /// Served in this process, over `db`, which is at `path`.
     #[must_use]
-    pub const fn with_db_path(mut self, path: &'a std::path::Path) -> Self {
+    pub const fn with_local(mut self, db: &'a jkb_core::Db, path: &'a std::path::Path) -> Self {
+        self.db = Some(db);
         self.db_path = Some(path);
         self
     }

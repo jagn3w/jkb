@@ -202,7 +202,8 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   would wedge landing until the directory was deleted by hand), and it is removed once its batch
   has merged — otherwise it both attracts new sessions onto a dead branch and stops
   `git branch -d` from deleting it.
-- **The land lock is taken before the checks, not just before the graft** — which is what lets
+- **The land lock is taken before the checks, not just before the graft** (a database lease since
+  tasks S6.4 stage 4; its rules are in [message-queue.md](message-queue.md)) — which is what lets
   "is the target checkout dirty?" be asked **once**, by `staging::target_dirty_reason`, the same
   function the In Flight row renders. It used to be asked twice, in two wordings, on either side of
   the lock; the second copy did not close the window it justified itself with (it has the same gap

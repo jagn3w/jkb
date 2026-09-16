@@ -562,7 +562,7 @@ The container follow-up bucket. Design in `.container/README.md`; the container 
   to clear the record — ordinary once host and container share `~/.jkb` at different paths, and it
   deleted the only record of a live worktree. Two concurrent sweeps did lose each other's updates
   (the second finds the worktree gone and drops the record the first just wrote), so a `SweepLock`
-  covers the reads as well as the writes, with `LandLock`'s rule that a lock is stale only when its
+  covers the reads as well as the writes, with the land lock's rule that a lock is stale only when its
   holder is **proven** gone.
 - **`workspaceFolder` follows the folder you opened, and `initializeCommand` refuses one the mount
   cannot place.** A literal path under the target opens whichever repo sits there — for a session
