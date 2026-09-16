@@ -193,9 +193,11 @@ Two decisions in it:
   names by id, must be `~/`-relative, of plain segments, and under `~/repos` once resolved against the
   daemon's home (`FileRoots::admits_home_path`). That check is spelling only, and the container can
   plant links under `~/repos`, so the **reader** confines too (stage-3 review, must-fix: a linked
-  `.jkb/archive` had the host sweep delete `~/Documents`). A row not written by the host's own CLI or
-  reap service, and every file of the old store (`~/.jkb` is bind-mounted read-write), is acted on
-  only if its repo root, resolved at the moment of acting, lies under `~/repos`; and the sweep's
+  `.jkb/archive` had the host sweep delete `~/Documents`). A row is **confined** unless the host's
+  own CLI or reap service wrote it *and* it names no `~/` path (a client can re-point a host row
+  under `~/repos` with `removal.archived`, so who wrote it proves nothing there). A confined row is
+  acted on only if its repo root, resolved at the moment of acting, lies under `~/repos`; one that
+  resolves elsewhere is reported REFUSED and never touched. The sweep's
   rename and removal walk that resolved path with `O_NOFOLLOW` (`jkb_core::nofollow::rename_into`,
   `remove_tree`), so a link anywhere below the root is refused rather than followed. What remains
   is git: the sweep's `git worktree prune`/`branch -D` run with the path as spelled, and a branch is
@@ -207,7 +209,14 @@ Two decisions in it:
   land lease) and hold it: that stops the host's sweep **and every `task work`** (a cancel is refused
   while the lease is held, even with nothing to cancel), acts on nothing, and
   `jkb task reap --break-lock` on the host ends it. An older jkb's `.sweep.lock` on the old store is
-  honoured for that store's files, and broken with the lease. `task reclaim` proves
+  honoured for that store's files, and broken with the lease.
+- **The old file store is imported, never acted on in place** (round 2). `~/.jkb` is bind-mounted
+  read-write, so the store directory and its files are the container's to replace — with a link, a
+  FIFO, a huge file. On the host each `*.json` is read link-free and size-capped
+  (`nofollow::read`), stored as a `legacy` row (always confined), and unlinked through a link-free
+  walk; nothing is written there any more. The lock file is read the same way, and one that cannot
+  be read is an unknown holder, respected. `--break-lock` breaks the lease first and names both
+  holders. `task reclaim` proves
   owners gone by probing their processes, which only their host can do. A claim held by a live or
   unestablished owner is refused by `task.claim` from anywhere. **But the daemon does not judge
   liveness.** A client that names an owner can drop it (`task.release`), and so can a session op's

@@ -37,8 +37,8 @@ fn link_refusal(path: &Path, at: &Path, why: &str) -> io::Error {
         path,
         at,
         &format!(
-            "{why} — sync does not follow symbolic links; if the directory really moved, re-create \
-             its mount at the real path"
+            "{why} — jkb does not follow symbolic links here; if the directory really moved, use \
+             its real path (for a synced file, re-create its mount there)"
         ),
     )
 }

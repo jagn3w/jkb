@@ -134,9 +134,9 @@ impl<'a> Kb<'a> {
         }
     }
 
-    /// `removal.add`.
-    pub(crate) fn removal_add(&self, removal: Removal) -> Result<i64> {
-        match self.call(Request::RemovalAdd { removal })? {
+    /// `removal.add`; `legacy` for a record imported from the old file store.
+    pub(crate) fn removal_add(&self, removal: Removal, legacy: bool) -> Result<i64> {
+        match self.call(Request::RemovalAdd { removal, legacy })? {
             Response::RemovalAdded { id } => Ok(id),
             other => unexpected("removal.add", &other),
         }
@@ -614,7 +614,13 @@ pub(crate) fn work(
     // a directory now under `.jkb/archive` (stage-3 review). Only a checkout PROVEN gone is opened
     // afresh: one this process cannot stat is still a claim's live checkout, and a failed add would
     // release that claim.
-    let resumed = resumed && !presence::present_under(&worktree, &ctx.root).fact().is_no();
+    let vanished = resumed && presence::present_under(&worktree, &ctx.root).fact().is_no();
+    if vanished {
+        // Git still registers it — the sweep's own prune is best-effort, and a checkout removed by
+        // hand was never pruned — and `git worktree add` refuses a registered path.
+        gitrepo::prune_worktrees(&ctx.root)?;
+    }
+    let resumed = resumed && !vanished;
     if !resumed {
         open_worktree(kb, &facts.uid, &owner, &ctx.root, &worktree, &branch, &onto)?;
     }

@@ -3963,7 +3963,7 @@ fn a_container_session_s_deferred_disposal_is_finished_by_the_host() {
     );
 }
 
-/// **A record left in the old file store is still cancelled, listed, swept and updated where it is**
+/// **A record left in the old file store is still cancelled, listed and swept, once imported**
 /// (tasks S6.4 stage 3): the records moved into the database, and a host upgraded with checkouts still
 /// owed a disposal must not forget them. The directory is bind-mounted into the dev container, so a
 /// file there is acted on only when its repo resolves under `~/repos`.
@@ -4004,12 +4004,9 @@ fn a_record_in_the_old_file_store_is_still_finished() {
     assert!(resumed.status.success(), "{resumed:?}");
     assert!(!marker.exists(), "the resume cancelled the old record");
 
+    // Imported by a process whose `~/repos` is elsewhere: the record keeps its absolute paths, and
+    // is refused there — its repo is outside that `~/repos` — with nothing touched.
     plant();
-    let listed = host(&["task", "sessions", "--json"]);
-    let rows: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(rows[0]["awaiting_archive"], true, "{rows:?}");
-
-    // Seen from a home whose `~/repos` is elsewhere, it is held and nothing is touched.
     let stranger = TempDir::new().unwrap();
     std::fs::create_dir(stranger.path().join("repos")).unwrap();
     let refused = f
@@ -4019,17 +4016,48 @@ fn a_record_in_the_old_file_store_is_still_finished() {
         .output()
         .unwrap();
     assert!(refused.status.success(), "{refused:?}");
+    assert!(!marker.exists(), "imported, and never written back");
     assert!(wt.exists(), "outside ~/repos: not moved");
     assert!(
         String::from_utf8_lossy(&refused.stdout).contains("outside"),
         "{refused:?}"
     );
 
+    // Where it is under `~/repos`, the same row is listed and finished.
+    let listed = host(&["task", "sessions", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(rows[0]["awaiting_archive"], true, "{rows:?}");
     let reaped = host(&["--json", "task", "reap"]);
     assert!(reaped.status.success(), "{reaped:?}");
     assert!(!wt.exists(), "archived");
-    let left: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
-    assert!(left["archive"].is_string(), "updated in place: {left}");
+    let rows = jkb_core::Db::open(&f.db)
+        .unwrap()
+        .read(jkb_core::removal::list_all)
+        .unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.written_via == "legacy" && r.removal.archive.is_some()),
+        "{rows:?}"
+    );
+}
+
+/// **A session whose checkout vanished is opened again, not reported as resumed** — the state a sweep
+/// that archived it, or a hand removal, leaves while git still registers the path.
+#[test]
+fn a_registered_but_vanished_checkout_is_opened_again() {
+    let f = Fixture::new();
+    let uid = f.add_task("gone from under it");
+    let first = f.work(&uid);
+    let worktree = PathBuf::from(first["worktree"].as_str().unwrap());
+    std::fs::remove_dir_all(&worktree).unwrap();
+    assert!(
+        git(&f.repo, &["worktree", "list", "--porcelain"]).contains(worktree.to_str().unwrap()),
+        "the premise: git still registers it"
+    );
+    let again = f.work(&uid);
+    assert_eq!(again["resumed"], false, "{again}");
+    assert!(worktree.join(".git").exists(), "a checkout is there again");
+    assert!(claim_of(&f.db, &uid).is_some(), "and the claim is held");
 }
 
 /// **A session that cannot be opened leaves no claim behind** — and the release is the run's own

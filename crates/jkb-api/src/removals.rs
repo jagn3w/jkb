@@ -29,6 +29,9 @@ use crate::{ApiError, ErrorCode};
 /// The removal sweep's lease: one sweep at a time, across the host and every client.
 pub const SWEEP_LEASE: &str = "removal-sweep";
 
+/// The `written_via` of a record imported from the old file store (`removal.add` with `legacy`).
+pub const LEGACY_WRITER: &str = "legacy";
+
 /// The prefix of a repo's land lease (`land:<repo key>`).
 pub const LAND_LEASE_PREFIX: &str = "land:";
 

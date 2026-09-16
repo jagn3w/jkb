@@ -4285,14 +4285,18 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         // `--dry-run` promises to change nothing, and this ran before that was consulted — so
         // `--dry-run --break-lock` removed a live sweeper's lock while saying it would not.
         if dry_run {
-            match archive::lock_holder(&stores)? {
-                Some(holder) => println!("would break the sweep lease held by {holder}"),
-                None => println!("no sweep lease is held"),
+            let held = archive::lock_holder(&stores)?;
+            if held.is_empty() {
+                println!("no sweep lock is held");
+            } else {
+                println!("would break {}", held.describe());
             }
         } else {
-            match archive::break_lock(&stores)? {
-                Some(holder) => println!("broke the sweep lease held by {holder}"),
-                None => println!("no sweep lease was held"),
+            let broken = archive::break_lock(&stores)?;
+            if broken.is_empty() {
+                println!("no sweep lock was held");
+            } else {
+                println!("broke {}", broken.describe());
             }
         }
     }

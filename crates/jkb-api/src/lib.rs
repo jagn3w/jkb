@@ -500,6 +500,10 @@ pub enum Request {
     RemovalAdd {
         /// The record.
         removal: removals::Removal,
+        /// Imported from the old file store, which a dev container can write: stamped `legacy`,
+        /// which every reader confines to `~/repos`.
+        #[serde(default)]
+        legacy: bool,
     },
     /// The worktree-removal records, a page at a time ([`removals::list`]).
     #[serde(rename = "removal.list")]
@@ -2219,11 +2223,16 @@ impl Backend for LocalBackend {
                     state: db.read(move |c| claude_session::state(c, &session))?.into(),
                 }
             }
-            Request::RemovalAdd { removal } => {
+            Request::RemovalAdd { removal, legacy } => {
                 let roots = self.file_roots.clone();
+                let via = if legacy {
+                    removals::LEGACY_WRITER
+                } else {
+                    actor
+                };
                 Response::RemovalAdded {
                     id: db.write_txn_with(actor, move |c, m| {
-                        removals::add(c, m, removal, actor, roots.as_ref())
+                        removals::add(c, m, removal, via, roots.as_ref())
                     })?,
                 }
             }
