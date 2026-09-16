@@ -870,6 +870,16 @@ setting `portsAttributes."7117".onAutoForward` to `ignore`, which attaching read
 from `container.json`) — **whether attaching honours it is not yet measured**. `jkb serve` names the
 condition itself now: the refusal gives the `lsof` command and this cause.
 
+**The probe must not trip a caller's ERR trap on the Mac.** `egress-lib.sh --self-test` (in `check.sh`)
+runs every probe under `set -eE` with an ERR trap, on whatever machine runs the gate. On the Mac,
+2026-09-16, `daemon_state` tripped it and the other probes did not. The Mac has neither `ipset` nor
+`getent`, and its bash is 3.2. `daemon_state` was the only probe written `x="$(failing …)" || x=""`,
+and that `||` guards only the assignment in the outer shell, not the failure inside the substitution's
+subshell, to which `set -E` hands the trap. bash 5.2 in the container, with the tools present and
+also with them hidden from `PATH`, did not fire it. So the mechanism is inferred, not reproduced.
+Every fallback is now inside its substitution, and statuses are read by `ipset_rc`, which takes them
+in an `&&`/`||` list inside the subshell.
+
 Changing any of this takes a **rebuild** (`./.container/run.sh --rm && ./.container/run.sh --build`):
 the firewall, its library and the posture snapshot are installed into the image and read at create.
 

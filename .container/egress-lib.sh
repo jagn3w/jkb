@@ -271,6 +271,17 @@ allowlist_state() { # -> yes|no
     fi
 }
 
+# `ipset <args>`, answered as `<status>:<its stderr>` and never failing itself. The status is taken
+# INSIDE the substitution, in an `&&`/`||` list, so the failure is in a list in the subshell too — an
+# `if` around the substitution would guard only the outer shell (see `daemon_state`). `$?` on the right
+# of `||` is the left list's status, which is ipset's: the `echo` after `&&` runs only when it
+# succeeded. stdout is discarded; `save` writes the set there.
+ipset_rc() {
+    local out
+    out="$({ ipset "$@" 2>&1 >/dev/null && echo "rc=0"; } || echo "rc=$?")"
+    printf '%s:%s' "${out##*rc=}" "${out%rc=*}"
+}
+
 # The daemon opening, from the live chain and sets. Root, like the other probes (egress-status.sh).
 #
 # WHICH ADDRESSES ARE TESTED against `allowed`: the set's members AND the alias resolved now. The
@@ -286,21 +297,28 @@ allowlist_state() { # -> yes|no
 # Both phrases are libipset's own format strings, read out of libipset.so.13 (ipset v7.19, the image's)
 # with `strings`: " is NOT in set %s." and "The set with the given name does not exist". A rewording
 # upstream makes this report `wide`, loudly — the direction a probe is allowed to be wrong in.
+#
+# NOTHING INSIDE A COMMAND SUBSTITUTION MAY FAIL OUTSIDE AN `if` OR A `||` LIST. A caller with `set -E`
+# and an ERR trap (the self-test's `under_trap`) hands the trap to the substitution's subshell, and
+# `x="$(failing)" || x=""` guards only the assignment: the failure inside is not in that list. macOS's
+# bash 3.2, where neither ipset nor getent exists, fired the trap there ("daemon_state tripped the
+# caller's ERR trap", check.sh on the Mac, 2026-09-16); bash 5.2 in the container did not. So each
+# fallback is inside its substitution, and a status that is needed is read by `ipset_rc`.
 daemon_state() { # -> port|unresolved|absent|wide
     local rule=no members="" resolved="" n=0 in_allow=0 ip out rc
     if command -v iptables >/dev/null 2>&1 \
        && iptables -w 5 -C OUTPUT $RULE_DAEMON >/dev/null 2>&1; then
         rule=yes
     fi
-    members="$(ipset save "$DAEMON_SET" 2>/dev/null | awk '$1 == "add" { print $3 }')" || members=""
-    resolved="$(getent ahostsv4 "$DAEMON_HOST" 2>/dev/null | awk '{ print $1 }')" || resolved=""
-    n="$(printf '%s\n' "$members" | grep -c .)" || n=0
-    rc=0; out="$(ipset save allowed 2>&1 >/dev/null)" || rc=$?
-    if [ "$rc" -eq 0 ]; then
+    members="$(ipset save "$DAEMON_SET" 2>/dev/null | awk '$1 == "add" { print $3 }' || true)"
+    resolved="$(getent ahostsv4 "$DAEMON_HOST" 2>/dev/null | awk '{ print $1 }' || true)"
+    n="$(printf '%s\n' "$members" | grep -c . || true)"
+    out="$(ipset_rc save allowed)"; rc="${out%%:*}"; out="${out#*:}"
+    if [ "$rc" = 0 ]; then
         while IFS= read -r ip; do
             [ -n "$ip" ] || continue
-            rc=0; out="$(ipset test allowed "$ip" 2>&1)" || rc=$?
-            if [ "$rc" -eq 0 ]; then
+            out="$(ipset_rc test allowed "$ip")"; rc="${out%%:*}"; out="${out#*:}"
+            if [ "$rc" = 0 ]; then
                 [ "$in_allow" = unmeasured ] || in_allow=$((in_allow + 1))
             else
                 case "$out" in *"is NOT in set"*) ;; *) in_allow=unmeasured ;; esac
