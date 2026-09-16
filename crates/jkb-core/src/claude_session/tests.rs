@@ -173,17 +173,29 @@ fn one_process_ending_leaves_a_session_another_still_holds() {
     );
 }
 
-/// A verdict with no pid proves nothing: nothing was probed. The process's own end still counts,
-/// since it is a report, not a probe — and it ends only the pid-less row.
+/// A verdict with no pid proves nothing: nothing was probed. And a pid-less end is never evidence that
+/// the session ended: every process the hook could not name shares that row, so a second one — a
+/// `--resume` of the same id — may still be running.
 #[test]
-fn a_sweep_with_no_pid_proves_nothing() {
+fn a_pid_less_process_never_proves_a_session_ended() {
     let db = Db::open_in_memory().unwrap();
     let blind = p("s1", "", "h");
     start(&db, &blind, "startup", T0);
     assert!(!prove_gone(&db, &blind, T0 + 1));
     assert_eq!(st(&db, "s1"), SessionState::Live);
     assert_eq!(end(&db, &blind, "clear", T0 + 2), Ended::Recorded);
-    assert_eq!(st(&db, "s1"), SessionState::Ended);
+    assert_eq!(
+        one(&db, "s1").end_reason.as_deref(),
+        Some("clear"),
+        "still recorded"
+    );
+    assert_eq!(st(&db, "s1"), SessionState::Unknown, "but not evidence");
+
+    // Beside named processes too: they all ended, the pid-less row cannot say it has.
+    start(&db, &p("s2", "10", "h"), "startup", T0);
+    end(&db, &p("s2", "", "h"), "other", T0 + 1);
+    end(&db, &p("s2", "10", "h"), "other", T0 + 2);
+    assert_eq!(st(&db, "s2"), SessionState::Unknown);
 }
 
 /// A process whose start was never seen (it began before the hook shipped) still has its end recorded
@@ -298,10 +310,41 @@ fn the_listing_is_paged() {
         seen.dedup();
         assert_eq!(seen.len(), LIST_CAP + 1, "every row once, all={all}");
     }
+    // Rows alike in `seen_at` and session, told apart only by pid and instance, across the cut: the
+    // cursor must carry all four.
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, _| {
+        for i in 0..=LIST_CAP {
+            c.execute(
+                "INSERT INTO claude_sessions (session, pid, instance, cwd, seen_at) \
+                 VALUES ('s', ?1, ?2, '', ?3)",
+                rusqlite::params![(i / 2).to_string(), ["a", "b"][i % 2], T0],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    for all in [false, true] {
+        let first = db.read(move |c| list(c, all, None)).unwrap();
+        let next = first.next.clone().expect("cut");
+        let second = db.read(move |c| list(c, all, Some(&next))).unwrap();
+        let mut keys: Vec<(String, String)> = first
+            .rows
+            .iter()
+            .chain(&second.rows)
+            .map(|r| (r.pid.clone(), r.instance.clone()))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), LIST_CAP + 1, "every row once, all={all}");
+    }
     let whole = db.read(|c| list(c, false, None)).unwrap();
     assert!(whole.next.is_some());
     db.write_txn("t", |c, _| {
-        c.execute("DELETE FROM claude_sessions WHERE session = 's0000'", [])?;
+        c.execute(
+            "DELETE FROM claude_sessions WHERE pid = '0' AND instance = 'a'",
+            [],
+        )?;
         Ok(())
     })
     .unwrap();

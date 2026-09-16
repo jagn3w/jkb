@@ -11,7 +11,7 @@ use jkb_fsm::Fact;
 use serde_json::json;
 
 use super::{
-    append_log, ask, handle, instance_from, owner_from, verdict, Ask, Edge, HOOK_EVENTS,
+    append_log, ask, handle, instance_from, owner_from, owner_in, verdict, Ask, Edge, HOOK_EVENTS,
     LOG_CAP_BYTES,
 };
 
@@ -771,4 +771,135 @@ fn the_sweep_pages_past_rows_it_cannot_judge() {
         .find(|s| s.session == "zzz-dead-here")
         .expect("listed");
     assert_eq!(dead.end_reason.as_deref(), Some("gone"));
+}
+
+/// A backend that holds its first `op` call for `delay`, recording every op it was asked.
+struct SlowAt {
+    inner: LocalBackend,
+    op: &'static str,
+    delay: Duration,
+    asked: std::cell::RefCell<Vec<&'static str>>,
+}
+
+impl Backend for SlowAt {
+    fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let op = request.op();
+        let first = !self.asked.borrow().contains(&op);
+        self.asked.borrow_mut().push(op);
+        if op == self.op && first {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.call(request)
+    }
+}
+
+/// **The sweep's own time limit, inside its loops.** A listing page or a verdict that runs past the
+/// request deadline stops the sweep there: no further page is read and no further verdict sent, and the
+/// log names where it stopped — so a slow daemon cannot carry `SessionStart` much past 2 s.
+#[test]
+fn a_slow_sweep_step_stops_the_sweep_there() {
+    let edge = |b| Edge {
+        began: std::time::Instant::now(),
+        backend: b,
+        owner: "30".into(),
+        instance: "host".into(),
+        probe: &|pid| if pid == 30 { Fact::Yes } else { Fact::No },
+    };
+    let no_session = json!({ "hook_event_name": "SessionStart" }).to_string();
+
+    // A first page with more behind it.
+    let inner = LocalBackend::new(Db::open_in_memory().unwrap());
+    for i in 0..=jkb_core::claude_session::LIST_CAP {
+        register(
+            &inner,
+            &format!("elsewhere-{i:04}"),
+            "10",
+            "d9e0#pid:[1]/pid:[1]",
+        );
+    }
+    let b = SlowAt {
+        inner,
+        op: "session.list",
+        delay: super::TOTAL,
+        asked: std::cell::RefCell::new(Vec::new()),
+    };
+    assert_eq!(
+        handle(&no_session, &edge(&b)),
+        [format!("session.list: {}", super::OUT_OF_TIME)]
+    );
+    let lists = b
+        .asked
+        .borrow()
+        .iter()
+        .filter(|o| **o == "session.list")
+        .count();
+    assert_eq!(lists, 1, "the second page is not read");
+
+    // Two provably gone processes: the first verdict is slow, the second is not sent.
+    let inner = LocalBackend::new(Db::open_in_memory().unwrap());
+    register(&inner, "dead-1", "10", "host");
+    register(&inner, "dead-2", "11", "host");
+    let b = SlowAt {
+        inner,
+        op: "session.gone",
+        delay: super::TOTAL,
+        asked: std::cell::RefCell::new(Vec::new()),
+    };
+    assert_eq!(
+        handle(&no_session, &edge(&b)),
+        [format!("session.gone: {}", super::OUT_OF_TIME)]
+    );
+    let gones = b
+        .asked
+        .borrow()
+        .iter()
+        .filter(|o| **o == "session.gone")
+        .count();
+    assert_eq!(gones, 1);
+}
+
+/// With no instance to send, the hook names no process: the daemon refuses a pid without one, and the
+/// notification must not be lost to that refusal.
+#[test]
+fn a_hook_with_no_instance_sends_no_pid() {
+    let b = backend();
+    let raw = json!({
+        "hook_event_name": "Notification",
+        "session_id": "s1",
+        "message": "Claude needs your permission to use Bash",
+    })
+    .to_string();
+    let failures = handle(
+        &raw,
+        &Edge {
+            began: std::time::Instant::now(),
+            backend: &b,
+            owner: String::new(),
+            instance: String::new(),
+            probe: &|_| Fact::Unknown,
+        },
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(open(&b), ["s1"]);
+    let failures = handle(
+        &raw,
+        &Edge {
+            began: std::time::Instant::now(),
+            backend: &b,
+            owner: "4242".into(),
+            instance: String::new(),
+            probe: &|_| Fact::Unknown,
+        },
+    );
+    assert_eq!(
+        failures.len(),
+        1,
+        "the daemon refuses the pair: {failures:?}"
+    );
+    assert!(
+        failures[0].starts_with("notify.event: Invalid"),
+        "{failures:?}"
+    );
+    assert_eq!(owner_in("", || "4242".into()), "", "so the hook sends none");
+    assert_eq!(owner_in("host", || "4242".into()), "4242");
 }

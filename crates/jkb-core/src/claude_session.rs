@@ -95,7 +95,9 @@ pub enum SessionState {
     Unknown,
     /// Some process still holds it, as far as anyone has shown.
     Live,
-    /// Every process that held it has ended — the one answer that is evidence.
+    /// Every process that held it has ended — the one answer that is evidence. Never the answer for a
+    /// session with a pid-less row: processes the hook could not name share that one row, so its end
+    /// is only one of theirs.
     Ended,
 }
 
@@ -123,20 +125,10 @@ pub struct Process<'a> {
 }
 
 impl Process<'_> {
-    /// The shared identity checks, and one of the registry's own: a pid names a process only together
-    /// with the instance it belongs to. A pid with no instance would read as the bare host's and be
-    /// probed there, ending a live row on a verdict about some other process (stage-1 review, round 2).
+    /// The identity checks the notification ops use — including that a pid needs its instance.
     fn check(&self) -> Result<()> {
         check_session(self.session)?;
-        check_owner_and_instance(self.pid, self.instance)?;
-        if !self.pid.is_empty() && self.instance.is_empty() {
-            return Err(crate::mq::QueueError::Invalid {
-                what: "instance",
-                why: "a pid needs the instance it belongs to".to_owned(),
-            }
-            .into());
-        }
-        Ok(())
+        check_owner_and_instance(self.pid, self.instance)
     }
 }
 
@@ -206,18 +198,25 @@ fn row_to_holder(r: &rusqlite::Row<'_>) -> rusqlite::Result<HolderRow> {
 
 /// A session's state, from all its rows.
 ///
+/// A session with a pid-less row is never [`SessionState::Ended`]: every process the hook could not
+/// name, on one instance, shares that row, so one of them ending ends it for all — the false end the
+/// per-process rows exist to prevent (stage-1 review, round 3). Such a session is live while any row is,
+/// and unknown after.
+///
 /// # Errors
 /// A database error.
 pub fn state(conn: &Connection, session: &str) -> Result<SessionState> {
-    let (rows, live): (i64, i64) = conn
+    let (rows, live, blind): (i64, i64, i64) = conn
         .prepare_cached(
-            "SELECT count(*), count(*) FILTER (WHERE ended_at IS NULL) \
+            "SELECT count(*), count(*) FILTER (WHERE ended_at IS NULL), \
+                    count(*) FILTER (WHERE pid = '') \
              FROM claude_sessions WHERE session = ?1",
         )?
-        .query_row([session], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(match (rows, live) {
-        (0, _) => SessionState::Unknown,
-        (_, 0) => SessionState::Ended,
+        .query_row([session], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(match (rows, live, blind) {
+        (0, _, _) => SessionState::Unknown,
+        (_, 0, 0) => SessionState::Ended,
+        (_, 0, _) => SessionState::Unknown,
         _ => SessionState::Live,
     })
 }
@@ -389,9 +388,12 @@ pub struct Page {
 }
 
 /// A page of rows, after `after`: the live ones, least recently seen first — what a sweep probes, and
-/// the likeliest to be gone come first — or, with `all`, every one, most recently seen first. The pages
-/// are keyset-ordered, so a row written between two pages cannot shift one already returned into the
-/// next.
+/// the likeliest to be gone come first — or, with `all`, every one, most recently seen first.
+///
+/// The pages are keyset-ordered on (`seen_at`, session, pid, instance), so rows that do not change
+/// between two pages are each returned once. A row written between pages moves: its `seen_at` rises, so
+/// in the live order it may be returned again (harmless to a sweep, whose verdicts are compare-and-set)
+/// and in the `all` order it may be skipped — `jkb notify sessions --all` is a listing, not a snapshot.
 ///
 /// # Errors
 /// A database error.

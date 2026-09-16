@@ -408,6 +408,13 @@ fn malformed_observations_are_refused() {
         ),
         (
             Observation {
+                instance: String::new(),
+                ..needed("s1")
+            },
+            "a pid with no instance",
+        ),
+        (
+            Observation {
                 instance: "x".repeat(151),
                 ..needed("s1")
             },

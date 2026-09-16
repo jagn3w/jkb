@@ -53,8 +53,8 @@ pub const TOTAL: Duration = Duration::from_secs(1);
 /// `SessionEnd`'s hooks get 1.5 s by default (Claude Code's hooks documentation), and it sends two
 /// requests: the second starts only this soon after the hook began (measured from [`hook`]'s first
 /// line, so the shim's and this binary's start-up come on top), because it may itself take a full
-/// [`TOTAL`] — 0.3 + 1.0 s leaves the start-up and a margin inside the budget. A warm round trip is a
-/// few milliseconds. A hook killed at the budget logs nothing, so this is what keeps a slow end
+/// [`TOTAL`] — 0.3 + 1.0 s leaves 200 ms for start-up inside the budget. That margin is assumed, not
+/// measured (docs/notifications.md). A warm round trip on the host is a few milliseconds. A hook killed at the budget logs nothing, so this is what keeps a slow end
 /// visible in the log instead.
 pub const SESSION_END_SECOND_REQUEST: Duration = Duration::from_millis(300);
 
@@ -240,6 +240,17 @@ fn owner_id() -> String {
         std::os::unix::process::parent_id(),
         std::process::id(),
     )
+}
+
+/// The owner to send from `instance`: none when there is no instance. A pid means nothing without the
+/// instance it belongs to, and the daemon refuses the pair, so the hook names no process rather than
+/// losing the notification.
+fn owner_in(instance: &str, owner: impl FnOnce() -> String) -> String {
+    if instance.is_empty() {
+        String::new()
+    } else {
+        owner()
+    }
 }
 
 /// The decision itself, with the two pids it must reject handed in, so it can be tested.
@@ -532,13 +543,15 @@ fn hook() {
                 return;
             }
         };
+    let instance = instance();
+    let owner = owner_in(&instance, owner_id);
     let failures = handle(
         &raw,
         &Edge {
             began,
             backend: &backend,
-            owner: owner_id(),
-            instance: instance(),
+            owner,
+            instance,
             probe: &crate::owner::pid_alive,
         },
     );

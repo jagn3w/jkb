@@ -519,9 +519,20 @@ pub(crate) fn check_session(session: &str) -> Result<()> {
 }
 
 /// A pid (digits, or empty for none) and the instance it belongs to. Shared like [`check_session`].
+///
+/// A pid names a process only together with its instance: one sent without would read as nobody's, and
+/// the registry could not keep it apart from the bare host's. Refused here, for both op families, so a
+/// `notify.event` is refused at the same point its registry half would be — refused later, inside the
+/// same transaction, it rolled the notification back (stage-1 review, round 3).
 pub(crate) fn check_owner_and_instance(owner: &str, instance: &str) -> Result<()> {
     if owner.len() > MAX_OWNER_BYTES || !owner.chars().all(|c| c.is_ascii_digit()) {
         return Err(invalid("owner", format!("{owner:?} is not a pid")));
+    }
+    if !owner.is_empty() && instance.is_empty() {
+        return Err(invalid(
+            "instance",
+            "a pid needs the instance it belongs to",
+        ));
     }
     if instance.len() > MAX_INSTANCE_BYTES || instance.chars().any(char::is_control) {
         return Err(invalid(

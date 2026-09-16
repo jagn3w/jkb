@@ -179,8 +179,14 @@ while any of its rows is live, **ended** once every row has ended, and **unknown
   stage-1 review showed that the later process's exit then recorded as ended a session the earlier one
   was still running. `session.gone` also ends only a live row that still names exactly the pid and
   instance that were probed. That is `notify.gone`'s rule, for the same race.
-- A verdict with no pid proves nothing. A pid-less process's own end still ends its own row, since it
-  is a report rather than a probe.
+- A verdict with no pid proves nothing. A pid-less process's own end is recorded, but it is never
+  evidence: every process the hook could not name, on one instance, shares that one row, so a session
+  with a pid-less row reads **unknown** once nothing is live, never ended (review round 3; pinned by
+  `a_pid_less_process_never_proves_a_session_ended`).
+- A pid is refused without the instance it belongs to, by the check the notification ops share. The
+  hook, with no instance to send, sends no pid. When only the registry refused the pair, inside
+  `notify.event`'s transaction, the notification was rolled back with it (review round 3; pinned by
+  `a_hook_with_no_instance_sends_no_pid`).
 
 **Four repairs came from the stage-1 review, each pinned by a test:**
 
@@ -211,8 +217,9 @@ while any of its rows is live, **ended** once every row has ended, and **unknown
 
 **Budgets.** `SessionEnd` hooks get 1.5 s (Claude Code's documentation), and the end sends two requests.
 The second starts only within 300 ms of the hook's first line (`SESSION_END_SECOND_REQUEST`), because it
-may itself take the full 1 s request deadline. That leaves room for the shim's and the binary's
-start-up. A warm round trip takes a few milliseconds. What is not sent is logged, whereas a hook killed
+may itself take the full 1 s request deadline. That leaves 200 ms for the shim's and the binary's
+start-up. **That margin is assumed, not measured:** neither the start-up nor the container's round
+trip to the host has been timed (above). A warm round trip on the host took 2.1–2.4 ms (tasks 5.2). What is not sent is logged, whereas a hook killed
 at the budget would log nothing. For a process that then exits, a later sweep proves the same end from
 its pid. After `/clear` or `/resume` the process lives on, so a lost end leaves the old session live
 until the process is gone, which means a `--force` in stage 2.
@@ -221,8 +228,9 @@ That is deliberate. Ending a process's other sessions at each start would assume
 one session, and a process hosting several (the Agent SDK) would then have a running session recorded as
 ended. Round 2 of the review proposed exactly that rule, and it was rejected on this ground. Pinned by
 `a_start_never_ends_another_session_of_the_same_process`.
-`SessionStart` starts nothing 1 s after the hook began, so a start plus both sweeps is bounded by about
-2 s. Pinned by `a_slow_first_request_leaves_the_rest_unsent`.
+`SessionStart` starts nothing 1 s after the hook began, including inside the sweep's loops (a page, a
+verdict), so a start plus both sweeps is bounded by about 2 s. Pinned by
+`a_slow_first_request_leaves_the_rest_unsent` and `a_slow_sweep_step_stops_the_sweep_there`.
 
 **Pruning.** A session starting deletes every session none of whose rows has been seen for 90 days,
 except its own. Whole sessions only: deleting one stale live row beside a recent ended one would turn
@@ -234,7 +242,10 @@ anything about any more, such as a rebuilt container's sessions.
 **Not changelogged**, like `notify_sessions`: it is observation, and `jkb undo` must not revive or
 end a session.
 
-**Paged listing.** The sweep follows `session.list`'s `next` cursor within its time limit. Rows it can
+**Paged listing.** The sweep follows `session.list`'s `next` cursor within its time limit. The keyset
+is (`seen_at`, session, pid, instance). A row written between two pages moves: in the live order it
+may be returned twice, which is harmless because verdicts are compare-and-set, and in the `--all` order
+it may be skipped, so that listing is not a snapshot. Rows it can
 never judge (another container's, the host's seen from a container, pid-less ones) would otherwise
 fill the single 1000-row page and hide one it could judge. Pinned by
 `the_sweep_pages_past_rows_it_cannot_judge` and `the_listing_is_paged`.
