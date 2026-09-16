@@ -210,18 +210,15 @@ Two decisions in it:
   while the lease is held, even with nothing to cancel), acts on nothing, and
   `jkb task reap --break-lock` on the host ends it. An older jkb's `.sweep.lock` on the old store is
   honoured for that store's files, and broken with the lease.
-- **The old file store is imported only when the operator asks, and never acted on in place**
-  (rounds 2–4). `~/.jkb` is bind-mounted read-write, so the store directory and its files are the
-  container's to replace — with a link, a FIFO, thousands of huge files. A record written before the
-  move may also be a pending removal of a checkout somebody has since gone back to. So sweeps,
-  `task work` and reports only *say* what is there (`LegacyOutlook`, in `task reap` and `doctor`);
-  `jkb task reap --import-old-records [--dry-run]` takes it, and does nothing else. A look examines at
-  most 4096 entries; files that are not regular or exceed 64 KiB are told apart without being opened.
-  An import takes at most 256 files, each read link-free (`nofollow::read_capped`), **removed first**
-  through a link-free walk, and only then stored as a `legacy` row (always confined) — so a file that
-  cannot be removed is never taken, and none is taken twice. A store directory that is a link is not
-  read and holds nothing up; a lock file that cannot be read is an unknown holder, respected.
-  `--break-lock` breaks the lease first and names both holders.
+- **The old file store is reported, and nothing acts on it** (rounds 2–5 of the stage-3 review).
+  Records an older jkb wrote beside the database were first swept in place, then imported by every
+  sweep, then imported on request — and each version was found steerable or lossy: `~/.jkb` is
+  bind-mounted read-write, so the directory and its files are the dev container's to replace (links,
+  FIFOs, huge or countless files), and a pending removal written before the move may name a checkout
+  somebody has since gone back to, which an import would then archive. So `task reap` and `doctor`
+  only list the files by name (a bounded look that never opens one; a store directory that is a link
+  is not looked into) and ask the operator to judge each checkout and remove the file by hand. No
+  lock file there is read or honoured any more.
 - **`removal.cancel` skips and names a record the client may not name** rather than refusing the
   batch, and `task work` then refuses to hand the checkout back: that record is still owed. `task work`
   sends its ids in batches under the daemon's cap, whose count the container could otherwise inflate.

@@ -108,9 +108,8 @@ pub struct Entry {
     #[serde(default)]
     pub archived_at: Option<u64>,
     /// The directory this record's repo must resolve under before anything is done to it, when a dev
-    /// container could have written or re-pointed the record: a row written through `jkb serve`, one
-    /// imported from the old store (`~/.jkb` is bind-mounted read-write), or any row naming a `~/`
-    /// path. `~/repos`, the one directory the container could change anyway. Never stored — the reader
+    /// container could have written or re-pointed the record: a row written through `jkb serve`, or
+    /// any row naming a `~/` path. `~/repos`, the one directory the container could change anyway. Never stored — the reader
     /// decides it ([`entries`]).
     #[serde(skip)]
     pub confine: Option<PathBuf>,
@@ -218,9 +217,11 @@ pub struct Held {
 /// disposal be finished by the host's reap service. The records used to be files beside the database,
 /// which a client of the daemon has no path to.
 ///
-/// **And the old file store, on the host, until it is empty.** Records written before the move are
-/// imported into the database by the next sweep or cancel ([`import_legacy`]) and removed; nothing is
-/// ever written there. A process with no local database (remote mode) has none.
+/// **And the old file store, on the host — reported, never acted on.** Records an older jkb wrote beside
+/// the database are listed by name for the operator ([`LegacyOutlook`]): the directory is the dev
+/// container's to write, and a pending removal written before the move may name a checkout somebody
+/// has since gone back to, so nothing here reads or acts on them. A process with no local database
+/// (remote mode) has none.
 #[derive(Clone, Copy)]
 pub struct Stores<'a> {
     kb: Kb<'a>,
@@ -268,7 +269,7 @@ impl<'a> Stores<'a> {
 
     /// Add a new record, one per disposal.
     fn add(&self, entry: &Entry) -> Result<()> {
-        self.kb.removal_add(to_row(entry)?, false)?;
+        self.kb.removal_add(to_row(entry)?)?;
         Ok(())
     }
 
@@ -392,69 +393,28 @@ fn beneath(repo_root: &Path, path: &Path, confine: Option<&Path>) -> io::Result<
     Ok(root.join(rest).join(name))
 }
 
-/// Who holds the sweep's locks: the lease, and an older jkb's lock file on the old store. Owner ids
-/// only — the nonce is a release identity, no part of who holds it.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Holders {
-    /// The `removal-sweep` lease's holder.
-    pub lease: Option<String>,
-    /// The old store's `.sweep.lock` holder; `unknown (…)` when the file is there and cannot be read.
-    pub legacy: Option<String>,
-}
-
-impl Holders {
-    /// Nobody holds either.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.lease.is_none() && self.legacy.is_none()
-    }
-
-    /// Both, labelled, for a person.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(h) = &self.lease {
-            parts.push(format!("the sweep lease ({h})"));
-        }
-        if let Some(h) = &self.legacy {
-            parts.push(format!("an older jkb's lock on the old record store ({h})"));
-        }
-        parts.join(" and ")
-    }
-}
-
-/// What the old file store looks like from here — read only.
+/// What the old file store looks like from here — names only, never a file's contents.
 #[derive(Debug, Default)]
 struct Legacy {
-    /// Record files an import would try, at most [`MAX_LEGACY_FILES`], in name order.
-    files: Vec<PathBuf>,
-    /// More record files than that, or more directory entries than one look examines.
+    /// Record files there (any `*.json` entry), counted up to [`MAX_LEGACY_ENTRIES`] entries looked at.
+    files: usize,
+    /// More entries than one look examines.
     more: bool,
-    /// Files an import will never take, and why: not a regular file, or too large. Seen without
-    /// opening them.
-    refused: Vec<(PathBuf, String)>,
-    /// An older jkb's lock on it: its holder, or `unknown …` for a lock file that cannot be read.
-    lock: Option<String>,
-    /// Why the store cannot be used at all — its directory is a link, or not a directory. Nothing is
-    /// read from such a store.
+    /// The first [`SHOWN_LEGACY_FILES`] of them, by name.
+    shown: Vec<PathBuf>,
+    /// Why the store cannot be looked at — its directory is a link, or not a directory.
     unusable: Option<String>,
 }
-
-/// The most old-store record files one import takes.
-const MAX_LEGACY_FILES: usize = 256;
 
 /// The most directory entries one look at the old store examines. The directory is the dev
 /// container's to fill.
 const MAX_LEGACY_ENTRIES: usize = 4096;
 
-/// The largest old-store record read. A real one is a few hundred bytes.
-const MAX_LEGACY_BYTES: u64 = 64 * 1024;
+/// The most old-store files a report names.
+const SHOWN_LEGACY_FILES: usize = 20;
 
 /// The old store's directory name, beside the database.
 const LEGACY_DIR: &str = "worktree-removals";
-
-/// The lock an older jkb takes on the old file store while it sweeps.
-const LEGACY_LOCK: &str = ".sweep.lock";
 
 fn legacy(stores: &Stores<'_>) -> Legacy {
     let mut out = Legacy::default();
@@ -465,10 +425,7 @@ fn legacy(stores: &Stores<'_>) -> Legacy {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return out,
         Ok(m) if m.file_type().is_dir() => {}
         Ok(_) => {
-            out.unusable = Some(format!(
-                "{} is not a plain directory, so nothing in it is read",
-                dir.display()
-            ));
+            out.unusable = Some(format!("{} is not a plain directory", dir.display()));
             return out;
         }
         Err(e) => {
@@ -483,7 +440,7 @@ fn legacy(stores: &Stores<'_>) -> Legacy {
             return out;
         }
     };
-    let mut files = Vec::new();
+    let mut names = Vec::new();
     for (seen, item) in listing.enumerate() {
         if seen >= MAX_LEGACY_ENTRIES {
             out.more = true;
@@ -491,83 +448,39 @@ fn legacy(stores: &Stores<'_>) -> Legacy {
         }
         let Ok(item) = item else { continue };
         let path = dir.join(item.file_name());
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        // `DirEntry::metadata` does not follow a link: a link is seen as one.
-        match item.metadata() {
-            Ok(m) if !m.file_type().is_file() => {
-                out.refused.push((path, "not a regular file".to_owned()));
-            }
-            Ok(m) if m.len() > MAX_LEGACY_BYTES => {
-                out.refused.push((
-                    path,
-                    format!("larger than the {MAX_LEGACY_BYTES} bytes a record may be"),
-                ));
-            }
-            Ok(_) => files.push(path),
-            Err(e) => {
-                out.refused
-                    .push((path, format!("could not be examined: {e}")));
-            }
+        if path.extension().is_some_and(|e| e == "json") {
+            names.push(path);
         }
     }
-    files.sort();
-    if files.len() > MAX_LEGACY_FILES {
-        out.more = true;
-        files.truncate(MAX_LEGACY_FILES);
-    }
-    out.refused.sort();
-    out.files = files;
-    let lock = dir.join(LEGACY_LOCK);
-    out.lock = match fs::symlink_metadata(&lock) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        _ => match jkb_core::nofollow::read_capped(&lock, MAX_LEGACY_BYTES) {
-            Ok(Some(bytes)) => {
-                Some(jkb_core::lease::owner_of(&String::from_utf8_lossy(&bytes)).to_owned())
-            }
-            Ok(None) => None,
-            Err(e) => Some(format!("unknown — the lock could not be read: {e}")),
-        },
-    };
+    names.sort();
+    out.files = names.len();
+    names.truncate(SHOWN_LEGACY_FILES);
+    out.shown = names;
     out
 }
 
-/// Who holds the sweep's locks, without touching them.
+/// Who holds the sweep's lease, if anyone — without touching it. The owner id only: the nonce is the
+/// lease's release identity, no part of who holds it.
 ///
 /// # Errors
 /// Returns an error if the lease cannot be read.
-pub fn lock_holder(stores: &Stores<'_>) -> Result<Holders> {
-    Ok(Holders {
-        lease: stores
-            .kb
-            .lease_holder(SWEEP_LEASE)?
-            .map(|h| jkb_core::lease::owner_of(&h).to_owned()),
-        legacy: legacy(stores).lock,
-    })
+pub fn lock_holder(stores: &Stores<'_>) -> Result<Option<String>> {
+    Ok(stores
+        .kb
+        .lease_holder(SWEEP_LEASE)?
+        .map(|h| jkb_core::lease::owner_of(&h).to_owned()))
 }
 
-/// Drop the sweep lease and the old store's lock file, whoever holds them; what was displaced. Host
-/// only: the daemon refuses the lease to a client. The lease first, so nothing about the old store
-/// can keep it held.
+/// Drop the sweep lease, whoever holds it; the owner id it displaced. Host only: the daemon refuses it
+/// to a client.
 ///
 /// # Errors
-/// Returns an error if the lease cannot be broken, or the lock file cannot be removed.
-pub fn break_lock(stores: &Stores<'_>) -> Result<Holders> {
-    let lease = stores
+/// Returns an error if the lease cannot be broken.
+pub fn break_lock(stores: &Stores<'_>) -> Result<Option<String>> {
+    Ok(stores
         .kb
         .lease_break(SWEEP_LEASE)?
-        .map(|h| jkb_core::lease::owner_of(&h).to_owned());
-    let legacy_lock = legacy(stores).lock;
-    if let (Some(_), Some(dir)) = (&legacy_lock, stores.legacy_dir()) {
-        let path = dir.join(LEGACY_LOCK);
-        jkb_core::nofollow::remove_tree(&path)
-            .with_context(|| format!("removing {}", path.display()))?;
-    }
-    Ok(Holders {
-        lease,
-        legacy: legacy_lock,
-    })
+        .map(|h| jkb_core::lease::owner_of(&h).to_owned()))
 }
 
 /// Seconds since the Unix epoch. A clock that cannot be read reads as 0, which makes everything
@@ -581,8 +494,8 @@ pub fn now_secs() -> u64 {
 }
 
 /// Where the removal records lived before they moved into the database: beside it, so the reaper
-/// needed no repo context and one service could sweep every repo the machine has. Imported from, on
-/// the host ([`import_legacy`]); the tests plant files there.
+/// needed no repo context and one service could sweep every repo the machine has. Reported, never
+/// acted on ([`LegacyOutlook`]); the tests plant files there.
 #[cfg(test)]
 #[must_use]
 pub fn store_dir(db: &Path) -> PathBuf {
@@ -630,15 +543,13 @@ pub struct Store {
 /// The old file store, as a report sees it.
 #[derive(Default, Debug)]
 pub struct LegacyOutlook {
-    /// Record files there that an import would try.
+    /// Record files there.
     pub files: usize,
-    /// There are more than were looked at.
+    /// There may be more than were counted.
     pub more: bool,
-    /// Files an import will never take, and why.
-    pub refused: Vec<(PathBuf, String)>,
-    /// An older jkb's lock, not proven gone, which holds an import back.
-    pub held: Option<String>,
-    /// Why the store cannot be used at all.
+    /// The first few, by name.
+    pub shown: Vec<PathBuf>,
+    /// Why the store could not be looked at.
     pub unusable: Option<String>,
 }
 
@@ -649,25 +560,21 @@ impl LegacyOutlook {
         let mut out = Vec::new();
         if self.files > 0 {
             out.push(format!(
-                "{}{} record(s) in the old record store, written before this jkb and not acted on — \
-                 review them with `jkb task reap --import-old-records --dry-run`, then import them \
-                 with `jkb task reap --import-old-records`{}",
+                "{}{} worktree-removal record file(s) written by an older jkb, which this jkb does \
+                 not act on. Each names a session checkout an older sweep still owed a removal — \
+                 look at the checkout it names (somebody may have gone back to it), remove what is \
+                 not wanted, then remove the file:",
                 if self.more { "at least " } else { "" },
-                self.files,
-                self.held.as_ref().map_or_else(String::new, |h| format!(
-                    " (an older jkb's sweep holds that store: {h} — `jkb task reap --break-lock` \
-                     if it is gone)"
-                )),
+                self.files
             ));
+            out.extend(self.shown.iter().map(|p| format!("  {}", p.display())));
+            if self.files > self.shown.len() {
+                out.push(format!("  and {} more", self.files - self.shown.len()));
+            }
         }
         if let Some(why) = &self.unusable {
-            out.push(format!("the old record store is not read: {why}"));
-        }
-        for (path, why) in &self.refused {
             out.push(format!(
-                "{} in the old record store cannot be imported ({why}) — look at it and remove it \
-                 yourself",
-                path.display()
+                "the old record store could not be looked at: {why}"
             ));
         }
         out
@@ -724,6 +631,17 @@ pub fn revoke(stores: &Stores<'_>, worktree: &Path) -> Result<bool> {
     // container's), and the host's reap service would skip every pass until someone broke it.
     // In batches the daemon accepts: the count is the dev container's to inflate.
     let mut cancelled = 0;
+    let refused = |holder: &str, cancelled: usize| {
+        let e = refused(holder);
+        if cancelled == 0 {
+            e
+        } else {
+            e.context(format!(
+                "{cancelled} of this checkout's pending removals were cancelled before that; the rest \
+                 are still owed"
+            ))
+        }
+    };
     let batches: Vec<&[i64]> = if ids.is_empty() {
         vec![&[]]
     } else {
@@ -732,7 +650,7 @@ pub fn revoke(stores: &Stores<'_>, worktree: &Path) -> Result<bool> {
     for batch in batches {
         let outcome = stores.kb.removal_cancel(batch.to_vec())?;
         if let Some(holder) = outcome.sweep_holder {
-            return Err(refused(&holder));
+            return Err(refused(&holder, cancelled));
         }
         // A record for this checkout that this process may not cancel is still owed, so the
         // checkout is not handed back.
@@ -753,96 +671,6 @@ pub fn revoke(stores: &Stores<'_>, worktree: &Path) -> Result<bool> {
     Ok(cancelled > 0)
 }
 
-/// What an import of the old file store did, or would do.
-#[derive(Default, Debug)]
-pub struct Imported {
-    /// One line per record taken (or, dry, that would be).
-    pub taken: Vec<String>,
-    /// Files it could not take, and why. Left where they are unless the reason says otherwise.
-    pub failed: Vec<(PathBuf, String)>,
-    /// An older jkb's lock, not proven gone: nothing was taken.
-    pub held: Option<String>,
-    /// There are more files than one import takes; run it again.
-    pub more: bool,
-}
-
-/// Move the old file store's records into the database (tasks S6.4 stage 3) — on the host, and only
-/// when the operator asks (`jkb task reap --import-old-records`). A record written before the move
-/// may be a pending removal of a checkout somebody has since gone back to, so taking it is a decision,
-/// not a side effect of a sweep.
-///
-/// **Taken, never acted on in place.** `~/.jkb` is bind-mounted into the dev container, so the
-/// directory and every file in it are the container's to replace. At most [`MAX_LEGACY_FILES`] are
-/// taken, each read without following a link, only if it is a regular file of at most
-/// [`MAX_LEGACY_BYTES`]; it is **removed first**, through a link-free walk, and only then stored as a
-/// `legacy` row (confined to `~/repos` by every reader) — so a file that cannot be removed is never
-/// taken, and none is taken twice. A record removed but then refused by the database is printed in
-/// full, so nothing is lost silently.
-///
-pub fn import_legacy(stores: &Stores<'_>, dry_run: bool) -> Imported {
-    let state = legacy(stores);
-    let mut out = Imported {
-        more: state.more,
-        failed: state.refused,
-        ..Imported::default()
-    };
-    if let Some(holder) = state.lock {
-        if !state.files.is_empty() && !crate::owner::is_alive(&holder).is_no() {
-            out.held = Some(holder);
-            return out;
-        }
-    }
-    for path in state.files {
-        let parsed = match jkb_core::nofollow::read_capped(&path, MAX_LEGACY_BYTES) {
-            Ok(None) => continue,
-            Ok(Some(bytes)) => serde_json::from_slice::<Entry>(&bytes)
-                .map_err(|e| format!("not a record: {e}"))
-                .and_then(|entry| {
-                    let row = to_row(&entry).map_err(|e| format!("{e:#}"))?;
-                    Ok((entry, row))
-                }),
-            Err(e) => Err(e.to_string()),
-        };
-        let (entry, row) = match parsed {
-            Ok(parsed) => parsed,
-            Err(why) => {
-                out.failed.push((path, why));
-                continue;
-            }
-        };
-        let line = format!(
-            "{} — {} {}",
-            entry.uid,
-            if entry.archive.is_some() {
-                "archive of"
-            } else {
-                "pending removal of"
-            },
-            entry.worktree.display()
-        );
-        if dry_run {
-            out.taken.push(line);
-            continue;
-        }
-        if let Err(e) = jkb_core::nofollow::remove_tree(&path) {
-            out.failed
-                .push((path, format!("not taken: it could not be removed ({e})")));
-            continue;
-        }
-        match stores.kb.removal_add(row, true) {
-            Ok(_) => out.taken.push(line),
-            Err(e) => out.failed.push((
-                path,
-                format!(
-                    "removed, but the database refused it ({e:#}) — it read: {}",
-                    serde_json::to_string(&entry).unwrap_or_default()
-                ),
-            )),
-        }
-    }
-    out
-}
-
 /// Every record currently in the store, with the key each is known by, and the old file store's
 /// state. Reads only.
 ///
@@ -852,12 +680,9 @@ pub fn entries(stores: &Stores<'_>) -> Result<Store> {
     let state = legacy(stores);
     let mut store = Store {
         legacy: LegacyOutlook {
-            files: state.files.len(),
+            files: state.files,
             more: state.more,
-            refused: state.refused,
-            held: state
-                .lock
-                .filter(|h| !state.files.is_empty() && !crate::owner::is_alive(h).is_no()),
+            shown: state.shown,
             unusable: state.unusable,
         },
         ..Store::default()
@@ -866,9 +691,9 @@ pub fn entries(stores: &Stores<'_>) -> Result<Store> {
     for row in stores.kb.removals()? {
         let key = Key(row.id);
         let mut entry = from_row(row.removal.clone());
-        // CONFINED unless the host wrote it AND it names no `~/` path: a row a client wrote, one
-        // imported from the old store, and any row a client could have re-pointed (`removal.archived`
-        // accepts a client's archive for a host row under `~/repos`) are held to `~/repos`.
+        // CONFINED unless the host wrote it AND it names no `~/` path: a row a client wrote, and any
+        // row a client could have re-pointed (`removal.archived` accepts a client's archive for a host
+        // row under `~/repos`), are held to `~/repos`.
         let confined = !HOST_WRITERS.contains(&row.written_via.as_str())
             || [Some(&row.removal.repo_root), Some(&row.removal.worktree)]
                 .into_iter()
@@ -2004,7 +1829,7 @@ pub fn reap(stores: &Stores<'_>, retain_days: u64, dry_run: bool) -> Result<Repo
     let now = now_secs();
     let store = entries(stores)?;
     let mut report = Report::default();
-    // The old store is reported, never swept: importing it is the operator's decision.
+    // The old store is reported, never acted on: what it names is the operator's to judge.
     for line in store.legacy.lines() {
         report.held.push((String::new(), line));
     }
@@ -2342,13 +2167,6 @@ mod tests {
     use super::*;
 
     /// A database at a test's path, and the stores over it: its rows, and the old file store beside it.
-    /// A record written the way an older jkb wrote one: a file in the old store.
-    fn record_at(path: &Path, entry: &Entry) -> Result<()> {
-        fs::create_dir_all(path.parent().expect("a parent"))?;
-        fs::write(path, serde_json::to_vec(entry)?)?;
-        Ok(())
-    }
-
     struct TestKb {
         backend: jkb_api::LocalBackend,
         db: PathBuf,
@@ -2582,54 +2400,6 @@ mod tests {
         assert_eq!(r.archived.len(), 1, "{r:?}");
     }
 
-    /// An older jkb sweeping the old file store under its own lock file is not raced: its records
-    /// are held until it finishes, and `--break-lock` clears that lock too.
-    #[test]
-    fn an_older_sweep_of_the_old_store_is_not_raced() {
-        let t = tempfile::tempdir().expect("tempdir");
-        let db = t.path().join("jkb.db");
-        let kb = TestKb::at(&db);
-        let s = kb.stores();
-        let repo = t.path().join("repo");
-        let (wt, branch, head) = session(&repo, "sess");
-        fs::create_dir_all(store_dir(&db)).expect("mk");
-        record_at(
-            &store_dir(&db).join("old.json"),
-            &session_entry(&repo, &wt, &branch, &head),
-        )
-        .expect("record");
-        fs::write(
-            store_dir(&db).join(LEGACY_LOCK),
-            format!("{} n", crate::owner::self_owner()),
-        )
-        .expect("lock");
-
-        let imported = import_legacy(&s, false);
-        assert!(imported.held.is_some(), "{imported:?}");
-        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
-        assert!(wt.exists(), "{r:?}");
-        assert!(
-            r.held.iter().any(|(_, why)| why.contains("older jkb")),
-            "{r:?}"
-        );
-        assert!(
-            entries(&s)
-                .expect("entries")
-                .legacy
-                .lines()
-                .iter()
-                .any(|l| l.contains("older jkb")),
-            "and every report says so"
-        );
-        assert_eq!(
-            break_lock(&s).expect("break").legacy.as_deref(),
-            Some(crate::owner::self_owner().as_str())
-        );
-        assert_eq!(import_legacy(&s, false).taken.len(), 1);
-        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
-        assert_eq!(r.archived.len(), 1, "{r:?}");
-    }
-
     /// A row the host wrote is confined too once it names a `~/` path: a client may re-point such a
     /// row (`removal.archived` accepts one under `~/repos`), so who wrote it proves nothing.
     #[test]
@@ -2650,10 +2420,9 @@ mod tests {
             archive: None,
             archived_at: None,
         };
-        s.kb.removal_add(row("~/repos/p/.jkb/work/s", "~/repos/p"), false)
+        s.kb.removal_add(row("~/repos/p/.jkb/work/s", "~/repos/p"))
             .expect("add");
-        s.kb.removal_add(row("/r/.jkb/work/s", "/r"), false)
-            .expect("add");
+        s.kb.removal_add(row("/r/.jkb/work/s", "/r")).expect("add");
         let confined: Vec<bool> = entries(&s)
             .expect("entries")
             .records
@@ -2743,8 +2512,11 @@ mod tests {
         assert!(left.is_empty(), "and its record goes with it");
     }
 
+    /// **The old file store is reported, never acted on** — by a sweep or a dry one, a cancel, or
+    /// anything else. A pending removal an older jkb wrote may name a checkout somebody has since gone
+    /// back to, and the directory is the dev container's to write.
     #[test]
-    fn an_old_store_file_is_imported_on_request_and_never_rewritten() {
+    fn the_old_store_is_reported_and_never_acted_on() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
         let kb = TestKb::at(&db);
@@ -2752,35 +2524,36 @@ mod tests {
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
         let marker = store_dir(&db).join("legacy-name.json");
-        record_at(&marker, &session_entry(&repo, &wt, &branch, &head)).expect("plant");
+        fs::create_dir_all(store_dir(&db)).expect("mk");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&session_entry(&repo, &wt, &branch, &head)).expect("json"),
+        )
+        .expect("plant");
 
-        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
-        assert!(
-            r.archived.is_empty() && wt.exists(),
-            "a sweep never imports: {r:?}"
-        );
-        let dry = import_legacy(&s, true);
-        assert_eq!(dry.taken.len(), 1, "{dry:?}");
-        assert!(marker.exists(), "a dry import takes nothing");
-
-        let taken = import_legacy(&s, false);
-        assert_eq!(taken.taken.len(), 1, "{taken:?}");
-        assert!(!marker.exists(), "taken, then removed — never written back");
-        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
-        assert_eq!(r.archived.len(), 1, "{r:?}");
-        let left = entries(&s).expect("entries").records;
-        assert_eq!(left.len(), 1, "one record, not the original plus an update");
-        assert!(left[0].1.archive.is_some(), "carrying where the tree went");
-        assert!(
-            left[0].1.confine.is_some(),
-            "and confined: the old store is the dev container's to write"
-        );
+        for dry_run in [true, false] {
+            let r = reap(&s, 0, dry_run).expect("reap");
+            assert!(r.archived.is_empty() && wt.exists(), "{r:?}");
+            assert!(
+                r.held.iter().any(|(_, why)| why.contains("older jkb")),
+                "and it says so: {r:?}"
+            );
+            assert!(
+                r.held
+                    .iter()
+                    .any(|(_, why)| why.contains("legacy-name.json")),
+                "naming the file: {r:?}"
+            );
+        }
+        assert!(!revoke(&s, &wt).expect("revoke"));
+        assert!(marker.exists(), "nothing removed it");
+        assert!(s.kb.removals().expect("rows").is_empty(), "nothing took it");
     }
 
-    /// What the dev container can put in the old store — a FIFO, a link, a torn file — is neither
-    /// followed nor blocked on, and is left where it is; a FIFO lock is an unknown holder.
+    /// What the dev container can put in the old store — a FIFO, a link — is never opened: a report
+    /// names it and neither follows nor blocks on it.
     #[test]
-    fn the_old_store_s_files_are_read_without_following_or_blocking() {
+    fn the_old_store_s_files_are_never_opened() {
         use std::os::unix::fs::symlink;
 
         let t = tempfile::tempdir().expect("tempdir");
@@ -2789,48 +2562,20 @@ mod tests {
         let s = kb.stores();
         let dir = store_dir(&db);
         fs::create_dir_all(&dir).expect("mk");
-        let fifo = |p: &Path| {
-            assert!(std::process::Command::new("mkfifo")
-                .arg(p)
-                .status()
-                .expect("mkfifo")
-                .success());
-        };
-        fifo(&dir.join("pipe.json"));
+        assert!(std::process::Command::new("mkfifo")
+            .arg(dir.join("pipe.json"))
+            .status()
+            .expect("mkfifo")
+            .success());
         fs::write(t.path().join("secret.json"), b"{}").expect("write");
         symlink(t.path().join("secret.json"), dir.join("link.json")).expect("link");
         fs::write(dir.join("torn.json"), b"{not json").expect("write");
 
-        let imported = import_legacy(&s, false);
-        assert_eq!(imported.failed.len(), 3, "{imported:?}");
-        assert!(entries(&s).expect("entries").records.is_empty());
-        assert!(t.path().join("secret.json").exists());
-        for name in ["pipe.json", "link.json", "torn.json"] {
-            assert!(
-                fs::symlink_metadata(dir.join(name)).is_ok(),
-                "{name} is left"
-            );
-        }
-
-        fifo(&dir.join(LEGACY_LOCK));
-        let held = lock_holder(&s).expect("holders");
-        assert!(
-            held.legacy
-                .as_deref()
-                .is_some_and(|h| h.starts_with("unknown")),
-            "{held:?}"
-        );
+        let outlook = entries(&s).expect("entries, not a hang").legacy;
+        assert_eq!(outlook.files, 3, "{outlook:?}");
         let r = reap(&s, RETAIN_DAYS, false).expect("reap, not a hang");
-        assert!(
-            r.held.iter().any(|(_, why)| why.contains("older jkb")),
-            "{r:?}"
-        );
-        let broken = break_lock(&s).expect("break, not a hang");
-        assert!(broken.legacy.is_some());
-        assert!(
-            fs::symlink_metadata(dir.join(LEGACY_LOCK)).is_err(),
-            "removed"
-        );
+        assert!(r.archived.is_empty() && r.deleted.is_empty(), "{r:?}");
+        assert!(t.path().join("secret.json").exists());
     }
 
     /// A pending record for the checkout that this process may not cancel keeps the checkout from
@@ -2864,60 +2609,10 @@ mod tests {
         assert!(s.kb.removals().expect("rows").is_empty());
     }
 
-    /// A dry run imports nothing: the old store's files stay, and it says they are there.
+    /// A report names a few old-store files and counts the rest; a store directory that is a link is
+    /// not looked into.
     #[test]
-    fn a_dry_run_leaves_the_old_store_alone() {
-        let t = tempfile::tempdir().expect("tempdir");
-        let db = t.path().join("jkb.db");
-        let kb = TestKb::at(&db);
-        let s = kb.stores();
-        let file = store_dir(&db).join("one.json");
-        record_at(&file, &entry(Path::new("/r/.jkb/work/s"), Path::new("/r"))).expect("plant");
-        let r = reap(&s, RETAIN_DAYS, true).expect("reap");
-        assert!(file.exists(), "{r:?}");
-        assert!(s.kb.removals().expect("rows").is_empty());
-        assert!(
-            r.held.iter().any(|(_, why)| why.contains("1 record(s)")),
-            "{r:?}"
-        );
-    }
-
-    /// A file that cannot be removed — the directory is not ours to write — is not taken at all, so
-    /// it is never taken twice; it is reported, and taken once it can be removed.
-    #[test]
-    fn a_file_that_cannot_be_removed_is_not_taken() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let t = tempfile::tempdir().expect("tempdir");
-        let db = t.path().join("jkb.db");
-        let kb = TestKb::at(&db);
-        let s = kb.stores();
-        let dir = store_dir(&db);
-        record_at(
-            &dir.join("one.json"),
-            &entry(Path::new("/r/.jkb/work/s"), Path::new("/r")),
-        )
-        .expect("plant");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("chmod");
-        let imported = import_legacy(&s, false);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(imported.failed.len(), 1, "{imported:?}");
-        assert!(
-            imported.failed[0].1.contains("could not be removed"),
-            "{imported:?}"
-        );
-        assert!(s.kb.removals().expect("rows").is_empty(), "not taken");
-
-        let imported = import_legacy(&s, false);
-        assert_eq!(imported.taken.len(), 1, "{imported:?}");
-        assert!(!dir.join("one.json").exists());
-        assert_eq!(s.kb.removals().expect("rows").len(), 1);
-    }
-
-    /// What the old store may hold that an import never takes — a store directory that is a link, a
-    /// file too large, more files than one pass takes — is told apart without reading it.
-    #[test]
-    fn the_old_store_s_limits_hold() {
+    fn the_old_store_report_is_bounded() {
         use std::os::unix::fs::symlink;
 
         let t = tempfile::tempdir().expect("tempdir");
@@ -2925,47 +2620,29 @@ mod tests {
         let kb = TestKb::at(&db);
         let s = kb.stores();
         let dir = store_dir(&db);
-        let one = |name: &str| {
-            record_at(
-                &dir.join(name),
-                &entry(Path::new("/r/.jkb/work/s"), Path::new("/r")),
-            )
-            .expect("plant");
-        };
-        for i in 0..=MAX_LEGACY_FILES {
-            one(&format!("r{i:04}.json"));
+        fs::create_dir_all(&dir).expect("mk");
+        for i in 0..SHOWN_LEGACY_FILES + 5 {
+            fs::write(dir.join(format!("r{i:04}.json")), b"{}").expect("write");
         }
-        fs::write(
-            dir.join("huge.json"),
-            vec![b' '; usize::try_from(MAX_LEGACY_BYTES).expect("fits") + 1],
-        )
-        .expect("write");
         let outlook = entries(&s).expect("entries").legacy;
         assert_eq!(
-            (outlook.files, outlook.more, outlook.refused.len()),
-            (MAX_LEGACY_FILES, true, 1),
+            (outlook.files, outlook.shown.len(), outlook.more),
+            (SHOWN_LEGACY_FILES + 5, SHOWN_LEGACY_FILES, false),
             "{outlook:?}"
         );
-        assert!(outlook.lines()[0].starts_with("at least"), "{outlook:?}");
-        let imported = import_legacy(&s, false);
-        assert_eq!(imported.taken.len(), MAX_LEGACY_FILES);
-        assert!(imported.more);
-        assert!(dir.join("huge.json").exists(), "a refused file is left");
+        let lines = outlook.lines();
+        assert_eq!(lines.len(), 1 + SHOWN_LEGACY_FILES + 1, "{lines:?}");
+        assert!(
+            lines.last().is_some_and(|l| l.contains("and 5 more")),
+            "{lines:?}"
+        );
 
-        // The whole store a link: nothing in it is read, and nothing is held up.
         let elsewhere = t.path().join("elsewhere");
         fs::rename(&dir, &elsewhere).expect("move");
         symlink(&elsewhere, &dir).expect("link");
         let outlook = entries(&s).expect("entries").legacy;
         assert!(outlook.unusable.is_some(), "{outlook:?}");
         assert_eq!(outlook.files, 0);
-        let imported = import_legacy(&s, false);
-        assert!(imported.taken.is_empty() && imported.held.is_none());
-        let wt = t.path().join("repo/.jkb/work/s");
-        assert!(
-            revoke(&s, &wt).is_ok(),
-            "and a cancel is not refused for it"
-        );
     }
 
     /// A size cap below the synced-file one is honoured.
@@ -4169,7 +3846,7 @@ mod tests {
         // foreign holder is `Unknown` by construction. It reports the OWNER, never the nonce: that is
         // what `jkb task release --owner` and the liveness probe take.
         assert_eq!(
-            break_lock(&s).expect("break").lease.as_deref(),
+            break_lock(&s).expect("break").as_deref(),
             Some(crate::owner::self_owner().as_str()),
         );
         let Ok(successor) = SweepLease::acquire(&s).expect("acquire") else {
@@ -4185,13 +3862,13 @@ mod tests {
             "the successor still holds the lease after the displaced sweeper released"
         );
         assert_eq!(
-            lock_holder(&s).expect("holder").lease.as_deref(),
+            lock_holder(&s).expect("holder").as_deref(),
             Some(crate::owner::self_owner().as_str()),
         );
 
         drop(successor);
         assert_eq!(
-            lock_holder(&s).expect("holder").lease,
+            lock_holder(&s).expect("holder"),
             None,
             "the holder's own release does free it"
         );
@@ -4210,10 +3887,7 @@ mod tests {
             panic!("free to begin with")
         };
         let one = first.holder.clone();
-        break_lock(&s)
-            .expect("break")
-            .lease
-            .expect("there was a holder");
+        break_lock(&s).expect("break").expect("there was a holder");
         let Ok(second) = SweepLease::acquire(&s).expect("acquire") else {
             panic!("free again once broken")
         };
@@ -4221,7 +3895,7 @@ mod tests {
 
         assert_ne!(one, two, "same process, same host, same pid");
         assert_eq!(
-            lock_holder(&s).expect("holder").lease.as_deref(),
+            lock_holder(&s).expect("holder").as_deref(),
             Some(crate::owner::self_owner().as_str()),
             "the nonce is a release identity, not part of who holds the lease"
         );
@@ -4269,51 +3943,12 @@ mod tests {
         hold(&s, &dead_holder);
         let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(r.skipped.is_none(), "a dead holder's lease is taken over");
-        assert_eq!(
-            lock_holder(&s).expect("holder").lease,
-            None,
-            "and released after"
-        );
+        assert_eq!(lock_holder(&s).expect("holder"), None, "and released after");
 
         // A holder on another host is `Unknown`, and unknown frees nothing.
         hold(&s, "host:some-other-machine:12");
         let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(r.skipped.is_some(), "a foreign holder is respected");
-    }
-
-    #[test]
-    fn a_record_written_before_the_plan_existed_still_reads_and_keeps_the_branch() {
-        let t = tempfile::tempdir().expect("tempdir");
-        let db = t.path().join("jkb.db");
-        let kb = TestKb::at(&db);
-        let s = kb.stores();
-        fs::create_dir_all(store_dir(&db)).expect("mk");
-        // Exactly the shape this shipped with before `Plan`: no `delete_branch`, no
-        // `accept_dirty`. It has to parse, and it has to default to the SAFE answers — keep the
-        // branch, do not touch a dirty tree — because the record cannot say what was decided.
-        fs::write(
-            store_dir(&db).join("legacy.json"),
-            br#"{"worktree":"/r/.jkb/work/s","repo_root":"/r","branch":"task/s",
-                 "uid":"task:t","recorded_at":1,"head":"abc","archive":null,"archived_at":null}"#,
-        )
-        .expect("write");
-
-        let before = entries(&s).expect("entries");
-        assert_eq!(
-            (before.records.len(), before.legacy.files),
-            (0, 1),
-            "a read imports nothing"
-        );
-        let imported = import_legacy(&s, false);
-        assert!(imported.failed.is_empty(), "an older record still parses");
-        let store = entries(&s).expect("entries");
-        assert_eq!(store.records.len(), 1);
-        let plan = store.records[0].1.plan;
-        assert!(
-            !plan.delete_branch,
-            "a record that cannot say defaults to keeping the branch"
-        );
-        assert!(!plan.accept_dirty, "and to not touching uncommitted work");
     }
 
     #[test]
@@ -4456,14 +4091,7 @@ mod tests {
             head: Some("abc".into()),
             ..entry(&repo.join(".jkb/work/s"), &repo)
         };
-        fs::create_dir_all(store_dir(&db)).expect("mk");
-        fs::write(
-            store_dir(&db).join("hostile.json"),
-            serde_json::to_vec(&e).expect("json"),
-        )
-        .expect("write");
-
-        import_legacy(&s, false);
+        record(&s, &e).expect("record");
         let store = entries(&s).expect("entries");
         assert!(
             store.records.is_empty(),
@@ -4917,9 +4545,11 @@ mod tests {
         let junk = store_dir(&db).join("torn.json");
         fs::write(&junk, b"{not json").expect("write");
 
-        let imported = import_legacy(&s, false);
-        assert_eq!(imported.failed.len(), 1, "{imported:?}");
-        assert_eq!(imported.failed[0].0, junk);
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
+        assert!(
+            r.held.iter().any(|(_, why)| why.contains("torn.json")),
+            "{r:?}"
+        );
         assert!(
             junk.exists(),
             "it may be a torn write for a live worktree, so it stays"

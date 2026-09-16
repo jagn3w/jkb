@@ -1428,7 +1428,7 @@ mod tests {
         ),
         (
             "src/archive.rs",
-            "the_old_store_s_files_are_read_without_following_or_blocking",
+            "the_old_store_s_files_are_never_opened",
             "spawns `mkfifo` on a temp path; it is never asked about a repository",
         ),
     ];

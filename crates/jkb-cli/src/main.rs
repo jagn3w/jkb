@@ -972,12 +972,6 @@ enum TaskCmd {
         /// container killed mid-sweep and then rebuilt leaves one nothing can ever clear.
         #[arg(long)]
         break_lock: bool,
-        /// Take the worktree-removal records an older jkb left beside the database into the
-        /// database, where the next sweep acts on them — and do nothing else. With `--dry-run`, list
-        /// them. A record written before this jkb may be a pending removal of a checkout somebody
-        /// has gone back to, so this is asked for, never done by a sweep on its own.
-        #[arg(long)]
-        import_old_records: bool,
         /// Keep sweeping, for the installed service. Ctrl-C stops it.
         #[arg(long)]
         watch: bool,
@@ -1213,7 +1207,6 @@ fn run(cli: Cli) -> Result<()> {
             retain_days,
             dry_run,
             break_lock,
-            import_old_records,
             watch,
             interval_secs,
         } = cmd
@@ -1226,7 +1219,6 @@ fn run(cli: Cli) -> Result<()> {
                 retain_days,
                 dry_run,
                 break_lock,
-                import_old_records,
                 watch,
                 interval_secs,
             },
@@ -3271,7 +3263,6 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
             retain_days,
             dry_run,
             break_lock,
-            import_old_records,
             watch,
             interval_secs,
         } => cmd_task_reap(
@@ -3280,7 +3271,6 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
                 retain_days,
                 dry_run,
                 break_lock,
-                import_old_records,
                 watch,
                 interval_secs,
             },
@@ -4272,12 +4262,10 @@ fn report_landing(
 /// database this binary cannot open fails a pass rather than the service. The records need no repo
 /// context, so one service sweeps every repo on the machine.
 #[derive(Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)] // a command's flags, not state
 struct ReapFlags {
     retain_days: u64,
     dry_run: bool,
     break_lock: bool,
-    import_old_records: bool,
     watch: bool,
     interval_secs: u64,
 }
@@ -4287,18 +4275,9 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         retain_days,
         dry_run,
         break_lock,
-        import_old_records,
         watch,
         interval_secs,
     } = flags;
-    if import_old_records {
-        let db = open_db(db_path)?;
-        let backend = jkb_api::LocalBackend::new(db).with_actor("reap");
-        let stores = archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path));
-        report_import(&archive::import_legacy(&stores, dry_run), dry_run, json);
-        // The import only: the sweep that then acts on what was taken is its own run.
-        return Ok(());
-    }
     if break_lock {
         let db = open_db(db_path)?;
         let backend = jkb_api::LocalBackend::new(db).with_actor("reap");
@@ -4306,18 +4285,14 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         // `--dry-run` promises to change nothing, and this ran before that was consulted — so
         // `--dry-run --break-lock` removed a live sweeper's lock while saying it would not.
         if dry_run {
-            let held = archive::lock_holder(&stores)?;
-            if held.is_empty() {
-                println!("no sweep lock is held");
-            } else {
-                println!("would break {}", held.describe());
+            match archive::lock_holder(&stores)? {
+                Some(holder) => println!("would break the sweep lease held by {holder}"),
+                None => println!("no sweep lease is held"),
             }
         } else {
-            let broken = archive::break_lock(&stores)?;
-            if broken.is_empty() {
-                println!("no sweep lock was held");
-            } else {
-                println!("broke {}", broken.describe());
+            match archive::break_lock(&stores)? {
+                Some(holder) => println!("broke the sweep lease held by {holder}"),
+                None => println!("no sweep lease was held"),
             }
         }
     }
@@ -4389,43 +4364,6 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn report_import(imported: &archive::Imported, dry_run: bool, json: bool) {
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "dry_run": dry_run,
-                "taken": imported.taken,
-                "failed": imported.failed.iter()
-                    .map(|(p, why)| serde_json::json!({ "file": p.display().to_string(), "reason": why }))
-                    .collect::<Vec<_>>(),
-                "held_by": imported.held,
-                "more": imported.more,
-            })
-        );
-        return;
-    }
-    if let Some(holder) = &imported.held {
-        println!(
-            "the old record store is held by an older jkb's sweep ({holder}); nothing was taken — \
-             `jkb task reap --break-lock` if it is gone"
-        );
-    }
-    let verb = if dry_run { "would take" } else { "took" };
-    if imported.taken.is_empty() && imported.held.is_none() {
-        println!("no old records to take");
-    }
-    for line in &imported.taken {
-        println!("{verb} {line}");
-    }
-    for (path, why) in &imported.failed {
-        println!("did not take {}: {why}", path.display());
-    }
-    if imported.more {
-        println!("there are more; run it again");
-    }
 }
 
 /// One sweep, with the database opened for it and closed after.
@@ -5044,7 +4982,7 @@ fn report_worktree_removals(db: &Db, db_path: &Path, fix: bool) {
             );
         }
     }
-    // The old file store: what the next sweep imports, or why it cannot.
+    // The old file store: what an older jkb left there, for the operator to judge.
     for line in &legacy {
         println!("  {line}");
     }
@@ -5056,12 +4994,12 @@ fn report_worktree_removals(db: &Db, db_path: &Path, fix: bool) {
     }
     if fix {
         fix_worktree_removals(&stores);
-    } else if !awaiting.is_empty() || store.legacy.files > 0 {
+    } else if !awaiting.is_empty() {
         println!("  run `jkb doctor --fix` or `jkb task reap` (the watcher service runs it)");
     }
 }
 
-/// `doctor --fix`'s sweep — the one the service runs, which also imports the old record store.
+/// `doctor --fix`'s sweep — the one the service runs.
 fn fix_worktree_removals(stores: &archive::Stores<'_>) {
     match archive::reap(stores, archive::RETAIN_DAYS, false) {
         Ok(r) => report_reap(&r, false, false, None),

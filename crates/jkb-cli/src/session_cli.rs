@@ -134,9 +134,9 @@ impl<'a> Kb<'a> {
         }
     }
 
-    /// `removal.add`; `legacy` for a record imported from the old file store.
-    pub(crate) fn removal_add(&self, removal: Removal, legacy: bool) -> Result<i64> {
-        match self.call(Request::RemovalAdd { removal, legacy })? {
+    /// `removal.add`.
+    pub(crate) fn removal_add(&self, removal: Removal) -> Result<i64> {
+        match self.call(Request::RemovalAdd { removal })? {
             Response::RemovalAdded { id } => Ok(id),
             other => unexpected("removal.add", &other),
         }

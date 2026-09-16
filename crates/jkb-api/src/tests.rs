@@ -287,7 +287,6 @@ fn samples() -> Vec<Request> {
                 archive: None,
                 archived_at: None,
             },
-            legacy: false,
         },
         Request::RemovalList { after: None },
         Request::RemovalArchived {
