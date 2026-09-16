@@ -392,8 +392,13 @@ struct CenterDisplay: Display {
                         }
                     } else {
                         group.enter()
+                        // The script is built here, on the main queue, and only the finished string
+                        // crosses to the background one: Swift 6 flags any global function run from a
+                        // concurrently-executed closure (`bannerScript` warned under `-swift-version 5`).
+                        let script = bannerScript(
+                            title: n.title, subtitle: subtitle(n, now: now), body: n.body)
                         DispatchQueue.global().async {
-                            banner(title: n.title, subtitle: subtitle(n, now: now), body: n.body)
+                            runOsascript(script)
                             group.leave()
                         }
                     }
@@ -422,10 +427,11 @@ final class Once {
     }
 }
 
-func banner(title: String, subtitle: String, body: String) {
+/// Show a plain banner by running `script` (from `bannerScript`) with `osascript`, and wait for it.
+func runOsascript(_ script: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", bannerScript(title: title, subtitle: subtitle, body: body)]
+    p.arguments = ["-e", script]
     do {
         try p.run()
         p.waitUntilExit()
