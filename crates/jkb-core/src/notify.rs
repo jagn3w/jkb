@@ -407,12 +407,9 @@ pub fn machine() -> Machine<NotifState, NotifEvent, NotifCtx, NotifEffect> {
 pub fn sanitize(session: &str) -> String {
     session
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
+        .map(|c| match u8::try_from(c) {
+            Ok(b) if jkb_types::is_session_id_byte(b) => c,
+            _ => '_',
         })
         .collect()
 }

@@ -88,6 +88,18 @@ impl<'a> Kb<'a> {
         self.taken("task.take", Request::TaskTake(ask))
     }
 
+    /// `task.locate`: record where `owner`'s work is; `false` when `owner` no longer holds the claim.
+    pub(crate) fn locate(&self, uid: &str, owner: &str, place: Place) -> Result<bool> {
+        self.taken(
+            "task.locate",
+            Request::TaskLocate {
+                uid: uid.to_owned(),
+                owner: owner.to_owned(),
+                place,
+            },
+        )
+    }
+
     /// `task.release`: drop `owner`'s claim, and only `owner`'s.
     pub(crate) fn release(&self, uid: &str, owner: &str) -> Result<bool> {
         match self.call(Request::TaskRelease {
@@ -468,19 +480,12 @@ pub(crate) fn work(
     // claim on a checkout that no verb could find the task from. The facets are *set*, not added: a
     // second value would be a contradiction, and is how a task ends up with two branches and one
     // worktree. A **resumed** session re-asserts both, which writes nothing new.
-    let owner = owner::session_owner(&worktree);
-    claim_session(
-        kb,
-        &facts,
-        uid,
-        &owner,
-        &worktree,
-        Place {
-            branch: branch.clone(),
-            repo: ctx.key.clone(),
-            onto: Some(onto.clone()),
-        },
-    )?;
+    let place = Place {
+        branch: branch.clone(),
+        repo: ctx.key.clone(),
+        onto: Some(onto.clone()),
+    };
+    let owner = claim_session(kb, &facts, uid, &worktree, place.clone())?;
 
     // CANCELLED FIRST, and a refusal stops the verb.
     //
@@ -516,6 +521,21 @@ pub(crate) fn work(
     let resumed = sessions.iter().any(|s| s.branch == branch);
     if !resumed {
         open_worktree(kb, &facts.uid, &owner, &ctx.root, &worktree, &branch, &onto)?;
+    }
+    // Where the work is, now that it is there — only while this run still holds the claim, so a
+    // run displaced meanwhile does not overwrite its successor's record. The place was judged by the
+    // take, so a refusal here is a change since; the claim is released, as any failure after it.
+    match kb.locate(&facts.uid, &owner, place) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "{uid} was claimed by someone else while its session was being opened — {} is \
+             there, but the task now belongs to another run; nothing was recorded",
+            worktree.display()
+        ),
+        Err(e) => {
+            let _ = kb.release(&facts.uid, &owner);
+            return Err(e);
+        }
     }
 
     if json {
@@ -775,14 +795,15 @@ fn release_base_worktree(ctx: &repo::RepoCtx) -> Result<()> {
 /// opener has ended or is unknown to the registry. What is refused is a second Claude session starting
 /// work in a checkout the registry says the first is still working in. Only a registry answer of
 /// `live` refuses: unknown holds nothing back, as before.
+///
+/// Returns the owner the claim was taken as.
 fn claim_session(
     kb: &Kb<'_>,
     facts: &TaskState,
     uid: &str,
-    owner: &str,
     worktree: &Path,
     place: Place,
-) -> Result<()> {
+) -> Result<String> {
     let held = facts.claim.clone();
     if let Some(prev) = &held {
         let same_session =
@@ -802,10 +823,12 @@ fn claim_session(
             refuse_a_running_opener(kb, uid, prev, worktree)?;
         }
     }
+    let opener = opener_for(kb, held.as_deref(), worktree)?;
+    let owner = owner::session_owner(worktree, opener.as_deref());
     let ok = kb.take(TakeAsk {
         uid: facts.uid.clone(),
         take: Take {
-            owner: owner.to_owned(),
+            owner: owner.clone(),
             displace: held,
         },
         place,
@@ -815,7 +838,31 @@ fn claim_session(
         "{uid} was claimed by someone else while this command was checking — nothing was \
          changed; run it again"
     );
-    Ok(())
+    Ok(owner)
+}
+
+/// Which Claude Code session a session owner records as having opened the work.
+///
+/// This process's session — unless it is resuming a checkout somebody else opened and is not itself
+/// a running session the registry knows (a person at a terminal, a subagent): then the opener it found
+/// is kept. Writing its own id there, or none, cleared the only thing that stops a second running
+/// session taking over the checkout while its opener still works in it (stage-2 review, round 2).
+fn opener_for(kb: &Kb<'_>, held: Option<&str>, worktree: &Path) -> Result<Option<String>> {
+    let mine = owner::claude_session();
+    let found = held
+        .filter(|h| owner::session_worktree(h).is_some_and(|w| session::same_path(&w, worktree)))
+        .and_then(|h| AgentId::parse(h).opened_by().map(str::to_owned));
+    Ok(match (mine, found) {
+        (Some(mine), Some(found)) if mine != found => {
+            if kb.session_state(&mine)? == SessionStateIs::Live {
+                Some(mine)
+            } else {
+                Some(found)
+            }
+        }
+        (None, Some(found)) => Some(found),
+        (mine, _) => mine,
+    })
 }
 
 /// `task abandon` — drop a session without landing it (design D36.6).

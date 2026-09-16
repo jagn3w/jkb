@@ -155,11 +155,12 @@ fn a_takeover_of_an_owner_that_changed_writes_nothing() {
     assert_eq!(facts(&b, &uid).tags["branch"], ["feat2"]);
 }
 
-/// `task.take` is `task work`'s claim and location in one write: the start transition carries the
-/// branch and land target, the facets are set beside it, a same-owner retake is not an error — and a
-/// displaced run's late take writes nothing, so it cannot overwrite what its successor recorded.
+/// `task.take` is `task work`'s claim: the start transition carries the branch and land target, a
+/// same-owner retake is not an error — and it writes no location. `task.locate` does, once the
+/// worktree exists, and only for the owner that holds the claim, so a displaced run's late write
+/// changes nothing.
 #[test]
-fn a_take_claims_and_locates_in_one_write() {
+fn a_take_claims_and_a_locate_records_the_holder_s_place() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
     let uid = add(&b, "work it +tasks/x");
     let take = |owner: &str, displace: Option<&str>, branch: &str| {
@@ -171,21 +172,34 @@ fn a_take_claims_and_locates_in_one_write() {
         )
         .map(taken)
     };
+    let locate = |owner: &str, branch: &str| {
+        call(
+            &b,
+            json!({ "op": "task.locate", "uid": uid, "owner": owner,
+                    "place": { "branch": branch, "repo": "proj", "onto": "batch" } }),
+        )
+        .map(taken)
+        .unwrap()
+    };
     assert!(take("session:1:~/w", None, "task/w").unwrap());
     let f = facts(&b, &uid);
     assert_eq!(
         (f.claim.as_deref(), f.land_target.as_deref()),
         (Some("session:1:~/w"), Some("batch"))
     );
+    assert!(!f.tags.contains_key("branch"), "a take writes no location");
+    assert!(locate("session:1:~/w", "task/w"));
+    let f = facts(&b, &uid);
     assert_eq!(f.tags["branch"], ["task/w"]);
     assert_eq!(f.tags["repo"], ["proj"]);
     assert!(
         take("session:1:~/w", Some("session:1:~/w"), "task/w").unwrap(),
         "a resume re-takes its own claim"
     );
-    // Another run took over; the displaced one's late take changes nothing.
+    // Another run took over and recorded its place; the displaced one's late locate changes nothing.
     assert!(take("session:2:~/v", Some("session:1:~/w"), "task/v").unwrap());
-    assert!(!take("session:1:~/w", Some("session:1:~/w"), "task/w").unwrap());
+    assert!(locate("session:2:~/v", "task/v"));
+    assert!(!locate("session:1:~/w", "task/w"));
     assert_eq!(facts(&b, &uid).tags["branch"], ["task/v"]);
     // A session's claim says where it lands.
     let e = call(
@@ -195,6 +209,70 @@ fn a_take_claims_and_locates_in_one_write() {
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
+}
+
+/// **A place the task's `tasks.md` line cannot carry is refused by the take**, before any git work, and
+/// the trial leaves nothing behind: no claim, no facet, no history entry for it.
+#[test]
+fn a_take_refuses_a_place_the_task_s_line_cannot_carry_and_writes_nothing() {
+    use jkb_core::{mount, ns};
+    use jkb_types::{ConflictPolicy, SyncMode};
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let id = ns::ensure(c, "repos/in")?;
+        mount::create(
+            c,
+            m,
+            id,
+            "file:///Users/u/repos/in",
+            SyncMode::Bidirectional,
+            "tasks",
+            None,
+            None,
+            ConflictPolicy::Manual,
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let uid = match call(&b, json!({ "op": "task.add", "text": "filed +repos/in" })).unwrap() {
+        Response::Added { added } => {
+            assert!(added.binding.is_some(), "file-backed");
+            added.uid
+        }
+        other => panic!("{other:?}"),
+    };
+    let history = |b: &LocalBackend| match call(b, json!({ "op": "task.why", "uid": uid })).unwrap()
+    {
+        Response::History { entries, .. } => entries.len(),
+        other => panic!("{other:?}"),
+    };
+    let before = history(&b);
+    // A repo key with a space: the line would not read back (tasks F4).
+    let e = call(
+        &b,
+        json!({ "op": "task.take", "uid": uid, "take": { "owner": "session:1:~/w" },
+                "place": { "branch": "task/w", "repo": "My App", "onto": "batch" } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    let f = facts(&b, &uid);
+    assert_eq!((f.claim, f.land_target), (None, None));
+    assert!(
+        !f.tags.contains_key("branch") && !f.tags.contains_key("repo"),
+        "{:?}",
+        f.tags
+    );
+    assert_eq!(history(&b), before, "no transition recorded");
+    // The same take with a place the line can carry succeeds, and writes no location yet.
+    assert!(call(
+        &b,
+        json!({ "op": "task.take", "uid": uid, "take": { "owner": "session:1:~/w" },
+                "place": { "branch": "task/w", "repo": "proj", "onto": "batch" } }),
+    )
+    .map(taken)
+    .unwrap());
+    assert!(!facts(&b, &uid).tags.contains_key("branch"));
 }
 
 /// A terminal task cannot be started: the lifecycle's refusal is what `task.facts` reports and what a

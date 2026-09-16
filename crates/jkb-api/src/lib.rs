@@ -463,6 +463,16 @@ pub enum Request {
     /// `jkb task work`'s claim ([`sessions::take`]).
     #[serde(rename = "task.take")]
     TaskTake(sessions::TakeAsk),
+    /// Record where a claim holder's work is ([`sessions::locate`]).
+    #[serde(rename = "task.locate")]
+    TaskLocate {
+        /// The task.
+        uid: String,
+        /// The owner that must hold the claim.
+        owner: String,
+        /// Where.
+        place: sessions::Place,
+    },
     /// `jkb task abandon`'s write: release the judged claim and reopen ([`sessions::abandon`]).
     #[serde(rename = "task.abandon")]
     TaskAbandon {
@@ -835,6 +845,7 @@ impl Request {
         "task.by_branch",
         "task.start",
         "task.take",
+        "task.locate",
         "task.abandon",
         "repo.gate",
         "session.state",
@@ -888,6 +899,7 @@ impl Request {
             Self::TaskByBranch { .. } => "task.by_branch",
             Self::TaskStart(_) => "task.start",
             Self::TaskTake(_) => "task.take",
+            Self::TaskLocate { .. } => "task.locate",
             Self::TaskAbandon { .. } => "task.abandon",
             Self::RepoGate { .. } => "repo.gate",
             Self::SessionState { .. } => "session.state",
@@ -951,6 +963,7 @@ impl Request {
             | Self::IngestText(_)
             | Self::TaskStart(_)
             | Self::TaskTake(_)
+            | Self::TaskLocate { .. }
             | Self::TaskAbandon { .. }
             | Self::SessionState { .. } => false,
         }
@@ -2028,6 +2041,14 @@ impl Backend for LocalBackend {
                 Response::Taken {
                     taken: task_write(db, actor, uid, move |c, m, _| {
                         sessions::take(c, m, &ask, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskLocate { uid, owner, place } => {
+                let roots = self.file_roots.clone();
+                Response::Taken {
+                    taken: task_write(db, actor, uid, move |c, m, uid| {
+                        sessions::locate(c, m, uid, &owner, &place, roots.as_ref())
                     })?,
                 }
             }

@@ -3589,9 +3589,10 @@ fn a_session_owner_names_its_worktree_under_the_home() {
 }
 
 /// **A checkout another Claude Code session is still working in is not taken over** (decision E) —
-/// by another session the registry also knows to be running. The session that opened it resumes it;
-/// a process with no session, and a session the registry does not know (a subagent has an id of its
-/// own), are let through as before; once the opener has ended, anyone may take it over.
+/// by another session the registry also knows to be running. The opener resumes it; a process with no
+/// session, and a session the registry does not know (a subagent has an id of its own), are let
+/// through, and keep the opener they found rather than clearing it; once the opener has ended, a
+/// running session may take the checkout over and is recorded as its opener.
 #[test]
 fn a_session_opened_by_a_running_claude_session_is_not_taken_over() {
     let f = Fixture::new();
@@ -3605,47 +3606,50 @@ fn a_session_opened_by_a_running_claude_session_is_not_taken_over() {
         };
         cmd.output().unwrap()
     };
-    let opened = work_as(Some("opener-1"));
-    assert!(opened.status.success(), "{opened:?}");
-    let owner = claim_of(&f.db, &uid).expect("claimed");
-    assert!(
-        owner.contains("@opener-1:"),
-        "the opener is recorded: {owner}"
+    let opener = || {
+        let owner = claim_of(&f.db, &uid).expect("claimed");
+        owner
+            .split_once('@')
+            .and_then(|(_, rest)| rest.split_once(':'))
+            .map(|(by, _)| by.to_owned())
+    };
+    let first = work_as(Some("opener-1"));
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(
+        opener().as_deref(),
+        Some("opener-1"),
+        "the opener is recorded"
     );
 
-    // The opener unknown to the registry: nothing is known, nothing is held back — as before.
+    // A resume by a session the registry does not know keeps the opener it found.
     assert!(work_as(Some("other-2")).status.success());
-    assert!(
-        claim_of(&f.db, &uid).unwrap().contains("@other-2:"),
-        "the second run re-took the claim as itself"
-    );
+    assert_eq!(opener().as_deref(), Some("opener-1"));
 
-    // `other-2` is running, and so is `third-3`: the second top-level session is refused.
-    registry(&f.db, "other-2", true);
+    // `opener-1` is running, and so is `third-3`: the second top-level session is refused.
+    registry(&f.db, "opener-1", true);
     registry(&f.db, "third-3", true);
     let refused = work_as(Some("third-3"));
     assert!(!refused.status.success(), "{refused:?}");
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("still running"), "{stderr}");
-    assert!(stderr.contains("other-2"), "{stderr}");
-    assert!(
-        claim_of(&f.db, &uid).unwrap().contains("@other-2:"),
-        "unchanged"
-    );
-    // A session the registry does not know — a subagent — and a process with no session are let
-    // through; each takes the claim over as itself, so hand it back to `other-2` after each.
+    assert!(stderr.contains("opener-1"), "{stderr}");
+    assert_eq!(opener().as_deref(), Some("opener-1"), "unchanged");
+
+    // A subagent (unknown to the registry) and a process with no session are let through, and the
+    // opener survives them — so the running `third-3` is still refused afterwards.
     for caller in [Some("subagent-4"), None] {
         assert!(work_as(caller).status.success(), "{caller:?}");
-        assert!(
-            work_as(Some("other-2")).status.success(),
-            "the opener resumes"
-        );
+        assert_eq!(opener().as_deref(), Some("opener-1"), "{caller:?}");
+        assert!(!work_as(Some("third-3")).status.success(), "{caller:?}");
     }
+    // The opener, running, resumes its own checkout.
+    assert!(work_as(Some("opener-1")).status.success());
+    assert_eq!(opener().as_deref(), Some("opener-1"));
 
-    // Once `other-2` has ended, `third-3` may take the checkout over.
-    registry(&f.db, "other-2", false);
+    // Once `opener-1` has ended, the running `third-3` takes the checkout over, as its opener.
+    registry(&f.db, "opener-1", false);
     assert!(work_as(Some("third-3")).status.success());
-    assert!(claim_of(&f.db, &uid).unwrap().contains("@third-3:"));
+    assert_eq!(opener().as_deref(), Some("third-3"));
 }
 
 /// **A `~/` owner is judged from any home that reaches its checkout** (decision E): a session opened
@@ -3849,10 +3853,35 @@ fn a_session_blocked_by_a_running_sweep_leaves_no_claim() {
     std::fs::create_dir_all(&store).unwrap();
     // pid 1 on this host always exists, so the lock is live.
     std::fs::write(store.join(".sweep.lock"), "host:1 nonce").unwrap();
+    // The task already records where its work was; a refused run must leave that alone.
+    f.jkb()
+        .args(["task", "tag", "set", &uid, "branch=feat"])
+        .assert()
+        .success();
     f.jkb()
         .args(["task", "work", &uid])
         .assert()
         .failure()
         .stderr(predicate::str::contains("sweep is running"));
     assert_eq!(claim_of(&f.db, &uid), None);
+    let shown: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--global", "--json", "task", "show", &uid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let branches: Vec<&str> = shown["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["facet"] == "branch")
+        .map(|t| t["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        branches,
+        ["feat"],
+        "the recorded branch is untouched: {shown}"
+    );
 }

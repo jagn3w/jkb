@@ -13,7 +13,7 @@
 //! There is still deliberately **no time component**: no TTL, no heartbeat, so an agent paused
 //! on a permission prompt keeps its claim.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use jkb_fsm::Fact;
 
@@ -28,21 +28,22 @@ pub fn self_owner() -> String {
     AgentId::this_process(&hostname(), std::process::id()).as_str()
 }
 
-/// The owner id for a session working in `worktree`:
+/// The owner id for a session working in `worktree`, opened by the Claude Code session `opened_by`:
 /// `session:<this pid>[@<claude session>]:<worktree>`.
 ///
 /// The pid is **provenance** — which `jkb task work` process opened the session — and is
 /// deliberately *not* a liveness signal: that process exits within a second, long before anyone
-/// reads the claim. Liveness is the worktree; see [`is_alive`]. The Claude Code session this runs in
-/// (`CLAUDE_CODE_SESSION_ID`) is provenance too: it lets another session see whether the one that
-/// opened the work has ended (tasks S6.4, decision E).
+/// reads the claim. Liveness is the worktree; see [`is_alive`]. The opener is provenance too: it lets
+/// another session see whether the one that opened the work has ended (tasks S6.4, decision E). The
+/// caller chooses it — usually [`claude_session`], but a resume by something that is not a running
+/// session keeps the opener it found.
 ///
 /// The worktree is written `~/`-relative when it lies under `$HOME`, so the host and the dev
 /// container — which see the same `~/repos` under different homes — both resolve it
 /// ([`session_worktree`]).
 #[must_use]
-pub fn session_owner(worktree: &Path) -> String {
-    session_owner_in(worktree, claude_session().as_deref(), home().as_deref())
+pub fn session_owner(worktree: &Path, opened_by: Option<&str>) -> String {
+    session_owner_in(worktree, opened_by, home().as_deref())
 }
 
 /// [`session_owner`] with its environment handed in.
@@ -63,17 +64,55 @@ pub fn claude_session() -> Option<String> {
         .filter(|s| jkb_types::is_session_id(s))
 }
 
+/// `$HOME`, when it names a directory below `/` — a home of `/` (a uid with no passwd entry under
+/// `docker exec`) would make every absolute path home-relative, and another side would resolve it
+/// under its own home, to a different place.
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|h| h.is_absolute())
+    home_from(std::env::var_os("HOME"))
+}
+
+fn home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    raw.map(PathBuf::from)
+        .filter(|h| h.is_absolute() && h.components().any(|c| matches!(c, Component::Normal(_))))
 }
 
 /// `path` as `~/…` when it lies under `home`, else unchanged.
+///
+/// Asked of the paths as given and, failing that, as the filesystem resolves them: git reports a
+/// checkout's physical path (`/private/var/…` on macOS) while `$HOME` may name it through a symlink
+/// (`/var/…`), and a home reached through a link would otherwise never give a `~/` owner (stage-2
+/// review, round 2). A worktree that does not exist yet is resolved through its nearest existing
+/// ancestor.
 fn home_relative(path: &Path, home: Option<&Path>) -> PathBuf {
-    match home.and_then(|h| path.strip_prefix(h).ok()) {
-        Some(rest) if !rest.as_os_str().is_empty() => Path::new("~").join(rest),
-        _ => path.to_path_buf(),
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
+    let under = |p: &Path, h: &Path| {
+        p.strip_prefix(h)
+            .ok()
+            .filter(|rest| !rest.as_os_str().is_empty())
+            .map(|rest| Path::new("~").join(rest))
+    };
+    under(path, home)
+        .or_else(|| under(&resolved(path), &resolved(home)))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// `path` with symlinks resolved as far as it exists, and the rest appended unchanged.
+fn resolved(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -264,8 +303,8 @@ fn liveness_from(probe: Result<(), Errno>) -> Fact {
 #[cfg(test)]
 mod tests {
     use super::{
-        alive_in, home_relative, hostname, is_alive, resolve_home, self_owner, session_owner,
-        session_owner_in, session_worktree,
+        alive_in, home_from, home_relative, hostname, is_alive, resolve_home, self_owner,
+        session_owner, session_owner_in, session_worktree,
     };
     use jkb_fsm::Fact;
     use jkb_types::AgentId;
@@ -317,12 +356,12 @@ mod tests {
         // Alive: the checkout is there.
         let live = work.join("live");
         std::fs::create_dir(&live).unwrap();
-        assert_eq!(is_alive(&session_owner(&live)), Fact::Yes);
+        assert_eq!(is_alive(&session_owner(&live, None)), Fact::Yes);
 
         // Provably gone: this machine can see the directory it would be in.
         let gone = work.join("gone");
         assert_eq!(
-            is_alive(&session_owner(&gone)),
+            is_alive(&session_owner(&gone, None)),
             Fact::No,
             "an absence IS proof where the place it would be is visible"
         );
@@ -415,7 +454,7 @@ mod tests {
     #[test]
     fn a_session_outlives_the_process_that_claimed_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let owner = session_owner(tmp.path());
+        let owner = session_owner(tmp.path(), None);
         assert_eq!(owner_pid(&owner), Some(std::process::id()));
         assert_eq!(session_worktree(&owner).as_deref(), Some(tmp.path()));
 
@@ -438,6 +477,18 @@ mod tests {
         assert_eq!(is_alive(&gone), Fact::No, "the worktree alone decides");
 
         assert!(session_worktree("host:123").is_none());
+    }
+
+    /// A home of `/` names no directory of its own: taken as a home, it would make every absolute path
+    /// `~/…` and another side would resolve it under its own home, somewhere else entirely.
+    #[test]
+    fn a_home_of_root_is_no_home() {
+        let is_home = |h: &str| home_from(Some(h.into())).is_some();
+        assert!(!is_home("/"));
+        assert!(!is_home("relative"));
+        assert!(!is_home(""));
+        assert!(is_home("/home/me"));
+        assert_eq!(home_from(None), None);
     }
 
     #[test]
@@ -549,6 +600,19 @@ mod tests {
             alive_in(&owner, None),
             Fact::Unknown,
             "no home, no place to look"
+        );
+        // Written through a home that is a symlink to where the checkout really is — git reports
+        // the physical path — the owner is still home-relative.
+        let linked_home = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&container_home, &linked_home).unwrap();
+        let physical = container_home
+            .canonicalize()
+            .unwrap()
+            .join("repos/proj/.jkb/work/t");
+        assert!(
+            session_owner_in(&physical, None, Some(&linked_home))
+                .ends_with(":~/repos/proj/.jkb/work/t"),
+            "a worktree not made yet, under a linked home"
         );
         // An absolute owner is judged as it always was, whatever the home.
         let abs = session_owner_in(&work.join("s"), None, Some(&elsewhere));

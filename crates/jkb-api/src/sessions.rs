@@ -18,13 +18,13 @@
 use std::collections::BTreeMap;
 
 use jkb_core::lifecycle::{self, TaskEvent};
-use jkb_core::location::{set_location_facets, valid_ref, Location, FACET_BRANCH, FACET_REPO};
+use jkb_core::location::{set_location_facets, valid_ref, Location, FACET_BRANCH};
 use jkb_core::{claim, item, ns, tag, task, transition, WriteMeta};
 use jkb_types::AgentId;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::tasks::{check_owner, no_item, writable, FileRoots};
+use crate::tasks::{check_line, check_owner, line_problem, no_item, writable, FileRoots};
 use crate::{ApiError, ErrorCode};
 
 /// The longest branch, repo key or land target a session op accepts, in bytes. Each is stored as a
@@ -109,16 +109,7 @@ pub struct BranchTask {
 /// [`ErrorCode::Invalid`] for a malformed repo key, or a failed read.
 pub fn by_branch(conn: &Connection, repo: &str) -> Result<BTreeMap<String, BranchTask>, ApiError> {
     check_name("repo key", repo)?;
-    let query = jkb_core::query::Query {
-        kind: Some("task".to_owned()),
-        tags: vec![jkb_core::query::TagPred {
-            facet: FACET_REPO.to_owned(),
-            op: jkb_core::query::CmpOp::Eq,
-            value: repo.to_owned(),
-        }],
-        ..jkb_core::query::Query::default()
-    };
-    let ids = query.evaluate(conn)?;
+    let ids = jkb_core::location::tasks_in_repo(repo).evaluate(conn)?;
     let metas = item::get_many(conn, &ids)?;
     let tags = tag::applications_for(conn, &ids)?;
     let mut out = BTreeMap::new();
@@ -305,17 +296,17 @@ pub struct TakeAsk {
     pub place: Place,
 }
 
-/// `task.take`: `jkb task work`'s claim and location, in one transaction — the `start` transition
-/// carrying the session's branch and land target, compare-and-set against the owner the caller
-/// judged, and the location facets set beside it. `false` when the claim changed hands, with nothing
-/// written.
+/// `task.take`: `jkb task work`'s claim — the `start` transition carrying the session's branch and
+/// land target, compare-and-set against the owner the caller judged. `false` when the claim changed
+/// hands, with nothing written.
 ///
-/// **Before any git work**, so every refusal — a malformed place, a line the task's `tasks.md` could
-/// not read back — comes while there is nothing to undo. The facets were written after the worktree
-/// was made, and a refusal there left a claim on a checkout no verb could find its task from.
-///
-/// The facets are written under the claim that was just taken, so a run displaced by another cannot
-/// later overwrite the location the new holder recorded.
+/// **The location is judged here and written later** ([`locate`], once the worktree exists). Every
+/// refusal of it — a malformed place, a line the task's `tasks.md` could not read back with it —
+/// comes now, while there is nothing to undo: the facets are written for trial inside a savepoint,
+/// the line is checked, and the trial is rolled back. Written for real here, a run that then failed
+/// its git work left the task pointing at a branch nobody made and unlinked from the one it had
+/// (stage-2 review, round 2); refused only after the worktree was made, it left a claim on a
+/// checkout no verb could find its task from (round 1).
 ///
 /// # Errors
 /// As [`start`].
@@ -334,10 +325,52 @@ pub fn take(
         ));
     }
     let id = writable(conn, &ask.uid, roots)?;
-    if !swap(conn, meta, id, &ask.take, &ask.place.labels())? {
+    trial_locate(conn, meta, id, &ask.uid, &ask.place)?;
+    swap(conn, meta, id, &ask.take, &ask.place.labels())
+}
+
+/// Write the place, check the task's `tasks.md` line would still read back, and undo the write —
+/// whatever the check said. The refusal is the check's own, as a write would get it.
+fn trial_locate(
+    conn: &Connection,
+    meta: &WriteMeta,
+    id: jkb_types::ItemId,
+    uid: &str,
+    place: &Place,
+) -> Result<(), ApiError> {
+    let before = line_problem(conn, uid)?;
+    conn.execute_batch("SAVEPOINT trial_locate")
+        .map_err(jkb_core::Error::from)?;
+    let tried =
+        locate_id(conn, meta, id, place).and_then(|()| check_line(conn, uid, before.as_deref()));
+    conn.execute_batch("ROLLBACK TO trial_locate; RELEASE trial_locate")
+        .map_err(jkb_core::Error::from)?;
+    tried
+}
+
+/// `task.locate`: record where `owner`'s work on a task is — the facets are *set*, not added, since a
+/// second value would be a contradiction (D36.6). **Only while `owner` holds the claim**: `false`, with
+/// nothing written, when it does not, so a run displaced by another cannot overwrite the location its
+/// successor recorded.
+///
+/// # Errors
+/// As [`start`].
+pub fn locate(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    owner: &str,
+    place: &Place,
+    roots: Option<&FileRoots>,
+) -> Result<bool, ApiError> {
+    check_owner(owner)?;
+    place.check()?;
+    let id = writable(conn, uid, roots)?;
+    let held = task::observe(conn, id)?.claimant.map(|c| c.as_str());
+    if held.as_deref() != Some(owner) {
         return Ok(false);
     }
-    locate_id(conn, meta, id, &ask.place)?;
+    locate_id(conn, meta, id, place)?;
     Ok(true)
 }
 

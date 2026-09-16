@@ -638,7 +638,6 @@ impl<'a> Ops<'a> {
     }
 }
 
-/// An answer of the wrong shape: a daemon from another build that means something else by the op.
 /// An op's refusal as this command's error — the one mapping, for [`Ops`] and every client module
 /// that speaks to a backend directly.
 pub(crate) fn op_error(e: ApiError, remote: bool) -> anyhow::Error {
@@ -652,6 +651,7 @@ pub(crate) fn op_error(e: ApiError, remote: bool) -> anyhow::Error {
     }
 }
 
+/// An answer of the wrong shape: a daemon from another build that means something else by the op.
 pub(crate) fn unexpected<T>(op: &str, response: &Response) -> Result<T> {
     let kind = serde_json::to_value(response)
         .ok()

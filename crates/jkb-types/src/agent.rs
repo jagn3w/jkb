@@ -275,10 +275,13 @@ pub const MAX_SESSION_ID_BYTES: usize = 200;
 /// which keeps an id clear of an owner's `@` and `:`.
 #[must_use]
 pub fn is_session_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= MAX_SESSION_ID_BYTES
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    !s.is_empty() && s.len() <= MAX_SESSION_ID_BYTES && s.bytes().all(is_session_id_byte)
+}
+
+/// A byte a session id may hold — the alphabet [`is_session_id`] and the hook's sanitizer share.
+#[must_use]
+pub const fn is_session_id_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
 impl fmt::Display for AgentId {
@@ -346,6 +349,17 @@ mod tests {
             "an id with a separator is dropped, not stored"
         );
         assert_eq!(AgentId::session(1, Some(""), w).opened_by(), None);
+        let longest = "a".repeat(super::MAX_SESSION_ID_BYTES);
+        assert_eq!(
+            AgentId::session(1, Some(&longest), w).opened_by(),
+            Some(longest.as_str()),
+            "the longest id is kept"
+        );
+        assert_eq!(
+            AgentId::session(1, Some(&format!("{longest}a")), w).opened_by(),
+            None,
+            "one byte longer is dropped"
+        );
         assert_eq!(
             AgentId::parse("session:1@s-1:/tmp/w").liveness(),
             Liveness::Worktree(PathBuf::from("/tmp/w"))

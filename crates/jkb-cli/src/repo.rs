@@ -18,7 +18,7 @@ use jkb_types::ItemId;
 
 use crate::gitrepo;
 
-pub(crate) use jkb_core::location::{set_facet, FACET_BRANCH, FACET_REPO};
+pub(crate) use jkb_core::location::{set_facet, FACET_BRANCH};
 
 /// The branch a session's work lands on used to be a facet here (`onto=`). It is now
 /// a label on the task's transition history: it is a statement about a moment, so two tasks told
@@ -152,25 +152,10 @@ pub(crate) fn repo_ctx() -> Result<RepoCtx> {
     Ok(RepoCtx { root, key, trunk })
 }
 
-/// Every task tagged `repo=<repo_key>`, as a **typed** query.
-///
-/// Built rather than parsed from `format!("kind:task tag:repo={key}")`: the key is a
-/// directory basename, so a repo cloned into `~/dev/my project` produced `tag:repo=my` plus
-/// a bare FTS term, which matches nothing. Every staging surface then reported empty — no
-/// staging branches, no batch to join, no task recording the branch a review ran on — while
-/// the tags themselves were stored correctly and nothing errored. Same reasoning as
-/// `review::findings_in`, which was fixed for the namespace and left here.
+/// Every task tagged `repo=<repo_key>` — `jkb_core::location::tasks_in_repo`, the one definition the
+/// session ops share.
 pub(crate) fn tasks_in_repo(repo_key: &str) -> jkb_core::query::Query {
-    use jkb_core::query::{CmpOp, Query, TagPred};
-    Query {
-        kind: Some("task".to_owned()),
-        tags: vec![TagPred {
-            facet: FACET_REPO.to_owned(),
-            op: CmpOp::Eq,
-            value: repo_key.to_owned(),
-        }],
-        ..Query::default()
-    }
+    jkb_core::location::tasks_in_repo(repo_key)
 }
 
 /// One of this repo's tasks with everything the session and staging reads need.

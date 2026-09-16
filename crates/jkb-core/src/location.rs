@@ -43,6 +43,27 @@ pub fn valid_ref(name: &str) -> Result<()> {
     }
 }
 
+/// Every task tagged `repo=<repo_key>`, as a **typed** query — the one definition of "this repo's
+/// tasks", which the session ops (`jkb_api::sessions`) and the staging surfaces both ask, so they cannot
+/// disagree about which batches are live.
+///
+/// Built rather than parsed from `format!("kind:task tag:repo={key}")`: the key is a directory
+/// basename, so a repo cloned into `~/dev/my project` produced `tag:repo=my` plus a bare FTS term,
+/// which matches nothing.
+#[must_use]
+pub fn tasks_in_repo(repo_key: &str) -> crate::query::Query {
+    use crate::query::{CmpOp, Query, TagPred};
+    Query {
+        kind: Some("task".to_owned()),
+        tags: vec![TagPred {
+            facet: FACET_REPO.to_owned(),
+            op: CmpOp::Eq,
+            value: repo_key.to_owned(),
+        }],
+        ..Query::default()
+    }
+}
+
 /// The facet recording which branch a task is being done on, and which repo that branch is
 /// in. Plain tags (design D34.1): no migration, and queryable as `tag:branch=<name>`.
 pub const FACET_BRANCH: &str = "branch";

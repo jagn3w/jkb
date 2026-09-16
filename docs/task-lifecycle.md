@@ -136,8 +136,11 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   `CLAUDE_CODE_SESSION_ID` (measured), and `CLAUDE_CODE_CHILD_SESSION` is set in a top-level
   session's shell as well, so nothing tells a subagent apart. Whether a subagent's start ever
   reaches the registry is not measured; if it does, a subagent resuming its parent's checkout is
-  refused. The refusal names `jkb task release` for an opener that is gone but was never recorded
-  as such. Pinned by `a_session_opened_by_a_running_claude_session_is_not_taken_over`,
+  refused. A resume by something that is not itself a running, registered session keeps the opener
+  it found rather than clearing it; otherwise one terminal resume would have lifted the protection.
+  The refusal names `jkb task release` for an opener that is gone but was never recorded as such. A
+  home reached through a symlink still gives a `~/` owner: git reports the physical path, so the
+  mapping also compares the resolved paths. Pinned by `a_session_opened_by_a_running_claude_session_is_not_taken_over`,
   `a_session_owner_names_its_worktree_under_the_home` and
   `a_home_relative_owner_is_reclaimed_from_another_home`.
 - **The session verbs' database steps are ops** (tasks S6.4, `jkb_api::sessions`), and every write
@@ -145,9 +148,13 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   - `task.start` and `task.take` clear only the owner they were told about, and write nothing when a
     claim appeared that the caller did not see. `task.start` keeping a claim writes only while that
     claim is still there.
-  - `task.take` records `task work`'s location in the claim's own transaction, **before** any git
-    work. A refusal of the location (a `tasks.md` line that could not carry it) then leaves nothing
-    to undo, and a displaced run cannot overwrite what its successor recorded.
+  - `task.take` **judges** `task work`'s location before any git work: it writes the facets for
+    trial in a savepoint, checks the task's `tasks.md` line, and rolls the trial back. A refusal
+    (a line that could not carry the place) then leaves nothing to undo. `task.locate` records the
+    location once the worktree exists, and only while the run still holds the claim, so a displaced
+    run cannot overwrite what its successor recorded. Writing the location with the claim, as the
+    first fix did, left a run that then failed its git work pointing the task at a branch nobody
+    made (stage-2 review, round 2).
   - `task.abandon` changes nothing when the claim is no longer the one observed before the git work.
   - A failed worktree add, and a pending removal that could not be cancelled, release only the verb's
     own claim, through `task.release`. The first used to clear the claim unconditionally; the second
