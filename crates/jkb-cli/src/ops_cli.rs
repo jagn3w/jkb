@@ -178,20 +178,18 @@ impl<'a> Ops<'a> {
         self.backend
     }
 
+    /// Whether this serves through `jkb serve`.
+    pub(crate) const fn is_remote(&self) -> bool {
+        self.remote
+    }
+
     /// Every op goes through here, so a cut answer is reported here — once, for every command, rather
     /// than in each place an answer is taken apart, where one arm could forget.
     pub(crate) fn call(&self, request: Request) -> Result<Response> {
         let response = self
             .backend
             .call(request)
-            .map_err(|e: ApiError| match e.code {
-                // The daemon's body cap is its own; the host takes the same request whole.
-                ErrorCode::TooLarge if self.remote => anyhow::anyhow!(
-                    "{} — larger than the daemon accepts in one request; run it on the host",
-                    e.message
-                ),
-                _ => anyhow::Error::msg(e.message),
-            })?;
+            .map_err(|e| op_error(e, self.remote))?;
         // What cut it decides what lifts it: the daemon's byte budget is lifted on the host, which has
         // none; a tree's node cap is the same everywhere.
         let notice = match &response {
@@ -641,6 +639,19 @@ impl<'a> Ops<'a> {
 }
 
 /// An answer of the wrong shape: a daemon from another build that means something else by the op.
+/// An op's refusal as this command's error — the one mapping, for [`Ops`] and every client module
+/// that speaks to a backend directly.
+pub(crate) fn op_error(e: ApiError, remote: bool) -> anyhow::Error {
+    match e.code {
+        // The daemon's body cap is its own; the host takes the same request whole.
+        ErrorCode::TooLarge if remote => anyhow::anyhow!(
+            "{} — larger than the daemon accepts in one request; run it on the host",
+            e.message
+        ),
+        _ => anyhow::Error::msg(e.message),
+    }
+}
+
 pub(crate) fn unexpected<T>(op: &str, response: &Response) -> Result<T> {
     let kind = serde_json::to_value(response)
         .ok()

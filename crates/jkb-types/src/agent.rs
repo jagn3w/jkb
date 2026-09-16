@@ -165,8 +165,8 @@ impl AgentId {
         let rest: Vec<&str> = parts.collect();
         match head {
             SESSION => {
-                // `session:<pid>:<worktree>`; fields 2.. are rejoined so a path containing a
-                // colon survives the round trip.
+                // `session:<pid>[@<claude session>]:<worktree>`; fields 2.. are rejoined so a path
+                // containing a colon survives the round trip.
                 match rest.split_first() {
                     Some((opener, tail)) if !tail.is_empty() => {
                         let (pid, opened_by) = match opener.split_once('@') {
@@ -267,12 +267,16 @@ impl AgentId {
     }
 }
 
+/// The longest Claude Code session id jkb records.
+pub const MAX_SESSION_ID_BYTES: usize = 200;
+
 /// Whether `s` can be a Claude Code session id as jkb records one: non-empty, bounded, and only
-/// `[A-Za-z0-9_-]` — the notification ops' rule, which also keeps it clear of `@` and `:`.
+/// `[A-Za-z0-9_-]` — THE rule, which the session registry and the notification ops apply too, and
+/// which keeps an id clear of an owner's `@` and `:`.
 #[must_use]
 pub fn is_session_id(s: &str) -> bool {
     !s.is_empty()
-        && s.len() <= 200
+        && s.len() <= MAX_SESSION_ID_BYTES
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }

@@ -42,10 +42,15 @@ pub fn self_owner() -> String {
 /// ([`session_worktree`]).
 #[must_use]
 pub fn session_owner(worktree: &Path) -> String {
+    session_owner_in(worktree, claude_session().as_deref(), home().as_deref())
+}
+
+/// [`session_owner`] with its environment handed in.
+fn session_owner_in(worktree: &Path, opened_by: Option<&str>, home: Option<&Path>) -> String {
     AgentId::session(
         std::process::id(),
-        claude_session().as_deref(),
-        &home_relative(worktree, home().as_deref()),
+        opened_by,
+        &home_relative(worktree, home),
     )
     .as_str()
 }
@@ -163,6 +168,11 @@ pub fn hostname() -> String {
 ///   [`Fact::Unknown`]: nothing here can say. That is not "dead" — see the module docs.
 #[must_use]
 pub fn is_alive(owner: &str) -> Fact {
+    alive_in(owner, home().as_deref())
+}
+
+/// [`is_alive`], with the home a `~/` worktree resolves against handed in.
+fn alive_in(owner: &str, home: Option<&Path>) -> Fact {
     match AgentId::parse(owner).liveness() {
         // A pid is only meaningful on the host that issued it. `~/.jkb` is bind-mounted into the
         // dev container on purpose, so a claim — or a sweep lock — written in there names a pid in
@@ -172,7 +182,7 @@ pub fn is_alive(owner: &str) -> Fact {
         Liveness::Process { host, pid } if host == hostname() => pid_exists(pid),
         // An absence is only proof where the place it would be is visible, and for an owner id
         // the only anchor available is the path's own parent — see [`present_here`].
-        Liveness::Worktree(dir) => present_here(&resolve_home(&dir, home().as_deref())),
+        Liveness::Worktree(dir) => present_here(&resolve_home(&dir, home)),
         // An owner on another host and an external agent are the same answer for the same
         // reason: nothing here can establish it. Never "dead" — see the module docs.
         Liveness::Process { .. } | Liveness::External => Fact::Unknown,
@@ -254,8 +264,8 @@ fn liveness_from(probe: Result<(), Errno>) -> Fact {
 #[cfg(test)]
 mod tests {
     use super::{
-        home_relative, hostname, is_alive, resolve_home, self_owner, session_owner,
-        session_worktree,
+        alive_in, home_relative, hostname, is_alive, resolve_home, self_owner, session_owner,
+        session_owner_in, session_worktree,
     };
     use jkb_fsm::Fact;
     use jkb_types::AgentId;
@@ -495,23 +505,54 @@ mod tests {
         );
     }
 
-    /// The owner this process mints for a worktree under its home is home-relative, and resolves back
-    /// to the same directory here — so the probe still sees a live session as live.
+    /// **A `~/` owner is judged against the home of whoever asks** — which is what lets the host and
+    /// the dev container judge each other's sessions — and a session opened under one home is judged
+    /// live, then dead, from another that reaches the same checkout by a different path.
     #[test]
-    fn a_minted_session_owner_round_trips_through_this_home() {
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            return;
-        };
-        let Ok(tmp) = tempfile::tempdir_in(&home) else {
-            return; // a home this test may not write in: nothing to assert
-        };
-        let owner = session_owner(tmp.path());
-        let worktree = AgentId::parse(&owner);
+    fn a_home_relative_owner_is_judged_against_the_asker_s_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let container_home = tmp.path().join("container");
+        let host_home = tmp.path().join("host");
+        let work = container_home.join("repos/proj/.jkb/work");
+        std::fs::create_dir_all(work.join("s")).unwrap();
+        std::fs::create_dir_all(&host_home).unwrap();
+        // The host sees the same `repos` under its own home.
+        std::os::unix::fs::symlink(container_home.join("repos"), host_home.join("repos")).unwrap();
+
+        let owner = session_owner_in(&work.join("s"), Some("sess-1"), Some(&container_home));
         assert!(
-            worktree.worktree().is_some_and(|w| w.starts_with("~")),
-            "{owner}"
+            owner.contains("@sess-1:~/repos/proj/.jkb/work/s"),
+            "written under the home, with its opener: {owner}"
         );
-        assert_eq!(session_worktree(&owner).as_deref(), Some(tmp.path()));
-        assert_eq!(is_alive(&owner), Fact::Yes);
+        for home in [&container_home, &host_home] {
+            assert_eq!(
+                alive_in(&owner, Some(home)),
+                Fact::Yes,
+                "{}",
+                home.display()
+            );
+        }
+        std::fs::remove_dir(work.join("s")).unwrap();
+        for home in [&container_home, &host_home] {
+            assert_eq!(
+                alive_in(&owner, Some(home)),
+                Fact::No,
+                "gone, from {}",
+                home.display()
+            );
+        }
+        // A home that does not reach the checkout establishes nothing.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(alive_in(&owner, Some(&elsewhere)), Fact::Unknown);
+        assert_eq!(
+            alive_in(&owner, None),
+            Fact::Unknown,
+            "no home, no place to look"
+        );
+        // An absolute owner is judged as it always was, whatever the home.
+        let abs = session_owner_in(&work.join("s"), None, Some(&elsewhere));
+        assert!(!abs.contains('~'), "{abs}");
+        assert_eq!(alive_in(&abs, Some(&host_home)), Fact::No);
     }
 }

@@ -238,6 +238,7 @@ fn samples() -> Vec<Request> {
         Request::TaskStart(super::sessions::StartAsk {
             uid: "u".into(),
             take: None,
+            keep: Some("agent:x".into()),
             place: super::sessions::Place {
                 branch: "b".into(),
                 repo: "r".into(),
@@ -250,17 +251,12 @@ fn samples() -> Vec<Request> {
                 owner: "agent:x".into(),
                 displace: None,
             },
-            branch: "b".into(),
-            onto: "o".into(),
-        }),
-        Request::TaskLocate {
-            uid: "u".into(),
             place: super::sessions::Place {
                 branch: "b".into(),
                 repo: "r".into(),
-                onto: None,
+                onto: Some("o".into()),
             },
-        },
+        }),
         Request::TaskAbandon {
             uid: "u".into(),
             observed: None,
@@ -1699,7 +1695,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 15, "every task write was asked");
+    assert_eq!(checked, 14, "every task write was asked");
 }
 
 #[test]
@@ -1987,9 +1983,7 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
                 "place": { "branch": "b1", "repo": "r", "onto": "o" } }),
         json!({ "op": "task.take", "uid": inside,
                 "take": { "owner": "agent:c", "displace": "agent:b" },
-                "branch": "b", "onto": "o" }),
-        json!({ "op": "task.locate", "uid": inside,
-                "place": { "branch": "b2", "repo": "r" } }),
+                "place": { "branch": "b2", "repo": "r", "onto": "o" } }),
         json!({ "op": "task.abandon", "uid": inside, "observed": "agent:c" }),
     ];
     // Every task write the wire accepts is here; `task.add` checks the task it makes, below.

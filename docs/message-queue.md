@@ -88,14 +88,13 @@ routinely built from different checkouts.
 | `task.bind` | `uid`, `sync?` (`managed:` when absent) | `applied` |
 | `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
 | `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
-| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?`, `terminal`} |
+| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?` (for a finished task only), `terminal`} |
 | `task.by_branch` | `repo` | `branch_tasks` {`tasks`: branch → {`uid`, `status`, `onto?`}} |
-| `task.start` | `uid`, `take?` {`owner`, `displace?`}, `place` {`branch`, `repo`, `onto?`} | `taken` {`taken`} — `false`, nothing written, when the claim is no longer `displace` |
-| `task.take` | `uid`, `take` {`owner`, `displace?`}, `branch`, `onto` | `taken` {`taken`} |
-| `task.locate` | `uid`, `place` {`branch`, `repo`, `onto?`} | `applied` |
+| `task.start` | `uid`, exactly one of `take` {`owner`, `displace?`} and `keep` (the claim kept), `place` {`branch`, `repo`, `onto?`} | `taken` {`taken`} — `false`, nothing written, when the claim is not the one judged (`displace`, `keep`, or none) |
+| `task.take` | `uid`, `take` {`owner`, `displace?`}, `place` {`branch`, `repo`, `onto`} — claim and location in one write | `taken` {`taken`} |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`reopened`, `status`} |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
-| `session.state` | `session` | `session_is` {`state`: `live`\|`ended`\|`unknown`} |
+| `session.state` | `session` | `session_is` {`state`: `live`\|`ended`\|`unknown`} (a closed set) |
 | `ingest.text` | `text`, `mime` (≤ 255 bytes), `namespace` | `ingested` {`document`, `namespace`, `chunk_count`, `embedded`, `already_ingested`, `warnings`} |
 
 Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`, `history`) and `grep_hits`
@@ -174,9 +173,10 @@ Two decisions in it:
   remove one, and `ns mv` checks every path it would write.
   `task.add`'s global-backlog question is answered by running the whole create and rolling it back, so
   it is asked only when the add would otherwise succeed.
-- **What stays on the host.** `task start`/`work`/`land`/`abandon`/`gate`/`sessions` run git, the
-  session record store beside the database and the stored gate command, which a later stage splits
-  into client-side work and ops; `task reclaim` proves owners gone by probing their processes, which
+- **What stays on the host.** The session verbs are being split into client-side git and ops (tasks
+  S6.4, `jkb_api::sessions`): `task start` and `task gate` (show) run remotely; `work`, `abandon` and
+  `sessions` still read the removal records beside the database, and `land` is not yet ported;
+  storing a gate never runs remotely (a stored gate is a command the host runs). `task reclaim` proves owners gone by probing their processes, which
   only their host can do — a claim held by a live or unestablished owner is refused by `task.claim`
   from anywhere; and `task mirror` is a sweep over every task.
 
@@ -516,7 +516,8 @@ migration's lock),
   it will take already exists; see `.container/README.md`, "The one opening to the host".
 - The rest of the container's commands, then the cutover — stages S6.4/S6.5. The read set (S6.1), the
   task-mutate set (S6.2) and ingest (S6.3) are done; `stat`, `item show`/`edit`/`rm`, `related`, `inv`, `view`, `ns`, `tag`, `undo`,
-  `history`, `blob`, and the session verbs (`task start`/`work`/`land`/…) are still refused remotely.
+  `history`, `blob`, and the session verbs other than `task start` and `task gate` (show) are still
+  refused remotely.
 - Embedding what the container ingests (tasks F5): captured and keyword-searchable, it stays unembedded
   until `jkb index --pending` runs on the host, and nothing runs it on a schedule.
 - The MCP server's read tools (`jkb-mcp/src/logic.rs`) still read the database directly rather than

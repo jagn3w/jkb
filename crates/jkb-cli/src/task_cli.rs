@@ -29,7 +29,7 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             repo,
             owner,
         } => crate::session_cli::start(
-            &crate::session_cli::Kb::new(ops.backend()),
+            &crate::session_cli::Kb::from_ops(ops),
             &uid,
             crate::session_cli::StartWhere {
                 branch,
@@ -42,7 +42,7 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Gate {
             cmd: None,
             clear: false,
-        } => crate::session_cli::gate(&crate::session_cli::Kb::new(ops.backend()), ops.json),
+        } => crate::session_cli::gate(&crate::session_cli::Kb::from_ops(ops), ops.json),
         TaskCmd::Add {
             text,
             backlog,

@@ -487,7 +487,7 @@ pub struct SessionRecord {
     pub updated_at: i64,
 }
 
-const MAX_SESSION_BYTES: usize = 200;
+const MAX_SESSION_BYTES: usize = jkb_types::MAX_SESSION_ID_BYTES;
 const MAX_INSTANCE_BYTES: usize = 150;
 const MAX_OWNER_BYTES: usize = 20;
 
@@ -503,16 +503,12 @@ fn invalid(what: &'static str, why: impl Into<String>) -> crate::Error {
 /// ([`crate::claude_session`]), so one hook invocation's `notify.*` and `session.*` requests are held to
 /// one rule.
 pub(crate) fn check_session(session: &str) -> Result<()> {
-    if session.is_empty() || session.len() > MAX_SESSION_BYTES {
+    // `jkb_types::is_session_id` is the rule — the one a session owner's opener is held to as well,
+    // so an id the registry records is never one an owner silently drops.
+    if !jkb_types::is_session_id(session) {
         return Err(invalid(
             "session",
-            format!("must be 1..={MAX_SESSION_BYTES} bytes"),
-        ));
-    }
-    if sanitize(session) != session {
-        return Err(invalid(
-            "session",
-            format!("{session:?} has characters other than [A-Za-z0-9_-]"),
+            format!("{session:?} is not 1..={MAX_SESSION_BYTES} bytes of [A-Za-z0-9_-]"),
         ));
     }
     Ok(())

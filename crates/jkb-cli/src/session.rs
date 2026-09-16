@@ -317,20 +317,9 @@ fn repo_ns(repo_key: &str) -> String {
     format!("repos/{repo_key}")
 }
 
-/// The gate command remembered for `repo_key`, if any.
-///
-/// # Errors
-/// Returns an error if the database read fails.
-pub fn stored_gate(db: &Db, repo_key: &str) -> Result<Option<String>> {
-    let path = repo_ns(repo_key);
-    Ok(db.read(move |conn| {
-        let Some(id) = ns::get(conn, &path)? else {
-            return Ok(None);
-        };
-        Ok(ns::get_metadata(conn, id)?
-            .and_then(|m| m.get("gate").and_then(Value::as_str).map(str::to_owned)))
-    })?)
-}
+// The gate command remembered for a repo is read through the `repo.gate` op
+// (`crate::session_cli::Kb::gate`), the one reader in both modes; storing one stays here, a host
+// command (decision A).
 
 /// Remember `cmd` as `repo_key`'s gate (or forget it when `cmd` is [`None`]).
 ///
@@ -410,6 +399,7 @@ impl GateSource {
 /// Returns an error if reading or writing the stored gate fails.
 pub fn resolve_gate(
     db: &Db,
+    kb: &crate::session_cli::Kb<'_>,
     repo_root: &Path,
     repo_key: &str,
     flag: Option<&str>,
@@ -422,7 +412,7 @@ pub fn resolve_gate(
         set_gate(db, repo_key, Some(cmd))?;
         return Ok((Some(cmd.to_owned()), GateSource::Flag));
     }
-    if let Some(cmd) = stored_gate(db, repo_key)? {
+    if let Some(cmd) = kb.gate(repo_key)? {
         return Ok((Some(cmd), GateSource::Stored));
     }
     match autodetect_gate(repo_root) {

@@ -3925,7 +3925,15 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
         ),
     };
 
-    let (gate, source) = session::resolve_gate(db, &ctx.root, &ctx.key, gate_flag, no_gate)?;
+    let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
+    let (gate, source) = session::resolve_gate(
+        db,
+        &session_cli::Kb::new(&backend),
+        &ctx.root,
+        &ctx.key,
+        gate_flag,
+        no_gate,
+    )?;
     if !json {
         println!(
             "gate: {} ({})",

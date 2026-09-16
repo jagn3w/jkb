@@ -12,7 +12,7 @@
 //! Liveness is by **owner-existence**, never by a claim's age: there is no TTL and no
 //! agent heartbeat, precisely so a paused-but-alive agent (e.g. blocked on a permission
 //! prompt) is never reclaimed. The `claimant_id` is a liveness-checkable owner id
-//! (`host:pid`+run, or `session:<pid>:<worktree>`); the probe lives at the CLI/coordinator
+//! (`host:pid`+run, or `session:<pid>[@<claude session>]:<worktree>`); the probe lives at the CLI/coordinator
 //! edge (`owner::is_alive` — `kill(pid, 0)` for a process owner, worktree existence for a
 //! session owner) — this
 //! module only records who holds what. Every seam here is **changelogged** (op

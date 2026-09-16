@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use jkb_core::lifecycle::{self, TaskEvent};
-use jkb_core::location::{set_location_facets, Location, FACET_BRANCH, FACET_REPO};
+use jkb_core::location::{set_location_facets, valid_ref, Location, FACET_BRANCH, FACET_REPO};
 use jkb_core::{claim, item, ns, tag, task, transition, WriteMeta};
 use jkb_types::AgentId;
 use rusqlite::Connection;
@@ -54,8 +54,9 @@ pub struct TaskState {
     pub claim: Option<String>,
     /// Where its work lands, from its transition history.
     pub land_target: Option<String>,
-    /// Why the lifecycle would refuse to start it, if it would — for a terminal task, what
-    /// `task work` refuses with.
+    /// Why the lifecycle refuses to start a **finished** task — what `task work` refuses with. `None`
+    /// for a task that is not finished: whether an unfinished one can be started depends on who asks,
+    /// which only the write decides.
     pub start_refusal: Option<String>,
     /// Whether its status is terminal (`done`, `cancelled`).
     pub terminal: bool,
@@ -74,14 +75,19 @@ pub fn facts(conn: &Connection, reference: &str) -> Result<TaskState, ApiError> 
     }
     let observed = task::observe(conn, id)?;
     let status = meta.status.clone().unwrap_or_default();
+    let terminal = jkb_types::TaskStatus::is_terminal_str(Some(status.as_str()));
     Ok(TaskState {
         uid: meta.uid,
-        terminal: jkb_types::TaskStatus::is_terminal_str(Some(status.as_str())),
+        terminal,
         status,
         tags,
         claim: observed.claimant.as_ref().map(AgentId::as_str),
         land_target: transition::land_target(conn, id)?,
-        start_refusal: lifecycle::apply(&observed, TaskEvent::Start).refusal(),
+        start_refusal: if terminal {
+            lifecycle::apply(&observed, TaskEvent::Start).refusal()
+        } else {
+            None
+        },
     })
 }
 
@@ -150,13 +156,26 @@ pub struct Place {
 }
 
 impl Place {
+    /// Bounded, and the branch and land target are names git can take — the check every other
+    /// writer of a land target makes, so a value like `--upload-pack=…` is refused here rather than
+    /// stored for `staging ls` and `task land` to trip on.
     fn check(&self) -> Result<(), ApiError> {
         check_name("branch", &self.branch)?;
+        valid_ref(&self.branch)?;
         check_name("repo key", &self.repo)?;
         if let Some(onto) = &self.onto {
             check_name("land target", onto)?;
+            valid_ref(onto)?;
         }
         Ok(())
+    }
+
+    fn labels(&self) -> transition::Labels {
+        transition::Labels {
+            branch: Some(self.branch.clone()),
+            onto: self.onto.clone(),
+            ..transition::Labels::default()
+        }
     }
 }
 
@@ -175,7 +194,9 @@ pub struct Take {
 
 /// Move the claim on `id` to `take.owner`, atomically against `take.displace`, through the lifecycle's
 /// `start` — so starting a task is in its history, with who started it and where. `false` means the
-/// claim changed hands since the caller read it, and nothing was written.
+/// claim changed hands since the caller read it, and nothing was written: a claim that is not
+/// `displace` (or, with no `displace`, any claim but `take.owner`'s own) was never judged by the
+/// caller.
 ///
 /// Clearing first is what lets a resumed session re-take its own claim under a new pid: the claim's
 /// compare-and-set accepts only a free task or a byte-identical owner. Clearing only the *judged*
@@ -187,10 +208,14 @@ fn swap(
     take: &Take,
     labels: &transition::Labels,
 ) -> Result<bool, ApiError> {
-    if let Some(prev) = &take.displace {
-        if !claim::clear_if(conn, meta, id, prev)? {
-            return Ok(false);
-        }
+    let judged = match &take.displace {
+        Some(prev) => claim::clear_if(conn, meta, id, prev)?,
+        None => task::observe(conn, id)?
+            .claimant
+            .is_none_or(|c| c.as_str() == take.owner),
+    };
+    if !judged {
+        return Ok(false);
     }
     let facts = lifecycle::TaskFacts {
         actor: Some(AgentId::parse(&take.owner)),
@@ -206,16 +231,19 @@ fn swap(
     }
 }
 
-/// What `task.start` was asked.
+/// What `task.start` was asked. Exactly one of `take` and `keep`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartAsk {
     /// The task.
     pub uid: String,
-    /// The claim to take, or `None` to keep the one the caller found (a live session it is standing
-    /// inside).
+    /// The claim to take.
     #[serde(default)]
     pub take: Option<Take>,
+    /// The claim the caller found and keeps — a live session it is standing inside. The write happens
+    /// only while the task is still held by exactly this owner.
+    #[serde(default)]
+    pub keep: Option<String>,
     /// Where the work is.
     pub place: Place,
 }
@@ -235,19 +263,30 @@ pub fn start(
 ) -> Result<bool, ApiError> {
     ask.place.check()?;
     let id = writable(conn, &ask.uid, roots)?;
-    let labels = transition::Labels {
-        branch: Some(ask.place.branch.clone()),
-        onto: ask.place.onto.clone(),
-        ..transition::Labels::default()
-    };
-    if let Some(take) = &ask.take {
-        check_owner(&take.owner)?;
-        if !swap(conn, meta, id, take, &labels)? {
-            return Ok(false);
+    let labels = ask.place.labels();
+    match (&ask.take, &ask.keep) {
+        (Some(take), None) => {
+            check_owner(&take.owner)?;
+            if !swap(conn, meta, id, take, &labels)? {
+                return Ok(false);
+            }
+        }
+        (None, Some(kept)) => {
+            check_owner(kept)?;
+            let held = task::observe(conn, id)?.claimant.map(|c| c.as_str());
+            if held.as_deref() != Some(kept.as_str()) {
+                return Ok(false);
+            }
+        }
+        _ => {
+            return Err(ApiError::with_code(
+                ErrorCode::Invalid,
+                "a start takes a claim or keeps one: exactly one of `take` and `keep`",
+            ))
         }
     }
-    // Through the one location-facet writer, exactly as `task.locate` does. The branch and its land
-    // target are also labels on a transition, so there is no second store to keep in step.
+    // Through the one location-facet writer, as `task.take` does. The branch and its land target are
+    // also labels on a transition, so there is no second store to keep in step.
     locate_id(conn, meta, id, &ask.place)?;
     let facts = task::observe(conn, id)?;
     transition::note(conn, meta, id, &facts, &labels)?;
@@ -262,15 +301,21 @@ pub struct TakeAsk {
     pub uid: String,
     /// The claim.
     pub take: Take,
-    /// The branch the work will be on, recorded on the `start` transition.
-    pub branch: String,
-    /// Where it lands.
-    pub onto: String,
+    /// Where the work will be; the land target is required.
+    pub place: Place,
 }
 
-/// `task.take`: `jkb task work`'s claim — the `start` transition carrying the session's branch and
-/// land target, compare-and-set against the owner the caller judged. `false` when the claim changed
-/// hands, with nothing written.
+/// `task.take`: `jkb task work`'s claim and location, in one transaction — the `start` transition
+/// carrying the session's branch and land target, compare-and-set against the owner the caller
+/// judged, and the location facets set beside it. `false` when the claim changed hands, with nothing
+/// written.
+///
+/// **Before any git work**, so every refusal — a malformed place, a line the task's `tasks.md` could
+/// not read back — comes while there is nothing to undo. The facets were written after the worktree
+/// was made, and a refusal there left a claim on a checkout no verb could find its task from.
+///
+/// The facets are written under the claim that was just taken, so a run displaced by another cannot
+/// later overwrite the location the new holder recorded.
 ///
 /// # Errors
 /// As [`start`].
@@ -281,20 +326,19 @@ pub fn take(
     roots: Option<&FileRoots>,
 ) -> Result<bool, ApiError> {
     check_owner(&ask.take.owner)?;
-    check_name("branch", &ask.branch)?;
-    check_name("land target", &ask.onto)?;
+    ask.place.check()?;
+    if ask.place.onto.is_none() {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            "a session's claim records where its work lands",
+        ));
+    }
     let id = writable(conn, &ask.uid, roots)?;
-    swap(
-        conn,
-        meta,
-        id,
-        &ask.take,
-        &transition::Labels {
-            branch: Some(ask.branch.clone()),
-            onto: Some(ask.onto.clone()),
-            ..transition::Labels::default()
-        },
-    )
+    if !swap(conn, meta, id, &ask.take, &ask.place.labels())? {
+        return Ok(false);
+    }
+    locate_id(conn, meta, id, &ask.place)?;
+    Ok(true)
 }
 
 fn locate_id(
@@ -314,23 +358,6 @@ fn locate_id(
         },
     )?;
     Ok(())
-}
-
-/// `task.locate`: record where a task's work is — the facets are *set*, not added, since a second
-/// value would be a contradiction rather than extra information (D36.6).
-///
-/// # Errors
-/// As [`start`].
-pub fn locate(
-    conn: &Connection,
-    meta: &WriteMeta,
-    uid: &str,
-    place: &Place,
-    roots: Option<&FileRoots>,
-) -> Result<(), ApiError> {
-    place.check()?;
-    let id = writable(conn, uid, roots)?;
-    locate_id(conn, meta, id, place)
 }
 
 /// What `task.abandon` did.
@@ -383,7 +410,9 @@ pub fn abandon(
     let facts = lifecycle::TaskFacts {
         // Stated by the caller, which is entitled to state it: it refused a checkout it could not
         // prove clean unless the operator passed `--force`, which is the operator supplying the fact
-        // (the same decision the removal record's `accept_dirty` carries).
+        // (the same decision the removal record's `accept_dirty` carries). A client of `jkb serve`
+        // states it the same way; that grants nothing it lacks, since `task.set` already sets any
+        // status (6.2).
         work_dirty: jkb_fsm::Fact::No,
         ..task::observe(conn, id)?
     };

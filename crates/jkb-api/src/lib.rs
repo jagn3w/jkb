@@ -463,14 +463,6 @@ pub enum Request {
     /// `jkb task work`'s claim ([`sessions::take`]).
     #[serde(rename = "task.take")]
     TaskTake(sessions::TakeAsk),
-    /// Record where a task's work is ([`sessions::locate`]).
-    #[serde(rename = "task.locate")]
-    TaskLocate {
-        /// The task.
-        uid: String,
-        /// Where.
-        place: sessions::Place,
-    },
     /// `jkb task abandon`'s write: release the judged claim and reopen ([`sessions::abandon`]).
     #[serde(rename = "task.abandon")]
     TaskAbandon {
@@ -617,6 +609,28 @@ impl SessionCursor {
             pid: c.pid,
             instance: c.instance,
         })
+    }
+}
+
+/// A Claude Code session's state, as `session.state` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStateIs {
+    /// No row: nothing is known.
+    Unknown,
+    /// Some process still holds it.
+    Live,
+    /// Every process that held it has ended.
+    Ended,
+}
+
+impl From<claude_session::SessionState> for SessionStateIs {
+    fn from(s: claude_session::SessionState) -> Self {
+        match s {
+            claude_session::SessionState::Unknown => Self::Unknown,
+            claude_session::SessionState::Live => Self::Live,
+            claude_session::SessionState::Ended => Self::Ended,
+        }
     }
 }
 
@@ -821,7 +835,6 @@ impl Request {
         "task.by_branch",
         "task.start",
         "task.take",
-        "task.locate",
         "task.abandon",
         "repo.gate",
         "session.state",
@@ -875,7 +888,6 @@ impl Request {
             Self::TaskByBranch { .. } => "task.by_branch",
             Self::TaskStart(_) => "task.start",
             Self::TaskTake(_) => "task.take",
-            Self::TaskLocate { .. } => "task.locate",
             Self::TaskAbandon { .. } => "task.abandon",
             Self::RepoGate { .. } => "repo.gate",
             Self::SessionState { .. } => "session.state",
@@ -939,7 +951,6 @@ impl Request {
             | Self::IngestText(_)
             | Self::TaskStart(_)
             | Self::TaskTake(_)
-            | Self::TaskLocate { .. }
             | Self::TaskAbandon { .. }
             | Self::SessionState { .. } => false,
         }
@@ -1168,10 +1179,11 @@ pub enum Response {
         /// The stored command, if any.
         gate: Option<String>,
     },
-    /// A `session.state`: `live`, `ended` or `unknown`.
+    /// A `session.state`.
     SessionIs {
-        /// The state.
-        state: String,
+        /// The state — a closed set, so a state a newer daemon adds fails to decode rather than reading
+        /// as some other one.
+        state: SessionStateIs,
     },
     /// A `task.show`.
     Task {
@@ -2019,13 +2031,6 @@ impl Backend for LocalBackend {
                     })?,
                 }
             }
-            Request::TaskLocate { uid, place } => {
-                let roots = self.file_roots.clone();
-                task_write(db, actor, uid, move |c, m, uid| {
-                    sessions::locate(c, m, uid, &place, roots.as_ref())
-                })?;
-                Response::Applied {}
-            }
             Request::TaskAbandon { uid, observed } => {
                 let roots = self.file_roots.clone();
                 Response::Abandoned {
@@ -2038,10 +2043,7 @@ impl Backend for LocalBackend {
                 gate: db.read_with(move |c| sessions::gate(c, &repo))?,
             },
             Request::SessionState { session } => Response::SessionIs {
-                state: db
-                    .read(move |c| claude_session::state(c, &session))?
-                    .as_str()
-                    .to_owned(),
+                state: db.read(move |c| claude_session::state(c, &session))?.into(),
             },
             Request::TaskSubtasks { uid, all } => {
                 let (children, truncated) = db.read_with(move |c| {

@@ -16,27 +16,39 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use jkb_api::sessions::{Abandoned, BranchTask, Place, StartAsk, Take, TakeAsk, TaskState};
-use jkb_api::{ApiError, Backend, Request, Response};
+use jkb_api::{Backend, Request, Response, SessionStateIs};
 use jkb_types::AgentId;
 
-use crate::ops_cli::unexpected;
+use crate::ops_cli::{op_error, unexpected, Ops};
 use crate::{archive, branch_fate, gitrepo, owner, presence, repo, session, BranchFate};
 
 /// The database, through whichever backend serves this command.
 pub(crate) struct Kb<'a> {
     backend: &'a dyn Backend,
+    remote: bool,
 }
 
 impl<'a> Kb<'a> {
-    /// Serves through `backend`.
+    /// Serves through `backend`, in this process.
     pub(crate) const fn new(backend: &'a dyn Backend) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            remote: false,
+        }
+    }
+
+    /// Serves through whatever `ops` serves through — `jkb serve`, in remote mode.
+    pub(crate) fn from_ops(ops: &Ops<'a>) -> Self {
+        Self {
+            backend: ops.backend(),
+            remote: ops.is_remote(),
+        }
     }
 
     fn call(&self, request: Request) -> Result<Response> {
         self.backend
             .call(request)
-            .map_err(|e: ApiError| anyhow::Error::msg(e.message))
+            .map_err(|e| op_error(e, self.remote))
     }
 
     /// `task.facts`.
@@ -76,17 +88,6 @@ impl<'a> Kb<'a> {
         self.taken("task.take", Request::TaskTake(ask))
     }
 
-    /// `task.locate`.
-    pub(crate) fn locate(&self, uid: &str, place: Place) -> Result<()> {
-        match self.call(Request::TaskLocate {
-            uid: uid.to_owned(),
-            place,
-        })? {
-            Response::Applied {} => Ok(()),
-            other => unexpected("task.locate", &other),
-        }
-    }
-
     /// `task.release`: drop `owner`'s claim, and only `owner`'s.
     pub(crate) fn release(&self, uid: &str, owner: &str) -> Result<bool> {
         match self.call(Request::TaskRelease {
@@ -119,8 +120,8 @@ impl<'a> Kb<'a> {
         }
     }
 
-    /// `session.state`: `live`, `ended` or `unknown`.
-    pub(crate) fn session_state(&self, session: &str) -> Result<String> {
+    /// `session.state`.
+    pub(crate) fn session_state(&self, session: &str) -> Result<SessionStateIs> {
         match self.call(Request::SessionState {
             session: session.to_owned(),
         })? {
@@ -144,7 +145,7 @@ pub(crate) struct StartWhere {
 /// **Liveness, not string equality** (D27.1). The bare `claim::claim` CAS accepts only a free
 /// task or a byte-identical owner, so using its answer as a refusal meant `task start` refused
 /// its own second run under a new pid, and refused after `task work` — the very sequence the
-/// facet writing exists for, since a session claims as `session:<pid>:<worktree>`.
+/// facet writing exists for, since a session claims as `session:<pid>[@<claude session>]:<worktree>`.
 ///
 /// Returns whether the existing claim should be **kept**.
 ///
@@ -234,8 +235,10 @@ pub(crate) fn start(kb: &Kb<'_>, uid: &str, where_: StartWhere, json: bool) -> R
         uid: facts.uid.clone(),
         take: (!keep_claim).then(|| Take {
             owner: owner.clone(),
-            displace: held,
+            displace: held.clone(),
         }),
+        // A kept claim is kept only while it is still the one judged.
+        keep: if keep_claim { held } else { None },
         place: Place {
             branch: branch.clone(),
             repo: repo.clone(),
@@ -458,8 +461,26 @@ pub(crate) fn work(
     // The branch and its land target ride along **on the `start` transition**, because both are
     // already known here and `start` is the entry a reader looks at first — a history whose
     // opening line does not say where the work is sends them to the next line to find out.
+    //
+    // WHERE the work is (D34.1) is recorded in the same write, **before** any git work, so every
+    // refusal of it — a place the task's `tasks.md` line could not carry, say — comes while there
+    // is nothing to undo. It was written after the worktree was made, and a refusal there left a
+    // claim on a checkout that no verb could find the task from. The facets are *set*, not added: a
+    // second value would be a contradiction, and is how a task ends up with two branches and one
+    // worktree. A **resumed** session re-asserts both, which writes nothing new.
     let owner = owner::session_owner(&worktree);
-    claim_session(kb, &facts, uid, &owner, &worktree, (&branch, &onto))?;
+    claim_session(
+        kb,
+        &facts,
+        uid,
+        &owner,
+        &worktree,
+        Place {
+            branch: branch.clone(),
+            repo: ctx.key.clone(),
+            onto: Some(onto.clone()),
+        },
+    )?;
 
     // CANCELLED FIRST, and a refusal stops the verb.
     //
@@ -472,7 +493,13 @@ pub(crate) fn work(
     //
     // Before `open_worktree`, so a sweep sees either no worktree or no record — never a live
     // checkout it still holds a licence for.
+    //
+    // A refusal releases this run's claim, as a failed worktree add does: the verb stops, and a
+    // claim on a session nobody opened is a claim nothing else would free.
     archive::revoke(db_path, &worktree)
+        .inspect_err(|_| {
+            let _ = kb.release(&facts.uid, &owner);
+        })
         .map(|cancelled| {
             if cancelled {
                 println!("cancelled the pending removal of {}", worktree.display());
@@ -490,24 +517,6 @@ pub(crate) fn work(
     if !resumed {
         open_worktree(kb, &facts.uid, &owner, &ctx.root, &worktree, &branch, &onto)?;
     }
-
-    // Record where the work is happening, exactly as `task start` does (D34.1), plus the
-    // land target so `land` and a resumed `work` agree on it. The two facets are *set*, not
-    // added: a second value would be a contradiction rather than extra information, and is how
-    // a task ends up with two branches and one worktree.
-    //
-    // The land target itself is recorded on the `start` transition above, not here: it is a
-    // label on the moment somebody said so, and there is no second store for a resume to find
-    // out of step. A **resumed** session re-asserts the claim, which is idempotent and writes no
-    // second row, so the facets are what this transaction is for.
-    kb.locate(
-        &facts.uid,
-        Place {
-            branch: branch.clone(),
-            repo: ctx.key.clone(),
-            onto: Some(onto.clone()),
-        },
-    )?;
 
     if json {
         println!(
@@ -538,7 +547,7 @@ pub(crate) fn work(
 /// Split out of `cmd_task_work` for length.
 ///
 /// **Every** failure path releases the claim. `claim_session` has already written a
-/// `session:<pid>:<worktree>` owner, and `owner::is_alive` judges one solely by whether that
+/// `session:<pid>[@<claude session>]:<worktree>` owner, and `owner::is_alive` judges one solely by whether that
 /// directory exists (D36.6) — so a bail-out caused by the directory being in the way leaves a
 /// claim that reads as alive forever, freed by neither `doctor --fix` nor `task reclaim`. Only the
 /// `worktree_add` arm used to release, while the doc claimed all of them did.
@@ -772,7 +781,7 @@ fn claim_session(
     uid: &str,
     owner: &str,
     worktree: &Path,
-    (branch, onto): (&str, &str),
+    place: Place,
 ) -> Result<()> {
     let held = facts.claim.clone();
     if let Some(prev) = &held {
@@ -799,8 +808,7 @@ fn claim_session(
             owner: owner.to_owned(),
             displace: held,
         },
-        branch: branch.to_owned(),
-        onto: onto.to_owned(),
+        place,
     })?;
     anyhow::ensure!(
         ok,
@@ -1246,17 +1254,27 @@ pub(crate) fn gate(kb: &Kb<'_>, json: bool) -> Result<()> {
 }
 
 /// Refuse to take over a session worktree another, still-running Claude Code session opened (decision
-/// E). The opener is read off the claim, and its state off the registry; anything but `live` lets the
-/// takeover through.
+/// E): **two top-level sessions in one checkout**, each overwriting the other's work.
+///
+/// Refused only when both are established: the opener is `live` in the registry, and so is the
+/// session asking. A process with no session of its own (a person at a terminal) and a session the
+/// registry does not know are let through, as before. That second case includes a subagent: it has an
+/// id of its own (measured: `CLAUDE_CODE_SESSION_ID` differs from its parent's, and
+/// `CLAUDE_CODE_CHILD_SESSION` is set in top-level sessions' shells too, so it tells nothing apart), and
+/// refusing one would refuse its own parent's work. Whether a subagent's start ever reaches the
+/// registry is not measured; if it does, a subagent resuming its parent's checkout is refused.
 fn refuse_a_running_opener(kb: &Kb<'_>, uid: &str, held: &str, worktree: &Path) -> Result<()> {
     let prev = AgentId::parse(held);
     let Some(opener) = prev.opened_by() else {
         return Ok(());
     };
-    if owner::claude_session().as_deref() == Some(opener) {
+    let Some(mine) = owner::claude_session() else {
         return Ok(());
-    }
-    if kb.session_state(opener)? != "live" {
+    };
+    if mine == opener
+        || kb.session_state(opener)? != SessionStateIs::Live
+        || kb.session_state(&mine)? != SessionStateIs::Live
+    {
         return Ok(());
     }
     anyhow::bail!(
@@ -1265,4 +1283,76 @@ fn refuse_a_running_opener(kb: &Kb<'_>, uid: &str, held: &str, worktree: &Path) 
          for it to end, or if you are sure it is gone, `jkb task release {uid} --owner {held}`.",
         worktree.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{open_worktree, Kb};
+    use jkb_api::{Backend, LocalBackend, Request, Response};
+    use jkb_core::Db;
+
+    fn claim_of(b: &LocalBackend, uid: &str) -> Option<String> {
+        match b
+            .call(Request::TaskFacts {
+                uid: uid.to_owned(),
+            })
+            .unwrap()
+        {
+            Response::TaskState { state } => state.claim,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A worktree that cannot be made releases this run's claim, and only this run's.** A claim
+    /// somebody else took in the meantime is theirs; the old compensation cleared whatever claim the
+    /// task had.
+    #[test]
+    fn a_failed_worktree_releases_only_the_run_s_own_claim() {
+        let b = LocalBackend::new(Db::open_in_memory().unwrap());
+        let Response::Added { added } = b
+            .call(
+                serde_json::from_value(serde_json::json!({
+                    "op": "task.add", "text": "t +tasks/x", "managed": true
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("added")
+        };
+        let uid = added.uid;
+        let tmp = tempfile::tempdir().unwrap();
+        // Something is already where the worktree goes, so the add fails before git runs.
+        let worktree = tmp.path().join(".jkb/work/s");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let kb = Kb::new(&b);
+        let claim = |owner: &str| {
+            b.call(Request::TaskClaim {
+                uid: uid.clone(),
+                owner: owner.to_owned(),
+            })
+            .unwrap();
+        };
+
+        claim("host:someone-else");
+        assert!(
+            open_worktree(&kb, &uid, "session:1:~/w", tmp.path(), &worktree, "b", "o").is_err()
+        );
+        assert_eq!(
+            claim_of(&b, &uid).as_deref(),
+            Some("host:someone-else"),
+            "another owner's claim survives"
+        );
+
+        b.call(Request::TaskRelease {
+            uid: uid.clone(),
+            owner: "host:someone-else".to_owned(),
+        })
+        .unwrap();
+        claim("session:1:~/w");
+        assert!(
+            open_worktree(&kb, &uid, "session:1:~/w", tmp.path(), &worktree, "b", "o").is_err()
+        );
+        assert_eq!(claim_of(&b, &uid), None, "the run's own claim is released");
+    }
 }

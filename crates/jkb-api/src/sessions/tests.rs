@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
+use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response, SessionStateIs};
 use jkb_core::Db;
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
@@ -36,19 +36,30 @@ fn taken(r: Response) -> bool {
     }
 }
 
+fn start_on(
+    b: &LocalBackend,
+    uid: &str,
+    owner: &str,
+    displace: Option<&str>,
+    branch: &str,
+    onto: &str,
+) -> Result<bool, ApiError> {
+    call(
+        b,
+        json!({ "op": "task.start", "uid": uid,
+                "take": { "owner": owner, "displace": displace },
+                "place": { "branch": branch, "repo": "proj", "onto": onto } }),
+    )
+    .map(taken)
+}
+
 fn start(
     b: &LocalBackend,
     uid: &str,
     owner: &str,
     displace: Option<&str>,
 ) -> Result<bool, ApiError> {
-    call(
-        b,
-        json!({ "op": "task.start", "uid": uid,
-                "take": { "owner": owner, "displace": displace },
-                "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
-    )
-    .map(taken)
+    start_on(b, uid, owner, displace, "feat", "batch")
 }
 
 /// `task.start` takes the claim, sets the location facets and records the branch and land target in
@@ -68,15 +79,13 @@ fn a_start_claims_and_records_where_the_work_is() {
     let after = facts(&b, &uid);
     assert_eq!(after.claim.as_deref(), Some("host:1"));
     assert_eq!(after.status, "in_progress");
-    assert_eq!(
-        after.tags.get("branch").map(Vec::as_slice),
-        Some(&["feat".to_owned()][..])
-    );
-    assert_eq!(
-        after.tags.get("repo").map(Vec::as_slice),
-        Some(&["proj".to_owned()][..])
-    );
+    assert_eq!(after.tags["branch"], ["feat"]);
+    assert_eq!(after.tags["repo"], ["proj"]);
     assert_eq!(after.land_target.as_deref(), Some("batch"));
+    assert_eq!(
+        after.start_refusal, None,
+        "an unfinished task reports no refusal: whether it can be started depends on who asks"
+    );
 
     let Response::BranchTasks { tasks } =
         call(&b, json!({ "op": "task.by_branch", "repo": "proj" })).unwrap()
@@ -96,66 +105,96 @@ fn a_start_claims_and_records_where_the_work_is() {
     assert!(tasks.is_empty());
 }
 
-/// **The compare-and-set.** A takeover names the owner the caller judged; if the claim moved since,
-/// nothing is written — not the claim, not the facets.
+/// **The compare-and-set.** A takeover names the owner the caller judged; if the claim moved since —
+/// or appeared where the caller saw none — nothing is written: not the claim, not the facets, not the
+/// land target.
 #[test]
 fn a_takeover_of_an_owner_that_changed_writes_nothing() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
     let uid = add(&b, "contested +tasks/x");
     assert!(start(&b, &uid, "host:1", None).unwrap());
     // The caller judged `host:9` gone, but the claim is `host:1`'s.
-    assert!(!start(&b, &uid, "host:2", Some("host:9")).unwrap());
+    assert!(!start_on(&b, &uid, "host:2", Some("host:9"), "other", "elsewhere").unwrap());
+    // The caller saw no claim, and there is one now.
+    assert!(!start_on(&b, &uid, "host:2", None, "other", "elsewhere").unwrap());
     let f = facts(&b, &uid);
     assert_eq!(f.claim.as_deref(), Some("host:1"));
+    assert_eq!(f.tags["branch"], ["feat"]);
+    assert_eq!(f.land_target.as_deref(), Some("batch"));
+
     // A takeover of the owner actually there succeeds.
     assert!(start(&b, &uid, "host:2", Some("host:1")).unwrap());
     assert_eq!(facts(&b, &uid).claim.as_deref(), Some("host:2"));
-    // Kept: no claim change, only the location.
-    let kept = call(
-        &b,
-        json!({ "op": "task.start", "uid": uid,
-                "place": { "branch": "feat2", "repo": "proj" } }),
-    )
-    .map(taken)
-    .unwrap();
-    assert!(kept);
+
+    // Kept: no claim change, only the location — and only while the claim is still the one kept.
+    let keep = |kept: &str, branch: &str| {
+        call(
+            &b,
+            json!({ "op": "task.start", "uid": uid, "keep": kept,
+                    "place": { "branch": branch, "repo": "proj" } }),
+        )
+        .map(taken)
+        .unwrap()
+    };
+    assert!(!keep("host:1", "stale"), "the kept claim moved on");
+    assert_eq!(facts(&b, &uid).tags["branch"], ["feat"]);
+    assert!(keep("host:2", "feat2"));
     let f = facts(&b, &uid);
     assert_eq!(f.claim.as_deref(), Some("host:2"));
     assert_eq!(f.tags["branch"], ["feat2"]);
+
+    // Exactly one of take and keep.
+    for bad in [
+        json!({ "op": "task.start", "uid": uid, "place": { "branch": "x", "repo": "proj" } }),
+        json!({ "op": "task.start", "uid": uid, "keep": "host:2", "take": { "owner": "host:2" },
+                "place": { "branch": "x", "repo": "proj" } }),
+    ] {
+        let e = call(&b, bad.clone()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{bad}: {e:?}");
+    }
+    assert_eq!(facts(&b, &uid).tags["branch"], ["feat2"]);
 }
 
-/// `task.take` is `task work`'s claim: the start transition carries the branch and land target, and a
-/// same-owner retake is not an error.
+/// `task.take` is `task work`'s claim and location in one write: the start transition carries the
+/// branch and land target, the facets are set beside it, a same-owner retake is not an error — and a
+/// displaced run's late take writes nothing, so it cannot overwrite what its successor recorded.
 #[test]
-fn a_take_claims_with_the_session_labels_and_is_idempotent() {
+fn a_take_claims_and_locates_in_one_write() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
     let uid = add(&b, "work it +tasks/x");
-    let take = |displace: Option<&str>| {
+    let take = |owner: &str, displace: Option<&str>, branch: &str| {
         call(
             &b,
             json!({ "op": "task.take", "uid": uid,
-                    "take": { "owner": "session:1:~/w", "displace": displace },
-                    "branch": "task/w", "onto": "batch" }),
+                    "take": { "owner": owner, "displace": displace },
+                    "place": { "branch": branch, "repo": "proj", "onto": "batch" } }),
         )
         .map(taken)
     };
-    assert!(take(None).unwrap());
+    assert!(take("session:1:~/w", None, "task/w").unwrap());
     let f = facts(&b, &uid);
     assert_eq!(
         (f.claim.as_deref(), f.land_target.as_deref()),
         (Some("session:1:~/w"), Some("batch"))
     );
+    assert_eq!(f.tags["branch"], ["task/w"]);
+    assert_eq!(f.tags["repo"], ["proj"]);
     assert!(
-        take(Some("session:1:~/w")).unwrap(),
+        take("session:1:~/w", Some("session:1:~/w"), "task/w").unwrap(),
         "a resume re-takes its own claim"
     );
-    call(
+    // Another run took over; the displaced one's late take changes nothing.
+    assert!(take("session:2:~/v", Some("session:1:~/w"), "task/v").unwrap());
+    assert!(!take("session:1:~/w", Some("session:1:~/w"), "task/w").unwrap());
+    assert_eq!(facts(&b, &uid).tags["branch"], ["task/v"]);
+    // A session's claim says where it lands.
+    let e = call(
         &b,
-        json!({ "op": "task.locate", "uid": uid,
-                "place": { "branch": "task/w", "repo": "proj", "onto": "batch" } }),
+        json!({ "op": "task.take", "uid": uid, "take": { "owner": "session:2:~/v" },
+                "place": { "branch": "task/v", "repo": "proj" } }),
     )
-    .unwrap();
-    assert_eq!(facts(&b, &uid).tags["repo"], ["proj"]);
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
 }
 
 /// A terminal task cannot be started: the lifecycle's refusal is what `task.facts` reports and what a
@@ -244,25 +283,33 @@ fn the_gate_is_read_only() {
     );
 }
 
-/// Every name a session op stores is bounded and free of control characters, and an owner is held to
-/// the claim ops' own limit.
+/// Every name a session op stores is bounded, free of control characters, and — for a branch and a
+/// land target — not one git would read as an option; an owner is held to the claim ops' own limit. A refused write
+/// changes nothing.
 #[test]
 fn malformed_session_fields_are_refused() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
     let uid = add(&b, "bounded +tasks/x");
     let long = "b".repeat(super::MAX_NAME_BYTES + 1);
     for place in [
-        json!({ "branch": "", "repo": "r" }),
-        json!({ "branch": long, "repo": "r" }),
-        json!({ "branch": "b\nx", "repo": "r" }),
+        json!({ "branch": "", "repo": "r", "onto": "o" }),
+        json!({ "branch": long, "repo": "r", "onto": "o" }),
+        json!({ "branch": "b\nx", "repo": "r", "onto": "o" }),
         json!({ "branch": "b", "repo": "r", "onto": "" }),
+        json!({ "branch": "b", "repo": "", "onto": "o" }),
+        // Names git would read as options (`location::valid_ref`, the rule every land-target writer
+        // applies).
+        json!({ "branch": "b", "repo": "r", "onto": "--upload-pack=x" }),
+        json!({ "branch": "-b", "repo": "r", "onto": "o" }),
     ] {
-        let e = call(
-            &b,
-            json!({ "op": "task.locate", "uid": uid, "place": place }),
-        )
-        .unwrap_err();
-        assert_eq!(e.code, ErrorCode::Invalid, "{place}: {e:?}");
+        for op in ["task.take", "task.start"] {
+            let e = call(
+                &b,
+                json!({ "op": op, "uid": uid, "take": { "owner": "host:1" }, "place": place }),
+            )
+            .unwrap_err();
+            assert_eq!(e.code, ErrorCode::Invalid, "{op} {place}: {e:?}");
+        }
     }
     let e = call(&b, json!({ "op": "task.by_branch", "repo": "" })).unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
@@ -274,12 +321,15 @@ fn malformed_session_fields_are_refused() {
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
-    assert!(!facts(&b, &uid).tags.contains_key("branch"));
+    let f = facts(&b, &uid);
+    assert!(!f.tags.contains_key("branch"));
+    assert_eq!(f.claim, None);
     let e = call(&b, json!({ "op": "task.facts", "uid": "task:nope" })).unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound);
 }
 
-/// `session.state` answers from the registry: unknown, live, ended.
+/// `session.state` answers from the registry: unknown, live, ended — a closed set on the wire, so a
+/// state a newer daemon added fails to decode rather than reading as one of these.
 #[test]
 fn a_session_state_is_read_from_the_registry() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
@@ -287,19 +337,27 @@ fn a_session_state_is_read_from_the_registry() {
         Response::SessionIs { state } => state,
         other => panic!("{other:?}"),
     };
-    assert_eq!(state(), "unknown");
+    assert_eq!(state(), SessionStateIs::Unknown);
     call(
         &b,
         json!({ "op": "session.started", "session": "s1", "source": "startup",
                 "pid": "1", "instance": "h" }),
     )
     .unwrap();
-    assert_eq!(state(), "live");
+    assert_eq!(state(), SessionStateIs::Live);
     call(
         &b,
         json!({ "op": "session.ended", "session": "s1", "reason": "other",
                 "pid": "1", "instance": "h" }),
     )
     .unwrap();
-    assert_eq!(state(), "ended");
+    assert_eq!(state(), SessionStateIs::Ended);
+    assert_eq!(
+        serde_json::to_value(SessionStateIs::Ended).unwrap(),
+        json!("ended")
+    );
+    assert!(serde_json::from_value::<Response>(
+        json!({ "result": "session_is", "state": "suspended" })
+    )
+    .is_err());
 }

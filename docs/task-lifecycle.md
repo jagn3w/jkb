@@ -128,17 +128,30 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   about every session it did not open. Each side now resolves `~` against its own home
   (`owner::session_worktree`), and old absolute owners still parse and are judged as before. The
   opener (`CLAUDE_CODE_SESSION_ID`) is provenance and never decides liveness. It does decide one
-  thing: `task work` refuses to take over a checkout whose opener the session registry says is
-  still **live**, unless it is that same session. That is how two Claude sessions stop ending up in
-  one worktree. `ended` and `unknown` let the takeover through, as before, and the refusal names
-  `jkb task release` for an opener that is gone but was never recorded as such. Pinned by
-  `a_session_opened_by_a_running_claude_session_is_not_taken_over` and
-  `a_session_owner_names_its_worktree_under_the_home`.
+  thing: `task work` refuses to take over a checkout when **both** its opener and the session
+  asking are `live` in the session registry and are different sessions. That is how two top-level
+  Claude sessions stop ending up in one worktree. Anything less established lets the takeover
+  through, as before: a process with no session, a session the registry does not know, an opener
+  that ended. The unknown-session case covers a subagent. It has its own
+  `CLAUDE_CODE_SESSION_ID` (measured), and `CLAUDE_CODE_CHILD_SESSION` is set in a top-level
+  session's shell as well, so nothing tells a subagent apart. Whether a subagent's start ever
+  reaches the registry is not measured; if it does, a subagent resuming its parent's checkout is
+  refused. The refusal names `jkb task release` for an opener that is gone but was never recorded
+  as such. Pinned by `a_session_opened_by_a_running_claude_session_is_not_taken_over`,
+  `a_session_owner_names_its_worktree_under_the_home` and
+  `a_home_relative_owner_is_reclaimed_from_another_home`.
 - **The session verbs' database steps are ops** (tasks S6.4, `jkb_api::sessions`), and every write
-  they make is a compare-and-set on the owner the verb judged. `task.start` and `task.take` clear
-  only the owner they were told about. `task.abandon` changes nothing when the claim is no longer
-  the one observed before the git work. The release after a failed worktree add goes through
-  `task.release` with the verb's own owner, where it used to clear the claim unconditionally.
+  they make is a compare-and-set on the owner the verb judged.
+  - `task.start` and `task.take` clear only the owner they were told about, and write nothing when a
+    claim appeared that the caller did not see. `task.start` keeping a claim writes only while that
+    claim is still there.
+  - `task.take` records `task work`'s location in the claim's own transaction, **before** any git
+    work. A refusal of the location (a `tasks.md` line that could not carry it) then leaves nothing
+    to undo, and a displaced run cannot overwrite what its successor recorded.
+  - `task.abandon` changes nothing when the claim is no longer the one observed before the git work.
+  - A failed worktree add, and a pending removal that could not be cancelled, release only the verb's
+    own claim, through `task.release`. The first used to clear the claim unconditionally; the second
+    left it held.
   `task start` and `task gate` (show) run in the dev container through `jkb serve`. Storing a gate
   never does (decision A): it is a shell command the host later runs, so only the host stores one.
 - **Branch existence counts the remote-tracking copy, and creating is not adopting.**
