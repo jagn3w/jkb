@@ -38,11 +38,11 @@ pub(crate) struct OpenFinding {
 /// # Errors
 /// Returns an error if the read fails.
 pub(crate) fn findings_in(db: &Db, review_nss: &[String]) -> Result<Findings> {
-    let nss = review_nss.to_vec();
-    Ok(db
-        .read_with(move |conn| jkb_api::sessions::review_findings(conn, &nss))
-        .map_err(|e| anyhow::anyhow!(e.message))?
-        .into())
+    chunked(review_nss, |nss| {
+        let nss = nss.to_vec();
+        db.read_with(move |conn| jkb_api::sessions::review_findings(conn, &nss))
+            .map_err(|e| anyhow::anyhow!(e.message))
+    })
 }
 
 /// [`findings_in`], through whichever backend serves this command.
@@ -53,7 +53,24 @@ pub(crate) fn findings_via(
     kb: &crate::session_cli::Kb<'_>,
     review_nss: &[String],
 ) -> Result<Findings> {
-    Ok(kb.review_findings(review_nss)?.into())
+    chunked(review_nss, |nss| kb.review_findings(nss))
+}
+
+/// Ask `read` about `review_nss` in pieces the query accepts, and add the answers up. Every
+/// `/review-log` pass adds a `review=` value, so a long-lived branch's task outgrows one piece; a land
+/// refused for that — even with `--no-review` — would be a wedge.
+fn chunked(
+    review_nss: &[String],
+    read: impl Fn(&[String]) -> Result<jkb_api::sessions::ReviewFindings>,
+) -> Result<Findings> {
+    let mut out = Findings::default();
+    for nss in review_nss.chunks(jkb_api::sessions::MAX_REVIEW_NAMESPACES) {
+        let part: Findings = read(nss)?.into();
+        out.total += part.total;
+        out.open_count += part.open_count;
+        out.open_must_fix.extend(part.open_must_fix);
+    }
+    Ok(out)
 }
 
 /// What a review's namespaces actually contain.
@@ -441,4 +458,34 @@ fn credited_by(db: &Db, t: &crate::repo::RepoTask, branch: &str) -> Result<Credi
     }
 
     Ok(Credit::Unrelated)
+}
+
+#[cfg(test)]
+mod tests {
+    use jkb_core::Db;
+
+    /// A task whose reviews outnumber what one query takes is still gated by all of them — asked in
+    /// pieces, added up — rather than refused outright, which blocked even `--no-review`.
+    #[test]
+    fn findings_across_more_reviews_than_one_query_takes_are_added_up() {
+        let db = Db::open_in_memory().unwrap();
+        let backend = jkb_api::LocalBackend::new(db.clone());
+        let n = jkb_api::sessions::MAX_REVIEW_NAMESPACES + 1;
+        let nss: Vec<String> = (0..n).map(|i| format!("reviews/r{i}")).collect();
+        for ns in [&nss[0], &nss[n - 1]] {
+            jkb_api::Backend::call(
+                &backend,
+                serde_json::from_value(serde_json::json!({
+                    "op": "task.add", "text": format!("must fix !p1 +{ns}"), "managed": true
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let local = super::findings_in(&db, &nss).unwrap();
+        let via = super::findings_via(&crate::session_cli::Kb::new(&backend), &nss).unwrap();
+        for f in [local, via] {
+            assert_eq!((f.total, f.open_count, f.open_must_fix.len()), (2, 2, 2));
+        }
+    }
 }

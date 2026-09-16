@@ -379,14 +379,17 @@ pub fn lease_break(
     name: &str,
     roots: Option<&FileRoots>,
 ) -> Result<Option<String>, ApiError> {
-    if roots.is_some() {
-        return Err(forbidden(
-            "breaking a lease is the host operator's escape — run `jkb task reap --break-lock` on the \
-             host"
-                .to_owned(),
-        ));
-    }
     check_lease_name(name)?;
+    if roots.is_some() {
+        let escape = if name == SWEEP_LEASE {
+            "`jkb task reap --break-lock`"
+        } else {
+            "`jkb task land --break-lock`, in that repo"
+        };
+        return Err(forbidden(format!(
+            "breaking a lease is the host operator's escape — run {escape} on the host"
+        )));
+    }
     Ok(lease::break_lease(conn, meta, name)?)
 }
 

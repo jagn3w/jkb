@@ -60,7 +60,10 @@ pub const fn handles(command: &Command) -> bool {
                 | TaskCmd::Work { .. }
                 | TaskCmd::Abandon { .. }
                 | TaskCmd::Sessions
-                | TaskCmd::Land { .. }
+                | TaskCmd::Land {
+                    break_lock: false,
+                    ..
+                }
                 | TaskCmd::Landed { .. }
                 | TaskCmd::Gate {
                     cmd: None,

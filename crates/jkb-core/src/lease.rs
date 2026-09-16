@@ -40,7 +40,8 @@ impl Lease {
     }
 }
 
-/// The owner id out of a `<owner id> <nonce>` holder.
+/// The owner id out of a `<owner id> <nonce> [more…]` holder — the first field, whatever follows (the
+/// land lease appends the Claude Code session it was taken in).
 #[must_use]
 pub fn owner_of(holder: &str) -> &str {
     holder.split_whitespace().next().unwrap_or_default()

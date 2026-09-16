@@ -42,7 +42,14 @@ pub const fn support(command: &Command) -> Support {
         }
         Command::Mount { .. }
         | Command::Sync { .. }
-        | Command::Service { .. } => Support::Refused(HOST_ONLY),
+        | Command::Service { .. }
+        // Breaking a land lease is the host operator's escape: nothing here can prove its holder gone.
+        | Command::Task {
+            cmd: TaskCmd::Land {
+                break_lock: true,
+                ..
+            },
+        } => Support::Refused(HOST_ONLY),
         // The queue, and the agent read set (tasks S6.1). `ops_cli::handles` names the same reads for
         // dispatch; `the_ported_reads_are_the_ones_ops_cli_handles` holds the two together.
         Command::Mq { .. }
@@ -82,7 +89,10 @@ pub const fn support(command: &Command) -> Support {
                 | TaskCmd::Abandon { .. }
                 | TaskCmd::Sessions
                 // The land lock is a lease, and a gate is run, never stored, from here (stage 4).
-                | TaskCmd::Land { .. }
+                | TaskCmd::Land {
+                    break_lock: false,
+                    ..
+                }
                 | TaskCmd::Landed { .. }
                 | TaskCmd::Gate {
                     cmd: None,

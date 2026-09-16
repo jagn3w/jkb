@@ -216,10 +216,11 @@ Two decisions in it:
   absolute paths included. A disposal whose record the daemon refused says nothing will finish it. `task work` cancels a pending record with `removal.cancel`, one write that a sweep
   in flight refuses, rather than by taking the sweep's lease: a container `task work` killed while
   holding it would have left a holder the host cannot probe, and the host's reap service would skip
-  every pass until someone broke it. A client can still take `removal-sweep` (or, from stage 4, a
-  land lease) and hold it: that stops the host's sweep **and every `task work`** (a cancel is refused
-  while the lease is held, even with nothing to cancel), acts on nothing, and
-  `jkb task reap --break-lock` on the host ends it.
+  every pass until someone broke it. A client can still take `removal-sweep` and hold it: that stops
+  the host's sweep **and every `task work`** (a cancel is refused while the lease is held, even with
+  nothing to cancel), acts on nothing, and `jkb task reap --break-lock` on the host ends it. A client
+  holding a `land:<repo>` lease stops only landings in repos of that name, and
+  `jkb task land --break-lock`, run on the host in that repo, ends it.
 - **The old file store is reported, and nothing acts on it** (rounds 2–5 of the stage-3 review).
   Records an older jkb wrote beside the database were first swept in place, then imported by every
   sweep, then imported on request — and each version was found steerable or lossy: `~/.jkb` is

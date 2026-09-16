@@ -1020,7 +1020,7 @@ impl Request {
     }
 
     /// Whether this op is in the agent read set (`kb.*`, `task.ready`/`show`/`subtasks`/`why`, and the
-    /// session verbs' reads `task.facts`/`by_branch` and `repo.gate`) — the one
+    /// session verbs' reads `task.facts`/`by_branch`/`review_findings` and `repo.gate`) — the one
     /// place that says so. [`LocalBackend`] serves it on its reader and within its read budget, and
     /// `jkb serve` counts it against its read permits, from this answer; no dispatch arm chooses.
     ///
@@ -2211,7 +2211,10 @@ impl Backend for LocalBackend {
                 ingested: ingest::ingest(db, actor, self.embedder.as_ref(), &ask)?,
             },
             Request::TaskFacts { uid } => Response::TaskState {
-                state: db.read_with(move |c| sessions::facts(c, &uid))?,
+                state: {
+                    let roots = self.file_roots.clone();
+                    db.read_with(move |c| sessions::facts(c, &uid, roots.as_ref()))?
+                },
             },
             Request::TaskByBranch { repo } => Response::BranchTasks {
                 tasks: db.read_with(move |c| sessions::by_branch(c, &repo))?,

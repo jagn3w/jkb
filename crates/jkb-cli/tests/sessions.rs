@@ -4071,8 +4071,11 @@ fn landing_is_serialised_by_a_lease_freed_only_when_its_holder_is_proven_gone() 
     };
     let name = "land:proj";
 
-    // pid 1 on this host is alive.
+    // pid 1 on this host is alive — whatever became of the session it names.
     set_lease(&f.db, name, Some("host:1 n -"));
+    refused(&land());
+    registry(&f.db, SESSION, false);
+    set_lease(&f.db, name, Some(&format!("host:1 n {SESSION}")));
     refused(&land());
     // Another machine, in a session the registry knows to be live: nothing can say it is gone.
     registry(&f.db, SESSION, true);
@@ -4130,6 +4133,22 @@ fn a_container_session_lands_through_the_daemon() {
         "add c",
     );
 
+    // The review gate is read through the daemon: an open must-fix finding refuses the landing.
+    let branch = v["branch"].as_str().unwrap().to_owned();
+    f.add_finding("reviews/remote", "found from the container");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/remote"])
+        .assert()
+        .success();
+    let gated = remote(&["task", "land", &uid, "--gate", "true"]);
+    assert!(!gated.status.success(), "{gated:?}");
+    assert!(
+        String::from_utf8_lossy(&gated.stderr).contains("found from the container"),
+        "{gated:?}"
+    );
+    assert_eq!(f.status_of(&uid), "needs_review", "not landed");
+
     let landed = remote(&[
         "--json",
         "task",
@@ -4149,6 +4168,22 @@ fn a_container_session_lands_through_the_daemon() {
         "{v}"
     );
     assert_eq!(f.status_of(&uid), "done");
+    let shown: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--global", "--json", "task", "show", &uid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        shown["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["facet"] == "review-waived"),
+        "the waiver was recorded through the daemon: {shown}"
+    );
     let stored: serde_json::Value = serde_json::from_slice(
         &f.jkb()
             .args(["--json", "task", "gate"])
@@ -4161,6 +4196,33 @@ fn a_container_session_lands_through_the_daemon() {
     assert_eq!(lease_of(&f.db, "land:proj"), None);
     assert!(git(&f.repo, &["log", "--format=%s", "batch"]).contains("add c"));
 
+    let broke = remote(&["task", "land", "--break-lock"]);
+    assert!(!broke.status.success(), "{broke:?}");
+    assert!(
+        String::from_utf8_lossy(&broke.stderr).contains("on the host"),
+        "{broke:?}"
+    );
+}
+
+/// **The merge queue's landing is recorded through the daemon** (tasks S6.4 stage 4): `task landed`
+/// finds every task on the branch and records the graft for each.
+#[test]
+fn the_queue_s_landing_is_recorded_through_the_daemon() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "batch"]);
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env_remove("JKB_DB")
+            .output()
+            .unwrap()
+    };
     // The merge queue's record, for a task on a branch it grafted itself.
     let other = f.add_task("queued elsewhere");
     f.jkb()
@@ -4179,9 +4241,6 @@ fn a_container_session_lands_through_the_daemon() {
     assert!(queued.status.success(), "{queued:?}");
     let v: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();
     assert_eq!(v["landed"].as_array().map(Vec::len), Some(1), "{v}");
-
-    let broke = remote(&["task", "land", "--break-lock"]);
-    assert!(!broke.status.success(), "{broke:?}");
 }
 
 /// **A session that cannot be opened leaves no claim behind** — and the release is the run's own

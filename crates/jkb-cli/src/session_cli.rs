@@ -1699,12 +1699,19 @@ impl<'a> LandLease<'a> {
         anyhow::bail!("could not take the land lease {name}; try again")
     }
 
-    /// Whether the holder is proven gone.
+    /// Whether the holder is proven gone: its process dead on this host, or — only when its process
+    /// cannot be judged from here — the session it names ended.
     fn gone(kb: &Kb<'_>, holder: &str) -> Result<bool> {
         let mut parts = holder.split_whitespace();
         let owner_id = parts.next().unwrap_or_default();
-        if owner::is_alive(owner_id).is_no() {
+        // Its process answers first, both ways: a live one holds the lease whatever became of the
+        // session it ran in — a land left running by a Claude Code that died is still grafting.
+        let alive = owner::is_alive(owner_id);
+        if alive.is_no() {
             return Ok(true);
+        }
+        if alive.is_yes() {
+            return Ok(false);
         }
         match parts.nth(1) {
             Some(session) if session != "-" && jkb_types::is_session_id(session) => {

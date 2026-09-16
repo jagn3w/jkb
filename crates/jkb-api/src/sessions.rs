@@ -64,14 +64,26 @@ pub struct TaskState {
     pub terminal: bool,
     /// Whether any subtask is unfinished — what holds a landing (D35).
     pub open_subtasks: bool,
+    /// Whether this client may write the task at all — `false` for one filed outside `jkb serve`'s
+    /// file roots. A verb that does git work before its write asks this first.
+    pub writable: bool,
 }
 
 /// `task.facts`: what the session verbs read about a task, in one read.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`] for no such task, or a failed read.
-pub fn facts(conn: &Connection, reference: &str) -> Result<TaskState, ApiError> {
+pub fn facts(
+    conn: &Connection,
+    reference: &str,
+    roots: Option<&FileRoots>,
+) -> Result<TaskState, ApiError> {
     let id = task::resolve_ref(conn, reference)?.ok_or_else(|| no_item(reference))?;
+    let writable = match writable(conn, reference, roots) {
+        Ok(_) => true,
+        Err(e) if e.code == ErrorCode::Forbidden => false,
+        Err(e) => return Err(e),
+    };
     let meta = item::get(conn, id)?.ok_or_else(|| no_item(reference))?;
     let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (facet, value) in tag::applications(conn, id)? {
@@ -88,6 +100,7 @@ pub fn facts(conn: &Connection, reference: &str) -> Result<TaskState, ApiError> 
         claim: claim::holder(conn, id)?,
         land_target: transition::land_target(conn, id)?,
         open_subtasks: !task::subtasks_all_terminal(conn, id)?,
+        writable,
         start_refusal: if terminal {
             lifecycle::apply(&observed, TaskEvent::Start).refusal()
         } else {
@@ -681,6 +694,13 @@ pub const MAX_REVIEW_NAMESPACES: usize = 64;
 /// The most open findings one answer lists.
 pub const MAX_LISTED_FINDINGS: usize = 100;
 
+/// The most finding items one answer examines. A review holds tens; a client naming a whole tree is
+/// refused rather than served every task body in it.
+pub const MAX_EXAMINED_FINDINGS: usize = 10_000;
+
+/// The longest finding title one answer carries.
+pub const MAX_FINDING_TITLE_CHARS: usize = 200;
+
 /// `task.review_findings`: the findings under `namespaces` (every recorded review of a task).
 ///
 /// A **typed** scope, never a namespace interpolated into the DSL: a path with `,` in it split into two
@@ -713,6 +733,15 @@ pub fn review_findings(
         ..Query::default()
     };
     let ids = query.evaluate(conn)?;
+    if ids.len() > MAX_EXAMINED_FINDINGS {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!(
+                "those namespaces hold {} tasks; a review holds at most {MAX_EXAMINED_FINDINGS}",
+                ids.len()
+            ),
+        ));
+    }
     let metas = item::get_many(conn, &ids)?;
     let mut out = ReviewFindings {
         total: ids.len(),
@@ -730,7 +759,10 @@ pub fn review_findings(
         if out.open_must_fix.len() < MAX_LISTED_FINDINGS {
             out.open_must_fix.push(ReviewFinding {
                 uid: m.uid.clone(),
-                title: item::title_of(m),
+                title: item::title_of(m)
+                    .chars()
+                    .take(MAX_FINDING_TITLE_CHARS)
+                    .collect(),
             });
         }
     }

@@ -3258,13 +3258,18 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Work { .. }
         | TaskCmd::Abandon { .. }
         | TaskCmd::Sessions
-        | TaskCmd::Land { .. }
+        | TaskCmd::Land {
+            break_lock: false, ..
+        }
         | TaskCmd::Landed { .. } => {
             anyhow::bail!("internal: a task verb served as an op missed ops_cli's dispatch")
         }
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         TaskCmd::Pr { uid, number } => cmd_task_pr(db, &uid, number, json)?,
-        cmd @ TaskCmd::Gate { .. } => {
+        cmd @ (TaskCmd::Gate { .. }
+        | TaskCmd::Land {
+            break_lock: true, ..
+        }) => {
             cmd_task_session(db, db_path, cmd, json)?;
         }
         TaskCmd::Reap {
@@ -3562,13 +3567,28 @@ pub(crate) fn cmd_task_landed(
     Ok(())
 }
 
-/// Configure the gate that guards a landing (design D36.5). The other session verbs are served as
-/// ops (`task_cli`), in both modes.
+/// The host-only session verbs: configure the gate that guards a landing (design D36.5), and break a
+/// repo's land lease. The other session verbs are served as ops (`task_cli`), in both modes.
 fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
     let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
     let kb = session_cli::Kb::new(&backend);
-    let _ = db_path;
     match cmd {
+        TaskCmd::Land {
+            break_lock: true, ..
+        } => cmd_task_land(
+            &kb,
+            &archive::Stores::new(kb, Some(db_path)),
+            Some(db),
+            None,
+            LandFlags {
+                gate: None,
+                no_gate: false,
+                keep_worktree: false,
+                no_review: false,
+                break_lock: true,
+            },
+            json,
+        ),
         // Storing a gate is a host command (decision A), so it is done here, against the database,
         // and never through an op. Showing one is served as an op in both modes.
         TaskCmd::Gate { cmd, clear } => {
@@ -3809,14 +3829,17 @@ pub(crate) fn cmd_task_land(
     let gate_flag = gate_flag.as_deref();
     let ctx = repo::repo_ctx()?;
     if break_lock {
-        match session_cli::LandLease::break_held(kb, &ctx.key)? {
-            Some(holder) => println!("broke {}'s land lease held by {holder}", ctx.key),
-            None => println!("no land lease was held for {}", ctx.key),
-        }
-        return Ok(());
+        return break_land_lease(kb, &ctx.key, json);
     }
     let uid = uid.context("a task to land")?;
     let facts = kb.facts(uid)?;
+    // Asked before anything moves: a task this client may not write would otherwise be grafted and
+    // its session disposed of, and only then refused its record — landed, in progress, sessionless.
+    anyhow::ensure!(
+        facts.writable,
+        "{uid} is filed outside the directories this client may cause host files to be written in, \
+         so its landing cannot be recorded from here — land it on the host"
+    );
     let tags = facts.tags.clone();
 
     // The lock is taken **before** anything is checked, not just before the graft.
@@ -3831,11 +3854,10 @@ pub(crate) fn cmd_task_land(
     // Acquiring costs nothing here: it fails fast rather than waiting, and every other precondition
     // below is equally worth serialising against a concurrent land.
     //
-    // The lock file lives in `.jkb/`, and taking it this early means a land that is about to be
-    // *refused* creates that directory too — in a repo where `task work` has never run, and so has
-    // never excluded it. A lock file stranded by a kill would then show up as untracked and make
-    // the user's tree dirty. Excluded first, in `.git/info/exclude` exactly as `task work` does it:
-    // local to this clone, never their committed `.gitignore` (D36.2).
+    // `.jkb/` is excluded first, in `.git/info/exclude` exactly as `task work` does it — local to this
+    // clone, never their committed `.gitignore` (D36.2) — because a land may create `.jkb/base` and
+    // `.jkb/archive` in a repo where `task work` has never run. The lock itself is a database lease
+    // now, and leaves nothing on disk.
     session::ensure_excluded(&ctx.root)?;
     let _lock = session_cli::LandLease::acquire(kb, &ctx.key)?;
 
@@ -3925,6 +3947,23 @@ pub(crate) fn cmd_task_land(
         },
         json,
     )
+}
+
+/// `task land --break-lock`: drop this repo's land lease, whoever holds it.
+fn break_land_lease(kb: &session_cli::Kb<'_>, repo_key: &str, json: bool) -> Result<()> {
+    let broken = session_cli::LandLease::break_held(kb, repo_key)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "repo": repo_key, "broken_holder": broken })
+        );
+    } else {
+        match broken {
+            Some(holder) => println!("broke {repo_key}'s land lease held by {holder}"),
+            None => println!("no land lease was held for {repo_key}"),
+        }
+    }
+    Ok(())
 }
 
 /// What a successful graft produced, for the bookkeeping that follows it.

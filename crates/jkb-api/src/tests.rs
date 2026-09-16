@@ -1762,6 +1762,13 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         checked += 1;
     }
     assert_eq!(checked, 17, "every task write was asked");
+    // And a verb that does git work first can ask, before it does any.
+    for (uid, writable) in [(&outside, false), (&inside, true)] {
+        match call(&b, json!({ "op": "task.facts", "uid": uid })).unwrap() {
+            Response::TaskState { state } => assert_eq!(state.writable, writable, "{uid}"),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 #[test]
