@@ -1898,6 +1898,7 @@ version = "0.1.0"
 dependencies = [
  "jkb-core",
  "jkb-embed",
+ "jkb-fsm",
  "jkb-ingest",
  "jkb-search",
  "jkb-sync",

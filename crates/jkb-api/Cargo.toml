@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 jkb-core = { version = "0.1.0", path = "../jkb-core" }
+jkb-fsm = { version = "0.1.0", path = "../jkb-fsm" }
 jkb-embed = { version = "0.1.0", path = "../jkb-embed" }
 jkb-ingest = { version = "0.1.0", path = "../jkb-ingest" }
 jkb-search = { version = "0.1.0", path = "../jkb-search" }

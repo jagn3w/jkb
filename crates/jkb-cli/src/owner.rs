@@ -28,14 +28,57 @@ pub fn self_owner() -> String {
     AgentId::this_process(&hostname(), std::process::id()).as_str()
 }
 
-/// The owner id for a session working in `worktree`: `session:<this pid>:<worktree>`.
+/// The owner id for a session working in `worktree`:
+/// `session:<this pid>[@<claude session>]:<worktree>`.
 ///
 /// The pid is **provenance** — which `jkb task work` process opened the session — and is
 /// deliberately *not* a liveness signal: that process exits within a second, long before anyone
-/// reads the claim. Liveness is the worktree; see [`is_alive`].
+/// reads the claim. Liveness is the worktree; see [`is_alive`]. The Claude Code session this runs in
+/// (`CLAUDE_CODE_SESSION_ID`) is provenance too: it lets another session see whether the one that
+/// opened the work has ended (tasks S6.4, decision E).
+///
+/// The worktree is written `~/`-relative when it lies under `$HOME`, so the host and the dev
+/// container — which see the same `~/repos` under different homes — both resolve it
+/// ([`session_worktree`]).
 #[must_use]
 pub fn session_owner(worktree: &Path) -> String {
-    AgentId::session(std::process::id(), worktree).as_str()
+    AgentId::session(
+        std::process::id(),
+        claude_session().as_deref(),
+        &home_relative(worktree, home().as_deref()),
+    )
+    .as_str()
+}
+
+/// The Claude Code session this process runs in, if any.
+#[must_use]
+pub fn claude_session() -> Option<String> {
+    std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|s| jkb_types::is_session_id(s))
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+}
+
+/// `path` as `~/…` when it lies under `home`, else unchanged.
+fn home_relative(path: &Path, home: Option<&Path>) -> PathBuf {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if !rest.as_os_str().is_empty() => Path::new("~").join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// A `~/…` path resolved against `home`; anything else unchanged. With no home, a `~` path stays as it
+/// is — relative, so it names nothing, and a probe of it establishes nothing.
+fn resolve_home(path: &Path, home: Option<&Path>) -> PathBuf {
+    match (path.strip_prefix("~"), home) {
+        (Ok(rest), Some(h)) => h.join(rest),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// An externally-minted agent owner, from `JKB_AGENT_ID` when the environment sets one.
@@ -61,7 +104,9 @@ pub fn preferred_owner() -> String {
 /// The worktree a session owner id points at, or [`None`] for any other owner shape.
 #[must_use]
 pub fn session_worktree(owner: &str) -> Option<PathBuf> {
-    AgentId::parse(owner).worktree().map(Path::to_path_buf)
+    AgentId::parse(owner)
+        .worktree()
+        .map(|w| resolve_home(w, home().as_deref()))
 }
 
 /// Whether a process with this pid exists — the raw probe, for callers that hold a pid rather
@@ -127,7 +172,7 @@ pub fn is_alive(owner: &str) -> Fact {
         Liveness::Process { host, pid } if host == hostname() => pid_exists(pid),
         // An absence is only proof where the place it would be is visible, and for an owner id
         // the only anchor available is the path's own parent — see [`present_here`].
-        Liveness::Worktree(dir) => present_here(&dir),
+        Liveness::Worktree(dir) => present_here(&resolve_home(&dir, home().as_deref())),
         // An owner on another host and an external agent are the same answer for the same
         // reason: nothing here can establish it. Never "dead" — see the module docs.
         Liveness::Process { .. } | Liveness::External => Fact::Unknown,
@@ -179,6 +224,9 @@ fn pid_exists(pid: u32) -> Fact {
 /// `git clean -xdf` — which is why that path anchors on the repo root instead. See
 /// [`present_under`] for choosing one.
 fn present_here(path: &Path) -> Fact {
+    if !path.is_absolute() {
+        return Fact::Unknown;
+    }
     match path.parent() {
         // A path with no parent is `/`, whose absence is not a thing to reason about.
         None => Fact::Unknown,
@@ -205,9 +253,13 @@ fn liveness_from(probe: Result<(), Errno>) -> Fact {
 
 #[cfg(test)]
 mod tests {
-    use super::{hostname, is_alive, self_owner, session_owner, session_worktree};
+    use super::{
+        home_relative, hostname, is_alive, resolve_home, self_owner, session_owner,
+        session_worktree,
+    };
     use jkb_fsm::Fact;
     use jkb_types::AgentId;
+    use std::path::Path;
 
     /// The pid an owner id carries, for the tests that assert what this module mints.
     fn owner_pid(owner: &str) -> Option<u32> {
@@ -394,5 +446,72 @@ mod tests {
         let id = AgentId::agent("run-7").as_str();
         assert_eq!(id, "agent:run-7");
         assert_eq!(is_alive(&id), Fact::Unknown);
+    }
+
+    /// **A session owner names its worktree the same way on both sides of the bind** (tasks S6.4,
+    /// decision E). Written under one home as `~/…`, it resolves under another home to that home's
+    /// copy — which is how the host and the dev container, whose `~/repos` is the same directory
+    /// under different homes, can each judge the other's session.
+    #[test]
+    fn a_session_worktree_is_written_home_relative_and_resolved_by_each_side() {
+        let container = Path::new("/home/vscode");
+        let host = Path::new("/Users/me");
+        let written = home_relative(
+            Path::new("/home/vscode/repos/jkb/.jkb/work/s"),
+            Some(container),
+        );
+        assert_eq!(written, Path::new("~/repos/jkb/.jkb/work/s"));
+        assert_eq!(
+            resolve_home(&written, Some(host)),
+            Path::new("/Users/me/repos/jkb/.jkb/work/s")
+        );
+        // Outside the home, or the home itself: kept absolute.
+        assert_eq!(
+            home_relative(Path::new("/tmp/w"), Some(container)),
+            Path::new("/tmp/w")
+        );
+        assert_eq!(
+            home_relative(container, Some(container)),
+            Path::new("/home/vscode")
+        );
+        assert_eq!(
+            home_relative(Path::new("/home/vscodex/w"), Some(container)),
+            Path::new("/home/vscodex/w"),
+            "a sibling that merely shares the prefix is not under the home"
+        );
+        assert_eq!(
+            resolve_home(Path::new("/abs"), Some(host)),
+            Path::new("/abs")
+        );
+        // No home: a `~` path stays relative, and a relative path establishes nothing.
+        assert_eq!(
+            resolve_home(&written, None),
+            Path::new("~/repos/jkb/.jkb/work/s")
+        );
+        assert_eq!(
+            is_alive("session:1:relative/work/s"),
+            Fact::Unknown,
+            "a relative worktree names no place to look"
+        );
+    }
+
+    /// The owner this process mints for a worktree under its home is home-relative, and resolves back
+    /// to the same directory here — so the probe still sees a live session as live.
+    #[test]
+    fn a_minted_session_owner_round_trips_through_this_home() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let Ok(tmp) = tempfile::tempdir_in(&home) else {
+            return; // a home this test may not write in: nothing to assert
+        };
+        let owner = session_owner(tmp.path());
+        let worktree = AgentId::parse(&owner);
+        assert!(
+            worktree.worktree().is_some_and(|w| w.starts_with("~")),
+            "{owner}"
+        );
+        assert_eq!(session_worktree(&owner).as_deref(), Some(tmp.path()));
+        assert_eq!(is_alive(&owner), Fact::Yes);
     }
 }

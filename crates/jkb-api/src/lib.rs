@@ -31,6 +31,7 @@ use serde_json::Value;
 
 pub mod ingest;
 pub mod kb;
+pub mod sessions;
 pub mod tasks;
 
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
@@ -443,6 +444,54 @@ pub enum Request {
     /// Store a document whose text the client extracted, and chunk it.
     #[serde(rename = "ingest.text")]
     IngestText(ingest::IngestAsk),
+    /// What the session verbs read about a task ([`sessions::facts`]).
+    #[serde(rename = "task.facts")]
+    TaskFacts {
+        /// The task (a uid or bare slug).
+        uid: String,
+    },
+    /// A repo's tasks by every branch they record ([`sessions::by_branch`]).
+    #[serde(rename = "task.by_branch")]
+    TaskByBranch {
+        /// The repo key.
+        repo: String,
+    },
+    /// `jkb task start`'s write: take the claim, record where the work is, note it
+    /// ([`sessions::start`]).
+    #[serde(rename = "task.start")]
+    TaskStart(sessions::StartAsk),
+    /// `jkb task work`'s claim ([`sessions::take`]).
+    #[serde(rename = "task.take")]
+    TaskTake(sessions::TakeAsk),
+    /// Record where a task's work is ([`sessions::locate`]).
+    #[serde(rename = "task.locate")]
+    TaskLocate {
+        /// The task.
+        uid: String,
+        /// Where.
+        place: sessions::Place,
+    },
+    /// `jkb task abandon`'s write: release the judged claim and reopen ([`sessions::abandon`]).
+    #[serde(rename = "task.abandon")]
+    TaskAbandon {
+        /// The task.
+        uid: String,
+        /// The claim the caller read before its git work, or `None` for none.
+        #[serde(default)]
+        observed: Option<String>,
+    },
+    /// The gate command stored for a repo — read-only ([`sessions::gate`]).
+    #[serde(rename = "repo.gate")]
+    RepoGate {
+        /// The repo key.
+        repo: String,
+    },
+    /// Whether a Claude Code session is live, ended or unknown to the registry.
+    #[serde(rename = "session.state")]
+    SessionState {
+        /// The session id.
+        session: String,
+    },
 }
 
 /// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
@@ -768,6 +817,14 @@ impl Request {
         "task.claim",
         "task.release",
         "ingest.text",
+        "task.facts",
+        "task.by_branch",
+        "task.start",
+        "task.take",
+        "task.locate",
+        "task.abandon",
+        "repo.gate",
+        "session.state",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -814,6 +871,14 @@ impl Request {
             Self::TaskClaim { .. } => "task.claim",
             Self::TaskRelease { .. } => "task.release",
             Self::IngestText(_) => "ingest.text",
+            Self::TaskFacts { .. } => "task.facts",
+            Self::TaskByBranch { .. } => "task.by_branch",
+            Self::TaskStart(_) => "task.start",
+            Self::TaskTake(_) => "task.take",
+            Self::TaskLocate { .. } => "task.locate",
+            Self::TaskAbandon { .. } => "task.abandon",
+            Self::RepoGate { .. } => "repo.gate",
+            Self::SessionState { .. } => "session.state",
         }
     }
 
@@ -841,7 +906,10 @@ impl Request {
             | Self::TaskReady { .. }
             | Self::TaskShow { .. }
             | Self::TaskSubtasks { .. }
-            | Self::TaskWhy { .. } => true,
+            | Self::TaskWhy { .. }
+            | Self::TaskFacts { .. }
+            | Self::TaskByBranch { .. }
+            | Self::RepoGate { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -868,7 +936,12 @@ impl Request {
             | Self::TaskBind { .. }
             | Self::TaskClaim { .. }
             | Self::TaskRelease { .. }
-            | Self::IngestText(_) => false,
+            | Self::IngestText(_)
+            | Self::TaskStart(_)
+            | Self::TaskTake(_)
+            | Self::TaskLocate { .. }
+            | Self::TaskAbandon { .. }
+            | Self::SessionState { .. } => false,
         }
     }
 }
@@ -1068,6 +1141,38 @@ pub enum Response {
         #[serde(flatten)]
         ingested: ingest::Ingested,
     },
+    /// A `task.facts`.
+    TaskState {
+        /// The task as the session verbs see it.
+        #[serde(flatten)]
+        state: sessions::TaskState,
+    },
+    /// A `task.by_branch`.
+    BranchTasks {
+        /// By branch.
+        tasks: std::collections::BTreeMap<String, sessions::BranchTask>,
+    },
+    /// A `task.start` or `task.take`.
+    Taken {
+        /// `false` when the claim changed hands since the caller read it; nothing was written.
+        taken: bool,
+    },
+    /// A `task.abandon`.
+    Abandoned {
+        /// What it did.
+        #[serde(flatten)]
+        abandoned: sessions::Abandoned,
+    },
+    /// A `repo.gate`.
+    Gate {
+        /// The stored command, if any.
+        gate: Option<String>,
+    },
+    /// A `session.state`: `live`, `ended` or `unknown`.
+    SessionIs {
+        /// The state.
+        state: String,
+    },
     /// A `task.show`.
     Task {
         /// The task.
@@ -1115,6 +1220,12 @@ impl Response {
             | Self::Released { .. }
             | Self::Edited { .. }
             | Self::Ingested { .. }
+            | Self::TaskState { .. }
+            | Self::BranchTasks { .. }
+            | Self::Taken { .. }
+            | Self::Abandoned { .. }
+            | Self::Gate { .. }
+            | Self::SessionIs { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -1158,6 +1269,12 @@ impl Response {
             | Self::History { .. }
             | Self::Edited { .. }
             | Self::Ingested { .. }
+            | Self::TaskState { .. }
+            | Self::BranchTasks { .. }
+            | Self::Taken { .. }
+            | Self::Abandoned { .. }
+            | Self::Gate { .. }
+            | Self::SessionIs { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -1877,6 +1994,54 @@ impl Backend for LocalBackend {
             }
             Request::IngestText(ask) => Response::Ingested {
                 ingested: ingest::ingest(db, actor, self.embedder.as_ref(), &ask)?,
+            },
+            Request::TaskFacts { uid } => Response::TaskState {
+                state: db.read_with(move |c| sessions::facts(c, &uid))?,
+            },
+            Request::TaskByBranch { repo } => Response::BranchTasks {
+                tasks: db.read_with(move |c| sessions::by_branch(c, &repo))?,
+            },
+            Request::TaskStart(ask) => {
+                let roots = self.file_roots.clone();
+                let uid = ask.uid.clone();
+                Response::Taken {
+                    taken: task_write(db, actor, uid, move |c, m, _| {
+                        sessions::start(c, m, &ask, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskTake(ask) => {
+                let roots = self.file_roots.clone();
+                let uid = ask.uid.clone();
+                Response::Taken {
+                    taken: task_write(db, actor, uid, move |c, m, _| {
+                        sessions::take(c, m, &ask, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskLocate { uid, place } => {
+                let roots = self.file_roots.clone();
+                task_write(db, actor, uid, move |c, m, uid| {
+                    sessions::locate(c, m, uid, &place, roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskAbandon { uid, observed } => {
+                let roots = self.file_roots.clone();
+                Response::Abandoned {
+                    abandoned: task_write(db, actor, uid, move |c, m, uid| {
+                        sessions::abandon(c, m, uid, observed.as_deref(), roots.as_ref())
+                    })?,
+                }
+            }
+            Request::RepoGate { repo } => Response::Gate {
+                gate: db.read_with(move |c| sessions::gate(c, &repo))?,
+            },
+            Request::SessionState { session } => Response::SessionIs {
+                state: db
+                    .read(move |c| claude_session::state(c, &session))?
+                    .as_str()
+                    .to_owned(),
             },
             Request::TaskSubtasks { uid, all } => {
                 let (children, truncated) = db.read_with(move |c| {

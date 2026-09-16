@@ -20,6 +20,29 @@ use super::{TaskCmd, TaskTagCmd};
 #[allow(clippy::too_many_lines)] // a flat verb dispatcher: one arm per verb, as in `jkb_api`
 pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
     match cmd {
+        // The session verbs served in both modes (tasks S6.4): their git work is done here, their
+        // database work through the ops.
+        TaskCmd::Start {
+            uid,
+            branch,
+            onto,
+            repo,
+            owner,
+        } => crate::session_cli::start(
+            &crate::session_cli::Kb::new(ops.backend()),
+            &uid,
+            crate::session_cli::StartWhere {
+                branch,
+                onto,
+                repo,
+                owner,
+            },
+            ops.json,
+        ),
+        TaskCmd::Gate {
+            cmd: None,
+            clear: false,
+        } => crate::session_cli::gate(&crate::session_cli::Kb::new(ops.backend()), ops.json),
         TaskCmd::Add {
             text,
             backlog,

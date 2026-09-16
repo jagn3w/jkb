@@ -9,9 +9,8 @@
 //! refuses binding a task to a file at all. The host CLI's backend has no roots and is refused
 //! nothing.
 //!
-//! Not in the set, on purpose: `task start`/`work`/`land`/`abandon`/`gate`/`sessions` (git, the
-//! session record store and the stored gate command, which the container must run itself — a later
-//! stage), `task reclaim` (it probes whether owners' processes are alive, which only their host can
+//! Not in the set, on purpose: the session verbs, whose database steps are their own ops
+//! ([`crate::sessions`]), `task reclaim` (it probes whether owners' processes are alive, which only their host can
 //! answer), and `task mirror` (a sweep over every task).
 
 use std::path::{Component, Path, PathBuf};
@@ -69,12 +68,12 @@ fn forbidden(what: impl Into<String>) -> ApiError {
     ApiError::with_code(ErrorCode::Forbidden, what)
 }
 
-fn no_item(reference: &str) -> ApiError {
+pub(crate) fn no_item(reference: &str) -> ApiError {
     ApiError::with_code(ErrorCode::NotFound, format!("no item with uid {reference}"))
 }
 
 /// The task a reference names, refused under `roots` when its binding is a file outside them.
-fn writable(
+pub(crate) fn writable(
     conn: &Connection,
     reference: &str,
     roots: Option<&FileRoots>,
@@ -130,7 +129,7 @@ fn check_len(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
 /// task's history by a megabyte a round.
 pub const MAX_OWNER_BYTES: usize = 512;
 
-fn check_owner(owner: &str) -> Result<(), ApiError> {
+pub(crate) fn check_owner(owner: &str) -> Result<(), ApiError> {
     if owner.is_empty() || owner.len() > MAX_OWNER_BYTES {
         return Err(ApiError::with_code(
             ErrorCode::Invalid,

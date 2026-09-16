@@ -233,6 +233,42 @@ fn samples() -> Vec<Request> {
             namespace: "inbox".into(),
             raw: None,
         }),
+        Request::TaskFacts { uid: "u".into() },
+        Request::TaskByBranch { repo: "r".into() },
+        Request::TaskStart(super::sessions::StartAsk {
+            uid: "u".into(),
+            take: None,
+            place: super::sessions::Place {
+                branch: "b".into(),
+                repo: "r".into(),
+                onto: None,
+            },
+        }),
+        Request::TaskTake(super::sessions::TakeAsk {
+            uid: "u".into(),
+            take: super::sessions::Take {
+                owner: "agent:x".into(),
+                displace: None,
+            },
+            branch: "b".into(),
+            onto: "o".into(),
+        }),
+        Request::TaskLocate {
+            uid: "u".into(),
+            place: super::sessions::Place {
+                branch: "b".into(),
+                repo: "r".into(),
+                onto: None,
+            },
+        },
+        Request::TaskAbandon {
+            uid: "u".into(),
+            observed: None,
+        },
+        Request::RepoGate { repo: "r".into() },
+        Request::SessionState {
+            session: "s".into(),
+        },
     ]
 }
 
@@ -1246,6 +1282,9 @@ const READS: &[&str] = &[
     "task.show",
     "task.subtasks",
     "task.why",
+    "task.facts",
+    "task.by_branch",
+    "repo.gate",
 ];
 
 #[test]
@@ -1660,7 +1699,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 11, "every task write was asked");
+    assert_eq!(checked, 15, "every task write was asked");
 }
 
 #[test]
@@ -1944,6 +1983,14 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         json!({ "op": "task.bind", "uid": inside, "sync": uri }),
         json!({ "op": "task.claim", "uid": inside, "owner": "agent:a" }),
         json!({ "op": "task.release", "uid": inside, "owner": "agent:a" }),
+        json!({ "op": "task.start", "uid": inside, "take": { "owner": "agent:b" },
+                "place": { "branch": "b1", "repo": "r", "onto": "o" } }),
+        json!({ "op": "task.take", "uid": inside,
+                "take": { "owner": "agent:c", "displace": "agent:b" },
+                "branch": "b", "onto": "o" }),
+        json!({ "op": "task.locate", "uid": inside,
+                "place": { "branch": "b2", "repo": "r" } }),
+        json!({ "op": "task.abandon", "uid": inside, "observed": "agent:c" }),
     ];
     // Every task write the wire accepts is here; `task.add` checks the task it makes, below.
     let mut covered: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();

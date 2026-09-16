@@ -18,7 +18,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// The host segment marking a **session** owner: `session:<pid>:<worktree>`.
+/// The host segment marking a **session** owner: `session:<pid>[@<claude session>]:<worktree>`.
 const SESSION: &str = "session";
 
 /// The host segment marking an **agent** owner: `agent:<id>`.
@@ -49,15 +49,25 @@ pub enum AgentId {
         /// An optional run discriminator, kept so two runs of one coordinator are distinct ids.
         run: Option<String>,
     },
-    /// A `jkb task work` session: `session:<pid>:<worktree>` (design D36.6).
+    /// A `jkb task work` session: `session:<pid>[@<claude session>]:<worktree>` (design D36.6).
     ///
     /// The pid is **provenance** — which process opened the session — and is deliberately never
     /// consulted for liveness: `jkb task work` exits within a second, long before anybody reads
     /// the claim. The worktree is what persists and what means "this work is in flight".
+    ///
+    /// The Claude Code session that opened it, when there was one, is provenance too (tasks S6.4,
+    /// decision E): it lets another session tell a worktree someone is still working in from one
+    /// whose opener has ended. It never decides liveness either — the worktree does.
+    ///
+    /// The worktree may be written home-relative (`~/repos/…`): the dev container and the host see
+    /// the same `~/repos` under different homes, and a `~` path is resolved by each side against its
+    /// own, where an absolute one names a directory only one of them has.
     Session {
         /// Which process opened it. Recorded, never probed.
         pid: u32,
-        /// The checkout whose existence is the claim.
+        /// The Claude Code session that opened it, if any.
+        opened_by: Option<String>,
+        /// The checkout whose existence is the claim, absolute or `~/`-relative.
         worktree: PathBuf,
     },
     /// An externally-minted agent identity: `agent:<id>`.
@@ -121,11 +131,14 @@ impl AgentId {
         }
     }
 
-    /// The owner id for a session working in `worktree`.
+    /// The owner id for a session working in `worktree`, opened by process `pid` — and by the Claude
+    /// Code session `opened_by`, when that is a valid session id (anything else is dropped rather than
+    /// allowed to break the field boundaries).
     #[must_use]
-    pub fn session(pid: u32, worktree: &Path) -> Self {
+    pub fn session(pid: u32, opened_by: Option<&str>, worktree: &Path) -> Self {
         Self::Session {
             pid,
+            opened_by: opened_by.filter(|s| is_session_id(s)).map(str::to_owned),
             worktree: worktree.to_path_buf(),
         }
     }
@@ -155,15 +168,22 @@ impl AgentId {
                 // `session:<pid>:<worktree>`; fields 2.. are rejoined so a path containing a
                 // colon survives the round trip.
                 match rest.split_first() {
-                    Some((pid, tail)) if !tail.is_empty() => match pid.parse::<u32>() {
-                        Ok(pid) => Self::Session {
-                            pid,
-                            worktree: PathBuf::from(tail.join(":")),
-                        },
-                        Err(_) => Self::Unrecognized {
-                            raw: raw.to_owned(),
-                        },
-                    },
+                    Some((opener, tail)) if !tail.is_empty() => {
+                        let (pid, opened_by) = match opener.split_once('@') {
+                            Some((pid, by)) => (pid, Some(by)),
+                            None => (*opener, None),
+                        };
+                        match (pid.parse::<u32>(), opened_by) {
+                            (Ok(pid), by) if by.is_none_or(is_session_id) => Self::Session {
+                                pid,
+                                opened_by: by.map(str::to_owned),
+                                worktree: PathBuf::from(tail.join(":")),
+                            },
+                            _ => Self::Unrecognized {
+                                raw: raw.to_owned(),
+                            },
+                        }
+                    }
                     _ => Self::Unrecognized {
                         raw: raw.to_owned(),
                     },
@@ -196,9 +216,14 @@ impl AgentId {
                 Some(run) => format!("{host}:{pid}:{run}"),
                 None => format!("{host}:{pid}"),
             },
-            Self::Session { pid, worktree } => {
-                format!("{SESSION}:{pid}:{}", worktree.to_string_lossy())
-            }
+            Self::Session {
+                pid,
+                opened_by,
+                worktree,
+            } => match opened_by {
+                Some(by) => format!("{SESSION}:{pid}@{by}:{}", worktree.to_string_lossy()),
+                None => format!("{SESSION}:{pid}:{}", worktree.to_string_lossy()),
+            },
             Self::Agent { id } => format!("{AGENT}:{id}"),
             Self::Unrecognized { raw } => raw.clone(),
         }
@@ -222,7 +247,8 @@ impl AgentId {
         }
     }
 
-    /// The session worktree this owner names, if it is a session owner.
+    /// The session worktree this owner names, if it is a session owner — as written, so possibly
+    /// `~/`-relative; the caller resolves it against its own home.
     #[must_use]
     pub fn worktree(&self) -> Option<&Path> {
         match self {
@@ -230,6 +256,25 @@ impl AgentId {
             _ => None,
         }
     }
+
+    /// The Claude Code session that opened this session owner's work, if recorded.
+    #[must_use]
+    pub fn opened_by(&self) -> Option<&str> {
+        match self {
+            Self::Session { opened_by, .. } => opened_by.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `s` can be a Claude Code session id as jkb records one: non-empty, bounded, and only
+/// `[A-Za-z0-9_-]` — the notification ops' rule, which also keeps it clear of `@` and `:`.
+#[must_use]
+pub fn is_session_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 impl fmt::Display for AgentId {
@@ -264,6 +309,8 @@ mod tests {
             "host:123",
             "host:123:run-7",
             "session:99:/tmp/work/a-task",
+            "session:99@0f1e-2d3c_4b:/tmp/work/a-task",
+            "session:99:~/repos/jkb/.jkb/work/a-task",
             "agent:01JBX7Q4",
             "garbage",
             "",
@@ -276,9 +323,40 @@ mod tests {
     #[test]
     fn a_path_with_a_colon_survives() {
         let odd = Path::new("/tmp/we:ird/work");
-        let id = AgentId::session(7, odd);
+        let id = AgentId::session(7, None, odd);
         assert_eq!(AgentId::parse(&id.as_str()), id);
         assert_eq!(id.worktree(), Some(odd));
+        let id = AgentId::session(7, Some("abc-1"), odd);
+        assert_eq!(AgentId::parse(&id.as_str()), id);
+        assert_eq!((id.worktree(), id.opened_by()), (Some(odd), Some("abc-1")));
+    }
+
+    /// The opening Claude session is provenance: recorded when it is a valid id, dropped when it is
+    /// not (so it can never absorb a field boundary), and never the liveness basis.
+    #[test]
+    fn the_opening_session_is_recorded_and_never_decides_liveness() {
+        let w = Path::new("/tmp/w");
+        assert_eq!(
+            AgentId::session(1, Some("a:b"), w).as_str(),
+            "session:1:/tmp/w",
+            "an id with a separator is dropped, not stored"
+        );
+        assert_eq!(AgentId::session(1, Some(""), w).opened_by(), None);
+        assert_eq!(
+            AgentId::parse("session:1@s-1:/tmp/w").liveness(),
+            Liveness::Worktree(PathBuf::from("/tmp/w"))
+        );
+        for raw in [
+            "session:1@:/tmp/w",
+            "session:1@a b:/tmp/w",
+            "session:x@s:/tmp/w",
+        ] {
+            assert!(
+                matches!(AgentId::parse(raw), AgentId::Unrecognized { .. }),
+                "{raw} is not a session owner"
+            );
+            assert_eq!(AgentId::parse(raw).as_str(), raw, "but it round-trips");
+        }
     }
 
     /// The liveness basis is the whole point of the type: each shape declares what would prove

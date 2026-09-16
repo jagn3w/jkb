@@ -18,9 +18,7 @@ use jkb_types::ItemId;
 
 use crate::gitrepo;
 
-pub(crate) use jkb_core::location::{
-    set_facet, set_location_facets, Location, FACET_BRANCH, FACET_REPO,
-};
+pub(crate) use jkb_core::location::{set_facet, FACET_BRANCH, FACET_REPO};
 
 /// The branch a session's work lands on used to be a facet here (`onto=`). It is now
 /// a label on the task's transition history: it is a statement about a moment, so two tasks told
@@ -154,42 +152,6 @@ pub(crate) fn repo_ctx() -> Result<RepoCtx> {
     Ok(RepoCtx { root, key, trunk })
 }
 
-/// One task, as far as the session commands care.
-pub(crate) struct SessionTask {
-    pub(crate) uid: String,
-    pub(crate) status: String,
-    /// Where **this** branch lands, from its own record.
-    ///
-    /// Per branch rather than per task, which is what it always was in substance: a task carrying
-    /// two branches had one `onto=` facet, so whichever branch you looked up got the other's
-    /// answer.
-    pub(crate) onto: Option<String>,
-}
-
-/// This repo's tasks indexed by **every** branch each records.
-///
-/// `branch=` is the only link from a worktree back to its task — there is deliberately no
-/// session state file to fall out of step with git (design D36.2). A task carrying two of
-/// them is indexed under both, so a worktree is found whichever one names it.
-pub(crate) fn tasks_by_branch(db: &Db, repo_key: &str) -> Result<BTreeMap<String, SessionTask>> {
-    let mut out = BTreeMap::new();
-    for t in repo_tasks(db, repo_key)? {
-        let id = t.meta.id;
-        let onto = db.read(move |conn| jkb_core::transition::land_target(conn, id))?;
-        for branch in facet_values(&t.tags, FACET_BRANCH) {
-            out.insert(
-                branch.clone(),
-                SessionTask {
-                    uid: t.meta.uid.clone(),
-                    status: t.meta.status.clone().unwrap_or_default(),
-                    onto: onto.clone(),
-                },
-            );
-        }
-    }
-    Ok(out)
-}
-
 /// Every task tagged `repo=<repo_key>`, as a **typed** query.
 ///
 /// Built rather than parsed from `format!("kind:task tag:repo={key}")`: the key is a
@@ -254,8 +216,9 @@ pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{facet_values, set_location_facets, task_tags, Location, FACET_BRANCH};
+    use super::{facet_values, task_tags, FACET_BRANCH};
     use jkb_core::item::NewItem;
+    use jkb_core::location::{set_location_facets, Location};
     use jkb_core::Db;
 
     /// `branch=` is *set*, not added, by this writer: a second value is a contradiction rather

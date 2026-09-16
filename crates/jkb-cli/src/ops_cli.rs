@@ -56,6 +56,11 @@ pub const fn handles(command: &Command) -> bool {
                 | TaskCmd::Bind { .. }
                 | TaskCmd::Claim { .. }
                 | TaskCmd::Release { .. }
+                | TaskCmd::Start { .. }
+                | TaskCmd::Gate {
+                    cmd: None,
+                    clear: false
+                }
         ),
         _ => false,
     }
@@ -165,6 +170,12 @@ impl<'a> Ops<'a> {
             },
             _ => bail!("internal: a command the read set does not handle"),
         }
+    }
+
+    /// The backend this serves through, for a client module that speaks to it directly
+    /// ([`crate::session_cli::Kb`]).
+    pub(crate) fn backend(&self) -> &'a dyn Backend {
+        self.backend
     }
 
     /// Every op goes through here, so a cut answer is reported here — once, for every command, rather

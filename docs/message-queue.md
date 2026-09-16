@@ -88,6 +88,14 @@ routinely built from different checkouts.
 | `task.bind` | `uid`, `sync?` (`managed:` when absent) | `applied` |
 | `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
 | `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
+| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?`, `terminal`} |
+| `task.by_branch` | `repo` | `branch_tasks` {`tasks`: branch → {`uid`, `status`, `onto?`}} |
+| `task.start` | `uid`, `take?` {`owner`, `displace?`}, `place` {`branch`, `repo`, `onto?`} | `taken` {`taken`} — `false`, nothing written, when the claim is no longer `displace` |
+| `task.take` | `uid`, `take` {`owner`, `displace?`}, `branch`, `onto` | `taken` {`taken`} |
+| `task.locate` | `uid`, `place` {`branch`, `repo`, `onto?`} | `applied` |
+| `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`reopened`, `status`} |
+| `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
+| `session.state` | `session` | `session_is` {`state`: `live`\|`ended`\|`unknown`} |
 | `ingest.text` | `text`, `mime` (≤ 255 bytes), `namespace` | `ingested` {`document`, `namespace`, `chunk_count`, `embedded`, `already_ingested`, `warnings`} |
 
 Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`, `history`) and `grep_hits`

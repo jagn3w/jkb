@@ -48,16 +48,8 @@ impl Fixture {
     /// A `jkb` invocation rooted in the repo, with git's global config neutralized for the
     /// `git` subprocesses jkb itself spawns.
     fn jkb(&self) -> Command {
-        let mut cmd = Command::cargo_bin("jkb").unwrap();
-        cmd.arg("--db").arg(&self.db).current_dir(&self.repo);
-        // The same isolation the fixture's own git calls get: jkb spawns git, so the
-        // developer's shell reaches it through this process just as directly.
-        isolate_git_env(&mut cmd);
-        common::isolate_remote_env(&mut cmd);
-        // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
-        // probed for liveness on the host that issued it, so an unpinned name makes every
-        // claim fixture `Unknown` and nothing is ever reclaimed.
-        cmd.env("HOSTNAME", "host");
+        let mut cmd = jkb(Some(&self.db));
+        cmd.current_dir(&self.repo);
         cmd
     }
 
@@ -98,6 +90,24 @@ impl Fixture {
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         v["status"].as_str().unwrap_or_default().to_owned()
     }
+}
+
+/// A `jkb` invocation with `--db db`, or none for remote mode (which refuses `--db`) — the one place
+/// this file spawns `jkb`, so the isolation below covers every invocation.
+fn jkb(db: Option<&Path>) -> Command {
+    let mut cmd = Command::cargo_bin("jkb").unwrap();
+    if let Some(db) = db {
+        cmd.arg("--db").arg(db);
+    }
+    // The same isolation the fixture's own git calls get: jkb spawns git, so the
+    // developer's shell reaches it through this process just as directly.
+    isolate_git_env(&mut cmd);
+    common::isolate_remote_env(&mut cmd);
+    // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
+    // probed for liveness on the host that issued it, so an unpinned name makes every
+    // claim fixture `Unknown` and nothing is ever reclaimed.
+    cmd.env("HOSTNAME", "host");
+    cmd
 }
 
 /// Run `git` in `dir` with the developer's global config neutralized. This machine sets
@@ -3505,4 +3515,272 @@ fn an_exported_repository_selection_cannot_redirect_a_session() {
              spawn stopped scrubbing, whatever the lists say."
         );
     }
+}
+
+/// The claim a task is held under, read from the database.
+fn claim_of(db: &Path, uid: &str) -> Option<String> {
+    let db = jkb_core::Db::open(db).unwrap();
+    let uid = uid.to_owned();
+    db.read(move |conn| {
+        let id = jkb_core::task::resolve_ref(conn, &uid)?.expect("task");
+        Ok(jkb_core::claim::claimed(conn)?
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| c.owner))
+    })
+    .unwrap()
+}
+
+/// Mark a Claude Code session live (or ended) in the registry, as the hook would.
+fn registry(db: &Path, session: &str, live: bool) {
+    let db = jkb_core::Db::open(db).unwrap();
+    let session = session.to_owned();
+    db.write_txn("t", move |conn, meta| {
+        let p = jkb_core::claude_session::Process {
+            session: &session,
+            pid: "4242",
+            instance: "host",
+        };
+        if live {
+            jkb_core::claude_session::started(conn, meta, &p, "/w", "startup", 0)?;
+        } else {
+            jkb_core::claude_session::ended(conn, meta, &p, "other", 1)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// **A session worktree is named home-relative** (tasks S6.4, decision E): the host and the dev
+/// container see the same `~/repos` under different homes, so a `~/` owner is one both can judge. The
+/// session is still judged live by its checkout, and still recognised as this session's by `abandon`.
+#[test]
+fn a_session_owner_names_its_worktree_under_the_home() {
+    let f = Fixture::new();
+    let uid = f.add_task("homed session");
+    let out = f
+        .jkb()
+        .env("HOME", f.home.path())
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .args(["task", "work", &uid, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let owner = claim_of(&f.db, &uid).expect("claimed");
+    assert!(
+        owner.contains(":~/proj/.jkb/work/"),
+        "the worktree is written under the home: {owner}"
+    );
+    // Live by its checkout: nothing reclaims it.
+    f.jkb()
+        .env("HOME", f.home.path())
+        .args(["task", "reclaim"])
+        .assert()
+        .success();
+    assert_eq!(claim_of(&f.db, &uid).as_deref(), Some(owner.as_str()));
+    // And the session's own abandon recognises it as this session's claim.
+    f.jkb()
+        .env("HOME", f.home.path())
+        .args(["task", "abandon", &uid])
+        .assert()
+        .success();
+    assert_eq!(claim_of(&f.db, &uid), None);
+    assert_eq!(f.status_of(&uid), "open");
+}
+
+/// **A checkout another Claude Code session is still working in is not taken over** (decision E).
+/// The session that opened it resumes it; anyone else is refused while the registry says the opener
+/// is live, and let through once it has ended — or when the registry does not know it.
+#[test]
+fn a_session_opened_by_a_running_claude_session_is_not_taken_over() {
+    let f = Fixture::new();
+    let uid = f.add_task("one session at a time");
+    let work_as = |session: Option<&str>| {
+        let mut cmd = f.jkb();
+        cmd.args(["task", "work", &uid, "--json"]);
+        match session {
+            Some(s) => cmd.env("CLAUDE_CODE_SESSION_ID", s),
+            None => cmd.env_remove("CLAUDE_CODE_SESSION_ID"),
+        };
+        cmd.output().unwrap()
+    };
+    let opened = work_as(Some("opener-1"));
+    assert!(opened.status.success(), "{opened:?}");
+    let owner = claim_of(&f.db, &uid).expect("claimed");
+    assert!(
+        owner.contains("@opener-1:"),
+        "the opener is recorded: {owner}"
+    );
+
+    // Unknown to the registry: nothing is known, nothing is held back — as before.
+    assert!(work_as(Some("other-2")).status.success());
+    // The second run re-took the claim as itself.
+    assert!(claim_of(&f.db, &uid).unwrap().contains("@other-2:"));
+
+    // Now `other-2` is running: a third session, and a process with no session, are refused.
+    registry(&f.db, "other-2", true);
+    for session in [Some("third-3"), None] {
+        let refused = work_as(session);
+        assert!(!refused.status.success(), "{session:?}: {refused:?}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains("still running"), "{stderr}");
+        assert!(stderr.contains("other-2"), "{stderr}");
+    }
+    assert!(
+        claim_of(&f.db, &uid).unwrap().contains("@other-2:"),
+        "unchanged"
+    );
+    // The running session itself resumes.
+    assert!(work_as(Some("other-2")).status.success());
+
+    // Once it has ended, another session may take the checkout over.
+    registry(&f.db, "other-2", false);
+    assert!(work_as(Some("third-3")).status.success());
+    assert!(claim_of(&f.db, &uid).unwrap().contains("@third-3:"));
+}
+
+/// `jkb serve` on the fixture's database, stopped when dropped.
+struct Serve(std::process::Child);
+
+impl Serve {
+    /// Start it on an ephemeral port; the daemon and its `http://` address.
+    fn start(f: &Fixture, token: &Path) -> (Self, String) {
+        use std::io::BufRead as _;
+        let mut child = f
+            .jkb()
+            .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(token)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let serve = Self(child);
+        let banner = std::io::BufReader::new(stdout)
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        let url = banner
+            .split_whitespace()
+            .find(|w| w.starts_with("http://"))
+            .unwrap_or_else(|| panic!("no address in {banner}"))
+            .to_owned();
+        (serve, url)
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// **`task start` and the gate read go through the daemon** (tasks S6.4): the git half runs where the
+/// command runs, the database half as ops, and the host sees the claim, the facets and the history.
+/// Storing a gate is refused there — a stored gate is a command the host runs (decision A) — and the
+/// verbs that still read the host's removal records are refused until they move.
+#[test]
+fn start_and_the_gate_read_go_through_the_daemon() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "feature"]);
+    let uid = f.add_task("started from the container");
+    f.jkb()
+        .args(["task", "gate", "make test"])
+        .assert()
+        .success();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env_remove("JKB_DB")
+            .output()
+            .unwrap()
+    };
+
+    let started = remote(&["--json", "task", "start", &uid]);
+    assert!(started.status.success(), "{started:?}");
+    let v: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(
+        (&v["branch"], &v["repo"]),
+        (&"feature".into(), &"proj".into()),
+        "{v}"
+    );
+    let owner = v["owner"].as_str().unwrap();
+    assert!(owner.starts_with("container:"), "{v}");
+    assert_eq!(claim_of(&f.db, &uid).as_deref(), Some(owner));
+    assert_eq!(f.status_of(&uid), "in_progress");
+    let why = f
+        .jkb()
+        .args(["--global", "task", "why", &uid, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&why.stdout).contains("\"feature\""),
+        "the branch is in the history: {why:?}"
+    );
+
+    let gate = remote(&["--json", "task", "gate"]);
+    assert!(gate.status.success(), "{gate:?}");
+    let v: serde_json::Value = serde_json::from_slice(&gate.stdout).unwrap();
+    assert_eq!(v["gate"], "make test", "{v}");
+
+    for args in [
+        vec!["task", "gate", "rm -rf ~"],
+        vec!["task", "gate", "--clear"],
+        vec!["task", "work", &uid],
+        vec!["task", "abandon", &uid],
+        vec!["task", "sessions"],
+    ] {
+        let out = remote(&args);
+        assert!(!out.status.success(), "{args:?} was served: {out:?}");
+    }
+    let still: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--json", "task", "gate"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(still["gate"], "make test", "the stored gate is untouched");
+}
+
+/// **A session that cannot be opened leaves no claim behind** — and the release is the run's own
+/// claim only (`task.release` with its owner), where it used to clear whatever claim the task had.
+/// Something in the way of the worktree is the failure that must not strand a claim: a session owner
+/// is judged live by that very directory, so nothing would ever free it.
+#[test]
+fn a_session_that_cannot_be_opened_releases_its_claim() {
+    let f = Fixture::new();
+    let uid = f.add_task("blocked checkout");
+    let first = f.work(&uid);
+    let worktree = PathBuf::from(first["worktree"].as_str().unwrap());
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force"])
+        .assert()
+        .success();
+    assert!(!worktree.exists(), "the checkout was moved away");
+    // Something else now sits where the session's checkout goes.
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("stray"), "not a checkout").unwrap();
+
+    f.jkb()
+        .args(["task", "work", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "git does not know it as a worktree",
+        ));
+    assert_eq!(
+        claim_of(&f.db, &uid),
+        None,
+        "the failed run's claim is gone"
+    );
 }

@@ -120,6 +120,27 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   tell a session you are sitting in from one you walked away from, and a flag built on that pid
   labelled *every* session unattended and advised abandoning it. `sessions`/`doctor` report what
   is observable — uncommitted work and commits ahead.
+- **A session owner names its worktree home-relative, and the Claude Code session that opened it**
+  (tasks S6.4, decision E; `openspec/changes/jkb-message-queue/design-s6-4.md`). The form is now
+  `session:<pid>[@<claude session>]:<worktree>`, and the worktree is written `~/…` when it lies
+  under `$HOME`. The host and the dev container see the same `~/repos` under different homes, so an
+  absolute path named a directory only one side had, and the other side's probe answered `Unknown`
+  about every session it did not open. Each side now resolves `~` against its own home
+  (`owner::session_worktree`), and old absolute owners still parse and are judged as before. The
+  opener (`CLAUDE_CODE_SESSION_ID`) is provenance and never decides liveness. It does decide one
+  thing: `task work` refuses to take over a checkout whose opener the session registry says is
+  still **live**, unless it is that same session. That is how two Claude sessions stop ending up in
+  one worktree. `ended` and `unknown` let the takeover through, as before, and the refusal names
+  `jkb task release` for an opener that is gone but was never recorded as such. Pinned by
+  `a_session_opened_by_a_running_claude_session_is_not_taken_over` and
+  `a_session_owner_names_its_worktree_under_the_home`.
+- **The session verbs' database steps are ops** (tasks S6.4, `jkb_api::sessions`), and every write
+  they make is a compare-and-set on the owner the verb judged. `task.start` and `task.take` clear
+  only the owner they were told about. `task.abandon` changes nothing when the claim is no longer
+  the one observed before the git work. The release after a failed worktree add goes through
+  `task.release` with the verb's own owner, where it used to clear the claim unconditionally.
+  `task start` and `task gate` (show) run in the dev container through `jkb serve`. Storing a gate
+  never does (decision A): it is a shell command the host later runs, so only the host stores one.
 - **Branch existence counts the remote-tracking copy, and creating is not adopting.**
   `gitrepo::branch_ref(dir, branch, prefer)` is the one answer to "does this branch exist, and
   under what name" — `is_merged` and `close-merged` both ask it, because a branch living only on

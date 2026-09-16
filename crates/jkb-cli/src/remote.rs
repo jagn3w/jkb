@@ -74,8 +74,22 @@ pub const fn support(command: &Command) -> Support {
                 | TaskCmd::Unplace { .. }
                 | TaskCmd::Bind { .. }
                 | TaskCmd::Claim { .. }
-                | TaskCmd::Release { .. },
+                | TaskCmd::Release { .. }
+                // The session verbs (tasks S6.4): git here, the database through the ops.
+                | TaskCmd::Start { .. }
+                | TaskCmd::Gate {
+                    cmd: None,
+                    clear: false,
+                },
         } => Support::Ported,
+        // A stored gate is a command the host runs later (decision A): a client reads it, and runs it
+        // where it is, but never stores one.
+        Command::Task {
+            cmd: TaskCmd::Gate { .. },
+        } => Support::Refused(
+            "a stored gate is a shell command the host runs, so only the host stores one; run \
+             `jkb task gate` with a command on the host",
+        ),
         Command::Ns { .. }
         | Command::Tag { .. }
         | Command::Staging { .. }
@@ -377,6 +391,12 @@ mod tests {
             vec!["task", "claim", "u"],
             vec!["task", "bind", "u", "--managed"],
             vec!["task", "start", "u"],
+            vec!["task", "gate"],
+            vec!["task", "gate", "make test"],
+            vec!["task", "gate", "--clear"],
+            vec!["task", "work", "u"],
+            vec!["task", "abandon", "u"],
+            vec!["task", "sessions"],
             vec!["task", "reclaim"],
             vec!["task", "mirror"],
             vec!["stat", "u"],
