@@ -3,7 +3,8 @@
 //! [`jkb_core::notify`]).
 //!
 //! **The hook decides nothing and performs nothing.** It reads the hook payload, sends what it
-//! observed to `jkb serve` as one `notify.event`, and exits. The daemon runs the lifecycle table
+//! observed to `jkb serve` — one `notify.event`, plus a `session.*` request at a session's start and
+//! end — and exits. The daemon runs the lifecycle table
 //! against its own record of the session and puts the effects on the `claude/notify` queue, where
 //! the notifier on the Mac picks them up. So a hook in the dev container — which cannot reach the
 //! Mac's notification centre, and must never open the host's database — works exactly as one on the
@@ -24,10 +25,11 @@
 //! tells the daemon (`notify.gone`). That sweep is the only route by which a killed session's
 //! Alerts-style notification — which waits for ever by design — comes down.
 //!
-//! **It also feeds the session registry** (tasks S6.4, [`jkb_core::claude_session`]): `SessionStart`
-//! sends `session.started`, `SessionEnd` sends `session.ended`, and the same sweep ends the live
-//! sessions it proves gone (`session.list`, `session.gone`) — the only way a killed `claude` or a
-//! restarted container, which send no `SessionEnd` (measured), is ever recorded as ended.
+//! **It also feeds the session registry** (tasks S6.4, [`jkb_core::claude_session`];
+//! docs/notifications.md, "The session registry"): `SessionStart` sends `session.started`,
+//! `SessionEnd` sends `session.ended`, every `notify.event` marks its process running, and the same
+//! sweep ends the processes it proves gone (`session.list`, `session.gone`) — the only way a killed
+//! `claude` or a restarted container, which send no `SessionEnd` (measured), is ever recorded as ended.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -48,9 +50,12 @@ pub const CONNECT: Duration = Duration::from_millis(200);
 pub const TOTAL: Duration = Duration::from_secs(1);
 
 /// `SessionEnd`'s hooks get 1.5 s by default (Claude Code's hooks documentation), and it sends two
-/// requests: the second starts only this soon after the invocation began, so that a slow first one
-/// cannot carry the second past the budget. A warm round trip is a few milliseconds.
-pub const SESSION_END_SECOND_REQUEST: Duration = Duration::from_millis(500);
+/// requests: the second starts only this soon after the hook began (measured from [`hook`]'s first
+/// line, so the shim's and this binary's start-up come on top), because it may itself take a full
+/// [`TOTAL`] — 0.3 + 1.0 s leaves the start-up and a margin inside the budget. A warm round trip is a
+/// few milliseconds. A hook killed at the budget logs nothing, so this is what keeps a slow end
+/// visible in the log instead.
+pub const SESSION_END_SECOND_REQUEST: Duration = Duration::from_millis(300);
 
 /// The log grows to this, then starts again beside its predecessor (`.1`).
 const LOG_CAP_BYTES: u64 = 256 * 1024;
@@ -93,12 +98,12 @@ fn sessions(all: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// One session, on one line: id, state, process and where it runs.
+/// One process's hold on a session, on one line: id, state, process and where it runs.
 fn session_line(s: &jkb_api::ClaudeSession) -> String {
     let state = match (&s.end_reason, &s.start_source) {
         (Some(reason), _) => format!("ended ({reason})"),
         (None, Some(source)) => format!("live ({source})"),
-        (None, None) => "live".to_owned(),
+        (None, None) => "live (seen)".to_owned(),
     };
     let pid = if s.pid.is_empty() { "?" } else { &s.pid };
     format!(
@@ -130,6 +135,8 @@ const HOOK_EVENTS: &[(&str, Option<HookEvent>)] = &[
 struct Ask {
     requests: Vec<Request>,
     sweep: bool,
+    /// The payload's session, sanitized, or empty.
+    session: String,
 }
 
 /// The payload, read into what it asks for. `owner` and `instance` are handed in, resolved at the
@@ -166,13 +173,14 @@ fn ask(raw: &str, owner: &str, instance: &str) -> Result<Ask> {
     let mut out = Ask {
         requests: Vec::new(),
         sweep: event.is_none(),
+        session: session.clone(),
     };
     if session.is_empty() {
         return Ok(out);
     }
     match event {
         None => out.requests.push(Request::SessionStarted {
-            session,
+            session: session.clone(),
             source: word("source"),
             pid: owner.to_owned(),
             instance: instance.to_owned(),
@@ -190,7 +198,7 @@ fn ask(raw: &str, owner: &str, instance: &str) -> Result<Ask> {
             });
             if *event == HookEvent::SessionEnded {
                 out.requests.push(Request::SessionEnded {
-                    session,
+                    session: session.clone(),
                     reason: word("reason"),
                     pid: owner.to_owned(),
                     instance: instance.to_owned(),
@@ -286,6 +294,22 @@ fn instance_from(host: &str, marker: Option<&str>, pidns: Option<&str>) -> Strin
     out
 }
 
+/// Whether an instance names neither a boot nor a pid namespace — the macOS host, whose instance is its
+/// hostname alone. The dev container always records both, and a Linux host its namespace.
+fn is_bare(instance: &str) -> bool {
+    !instance.contains(['#', '/'])
+}
+
+/// Whether a pid recorded in `theirs` means the same process here, in `mine`.
+///
+/// Equal instances do. So do two bare ones, even with different names: a bare instance is the machine
+/// `jkb serve` runs on — its clients are that host and its containers — and that machine's name changes
+/// under it (macOS renames the host on a network change), which would otherwise leave a session that
+/// ended under the new name recorded live for ever (stage-1 review).
+fn same_pid_space(theirs: &str, mine: &str) -> bool {
+    theirs == mine || (is_bare(theirs) && is_bare(mine))
+}
+
 /// An instance string's host and boot.
 fn host_and_boot(instance: &str) -> (&str, Option<&str>) {
     let without_ns = instance.split_once('/').map_or(instance, |(head, _)| head);
@@ -299,8 +323,9 @@ fn host_and_boot(instance: &str) -> (&str, Option<&str>) {
 /// is provably gone, as seen from this process. The notification record and the registry row ask the
 /// same question of the same two fields.
 ///
-/// * **The same instance** — same host, boot and pid namespace: its owner pid means the same process
-///   here, so probe it — by the kernel, with `EPERM` counted as alive ([`crate::owner::pid_alive`]).
+/// * **The same instance** — same host, boot and pid namespace, or both the bare host
+///   ([`same_pid_space`]): its owner pid means the same process here, so probe it — by the kernel,
+///   with `EPERM` counted as alive ([`crate::owner::pid_alive`]).
 /// * **Another boot of this same container** — same host, both with a boot, the boots differ: every
 ///   process of that boot is gone, whatever namespace either side is in.
 /// * **Anything else** — the host from a container, another container, a nested sandbox of this
@@ -310,7 +335,7 @@ fn verdict(owner: &str, instance: &str, mine: &str, probe: impl Fn(u32) -> Fact)
     let Ok(pid) = owner.parse::<u32>() else {
         return Fact::Unknown;
     };
-    if instance == mine {
+    if same_pid_space(instance, mine) {
         return match probe(pid) {
             Fact::No => Fact::No,
             _ => Fact::Unknown,
@@ -328,6 +353,8 @@ fn verdict(owner: &str, instance: &str, mine: &str, probe: impl Fn(u32) -> Fact)
 
 /// Everything a hook invocation touches outside its arguments, resolved once at the edge.
 struct Edge<'a> {
+    /// When the hook began: what every time limit is measured from.
+    began: Instant,
     backend: &'a dyn Backend,
     owner: String,
     instance: String,
@@ -337,7 +364,7 @@ struct Edge<'a> {
 /// One hook invocation. Returns the failures to log — never an error, because nothing a hook can
 /// return reaches anyone but the session it would disturb.
 fn handle(raw: &str, edge: &Edge<'_>) -> Vec<String> {
-    let started = Instant::now();
+    let started = edge.began;
     let ask = match ask(raw, &edge.owner, &edge.instance) {
         Ok(ask) => ask,
         Err(e) => return vec![format!("{e:#}")],
@@ -361,7 +388,7 @@ fn handle(raw: &str, edge: &Edge<'_>) -> Vec<String> {
         }
     }
     if ask.sweep {
-        failures.extend(sweep(edge, started));
+        failures.extend(sweep(edge, &ask.session));
     }
     failures
 }
@@ -372,14 +399,20 @@ fn failure(op: &str, e: &ApiError) -> String {
 
 const OUT_OF_TIME: &str = "the sweep ran out of time; the next session resumes it";
 
-/// The `SessionStart` sweep, over what provably-gone sessions left: their notifications are withdrawn,
-/// and their registry rows ended. It starts no request once [`TOTAL`] has passed since `started`, so
-/// the invocation ends within about twice that; whatever is left is swept by the next session to
+/// The `SessionStart` sweep, over what provably-gone processes left: their notifications are withdrawn,
+/// and their registry rows ended. It starts no request once [`TOTAL`] has passed since the hook began,
+/// so the invocation ends within about twice that; whatever is left is swept by the next session to
 /// start.
 ///
 /// What each verdict was computed from goes back with its request: the daemon acts only if the record
 /// still names that owner in that instance, so a session resumed since the listing is spared.
-fn sweep(edge: &Edge<'_>, started: Instant) -> Vec<String> {
+///
+/// **The invoking session's own registry rows are never judged.** It is running — this is its start —
+/// so an earlier process of it proved dead (it was killed, then resumed) must not leave it recorded as
+/// ended if its own `session.started` was just lost (stage-1 review). A later sweep, from another
+/// session, ends that row, by which time this process's own row is live.
+fn sweep(edge: &Edge<'_>, own: &str) -> Vec<String> {
+    let started = edge.began;
     let mut failures = Vec::new();
     let out_of_time = |failures: &mut Vec<String>, op: &str| {
         let late = started.elapsed() >= TOTAL;
@@ -421,7 +454,9 @@ fn sweep(edge: &Edge<'_>, started: Instant) -> Vec<String> {
     match edge.backend.call(Request::SessionList { all: false }) {
         Ok(Response::ClaudeSessions { sessions }) => {
             for row in sessions {
-                if verdict(&row.pid, &row.instance, &edge.instance, edge.probe) != Fact::No {
+                if row.session == own
+                    || verdict(&row.pid, &row.instance, &edge.instance, edge.probe) != Fact::No
+                {
                     continue;
                 }
                 if out_of_time(&mut failures, "session.gone") {
@@ -444,6 +479,7 @@ fn sweep(edge: &Edge<'_>, started: Instant) -> Vec<String> {
 
 /// Decide and send. This is what the hook shim calls.
 fn hook() {
+    let began = Instant::now();
     let mut raw = String::new();
     let read = std::io::stdin().read_to_string(&mut raw);
     let log = log_path();
@@ -465,6 +501,7 @@ fn hook() {
     let failures = handle(
         &raw,
         &Edge {
+            began,
             backend: &backend,
             owner: owner_id(),
             instance: instance(),

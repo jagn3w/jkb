@@ -499,7 +499,10 @@ fn invalid(what: &'static str, why: impl Into<String>) -> crate::Error {
     .into()
 }
 
-fn check_session(session: &str) -> Result<()> {
+/// A session id as a hook sends it: bounded and already [`sanitize`]d. Shared with the session registry
+/// ([`crate::claude_session`]), so one hook invocation's `notify.*` and `session.*` requests are held to
+/// one rule.
+pub(crate) fn check_session(session: &str) -> Result<()> {
     if session.is_empty() || session.len() > MAX_SESSION_BYTES {
         return Err(invalid(
             "session",
@@ -515,7 +518,8 @@ fn check_session(session: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_owner_and_instance(owner: &str, instance: &str) -> Result<()> {
+/// A pid (digits, or empty for none) and the instance it belongs to. Shared like [`check_session`].
+pub(crate) fn check_owner_and_instance(owner: &str, instance: &str) -> Result<()> {
     if owner.len() > MAX_OWNER_BYTES || !owner.chars().all(|c| c.is_ascii_digit()) {
         return Err(invalid("owner", format!("{owner:?} is not a pid")));
     }

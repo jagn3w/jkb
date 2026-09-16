@@ -74,10 +74,10 @@ enum NotifyCmd {
     /// Print the queue topic notifications are sent on, for `scripts/setup.sh` (which creates it) and
     /// `scripts/build-notifier.sh` (whose agent subscribes to it) — so the name is spelled once.
     Topic,
-    /// List the Claude Code sessions the daemon's registry holds: the live ones, or with `--all`
-    /// the ended ones too. Asked of `jkb serve`, like the hook.
+    /// List the Claude Code sessions the daemon's registry holds, one line per process holding one:
+    /// the live ones, or with `--all` the ended ones too. Asked of `jkb serve`, like the hook.
     Sessions {
-        /// Include ended sessions, most recent first.
+        /// Include ended rows, most recently seen first.
         #[arg(long)]
         all: bool,
     },

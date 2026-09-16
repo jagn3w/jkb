@@ -60,13 +60,13 @@ routinely built from different checkouts.
 | `mq.compact` | `force?` | `compacted` {…counts} |
 | `mq.inspect` | — | `topics` {`topics`} |
 | `mq.tail` | `topic`, `limit` | `messages` {`messages`} |
-| `notify.event` | `session`, `event` (`needed`\|`tool_finished`\|`user_acted`\|`turn_ended`\|`session_ended`), `tool?`, `message?`, `cwd?`, `owner?`, `instance?` | `notified` {`state`, `moved`, `effects`, `refusal?`, `sent`} |
+| `notify.event` | `session`, `event` (`needed`\|`tool_finished`\|`user_acted`\|`turn_ended`\|`session_ended`), `tool?`, `message?`, `cwd?`, `owner?`, `instance?` — every event but `session_ended` also marks the process running in the session registry | `notified` {`state`, `moved`, `effects`, `refusal?`, `sent`} |
 | `notify.open_sessions` | — | `sessions` {`sessions`: [{`session`, `tool`, `owner`, `instance`, `updated_at`}]} |
 | `notify.gone` | `session`, `owner`, `instance` (as `notify.open_sessions` reported them) | `notified` {…} |
-| `session.started` | `session`, `source`, `pid?`, `instance?`, `cwd?` | `session_start` {`outcome`: `new`\|`restarted`\|`revived`} |
-| `session.ended` | `session`, `reason`, `pid?`, `instance?` | `session_end` {`outcome`: `recorded`\|`already_ended`\|`other_process`} |
+| `session.started` | `session`, `source`, `pid?`, `instance?`, `cwd?` | `session_start` {`was`: `unknown`\|`live`\|`ended`} (the session's state before) |
+| `session.ended` | `session`, `reason`, `pid?`, `instance?` — ends that process's hold only | `session_end` {`outcome`: `recorded`\|`already_ended`} |
 | `session.gone` | `session`, `pid`, `instance` (as `session.list` reported them) | `session_gone` {`ended`} |
-| `session.list` | `all?` | `claude_sessions` {`sessions`: [{`session`, `pid`, `instance`, `cwd`, `started_at?`, `start_source?`, `ended_at?`, `end_reason?`}]} |
+| `session.list` | `all?` | `claude_sessions` {`sessions`: one per process holding a session, [{`session`, `pid`, `instance`, `cwd`, `started_at?`, `start_source?`, `seen_at`, `ended_at?`, `end_reason?`}]} |
 | `kb.ambient` | `cwd`, `home?` | `ambient` {`namespace`} |
 | `kb.query` | `dsl`, `default_scope?`, `limit?`, `count?`, `order?` (`id`\|`updated_desc`) | `items` {`items`}, or with `count` `count` {`count`} |
 | `kb.ls` | `path?`, `all?`, `recursive?` | `listing` {`rows`: [{`parent`, `child`}]} |

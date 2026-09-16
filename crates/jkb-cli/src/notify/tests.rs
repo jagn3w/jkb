@@ -53,6 +53,7 @@ fn a_session_start_and_end_feed_the_registry() {
                 cwd: "/w".into(),
             }],
             sweep: true,
+            session: "s1".into(),
         }
     );
     let raw = json!({ "hook_event_name": "SessionEnd", "session_id": "s1", "reason": "clear" })
@@ -82,7 +83,8 @@ fn a_session_start_and_end_feed_the_registry() {
         ask(&raw, "", "").unwrap(),
         Ask {
             requests: Vec::new(),
-            sweep: true
+            sweep: true,
+            session: String::new(),
         }
     );
 }
@@ -111,6 +113,7 @@ fn a_payload_becomes_one_notify_event() {
                 instance: "host#pid:[1]".into(),
             }],
             sweep: false,
+            session: "___s1".into(),
         }
     );
     let raw = json!({ "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash" })
@@ -249,6 +252,25 @@ fn only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone() {
         "and a nested sandbox cannot probe the outer namespace's pids either"
     );
     assert_eq!(
+        verdict("10", "Johns-MBP.local", "johns-mbp.lan", dead),
+        Fact::No,
+        "the macOS host under a new name is still this machine: probe it"
+    );
+    assert_eq!(
+        verdict("10", "Johns-MBP.local", "johns-mbp.lan", alive),
+        Fact::Unknown
+    );
+    assert_eq!(
+        verdict("10", "Johns-MBP.local", me, dead),
+        Fact::Unknown,
+        "but a container never probes the host's pids"
+    );
+    assert_eq!(
+        verdict("10", me, "Johns-MBP.local", dead),
+        Fact::Unknown,
+        "nor the host a container's"
+    );
+    assert_eq!(
         verdict("", me, me, dead),
         Fact::Unknown,
         "no owner, no probe"
@@ -312,6 +334,7 @@ fn the_sweep_withdraws_what_is_provably_gone_and_spares_the_rest() {
     let failures = handle(
         &session_start(),
         &Edge {
+            began: std::time::Instant::now(),
             backend: &b,
             owner: "30".into(),
             instance: me.into(),
@@ -353,6 +376,7 @@ fn the_sweep_spares_a_session_resumed_after_it_looked() {
     let failures = handle(
         &session_start(),
         &Edge {
+            began: std::time::Instant::now(),
             backend: &b,
             owner: "30".into(),
             instance: "host".into(),
@@ -375,6 +399,7 @@ impl Backend for Down {
 #[test]
 fn an_unreachable_daemon_is_a_logged_failure() {
     let edge = Edge {
+        began: std::time::Instant::now(),
         backend: &Down,
         owner: String::new(),
         instance: "host".into(),
@@ -462,6 +487,7 @@ fn a_hook_event_reaches_a_real_daemon_within_the_hook_deadlines() {
     let failures = handle(
         &raw,
         &Edge {
+            began: std::time::Instant::now(),
             backend: &remote,
             owner: "4242".into(),
             instance: "host".into(),
@@ -522,6 +548,7 @@ fn the_sweep_ends_the_registry_sessions_that_are_provably_gone() {
     let failures = handle(
         &session_start(),
         &Edge {
+            began: std::time::Instant::now(),
             backend: &b,
             owner: "30".into(),
             instance: me.into(),
@@ -573,6 +600,7 @@ fn the_sweep_spares_a_registry_session_resumed_after_it_looked() {
     let failures = handle(
         &session_start(),
         &Edge {
+            began: std::time::Instant::now(),
             backend: &b,
             owner: "30".into(),
             instance: "host".into(),
@@ -619,6 +647,7 @@ fn a_slow_first_request_leaves_the_rest_unsent() {
     let end = json!({ "hook_event_name": "SessionEnd", "session_id": "s1" }).to_string();
     let b = slow_first(super::SESSION_END_SECOND_REQUEST);
     let edge = |b| Edge {
+        began: std::time::Instant::now(),
         backend: b,
         owner: "1".into(),
         instance: "host".into(),
@@ -644,4 +673,42 @@ fn a_slow_first_request_leaves_the_rest_unsent() {
         [format!("notify.open_sessions: {}", super::OUT_OF_TIME)]
     );
     assert_eq!(*b.asked.borrow(), ["session.started"]);
+}
+
+/// **The invoking session is never judged by its own sweep.** It was killed and is now being resumed:
+/// its earlier process is provably dead, but ending that row now would record a running session as
+/// ended if this start's own `session.started` had been lost. The row is left for a later sweep.
+#[test]
+fn the_sweep_never_judges_the_session_that_is_starting() {
+    let b = backend();
+    let me = "host";
+    register(&b, "new", "10", me);
+    register(&b, "other", "10", me);
+    let failures = handle(
+        &session_start(),
+        &Edge {
+            began: std::time::Instant::now(),
+            backend: &b,
+            owner: "30".into(),
+            instance: me.into(),
+            probe: &|pid| if pid == 30 { Fact::Yes } else { Fact::No },
+        },
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    let Response::ClaudeSessions { sessions } =
+        b.call(Request::SessionList { all: false }).unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    let mut live: Vec<(String, String)> =
+        sessions.into_iter().map(|s| (s.session, s.pid)).collect();
+    live.sort();
+    assert_eq!(
+        live,
+        [
+            ("new".to_owned(), "10".to_owned()),
+            ("new".to_owned(), "30".to_owned())
+        ],
+        "the other session's dead process is ended; this session's is left"
+    );
 }

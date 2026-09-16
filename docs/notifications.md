@@ -130,11 +130,15 @@ notifications (design R1).
 
 The hook also feeds a registry of Claude Code sessions (`claude_sessions`, V019;
 `jkb_core::claude_session`), so that the session verbs of S6.4 can ask whether the session holding a
-claim or a lock has ended (`openspec/changes/jkb-message-queue/design-s6-4.md`). `SessionStart` sends
-`session.started`, `SessionEnd` sends `session.ended` after its `notify.event`, and the `SessionStart`
-sweep, after the notification records, lists the live sessions (`session.list`) and sends
-`session.gone` for those its [verdict](#where-it-runs-and-why-it-moved-r32-2026-09-14) proves gone —
-the same function, asked of the row's `pid` and `instance`. `jkb notify sessions [--all]` prints it.
+claim or a lock has ended (`openspec/changes/jkb-message-queue/design-s6-4.md`). The hook sends:
+
+- `session.started` on `SessionStart`;
+- `session.ended` on `SessionEnd`, after that event's `notify.event`.
+
+Every `notify.event` except the end's also marks its process running. The `SessionStart` sweep, after
+the notification records, lists the live rows (`session.list`) and sends `session.gone` for those its
+[verdict](#where-it-runs-and-why-it-moved-r32-2026-09-14) proves gone. It is the same function, asked of
+the row's `pid` and `instance`. `jkb notify sessions [--all]` prints the registry.
 
 **What the design rests on was measured, not read** (2026-09-16, the dev container, a logging hook
 recording each payload while the user ended sessions by hand):
@@ -151,42 +155,82 @@ recording each payload while the user ended sessions by hand):
 | `kill -9` of `claude` | nothing | — |
 | `docker restart` | nothing | — |
 
-`$CLAUDE_CODE_SESSION_ID` equalled the payload's `session_id` in every event. Hooks edited into
-settings took effect in a running session. Hooks in the project's `.claude/settings.json` did not run for a
-session started outside the repository — which first read as a killed session that had never
-started. A first attempt to log the `claude` pid from `sh -c '…$PPID…'` recorded a different pid per
-event: that `$PPID` is the shell Claude Code wraps a hook command in, not `claude`. The shim's
-single-command `bash <script>` form is what makes its `$PPID` `claude` (above).
+Other measured facts:
 
-So **only an ended row is evidence.** A live row is a session nobody has disproved: a killed one
-stays live until the next `SessionStart` in its instance sweeps it, and one on a rebuilt container
-never can be. A session with no row is unknown, and unknown licenses nothing. An ended row is not final
-either: a `resume` makes it live again.
+- `$CLAUDE_CODE_SESSION_ID` equalled the payload's `session_id` in every event.
+- Hooks edited into settings took effect in a running session.
+- Hooks in the project's `.claude/settings.json` did not run for a session started outside the
+  repository. That first looked like a killed session that had never started.
+- A first attempt to log the `claude` pid from `sh -c '…$PPID…'` recorded a different pid for each
+  event. That `$PPID` is the shell Claude Code wraps a hook command in, not `claude`. The shim's
+  single-command form, `bash <script>`, is what makes its `$PPID` `claude` (above).
 
-**An end applies only to the process it is about.** `claude --resume` runs the same id in a new
-process, perhaps while the old one is still exiting, so `session.ended` and `session.gone` carry the
-pid and instance they came from, and change nothing once the row names another. This is `notify.gone`'s
-rule for the same race, pinned by `an_end_about_another_process_leaves_the_session_live` and
-`the_sweep_spares_a_registry_session_resumed_after_it_looked`. A verdict with no pid proves
-nothing; the session's own end with no pid still counts, since it is a report rather than a probe.
+Not measured: whether Claude Code lets two processes hold one session id at once. The design assumes
+it can.
 
-**Budgets.** `SessionEnd` hooks get 1.5 s (Claude Code's documentation), and the end now sends two
-requests, so the second starts only within 500 ms of the invocation (`SESSION_END_SECOND_REQUEST`); a
-warm round trip is a few milliseconds. `SessionStart` starts nothing after 1 s, as before, so a start plus
-both sweeps stays bounded by about 2 s. What is left unsent is logged, and the next sweep proves the
-same end from the pid. Pinned by `a_slow_first_request_leaves_the_rest_unsent`.
+**A row is a process holding a session**, keyed by (session, pid, instance). A session is **live**
+while any of its rows is live, **ended** once every row has ended, and **unknown** with no rows.
 
-**Pruning.** A session starting deletes rows neither started nor ended for 90 days, live or ended.
-Deleting a row makes that session unknown, which licenses nothing. That is the safe direction for a record
-nobody can prove anything about any more, such as a rebuilt container's sessions.
+- **Only an ended session is evidence.** A killed process stays live until the next `SessionStart` in
+  its instance sweeps it, and one on a rebuilt container never can be. Unknown licenses nothing.
+- **Ended is not final.** A `resume` or any later event from the process makes its row live again.
+- **One process's end or death ends only its own row**, because `claude --resume` can run an id in a
+  second process while the first still runs it. The first version kept one row per session, and the
+  stage-1 review showed that the later process's exit then recorded as ended a session the earlier one
+  was still running. `session.gone` also ends only a live row that still names exactly the pid and
+  instance that were probed. That is `notify.gone`'s rule, for the same race.
+- A verdict with no pid proves nothing. A pid-less process's own end still ends its own row, since it
+  is a report rather than a probe.
+
+**Four repairs came from the stage-1 review, each pinned by a test:**
+
+- **A lost start is repaired by the next event.** If `session.started` is lost (the daemon is busy or
+  restarting), a resumed session would stay recorded as ended while it ran, because nothing else makes
+  a row live. So every `notify.event` from a process makes its row live. The one exception is the end's
+  own `notify.event`, which must not revive what `session.ended` is about to end. A live row's
+  `seen_at` is rewritten at most hourly, so a tool call on a known session writes nothing. Pinned by
+  `a_notify_event_marks_its_process_running_except_at_the_end` and
+  `any_event_from_a_process_makes_it_live`.
+- **The starting session is never judged by its own sweep.** Suppose it was killed and is now being
+  resumed. Its earlier process is provably dead, but ending that row would record a running session
+  as ended if this start's `session.started` had been lost. A later sweep, from another session, ends
+  the row. Pinned by `the_sweep_never_judges_the_session_that_is_starting`.
+- **The macOS host's name may change.** Its instance is the hostname alone, and macOS renames the host
+  on a network change. Two *bare* instances (no boot, no namespace) are therefore taken to be the same
+  machine, and the pid is probed. **The assumption, stated:** every bare instance is the machine
+  `jkb serve` runs on, because its clients are that host and its containers, and a container always
+  records a boot and a namespace. A second bare machine reaching the daemon would break it. Pinned in
+  `only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone`.
+- **What is only shown is normalised, not refused.** An unusual start source or end reason is recorded
+  as `unknown`, and a long working directory is cut, because a refused start is exactly the lost write
+  above. Identity (session, pid, instance) is still refused when malformed, with the notification ops'
+  own checks, shared rather than copied.
+
+**Budgets.** `SessionEnd` hooks get 1.5 s (Claude Code's documentation), and the end sends two requests.
+The second starts only within 300 ms of the hook's first line (`SESSION_END_SECOND_REQUEST`), because it
+may itself take the full 1 s request deadline. That leaves room for the shim's and the binary's
+start-up. A warm round trip takes a few milliseconds. What is not sent is logged, and a later sweep
+proves the same end from the pid; a hook killed at the budget would have logged nothing.
+`SessionStart` starts nothing 1 s after the hook began, so a start plus both sweeps is bounded by about
+2 s. Pinned by `a_slow_first_request_leaves_the_rest_unsent`.
+
+**Pruning.** A session starting deletes rows not seen for 90 days, except its own. Deleting a row makes
+that process unknown, which licenses nothing. That is the safe direction for a record nobody can prove
+anything about any more, such as a rebuilt container's sessions.
 
 **Not changelogged**, like `notify_sessions`: it is observation, and `jkb undo` must not revive or
 end a session.
 
-**Residual, stated:** the daemon cannot tell a host client from a container client, so a
-misbehaving container could report a host session ended. An honest one never does, because its verdict
-about a host row is `Unknown`. That grants nothing a container could not already do with `task.release`
-and a claim's owner string.
+**Residuals, stated:**
+
+- **The daemon cannot tell a host client from a container client**, so a misbehaving container could
+  report a host session's process ended. An honest one never does, because its verdict about a host row
+  is `Unknown`. That grants nothing a container could not already do with `task.release` and a claim's
+  owner string.
+- **Two containers given the same `--hostname`** read as each other's earlier boot, and each one's
+  sweep ends the other's live rows. For notifications that cost a withdrawn prompt; here it records
+  running sessions as ended until their next hook event revives them. Stage 2 must therefore confirm
+  "ended" against something it can observe, the worktree above all, before it takes anything over.
 
 ## The hook, the table and the notifier
 

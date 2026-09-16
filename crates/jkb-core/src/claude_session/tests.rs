@@ -1,207 +1,260 @@
-//! The registry's rules: what a start, an end and a sweep verdict do, and above all that an end
-//! about one process never ends the same id held by another.
+//! The registry's rules: what a start, a sighting, an end and a sweep verdict do, and above all that
+//! one process's end or death never ends a session another process still holds.
 
 use super::{
-    ended, get, gone, list, started, Ended, SessionRow, Start, Started, GONE, LIST_CAP,
-    PRUNE_AFTER_MS,
+    ended, gone, holders, list, seen, started, state, Ended, HolderRow, Process, SessionState,
+    GONE, LIST_CAP, MAX_CWD_BYTES, PRUNE_AFTER_MS, SEEN_REFRESH_MS, UNKNOWN,
 };
+use crate::mq::QueueError;
 use crate::{Db, Error};
 
 const T0: i64 = 1_800_000_000_000;
 
-fn start<'a>(session: &'a str, pid: &'a str, instance: &'a str, source: &'a str) -> Start<'a> {
-    Start {
+fn p<'a>(session: &'a str, pid: &'a str, instance: &'a str) -> Process<'a> {
+    Process {
         session,
         pid,
         instance,
-        cwd: "/w/repo",
-        source,
     }
 }
 
-fn try_start(db: &Db, s: &Start<'_>, now: i64) -> crate::Result<Started> {
-    let (session, pid, instance, cwd, source) = (
-        s.session.to_owned(),
-        s.pid.to_owned(),
-        s.instance.to_owned(),
-        s.cwd.to_owned(),
-        s.source.to_owned(),
-    );
+/// Owned copies, for a closure the writer thread runs.
+fn own(p: &Process<'_>) -> (String, String, String) {
+    (
+        p.session.to_owned(),
+        p.pid.to_owned(),
+        p.instance.to_owned(),
+    )
+}
+
+fn try_start(
+    db: &Db,
+    proc_: &Process<'_>,
+    dir: &str,
+    source: &str,
+    now: i64,
+) -> crate::Result<SessionState> {
+    let (s, i, n) = own(proc_);
+    let (dir, source) = (dir.to_owned(), source.to_owned());
     db.write_txn("t", move |c, m| {
-        started(
-            c,
-            m,
-            &Start {
-                session: &session,
-                pid: &pid,
-                instance: &instance,
-                cwd: &cwd,
-                source: &source,
-            },
-            now,
-        )
+        started(c, m, &p(&s, &i, &n), &dir, &source, now)
     })
 }
 
-fn do_start(db: &Db, s: &Start<'_>, now: i64) -> Started {
-    try_start(db, s, now).unwrap()
+fn start(db: &Db, proc_: &Process<'_>, source: &str, now: i64) -> SessionState {
+    try_start(db, proc_, "/w/repo", source, now).unwrap()
 }
 
-fn do_end(db: &Db, session: &str, pid: &str, instance: &str, reason: &str, now: i64) -> Ended {
-    let (s, p, i, r) = (
-        session.to_owned(),
-        pid.to_owned(),
-        instance.to_owned(),
-        reason.to_owned(),
-    );
-    db.write_txn("t", move |c, m| ended(c, m, &s, &p, &i, &r, now))
+fn see(db: &Db, proc_: &Process<'_>, now: i64) {
+    let (s, i, n) = own(proc_);
+    db.write_txn("t", move |c, m| seen(c, m, &p(&s, &i, &n), "/w/seen", now))
+        .unwrap();
+}
+
+fn end(db: &Db, proc_: &Process<'_>, reason: &str, now: i64) -> Ended {
+    let (s, i, n) = own(proc_);
+    let reason = reason.to_owned();
+    db.write_txn("t", move |c, m| ended(c, m, &p(&s, &i, &n), &reason, now))
         .unwrap()
 }
 
-fn do_gone(db: &Db, session: &str, pid: &str, instance: &str, now: i64) -> bool {
-    let (s, p, i) = (session.to_owned(), pid.to_owned(), instance.to_owned());
-    db.write_txn("t", move |c, m| gone(c, m, &s, &p, &i, now))
+fn prove_gone(db: &Db, proc_: &Process<'_>, now: i64) -> bool {
+    let (s, i, n) = own(proc_);
+    db.write_txn("t", move |c, m| gone(c, m, &p(&s, &i, &n), now))
         .unwrap()
 }
 
-fn row(db: &Db, session: &str) -> Option<SessionRow> {
+fn st(db: &Db, session: &str) -> SessionState {
     let s = session.to_owned();
-    db.read(move |c| get(c, &s)).unwrap()
+    db.read(move |c| state(c, &s)).unwrap()
 }
 
-fn live(db: &Db) -> Vec<String> {
+fn rows(db: &Db, session: &str) -> Vec<HolderRow> {
+    let s = session.to_owned();
+    db.read(move |c| holders(c, &s)).unwrap()
+}
+
+fn one(db: &Db, session: &str) -> HolderRow {
+    let mut r = rows(db, session);
+    assert_eq!(r.len(), 1, "{r:?}");
+    r.remove(0)
+}
+
+fn live(db: &Db) -> Vec<(String, String)> {
     db.read(|c| list(c, false))
         .unwrap()
         .into_iter()
-        .map(|r| r.session)
+        .map(|r| (r.session, r.pid))
         .collect()
 }
 
-/// The measured lifecycle: start, end, and a `claude --resume` in a new process bringing the same id
-/// back to live.
+/// The measured lifecycle for one process: start, end, a second end keeping the first reason, and a
+/// `--resume` bringing the session back to live.
 #[test]
 fn a_session_starts_ends_and_is_revived_by_a_resume() {
     let db = Db::open_in_memory().unwrap();
-    assert_eq!(row(&db, "s1"), None, "unknown before any event");
+    let a = p("s1", "10", "h");
+    assert_eq!(st(&db, "s1"), SessionState::Unknown);
     assert_eq!(
-        do_start(&db, &start("s1", "10", "h", "startup"), T0),
-        Started::New
+        start(&db, &a, "startup", T0),
+        SessionState::Unknown,
+        "state before"
     );
-    let r = row(&db, "s1").unwrap();
-    assert!(!r.ended());
+    assert_eq!(st(&db, "s1"), SessionState::Live);
+    let r = one(&db, "s1");
     assert_eq!(
-        (r.pid.as_str(), r.started_at, r.start_source.as_deref()),
-        ("10", Some(T0), Some("startup"))
+        (
+            r.started_at,
+            r.start_source.as_deref(),
+            r.seen_at,
+            r.cwd.as_str()
+        ),
+        (Some(T0), Some("startup"), T0, "/w/repo")
     );
 
+    assert_eq!(end(&db, &a, "prompt_input_exit", T0 + 1), Ended::Recorded);
+    assert_eq!(st(&db, "s1"), SessionState::Ended);
     assert_eq!(
-        do_end(&db, "s1", "10", "h", "prompt_input_exit", T0 + 1),
-        Ended::Recorded
+        end(&db, &a, "other", T0 + 2),
+        Ended::AlreadyEnded,
+        "a second end keeps the first reason"
     );
-    let r = row(&db, "s1").unwrap();
-    assert!(r.ended());
+    let r = one(&db, "s1");
     assert_eq!(
         (r.ended_at, r.end_reason.as_deref()),
         (Some(T0 + 1), Some("prompt_input_exit"))
     );
-    assert_eq!(
-        do_end(&db, "s1", "10", "h", "other", T0 + 2),
-        Ended::AlreadyEnded,
-        "a second end keeps the first reason"
-    );
-    assert_eq!(
-        row(&db, "s1").unwrap().end_reason.as_deref(),
-        Some("prompt_input_exit")
-    );
 
+    assert_eq!(start(&db, &a, "resume", T0 + 3), SessionState::Ended);
+    let r = one(&db, "s1");
     assert_eq!(
-        do_start(&db, &start("s1", "20", "h", "resume"), T0 + 3),
-        Started::Revived
-    );
-    let r = row(&db, "s1").unwrap();
-    assert_eq!(
-        (
-            r.pid.as_str(),
-            r.ended_at,
-            r.end_reason,
-            r.start_source.as_deref()
-        ),
-        ("20", None, None, Some("resume"))
+        (r.ended_at, r.end_reason, r.start_source.as_deref()),
+        (None, None, Some("resume"))
     );
     assert_eq!(
-        do_start(&db, &start("s1", "30", "h", "compact"), T0 + 4),
-        Started::Restarted
+        start(&db, &a, "compact", T0 + 4),
+        SessionState::Live,
+        "a compaction finds it live"
     );
 }
 
-/// **The race this module exists around.** `claude --resume` runs the id in a new process; the old
-/// process's end, arriving after, must not end the session the new one holds — nor may a sweep's
-/// verdict about the old process, or about the same pid in another instance.
+/// **The race the per-process rows exist for.** Two processes hold one id — `claude --resume` in a
+/// second terminal — and the end or proven death of either leaves the session live while the other
+/// runs. Only when both have ended is the session ended.
 #[test]
-fn an_end_about_another_process_leaves_the_session_live() {
+fn one_process_ending_leaves_a_session_another_still_holds() {
     let db = Db::open_in_memory().unwrap();
-    do_start(&db, &start("s1", "10", "h#b1", "startup"), T0);
-    do_start(&db, &start("s1", "20", "h#b1", "resume"), T0 + 1);
+    let first = p("s1", "10", "h#b1");
+    let second = p("s1", "20", "h#b1");
+    start(&db, &first, "startup", T0);
+    assert_eq!(start(&db, &second, "resume", T0 + 1), SessionState::Live);
 
-    assert_eq!(
-        do_end(&db, "s1", "10", "h#b1", "other", T0 + 2),
-        Ended::OtherProcess
-    );
-    assert!(!do_gone(&db, "s1", "10", "h#b1", T0 + 2), "the old pid");
+    assert_eq!(end(&db, &second, "other", T0 + 2), Ended::Recorded);
+    assert_eq!(st(&db, "s1"), SessionState::Live, "the first still runs it");
     assert!(
-        !do_gone(&db, "s1", "20", "h#b2", T0 + 2),
+        !prove_gone(&db, &p("s1", "10", "h#b2"), T0 + 2),
         "the same pid in another boot is another process"
     );
-    assert!(
-        !row(&db, "s1").unwrap().ended(),
-        "the resumed session is still live"
-    );
+    assert_eq!(st(&db, "s1"), SessionState::Live);
 
-    assert!(do_gone(&db, "s1", "20", "h#b1", T0 + 3));
-    let r = row(&db, "s1").unwrap();
-    assert_eq!(r.end_reason.as_deref(), Some(GONE));
+    assert!(prove_gone(&db, &first, T0 + 3));
+    assert_eq!(st(&db, "s1"), SessionState::Ended);
+    let reasons: Vec<Option<String>> = rows(&db, "s1").into_iter().map(|r| r.end_reason).collect();
+    assert_eq!(reasons, [Some(GONE.to_owned()), Some("other".to_owned())]);
     assert!(
-        !do_gone(&db, "s1", "20", "h#b1", T0 + 4),
-        "a session already ended is not ended again"
+        !prove_gone(&db, &first, T0 + 4),
+        "a row already ended is not ended again"
     );
-    assert_eq!(row(&db, "s1").unwrap().ended_at, Some(T0 + 3));
+    assert_eq!(
+        rows(&db, "s1")[0].ended_at,
+        Some(T0 + 3),
+        "and keeps when it ended"
+    );
 }
 
-/// A verdict with no pid proves nothing, even against a row that recorded none: the hook had no
-/// process it could trust, so nothing was probed.
+/// A verdict with no pid proves nothing: nothing was probed. The process's own end still counts,
+/// since it is a report, not a probe — and it ends only the pid-less row.
 #[test]
 fn a_sweep_with_no_pid_proves_nothing() {
     let db = Db::open_in_memory().unwrap();
-    do_start(&db, &start("s1", "", "h", "startup"), T0);
-    assert!(!do_gone(&db, "s1", "", "h", T0 + 1));
-    assert!(!row(&db, "s1").unwrap().ended());
-    // The session's own end, from the same untrusted-pid process, still counts: it is not a probe.
-    assert_eq!(do_end(&db, "s1", "", "h", "clear", T0 + 2), Ended::Recorded);
+    let blind = p("s1", "", "h");
+    start(&db, &blind, "startup", T0);
+    assert!(!prove_gone(&db, &blind, T0 + 1));
+    assert_eq!(st(&db, "s1"), SessionState::Live);
+    assert_eq!(end(&db, &blind, "clear", T0 + 2), Ended::Recorded);
+    assert_eq!(st(&db, "s1"), SessionState::Ended);
 }
 
-/// A session whose start was never seen (it began before the hook shipped) still has its end
-/// recorded — that is evidence — and a sweep verdict about an unknown session changes nothing.
+/// A process whose start was never seen (it began before the hook shipped) still has its end recorded
+/// — that is evidence — and a verdict about an unknown process creates nothing.
 #[test]
 fn an_end_with_no_start_is_still_evidence() {
     let db = Db::open_in_memory().unwrap();
-    assert!(!do_gone(&db, "never", "10", "h", T0));
-    assert_eq!(row(&db, "never"), None);
-    assert_eq!(do_end(&db, "old", "10", "h", "other", T0), Ended::Recorded);
-    let r = row(&db, "old").unwrap();
-    assert_eq!((r.started_at, r.ended_at), (None, Some(T0)));
+    assert!(!prove_gone(&db, &p("never", "10", "h"), T0));
+    assert_eq!(st(&db, "never"), SessionState::Unknown);
+    assert_eq!(end(&db, &p("old", "10", "h"), "other", T0), Ended::Recorded);
+    assert_eq!(st(&db, "old"), SessionState::Ended);
+    let r = one(&db, "old");
+    assert_eq!((r.started_at, r.seen_at, r.ended_at), (None, T0, Some(T0)));
     assert!(live(&db).is_empty());
 }
 
-/// The sweep's listing is the live sessions, oldest start first; `all` adds the ended ones, most
+/// **A lost start is repaired by the next event.** A process that is seen — any hook event — is live:
+/// a session nobody saw start becomes known, and an ended row (its revival start was lost, or a sweep
+/// wrongly proved it gone) comes back. A known live row is refreshed only once it is stale, so a tool
+/// call changes nothing.
+#[test]
+fn any_event_from_a_process_makes_it_live() {
+    let db = Db::open_in_memory().unwrap();
+    let a = p("s1", "10", "h");
+    see(&db, &a, T0);
+    assert_eq!(st(&db, "s1"), SessionState::Live);
+    let r = one(&db, "s1");
+    assert_eq!(
+        (r.started_at, r.start_source, r.seen_at, r.cwd.as_str()),
+        (None, None, T0, "/w/seen")
+    );
+
+    end(&db, &a, "prompt_input_exit", T0 + 1);
+    see(&db, &a, T0 + 2);
+    assert_eq!(st(&db, "s1"), SessionState::Live, "revived");
+    assert_eq!(one(&db, "s1").seen_at, T0 + 2);
+
+    see(&db, &a, T0 + 2 + SEEN_REFRESH_MS - 1);
+    assert_eq!(one(&db, "s1").seen_at, T0 + 2, "fresh enough: untouched");
+    see(&db, &a, T0 + 3 + SEEN_REFRESH_MS);
+    assert_eq!(
+        one(&db, "s1").seen_at,
+        T0 + 3 + SEEN_REFRESH_MS,
+        "stale: refreshed"
+    );
+
+    start(&db, &a, "startup", T0 + 5 + SEEN_REFRESH_MS);
+    see(&db, &a, T0 + 6 + 2 * SEEN_REFRESH_MS);
+    let r = one(&db, "s1");
+    assert_eq!(
+        (r.start_source.as_deref(), r.cwd.as_str()),
+        (Some("startup"), "/w/repo"),
+        "a sighting keeps what the start recorded"
+    );
+}
+
+/// The sweep's listing is the live rows, least recently seen first; `all` adds the ended ones, most
 /// recent first.
 #[test]
-fn the_listing_is_the_live_sessions_oldest_first() {
+fn the_listing_is_the_live_rows_least_recently_seen_first() {
     let db = Db::open_in_memory().unwrap();
-    do_start(&db, &start("b", "1", "h", "startup"), T0 + 2);
-    do_start(&db, &start("a", "2", "h", "startup"), T0 + 1);
-    do_start(&db, &start("c", "3", "h", "startup"), T0 + 3);
-    do_end(&db, "c", "3", "h", "other", T0 + 4);
-    assert_eq!(live(&db), ["a", "b"]);
+    start(&db, &p("b", "1", "h"), "startup", T0 + 2);
+    start(&db, &p("a", "2", "h"), "startup", T0 + 1);
+    start(&db, &p("c", "3", "h"), "startup", T0 + 3);
+    end(&db, &p("c", "3", "h"), "other", T0 + 4);
+    assert_eq!(
+        live(&db),
+        [
+            ("a".to_owned(), "2".to_owned()),
+            ("b".to_owned(), "1".to_owned())
+        ]
+    );
     let all: Vec<String> = db
         .read(|c| list(c, true))
         .unwrap()
@@ -218,8 +271,8 @@ fn the_listing_is_capped() {
     db.write_txn("t", |c, _| {
         for i in 0..=LIST_CAP {
             c.execute(
-                "INSERT INTO claude_sessions (session, pid, instance, cwd, started_at, start_source) \
-                 VALUES (?1, '1', 'h', '', ?2, 'startup')",
+                "INSERT INTO claude_sessions (session, pid, instance, cwd, seen_at) \
+                 VALUES (?1, '1', 'h', '', ?2)",
                 rusqlite::params![format!("s{i}"), T0],
             )?;
         }
@@ -229,77 +282,73 @@ fn the_listing_is_capped() {
     assert_eq!(live(&db).len(), LIST_CAP);
 }
 
-/// Rows idle past the prune age go when another session starts — live or ended, since neither can
-/// be proved anything about any more — and the rest stay.
+/// Rows not seen within the prune age go when another session starts — live, ended, or known only by
+/// their end — and rows seen within it stay. The starting session's own rows are never pruned out from
+/// under it: its start still finds the session as it was.
 #[test]
-fn a_start_prunes_rows_idle_past_the_prune_age() {
+fn a_start_prunes_rows_not_seen_within_the_prune_age() {
     let db = Db::open_in_memory().unwrap();
-    do_start(&db, &start("old-live", "1", "gone-host", "startup"), T0);
-    do_start(&db, &start("old-ended", "2", "h", "startup"), T0);
-    do_end(&db, "old-ended", "2", "h", "other", T0 + 1);
-    do_start(&db, &start("recent", "3", "h", "startup"), T0 + 2);
-    do_end(&db, "recent", "3", "h", "other", T0 + PRUNE_AFTER_MS);
+    let now = T0 + PRUNE_AFTER_MS;
+    start(&db, &p("old-live", "1", "gone-host"), "startup", T0 - 1);
+    start(&db, &p("old-ended", "2", "h"), "startup", T0 - 5);
+    end(&db, &p("old-ended", "2", "h"), "other", T0 - 1);
+    end(&db, &p("old-end-only", "3", "h"), "other", T0 - 1);
+    start(&db, &p("recent", "4", "h"), "startup", T0 + 1);
+    start(&db, &p("idle", "5", "h"), "startup", T0 - 10);
 
-    let now = T0 + PRUNE_AFTER_MS + 2;
-    do_start(&db, &start("new", "4", "h", "startup"), now);
-    assert_eq!(row(&db, "old-live"), None);
-    assert_eq!(row(&db, "old-ended"), None);
-    assert!(row(&db, "recent").is_some(), "ended within the prune age");
-    assert!(row(&db, "new").is_some());
-
-    // The session starting is never pruned out from under its own start.
-    do_start(&db, &start("idle", "5", "h", "startup"), T0);
-    do_start(
-        &db,
-        &start("idle", "5", "h", "resume"),
-        now + PRUNE_AFTER_MS,
-    );
     assert_eq!(
-        row(&db, "idle").unwrap().start_source.as_deref(),
-        Some("resume")
+        start(&db, &p("idle", "6", "h"), "resume", now),
+        SessionState::Live,
+        "the session starting keeps its idle row"
     );
+    for gone_ in ["old-live", "old-ended", "old-end-only"] {
+        assert_eq!(st(&db, gone_), SessionState::Unknown, "{gone_} was pruned");
+    }
+    assert_eq!(st(&db, "recent"), SessionState::Live, "seen within the age");
+    assert_eq!(rows(&db, "idle").len(), 2);
 }
 
-/// Every input is bounded and shaped before it is stored; a refusal writes nothing.
+/// Identity is refused when malformed, with the notification ops' own rule; what is only shown is
+/// normalised instead, because refusing a start is what leaves a running session recorded as ended.
 #[test]
-fn malformed_input_is_refused() {
+fn identity_is_refused_and_the_rest_normalised() {
     let db = Db::open_in_memory().unwrap();
-    let long_cwd = "x".repeat(4097);
     let long_instance = "h".repeat(151);
-    for (s, why) in [
-        (start("", "1", "h", "startup"), "empty id"),
-        (start("a/b", "1", "h", "startup"), "unsanitized id"),
-        (start("s", "-1", "h", "startup"), "not a pid"),
-        (
-            start("s", "123456789012345678901", "h", "startup"),
-            "long pid",
-        ),
-        (start("s", "1", "h\n", "startup"), "control in instance"),
-        (start("s", "1", &long_instance, "startup"), "long instance"),
-        (start("s", "1", "h", ""), "empty source"),
-        (start("s", "1", "h", "Startup"), "not snake case"),
-        (start("s", "1", "h", &"x".repeat(33)), "long source"),
-        (
-            Start {
-                cwd: &long_cwd,
-                ..start("s", "1", "h", "startup")
-            },
-            "long cwd",
-        ),
+    for (bad, why) in [
+        (p("", "1", "h"), "empty id"),
+        (p("a/b", "1", "h"), "unsanitized id"),
+        (p("s", "-1", "h"), "not a pid"),
+        (p("s", "123456789012345678901", "h"), "long pid"),
+        (p("s", "1", "h\n"), "control in instance"),
+        (p("s", "1", &long_instance), "long instance"),
     ] {
-        let err = try_start(&db, &s, T0).unwrap_err();
+        let err = try_start(&db, &bad, "/w", "startup", T0).unwrap_err();
         assert!(
-            matches!(err, Error::Types(jkb_types::Error::Validation(_))),
+            matches!(err, Error::Queue(QueueError::Invalid { .. })),
             "{why}: {err}"
         );
+        let (s, i, n) = own(&bad);
+        let err = db
+            .write_txn("t", move |c, m| ended(c, m, &p(&s, &i, &n), "other", T0))
+            .unwrap_err();
+        assert!(matches!(err, Error::Queue(_)), "{why}: {err}");
     }
     assert!(db.read(|c| list(c, true)).unwrap().is_empty());
-    let err = db
-        .write_txn("t", |c, m| ended(c, m, "s", "1", "h", "", T0))
-        .unwrap_err();
-    assert!(matches!(err, Error::Types(_)), "{err}");
-    let err = db
-        .write_txn("t", |c, m| gone(c, m, "s!", "1", "h", T0))
-        .unwrap_err();
-    assert!(matches!(err, Error::Types(_)), "{err}");
+
+    let wide = "é".repeat(MAX_CWD_BYTES); // two bytes each
+    for (source, recorded) in [
+        ("", UNKNOWN),
+        ("Startup", UNKNOWN),
+        ("resume-fork", UNKNOWN),
+        (&*"x".repeat(33), UNKNOWN),
+        ("startup_2", "startup_2"),
+    ] {
+        try_start(&db, &p("s", "1", "h"), &wide, source, T0).unwrap();
+        let r = one(&db, "s");
+        assert_eq!(r.start_source.as_deref(), Some(recorded), "{source:?}");
+        assert_eq!(r.cwd.len(), MAX_CWD_BYTES, "cut at a character boundary");
+        assert!(r.cwd.chars().all(|c| c == 'é'));
+    }
+    end(&db, &p("s", "1", "h"), "Other!", T0 + 1);
+    assert_eq!(one(&db, "s").end_reason.as_deref(), Some(UNKNOWN));
 }

@@ -2430,15 +2430,17 @@ fn ingest_text_takes_source_bytes_only_in_process() {
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
 }
 
-/// The session registry through its ops, as the hook drives it: a start, an end from another
-/// process ignored, a sweep verdict, and the listing — with the wire shapes a client in another
-/// version parses.
+/// The session registry through its ops, as the hook drives it: two processes on one id, the end of
+/// one leaving the session live, a sweep verdict ending the other, a revival — with the wire shapes a
+/// client in another version parses.
 #[test]
 fn the_session_ops_drive_the_registry() {
     let b = backend();
-    let outcome = |r: Response| match r {
-        Response::SessionStart { outcome } | Response::SessionEnd { outcome } => outcome,
-        other => panic!("unexpected {other:?}"),
+    let rows = |all: bool| -> Vec<super::ClaudeSession> {
+        match b.call(Request::SessionList { all }).unwrap() {
+            Response::ClaudeSessions { sessions } => sessions,
+            other => panic!("unexpected {other:?}"),
+        }
     };
     let started = call(
         &b,
@@ -2448,35 +2450,42 @@ fn the_session_ops_drive_the_registry() {
     .unwrap();
     assert_eq!(
         serde_json::to_value(&started).unwrap(),
-        json!({ "result": "session_start", "outcome": "new" })
+        json!({ "result": "session_start", "was": "unknown" })
     );
     assert_eq!(
-        outcome(
-            call(
-                &b,
-                json!({ "op": "session.ended", "session": "s1", "reason": "other",
-                        "pid": "11", "instance": "h" }),
-            )
-            .unwrap()
-        ),
-        "other_process"
+        call(
+            &b,
+            json!({ "op": "session.started", "session": "s1", "source": "resume",
+                    "pid": "11", "instance": "h" }),
+        )
+        .unwrap(),
+        Response::SessionStart { was: "live".into() },
+        "a second process joins a running session"
     );
-    let mut listed =
-        serde_json::to_value(call(&b, json!({ "op": "session.list" })).unwrap()).unwrap();
-    let started_at = listed["sessions"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("started_at")
-        .unwrap();
-    assert!(started_at.as_i64().is_some_and(|t| t > 0), "{started_at}");
+    let ended = call(
+        &b,
+        json!({ "op": "session.ended", "session": "s1", "reason": "other",
+                "pid": "11", "instance": "h" }),
+    )
+    .unwrap();
     assert_eq!(
-        listed,
-        json!({ "result": "claude_sessions", "sessions": [{
-            "session": "s1", "pid": "10", "instance": "h", "cwd": "/w",
-            "start_source": "startup",
-        }]}),
-        "a live session carries no end fields"
+        serde_json::to_value(&ended).unwrap(),
+        json!({ "result": "session_end", "outcome": "recorded" })
     );
+
+    let mut live = serde_json::to_value(rows(false)).unwrap();
+    let row = live[0].as_object_mut().unwrap();
+    for stamp in ["started_at", "seen_at"] {
+        let t = row.remove(stamp).unwrap();
+        assert!(t.as_i64().is_some_and(|t| t > 0), "{stamp}: {t}");
+    }
+    assert_eq!(
+        live,
+        json!([{ "session": "s1", "pid": "10", "instance": "h", "cwd": "/w",
+                 "start_source": "startup" }]),
+        "the first process still holds it; a live row carries no end fields"
+    );
+
     assert_eq!(
         call(
             &b,
@@ -2485,27 +2494,20 @@ fn the_session_ops_drive_the_registry() {
         .unwrap(),
         Response::SessionGone { ended: true }
     );
-    let Response::ClaudeSessions { sessions } = call(&b, json!({ "op": "session.list" })).unwrap()
-    else {
-        panic!("expected sessions")
-    };
-    assert!(sessions.is_empty(), "no live sessions left");
-    let Response::ClaudeSessions { sessions } =
-        call(&b, json!({ "op": "session.list", "all": true })).unwrap()
-    else {
-        panic!("expected sessions")
-    };
-    assert_eq!(sessions[0].end_reason.as_deref(), Some("gone"));
+    assert!(rows(false).is_empty(), "no live rows left");
+    let reasons: Vec<Option<String>> = rows(true).into_iter().map(|r| r.end_reason).collect();
+    assert_eq!(reasons.len(), 2);
+    assert!(reasons.contains(&Some("gone".into())), "{reasons:?}");
     assert_eq!(
-        outcome(
-            call(
-                &b,
-                json!({ "op": "session.started", "session": "s1", "source": "resume",
-                        "pid": "12", "instance": "h" }),
-            )
-            .unwrap()
-        ),
-        "revived"
+        call(
+            &b,
+            json!({ "op": "session.started", "session": "s1", "source": "resume",
+                    "pid": "12", "instance": "h" }),
+        )
+        .unwrap(),
+        Response::SessionStart {
+            was: "ended".into()
+        }
     );
 
     let err = call(
@@ -2514,4 +2516,43 @@ fn the_session_ops_drive_the_registry() {
     )
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid, "{err:?}");
+}
+
+/// **A lost start is repaired by the next hook event**: a `notify.event` from a process marks it
+/// running in the registry — reviving a row that had ended — except the `session_ended` event, which
+/// the hook follows with `session.ended` and which must not revive what it is ending.
+#[test]
+fn a_notify_event_marks_its_process_running_except_at_the_end() {
+    let b = backend();
+    // An end withdraws whatever is on screen, so the topic must exist.
+    b.call(Request::MqTopicCreate {
+        topic: jkb_core::notify::TOPIC.into(),
+        spec: SpecInput::default(),
+    })
+    .unwrap();
+    let event = |event: &str| {
+        call(
+            &b,
+            json!({ "op": "notify.event", "session": "s1", "event": event,
+                    "owner": "10", "instance": "h", "cwd": "/w" }),
+        )
+        .unwrap();
+    };
+    let live = || match b.call(Request::SessionList { all: false }).unwrap() {
+        Response::ClaudeSessions { sessions } => sessions.len(),
+        other => panic!("unexpected {other:?}"),
+    };
+    event("tool_finished");
+    assert_eq!(live(), 1, "a session nobody saw start is known live");
+    call(
+        &b,
+        json!({ "op": "session.ended", "session": "s1", "reason": "other",
+                "pid": "10", "instance": "h" }),
+    )
+    .unwrap();
+    assert_eq!(live(), 0);
+    event("session_ended");
+    assert_eq!(live(), 0, "the end's own notify.event revives nothing");
+    event("user_acted");
+    assert_eq!(live(), 1, "a later event from the process revives it");
 }

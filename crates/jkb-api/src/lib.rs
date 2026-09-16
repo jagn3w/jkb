@@ -121,7 +121,9 @@ pub enum Request {
         limit: usize,
     },
     /// One Claude Code hook event, as the hook observed it. The daemon runs the notification
-    /// machine against its record of the session and sends the effects on `claude/notify`.
+    /// machine against its record of the session and sends the effects on `claude/notify` — and,
+    /// for every event but `session_ended`, records the process as running in the session registry
+    /// ([`jkb_core::claude_session::seen`]), which repairs a `session.started` that was lost.
     #[serde(rename = "notify.event")]
     NotifyEvent {
         /// The session id, sanitized to `[A-Za-z0-9_-]` (anything else is refused).
@@ -159,7 +161,7 @@ pub enum Request {
         instance: String,
     },
     /// A Claude Code session started, resumed, was cleared into or compacted
-    /// ([`jkb_core::claude_session`]): it is live, held by this process.
+    /// ([`jkb_core::claude_session`]): this process holds it.
     #[serde(rename = "session.started")]
     SessionStarted {
         /// The session id, sanitized to `[A-Za-z0-9_-]` (anything else is refused).
@@ -176,8 +178,8 @@ pub enum Request {
         #[serde(default)]
         cwd: String,
     },
-    /// A Claude Code session ended, as its own process reported. Ignored once the session is held by
-    /// another process.
+    /// A Claude Code session ended, as its own process reported: that process's hold ends. The session
+    /// stays live while another process holds it.
     #[serde(rename = "session.ended")]
     SessionEnded {
         /// The session id.
@@ -191,8 +193,7 @@ pub enum Request {
         #[serde(default)]
         instance: String,
     },
-    /// A producer proved a session's process gone: end the session, but only while it is live and
-    /// still held by that process.
+    /// A producer proved a process gone: end its hold on the session, if still live.
     #[serde(rename = "session.gone")]
     SessionGone {
         /// The session id.
@@ -202,10 +203,11 @@ pub enum Request {
         /// Its instance, as `session.list` reported it.
         instance: String,
     },
-    /// The session registry: the live sessions, oldest first (what a sweep probes), or every one.
+    /// The session registry, one row per process holding a session: the live rows, least recently
+    /// seen first (what a sweep probes), or every one.
     #[serde(rename = "session.list")]
     SessionList {
-        /// Include ended sessions, most recent first.
+        /// Include ended rows, most recently seen first.
         #[serde(default)]
         all: bool,
     },
@@ -481,23 +483,25 @@ pub struct NotifySession {
     pub updated_at: i64,
 }
 
-/// A Claude Code session as `session.list` reports it.
+/// One process's hold on a Claude Code session, as `session.list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeSession {
     /// The session id.
     pub session: String,
-    /// The `claude` process that last started it, or empty.
+    /// The `claude` process, or empty when the hook had none it could trust.
     pub pid: String,
     /// Where `pid` means something: `host[#boot][/pidns]`.
     pub instance: String,
     /// Its working directory, as the hook reported it.
     pub cwd: String,
-    /// When it last started (Unix ms); absent when only its end was seen.
+    /// When this process last started it (Unix ms); absent when it was first seen otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<i64>,
     /// How it last started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_source: Option<String>,
+    /// The last event from this process (Unix ms), refreshed at most hourly.
+    pub seen_at: i64,
     /// When it ended (Unix ms); absent while live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
@@ -506,8 +510,8 @@ pub struct ClaudeSession {
     pub end_reason: Option<String>,
 }
 
-impl From<jkb_core::claude_session::SessionRow> for ClaudeSession {
-    fn from(r: jkb_core::claude_session::SessionRow) -> Self {
+impl From<jkb_core::claude_session::HolderRow> for ClaudeSession {
+    fn from(r: jkb_core::claude_session::HolderRow) -> Self {
         Self {
             session: r.session,
             pid: r.pid,
@@ -515,6 +519,7 @@ impl From<jkb_core::claude_session::SessionRow> for ClaudeSession {
             cwd: r.cwd,
             started_at: r.started_at,
             start_source: r.start_source,
+            seen_at: r.seen_at,
             ended_at: r.ended_at,
             end_reason: r.end_reason,
         }
@@ -882,21 +887,20 @@ pub enum Response {
         /// By session.
         sessions: Vec<NotifySession>,
     },
-    /// A `session.started`: `new`, `restarted` (it was live under another process) or `revived`
-    /// (it had ended).
+    /// A `session.started`.
     SessionStart {
-        /// What the start did.
-        outcome: String,
+        /// The session's state before: `unknown`, `live` (a compaction, or another process holds
+        /// it too) or `ended` (a revival).
+        was: String,
     },
-    /// A `session.ended`: `recorded`, `already_ended`, or `other_process` (the session is held by
-    /// another process, so nothing changed).
+    /// A `session.ended`.
     SessionEnd {
-        /// What the end did.
+        /// `recorded`, or `already_ended` (the first reason stands).
         outcome: String,
     },
     /// A `session.gone`.
     SessionGone {
-        /// Whether the session was ended by it.
+        /// Whether the process's hold was ended by it.
         ended: bool,
     },
     /// A `session.list`.
@@ -1485,6 +1489,7 @@ impl Backend for LocalBackend {
                 owner,
                 instance,
             } => {
+                let running = event != HookEvent::SessionEnded;
                 let obs = Observation {
                     session,
                     event: event.into(),
@@ -1494,8 +1499,21 @@ impl Backend for LocalBackend {
                     owner,
                     instance,
                 };
-                db.write_txn(actor, move |c, m| notify::observe(c, m, &obs, now))?
-                    .into()
+                db.write_txn(actor, move |c, m| {
+                    let applied = notify::observe(c, m, &obs, now)?;
+                    // After `observe`, which has refused anything malformed, so this cannot cost the
+                    // notification its transaction on the same input.
+                    if running {
+                        let process = claude_session::Process {
+                            session: &obs.session,
+                            pid: &obs.owner,
+                            instance: &obs.instance,
+                        };
+                        claude_session::seen(c, m, &process, &obs.cwd, now)?;
+                    }
+                    Ok(applied)
+                })?
+                .into()
             }
             Request::NotifyOpenSessions {} => Response::Sessions {
                 sessions: db
@@ -1526,18 +1544,16 @@ impl Backend for LocalBackend {
                 instance,
                 cwd,
             } => {
-                let started = db.write_txn(actor, move |c, m| {
-                    let start = claude_session::Start {
+                let was = db.write_txn(actor, move |c, m| {
+                    let process = claude_session::Process {
                         session: &session,
                         pid: &pid,
                         instance: &instance,
-                        cwd: &cwd,
-                        source: &source,
                     };
-                    claude_session::started(c, m, &start, now)
+                    claude_session::started(c, m, &process, &cwd, &source, now)
                 })?;
                 Response::SessionStart {
-                    outcome: started.as_str().to_owned(),
+                    was: was.as_str().to_owned(),
                 }
             }
             Request::SessionEnded {
@@ -1548,7 +1564,12 @@ impl Backend for LocalBackend {
             } => Response::SessionEnd {
                 outcome: db
                     .write_txn(actor, move |c, m| {
-                        claude_session::ended(c, m, &session, &pid, &instance, &reason, now)
+                        let process = claude_session::Process {
+                            session: &session,
+                            pid: &pid,
+                            instance: &instance,
+                        };
+                        claude_session::ended(c, m, &process, &reason, now)
                     })?
                     .as_str()
                     .to_owned(),
@@ -1559,7 +1580,12 @@ impl Backend for LocalBackend {
                 instance,
             } => Response::SessionGone {
                 ended: db.write_txn(actor, move |c, m| {
-                    claude_session::gone(c, m, &session, &pid, &instance, now)
+                    let process = claude_session::Process {
+                        session: &session,
+                        pid: &pid,
+                        instance: &instance,
+                    };
+                    claude_session::gone(c, m, &process, now)
                 })?,
             },
             Request::SessionList { all } => Response::ClaudeSessions {
