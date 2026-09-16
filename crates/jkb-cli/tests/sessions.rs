@@ -4084,11 +4084,16 @@ fn landing_is_serialised_by_a_lease_freed_only_when_its_holder_is_proven_gone() 
     // No session to ask either: only the operator can end it.
     set_lease(&f.db, name, Some("elsewhere:5 n -"));
     refused(&land());
-    f.jkb()
-        .args(["task", "land", "--break-lock"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("elsewhere:5"));
+    let broke = f
+        .jkb()
+        .args(["--json", "task", "land", "--break-lock"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&broke.stdout).unwrap();
+    assert_eq!(
+        v["broken_holder"], "elsewhere:5 n -",
+        "the holder as stored: {v}"
+    );
     assert_eq!(lease_of(&f.db, name), None);
 
     // The session it names has ended: taken over, and released once the landing is done.
@@ -4241,6 +4246,66 @@ fn the_queue_s_landing_is_recorded_through_the_daemon() {
     assert!(queued.status.success(), "{queued:?}");
     let v: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();
     assert_eq!(v["landed"].as_array().map(Vec::len), Some(1), "{v}");
+}
+
+/// **A task this client may not write is refused before any git work** (stage-4 review): landed or
+/// abandoned through the daemon, a task filed outside its roots would otherwise be grafted, or have its
+/// checkout and branch removed, and only then be refused its record.
+#[test]
+fn a_task_the_client_may_not_write_is_refused_before_git_moves() {
+    let f = Fixture::new();
+    let uid = f.add_task("filed elsewhere");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(&wt, "e.txt", "e\n", "add e");
+    f.jkb()
+        .args([
+            "task",
+            "bind",
+            &uid,
+            "--sync",
+            "file:///nowhere-the-daemon-serves/tasks.md",
+        ])
+        .assert()
+        .success();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env_remove("JKB_DB")
+            .output()
+            .unwrap()
+    };
+    let before = git(&f.repo, &["rev-parse", &onto]);
+    for args in [
+        vec!["task", "land", &uid, "--no-gate", "--no-review"],
+        vec!["task", "abandon", &uid, "--force", "--delete-branch"],
+    ] {
+        let out = remote(&args);
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("run it on the host"),
+            "{out:?}"
+        );
+    }
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &onto]),
+        before,
+        "nothing grafted"
+    );
+    assert!(wt.exists(), "the checkout is still there");
+    assert!(
+        !git(&f.repo, &["branch", "--list", &branch]).is_empty(),
+        "and its branch"
+    );
+    assert_eq!(f.status_of(&uid), "in_progress");
 }
 
 /// **A session that cannot be opened leaves no claim behind** — and the release is the run's own

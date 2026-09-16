@@ -3832,14 +3832,9 @@ pub(crate) fn cmd_task_land(
         return break_land_lease(kb, &ctx.key, json);
     }
     let uid = uid.context("a task to land")?;
-    let facts = kb.facts(uid)?;
     // Asked before anything moves: a task this client may not write would otherwise be grafted and
     // its session disposed of, and only then refused its record — landed, in progress, sessionless.
-    anyhow::ensure!(
-        facts.writable,
-        "{uid} is filed outside the directories this client may cause host files to be written in, \
-         so its landing cannot be recorded from here — land it on the host"
-    );
+    let facts = kb.facts_for_write(uid)?;
     let tags = facts.tags.clone();
 
     // The lock is taken **before** anything is checked, not just before the graft.
@@ -3955,11 +3950,14 @@ fn break_land_lease(kb: &session_cli::Kb<'_>, repo_key: &str, json: bool) -> Res
     if json {
         println!(
             "{}",
-            serde_json::json!({ "repo": repo_key, "broken_holder": broken })
+            serde_json::json!({
+                "repo": repo_key,
+                "broken_holder": broken.as_ref().map(|(raw, _)| raw),
+            })
         );
     } else {
         match broken {
-            Some(holder) => println!("broke {repo_key}'s land lease held by {holder}"),
+            Some((_, holder)) => println!("broke {repo_key}'s land lease held by {holder}"),
             None => println!("no land lease was held for {repo_key}"),
         }
     }

@@ -737,7 +737,10 @@ pub fn review_findings(
         return Err(ApiError::with_code(
             ErrorCode::Invalid,
             format!(
-                "those namespaces hold {} tasks; a review holds at most {MAX_EXAMINED_FINDINGS}",
+                "the review namespaces {} hold {} tasks, and a review holds at most \
+                 {MAX_EXAMINED_FINDINGS} — a `review=` facet names something that is not a review; \
+                 remove it from the task (`jkb task tag rm <uid> review=<namespace>`)",
+                namespaces.join(", "),
                 ids.len()
             ),
         ));

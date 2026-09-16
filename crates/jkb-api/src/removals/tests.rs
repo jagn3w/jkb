@@ -218,10 +218,14 @@ fn leases_are_named_compared_and_broken_only_on_the_host() {
         "the displaced holder releases nothing"
     );
 
-    forbidden(
-        call(&b, json!({ "op": "lease.break", "name": "removal-sweep" })),
-        "a client breaking a lease",
-    );
+    for (name, escape) in [
+        ("removal-sweep", "task reap --break-lock"),
+        ("land:proj", "task land --break-lock"),
+    ] {
+        let e = call(&b, json!({ "op": "lease.break", "name": name })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Forbidden, "{name}");
+        assert!(e.message.contains(escape), "{name}: {e:?}");
+    }
     assert!(matches!(
         call(&host, json!({ "op": "lease.break", "name": "removal-sweep" })).unwrap(),
         Response::LeaseBroken { holder: Some(h) } if h == "host:h 2"

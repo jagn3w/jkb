@@ -88,14 +88,14 @@ routinely built from different checkouts.
 | `task.bind` | `uid`, `sync?` (`managed:` when absent) | `applied` |
 | `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
 | `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
-| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?` (for a finished task only), `terminal`, `open_subtasks`} |
+| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?` (for a finished task only), `terminal`, `open_subtasks`, `writable` (`false` for a task filed outside the daemon's file roots — asked before git work)} |
 | `task.by_branch` | `repo` | `branch_tasks` {`tasks`: branch → [{`uid`, `status`, `onto?`}], every task on the branch, in id order} |
 | `task.start` | `uid`, exactly one of `take` {`owner`, `displace?`} and `keep` (the claim kept), `place` {`branch`, `repo`, `onto?`} | `taken` {`taken`} — `false`, nothing written, when the claim is not the one judged (`displace`, `keep`, or none) |
 | `task.take` | `uid`, `take` {`owner`, `displace?`}, `place` {`branch`, `repo`, `onto`} — the claim; the place is judged (written for trial and rolled back), not recorded | `taken` {`taken`} |
 | `task.locate` | `uid`, `owner`, `place` — recorded only while `owner` holds the claim | `taken` {`taken`} |
 | `task.land` | `uid`, `landed` {`branch`, `onto`, `head?`} | `landing` {`moved`, `refusal?`, `status`} — the facts the caller established (graft, green gate, disposal) are stated |
 | `task.landed` | `uid`, `landed` | `landing` — `observed_landed`; a guard's refusal is still recorded, an event the task's state does not define is not |
-| `task.review_findings` | `namespaces` (≤64) | `review_findings` {`total`, `open_count`, `open_must_fix` (≤100 {`uid`, `title`})} |
+| `task.review_findings` | `namespaces` (≤64; a client asks in pieces) | `review_findings` {`total`, `open_count`, `open_must_fix` (≤100 {`uid`, `title` (≤200 chars)})} — refused past 10 000 tasks examined |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
 | `session.state` | `session` | `session_is` {`state`: `live`\|`ended`\|`unknown`} (a closed set) |
@@ -194,9 +194,11 @@ Two decisions in it:
   `task land --break-lock`).
 - **The land lock is the `land:<repo key>` lease** (stage 4, decision D), taken as a compare-and-set
   with holder `<owner> <nonce> <Claude Code session or ->`. It was `.jkb/land.lock` holding a pid, which
-  the other side of the bind cannot probe. A holder is stale only when proven gone: its process dead on
-  this host, or the session it names ended in the registry. Anything else is respected until
-  `jkb task land --break-lock` on the host. The repo key is a directory's basename, so two repos of
+  the other side of the bind cannot probe. A holder is stale only when proven gone, asked in this
+  order: a process this host can probe decides — dead is stale, alive is not, whatever became of its
+  session (a land left running by a Claude Code that died is still grafting; stage-4 review); only a
+  process this host cannot probe falls back to the session it names, stale once that has ended in
+  the registry. Anything else is respected until `jkb task land --break-lock` on the host. The repo key is a directory's basename, so two repos of
   one name share a lease: they land one at a time, which costs only waiting.
 - **Worktree-removal records name only the shared directory** (stage 3). They moved from files beside
   the database into `worktree_removals` (V020), and the sweep's lock into the `leases` table. A record

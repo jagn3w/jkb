@@ -68,7 +68,11 @@ fn chunked(
         let part: Findings = read(nss)?.into();
         out.total += part.total;
         out.open_count += part.open_count;
-        out.open_must_fix.extend(part.open_must_fix);
+        for f in part.open_must_fix {
+            if !out.open_must_fix.iter().any(|seen| seen.uid == f.uid) {
+                out.open_must_fix.push(f);
+            }
+        }
     }
     Ok(out)
 }
@@ -210,7 +214,18 @@ pub(crate) fn enforce(
     no_review: bool,
     json: bool,
 ) -> Result<bool> {
-    let verdict = gate(kb, tags)?;
+    let verdict = match gate(kb, tags) {
+        Ok(v) => v,
+        // A review whose findings cannot be read is not a passed one — and `--no-review` is the
+        // operator saying not to ask, so it is not a reason to refuse the waiver either.
+        Err(e) if no_review => {
+            if !json {
+                eprintln!("note: the task's review could not be read ({e:#})");
+            }
+            GateVerdict::NeverReviewed
+        }
+        Err(e) => return Err(e),
+    };
     if matches!(verdict, GateVerdict::Passed) {
         return Ok(false);
     }

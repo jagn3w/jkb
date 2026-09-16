@@ -68,6 +68,19 @@ impl<'a> Kb<'a> {
         }
     }
 
+    /// `task.facts`, refused when this client may not write the task — asked by a verb before it does
+    /// git work, so a task filed outside `jkb serve`'s roots is refused while nothing has moved rather
+    /// than after its branch was grafted or deleted.
+    pub(crate) fn facts_for_write(&self, uid: &str) -> Result<TaskState> {
+        let facts = self.facts(uid)?;
+        anyhow::ensure!(
+            facts.writable,
+            "{uid} is filed outside the directories this client may cause host files to be written \
+             in, so this cannot be recorded from here — run it on the host"
+        );
+        Ok(facts)
+    }
+
     /// `task.by_branch`: every task on each branch.
     pub(crate) fn by_branch(&self, repo: &str) -> Result<BTreeMap<String, Vec<BranchTask>>> {
         match self.call(Request::TaskByBranch {
@@ -1112,7 +1125,7 @@ pub(crate) fn abandon(
     json: bool,
 ) -> Result<()> {
     let ctx = repo::repo_ctx()?;
-    let facts = kb.facts(uid)?;
+    let facts = kb.facts_for_write(uid)?;
     // Abandon does two separable things: it **disposes of the session**, and it **reopens the
     // task**. Only the second is wrong for a terminal task — a landed one is already merged
     // and a cancelled one was deliberately dropped, so putting either back on the ready
@@ -1638,10 +1651,12 @@ fn refuse_a_running_opener(kb: &Kb<'_>, uid: &str, held: &str, worktree: &Path) 
 /// catch (design D36.4). The lock was a file in the repo holding a pid, which a process on the other
 /// side of the container bind cannot probe — each side would read the other's live lock as stale.
 ///
-/// **Stale only when its holder is proven gone:** its process is dead on this host, or the Claude Code
-/// session it names has ended in the registry (a `SessionEnd`, or the sweep's `session.gone`). A holder
-/// on another host in a session nobody has seen end is respected; a land killed there leaves the lease
-/// until that session ends — or an operator runs `jkb task land --break-lock` on the host.
+/// **Stale only when its holder is proven gone**, asked in this order: a process this host can probe
+/// decides it — dead is stale, alive is not, whatever became of its session (a land left running by a
+/// Claude Code that died is still grafting); only a process this host cannot probe falls back to the
+/// Claude Code session it names, stale once that session has ended in the registry. Anything else is
+/// respected — a land killed on another host in a session nobody saw end leaves the lease until an
+/// operator runs `jkb task land --break-lock` on the host.
 pub(crate) struct LandLease<'a> {
     kb: Kb<'a>,
     name: String,
@@ -1730,11 +1745,13 @@ impl<'a> LandLease<'a> {
         }
     }
 
-    /// Drop the lease for `repo_key` whoever holds it — the operator's escape; host only.
-    pub(crate) fn break_held(kb: &Kb<'_>, repo_key: &str) -> Result<Option<String>> {
-        Ok(kb
-            .lease_break(&Self::name(repo_key))?
-            .map(|h| Self::describe(&h)))
+    /// Drop the lease for `repo_key` whoever holds it — the operator's escape; host only. The holder
+    /// as stored, and as a person reads it.
+    pub(crate) fn break_held(kb: &Kb<'_>, repo_key: &str) -> Result<Option<(String, String)>> {
+        Ok(kb.lease_break(&Self::name(repo_key))?.map(|h| {
+            let described = Self::describe(&h);
+            (h, described)
+        }))
     }
 }
 

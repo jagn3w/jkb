@@ -739,3 +739,38 @@ fn review_findings_count_what_blocks_a_landing() {
         .collect();
     assert_eq!(ask(json!(many)).unwrap_err().code, ErrorCode::Invalid);
 }
+
+/// A finding's title is cut to its cap, and a namespace set holding more tasks than a review can is
+/// refused with the remedy.
+#[test]
+fn review_findings_are_bounded() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let long = "x".repeat(super::MAX_FINDING_TITLE_CHARS + 50);
+    add(&b, &format!("{long} !p1 +reviews/long"));
+    let ask = |nss: serde_json::Value| {
+        call(
+            &b,
+            json!({ "op": "task.review_findings", "namespaces": nss }),
+        )
+    };
+    match ask(json!(["reviews/long"])).unwrap() {
+        Response::ReviewFindings { findings } => assert_eq!(
+            findings.open_must_fix[0].title.chars().count(),
+            super::MAX_FINDING_TITLE_CHARS
+        ),
+        other => panic!("{other:?}"),
+    }
+    db.write_txn("t", |c, m| {
+        for i in 0..=super::MAX_EXAMINED_FINDINGS {
+            let mut t = jkb_core::task::NewTask::new(format!("task:huge-{i}"), format!("t{i}"));
+            "reviews/huge".clone_into(&mut t.home);
+            jkb_core::task::create(c, m, &t)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let e = ask(json!(["reviews/huge"])).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
+    assert!(e.message.contains("review="), "{e:?}");
+}
