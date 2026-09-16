@@ -229,7 +229,8 @@ in_lib() {
     local -a envs=()
     while [ "$1" != -- ]; do envs+=("$1"); shift; done
     shift
-    env PATH="$nbin:$PATH" "${envs[@]}" bash -c ". \"\$1\"; $1" _ "$repo_root/scripts/lib.sh" 2>/dev/null
+    # Guarded: macOS bash 3.2 calls an empty array unbound under `set -u`, and case 8 passes no envs.
+    env PATH="$nbin:$PATH" ${envs[@]+"${envs[@]}"} bash -c ". \"\$1\"; $1" _ "$repo_root/scripts/lib.sh" 2>/dev/null
 }
 
 case6() {
