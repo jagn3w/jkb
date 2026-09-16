@@ -208,8 +208,7 @@ Two decisions in it:
   every pass until someone broke it. A client can still take `removal-sweep` (or, from stage 4, a
   land lease) and hold it: that stops the host's sweep **and every `task work`** (a cancel is refused
   while the lease is held, even with nothing to cancel), acts on nothing, and
-  `jkb task reap --break-lock` on the host ends it. An older jkb's `.sweep.lock` on the old store is
-  honoured for that store's files, and broken with the lease.
+  `jkb task reap --break-lock` on the host ends it.
 - **The old file store is reported, and nothing acts on it** (rounds 2–5 of the stage-3 review).
   Records an older jkb wrote beside the database were first swept in place, then imported by every
   sweep, then imported on request — and each version was found steerable or lossy: `~/.jkb` is

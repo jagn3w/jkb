@@ -4284,16 +4284,24 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         let stores = archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path));
         // `--dry-run` promises to change nothing, and this ran before that was consulted — so
         // `--dry-run --break-lock` removed a live sweeper's lock while saying it would not.
+        // On stderr under `--json`, whose stdout is the one report document.
+        let say = |line: String| {
+            if json {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        };
         if dry_run {
-            match archive::lock_holder(&stores)? {
-                Some(holder) => println!("would break the sweep lease held by {holder}"),
-                None => println!("no sweep lease is held"),
-            }
+            say(match archive::lock_holder(&stores)? {
+                Some(holder) => format!("would break the sweep lease held by {holder}"),
+                None => "no sweep lease is held".to_owned(),
+            });
         } else {
-            match archive::break_lock(&stores)? {
-                Some(holder) => println!("broke the sweep lease held by {holder}"),
-                None => println!("no sweep lease was held"),
-            }
+            say(match archive::break_lock(&stores)? {
+                Some(holder) => format!("broke the sweep lease held by {holder}"),
+                None => "no sweep lease was held".to_owned(),
+            });
         }
     }
     if !watch {
@@ -4562,6 +4570,7 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool, compaction: Optio
                     "lock": jkb_api::removals::SWEEP_LEASE,
                     "holder": h.holder,
                 })),
+                "old_records": r.old_records,
                 "retained": r.retained.len(),
                 "retained_bytes": r.retained.iter().map(|p| archive::dir_size(p)).sum::<u64>(),
             })
@@ -4596,6 +4605,9 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool, compaction: Optio
     // says what would move it rather than reading as a failure.
     for (uid, why) in &r.held {
         println!("held {uid}: {why}");
+    }
+    for line in &r.old_records {
+        println!("{line}");
     }
     if let Some(held) = &r.skipped {
         // Named in full: an owner on another host is Unknown and unknown frees nothing, so a lock
@@ -5002,7 +5014,16 @@ fn report_worktree_removals(db: &Db, db_path: &Path, fix: bool) {
 /// `doctor --fix`'s sweep — the one the service runs.
 fn fix_worktree_removals(stores: &archive::Stores<'_>) {
     match archive::reap(stores, archive::RETAIN_DAYS, false) {
-        Ok(r) => report_reap(&r, false, false, None),
+        // The old store was listed a few lines above; once is enough.
+        Ok(r) => report_reap(
+            &archive::Report {
+                old_records: Vec::new(),
+                ..r
+            },
+            false,
+            false,
+            None,
+        ),
         Err(e) => println!("  sweep failed: {e}"),
     }
 }

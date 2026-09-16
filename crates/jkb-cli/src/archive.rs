@@ -153,6 +153,8 @@ pub struct Report {
     /// "there was nothing to do" and "I did not look" are different facts, and printing the
     /// first for the second is what this module keeps being corrected for.
     pub skipped: Option<Held>,
+    /// What an older jkb left in the old record store, for the operator — reported, never acted on.
+    pub old_records: Vec<String>,
 }
 
 impl Report {
@@ -174,6 +176,7 @@ impl Report {
             // printed". Omitted here, the watcher went permanently silent about exactly it —
             // every deferred landing on the machine stopped completing with no log line anywhere.
             .chain(self.skipped.iter().map(|h| format!("l {}", h.holder)))
+            .chain(self.old_records.iter().map(|l| format!("o {l}")))
             .collect();
         lines.sort();
         lines.join("\n")
@@ -558,6 +561,13 @@ impl LegacyOutlook {
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if self.files == 0 && self.more {
+            out.push(
+                "the old record store holds more entries than one look examines, none of them a \
+                 record among those seen — look at it yourself"
+                    .to_owned(),
+            );
+        }
         if self.files > 0 {
             out.push(format!(
                 "{}{} worktree-removal record file(s) written by an older jkb, which this jkb does \
@@ -652,10 +662,11 @@ pub fn revoke(stores: &Stores<'_>, worktree: &Path) -> Result<bool> {
         if let Some(holder) = outcome.sweep_holder {
             return Err(refused(&holder, cancelled));
         }
+        cancelled += outcome.cancelled;
         // A record for this checkout that this process may not cancel is still owed, so the
         // checkout is not handed back.
-        anyhow::ensure!(
-            outcome.skipped.is_empty(),
+        if !outcome.skipped.is_empty() {
+            let e = anyhow::anyhow!(
             "a pending removal of {} ({}) was recorded where this process may not cancel it — run \
              `jkb task work` on the host",
             worktree.display(),
@@ -665,8 +676,16 @@ pub fn revoke(stores: &Stores<'_>, worktree: &Path) -> Result<bool> {
                 .map(|id| format!("record #{id}"))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
-        cancelled += outcome.cancelled;
+            );
+            return Err(if cancelled == 0 {
+                e
+            } else {
+                e.context(format!(
+                    "{cancelled} of this checkout's pending removals were cancelled first; the rest \
+                     are still owed"
+                ))
+            });
+        }
     }
     Ok(cancelled > 0)
 }
@@ -1828,11 +1847,11 @@ pub fn reap(stores: &Stores<'_>, retain_days: u64, dry_run: bool) -> Result<Repo
     };
     let now = now_secs();
     let store = entries(stores)?;
-    let mut report = Report::default();
     // The old store is reported, never acted on: what it names is the operator's to judge.
-    for line in store.legacy.lines() {
-        report.held.push((String::new(), line));
-    }
+    let mut report = Report {
+        old_records: store.legacy.lines(),
+        ..Report::default()
+    };
     for r in store.rejected {
         report.held.push((
             r.uid,
@@ -2535,15 +2554,14 @@ mod tests {
             let r = reap(&s, 0, dry_run).expect("reap");
             assert!(r.archived.is_empty() && wt.exists(), "{r:?}");
             assert!(
-                r.held.iter().any(|(_, why)| why.contains("older jkb")),
+                r.old_records.iter().any(|l| l.contains("older jkb")),
                 "and it says so: {r:?}"
             );
             assert!(
-                r.held
-                    .iter()
-                    .any(|(_, why)| why.contains("legacy-name.json")),
+                r.old_records.iter().any(|l| l.contains("legacy-name.json")),
                 "naming the file: {r:?}"
             );
+            assert!(r.held.is_empty(), "and holds nothing: {r:?}");
         }
         assert!(!revoke(&s, &wt).expect("revoke"));
         assert!(marker.exists(), "nothing removed it");
@@ -2643,18 +2661,6 @@ mod tests {
         let outlook = entries(&s).expect("entries").legacy;
         assert!(outlook.unusable.is_some(), "{outlook:?}");
         assert_eq!(outlook.files, 0);
-    }
-
-    /// A size cap below the synced-file one is honoured.
-    #[test]
-    fn a_capped_read_refuses_what_is_over_its_cap() {
-        let t = tempfile::tempdir().expect("tempdir");
-        let path = t.path().canonicalize().expect("real").join("f");
-        fs::write(&path, b"12345").expect("write");
-        assert!(jkb_core::nofollow::read_capped(&path, 5)
-            .expect("read")
-            .is_some());
-        assert!(jkb_core::nofollow::read_capped(&path, 4).is_err());
     }
 
     /// An archive this machine cannot stat is held with the fix that ends it, not with the
@@ -4547,7 +4553,7 @@ mod tests {
 
         let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(
-            r.held.iter().any(|(_, why)| why.contains("torn.json")),
+            r.old_records.iter().any(|l| l.contains("torn.json")),
             "{r:?}"
         );
         assert!(

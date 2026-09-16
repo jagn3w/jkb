@@ -43,8 +43,8 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             cmd: None,
             clear: false,
         } => crate::session_cli::gate(&crate::session_cli::Kb::from_ops(ops), ops.json),
-        // On the host the old file store of worktree-removal records beside the database is still
-        // read (`archive::Stores`); a client of `jkb serve` has none.
+        // On the host the old file store beside the database is listed for the operator
+        // (`archive::Stores`); a client of `jkb serve` has none.
         TaskCmd::Work { uid, onto } => {
             let kb = crate::session_cli::Kb::from_ops(ops);
             let stores = crate::archive::Stores::new(kb, ops.db_path);

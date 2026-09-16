@@ -64,14 +64,6 @@ pub fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
     imp::read(path, MAX_READ_BYTES)
 }
 
-/// [`read`], refusing a file larger than `max` bytes.
-///
-/// # Errors
-/// As [`read`].
-pub fn read_capped(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
-    imp::read(path, max.min(MAX_READ_BYTES))
-}
-
 /// Write `bytes` to `path` — creating missing directories, never through a symlink — by writing a
 /// temporary file beside it and renaming it into place.
 ///
