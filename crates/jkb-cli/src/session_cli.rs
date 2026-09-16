@@ -478,10 +478,16 @@ pub(crate) fn work(
     // checkout it still holds a licence for.
     //
     // A refusal releases this run's claim, as a failed worktree add does: the verb stops, and a
-    // claim on a session nobody opened is a claim nothing else would free.
+    // claim on a session nobody opened is a claim nothing else would free. **Unless the checkout is
+    // already there**: then the claim is alive by D27's rule, and it may be the only record of the
+    // checkout — a run stopped before its locate left nothing else — so releasing it would have the
+    // re-run fork a second session and `abandon` find neither (stage-2 review, round 7).
+    let resumed = sessions.iter().any(|s| s.branch == branch);
     archive::revoke(db_path, &worktree)
         .inspect_err(|_| {
-            let _ = kb.release(&facts.uid, &owner);
+            if !resumed {
+                let _ = kb.release(&facts.uid, &owner);
+            }
         })
         .map(|cancelled| {
             if cancelled {
@@ -496,7 +502,6 @@ pub(crate) fn work(
             )
         })?;
 
-    let resumed = sessions.iter().any(|s| s.branch == branch);
     if !resumed {
         open_worktree(kb, &facts.uid, &owner, &ctx.root, &worktree, &branch, &onto)?;
     }

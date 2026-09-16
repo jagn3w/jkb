@@ -355,6 +355,19 @@ fn an_abandon_releases_only_the_judged_claim() {
     let a = abandon(&b, &uid, None);
     assert!(!a.released && !a.reopened, "a claim nobody judged stays");
 
+    // The judged claim went, and nobody holds the task: it is reopened as asked.
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": "host:1" }),
+    )
+    .unwrap();
+    let a = abandon(&b, &uid, Some("host:1"));
+    assert_eq!(
+        (a.released, a.reopened, a.status.as_str()),
+        (true, true, "open")
+    );
+    assert!(start(&b, &uid, "host:1", None).unwrap());
+
     let a = abandon(&b, &uid, Some("host:1"));
     assert_eq!(
         (a.released, a.reopened, a.status.as_str()),
@@ -548,4 +561,48 @@ fn a_claim_is_taken_only_in_its_stored_spelling() {
     ));
     assert_eq!(facts(&b, &uid).claim, None, "nothing was taken");
     assert!(start(&b, &uid, "agent:reviewer-G3", None).unwrap());
+}
+
+/// **A claim held in an older spelling is refused with the way out, not reported as a race.** Its holder,
+/// sending the spelling it is now required to, would otherwise pass the lifecycle (which compares parsed
+/// owners) and fail the claim's byte compare-and-set.
+#[test]
+fn a_claim_held_in_an_older_spelling_is_refused_with_the_way_out() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let uid = add(&b, "respelled +tasks/x");
+    let u = uid.clone();
+    db.write_txn("t", move |c, m| {
+        let id = jkb_core::task::resolve_ref(c, &u)?.expect("task");
+        jkb_core::claim::claim(c, m, id, "agent:reviewer:G3")?;
+        Ok(())
+    })
+    .unwrap();
+    match call(
+        &b,
+        json!({ "op": "task.claim", "uid": uid, "owner": "agent:reviewer-G3" }),
+    )
+    .unwrap()
+    {
+        Response::Claimed { claimed } => {
+            assert!(!claimed.acquired);
+            let why = claimed.refusal.unwrap();
+            assert!(why.contains("--owner 'agent:reviewer:G3'"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": "agent:reviewer:G3" }),
+    )
+    .unwrap();
+    match call(
+        &b,
+        json!({ "op": "task.claim", "uid": uid, "owner": "agent:reviewer-G3" }),
+    )
+    .unwrap()
+    {
+        Response::Claimed { claimed } => assert!(claimed.acquired, "{claimed:?}"),
+        other => panic!("{other:?}"),
+    }
 }

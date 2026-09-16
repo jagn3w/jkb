@@ -156,6 +156,25 @@ pub(crate) fn check_new_owner(owner: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Why `owner` cannot take the claim on `id` when the task is held **by `owner` in another spelling** —
+/// a claim written by an older binary or by hand. The lifecycle compares parsed owners and passes it;
+/// the claim's compare-and-set compares stored bytes and fails, which read as a race. The way out is
+/// to release it as stored.
+pub(crate) fn respelled_claim(
+    conn: &Connection,
+    id: ItemId,
+    owner: &str,
+) -> Result<Option<String>, ApiError> {
+    Ok(claim::holder(conn, id)?
+        .filter(|held| held != owner && jkb_types::AgentId::parse(held).as_str() == owner)
+        .map(|held| {
+            format!(
+                "it is held as {held:?}, which is {owner}'s claim in an older spelling — release it \
+                 as stored (`jkb task release <uid> --owner '{held}'`) and take it again"
+            )
+        }))
+}
+
 /// How `task.tag` treats the facet's other values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -720,6 +739,12 @@ pub fn claim(
 ) -> Result<Claimed, ApiError> {
     check_new_owner(owner)?;
     let id = writable(conn, reference, roots)?;
+    if let Some(why) = respelled_claim(conn, id, owner)? {
+        return Ok(Claimed {
+            acquired: false,
+            refusal: Some(why),
+        });
+    }
     let facts = lifecycle::TaskFacts {
         actor: Some(jkb_types::AgentId::parse(owner)),
         ..task::observe(conn, id)?

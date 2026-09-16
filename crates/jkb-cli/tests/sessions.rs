@@ -3962,6 +3962,37 @@ fn a_session_whose_location_was_never_recorded_is_resumed_not_forked() {
     assert_eq!(claim_of(&f.db, &uid), None);
 }
 
+/// **A claim-only checkout keeps its claim when a running sweep blocks the resume.** The claim is the
+/// only record of that checkout, so releasing it would have the re-run fork a second session and
+/// `abandon` find neither (stage-2 review, round 7).
+#[test]
+fn a_blocked_resume_of_a_claim_only_checkout_keeps_the_claim() {
+    let f = Fixture::new();
+    let uid = f.add_task("blocked resume");
+    let first = f.work(&uid);
+    let branch = first["branch"].as_str().unwrap().to_owned();
+    let onto = first["onto"].as_str().unwrap().to_owned();
+    f.jkb()
+        .args(["task", "tag", "rm", &uid, &format!("branch={branch}")])
+        .assert()
+        .success();
+    let held = claim_of(&f.db, &uid);
+    assert!(held.is_some());
+    let store = f.db.parent().unwrap().join("worktree-removals");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join(".sweep.lock"), "host:1 nonce").unwrap();
+    f.jkb()
+        .args(["task", "work", &uid, "--onto", &onto])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("sweep is running"));
+    assert!(claim_of(&f.db, &uid).is_some(), "the claim is kept");
+
+    std::fs::remove_file(store.join(".sweep.lock")).unwrap();
+    let again = f.work_onto(&uid, &onto);
+    assert_eq!(again["worktree"], first["worktree"], "the same checkout");
+}
+
 /// **Every task on a branch the queue landed is recorded** — the queue lands a group at once, and two
 /// tasks can record one branch.
 #[test]

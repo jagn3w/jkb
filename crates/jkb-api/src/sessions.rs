@@ -415,8 +415,8 @@ fn locate_id(
 /// What `task.abandon` did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Abandoned {
-    /// Whether the claim the caller observed was released (`true` too when it observed none and there
-    /// is none). `false` means the task is held by someone the caller never judged, and was left alone.
+    /// Whether the task is free of claims afterwards — the judged claim was released, or had already
+    /// gone. `false` means someone the caller never judged holds it, and it was left alone.
     pub released: bool,
     /// Whether the task was reopened.
     pub reopened: bool,
@@ -428,7 +428,8 @@ pub struct Abandoned {
 ///
 /// The claim is the one the caller **observed** before its git work (`observed`), cleared as a
 /// compare-and-set: a claim taken in the meantime belongs to a worker this verb never judged, so
-/// nothing is changed and that is reported. The status is re-read here, so a task that finished while
+/// nothing is changed and that is reported. A judged claim that has simply gone, with nobody holding
+/// the task, is no reason to stop. The status is re-read here, so a task that finished while
 /// the caller was removing a worktree is left alone — the lifecycle has no `abandon` out of a terminal
 /// status, and its refusal is the one answer.
 ///
@@ -460,7 +461,14 @@ pub fn abandon(
     match observed {
         // No claim was observed, but one exists now: its holder was never judged.
         None if claim::holder(conn, id)?.is_some() => return unchanged(conn, false),
-        Some(prev) if !claim::clear_if(conn, meta, id, prev)? => return unchanged(conn, false),
+        // The judged claim is not there any more. Someone else holds the task now, or nobody does: a
+        // concurrent reclaim or abandon cleared it, and then the task is reopened as asked — telling
+        // the operator another worker holds a task nobody holds would strand it `in_progress`.
+        Some(prev)
+            if !claim::clear_if(conn, meta, id, prev)? && claim::holder(conn, id)?.is_some() =>
+        {
+            return unchanged(conn, false)
+        }
         _ => {}
     }
     let facts = lifecycle::TaskFacts {
