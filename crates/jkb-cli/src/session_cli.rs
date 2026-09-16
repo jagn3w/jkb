@@ -438,38 +438,8 @@ pub(crate) fn work(
     // Session worktrees live inside the repo, so the first one must not make it dirty.
     session::ensure_excluded(&ctx.root)?;
 
-    let tags = &facts.tags;
     let sessions = session::discover(&ctx.root)?;
-    // A session already recorded on the task keeps its name, so a second invocation returns
-    // the same worktree instead of forking the work onto a second branch. A task may record
-    // more than one branch (a `jkb task start` before a `task work`, or an earlier `--onto`),
-    // so prefer the one that has a live worktree over merely the first that parses.
-    let recorded = repo::facet_values(tags, repo::FACET_BRANCH);
-    //
-    // Failing that, the session the task's CLAIM names: a run stopped between taking the claim and
-    // recording the location (interrupted, or refused by the record) leaves a claim on a checkout
-    // and no `branch=` pointing at it, and minting a fresh name then forked the work onto a second
-    // session beside a first no verb could find (stage-2 review, round 4).
-    let existing = recorded
-        .iter()
-        .find(|b| sessions.iter().any(|s| s.branch == **b))
-        .or_else(|| {
-            recorded
-                .iter()
-                .find(|b| session::name_from_branch(b).is_some())
-        })
-        .and_then(|b| session::name_from_branch(b))
-        .map(str::to_owned)
-        .or_else(|| claimed_session(&facts, &sessions).map(|s| s.name.clone()));
-    let name = if let Some(existing) = existing {
-        existing
-    } else {
-        let taken: std::collections::HashSet<String> =
-            sessions.iter().map(|s| s.name.clone()).collect();
-        session::mint_name(uid, |n| {
-            taken.contains(n) || session::worktree_path(&ctx.root, n).exists()
-        })
-    };
+    let name = session_name(kb, &ctx, &facts, &sessions, uid, onto)?;
     let branch = session::branch_for(&name);
     let worktree = session::worktree_path(&ctx.root, &name);
     let onto = resolve_onto(kb, &ctx, &cwd, facts.land_target.as_deref(), onto, &name)?;
@@ -545,8 +515,8 @@ pub(crate) fn work(
         // the checkout was left with nothing pointing at it.
         Err(e) => {
             return Err(e.context(format!(
-                "{} was opened but where it is could not be recorded — run `jkb task work {uid}` \
-                 again to resume it, or `jkb task abandon {uid}`",
+                "{} was opened but where it is could not be recorded — run `jkb task work {uid} \
+                 --onto {onto}` again to resume it, or `jkb task abandon {uid}`",
                 worktree.display()
             )))
         }
@@ -574,6 +544,74 @@ pub(crate) fn work(
         println!("  finish:   jkb task land {uid}");
     }
     Ok(())
+}
+
+/// The session `task work` opens for a task: the one it already has, or a fresh name.
+///
+/// Split out of [`work`] for length; every rule is as `work` states it.
+fn session_name(
+    kb: &Kb<'_>,
+    ctx: &repo::RepoCtx,
+    facts: &TaskState,
+    sessions: &[session::Session],
+    uid: &str,
+    onto: Option<&str>,
+) -> Result<String> {
+    let tags = &facts.tags;
+    // A session already recorded on the task keeps its name, so a second invocation returns
+    // the same worktree instead of forking the work onto a second branch. A task may record
+    // more than one branch (a `jkb task start` before a `task work`, or an earlier `--onto`),
+    // so prefer the one that has a live worktree over merely the first that parses.
+    let recorded = repo::facet_values(tags, repo::FACET_BRANCH);
+    //
+    // Failing that, the session the task's CLAIM names: a run stopped between taking the claim and
+    // recording the location (interrupted, or refused by the record) leaves a claim on a checkout
+    // and no `branch=` pointing at it, and minting a fresh name then forked the work onto a second
+    // session beside a first no verb could find (stage-2 review, round 4).
+    //
+    // In that order: a live checkout a recorded branch names, then one only the claim names, then a
+    // recorded session name with no checkout yet.
+    let by_branch = kb.by_branch(&ctx.key)?;
+    let live_recorded = recorded
+        .iter()
+        .find(|b| sessions.iter().any(|s| s.branch == **b))
+        .and_then(|b| session::name_from_branch(b))
+        .map(str::to_owned);
+    let claimed = if live_recorded.is_none() {
+        claimed_session(facts, sessions, &by_branch).map(|s| s.name.clone())
+    } else {
+        None
+    };
+    let existing = live_recorded
+        .clone()
+        .or_else(|| claimed.clone())
+        .or_else(|| {
+            recorded
+                .iter()
+                .find_map(|b| session::name_from_branch(b))
+                .map(str::to_owned)
+        });
+    // A checkout found only through the claim has no land target on record — the run that made it
+    // stopped before recording one — so guessing one here could land its branch somewhere it was not
+    // cut from. The operator names it.
+    anyhow::ensure!(
+        claimed.is_none() || facts.land_target.is_some() || onto.is_some(),
+        "{uid}'s checkout {} was opened but where it lands was never recorded — run `jkb task work \
+         {uid} --onto <branch>` naming the branch it was cut from",
+        claimed
+            .as_deref()
+            .map(|n| session::worktree_path(&ctx.root, n).display().to_string())
+            .unwrap_or_default()
+    );
+    Ok(if let Some(existing) = existing {
+        existing
+    } else {
+        let taken: std::collections::HashSet<String> =
+            sessions.iter().map(|s| s.name.clone()).collect();
+        session::mint_name(uid, |n| {
+            taken.contains(n) || session::worktree_path(&ctx.root, n).exists()
+        })
+    })
 }
 
 /// Make the session's worktree, returning whether its **branch** had to be created.
@@ -918,13 +956,21 @@ pub(crate) fn abandon(
         branch,
     } = repo::work_for(&ctx, tags)?;
     // A session only the claim names — its location was never recorded — is still this task's.
-    let (sess, branch) = match (sess, branch) {
-        (None, None) => {
-            let found = claimed_session(&facts, &session::discover(&ctx.root)?).cloned();
-            let branch = found.as_ref().map(|s| s.branch.clone());
-            (found, branch)
+    // The same rule `work` resumes by: with no checkout a recorded branch names, the one the claim
+    // names — whatever branches are recorded, since a `task start` before an interrupted `task work`
+    // leaves one that is not the session's (stage-2 review, round 5).
+    let (sess, branch) = if let Some(s) = sess {
+        (Some(s), branch)
+    } else {
+        let sessions = session::discover(&ctx.root)?;
+        let by_branch = kb.by_branch(&ctx.key)?;
+        match claimed_session(&facts, &sessions, &by_branch).cloned() {
+            Some(found) => {
+                let b = found.branch.clone();
+                (Some(found), Some(b))
+            }
+            None => (None, branch),
         }
-        other => other,
     };
     let branch = branch.with_context(|| format!("{uid} has no session"))?;
 
@@ -1329,14 +1375,25 @@ pub(crate) fn gate(kb: &Kb<'_>, json: bool) -> Result<()> {
 
 /// The discovered session the task's claim names, if its claim is a session owner whose checkout is
 /// one of `sessions` — how a session whose location was never recorded is still found.
+///
+/// **Not if another task records that session's branch.** Session names are minted from a task's
+/// slug, so two tasks can mint the same name; a checkout sitting at the claimed path that another task
+/// has since recorded is that task's, and resuming or abandoning it from here would take over, or
+/// archive, somebody else's work (stage-2 review, round 5).
 fn claimed_session<'s>(
     facts: &TaskState,
     sessions: &'s [session::Session],
+    by_branch: &BTreeMap<String, Vec<BranchTask>>,
 ) -> Option<&'s session::Session> {
     let worktree = owner::session_worktree(facts.claim.as_deref()?)?;
     sessions
         .iter()
         .find(|s| session::same_path(&s.worktree, &worktree))
+        .filter(|s| {
+            by_branch
+                .get(&s.branch)
+                .is_none_or(|ts| ts.iter().all(|t| t.uid == facts.uid))
+        })
 }
 
 /// The task a session on a branch is for, when several tasks record that branch: an unfinished one if

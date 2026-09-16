@@ -4991,16 +4991,25 @@ fn report_sessions(db: &Db) {
         .unwrap_or_default();
     println!("task sessions: {} in flight", sessions.len());
     for s in &sessions {
-        let uid = by_branch
+        match by_branch
             .get(&s.branch)
             .and_then(|ts| session_cli::task_on(ts))
-            .map_or("(no task)", |t| t.uid.as_str());
-        println!(
-            "  {} — {uid}: resume with `cd {}`, land it with `jkb task land {uid}`, or drop \
-             it with `jkb task abandon {uid}`",
-            s.name,
-            s.worktree.display()
-        );
+        {
+            Some(t) => println!(
+                "  {} — {uid}: resume with `cd {}`, land it with `jkb task land {uid}`, or drop \
+                 it with `jkb task abandon {uid}`",
+                s.name,
+                s.worktree.display(),
+                uid = t.uid
+            ),
+            // No task records this branch — a `task work` that stopped before recording where it
+            // was, typically. The task's own `task work` or `task abandon` finds it through its claim.
+            None => println!(
+                "  {} — no task records {}; `jkb task work <uid>` resumes it, `jkb task abandon \
+                 <uid>` drops it, for the task that opened it",
+                s.name, s.branch
+            ),
+        }
     }
 }
 

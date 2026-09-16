@@ -81,7 +81,7 @@ pub fn facts(conn: &Connection, reference: &str) -> Result<TaskState, ApiError> 
         terminal,
         status,
         tags,
-        claim: observed.claimant.as_ref().map(AgentId::as_str),
+        claim: claim::holder(conn, id)?,
         land_target: transition::land_target(conn, id)?,
         start_refusal: if terminal {
             lifecycle::apply(&observed, TaskEvent::Start).refusal()
@@ -205,9 +205,7 @@ fn swap(
 ) -> Result<bool, ApiError> {
     let judged = match &take.displace {
         Some(prev) => claim::clear_if(conn, meta, id, prev)?,
-        None => task::observe(conn, id)?
-            .claimant
-            .is_none_or(|c| c.as_str() == take.owner),
+        None => claim::holder(conn, id)?.is_none_or(|c| c == take.owner),
     };
     if !judged {
         return Ok(false);
@@ -268,8 +266,7 @@ pub fn start(
         }
         (None, Some(kept)) => {
             check_owner(kept)?;
-            let held = task::observe(conn, id)?.claimant.map(|c| c.as_str());
-            if held.as_deref() != Some(kept.as_str()) {
+            if claim::holder(conn, id)?.as_deref() != Some(kept.as_str()) {
                 return Ok(false);
             }
         }
@@ -378,10 +375,10 @@ pub fn locate(
     check_owner(owner)?;
     place.check()?;
     let id = writable(conn, uid, roots)?;
-    let facts = task::observe(conn, id)?;
-    if facts.claimant.as_ref().map(AgentId::as_str).as_deref() != Some(owner) {
+    if claim::holder(conn, id)?.as_deref() != Some(owner) {
         return Ok(false);
     }
+    let facts = task::observe(conn, id)?;
     locate_id(conn, meta, id, place)?;
     let branch_known = transition::latest_with_branch(conn, id)?
         .and_then(|r| r.labels.branch)
@@ -456,7 +453,7 @@ pub fn abandon(
     };
     match observed {
         // No claim was observed, but one exists now: its holder was never judged.
-        None if task::observe(conn, id)?.claimant.is_some() => return unchanged(conn),
+        None if claim::holder(conn, id)?.is_some() => return unchanged(conn),
         Some(prev) if !claim::clear_if(conn, meta, id, prev)? => return unchanged(conn),
         _ => {}
     }

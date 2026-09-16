@@ -164,7 +164,12 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     `branch=` naming it. `task work` and `task abandon` then find the session **through the claim**
     (`session_cli::claimed_session`), so a re-run resumes that checkout rather than forking a
     second one, and abandon can still remove it. A `task.locate` that fails keeps the claim for the
-    same reason (review, round 4).
+    same reason (review, round 4). Both verbs use the one rule, whatever other branches the task
+    records. They accept the claimed checkout only when no other task records its branch: names are
+    minted from slugs, so two tasks can reach one path. Such a checkout has no land target on
+    record, so `task work` requires `--onto` for it rather than guessing (round 5).
+  - Claims are compared **as stored** (`claim::holder`): `task.facts` reports the stored string, so
+    an owner in a spelling `AgentId` would render differently still matches when it is sent back.
   - `task.abandon` changes nothing when the claim is no longer the one observed before the git work.
   - A failed worktree add, and a pending removal that could not be cancelled, release only the verb's
     own claim, through `task.release`. The first used to clear the claim unconditionally; the second

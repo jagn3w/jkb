@@ -3983,3 +3983,118 @@ fn every_task_on_a_landed_branch_is_recorded() {
         assert_eq!(f.status_of(uid), "done", "{uid}");
     }
 }
+
+/// Remove a recorded branch from a task.
+fn untag_branch(f: &Fixture, uid: &str, branch: &str) {
+    f.jkb()
+        .args(["task", "tag", "rm", uid, &format!("branch={branch}")])
+        .assert()
+        .success();
+}
+
+fn has_branch(f: &Fixture, branch: &str) -> bool {
+    git_cmd(
+        &f.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .status()
+    .unwrap()
+    .success()
+}
+
+/// **`abandon` finds an unrecorded session through the claim whatever branches the task records** —
+/// a `task start` on `feat` before an interrupted `task work` leaves `branch=feat`, which is not the
+/// session's — and deletes only the session's branch.
+#[test]
+fn abandon_finds_a_session_only_the_claim_names_beside_another_recorded_branch() {
+    let f = Fixture::new();
+    let uid = f.add_task("started, then worked, then stopped");
+    git(&f.repo, &["branch", "feat"]);
+    let s = f.work(&uid);
+    let session_branch = s["branch"].as_str().unwrap().to_owned();
+    let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+    untag_branch(&f, &uid, &session_branch);
+    f.jkb()
+        .args(["task", "tag", "add", &uid, "branch=feat"])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force", "--delete-branch"])
+        .assert()
+        .success();
+    assert!(
+        !worktree.exists(),
+        "the session found through the claim is gone"
+    );
+    assert!(!has_branch(&f, &session_branch), "its branch is deleted");
+    assert!(
+        has_branch(&f, "feat"),
+        "the other recorded branch is not the session's"
+    );
+    assert_eq!(claim_of(&f.db, &uid), None);
+}
+
+/// **A checkout another task has recorded is not recovered through a claim that names its path** —
+/// session names are minted from slugs, so two tasks can reach one path; the recorded one owns it.
+#[test]
+fn a_claim_naming_another_task_s_checkout_recovers_nothing() {
+    let f = Fixture::new();
+    let a = f.add_task("first claimant");
+    let b = f.add_task("the checkout's task");
+    let s = f.work(&a);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+    untag_branch(&f, &a, &branch);
+    // Recorded the way `task work` records a session: the branch, in this repo.
+    for tag in [format!("branch={branch}"), "repo=proj".to_owned()] {
+        f.jkb()
+            .args(["task", "tag", "set", &b, &tag])
+            .assert()
+            .success();
+    }
+
+    f.jkb()
+        .args(["task", "abandon", &a, "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has no session"));
+    assert!(worktree.exists(), "the other task's checkout is untouched");
+}
+
+/// **A checkout found only through the claim, with no land target on record, needs `--onto`** — the
+/// run that made it never recorded where it lands, and a guess could land its branch somewhere it was
+/// not cut from. Named, the checkout is resumed.
+#[test]
+fn a_claimed_checkout_with_no_recorded_target_needs_onto() {
+    let f = Fixture::new();
+    let a = f.add_task("made the checkout");
+    let b = f.add_task("holds its claim");
+    let s = f.work(&a);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let owner = claim_of(&f.db, &a).unwrap();
+    untag_branch(&f, &a, &branch);
+    f.jkb()
+        .args(["task", "release", &a, "--owner", &owner])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "claim", &b, "--owner", &owner])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["task", "work", &b])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--onto"));
+    let resumed = f.work_onto(&b, &onto);
+    assert_eq!(resumed["worktree"], s["worktree"]);
+    assert_eq!(resumed["resumed"], true);
+}

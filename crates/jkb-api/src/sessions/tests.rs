@@ -474,3 +474,39 @@ fn a_session_state_is_read_from_the_registry() {
         assert_eq!(e.code, ErrorCode::Invalid, "{bad:?}");
     }
 }
+
+/// **A claim is compared as stored.** An owner written in a spelling `AgentId` would render differently
+/// (`agent:a:b` renders `agent:a-b`) is reported verbatim by `task.facts`, so sending it back as
+/// `displace` or `observed` matches it — a re-rendered owner never would, and the verb would loop on
+/// "run it again" for ever.
+#[test]
+fn a_claim_in_a_non_canonical_spelling_is_compared_as_stored() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let uid = add(&b, "legacy claim +tasks/x");
+    // Written below the ops, as an older binary or a hand edit could have left it.
+    let plant = |db: &Db| {
+        let uid = uid.clone();
+        db.write_txn("t", move |c, m| {
+            let id = jkb_core::task::resolve_ref(c, &uid)?.expect("task");
+            jkb_core::claim::claim(c, m, id, "agent:reviewer:G3")?;
+            Ok(())
+        })
+        .unwrap();
+    };
+    plant(&db);
+    let held = facts(&b, &uid).claim.unwrap();
+    assert_eq!(held, "agent:reviewer:G3");
+    assert!(start(&b, &uid, "host:1", Some(&held)).unwrap());
+    assert_eq!(facts(&b, &uid).claim.as_deref(), Some("host:1"));
+
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": "host:1" }),
+    )
+    .unwrap();
+    plant(&db);
+    let a = abandon(&b, &uid, Some("agent:reviewer:G3"));
+    assert!(a.reopened, "the stored claim was released: {a:?}");
+    assert_eq!(facts(&b, &uid).claim, None);
+}

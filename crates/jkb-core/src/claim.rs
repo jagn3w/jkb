@@ -288,6 +288,17 @@ pub fn release(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -
     Ok(false)
 }
 
+/// Who holds `item`'s claim, **as stored** — the exact bytes [`clear_if`] and [`release`] compare
+/// against. A re-rendered owner id is not safe to compare: a claim written outside the lifecycle need
+/// not be in `AgentId`'s canonical spelling, and a caller that sent back the canonical form would never
+/// match it.
+///
+/// # Errors
+/// A database error.
+pub fn holder(conn: &Connection, item: ItemId) -> Result<Option<String>> {
+    Ok(read_before(conn, item)?.and_then(|b| b.claimant_id))
+}
+
 /// Every task that currently holds a claim (`claimant_id IS NOT NULL`).
 ///
 /// Used by `doctor` and the coordinator's reclaim scan to enumerate holders before

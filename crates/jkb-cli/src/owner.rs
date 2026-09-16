@@ -38,9 +38,9 @@ pub fn self_owner() -> String {
 /// caller chooses it — usually [`claude_session`], but a resume by something that is not a running
 /// session keeps the opener it found.
 ///
-/// The worktree is written `~/`-relative when it lies under `$HOME`, so the host and the dev
-/// container — which see the same `~/repos` under different homes — both resolve it
-/// ([`session_worktree`]).
+/// The worktree is written `~/repos/…` when it lies under `~/repos` (`CLIENT_FILE_ROOT`) — the one
+/// directory the host and the dev container both see, under different homes — so both resolve it
+/// ([`session_worktree`]); anywhere else it stays absolute ([`home_relative`] says why).
 #[must_use]
 pub fn session_owner(worktree: &Path, opened_by: Option<&str>) -> String {
     session_owner_in(worktree, opened_by, home().as_deref())
