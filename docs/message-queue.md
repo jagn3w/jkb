@@ -200,7 +200,7 @@ Two decisions in it:
   resolves elsewhere is reported REFUSED and never touched. The sweep's
   rename and removal walk that resolved path with `O_NOFOLLOW` (`jkb_core::nofollow::rename_into`,
   `remove_tree`), so a link anywhere below the root is refused rather than followed. What remains
-  is git: the sweep's `git worktree prune`/`branch -D` run with the path as spelled, and a branch is
+  is git: the sweep's `git worktree remove`/`branch -D` run with the path as spelled, and a branch is
   deleted only when its tip is the commit the record names. Clients read every record, the host's
   absolute paths included. A disposal whose record the daemon refused says nothing will finish it. `task work` cancels a pending record with `removal.cancel`, one write that a sweep
   in flight refuses, rather than by taking the sweep's lease: a container `task work` killed while
