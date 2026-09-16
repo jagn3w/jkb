@@ -89,7 +89,7 @@ routinely built from different checkouts.
 | `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
 | `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
 | `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?` (for a finished task only), `terminal`} |
-| `task.by_branch` | `repo` | `branch_tasks` {`tasks`: branch → {`uid`, `status`, `onto?`}} |
+| `task.by_branch` | `repo` | `branch_tasks` {`tasks`: branch → [{`uid`, `status`, `onto?`}], every task on the branch, in id order} |
 | `task.start` | `uid`, exactly one of `take` {`owner`, `displace?`} and `keep` (the claim kept), `place` {`branch`, `repo`, `onto?`} | `taken` {`taken`} — `false`, nothing written, when the claim is not the one judged (`displace`, `keep`, or none) |
 | `task.take` | `uid`, `take` {`owner`, `displace?`}, `place` {`branch`, `repo`, `onto`} — the claim; the place is judged (written for trial and rolled back), not recorded | `taken` {`taken`} |
 | `task.locate` | `uid`, `owner`, `place` — recorded only while `owner` holds the claim | `taken` {`taken`} |

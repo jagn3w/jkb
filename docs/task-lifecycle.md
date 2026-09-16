@@ -122,8 +122,8 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
   is observable — uncommitted work and commits ahead.
 - **A session owner names its worktree home-relative, and the Claude Code session that opened it**
   (tasks S6.4, decision E; `openspec/changes/jkb-message-queue/design-s6-4.md`). The form is now
-  `session:<pid>[@<claude session>]:<worktree>`, and the worktree is written `~/…` when it lies
-  under `$HOME`. The host and the dev container see the same `~/repos` under different homes, so an
+  `session:<pid>[@<claude session>]:<worktree>`, and the worktree is written `~/repos/…` when it lies
+  under `~/repos` (only there; see below). The host and the dev container see the same `~/repos` under different homes, so an
   absolute path named a directory only one side had, and the other side's probe answered `Unknown`
   about every session it did not open. Each side now resolves `~` against its own home
   (`owner::session_worktree`), and old absolute owners still parse and are judged as before. The
@@ -158,9 +158,13 @@ this task with Claude" twice gave two agents one checkout, and neither claimed i
     run cannot overwrite what its successor recorded. The take's `start` entry carries no branch or
     land target either; `task.locate` adds a `note` carrying them when they changed. A failed run
     would otherwise leave the history naming a branch nobody made, which `close-merged` then waits
-    on for ever. Writing the location with the claim, as the
-    first fix did, left a run that then failed its git work pointing the task at a branch nobody
-    made (stage-2 review, round 2).
+    on for ever. Writing the location with the claim, as the first fix did, left a run that then
+    failed its git work pointing the task at a branch nobody made (stage-2 review, round 2).
+  - A run stopped between the claim and `task.locate` leaves a claim on a checkout with no
+    `branch=` naming it. `task work` and `task abandon` then find the session **through the claim**
+    (`session_cli::claimed_session`), so a re-run resumes that checkout rather than forking a
+    second one, and abandon can still remove it. A `task.locate` that fails keeps the claim for the
+    same reason (review, round 4).
   - `task.abandon` changes nothing when the claim is no longer the one observed before the git work.
   - A failed worktree add, and a pending removal that could not be cancelled, release only the verb's
     own claim, through `task.release`. The first used to clear the claim unconditionally; the second

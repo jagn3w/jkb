@@ -2064,9 +2064,19 @@ impl Backend for LocalBackend {
             Request::RepoGate { repo } => Response::Gate {
                 gate: db.read_with(move |c| sessions::gate(c, &repo))?,
             },
-            Request::SessionState { session } => Response::SessionIs {
-                state: db.read(move |c| claude_session::state(c, &session))?.into(),
-            },
+            Request::SessionState { session } => {
+                // Held to the rule every other `session.*` op applies, so a malformed id is refused
+                // rather than answered `unknown`.
+                if !jkb_types::is_session_id(&session) {
+                    return Err(ApiError::with_code(
+                        ErrorCode::Invalid,
+                        format!("{session:?} is not a session id"),
+                    ));
+                }
+                Response::SessionIs {
+                    state: db.read(move |c| claude_session::state(c, &session))?.into(),
+                }
+            }
             Request::TaskSubtasks { uid, all } => {
                 let (children, truncated) = db.read_with(move |c| {
                     let children = kb::subtasks(c, &uid, all, &mut budget)?;

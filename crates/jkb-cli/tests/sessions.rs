@@ -3909,3 +3909,77 @@ fn a_session_blocked_by_a_running_sweep_leaves_no_claim() {
         "{why}"
     );
 }
+
+/// **A session whose location was never recorded is resumed, not forked** — the state a `task work`
+/// stopped between its claim and its record leaves: a claim on a checkout, and no `branch=` naming it.
+/// The claim is what names it, so a re-run resumes that checkout and records it, and `abandon` finds it.
+#[test]
+fn a_session_whose_location_was_never_recorded_is_resumed_not_forked() {
+    let f = Fixture::new();
+    let uid = f.add_task("stopped half way");
+    let first = f.work(&uid);
+    let branch = first["branch"].as_str().unwrap().to_owned();
+    let forget = || {
+        f.jkb()
+            .args(["task", "tag", "rm", &uid, &format!("branch={branch}")])
+            .assert()
+            .success();
+    };
+    forget();
+    let again = f.work(&uid);
+    assert_eq!(again["worktree"], first["worktree"], "the same checkout");
+    assert_eq!(again["resumed"], true);
+    let shown: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--global", "--json", "task", "show", &uid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        shown["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["facet"] == "branch" && t["value"] == branch.as_str()),
+        "recorded again: {shown}"
+    );
+
+    forget();
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force"])
+        .assert()
+        .success();
+    assert!(!PathBuf::from(first["worktree"].as_str().unwrap()).exists());
+    assert_eq!(claim_of(&f.db, &uid), None);
+}
+
+/// **Every task on a branch the queue landed is recorded** — the queue lands a group at once, and two
+/// tasks can record one branch.
+#[test]
+fn every_task_on_a_landed_branch_is_recorded() {
+    let f = Fixture::new();
+    let first = f.add_task("first of the group");
+    let s = f.work(&first);
+    let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "g.txt", "group work\n", "group work");
+    let second = f.add_task("second of the group");
+    f.jkb()
+        .args([
+            "task", "start", &second, "--branch", &branch, "--onto", &onto,
+        ])
+        .assert()
+        .success();
+
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", &onto])
+        .assert()
+        .success();
+    for uid in [&first, &second] {
+        assert_eq!(f.status_of(uid), "done", "{uid}");
+    }
+}

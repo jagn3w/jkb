@@ -445,6 +445,11 @@ pub(crate) fn work(
     // more than one branch (a `jkb task start` before a `task work`, or an earlier `--onto`),
     // so prefer the one that has a live worktree over merely the first that parses.
     let recorded = repo::facet_values(tags, repo::FACET_BRANCH);
+    //
+    // Failing that, the session the task's CLAIM names: a run stopped between taking the claim and
+    // recording the location (interrupted, or refused by the record) leaves a claim on a checkout
+    // and no `branch=` pointing at it, and minting a fresh name then forked the work onto a second
+    // session beside a first no verb could find (stage-2 review, round 4).
     let existing = recorded
         .iter()
         .find(|b| sessions.iter().any(|s| s.branch == **b))
@@ -453,9 +458,11 @@ pub(crate) fn work(
                 .iter()
                 .find(|b| session::name_from_branch(b).is_some())
         })
-        .and_then(|b| session::name_from_branch(b));
+        .and_then(|b| session::name_from_branch(b))
+        .map(str::to_owned)
+        .or_else(|| claimed_session(&facts, &sessions).map(|s| s.name.clone()));
     let name = if let Some(existing) = existing {
-        existing.to_owned()
+        existing
     } else {
         let taken: std::collections::HashSet<String> =
             sessions.iter().map(|s| s.name.clone()).collect();
@@ -474,12 +481,13 @@ pub(crate) fn work(
     // already known here and `start` is the entry a reader looks at first — a history whose
     // opening line does not say where the work is sends them to the next line to find out.
     //
-    // WHERE the work is (D34.1) is recorded in the same write, **before** any git work, so every
-    // refusal of it — a place the task's `tasks.md` line could not carry, say — comes while there
-    // is nothing to undo. It was written after the worktree was made, and a refusal there left a
-    // claim on a checkout that no verb could find the task from. The facets are *set*, not added: a
-    // second value would be a contradiction, and is how a task ends up with two branches and one
-    // worktree. A **resumed** session re-asserts both, which writes nothing new.
+    // WHERE the work is (D34.1) is judged by the same write, **before** any git work, so every
+    // refusal of it — a place the task's `tasks.md` line could not carry, say — comes while there is
+    // nothing to undo; the write only tries it and rolls it back. It is recorded by `task.locate`
+    // once the worktree exists, which also notes the branch and land target in the history. The
+    // facets are *set*, not added: a second value would be a contradiction, and is how a task ends up
+    // with two branches and one worktree. A **resumed** session re-asserts both, which writes nothing
+    // new.
     let place = Place {
         branch: branch.clone(),
         repo: ctx.key.clone(),
@@ -532,9 +540,15 @@ pub(crate) fn work(
              there, but the task now belongs to another run; nothing was recorded",
             worktree.display()
         ),
+        // The claim is KEPT: it is what names this checkout until the location is recorded, so a
+        // re-run resumes it (see the name choice above) and `abandon` can still find it. Released,
+        // the checkout was left with nothing pointing at it.
         Err(e) => {
-            let _ = kb.release(&facts.uid, &owner);
-            return Err(e);
+            return Err(e.context(format!(
+                "{} was opened but where it is could not be recorded — run `jkb task work {uid}` \
+                 again to resume it, or `jkb task abandon {uid}`",
+                worktree.display()
+            )))
         }
     }
 
@@ -903,6 +917,15 @@ pub(crate) fn abandon(
         session: sess,
         branch,
     } = repo::work_for(&ctx, tags)?;
+    // A session only the claim names — its location was never recorded — is still this task's.
+    let (sess, branch) = match (sess, branch) {
+        (None, None) => {
+            let found = claimed_session(&facts, &session::discover(&ctx.root)?).cloned();
+            let branch = found.as_ref().map(|s| s.branch.clone());
+            (found, branch)
+        }
+        other => other,
+    };
     let branch = branch.with_context(|| format!("{uid} has no session"))?;
 
     // Abandoning is for **this** session's work. Since the swarm now records `branch=` and its
@@ -1304,6 +1327,18 @@ pub(crate) fn gate(kb: &Kb<'_>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The discovered session the task's claim names, if its claim is a session owner whose checkout is
+/// one of `sessions` — how a session whose location was never recorded is still found.
+fn claimed_session<'s>(
+    facts: &TaskState,
+    sessions: &'s [session::Session],
+) -> Option<&'s session::Session> {
+    let worktree = owner::session_worktree(facts.claim.as_deref()?)?;
+    sessions
+        .iter()
+        .find(|s| session::same_path(&s.worktree, &worktree))
+}
+
 /// The task a session on a branch is for, when several tasks record that branch: an unfinished one if
 /// there is one, since that is the work the checkout is being used for, else the first.
 pub(crate) fn task_on(tasks: &[BranchTask]) -> Option<&BranchTask> {
@@ -1347,7 +1382,47 @@ fn refuse_a_running_opener(kb: &Kb<'_>, uid: &str, held: &str, worktree: &Path) 
 
 #[cfg(test)]
 mod tests {
-    use super::{open_worktree, Kb};
+    use super::{batch_is_spent, open_worktree, task_on, Kb};
+    use jkb_api::sessions::BranchTask;
+    use std::collections::BTreeMap;
+
+    fn task(uid: &str, status: &str, onto: &str) -> BranchTask {
+        BranchTask {
+            uid: uid.into(),
+            status: status.into(),
+            onto: Some(onto.into()),
+        }
+    }
+
+    /// A batch is spent only when every task on every branch landing on it has finished — not when the
+    /// first task on a branch has; and a session is for its unfinished task.
+    #[test]
+    fn a_batch_with_one_open_task_among_finished_ones_is_live() {
+        let mut by_branch = BTreeMap::new();
+        by_branch.insert(
+            "task/w".to_owned(),
+            vec![
+                task("task:a", "done", "batch"),
+                task("task:b", "in_progress", "batch"),
+            ],
+        );
+        assert!(!batch_is_spent(&by_branch, "batch"));
+        assert_eq!(
+            task_on(&by_branch["task/w"]).map(|t| t.uid.as_str()),
+            Some("task:b")
+        );
+        by_branch.get_mut("task/w").unwrap()[1].status = "done".into();
+        assert!(batch_is_spent(&by_branch, "batch"));
+        assert_eq!(
+            task_on(&by_branch["task/w"]).map(|t| t.uid.as_str()),
+            Some("task:a")
+        );
+        assert!(
+            !batch_is_spent(&by_branch, "other"),
+            "a batch nothing records is not spent"
+        );
+        assert!(task_on(&[]).is_none());
+    }
     use jkb_api::{Backend, LocalBackend, Request, Response};
     use jkb_core::Db;
 

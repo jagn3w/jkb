@@ -469,4 +469,8 @@ fn a_session_state_is_read_from_the_registry() {
         json!({ "result": "session_is", "state": "suspended" })
     )
     .is_err());
+    for bad in ["", "a b", "a:b"] {
+        let e = call(&b, json!({ "op": "session.state", "session": bad })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{bad:?}");
+    }
 }
