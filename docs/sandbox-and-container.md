@@ -670,8 +670,8 @@ The container follow-up bucket. Design in `.container/README.md`; the container 
   checkout — which gives the container's deferrals the finisher the bullet above says they lacked.
   The lock is the `removal-sweep` row of `leases`, with the file lock's rules kept as properties of the
   row: holder `<owner> <nonce>`, takeover and release as compare-and-sets on the exact holder, stale
-  only when proven gone. The old file store is still read, swept and cancelled on the host
-  (`archive::Stores`) and nothing new is written there — and since `~/.jkb` is bind-mounted, its
+  only when proven gone. The old file store is imported on the host
+  (`archive::Stores`) and nothing is written there — and since `~/.jkb` is bind-mounted, its
   files are imported as confined rows and unlinked, never rewritten or acted on in place (the
   stage-3 reviews' must-fixes; the rules are in message-queue.md). `jkb task reap` now opens the database each
   pass, so a database a newer jkb migrated fails that pass — reported once while unchanged — not the

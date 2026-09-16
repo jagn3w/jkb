@@ -247,8 +247,7 @@ pub struct Cancelled {
 /// the host's reap service until an operator broke it. A record already archived, or gone, is left.
 ///
 /// # Errors
-/// [`ErrorCode::Invalid`] for too many ids, [`ErrorCode::Forbidden`] for a record outside `roots`, or a
-/// failed write.
+/// [`ErrorCode::Invalid`] for too many ids, or a failed write. A record outside `roots` is skipped.
 pub fn cancel(
     conn: &Connection,
     meta: &WriteMeta,
@@ -267,9 +266,17 @@ pub fn cancel(
             sweep_holder: Some(held.owner().to_owned()),
         });
     }
+    // A record this client may not name is skipped, not a refusal of the whole cancel: `task work`
+    // sends every pending record naming its checkout as it resolves them, and one spelled another way
+    // (the host's own, say) must not wedge it.
     let mut cancelled = 0;
     for &id in ids {
-        if reachable(conn, id, roots)? && removal::cancel_pending(conn, meta, id)? {
+        let mayname = match reachable(conn, id, roots) {
+            Ok(found) => found,
+            Err(e) if e.code == ErrorCode::Forbidden => false,
+            Err(e) => return Err(e),
+        };
+        if mayname && removal::cancel_pending(conn, meta, id)? {
             cancelled += 1;
         }
     }

@@ -255,7 +255,8 @@ fn a_cancel_drops_pending_records_unless_a_sweep_runs() {
         other => panic!("{other:?}"),
     };
 
-    forbidden(cancel(&b, &[theirs]), "a host record");
+    let c = cancel(&b, &[theirs]).unwrap();
+    assert_eq!(c.cancelled, 0, "a host record is skipped, not cancelled");
     assert!(changed(call(
         &host,
         json!({ "op": "lease.take", "name": "removal-sweep", "holder": "host:h 1" }),
@@ -291,6 +292,6 @@ fn a_cancel_drops_pending_records_unless_a_sweep_runs() {
         ),
         "a cancel takes no lease"
     );
-    let e = cancel(&b, &vec![1; super::MAX_CANCEL + 1]).unwrap_err();
+    let e: ApiError = cancel(&b, &vec![1; super::MAX_CANCEL + 1]).unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
 }

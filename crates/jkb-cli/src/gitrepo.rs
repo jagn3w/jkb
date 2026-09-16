@@ -577,15 +577,30 @@ pub fn worktree_for_branch(dir: &Path, branch: &str) -> Result<Option<PathBuf>> 
         .map(|w| w.path))
 }
 
-/// Drop git's registrations for worktrees whose directories are gone (`git worktree prune`).
+/// Drop git's registration of the worktree at `path`, whose directory is gone.
 ///
-/// Needed when something outside this process removed a session directory — `git worktree
-/// list` keeps reporting it, and its branch stays locked to a checkout that is not there.
+/// **This path only — never `git worktree prune`.** Prune drops every registration whose directory
+/// this process cannot see, and across the host/container bind that is every session opened on the
+/// other side: their gitdirs name paths that do not exist here, so one side's prune unregistered the
+/// other side's live checkouts (stage-3 review, round 3). `git worktree remove` on a missing directory
+/// only drops its registration (measured, git 2.51.1).
+///
+/// Refused while the directory is there: `worktree remove` would delete a clean one.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed.
-pub fn prune_worktrees(dir: &Path) -> Result<()> {
-    git_must(dir, &["worktree", "prune"])?;
+/// Returns an error if the directory is present or cannot be examined, or git refuses — including
+/// for a path it does not register.
+pub fn forget_worktree(dir: &Path, path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!(
+            "{} is still there, so its registration is kept",
+            path.display()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("examining {}", path.display())),
+    }
+    let path_s = path.to_string_lossy().into_owned();
+    git_must(dir, &["worktree", "remove", "--", &path_s])?;
     Ok(())
 }
 

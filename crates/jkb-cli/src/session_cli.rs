@@ -618,7 +618,7 @@ pub(crate) fn work(
     if vanished {
         // Git still registers it — the sweep's own prune is best-effort, and a checkout removed by
         // hand was never pruned — and `git worktree add` refuses a registered path.
-        gitrepo::prune_worktrees(&ctx.root)?;
+        gitrepo::forget_worktree(&ctx.root, &worktree)?;
     }
     let resumed = resumed && !vanished;
     if !resumed {
@@ -1233,7 +1233,7 @@ fn abandon_session(
         .fact()
         .is_no()
     {
-        let _ = gitrepo::prune_worktrees(&ctx.root);
+        let _ = gitrepo::forget_worktree(&ctx.root, &sess.worktree);
         return Ok(None);
     }
     {

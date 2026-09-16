@@ -61,7 +61,15 @@ pub fn is_temp_name(name: &std::ffi::OsStr) -> bool {
 /// # Errors
 /// A refusal (`InvalidInput`), or any other I/O failure.
 pub fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    imp::read(path)
+    imp::read(path, MAX_READ_BYTES)
+}
+
+/// [`read`], refusing a file larger than `max` bytes.
+///
+/// # Errors
+/// As [`read`].
+pub fn read_capped(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
+    imp::read(path, max.min(MAX_READ_BYTES))
 }
 
 /// Write `bytes` to `path` — creating missing directories, never through a symlink — by writing a
@@ -165,7 +173,7 @@ mod imp {
         }
     }
 
-    pub(super) fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    pub(super) fn read(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
         let (parent, name) = split(path)?;
         let Some(dir) = open_dir(path, parent, false)? else {
             return Ok(None);
@@ -184,21 +192,25 @@ mod imp {
             refusal(
                 path,
                 path,
-                &format!(
-                    "is larger than the {} MiB a synced file may be",
-                    super::MAX_READ_BYTES / (1024 * 1024)
-                ),
+                &if max == super::MAX_READ_BYTES {
+                    format!(
+                        "is larger than the {} MiB a synced file may be",
+                        max / (1024 * 1024)
+                    )
+                } else {
+                    format!("is larger than the {max} bytes it may be")
+                },
             )
         };
-        if u64::try_from(stat.st_size).unwrap_or(u64::MAX) > super::MAX_READ_BYTES {
+        if u64::try_from(stat.st_size).unwrap_or(u64::MAX) > max {
             return Err(too_big());
         }
         let mut bytes = Vec::new();
         // Bounded again as it is read: the size can grow between the stat and the read.
         std::fs::File::from(fd)
-            .take(super::MAX_READ_BYTES + 1)
+            .take(max + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > super::MAX_READ_BYTES {
+        if bytes.len() as u64 > max {
             return Err(too_big());
         }
         Ok(Some(bytes))
@@ -333,7 +345,7 @@ mod imp {
     use std::path::Path;
 
     /// Off Unix there is no dev container kernel binding host directories; plain I/O.
-    pub(super) fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    pub(super) fn read(path: &Path, _max: u64) -> io::Result<Option<Vec<u8>>> {
         match std::fs::read(path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),

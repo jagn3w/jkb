@@ -4054,10 +4054,23 @@ fn a_registered_but_vanished_checkout_is_opened_again() {
         git(&f.repo, &["worktree", "list", "--porcelain"]).contains(worktree.to_str().unwrap()),
         "the premise: git still registers it"
     );
+    // Another session, opened on the other side of the bind: its gitdir names a path this side
+    // cannot see. Unregistering the vanished checkout must leave it registered.
+    let other = f.add_task("opened elsewhere");
+    let there = f.work(&other);
+    let name = there["session"].as_str().unwrap();
+    let admin = f.repo.join(".git/worktrees").join(name);
+    std::fs::write(
+        admin.join("gitdir"),
+        format!("/nonexistent/other-side/{name}/.git\n"),
+    )
+    .unwrap();
+
     let again = f.work(&uid);
     assert_eq!(again["resumed"], false, "{again}");
     assert!(worktree.join(".git").exists(), "a checkout is there again");
     assert!(claim_of(&f.db, &uid).is_some(), "and the claim is held");
+    assert!(admin.exists(), "the other side's registration is untouched");
 }
 
 /// **A session that cannot be opened leaves no claim behind** — and the release is the run's own

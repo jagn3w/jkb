@@ -4664,7 +4664,7 @@ fn dispose_session(
     if disposed_already {
         // Somebody removed it while the gate ran. Nothing to dispose of, and prune the
         // registration so git stops listing a worktree whose directory is gone.
-        let _ = gitrepo::prune_worktrees(&ctx.root);
+        let _ = gitrepo::forget_worktree(&ctx.root, &sess.worktree);
         disposal = Disposal::AlreadyGone;
     } else if landed.keep_worktree {
         // `graft` rebased a detached HEAD, so the branch ref still points at its pre-rebase
@@ -4893,8 +4893,12 @@ fn report_worktree_removals(db: &Db, db_path: &Path, fix: bool) {
             return;
         }
     };
-    if store.records.is_empty() && store.unreadable.is_empty() && store.rejected.is_empty() {
+    let legacy = store.legacy.lines();
+    if store.records.is_empty() && store.rejected.is_empty() && legacy.is_empty() {
         println!("worktree removals: none pending");
+        if fix {
+            fix_worktree_removals(&stores);
+        }
         return;
     }
     let archived: Vec<_> = store
@@ -4986,8 +4990,9 @@ fn report_worktree_removals(db: &Db, db_path: &Path, fix: bool) {
             );
         }
     }
-    for path in &store.unreadable {
-        println!("  unreadable record {}", path.display());
+    // The old file store: what the next sweep imports, or why it cannot.
+    for line in &legacy {
+        println!("  {line}");
     }
     // Refused records were invisible here while `reap` reported them held — so a store holding
     // nothing BUT refused records read as "none pending", which is the one state a person needs
@@ -4996,12 +5001,17 @@ fn report_worktree_removals(db: &Db, db_path: &Path, fix: bool) {
         println!("  {} — REFUSED: {} ({})", r.uid, r.why, r.marker);
     }
     if fix {
-        match archive::reap(&stores, archive::RETAIN_DAYS, false) {
-            Ok(r) => report_reap(&r, false, false, None),
-            Err(e) => println!("  sweep failed: {e}"),
-        }
-    } else if !awaiting.is_empty() {
+        fix_worktree_removals(&stores);
+    } else if !awaiting.is_empty() || store.legacy.files > 0 {
         println!("  run `jkb doctor --fix` or `jkb task reap` (the watcher service runs it)");
+    }
+}
+
+/// `doctor --fix`'s sweep — the one the service runs, which also imports the old record store.
+fn fix_worktree_removals(stores: &archive::Stores<'_>) {
+    match archive::reap(stores, archive::RETAIN_DAYS, false) {
+        Ok(r) => report_reap(&r, false, false, None),
+        Err(e) => println!("  sweep failed: {e}"),
     }
 }
 

@@ -212,11 +212,19 @@ Two decisions in it:
   honoured for that store's files, and broken with the lease.
 - **The old file store is imported, never acted on in place** (round 2). `~/.jkb` is bind-mounted
   read-write, so the store directory and its files are the container's to replace — with a link, a
-  FIFO, a huge file. On the host each `*.json` is read link-free and size-capped
-  (`nofollow::read`), stored as a `legacy` row (always confined), and unlinked through a link-free
-  walk; nothing is written there any more. The lock file is read the same way, and one that cannot
-  be read is an unknown holder, respected. `--break-lock` breaks the lease first and names both
-  holders. `task reclaim` proves
+  FIFO, thousands of huge files. On the host a real sweep (and `task work`'s cancel) imports it — a
+  report or `--dry-run` never does: at most 256 files a pass, each read link-free and capped at
+  64 KiB (`nofollow::read_capped`), stored as a `legacy` row (always confined) unless an identical
+  one is stored, and unlinked through a link-free walk. A file that fails any step is left and
+  reported, never a reason to fail the caller. Nothing is written there any more. A store directory
+  that is a link is not read and holds nothing up; a lock file that cannot be read is an unknown
+  holder, respected. `--break-lock` breaks the lease first and names both holders.
+- **`removal.cancel` skips a record the client may not name** rather than refusing the batch (round
+  3), so a host row spelled another way never wedges a container's `task work`.
+- **A vanished checkout is unregistered by path** (`gitrepo::forget_worktree`, `git worktree remove`
+  on the missing directory — measured on git 2.51.1), never with `git worktree prune`: prune drops
+  every registration whose directory this side cannot see, which across the bind is every session
+  opened on the other side. `task reclaim` proves
   owners gone by probing their processes, which only their host can do. A claim held by a live or
   unestablished owner is refused by `task.claim` from anywhere. **But the daemon does not judge
   liveness.** A client that names an owner can drop it (`task.release`), and so can a session op's
