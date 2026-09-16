@@ -11,7 +11,7 @@ use jkb_fsm::Fact;
 use serde_json::json;
 
 use super::{
-    append_log, ask, handle, instance_from, merge_page, owner_from, owner_in, verdict, Ask, Edge,
+    append_log, ask, handle, instance_from, keep_latest, owner_from, owner_in, verdict, Ask, Edge,
     HOOK_EVENTS, LOG_CAP_BYTES,
 };
 
@@ -923,12 +923,13 @@ fn a_row_repeated_across_pages_is_listed_once() {
         ended_at: None,
         end_reason: None,
     };
-    let mut rows = Vec::new();
-    merge_page(&mut rows, vec![row("a", "1", 1), row("b", "1", 2)]);
-    merge_page(
-        &mut rows,
-        vec![row("c", "1", 3), row("a", "1", 4), row("a", "2", 4)],
-    );
+    let rows = keep_latest(vec![
+        row("a", "1", 1),
+        row("b", "1", 2),
+        row("c", "1", 3),
+        row("a", "1", 4),
+        row("a", "2", 4),
+    ]);
     let got: Vec<(&str, &str, i64)> = rows
         .iter()
         .map(|r| (r.session.as_str(), r.pid.as_str(), r.seen_at))

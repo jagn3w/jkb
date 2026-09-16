@@ -5,7 +5,9 @@ order an event passes through them:
 
 1. the hook shim `.claude/hooks/notify-sticky.sh`, which hands the payload to
 2. `jkb notify hook` (`crates/jkb-cli/src/notify.rs`), a client of `jkb serve` that never opens a
-   database, which sends one `notify.event` to
+   database, which sends what it observed — a `notify.event` for each lifecycle event, and the
+   `session.*` requests of [the session registry](#the-session-registry-tasks-s64-2026-09-16) at a
+   session's start and end — to
 3. the daemon, where the lifecycle table (`crates/jkb-core/src/notify.rs`, design
    `openspec/changes/jkb-notification-lifecycle/`) runs against its record of the session
    (`notify_sessions`) and sends posts and withdrawals on the `claude/notify` queue topic, consumed by
@@ -99,8 +101,9 @@ untried. **Not yet measured:** the round trip from the container on the Mac.
 
 **The sweep is the producer's, because only the producer can probe a pid.** At `SessionStart` the hook
 asks `notify.open_sessions`, decides for each record whether its session is provably gone, and sends
-`notify.gone` for those. A record is gone when (a) it was written from **this instance** and its owner
-pid is dead by `kill(pid, 0)` (`EPERM` counts as alive), or (b) it was written from **another boot of
+`notify.gone` for those. A record is gone when (a) it was written from **this instance** — or both it and
+this process are the bare macOS host, whose name changes (see the registry section below for that
+assumption) — and its owner pid is dead by `kill(pid, 0)` (`EPERM` counts as alive), or (b) it was written from **another boot of
 this same container**. The instance is `host[#boot][/pidns]`: the hostname; in the container, the
 boot — the pid namespace the entrypoint recorded in `JKB_NS_MARKER`; and the pid namespace the
 writing process is actually in. A container keeps its hostname across `docker stop`/`start` but writes

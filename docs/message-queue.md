@@ -267,8 +267,8 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   payload however large its topic's creator — a container included — let it grow. `session.list`,
   also on the writer, is paged instead: at most 1000 rows (`claude_session::LIST_CAP`) and an opaque
   `next` cursor when there are more, which the hook's sweep and `jkb notify sessions` follow. A row is
-  usually a few hundred bytes. A working directory may take 4 KiB, so a page is bounded at about
-  4.5 MiB, not less. Refused, not
+  usually a few hundred bytes. The bound is larger: a working directory may take 4 KiB, and JSON
+  escaping can double that, so a page of 1000 is bounded at about 9 MiB. Refused, not
   clamped: the subscribe stream reads a batch shorter than it asked for as caught up, and a clamp
   announced `caught_up` after every capped poll of a backlog (a fifth review caught it). The frontier (`task.ready`) is ordered
   and limited over ids, and a task's subtasks are streamed, so at most one body is held at a time

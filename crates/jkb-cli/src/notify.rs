@@ -92,7 +92,7 @@ fn sessions(all: bool, json: bool) -> Result<()> {
                 sessions: page,
                 next,
             }) => {
-                merge_page(&mut sessions, page);
+                sessions.extend(page);
                 match next {
                     Some(next) => after = Some(next),
                     None => break,
@@ -102,6 +102,7 @@ fn sessions(all: bool, json: bool) -> Result<()> {
             Err(e) => anyhow::bail!("session.list: {}", e.message),
         }
     }
+    let sessions = keep_latest(sessions);
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
         return Ok(());
@@ -112,15 +113,18 @@ fn sessions(all: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Add a listing page to the rows so far. A row written between two pages can come back on the second
-/// (docs/notifications.md): its later copy is kept, once, in its later place.
-fn merge_page(rows: &mut Vec<jkb_api::ClaudeSession>, page: Vec<jkb_api::ClaudeSession>) {
-    for row in page {
-        rows.retain(|s| {
-            (&s.session, &s.pid, &s.instance) != (&row.session, &row.pid, &row.instance)
-        });
-        rows.push(row);
-    }
+/// The rows of every page, each once. A row written between two pages can come back on a later one
+/// (docs/notifications.md): its later copy is kept, in its later place. One pass, so a registry of many
+/// pages costs linear time.
+fn keep_latest(rows: Vec<jkb_api::ClaudeSession>) -> Vec<jkb_api::ClaudeSession> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<_> = rows
+        .into_iter()
+        .rev()
+        .filter(|r| seen.insert((r.session.clone(), r.pid.clone(), r.instance.clone())))
+        .collect();
+    kept.reverse();
+    kept
 }
 
 /// One process's hold on a session, on one line: id, state, process and where it runs.
