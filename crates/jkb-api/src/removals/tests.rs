@@ -255,8 +255,13 @@ fn a_cancel_drops_pending_records_unless_a_sweep_runs() {
         other => panic!("{other:?}"),
     };
 
-    let c = cancel(&b, &[theirs]).unwrap();
-    assert_eq!(c.cancelled, 0, "a host record is skipped, not cancelled");
+    let other = add(&b, &record("~/repos/p/.jkb/work/o", "~/repos/p")).unwrap();
+    let c = cancel(&b, &[theirs, other]).unwrap();
+    assert_eq!(
+        (c.cancelled, c.skipped.as_slice()),
+        (1, [theirs].as_slice()),
+        "a host record is skipped and named, and the rest of the batch still applies"
+    );
     assert!(changed(call(
         &host,
         json!({ "op": "lease.take", "name": "removal-sweep", "holder": "host:h 1" }),

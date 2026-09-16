@@ -210,27 +210,31 @@ Two decisions in it:
   while the lease is held, even with nothing to cancel), acts on nothing, and
   `jkb task reap --break-lock` on the host ends it. An older jkb's `.sweep.lock` on the old store is
   honoured for that store's files, and broken with the lease.
-- **The old file store is imported, never acted on in place** (round 2). `~/.jkb` is bind-mounted
-  read-write, so the store directory and its files are the container's to replace — with a link, a
-  FIFO, thousands of huge files. On the host a real sweep (and `task work`'s cancel) imports it — a
-  report or `--dry-run` never does: at most 256 files a pass, each read link-free and capped at
-  64 KiB (`nofollow::read_capped`), stored as a `legacy` row (always confined) unless an identical
-  one is stored, and unlinked through a link-free walk. A file that fails any step is left and
-  reported, never a reason to fail the caller. Nothing is written there any more. A store directory
-  that is a link is not read and holds nothing up; a lock file that cannot be read is an unknown
-  holder, respected. `--break-lock` breaks the lease first and names both holders.
-- **`removal.cancel` skips a record the client may not name** rather than refusing the batch (round
-  3), so a host row spelled another way never wedges a container's `task work`.
-- **A vanished checkout is unregistered by path** (`gitrepo::forget_worktree`, `git worktree remove`
-  on the missing directory — measured on git 2.51.1), never with `git worktree prune`: prune drops
-  every registration whose directory this side cannot see, which across the bind is every session
-  opened on the other side. `task reclaim` proves
-  owners gone by probing their processes, which only their host can do. A claim held by a live or
-  unestablished owner is refused by `task.claim` from anywhere. **But the daemon does not judge
-  liveness.** A client that names an owner can drop it (`task.release`), and so can a session op's
-  `displace`. A misbehaving container can therefore free any claim, and an honest one never does,
-  because it can prove gone only what its own machine can see (tasks S6.4 design, "Residual,
-  stated"). `task mirror` is a sweep over every task.
+- **The old file store is imported only when the operator asks, and never acted on in place**
+  (rounds 2–4). `~/.jkb` is bind-mounted read-write, so the store directory and its files are the
+  container's to replace — with a link, a FIFO, thousands of huge files. A record written before the
+  move may also be a pending removal of a checkout somebody has since gone back to. So sweeps,
+  `task work` and reports only *say* what is there (`LegacyOutlook`, in `task reap` and `doctor`);
+  `jkb task reap --import-old-records [--dry-run]` takes it, and does nothing else. A look examines at
+  most 4096 entries; files that are not regular or exceed 64 KiB are told apart without being opened.
+  An import takes at most 256 files, each read link-free (`nofollow::read_capped`), **removed first**
+  through a link-free walk, and only then stored as a `legacy` row (always confined) — so a file that
+  cannot be removed is never taken, and none is taken twice. A store directory that is a link is not
+  read and holds nothing up; a lock file that cannot be read is an unknown holder, respected.
+  `--break-lock` breaks the lease first and names both holders.
+- **`removal.cancel` skips and names a record the client may not name** rather than refusing the
+  batch, and `task work` then refuses to hand the checkout back: that record is still owed. `task work`
+  sends its ids in batches under the daemon's cap, whose count the container could otherwise inflate.
+- **A worktree is unregistered by its own path, never with `git worktree prune`** (rounds 3–4):
+  prune drops every registration whose directory this side cannot see, which across the bind is every
+  session opened on the other side. `gitrepo::forget_worktree` runs `git worktree remove` on a missing
+  directory, and `worktree_remove` no longer prunes after removing (both measured on git 2.51.1).
+- **Liveness stays with the host.** `task reclaim` proves owners gone by probing their processes,
+  which only their host can do. A claim held by a live or unestablished owner is refused by
+  `task.claim` from anywhere. **But the daemon does not judge liveness.** A client that names an owner
+  can drop it (`task.release`), and so can a session op's `displace`. A misbehaving container can
+  therefore free any claim, and an honest one never does, because it can prove gone only what its own
+  machine can see (tasks S6.4 design, "Residual, stated"). `task mirror` is a sweep over every task.
 
 **Ingest** (`ingest.text`; tasks S6.3, `crates/jkb-api/src/ingest.rs`). `jkb ingest <file|url>` reads
 and parses its source where it runs (`jkb_ingest::read_source`: a file by its extension, a URL rendered

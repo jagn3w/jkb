@@ -632,9 +632,14 @@ pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Resul
     Ok(())
 }
 
-/// Remove the worktree at `path` and prune the administrative entry. `force` discards
+/// Remove the worktree at `path`, which also drops its own administrative entry. `force` discards
 /// uncommitted changes; without it git refuses a dirty worktree, which is the check the
 /// caller wants.
+///
+/// **No `git worktree prune` after it.** Prune drops every registration whose directory this side
+/// cannot see — across the host/container bind, every session opened on the other side (stage-3
+/// review, round 4). `worktree remove` needs no prune to unregister its own path (measured, git
+/// 2.51.1).
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to remove the worktree.
@@ -646,7 +651,6 @@ pub fn worktree_remove(dir: &Path, path: &Path, force: bool) -> Result<()> {
     }
     args.push(&path_s);
     git_must(dir, &args)?;
-    let _ = git_run(dir, &["worktree", "prune"])?;
     Ok(())
 }
 
@@ -1873,6 +1877,45 @@ mod tests {
         super::fixture_env::assert_isolated(
             "gitrepo fixture",
             &fixture_git(Path::new("/somewhere"), &["status"]),
+        );
+    }
+
+    /// Unregistering one worktree — removed, or already gone — leaves a registration whose directory
+    /// this side cannot see: the other side of the host/container bind's session.
+    #[test]
+    fn unregistering_one_worktree_leaves_the_other_side_s() {
+        use super::{forget_worktree, worktree_add, worktree_remove};
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        for name in ["mine", "gone", "theirs"] {
+            worktree_add(
+                &dir,
+                &dir.join(".jkb/work").join(name),
+                &format!("task/{name}"),
+                "main",
+            )
+            .unwrap();
+        }
+        let admin = dir.join(".git/worktrees/theirs");
+        std::fs::write(
+            admin.join("gitdir"),
+            "/nonexistent/other-side/theirs/.git\n",
+        )
+        .unwrap();
+
+        worktree_remove(&dir, &dir.join(".jkb/work/mine"), true).unwrap();
+        assert!(admin.exists(), "a removal prunes nothing else");
+        assert!(!dir.join(".git/worktrees/mine").exists());
+
+        std::fs::remove_dir_all(dir.join(".jkb/work/gone")).unwrap();
+        forget_worktree(&dir, &dir.join(".jkb/work/gone")).unwrap();
+        assert!(admin.exists(), "nor does forgetting a vanished one");
+        assert!(!dir.join(".git/worktrees/gone").exists());
+        assert!(
+            forget_worktree(&dir, &dir.join(".jkb/work/theirs")).is_err(),
+            "a directory that is there is not forgotten"
         );
     }
 

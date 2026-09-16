@@ -616,8 +616,9 @@ pub(crate) fn work(
     // release that claim.
     let vanished = resumed && presence::present_under(&worktree, &ctx.root).fact().is_no();
     if vanished {
-        // Git still registers it — the sweep's own prune is best-effort, and a checkout removed by
-        // hand was never pruned — and `git worktree add` refuses a registered path.
+        // Git still registers it — the sweep's own unregister is best-effort, and a checkout removed
+        // by hand was never unregistered — and `git worktree add` refuses a registered path. Dropped
+        // by path.
         gitrepo::forget_worktree(&ctx.root, &worktree)?;
     }
     let resumed = resumed && !vanished;
@@ -774,8 +775,8 @@ fn open_worktree_inner(root: &Path, worktree: &Path, branch: &str, onto: &str) -
     }
     anyhow::ensure!(
         !worktree.exists(),
-        "{} exists but git does not know it as a worktree — remove it, or run \
-         `git worktree prune`",
+        "{} exists but git does not know it as a worktree — look at it, then move it \
+         out of the way (not `git worktree prune`, which drops every checkout this side cannot see)",
         worktree.display()
     );
     gitrepo::worktree_add(root, worktree, branch, onto)

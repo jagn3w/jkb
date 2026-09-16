@@ -235,6 +235,9 @@ pub struct Cancelled {
     /// The sweep holding its lease, when the cancel was refused for it — nothing was dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_holder: Option<String>,
+    /// Records named that this client may not name, left as they are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<i64>,
 }
 
 /// `removal.cancel`: drop the pending records `ids` — `jkb task work` handing a checkout back — unless a
@@ -264,16 +267,20 @@ pub fn cancel(
         return Ok(Cancelled {
             cancelled: 0,
             sweep_holder: Some(held.owner().to_owned()),
+            skipped: Vec::new(),
         });
     }
-    // A record this client may not name is skipped, not a refusal of the whole cancel: `task work`
-    // sends every pending record naming its checkout as it resolves them, and one spelled another way
-    // (the host's own, say) must not wedge it.
+    // A record this client may not name is skipped and reported, not a refusal of the whole cancel:
+    // the caller decides what a skipped record naming its checkout means.
     let mut cancelled = 0;
+    let mut skipped = Vec::new();
     for &id in ids {
         let mayname = match reachable(conn, id, roots) {
             Ok(found) => found,
-            Err(e) if e.code == ErrorCode::Forbidden => false,
+            Err(e) if e.code == ErrorCode::Forbidden => {
+                skipped.push(id);
+                false
+            }
             Err(e) => return Err(e),
         };
         if mayname && removal::cancel_pending(conn, meta, id)? {
@@ -283,6 +290,7 @@ pub fn cancel(
     Ok(Cancelled {
         cancelled,
         sweep_holder: None,
+        skipped,
     })
 }
 

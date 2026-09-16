@@ -3963,12 +3963,13 @@ fn a_container_session_s_deferred_disposal_is_finished_by_the_host() {
     );
 }
 
-/// **A record left in the old file store is still cancelled, listed and swept, once imported**
+/// **A record left in the old file store is reported, and finished once the operator imports it**
 /// (tasks S6.4 stage 3): the records moved into the database, and a host upgraded with checkouts still
-/// owed a disposal must not forget them. The directory is bind-mounted into the dev container, so a
-/// file there is acted on only when its repo resolves under `~/repos`.
+/// owed a disposal must not forget them — nor act on one somebody has gone back to without being
+/// asked. The directory is bind-mounted into the dev container, so an imported record is acted on
+/// only when its repo resolves under `~/repos`.
 #[test]
-fn a_record_in_the_old_file_store_is_still_finished() {
+fn a_record_in_the_old_file_store_is_finished_once_imported() {
     let f = Fixture::new();
     let uid = f.add_task("recorded before the move");
     let s = f.work(&uid);
@@ -3979,55 +3980,55 @@ fn a_record_in_the_old_file_store_is_still_finished() {
     let store = f.db.parent().unwrap().join("worktree-removals");
     std::fs::create_dir_all(&store).unwrap();
     let marker = store.join("legacy-0001.json");
-    let plant = || {
-        std::fs::write(
-            &marker,
-            serde_json::to_vec(&serde_json::json!({
-                "worktree": wt, "repo_root": f.repo, "branch": s["branch"], "uid": uid,
-                "recorded_at": 1, "head": head,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    };
-    let host = |args: &[&str]| {
-        f.jkb()
-            .env("HOME", home.path())
-            .args(args)
-            .output()
-            .unwrap()
-    };
+    std::fs::write(
+        &marker,
+        serde_json::to_vec(&serde_json::json!({
+            "worktree": wt, "repo_root": f.repo, "branch": s["branch"], "uid": uid,
+            "recorded_at": 1, "head": head,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let with_home =
+        |home: &Path, args: &[&str]| f.jkb().env("HOME", home).args(args).output().unwrap();
+    let text = |o: &std::process::Output| String::from_utf8_lossy(&o.stdout).into_owned();
 
-    // A resume cancels it.
-    plant();
-    let resumed = host(&["task", "work", &uid]);
+    // Reported, and nothing is done to it — not by a sweep, not by a resume.
+    let doctor = with_home(home.path(), &["doctor"]);
+    assert!(text(&doctor).contains("--import-old-records"), "{doctor:?}");
+    let resumed = with_home(home.path(), &["task", "work", &uid]);
     assert!(resumed.status.success(), "{resumed:?}");
-    assert!(!marker.exists(), "the resume cancelled the old record");
+    let reaped = with_home(home.path(), &["task", "reap"]);
+    assert!(reaped.status.success(), "{reaped:?}");
+    assert!(marker.exists() && wt.exists(), "{reaped:?}");
+    let dry = with_home(
+        home.path(),
+        &["task", "reap", "--import-old-records", "--dry-run"],
+    );
+    assert!(text(&dry).contains("would take"), "{dry:?}");
+    assert!(marker.exists());
 
     // Imported by a process whose `~/repos` is elsewhere: the record keeps its absolute paths, and
     // is refused there — its repo is outside that `~/repos` — with nothing touched.
-    plant();
     let stranger = TempDir::new().unwrap();
     std::fs::create_dir(stranger.path().join("repos")).unwrap();
-    let refused = f
-        .jkb()
-        .env("HOME", stranger.path())
-        .args(["--json", "task", "reap"])
-        .output()
-        .unwrap();
-    assert!(refused.status.success(), "{refused:?}");
-    assert!(!marker.exists(), "imported, and never written back");
-    assert!(wt.exists(), "outside ~/repos: not moved");
-    assert!(
-        String::from_utf8_lossy(&refused.stdout).contains("outside"),
-        "{refused:?}"
+    let taken = with_home(
+        stranger.path(),
+        &["--json", "task", "reap", "--import-old-records"],
     );
+    let taken: serde_json::Value = serde_json::from_slice(&taken.stdout).unwrap();
+    assert_eq!(taken["taken"].as_array().map(Vec::len), Some(1), "{taken}");
+    assert!(!marker.exists(), "taken, and never written back");
+    let refused = with_home(stranger.path(), &["--json", "task", "reap"]);
+    assert!(refused.status.success(), "{refused:?}");
+    assert!(wt.exists(), "outside ~/repos: not moved");
+    assert!(text(&refused).contains("outside"), "{refused:?}");
 
     // Where it is under `~/repos`, the same row is listed and finished.
-    let listed = host(&["task", "sessions", "--json"]);
+    let listed = with_home(home.path(), &["task", "sessions", "--json"]);
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(rows[0]["awaiting_archive"], true, "{rows:?}");
-    let reaped = host(&["--json", "task", "reap"]);
+    let reaped = with_home(home.path(), &["--json", "task", "reap"]);
     assert!(reaped.status.success(), "{reaped:?}");
     assert!(!wt.exists(), "archived");
     let rows = jkb_core::Db::open(&f.db)
