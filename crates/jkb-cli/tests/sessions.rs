@@ -3531,6 +3531,27 @@ fn claim_of(db: &Path, uid: &str) -> Option<String> {
     .unwrap()
 }
 
+/// Hold the removal sweep's lease for `holder` (`None` frees it), as a sweep in flight would.
+fn sweep_lease(db: &Path, holder: Option<&str>) {
+    let db = jkb_core::Db::open(db).unwrap();
+    let holder = holder.map(str::to_owned);
+    db.write_txn("t", move |conn, meta| {
+        jkb_core::lease::break_lease(conn, meta, jkb_api::removals::SWEEP_LEASE)?;
+        if let Some(h) = holder {
+            assert!(jkb_core::lease::take(
+                conn,
+                meta,
+                jkb_api::removals::SWEEP_LEASE,
+                &h,
+                None,
+                0
+            )?);
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
 /// Mark a Claude Code session live (or ended) in the registry, as the hook would.
 fn registry(db: &Path, session: &str, live: bool) {
     let db = jkb_core::Db::open(db).unwrap();
@@ -3709,9 +3730,19 @@ struct Serve(std::process::Child);
 impl Serve {
     /// Start it on an ephemeral port; the daemon and its `http://` address.
     fn start(f: &Fixture, token: &Path) -> (Self, String) {
+        Self::spawn(f.jkb(), token)
+    }
+
+    /// [`Self::start`], with the daemon's home — whose `repos` is what its clients may name — at `home`.
+    fn start_in(f: &Fixture, token: &Path, home: &Path) -> (Self, String) {
+        let mut cmd = f.jkb();
+        cmd.env("HOME", home);
+        Self::spawn(cmd, token)
+    }
+
+    fn spawn(mut cmd: Command, token: &Path) -> (Self, String) {
         use std::io::BufRead as _;
-        let mut child = f
-            .jkb()
+        let mut child = cmd
             .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
             .arg(token)
             .stdout(std::process::Stdio::piped())
@@ -3743,8 +3774,7 @@ impl Drop for Serve {
 
 /// **`task start` and the gate read go through the daemon** (tasks S6.4): the git half runs where the
 /// command runs, the database half as ops, and the host sees the claim, the facets and the history.
-/// Storing a gate is refused there — a stored gate is a command the host runs (decision A) — and the
-/// verbs that still read the host's removal records are refused until they move.
+/// Storing a gate is refused there — a stored gate is a command the host runs (decision A).
 #[test]
 fn start_and_the_gate_read_go_through_the_daemon() {
     let f = Fixture::new();
@@ -3798,9 +3828,7 @@ fn start_and_the_gate_read_go_through_the_daemon() {
     for args in [
         vec!["task", "gate", "rm -rf ~"],
         vec!["task", "gate", "--clear"],
-        vec!["task", "work", &uid],
-        vec!["task", "abandon", &uid],
-        vec!["task", "sessions"],
+        vec!["task", "reap"],
     ] {
         let out = remote(&args);
         assert!(!out.status.success(), "{args:?} was served: {out:?}");
@@ -3814,6 +3842,163 @@ fn start_and_the_gate_read_go_through_the_daemon() {
     )
     .unwrap();
     assert_eq!(still["gate"], "make test", "the stored gate is untouched");
+}
+
+/// **A container session's deferred disposal is finished by the host** (tasks S6.4 stage 3). `work`,
+/// `sessions` and `abandon` run through the daemon; the record of a checkout the container could not
+/// move is written to the database with `~/repos` paths, which the daemon checks against its own home;
+/// and the host's reap, under a different home, finds the same checkout and archives it. A sweep in
+/// flight on the host — a holder the container cannot probe — holds a resume back.
+#[test]
+fn a_container_session_s_deferred_disposal_is_finished_by_the_host() {
+    let f = Fixture::new();
+    let uid = f.add_task("from the container");
+    // Two homes whose `repos` is the one directory both sides share: the fixture's.
+    let host_home = TempDir::new().unwrap();
+    let box_home = TempDir::new().unwrap();
+    for h in [&host_home, &box_home] {
+        std::os::unix::fs::symlink(f.home.path(), h.path().join("repos")).unwrap();
+    }
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start_in(&f, &token, host_home.path());
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env("HOME", box_home.path())
+            .env_remove("JKB_DB")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap()
+    };
+
+    let opened = remote(&["--json", "task", "work", &uid]);
+    assert!(opened.status.success(), "{opened:?}");
+    let v: serde_json::Value = serde_json::from_slice(&opened.stdout).unwrap();
+    let worktree = PathBuf::from(v["worktree"].as_str().unwrap());
+    let name = v["session"].as_str().unwrap().to_owned();
+    let listed = remote(&["--json", "task", "sessions"]);
+    assert!(listed.status.success(), "{listed:?}");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains(&name),
+        "{listed:?}"
+    );
+
+    // The host's sweep is in flight: the container cannot probe its holder, so it waits.
+    sweep_lease(&f.db, Some("host:1 nonce"));
+    let blocked = remote(&["task", "work", &uid]);
+    assert!(!blocked.status.success(), "{blocked:?}");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("sweep is running"),
+        "{blocked:?}"
+    );
+    sweep_lease(&f.db, None);
+
+    // Nothing can be moved into a regular file, so the container defers.
+    std::fs::write(f.repo.join(".jkb/archive"), b"in the way").unwrap();
+    let rows = || {
+        jkb_core::Db::open(&f.db)
+            .unwrap()
+            .read(jkb_core::removal::list_all)
+            .unwrap()
+    };
+    let abandon = || {
+        let abandoned = remote(&["--json", "task", "abandon", &uid]);
+        assert!(abandoned.status.success(), "{abandoned:?}");
+        assert!(worktree.exists(), "deferred, so still there");
+    };
+    abandon();
+    assert_eq!(rows().len(), 1);
+    // Brought back to life from the container: the pending record is cancelled, found by the path
+    // this side resolves it to.
+    let resumed = remote(&["--json", "task", "work", &uid]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert!(
+        rows().is_empty(),
+        "the resume cancelled the pending removal"
+    );
+    abandon();
+    let rows = rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (
+            rows[0].removal.worktree.as_str(),
+            rows[0].removal.repo_root.as_str(),
+            rows[0].written_via.as_str()
+        ),
+        (
+            format!("~/repos/proj/.jkb/work/{name}").as_str(),
+            "~/repos/proj",
+            "serve"
+        ),
+        "named as both sides can resolve it, by the daemon"
+    );
+
+    // The host finishes it, from its own home.
+    std::fs::remove_file(f.repo.join(".jkb/archive")).unwrap();
+    let reaped = f
+        .jkb()
+        .env("HOME", host_home.path())
+        .args(["--json", "task", "reap"])
+        .output()
+        .unwrap();
+    assert!(reaped.status.success(), "{reaped:?}");
+    let r: serde_json::Value = serde_json::from_slice(&reaped.stdout).unwrap();
+    assert_eq!(r["archived"].as_array().map(Vec::len), Some(1), "{r}");
+    assert!(!worktree.exists(), "archived by the host");
+    let rows = jkb_core::Db::open(&f.db)
+        .unwrap()
+        .read(jkb_core::removal::list_all)
+        .unwrap();
+    assert!(
+        rows[0]
+            .removal
+            .archive
+            .as_deref()
+            .is_some_and(|a| a.starts_with("~/repos/proj/.jkb/archive/")),
+        "{rows:?}"
+    );
+}
+
+/// **A record left in the old file store is still listed, swept and updated where it is** (tasks S6.4
+/// stage 3): the records moved into the database, and a host upgraded with checkouts still owed a
+/// disposal must not forget them.
+#[test]
+fn a_record_in_the_old_file_store_is_still_finished() {
+    let f = Fixture::new();
+    let uid = f.add_task("recorded before the move");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let head = git(&wt, &["rev-parse", "HEAD"]);
+    let store = f.db.parent().unwrap().join("worktree-removals");
+    std::fs::create_dir_all(&store).unwrap();
+    let marker = store.join("legacy-0001.json");
+    std::fs::write(
+        &marker,
+        serde_json::to_vec(&serde_json::json!({
+            "worktree": wt, "repo_root": f.repo, "branch": s["branch"], "uid": uid,
+            "recorded_at": 1, "head": head,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let listed = f
+        .jkb()
+        .args(["task", "sessions", "--json"])
+        .output()
+        .unwrap();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(rows[0]["awaiting_archive"], true, "{rows:?}");
+
+    let reaped = f.jkb().args(["--json", "task", "reap"]).output().unwrap();
+    assert!(reaped.status.success(), "{reaped:?}");
+    assert!(!wt.exists(), "archived");
+    let left: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert!(left["archive"].is_string(), "updated in place: {left}");
 }
 
 /// **A session that cannot be opened leaves no claim behind** — and the release is the run's own
@@ -3856,10 +4041,8 @@ fn a_session_that_cannot_be_opened_releases_its_claim() {
 fn a_session_blocked_by_a_running_sweep_leaves_no_claim() {
     let f = Fixture::new();
     let uid = f.add_task("swept under");
-    let store = f.db.parent().unwrap().join("worktree-removals");
-    std::fs::create_dir_all(&store).unwrap();
-    // pid 1 on this host always exists, so the lock is live.
-    std::fs::write(store.join(".sweep.lock"), "host:1 nonce").unwrap();
+    // pid 1 on this host always exists, so the sweep is live.
+    sweep_lease(&f.db, Some("host:1 nonce"));
     // The task already records where its work was; a refused run must leave that alone.
     f.jkb()
         .args(["task", "tag", "set", &uid, "branch=feat"])
@@ -3978,9 +4161,8 @@ fn a_blocked_resume_of_a_claim_only_checkout_keeps_the_claim() {
         .success();
     let held = claim_of(&f.db, &uid);
     assert!(held.is_some());
-    let store = f.db.parent().unwrap().join("worktree-removals");
-    std::fs::create_dir_all(&store).unwrap();
-    std::fs::write(store.join(".sweep.lock"), "host:1 nonce").unwrap();
+    // pid 1 on this host always exists, so the sweep is live.
+    sweep_lease(&f.db, Some("host:1 nonce"));
     f.jkb()
         .args(["task", "work", &uid, "--onto", &onto])
         .assert()
@@ -3988,7 +4170,7 @@ fn a_blocked_resume_of_a_claim_only_checkout_keeps_the_claim() {
         .stderr(predicate::str::contains("sweep is running"));
     assert!(claim_of(&f.db, &uid).is_some(), "the claim is kept");
 
-    std::fs::remove_file(store.join(".sweep.lock")).unwrap();
+    sweep_lease(&f.db, None);
     let again = f.work_onto(&uid, &onto);
     assert_eq!(again["worktree"], first["worktree"], "the same checkout");
 }

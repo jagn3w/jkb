@@ -104,6 +104,27 @@ fn home_relative(path: &Path, home: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
+/// `path` as another process sharing `~/repos` can resolve it: `~/repos/…` when it lies there, else
+/// absolute ([`home_relative`]). A worktree-removal record stores its paths this way (tasks S6.4 stage 3),
+/// so a record the dev container writes is one the host's reap service can act on.
+///
+/// # Errors
+/// A path that is not UTF-8, which a record cannot carry.
+pub fn shared_path(path: &Path) -> anyhow::Result<String> {
+    let shared = home_relative(path, home().as_deref());
+    shared
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{} is not UTF-8", path.display()))
+}
+
+/// A [`shared_path`] resolved here: `~/…` against this process's home, anything else unchanged. With no
+/// home a `~` path stays relative, which every reader refuses.
+#[must_use]
+pub fn from_shared_path(path: &str) -> PathBuf {
+    resolve_home(Path::new(path), home().as_deref())
+}
+
 /// `path` with symlinks resolved as far as it exists, and the rest appended unchanged.
 fn resolved(path: &Path) -> PathBuf {
     let mut tail = Vec::new();

@@ -36,8 +36,11 @@ use anyhow::{Context, Result};
 use jkb_fsm::Fact;
 use serde::{Deserialize, Serialize};
 
+use jkb_api::removals::{Removal, SWEEP_LEASE};
+
 use crate::gitrepo;
 use crate::presence;
+use crate::session_cli::Kb;
 
 /// How long an archived worktree is kept before the sweep deletes it.
 pub const RETAIN_DAYS: u64 = 30;
@@ -168,11 +171,7 @@ impl Report {
             // make visible: `Held`'s own doc says the escape "needs the file and the holder
             // printed". Omitted here, the watcher went permanently silent about exactly it —
             // every deferred landing on the machine stopped completing with no log line anywhere.
-            .chain(
-                self.skipped
-                    .iter()
-                    .map(|h| format!("l {} {}", h.path.display(), h.holder)),
-            )
+            .chain(self.skipped.iter().map(|h| format!("l {}", h.holder)))
             .collect();
         lines.sort();
         lines.join("\n")
@@ -195,46 +194,167 @@ impl Report {
     }
 }
 
-/// A sweep lock somebody else holds.
+/// A sweep lease somebody else holds.
 ///
-/// Named in full because there is no automatic way out of one: an owner on another host is
-/// `Fact::Unknown` and unknown never frees anything, so a lock left by a container that has since
+/// Named in full because there is no automatic way out of one: a holder on another host is
+/// `Fact::Unknown` and unknown never frees anything, so a lease left by a container that has since
 /// been rebuilt — its hostname gone with it — is respected by every later sweep, on both sides,
-/// permanently. That is the right default (breaking a live sweeper's lock is what the lock exists
-/// to prevent) but it needs an escape a person can take, and an escape needs the file and the
-/// holder printed.
+/// permanently. That is the right default (breaking a live sweeper's lease is what the lease exists
+/// to prevent) but it needs an escape a person can take — `jkb task reap --break-lock` — and an
+/// escape needs the holder printed.
 #[derive(Debug, Clone)]
 pub struct Held {
-    /// The lock file, so `--break-lock` and an operator's `rm` have something to name.
-    pub path: PathBuf,
-    /// Its holder, verbatim. Empty when the lock could not be read.
+    /// Its holder's owner id. Empty when the lease changed hands too fast to say.
     pub holder: String,
 }
 
-/// Who holds the sweep lock, if anyone — without touching it.
+/// Where the removal records are kept, and how this process reaches them (tasks S6.4 stage 3).
 ///
-/// # Errors
-/// Returns an error if the lock exists and cannot be read.
-pub fn lock_holder(db: &Path) -> Result<Option<String>> {
-    let path = store_dir(db).join(".sweep.lock");
-    match fs::read_to_string(&path) {
-        // The file is `<owner> <nonce>` — the nonce is `SweepLock`'s release identity and is no
-        // part of who holds it. Taking the first field keeps every consumer unchanged: this is
-        // what `jkb task reap`'s refusal prints and what `owner::is_alive` is asked about, and a
-        // nonce appended to the id would make the liveness probe unable to parse it, so every
-        // holder would read `Unrecognized` -> `Unknown` and no stale lock could ever be broken.
-        Ok(holder) => Ok(Some(holder_of(&holder).to_owned())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+/// **The database**, through a [`Kb`]: the host CLI's own backend, or `jkb serve` from the dev
+/// container — the same records either way, which is what lets a container session's deferred
+/// disposal be finished by the host's reap service. The records used to be files beside the database,
+/// which a client of the daemon has no path to.
+///
+/// **And the old file store, on the host, until it is empty.** Records written before the move are
+/// still read, swept and cancelled where they are; nothing new is written there. A process with no
+/// local database (remote mode) has none.
+#[derive(Clone, Copy)]
+pub struct Stores<'a> {
+    kb: Kb<'a>,
+    legacy: Option<&'a Path>,
+}
+
+impl<'a> Stores<'a> {
+    /// The records `kb` serves, plus the file store beside `db` when this process has a local database.
+    #[must_use]
+    pub const fn new(kb: Kb<'a>, db: Option<&'a Path>) -> Self {
+        Self { kb, legacy: db }
+    }
+
+    fn legacy_dir(&self) -> Option<PathBuf> {
+        self.legacy.map(store_dir)
+    }
+
+    /// Add a new record, one per disposal.
+    fn add(&self, entry: &Entry) -> Result<()> {
+        self.kb.removal_add(to_row(entry)?)?;
+        Ok(())
+    }
+
+    /// Record that the pending record `key` was archived, as `entry` now says.
+    fn archived(&self, key: &Key, entry: &Entry) -> Result<()> {
+        match key {
+            Key::File(marker) => record_at(marker, entry),
+            Key::Row(id) => {
+                let (Some(dir), Some(at)) = (&entry.archive, entry.archived_at) else {
+                    anyhow::bail!("record #{id} has no archive to record");
+                };
+                let archive = crate::owner::shared_path(dir)?;
+                anyhow::ensure!(
+                    self.kb.removal_archived(
+                        *id,
+                        archive,
+                        i64::try_from(at).unwrap_or(i64::MAX)
+                    )?,
+                    "record #{id} was archived or dropped by something else meanwhile"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Forget the record `key`.
+    fn forget(&self, key: &Key) -> Result<()> {
+        match key {
+            Key::File(marker) => {
+                fs::remove_file(marker).with_context(|| format!("removing {}", marker.display()))
+            }
+            Key::Row(id) => self.kb.removal_drop(*id).map(|_| ()),
+        }
     }
 }
 
-/// Remove the sweep lock, whoever holds it. Returns the holder it displaced, if any.
+/// Which record: a file of the old store, or a database row. Legacy files order first — every one of
+/// them was written before any row — so "the later disposal" is still the larger key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Key {
+    /// A file in the store beside the database.
+    File(PathBuf),
+    /// A row of `worktree_removals`.
+    Row(i64),
+}
+
+impl std::fmt::Display for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(p) => write!(f, "{}", p.display()),
+            Self::Row(id) => write!(f, "removal record #{id}"),
+        }
+    }
+}
+
+/// A record as the database stores it: paths [`crate::owner::shared_path`]s, so the host and the dev
+/// container read one row as the same checkout.
+fn to_row(e: &Entry) -> Result<Removal> {
+    Ok(Removal {
+        worktree: crate::owner::shared_path(&e.worktree)?,
+        repo_root: crate::owner::shared_path(&e.repo_root)?,
+        branch: e.branch.clone(),
+        uid: e.uid.clone(),
+        delete_branch: e.plan.delete_branch,
+        accept_dirty: e.plan.accept_dirty,
+        recorded_at: i64::try_from(e.recorded_at).unwrap_or(i64::MAX),
+        head: e.head.clone(),
+        archive: e
+            .archive
+            .as_deref()
+            .map(crate::owner::shared_path)
+            .transpose()?,
+        archived_at: e.archived_at.map(|a| i64::try_from(a).unwrap_or(i64::MAX)),
+    })
+}
+
+/// A stored row as this process sees it. Untrusted, like a file was: [`Record::parse`] judges it next.
+fn from_row(r: Removal) -> Entry {
+    let secs = |s: i64| u64::try_from(s).unwrap_or(0);
+    Entry {
+        worktree: crate::owner::from_shared_path(&r.worktree),
+        repo_root: crate::owner::from_shared_path(&r.repo_root),
+        branch: r.branch,
+        uid: r.uid,
+        plan: Plan {
+            delete_branch: r.delete_branch,
+            accept_dirty: r.accept_dirty,
+        },
+        recorded_at: secs(r.recorded_at),
+        head: r.head,
+        archive: r.archive.as_deref().map(crate::owner::from_shared_path),
+        archived_at: r.archived_at.map(secs),
+    }
+}
+
+/// Who holds the sweep lease, if anyone — without touching it. The owner id only: the nonce is the
+/// lease's release identity, no part of who holds it, and not something `owner::is_alive` can parse.
 ///
 /// # Errors
-/// Returns an error if the lock exists and cannot be removed.
-pub fn break_lock(db: &Path) -> Result<Option<String>> {
-    SweepLock::break_held(db)
+/// Returns an error if the lease cannot be read.
+pub fn lock_holder(stores: &Stores<'_>) -> Result<Option<String>> {
+    Ok(stores
+        .kb
+        .lease_holder(SWEEP_LEASE)?
+        .map(|h| jkb_core::lease::owner_of(&h).to_owned()))
+}
+
+/// Drop the sweep lease, whoever holds it. Returns the owner id it displaced, if any. Host only: the
+/// daemon refuses it to a client.
+///
+/// # Errors
+/// Returns an error if the lease cannot be broken.
+pub fn break_lock(stores: &Stores<'_>) -> Result<Option<String>> {
+    Ok(stores
+        .kb
+        .lease_break(SWEEP_LEASE)?
+        .map(|h| jkb_core::lease::owner_of(&h).to_owned()))
 }
 
 /// Seconds since the Unix epoch. A clock that cannot be read reads as 0, which makes everything
@@ -247,8 +367,9 @@ pub fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Where the removal records live: beside the database, so the reaper needs no repo context and
-/// one service can sweep every repo the machine has.
+/// Where the removal records lived before they moved into the database: beside it, so the reaper
+/// needed no repo context and one service could sweep every repo the machine has. Still read (see
+/// [`Stores`]).
 #[must_use]
 pub fn store_dir(db: &Path) -> PathBuf {
     db.parent()
@@ -263,70 +384,24 @@ pub fn archive_root(repo_root: &Path) -> PathBuf {
     repo_root.join(".jkb").join("archive")
 }
 
-/// One record per file, named for the worktree it is about. Per-entry files rather than one
-/// document holding a map: two processes sweeping at once then cannot lose each other's updates,
-/// and a take is one `remove_file` touching nothing else.
+/// Write a new record for one disposal.
 ///
-/// The readable part is a slug, and the slug alone is **not** an identity: mapping every
-/// non-alphanumeric character to `-` makes `~/repos/a-b/.jkb/work/s` and `~/repos/a/b/.jkb/work/s`
-/// the same name, and the second record would then overwrite the first — silently leaving one
-/// landed worktree that nothing ever archives. The hash is what makes the name unique; the slug
-/// is there so a person can tell the files apart.
-fn marker_stem(db: &Path, worktree: &Path) -> PathBuf {
-    let raw = worktree.to_string_lossy();
-    let slug: String = raw
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let digest = jkb_core::blob::hash_bytes(raw.as_bytes());
-    store_dir(db).join(format!("{slug}-{}", &digest[..8]))
-}
-
-/// A marker file no existing record occupies.
-///
-/// ONE DISPOSAL, ONE RECORD. The name used to be a pure function of the worktree path — and a
-/// session name is reused: abandon a session (archived to `sess-<stamp>`, recorded), reopen the
-/// task, `jkb task work` mints the same name at the same path, and the next disposal wrote its
-/// record over the first. The first archive was then referenced by nothing: no sweep saw it, no
-/// `doctor` listed it, and a checkout with its build output sat there permanently — defeating the
-/// retention window whose whole job is keeping the disk from filling. `Entry.head` exists because
-/// a path and a branch are both reusable names; the record's own identity was still the path.
-fn fresh_marker(db: &Path, worktree: &Path) -> PathBuf {
-    let stem = marker_stem(db, worktree);
-    // EVERY file carries the counter, zero-padded, so lexical order IS creation order. The first
-    // version left the first file bare and suffixed the rest — and `slug-hash-2.json` sorts BELOW
-    // `slug-hash.json`, because `-` precedes `.`. `governing_pending` breaks a `recorded_at` tie
-    // on the marker, so two disposals in the same second gave the older, withdrawn plan the vote:
-    // the inverse of the rule that function exists for. Making the name order the truth costs one
-    // format string; reasoning about `-` versus `.` at the comparison site does not survive.
-    let mut n = 1;
-    loop {
-        let path = PathBuf::from(format!("{}-{n:04}.json", stem.display()));
-        if !path.exists() {
-            return path;
-        }
-        n += 1;
-    }
-}
-
-/// Write (or replace) the record for one worktree.
+/// ONE DISPOSAL, ONE RECORD. The record's identity is its own — a row id — never the worktree path:
+/// a session name is reused (abandon a session, reopen the task, and `jkb task work` mints the same
+/// name at the same path), and a record keyed by the path was overwritten by the next disposal,
+/// leaving the first archive referenced by nothing and never deleted. `Entry.head` exists because a
+/// path and a branch are both reusable names.
 ///
 /// # Errors
-/// Returns an error if the store cannot be created or the record cannot be written.
-pub fn record(db: &Path, entry: &Entry) -> Result<()> {
-    // A FRESH file every time. This is only ever called to record a NEW disposal; the sweep
-    // updates an existing record through `record_at`, with the marker it read.
-    fs::create_dir_all(store_dir(db))
-        .with_context(|| format!("creating {}", store_dir(db).display()))?;
-    record_at(&fresh_marker(db, &entry.worktree), entry)
+/// Returns an error if the record cannot be written.
+pub fn record(stores: &Stores<'_>, entry: &Entry) -> Result<()> {
+    stores.add(entry)
 }
 
-/// Write one record to a marker file **already chosen**.
+/// Rewrite one record of the old file store, in the file it was read from.
 ///
-/// `reap` updates through this rather than through [`record`], so an entry is written back to the
-/// file it was read from. Recomputing the name would leave the original beside the update the
-/// moment the two disagree — a record read from a hand-written or older-scheme marker then
-/// survives as a second, stale copy of the same worktree, which the next sweep reads as live.
+/// `reap` updates a legacy record through this, so an entry is written back to the file it was read
+/// from and no second copy can appear.
 ///
 /// # Errors
 /// Returns an error if the store cannot be created or the record cannot be written.
@@ -343,18 +418,19 @@ pub fn record_at(path: &Path, entry: &Entry) -> Result<()> {
     Ok(())
 }
 
-/// What the record store holds: the records that parsed, and the files that did not.
+/// What the record store holds: the records that parsed, and the ones that did not.
 #[derive(Default, Debug)]
 pub struct Store {
-    /// `(marker file, record)`, ordered by marker path so a sweep is deterministic.
+    /// `(key, record)`: the old store's files by path, then the rows by id — creation order within
+    /// each, so a sweep is deterministic.
     ///
     /// Only records that [`Record::parse`] accepted. The sweep receives no others, which is why
     /// no arm of it can forget to ask.
-    pub records: Vec<(PathBuf, Record)>,
-    /// Marker files that could not be read or parsed as JSON at all.
+    pub records: Vec<(Key, Record)>,
+    /// Old-store files that could not be read or parsed as JSON at all.
     pub unreadable: Vec<PathBuf>,
-    /// Records that parsed as JSON but describe paths this mechanism does not own. Reported and
-    /// kept, never deleted: a refusal is not a licence to act on the file.
+    /// Records that parsed but describe paths this mechanism does not own. Reported and kept, never
+    /// deleted: a refusal is not a licence to act on the record.
     pub rejected: Vec<Rejected>,
 }
 
@@ -371,76 +447,123 @@ pub struct Store {
 /// the record is what says where it went, and the retention sweep owns it.
 ///
 /// # Errors
-/// Returns an error if the store cannot be read or the record cannot be removed.
-pub fn revoke(db: &Path, worktree: &Path) -> Result<bool> {
-    // UNDER THE SWEEP LOCK. Without it a sweep already in flight is working from a snapshot taken
-    // before this removal: it archives the checkout `task work` is at that moment handing back,
-    // and re-writes the record this deleted. Refusing is the honest outcome — the caller says so
-    // and the operator re-runs — because a cancellation that silently lost the race is worse than
-    // one that admits it.
-    let _lock = SweepLock::acquire(db)?.map_err(|held| {
+/// Returns an error if a sweep is running, or the store cannot be read, or a record cannot be removed.
+pub fn revoke(stores: &Stores<'_>, worktree: &Path) -> Result<bool> {
+    // REFUSED WHILE A SWEEP RUNS. A sweep already in flight is working from a snapshot taken before
+    // this removal: it archives the checkout `task work` is at that moment handing back, and
+    // re-writes the record this deleted. Refusing is the honest outcome — the caller says so and the
+    // operator re-runs — because a cancellation that silently lost the race is worse than one that
+    // admits it.
+    let refused = |holder: &str| {
         anyhow::anyhow!(
             "a sweep is running ({}), so the pending removal could not be cancelled — re-run \
-             this in a moment, or clear a stale lock with `jkb task reap --break-lock`",
-            if held.holder.is_empty() {
+             this in a moment, or clear a stale lease with `jkb task reap --break-lock` on the host",
+            if holder.is_empty() {
                 "holder unknown"
             } else {
-                &held.holder
+                holder
             }
         )
-    })?;
-    // Found by ASKING the store rather than by computing a filename: one worktree can have
-    // several records now (one per disposal), and only the pending ones are cancellable.
+    };
+    // Found by ASKING the store rather than by computing a name: one worktree can have several
+    // records (one per disposal), and only the pending ones are cancellable. Compared as paths this
+    // process resolves, so a record the other side of the bind wrote for this checkout is found too.
+    let pending = |store: Store| -> Vec<Key> {
+        store
+            .records
+            .into_iter()
+            .filter(|(_, r)| {
+                r.archive.is_none() && crate::session::same_path(&r.worktree, worktree)
+            })
+            .map(|(key, _)| key)
+            .collect()
+    };
     let mut cancelled = false;
-    for (path, record) in entries(db)?.records {
-        if record.archive.is_some() || record.worktree != worktree {
-            continue;
+    // The old store's files, under the lease: a file cannot be checked and removed in one step. Only
+    // ever on the host, whose own process a lease left behind names — so the next sweep can prove it
+    // gone.
+    if pending(entries(stores)?)
+        .iter()
+        .any(|k| matches!(k, Key::File(_)))
+    {
+        let lease = SweepLease::acquire(stores)?.map_err(|held| refused(&held.holder))?;
+        for key in pending(entries(stores)?) {
+            if matches!(key, Key::File(_)) {
+                stores.forget(&key)?;
+                cancelled = true;
+            }
         }
-        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-        cancelled = true;
+        drop(lease);
     }
-    Ok(cancelled)
+    // The rows, in ONE write that a sweep in flight refuses — **without taking the lease**, even
+    // when nothing matches, so a running sweep still holds every resume back. Taking it here would
+    // let a `task work` killed in between leave the lease to a holder the host cannot probe (the dev
+    // container's), and the host's reap service would skip every pass until someone broke it.
+    let ids = pending(entries(stores)?)
+        .into_iter()
+        .filter_map(|k| match k {
+            Key::Row(id) => Some(id),
+            Key::File(_) => None,
+        })
+        .collect();
+    let outcome = stores.kb.removal_cancel(ids)?;
+    if let Some(holder) = outcome.sweep_holder {
+        return Err(refused(&holder));
+    }
+    Ok(cancelled || outcome.cancelled > 0)
 }
 
-/// Every record currently in the store, with the marker file each came from.
+/// Every record currently in the store, with the key each is known by.
 ///
 /// # Errors
-/// Returns an error only if the store directory exists and cannot be listed; an absent store is
-/// the ordinary state and reads as empty.
-pub fn entries(db: &Path) -> Result<Store> {
-    let dir = store_dir(db);
+/// Returns an error if the database cannot be read, or the old store's directory exists and cannot be
+/// listed; an absent directory is the ordinary state and reads as empty.
+pub fn entries(stores: &Stores<'_>) -> Result<Store> {
     let mut store = Store::default();
-    let listing = match fs::read_dir(&dir) {
-        Ok(l) => l,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(store),
-        Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
-    };
-    for item in listing {
-        let path = item
-            .with_context(|| format!("listing {}", dir.display()))?
-            .path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
+    let mut admit = |key: Key, entry: Entry| {
+        let uid = entry.uid.clone();
+        match Record::parse(entry) {
+            Ok(record) => store.records.push((key, record)),
+            Err(why) => store.rejected.push(Rejected {
+                marker: key,
+                uid,
+                why,
+            }),
         }
-        match fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|b| serde_json::from_slice::<Entry>(&b).map_err(|e| e.to_string()))
-        {
-            Ok(entry) => {
-                let uid = entry.uid.clone();
-                match Record::parse(entry) {
-                    Ok(record) => store.records.push((path, record)),
-                    Err(why) => store.rejected.push(Rejected {
-                        marker: path,
-                        uid,
-                        why,
-                    }),
+    };
+    let mut files = Vec::new();
+    let mut unreadable = Vec::new();
+    if let Some(dir) = stores.legacy_dir() {
+        match fs::read_dir(&dir) {
+            Ok(listing) => {
+                for item in listing {
+                    let path = item
+                        .with_context(|| format!("listing {}", dir.display()))?
+                        .path();
+                    if path.extension().is_none_or(|e| e != "json") {
+                        continue;
+                    }
+                    match fs::read(&path).map_err(|e| e.to_string()).and_then(|b| {
+                        serde_json::from_slice::<Entry>(&b).map_err(|e| e.to_string())
+                    }) {
+                        Ok(entry) => files.push((path, entry)),
+                        Err(_) => unreadable.push(path),
+                    }
                 }
             }
-            Err(_) => store.unreadable.push(path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
         }
     }
-    store.records.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, entry) in files {
+        admit(Key::File(path), entry);
+    }
+    for row in stores.kb.removals()? {
+        admit(Key::Row(row.id), from_row(row.removal));
+    }
+    unreadable.sort();
+    store.unreadable = unreadable;
     Ok(store)
 }
 
@@ -530,7 +653,7 @@ pub enum Disposed {
 /// Returns an error only if the worktree's HEAD cannot be read, which is the one thing this
 /// cannot proceed without: it is the identity the sweep later checks before acting on the path.
 pub fn dispose(
-    db: &Path,
+    stores: &Stores<'_>,
     repo_root: &Path,
     worktree: &Path,
     branch: &str,
@@ -570,7 +693,7 @@ pub fn dispose(
             // says where the tree went, and an archive nothing records is never swept. A failure
             // here is reported rather than returned — the tree is safely out of the way and the
             // caller's work succeeded, so the cost is disk, and bailing would cost the landing.
-            if let Err(e) = record(db, &entry) {
+            if let Err(e) = record(stores, &entry) {
                 eprintln!(
                     "note: archived to {} but the removal record could not be written ({e}) — it \
                      will not be swept automatically; delete it by hand when you no longer want it",
@@ -612,7 +735,7 @@ pub fn dispose(
             // deletion and drops the record. A refusal must leave something worth preserving, and
             // here there is nothing: the checkout can no longer answer git for itself, and the
             // operator has already said `--force`.
-            if let Err(rec) = record(db, &entry) {
+            if let Err(rec) = record(stores, &entry) {
                 eprintln!(
                     "note: {} could not be archived from here ({e}) and the removal record could \
                      not be written either ({rec}) — remove the directory by hand",
@@ -649,7 +772,7 @@ fn removable(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Exclusive access to the record store for the duration of one sweep.
+/// Exclusive access to the record store for the duration of one sweep: the `removal-sweep` lease.
 ///
 /// Two sweeps racing do lose each other's work, and not hypothetically: the service runs one every
 /// quarter hour and `jkb doctor --fix` runs another on demand. Both read the same pending record;
@@ -657,53 +780,25 @@ fn removable(path: &Path) -> Result<(), String> {
 /// "nothing left to act on" arm and **deletes the record the first just wrote** — leaving an
 /// archive directory nothing tracks and nothing will ever delete.
 ///
-/// Same shape as `session::LandLock`, including its rule: a lock is stale only when its holder is
-/// **proven** gone. An unparseable pid and a probe that could not run are both unestablished, and
-/// breaking a live sweep's lock on an unestablished answer is what the lock exists to prevent.
-struct SweepLock {
-    path: PathBuf,
-    /// EXACTLY WHAT THIS ACQUISITION WROTE. `Drop` unlinks only while the file still contains
-    /// it, for the reason `acquire` states about the stale-lock path: releasing a lock that is no
-    /// longer yours takes its current holder's with it.
-    ///
-    /// The identity has to be something neither the owner id nor the filesystem can hand back:
-    ///
-    /// * the **owner id alone** cannot tell an acquisition from its successor — `host:pid` is the
-    ///   same string for both when one process reacquires, which is what the test for this does;
-    /// * the **inode** was the first fix and is not safe either. `break_lock` unlinks the file,
-    ///   freeing its inode, and the successor creates a new one in the same directory an instant
-    ///   later — on ext4 the just-freed bit in the parent group's bitmap is a prime candidate, so
-    ///   the displaced sweeper's `Drop` would delete the successor's lock. APFS hands out
-    ///   monotonic inode numbers, which is the only reason the test passed on this machine.
-    ///
-    /// So a per-acquisition **nonce** goes in the file beside the owner id, and `content` is the
-    /// whole line as it was read back off disk.
-    ///
-    /// NOT an `Option`. It was one — `None` when the read-back failed — and that spelled "this
-    /// lock has no release identity", which `Drop` could only honour by leaving the file behind
-    /// at the end of a sweep that had run perfectly. The next acquisition then reads an owner id
-    /// of `""`, which `owner::is_alive` cannot recognise and so answers `Fact::Unknown`, which is
-    /// never `is_no()` — so the lock is held for ever by nobody and every later sweep no-ops,
-    /// breakable only by a person running `--break-lock`. A lock that cannot say what it wrote is
-    /// not a lock, so `acquire` removes the file and refuses instead of returning one.
-    content: String,
-}
-
-/// The owner id out of a lock file's `<owner> <nonce>` contents.
+/// A lease is stale only when its holder is **proven** gone. An unparseable id and a probe that could
+/// not run are both unestablished, and breaking a live sweep's lease on an unestablished answer is
+/// what the lease exists to prevent.
 ///
-/// ONE parser, because there are two readers and they must not disagree: `lock_holder` renders
-/// this to the operator, and `SweepLock::acquire` hands it to `owner::is_alive`. Left as the raw
-/// contents, the appended nonce would make every id `Unrecognized` — hence `Fact::Unknown`, hence
-/// never `is_no()` — and no stale lock could ever be broken again.
-fn holder_of(contents: &str) -> &str {
-    // No `.trim()`: `split_whitespace` already skips leading whitespace, and clippy is right
-    // that chaining them is redundant.
-    contents.split_whitespace().next().unwrap_or_default()
+/// It was a file beside the store, and every hard-won rule of that file carries over as a property of
+/// the row: the holder is `<owner id> <nonce>`, so one process's successive acquisitions are told
+/// apart (an inode was not safe, a bare owner id was not either); a takeover and a release are
+/// compare-and-sets on the exact holder, so a displaced sweeper's release cannot take its successor's
+/// lease, and two sweeps judging one stale holder cannot both take over. A file on a bind-mounted
+/// directory was also no lock at all across the two kernels that shared it; a row taken through the
+/// one writer is.
+struct SweepLease<'a> {
+    stores: Stores<'a>,
+    /// Exactly what this acquisition wrote, which is what its release compares against.
+    holder: String,
 }
 
-/// A value no other acquisition of this lock will write. Not security, just distinctness: pid and
-/// a monotonic-ish clock reading, which cannot repeat within one process and cannot collide
-/// across processes.
+/// A value no other acquisition of this lease will write. Not security, just distinctness: pid and a
+/// clock reading, which cannot repeat within one process and cannot collide across processes.
 fn lock_nonce() -> String {
     format!(
         "{}.{}",
@@ -714,139 +809,47 @@ fn lock_nonce() -> String {
     )
 }
 
-impl SweepLock {
-    fn acquire(db: &Path) -> Result<Result<Self, Held>> {
-        let dir = store_dir(db);
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join(".sweep.lock");
+impl<'a> SweepLease<'a> {
+    fn acquire(stores: &Stores<'a>) -> Result<Result<Self, Held>> {
+        let holder = format!("{} {}", crate::owner::self_owner(), lock_nonce());
+        let mut seen = String::new();
+        // Twice: a lease released between the failed take and the read is free on the second round;
+        // one taken over by somebody else in that instant is theirs.
         for _ in 0..2 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    // `<owner> <nonce>`. `lock_holder` reports the first field, so what an
-                    // operator is shown is unchanged.
-                    let line = format!("{} {}", crate::owner::self_owner(), lock_nonce());
-                    let wrote = write!(f, "{line}").is_ok();
-                    drop(f);
-                    // Read back rather than assumed: `Drop` compares against what is ON DISK, so
-                    // an identity that never reached it would make the release a silent no-op and
-                    // wedge the lock for every later sweep.
-                    let content = if wrote {
-                        fs::read_to_string(&path).ok().filter(|c| c.trim() == line)
-                    } else {
-                        None
-                    };
-                    let Some(content) = content else {
-                        // Removing it is safe for the reason that makes this arm reachable at
-                        // all: `create_new` succeeded, so this acquisition is the only party
-                        // that can be holding this file, and the identity never landed, so
-                        // nothing else could recognise it either. Leaving it is the one option
-                        // that costs something — see the field's doc.
-                        let _ = fs::remove_file(&path);
-                        anyhow::bail!(
-                            "could not establish a sweep lock at {} — it was created, but what \
-                             was written to it could not be read back, so releasing it later \
-                             could not be told from releasing whoever holds it by then. The file \
-                             has been removed and nothing was swept; try again.",
-                            path.display()
-                        );
-                    };
-                    return Ok(Ok(Self { path, content }));
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let contents = fs::read_to_string(&path).unwrap_or_default();
-                    let holder = holder_of(&contents);
-                    // `host:pid`, judged by `owner::is_alive`, which answers `Fact`. A BARE pid
-                    // was wrong here in a way it is not for `LandLock`: this store is shared
-                    // across the host/container bind on purpose, and pid 812 in the container is
-                    // a different process from pid 812 on the host — so the lock excluded nothing
-                    // at exactly the boundary where two sweepers meet, and could declare a live
-                    // one dead. An owner on another host is `Unknown`, and unknown respects.
-                    let dead = crate::owner::is_alive(holder).is_no();
-                    if !dead {
-                        // Not an error: the other sweep is doing this sweep's work. A service
-                        // tick that says "someone else is on it" must not read as a failure.
-                        return Ok(Err(Held {
-                            path,
-                            holder: holder.to_owned(),
-                        }));
-                    }
-                    // RE-READ BEFORE UNLINKING, which is the half of `LandLock`'s shape this
-                    // dropped: two sweeps that both judge one stale lock would otherwise both
-                    // remove it, and the second's remove would take the first's fresh lock with
-                    // it. Removing only while the content is still what was judged makes that a
-                    // race one of them loses instead of one they both win.
-                    // Against the WHOLE contents, not the owner id parsed out of it: the file is
-                    // `<owner> <nonce>`, so comparing the first field alone would match a
-                    // successor written by the same host and pid, and comparing to the parsed id
-                    // would never match at all — which would leave the stale lock in place and
-                    // fail every later acquisition.
-                    let still = fs::read_to_string(&path).unwrap_or_default();
-                    if still.trim() == contents.trim() {
-                        let _ = fs::remove_file(&path);
-                    }
-                }
-                Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+            if stores.kb.lease_take(SWEEP_LEASE, &holder, None)? {
+                return Ok(Ok(Self {
+                    stores: *stores,
+                    holder,
+                }));
             }
-        }
-        Ok(Err(Held {
-            path,
-            holder: String::new(),
-        }))
-    }
-
-    /// Remove a lock whoever holds it — the operator's escape.
-    ///
-    /// There is no automatic one and there should not be: a holder on another host is `Unknown`,
-    /// and breaking a live sweeper's lock on an unestablished answer is exactly what the lock
-    /// prevents. But a container that was killed mid-sweep and then rebuilt leaves a holder whose
-    /// hostname no longer exists anywhere, and without this every sweep on both sides no-ops for
-    /// ever with nothing to do about it.
-    ///
-    /// # Errors
-    /// Returns an error if the lock file exists and cannot be removed.
-    fn break_held(db: &Path) -> Result<Option<String>> {
-        let path = store_dir(db).join(".sweep.lock");
-        match fs::read_to_string(&path) {
-            Ok(holder) => {
-                fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-                // THE THIRD READER, and it was the one not routed through the parser. `holder_of`
-                // says "ONE parser, because there are two readers and they must not disagree";
-                // there were three. `--dry-run --break-lock` goes through `lock_holder` and
-                // prints a clean owner id, while `--break-lock` came through here and printed the
-                // same identity with the nonce glued on — two spellings of one id in adjacent
-                // lines of one command, and the second is not something
-                // `jkb task release --owner` will match.
-                Ok(Some(holder_of(&holder).to_owned()))
+            let Some(current) = stores.kb.lease_holder(SWEEP_LEASE)? else {
+                continue;
+            };
+            let owner = jkb_core::lease::owner_of(&current).to_owned();
+            // `host:pid`, judged by `owner::is_alive`, which answers `Fact`. A holder on another host
+            // — the dev container, for the host — is `Unknown`, and unknown respects.
+            if !crate::owner::is_alive(&owner).is_no() {
+                // Not an error: the other sweep is doing this sweep's work. A service tick that says
+                // "someone else is on it" must not read as a failure.
+                return Ok(Err(Held { holder: owner }));
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+            // Proven gone: take it over, but only while it is still exactly what was judged.
+            if stores.kb.lease_take(SWEEP_LEASE, &holder, Some(&current))? {
+                return Ok(Ok(Self {
+                    stores: *stores,
+                    holder,
+                }));
+            }
+            seen = owner;
         }
+        Ok(Err(Held { holder: seen }))
     }
 }
 
-impl Drop for SweepLock {
-    /// Release, but only what is still ours.
-    ///
-    /// An unconditional unlink here undid the rule `acquire` states above it, and `--break-lock`
-    /// is what makes that reachable rather than theoretical: across the host/container bind a
-    /// foreign holder is `Unknown` by construction, so breaking the lock is the ORDINARY remedy
-    /// there, not an escape from a wedge. Break a live sweeper's lock, acquire a fresh one, and
-    /// the displaced sweeper's `Drop` removes the successor's — after which two sweeps run
-    /// concurrently, which is the whole thing this type exists to prevent.
-    ///
-    /// Re-reading is not atomic with the unlink and does not need to be: it converts a race both
-    /// parties win into one a party can only lose by being displaced in the instant between, and
-    /// the displacing party is a person running `--break-lock`.
+impl Drop for SweepLease<'_> {
+    /// Release, but only what is still ours: a compare-and-set on the holder this acquisition wrote.
     fn drop(&mut self) {
-        let mine = self.content.as_str();
-        if fs::read_to_string(&self.path).is_ok_and(|c| c.trim() == mine) {
-            let _ = fs::remove_file(&self.path);
-        }
+        let _ = self.stores.kb.lease_release(SWEEP_LEASE, &self.holder);
     }
 }
 
@@ -901,8 +904,8 @@ impl std::ops::Deref for Record {
 /// rounds removing from everywhere else.
 #[derive(Debug, Clone)]
 pub struct Rejected {
-    /// The marker file, so it can be found and looked at.
-    pub marker: PathBuf,
+    /// The record, so it can be found and looked at.
+    pub marker: Key,
     /// The uid the record claims. A label, never authority.
     pub uid: String,
     /// Why it was refused.
@@ -1513,8 +1516,8 @@ pub fn pending_verdict(entry: &Entry) -> Verdict {
 ///
 /// # Errors
 /// Returns an error if the record store cannot be read.
-pub fn pending_outlook(db: &Path) -> Result<Vec<(Entry, Verdict)>> {
-    Ok(pending_outlook_in(&entries(db)?))
+pub fn pending_outlook(stores: &Stores<'_>) -> Result<Vec<(Entry, Verdict)>> {
+    Ok(pending_outlook_in(&entries(stores)?))
 }
 
 /// [`pending_outlook`] over a store already in hand.
@@ -1545,7 +1548,7 @@ pub fn pending_outlook_in(store: &Store) -> Vec<(Entry, Verdict)> {
 }
 
 /// Which pending record governs each worktree: the newest, by `recorded_at`, ties broken by
-/// marker path so the choice is deterministic rather than whichever the directory listing yielded.
+/// key — creation order — so the choice is deterministic rather than whichever the listing yielded.
 ///
 /// ONE DISPOSAL'S DECISION APPLIES. Giving each disposal its own marker fixed an archived record
 /// being overwritten, and opened this: `abandon --delete-branch`, change your mind, `abandon`
@@ -1555,14 +1558,14 @@ pub fn pending_outlook_in(store: &Store) -> Vec<(Entry, Verdict)> {
 ///
 /// ARCHIVED records are never superseded: each names a distinct archive that still has to be
 /// swept, so they are a set of facts rather than competing instructions.
-fn governing_pending(records: &[(PathBuf, Record)]) -> BTreeMap<PathBuf, PathBuf> {
-    let mut best: BTreeMap<PathBuf, (u64, PathBuf)> = BTreeMap::new();
+fn governing_pending(records: &[(Key, Record)]) -> BTreeMap<PathBuf, Key> {
+    let mut best: BTreeMap<PathBuf, (u64, Key)> = BTreeMap::new();
     for (marker, record) in records {
         if record.archive.is_some() {
             continue;
         }
-        // Marker names sort in creation order (see `fresh_marker`), so the larger pair is the
-        // later disposal even when the timestamps tie.
+        // Keys sort in creation order (see [`Key`]), so the larger pair is the later disposal even
+        // when the timestamps tie.
         let candidate = (record.recorded_at, marker.clone());
         match best.get(&record.worktree) {
             Some(current) if *current >= candidate => {}
@@ -1576,9 +1579,10 @@ fn governing_pending(records: &[(PathBuf, Record)]) -> BTreeMap<PathBuf, PathBuf
 
 /// Drop a pending record a later disposal of the same worktree replaced. Returns whether it did.
 fn superseded(
-    governing: &BTreeMap<PathBuf, PathBuf>,
+    stores: &Stores<'_>,
+    governing: &BTreeMap<PathBuf, Key>,
     entry: &Entry,
-    marker: &Path,
+    marker: &Key,
     dry_run: bool,
     report: &mut Report,
 ) -> bool {
@@ -1592,7 +1596,7 @@ fn superseded(
         return false;
     }
     if !dry_run {
-        let _ = fs::remove_file(marker);
+        let _ = stores.forget(marker);
     }
     report.superseded.push(entry.uid.clone());
     true
@@ -1605,13 +1609,13 @@ fn superseded(
 /// unattended from a service and one wedged entry must not stop the rest.
 ///
 /// # Errors
-/// Returns an error only if the record store itself cannot be listed.
-pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
+/// Returns an error only if the record store itself cannot be read.
+pub fn reap(stores: &Stores<'_>, retain_days: u64, dry_run: bool) -> Result<Report> {
     // One sweep at a time, held across the reads as well as the writes: what races here is the
     // DECISION as much as the write, because two sweeps that both read one pending record both
     // act on it. A sweep that finds the lock held reports nothing and returns — the other process
     // is doing this one's work, which is not a failure.
-    let _lock = match SweepLock::acquire(db)? {
+    let _lease = match SweepLease::acquire(stores)? {
         Ok(lock) => lock,
         Err(held) => {
             return Ok(Report {
@@ -1621,7 +1625,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         }
     };
     let now = now_secs();
-    let store = entries(db)?;
+    let store = entries(stores)?;
     let mut report = Report {
         unreadable: store.unreadable,
         ..Report::default()
@@ -1631,8 +1635,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
             r.uid,
             format!(
                 "{} — refused; this record does not describe anything this sweep owns ({})",
-                r.why,
-                r.marker.display()
+                r.why, r.marker
             ),
         ));
     }
@@ -1641,7 +1644,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
 
     for (marker, record) in store.records {
         let mut entry = record.clone_entry();
-        if superseded(&governing, &entry, &marker, dry_run, &mut report) {
+        if superseded(stores, &governing, &entry, &marker, dry_run, &mut report) {
             continue;
         }
         // CAN THIS PROCESS SEE THE REPO AT ALL, before either arm looks at the record. Above the
@@ -1669,6 +1672,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         // Already archived, so the only question left is whether it is old enough to delete.
         if let Some(dir) = entry.archive.clone() {
             sweep_archived(
+                stores,
                 &dir,
                 &entry,
                 &marker,
@@ -1681,7 +1685,7 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
         }
 
         // Not archived yet: this is the deferred half of a landing.
-        sweep_pending(&mut entry, &marker, now, dry_run, &mut report);
+        sweep_pending(stores, &mut entry, &marker, now, dry_run, &mut report);
     }
 
     Ok(report)
@@ -1691,7 +1695,14 @@ pub fn reap(db: &Path, retain_days: u64, dry_run: bool) -> Result<Report> {
 ///
 /// Sibling of [`sweep_archived`], and split out for the same reason — the reachability check that
 /// licenses reading an absence at all runs in the caller, above both.
-fn sweep_pending(entry: &mut Entry, marker: &Path, now: u64, dry_run: bool, report: &mut Report) {
+fn sweep_pending(
+    stores: &Stores<'_>,
+    entry: &mut Entry,
+    marker: &Key,
+    now: u64,
+    dry_run: bool,
+    report: &mut Report,
+) {
     // ONE decision, and it is not made here. The sweep EXECUTES the verdict that
     // `report_landing`, `report_abandon` and `jkb doctor` all render, so a verb can no longer
     // promise something the sweep will not do — which it did, for every record whose tree could
@@ -1702,7 +1713,7 @@ fn sweep_pending(entry: &mut Entry, marker: &Path, now: u64, dry_run: bool, repo
                 let _ = gitrepo::prune_worktrees(&entry.repo_root);
                 delete_branch_if_any(entry, report);
             }
-            drop_marker(marker, dry_run, report, &entry.uid);
+            drop_marker(stores, marker, dry_run, report, &entry.uid);
             return;
         }
         Verdict::Hold(blocked) => {
@@ -1726,8 +1737,8 @@ fn sweep_pending(entry: &mut Entry, marker: &Path, now: u64, dry_run: bool, repo
             entry.archived_at = Some(now);
             // THE RECORD IS WRITTEN FIRST, before the two git commands below, because those
             // can fail and this is the only thing that says where the tree went. Written back
-            // to the SAME file it was read from, so no second copy can appear.
-            if let Err(e) = record_at(marker, entry) {
+            // to the SAME record it was read from, so no second copy can appear.
+            if let Err(e) = stores.archived(marker, entry) {
                 report.held.push((
                     entry.uid.clone(),
                     format!(
@@ -1761,9 +1772,10 @@ fn sweep_pending(entry: &mut Entry, marker: &Path, now: u64, dry_run: bool, repo
 /// all runs in the caller, above both arms.
 #[allow(clippy::too_many_arguments)]
 fn sweep_archived(
+    stores: &Stores<'_>,
     dir: &Path,
     entry: &Entry,
-    marker: &Path,
+    marker: &Key,
     retain_days: u64,
     now: u64,
     dry_run: bool,
@@ -1779,7 +1791,7 @@ fn sweep_archived(
     match presence::present_under(dir, &entry.repo_root) {
         // Somebody removed it by hand. Nothing owed, so stop tracking it.
         presence::Presence::Gone => {
-            drop_marker(marker, dry_run, report, &entry.uid);
+            drop_marker(stores, marker, dry_run, report, &entry.uid);
             return;
         }
         // Dropping the record here is destructive in the quiet way: it is the only thing that
@@ -1832,13 +1844,14 @@ fn sweep_archived(
         ));
     } else {
         report.deleted.push(dir.to_path_buf());
-        drop_marker(marker, dry_run, report, "");
+        drop_marker(stores, marker, dry_run, report, "");
     }
 }
 
-fn drop_marker(marker: &Path, dry_run: bool, report: &mut Report, uid: &str) {
+fn drop_marker(stores: &Stores<'_>, marker: &Key, dry_run: bool, report: &mut Report, uid: &str) {
+    // A record that could not be dropped is still there, and the next sweep finds it again.
     if !dry_run {
-        let _ = fs::remove_file(marker);
+        let _ = stores.forget(marker);
     }
     if !uid.is_empty() {
         report.cleared.push(uid.to_owned());
@@ -1933,6 +1946,26 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database at a test's path, and the stores over it: its rows, and the old file store beside it.
+    struct TestKb {
+        backend: jkb_api::LocalBackend,
+        db: PathBuf,
+    }
+
+    impl TestKb {
+        fn at(db: &Path) -> Self {
+            Self {
+                backend: jkb_api::LocalBackend::new(jkb_core::Db::open(db).expect("db"))
+                    .with_actor("cli"),
+                db: db.to_path_buf(),
+            }
+        }
+
+        fn stores(&self) -> Stores<'_> {
+            Stores::new(Kb::new(&self.backend), Some(&self.db))
+        }
+    }
 
     fn entry(worktree: &Path, repo: &Path) -> Entry {
         Entry {
@@ -2031,14 +2064,16 @@ mod tests {
     fn two_worktrees_whose_slugs_collide_keep_separate_records() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         // Identical once every non-alphanumeric character becomes `-`, which is why the name
         // cannot be the slug alone.
         let a = Path::new("/r/a-b/.jkb/work/s");
         let b = Path::new("/r/a/b/.jkb/work/s");
-        record(&db, &entry(a, Path::new("/r/a-b"))).expect("a");
-        record(&db, &entry(b, Path::new("/r/a/b"))).expect("b");
+        record(&s, &entry(a, Path::new("/r/a-b"))).expect("a");
+        record(&s, &entry(b, Path::new("/r/a/b"))).expect("b");
 
-        let records = entries(&db).expect("entries").records;
+        let records = entries(&s).expect("entries").records;
         assert_eq!(records.len(), 2, "neither record overwrote the other");
         let mut seen: Vec<&Path> = records.iter().map(|(_, e)| e.worktree.as_path()).collect();
         seen.sort_unstable();
@@ -2094,11 +2129,13 @@ mod tests {
     fn a_pending_record_is_archived_and_then_swept_when_it_ages_out() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
-        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        record(&s, &session_entry(&repo, &wt, &branch, &head)).expect("record");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(
             r.archived.len(),
             1,
@@ -2110,16 +2147,16 @@ mod tests {
         assert!(dest.exists(), "and the archive is where the report says");
 
         // Still inside the window: the sweep must NOT delete it.
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(r.retained.len(), 1);
         assert!(dest.exists(), "a fresh archive is kept");
         assert!(r.deleted.is_empty());
 
         // Past it.
-        let r = reap(&db, 0, false).expect("reap");
+        let r = reap(&s, 0, false).expect("reap");
         assert_eq!(r.deleted, vec![dest.clone()]);
         assert!(!dest.exists(), "an aged-out archive is deleted");
-        let left = entries(&db).expect("entries").records;
+        let left = entries(&s).expect("entries").records;
         assert!(left.is_empty(), "and its record goes with it");
     }
 
@@ -2127,6 +2164,8 @@ mod tests {
     fn archiving_updates_the_marker_it_read_rather_than_writing_a_second_one() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
         // A marker under a name `marker_path` would not choose — an older scheme, or one written
@@ -2136,11 +2175,15 @@ mod tests {
         let e = session_entry(&repo, &wt, &branch, &head);
         fs::write(&marker, serde_json::to_vec(&e).expect("json")).expect("write");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(r.archived.len(), 1);
-        let left = entries(&db).expect("entries").records;
+        let left = entries(&s).expect("entries").records;
         assert_eq!(left.len(), 1, "one record, not the original plus an update");
-        assert_eq!(left[0].0, marker, "and it is the file the sweep read");
+        assert_eq!(
+            left[0].0,
+            Key::File(marker),
+            "and it is the file the sweep read"
+        );
         assert!(left[0].1.archive.is_some(), "carrying where the tree went");
     }
 
@@ -2157,6 +2200,8 @@ mod tests {
 
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
         let dir = archive_root(&repo).join("sess-19700101T000000Z");
@@ -2178,7 +2223,7 @@ mod tests {
         let parent = archive_root(&repo);
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).expect("chmod");
         let stat_failed = dir.try_exists().is_err();
-        let r = reap(&db, RETAIN_DAYS, false);
+        let r = reap(&s, RETAIN_DAYS, false);
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("restore");
 
         assert!(
@@ -2208,6 +2253,8 @@ mod tests {
         for moved in [false, true] {
             let t = tempfile::tempdir().expect("tempdir");
             let db = t.path().join("jkb.db");
+            let kb = TestKb::at(&db);
+            let s = kb.stores();
             let repo = t.path().join("repo");
             let (wt, branch, head) = session(&repo, "sess");
             fs::create_dir_all(store_dir(&db)).expect("mk");
@@ -2248,7 +2295,7 @@ mod tests {
                 "the premise: git answers about the enclosing repo, so this is a proven wreck"
             );
 
-            let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+            let r = reap(&s, RETAIN_DAYS, false).expect("reap");
             assert_eq!(r.archived.len(), 1, "the tree is stowed either way: {r:?}");
 
             // `branch --list`, not `rev-parse --verify`: the fixture's `git` asserts success, and
@@ -2288,6 +2335,8 @@ mod tests {
     fn a_session_whose_head_cannot_be_read_is_still_archived() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, _) = session(&repo, "sess");
 
@@ -2300,7 +2349,7 @@ mod tests {
         );
 
         let out = dispose(
-            &db,
+            &s,
             &repo,
             &wt,
             &branch,
@@ -2612,13 +2661,15 @@ mod tests {
     fn only_the_governing_record_is_reported() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, _) = session(&repo, "sess");
         fs::write(repo.join(".jkb/archive"), b"in the way").expect("write");
 
         for accept_dirty in [false, true] {
             let out = dispose(
-                &db,
+                &s,
                 &repo,
                 &wt,
                 &branch,
@@ -2632,12 +2683,12 @@ mod tests {
             assert!(matches!(out, Disposed::Deferred(_)));
         }
         assert_eq!(
-            entries(&db).expect("entries").records.len(),
+            entries(&s).expect("entries").records.len(),
             2,
             "the premise: two disposals of one worktree really did leave two records"
         );
 
-        let outlook = pending_outlook(&db).expect("outlook");
+        let outlook = pending_outlook(&s).expect("outlook");
         assert_eq!(
             outlook.len(),
             1,
@@ -2963,6 +3014,8 @@ mod tests {
     fn a_deferred_disposal_whose_head_cannot_be_read_is_recorded_rather_than_refused() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, _) = session(&repo, "sess");
 
@@ -2977,7 +3030,7 @@ mod tests {
         );
 
         let out = dispose(
-            &db,
+            &s,
             &repo,
             &wt,
             &branch,
@@ -2990,7 +3043,7 @@ mod tests {
         .expect("recorded, not refused — the caller's claim release is behind this `?`");
         assert!(matches!(out, Disposed::Deferred(_)));
 
-        let records = entries(&db).expect("entries").records;
+        let records = entries(&s).expect("entries").records;
         assert_eq!(records.len(), 1, "the tree is remembered, not forgotten");
         assert!(
             records[0].1.head.is_none(),
@@ -3023,12 +3076,14 @@ mod tests {
     fn the_sweep_does_not_identify_a_worktree_by_its_parents_head() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, _) = session(&repo, "sess");
 
         fs::write(repo.join(".jkb/archive"), b"in the way").expect("write");
         let out = dispose(
-            &db,
+            &s,
             &repo,
             &wt,
             &branch,
@@ -3040,7 +3095,7 @@ mod tests {
         )
         .expect("dispose");
         assert!(matches!(out, Disposed::Deferred(_)));
-        let entry = entries(&db).expect("entries").records.remove(0).1;
+        let entry = entries(&s).expect("entries").records.remove(0).1;
         let want = entry
             .head
             .clone()
@@ -3097,11 +3152,13 @@ mod tests {
 
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
 
         record(
-            &db,
+            &s,
             &Entry {
                 head: Some(head),
                 branch: branch.clone(),
@@ -3117,7 +3174,7 @@ mod tests {
         let work = repo.join(".jkb/work");
         fs::set_permissions(&work, fs::Permissions::from_mode(0o000)).expect("chmod 000");
         let stat = fs::metadata(&wt).err().map(|e| e.kind());
-        let swept = reap(&db, 0, false);
+        let swept = reap(&s, 0, false);
         fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).expect("restore");
 
         assert_eq!(
@@ -3154,6 +3211,8 @@ mod tests {
 
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, _, head) = session(&repo, "sess");
         let root = archive_root(&repo);
@@ -3162,7 +3221,7 @@ mod tests {
         fs::write(archived.join("f"), b"x").expect("write");
 
         record(
-            &db,
+            &s,
             &Entry {
                 head: Some(head),
                 archive: Some(archived.clone()),
@@ -3175,7 +3234,7 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).expect("chmod 000");
         let stat = fs::metadata(&archived).err().map(|e| e.kind());
         // Retention 0, so a sweep that got past the guard would go on to delete it.
-        let swept = reap(&db, 0, false);
+        let swept = reap(&s, 0, false);
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("restore");
 
         assert_eq!(
@@ -3196,6 +3255,8 @@ mod tests {
     fn a_deferred_disposal_records_the_head_the_worktree_is_actually_on() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, _) = session(&repo, "sess");
 
@@ -3213,7 +3274,7 @@ mod tests {
         let after = git(&wt, &["rev-parse", "HEAD"]);
 
         let out = dispose(
-            &db,
+            &s,
             &repo,
             &wt,
             &branch,
@@ -3230,7 +3291,7 @@ mod tests {
         );
         assert!(wt.exists(), "and nothing was");
 
-        let records = entries(&db).expect("entries").records;
+        let records = entries(&s).expect("entries").records;
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].1.head.as_deref(),
@@ -3240,7 +3301,7 @@ mod tests {
 
         // ...which is what lets the reaper act on it once the obstruction is gone.
         fs::remove_file(repo.join(".jkb/archive")).expect("rm");
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(r.archived.len(), 1, "held for no reason: {:?}", r.held);
     }
 
@@ -3254,31 +3315,35 @@ mod tests {
     fn observing_is_not_acting_and_an_unchanged_observation_is_one_fingerprint() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         // A container-written record: this machine cannot reach the repo, so it is held for ever.
         let repo = unreachable_repo(&t);
         let e = Entry {
             head: Some("abc".into()),
             ..entry(&repo.join(".jkb/work/s"), &repo)
         };
-        record(&db, &e).expect("record");
+        record(&s, &e).expect("record");
 
-        let first = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let first = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(first.held.len(), 1, "it is held: {:?}", first.held);
         assert!(
             first.is_empty(),
             "but nothing was DONE, so the watcher has no action to report"
         );
 
-        let second = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let second = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(
             first.observed(),
             second.observed(),
             "and an unchanged observation reads the same, so it is said once rather than hourly"
         );
 
-        // A new thing to observe changes the fingerprint, so it is not silence either.
+        // A new thing to observe changes the fingerprint, so it is not silence either: here a torn
+        // file in the old store, which is still read.
+        fs::create_dir_all(store_dir(&db)).expect("mk");
         fs::write(store_dir(&db).join("torn.json"), b"{not json").expect("write");
-        let third = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let third = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_ne!(
             second.observed(),
             third.observed(),
@@ -3286,112 +3351,106 @@ mod tests {
         );
     }
 
+    /// Take the sweep lease for `owner`, as another sweeper would.
+    fn hold(s: &Stores<'_>, owner: &str) {
+        assert!(s
+            .kb
+            .lease_take(SWEEP_LEASE, &format!("{owner} elsewhere"), None)
+            .expect("take"));
+    }
+
     #[test]
-    fn releasing_the_lock_never_removes_a_successors() {
+    fn releasing_the_lease_never_removes_a_successors() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
-        let path = store_dir(&db).join(".sweep.lock");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
 
-        let Ok(displaced) = SweepLock::acquire(&db).expect("acquire") else {
-            panic!("the lock is free to begin with")
+        let Ok(displaced) = SweepLease::acquire(&s).expect("acquire") else {
+            panic!("the lease is free to begin with")
         };
 
-        // What `--break-lock` does. NOT an exotic path across the host/container bind: a foreign
-        // holder is `Unknown` there by construction, so `jkb task reap` advises breaking it and
-        // the operator is invited to do exactly this against a live sweeper.
-        // ITS RETURN VALUE, not merely that there was one. `break_held` read the file directly
-        // instead of going through `holder_of`, so `--break-lock` printed the owner id with the
-        // release nonce glued on while `--dry-run --break-lock`, which goes through
-        // `lock_holder`, printed it clean — one identity rendered two ways by adjacent lines of
-        // one command, and the noisy one is not something `jkb task release --owner` matches.
+        // What `--break-lock` does — the ordinary remedy across the host/container bind, where a
+        // foreign holder is `Unknown` by construction. It reports the OWNER, never the nonce: that is
+        // what `jkb task release --owner` and the liveness probe take.
         assert_eq!(
-            break_lock(&db).expect("break").as_deref(),
+            break_lock(&s).expect("break").as_deref(),
             Some(crate::owner::self_owner().as_str()),
-            "every reader of the lock file goes through the one parser"
         );
-        let Ok(successor) = SweepLock::acquire(&db).expect("acquire") else {
-            panic!("the lock is free again once it has been broken")
+        let Ok(successor) = SweepLease::acquire(&s).expect("acquire") else {
+            panic!("the lease is free again once it has been broken")
         };
 
-        // The displaced sweeper finishes and releases. `Drop` used to unlink unconditionally,
-        // taking the successor's lock with it — after which two sweeps run at once, which is the
-        // one thing this type exists to prevent.
+        // The displaced sweeper finishes and releases. An unconditional release would take the
+        // successor's lease with it — after which two sweeps run at once.
         drop(displaced);
-        assert!(
-            path.exists(),
-            "the successor still holds the lock after the displaced sweeper released"
+        assert_eq!(
+            s.kb.lease_holder(SWEEP_LEASE).expect("get"),
+            Some(successor.holder.clone()),
+            "the successor still holds the lease after the displaced sweeper released"
         );
         assert_eq!(
-            lock_holder(&db).expect("holder").as_deref(),
+            lock_holder(&s).expect("holder").as_deref(),
             Some(crate::owner::self_owner().as_str()),
-            "and it is still the successor's"
         );
 
         drop(successor);
-        assert!(!path.exists(), "the holder's own release does remove it");
+        assert_eq!(
+            lock_holder(&s).expect("holder"),
+            None,
+            "the holder's own release does free it"
+        );
     }
 
-    /// Two acquisitions never share a release identity, whatever the filesystem does.
-    ///
-    /// The identity was the inode, and that is not safe: `break_lock` unlinks the file, freeing
-    /// its inode, and on ext4 the just-freed bit in the parent group's bitmap is a prime
-    /// candidate for the successor created an instant later — so the displaced sweeper's `Drop`
-    /// would delete the successor's lock and two sweeps would run at once. APFS hands out
-    /// monotonic inode numbers, which is the only reason the sibling test above passes here; a
-    /// test asserting a property the local filesystem happens to provide is not a test of the
-    /// code. The nonce is what makes it hold on both.
+    /// Two acquisitions by one process never share a release identity: the owner id alone cannot tell
+    /// them apart, so the nonce must.
     #[test]
     fn two_acquisitions_never_share_a_release_identity() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
 
-        let Ok(first) = SweepLock::acquire(&db).expect("acquire") else {
+        let Ok(first) = SweepLease::acquire(&s).expect("acquire") else {
             panic!("free to begin with")
         };
-        let one = first.content.clone();
-        break_lock(&db).expect("break").expect("there was a holder");
-        let Ok(second) = SweepLock::acquire(&db).expect("acquire") else {
+        let one = first.holder.clone();
+        break_lock(&s).expect("break").expect("there was a holder");
+        let Ok(second) = SweepLease::acquire(&s).expect("acquire") else {
             panic!("free again once broken")
         };
-        let two = second.content.clone();
+        let two = second.holder.clone();
 
-        assert_ne!(
-            one, two,
-            "same process, same host, same pid — so an identity built from the owner id alone \
-             cannot tell these apart, and one built from the inode cannot on a filesystem that \
-             reuses them"
-        );
-        // The owner id is still what an operator is shown, nonce and all kept out of it.
+        assert_ne!(one, two, "same process, same host, same pid");
         assert_eq!(
-            lock_holder(&db).expect("holder").as_deref(),
+            lock_holder(&s).expect("holder").as_deref(),
             Some(crate::owner::self_owner().as_str()),
-            "the nonce is a release identity, not part of who holds the lock"
+            "the nonce is a release identity, not part of who holds the lease"
         );
         drop(first);
-        assert!(
-            store_dir(&db).join(".sweep.lock").exists(),
-            "and the displaced sweeper still does not take its successor's lock"
+        assert_eq!(
+            s.kb.lease_holder(SWEEP_LEASE).expect("get"),
+            Some(two),
+            "and the displaced sweeper still does not take its successor's lease"
         );
         drop(second);
     }
 
     #[test]
-    fn a_sweep_that_could_not_take_the_lock_says_so_rather_than_reporting_nothing_to_do() {
+    fn a_sweep_that_could_not_take_the_lease_says_so_rather_than_reporting_nothing_to_do() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
-        // A live holder, written the way `acquire` writes it. A BARE pid would pass this test
-        // for the wrong reason: `owner::is_alive` cannot parse one, so it answers `Unknown` and
-        // the lock is respected — which a garbage string achieves equally well. The id has to be
-        // one the liveness probe actually recognises, or the test is about parsing, not liveness.
-        fs::create_dir_all(store_dir(&db)).expect("mk");
-        let lock = store_dir(&db).join(".sweep.lock");
-        fs::write(&lock, crate::owner::self_owner()).expect("write");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
+        // A live holder, in the shape `acquire` writes. A holder the liveness probe cannot parse
+        // would pass this for the wrong reason: `Unknown` is respected too.
+        hold(&s, &crate::owner::self_owner());
         assert!(
             crate::owner::is_alive(&crate::owner::self_owner()).is_yes(),
             "the fixture's holder must be recognised as ALIVE, or this asserts nothing"
         );
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         let held = r
             .skipped
             .expect("it did not look, and that is not finding nothing");
@@ -3402,22 +3461,30 @@ mod tests {
         );
 
         // ...and a holder PROVEN gone is taken over, or one crashed sweep wedges the machine's
-        // reaper for ever. THIS host — a pid on another one is `Unknown`, which is respected, so
-        // a foreign hostname here would assert the opposite of what this line says.
+        // reaper for ever. THIS host — a pid on another one is `Unknown`, which is respected.
         let dead_holder = format!("{}:4294967290", crate::owner::hostname_for_test());
         assert!(
             crate::owner::is_alive(&dead_holder).is_no(),
             "the fixture's holder must be PROVEN gone, or this asserts nothing"
         );
-        fs::write(&lock, &dead_holder).expect("write");
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
-        assert!(r.skipped.is_none(), "a dead holder's lock is taken over");
+        break_lock(&s).expect("break");
+        hold(&s, &dead_holder);
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
+        assert!(r.skipped.is_none(), "a dead holder's lease is taken over");
+        assert_eq!(lock_holder(&s).expect("holder"), None, "and released after");
+
+        // A holder on another host is `Unknown`, and unknown frees nothing.
+        hold(&s, "host:some-other-machine:12");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
+        assert!(r.skipped.is_some(), "a foreign holder is respected");
     }
 
     #[test]
     fn a_record_written_before_the_plan_existed_still_reads_and_keeps_the_branch() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         fs::create_dir_all(store_dir(&db)).expect("mk");
         // Exactly the shape this shipped with before `Plan`: no `delete_branch`, no
         // `accept_dirty`. It has to parse, and it has to default to the SAFE answers — keep the
@@ -3429,7 +3496,7 @@ mod tests {
         )
         .expect("write");
 
-        let store = entries(&db).expect("entries");
+        let store = entries(&s).expect("entries");
         assert!(store.unreadable.is_empty(), "an older record still parses");
         assert_eq!(store.records.len(), 1);
         let plan = store.records[0].1.plan;
@@ -3444,6 +3511,8 @@ mod tests {
     fn a_record_round_trips_through_the_store() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let e = Entry {
             plan: Plan {
                 delete_branch: true,
@@ -3452,8 +3521,8 @@ mod tests {
             head: Some("cafe".into()),
             ..entry(Path::new("/r/.jkb/work/s"), Path::new("/r"))
         };
-        record(&db, &e).expect("record");
-        let back = entries(&db).expect("entries").records.pop().expect("one").1;
+        record(&s, &e).expect("record");
+        let back = entries(&s).expect("entries").records.pop().expect("one").1;
         assert!(
             back.plan.delete_branch && back.plan.accept_dirty,
             "the plan survives the store"
@@ -3466,6 +3535,8 @@ mod tests {
     fn the_sweep_applies_the_plan_the_verb_recorded_not_lands_defaults() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
         // `jkb task abandon` without --delete-branch: the branch holds the only copy of the work,
@@ -3477,9 +3548,9 @@ mod tests {
             },
             ..session_entry(&repo, &wt, &branch, &head)
         };
-        record(&db, &e).expect("record");
+        record(&s, &e).expect("record");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(
             r.archived.len(),
             1,
@@ -3496,6 +3567,8 @@ mod tests {
     fn an_accepted_dirty_tree_does_not_hold_the_sweep_for_ever() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
         // `--force` is the operator saying they accept what is uncommitted in there. Asking again
@@ -3507,10 +3580,10 @@ mod tests {
             },
             ..session_entry(&repo, &wt, &branch, &head)
         };
-        record(&db, &e).expect("record");
+        record(&s, &e).expect("record");
         fs::write(wt.join("scratch.txt"), "unsaved").expect("write");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(r.archived.len(), 1, "held anyway: {:?}", r.held);
         assert!(
             r.archived[0].1.join("scratch.txt").exists(),
@@ -3522,34 +3595,38 @@ mod tests {
     fn a_record_can_be_cancelled_while_it_is_still_pending() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
-        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        record(&s, &session_entry(&repo, &wt, &branch, &head)).expect("record");
 
         assert!(
-            revoke(&db, &wt).expect("revoke"),
+            revoke(&s, &wt).expect("revoke"),
             "a pending record is cancellable"
         );
-        assert!(entries(&db).expect("entries").records.is_empty());
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        assert!(entries(&s).expect("entries").records.is_empty());
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(r.archived.is_empty(), "and the live session is left alone");
         assert!(wt.exists());
 
         // ...but once the tree has been moved the record is what says where it went, so it is
         // the retention sweep's and cancelling it would strand the archive.
-        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
-        reap(&db, RETAIN_DAYS, false).expect("reap");
+        record(&s, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(
-            !revoke(&db, &wt).expect("revoke"),
+            !revoke(&s, &wt).expect("revoke"),
             "an archived record is not cancellable"
         );
-        assert_eq!(entries(&db).expect("entries").records.len(), 1);
+        assert_eq!(entries(&s).expect("entries").records.len(), 1);
     }
 
     #[test]
     fn a_traversal_out_of_the_archive_root_is_refused_not_followed() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         fs::create_dir_all(&repo).expect("mk");
         let victim = t.path().join("Documents");
@@ -3577,21 +3654,21 @@ mod tests {
         )
         .expect("write");
 
-        let store = entries(&db).expect("entries");
+        let store = entries(&s).expect("entries");
         assert!(
             store.records.is_empty(),
             "the sweep is never handed a record it has not proven"
         );
         assert_eq!(store.rejected.len(), 1, "it is refused, with the reason");
 
-        let r = reap(&db, 0, false).expect("reap");
+        let r = reap(&s, 0, false).expect("reap");
         assert!(r.deleted.is_empty());
         assert!(
             victim.join("taxes/2025.pdf").exists(),
             "and the directory it aimed at is untouched"
         );
         assert_eq!(
-            entries(&db).expect("entries").rejected.len(),
+            entries(&s).expect("entries").rejected.len(),
             1,
             "a refusal is not a licence to delete the file either"
         );
@@ -3601,6 +3678,8 @@ mod tests {
     fn an_unreachable_repo_holds_an_archived_record_too() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         // One side writes a record the other cannot reach — the container's `/home/vscode/…` swept
         // on the host, or the reverse. The archived arm used to read "not visible from here" as
         // "somebody removed it by hand" and drop the record, so each side destroyed the other's and
@@ -3612,13 +3691,13 @@ mod tests {
             head: Some("abc".into()),
             ..entry(&repo.join(".jkb/work/s"), &repo)
         };
-        record(&db, &e).expect("record");
+        record(&s, &e).expect("record");
 
-        let r = reap(&db, 0, false).expect("reap");
+        let r = reap(&s, 0, false).expect("reap");
         assert!(r.cleared.is_empty(), "an unreachable repo settles nothing");
         assert_eq!(r.held.len(), 1, "{:?}", r.held);
         assert_eq!(
-            entries(&db).expect("entries").records.len(),
+            entries(&s).expect("entries").records.len(),
             1,
             "the record survives for whichever side can see the repo"
         );
@@ -3634,6 +3713,8 @@ mod tests {
     fn a_same_second_redisposal_is_still_governed_by_the_later_one() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
 
@@ -3641,13 +3722,13 @@ mod tests {
         let mut first = session_entry(&repo, &wt, &branch, &head);
         first.plan.delete_branch = true;
         first.recorded_at = stamp;
-        record(&db, &first).expect("first");
+        record(&s, &first).expect("first");
         let mut second = session_entry(&repo, &wt, &branch, &head);
         second.plan.delete_branch = false;
         second.recorded_at = stamp; // the same second, so only the marker order can decide
-        record(&db, &second).expect("second");
+        record(&s, &second).expect("second");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(r.superseded.len(), 1, "one of them is withdrawn: {r:?}");
         assert!(
             gitrepo::rev(&repo, &branch).expect("rev").is_some(),
@@ -3659,6 +3740,8 @@ mod tests {
     fn a_withdrawn_decision_does_not_still_delete_the_branch() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
 
@@ -3668,13 +3751,13 @@ mod tests {
         let mut first = session_entry(&repo, &wt, &branch, &head);
         first.plan.delete_branch = true;
         first.recorded_at = 1;
-        record(&db, &first).expect("first");
+        record(&s, &first).expect("first");
         let mut second = session_entry(&repo, &wt, &branch, &head);
         second.plan.delete_branch = false;
         second.recorded_at = 2;
-        record(&db, &second).expect("second");
+        record(&s, &second).expect("second");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(
             r.superseded.len(),
             1,
@@ -3686,7 +3769,7 @@ mod tests {
             "the branch the LATER disposal said it kept is still there"
         );
         assert_eq!(
-            entries(&db).expect("entries").records.len(),
+            entries(&s).expect("entries").records.len(),
             1,
             "one record survives, and it is the archived one"
         );
@@ -3696,6 +3779,8 @@ mod tests {
     fn two_archived_records_for_one_worktree_are_both_kept() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let wt = repo.join(".jkb/work/sess");
         // Archived records are facts, not competing instructions: each names a distinct archive
@@ -3712,10 +3797,10 @@ mod tests {
                 ..entry(&wt, &repo)
             };
             fs::create_dir_all(e.archive.as_ref().expect("set")).expect("mk");
-            record(&db, &e).expect("record");
+            record(&s, &e).expect("record");
         }
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(r.superseded.is_empty(), "neither archive is superseded");
         assert_eq!(r.retained.len(), 2, "both are tracked to their retention");
     }
@@ -3724,6 +3809,8 @@ mod tests {
     fn a_second_disposal_of_one_session_does_not_overwrite_the_first_record() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let wt = repo.join(".jkb/work/sess");
         // A session name is REUSED: abandon, reopen the task, `task work` mints the same name at
@@ -3741,10 +3828,10 @@ mod tests {
             head: Some("bbb".into()),
             ..entry(&wt, &repo)
         };
-        record(&db, &first).expect("first");
-        record(&db, &second).expect("second");
+        record(&s, &first).expect("first");
+        record(&s, &second).expect("second");
 
-        let kept = entries(&db).expect("entries").records;
+        let kept = entries(&s).expect("entries").records;
         assert_eq!(kept.len(), 2, "both disposals are tracked");
         let mut archives: Vec<String> = kept
             .iter()
@@ -3762,6 +3849,8 @@ mod tests {
     fn a_record_pointing_outside_the_repo_deletes_nothing() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         fs::create_dir_all(&repo).expect("mk");
         // Somebody's documents. The record store is inside the `~/.jkb` bind, which the container
@@ -3777,9 +3866,9 @@ mod tests {
             head: Some("abc".into()),
             ..entry(&repo.join(".jkb/work/s"), &repo)
         };
-        record(&db, &e).expect("record");
+        record(&s, &e).expect("record");
 
-        let r = reap(&db, 0, false).expect("reap");
+        let r = reap(&s, 0, false).expect("reap");
         assert!(r.deleted.is_empty(), "nothing outside the repo is deleted");
         assert_eq!(r.held.len(), 1, "it is held, with the reason: {:?}", r.held);
         assert!(
@@ -3792,6 +3881,8 @@ mod tests {
     fn a_record_naming_a_worktree_outside_jkb_work_is_refused() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         fs::create_dir_all(&repo).expect("mk");
         let elsewhere = t.path().join("not-a-session");
@@ -3802,14 +3893,14 @@ mod tests {
             head: Some("abc".into()),
             ..entry(&elsewhere, &repo)
         };
-        record(&db, &e).expect("record");
+        record(&s, &e).expect("record");
 
         // REFUSED BY `Record::parse`, and the assertion says so — this used to check only that
         // exactly one record was held, which `still_the_recorded_session` satisfies on its own
         // (a path outside `.jkb/work` is no registered worktree either), so the one test pinning
         // the bound on what `stow`'s `fs::rename` may pick up passed with the containment half of
         // the parser deleted. The refusal has its own wording; ask for it.
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(r.archived.is_empty(), "and nothing is moved either");
         assert_eq!(r.held.len(), 1, "{:?}", r.held);
         assert!(
@@ -3820,7 +3911,7 @@ mod tests {
             r.held[0]
         );
         assert_eq!(
-            entries(&db).expect("entries").rejected.len(),
+            entries(&s).expect("entries").rejected.len(),
             1,
             "and it never becomes a Record at all"
         );
@@ -3831,6 +3922,8 @@ mod tests {
     fn a_dry_run_does_not_delete_an_empty_archive_through_its_own_probe() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         // `removable` works by ATTEMPTING `remove_dir`, which succeeds on an empty directory — so
         // asking the question during a dry run deleted the thing it was about to say it *would*.
@@ -3842,9 +3935,9 @@ mod tests {
             head: Some("abc".into()),
             ..entry(&repo.join(".jkb/work/s"), &repo)
         };
-        record(&db, &e).expect("record");
+        record(&s, &e).expect("record");
 
-        let r = reap(&db, 0, true).expect("reap");
+        let r = reap(&s, 0, true).expect("reap");
         assert_eq!(r.deleted, vec![dir.clone()], "it says what it would delete");
         assert!(dir.exists(), "and a dry run deleted nothing");
     }
@@ -3853,26 +3946,24 @@ mod tests {
     fn cancelling_refuses_while_a_sweep_holds_the_lock() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
-        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        record(&s, &session_entry(&repo, &wt, &branch, &head)).expect("record");
 
         // A sweep already in flight is working from a snapshot taken before this cancellation:
         // it would archive the checkout `task work` is at that moment handing back, and re-write
         // the record this deleted. Refusing is the honest outcome — the caller says so and the
         // operator re-runs — because a cancellation that silently lost the race is worse.
-        fs::write(
-            store_dir(&db).join(".sweep.lock"),
-            crate::owner::self_owner(),
-        )
-        .expect("write");
+        hold(&s, &crate::owner::self_owner());
 
         assert!(
-            revoke(&db, &wt).is_err(),
+            revoke(&s, &wt).is_err(),
             "a cancellation that cannot exclude the sweep must say so, not report success"
         );
         assert_eq!(
-            entries(&db).expect("entries").records.len(),
+            entries(&s).expect("entries").records.len(),
             1,
             "and the record it could not safely remove is still there"
         );
@@ -3882,9 +3973,11 @@ mod tests {
     fn a_session_reusing_the_recorded_name_is_held_rather_than_archived() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
-        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        record(&s, &session_entry(&repo, &wt, &branch, &head)).expect("record");
 
         // The deferred worktree is removed by hand and a NEW session is opened at the same path
         // on the same branch — which is what reopening the task and running `jkb task work` does.
@@ -3911,7 +4004,7 @@ mod tests {
         git(&wt, &["add", "-A"]);
         git(&wt, &["commit", "-qm", "different work"]);
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(r.archived.is_empty(), "the live session was not archived");
         assert_eq!(r.held.len(), 1, "it is held, with the reason: {:?}", r.held);
         assert!(
@@ -3928,12 +4021,14 @@ mod tests {
     fn uncommitted_work_in_a_recorded_session_holds_the_sweep() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
-        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        record(&s, &session_entry(&repo, &wt, &branch, &head)).expect("record");
         std::fs::write(wt.join("scratch.txt"), "unsaved").expect("write");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(r.archived.is_empty(), "nothing is moved out from under it");
         assert_eq!(r.held.len(), 1, "{:?}", r.held);
         assert!(wt.join("scratch.txt").exists());
@@ -3943,6 +4038,8 @@ mod tests {
     fn a_repo_this_process_cannot_see_holds_its_record_instead_of_clearing_it() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         // The ordinary cross-boundary case: a landing recorded on one side of the container bind,
         // swept from the other, where the repo it names is not reachable.
         let repo = unreachable_repo(&t);
@@ -3950,13 +4047,13 @@ mod tests {
             head: Some("deadbeef".into()),
             ..entry(&repo.join(".jkb/work/s"), &repo)
         };
-        record(&db, &e).expect("record");
+        record(&s, &e).expect("record");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert!(r.cleared.is_empty(), "an unreachable repo settles nothing");
         assert_eq!(r.held.len(), 1, "{:?}", r.held);
         assert_eq!(
-            entries(&db).expect("entries").records.len(),
+            entries(&s).expect("entries").records.len(),
             1,
             "the record survives for whichever side can see the repo"
         );
@@ -3966,11 +4063,13 @@ mod tests {
     fn a_dry_run_reports_without_moving_or_deleting_anything() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         let (wt, branch, head) = session(&repo, "sess");
-        record(&db, &session_entry(&repo, &wt, &branch, &head)).expect("record");
+        record(&s, &session_entry(&repo, &wt, &branch, &head)).expect("record");
 
-        let r = reap(&db, RETAIN_DAYS, true).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, true).expect("reap");
         assert_eq!(
             r.archived.len(),
             1,
@@ -3978,7 +4077,7 @@ mod tests {
             r.held
         );
         assert!(wt.exists(), "and the tree has not moved");
-        let left = entries(&db).expect("entries").records;
+        let left = entries(&s).expect("entries").records;
         assert_eq!(left.len(), 1, "and the record survives for the real run");
     }
 
@@ -3986,13 +4085,15 @@ mod tests {
     fn a_record_whose_worktree_vanished_is_cleared_rather_than_held_for_ever() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         let repo = t.path().join("repo");
         fs::create_dir_all(&repo).expect("mk");
-        record(&db, &entry(&repo.join(".jkb/work/gone"), &repo)).expect("record");
+        record(&s, &entry(&repo.join(".jkb/work/gone"), &repo)).expect("record");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(r.cleared.len(), 1);
-        let left = entries(&db).expect("entries").records;
+        let left = entries(&s).expect("entries").records;
         assert!(left.is_empty());
     }
 
@@ -4000,11 +4101,13 @@ mod tests {
     fn an_unparseable_record_is_reported_and_kept() {
         let t = tempfile::tempdir().expect("tempdir");
         let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
         fs::create_dir_all(store_dir(&db)).expect("mk");
         let junk = store_dir(&db).join("torn.json");
         fs::write(&junk, b"{not json").expect("write");
 
-        let r = reap(&db, RETAIN_DAYS, false).expect("reap");
+        let r = reap(&s, RETAIN_DAYS, false).expect("reap");
         assert_eq!(r.unreadable, vec![junk.clone()]);
         assert!(
             junk.exists(),

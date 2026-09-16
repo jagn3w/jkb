@@ -7,14 +7,15 @@
 //! what changed is only where each database step runs (`jkb_api::sessions`), and that every write the
 //! verbs make is now a compare-and-set on the owner they judged.
 //!
-//! `start` and the gate read run in both modes. `work`, `abandon` and `sessions` still read the
-//! host's worktree-removal records beside the database, so they run on the host only until those
-//! records move into the database (stage 3).
+//! `start`, `work`, `abandon`, `sessions` and the gate read run in both modes; the worktree-removal
+//! records and the sweep's lease are ops too (stage 3, `archive::Stores`). Storing a gate stays on the
+//! host (decision A), and `land` is not yet ported (stage 4).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use jkb_api::removals::{Removal, RemovalRecord};
 use jkb_api::sessions::{Abandoned, BranchTask, Place, StartAsk, Take, TakeAsk, TaskState};
 use jkb_api::{Backend, Request, Response, SessionStateIs};
 use jkb_types::AgentId;
@@ -23,6 +24,7 @@ use crate::ops_cli::{op_error, unexpected, Ops};
 use crate::{archive, branch_fate, gitrepo, owner, presence, repo, session, BranchFate};
 
 /// The database, through whichever backend serves this command.
+#[derive(Clone, Copy)]
 pub(crate) struct Kb<'a> {
     backend: &'a dyn Backend,
     remote: bool,
@@ -129,6 +131,111 @@ impl<'a> Kb<'a> {
         })? {
             Response::Gate { gate } => Ok(gate),
             other => unexpected("repo.gate", &other),
+        }
+    }
+
+    /// `removal.add`.
+    pub(crate) fn removal_add(&self, removal: Removal) -> Result<i64> {
+        match self.call(Request::RemovalAdd { removal })? {
+            Response::RemovalAdded { id } => Ok(id),
+            other => unexpected("removal.add", &other),
+        }
+    }
+
+    /// `removal.list`, every page: the whole store, oldest first. A reader that stopped at one page
+    /// would miss a record — the one `task work` must cancel, say.
+    pub(crate) fn removals(&self) -> Result<Vec<RemovalRecord>> {
+        let mut out = Vec::new();
+        let mut after = None;
+        loop {
+            match self.call(Request::RemovalList { after })? {
+                Response::Removals { records, next } => {
+                    out.extend(records);
+                    match next {
+                        // A page must move forward, or a confused server has this loop for ever.
+                        Some(n) if after.is_none_or(|a| n > a) => after = Some(n),
+                        Some(n) => anyhow::bail!("removal.list did not advance past {n}"),
+                        None => return Ok(out),
+                    }
+                }
+                other => return unexpected("removal.list", &other),
+            }
+        }
+    }
+
+    fn changed(&self, op: &str, request: Request) -> Result<bool> {
+        match self.call(request)? {
+            Response::Changed { changed } => Ok(changed),
+            other => unexpected(op, &other),
+        }
+    }
+
+    /// `removal.archived`.
+    pub(crate) fn removal_archived(&self, id: i64, archive: String, at: i64) -> Result<bool> {
+        self.changed(
+            "removal.archived",
+            Request::RemovalArchived { id, archive, at },
+        )
+    }
+
+    /// `removal.cancel`: how many were cancelled, or the sweep that refused it.
+    pub(crate) fn removal_cancel(&self, ids: Vec<i64>) -> Result<jkb_api::removals::Cancelled> {
+        match self.call(Request::RemovalCancel { ids })? {
+            Response::RemovalsCancelled { cancelled } => Ok(cancelled),
+            other => unexpected("removal.cancel", &other),
+        }
+    }
+
+    /// `removal.drop`.
+    pub(crate) fn removal_drop(&self, id: i64) -> Result<bool> {
+        self.changed("removal.drop", Request::RemovalDrop { id })
+    }
+
+    /// `lease.get`: the holder, as its taker wrote it.
+    pub(crate) fn lease_holder(&self, name: &str) -> Result<Option<String>> {
+        match self.call(Request::LeaseGet {
+            name: name.to_owned(),
+        })? {
+            Response::Lease { lease } => Ok(lease.map(|l| l.holder)),
+            other => unexpected("lease.get", &other),
+        }
+    }
+
+    /// `lease.take`.
+    pub(crate) fn lease_take(
+        &self,
+        name: &str,
+        holder: &str,
+        displace: Option<&str>,
+    ) -> Result<bool> {
+        self.changed(
+            "lease.take",
+            Request::LeaseTake {
+                name: name.to_owned(),
+                holder: holder.to_owned(),
+                displace: displace.map(str::to_owned),
+            },
+        )
+    }
+
+    /// `lease.release`.
+    pub(crate) fn lease_release(&self, name: &str, holder: &str) -> Result<bool> {
+        self.changed(
+            "lease.release",
+            Request::LeaseRelease {
+                name: name.to_owned(),
+                holder: holder.to_owned(),
+            },
+        )
+    }
+
+    /// `lease.break`: the holder it displaced.
+    pub(crate) fn lease_break(&self, name: &str) -> Result<Option<String>> {
+        match self.call(Request::LeaseBreak {
+            name: name.to_owned(),
+        })? {
+            Response::LeaseBroken { holder } => Ok(holder),
+            other => unexpected("lease.break", &other),
         }
     }
 
@@ -415,7 +522,7 @@ struct Land {
 /// invocation hands back the same worktree instead of forking the work onto a second branch.
 pub(crate) fn work(
     kb: &Kb<'_>,
-    db_path: &Path,
+    stores: &archive::Stores<'_>,
     uid: &str,
     onto: Option<&str>,
     json: bool,
@@ -467,7 +574,7 @@ pub(crate) fn work(
 
     // CANCELLED FIRST, and a refusal stops the verb.
     //
-    // `revoke` takes the sweep lock, so a refusal means a sweep is in flight working from a
+    // `revoke` is refused while a sweep runs, so a refusal means a sweep is in flight working from a
     // snapshot that still lists this worktree — and its checks all pass, because the tree is
     // registered, on the recorded HEAD and clean. Printing a note and handing the session back
     // anyway licensed that sweep to archive the checkout the operator was just told to work in
@@ -483,7 +590,7 @@ pub(crate) fn work(
     // checkout — a run stopped before its locate left nothing else — so releasing it would have the
     // re-run fork a second session and `abandon` find neither (stage-2 review, round 7).
     let resumed = sessions.iter().any(|s| s.branch == branch);
-    archive::revoke(db_path, &worktree)
+    archive::revoke(stores, &worktree)
         .inspect_err(|_| {
             if !resumed {
                 let _ = kb.release(&facts.uid, &owner);
@@ -929,7 +1036,7 @@ fn opener_for(kb: &Kb<'_>, held: Option<&str>, worktree: &Path) -> Result<Option
 /// `task abandon` — drop a session without landing it (design D36.6).
 pub(crate) fn abandon(
     kb: &Kb<'_>,
-    db_path: &Path,
+    stores: &archive::Stores<'_>,
     uid: &str,
     force: bool,
     delete_branch: bool,
@@ -1006,7 +1113,7 @@ pub(crate) fn abandon(
     }
 
     let deferred = abandon_session(
-        db_path,
+        stores,
         &ctx,
         sess.as_ref(),
         &branch,
@@ -1090,7 +1197,7 @@ pub(crate) fn abandon(
 /// Split out so `cmd_task_abandon` stays readable; the decision itself is the caller's and is
 /// recorded in the [`archive::Plan`], which is what the sweep applies later.
 fn abandon_session(
-    db_path: &Path,
+    stores: &archive::Stores<'_>,
     ctx: &repo::RepoCtx,
     sess: Option<&session::Session>,
     branch: &str,
@@ -1139,7 +1246,7 @@ fn abandon_session(
         // only copy of real work, which is why `--force` here discards a dirty tree but never
         // the commits.
         if let archive::Disposed::Deferred(d) = archive::dispose(
-            db_path,
+            stores,
             &ctx.root,
             &sess.worktree,
             branch,
@@ -1238,7 +1345,7 @@ fn report_abandon(uid: &str, branch: &str, out: &AbandonOutcome<'_>, json: bool)
 }
 
 /// `task sessions` — what is in flight in this repo.
-pub(crate) fn sessions(kb: &Kb<'_>, db_path: &Path, json: bool) -> Result<()> {
+pub(crate) fn sessions(kb: &Kb<'_>, stores: &archive::Stores<'_>, json: bool) -> Result<()> {
     let ctx = repo::repo_ctx()?;
     let sessions = session::discover(&ctx.root)?;
     let by_branch = kb.by_branch(&ctx.key)?;
@@ -1261,7 +1368,7 @@ pub(crate) fn sessions(kb: &Kb<'_>, db_path: &Path, json: bool) -> Result<()> {
     // can say a checkout needs attention rather than silently omitting it — an absent badge reads
     // as "nothing outstanding".
     let (stuck, awaiting): (std::collections::BTreeSet<PathBuf>, _) =
-        archive::pending_outlook(db_path)
+        archive::pending_outlook(stores)
             .map(|rows| {
                 let (held, moving): (Vec<_>, Vec<_>) = rows
                     .into_iter()

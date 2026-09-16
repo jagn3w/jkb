@@ -57,6 +57,9 @@ pub const fn handles(command: &Command) -> bool {
                 | TaskCmd::Claim { .. }
                 | TaskCmd::Release { .. }
                 | TaskCmd::Start { .. }
+                | TaskCmd::Work { .. }
+                | TaskCmd::Abandon { .. }
+                | TaskCmd::Sessions
                 | TaskCmd::Gate {
                     cmd: None,
                     clear: false
@@ -76,6 +79,9 @@ pub struct Ops<'a> {
     pub(crate) remote: bool,
     /// Notices printed on stderr, kept so a test can see them.
     notices: std::cell::RefCell<Vec<String>>,
+    /// The local database's path, on the host: the session verbs still read the worktree-removal
+    /// records written beside it before they moved into the database (`archive::Stores`).
+    pub(crate) db_path: Option<&'a std::path::Path>,
 }
 
 impl<'a> Ops<'a> {
@@ -88,7 +94,15 @@ impl<'a> Ops<'a> {
             json,
             remote,
             notices: std::cell::RefCell::new(Vec::new()),
+            db_path: None,
         }
+    }
+
+    /// Served in this process, over the database at `path`.
+    #[must_use]
+    pub const fn with_db_path(mut self, path: &'a std::path::Path) -> Self {
+        self.db_path = Some(path);
+        self
     }
 
     /// The route `jkb search` takes when `--route` is not given: hybrid where this process embeds, FTS

@@ -31,13 +31,51 @@ use crate::{ApiError, ErrorCode};
 /// could already make itself. Anything else is a host file the container cannot see, and a database
 /// row must not choose it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileRoots(Vec<PathBuf>);
+pub struct FileRoots {
+    roots: Vec<PathBuf>,
+    /// The serving host's home, against which a client's `~/` path is resolved.
+    home: Option<PathBuf>,
+}
 
 impl FileRoots {
     /// These directories, which must be absolute.
     #[must_use]
     pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self(roots.into_iter().filter(|r| r.is_absolute()).collect())
+        Self {
+            roots: roots.into_iter().filter(|r| r.is_absolute()).collect(),
+            home: None,
+        }
+    }
+
+    /// The serving host's home, which must be absolute: a client names a host directory as `~/…`,
+    /// since its own home is somewhere else ([`Self::admits_home_path`]).
+    #[must_use]
+    pub fn with_home(mut self, home: PathBuf) -> Self {
+        self.home = Some(home).filter(|h| h.is_absolute());
+        self
+    }
+
+    /// Whether a path a client names — in a worktree-removal record, which the host's reap service acts
+    /// on — is `~/`-relative, of ordinary components only, and under a root once resolved against this
+    /// host's home. Anything else, an absolute path included, is refused: the client's absolute paths
+    /// are in its own filesystem, not this one. Spelling only, as [`Self::admits`].
+    #[must_use]
+    pub fn admits_home_path(&self, path: &str) -> bool {
+        let (Some(rest), Some(home)) = (path.strip_prefix("~/"), &self.home) else {
+            return false;
+        };
+        // Segment by segment, not by `Path::components`, which drops an interior `.` and an empty
+        // segment: what is stored is then exactly what was judged.
+        if !rest
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+        {
+            return false;
+        }
+        let path = home.join(rest);
+        self.roots
+            .iter()
+            .any(|root| path.starts_with(root) && path != *root)
     }
 
     /// Whether a binding `uri` writes no host file outside these roots: not a `file://` uri at all,
@@ -60,7 +98,7 @@ impl FileRoots {
         {
             return false;
         }
-        self.0.iter().any(|root| path.starts_with(root))
+        self.roots.iter().any(|root| path.starts_with(root))
     }
 }
 

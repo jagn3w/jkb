@@ -31,6 +31,7 @@ use serde_json::Value;
 
 pub mod ingest;
 pub mod kb;
+pub mod removals;
 pub mod sessions;
 pub mod tasks;
 
@@ -494,6 +495,72 @@ pub enum Request {
         /// The session id.
         session: String,
     },
+    /// Record a worktree disposal for the reap service ([`removals::add`]).
+    #[serde(rename = "removal.add")]
+    RemovalAdd {
+        /// The record.
+        removal: removals::Removal,
+    },
+    /// The worktree-removal records, a page at a time ([`removals::list`]).
+    #[serde(rename = "removal.list")]
+    RemovalList {
+        /// Continue after this: the `next` of the previous page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<i64>,
+    },
+    /// A pending record's tree was archived ([`removals::archived`]).
+    #[serde(rename = "removal.archived")]
+    RemovalArchived {
+        /// The record.
+        id: i64,
+        /// Where the tree went.
+        archive: String,
+        /// When (Unix seconds).
+        at: i64,
+    },
+    /// Cancel pending records unless a sweep is in flight ([`removals::cancel`]).
+    #[serde(rename = "removal.cancel")]
+    RemovalCancel {
+        /// The records.
+        ids: Vec<i64>,
+    },
+    /// Forget a record ([`removals::drop_record`]).
+    #[serde(rename = "removal.drop")]
+    RemovalDrop {
+        /// The record.
+        id: i64,
+    },
+    /// Who holds a lease ([`removals::lease_get`]).
+    #[serde(rename = "lease.get")]
+    LeaseGet {
+        /// The lease.
+        name: String,
+    },
+    /// Take a lease, compare-and-set ([`removals::lease_take`]).
+    #[serde(rename = "lease.take")]
+    LeaseTake {
+        /// The lease.
+        name: String,
+        /// `<owner id> <nonce>`.
+        holder: String,
+        /// The holder the caller judged gone, replaced only while it still holds the lease.
+        #[serde(default)]
+        displace: Option<String>,
+    },
+    /// Release a lease the caller holds ([`removals::lease_release`]).
+    #[serde(rename = "lease.release")]
+    LeaseRelease {
+        /// The lease.
+        name: String,
+        /// The holder, exactly as taken.
+        holder: String,
+    },
+    /// Drop a lease whoever holds it — host only ([`removals::lease_break`]).
+    #[serde(rename = "lease.break")]
+    LeaseBreak {
+        /// The lease.
+        name: String,
+    },
 }
 
 /// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
@@ -849,6 +916,15 @@ impl Request {
         "task.abandon",
         "repo.gate",
         "session.state",
+        "removal.add",
+        "removal.list",
+        "removal.archived",
+        "removal.cancel",
+        "removal.drop",
+        "lease.get",
+        "lease.take",
+        "lease.release",
+        "lease.break",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -903,6 +979,15 @@ impl Request {
             Self::TaskAbandon { .. } => "task.abandon",
             Self::RepoGate { .. } => "repo.gate",
             Self::SessionState { .. } => "session.state",
+            Self::RemovalAdd { .. } => "removal.add",
+            Self::RemovalList { .. } => "removal.list",
+            Self::RemovalArchived { .. } => "removal.archived",
+            Self::RemovalCancel { .. } => "removal.cancel",
+            Self::RemovalDrop { .. } => "removal.drop",
+            Self::LeaseGet { .. } => "lease.get",
+            Self::LeaseTake { .. } => "lease.take",
+            Self::LeaseRelease { .. } => "lease.release",
+            Self::LeaseBreak { .. } => "lease.break",
         }
     }
 
@@ -966,7 +1051,17 @@ impl Request {
             | Self::TaskTake(_)
             | Self::TaskLocate { .. }
             | Self::TaskAbandon { .. }
-            | Self::SessionState { .. } => false,
+            | Self::SessionState { .. }
+            // The sweep's reads, short and on its clock, like `session.list`.
+            | Self::RemovalList { .. }
+            | Self::LeaseGet { .. }
+            | Self::RemovalAdd { .. }
+            | Self::RemovalArchived { .. }
+            | Self::RemovalCancel { .. }
+            | Self::RemovalDrop { .. }
+            | Self::LeaseTake { .. }
+            | Self::LeaseRelease { .. }
+            | Self::LeaseBreak { .. } => false,
         }
     }
 }
@@ -1199,6 +1294,41 @@ pub enum Response {
         /// as some other one.
         state: SessionStateIs,
     },
+    /// A `removal.add`.
+    RemovalAdded {
+        /// The new record.
+        id: i64,
+    },
+    /// A `removal.list` page.
+    Removals {
+        /// Oldest first.
+        records: Vec<removals::RemovalRecord>,
+        /// Where the next page starts, to be sent back as `after`; absent on the last page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<i64>,
+    },
+    /// A `removal.archived`, `removal.drop`, `lease.take` or `lease.release`: whether it changed
+    /// anything. `false` is an answer — the record or the lease was not as the caller read it.
+    Changed {
+        /// Whether it did.
+        changed: bool,
+    },
+    /// A `removal.cancel`.
+    RemovalsCancelled {
+        /// What it did.
+        #[serde(flatten)]
+        cancelled: removals::Cancelled,
+    },
+    /// A `lease.get`.
+    Lease {
+        /// The lease, if anyone holds it.
+        lease: Option<removals::LeaseHeld>,
+    },
+    /// A `lease.break`.
+    LeaseBroken {
+        /// The holder it displaced, if any.
+        holder: Option<String>,
+    },
     /// A `task.show`.
     Task {
         /// The task.
@@ -1252,6 +1382,12 @@ impl Response {
             | Self::Abandoned { .. }
             | Self::Gate { .. }
             | Self::SessionIs { .. }
+            | Self::RemovalAdded { .. }
+            | Self::Removals { .. }
+            | Self::Changed { .. }
+            | Self::RemovalsCancelled { .. }
+            | Self::Lease { .. }
+            | Self::LeaseBroken { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -1301,6 +1437,12 @@ impl Response {
             | Self::Abandoned { .. }
             | Self::Gate { .. }
             | Self::SessionIs { .. }
+            | Self::RemovalAdded { .. }
+            | Self::Removals { .. }
+            | Self::Changed { .. }
+            | Self::RemovalsCancelled { .. }
+            | Self::Lease { .. }
+            | Self::LeaseBroken { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -2075,6 +2217,67 @@ impl Backend for LocalBackend {
                 }
                 Response::SessionIs {
                     state: db.read(move |c| claude_session::state(c, &session))?.into(),
+                }
+            }
+            Request::RemovalAdd { removal } => {
+                let roots = self.file_roots.clone();
+                Response::RemovalAdded {
+                    id: db.write_txn_with(actor, move |c, m| {
+                        removals::add(c, m, removal, actor, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::RemovalList { after } => {
+                let (records, next) = db.read_with(move |c| removals::list(c, after))?;
+                Response::Removals { records, next }
+            }
+            Request::RemovalArchived { id, archive, at } => {
+                let roots = self.file_roots.clone();
+                Response::Changed {
+                    changed: db.write_txn_with(actor, move |c, m| {
+                        removals::archived(c, m, id, &archive, at, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::RemovalCancel { ids } => {
+                let roots = self.file_roots.clone();
+                Response::RemovalsCancelled {
+                    cancelled: db.write_txn_with(actor, move |c, m| {
+                        removals::cancel(c, m, &ids, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::RemovalDrop { id } => {
+                let roots = self.file_roots.clone();
+                Response::Changed {
+                    changed: db.write_txn_with(actor, move |c, m| {
+                        removals::drop_record(c, m, id, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::LeaseGet { name } => Response::Lease {
+                lease: db.read_with(move |c| removals::lease_get(c, &name))?,
+            },
+            Request::LeaseTake {
+                name,
+                holder,
+                displace,
+            } => Response::Changed {
+                changed: db.write_txn_with(actor, move |c, m| {
+                    removals::lease_take(c, m, &name, &holder, displace.as_deref())
+                })?,
+            },
+            Request::LeaseRelease { name, holder } => Response::Changed {
+                changed: db.write_txn_with(actor, move |c, m| {
+                    removals::lease_release(c, m, &name, &holder)
+                })?,
+            },
+            Request::LeaseBreak { name } => {
+                let roots = self.file_roots.clone();
+                Response::LeaseBroken {
+                    holder: db.write_txn_with(actor, move |c, m| {
+                        removals::lease_break(c, m, &name, roots.as_ref())
+                    })?,
                 }
             }
             Request::TaskSubtasks { uid, all } => {

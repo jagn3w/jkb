@@ -241,12 +241,16 @@ enum Source {
 /// the one host directory the dev container binds. No `$HOME` leaves no root, which refuses every
 /// file-backed write.
 fn client_file_roots() -> jkb_api::tasks::FileRoots {
-    jkb_api::tasks::FileRoots::new(
-        std::env::var_os("HOME")
-            .map(|home| std::path::PathBuf::from(home).join(crate::CLIENT_FILE_ROOT))
-            .into_iter()
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let roots = jkb_api::tasks::FileRoots::new(
+        home.iter()
+            .map(|home| home.join(crate::CLIENT_FILE_ROOT))
             .collect(),
-    )
+    );
+    match home {
+        Some(home) => roots.with_home(home),
+        None => roots,
+    }
 }
 
 /// The backend serving `db`: every read's answer bounded to `read_budget_bytes`, and the read set on a

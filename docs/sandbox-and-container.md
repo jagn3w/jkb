@@ -662,6 +662,18 @@ The container follow-up bucket. Design in `.container/README.md`; the container 
   gone with it, so every sweep on both sides no-ops for ever. The default stays (breaking a live
   sweeper's lock is what the lock prevents); what was missing is an escape a person can take, so
   the refusal names the lock file and its holder and `jkb task reap --break-lock` exists.
+- **The records and the lock moved into the database** (tasks S6.4 stage 3; the op rules are in
+  [message-queue.md](message-queue.md)). A file beside the database was no lock at all across the two
+  kernels that share `~/.jkb`, and a dev container reaching the knowledge base through `jkb serve`
+  has no path to it. The records are rows of `worktree_removals`, their paths written `~/repos/…`
+  where they lie there, so the host's reap service resolves a record the container wrote to the same
+  checkout — which gives the container's deferrals the finisher the bullet above says they lacked.
+  The lock is the `removal-sweep` row of `leases`, with the file lock's rules kept as properties of the
+  row: holder `<owner> <nonce>`, takeover and release as compare-and-sets on the exact holder, stale
+  only when proven gone. The old file store is still read, swept and cancelled on the host
+  (`archive::Stores`) and nothing new is written there. `jkb task reap` now opens the database each
+  pass, so a database a newer jkb migrated fails that pass — reported once while unchanged — not the
+  service.
 - **Sharing memory through `~/.jkb` widens what sandboxed Bash can reach, and that is a decision,
   not an oversight.** `~/.claude/projects` is under the posture's blanket `denyRead` and in no
   allow list; `~/.jkb` is in `allowRead` **and** `allowWrite`, because the database lives there.

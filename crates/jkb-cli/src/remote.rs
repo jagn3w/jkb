@@ -75,8 +75,12 @@ pub const fn support(command: &Command) -> Support {
                 | TaskCmd::Bind { .. }
                 | TaskCmd::Claim { .. }
                 | TaskCmd::Release { .. }
-                // The session verbs (tasks S6.4): git here, the database through the ops.
+                // The session verbs (tasks S6.4): git here, the database through the ops — the
+                // worktree-removal records and the sweep lease included (stage 3).
                 | TaskCmd::Start { .. }
+                | TaskCmd::Work { .. }
+                | TaskCmd::Abandon { .. }
+                | TaskCmd::Sessions
                 | TaskCmd::Gate {
                     cmd: None,
                     clear: false,

@@ -274,6 +274,43 @@ fn samples() -> Vec<Request> {
         Request::SessionState {
             session: "s".into(),
         },
+        Request::RemovalAdd {
+            removal: super::removals::Removal {
+                worktree: "~/repos/p/.jkb/work/s".into(),
+                repo_root: "~/repos/p".into(),
+                branch: String::new(),
+                uid: String::new(),
+                delete_branch: false,
+                accept_dirty: false,
+                recorded_at: 0,
+                head: None,
+                archive: None,
+                archived_at: None,
+            },
+        },
+        Request::RemovalList { after: None },
+        Request::RemovalArchived {
+            id: 1,
+            archive: "~/repos/p/.jkb/archive/s".into(),
+            at: 0,
+        },
+        Request::RemovalCancel { ids: vec![1] },
+        Request::RemovalDrop { id: 1 },
+        Request::LeaseGet {
+            name: "removal-sweep".into(),
+        },
+        Request::LeaseTake {
+            name: "removal-sweep".into(),
+            holder: "host:1 n".into(),
+            displace: None,
+        },
+        Request::LeaseRelease {
+            name: "removal-sweep".into(),
+            holder: "host:1 n".into(),
+        },
+        Request::LeaseBreak {
+            name: "removal-sweep".into(),
+        },
     ]
 }
 

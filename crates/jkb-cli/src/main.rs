@@ -965,7 +965,7 @@ enum TaskCmd {
         /// Report what would happen and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Remove a sweep lock whose holder is gone for good.
+        /// Drop the sweep's lease when its holder is gone for good.
         ///
         /// There is no automatic escape and there should not be: a holder on another host
         /// cannot be probed, and breaking a live sweeper's lock is what the lock prevents. A
@@ -1191,14 +1191,14 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
-    // THE SWEEP TOUCHES NO ROWS, so it must not be stopped by a schema it never reads. `open_db`
-    // runs the migrations, which refuse outright when the shared `~/.jkb/jkb.db` carries one this
-    // binary does not know — routine across branches here. The host's `com.jkb.reap` unit is
-    // whichever binary `setup.sh` last installed, so that divergence turned the one process that
-    // finishes every deferred landing into a launchd restart-loop, with the only symptom in
-    // reap.log. The sweep works from the record store beside the database. The message queue's
-    // compaction, which this command also runs, DOES open the database — separately, per pass, in
-    // `compact_queue`, where a failure is reported and never stops the sweep.
+    // THE SWEEP OPENS THE DATABASE PER PASS, never before the loop. `open_db` runs the migrations,
+    // which refuse outright when the shared `~/.jkb/jkb.db` carries one this binary does not know —
+    // routine across branches here. The host's `com.jkb.reap` unit is whichever binary `setup.sh`
+    // last installed, so an open up front turned the one process that finishes every deferred
+    // landing into a launchd restart-loop, with the only symptom in reap.log. The sweep's records
+    // were beside the database for that reason; they are in it now (tasks S6.4 stage 3), so each
+    // pass opens it (`reap_once`), as the queue's compaction does (`compact_queue`), and a failure is
+    // reported and never stops the service.
     if let Command::Task {
         cmd: cmd @ TaskCmd::Reap { .. },
     } = cli.command
@@ -1280,7 +1280,7 @@ fn run(cli: Cli) -> Result<()> {
         // Ahead of every other arm, and asked through the same predicate remote mode dispatches on:
         // a read ported later is then served by its op here too, rather than by an arm below that
         // still compiles.
-        cmd if ops_cli::handles(&cmd) => local_ops(&db, cmd, global, json),
+        cmd if ops_cli::handles(&cmd) => local_ops(&db, &db_path, cmd, global, json),
         Command::Query { .. }
         | Command::Search { .. }
         | Command::Find { .. }
@@ -1546,13 +1546,15 @@ fn embedder() -> Result<Arc<dyn Embedder + Send + Sync>> {
 
 /// The agent read set on this host (`ops_cli`): through a `LocalBackend` over `db`, the same op
 /// `jkb serve` answers the dev container with, so the two cannot list different things.
-fn local_ops(db: &Db, command: Command, global: bool, json: bool) -> Result<()> {
+fn local_ops(db: &Db, db_path: &Path, command: Command, global: bool, json: bool) -> Result<()> {
     let mut backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
     // Only a search or an ingest embeds; building the embedder is not a cost `ls` should pay.
     if matches!(command, Command::Search { .. } | Command::Ingest { .. }) {
         backend = backend.with_embedder(embedder()?);
     }
-    ops_cli::Ops::new(&backend, global, json, false).run(command)
+    ops_cli::Ops::new(&backend, global, json, false)
+        .with_db_path(db_path)
+        .run(command)
 }
 
 /// The ambient repo key: the full namespace path of the `file://` mount covering the
@@ -3246,16 +3248,17 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Bind { .. }
         | TaskCmd::Claim { .. }
         | TaskCmd::Release { .. }
-        | TaskCmd::Start { .. } => {
+        | TaskCmd::Start { .. }
+        | TaskCmd::Work { .. }
+        | TaskCmd::Abandon { .. }
+        | TaskCmd::Sessions => {
             anyhow::bail!("internal: a task verb served as an op missed ops_cli's dispatch")
         }
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
         TaskCmd::Pr { uid, number } => cmd_task_pr(db, &uid, number, json)?,
-        cmd @ (TaskCmd::Work { .. }
-        | TaskCmd::Land { .. }
-        | TaskCmd::Abandon { .. }
-        | TaskCmd::Sessions
-        | TaskCmd::Gate { .. }) => cmd_task_session(db, db_path, cmd, json)?,
+        cmd @ (TaskCmd::Land { .. } | TaskCmd::Gate { .. }) => {
+            cmd_task_session(db, db_path, cmd, json)?;
+        }
         TaskCmd::Reap {
             retain_days,
             dry_run,
@@ -3610,7 +3613,6 @@ fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result
     let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
     let kb = session_cli::Kb::new(&backend);
     match cmd {
-        TaskCmd::Work { uid, onto } => session_cli::work(&kb, db_path, &uid, onto.as_deref(), json),
         TaskCmd::Land {
             uid,
             gate,
@@ -3629,12 +3631,6 @@ fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result
             },
             json,
         ),
-        TaskCmd::Abandon {
-            uid,
-            force,
-            delete_branch,
-        } => session_cli::abandon(&kb, db_path, &uid, force, delete_branch, json),
-        TaskCmd::Sessions => session_cli::sessions(&kb, db_path, json),
         // Storing a gate is a host command (decision A), so it is done here, against the database,
         // and never through an op. Showing one is served as an op in both modes.
         TaskCmd::Gate { cmd, clear } => {
@@ -3960,7 +3956,7 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
 
     settle_landing(
         db,
-        db_path,
+        &archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path)),
         id,
         &ctx,
         &sess,
@@ -4007,7 +4003,7 @@ struct Landed<'a> {
 /// Mark the task done, free the claim, and dispose of the session (design D36.4).
 fn settle_landing(
     db: &Db,
-    db_path: &Path,
+    stores: &archive::Stores<'_>,
     id: ItemId,
     ctx: &repo::RepoCtx,
     sess: &session::Session,
@@ -4064,7 +4060,7 @@ fn settle_landing(
         uid = landed.uid,
     );
 
-    let disposal = dispose_session(db_path, ctx, sess, &landed, disposed_already)?;
+    let disposal = dispose_session(stores, ctx, sess, &landed, disposed_already)?;
 
     // Landed: the task is done, the claim is free, and the session branch is a duplicate of
     // commits now in `onto`.
@@ -4262,9 +4258,9 @@ fn report_landing(
 /// `task reap` — archive worktrees a landing could not move, then delete archives past the
 /// retention window (design D49).
 ///
-/// Takes the database **path** rather than a handle: it touches no rows. The records live beside
-/// the database precisely so this needs no repo context and one service sweeps every repo on the
-/// machine.
+/// Takes the database **path** rather than a handle, and opens it per pass (`reap_once`), so a
+/// database this binary cannot open fails a pass rather than the service. The records need no repo
+/// context, so one service sweeps every repo on the machine.
 #[derive(Clone, Copy)]
 struct ReapFlags {
     retain_days: u64,
@@ -4283,22 +4279,25 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         interval_secs,
     } = flags;
     if break_lock {
+        let db = open_db(db_path)?;
+        let backend = jkb_api::LocalBackend::new(db).with_actor("reap");
+        let stores = archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path));
         // `--dry-run` promises to change nothing, and this ran before that was consulted — so
         // `--dry-run --break-lock` removed a live sweeper's lock while saying it would not.
         if dry_run {
-            match archive::lock_holder(db_path)? {
-                Some(holder) => println!("would break the sweep lock held by {holder}"),
-                None => println!("no sweep lock is held"),
+            match archive::lock_holder(&stores)? {
+                Some(holder) => println!("would break the sweep lease held by {holder}"),
+                None => println!("no sweep lease is held"),
             }
         } else {
-            match archive::break_lock(db_path)? {
-                Some(holder) => println!("broke the sweep lock held by {holder}"),
-                None => println!("no sweep lock was held"),
+            match archive::break_lock(&stores)? {
+                Some(holder) => println!("broke the sweep lease held by {holder}"),
+                None => println!("no sweep lease was held"),
             }
         }
     }
     if !watch {
-        let report = archive::reap(db_path, retain_days, dry_run)?;
+        let report = reap_once(db_path, retain_days, dry_run)?;
         let compaction = (!dry_run).then(|| compact_queue(db_path));
         report_reap(&report, dry_run, json, compaction.as_ref());
         return Ok(());
@@ -4315,6 +4314,7 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     // of the signal.
     let mut last_observed = String::new();
     let mut last_compaction_failure = String::new();
+    let mut last_sweep_failure = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         // The queue's compaction rides the same timer (design r3.2 Q3). Work done is always
         // printed — two passes that each reaped one message are two events, not a repeat. Only a
@@ -4334,17 +4334,26 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
                 Compaction::Quiet => last_compaction_failure.clear(),
             }
         }
-        match archive::reap(db_path, retain_days, dry_run) {
+        match reap_once(db_path, retain_days, dry_run) {
             // Silence when there is nothing to say: this runs every quarter hour for ever, and a
             // log that says "nothing to do" 96 times a day is a log nobody reads the rest of.
-            Ok(r) if r.is_empty() && r.observed() == last_observed => {}
+            Ok(r) if r.is_empty() && r.observed() == last_observed => last_sweep_failure.clear(),
             Ok(r) => {
+                last_sweep_failure.clear();
                 last_observed = r.observed();
                 report_reap(&r, dry_run, json, None);
             }
             // A sweep that failed must not stop the service — the next one may well succeed, and
-            // this is the process that finishes every deferred landing on the machine.
-            Err(e) => eprintln!("reap: {e:#}"),
+            // this is the process that finishes every deferred landing on the machine. Said once
+            // while it stays the same, as the compaction's failure is: a database a newer jkb
+            // migrated fails every pass until that jkb's `setup.sh` replaces this one.
+            Err(e) => {
+                let why = format!("{e:#}");
+                if why != last_sweep_failure {
+                    eprintln!("reap: {why}");
+                    last_sweep_failure = why;
+                }
+            }
         }
         // Slept in slices so Ctrl-C is answered promptly rather than up to `interval` later.
         let deadline = std::time::Instant::now() + interval;
@@ -4355,6 +4364,19 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One sweep, with the database opened for it and closed after.
+///
+/// **Per sweep, not once for the service**, for the reason the queue's compaction is: the records are
+/// in the database now (tasks S6.4 stage 3), and a database this binary cannot open — one a newer jkb
+/// migrated, routine across branches here — must fail this pass, not the process. The service loop
+/// reports the failure and tries again next interval, where exiting put launchd into a restart loop.
+fn reap_once(db_path: &Path, retain_days: u64, dry_run: bool) -> Result<archive::Report> {
+    let db = open_db(db_path)?;
+    let backend = jkb_api::LocalBackend::new(db).with_actor("reap");
+    let stores = archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path));
+    archive::reap(&stores, retain_days, dry_run)
 }
 
 /// `jkb serve`: run the daemon until Ctrl-C.
@@ -4537,7 +4559,7 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool, compaction: Optio
                     .map(|(uid, why)| serde_json::json!({ "uid": uid, "reason": why }))
                     .collect::<Vec<_>>(),
                                 "skipped": r.skipped.as_ref().map(|h| serde_json::json!({
-                    "lock": h.path.display().to_string(),
+                    "lock": jkb_api::removals::SWEEP_LEASE,
                     "holder": h.holder,
                 })),
                 "retained": r.retained.len(),
@@ -4584,8 +4606,8 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool, compaction: Optio
         // left by a container that has since been rebuilt is respected for ever by every sweep on
         // both sides. `--break-lock` is the way out, and it needs something to point at.
         println!(
-            "another sweep holds {} ({}); this one looked at nothing",
-            held.path.display(),
+            "another sweep holds the `{}` lease ({}); this one looked at nothing",
+            jkb_api::removals::SWEEP_LEASE,
             if held.holder.is_empty() {
                 "holder unknown"
             } else {
@@ -4616,7 +4638,7 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool, compaction: Optio
 /// runs BEFORE the task's plan is applied, so a refusal leaves the task exactly where it was and
 /// the verb is re-runnable (D48).
 fn dispose_session(
-    db_path: &Path,
+    stores: &archive::Stores<'_>,
     ctx: &repo::RepoCtx,
     sess: &session::Session,
     landed: &Landed<'_>,
@@ -4668,7 +4690,7 @@ fn dispose_session(
         // The one disposal both `land` and `abandon` call — see `archive::dispose` for why that
         // matters. A landing's branch is a duplicate of commits now in the target, so it goes.
         match archive::dispose(
-            db_path,
+            stores,
             &ctx.root,
             &sess.worktree,
             landed.branch,
@@ -4856,9 +4878,11 @@ fn branch_fate(asked_to_delete: bool, present: Fact, reaper_will_act: bool) -> B
 /// Reported by `doctor` because both halves are otherwise invisible: a deferred removal is a
 /// session directory sitting where a completed landing left it, and an archive is disk that will
 /// be deleted on a schedule nobody was told about. `--fix` runs the same sweep the service runs,
-/// which is the whole point of the record living beside the database rather than in a repo.
-fn report_worktree_removals(db_path: &Path, fix: bool) {
-    let store = match archive::entries(db_path) {
+/// which is the whole point of the record living in the database rather than in a repo.
+fn report_worktree_removals(db: &Db, db_path: &Path, fix: bool) {
+    let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
+    let stores = archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path));
+    let store = match archive::entries(&stores) {
         Ok(s) => s,
         Err(e) => {
             println!("worktree removals: unknown ({e})");
@@ -4965,10 +4989,10 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
     // nothing BUT refused records read as "none pending", which is the one state a person needs
     // to be told about.
     for r in &store.rejected {
-        println!("  {} — REFUSED: {} ({})", r.uid, r.why, r.marker.display());
+        println!("  {} — REFUSED: {} ({})", r.uid, r.why, r.marker);
     }
     if fix {
-        match archive::reap(db_path, archive::RETAIN_DAYS, false) {
+        match archive::reap(&stores, archive::RETAIN_DAYS, false) {
             Ok(r) => report_reap(&r, false, false, None),
             Err(e) => println!("  sweep failed: {e}"),
         }
@@ -5596,7 +5620,7 @@ fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Resu
     // you are working in from one you walked away from.
     report_sessions(db);
 
-    report_worktree_removals(db_path, fix);
+    report_worktree_removals(db, db_path, fix);
 
     // Cloud-sync-folder warning (design D23).
     match jkb_core::cloud_sync_warning(db_path) {

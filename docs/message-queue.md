@@ -93,9 +93,18 @@ routinely built from different checkouts.
 | `task.start` | `uid`, exactly one of `take` {`owner`, `displace?`} and `keep` (the claim kept), `place` {`branch`, `repo`, `onto?`} | `taken` {`taken`} — `false`, nothing written, when the claim is not the one judged (`displace`, `keep`, or none) |
 | `task.take` | `uid`, `take` {`owner`, `displace?`}, `place` {`branch`, `repo`, `onto`} — the claim; the place is judged (written for trial and rolled back), not recorded | `taken` {`taken`} |
 | `task.locate` | `uid`, `owner`, `place` — recorded only while `owner` holds the claim | `taken` {`taken`} |
-| `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`reopened`, `status`} |
+| `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
 | `session.state` | `session` | `session_is` {`state`: `live`\|`ended`\|`unknown`} (a closed set) |
+| `removal.add` | `removal` {`worktree`, `repo_root`, `branch`, `uid`, `delete_branch`, `accept_dirty`, `recorded_at`, `head?`, `archive?`, `archived_at?`} | `removal_added` {`id`} |
+| `removal.list` | `after?` | `removals` {`records`, `next?`} — 64 a page, oldest first; each record carries `id` and `written_via` |
+| `removal.archived` | `id`, `archive`, `at` | `changed` {`changed`} — only a pending record moves |
+| `removal.cancel` | `ids` (≤256) | `removals_cancelled` {`cancelled`, `sweep_holder?`} — nothing is dropped while the sweep's lease is held |
+| `removal.drop` | `id` | `changed` {`changed`} |
+| `lease.get` | `name` (`removal-sweep`, or `land:<repo>`) | `lease` {`lease?` {`holder`, `taken_at`}} |
+| `lease.take` | `name`, `holder` (`<owner> <nonce>`), `displace?` | `changed` {`changed`} — free, or still held by exactly `displace` |
+| `lease.release` | `name`, `holder` | `changed` {`changed`} — only the holder's own |
+| `lease.break` | `name` | `lease_broken` {`holder?`} — refused to a client of `jkb serve` |
 | `ingest.text` | `text`, `mime` (≤ 255 bytes), `namespace` | `ingested` {`document`, `namespace`, `chunk_count`, `embedded`, `already_ingested`, `warnings`} |
 
 Every listing answer (`items`, `listing`, `tree`, `children`, `search_hits`, `task`, `history`) and `grep_hits`
@@ -175,9 +184,22 @@ Two decisions in it:
   `task.add`'s global-backlog question is answered by running the whole create and rolling it back, so
   it is asked only when the add would otherwise succeed.
 - **What stays on the host.** The session verbs are being split into client-side git and ops (tasks
-  S6.4, `jkb_api::sessions`): `task start` and `task gate` (show) run remotely; `work`, `abandon` and
-  `sessions` still read the removal records beside the database, and `land` is not yet ported;
-  storing a gate never runs remotely (a stored gate is a command the host runs). `task reclaim` proves
+  S6.4, `jkb_api::sessions`, `jkb_api::removals`): `task start`, `work`, `abandon`, `sessions` and
+  `task gate` (show) run remotely; `land` is not yet ported; storing a gate never runs remotely (a
+  stored gate is a command the host runs), nor does `task reap` or breaking a lease.
+- **Worktree-removal records name only the shared directory** (stage 3). They moved from files beside
+  the database into `worktree_removals` (V020), and the sweep's lock into the `leases` table. A record
+  is acted on by the host's reap service — renamed, later deleted — so every path a client writes, or
+  names by id, must be `~/`-relative, of plain segments, and under `~/repos` once resolved against the
+  daemon's home (`FileRoots::admits_home_path`). A client can only point the sweep at directories it
+  could already change itself; what the sweep then does is still judged by the reader
+  (`archive::Record::parse`, the identity check). Clients read every record, the host's absolute
+  paths included. `task work` cancels a pending record with `removal.cancel`, one write that a sweep
+  in flight refuses, rather than by taking the sweep's lease: a container `task work` killed while
+  holding it would have left a holder the host cannot probe, and the host's reap service would skip
+  every pass until someone broke it. A client can still take `removal-sweep` (or, from stage 4, a
+  land lease) and hold it; that stops the host's sweep, never acts on anything, and
+  `jkb task reap --break-lock` ends it. `task reclaim` proves
   owners gone by probing their processes, which only their host can do. A claim held by a live or
   unestablished owner is refused by `task.claim` from anywhere. **But the daemon does not judge
   liveness.** A client that names an owner can drop it (`task.release`), and so can a session op's

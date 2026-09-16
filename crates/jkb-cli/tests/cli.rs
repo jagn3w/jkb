@@ -3508,7 +3508,8 @@ fn task_reap_compacts_the_message_queue() {
     let v: serde_json::Value = serde_json::from_str(&json).expect("a single JSON document");
     assert!(v.get("mq_compact").is_some(), "{v}");
 
-    // A database from a newer binary: refinery refuses to open it, and the sweep still runs.
+    // A database from a newer binary: refinery refuses to open it. The sweep's records are in it
+    // (tasks S6.4 stage 3), so a one-shot sweep cannot run and says why; the service keeps running.
     let newer = tmp.path().join("newer.db");
     run(&newer, &["mq", "topic", "ls"]);
     // Through jkb_core::Db, never a raw rusqlite open: db::open is the one sanctioned opener.
@@ -3524,17 +3525,12 @@ fn task_reap_compacts_the_message_queue() {
         })
         .unwrap();
     let out = jkb(&newer).args(["task", "reap"]).output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        !out.status.success(),
+        "a sweep that could not run is not a success"
     );
-    assert!(
-        stdout.contains("nothing to reap"),
-        "the sweep ran: {stdout}"
-    );
-    assert!(stdout.contains("mq compact: not run"), "{stdout}");
+    assert!(stderr.contains("newer jkb"), "{stderr}");
 
     // And under --watch, where compaction runs FIRST each pass, its failure does not end the service.
     let mut watch = jkb(&newer)

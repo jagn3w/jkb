@@ -43,6 +43,27 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             cmd: None,
             clear: false,
         } => crate::session_cli::gate(&crate::session_cli::Kb::from_ops(ops), ops.json),
+        // On the host the old file store of worktree-removal records beside the database is still
+        // read (`archive::Stores`); a client of `jkb serve` has none.
+        TaskCmd::Work { uid, onto } => {
+            let kb = crate::session_cli::Kb::from_ops(ops);
+            let stores = crate::archive::Stores::new(kb, ops.db_path);
+            crate::session_cli::work(&kb, &stores, &uid, onto.as_deref(), ops.json)
+        }
+        TaskCmd::Abandon {
+            uid,
+            force,
+            delete_branch,
+        } => {
+            let kb = crate::session_cli::Kb::from_ops(ops);
+            let stores = crate::archive::Stores::new(kb, ops.db_path);
+            crate::session_cli::abandon(&kb, &stores, &uid, force, delete_branch, ops.json)
+        }
+        TaskCmd::Sessions => {
+            let kb = crate::session_cli::Kb::from_ops(ops);
+            let stores = crate::archive::Stores::new(kb, ops.db_path);
+            crate::session_cli::sessions(&kb, &stores, ops.json)
+        }
         TaskCmd::Add {
             text,
             backlog,
