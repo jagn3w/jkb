@@ -44,9 +44,10 @@ use crate::NotifyCmd;
 /// How long the hook waits to connect to the daemon.
 pub const CONNECT: Duration = Duration::from_millis(200);
 
-/// How long one request may take. A hook invocation starts no request after its first once this has
-/// passed, so `SessionStart` — a start and a sweep — is bounded by about twice this (a request started
-/// just before the deadline runs its own full `TOTAL`), once per session.
+/// How long one request may take. `SessionStart` — a start and a sweep — starts no request once this
+/// has passed since the hook began, so it is bounded by about twice this (a request started just before
+/// the deadline runs its own full `TOTAL`), once per session. `SessionEnd`'s own, shorter limit is
+/// [`SESSION_END_SECOND_REQUEST`].
 pub const TOTAL: Duration = Duration::from_secs(1);
 
 /// `SessionEnd`'s hooks get 1.5 s by default (Claude Code's hooks documentation), and it sends two
@@ -83,11 +84,24 @@ fn sessions(all: bool, json: bool) -> Result<()> {
     let url = crate::remote::daemon_url();
     let backend = jkb_daemon::client::RemoteBackend::new(&url, crate::remote::token_file(&url))
         .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let sessions = match backend.call(Request::SessionList { all }) {
-        Ok(Response::ClaudeSessions { sessions }) => sessions,
-        Ok(other) => anyhow::bail!("session.list: unexpected {other:?}"),
-        Err(e) => anyhow::bail!("session.list: {}", e.message),
-    };
+    let mut sessions = Vec::new();
+    let mut after = None;
+    loop {
+        match backend.call(Request::SessionList { all, after }) {
+            Ok(Response::ClaudeSessions {
+                sessions: page,
+                next,
+            }) => {
+                sessions.extend(page);
+                match next {
+                    Some(next) => after = Some(next),
+                    None => break,
+                }
+            }
+            Ok(other) => anyhow::bail!("session.list: unexpected {other:?}"),
+            Err(e) => anyhow::bail!("session.list: {}", e.message),
+        }
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
         return Ok(());
@@ -295,9 +309,11 @@ fn instance_from(host: &str, marker: Option<&str>, pidns: Option<&str>) -> Strin
 }
 
 /// Whether an instance names neither a boot nor a pid namespace — the macOS host, whose instance is its
-/// hostname alone. The dev container always records both, and a Linux host its namespace.
+/// hostname alone. The dev container always records both, and a Linux host its namespace. An empty
+/// instance names nothing, so it is not the host either: a pid recorded without one must never be
+/// probed here (stage-1 review, round 2).
 fn is_bare(instance: &str) -> bool {
-    !instance.contains(['#', '/'])
+    !instance.is_empty() && !instance.contains(['#', '/'])
 }
 
 /// Whether a pid recorded in `theirs` means the same process here, in `mine`.
@@ -448,33 +464,51 @@ fn sweep(edge: &Edge<'_>, own: &str) -> Vec<String> {
         Err(e) => failures.push(failure("notify.open_sessions", &e)),
     }
 
-    if out_of_time(&mut failures, "session.list") {
-        return failures;
-    }
-    match edge.backend.call(Request::SessionList { all: false }) {
-        Ok(Response::ClaudeSessions { sessions }) => {
-            for row in sessions {
-                if row.session == own
-                    || verdict(&row.pid, &row.instance, &edge.instance, edge.probe) != Fact::No
-                {
-                    continue;
-                }
-                if out_of_time(&mut failures, "session.gone") {
-                    return failures;
-                }
-                if let Err(e) = edge.backend.call(Request::SessionGone {
-                    session: row.session,
-                    pid: row.pid,
-                    instance: row.instance,
-                }) {
-                    failures.push(failure("session.gone", &e));
-                }
-            }
+    // Page by page, so rows this process can never judge — another container's, the host's from here,
+    // pid-less ones — cannot fill the one page and hide one it could (stage-1 review, round 2).
+    let mut after = None;
+    loop {
+        if out_of_time(&mut failures, "session.list") {
+            return failures;
         }
-        Ok(other) => failures.push(format!("session.list: unexpected {other:?}")),
-        Err(e) => failures.push(failure("session.list", &e)),
+        let next = match edge
+            .backend
+            .call(Request::SessionList { all: false, after })
+        {
+            Ok(Response::ClaudeSessions { sessions, next }) => {
+                for row in sessions {
+                    if row.session == own
+                        || verdict(&row.pid, &row.instance, &edge.instance, edge.probe) != Fact::No
+                    {
+                        continue;
+                    }
+                    if out_of_time(&mut failures, "session.gone") {
+                        return failures;
+                    }
+                    if let Err(e) = edge.backend.call(Request::SessionGone {
+                        session: row.session,
+                        pid: row.pid,
+                        instance: row.instance,
+                    }) {
+                        failures.push(failure("session.gone", &e));
+                    }
+                }
+                next
+            }
+            Ok(other) => {
+                failures.push(format!("session.list: unexpected {other:?}"));
+                None
+            }
+            Err(e) => {
+                failures.push(failure("session.list", &e));
+                None
+            }
+        };
+        match next {
+            Some(next) => after = Some(next),
+            None => return failures,
+        }
     }
-    failures
 }
 
 /// Decide and send. This is what the hook shim calls.

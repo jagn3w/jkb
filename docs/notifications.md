@@ -136,7 +136,7 @@ claim or a lock has ended (`openspec/changes/jkb-message-queue/design-s6-4.md`).
 - `session.ended` on `SessionEnd`, after that event's `notify.event`.
 
 Every `notify.event` except the end's also marks its process running. The `SessionStart` sweep, after
-the notification records, lists the live rows (`session.list`) and sends `session.gone` for those its
+the notification records, lists the live rows page by page (`session.list`) and sends `session.gone` for those its
 [verdict](#where-it-runs-and-why-it-moved-r32-2026-09-14) proves gone. It is the same function, asked of
 the row's `pid` and `instance`. `jkb notify sessions [--all]` prints the registry.
 
@@ -199,8 +199,11 @@ while any of its rows is live, **ended** once every row has ended, and **unknown
   on a network change. Two *bare* instances (no boot, no namespace) are therefore taken to be the same
   machine, and the pid is probed. **The assumption, stated:** every bare instance is the machine
   `jkb serve` runs on, because its clients are that host and its containers, and a container always
-  records a boot and a namespace. A second bare machine reaching the daemon would break it. Pinned in
-  `only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone`.
+  records a boot and a namespace. A second bare machine reaching the daemon would break it. An *empty*
+  instance is not bare: it names nothing, and the registry refuses a pid sent without one. Before round
+  2 of the review, such a row would have been probed as the host's. Pinned in
+  `only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone` and
+  `identity_is_refused_and_the_rest_normalised`.
 - **What is only shown is normalised, not refused.** An unusual start source or end reason is recorded
   as `unknown`, and a long working directory is cut, because a refused start is exactly the lost write
   above. Identity (session, pid, instance) is still refused when malformed, with the notification ops'
@@ -209,17 +212,32 @@ while any of its rows is live, **ended** once every row has ended, and **unknown
 **Budgets.** `SessionEnd` hooks get 1.5 s (Claude Code's documentation), and the end sends two requests.
 The second starts only within 300 ms of the hook's first line (`SESSION_END_SECOND_REQUEST`), because it
 may itself take the full 1 s request deadline. That leaves room for the shim's and the binary's
-start-up. A warm round trip takes a few milliseconds. What is not sent is logged, and a later sweep
-proves the same end from the pid; a hook killed at the budget would have logged nothing.
+start-up. A warm round trip takes a few milliseconds. What is not sent is logged, whereas a hook killed
+at the budget would log nothing. For a process that then exits, a later sweep proves the same end from
+its pid. After `/clear` or `/resume` the process lives on, so a lost end leaves the old session live
+until the process is gone, which means a `--force` in stage 2.
+
+That is deliberate. Ending a process's other sessions at each start would assume that one process runs
+one session, and a process hosting several (the Agent SDK) would then have a running session recorded as
+ended. Round 2 of the review proposed exactly that rule, and it was rejected on this ground. Pinned by
+`a_start_never_ends_another_session_of_the_same_process`.
 `SessionStart` starts nothing 1 s after the hook began, so a start plus both sweeps is bounded by about
 2 s. Pinned by `a_slow_first_request_leaves_the_rest_unsent`.
 
-**Pruning.** A session starting deletes rows not seen for 90 days, except its own. Deleting a row makes
-that process unknown, which licenses nothing. That is the safe direction for a record nobody can prove
+**Pruning.** A session starting deletes every session none of whose rows has been seen for 90 days,
+except its own. Whole sessions only: deleting one stale live row beside a recent ended one would turn
+a live session into an ended one (review round 2; pinned by
+`a_start_prunes_whole_sessions_not_seen_within_the_prune_age`). Deleting a session makes it unknown,
+which licenses nothing. That is the safe direction for a record nobody can prove
 anything about any more, such as a rebuilt container's sessions.
 
 **Not changelogged**, like `notify_sessions`: it is observation, and `jkb undo` must not revive or
 end a session.
+
+**Paged listing.** The sweep follows `session.list`'s `next` cursor within its time limit. Rows it can
+never judge (another container's, the host's seen from a container, pid-less ones) would otherwise
+fill the single 1000-row page and hide one it could judge. Pinned by
+`the_sweep_pages_past_rows_it_cannot_judge` and `the_listing_is_paged`.
 
 **Residuals, stated:**
 

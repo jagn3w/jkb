@@ -121,7 +121,10 @@ fn samples() -> Vec<Request> {
             pid: "1".into(),
             instance: "h".into(),
         },
-        Request::SessionList { all: false },
+        Request::SessionList {
+            all: false,
+            after: None,
+        },
         Request::KbAmbient {
             cwd: "/".into(),
             home: String::new(),
@@ -2437,8 +2440,11 @@ fn ingest_text_takes_source_bytes_only_in_process() {
 fn the_session_ops_drive_the_registry() {
     let b = backend();
     let rows = |all: bool| -> Vec<super::ClaudeSession> {
-        match b.call(Request::SessionList { all }).unwrap() {
-            Response::ClaudeSessions { sessions } => sessions,
+        match b.call(Request::SessionList { all, after: None }).unwrap() {
+            Response::ClaudeSessions {
+                sessions,
+                next: None,
+            } => sessions,
             other => panic!("unexpected {other:?}"),
         }
     };
@@ -2538,8 +2544,14 @@ fn a_notify_event_marks_its_process_running_except_at_the_end() {
         )
         .unwrap();
     };
-    let live = || match b.call(Request::SessionList { all: false }).unwrap() {
-        Response::ClaudeSessions { sessions } => sessions.len(),
+    let live = || match b
+        .call(Request::SessionList {
+            all: false,
+            after: None,
+        })
+        .unwrap()
+    {
+        Response::ClaudeSessions { sessions, .. } => sessions.len(),
         other => panic!("unexpected {other:?}"),
     };
     event("tool_finished");

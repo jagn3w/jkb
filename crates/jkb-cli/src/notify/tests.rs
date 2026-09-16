@@ -271,6 +271,12 @@ fn only_a_dead_pid_here_or_an_earlier_boot_of_this_container_is_gone() {
         "nor the host a container's"
     );
     assert_eq!(
+        verdict("10", "", "Johns-MBP.local", dead),
+        Fact::Unknown,
+        "a pid recorded with no instance is nobody's to probe"
+    );
+    assert_eq!(verdict("10", "Johns-MBP.local", "", dead), Fact::Unknown);
+    assert_eq!(
         verdict("", me, me, dead),
         Fact::Unknown,
         "no owner, no probe"
@@ -522,8 +528,12 @@ fn register(b: &dyn Backend, session: &str, pid: &str, instance: &str) {
 }
 
 fn live_sessions(b: &dyn Backend) -> Vec<String> {
-    let Response::ClaudeSessions { sessions } =
-        b.call(Request::SessionList { all: false }).unwrap()
+    let Response::ClaudeSessions { sessions, .. } = b
+        .call(Request::SessionList {
+            all: false,
+            after: None,
+        })
+        .unwrap()
     else {
         panic!("expected sessions")
     };
@@ -557,7 +567,12 @@ fn the_sweep_ends_the_registry_sessions_that_are_provably_gone() {
     );
     assert!(failures.is_empty(), "{failures:?}");
     assert_eq!(live_sessions(&b), ["host", "live", "new", "no-pid"]);
-    let Response::ClaudeSessions { sessions } = b.call(Request::SessionList { all: true }).unwrap()
+    let Response::ClaudeSessions { sessions, .. } = b
+        .call(Request::SessionList {
+            all: true,
+            after: None,
+        })
+        .unwrap()
     else {
         panic!("expected sessions")
     };
@@ -640,7 +655,7 @@ fn slow_first(delay: Duration) -> SlowFirst {
 
 /// **The hook stays inside its budget.** A slow first request still goes, but nothing starts after
 /// the event's last start time: at `SessionEnd`, whose hooks get 1.5 s, the registry end is not sent
-/// once half a second has gone; at `SessionStart` the sweep is not begun once the full request
+/// once [`super::SESSION_END_SECOND_REQUEST`] (300 ms) has gone; at `SessionStart` the sweep is not begun once the full request
 /// deadline has.
 #[test]
 fn a_slow_first_request_leaves_the_rest_unsent() {
@@ -695,8 +710,12 @@ fn the_sweep_never_judges_the_session_that_is_starting() {
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
-    let Response::ClaudeSessions { sessions } =
-        b.call(Request::SessionList { all: false }).unwrap()
+    let Response::ClaudeSessions { sessions, .. } = b
+        .call(Request::SessionList {
+            all: false,
+            after: None,
+        })
+        .unwrap()
     else {
         panic!("expected sessions")
     };
@@ -711,4 +730,45 @@ fn the_sweep_never_judges_the_session_that_is_starting() {
         ],
         "the other session's dead process is ended; this session's is left"
     );
+}
+
+/// **The sweep reaches every row it can judge.** A full page of rows it never can — another
+/// container's — sorts first; the dead process of this host behind them is still found and ended.
+#[test]
+fn the_sweep_pages_past_rows_it_cannot_judge() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    for i in 0..jkb_core::claude_session::LIST_CAP {
+        register(
+            &b,
+            &format!("elsewhere-{i:04}"),
+            "10",
+            "d9e0#pid:[1]/pid:[1]",
+        );
+    }
+    register(&b, "zzz-dead-here", "10", "host");
+    let failures = handle(
+        &json!({ "hook_event_name": "SessionStart" }).to_string(),
+        &Edge {
+            began: std::time::Instant::now(),
+            backend: &b,
+            owner: "30".into(),
+            instance: "host".into(),
+            probe: &|_| Fact::No,
+        },
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    let Response::ClaudeSessions { sessions, .. } = b
+        .call(Request::SessionList {
+            all: true,
+            after: None,
+        })
+        .unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    let dead = sessions
+        .iter()
+        .find(|s| s.session == "zzz-dead-here")
+        .expect("listed");
+    assert_eq!(dead.end_reason.as_deref(), Some("gone"));
 }

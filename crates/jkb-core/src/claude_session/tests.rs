@@ -81,8 +81,9 @@ fn one(db: &Db, session: &str) -> HolderRow {
 }
 
 fn live(db: &Db) -> Vec<(String, String)> {
-    db.read(|c| list(c, false))
+    db.read(|c| list(c, false, None))
         .unwrap()
+        .rows
         .into_iter()
         .map(|r| (r.session, r.pid))
         .collect()
@@ -256,37 +257,87 @@ fn the_listing_is_the_live_rows_least_recently_seen_first() {
         ]
     );
     let all: Vec<String> = db
-        .read(|c| list(c, true))
+        .read(|c| list(c, true, None))
         .unwrap()
+        .rows
         .into_iter()
         .map(|r| r.session)
         .collect();
     assert_eq!(all, ["c", "b", "a"]);
 }
 
-/// The listing is bounded, so a registry nobody pruned cannot make the sweep's one read unbounded.
+/// The listing is paged, so a registry nobody pruned cannot make the sweep's one read unbounded — and
+/// a page that was cut says where to continue, in both orders, so no row is skipped or repeated.
 #[test]
-fn the_listing_is_capped() {
+fn the_listing_is_paged() {
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, _| {
         for i in 0..=LIST_CAP {
             c.execute(
                 "INSERT INTO claude_sessions (session, pid, instance, cwd, seen_at) \
                  VALUES (?1, '1', 'h', '', ?2)",
-                rusqlite::params![format!("s{i}"), T0],
+                rusqlite::params![format!("s{i:04}"), T0 + i64::try_from(i % 7).unwrap()],
             )?;
         }
         Ok(())
     })
     .unwrap();
-    assert_eq!(live(&db).len(), LIST_CAP);
+    for all in [false, true] {
+        let first = db.read(move |c| list(c, all, None)).unwrap();
+        assert_eq!(first.rows.len(), LIST_CAP, "all={all}");
+        let next = first.next.clone().expect("a cut page says where to go on");
+        let second = db.read(move |c| list(c, all, Some(&next))).unwrap();
+        assert_eq!((second.rows.len(), second.next), (1, None), "all={all}");
+        let mut seen: Vec<String> = first
+            .rows
+            .iter()
+            .chain(&second.rows)
+            .map(|r| r.session.clone())
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), LIST_CAP + 1, "every row once, all={all}");
+    }
+    let whole = db.read(|c| list(c, false, None)).unwrap();
+    assert!(whole.next.is_some());
+    db.write_txn("t", |c, _| {
+        c.execute("DELETE FROM claude_sessions WHERE session = 's0000'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        db.read(|c| list(c, false, None)).unwrap().next,
+        None,
+        "an uncut page has no cursor"
+    );
 }
 
-/// Rows not seen within the prune age go when another session starts — live, ended, or known only by
-/// their end — and rows seen within it stay. The starting session's own rows are never pruned out from
-/// under it: its start still finds the session as it was.
+/// **A start never ends a session it is not about**, even one the same process held: a process may
+/// host several sessions (the Agent SDK), and ending one of them would record a running session as
+/// ended. The cost, chosen deliberately: after `/clear` with its `SessionEnd` lost, the old session
+/// stays live until its process is proved gone.
 #[test]
-fn a_start_prunes_rows_not_seen_within_the_prune_age() {
+fn a_start_never_ends_another_session_of_the_same_process() {
+    let db = Db::open_in_memory().unwrap();
+    start(&db, &p("a", "10", "h"), "startup", T0);
+    start(&db, &p("b", "10", "h"), "clear", T0 + 1);
+    assert_eq!(st(&db, "a"), SessionState::Live);
+    assert_eq!(st(&db, "b"), SessionState::Live);
+    assert!(prove_gone(&db, &p("a", "10", "h"), T0 + 2));
+    assert!(prove_gone(&db, &p("b", "10", "h"), T0 + 2));
+    assert_eq!(
+        st(&db, "a"),
+        SessionState::Ended,
+        "once the process is gone, both end"
+    );
+}
+
+/// Sessions none of whose rows was seen within the prune age go when another session starts — live,
+/// ended, or known only by their end — and the rest stay. **Whole sessions only**: a session with one
+/// stale live row and one recent ended row keeps both, since deleting the live one alone would turn it
+/// into an ended session. The starting session is never pruned out from under its own start.
+#[test]
+fn a_start_prunes_whole_sessions_not_seen_within_the_prune_age() {
     let db = Db::open_in_memory().unwrap();
     let now = T0 + PRUNE_AFTER_MS;
     start(&db, &p("old-live", "1", "gone-host"), "startup", T0 - 1);
@@ -294,6 +345,8 @@ fn a_start_prunes_rows_not_seen_within_the_prune_age() {
     end(&db, &p("old-ended", "2", "h"), "other", T0 - 1);
     end(&db, &p("old-end-only", "3", "h"), "other", T0 - 1);
     start(&db, &p("recent", "4", "h"), "startup", T0 + 1);
+    start(&db, &p("mixed", "7", "idle-host"), "startup", T0 - 1);
+    end(&db, &p("mixed", "8", "h"), "other", T0 + 1);
     start(&db, &p("idle", "5", "h"), "startup", T0 - 10);
 
     assert_eq!(
@@ -305,6 +358,12 @@ fn a_start_prunes_rows_not_seen_within_the_prune_age() {
         assert_eq!(st(&db, gone_), SessionState::Unknown, "{gone_} was pruned");
     }
     assert_eq!(st(&db, "recent"), SessionState::Live, "seen within the age");
+    assert_eq!(
+        st(&db, "mixed"),
+        SessionState::Live,
+        "a stale live row is kept beside a recent ended one"
+    );
+    assert_eq!(rows(&db, "mixed").len(), 2);
     assert_eq!(rows(&db, "idle").len(), 2);
 }
 
@@ -321,6 +380,10 @@ fn identity_is_refused_and_the_rest_normalised() {
         (p("s", "123456789012345678901", "h"), "long pid"),
         (p("s", "1", "h\n"), "control in instance"),
         (p("s", "1", &long_instance), "long instance"),
+        (
+            p("s", "1", ""),
+            "a pid with no instance to mean something in",
+        ),
     ] {
         let err = try_start(&db, &bad, "/w", "startup", T0).unwrap_err();
         assert!(
@@ -333,7 +396,13 @@ fn identity_is_refused_and_the_rest_normalised() {
             .unwrap_err();
         assert!(matches!(err, Error::Queue(_)), "{why}: {err}");
     }
-    assert!(db.read(|c| list(c, true)).unwrap().is_empty());
+    assert!(db.read(|c| list(c, true, None)).unwrap().rows.is_empty());
+    try_start(&db, &p("s", "", ""), "/w", "startup", T0).expect("no pid needs no instance");
+    db.write_txn("t", |c, _| {
+        c.execute("DELETE FROM claude_sessions", [])?;
+        Ok(())
+    })
+    .unwrap();
 
     let wide = "é".repeat(MAX_CWD_BYTES); // two bytes each
     for (source, recorded) in [

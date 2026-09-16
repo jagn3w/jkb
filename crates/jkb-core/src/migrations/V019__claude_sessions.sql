@@ -24,7 +24,7 @@ CREATE TABLE claude_sessions (
     started_at   INTEGER,
     start_source TEXT,
     -- The last event from this process (a start, an end, or any hook event, refreshed at most hourly):
-    -- what the prune ages rows by.
+    -- a session's newest row is what the prune ages it by.
     seen_at      INTEGER NOT NULL,
     ended_at     INTEGER,
     end_reason   TEXT,

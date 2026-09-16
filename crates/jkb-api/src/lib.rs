@@ -204,12 +204,15 @@ pub enum Request {
         instance: String,
     },
     /// The session registry, one row per process holding a session: the live rows, least recently
-    /// seen first (what a sweep probes), or every one.
+    /// seen first (what a sweep probes), or every one — a page at a time.
     #[serde(rename = "session.list")]
     SessionList {
         /// Include ended rows, most recently seen first.
         #[serde(default)]
         all: bool,
+        /// Continue after this: the `next` of the previous page, asked with the same `all`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<SessionCursor>,
     },
     /// The namespace of the mount holding a working directory — what an unscoped read defaults to.
     #[serde(rename = "kb.ambient")]
@@ -524,6 +527,20 @@ impl From<jkb_core::claude_session::HolderRow> for ClaudeSession {
             end_reason: r.end_reason,
         }
     }
+}
+
+/// Where a `session.list` page ended. Opaque to a client: sent back as it came.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCursor {
+    /// The last row's `seen_at`.
+    pub seen_at: i64,
+    /// The last row's session.
+    pub session: String,
+    /// The last row's pid.
+    pub pid: String,
+    /// The last row's instance.
+    pub instance: String,
 }
 
 /// A topic spec as a request carries it: every field optional, defaults from [`TopicSpec`].
@@ -903,10 +920,13 @@ pub enum Response {
         /// Whether the process's hold was ended by it.
         ended: bool,
     },
-    /// A `session.list`.
+    /// A `session.list` page.
     ClaudeSessions {
-        /// In the order asked for.
+        /// In the order asked for, at most `jkb_core::claude_session::LIST_CAP`.
         sessions: Vec<ClaudeSession>,
+        /// Where the next page starts; absent when this page is the last.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<SessionCursor>,
     },
     /// A `kb.ambient`.
     Ambient {
@@ -1588,13 +1608,24 @@ impl Backend for LocalBackend {
                     claude_session::gone(c, m, &process, now)
                 })?,
             },
-            Request::SessionList { all } => Response::ClaudeSessions {
-                sessions: db
-                    .read(move |c| claude_session::list(c, all))?
-                    .into_iter()
-                    .map(ClaudeSession::from)
-                    .collect(),
-            },
+            Request::SessionList { all, after } => {
+                let after = after.map(|c| claude_session::Cursor {
+                    seen_at: c.seen_at,
+                    session: c.session,
+                    pid: c.pid,
+                    instance: c.instance,
+                });
+                let page = db.read(move |c| claude_session::list(c, all, after.as_ref()))?;
+                Response::ClaudeSessions {
+                    sessions: page.rows.into_iter().map(ClaudeSession::from).collect(),
+                    next: page.next.map(|c| SessionCursor {
+                        seen_at: c.seen_at,
+                        session: c.session,
+                        pid: c.pid,
+                        instance: c.instance,
+                    }),
+                }
+            }
             Request::KbAmbient { cwd, home } => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 Response::Ambient {

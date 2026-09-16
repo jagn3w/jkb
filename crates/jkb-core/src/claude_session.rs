@@ -12,7 +12,12 @@
 //! the earlier one was still running (stage-1 review).
 //!
 //! The hook feeds it:
-//! - `SessionStart` makes this process's row live, reviving it if it had ended ([`started`]);
+//! - `SessionStart` makes this process's row live, reviving it if it had ended ([`started`]). It does
+//!   **not** end the process's rows for other sessions: after `/clear` or `/resume` a lost `SessionEnd`
+//!   therefore leaves the old session live until the process exits, which costs a `--force`. Ending
+//!   them would assume one process runs one session at a time, and a process hosting several (the
+//!   Agent SDK) would then have a running session recorded as ended — the one answer that is evidence.
+//!   Of the two ways to be wrong, the recoverable one is chosen (stage-1 review, round 2);
 //! - every other hook event marks the process seen ([`seen`]), which repairs a start that was lost
 //!   (daemon busy or restarting) — otherwise a resumed session could run for hours recorded as ended,
 //!   since nothing else ever makes a row live;
@@ -27,16 +32,18 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::notify::{check_owner_and_instance, check_session};
 use crate::{Result, WriteMeta};
 
-/// A row not seen for this long is deleted when another session starts. Deleting one makes its process
-/// unknown, which licenses nothing — the safe direction for a record nobody can prove anything about
-/// any more (a rebuilt container's sessions, whose hostname never recurs).
+/// A session none of whose rows has been seen for this long is deleted, whole, when another session
+/// starts. Deleting it makes it unknown, which licenses nothing — the safe direction for a record nobody
+/// can prove anything about any more (a rebuilt container's sessions, whose hostname never recurs).
+/// Whole sessions only: deleting one stale live row beside a recent ended one would turn a live session
+/// into an ended one, the single answer that is evidence (stage-1 review, round 2).
 pub const PRUNE_AFTER_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 
 /// How stale a live row's `seen_at` may get before [`seen`] rewrites it. `seen` runs on every tool call,
 /// and a write per call on the daemon's one writer buys nothing: the prune works in days.
 pub const SEEN_REFRESH_MS: i64 = 60 * 60 * 1000;
 
-/// The most rows [`list`] returns.
+/// The most rows one [`list`] page returns.
 pub const LIST_CAP: usize = 1000;
 
 /// The longest working directory kept, in bytes; a longer one is cut.
@@ -116,9 +123,20 @@ pub struct Process<'a> {
 }
 
 impl Process<'_> {
+    /// The shared identity checks, and one of the registry's own: a pid names a process only together
+    /// with the instance it belongs to. A pid with no instance would read as the bare host's and be
+    /// probed there, ending a live row on a verdict about some other process (stage-1 review, round 2).
     fn check(&self) -> Result<()> {
         check_session(self.session)?;
-        check_owner_and_instance(self.pid, self.instance)
+        check_owner_and_instance(self.pid, self.instance)?;
+        if !self.pid.is_empty() && self.instance.is_empty() {
+            return Err(crate::mq::QueueError::Invalid {
+                what: "instance",
+                why: "a pid needs the instance it belongs to".to_owned(),
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -228,8 +246,9 @@ fn holder(conn: &Connection, p: &Process<'_>) -> Result<Option<HolderRow>> {
         .optional()?)
 }
 
-/// `p` started its session (or resumed it, cleared into it, compacted): its row is live. Also prunes rows
-/// not seen for [`PRUNE_AFTER_MS`]. Returns the session's state **before** — a revival is
+/// `p` started its session (or resumed it, cleared into it, compacted): its row is live. Its rows for
+/// other sessions are left alone (the module doc says why). Also prunes sessions not seen for
+/// [`PRUNE_AFTER_MS`]. Returns the session's state **before** — a revival is
 /// [`SessionState::Ended`], a compaction or a second process joining a running session
 /// [`SessionState::Live`].
 ///
@@ -244,8 +263,12 @@ pub fn started(
     now: i64,
 ) -> Result<SessionState> {
     p.check()?;
-    conn.prepare_cached("DELETE FROM claude_sessions WHERE seen_at < ?1 AND session <> ?2")?
-        .execute(params![now.saturating_sub(PRUNE_AFTER_MS), p.session])?;
+    conn.prepare_cached(
+        "DELETE FROM claude_sessions WHERE session IN ( \
+             SELECT session FROM claude_sessions GROUP BY session HAVING max(seen_at) < ?1 \
+         ) AND session <> ?2",
+    )?
+    .execute(params![now.saturating_sub(PRUNE_AFTER_MS), p.session])?;
     let before = state(conn, p.session)?;
     conn.prepare_cached(
         "INSERT INTO claude_sessions \
@@ -343,28 +366,74 @@ pub fn gone(conn: &Connection, _meta: &WriteMeta, p: &Process<'_>, now: i64) -> 
     Ok(changed > 0)
 }
 
-/// Rows, at most [`LIST_CAP`]: the live ones, least recently seen first — what a sweep probes, and the
-/// likeliest to be gone come first — or, with `all`, every one, most recently seen first.
+/// Where a [`list`] page ended: the last row it returned, in the listing's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    /// The row's `seen_at`.
+    pub seen_at: i64,
+    /// The row's session.
+    pub session: String,
+    /// The row's pid.
+    pub pid: String,
+    /// The row's instance.
+    pub instance: String,
+}
+
+/// One page of rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// At most [`LIST_CAP`].
+    pub rows: Vec<HolderRow>,
+    /// Where to continue, when there are more.
+    pub next: Option<Cursor>,
+}
+
+/// A page of rows, after `after`: the live ones, least recently seen first — what a sweep probes, and
+/// the likeliest to be gone come first — or, with `all`, every one, most recently seen first. The pages
+/// are keyset-ordered, so a row written between two pages cannot shift one already returned into the
+/// next.
 ///
 /// # Errors
 /// A database error.
-pub fn list(conn: &Connection, all: bool) -> Result<Vec<HolderRow>> {
-    let sql = if all {
-        format!(
-            "SELECT {COLUMNS} FROM claude_sessions \
-             ORDER BY seen_at DESC, session, pid, instance LIMIT ?1"
-        )
+pub fn list(conn: &Connection, all: bool, after: Option<&Cursor>) -> Result<Page> {
+    let (filter, cmp, dir) = if all {
+        ("1", "<", "DESC")
     } else {
-        format!(
-            "SELECT {COLUMNS} FROM claude_sessions WHERE ended_at IS NULL \
-             ORDER BY seen_at, session, pid, instance LIMIT ?1"
-        )
+        ("ended_at IS NULL", ">", "ASC")
     };
-    let cap = i64::try_from(LIST_CAP).unwrap_or(i64::MAX);
-    Ok(conn
+    let sql = format!(
+        "SELECT {COLUMNS} FROM claude_sessions \
+         WHERE {filter} AND (?1 = 0 OR (seen_at, session, pid, instance) {cmp} (?2, ?3, ?4, ?5)) \
+         ORDER BY seen_at {dir}, session {dir}, pid {dir}, instance {dir} LIMIT ?6"
+    );
+    let fetch = i64::try_from(LIST_CAP + 1).unwrap_or(i64::MAX);
+    let (seen_at, session, pid, instance) = after.map_or((0, "", "", ""), |c| {
+        (
+            c.seen_at,
+            c.session.as_str(),
+            c.pid.as_str(),
+            c.instance.as_str(),
+        )
+    });
+    let mut rows: Vec<HolderRow> = conn
         .prepare_cached(&sql)?
-        .query_map([cap], row_to_holder)?
-        .collect::<rusqlite::Result<_>>()?)
+        .query_map(
+            params![after.is_some(), seen_at, session, pid, instance, fetch],
+            row_to_holder,
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let next = if rows.len() > LIST_CAP {
+        rows.truncate(LIST_CAP);
+        rows.last().map(|r| Cursor {
+            seen_at: r.seen_at,
+            session: r.session.clone(),
+            pid: r.pid.clone(),
+            instance: r.instance.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(Page { rows, next })
 }
 
 #[cfg(test)]

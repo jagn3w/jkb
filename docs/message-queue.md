@@ -66,7 +66,7 @@ routinely built from different checkouts.
 | `session.started` | `session`, `source`, `pid?`, `instance?`, `cwd?` | `session_start` {`was`: `unknown`\|`live`\|`ended`} (the session's state before) |
 | `session.ended` | `session`, `reason`, `pid?`, `instance?` — ends that process's hold only | `session_end` {`outcome`: `recorded`\|`already_ended`} |
 | `session.gone` | `session`, `pid`, `instance` (as `session.list` reported them) | `session_gone` {`ended`} |
-| `session.list` | `all?` | `claude_sessions` {`sessions`: one per process holding a session, [{`session`, `pid`, `instance`, `cwd`, `started_at?`, `start_source?`, `seen_at`, `ended_at?`, `end_reason?`}]} |
+| `session.list` | `all?`, `after?` (a page's `next`) | `claude_sessions` {`sessions`: one per process holding a session, [{`session`, `pid`, `instance`, `cwd`, `started_at?`, `start_source?`, `seen_at`, `ended_at?`, `end_reason?`}], `next?`} |
 | `kb.ambient` | `cwd`, `home?` | `ambient` {`namespace`} |
 | `kb.query` | `dsl`, `default_scope?`, `limit?`, `count?`, `order?` (`id`\|`updated_desc`) | `items` {`items`}, or with `count` `count` {`count`} |
 | `kb.ls` | `path?`, `all?`, `recursive?` | `listing` {`rows`: [{`parent`, `child`}]} |
@@ -264,7 +264,10 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   children are gathered before they are sorted and charged; and the queue's reads, which stay on the
   writer, are bounded instead by `mq::MAX_BATCH` (256): a poll or a tail asking for more is refused,
   and `jkb mq subscribe --batch` is held to it when parsed, so neither reads more than about 16 MiB of
-  payload however large its topic's creator — a container included — let it grow. Refused, not
+  payload however large its topic's creator — a container included — let it grow. `session.list`,
+  also on the writer, is paged instead: at most 1000 rows (`claude_session::LIST_CAP`, rows of a few
+  hundred bytes) and a `next` keyset cursor when there are more, which the hook's sweep and `jkb notify
+  sessions` follow. Refused, not
   clamped: the subscribe stream reads a batch shorter than it asked for as caught up, and a clamp
   announced `caught_up` after every capped poll of a backlog (a fifth review caught it). The frontier (`task.ready`) is ordered
   and limited over ids, and a task's subtasks are streamed, so at most one body is held at a time
