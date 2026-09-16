@@ -3558,9 +3558,12 @@ fn registry(db: &Path, session: &str, live: bool) {
 fn a_session_owner_names_its_worktree_under_the_home() {
     let f = Fixture::new();
     let uid = f.add_task("homed session");
+    // A home whose `repos` — the directory both sides of the bind share — holds the fixture repo.
+    let home = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(f.home.path(), home.path().join("repos")).unwrap();
     let out = f
         .jkb()
-        .env("HOME", f.home.path())
+        .env("HOME", home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["task", "work", &uid, "--json"])
         .output()
@@ -3568,19 +3571,19 @@ fn a_session_owner_names_its_worktree_under_the_home() {
     assert!(out.status.success(), "{out:?}");
     let owner = claim_of(&f.db, &uid).expect("claimed");
     assert!(
-        owner.contains(":~/proj/.jkb/work/"),
-        "the worktree is written under the home: {owner}"
+        owner.contains(":~/repos/proj/.jkb/work/"),
+        "the worktree is written under the home's repos: {owner}"
     );
     // Live by its checkout: nothing reclaims it.
     f.jkb()
-        .env("HOME", f.home.path())
+        .env("HOME", home.path())
         .args(["task", "reclaim"])
         .assert()
         .success();
     assert_eq!(claim_of(&f.db, &uid).as_deref(), Some(owner.as_str()));
     // And the session's own abandon recognises it as this session's claim.
     f.jkb()
-        .env("HOME", f.home.path())
+        .env("HOME", home.path())
         .args(["task", "abandon", &uid])
         .assert()
         .success();
@@ -3659,9 +3662,12 @@ fn a_session_opened_by_a_running_claude_session_is_not_taken_over() {
 fn a_home_relative_owner_is_reclaimed_from_another_home() {
     let f = Fixture::new();
     let uid = f.add_task("judged across homes");
+    // Two homes whose `repos` both reach the fixture repo, by different paths.
+    let first = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(f.home.path(), first.path().join("repos")).unwrap();
     let out = f
         .jkb()
-        .env("HOME", f.home.path())
+        .env("HOME", first.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["task", "work", &uid, "--json"])
         .output()
@@ -3670,10 +3676,11 @@ fn a_home_relative_owner_is_reclaimed_from_another_home() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let worktree = PathBuf::from(v["worktree"].as_str().unwrap());
     let owner = claim_of(&f.db, &uid).expect("claimed");
-    assert!(owner.contains(":~/proj/.jkb/work/"), "{owner}");
+    assert!(owner.contains(":~/repos/proj/.jkb/work/"), "{owner}");
 
     let other = TempDir::new().unwrap();
-    std::os::unix::fs::symlink(&f.repo, other.path().join("proj")).unwrap();
+    std::fs::create_dir_all(other.path().join("repos")).unwrap();
+    std::os::unix::fs::symlink(&f.repo, other.path().join("repos/proj")).unwrap();
     let reclaim = || {
         f.jkb()
             .env("HOME", other.path())
@@ -3883,5 +3890,22 @@ fn a_session_blocked_by_a_running_sweep_leaves_no_claim() {
         branches,
         ["feat"],
         "the recorded branch is untouched: {shown}"
+    );
+    // Nor does its history name a branch or a land target nobody made.
+    let why: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--global", "--json", "task", "why", &uid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        why["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["branch"].is_null() && e["onto"].is_null()),
+        "{why}"
     );
 }

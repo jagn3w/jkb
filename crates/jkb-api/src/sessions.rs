@@ -105,14 +105,21 @@ pub struct BranchTask {
 /// `task.by_branch`: the repo's tasks (`repo=<repo>`), indexed by **every** branch each records — the
 /// only link from a worktree back to its task (design D36.2). One read.
 ///
+/// **Every task on a branch**, in id order, not one of them: two tasks can record the same branch, and
+/// keeping whichever was indexed last had `task work` judge a batch spent from a finished task while a
+/// live one still landed on it (stage-2 review, round 3).
+///
 /// # Errors
 /// [`ErrorCode::Invalid`] for a malformed repo key, or a failed read.
-pub fn by_branch(conn: &Connection, repo: &str) -> Result<BTreeMap<String, BranchTask>, ApiError> {
+pub fn by_branch(
+    conn: &Connection,
+    repo: &str,
+) -> Result<BTreeMap<String, Vec<BranchTask>>, ApiError> {
     check_name("repo key", repo)?;
     let ids = jkb_core::location::tasks_in_repo(repo).evaluate(conn)?;
     let metas = item::get_many(conn, &ids)?;
     let tags = tag::applications_for(conn, &ids)?;
-    let mut out = BTreeMap::new();
+    let mut out: BTreeMap<String, Vec<BranchTask>> = BTreeMap::new();
     for id in ids {
         let Some(meta) = metas.get(&id) else { continue };
         let onto = transition::land_target(conn, id)?;
@@ -120,14 +127,11 @@ pub fn by_branch(conn: &Connection, repo: &str) -> Result<BTreeMap<String, Branc
             if facet != FACET_BRANCH {
                 continue;
             }
-            out.insert(
-                branch,
-                BranchTask {
-                    uid: meta.uid.clone(),
-                    status: meta.status.clone().unwrap_or_default(),
-                    onto: onto.clone(),
-                },
-            );
+            out.entry(branch).or_default().push(BranchTask {
+                uid: meta.uid.clone(),
+                status: meta.status.clone().unwrap_or_default(),
+                onto: onto.clone(),
+            });
         }
     }
     Ok(out)
@@ -296,9 +300,13 @@ pub struct TakeAsk {
     pub place: Place,
 }
 
-/// `task.take`: `jkb task work`'s claim — the `start` transition carrying the session's branch and
-/// land target, compare-and-set against the owner the caller judged. `false` when the claim changed
-/// hands, with nothing written.
+/// `task.take`: `jkb task work`'s claim — the `start` transition, compare-and-set against the owner the
+/// caller judged. `false` when the claim changed hands, with nothing written.
+///
+/// **The start carries no branch and no land target.** Nothing is there yet; [`locate`] labels the
+/// history once the worktree exists. Labelled here, a run that then failed its git work left the
+/// task's history naming a branch nobody made — which `close-merged` and `task pr` then looked for,
+/// holding the task for ever (stage-2 review, round 3).
 ///
 /// **The location is judged here and written later** ([`locate`], once the worktree exists). Every
 /// refusal of it — a malformed place, a line the task's `tasks.md` could not read back with it —
@@ -326,7 +334,7 @@ pub fn take(
     }
     let id = writable(conn, &ask.uid, roots)?;
     trial_locate(conn, meta, id, &ask.uid, &ask.place)?;
-    swap(conn, meta, id, &ask.take, &ask.place.labels())
+    swap(conn, meta, id, &ask.take, &transition::Labels::default())
 }
 
 /// Write the place, check the task's `tasks.md` line would still read back, and undo the write —
@@ -343,15 +351,19 @@ fn trial_locate(
         .map_err(jkb_core::Error::from)?;
     let tried =
         locate_id(conn, meta, id, place).and_then(|()| check_line(conn, uid, before.as_deref()));
-    conn.execute_batch("ROLLBACK TO trial_locate; RELEASE trial_locate")
-        .map_err(jkb_core::Error::from)?;
-    tried
+    let undone = conn
+        .execute_batch("ROLLBACK TO trial_locate; RELEASE trial_locate")
+        .map_err(|e| ApiError::from(jkb_core::Error::from(e)));
+    // The trial's own failure is the one to report: one that aborted the whole transaction (a full
+    // disk) also takes the savepoint with it, and "no such savepoint" would say nothing.
+    tried.and(undone)
 }
 
 /// `task.locate`: record where `owner`'s work on a task is — the facets are *set*, not added, since a
-/// second value would be a contradiction (D36.6). **Only while `owner` holds the claim**: `false`, with
-/// nothing written, when it does not, so a run displaced by another cannot overwrite the location its
-/// successor recorded.
+/// second value would be a contradiction (D36.6) — and, when the branch or land target differs from what
+/// the history last said, a `note` carrying them, so the history names where the work is once it is
+/// there. **Only while `owner` holds the claim**: `false`, with nothing written, when it does not, so a
+/// run displaced by another cannot overwrite the location its successor recorded.
 ///
 /// # Errors
 /// As [`start`].
@@ -366,11 +378,19 @@ pub fn locate(
     check_owner(owner)?;
     place.check()?;
     let id = writable(conn, uid, roots)?;
-    let held = task::observe(conn, id)?.claimant.map(|c| c.as_str());
-    if held.as_deref() != Some(owner) {
+    let facts = task::observe(conn, id)?;
+    if facts.claimant.as_ref().map(AgentId::as_str).as_deref() != Some(owner) {
         return Ok(false);
     }
     locate_id(conn, meta, id, place)?;
+    let branch_known = transition::latest_with_branch(conn, id)?
+        .and_then(|r| r.labels.branch)
+        .as_deref()
+        == Some(place.branch.as_str());
+    let onto_known = place.onto.is_none() || transition::land_target(conn, id)? == place.onto;
+    if !(branch_known && onto_known) {
+        transition::note(conn, meta, id, &facts, &place.labels())?;
+    }
     Ok(true)
 }
 

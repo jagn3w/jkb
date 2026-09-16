@@ -154,8 +154,8 @@ Two decisions in it:
   priority, due date, tags, out-of-file placements, in-file dependencies — rendered alone and parsed
   back, and a write that makes a readable line come back different is refused, naming the first field
   that fails on its own. A line that was already unreadable does not block later writes: writers outside
-  the typed operations do not ask the file (`jkb task start` recording `repo=My App`, the MCP server's
-  `task_update`, `jkb ns mv`, `jkb tag rename`), and refusing every write after one of them left the task
+  the typed operations do not ask the file (the MCP server's `task_update`, `jkb ns mv`, `jkb tag
+  rename`; the session verbs' ops do, since S6.4), and refusing every write after one of them left the task
   unable to be released. Except a write that moves the task to another line (`task.bind`), which is
   judged as a new line: excused by the old line's problem, a bind from an unreadable line onto another
   task's `#id` put two tasks on one line, and the next export dropped one. Checking only the text let `task set --due "2026-07-15 17:00"`, a tag value or a
@@ -177,9 +177,13 @@ Two decisions in it:
 - **What stays on the host.** The session verbs are being split into client-side git and ops (tasks
   S6.4, `jkb_api::sessions`): `task start` and `task gate` (show) run remotely; `work`, `abandon` and
   `sessions` still read the removal records beside the database, and `land` is not yet ported;
-  storing a gate never runs remotely (a stored gate is a command the host runs). `task reclaim` proves owners gone by probing their processes, which
-  only their host can do — a claim held by a live or unestablished owner is refused by `task.claim`
-  from anywhere; and `task mirror` is a sweep over every task.
+  storing a gate never runs remotely (a stored gate is a command the host runs). `task reclaim` proves
+  owners gone by probing their processes, which only their host can do. A claim held by a live or
+  unestablished owner is refused by `task.claim` from anywhere. **But the daemon does not judge
+  liveness.** A client that names an owner can drop it (`task.release`), and so can a session op's
+  `displace`. A misbehaving container can therefore free any claim, and an honest one never does,
+  because it can prove gone only what its own machine can see (tasks S6.4 design, "Residual,
+  stated"). `task mirror` is a sweep over every task.
 
 **Ingest** (`ingest.text`; tasks S6.3, `crates/jkb-api/src/ingest.rs`). `jkb ingest <file|url>` reads
 and parses its source where it runs (`jkb_ingest::read_source`: a file by its extension, a URL rendered
@@ -244,7 +248,7 @@ them differently from the host — pinned byte-for-byte by `tests/cli.rs`
   wide grep, a deep tree — held up every write behind it, the notification hook's 1 s round trip
   included (pinned by `a_long_read_on_the_reader_does_not_hold_up_a_write`: a 1.5 s read, and the
   write beside it under 0.7 s). Which ops go there is said once, by `Request::is_agent_read` — the
-  read set (`kb.*`, `task.ready`/`show`/`subtasks`), **not** every op that does not write: the reader
+  read set (`kb.*`, `task.ready`/`show`/`subtasks`/`why`, `task.facts`/`by_branch`, `repo.gate`), **not** every op that does not write: the reader
   serves one call at a time behind a client's greps, so the queue's and the hook's own short reads
   (`mq.inspect`, `mq.tail`, `notify.open_sessions`, `session.list`, whose `SessionStart` sweep has 1 s) stay on the
   writer. Classing by "does not write" put that sweep behind a container's grep, and a third review

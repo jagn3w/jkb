@@ -3488,9 +3488,10 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
     let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
     let by_branch = session_cli::Kb::new(&backend).by_branch(&ctx.key)?;
     let uids: Vec<String> = by_branch
-        .iter()
-        .filter(|(b, _)| b.as_str() == branch)
-        .map(|(_, t)| t.uid.clone())
+        .get(branch)
+        .into_iter()
+        .flatten()
+        .map(|t| t.uid.clone())
         .collect();
     anyhow::ensure!(
         !uids.is_empty(),
@@ -4992,6 +4993,7 @@ fn report_sessions(db: &Db) {
     for s in &sessions {
         let uid = by_branch
             .get(&s.branch)
+            .and_then(|ts| session_cli::task_on(ts))
             .map_or("(no task)", |t| t.uid.as_str());
         println!(
             "  {} — {uid}: resume with `cd {}`, land it with `jkb task land {uid}`, or drop \

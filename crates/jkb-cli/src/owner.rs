@@ -76,25 +76,31 @@ fn home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
         .filter(|h| h.is_absolute() && h.components().any(|c| matches!(c, Component::Normal(_))))
 }
 
-/// `path` as `~/…` when it lies under `home`, else unchanged.
+/// `path` as `~/repos/…` when it lies under `home`'s `repos`, else unchanged.
+///
+/// **Only `~/repos`**, the directory the dev container and the host both see
+/// (`jkb_daemon::CLIENT_FILE_ROOT`). Anywhere else under the home names a directory only one side has,
+/// and written `~/`-relative it would resolve on the other side to *that* side's unrelated directory —
+/// where an absent checkout reads as proven gone, and a live claim is freed (stage-2 review, round 3).
+/// Kept absolute, the other side answers `Unknown`, which frees nothing.
 ///
 /// Asked of the paths as given and, failing that, as the filesystem resolves them: git reports a
-/// checkout's physical path (`/private/var/…` on macOS) while `$HOME` may name it through a symlink
-/// (`/var/…`), and a home reached through a link would otherwise never give a `~/` owner (stage-2
-/// review, round 2). A worktree that does not exist yet is resolved through its nearest existing
+/// checkout's physical path (`/private/var/…` on macOS) while `$HOME`, or `~/repos` itself, may be a
+/// symlink (round 2). A worktree that does not exist yet is resolved through its nearest existing
 /// ancestor.
 fn home_relative(path: &Path, home: Option<&Path>) -> PathBuf {
     let Some(home) = home else {
         return path.to_path_buf();
     };
-    let under = |p: &Path, h: &Path| {
-        p.strip_prefix(h)
+    let shared = home.join(jkb_daemon::CLIENT_FILE_ROOT);
+    let under = |p: &Path, root: &Path| {
+        p.strip_prefix(root)
             .ok()
             .filter(|rest| !rest.as_os_str().is_empty())
-            .map(|rest| Path::new("~").join(rest))
+            .map(|rest| Path::new("~").join(jkb_daemon::CLIENT_FILE_ROOT).join(rest))
     };
-    under(path, home)
-        .or_else(|| under(&resolved(path), &resolved(home)))
+    under(path, &shared)
+        .or_else(|| under(&resolved(path), &resolved(&shared)))
         .unwrap_or_else(|| path.to_path_buf())
 }
 
@@ -479,6 +485,41 @@ mod tests {
         assert!(session_worktree("host:123").is_none());
     }
 
+    /// **Only `~/repos` is written home-relative**: it is the one directory both sides of the bind
+    /// share. A checkout elsewhere under the home keeps its absolute path, so the other side — whose
+    /// `~/src` is a different directory — answers `Unknown` about it rather than "gone".
+    #[test]
+    fn only_the_shared_directory_is_written_home_relative() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            home_relative(Path::new("/home/me/repos/p/.jkb/work/s"), Some(home)),
+            Path::new("~/repos/p/.jkb/work/s")
+        );
+        for elsewhere in [
+            "/home/me/src/p/.jkb/work/s",
+            "/home/me/reposx/s",
+            "/home/me/repos",
+        ] {
+            assert_eq!(
+                home_relative(Path::new(elsewhere), Some(home)),
+                Path::new(elsewhere),
+                "{elsewhere}"
+            );
+        }
+    }
+
+    /// A relative worktree names no place: judged against the process's directory, a missing child of
+    /// a parent that happens to exist there would read as proven gone.
+    #[test]
+    fn a_relative_worktree_is_never_judged_gone() {
+        // Tests run in the crate's directory, where `src` exists.
+        assert!(Path::new("src").is_dir());
+        assert_eq!(
+            alive_in("session:1:src/no-such-session", None),
+            Fact::Unknown
+        );
+    }
+
     /// A home of `/` names no directory of its own: taken as a home, it would make every absolute path
     /// `~/…` and another side would resolve it under its own home, somewhere else entirely.
     #[test]
@@ -613,6 +654,12 @@ mod tests {
             session_owner_in(&physical, None, Some(&linked_home))
                 .ends_with(":~/repos/proj/.jkb/work/t"),
             "a worktree not made yet, under a linked home"
+        );
+        // …and through a home whose `repos` is itself a link to where the checkout is.
+        assert!(
+            session_owner_in(&physical, None, Some(&host_home))
+                .ends_with(":~/repos/proj/.jkb/work/t"),
+            "a worktree under a linked ~/repos"
         );
         // An absolute owner is judged as it always was, whatever the home.
         let abs = session_owner_in(&work.join("s"), None, Some(&elsewhere));

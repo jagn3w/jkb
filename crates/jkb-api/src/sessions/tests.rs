@@ -93,10 +93,21 @@ fn a_start_claims_and_records_where_the_work_is() {
         panic!("expected tasks")
     };
     let t = &tasks["feat"];
+    assert_eq!(t.len(), 1);
     assert_eq!(
-        (t.uid.as_str(), t.onto.as_deref()),
+        (t[0].uid.as_str(), t[0].onto.as_deref()),
         (uid.as_str(), Some("batch"))
     );
+    // A second task on the same branch is listed beside the first, in id order, not in its place.
+    let second = add(&b, "same branch +tasks/x");
+    assert!(start(&b, &second, "host:2", None).unwrap());
+    let Response::BranchTasks { tasks } =
+        call(&b, json!({ "op": "task.by_branch", "repo": "proj" })).unwrap()
+    else {
+        panic!("expected tasks")
+    };
+    let uids: Vec<&str> = tasks["feat"].iter().map(|t| t.uid.as_str()).collect();
+    assert_eq!(uids, [uid.as_str(), second.as_str()]);
     let Response::BranchTasks { tasks } =
         call(&b, json!({ "op": "task.by_branch", "repo": "other" })).unwrap()
     else {
@@ -181,17 +192,37 @@ fn a_take_claims_and_a_locate_records_the_holder_s_place() {
         .map(taken)
         .unwrap()
     };
+    let history = || match call(&b, json!({ "op": "task.why", "uid": uid })).unwrap() {
+        Response::History { entries, .. } => entries,
+        other => panic!("{other:?}"),
+    };
     assert!(take("session:1:~/w", None, "task/w").unwrap());
     let f = facts(&b, &uid);
     assert_eq!(
-        (f.claim.as_deref(), f.land_target.as_deref()),
-        (Some("session:1:~/w"), Some("batch"))
+        (f.claim.as_deref(), f.land_target),
+        (Some("session:1:~/w"), None),
+        "a take names no branch and no land target: nothing is there yet"
     );
     assert!(!f.tags.contains_key("branch"), "a take writes no location");
+    assert!(history()
+        .iter()
+        .all(|e| e.branch.is_none() && e.onto.is_none()));
     assert!(locate("session:1:~/w", "task/w"));
     let f = facts(&b, &uid);
     assert_eq!(f.tags["branch"], ["task/w"]);
     assert_eq!(f.tags["repo"], ["proj"]);
+    assert_eq!(
+        f.land_target.as_deref(),
+        Some("batch"),
+        "the locate labels the history"
+    );
+    let labelled = history().len();
+    assert!(locate("session:1:~/w", "task/w"));
+    assert_eq!(
+        history().len(),
+        labelled,
+        "an unchanged place adds no entry"
+    );
     assert!(
         take("session:1:~/w", Some("session:1:~/w"), "task/w").unwrap(),
         "a resume re-takes its own claim"

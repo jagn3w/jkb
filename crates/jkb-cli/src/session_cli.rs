@@ -61,8 +61,8 @@ impl<'a> Kb<'a> {
         }
     }
 
-    /// `task.by_branch`.
-    pub(crate) fn by_branch(&self, repo: &str) -> Result<BTreeMap<String, BranchTask>> {
+    /// `task.by_branch`: every task on each branch.
+    pub(crate) fn by_branch(&self, repo: &str) -> Result<BTreeMap<String, Vec<BranchTask>>> {
         match self.call(Request::TaskByBranch {
             repo: repo.to_owned(),
         })? {
@@ -705,7 +705,11 @@ fn batch_onto(kb: &Kb<'_>, ctx: &repo::RepoCtx) -> Result<Option<String>> {
     let by_branch = kb.by_branch(&ctx.key)?;
     let mut found: Option<String> = None;
     for s in session::discover(&ctx.root)? {
-        let Some(onto) = by_branch.get(&s.branch).and_then(|t| t.onto.clone()) else {
+        let Some(onto) = by_branch
+            .get(&s.branch)
+            .and_then(|ts| task_on(ts))
+            .and_then(|t| t.onto.clone())
+        else {
             continue;
         };
         // Remote-aware for the same reason: a live batch whose local ref is gone must still be
@@ -762,9 +766,9 @@ fn base_branch(ctx: &repo::RepoCtx) -> Result<Option<String>> {
 /// A batch nothing records is **not** spent: an unknown batch is more likely one this repo has
 /// no tasks for than one that is finished, and losing a live batch is worse than reusing a
 /// spent one.
-fn batch_is_spent(by_branch: &BTreeMap<String, BranchTask>, branch: &str) -> bool {
+fn batch_is_spent(by_branch: &BTreeMap<String, Vec<BranchTask>>, branch: &str) -> bool {
     let mut any = false;
-    for t in by_branch.values() {
+    for t in by_branch.values().flatten() {
         if t.onto.as_deref() != Some(branch) {
             continue;
         }
@@ -1185,7 +1189,7 @@ pub(crate) fn sessions(kb: &Kb<'_>, db_path: &Path, json: bool) -> Result<()> {
 
     let mut rows = Vec::new();
     for s in &sessions {
-        let task = by_branch.get(&s.branch);
+        let task = by_branch.get(&s.branch).and_then(|ts| task_on(ts));
         let onto = task.and_then(|t| t.onto.clone());
         // Resolved first: a recorded land target whose branch has since been deleted cannot be
         // counted against, and `ahead_count` refuses an operand it cannot resolve rather than
@@ -1298,6 +1302,15 @@ pub(crate) fn gate(kb: &Kb<'_>, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The task a session on a branch is for, when several tasks record that branch: an unfinished one if
+/// there is one, since that is the work the checkout is being used for, else the first.
+pub(crate) fn task_on(tasks: &[BranchTask]) -> Option<&BranchTask> {
+    tasks
+        .iter()
+        .find(|t| !jkb_types::TaskStatus::is_terminal_str(Some(t.status.as_str())))
+        .or_else(|| tasks.first())
 }
 
 /// Refuse to take over a session worktree another, still-running Claude Code session opened (decision

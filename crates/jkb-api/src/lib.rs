@@ -906,7 +906,8 @@ impl Request {
         }
     }
 
-    /// Whether this op is in the agent read set (`kb.*`, `task.ready`/`show`/`subtasks`) — the one
+    /// Whether this op is in the agent read set (`kb.*`, `task.ready`/`show`/`subtasks`/`why`, and the
+    /// session verbs' reads `task.facts`/`by_branch` and `repo.gate`) — the one
     /// place that says so. [`LocalBackend`] serves it on its reader and within its read budget, and
     /// `jkb serve` counts it against its read permits, from this answer; no dispatch arm chooses.
     ///
@@ -1174,7 +1175,7 @@ pub enum Response {
     /// A `task.by_branch`.
     BranchTasks {
         /// By branch.
-        tasks: std::collections::BTreeMap<String, sessions::BranchTask>,
+        tasks: std::collections::BTreeMap<String, Vec<sessions::BranchTask>>,
     },
     /// A `task.start` or `task.take`.
     Taken {
