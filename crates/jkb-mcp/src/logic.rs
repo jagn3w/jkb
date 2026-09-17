@@ -52,7 +52,16 @@ impl From<Value> for Answer {
 /// What the server says of a cut answer.
 pub const TRUNCATED_NOTE: &str =
     "this answer was cut short at the server's read budget: it is not every match — narrow the \
-     query or pass a smaller limit";
+     query or its scope";
+
+/// Which kind of source an ingest tool takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A file (`ingest_path`).
+    Path,
+    /// An `http(s)://` page (`ingest_url`).
+    Url,
+}
 
 fn unexpected(op: &str, answer: &Response) -> Error {
     Error::Unexpected(format!("{op} answered {answer:?}"))
@@ -302,7 +311,21 @@ pub fn task_next(tools: &Tools, args: &QueryArgs) -> Result<Answer> {
 /// # Errors
 /// Returns an error if the namespace is malformed, the source can't be read or rendered, or capture
 /// fails.
-pub fn ingest(tools: &Tools, args: &IngestArgs) -> Result<Answer> {
+pub fn ingest(tools: &Tools, args: &IngestArgs, kind: SourceKind) -> Result<Answer> {
+    let is_url = args.source.starts_with("http://") || args.source.starts_with("https://");
+    match (kind, is_url) {
+        (SourceKind::Path, true) => {
+            return Err(Error::Source(
+                "ingest_path takes a file; use ingest_url for a page".to_owned(),
+            ))
+        }
+        (SourceKind::Url, false) => {
+            return Err(Error::Source(
+                "ingest_url takes an http(s):// address; use ingest_path for a file".to_owned(),
+            ))
+        }
+        _ => {}
+    }
     let namespace = args.namespace.clone().unwrap_or_else(|| "inbox".to_owned());
     let ask = jkb_api::ingest::IngestAsk::for_source(&args.source, namespace, &*tools.backend)?;
     let ingested = match tools.call(Request::IngestText(ask))? {
@@ -365,6 +388,10 @@ pub fn task_update(tools: &Tools, args: &TaskUpdateArgs) -> Result<Answer> {
         Ok(Response::Task { task, .. }) => {
             Ok(json!({ "id": task.item.id, "uid": task.item.uid }).into())
         }
+        // Applied, whatever the read-back said: the uid, and what went wrong reading it.
+        Ok(other) if changes => Ok(json!({ "id": null, "uid": args.uid,
+                   "note": unexpected("task.show", &other).to_string() })
+        .into()),
         Ok(other) => Err(unexpected("task.show", &other)),
         Err(e) if changes => {
             Ok(json!({ "id": null, "uid": args.uid, "note": e.to_string() }).into())
@@ -597,6 +624,7 @@ mod tests {
                 source: file.to_string_lossy().into_owned(),
                 namespace: Some("docs".to_owned()),
             },
+            super::SourceKind::Path,
         )
         .unwrap();
         assert_eq!(ingested.value["embedded"], true);
@@ -692,5 +720,77 @@ mod tests {
             },
         );
         assert!(hits.is_ok(), "{hits:?}");
+    }
+
+    /// A backend scripted for `task_update`: `task.set` applies, `task.show` fails.
+    struct Scripted {
+        sets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl jkb_api::Backend for Scripted {
+        fn call(
+            &self,
+            request: jkb_api::Request,
+        ) -> std::result::Result<jkb_api::Response, jkb_api::ApiError> {
+            match request {
+                jkb_api::Request::TaskSet { .. } => {
+                    self.sets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(jkb_api::Response::Applied {})
+                }
+                _ => Err(jkb_api::ApiError::with_code(
+                    jkb_api::ErrorCode::Unavailable,
+                    "gone",
+                )),
+            }
+        }
+    }
+
+    /// An applied update is never reported as a failure, and an update with nothing in it writes
+    /// nothing.
+    #[test]
+    fn task_update_reports_what_it_applied() {
+        let scripted = Arc::new(Scripted {
+            sets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tools = Tools {
+            backend: scripted.clone(),
+        };
+        let update = |status: Option<&str>| TaskUpdateArgs {
+            uid: "task:x".to_owned(),
+            status: status.map(str::to_owned),
+            priority: None,
+            due: None,
+        };
+        let applied = task_update(&tools, &update(Some("done"))).unwrap();
+        assert_eq!(applied.value["uid"], "task:x");
+        assert!(applied.value["note"].as_str().unwrap().contains("gone"));
+        assert_eq!(scripted.sets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Nothing to change: no write, and the failed read is the answer.
+        assert!(task_update(&tools, &update(None)).is_err());
+        assert_eq!(scripted.sets.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Each ingest tool takes its own kind of source, and a missing file is the caller's mistake.
+    #[test]
+    fn an_ingest_tool_refuses_the_other_kind_of_source() {
+        let db = db();
+        let ingest_one = |source: &str, kind| {
+            ingest(
+                &tools(&db),
+                &IngestArgs {
+                    source: source.to_owned(),
+                    namespace: None,
+                },
+                kind,
+            )
+            .unwrap_err()
+        };
+        for e in [
+            ingest_one("https://example.com/x", super::SourceKind::Path),
+            ingest_one("/tmp/notes.md", super::SourceKind::Url),
+            ingest_one("/no/such/file.md", super::SourceKind::Path),
+        ] {
+            assert!(e.is_user_error(), "{e}");
+        }
     }
 }

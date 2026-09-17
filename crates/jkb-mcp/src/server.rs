@@ -39,17 +39,18 @@ impl JkbServer {
         let out = tokio::task::spawn_blocking(move || f(tools))
             .await
             .map_err(|e| ErrorData::internal_error(format!("worker task failed: {e}"), None))?;
-        match out {
-            Ok(answer) => {
-                let mut content = vec![ContentBlock::json(answer.value)?];
-                if answer.truncated {
-                    content.push(ContentBlock::text(logic::TRUNCATED_NOTE));
-                }
-                Ok(CallToolResult::success(content))
-            }
-            Err(err) => Err(to_error_data(&err)),
-        }
+        out.map_err(|err| to_error_data(&err)).and_then(tool_result)
     }
+}
+
+/// A tool's answer as MCP content: its JSON, and a note when it was cut short, so an agent never reads
+/// a partial list as every match.
+fn tool_result(answer: logic::Answer) -> Result<CallToolResult, ErrorData> {
+    let mut content = vec![ContentBlock::json(answer.value)?];
+    if answer.truncated {
+        content.push(ContentBlock::text(logic::TRUNCATED_NOTE));
+    }
+    Ok(CallToolResult::success(content))
 }
 
 /// Map a logic error to MCP error data: client-input errors are `invalid_params`,
@@ -119,18 +120,20 @@ impl JkbServer {
         &self,
         params: Parameters<IngestArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |t| logic::ingest(&t, &params.0)).await
+        self.run(move |t| logic::ingest(&t, &params.0, logic::SourceKind::Path))
+            .await
     }
 
     /// Ingest a URL (rendered via a headless browser).
     #[tool(
-        description = "Ingest a URL into the KB. The page is rendered in a headless browser (JavaScript runs) before its text is captured + embedded via the audited pipeline."
+        description = "Ingest a URL into the KB. The page is rendered in a headless browser (JavaScript runs) where the server runs, and its text is captured, and embedded where the server embeds, via the audited pipeline."
     )]
     async fn ingest_url(
         &self,
         params: Parameters<IngestArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |t| logic::ingest(&t, &params.0)).await
+        self.run(move |t| logic::ingest(&t, &params.0, logic::SourceKind::Url))
+            .await
     }
 
     /// Create a task (audited, undoable).
@@ -174,7 +177,25 @@ impl ServerHandler for JkbServer {
 
 #[cfg(test)]
 mod tests {
-    use super::JkbServer;
+    use super::{tool_result, JkbServer};
+
+    /// A cut answer carries the note; a whole one does not.
+    #[test]
+    fn a_cut_answer_is_marked_to_the_agent() {
+        for truncated in [true, false] {
+            let result = tool_result(crate::logic::Answer {
+                value: serde_json::json!([]),
+                truncated,
+            })
+            .unwrap();
+            let text = serde_json::to_string(&result).unwrap();
+            assert_eq!(
+                text.contains(crate::logic::TRUNCATED_NOTE),
+                truncated,
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn tool_router_advertises_all_tools() {

@@ -354,6 +354,7 @@ fn mcp_smoke_flow() {
             source: file.to_string_lossy().into_owned(),
             namespace: Some("docs".to_owned()),
         },
+        logic::SourceKind::Path,
     )
     .unwrap();
 

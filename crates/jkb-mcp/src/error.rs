@@ -20,6 +20,10 @@ pub enum Error {
     #[error(transparent)]
     Types(#[from] jkb_types::Error),
 
+    /// A source of the wrong kind for the tool asked.
+    #[error("{0}")]
+    Source(String),
+
     /// An answer this build did not expect.
     #[error("internal: {0}")]
     Unexpected(String),
@@ -47,7 +51,25 @@ impl Error {
                     | ErrorCode::Unsupported
                     | ErrorCode::TooLarge
             ),
-            Self::Types(jkb_types::Error::Validation(_) | jkb_types::Error::NotFound(_)) => true,
+            Self::Types(jkb_types::Error::Validation(_) | jkb_types::Error::NotFound(_))
+            | Self::Source(_) => true,
+            // The source named: missing, unreadable as asked, of no kind jkb reads, or a page that would
+            // not load.
+            Self::Ingest(e) => {
+                matches!(
+                    e,
+                    jkb_ingest::Error::Unsupported(_)
+                        | jkb_ingest::Error::Fetch(_)
+                        | jkb_ingest::Error::Types(jkb_types::Error::Validation(_))
+                ) || matches!(e, jkb_ingest::Error::Io(io) if matches!(
+                    io.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::IsADirectory
+                ))
+            }
             _ => false,
         }
     }
