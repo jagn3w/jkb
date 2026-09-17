@@ -1359,7 +1359,6 @@ fn run(cli: Cli) -> Result<()> {
                     .with_actor("mcp")
                     .with_embedder(embedder()?),
             ),
-            remote: false,
         }),
         Command::Mq { cmd } => {
             mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)

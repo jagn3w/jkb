@@ -308,16 +308,19 @@ pub struct AddAsk {
     #[serde(default)]
     pub client_home: String,
     /// Take `text` as the title, word for word, with no quick-add modifiers read from it.
-    #[serde(default)]
+    ///
+    /// These four are left off the wire when unset, so a request that uses none of them is one an
+    /// older `jkb serve` still reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub literal: bool,
     /// The priority, over any `!p` in the line.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i64>,
     /// The due date, over any `@` in the line.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due: Option<String>,
     /// A namespace to also place it under, as a reference.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub also: Option<String>,
 }
 
@@ -807,7 +810,7 @@ pub fn line_problem(conn: &Connection, reference: &str) -> Result<Option<String>
 /// bound `#Fix_Login`, reached the file as a line the next import read back as a different task.
 ///
 /// Only a write that makes a readable line unreadable is refused (`before` is the problem the line had
-/// already). Writers outside the typed operations — the MCP server's `task_update`, `jkb ns mv` on the host, `jkb tag
+/// already). Writers outside the typed operations — `jkb ns mv` on the host, `jkb tag
 /// rename` — do not ask the file, and refusing every later write to a line
 /// one of them had broken left the task unable even to be released. A write that takes the offending
 /// value away passes, like any other. The exception is a write that moves the task to another line

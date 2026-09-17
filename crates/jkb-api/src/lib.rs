@@ -2097,6 +2097,18 @@ pub trait Backend {
     fn schema_newer_clears(&self) -> bool {
         false
     }
+
+    /// Whether this backend embeds text, so a search may take the vector and hybrid routes. `jkb serve`
+    /// does not (tasks F5), so its client defaults to FTS.
+    fn embeds(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend runs in the caller's own process, so a source's raw bytes may travel with
+    /// its text ([`ingest::IngestAsk::raw`]).
+    fn in_process(&self) -> bool {
+        false
+    }
 }
 
 /// Serves requests against a [`Db`] in this process.
@@ -2185,6 +2197,14 @@ impl LocalBackend {
 }
 
 impl Backend for LocalBackend {
+    fn embeds(&self) -> bool {
+        self.embedder.is_some()
+    }
+
+    fn in_process(&self) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_lines)] // a flat op dispatcher: one arm per op, as in the CLI's `run`
     fn call(&self, request: Request) -> Result<Response, ApiError> {
         let now = mq::now_ms();

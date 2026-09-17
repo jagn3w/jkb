@@ -340,7 +340,6 @@ fn mcp_smoke_flow() {
         backend: std::sync::Arc::new(
             jkb_api::LocalBackend::new(db.clone()).with_embedder(embedder()),
         ),
-        remote: false,
     };
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("note.md");
@@ -368,7 +367,7 @@ fn mcp_smoke_flow() {
         },
     )
     .unwrap();
-    let hits = hits.as_array().unwrap();
+    let hits = hits.value.as_array().unwrap();
     assert!(!hits.is_empty());
     let item_id = hits[0]["item"].as_i64().unwrap();
     let context = logic::get_context(
@@ -379,7 +378,7 @@ fn mcp_smoke_flow() {
         },
     )
     .unwrap();
-    assert!(!context.as_array().unwrap().is_empty());
+    assert!(!context.value.as_array().unwrap().is_empty());
 
     // task_create → appears in task_next → is undoable.
     let created = logic::task_create(
@@ -392,7 +391,7 @@ fn mcp_smoke_flow() {
         },
     )
     .unwrap();
-    let new_uid = created["uid"].as_str().unwrap().to_owned();
+    let new_uid = created.value["uid"].as_str().unwrap().to_owned();
 
     let next = logic::task_next(
         &tools,
@@ -403,6 +402,7 @@ fn mcp_smoke_flow() {
     )
     .unwrap();
     let next_uids: Vec<&str> = next
+        .value
         .as_array()
         .unwrap()
         .iter()

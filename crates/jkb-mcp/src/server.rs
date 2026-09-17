@@ -8,7 +8,6 @@
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
-use serde_json::Value;
 
 use crate::error::{Error, Result as LogicResult};
 use crate::logic::{
@@ -34,14 +33,20 @@ impl JkbServer {
     /// Run blocking logic `f` on a worker thread and wrap its JSON as a tool result.
     async fn run<F>(&self, f: F) -> Result<CallToolResult, ErrorData>
     where
-        F: FnOnce(Tools) -> LogicResult<Value> + Send + 'static,
+        F: FnOnce(Tools) -> LogicResult<logic::Answer> + Send + 'static,
     {
         let tools = self.tools.clone();
         let out = tokio::task::spawn_blocking(move || f(tools))
             .await
             .map_err(|e| ErrorData::internal_error(format!("worker task failed: {e}"), None))?;
         match out {
-            Ok(value) => Ok(CallToolResult::success(vec![ContentBlock::json(value)?])),
+            Ok(answer) => {
+                let mut content = vec![ContentBlock::json(answer.value)?];
+                if answer.truncated {
+                    content.push(ContentBlock::text(logic::TRUNCATED_NOTE));
+                }
+                Ok(CallToolResult::success(content))
+            }
             Err(err) => Err(to_error_data(&err)),
         }
     }
@@ -61,7 +66,7 @@ fn to_error_data(err: &Error) -> ErrorData {
 impl JkbServer {
     /// Search the knowledge base.
     #[tool(
-        description = "Search the knowledge base (routes: vector, fts, hybrid). Returns ranked items with namespace path and source document for citation."
+        description = "Search the knowledge base (routes: vector, fts, hybrid; hybrid by default where the server embeds, and only fts in the dev container). Returns ranked items with namespace path and source document for citation."
     )]
     async fn search(&self, params: Parameters<SearchArgs>) -> Result<CallToolResult, ErrorData> {
         self.run(move |t| logic::search(&t, &params.0)).await

@@ -116,8 +116,8 @@ routinely built from different checkouts.
 | `ns.list` | `scope?` | `namespaces` {`paths`, `truncated`} (budgeted) |
 | `ns.mv` | `from`, `to` | `moved` {`count`} — under the file roots only: refused for a reserved root (`repos`, `tasks`, `media`, `references`, `memory`, `_sys`) or anything under `_sys`, past 1000 items, 1000 namespaces or 64 tasks filed in a file, unless every mount at, above or below the subtree and every item in it is inside the roots, and when a task's line would not come back; on the host, the core's move alone |
 | `kb.context` | `item` (an id), `n` (≤50) | `context` {`chunks` [{`item`, `position`, `is_hit`, `content`}], `truncated`} (budgeted) — no text is embedded |
-| `view.list` | — | `views` {`views` [{`name`, `query`}], `truncated`} |
-| `view.run` | `name`, `limit?` | `items` {`items`, `truncated`} |
+| `view.list` | — | `views` {`views` [{`name`, `query`}], `truncated`} (budgeted) |
+| `view.run` | `name`, `limit?` | `items` {`items`, `truncated`} (budgeted) |
 | `kb.history` | `path` (absolute, the client's), `home?` (the client's `$HOME`, re-rooted to the host's as `kb.ambient` does) | `versions` {`uri`, `versions` [{`ts`, `blob`, `status`}], `truncated`} (budgeted) |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
@@ -189,8 +189,8 @@ Two decisions in it:
   priority, due date, tags, out-of-file placements, in-file dependencies — rendered alone and parsed
   back, and a write that makes a readable line come back different is refused, naming the first field
   that fails on its own. A line that was already unreadable does not block later writes: writers outside
-  the typed operations do not ask the file (the MCP server's `task_update`, `jkb ns mv` on the host, `jkb tag
-  rename`; the session verbs' ops and a client's `ns.mv` do, since S6.4), and refusing every write after one of them left the task
+  the typed operations do not ask the file (`jkb ns mv` on the host, `jkb tag rename`; the session verbs' ops,
+  the MCP server's tools and a client's `ns.mv` do, since S6.4), and refusing every write after one of them left the task
   unable to be released. Except a write that moves the task to another line (`task.bind`), which is
   judged as a new line: excused by the old line's problem, a bind from an unreadable line onto another
   task's `#id` put two tasks on one line, and the next export dropped one. Checking only the text let `task set --due "2026-07-15 17:00"`, a tag value or a
@@ -576,7 +576,8 @@ host.
 `~/.jkb/daemon/<port>/token` for that URL's port), `jkb`:
 
 - runs `jkb mq …`, the agent read set, the task-mutate set, `jkb ingest`, the session verbs, the review
-  and reclaim verbs and `jkb doctor`'s report (above) through the daemon;
+  and reclaim verbs, `jkb doctor`'s report and `jkb mcp` (above) through the daemon — `jkb search` and
+  the MCP `search` tool on the FTS route, the only one the daemon serves;
 - runs the commands that need no database (`notify`, `guide`, `commands`) as usual;
 - **refuses everything else before it does anything** — with a reason: host-only commands (`sync`,
   `mount`, `service`, `serve`, `doctor --fix`) never go through the daemon, the rest are not ported yet;

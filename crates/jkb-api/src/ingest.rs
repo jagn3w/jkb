@@ -40,6 +40,28 @@ pub struct IngestAsk {
     pub raw: Option<Vec<u8>>,
 }
 
+impl IngestAsk {
+    /// Read and parse `source` where the caller runs — a file by its extension, a URL rendered in a
+    /// headless browser — and ask to file its text under `namespace`, with its bytes when `backend` runs
+    /// in this process. The one copy: `jkb ingest` and the MCP server's ingest tools both ask it.
+    ///
+    /// # Errors
+    /// The source cannot be read, fetched or parsed.
+    pub fn for_source(
+        source: &str,
+        namespace: String,
+        backend: &dyn crate::Backend,
+    ) -> Result<Self, jkb_ingest::Error> {
+        let (raw, parsed) = jkb_ingest::read_source(source)?;
+        Ok(Self {
+            text: parsed.text,
+            mime: parsed.mime,
+            namespace,
+            raw: backend.in_process().then_some(raw),
+        })
+    }
+}
+
 /// What `ingest.text` did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ingested {

@@ -186,11 +186,14 @@ DSL), `recent [path]` (updated-desc listing), `cat <uid>` (raw body) / `stat <ui
 ## Section 13 — jkb-mcp (DONE, for reference)
 
 `crates/jkb-mcp` is the `rmcp` 2.0 stdio MCP server (design D17). Split in two:
-`logic.rs` holds the tool work as **plain synchronous fns** over `&Db` + `&Arc<dyn
-Embedder>` (search/get_context/query/list_views/run_view/task_next; ingest_path/
-ingest_url/task_create/task_update) returning `serde_json::Value` — directly unit-
-testable with no transport or runtime. `server.rs` is the thin async adapter:
-`JkbServer { db, embedder }`, `#[tool_router]`/`#[tool]` methods that `run()` each
+`logic.rs` holds the tool work as **plain synchronous fns** over `Tools { backend }` — a
+`jkb_api::Backend`, so every tool is an operation: a `LocalBackend` with the embedder on the host,
+`jkb serve` in the dev container (design-s6-4.md K; `search` defaults to FTS where the backend
+does not embed, and a file or URL is read where the server runs). The fns
+(search/get_context/query/list_views/run_view/task_next; ingest/task_create/task_update) return
+an `Answer` (JSON plus whether the read was cut, which the server tells the agent) — directly
+unit-testable with no transport or runtime. `server.rs` is the thin async adapter:
+`JkbServer { tools }`, `#[tool_router]`/`#[tool]` methods that `run()` each
 logic fn on `tokio::task::spawn_blocking` (the writer-actor + ollama block, so they
 must leave the async runtime) and wrap the JSON in a `CallToolResult`; `#[tool_handler]
 impl ServerHandler` with `get_info` advertising tools. rmcp gotchas learned via
@@ -199,8 +202,8 @@ impl ServerHandler` with `get_info` advertising tools. rmcp gotchas learned via
 derive `serde::Deserialize + schemars::JsonSchema` and arrive as `Parameters<T>`,
 content is `rmcp::model::ContentBlock` (`::json`/`::text`), `ServerInfo`/`ServerCapabilities`
 are `#[non_exhaustive]` (mutate a `default()`). Errors → `ErrorData` (user-input →
-`invalid_params`). `lib.rs::run_stdio(db, embedder)` builds a tokio runtime + `serve(stdio())`;
-`jkb mcp` (in the CLI) calls it. All writes go through `db.write_txn` → audited + undoable.
+`invalid_params`). `lib.rs::run_stdio(tools)` builds a tokio runtime + `serve(stdio())`;
+`jkb mcp` (in the CLI) calls it in both modes. All writes are ops → audited + undoable.
 
 ## v1 foundation complete — deferred follow-ups
 

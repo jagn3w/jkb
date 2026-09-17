@@ -2905,3 +2905,91 @@ fn a_session_list_cursor_is_opaque() {
         assert_eq!(err.code, ErrorCode::Invalid, "{bad}: {err:?}");
     }
 }
+
+/// The ops `jkb mcp` needed: a hit's context bounded, saved views listed and run, and `task.add`'s
+/// literal title, priority, due and extra placement — with the new fields left off the wire unset.
+#[test]
+fn the_mcp_ops_are_bounded_and_the_add_fields_optional() {
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        jkb_core::view::save(c, m, "open-work", "kind:task")?;
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db.clone());
+    for i in 0..3 {
+        call(
+            &b,
+            json!({ "op": "task.add", "text": format!("w{i} !p1 #x=y"), "literal": true,
+                    "priority": 2, "due": "2026-07-15", "also": "projects/p" }),
+        )
+        .unwrap();
+    }
+    match call(&b, json!({ "op": "view.list" })).unwrap() {
+        Response::Views { views, .. } => assert!(views[0].name.ends_with("open-work"), "{views:?}"),
+        other => panic!("{other:?}"),
+    }
+    match call(
+        &b,
+        json!({ "op": "view.run", "name": "open-work", "limit": 2 }),
+    )
+    .unwrap()
+    {
+        Response::Items { items, .. } => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(
+                items[0].snippet.as_deref(),
+                Some("w0 !p1 #x=y"),
+                "the title word for word"
+            );
+            assert_eq!(
+                (items[0].priority, items[0].due.as_deref()),
+                (Some(2), Some("2026-07-15"))
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let e = call(&b, json!({ "op": "view.run", "name": "nope" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+    match call(&b, json!({ "op": "kb.query", "dsl": "ns:projects/p/**" })).unwrap() {
+        Response::Items { items, .. } => assert_eq!(items.len(), 3, "placed under `also` too"),
+        other => panic!("{other:?}"),
+    }
+    let e = call(
+        &b,
+        json!({ "op": "kb.context", "item": 1, "n": super::kb::MAX_SEARCH_CONTEXT + 1 }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "  ", "literal": true }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
+    let tight = LocalBackend::new(db).with_read_budget(1);
+    match call(&tight, json!({ "op": "view.list" })).unwrap() {
+        Response::Views { views, truncated } => assert!(views.is_empty() && truncated),
+        other => panic!("{other:?}"),
+    }
+    let plain = serde_json::to_value(Request::TaskAdd(super::tasks::AddAsk {
+        text: "t".into(),
+        ..super::tasks::AddAsk::default()
+    }))
+    .unwrap();
+    for field in ["literal", "priority", "due", "also"] {
+        assert!(plain.get(field).is_none(), "{field} sent unset: {plain}");
+    }
+}
+
+/// A due date the task's tasks.md line cannot carry is refused from `task.add`'s own field too.
+#[test]
+fn an_added_due_is_held_to_the_line() {
+    let (db, ..) = mutate_fixture();
+    let e = call(
+        &LocalBackend::new(db),
+        json!({ "op": "task.add", "text": "filed +repos/in", "due": "2026-07-15 17:00" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+}

@@ -315,7 +315,6 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                 Command::Mq { cmd } => super::mq_cli::run(&backend, cmd, cli.json),
                 Command::Mcp => jkb_mcp::run_stdio(jkb_mcp::Tools {
                     backend: std::sync::Arc::new(backend),
-                    remote: true,
                 }),
                 command if super::ops_cli::handles(&command) => {
                     super::ops_cli::Ops::new(&backend, cli.global, cli.json, true).run(command)

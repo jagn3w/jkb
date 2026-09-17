@@ -133,13 +133,13 @@ impl<'a> Ops<'a> {
         self
     }
 
-    /// The route `jkb search` takes when `--route` is not given: hybrid where this process embeds, FTS
+    /// The route `jkb search` takes when `--route` is not given: hybrid where the backend embeds, FTS
     /// through the daemon, which does not.
-    const fn default_route(&self) -> SearchRoute {
-        if self.remote {
-            SearchRoute::Fts
-        } else {
+    fn default_route(&self) -> SearchRoute {
+        if self.backend.embeds() {
             SearchRoute::Hybrid
+        } else {
+            SearchRoute::Fts
         }
     }
 
@@ -346,13 +346,11 @@ impl<'a> Ops<'a> {
             Some(n) => n.to_owned(),
             None => self.ambient()?.unwrap_or_else(|| "inbox".to_owned()),
         };
-        let (raw, parsed) = jkb_ingest::read_source(source)?;
-        let request = Request::IngestText(jkb_api::ingest::IngestAsk {
-            text: parsed.text,
-            mime: parsed.mime,
+        let request = Request::IngestText(jkb_api::ingest::IngestAsk::for_source(
+            source,
             namespace,
-            raw: (!self.remote).then_some(raw),
-        });
+            self.backend,
+        )?);
         let ingested = match self.call(request)? {
             Response::Ingested { ingested } => ingested,
             other => return unexpected("ingest.text", &other),
