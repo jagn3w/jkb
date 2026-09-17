@@ -216,10 +216,16 @@ check "every event the hook handles is registered in settings.json" \
 # `"SessionStart"` literal in `hook()` disabled the sweep permanently with every check green.
 # Under CARGO_TARGET_DIR when it is set — the dev container sets it — or this compared a stale binary.
 built_jkb="${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target}/debug/jkb"
+# A binary that cannot answer is stale — built from a tree without `notify events` — and says so,
+# rather than being diffed as an empty list: that read as "the hook handles events jkb does not".
 if [ -x "$built_jkb" ]; then
-  rust_events=$("$built_jkb" notify events 2>/dev/null | sort)
-  check "the hook's events and jkb's agree" \
-    "$(comm -3 <(printf '%s\n' "$handled") <(printf '%s\n' "$rust_events") | tr -d '[:space:]')" ""
+  if rust_events=$("$built_jkb" notify events 2>/dev/null); then
+    rust_events=$(sort <<<"$rust_events")
+    check "the hook's events and jkb's agree" \
+      "$(comm -3 <(printf '%s\n' "$handled") <(printf '%s\n' "$rust_events") | tr -d '[:space:]')" ""
+  else
+    fail "$built_jkb cannot answer \`notify events\` — it is stale or broken; rebuild it (./scripts/build.sh) and re-run"
+  fi
 else
   printf '  --  %s\n' "jkb events cross-check ($built_jkb not built)"
 fi

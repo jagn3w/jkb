@@ -54,6 +54,15 @@ cargo fmt --all -- --check
 echo "==> clippy (warnings are errors)"
 cargo clippy --all-targets --all-features -- -D warnings
 
+# The shell tests ask this checkout's `target/debug/jkb` (notify-hook.test.sh diffs its
+# `notify events` against the hook), and nothing above builds it: clippy writes metadata only. In
+# `jkb task land`'s base checkout that binary was whatever the TARGET branch last built — one with no
+# `notify` at all — so the gate failed on the integrated result while the same tree passed in the
+# session, whose binary was fresh (measured on the Mac, 2026-09-17). Built here, so the shell tests
+# judge the tree they are in.
+echo "==> build jkb (for the shell tests)"
+cargo build -p jkb-cli --bin jkb
+
 # The shell under scripts/ is part of the codebase too, and setup.sh's installs are not
 # reachable from a Rust test. Each *.test.sh is self-contained and runs in a temp dir.
 echo "==> shell tests (scripts/tests)"
