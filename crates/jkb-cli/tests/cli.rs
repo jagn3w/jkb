@@ -4439,3 +4439,93 @@ fn ingest_through_the_daemon_sends_text_and_the_host_stores_it() {
     );
     assert_eq!(blob_count(), 1, "the host's ingest stores its source");
 }
+
+/// **`jkb mcp` runs in the dev container** (tasks S6.4, design-s6-4.md K): every tool is an op through
+/// `jkb serve`, a task it creates is on the host, and search defaults to the route the daemon serves.
+#[test]
+fn the_mcp_server_serves_its_tools_through_the_daemon() {
+    use std::io::{BufRead as _, Write as _};
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("host.db");
+    let token = tmp.path().join("daemon/token");
+    let (serve, url) = Daemon::start(&db, &token);
+    let client_home = tmp.path().join("container-home");
+    std::fs::create_dir_all(&client_home).unwrap();
+
+    let mut child = jkb_bare()
+        .arg("mcp")
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env("HOME", &client_home)
+        .env_remove("JKB_DB")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut ask = |msg: serde_json::Value, answered: bool| -> Option<serde_json::Value> {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+        answered.then(|| serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap())
+    };
+    let init = ask(
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" } } }),
+        true,
+    )
+    .unwrap();
+    assert!(init.get("result").is_some(), "{init}");
+    ask(
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        false,
+    );
+    let created = ask(
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "task_create",
+                        "arguments": { "title": "from the container !p1", "priority": 2 } } }),
+        true,
+    )
+    .unwrap();
+    let text = created["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    let body: serde_json::Value =
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("{created}"));
+    let uid = body["uid"].as_str().unwrap().to_owned();
+    let found = ask(
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "search", "arguments": { "query": "container" } } }),
+        true,
+    )
+    .unwrap();
+    assert!(
+        found["result"]["isError"] != true && found.get("error").is_none(),
+        "search defaults to the route the daemon serves: {found}"
+    );
+    let hybrid = ask(
+        serde_json::json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "search",
+                        "arguments": { "query": "container", "route": "hybrid" } } }),
+        true,
+    )
+    .unwrap();
+    assert!(
+        hybrid.get("error").is_some() || hybrid["result"]["isError"] == true,
+        "the daemon embeds nothing: {hybrid}"
+    );
+    drop(stdin);
+    let _ = child.wait();
+
+    // On the host: the title word for word, and the priority given.
+    let shown = jkb(&db)
+        .args(["--json", "task", "show", &uid])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(v["content"], "from the container !p1", "{v}");
+    assert_eq!(v["priority"], 2, "{v}");
+    drop(serve);
+}

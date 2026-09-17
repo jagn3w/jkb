@@ -1,6 +1,6 @@
-//! `jkb-mcp`'s error type: bridges the library errors the tools touch. The server
-//! maps these into MCP `ErrorData` (user-input errors → `invalid_params`, everything
-//! else → `internal_error`).
+//! `jkb-mcp`'s error type: bridges the errors the tools meet. The server maps these into MCP
+//! `ErrorData` (a request the tool could not serve as asked → `invalid_params`, everything else →
+//! `internal_error`).
 
 use thiserror::Error;
 
@@ -8,15 +8,11 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A `jkb-core` failure (database, repositories, transactions).
-    #[error(transparent)]
-    Core(#[from] jkb_core::Error),
+    /// An operation's refusal or failure, from whichever backend serves the tools.
+    #[error("{}", .0.message)]
+    Api(jkb_api::ApiError),
 
-    /// A search failure.
-    #[error(transparent)]
-    Search(#[from] jkb_search::Error),
-
-    /// An ingestion failure.
+    /// Reading a source to ingest.
     #[error(transparent)]
     Ingest(#[from] jkb_ingest::Error),
 
@@ -24,23 +20,36 @@ pub enum Error {
     #[error(transparent)]
     Types(#[from] jkb_types::Error),
 
-    /// A JSON (de)serialization failure.
-    #[error("json: {0}")]
-    Json(#[from] serde_json::Error),
+    /// An answer this build did not expect.
+    #[error("internal: {0}")]
+    Unexpected(String),
+}
+
+impl From<jkb_api::ApiError> for Error {
+    fn from(e: jkb_api::ApiError) -> Self {
+        Self::Api(e)
+    }
 }
 
 impl Error {
-    /// Whether this is a client-input error (validation / not-found), so the server
-    /// can report `invalid_params` rather than `internal_error`.
+    /// Whether this is a client-input error, so the server can report `invalid_params` rather than
+    /// `internal_error`.
     #[must_use]
     pub fn is_user_error(&self) -> bool {
-        matches!(
-            self,
-            Error::Types(jkb_types::Error::Validation(_) | jkb_types::Error::NotFound(_))
-                | Error::Core(jkb_core::Error::Types(
-                    jkb_types::Error::Validation(_) | jkb_types::Error::NotFound(_)
-                ))
-        )
+        use jkb_api::ErrorCode;
+        match self {
+            Self::Api(e) => matches!(
+                e.code,
+                ErrorCode::Invalid
+                    | ErrorCode::BadRequest
+                    | ErrorCode::NotFound
+                    | ErrorCode::Forbidden
+                    | ErrorCode::Unsupported
+                    | ErrorCode::TooLarge
+            ),
+            Self::Types(jkb_types::Error::Validation(_) | jkb_types::Error::NotFound(_)) => true,
+            _ => false,
+        }
     }
 }
 

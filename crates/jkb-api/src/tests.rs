@@ -181,6 +181,7 @@ fn samples() -> Vec<Request> {
             managed: false,
             cwd: String::new(),
             client_home: String::new(),
+            ..super::tasks::AddAsk::default()
         }),
         Request::TaskSet {
             uid: "u".into(),
@@ -386,6 +387,12 @@ fn samples() -> Vec<Request> {
         },
         Request::TaskPrFacts { uid: "u".into() },
         Request::NsList { scope: None },
+        Request::KbContext { item: 1, n: 1 },
+        Request::ViewList {},
+        Request::ViewRun {
+            name: "v".into(),
+            limit: None,
+        },
         Request::NsMv {
             from: "a".into(),
             to: "b".into(),
@@ -1434,6 +1441,9 @@ const READS: &[&str] = &[
     "task.pr_facts",
     "task.open_in_repo",
     "ns.list",
+    "kb.context",
+    "view.list",
+    "view.run",
 ];
 
 #[test]

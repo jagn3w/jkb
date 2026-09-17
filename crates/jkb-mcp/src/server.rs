@@ -5,48 +5,39 @@
 //! async runtime — then wraps the JSON result in a `CallToolResult`. `jkb-core`
 //! errors become MCP `ErrorData` (client-input errors → `invalid_params`).
 
-use std::sync::Arc;
-
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde_json::Value;
 
-use jkb_core::Db;
-use jkb_types::Embedder;
-
 use crate::error::{Error, Result as LogicResult};
 use crate::logic::{
     self, GetContextArgs, IngestArgs, QueryArgs, RunViewArgs, SearchArgs, TaskCreateArgs,
-    TaskUpdateArgs,
+    TaskUpdateArgs, Tools,
 };
 
-type Embed = Arc<dyn Embedder + Send + Sync>;
-
-/// The jkb MCP server: shares the CLI's [`Db`] and embedder.
+/// The jkb MCP server: every tool an operation on the backend the CLI chose ([`Tools`]).
 ///
 /// `#[tool_handler]` calls the generated `Self::tool_router()` per request, so the
 /// router is not stored on the struct.
 pub struct JkbServer {
-    db: Db,
-    embedder: Embed,
+    tools: Tools,
 }
 
 impl JkbServer {
-    /// Build a server over `db` and `embedder`.
+    /// Build a server over `tools`.
     #[must_use]
-    pub fn new(db: Db, embedder: Embed) -> Self {
-        Self { db, embedder }
+    pub const fn new(tools: Tools) -> Self {
+        Self { tools }
     }
 
     /// Run blocking logic `f` on a worker thread and wrap its JSON as a tool result.
     async fn run<F>(&self, f: F) -> Result<CallToolResult, ErrorData>
     where
-        F: FnOnce(Db, Embed) -> LogicResult<Value> + Send + 'static,
+        F: FnOnce(Tools) -> LogicResult<Value> + Send + 'static,
     {
-        let db = self.db.clone();
-        let embedder = self.embedder.clone();
-        let out = tokio::task::spawn_blocking(move || f(db, embedder))
+        let tools = self.tools.clone();
+        let out = tokio::task::spawn_blocking(move || f(tools))
             .await
             .map_err(|e| ErrorData::internal_error(format!("worker task failed: {e}"), None))?;
         match out {
@@ -73,8 +64,7 @@ impl JkbServer {
         description = "Search the knowledge base (routes: vector, fts, hybrid). Returns ranked items with namespace path and source document for citation."
     )]
     async fn search(&self, params: Parameters<SearchArgs>) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, embedder| logic::search(&db, &embedder, &params.0))
-            .await
+        self.run(move |t| logic::search(&t, &params.0)).await
     }
 
     /// Expand a hit into its neighbouring chunks.
@@ -85,8 +75,7 @@ impl JkbServer {
         &self,
         params: Parameters<GetContextArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, embedder| logic::get_context(&db, &embedder, &params.0))
-            .await
+        self.run(move |t| logic::get_context(&t, &params.0)).await
     }
 
     /// Structured query over the item substrate.
@@ -94,19 +83,19 @@ impl JkbServer {
         description = "Run a structured query (DSL: kind:, status:, ns:.../**, tag:, is:ready, ...) and return matching items."
     )]
     async fn query(&self, params: Parameters<QueryArgs>) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::query(&db, &params.0)).await
+        self.run(move |t| logic::query(&t, &params.0)).await
     }
 
     /// List saved views.
     #[tool(description = "List saved views (named queries).")]
     async fn list_views(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::list_views(&db)).await
+        self.run(move |t| logic::list_views(&t)).await
     }
 
     /// Run a saved view.
     #[tool(description = "Run a saved view by name and return its items.")]
     async fn run_view(&self, params: Parameters<RunViewArgs>) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::run_view(&db, &params.0)).await
+        self.run(move |t| logic::run_view(&t, &params.0)).await
     }
 
     /// The ready-frontier tasks.
@@ -114,20 +103,18 @@ impl JkbServer {
         description = "List the ready task frontier (unblocked, non-terminal), ordered by priority then due. Optional DSL scope/tags."
     )]
     async fn task_next(&self, params: Parameters<QueryArgs>) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::task_next(&db, &params.0))
-            .await
+        self.run(move |t| logic::task_next(&t, &params.0)).await
     }
 
     /// Ingest a local file (audited).
     #[tool(
-        description = "Ingest a local file into the KB (captured + embedded via the audited pipeline)."
+        description = "Ingest a local file into the KB (captured, and embedded where the server embeds, via the audited pipeline)."
     )]
     async fn ingest_path(
         &self,
         params: Parameters<IngestArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, embedder| logic::ingest_path(&db, &embedder, &params.0))
-            .await
+        self.run(move |t| logic::ingest(&t, &params.0)).await
     }
 
     /// Ingest a URL (rendered via a headless browser).
@@ -138,8 +125,7 @@ impl JkbServer {
         &self,
         params: Parameters<IngestArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, embedder| logic::ingest_url(&db, &embedder, &params.0))
-            .await
+        self.run(move |t| logic::ingest(&t, &params.0)).await
     }
 
     /// Create a task (audited, undoable).
@@ -150,8 +136,7 @@ impl JkbServer {
         &self,
         params: Parameters<TaskCreateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::task_create(&db, &params.0))
-            .await
+        self.run(move |t| logic::task_create(&t, &params.0)).await
     }
 
     /// Update a task's status/priority/due (audited).
@@ -162,8 +147,7 @@ impl JkbServer {
         &self,
         params: Parameters<TaskUpdateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::task_update(&db, &params.0))
-            .await
+        self.run(move |t| logic::task_update(&t, &params.0)).await
     }
 }
 

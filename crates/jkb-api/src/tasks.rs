@@ -277,7 +277,7 @@ pub enum TagMode {
 }
 
 /// What `task.add` was asked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)] // a request's flags, not state
 #[serde(deny_unknown_fields)]
 pub struct AddAsk {
@@ -307,6 +307,18 @@ pub struct AddAsk {
     /// The client's `$HOME`.
     #[serde(default)]
     pub client_home: String,
+    /// Take `text` as the title, word for word, with no quick-add modifiers read from it.
+    #[serde(default)]
+    pub literal: bool,
+    /// The priority, over any `!p` in the line.
+    #[serde(default)]
+    pub priority: Option<i64>,
+    /// The due date, over any `@` in the line.
+    #[serde(default)]
+    pub due: Option<String>,
+    /// A namespace to also place it under, as a reference.
+    #[serde(default)]
+    pub also: Option<String>,
 }
 
 /// Why `task.add` created nothing.
@@ -362,7 +374,24 @@ pub fn add(
 ) -> Result<Added, AddFailure> {
     let invalid = |why: String| ApiError::with_code(ErrorCode::Invalid, why);
     check_len("a task line", &ask.text, MAX_CONTENT_BYTES)?;
-    let mut qa = task::parse_quick_add(&ask.text)?;
+    let mut qa = if ask.literal {
+        let title = ask.text.trim();
+        if title.is_empty() {
+            return Err(invalid("a task title with some text".to_owned()).into());
+        }
+        task::QuickAdd {
+            title: title.to_owned(),
+            ..task::QuickAdd::default()
+        }
+    } else {
+        task::parse_quick_add(&ask.text)?
+    };
+    if ask.priority.is_some() {
+        qa.priority = ask.priority;
+    }
+    if let Some(due) = &ask.due {
+        qa.due = Some(due.clone());
+    }
     let modifiers = qa.placements.len() + qa.tags.len() + qa.depends_on.len();
     if modifiers > MAX_QUICK_ADD_MODIFIERS {
         return Err(invalid(format!(
@@ -422,6 +451,9 @@ pub fn add(
     };
 
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
+    if let Some(also) = &ask.also {
+        spec.mirrors.push(jkb_core::ns::normalize(also)?);
+    }
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
 
     let id = task::create(conn, meta, &spec)?;

@@ -78,7 +78,7 @@ routinely built from different checkouts.
 | `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
 | `task.subtasks` | `uid`, `all?` | `children` {`children`} |
 | `task.why` | `uid` | `history` {`entries`} (budgeted) |
-| `task.add` | `text`, `home?`, `under?`, `backlog?`, `global_backlog?`, `sync?`, `managed?`, `cwd?`, `client_home?` | `added` {`id`, `uid`, `home`, `binding`}, or `needs_global_backlog_assent` |
+| `task.add` | `text`, `home?`, `under?`, `backlog?`, `global_backlog?`, `sync?`, `managed?`, `cwd?`, `client_home?`, `literal?` (the text is the title, no modifiers read), `priority?`, `due?`, `also?` (a reference placement) | `added` {`id`, `uid`, `home`, `binding`}, or `needs_global_backlog_assent` |
 | `task.set` | `uid`, `status?`, `priority?`, `due?` | `applied` |
 | `task.edit` | `uid` (any item's), `text`, `append?` | `edited` {`file_backed`} — the result is capped at 256 KiB for a task, and for any item a client of `jkb serve` edits |
 | `task.tag` | `uid`, `facet_value`, `mode` (`add`\|`set`\|`rm`) | `applied` |
@@ -115,6 +115,9 @@ routinely built from different checkouts.
 | `task.close_merged` | `uid`, `merged` (`yes`\|`no`\|`unknown`, the client's `gh` answer), `observed` {`live_landing`, `resumed_at?`, `pr?`} (the history it judged from), `pr?`, `dry_run?` | `closed` {`refusal?`} — `observed_landed`, judged in the op's transaction; held if the history no longer matches `observed`; refused under the file roots like `pr_record` |
 | `ns.list` | `scope?` | `namespaces` {`paths`, `truncated`} (budgeted) |
 | `ns.mv` | `from`, `to` | `moved` {`count`} — under the file roots only: refused for a reserved root (`repos`, `tasks`, `media`, `references`, `memory`, `_sys`) or anything under `_sys`, past 1000 items, 1000 namespaces or 64 tasks filed in a file, unless every mount at, above or below the subtree and every item in it is inside the roots, and when a task's line would not come back; on the host, the core's move alone |
+| `kb.context` | `item` (an id), `n` (≤50) | `context` {`chunks` [{`item`, `position`, `is_hit`, `content`}], `truncated`} (budgeted) — no text is embedded |
+| `view.list` | — | `views` {`views` [{`name`, `query`}], `truncated`} |
+| `view.run` | `name`, `limit?` | `items` {`items`, `truncated`} |
 | `kb.history` | `path` (absolute, the client's), `home?` (the client's `$HOME`, re-rooted to the host's as `kb.ambient` does) | `versions` {`uri`, `versions` [{`ts`, `blob`, `status`}], `truncated`} (budgeted) |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
@@ -622,13 +625,14 @@ migration's lock),
 - The rest of the container's commands, then the cutover — stages S6.4/S6.5. The read set (S6.1), the
   task-mutate set (S6.2), ingest (S6.3), the session verbs, and (stage 5) `staging ls`, `stat`,
   `item`, `related`, `blob`, `history`, `inv`, `doctor`'s report, `task review` and `task reclaim` are
-  served, and so are `ns ls`/`mv`, `task pr` and `task close-merged`; `view`, `tag`, `ns mk`/`rm`/`type`
-  and `jkb mcp` are still refused remotely, and `undo`, `index` and `task mirror` always will be (they
+  served, and so are `ns ls`/`mv`, `task pr` and `task close-merged`; `jkb mcp` is served (every tool
+  an op, a file or URL read where it runs, `search` defaulting to FTS); `view`, `tag` and
+  `ns mk`/`rm`/`type` are still refused remotely, and `undo`, `index` and `task mirror` always will be (they
   revert the host's own writes, call its model, and sweep every task).
 - Embedding what the container ingests (tasks F5): captured and keyword-searchable, it stays unembedded
   until `jkb index --pending` runs on the host, and nothing runs it on a schedule.
-- The MCP server's read tools (`jkb-mcp/src/logic.rs`) still read the database directly rather than
-  through `jkb-api` (design H4 says they should become its callers).
+- Embedding a search query where the daemon runs (design-s6-4.md K): through `jkb serve`, `jkb search`
+  and the MCP server's `search` serve only the FTS route.
 - `work` (competing consumers) and `compacted` (newest per key) queue types — design Q9.
 - A native, non-subprocess client (Swift) — it would speak the HTTP protocol above. `jkb-notifier
   serve`, the first consumer, runs `jkb mq subscribe` as a child for now (design N2).

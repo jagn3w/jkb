@@ -1064,6 +1064,78 @@ fn search_error(e: jkb_search::Error) -> ApiError {
     }
 }
 
+/// `kb.context`: the chunks within `n` of item `item` (a chunk hit's neighbours, in document order),
+/// within `budget`. No text is embedded.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for `n` over [`MAX_SEARCH_CONTEXT`], or a failed read.
+pub fn context(
+    db: &Db,
+    item: i64,
+    n: usize,
+    budget: &mut Budget,
+) -> Result<Vec<ContextLine>, ApiError> {
+    if n > MAX_SEARCH_CONTEXT {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            format!("a context of at most {MAX_SEARCH_CONTEXT} chunks either side"),
+        ));
+    }
+    let searcher = Searcher::new(Arc::new(NoEmbedder));
+    let chunks = searcher
+        .get_context(db, jkb_types::ItemId::new(item), n)
+        .map_err(search_error)?;
+    Ok(chunks
+        .into_iter()
+        .map(|c| ContextLine {
+            item: c.item.get(),
+            position: c.position,
+            is_hit: c.is_hit,
+            content: c.content,
+        })
+        .take_while(|line| budget.take(line))
+        .collect())
+}
+
+/// A saved view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct View {
+    /// Its name.
+    pub name: String,
+    /// Its query.
+    pub query: String,
+}
+
+/// `view.list`: every saved view, within `budget`.
+///
+/// # Errors
+/// A failed read.
+pub fn views(conn: &Connection, budget: &mut Budget) -> Result<Vec<View>, ApiError> {
+    Ok(jkb_core::view::list(conn)?
+        .into_iter()
+        .map(|(name, query)| View { name, query })
+        .take_while(|v| budget.take(v))
+        .collect())
+}
+
+/// `view.run`: the items a saved view matches, as listing rows — the first `limit` — within
+/// `budget`.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] for no such view, a malformed stored query, or a failed read.
+pub fn run_view(
+    conn: &Connection,
+    name: &str,
+    limit: Option<usize>,
+    budget: &mut Budget,
+) -> Result<Vec<ItemRow>, ApiError> {
+    let mut ids = jkb_core::view::run(conn, name)?;
+    if let Some(limit) = limit {
+        ids.truncate(limit);
+    }
+    Ok(item_rows(conn, &ids, budget)?)
+}
+
 /// The embedder an FTS-only search is built with. `Searcher` embeds only for the vector and hybrid
 /// routes, which [`search`] refuses before constructing one of these; if that ever changes this
 /// refuses rather than returning a vector.

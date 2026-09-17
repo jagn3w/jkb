@@ -1353,7 +1353,14 @@ fn run(cli: Cli) -> Result<()> {
                 fix,
             )
         }
-        Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
+        Command::Mcp => jkb_mcp::run_stdio(jkb_mcp::Tools {
+            backend: std::sync::Arc::new(
+                jkb_api::LocalBackend::new(db)
+                    .with_actor("mcp")
+                    .with_embedder(embedder()?),
+            ),
+            remote: false,
+        }),
         Command::Mq { cmd } => {
             mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
         }

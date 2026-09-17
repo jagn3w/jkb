@@ -297,6 +297,7 @@ fn add(
             managed,
             cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
             client_home: std::env::var("HOME").unwrap_or_default(),
+            ..AddAsk::default()
         }))
     };
     // The op decides whether `--backlog` needs the user's assent to use the global backlog, once

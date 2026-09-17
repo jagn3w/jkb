@@ -2025,11 +2025,10 @@ name = "jkb-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jkb-api",
  "jkb-core",
- "jkb-embed",
  "jkb-index",
  "jkb-ingest",
- "jkb-search",
  "jkb-types",
  "rmcp",
  "schemars",

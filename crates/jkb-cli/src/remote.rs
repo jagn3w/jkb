@@ -84,6 +84,8 @@ pub const fn support(command: &Command) -> Support {
         | Command::Blob { .. }
         | Command::History { .. }
         | Command::Inv { .. }
+        // Every tool an op; a file or URL is read here and only its text sent (design-s6-4.md K).
+        | Command::Mcp
         | Command::Ns {
             cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. },
         }
@@ -141,7 +143,7 @@ pub const fn support(command: &Command) -> Support {
         | Command::Tag { .. }
         | Command::Task { .. }
         | Command::View { .. }
-        | Command::Mcp => Support::Refused(NOT_YET),
+        => Support::Refused(NOT_YET),
         // It reverts any transaction, the host's own included (design-s6-4.md J).
         Command::Undo { .. } => Support::Refused(
             "it reverts any transaction, the host's own included, so it runs only on the host",
@@ -311,6 +313,10 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
             };
             match cli.command {
                 Command::Mq { cmd } => super::mq_cli::run(&backend, cmd, cli.json),
+                Command::Mcp => jkb_mcp::run_stdio(jkb_mcp::Tools {
+                    backend: std::sync::Arc::new(backend),
+                    remote: true,
+                }),
                 command if super::ops_cli::handles(&command) => {
                     super::ops_cli::Ops::new(&backend, cli.global, cli.json, true).run(command)
                 }
@@ -466,6 +472,7 @@ mod tests {
             vec!["task", "close-merged"],
             vec!["ns", "ls"],
             vec!["ns", "mv", "a", "b"],
+            vec!["mcp"],
             vec!["inv", "do", "memory/x", "hypothesize", "t"],
             vec!["task", "mirror"],
             vec!["stat", "u"],
@@ -475,7 +482,8 @@ mod tests {
             vec!["guide"],
         ] {
             let command = parse(&args).command;
-            let is_mq = matches!(command, crate::Command::Mq { .. });
+            // The queue and the MCP server are dispatched by their own modules, not `ops_cli`.
+            let is_mq = matches!(command, crate::Command::Mq { .. } | crate::Command::Mcp);
             assert_eq!(
                 support(&command) == Support::Ported,
                 is_mq || crate::ops_cli::handles(&command),

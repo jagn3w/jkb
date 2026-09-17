@@ -726,6 +726,26 @@ pub enum Request {
         /// Its new path.
         to: String,
     },
+    /// The chunks around an item ([`kb::context`]).
+    #[serde(rename = "kb.context")]
+    KbContext {
+        /// The item's id.
+        item: i64,
+        /// How many chunks either side.
+        n: usize,
+    },
+    /// Every saved view ([`kb::views`]).
+    #[serde(rename = "view.list")]
+    ViewList {},
+    /// A saved view's items ([`kb::run_view`]).
+    #[serde(rename = "view.run")]
+    ViewRun {
+        /// The view.
+        name: String,
+        /// At most this many.
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// A synced file's versions ([`items::history`]).
     #[serde(rename = "kb.history")]
     KbHistory {
@@ -1121,6 +1141,9 @@ impl Request {
         "task.close_merged",
         "ns.list",
         "ns.mv",
+        "kb.context",
+        "view.list",
+        "view.run",
         "kb.history",
     ];
 
@@ -1204,6 +1227,9 @@ impl Request {
             Self::KbHistory { .. } => "kb.history",
             Self::NsList { .. } => "ns.list",
             Self::NsMv { .. } => "ns.mv",
+            Self::KbContext { .. } => "kb.context",
+            Self::ViewList {} => "view.list",
+            Self::ViewRun { .. } => "view.run",
             Self::TaskPrFacts { .. } => "task.pr_facts",
             Self::TaskOpenInRepo { .. } => "task.open_in_repo",
             Self::TaskPrRecord { .. } => "task.pr_record",
@@ -1251,6 +1277,9 @@ impl Request {
             | Self::TaskPrFacts { .. }
             | Self::TaskOpenInRepo { .. }
             | Self::NsList { .. }
+            | Self::KbContext { .. }
+            | Self::ViewList {}
+            | Self::ViewRun { .. }
             | Self::RepoGate { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -1694,6 +1723,22 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
+    /// A `kb.context`.
+    Context {
+        /// The chunks.
+        chunks: Vec<kb::ContextLine>,
+        /// Cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    /// A `view.list`.
+    Views {
+        /// The views.
+        views: Vec<kb::View>,
+        /// Cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
     /// An `ns.list`.
     Namespaces {
         /// The paths.
@@ -1738,6 +1783,8 @@ impl Response {
             | Self::StagingTasks { truncated, .. }
             | Self::Inv { truncated, .. }
             | Self::Namespaces { truncated, .. }
+            | Self::Context { truncated, .. }
+            | Self::Views { truncated, .. }
             | Self::Uids { truncated, .. }
             | Self::Related { truncated, .. }
             | Self::Blobs { truncated, .. }
@@ -1858,6 +1905,8 @@ impl Response {
             | Self::PrFacts { .. }
             | Self::Uids { .. }
             | Self::Closed { .. }
+            | Self::Context { .. }
+            | Self::Views { .. }
             | Self::Namespaces { .. }
             | Self::Moved { .. }
             | Self::Inv { .. }
@@ -2823,6 +2872,28 @@ impl Backend for LocalBackend {
                         prs::close_merged(c, m, uid, &ask, roots.as_ref())
                     })?,
                 }
+            }
+            Request::KbContext { item, n } => {
+                let reads = db.clone();
+                let chunks = kb::context(&reads, item, n, &mut budget)?;
+                Response::Context {
+                    chunks,
+                    truncated: budget.exhausted(),
+                }
+            }
+            Request::ViewList {} => {
+                let (views, truncated) = db.read_with(move |c| {
+                    let views = kb::views(c, &mut budget)?;
+                    Ok::<_, ApiError>((views, budget.exhausted()))
+                })?;
+                Response::Views { views, truncated }
+            }
+            Request::ViewRun { name, limit } => {
+                let (items, truncated) = db.read_with(move |c| {
+                    let items = kb::run_view(c, &name, limit, &mut budget)?;
+                    Ok::<_, ApiError>((items, budget.exhausted()))
+                })?;
+                Response::Items { items, truncated }
             }
             Request::NsList { scope } => {
                 let (paths, truncated) = db.read_with(move |c| {

@@ -1,9 +1,10 @@
-//! The tool logic, as plain synchronous functions over a [`Db`] + [`Embedder`].
+//! The tool logic, as plain synchronous functions over a [`Backend`] (tasks S6.4, design-s6-4.md K).
 //!
-//! Keeping the real work here (rather than in the async `#[tool]` methods) means it
-//! is directly testable without an MCP transport or a tokio runtime, and the server
-//! layer stays a thin adapter: `spawn_blocking` → one of these → JSON. Every write
-//! goes through `jkb-core`'s writer-actor, so agent changes are audited and undoable.
+//! **Every tool is an operation.** On the host the backend is a `LocalBackend` over the database (with
+//! the embedder, so `search` defaults to hybrid); in the dev container it is `jkb serve`'s, which embeds
+//! nothing, so `search` defaults to FTS there. A file or URL to ingest is read where the server runs
+//! and only its text is sent, as `jkb ingest` does. Keeping the work here (rather than in the async
+//! `#[tool]` methods) keeps it testable without an MCP transport; the server is a thin adapter.
 
 use std::sync::Arc;
 
@@ -11,15 +12,29 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use jkb_core::query::{Scope, TagPred};
-use jkb_core::{item, ns, task, view, Db};
-use jkb_ingest::Pipeline;
-use jkb_search::{Route, Searcher};
-use jkb_types::{Embedder, ItemId};
+use jkb_api::kb::{ItemRow, QueryOrder, SearchRoute};
+use jkb_api::{Backend, Request, Response};
 
 use crate::error::{Error, Result};
 
-type Embed = Arc<dyn Embedder + Send + Sync>;
+/// What the tools are served by.
+#[derive(Clone)]
+pub struct Tools {
+    /// The backend.
+    pub backend: Arc<dyn Backend + Send + Sync>,
+    /// It is `jkb serve`'s: it embeds nothing, and a source's bytes stay here.
+    pub remote: bool,
+}
+
+impl Tools {
+    fn call(&self, request: Request) -> Result<Response> {
+        Ok(self.backend.call(request)?)
+    }
+}
+
+fn unexpected(op: &str, answer: &Response) -> Error {
+    Error::Unexpected(format!("{op} answered {answer:?}"))
+}
 
 /// `search` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -107,265 +122,245 @@ pub struct TaskUpdateArgs {
     pub due: Option<String>,
 }
 
-/// Run a search and return ranked hits with provenance.
+/// Run a search and return ranked hits with provenance. The route defaults to hybrid where the
+/// backend embeds and to FTS through `jkb serve`, which does not.
 ///
 /// # Errors
-/// Returns an error if the query is malformed, the route is unknown, or embedding /
-/// a query fails.
-pub fn search(db: &Db, embedder: &Embed, args: &SearchArgs) -> Result<Value> {
-    let route = parse_route(args.route.as_deref())?;
-    let query = jkb_core::query::parse(&args.query)?;
-    let limit = args.limit.unwrap_or(10);
-    let searcher = Searcher::new(embedder.clone());
-    let hits = searcher.search(db, &query, route, limit)?;
-    let arr: Vec<Value> = hits
-        .into_iter()
-        .map(|h| {
-            json!({
-                "item": h.item.get(),
-                "route": h.route.as_str(),
-                "score": h.score,
-                "distance": h.distance,
-                "namespace": h.namespace_path,
-                "source_document": h.source_document.map(ItemId::get),
+/// Returns an error if the query is malformed, the route is unknown or unsupported here, or a read
+/// fails.
+pub fn search(tools: &Tools, args: &SearchArgs) -> Result<Value> {
+    let route = match args.route.as_deref() {
+        None if tools.remote => SearchRoute::Fts,
+        None | Some("hybrid") => SearchRoute::Hybrid,
+        Some("vector") => SearchRoute::Vector,
+        Some("fts") => SearchRoute::Fts,
+        Some(other) => {
+            return Err(Error::Types(jkb_types::Error::Validation(format!(
+                "unknown route `{other}`; use vector, fts, or hybrid"
+            ))))
+        }
+    };
+    let hits = match tools.call(Request::KbSearch {
+        dsl: args.query.clone(),
+        default_scope: None,
+        route,
+        limit: args.limit.unwrap_or(10),
+        context: None,
+    })? {
+        Response::SearchHits { hits, .. } => hits,
+        other => return Err(unexpected("kb.search", &other)),
+    };
+    Ok(Value::Array(
+        hits.into_iter()
+            .map(|h| {
+                json!({
+                    "item": h.item,
+                    "route": h.route,
+                    "score": h.score,
+                    "distance": h.distance,
+                    "namespace": h.namespace,
+                    "source_document": h.source_document.map(|d| d.id),
+                })
             })
-        })
-        .collect();
-    Ok(Value::Array(arr))
+            .collect(),
+    ))
 }
 
 /// Expand an item into its neighbour-chunk context.
 ///
 /// # Errors
 /// Returns an error if the read fails.
-pub fn get_context(db: &Db, embedder: &Embed, args: &GetContextArgs) -> Result<Value> {
-    let searcher = Searcher::new(embedder.clone());
-    let chunks = searcher.get_context(db, ItemId::new(args.item_id), args.n.unwrap_or(2))?;
-    let arr: Vec<Value> = chunks
-        .into_iter()
-        .map(|c| {
-            json!({
-                "item": c.item.get(),
-                "position": c.position,
-                "is_hit": c.is_hit,
-                "content": c.content,
+pub fn get_context(tools: &Tools, args: &GetContextArgs) -> Result<Value> {
+    let chunks = match tools.call(Request::KbContext {
+        item: args.item_id,
+        n: args.n.unwrap_or(2),
+    })? {
+        Response::Context { chunks, .. } => chunks,
+        other => return Err(unexpected("kb.context", &other)),
+    };
+    Ok(Value::Array(
+        chunks
+            .into_iter()
+            .map(|c| {
+                json!({
+                    "item": c.item,
+                    "position": c.position,
+                    "is_hit": c.is_hit,
+                    "content": c.content,
+                })
             })
-        })
-        .collect();
-    Ok(Value::Array(arr))
+            .collect(),
+    ))
+}
+
+fn items(tools: &Tools, op: &str, request: Request) -> Result<Value> {
+    match tools.call(request)? {
+        Response::Items { items, .. } => Ok(items_json(&items)),
+        other => Err(unexpected(op, &other)),
+    }
 }
 
 /// Evaluate a structured query and return the matching items.
 ///
 /// # Errors
 /// Returns an error if the query is malformed or a read fails.
-pub fn query(db: &Db, args: &QueryArgs) -> Result<Value> {
-    let mut q = jkb_core::query::parse(&args.query)?;
-    if let Some(limit) = args.limit {
-        q.limit = Some(limit);
-    }
-    let ids = db.read(move |conn| q.evaluate(conn))?;
-    items_json(db, &ids)
+pub fn query(tools: &Tools, args: &QueryArgs) -> Result<Value> {
+    items(
+        tools,
+        "kb.query",
+        Request::KbQuery {
+            dsl: args.query.clone(),
+            default_scope: None,
+            limit: args.limit,
+            count: false,
+            order: QueryOrder::default(),
+        },
+    )
 }
 
 /// List saved views.
 ///
 /// # Errors
 /// Returns an error if the read fails.
-pub fn list_views(db: &Db) -> Result<Value> {
-    let views = db.read(view::list)?;
-    let arr: Vec<Value> = views
-        .into_iter()
-        .map(|(name, query)| json!({ "name": name, "query": query }))
-        .collect();
-    Ok(Value::Array(arr))
+pub fn list_views(tools: &Tools) -> Result<Value> {
+    match tools.call(Request::ViewList {})? {
+        Response::Views { views, .. } => Ok(Value::Array(
+            views
+                .into_iter()
+                .map(|v| json!({ "name": v.name, "query": v.query }))
+                .collect(),
+        )),
+        other => Err(unexpected("view.list", &other)),
+    }
 }
 
 /// Run a saved view.
 ///
 /// # Errors
 /// Returns an error if the view is missing or a read fails.
-pub fn run_view(db: &Db, args: &RunViewArgs) -> Result<Value> {
-    let name = args.name.clone();
-    let ids = db.read(move |conn| view::run(conn, &name))?;
-    items_json(db, &ids)
+pub fn run_view(tools: &Tools, args: &RunViewArgs) -> Result<Value> {
+    items(
+        tools,
+        "view.run",
+        Request::ViewRun {
+            name: args.name.clone(),
+            limit: None,
+        },
+    )
 }
 
 /// The ready-frontier tasks, optionally scoped/tag-filtered by the DSL in `query`.
 ///
 /// # Errors
 /// Returns an error if the DSL is malformed or a read fails.
-pub fn task_next(db: &Db, args: &QueryArgs) -> Result<Value> {
-    let q = jkb_core::query::parse(&args.query)?;
-    let (scope, tags): (Scope, Vec<TagPred>) = (q.scope, q.tags);
-    let limit = args.limit;
-    let mut rows = db.read(move |conn| task::ready(conn, scope, &tags))?;
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    let ids: Vec<ItemId> = rows.iter().map(|r| r.id).collect();
-    items_json(db, &ids)
+pub fn task_next(tools: &Tools, args: &QueryArgs) -> Result<Value> {
+    items(
+        tools,
+        "task.ready",
+        Request::TaskReady {
+            dsl: args.query.clone(),
+            default_scope: None,
+            limit: args.limit,
+        },
+    )
 }
 
-/// Ingest a local file (the audited capture→embed pipeline).
+/// Ingest a local file or a URL: read and parse it here — a URL rendered in a headless browser — and
+/// send its text (design D18, tasks S6.3).
 ///
 /// # Errors
-/// Returns an error if the file can't be read/parsed or capture fails.
-pub fn ingest_path(db: &Db, embedder: &Embed, args: &IngestArgs) -> Result<Value> {
+/// Returns an error if the namespace is malformed, the source can't be read or rendered, or capture
+/// fails.
+pub fn ingest(tools: &Tools, args: &IngestArgs) -> Result<Value> {
     let namespace = args.namespace.clone().unwrap_or_else(|| "inbox".to_owned());
-    ns::normalize(&namespace)?;
-    let pipeline = Pipeline::new(embedder.clone());
-    let outcome = pipeline.ingest_path(db, std::path::Path::new(&args.source), &namespace)?;
+    let (raw, parsed) = jkb_ingest::read_source(&args.source)?;
+    let ingested = match tools.call(Request::IngestText(jkb_api::ingest::IngestAsk {
+        text: parsed.text,
+        mime: parsed.mime,
+        namespace,
+        raw: (!tools.remote).then_some(raw),
+    }))? {
+        Response::Ingested { ingested } => ingested,
+        other => return Err(unexpected("ingest.text", &other)),
+    };
     Ok(json!({
-        "document": outcome.document.get(),
-        "chunk_count": outcome.chunk_count,
-        "embedded": outcome.embedded,
-        "already_ingested": outcome.already_ingested,
-        "warnings": outcome.warnings,
+        "document": ingested.document,
+        "chunk_count": ingested.chunk_count,
+        "embedded": ingested.embedded,
+        "already_ingested": ingested.already_ingested,
+        "warnings": ingested.warnings,
     }))
 }
 
-/// Ingest a URL: render it in a headless browser (so client-side JavaScript runs),
-/// extract its text, and run the audited capture→embed pipeline (design D18).
+/// Create a task (audited, undoable): the title taken word for word, homed in the default inbox and
+/// placed under `namespace` too when given.
 ///
 /// # Errors
-/// Returns an error if the namespace is malformed, the page can't be rendered (e.g.
-/// no Chrome installed), or capture fails.
-pub fn ingest_url(db: &Db, embedder: &Embed, args: &IngestArgs) -> Result<Value> {
-    let namespace = args.namespace.clone().unwrap_or_else(|| "inbox".to_owned());
-    ns::normalize(&namespace)?;
-    let pipeline = Pipeline::new(embedder.clone());
-    let outcome = pipeline.ingest_url(db, &args.source, &namespace)?;
-    Ok(json!({
-        "document": outcome.document.get(),
-        "chunk_count": outcome.chunk_count,
-        "embedded": outcome.embedded,
-        "already_ingested": outcome.already_ingested,
-        "warnings": outcome.warnings,
-    }))
+/// Returns a validation error for a malformed namespace or due date, or a failed write.
+pub fn task_create(tools: &Tools, args: &TaskCreateArgs) -> Result<Value> {
+    match tools.call(Request::TaskAdd(jkb_api::tasks::AddAsk {
+        text: args.title.clone(),
+        literal: true,
+        priority: args.priority,
+        due: args.due.clone(),
+        also: args.namespace.clone(),
+        managed: true,
+        ..jkb_api::tasks::AddAsk::default()
+    }))? {
+        Response::Added { added } => Ok(json!({ "id": added.id, "uid": added.uid })),
+        other => Err(unexpected("task.add", &other)),
+    }
 }
 
-/// Create a task through the writer-actor (audited, undoable).
+/// Update a task's status/priority/due.
 ///
 /// # Errors
-/// Returns a validation error for a malformed namespace, or a database error.
-pub fn task_create(db: &Db, args: &TaskCreateArgs) -> Result<Value> {
-    // Validate the placement namespace up front for an actionable error.
-    if let Some(namespace) = &args.namespace {
-        ns::normalize(namespace)?;
+/// Returns a not-found error if the uid is unknown, a validation error for an illegal status (e.g.
+/// `blocked`), or a failed write.
+pub fn task_update(tools: &Tools, args: &TaskUpdateArgs) -> Result<Value> {
+    match tools.call(Request::TaskSet {
+        uid: args.uid.clone(),
+        status: args.status.clone(),
+        priority: args.priority,
+        due: args.due.clone(),
+    })? {
+        Response::Applied {} => {}
+        other => return Err(unexpected("task.set", &other)),
     }
-    let mut spec = task::NewTask::new(task::mint_uid(&args.title), args.title.clone());
-    spec.priority = args.priority;
-    spec.due.clone_from(&args.due);
-    if let Some(namespace) = &args.namespace {
-        spec.mirrors = vec![namespace.clone()];
+    match tools.call(Request::TaskShow {
+        uid: args.uid.clone(),
+    })? {
+        Response::Task { task, .. } => Ok(json!({ "id": task.item.id, "uid": task.item.uid })),
+        other => Err(unexpected("task.show", &other)),
     }
-    let uid = spec.uid.clone();
-    let id = db.write_txn("mcp", move |conn, meta| task::create(conn, meta, &spec))?;
-    Ok(json!({ "id": id.get(), "uid": uid }))
-}
-
-/// Update a task's status/priority/due through the writer-actor.
-///
-/// # Errors
-/// Returns a not-found error if the uid is unknown, a validation error for an
-/// illegal status (e.g. `blocked`), or a database error.
-pub fn task_update(db: &Db, args: &TaskUpdateArgs) -> Result<Value> {
-    let uid = args.uid.clone();
-    let status = args.status.clone();
-    let priority = args.priority;
-    let due = args.due.clone();
-    let id = db.write_txn("mcp", move |conn, meta| -> jkb_core::Result<ItemId> {
-        let id = item::id_for_uid(conn, &uid)?.ok_or_else(|| {
-            jkb_core::Error::Types(jkb_types::Error::NotFound(format!("task `{uid}`")))
-        })?;
-        if let Some(status) = &status {
-            task::set_status_str(conn, meta, id, status)?;
-        }
-        if priority.is_some() {
-            task::set_priority(conn, meta, id, priority)?;
-        }
-        if let Some(due) = &due {
-            task::set_due(conn, meta, id, Some(due))?;
-        }
-        Ok(id)
-    })?;
-    Ok(json!({ "id": id.get(), "uid": args.uid }))
 }
 
 // ---- helpers --------------------------------------------------------------
 
-fn parse_route(route: Option<&str>) -> Result<Route> {
-    match route.unwrap_or("hybrid") {
-        "hybrid" => Ok(Route::Hybrid),
-        "vector" => Ok(Route::Vector),
-        "fts" => Ok(Route::Fts),
-        other => Err(Error::Types(jkb_types::Error::Validation(format!(
-            "unknown route `{other}`; use vector, fts, or hybrid"
-        )))),
-    }
-}
-
-/// Fetch item rows as JSON, preserving id order and skipping missing rows.
-fn items_json(db: &Db, ids: &[ItemId]) -> Result<Value> {
-    let ids: Vec<i64> = ids.iter().map(|id| id.get()).collect();
-    let rows = db.read(move |conn| {
-        let mut out = Vec::new();
-        for id in &ids {
-            let row = conn
-                .prepare_cached(
-                    "SELECT id, uid, kind, status, priority, due, content
-                     FROM items WHERE id = ?1",
-                )?
-                .query_row([id], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, Option<i64>>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
+fn items_json(rows: &[ItemRow]) -> Value {
+    Value::Array(
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "uid": r.uid,
+                    "kind": r.kind,
+                    "status": r.status,
+                    "priority": r.priority,
+                    "due": r.due,
+                    "namespace": r.namespace,
+                    "snippet": r.snippet,
                 })
-                .ok();
-            let Some((id, uid, kind, status, priority, due, content)) = row else {
-                continue;
-            };
-            let namespace: Option<String> = conn
-                .prepare_cached(
-                    "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-                     WHERE p.item_id = ?1
-                     ORDER BY (p.role = 'primary') DESC, p.position LIMIT 1",
-                )?
-                .query_row([id], |r| r.get::<_, String>(0))
-                .ok();
-            out.push(json!({
-                "id": id,
-                "uid": uid,
-                "kind": kind,
-                "status": status,
-                "priority": priority,
-                "due": due,
-                "namespace": namespace,
-                "snippet": content.as_deref().map(snippet),
-            }));
-        }
-        Ok(out)
-    })?;
-    Ok(Value::Array(rows))
-}
-
-fn snippet(content: &str) -> String {
-    let line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    line.trim().chars().take(120).collect()
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        get_context, ingest_path, query, task_create, task_next, task_update, GetContextArgs,
-        IngestArgs, QueryArgs, SearchArgs, TaskCreateArgs, TaskUpdateArgs,
+        get_context, ingest, query, task_create, task_next, task_update, GetContextArgs,
+        IngestArgs, QueryArgs, SearchArgs, TaskCreateArgs, TaskUpdateArgs, Tools,
     };
     use std::sync::Arc;
 
@@ -402,6 +397,14 @@ mod tests {
         Db::open_in_memory_with(&[jkb_index::register]).unwrap()
     }
 
+    /// The tools over `db` in this process, with the embedder — as `jkb mcp` runs on the host.
+    fn tools(db: &Db) -> Tools {
+        Tools {
+            backend: Arc::new(jkb_api::LocalBackend::new(db.clone()).with_embedder(embedder())),
+            remote: false,
+        }
+    }
+
     fn count_tasks(db: &Db) -> i64 {
         db.read(|conn| {
             Ok(
@@ -422,7 +425,7 @@ mod tests {
             due: None,
             namespace: Some("repos/app".to_owned()),
         };
-        let created = task_create(&db, &args).unwrap();
+        let created = task_create(&tools(&db), &args).unwrap();
         assert!(created.get("uid").is_some());
         assert_eq!(count_tasks(&db), 1);
 
@@ -441,7 +444,7 @@ mod tests {
             due: None,
             namespace: Some("repos/../secret".to_owned()),
         };
-        let err = task_create(&db, &args).unwrap_err();
+        let err = task_create(&tools(&db), &args).unwrap_err();
         assert!(err.is_user_error());
         assert_eq!(count_tasks(&db), 0); // no partial state
     }
@@ -450,7 +453,7 @@ mod tests {
     fn task_update_rejects_blocked_and_sets_done() {
         let db = db();
         task_create(
-            &db,
+            &tools(&db),
             &TaskCreateArgs {
                 title: "ship it".to_owned(),
                 priority: None,
@@ -471,7 +474,7 @@ mod tests {
 
         // `blocked` is derived, not settable.
         let blocked = task_update(
-            &db,
+            &tools(&db),
             &TaskUpdateArgs {
                 uid: uid.clone(),
                 status: Some("blocked".to_owned()),
@@ -483,7 +486,7 @@ mod tests {
 
         // A real status is accepted.
         task_update(
-            &db,
+            &tools(&db),
             &TaskUpdateArgs {
                 uid: uid.clone(),
                 status: Some("done".to_owned()),
@@ -509,7 +512,7 @@ mod tests {
         let db = db();
         for title in ["alpha task", "beta task"] {
             task_create(
-                &db,
+                &tools(&db),
                 &TaskCreateArgs {
                     title: title.to_owned(),
                     priority: None,
@@ -520,7 +523,7 @@ mod tests {
             .unwrap();
         }
         let listed = query(
-            &db,
+            &tools(&db),
             &QueryArgs {
                 query: "kind:task".to_owned(),
                 limit: None,
@@ -530,7 +533,7 @@ mod tests {
         assert_eq!(listed.as_array().unwrap().len(), 2);
 
         let ready = task_next(
-            &db,
+            &tools(&db),
             &QueryArgs {
                 query: String::new(),
                 limit: None,
@@ -551,9 +554,8 @@ mod tests {
         )
         .unwrap();
 
-        let ingested = ingest_path(
-            &db,
-            &embedder(),
+        let ingested = ingest(
+            &tools(&db),
             &IngestArgs {
                 source: file.to_string_lossy().into_owned(),
                 namespace: Some("docs".to_owned()),
@@ -564,8 +566,7 @@ mod tests {
 
         // search → a hit, then get_context on it.
         let hits = super::search(
-            &db,
-            &embedder(),
+            &tools(&db),
             &SearchArgs {
                 query: "peculiar".to_owned(),
                 route: Some("fts".to_owned()),
@@ -578,8 +579,7 @@ mod tests {
         let item_id = hits[0]["item"].as_i64().unwrap();
 
         let context = get_context(
-            &db,
-            &embedder(),
+            &tools(&db),
             &GetContextArgs {
                 item_id,
                 n: Some(1),
