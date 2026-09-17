@@ -281,7 +281,7 @@ fn pid_exists(pid: u32) -> Fact {
 /// machine's process table; a filesystem path is no more portable across that boundary, and it
 /// was left un-qualified. A host session claims as `session:<pid>:/Users/…/.jkb/work/sess`;
 /// inside the container that path does not exist, so a bare `try_exists` answered `false`,
-/// `Fact::No`, and `reclaim_dead` freed the claim of a session running on the host.
+/// `Fact::No`, and the reclaim freed the claim of a session running on the host.
 ///
 /// An owner id is a bare string: unlike every other caller of [`present_under`], nothing here
 /// holds a repo root to anchor on, so the containing directory is the best evidence available.

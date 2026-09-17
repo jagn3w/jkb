@@ -96,11 +96,18 @@ routinely built from different checkouts.
 | `task.land` | `uid`, `landed` {`branch`, `onto`, `head?`} | `landing` {`moved`, `refusal?`, `status`} — the facts the caller established (graft, green gate, disposal) are stated |
 | `task.landed` | `uid`, `landed` | `landing` — `observed_landed`; a guard's refusal is still recorded, an event the task's state does not define is not |
 | `task.review_findings` | `namespaces` (≤64; a client asks in pieces) | `review_findings` {`total`, `open_count`, `open_must_fix` (≤100 {`uid`, `title` (≤200 chars)})} — refused past 10 000 tasks examined |
-| `task.review_file` | `ns` (must hold nothing; no `tasks` mount may cover it), `findings` (≤1000 [{`severity` (`must-fix`\|`concern`\|`nit`), `summary` (≤2 KiB), `file?`, `line?`, `scenario?`, `fix?` (≤32 KiB each)}]) | `review_filed` {`ns`, `uids`, `clean`} — `managed:` tasks under `<ns>/<severity>` at priority 1/2/3; no findings files one `done` "clean review" task |
+| `task.review_file` | `ns` (must hold nothing; no `tasks` mount may cover it), `findings` (≤1000 [{`severity` (`must-fix`\|`concern`\|`nit`), `summary` (≤2 KiB), `file?`, `line?`, `scenario?`, `fix?` (≤32 KiB each)}], ≤768 KiB serialized — one request; `jkb task review file` trims the longest texts to fit) | `review_filed` {`ns`, `uids`, `clean`} — `managed:` tasks under `<ns>/<severity>` at priority 1/2/3; no findings files one `done` "clean review" task |
 | `task.review_record` | `repo`, `branch`, `sha?` (letters and digits, ≤64), `findings` (must hold at least one item) | `review_recorded` {`recorded` [{`uid`, `moved_to_review`}], `skipped_unlanded`, `unusable`, `unwritable`} — one transaction |
-| `task.claims` | — | `claims` {`claims` [{`uid`, `owner`}], `truncated`} (≤10 000) |
+| `task.claims` | `after?` (a page's `next`) | `claims` {`claims` [{`uid`, `owner`}] (≤1000 a page, task order), `next?`} |
 | `task.reclaim` | `dead` (≤1000 owners the client proved gone) | `reclaimed` {`cleared`, `refused` [{`owner`, `reason`}], `unwritable`} — frees, through `observed_owner_gone`, claims still held by exactly one of `dead` |
-| `kb.health` | — | `health` {`schema_version`, `fts_ok`, `flagged` (≤200 {`uri`, `status`, `detail?`}), `flagged_count`, `vector_tables`, `stale_vectors`} — on the writer: FTS5's integrity check is an `INSERT` |
+| `kb.health` | — | `health` {`schema_version`, `fts_ok`, `flagged` (≤200 {`uri`, `status`, `detail?`}), `flagged_count`, `vector_tables`, `stale_vectors`} — on the writer: FTS5's integrity check is an `INSERT`. The un-embedded count is not here: which vector table counts depends on the host's embedder, so `doctor` prints it on the host only |
+| `task.staging` | `repo` | `staging_tasks` {`tasks` [{`uid`, `title`, `status`, `tags`, `land_target`, `open_subtasks`}] (only tasks with a land target), `truncated`} — `staging ls` asks git the rest |
+| `item.show` | `uid`, `preview?` (characters; by kind when absent, ≤1 000 000) | `item` {`item` {`uid`, `kind`, `status?`, `resolution?`, `priority?`, `due?`, `mime?`, `binding?`, `namespace?`, `content_chars`, `content_hash?`, `created_at`, `updated_at`, `tags` [{`facet`, `value`}], `preview`, `preview_truncated`}} |
+| `item.rm` | `uid` (full), `force?` | `item_removed` {`uid`, `kind`, `placements`, `edges`, `tags`} — refused under the file roots for an item filed outside them |
+| `kb.related` | `uid`, `edges?`, `depth` (≤16), `direction?` (`out`\|`in`\|`both`) | `related` {`rows` [{`uid`, `kind`, `status?`, `resolution?`, `depth`, `via`, `direction`, `snippet?`}], `truncated`} (budgeted) |
+| `kb.blobs` | `contains?` (non-empty), `limit` (≤10 000) | `blobs` {`blobs` [{`hash`, `size`, `mime?`, `created_at`}], `truncated`} (budgeted) |
+| `kb.blob` | `prefix` (4–64 hex digits, unique) | `blob` {`hash`, `text`} — a blob that is not UTF-8 is refused |
+| `kb.history` | `path` (absolute, the client's), `home?` (the client's `$HOME`, re-rooted to the host's as `kb.ambient` does) | `versions` {`uri`, `versions` [{`ts`, `blob`, `status`}], `truncated`} (budgeted) |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
 | `session.state` | `session` | `session_is` {`state`: `live`\|`ended`\|`unknown`} (a closed set) |
@@ -203,7 +210,10 @@ Two decisions in it:
   `/jkb-review-log` used to write a `tasks.md`, `mount create` its folder and `jkb sync` it; from the
   container that has the host read and write files at a path the container chose. `task.review_file`
   takes the reviewer's findings as data and writes rows, in both modes. A finding can no longer be
-  ticked in an editor.
+  ticked in an editor. `jkb task review file` refuses a result whose `error` is set or whose
+  `reviewers` is 0: an empty result from a review that did not run, filed as clean, would let
+  `task land` pass. (The command file `.claude/commands/review-log.md` still describes the mount;
+  its switch is pending.)
 - **The land lock is the `land:<repo key>` lease** (stage 4, decision D), taken as a compare-and-set
   with holder `<owner> <nonce> <Claude Code session or ->`. It was `.jkb/land.lock` holding a pid, which
   the other side of the bind cannot probe. A holder is stale only when proven gone, asked in this
@@ -255,7 +265,9 @@ Two decisions in it:
   list the claims (`task.claims`), probe each owner where they run, and send the owners they proved
   gone (`task.reclaim`, stage 5, design-s6-4.md H); the op frees the claims still held by exactly
   those strings, so a probe cannot free a claim taken after it — a new process or a resumed session
-  claims under another string. The host's in-transaction re-probe this replaced closed the same race.
+  claims under another string. **Residual, stated:** a `host:pid` owner carries no run, so a pid probed
+  dead and reused by a new process that claims under the same `host:pid` before the reclaim commits
+  (milliseconds) is freed; the host's in-transaction re-probe this replaced closed that window too.
   A client of the daemon is refused an owner it cannot have proved: a process of the daemon's own host,
   a session checkout outside `~/repos`, and (from anyone) an `agent:` or unreadable owner. A claim held
   by a live or unestablished owner is refused by `task.claim` from anywhere. **But the daemon does not

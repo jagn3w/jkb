@@ -340,7 +340,7 @@ fn samples() -> Vec<Request> {
             sha: None,
             findings: "reviews/x".into(),
         }),
-        Request::TaskClaims {},
+        Request::TaskClaims { after: None },
         Request::TaskReclaim {
             dead: vec!["box:1".into()],
         },
@@ -1571,10 +1571,13 @@ pub(crate) fn mutate_fixture() -> (Db, String, String, String) {
     (db, inside, outside, managed)
 }
 
+/// A backend confined as `jkb serve` confines one: the roots, and the host's home they resolve
+/// `~/` paths against.
 pub(crate) fn rooted(db: &Db) -> LocalBackend {
-    LocalBackend::new(db.clone()).with_file_roots(super::tasks::FileRoots::new(vec![
-        std::path::PathBuf::from("/Users/u/repos"),
-    ]))
+    LocalBackend::new(db.clone()).with_file_roots(
+        super::tasks::FileRoots::new(vec![std::path::PathBuf::from("/Users/u/repos")])
+            .with_home(std::path::PathBuf::from("/Users/u")),
+    )
 }
 
 #[test]

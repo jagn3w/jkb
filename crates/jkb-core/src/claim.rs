@@ -19,7 +19,7 @@
 //! `claim`/`release`) for audit; they are not auto-reverted by undo (which inverts only
 //! `insert` ops).
 //!
-//! The crash-recovery net moved out, to [`crate::transition::reclaim_dead`]: freeing a dead
+//! The crash-recovery net moved out, to [`crate::transition::reclaim_judged`]: freeing a dead
 //! owner's claim is a lifecycle transition (`observed_owner_gone`) like any other, and routing
 //! it through the machine is what makes it appear in a task's history and what stops it firing
 //! on an owner whose liveness merely could not be established.

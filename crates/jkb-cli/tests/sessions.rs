@@ -4706,6 +4706,34 @@ fn a_container_files_and_records_a_review_through_the_daemon() {
     );
     let again = remote(&file_args, None);
     assert!(!again.status.success(), "a review is filed once: {again:?}");
+    // A review that did not run is not a clean one.
+    for failed in [
+        r#"{"findings": [], "reviewers": 0, "error": "survey failed", "note": "nothing was reviewed; re-run"}"#,
+        r#"{"findings": [], "reviewers": 0, "note": "no findings"}"#,
+    ] {
+        let out = remote(
+            &[
+                "task",
+                "review",
+                "file",
+                "--findings",
+                "repos/proj/codereviews/failed",
+                "--from",
+                "-",
+            ],
+            Some(failed),
+        );
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("did not run"),
+            "{out:?}"
+        );
+    }
+    let listed = remote(&["--json", "ls", "repos/proj/codereviews/failed"], None);
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("task:"),
+        "nothing was filed: {listed:?}"
+    );
     let clean = remote(
         &[
             "--json",
@@ -4783,14 +4811,8 @@ fn a_container_reclaims_and_checks_health_through_the_daemon() {
     assert!(reclaimed.status.success(), "{reclaimed:?}");
     let v: serde_json::Value = serde_json::from_slice(&reclaimed.stdout).unwrap();
     assert_eq!(v["reclaimed"], serde_json::json!([dead]), "{v}");
-    assert!(
-        v["unverifiable"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|u| u == hosts.as_str()),
-        "{v}"
-    );
+    assert_eq!(v["unverifiable"], serde_json::json!([hosts]), "{v}");
+    assert_eq!(v["held_back"], serde_json::json!([]), "{v}");
     assert_eq!(claim_of(&f.db, &dead), None);
     assert_eq!(claim_of(&f.db, &hosts).as_deref(), Some("host:4194001"));
 

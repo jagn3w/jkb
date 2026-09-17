@@ -38,22 +38,25 @@ impl From<jkb_core::claim::ClaimInfo> for Claim {
     }
 }
 
-/// The most claims one `task.claims` answer lists. A knowledge base holds tens; more than this means
-/// something claims in a loop, and the answer says it was cut.
-pub const MAX_CLAIMS: usize = 10_000;
+/// The most claims one `task.claims` page lists.
+pub const CLAIMS_PAGE: usize = 1000;
 
 /// The most owners one `task.reclaim` names.
 pub const MAX_DEAD_OWNERS: usize = 1000;
 
-/// `task.claims`: every held claim, in task order, and whether the list was cut at [`MAX_CLAIMS`].
+/// `task.claims`: the held claims after cursor `after`, in task order, at most [`CLAIMS_PAGE`], and the
+/// cursor of the next page when there is one — sent back as it came.
 ///
 /// # Errors
 /// A failed read.
-pub fn claims(conn: &Connection) -> Result<(Vec<Claim>, bool), ApiError> {
-    let mut held = jkb_core::claim::claimed(conn)?;
-    let truncated = held.len() > MAX_CLAIMS;
-    held.truncate(MAX_CLAIMS);
-    Ok((held.into_iter().map(Claim::from).collect(), truncated))
+pub fn claims(conn: &Connection, after: Option<i64>) -> Result<(Vec<Claim>, Option<i64>), ApiError> {
+    let mut held: Vec<jkb_core::claim::ClaimInfo> = jkb_core::claim::claimed(conn)?
+        .into_iter()
+        .filter(|c| after.is_none_or(|a| c.id.get() > a))
+        .collect();
+    let next = (held.len() > CLAIMS_PAGE).then(|| held[CLAIMS_PAGE - 1].id.get());
+    held.truncate(CLAIMS_PAGE);
+    Ok((held.into_iter().map(Claim::from).collect(), next))
 }
 
 /// What `task.reclaim` did.
@@ -97,7 +100,8 @@ pub enum Asker<'a> {
 /// Nobody can prove an `agent:` owner or an unreadable one gone ([`Liveness::External`]), so neither is
 /// ever taken, from anyone. A client of the daemon cannot have probed a process of the daemon's own host
 /// either: its pid namespace is its own. A session is judged by its checkout, which a client sees only
-/// under `~/repos` — a `~/`-relative worktree, the one form both sides resolve.
+/// in the directory it shares with the host — a `~/`-relative worktree its file roots admit
+/// ([`FileRoots::admits_home_path`], which also refuses a `..`), the one form both sides resolve.
 fn unprovable(asker: Asker<'_>, owner: &str) -> Option<String> {
     match AgentId::parse(owner).liveness() {
         Liveness::External => Some(
@@ -111,10 +115,15 @@ fn unprovable(asker: Asker<'_>, owner: &str) -> Option<String> {
             _ => None,
         },
         Liveness::Worktree(dir) => match asker {
-            Asker::Remote { .. } if !dir.starts_with("~/repos") => Some(
-                "a session checkout outside ~/repos, which a client of jkb serve cannot see"
-                    .to_owned(),
-            ),
+            Asker::Remote { roots, .. }
+                if !dir.to_str().is_some_and(|d| roots.admits_home_path(d)) =>
+            {
+                Some(
+                    "a session checkout outside the directory this client shares with the host, \
+                     which it cannot see"
+                        .to_owned(),
+                )
+            }
             _ => None,
         },
     }

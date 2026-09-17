@@ -594,9 +594,13 @@ pub enum Request {
     /// Record a review against a branch ([`review::record`]).
     #[serde(rename = "task.review_record")]
     TaskReviewRecord(review::RecordAsk),
-    /// Every held task claim ([`claims::claims`]).
+    /// A page of the held task claims ([`claims::claims`]).
     #[serde(rename = "task.claims")]
-    TaskClaims {},
+    TaskClaims {
+        /// The previous page's `next`.
+        #[serde(default)]
+        after: Option<i64>,
+    },
     /// Free the claims of owners the client proved gone ([`claims::reclaim`]).
     #[serde(rename = "task.reclaim")]
     TaskReclaim {
@@ -1115,7 +1119,7 @@ impl Request {
             Self::TaskReviewFindings { .. } => "task.review_findings",
             Self::TaskReviewFile(_) => "task.review_file",
             Self::TaskReviewRecord(_) => "task.review_record",
-            Self::TaskClaims {} => "task.claims",
+            Self::TaskClaims { .. } => "task.claims",
             Self::TaskReclaim { .. } => "task.reclaim",
             Self::KbHealth {} => "kb.health",
             Self::TaskStaging { .. } => "task.staging",
@@ -1157,7 +1161,7 @@ impl Request {
             | Self::TaskFacts { .. }
             | Self::TaskByBranch { .. }
             | Self::TaskReviewFindings { .. }
-            | Self::TaskClaims {}
+            | Self::TaskClaims { .. }
             | Self::TaskStaging { .. }
             | Self::ItemShow { .. }
             | Self::KbRelated { .. }
@@ -1506,13 +1510,13 @@ pub enum Response {
         #[serde(flatten)]
         recording: review::Recording,
     },
-    /// A `task.claims`.
+    /// A `task.claims` page.
     Claims {
         /// The held claims.
         claims: Vec<claims::Claim>,
-        /// Cut short at [`claims::MAX_CLAIMS`].
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        truncated: bool,
+        /// The next page's cursor, when there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<i64>,
     },
     /// A `task.reclaim`.
     Reclaimed {
@@ -1601,7 +1605,6 @@ impl Response {
             | Self::Children { truncated, .. }
             | Self::SearchHits { truncated, .. }
             | Self::Task { truncated, .. }
-            | Self::Claims { truncated, .. }
             | Self::StagingTasks { truncated, .. }
             | Self::Related { truncated, .. }
             | Self::Blobs { truncated, .. }
@@ -1646,6 +1649,7 @@ impl Response {
             | Self::ReviewRecorded { .. }
             | Self::Reclaimed { .. }
             | Self::Health { .. }
+            | Self::Claims { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
             | Self::Blob { .. }
@@ -1686,7 +1690,6 @@ impl Response {
             | Self::GrepHits { .. }
             | Self::SearchHits { .. }
             | Self::Task { .. }
-            | Self::Claims { .. }
             | Self::StagingTasks { .. }
             | Self::Related { .. }
             | Self::Blobs { .. }
@@ -1715,6 +1718,7 @@ impl Response {
             | Self::ReviewRecorded { .. }
             | Self::Reclaimed { .. }
             | Self::Health { .. }
+            | Self::Claims { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
             | Self::Blob { .. }
@@ -2554,9 +2558,9 @@ impl Backend for LocalBackend {
                     })?,
                 }
             }
-            Request::TaskClaims {} => {
-                let (claims, truncated) = db.read_with(claims::claims)?;
-                Response::Claims { claims, truncated }
+            Request::TaskClaims { after } => {
+                let (claims, next) = db.read_with(move |c| claims::claims(c, after))?;
+                Response::Claims { claims, next }
             }
             Request::TaskReclaim { dead } => {
                 let roots = self.file_roots.clone();

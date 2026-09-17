@@ -599,7 +599,8 @@ fn append(
 ///
 /// # Errors
 /// Returns a database error if a query fails.
-pub fn reclaim_dead(
+#[cfg(test)]
+pub(crate) fn reclaim_dead(
     conn: &Connection,
     meta: &WriteMeta,
     keep: &[String],
@@ -618,7 +619,7 @@ pub fn reclaim_dead(
 }
 
 /// Free every held claim `judge` answers [`Fact::No`] for, through the lifecycle's
-/// `ObservedOwnerGone`, and report the ones it answers [`Fact::Unknown`] for — [`reclaim_dead`]
+/// `ObservedOwnerGone`, and report the ones it answers [`Fact::Unknown`] for — `reclaim_dead`
 /// with the judgement handed in per claim, for a caller whose answer depends on the task as well as
 /// its owner (`jkb-api`'s `task.reclaim`, which leaves alone a task its client may not write).
 ///

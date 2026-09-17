@@ -63,7 +63,7 @@ pub enum TaskEvent {
     /// backed by that file. Also [`Dest::Stated`] — the file names the status.
     SetFromFile,
     /// The agent holding the claim is gone. An effect-only self-loop: it releases the claim and
-    /// touches nothing else, which is exactly what `claim::reclaim_dead` documents in prose.
+    /// touches nothing else, which is what `transition::reclaim_judged` performs.
     ObservedOwnerGone,
     /// A merged pull request proves this work reached its target.
     ///

@@ -90,7 +90,15 @@ fn free(kb: &Kb<'_>, probed: Probed) -> Result<Freed> {
             held_back: Vec::new(),
         });
     }
-    let answer = kb.reclaim(probed.dead_owners())?;
+    // In batches the op takes. Each owner string is its own compare-and-set, so nothing is lost by
+    // asking about them in pieces.
+    let mut answer = jkb_api::claims::Reclaimed::default();
+    for batch in probed.dead_owners().chunks(jkb_api::claims::MAX_DEAD_OWNERS) {
+        let part = kb.reclaim(batch.to_vec())?;
+        answer.cleared.extend(part.cleared);
+        answer.refused.extend(part.refused);
+        answer.unwritable.extend(part.unwritable);
+    }
     let mut held_back = Vec::new();
     for c in &probed.gone {
         if answer.cleared.contains(c) {
@@ -126,14 +134,17 @@ pub(crate) fn reclaim(kb: &Kb<'_>, keep: &[String], json: bool) -> Result<()> {
     let freed = free(kb, probe(kb, keep)?)?;
     if json {
         let uids = |cs: &[Claim]| cs.iter().map(|c| c.uid.clone()).collect::<Vec<_>>();
-        let mut unverifiable = uids(&freed.probed.unknown);
-        unverifiable.extend(freed.held_back.iter().map(|(c, _)| c.uid.clone()));
         println!(
             "{}",
             serde_json::json!({
                 "held": freed.probed.held,
                 "reclaimed": uids(&freed.cleared),
-                "unverifiable": unverifiable,
+                // Owners nothing here can prove gone.
+                "unverifiable": uids(&freed.probed.unknown),
+                // Owners proven gone whose claims the op did not free, and why.
+                "held_back": freed.held_back.iter().map(|(c, why)| serde_json::json!({
+                    "uid": c.uid, "owner": c.owner, "reason": why,
+                })).collect::<Vec<_>>(),
             })
         );
         return Ok(());

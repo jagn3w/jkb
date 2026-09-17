@@ -86,3 +86,41 @@ pub fn health(conn: &Connection) -> Result<Health, ApiError> {
 fn index_error(e: &jkb_index::Error) -> ApiError {
     ApiError::with_code(crate::ErrorCode::Internal, e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use jkb_core::Db;
+
+    /// Past [`super::MAX_FLAGGED`] the list is cut and the count is not.
+    #[test]
+    fn the_flagged_files_are_counted_past_the_listed_ones() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            for i in 0..=super::MAX_FLAGGED {
+                let uri = format!("file:///r/f{i}.md");
+                jkb_core::sync_state::upsert(
+                    c,
+                    m,
+                    &jkb_core::sync_state::SyncStateWrite {
+                        uri: &uri,
+                        serializer: "document",
+                        status: "needs_attention",
+                        last_synced_hash: None,
+                        base_blob_hash: None,
+                        parse_error: Some("bad"),
+                        quarantine_blob_hash: None,
+                        document: None,
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let h = db.read_with(super::health).unwrap();
+        assert_eq!(h.flagged.len(), super::MAX_FLAGGED);
+        assert_eq!(h.flagged_count, super::MAX_FLAGGED + 1);
+        assert!(h.fts_ok);
+        assert_eq!((h.vector_tables, h.stale_vectors), (0, 0));
+        assert_eq!(h.flagged[0].detail.as_deref(), Some("bad"));
+    }
+}

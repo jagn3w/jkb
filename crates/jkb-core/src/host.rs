@@ -17,10 +17,18 @@ pub fn name() -> String {
         .ok()
         .or_else(|| std::env::var("HOST").ok())
         .filter(|h| !h.is_empty())
-        .or_else(|| {
-            let uts = rustix::system::uname();
-            let node = uts.nodename().to_string_lossy().into_owned();
-            (!node.is_empty()).then_some(node)
-        })
+        .or_else(nodename)
         .unwrap_or_else(|| "localhost".to_owned())
+}
+
+#[cfg(unix)]
+fn nodename() -> Option<String> {
+    let uts = rustix::system::uname();
+    let node = uts.nodename().to_string_lossy().into_owned();
+    (!node.is_empty()).then_some(node)
+}
+
+#[cfg(not(unix))]
+const fn nodename() -> Option<String> {
+    None
 }

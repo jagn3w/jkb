@@ -4769,10 +4769,6 @@ fn report_close_merged(verdicts: &[CloseVerdict], dry_run: bool, json: bool) {
     }
 }
 
-/// `task reclaim` (design D27.1/D27.6.6b): the deterministic owner-existence scan,
-/// exposed so the coordinator can run it SQL-free. Clears claims whose owner pid is
-/// gone, preserving `keep` owners (the live run passes its own owner so it never
-/// reclaims its own in-flight work).
 /// Print a short human/JSON confirmation for a task mutation.
 fn report(json: bool, uid: &str, action: &str) {
     if json {

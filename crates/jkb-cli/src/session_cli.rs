@@ -318,19 +318,23 @@ impl<'a> Kb<'a> {
         }
     }
 
-    /// `task.claims`: every held claim, refused when the answer was cut — a reclaim or a report over
-    /// part of the claims would say nothing about the rest.
+    /// `task.claims`: every held claim, page by page.
     pub(crate) fn claims(&self) -> Result<Vec<jkb_api::claims::Claim>> {
-        match self.call(Request::TaskClaims {})? {
-            Response::Claims { claims, truncated } => {
-                anyhow::ensure!(
-                    !truncated,
-                    "more than {} claims are held, which only something claiming in a loop does;                      list them with `jkb query 'kind:task'` and release them by hand",
-                    jkb_api::claims::MAX_CLAIMS
-                );
-                Ok(claims)
+        let mut out = Vec::new();
+        let mut after = None;
+        loop {
+            match self.call(Request::TaskClaims { after })? {
+                Response::Claims { claims, next } => {
+                    out.extend(claims);
+                    match next {
+                        // A cursor that does not move on would page forever.
+                        Some(n) if after.is_none_or(|a| n > a) => after = Some(n),
+                        Some(_) => anyhow::bail!("task.claims answered a cursor that does not advance"),
+                        None => return Ok(out),
+                    }
+                }
+                other => return unexpected("task.claims", &other),
             }
-            other => unexpected("task.claims", &other),
         }
     }
 

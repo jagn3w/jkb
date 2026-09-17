@@ -253,6 +253,15 @@ pub(crate) fn enforce(
 #[derive(serde::Deserialize)]
 struct WorkflowResult {
     findings: Vec<WorkflowFinding>,
+    /// Set when the review did not run (`code-review.js`: a failed survey). Its empty `findings` are
+    /// not a clean review, and filing them as one would let the land gate pass unreviewed work.
+    #[serde(default)]
+    error: Option<String>,
+    /// How many reviewers read the change: none means nothing was reviewed, whatever the findings say.
+    #[serde(default)]
+    reviewers: Option<u64>,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -298,23 +307,44 @@ pub(crate) fn file_cmd(
     };
     let result: WorkflowResult = serde_json::from_str(&text).with_context(|| {
         format!(
-            "{what} is not a review result: a JSON object with a `findings` array of {{severity              (must-fix|concern|nit), summary, file, line, scenario, fix}}"
+            "{what} is not a review result: a JSON object with a `findings` array of {{severity \
+             (must-fix|concern|nit), summary, file, line, scenario, fix}}"
         )
     })?;
+    let why_not_run = result.error.clone().or_else(|| {
+        (result.reviewers == Some(0)).then(|| "no reviewer read the change".to_owned())
+    });
+    if let Some(why) = why_not_run {
+        anyhow::bail!(
+            "{what} is from a review that did not run ({why}{}) — nothing was filed, because an \
+             empty result filed as a clean review would let `jkb task land` pass. Re-run the review.",
+            result
+                .note
+                .as_deref()
+                .map(|n| format!(": {n}"))
+                .unwrap_or_default()
+        );
+    }
+    let mut findings: Vec<jkb_api::review::Finding> = result
+        .findings
+        .into_iter()
+        .map(|f| jkb_api::review::Finding {
+            severity: f.severity,
+            summary: f.summary,
+            file: f.file,
+            line: f.line,
+            scenario: f.scenario,
+            fix: f.fix,
+        })
+        .collect();
+    if jkb_api::review::fit(&mut findings) {
+        eprintln!(
+            "note: some scenarios and fixes were cut to fit one filing; {what} holds them in full"
+        );
+    }
     let filed = kb.review_file(jkb_api::review::FileAsk {
         ns: findings_ns.to_owned(),
-        findings: result
-            .findings
-            .into_iter()
-            .map(|f| jkb_api::review::Finding {
-                severity: f.severity,
-                summary: f.summary,
-                file: f.file,
-                line: f.line,
-                scenario: f.scenario,
-                fix: f.fix,
-            })
-            .collect(),
+        findings,
     })?;
     if json {
         println!(
@@ -402,7 +432,8 @@ fn print_recording(
             println!("no task records branch={branch} — nothing to tag (review still filed)");
         } else {
             println!(
-                "nothing tagged for branch={branch} — every matching task was skipped, below                  (review still filed)"
+                "nothing tagged for branch={branch} — every matching task was skipped, below \
+                 (review still filed)"
             );
         }
     } else {
@@ -430,17 +461,20 @@ fn print_recording(
         }
     };
     bucket(
-        "not tagged — a recorded branch cannot be handed to git at all, so nothing about them could          be checked (`jkb task tag rm <uid> branch=<value>`):",
+        "not tagged — a recorded branch cannot be handed to git at all, so nothing about them could \
+         be checked (`jkb task tag rm <uid> branch=<value>`):",
         unusable,
     );
     bucket(
-        "not tagged — filed outside the directories this client may write; record the review on the          host:",
+        "not tagged — filed outside the directories this client may write; record the review on the \
+         host:",
         unwritable,
     );
     if !skipped_unlanded.is_empty() {
         bucket(
             &format!(
-                "not tagged — landing on {branch}, but jkb has not grafted their work onto it yet, so                  this review did not see it:"
+                "not tagged — landing on {branch}, but jkb has not grafted their work onto it yet, so \
+                 this review did not see it:"
             ),
             skipped_unlanded,
         );

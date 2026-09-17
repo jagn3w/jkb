@@ -240,3 +240,34 @@ fn a_rooted_recording_skips_the_tasks_its_client_may_not_write() {
     assert_eq!(got.unwritable, vec![outside.clone()]);
     assert_eq!(show(&host, &outside)["item"]["status"], "in_progress");
 }
+
+/// A review too large for one request is refused whole, and `fit` trims its longest texts until it
+/// files — marking each cut.
+#[test]
+fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let long = "x".repeat(7 * 1024);
+    let mut findings: Vec<super::Finding> = (0..150)
+        .map(|i| super::Finding {
+            severity: super::Severity::Concern,
+            summary: format!("finding {i}"),
+            file: None,
+            line: None,
+            scenario: Some(long.clone()),
+            fix: Some("é".repeat(10)),
+        })
+        .collect();
+    let e = file(&b, "reviews/big", &serde_json::to_value(&findings).unwrap()).unwrap_err();
+    assert!(e.message.contains("one filing takes at most"), "{e:?}");
+    assert!(super::fit(&mut findings));
+    assert!(serde_json::to_vec(&findings).unwrap().len() <= super::MAX_FILING_BYTES);
+    let scenario = findings[0].scenario.as_deref().unwrap();
+    assert!(scenario.ends_with(super::TRIMMED), "{}", &scenario[scenario.len() - 80..]);
+    assert_eq!(findings[0].fix.as_deref(), Some("é".repeat(10).as_str()), "a short text is kept");
+    let filed = file(&b, "reviews/big", &serde_json::to_value(&findings).unwrap()).unwrap();
+    assert_eq!(filed.uids.len(), 150);
+    // A review that already fits is left alone.
+    let mut small = findings[..1].to_vec();
+    small[0].scenario = Some("s".to_owned());
+    assert!(!super::fit(&mut small));
+}

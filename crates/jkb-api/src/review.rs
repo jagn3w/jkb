@@ -36,6 +36,43 @@ pub const MAX_SUMMARY_BYTES: usize = 2048;
 /// The longest scenario or fix a finding may carry, in bytes.
 pub const MAX_DETAIL_BYTES: usize = 32 * 1024;
 
+/// The most one filing's findings may take, serialized. It is one request, and a client of `jkb serve`
+/// sends at most a mebibyte; a filing cannot be split, because a review is filed once. [`fit`] trims a
+/// review's longest texts until it fits.
+pub const MAX_FILING_BYTES: usize = 768 * 1024;
+
+/// The shortest a scenario or fix is trimmed to by [`fit`].
+const MIN_TRIMMED_BYTES: usize = 256;
+
+/// What [`fit`] appends to a text it cut.
+pub const TRIMMED: &str = " … (cut to fit one filing; the reviewer's result holds the rest)";
+
+/// Trim `findings`' scenarios and fixes, longest allowance first, until they serialize within
+/// [`MAX_FILING_BYTES`] — halving the allowance each round, down to [`MIN_TRIMMED_BYTES`]. Returns
+/// whether anything was cut. A review that still does not fit is left for [`file`] to refuse.
+pub fn fit(findings: &mut [Finding]) -> bool {
+    let size = |f: &[Finding]| serde_json::to_vec(f).map_or(usize::MAX, |v| v.len());
+    let mut cut = false;
+    let mut allowance = MAX_DETAIL_BYTES;
+    while size(findings) > MAX_FILING_BYTES && allowance > MIN_TRIMMED_BYTES {
+        allowance /= 2;
+        for f in findings.iter_mut() {
+            for text in [&mut f.scenario, &mut f.fix].into_iter().flatten() {
+                if text.len() > allowance + TRIMMED.len() {
+                    let mut end = allowance;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                    text.push_str(TRIMMED);
+                    cut = true;
+                }
+            }
+        }
+    }
+    cut
+}
+
 /// How serious a finding is: where it is filed, and at what priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Severity {
@@ -195,6 +232,13 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
             MAX_DETAIL_BYTES,
         )?;
         check_bytes("fix", f.fix.as_deref().unwrap_or(""), MAX_DETAIL_BYTES)?;
+    }
+    let size = serde_json::to_vec(&ask.findings).map_or(usize::MAX, |v| v.len());
+    if size > MAX_FILING_BYTES {
+        return Err(invalid(format!(
+            "these findings take {size} bytes and one filing takes at most {MAX_FILING_BYTES}; \
+             shorten their scenarios and fixes (`jkb task review file` does this itself)"
+        )));
     }
     let held = Query {
         scope: Scope::Subtree(root.clone()),

@@ -30,8 +30,8 @@ fn claim(b: &LocalBackend, uid: &str, owner: &str) {
 
 fn held(b: &LocalBackend) -> Vec<(String, String)> {
     match call(b, json!({ "op": "task.claims" })).unwrap() {
-        Response::Claims { claims, truncated } => {
-            assert!(!truncated);
+        Response::Claims { claims, next } => {
+            assert_eq!(next, None);
             claims.into_iter().map(|c| (c.uid, c.owner)).collect()
         }
         other => panic!("{other:?}"),
@@ -106,16 +106,23 @@ fn a_rooted_reclaim_takes_only_what_its_client_could_have_proved() {
     let here = format!("{}:5", jkb_core::host::name());
     let shared = "session:5:~/repos/proj/.jkb/work/s";
     let private = "session:5:/Users/u/elsewhere/.jkb/work/s";
-    let (h, s, p) = (add(&host, "h"), add(&host, "s"), add(&host, "p"));
+    let climbing = "session:5:~/repos/../work/s";
+    let (h, s, p, c) = (
+        add(&host, "h"),
+        add(&host, "s"),
+        add(&host, "p"),
+        add(&host, "c"),
+    );
     claim(&host, &h, &here);
     claim(&host, &s, shared);
     claim(&host, &p, private);
+    claim(&host, &c, climbing);
     claim(&host, &inside, "container:7");
     claim(&host, &outside, "container:7");
     claim(&host, &managed, "container:7");
 
     let rooted = crate::tests::rooted(&db);
-    let got = reclaim(&rooted, &[&here, shared, private, "container:7"]);
+    let got = reclaim(&rooted, &[&here, shared, private, climbing, "container:7"]);
     let mut cleared: Vec<&str> = got.cleared.iter().map(|c| c.uid.as_str()).collect();
     cleared.sort_unstable();
     let mut want = vec![s.as_str(), inside.as_str(), managed.as_str()];
@@ -123,7 +130,7 @@ fn a_rooted_reclaim_takes_only_what_its_client_could_have_proved() {
     assert_eq!(cleared, want);
     let mut refused: Vec<&str> = got.refused.iter().map(|r| r.owner.as_str()).collect();
     refused.sort_unstable();
-    let mut want = vec![here.as_str(), private];
+    let mut want = vec![here.as_str(), private, climbing];
     want.sort_unstable();
     assert_eq!(refused, want);
     assert_eq!(
@@ -138,4 +145,32 @@ fn a_rooted_reclaim_takes_only_what_its_client_could_have_proved() {
     let got = reclaim(&host, &[&here, private, "container:7"]);
     assert_eq!(got.cleared.len(), 3, "{got:?}");
     assert!(got.refused.is_empty());
+}
+
+/// The claims are listed a page at a time, every one exactly once.
+#[test]
+fn the_claims_are_paged() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let db = b.db.clone();
+    db.write_txn("t", |c, m| {
+        for i in 0..=super::CLAIMS_PAGE {
+            let uid = format!("task:t{i}");
+            let id = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new(&uid, "t"))?;
+            jkb_core::claim::claim(c, m, id, "box:1")?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let page = |after: Option<i64>| match call(&b, json!({ "op": "task.claims", "after": after }))
+        .unwrap()
+    {
+        Response::Claims { claims, next } => (claims, next),
+        other => panic!("{other:?}"),
+    };
+    let (first, next) = page(None);
+    assert_eq!(first.len(), super::CLAIMS_PAGE);
+    let (second, last) = page(next);
+    assert_eq!(second.len(), 1);
+    assert_eq!(last, None);
+    assert_eq!(second[0].uid, format!("task:t{}", super::CLAIMS_PAGE));
 }
