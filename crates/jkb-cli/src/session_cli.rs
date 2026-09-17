@@ -329,7 +329,9 @@ impl<'a> Kb<'a> {
                     match next {
                         // A cursor that does not move on would page forever.
                         Some(n) if after.is_none_or(|a| n > a) => after = Some(n),
-                        Some(_) => anyhow::bail!("task.claims answered a cursor that does not advance"),
+                        Some(_) => {
+                            anyhow::bail!("task.claims answered a cursor that does not advance")
+                        }
                         None => return Ok(out),
                     }
                 }

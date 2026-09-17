@@ -3802,6 +3802,10 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
     host_ok(&["task", "add", "child", "--under", &parent], &host_repo);
     host_ok(&["task", "add", "sibling needle !p2"], &host_repo);
     host_ok(&["task", "add", "outside the repo"], &root);
+    host_ok(
+        &["inv", "new", "debugging", "bug", "--goal", "it crashes"],
+        &host_repo,
+    );
 
     let (mut serve, url) = Daemon::spawn({
         let mut cmd = jkb(&db);
@@ -3852,6 +3856,14 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
         vec!["--json", "blob", "ls"],
         vec!["--json", "history", "tasks.md"],
         vec!["history", "tasks.md"],
+        vec!["--json", "inv", "ls"],
+        vec!["inv", "ls"],
+        vec!["inv", "verbs", "memory/proj/bug"],
+        vec!["--json", "inv", "kinds", "memory/proj/bug"],
+        vec!["--json", "inv", "frontier", "memory/proj/bug"],
+        vec!["inv", "frontier", "memory/proj/bug"],
+        vec!["inv", "tombstones", "memory/proj/bug"],
+        vec!["inv", "digest", "memory/proj/bug", "--dry-run"],
     ];
     for args in &reads {
         let (h, r) = (host(args, &host_repo), remote(args, &client_repo));
@@ -3867,6 +3879,16 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
             "{args:?}: the daemon answered differently from the host"
         );
     }
+
+    // An investigation started from the container is homed by the repo it runs in, as on the host.
+    let started = remote(&["--json", "inv", "new", "debugging", "bug2"], &client_repo);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(v["ns"], "memory/proj/bug2", "{v}");
 
     // The ambient scope was applied through the daemon, not dropped: inside the repo `task next`
     // lists the repo's tasks and not the one captured outside it; `--global` lists that one too.

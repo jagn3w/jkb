@@ -93,7 +93,10 @@ fn free(kb: &Kb<'_>, probed: Probed) -> Result<Freed> {
     // In batches the op takes. Each owner string is its own compare-and-set, so nothing is lost by
     // asking about them in pieces.
     let mut answer = jkb_api::claims::Reclaimed::default();
-    for batch in probed.dead_owners().chunks(jkb_api::claims::MAX_DEAD_OWNERS) {
+    for batch in probed
+        .dead_owners()
+        .chunks(jkb_api::claims::MAX_DEAD_OWNERS)
+    {
         let part = kb.reclaim(batch.to_vec())?;
         answer.cleared.extend(part.cleared);
         answer.refused.extend(part.refused);

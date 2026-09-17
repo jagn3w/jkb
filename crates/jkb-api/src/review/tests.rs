@@ -262,8 +262,16 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
     assert!(super::fit(&mut findings));
     assert!(serde_json::to_vec(&findings).unwrap().len() <= super::MAX_FILING_BYTES);
     let scenario = findings[0].scenario.as_deref().unwrap();
-    assert!(scenario.ends_with(super::TRIMMED), "{}", &scenario[scenario.len() - 80..]);
-    assert_eq!(findings[0].fix.as_deref(), Some("é".repeat(10).as_str()), "a short text is kept");
+    assert!(
+        scenario.ends_with(super::TRIMMED),
+        "{}",
+        &scenario[scenario.len() - 80..]
+    );
+    assert_eq!(
+        findings[0].fix.as_deref(),
+        Some("é".repeat(10).as_str()),
+        "a short text is kept"
+    );
     let filed = file(&b, "reviews/big", &serde_json::to_value(&findings).unwrap()).unwrap();
     assert_eq!(filed.uids.len(), 150);
     // A review that already fits is left alone.

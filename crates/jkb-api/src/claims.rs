@@ -49,7 +49,10 @@ pub const MAX_DEAD_OWNERS: usize = 1000;
 ///
 /// # Errors
 /// A failed read.
-pub fn claims(conn: &Connection, after: Option<i64>) -> Result<(Vec<Claim>, Option<i64>), ApiError> {
+pub fn claims(
+    conn: &Connection,
+    after: Option<i64>,
+) -> Result<(Vec<Claim>, Option<i64>), ApiError> {
     let mut held: Vec<jkb_core::claim::ClaimInfo> = jkb_core::claim::claimed(conn)?
         .into_iter()
         .filter(|c| after.is_none_or(|a| c.id.get() > a))

@@ -234,8 +234,9 @@ const fn direction_name(d: edge::Direction) -> &'static str {
 /// The deepest `kb.related` walks.
 pub const MAX_RELATED_DEPTH: usize = 16;
 
-/// The longest snippet a related row carries, in characters.
-const SNIPPET_CHARS: usize = 100;
+/// The longest snippet a related row carries, in characters: one past the 100 a listing shows, so the
+/// listing can still tell a longer line and mark the cut.
+const SNIPPET_CHARS: usize = 101;
 
 /// `kb.related`: the items reached from `uid` over `edges` (any type when empty), breadth-first up to
 /// `depth`, each once at its shortest depth, within `budget`.

@@ -4706,34 +4706,6 @@ fn a_container_files_and_records_a_review_through_the_daemon() {
     );
     let again = remote(&file_args, None);
     assert!(!again.status.success(), "a review is filed once: {again:?}");
-    // A review that did not run is not a clean one.
-    for failed in [
-        r#"{"findings": [], "reviewers": 0, "error": "survey failed", "note": "nothing was reviewed; re-run"}"#,
-        r#"{"findings": [], "reviewers": 0, "note": "no findings"}"#,
-    ] {
-        let out = remote(
-            &[
-                "task",
-                "review",
-                "file",
-                "--findings",
-                "repos/proj/codereviews/failed",
-                "--from",
-                "-",
-            ],
-            Some(failed),
-        );
-        assert!(!out.status.success(), "{out:?}");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("did not run"),
-            "{out:?}"
-        );
-    }
-    let listed = remote(&["--json", "ls", "repos/proj/codereviews/failed"], None);
-    assert!(
-        !String::from_utf8_lossy(&listed.stdout).contains("task:"),
-        "nothing was filed: {listed:?}"
-    );
     let clean = remote(
         &[
             "--json",
@@ -4831,4 +4803,43 @@ fn a_container_reclaims_and_checks_health_through_the_daemon() {
     }
     let fix = remote(&["doctor", "--fix"]);
     assert!(!fix.status.success(), "{fix:?}");
+}
+
+/// **A review that did not run is not filed as a clean one** (stage-5a review): an empty result the
+/// workflow marked failed, or read by no reviewer, is refused and files nothing.
+#[test]
+fn a_review_that_did_not_run_is_not_filed() {
+    let f = Fixture::new();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote =
+        |args: &[&str], stdin: Option<&str>| container_jkb(&f.repo, &url, &token, args, stdin);
+    // A review that did not run is not a clean one.
+    for failed in [
+        r#"{"findings": [], "reviewers": 0, "error": "survey failed", "note": "nothing was reviewed; re-run"}"#,
+        r#"{"findings": [], "reviewers": 0, "note": "no findings"}"#,
+    ] {
+        let out = remote(
+            &[
+                "task",
+                "review",
+                "file",
+                "--findings",
+                "repos/proj/codereviews/failed",
+                "--from",
+                "-",
+            ],
+            Some(failed),
+        );
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("did not run"),
+            "{out:?}"
+        );
+    }
+    let listed = remote(&["--json", "ls", "repos/proj/codereviews/failed"], None);
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("task:"),
+        "nothing was filed: {listed:?}"
+    );
 }

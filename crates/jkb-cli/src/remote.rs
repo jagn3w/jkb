@@ -79,6 +79,7 @@ pub const fn support(command: &Command) -> Support {
         | Command::Related { .. }
         | Command::Blob { .. }
         | Command::History { .. }
+        | Command::Inv { .. }
         | Command::Task {
             cmd:
                 TaskCmd::Next { .. }
@@ -132,8 +133,7 @@ pub const fn support(command: &Command) -> Support {
         | Command::View { .. }
         | Command::Undo { .. }
         | Command::Index { .. }
-        | Command::Mcp
-        | Command::Inv { .. } => Support::Refused(NOT_YET),
+        | Command::Mcp => Support::Refused(NOT_YET),
     }
 }
 
@@ -449,6 +449,8 @@ mod tests {
             vec!["blob", "cat", "abcd"],
             vec!["history", "x.md"],
             vec!["item", "rm", "u"],
+            vec!["inv", "ls"],
+            vec!["inv", "do", "memory/x", "hypothesize", "t"],
             vec!["task", "mirror"],
             vec!["stat", "u"],
             vec!["ns", "ls"],

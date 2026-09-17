@@ -367,6 +367,11 @@ fn samples() -> Vec<Request> {
         Request::KbBlob {
             prefix: "abcd".into(),
         },
+        Request::InvRead(super::inv::InvRead::Ls {}),
+        Request::InvWrite(super::inv::InvWrite::Promise {
+            uid: "u".into(),
+            value: 0.5,
+        }),
         Request::KbHistory {
             path: "/tmp/x".into(),
             home: String::new(),
@@ -1395,6 +1400,7 @@ const READS: &[&str] = &[
     "kb.blobs",
     "kb.blob",
     "kb.history",
+    "inv.read",
 ];
 
 #[test]

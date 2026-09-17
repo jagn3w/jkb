@@ -32,6 +32,7 @@ use serde_json::Value;
 pub mod claims;
 pub mod health;
 pub mod ingest;
+pub mod inv;
 pub mod items;
 pub mod kb;
 pub mod removals;
@@ -663,6 +664,12 @@ pub enum Request {
         /// A unique hash prefix.
         prefix: String,
     },
+    /// An investigation read ([`inv::read`]).
+    #[serde(rename = "inv.read")]
+    InvRead(inv::InvRead),
+    /// An investigation write ([`inv::write`]).
+    #[serde(rename = "inv.write")]
+    InvWrite(inv::InvWrite),
     /// A synced file's versions ([`items::history`]).
     #[serde(rename = "kb.history")]
     KbHistory {
@@ -1050,6 +1057,8 @@ impl Request {
         "kb.related",
         "kb.blobs",
         "kb.blob",
+        "inv.read",
+        "inv.write",
         "kb.history",
     ];
 
@@ -1128,6 +1137,8 @@ impl Request {
             Self::KbRelated { .. } => "kb.related",
             Self::KbBlobs { .. } => "kb.blobs",
             Self::KbBlob { .. } => "kb.blob",
+            Self::InvRead(_) => "inv.read",
+            Self::InvWrite(_) => "inv.write",
             Self::KbHistory { .. } => "kb.history",
         }
     }
@@ -1168,6 +1179,7 @@ impl Request {
             | Self::KbBlobs { .. }
             | Self::KbBlob { .. }
             | Self::KbHistory { .. }
+            | Self::InvRead(_)
             | Self::RepoGate { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -1218,7 +1230,8 @@ impl Request {
             | Self::TaskReclaim { .. }
             // FTS5's integrity check is an `INSERT`, which the `query_only` reader refuses.
             | Self::KbHealth {}
-            | Self::ItemRm { .. } => false,
+            | Self::ItemRm { .. }
+            | Self::InvWrite(_) => false,
         }
     }
 }
@@ -1582,6 +1595,11 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
+    /// An `inv.read` or `inv.write`.
+    Inv {
+        /// What it answered.
+        answer: inv::InvAnswer,
+    },
     /// A `task.show`.
     Task {
         /// The task.
@@ -1650,6 +1668,7 @@ impl Response {
             | Self::Reclaimed { .. }
             | Self::Health { .. }
             | Self::Claims { .. }
+            | Self::Inv { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
             | Self::Blob { .. }
@@ -1719,6 +1738,7 @@ impl Response {
             | Self::Reclaimed { .. }
             | Self::Health { .. }
             | Self::Claims { .. }
+            | Self::Inv { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
             | Self::Blob { .. }
@@ -2617,6 +2637,17 @@ impl Backend for LocalBackend {
             Request::KbBlob { prefix } => {
                 let (hash, text) = db.read_with(move |c| items::blob_text(c, &prefix))?;
                 Response::Blob { hash, text }
+            }
+            Request::InvRead(ask) => Response::Inv {
+                answer: db.read_with(move |c| inv::read(c, &ask))?,
+            },
+            Request::InvWrite(ask) => {
+                let roots = self.file_roots.clone();
+                Response::Inv {
+                    answer: db.write_txn_with(actor, move |c, m| {
+                        inv::write(c, m, &ask, roots.as_ref())
+                    })?,
+                }
             }
             Request::KbHistory { path, home } => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
