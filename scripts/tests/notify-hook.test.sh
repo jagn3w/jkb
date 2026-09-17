@@ -238,8 +238,11 @@ check "every event registered in settings.json is handled by the hook" \
 #      than run from an installed bundle, which may be older than this checkout; `serve --dry-run`
 #      touches no notification centre, so no bundle is needed. macOS only (swiftc, osacompile).
 echo "==> jkb-notifier serve (dry run)"
-if ! command -v swiftc >/dev/null 2>&1; then
-  printf '  --  %s\n' "skipped (no swiftc — macOS with the Xcode Command Line Tools)"
+# macOS, not just swiftc: CI's Ubuntu image ships a Swift toolchain with no UserNotifications
+# module, so a swiftc-only test failed there on code that is correct (check.sh's swift gate asks
+# both for the same reason).
+if [ "$(uname -s)" != "Darwin" ] || ! command -v swiftc >/dev/null 2>&1; then
+  printf '  --  %s\n' "skipped (needs macOS + swiftc — the Xcode Command Line Tools)"
 elif ! swiftc -swift-version 5 -o "$tmp/jkb-notifier" \
     "$(cd "$(dirname "$0")/../.." && pwd)/macos/notifier/main.swift" 2>"$tmp/swiftc.err"; then
   fail "macos/notifier/main.swift does not compile: $(head -5 "$tmp/swiftc.err")"
