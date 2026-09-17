@@ -74,6 +74,17 @@ pub fn normalize(path: &str) -> Result<String> {
     Ok(normalized)
 }
 
+/// The top-level roots the D32 layout reserves, which readers find by their fixed paths (`memory`
+/// for investigations, `tasks` for the task index, `_sys` for views and journals, …).
+pub const RESERVED_ROOTS: &[&str] = &["repos", "tasks", "media", "references", "memory", "_sys"];
+
+/// Whether moving `path`, or moving something onto it, would move what a reader finds by its fixed
+/// path: a [`RESERVED_ROOTS`] root itself, or anything under `_sys`.
+#[must_use]
+pub fn is_fixed(path: &str) -> bool {
+    RESERVED_ROOTS.contains(&path) || path.starts_with("_sys/")
+}
+
 /// Whether `path` denotes a system namespace (`_sys` or below).
 fn kind_for(path: &str) -> &'static str {
     if path == "_sys" || path.starts_with("_sys/") {

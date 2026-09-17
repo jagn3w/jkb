@@ -8,7 +8,7 @@
 use jkb_core::lifecycle::{self, TaskEvent};
 use jkb_core::{item, task, transition, WriteMeta};
 use jkb_fsm::Fact;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 
 use crate::kb::Budget;
@@ -88,9 +88,16 @@ pub fn open_in_repo(
         .map_err(jkb_core::Error::from)?;
     let mut out = Vec::new();
     for id in jkb_core::location::tasks_in_repo(repo).evaluate(conn)? {
-        let (uid, status): (String, Option<String>) = row
-            .query_row([id.get()], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(jkb_core::Error::from)?;
+        // A task deleted since the ids were read is simply not listed.
+        let Some((uid, status)) = row
+            .query_row([id.get()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .optional()
+            .map_err(jkb_core::Error::from)?
+        else {
+            continue;
+        };
         if jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
             continue;
         }
@@ -147,6 +154,9 @@ pub struct Observed {
     /// [`PrFacts::resumed_at`], as read.
     #[serde(default)]
     pub resumed_at: Option<String>,
+    /// [`PrFacts::pr`], as read.
+    #[serde(default)]
+    pub pr: Option<i64>,
 }
 
 /// What `task.close_merged` is asked, beside the task.
@@ -222,6 +232,7 @@ pub fn close_merged(
     let landing = transition::landing(conn, id)?;
     if landing.live().is_some() != observed.live_landing
         || landing.resumed_at() != observed.resumed_at.as_deref()
+        || landing.pr_number() != observed.pr
     {
         return Ok(Some(
             "its landing history changed while the merge was being checked; run close-merged \

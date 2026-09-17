@@ -401,6 +401,7 @@ fn samples() -> Vec<Request> {
             observed: super::prs::Observed {
                 live_landing: false,
                 resumed_at: None,
+                pr: None,
             },
             pr: None,
             dry_run: true,

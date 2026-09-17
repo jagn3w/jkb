@@ -89,9 +89,49 @@ fn a_rooted_move_is_bounded() {
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    let host = LocalBackend::new(db.clone());
     call(
-        &LocalBackend::new(db),
+        &host,
         json!({ "op": "ns.mv", "from": "bulk", "to": "bulk2" }),
     )
     .unwrap();
+
+    // Nor a subtree of too many namespaces, however few items.
+    db.write_txn("t", |c, _| {
+        for i in 0..=super::MAX_MOVED_NAMESPACES {
+            jkb_core::ns::ensure(c, &format!("wide/n{i}"))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let e = call(
+        &crate::tests::rooted(&db),
+        json!({ "op": "ns.mv", "from": "wide", "to": "wide2" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    // Nor more filed tasks than it checks the lines of.
+    for i in 0..=super::MAX_MOVED_FILED {
+        call(
+            &host,
+            json!({ "op": "task.add", "text": format!("filed {i} +repos/in/many") }),
+        )
+        .unwrap();
+    }
+    let e = call(
+        &crate::tests::rooted(&db),
+        json!({ "op": "ns.mv", "from": "repos/in/many", "to": "repos/in/more" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert!(e.message.contains("filed in a file"), "{e:?}");
+    // Nor a root the layout reserves.
+    for root in jkb_core::ns::RESERVED_ROOTS {
+        let e = call(
+            &crate::tests::rooted(&db),
+            json!({ "op": "ns.mv", "from": root, "to": "elsewhere" }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Forbidden, "{root}: {e:?}");
+    }
 }

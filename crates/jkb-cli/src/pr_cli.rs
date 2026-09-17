@@ -66,6 +66,7 @@ impl Kb<'_> {
             observed: jkb_api::prs::Observed {
                 live_landing: facts.live_landing,
                 resumed_at: facts.resumed_at.clone(),
+                pr: facts.pr,
             },
             pr,
             dry_run,

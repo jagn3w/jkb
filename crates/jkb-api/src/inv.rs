@@ -386,8 +386,9 @@ fn within<T: Serialize>(rows: impl IntoIterator<Item = T>, budget: &mut Budget) 
 /// [`crate::items::MAX_RELATED_NODES`].
 ///
 /// **Residual, stated:** a bucket (`frontier`, `core`, `tombstones`) is computed over its whole
-/// investigation before the budget cuts the answer — the engine's work is proportional to the units one
-/// investigation holds, as it is on the host.
+/// investigation before the budget cuts the answer, and `retread` reads the full body of each of the
+/// (at most [`crate::items::MAX_RELATED_NODES`]) dead ends it reaches — the engine loads units whole,
+/// as it does on the host.
 ///
 /// # Errors
 /// The engine's refusal (an untyped namespace, an unknown uid), or a failed read.
@@ -453,7 +454,7 @@ pub fn read(conn: &Connection, ask: &InvRead, budget: &mut Budget) -> Result<Inv
         }
         InvRead::Evidence { uid } => {
             let id = require_id(conn, uid)?;
-            let mut edges = edge::evidence_edges(conn, id)?;
+            let mut edges = edge::evidence_edges_limited(conn, id, cap + 1)?;
             let at_node_cap = edges.len() > cap;
             edges.truncate(cap);
             let mut rows = Vec::new();

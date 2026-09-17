@@ -69,7 +69,8 @@ fn a_task_closes_on_a_merge_its_client_established() {
     let close = |merged: &str, dry_run: bool| match call(
         &b,
         json!({ "op": "task.close_merged", "uid": uid, "merged": merged, "pr": 31,
-                "dry_run": dry_run, "observed": { "live_landing": false } }),
+                "dry_run": dry_run,
+                "observed": { "live_landing": false, "pr": 31 } }),
     )
     .unwrap()
     {
@@ -102,4 +103,52 @@ fn a_task_closes_on_a_merge_its_client_established() {
         Response::Uids { uids, .. } => assert!(uids.is_empty()),
         other => panic!("{other:?}"),
     }
+}
+
+/// The close is held when the task was put back to work, or its pull request renamed, after the client
+/// read its history — and goes ahead on the history as it now is.
+#[test]
+fn a_close_is_held_when_the_history_moved() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = match call(
+        &b,
+        json!({ "op": "task.add", "text": "w", "managed": true }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    for status in ["in_progress", "needs_review", "in_progress"] {
+        call(
+            &b,
+            json!({ "op": "task.set", "uid": uid, "status": status }),
+        )
+        .unwrap();
+    }
+    call(
+        &b,
+        json!({ "op": "task.pr_record", "uid": uid, "number": 45 }),
+    )
+    .unwrap();
+    let now = facts(&b, &uid);
+    assert!(now.resumed_at.is_some());
+    let close = |observed: serde_json::Value| match call(
+        &b,
+        json!({ "op": "task.close_merged", "uid": uid, "merged": "yes", "pr": 45,
+                "dry_run": true, "observed": observed }),
+    )
+    .unwrap()
+    {
+        Response::Closed { refusal } => refusal,
+        other => panic!("{other:?}"),
+    };
+    let stale_resume = close(json!({ "live_landing": false, "pr": 45 }));
+    assert!(stale_resume.is_some_and(|r| r.contains("history changed")));
+    let stale_pr = close(json!({ "live_landing": false, "pr": 31, "resumed_at": now.resumed_at }));
+    assert!(stale_pr.is_some_and(|r| r.contains("history changed")));
+    assert_eq!(
+        close(json!({ "live_landing": false, "pr": 45, "resumed_at": now.resumed_at })),
+        None
+    );
 }

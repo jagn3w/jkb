@@ -221,6 +221,55 @@ fn a_related_walk_is_capped() {
     }
 }
 
+/// A neighbour linked by several edges is one neighbour, and the walk still finds every one.
+#[test]
+fn a_walk_counts_neighbours_not_edges() {
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let hub = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:hub", "hub"))?;
+        let mut ids = Vec::new();
+        for i in 0..900 {
+            let uid = format!("task:n{i}");
+            ids.push(jkb_core::task::create(
+                c,
+                m,
+                &jkb_core::task::NewTask::new(&uid, "n"),
+            )?);
+        }
+        // The first 500 neighbours two edges each, so the walk's first page (1001 rows) holds only
+        // 501 of them, and the rest are found only on the next.
+        for n in &ids[..500] {
+            for ty in [
+                jkb_types::EdgeType::References,
+                jkb_types::EdgeType::DerivedFrom,
+            ] {
+                jkb_core::edge::link(c, m, hub, *n, ty, None)?;
+            }
+        }
+        for n in &ids[500..] {
+            jkb_core::edge::link(c, m, hub, *n, jkb_types::EdgeType::References, None)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    match call(
+        &b,
+        json!({ "op": "kb.related", "uid": "task:hub", "depth": 1 }),
+    )
+    .unwrap()
+    {
+        Response::Related {
+            rows, at_node_cap, ..
+        } => {
+            assert_eq!(rows.len(), 900);
+            assert!(!at_node_cap);
+            assert!(rows.iter().all(|r| r.via == "references"));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// A blob larger than one answer is refused as text, and read whole in-process.
 #[test]
 fn a_large_blob_is_read_whole_only_in_process() {

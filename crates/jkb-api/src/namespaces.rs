@@ -6,7 +6,7 @@
 //! is inside its roots, and each task's tasks.md line still comes back from its file afterwards.
 
 use jkb_core::query::{Query, Scope};
-use jkb_core::{ns, nstype, WriteMeta};
+use jkb_core::{ns, WriteMeta};
 use rusqlite::Connection;
 
 use crate::kb::Budget;
@@ -40,25 +40,18 @@ pub const MAX_MOVED_ITEMS: usize = 1000;
 /// The most namespaces a client's `ns.mv` may carry: each is a row rewritten and logged.
 pub const MAX_MOVED_NAMESPACES: usize = 1000;
 
+/// The most tasks filed in a tasks.md a client's `ns.mv` may carry: each one's line is checked by
+/// rendering its whole file, before the move and after.
+pub const MAX_MOVED_FILED: usize = 64;
+
 fn invalid(why: String) -> ApiError {
     ApiError::with_code(ErrorCode::Invalid, why)
-}
-
-/// Whether moving `path` — or moving something onto it — would move a reserved namespace (a
-/// [`nstype::RESERVED_TYPES`] root, an ancestor of one, or anything under `_sys`), which readers find
-/// by its fixed path.
-fn touches_reserved(path: &str) -> bool {
-    path == "_sys"
-        || path.starts_with("_sys/")
-        || nstype::RESERVED_TYPES
-            .iter()
-            .any(|(r, _)| *r == path || r.starts_with(&format!("{path}/")))
 }
 
 /// `ns.mv`: move the subtree at `from` to `to`, answering how many namespaces moved.
 ///
 /// Under `roots` a move is held to them (see the module docs): refused for a reserved namespace, past
-/// [`MAX_MOVED_ITEMS`] or [`MAX_MOVED_NAMESPACES`], when a mount it touches or an item in it is
+/// [`MAX_MOVED_ITEMS`], [`MAX_MOVED_NAMESPACES`] or [`MAX_MOVED_FILED`], when a mount it touches or an item in it is
 /// outside the roots, or when it would leave a filed task's line unreadable. On the host the move is
 /// the core's alone, as it always was.
 ///
@@ -77,7 +70,7 @@ pub fn mv(
     };
     let from_path = ns::normalize(from)?;
     let to_path = ns::normalize(to)?;
-    if touches_reserved(&from_path) || touches_reserved(&to_path) {
+    if ns::is_fixed(&from_path) || ns::is_fixed(&to_path) {
         return Err(ApiError::with_code(
             ErrorCode::Forbidden,
             format!(
@@ -114,12 +107,24 @@ pub fn mv(
     let mut uid_of = conn
         .prepare_cached("SELECT uid FROM items WHERE id = ?1")
         .map_err(jkb_core::Error::from)?;
-    let mut lines = Vec::with_capacity(ids.len());
+    let mut filed = Vec::new();
     for id in &ids {
         let uid: String = uid_of
             .query_row([id.get()], |r| r.get(0))
             .map_err(jkb_core::Error::from)?;
         writable_id(conn, *id, &uid, Some(roots))?;
+        if jkb_core::binding::get(conn, *id)?.is_some_and(|b| b.uri.starts_with("file://")) {
+            filed.push(uid);
+        }
+    }
+    if filed.len() > MAX_MOVED_FILED {
+        return Err(invalid(format!(
+            "`{from_path}` holds more than {MAX_MOVED_FILED} items filed in a file, each of whose \
+             lines a client's move checks; move it on the host"
+        )));
+    }
+    let mut lines = Vec::with_capacity(filed.len());
+    for uid in filed {
         let before = line_problem(conn, &uid)?;
         lines.push((uid, before));
     }

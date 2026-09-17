@@ -318,7 +318,8 @@ impl<'a> Ops<'a> {
                     },
                 ..
             } => Some(format!(
-                "jkb: this walk stopped at {} items — lower --depth, or name the --edge types",
+                "jkb: this answer stopped at {} items, the most a walk or an evidence list reads — \
+                 narrow what you ask",
                 jkb_api::items::MAX_RELATED_NODES
             )),
             r if r.truncated() && self.remote => Some(
@@ -1124,6 +1125,14 @@ mod tests {
                     truncated: depth != 3,
                     at_node_cap: depth == 3,
                 },
+                Request::InvRead(jkb_api::inv::InvRead::Evidence { .. }) => Response::Inv {
+                    answer: jkb_api::inv::InvAnswer::Evidence {
+                        balance: 0.0,
+                        edges: Vec::new(),
+                        at_node_cap: true,
+                    },
+                    truncated: false,
+                },
                 Request::InvRead(ask) => Response::Inv {
                     answer: jkb_api::inv::InvAnswer::Units {
                         units: Vec::new(),
@@ -1170,6 +1179,7 @@ mod tests {
             vec!["related", "u", "--depth", "3"],
             vec!["inv", "frontier", "memory/x"],
             vec!["inv", "retread", "u", "--depth", "3"],
+            vec!["inv", "evidence", "u"],
             vec!["ns", "ls"],
             vec!["blob", "ls"],
         ] {
@@ -1182,7 +1192,8 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{args:?}: {e:#}"));
                 let notices = reads.notices.borrow();
                 assert_eq!(notices.len(), 1, "{args:?} (remote {remote}): {notices:?}");
-                let node_cap = args.ends_with(&["--depth", "3"]);
+                let node_cap =
+                    args.ends_with(&["--depth", "3"]) || args == ["inv", "evidence", "u"];
                 assert_eq!(
                     notices[0].contains("run it on the host"),
                     remote && !node_cap,

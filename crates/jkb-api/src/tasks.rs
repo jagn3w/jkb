@@ -20,7 +20,7 @@ use jkb_core::location::{self, BranchWrite};
 use jkb_core::transition;
 use jkb_core::{binding, claim, edge, item, mount, ns, placement, tag, task};
 use jkb_types::{EdgeType, ItemId, PlacementRole, SyncMode};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 
 use crate::{ApiError, ErrorCode};
@@ -148,9 +148,15 @@ pub(crate) fn writable_id(
     // Its uid too: a task taken out of a file is rebound `managed:` but keeps the `file://` uid it was
     // parsed with, and when the line comes back sync re-attaches it by that uid — carrying whatever
     // was written to it meanwhile back into the file.
-    if let Some(meta) = item::get(conn, id)? {
-        if !roots.admits(&meta.uid) {
-            return Err(refuse(&meta.uid));
+    let uid: Option<String> = conn
+        .prepare_cached("SELECT uid FROM items WHERE id = ?1")
+        .map_err(jkb_core::Error::from)?
+        .query_row([id.get()], |r| r.get(0))
+        .optional()
+        .map_err(jkb_core::Error::from)?;
+    if let Some(uid) = uid {
+        if !roots.admits(&uid) {
+            return Err(refuse(&uid));
         }
     }
     Ok(())
