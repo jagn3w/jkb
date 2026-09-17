@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use jkb_core::{item, tag, Db};
 
 use crate::gitrepo;
 
@@ -131,53 +130,6 @@ pub(crate) fn repo_ctx() -> Result<RepoCtx> {
     let key = gitrepo::key(&root)?.context("could not determine this repo's name")?;
     let trunk = gitrepo::trunk(&root)?;
     Ok(RepoCtx { root, key, trunk })
-}
-
-/// Every task tagged `repo=<repo_key>` — `jkb_core::location::tasks_in_repo`, the one definition the
-/// session ops share.
-pub(crate) fn tasks_in_repo(repo_key: &str) -> jkb_core::query::Query {
-    jkb_core::location::tasks_in_repo(repo_key)
-}
-
-/// One of this repo's tasks with everything the session and staging reads need.
-pub(crate) struct RepoTask {
-    pub(crate) meta: jkb_core::item::ItemMeta,
-    pub(crate) tags: BTreeMap<String, Vec<String>>,
-}
-
-impl RepoTask {
-    /// The first line of the task's body — what a human calls the task.
-    pub(crate) fn title(&self) -> String {
-        crate::output::title_of(&self.meta)
-    }
-}
-
-/// Every task tagged `repo=<repo_key>`, with its rows and tags, in **one** database read.
-///
-/// The previous shape issued the query, then a `tag::applications` *and* an `item::get` per
-/// task — each a round-trip serialized on the writer thread, over a set that grows with every
-/// task ever worked in this repo. That is fine for `task sessions` at three sessions and not
-/// fine for a view that redraws on every database write (design D38.2).
-pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
-    let query = tasks_in_repo(repo_key);
-    Ok(db.read(move |conn| {
-        let ids = query.evaluate(conn)?;
-        let metas = item::get_many(conn, &ids)?;
-        let tags = tag::applications_for(conn, &ids)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            let Some(meta) = metas.get(&id) else { continue };
-            let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for (facet, value) in tags.get(&id).cloned().unwrap_or_default() {
-                grouped.entry(facet).or_default().push(value);
-            }
-            out.push(RepoTask {
-                meta: meta.clone(),
-                tags: grouped,
-            });
-        }
-        Ok(out)
-    })?)
 }
 
 #[cfg(test)]

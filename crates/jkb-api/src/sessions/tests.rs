@@ -774,3 +774,54 @@ fn review_findings_are_bounded() {
     assert_eq!(e.code, ErrorCode::Invalid);
     assert!(e.message.contains("review="), "{e:?}");
 }
+
+/// `task.staging` answers only the repo's tasks that have somewhere to land, with what a row needs.
+#[test]
+fn the_staging_read_lists_the_repo_s_landing_tasks() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let landing = add(&b, "landing work");
+    let parent_sub = add(&b, "a sub");
+    let elsewhere = add(&b, "other repo");
+    let _idle = add(&b, "never started");
+    assert!(start_on(&b, &landing, "host:1", None, "feat", "batch").unwrap());
+    call(
+        &b,
+        json!({ "op": "task.add", "text": "child", "under": landing, "managed": true }),
+    )
+    .unwrap();
+    assert!(start_on(&b, &parent_sub, "host:1", None, "f2", "batch").unwrap());
+    call(
+        &b,
+        json!({ "op": "task.start", "uid": elsewhere, "take": { "owner": "host:1" },
+                "place": { "branch": "x", "repo": "other", "onto": "batch" } }),
+    )
+    .unwrap();
+    let Response::StagingTasks { tasks, truncated } =
+        call(&b, json!({ "op": "task.staging", "repo": "proj" })).unwrap()
+    else {
+        panic!("staging")
+    };
+    assert!(!truncated);
+    let rows: Vec<(&str, &str, &str, bool)> = tasks
+        .iter()
+        .map(|t| {
+            (
+                t.uid.as_str(),
+                t.title.as_str(),
+                t.land_target.as_str(),
+                t.open_subtasks,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (landing.as_str(), "landing work", "batch", true),
+            (parent_sub.as_str(), "a sub", "batch", false),
+        ]
+    );
+    assert_eq!(tasks[0].tags["branch"], vec!["feat".to_owned()]);
+    assert_eq!(tasks[0].status, "in_progress");
+    let e = call(&b, json!({ "op": "task.staging", "repo": "" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
+}

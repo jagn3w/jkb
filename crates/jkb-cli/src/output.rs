@@ -50,7 +50,7 @@ fn item_line(item: &DisplayItem) -> String {
     parts.join(" ")
 }
 
-pub(crate) use jkb_core::item::{first_nonblank, title_of};
+pub(crate) use jkb_core::item::first_nonblank;
 
 /// Fetch display rows for `ids`, preserving their order and skipping any that no
 /// longer exist.

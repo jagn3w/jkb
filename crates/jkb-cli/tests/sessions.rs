@@ -4741,6 +4741,16 @@ fn a_container_files_and_records_a_review_through_the_daemon() {
     assert_eq!(v["tasks"][0]["uid"], uid.as_str(), "{v}");
     assert_eq!(v["tasks"][0]["moved_to_review"], true, "{v}");
     assert_eq!(f.status_of(&uid), "needs_review");
+    // The staging listing reads the same findings, through the daemon.
+    let listed = remote(&["--json", "staging", "ls"], None);
+    assert!(listed.status.success(), "{listed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let row = &v[0]["tasks"][0];
+    assert_eq!(v[0]["branch"], "batch", "{v}");
+    assert_eq!(row["uid"], uid.as_str(), "{v}");
+    assert_eq!(row["open_must_fix"], 1, "{v}");
+    assert_eq!(row["commits"], 1, "{v}");
+    assert_eq!(row["title"], "reviewed from the container", "{v}");
     // The must-fix finding filed from the container is what the gate now reads.
     let gated = remote(&["task", "land", &uid, "--gate", "true"], None);
     assert!(!gated.status.success(), "{gated:?}");

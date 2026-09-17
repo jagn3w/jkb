@@ -36,6 +36,7 @@ pub mod kb;
 pub mod removals;
 pub mod review;
 pub mod sessions;
+pub mod staging;
 pub mod tasks;
 
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
@@ -604,6 +605,12 @@ pub enum Request {
     /// The database side of `jkb doctor` ([`health::health`]).
     #[serde(rename = "kb.health")]
     KbHealth {},
+    /// A repo's tasks with a land target, for `jkb staging ls` ([`staging::staging`]).
+    #[serde(rename = "task.staging")]
+    TaskStaging {
+        /// The repo key.
+        repo: String,
+    },
 }
 
 /// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
@@ -976,6 +983,7 @@ impl Request {
         "task.claims",
         "task.reclaim",
         "kb.health",
+        "task.staging",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -1047,6 +1055,7 @@ impl Request {
             Self::TaskClaims {} => "task.claims",
             Self::TaskReclaim { .. } => "task.reclaim",
             Self::KbHealth {} => "kb.health",
+            Self::TaskStaging { .. } => "task.staging",
         }
     }
 
@@ -1080,6 +1089,7 @@ impl Request {
             | Self::TaskByBranch { .. }
             | Self::TaskReviewFindings { .. }
             | Self::TaskClaims {}
+            | Self::TaskStaging { .. }
             | Self::RepoGate { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -1441,6 +1451,14 @@ pub enum Response {
         #[serde(flatten)]
         health: health::Health,
     },
+    /// A `task.staging`.
+    StagingTasks {
+        /// The tasks.
+        tasks: Vec<staging::StagingTask>,
+        /// Cut short at [`staging::MAX_STAGING_TASKS`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
     /// A `task.show`.
     Task {
         /// The task.
@@ -1465,6 +1483,7 @@ impl Response {
             | Self::SearchHits { truncated, .. }
             | Self::Task { truncated, .. }
             | Self::Claims { truncated, .. }
+            | Self::StagingTasks { truncated, .. }
             | Self::History { truncated, .. } => *truncated,
             Self::GrepHits { answer } => answer.truncated,
             Self::Created { .. }
@@ -1543,6 +1562,7 @@ impl Response {
             | Self::SearchHits { .. }
             | Self::Task { .. }
             | Self::Claims { .. }
+            | Self::StagingTasks { .. }
             | Self::Applied {}
             | Self::Added { .. }
             | Self::Unplaced { .. }
@@ -2424,6 +2444,10 @@ impl Backend for LocalBackend {
                         claims::reclaim(c, m, &dead, asker)
                     })?,
                 }
+            }
+            Request::TaskStaging { repo } => {
+                let (tasks, truncated) = db.read_with(move |c| staging::staging(c, &repo))?;
+                Response::StagingTasks { tasks, truncated }
             }
             Request::KbHealth {} => Response::Health {
                 health: db.read_with(health::health)?,

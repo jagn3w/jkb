@@ -71,6 +71,8 @@ pub const fn support(command: &Command) -> Support {
         // Parsed here, stored there (tasks S6.3): the daemon is sent only the extracted text.
         | Command::Ingest { .. }
         | Command::Doctor { .. }
+        // git here, the tasks and findings through the ops (stage 5).
+        | Command::Staging { .. }
         | Command::Task {
             cmd:
                 TaskCmd::Next { .. }
@@ -120,7 +122,6 @@ pub const fn support(command: &Command) -> Support {
         ),
         Command::Ns { .. }
         | Command::Tag { .. }
-        | Command::Staging { .. }
         | Command::Task { .. }
         | Command::View { .. }
         | Command::Undo { .. }
@@ -441,6 +442,7 @@ mod tests {
             vec!["task", "review", "file", "--findings", "r", "--from", "-"],
             vec!["doctor"],
             vec!["doctor", "--fix"],
+            vec!["staging", "ls"],
             vec!["task", "mirror"],
             vec!["stat", "u"],
             vec!["ns", "ls"],

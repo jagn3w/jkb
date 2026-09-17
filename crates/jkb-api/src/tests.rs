@@ -345,6 +345,7 @@ fn samples() -> Vec<Request> {
             dead: vec!["box:1".into()],
         },
         Request::KbHealth {},
+        Request::TaskStaging { repo: "r".into() },
     ]
 }
 
@@ -1363,6 +1364,7 @@ const READS: &[&str] = &[
     "repo.gate",
     "task.review_findings",
     "task.claims",
+    "task.staging",
 ];
 
 #[test]

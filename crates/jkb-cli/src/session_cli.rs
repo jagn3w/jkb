@@ -342,6 +342,24 @@ impl<'a> Kb<'a> {
         }
     }
 
+    /// `task.staging`, refused when the answer was cut: a listing of part of a repo's batches would
+    /// call the rest spent.
+    pub(crate) fn staging(&self, repo: &str) -> Result<Vec<jkb_api::staging::StagingTask>> {
+        match self.call(Request::TaskStaging {
+            repo: repo.to_owned(),
+        })? {
+            Response::StagingTasks { tasks, truncated } => {
+                anyhow::ensure!(
+                    !truncated,
+                    "{repo} has more than {} tasks with a land target",
+                    jkb_api::staging::MAX_STAGING_TASKS
+                );
+                Ok(tasks)
+            }
+            other => unexpected("task.staging", &other),
+        }
+    }
+
     /// `kb.health`.
     pub(crate) fn health(&self) -> Result<jkb_api::health::Health> {
         match self.call(Request::KbHealth {})? {

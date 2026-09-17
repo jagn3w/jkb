@@ -39,6 +39,7 @@ pub const fn handles(command: &Command) -> bool {
         | Command::Grep { .. }
         | Command::Cat { .. }
         | Command::Ingest { .. }
+        | Command::Staging { .. }
         // The report; a repair or a backup changes the host, and `main` runs it with the database.
         | Command::Doctor {
             fix: false,
@@ -192,6 +193,9 @@ impl<'a> Ops<'a> {
             } => self.grep(&pattern, path.as_deref(), ignore_case, names_only, count),
             Command::Cat { uid } => self.cat(&uid),
             Command::Ingest { path, ns } => self.ingest(&path, ns.as_deref()),
+            Command::Staging {
+                cmd: super::StagingCmd::Ls { all },
+            } => crate::cmd_staging_ls(&crate::session_cli::Kb::from_ops(self), all, self.json),
             Command::Doctor { backup, fix } => {
                 let host = self
                     .db

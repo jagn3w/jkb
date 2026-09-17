@@ -22,11 +22,12 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
-use jkb_core::Db;
 use jkb_fsm::Fact;
 
-use crate::repo::{facet_one, facet_values, RepoCtx, RepoTask, FACET_BRANCH};
+use crate::repo::{facet_one, facet_values, RepoCtx, FACET_BRANCH};
+use crate::session_cli::Kb;
 use crate::{gitrepo, review, session};
+use jkb_api::staging::StagingTask;
 
 /// Where a task sits in the pipeline. Derived, never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,52 +157,20 @@ pub(crate) struct Staging {
 ///
 /// # Errors
 /// Returns an error if git or the database cannot be read.
-pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Vec<Staging>> {
-    let tasks = crate::repo::repo_tasks(db, &ctx.key)?;
+pub(crate) fn collect(kb: &Kb<'_>, ctx: &RepoCtx, include_merged: bool) -> Result<Vec<Staging>> {
+    // Grouped by the branch each task's work lands on, read from its own **history** — the last time
+    // anybody said where its work lands (`task.staging`, which returns only tasks that have one). A
+    // task that has never been through `task work` or `task start` is simply not in this view.
+    //
+    // (D38.1 still holds: which branches *exist* comes from git, below. A recorded target is never
+    // evidence that a branch is there.)
+    //
+    // **One** read for the whole listing, not one per task: this view redraws on every database write.
+    let tasks = kb.staging(&ctx.key)?;
     let sessions = session::discover(&ctx.root)?;
-
-    // Group tasks by the branch they land on, read from each task's own **history** — the last
-    // time anybody said where its work lands. A task that has never been through `task work` or
-    // `task start` has no such entry and is simply not in this view.
-    //
-    // (D38.1 still holds: which branches *exist* comes from git, below. A recorded target is
-    // never evidence that a branch is there.)
-    //
-    // This used to read a `land_target` column keyed by branch, which had to be kept in agreement
-    // with a world where branches are deleted and their names reused. A history entry is a
-    // statement about a moment, so it needs no such agreement — and two tasks told different
-    // targets are now two entries with timestamps rather than one row silently keeping whichever
-    // wrote last.
-    // **One** read for the whole listing, not one per task. This view redraws on every database
-    // write and every `db.read` is a round trip to the single writer thread, so a per-task read
-    // is the N+1 shape `repo_tasks` already exists to avoid — and it replaced a batched read when
-    // the branch records went.
-    //
-    // The two per-task facts are gathered together: where the task's work lands, and whether it
-    // is held by an open subtask.
-    let ids: Vec<jkb_types::ItemId> = tasks.iter().map(|t| t.meta.id).collect();
-    let per_task: Vec<(Option<String>, bool)> = db.read(move |conn| {
-        ids.iter()
-            .map(|id| {
-                Ok((
-                    jkb_core::transition::land_target(conn, *id)?,
-                    !jkb_core::task::subtasks_all_terminal(conn, *id)?,
-                ))
-            })
-            .collect()
-    })?;
-    let held: std::collections::HashSet<jkb_types::ItemId> = tasks
-        .iter()
-        .zip(&per_task)
-        .filter(|(_, (_, open_subtasks))| *open_subtasks)
-        .map(|(t, _)| t.meta.id)
-        .collect();
-
-    let mut by_onto: BTreeMap<String, Vec<&RepoTask>> = BTreeMap::new();
-    for (t, (target, _)) in tasks.iter().zip(&per_task) {
-        if let Some(target) = target {
-            by_onto.entry(target.clone()).or_default().push(t);
-        }
+    let mut by_onto: BTreeMap<String, Vec<&StagingTask>> = BTreeMap::new();
+    for t in &tasks {
+        by_onto.entry(t.land_target.clone()).or_default().push(t);
     }
 
     // Everything git-wide is resolved ONCE, before the loop. This read backs a view that
@@ -246,9 +215,9 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         // picker that exists to offer it. With live work deciding both ways, the probe only
         // ever confirmed what the statuses already said, at the cost of several git spawns per
         // branch on a view that redraws on every database write.
-        let spent = group.iter().all(|t| {
-            State::from_status(t.meta.status.as_deref().unwrap_or_default()).is_terminal()
-        });
+        let spent = group
+            .iter()
+            .all(|t| State::from_status(&t.status).is_terminal());
         if spent && !include_merged {
             continue;
         }
@@ -274,7 +243,7 @@ pub(crate) fn collect(db: &Db, ctx: &RepoCtx, include_merged: bool) -> Result<Ve
         };
         let mut staged = Vec::new();
         for t in group {
-            staged.push(stage_task(db, ctx, &branch_ctx, t, &held, &mut cache)?);
+            staged.push(stage_task(kb, ctx, &branch_ctx, t, &mut cache)?);
         }
         // Pipeline order — what is being built, then what is under review, then what is
         // finished — with a stable uid tie-break so the listing does not reshuffle between
@@ -331,11 +300,11 @@ impl Cache {
         Ok(n)
     }
 
-    fn findings(&mut self, db: &Db, nss: &[String]) -> Result<std::rc::Rc<review::Findings>> {
+    fn findings(&mut self, kb: &Kb<'_>, nss: &[String]) -> Result<std::rc::Rc<review::Findings>> {
         if let Some(f) = self.findings.get(nss) {
             return Ok(f.clone());
         }
-        let f = std::rc::Rc::new(review::findings_in(db, nss)?);
+        let f = std::rc::Rc::new(review::findings_via(kb, nss)?);
         self.findings.insert(nss.to_vec(), f.clone());
         Ok(f)
     }
@@ -361,11 +330,10 @@ struct BranchCtx<'a> {
 
 /// Resolve one task's session, state and review standing.
 fn stage_task(
-    db: &Db,
+    kb: &Kb<'_>,
     ctx: &RepoCtx,
     branch_ctx: &BranchCtx<'_>,
-    t: &RepoTask,
-    held: &std::collections::HashSet<jkb_types::ItemId>,
+    t: &StagingTask,
     cache: &mut Cache,
 ) -> Result<StagedTask> {
     let BranchCtx {
@@ -379,7 +347,7 @@ fn stage_task(
     // second `branch=` still resolves to the session that actually exists on disk (D36.2).
     let branches = facet_values(&t.tags, FACET_BRANCH);
     let sess = sessions.iter().find(|s| branches.contains(&s.branch));
-    let status = t.meta.status.clone().unwrap_or_default();
+    let status = t.status.clone();
 
     // Read the status directly. An earlier version inferred `landed` from "no session and
     // not open/in_progress", which quietly called a **cancelled** task landed — the one
@@ -433,11 +401,11 @@ fn stage_task(
     // Every recorded review, not just the newest: a second `/review-log` run must not retire
     // the first run's still-open must-fix findings.
     let review_nss = facet_values(&t.tags, review::FACET_REVIEW).to_vec();
-    let found = cache.findings(db, &review_nss)?;
+    let found = cache.findings(kb, &review_nss)?;
     // Read once for the whole listing, from `containment` — the same source the command and the
     // machine read, so the row and the land it describes cannot disagree about which parents are
     // held. Terminal work is past the question.
-    let open_subtasks = !terminal && held.contains(&t.meta.id);
+    let open_subtasks = !terminal && t.open_subtasks;
     let worktree = sess.map(|s| s.worktree.clone());
     let verdict = review::gate_with(&found, &t.tags, &review_nss);
     let review_ok = matches!(verdict, review::GateVerdict::Passed);
@@ -454,8 +422,8 @@ fn stage_task(
     });
 
     Ok(StagedTask {
-        uid: t.meta.uid.clone(),
-        title: t.title(),
+        uid: t.uid.clone(),
+        title: t.title.clone(),
         status,
         state,
         branch: work_branch,

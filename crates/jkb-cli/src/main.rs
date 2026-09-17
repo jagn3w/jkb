@@ -1323,9 +1323,9 @@ fn run(cli: Cli) -> Result<()> {
             watch,
             conflict.map(ConflictPolicy::from),
         ),
-        Command::Staging { cmd } => match cmd {
-            StagingCmd::Ls { all } => cmd_staging_ls(&db, all, cli.json),
-        },
+        Command::Staging { .. } => {
+            anyhow::bail!("internal: staging missed ops_cli's dispatch")
+        }
         Command::Commands { cmd } => match cmd {
             CommandsCmd::Install => commands::install(),
             CommandsCmd::Uninstall => commands::uninstall(),
@@ -5092,7 +5092,7 @@ fn cmd_task_close_merged(db: &Db, repo: Option<String>, dry_run: bool, json: boo
     // Typed, not interpolated into the DSL: `--repo` is user-typed, and a value with whitespace
     // would re-tokenize into a different query that matches nothing — closing no task and
     // reporting no error.
-    let query = repo::tasks_in_repo(&repo);
+    let query = jkb_core::location::tasks_in_repo(&repo);
     let ids = db.read(move |conn| query.evaluate(conn))?;
 
     let mut verdicts = Vec::new();
@@ -5456,9 +5456,9 @@ fn first_line(content: &str) -> String {
 ///
 /// The one read behind both the explorer's branch picker and its In Flight view (design
 /// D38.2), so the two cannot disagree about what is live.
-fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
+pub(crate) fn cmd_staging_ls(kb: &session_cli::Kb<'_>, all: bool, json: bool) -> Result<()> {
     let ctx = repo::repo_ctx()?;
-    let rows = staging::collect(db, &ctx, all)?;
+    let rows = staging::collect(kb, &ctx, all)?;
 
     if json {
         let v: Vec<_> = rows

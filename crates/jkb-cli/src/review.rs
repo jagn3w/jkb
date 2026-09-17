@@ -14,7 +14,6 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use jkb_core::Db;
 
 pub(crate) use jkb_api::review::{FACET_REVIEW, FACET_REVIEWED};
 /// A recorded `--no-review` override. An override nobody can see is indistinguishable from a
@@ -29,19 +28,7 @@ pub(crate) struct OpenFinding {
 }
 
 /// The findings of the review(s) at `review_nss`, split into open must-fix and total seen — the one
-/// query ([`jkb_api::sessions::review_findings`]), read in this process.
-///
-/// # Errors
-/// Returns an error if the read fails.
-pub(crate) fn findings_in(db: &Db, review_nss: &[String]) -> Result<Findings> {
-    chunked(review_nss, |nss| {
-        let nss = nss.to_vec();
-        db.read_with(move |conn| jkb_api::sessions::review_findings(conn, &nss))
-            .map_err(|e| anyhow::anyhow!(e.message))
-    })
-}
-
-/// [`findings_in`], through whichever backend serves this command.
+/// query ([`jkb_api::sessions::review_findings`]), through whichever backend serves this command.
 ///
 /// # Errors
 /// Returns an error if the op fails.
@@ -483,10 +470,7 @@ mod tests {
             )
             .unwrap();
         }
-        let local = super::findings_in(&db, &nss).unwrap();
-        let via = super::findings_via(&crate::session_cli::Kb::new(&backend), &nss).unwrap();
-        for f in [local, via] {
-            assert_eq!((f.total, f.open_count, f.open_must_fix.len()), (2, 2, 2));
-        }
+        let f = super::findings_via(&crate::session_cli::Kb::new(&backend), &nss).unwrap();
+        assert_eq!((f.total, f.open_count, f.open_must_fix.len()), (2, 2, 2));
     }
 }
