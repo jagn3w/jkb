@@ -24,7 +24,7 @@ unicode-normalization = "0.1.25"
 # declared for Linux alone, it did not build on macOS). The same version jkb-cli already locks, so
 # nothing new is fetched.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "system"] }
 
 [dev-dependencies]
 proptest.workspace = true

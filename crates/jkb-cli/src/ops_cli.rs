@@ -38,7 +38,12 @@ pub const fn handles(command: &Command) -> bool {
         | Command::Tree { .. }
         | Command::Grep { .. }
         | Command::Cat { .. }
-        | Command::Ingest { .. } => true,
+        | Command::Ingest { .. }
+        // The report; a repair or a backup changes the host, and `main` runs it with the database.
+        | Command::Doctor {
+            fix: false,
+            backup: None,
+        } => true,
         Command::Task { cmd } => matches!(
             cmd,
             TaskCmd::Next { .. }
@@ -65,6 +70,8 @@ pub const fn handles(command: &Command) -> bool {
                     ..
                 }
                 | TaskCmd::Landed { .. }
+                | TaskCmd::Review { .. }
+                | TaskCmd::Reclaim { .. }
                 | TaskCmd::Gate {
                     cmd: None,
                     clear: false
@@ -185,6 +192,18 @@ impl<'a> Ops<'a> {
             } => self.grep(&pattern, path.as_deref(), ignore_case, names_only, count),
             Command::Cat { uid } => self.cat(&uid),
             Command::Ingest { path, ns } => self.ingest(&path, ns.as_deref()),
+            Command::Doctor { backup, fix } => {
+                let host = self
+                    .db
+                    .zip(self.db_path)
+                    .map(|(db, path)| crate::doctor::Host { db, path });
+                crate::doctor::run(
+                    &crate::session_cli::Kb::from_ops(self),
+                    host.as_ref(),
+                    backup.as_deref(),
+                    fix,
+                )
+            }
             Command::Task { cmd } => match cmd {
                 TaskCmd::Next { terms, limit } => self.task_next(&terms.join(" "), limit),
                 TaskCmd::Show { uid } => self.task_show(&uid),

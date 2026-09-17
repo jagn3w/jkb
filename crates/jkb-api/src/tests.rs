@@ -330,6 +330,21 @@ fn samples() -> Vec<Request> {
         Request::TaskReviewFindings {
             namespaces: vec!["reviews/x".into()],
         },
+        Request::TaskReviewFile(super::review::FileAsk {
+            ns: "reviews/sample".into(),
+            findings: Vec::new(),
+        }),
+        Request::TaskReviewRecord(super::review::RecordAsk {
+            repo: "r".into(),
+            branch: "b".into(),
+            sha: None,
+            findings: "reviews/x".into(),
+        }),
+        Request::TaskClaims {},
+        Request::TaskReclaim {
+            dead: vec!["box:1".into()],
+        },
+        Request::KbHealth {},
     ]
 }
 
@@ -1347,6 +1362,7 @@ const READS: &[&str] = &[
     "task.by_branch",
     "repo.gate",
     "task.review_findings",
+    "task.claims",
 ];
 
 #[test]
@@ -1482,7 +1498,7 @@ fn a_task_larger_than_the_budget_is_shown_whole_and_not_called_cut() {
 
 /// Two `tasks` mounts, one under the client's file root and one outside it, with a file-backed task in
 /// each (added through an unrooted backend, as the host would) and a managed task.
-fn mutate_fixture() -> (Db, String, String, String) {
+pub(crate) fn mutate_fixture() -> (Db, String, String, String) {
     use jkb_core::{mount, ns};
     use jkb_types::{ConflictPolicy, SyncMode};
     let db = Db::open_in_memory().unwrap();
@@ -1523,7 +1539,7 @@ fn mutate_fixture() -> (Db, String, String, String) {
     (db, inside, outside, managed)
 }
 
-fn rooted(db: &Db) -> LocalBackend {
+pub(crate) fn rooted(db: &Db) -> LocalBackend {
     LocalBackend::new(db.clone()).with_file_roots(super::tasks::FileRoots::new(vec![
         std::path::PathBuf::from("/Users/u/repos"),
     ]))
@@ -1744,7 +1760,10 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
     let b = rooted(&db);
     let mut checked = 0;
     for request in samples() {
-        if !request.op().starts_with("task.") || request.is_agent_read() {
+        if !request.op().starts_with("task.")
+            || request.is_agent_read()
+            || MANY_TASK_WRITES.contains(&request.op())
+        {
             continue;
         }
         let mut wire = serde_json::to_value(&request).unwrap();
@@ -1762,6 +1781,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         checked += 1;
     }
     assert_eq!(checked, 17, "every task write was asked");
+    many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {
         match call(&b, json!({ "op": "task.facts", "uid": uid })).unwrap() {
@@ -1769,6 +1789,56 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
             other => panic!("{other:?}"),
         }
     }
+}
+
+/// The task writes that act on every task matching a rule rather than on one named task: each leaves a
+/// task its client may not write alone and names it, rather than refusing the whole request.
+const MANY_TASK_WRITES: &[&str] = &["task.review_file", "task.review_record", "task.reclaim"];
+
+fn many_task_writes_leave_a_task_outside_the_roots_alone(db: &Db, inside: &str, outside: &str) {
+    let host = LocalBackend::new(db.clone());
+    let b = rooted(db);
+    for uid in [inside, outside] {
+        call(
+            &host,
+            json!({ "op": "task.start", "uid": uid, "take": { "owner": "box:3" },
+                    "place": { "branch": "many", "repo": "r" } }),
+        )
+        .unwrap();
+    }
+    // `task.review_file` files only `managed:` tasks, so it has no task of anyone's to leave alone.
+    let Response::ReviewFiled { filed } = call(
+        &b,
+        json!({ "op": "task.review_file", "ns": "reviews/many",
+                "findings": [{ "severity": "nit", "summary": "x" }] }),
+    )
+    .unwrap() else {
+        panic!("filed")
+    };
+    let Response::Task { task, .. } =
+        call(&b, json!({ "op": "task.show", "uid": filed.uids[0] })).unwrap()
+    else {
+        panic!("task")
+    };
+    assert_eq!(task.item.namespace.as_deref(), Some("reviews/many/nit"));
+    let Response::ReviewRecorded { recording } = call(
+        &b,
+        json!({ "op": "task.review_record", "repo": "r", "branch": "many",
+                "findings": "reviews/many" }),
+    )
+    .unwrap() else {
+        panic!("recorded")
+    };
+    assert_eq!(recording.unwritable, vec![outside.to_owned()]);
+    assert_eq!(recording.recorded.len(), 1);
+    let Response::Reclaimed { reclaimed } =
+        call(&b, json!({ "op": "task.reclaim", "dead": ["box:3"] })).unwrap()
+    else {
+        panic!("reclaimed")
+    };
+    assert_eq!(reclaimed.unwritable.len(), 1);
+    assert_eq!(reclaimed.unwritable[0].uid, outside);
+    assert_eq!(reclaimed.cleared.len(), 1);
 }
 
 #[test]
@@ -2064,11 +2134,17 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
                 "landed": { "branch": "b2", "onto": "o", "head": "abcd" } }),
         json!({ "op": "task.land", "uid": inside,
                 "landed": { "branch": "b2", "onto": "o" } }),
+        json!({ "op": "task.review_file", "ns": "reviews/rt",
+                "findings": [{ "severity": "nit", "summary": "x" }] }),
+        json!({ "op": "task.review_record", "repo": "r", "branch": "b2", "findings": "reviews/rt" }),
+        json!({ "op": "task.claim", "uid": inside, "owner": "box:4" }),
+        json!({ "op": "task.reclaim", "dead": ["box:4"] }),
     ];
     // Every task write the wire accepts is here; `task.add` checks the task it makes, below.
     let mut covered: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();
     covered.push("task.add");
     covered.sort_unstable();
+    covered.dedup();
     let mut task_writes: Vec<&str> = samples()
         .iter()
         .map(super::Request::op)

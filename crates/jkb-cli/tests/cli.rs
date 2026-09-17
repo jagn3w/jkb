@@ -3888,9 +3888,9 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = remote(&["task", "reclaim"], &client_repo);
+    let out = remote(&["task", "mirror"], &client_repo);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("jkb task reclaim: not available"),
+        String::from_utf8_lossy(&out.stderr).contains("jkb task mirror: not available"),
         "a partly served group names the verb it refused: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -4194,7 +4194,8 @@ fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
     assert_eq!(tail[0]["seq"].to_string(), seq.trim());
 
     for refused in [
-        &["task", "reclaim"][..],
+        &["task", "mirror"][..],
+        &["doctor", "--fix"],
         &["sync"],
         &["mount", "ls"],
         &["serve"],

@@ -296,6 +296,60 @@ impl<'a> Kb<'a> {
         }
     }
 
+    /// `task.review_file`.
+    pub(crate) fn review_file(
+        &self,
+        ask: jkb_api::review::FileAsk,
+    ) -> Result<jkb_api::review::Filed> {
+        match self.call(Request::TaskReviewFile(ask))? {
+            Response::ReviewFiled { filed } => Ok(filed),
+            other => unexpected("task.review_file", &other),
+        }
+    }
+
+    /// `task.review_record`.
+    pub(crate) fn review_record(
+        &self,
+        ask: jkb_api::review::RecordAsk,
+    ) -> Result<jkb_api::review::Recording> {
+        match self.call(Request::TaskReviewRecord(ask))? {
+            Response::ReviewRecorded { recording } => Ok(recording),
+            other => unexpected("task.review_record", &other),
+        }
+    }
+
+    /// `task.claims`: every held claim, refused when the answer was cut — a reclaim or a report over
+    /// part of the claims would say nothing about the rest.
+    pub(crate) fn claims(&self) -> Result<Vec<jkb_api::claims::Claim>> {
+        match self.call(Request::TaskClaims {})? {
+            Response::Claims { claims, truncated } => {
+                anyhow::ensure!(
+                    !truncated,
+                    "more than {} claims are held, which only something claiming in a loop does;                      list them with `jkb query 'kind:task'` and release them by hand",
+                    jkb_api::claims::MAX_CLAIMS
+                );
+                Ok(claims)
+            }
+            other => unexpected("task.claims", &other),
+        }
+    }
+
+    /// `task.reclaim`.
+    pub(crate) fn reclaim(&self, dead: Vec<String>) -> Result<jkb_api::claims::Reclaimed> {
+        match self.call(Request::TaskReclaim { dead })? {
+            Response::Reclaimed { reclaimed } => Ok(reclaimed),
+            other => unexpected("task.reclaim", &other),
+        }
+    }
+
+    /// `kb.health`.
+    pub(crate) fn health(&self) -> Result<jkb_api::health::Health> {
+        match self.call(Request::KbHealth {})? {
+            Response::Health { health } => Ok(health),
+            other => unexpected("kb.health", &other),
+        }
+    }
+
     /// `task.tag` with `set`: make `facet=value` the facet's only value.
     pub(crate) fn set_facet(&self, uid: &str, facet: &str, value: &str) -> Result<()> {
         match self.call(Request::TaskTag {

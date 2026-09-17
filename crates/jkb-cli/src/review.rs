@@ -14,13 +14,9 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use jkb_core::{item, tag, task, Db};
-use jkb_types::{ItemId, TaskStatus};
+use jkb_core::Db;
 
-/// The branch HEAD a review ran against.
-pub(crate) const FACET_REVIEWED: &str = "reviewed";
-/// The review's findings namespace, so the findings are one `jkb ls` away.
-pub(crate) const FACET_REVIEW: &str = "review";
+pub(crate) use jkb_api::review::{FACET_REVIEW, FACET_REVIEWED};
 /// A recorded `--no-review` override. An override nobody can see is indistinguishable from a
 /// rule that does not exist.
 pub(crate) const FACET_REVIEW_WAIVED: &str = "review-waived";
@@ -265,214 +261,204 @@ pub(crate) fn enforce(
     }
 }
 
-/// One task that a `review record` touched.
-pub(crate) struct Recorded {
-    pub(crate) uid: String,
-    pub(crate) moved_to_review: bool,
+/// The reviewer workflow's result, as `jkb task review file` reads it: its `findings`, each with the
+/// fields the op files and whatever else the workflow reports (`kind`, `unverified`), which are ignored.
+#[derive(serde::Deserialize)]
+struct WorkflowResult {
+    findings: Vec<WorkflowFinding>,
 }
 
-/// Record that a review ran against `branch` at `sha`, producing findings under `findings_ns`.
-///
-/// Keyed by **branch**, because that is what a review knows: it reviewed a range on a branch,
-/// not a task. Tasks are found through `branch=` (a session's own branch) **and** their branches'
-/// recorded land target (the
-/// staging branch a batch lands on), so reviewing either level tags the work it covers — a
-/// staging-branch review is the D38 flow, and its tasks share only the land target.
-///
-/// A branch no task claims (trunk, an ad-hoc range) matches nothing and returns an empty list
-/// — a note for the caller to print, not an error, because reviewing an arbitrary range is a
-/// legitimate thing to do.
-///
-/// Recording moves `in_progress` to `needs_review` and is the **only** author of that
-/// transition (design D38.6). Any other status is left alone.
-///
-/// The whole branch is recorded in **one transaction**, and each task's status is re-read
-/// *inside* it. Deciding the transition from a snapshot taken before the loop, then writing
-/// it per-task, could resurrect a task that landed in between — `set_status` is a plain
-/// `UPDATE` with no CAS, and `needs_review` is non-terminal, so a re-blocked dependent and a
-/// re-offered staging branch would follow. One transaction also means a Ctrl-C halfway
-/// through cannot leave half the branch tagged and half refusing to land as never reviewed.
-///
-/// `review=` is **added**, not set: a second run's findings do not retire the first run's
-/// still-open must-fix items (the gate unions every recorded namespace). `reviewed=` is set,
-/// since there is only one current HEAD.
+#[derive(serde::Deserialize)]
+struct WorkflowFinding {
+    severity: jkb_api::review::Severity,
+    summary: String,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    line: Option<u64>,
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    fix: Option<String>,
+}
+
+/// The largest workflow result `task review file` reads.
+const MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `jkb task review file` — file a review's findings as tasks (design-s6-4.md F).
 ///
 /// # Errors
-/// Returns an error if the database cannot be read or written.
-pub(crate) fn record(
-    db: &Db,
-    repo_key: &str,
-    branch: &str,
-    sha: Option<&str>,
+/// An unreadable or malformed result, or the op's refusal.
+pub(crate) fn file_cmd(
+    kb: &crate::session_cli::Kb<'_>,
     findings_ns: &str,
-) -> Result<Recording> {
-    // Matched on `branch=` — the task's own work is what was reviewed — **or** on the land target
-    // *when that work is already in the reviewed branch*. A review of a staging branch is the
-    // D38 flow, and its tasks share only the land target; matching `branch=` alone tagged
-    // nothing and left the whole batch refused as never reviewed.
-    //
-    // The containment test is what keeps the gate from failing open. A land target says a task
-    // *intends* to land on this branch, not that it has: a task still being built in its own
-    // session has commits the reviewed branch has never seen, and crediting it would let
-    // `jkb task land` graft never-reviewed work — the one direction a safety check must not
-    // fail (see `GateVerdict::NoFindingsRecorded`).
-    // Tasks that intend to land here but whose work is not on this branch yet, so the review
-    // cannot have seen it. Reported, because silence here reads as "everything was tagged".
-    let mut skipped_unlanded = Vec::new();
-    let mut on_branch: Vec<(ItemId, String)> = Vec::new();
-    let mut unusable = Vec::new();
-    for t in crate::repo::repo_tasks(db, repo_key)? {
-        // A branch value git cannot be handed at all costs its own row and no more. `?`-ing on one
-        // aborted the entire run, which records `reviewed=` for NO task — so one malformed tag
-        // anywhere in the repo silently turned every landing in the batch into "never reviewed".
-        if crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH)
-            .iter()
-            .any(|b| crate::gitrepo::valid_ref(b).is_err())
-        {
-            unusable.push(t.meta.uid.clone());
-            continue;
-        }
-        match credited_by(db, &t, branch)? {
-            Credit::OwnBranch | Credit::Grafted => on_branch.push((t.meta.id, t.meta.uid.clone())),
-            Credit::LandsHereButHasNot => skipped_unlanded.push(t.meta.uid.clone()),
-            // Dropped, and that is right: this loop walks **every** task in the repo, so
-            // `Unrelated` is overwhelmingly "records a different branch" — listing those would
-            // report most of the backlog on every run. The case that must not land here is a task
-            // whose work jkb really did graft onto this branch and which was then abandoned; that
-            // is answered by `credited_by` asking the *historical* question, above, not by a
-            // bucket here.
-            Credit::Unrelated => {}
-        }
-    }
-    if on_branch.is_empty() {
-        return Ok(Recording {
-            recorded: Vec::new(),
-            skipped_unlanded,
-            unusable,
-        });
-    }
-
-    let (sha_owned, ns_owned) = (sha.unwrap_or("unknown").to_owned(), findings_ns.to_owned());
-    let ids: Vec<ItemId> = on_branch.iter().map(|(id, _)| *id).collect();
-    let moved_ids = db
-        .write_txn("cli", move |conn, meta| {
-            let mut moved = Vec::new();
-            for id in &ids {
-                crate::repo::set_facet(conn, meta, *id, FACET_REVIEWED, &sha_owned)?;
-                // Additive: `review=` accumulates, so an earlier run's open findings keep
-                // gating. `set_facet` here would silently un-gate them.
-                tag::apply(conn, meta, *id, FACET_REVIEW, &ns_owned)?;
-                // Re-read inside the transaction: the status may have changed since the
-                // caller's snapshot, and only `in_progress` may become `needs_review`.
-                let current = item::get(conn, *id)?.and_then(|m| m.status);
-                if current.as_deref() == Some("in_progress") {
-                    task::set_status(conn, meta, *id, TaskStatus::NeedsReview)?;
-                    moved.push(*id);
-                }
-            }
-            Ok(moved)
-        })
-        .with_context(|| format!("recording the review of {branch}"))?;
-
-    Ok(Recording {
-        recorded: on_branch
+    from: &std::path::Path,
+    json: bool,
+) -> Result<()> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    let what = if from.as_os_str() == "-" {
+        std::io::stdin()
+            .take(MAX_RESULT_BYTES)
+            .read_to_string(&mut text)
+            .context("reading the review result from stdin")?;
+        "stdin".to_owned()
+    } else {
+        std::fs::File::open(from)
+            .and_then(|f| f.take(MAX_RESULT_BYTES).read_to_string(&mut text))
+            .with_context(|| format!("reading {}", from.display()))?;
+        from.display().to_string()
+    };
+    let result: WorkflowResult = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{what} is not a review result: a JSON object with a `findings` array of {{severity              (must-fix|concern|nit), summary, file, line, scenario, fix}}"
+        )
+    })?;
+    let filed = kb.review_file(jkb_api::review::FileAsk {
+        ns: findings_ns.to_owned(),
+        findings: result
+            .findings
             .into_iter()
-            .map(|(id, uid)| Recorded {
-                uid,
-                moved_to_review: moved_ids.contains(&id),
+            .map(|f| jkb_api::review::Finding {
+                severity: f.severity,
+                summary: f.summary,
+                file: f.file,
+                line: f.line,
+                scenario: f.scenario,
+                fix: f.fix,
             })
             .collect(),
-        skipped_unlanded,
-        unusable,
-    })
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ns": filed.ns, "uids": filed.uids, "clean": filed.clean })
+        );
+    } else if filed.clean {
+        println!("filed a clean review under {}", filed.ns);
+    } else {
+        println!("filed {} finding(s) under {}", filed.uids.len(), filed.ns);
+        for uid in &filed.uids {
+            println!("  {uid}");
+        }
+    }
+    Ok(())
 }
 
-/// What a `review record` did, and what it deliberately did not do.
-pub(crate) struct Recording {
-    pub(crate) recorded: Vec<Recorded>,
-    /// Tasks whose land target is this branch but whose work has not been grafted onto it yet,
-    /// so the review cannot have covered them. Reported, because silence here reads as
-    /// "everything was tagged".
-    pub(crate) skipped_unlanded: Vec<String>,
-    /// Skipped because a recorded branch value cannot be handed to git at all. Reported, not
-    /// fatal: one malformed tag must not stop the whole branch being credited.
-    pub(crate) unusable: Vec<String>,
-}
-
-/// Why a review of one branch does — or does not — cover a task.
-enum Credit {
-    /// The reviewed branch **is** this task's work branch. Covered by definition: the review
-    /// read it.
-    OwnBranch,
-    /// jkb itself grafted this task's work onto the reviewed branch, and recorded that it did.
-    Grafted,
-    /// The task means to land here and has not yet, so the review saw none of its work.
-    LandsHereButHasNot,
-    /// Nothing to do with this branch.
-    Unrelated,
-}
-
-/// Whether a review of `branch` covers this task's work.
-///
-/// This replaced a containment probe over the commit graph, and the replacement is not a cheaper
-/// version of the same question — it is a **recorded event** instead of an inference. The probe
-/// had to ask "are this task's commits already in the reviewed branch?", which after a rebase or
-/// squash cannot be answered from the commits, so it fell back to "does this branch add anything
-/// to the target?" — which a branch with *no commits at all* also answers no to. Separating those
-/// two needed a stored cut point per branch, and every degenerate case had to be pinned down by
-/// hand: an empty session read as covered and stamped `reviewed=` on work nobody had written.
-///
-/// jkb performs the graft, so it knows. A `land` transition onto this branch is the answer, and
-/// a task that has not landed yet simply has no such entry — which is the same conservative
-/// direction the probe was straining for, without the machinery.
+/// `jkb task review record` — record that a review ran against a branch (design D38.4): the branch and
+/// its HEAD resolved here with git, the rest by `task.review_record`.
 ///
 /// # Errors
-/// Returns an error if the history cannot be read.
-fn credited_by(db: &Db, t: &crate::repo::RepoTask, branch: &str) -> Result<Credit> {
-    if crate::repo::facet_values(&t.tags, crate::repo::FACET_BRANCH)
-        .iter()
-        .any(|b| b == branch)
-    {
-        return Ok(Credit::OwnBranch);
-    }
-    let id = t.meta.id;
-    let landing = db.read(move |conn| jkb_core::transition::landing(conn, id))?;
-    let onto_is_branch = |r: Option<&jkb_core::transition::TransitionRow>| -> bool {
-        r.and_then(|r| r.labels.onto.as_deref())
-            .is_some_and(|onto| onto == branch)
+/// A git failure, or the op's refusal.
+pub(crate) fn record_cmd(
+    kb: &crate::session_cli::Kb<'_>,
+    branch: Option<String>,
+    sha: Option<String>,
+    findings: &str,
+    json: bool,
+) -> Result<()> {
+    let ctx = crate::repo::repo_ctx()?;
+    let cwd = std::env::current_dir()?;
+    let branch = match branch {
+        Some(b) => b,
+        None => crate::gitrepo::current_branch(&cwd)?
+            .context("not on a branch here (detached HEAD?) — pass --branch")?,
     };
-
-    // **Present tense first, and it is the one that can credit.** A landing that still speaks for
-    // the work means this branch holds what the task is doing now, so the review read it.
-    if onto_is_branch(landing.live()) {
-        return Ok(Credit::Grafted);
+    let sha = match sha {
+        Some(s) => Some(s),
+        None => crate::gitrepo::rev(&ctx.root, &branch)?,
+    };
+    let recording = kb.review_record(jkb_api::review::RecordAsk {
+        repo: ctx.key.clone(),
+        branch: branch.clone(),
+        sha: sha.clone(),
+        findings: findings.to_owned(),
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "branch": branch,
+                "sha": sha,
+                "findings": findings,
+                "tasks": recording.recorded.iter().map(|r| serde_json::json!({
+                    "uid": r.uid, "moved_to_review": r.moved_to_review,
+                })).collect::<Vec<_>>(),
+                "skipped_unlanded": recording.skipped_unlanded,
+                "unusable": recording.unusable,
+                "unwritable": recording.unwritable,
+            })
+        );
+        return Ok(());
     }
+    print_recording(&recording, &branch, sha.as_deref(), findings);
+    Ok(())
+}
 
-    // **Then the question the present tense cannot answer.** A task still aimed here has work
-    // coming that this review has not seen, whatever it grafted before — so it is reported, never
-    // credited. Asking the historical question ahead of this credited a task that landed, was
-    // reopened for a must-fix, and had its fix committed in a session this branch has never seen:
-    // `reviewed=` was stamped for work this review never read, and the task was moved to
-    // `needs_review` under somebody's feet. Recording a false statement is the harm; that it also
-    // unblocks the gate is true only where the task had never been reviewed before, since
-    // `gate_with` asks whether a `reviewed=` exists and not whether it is current (D38 declines
-    // to enforce staleness deliberately).
-    let target = db.read(move |conn| jkb_core::transition::land_target(conn, id))?;
-    if target.as_deref() == Some(branch) {
-        return Ok(Credit::LandsHereButHasNot);
+fn print_recording(
+    recording: &jkb_api::review::Recording,
+    branch: &str,
+    sha: Option<&str>,
+    findings: &str,
+) {
+    let jkb_api::review::Recording {
+        recorded,
+        skipped_unlanded,
+        unusable,
+        unwritable,
+    } = recording;
+    if recorded.is_empty() {
+        // Reviewing an arbitrary range is a legitimate thing to do, so this is a note and not an error
+        // (design D38.4). But "no task records this branch" and "tasks record it and every one was
+        // skipped" are different facts.
+        if skipped_unlanded.is_empty() && unusable.is_empty() && unwritable.is_empty() {
+            println!("no task records branch={branch} — nothing to tag (review still filed)");
+        } else {
+            println!(
+                "nothing tagged for branch={branch} — every matching task was skipped, below                  (review still filed)"
+            );
+        }
+    } else {
+        println!(
+            "recorded review of {branch}@{} -> {findings}",
+            sha.unwrap_or("unknown")
+        );
+        for r in recorded {
+            let moved = if r.moved_to_review {
+                " (now needs_review)"
+            } else {
+                ""
+            };
+            println!("  {}{moved}", r.uid);
+        }
     }
-
-    // **Only now the historical question**, and only because nothing present-tense applies: the
-    // task aims nowhere. That is what `abandon` leaves — it retires the land target — and a graft
-    // does not un-happen, so a session abandoned after its work reached this branch is still
-    // covered by a review of it. Without this the task fell to `Unrelated`, which this loop drops,
-    // so `review record` said nothing about it and `land` refused it much later for want of a
-    // review nobody knew was missing.
-    if target.is_none() && onto_is_branch(landing.recorded()) {
-        return Ok(Credit::Grafted);
+    // Said out loud: silence reads as "everything was tagged", and a task skipped here is one
+    // `task land` will refuse as never reviewed.
+    let bucket = |title: &str, uids: &[String]| {
+        if !uids.is_empty() {
+            println!("{title}");
+            for uid in uids {
+                println!("  {uid}");
+            }
+        }
+    };
+    bucket(
+        "not tagged — a recorded branch cannot be handed to git at all, so nothing about them could          be checked (`jkb task tag rm <uid> branch=<value>`):",
+        unusable,
+    );
+    bucket(
+        "not tagged — filed outside the directories this client may write; record the review on the          host:",
+        unwritable,
+    );
+    if !skipped_unlanded.is_empty() {
+        bucket(
+            &format!(
+                "not tagged — landing on {branch}, but jkb has not grafted their work onto it yet, so                  this review did not see it:"
+            ),
+            skipped_unlanded,
+        );
+        println!("  review each in its own session (`/jkb-review-log` there), or land first.");
     }
-
-    Ok(Credit::Unrelated)
 }
 
 #[cfg(test)]

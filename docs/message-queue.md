@@ -96,6 +96,11 @@ routinely built from different checkouts.
 | `task.land` | `uid`, `landed` {`branch`, `onto`, `head?`} | `landing` {`moved`, `refusal?`, `status`} — the facts the caller established (graft, green gate, disposal) are stated |
 | `task.landed` | `uid`, `landed` | `landing` — `observed_landed`; a guard's refusal is still recorded, an event the task's state does not define is not |
 | `task.review_findings` | `namespaces` (≤64; a client asks in pieces) | `review_findings` {`total`, `open_count`, `open_must_fix` (≤100 {`uid`, `title` (≤200 chars)})} — refused past 10 000 tasks examined |
+| `task.review_file` | `ns` (must hold nothing; no `tasks` mount may cover it), `findings` (≤1000 [{`severity` (`must-fix`\|`concern`\|`nit`), `summary` (≤2 KiB), `file?`, `line?`, `scenario?`, `fix?` (≤32 KiB each)}]) | `review_filed` {`ns`, `uids`, `clean`} — `managed:` tasks under `<ns>/<severity>` at priority 1/2/3; no findings files one `done` "clean review" task |
+| `task.review_record` | `repo`, `branch`, `sha?` (letters and digits, ≤64), `findings` (must hold at least one item) | `review_recorded` {`recorded` [{`uid`, `moved_to_review`}], `skipped_unlanded`, `unusable`, `unwritable`} — one transaction |
+| `task.claims` | — | `claims` {`claims` [{`uid`, `owner`}], `truncated`} (≤10 000) |
+| `task.reclaim` | `dead` (≤1000 owners the client proved gone) | `reclaimed` {`cleared`, `refused` [{`owner`, `reason`}], `unwritable`} — frees, through `observed_owner_gone`, claims still held by exactly one of `dead` |
+| `kb.health` | — | `health` {`schema_version`, `fts_ok`, `flagged` (≤200 {`uri`, `status`, `detail?`}), `flagged_count`, `vector_tables`, `stale_vectors`} — on the writer: FTS5's integrity check is an `INSERT` |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
 | `session.state` | `session` | `session_is` {`state`: `live`\|`ended`\|`unknown`} (a closed set) |
@@ -188,10 +193,17 @@ Two decisions in it:
   it is asked only when the add would otherwise succeed.
 - **What stays on the host.** The session verbs are being split into client-side git and ops (tasks
   S6.4, `jkb_api::sessions`, `jkb_api::removals`): `task start`, `work`, `abandon`, `sessions` and
-  `task gate` (show), `task land` and `task landed` run remotely; storing a gate never runs remotely
+  `task gate` (show), `task land` and `task landed` run remotely, and so do `task review file`/`record`,
+  `task reclaim` and `doctor` (stage 5); storing a gate never runs remotely
   (a stored gate is a command the host runs: a `--gate` or detected gate is run there and not
-  remembered), nor does `task reap` or breaking a lease (`task reap --break-lock`,
-  `task land --break-lock`).
+  remembered), nor does `task reap`, breaking a lease (`task reap --break-lock`,
+  `task land --break-lock`), `doctor --fix`/`--backup`, `undo` (it reverts any transaction, the
+  host's own included), `mount` or `sync`.
+- **A review's findings are filed by an op, never through a mount** (stage 5, design-s6-4.md F).
+  `/jkb-review-log` used to write a `tasks.md`, `mount create` its folder and `jkb sync` it; from the
+  container that has the host read and write files at a path the container chose. `task.review_file`
+  takes the reviewer's findings as data and writes rows, in both modes. A finding can no longer be
+  ticked in an editor.
 - **The land lock is the `land:<repo key>` lease** (stage 4, decision D), taken as a compare-and-set
   with holder `<owner> <nonce> <Claude Code session or ->`. It was `.jkb/land.lock` holding a pid, which
   the other side of the bind cannot probe. A holder is stale only when proven gone, asked in this
@@ -239,9 +251,15 @@ Two decisions in it:
   prune drops every registration whose directory this side cannot see, which across the bind is every
   session opened on the other side. `gitrepo::forget_worktree` runs `git worktree remove` on a missing
   directory, and `worktree_remove` no longer prunes after removing (both measured on git 2.51.1).
-- **Liveness stays with the host.** `task reclaim` proves owners gone by probing their processes,
-  which only their host can do. A claim held by a live or unestablished owner is refused by
-  `task.claim` from anywhere. **But the daemon does not judge liveness.** A client that names an owner
+- **Liveness is judged where the owner lives; the daemon only compares.** `task reclaim` and `doctor`
+  list the claims (`task.claims`), probe each owner where they run, and send the owners they proved
+  gone (`task.reclaim`, stage 5, design-s6-4.md H); the op frees the claims still held by exactly
+  those strings, so a probe cannot free a claim taken after it — a new process or a resumed session
+  claims under another string. The host's in-transaction re-probe this replaced closed the same race.
+  A client of the daemon is refused an owner it cannot have proved: a process of the daemon's own host,
+  a session checkout outside `~/repos`, and (from anyone) an `agent:` or unreadable owner. A claim held
+  by a live or unestablished owner is refused by `task.claim` from anywhere. **But the daemon does not
+  judge liveness.** A client that names an owner
   can drop it (`task.release`), and so can a session op's `displace`. A misbehaving container can
   therefore free any claim, and an honest one never does, because it can prove gone only what its own
   machine can see (tasks S6.4 design, "Residual, stated"). `task mirror` is a sweep over every task.
@@ -534,10 +552,11 @@ host.
 **Remote mode.** With `JKB_REMOTE=http://<host>:<port>` set (and `JKB_REMOTE_TOKEN_FILE`, default
 `~/.jkb/daemon/<port>/token` for that URL's port), `jkb`:
 
-- runs `jkb mq …`, the agent read set, the task-mutate set and `jkb ingest` (above) through the daemon;
+- runs `jkb mq …`, the agent read set, the task-mutate set, `jkb ingest`, the session verbs, the review
+  and reclaim verbs and `jkb doctor`'s report (above) through the daemon;
 - runs the commands that need no database (`notify`, `guide`, `commands`) as usual;
 - **refuses everything else before it does anything** — with a reason: host-only commands (`sync`,
-  `mount`, `service`, `serve`) never go through the daemon, the rest are not ported yet;
+  `mount`, `service`, `serve`, `doctor --fix`) never go through the daemon, the rest are not ported yet;
 - refuses `--db`, and a non-empty `JKB_DB` — a process configured with both names a database two ways
   at once, and silently obeying one hides the other;
 - treats an error body that is not the daemon's (a proxy's `502`, say) as `unavailable`, and re-reads

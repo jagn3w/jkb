@@ -4625,3 +4625,178 @@ fn a_claimed_checkout_with_no_recorded_target_needs_onto() {
     assert_eq!(resumed["worktree"], s["worktree"]);
     assert_eq!(resumed["resumed"], true);
 }
+
+/// A `jkb` run in remote mode against `url`, as the dev container runs it, in `dir`, with `stdin`.
+fn container_jkb(
+    dir: &Path,
+    url: &str,
+    token: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> std::process::Output {
+    let mut cmd = jkb(None);
+    cmd.args(args)
+        .current_dir(dir)
+        .env("JKB_REMOTE", url)
+        .env("JKB_REMOTE_TOKEN_FILE", token)
+        .env("HOSTNAME", "container")
+        .env_remove("JKB_DB")
+        .env_remove("CLAUDE_CODE_SESSION_ID");
+    match stdin {
+        Some(text) => assert_cmd::Command::from_std(cmd)
+            .write_stdin(text)
+            .output()
+            .unwrap(),
+        None => cmd.output().unwrap(),
+    }
+}
+
+/// **A container files and records a review through the daemon** (tasks S6.4 stage 5): the workflow's
+/// result becomes tasks the land gate reads, filed once, and the record credits the session's task.
+#[test]
+fn a_container_files_and_records_a_review_through_the_daemon() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "batch"]);
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote =
+        |args: &[&str], stdin: Option<&str>| container_jkb(&f.repo, &url, &token, args, stdin);
+    let uid = f.add_task("reviewed from the container");
+    let opened = remote(&["--json", "task", "work", &uid], None);
+    assert!(opened.status.success(), "{opened:?}");
+    let v: serde_json::Value = serde_json::from_slice(&opened.stdout).unwrap();
+    let branch = v["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(v["worktree"].as_str().unwrap()),
+        "r.txt",
+        "reviewed\n",
+        "add r",
+    );
+
+    // The workflow's own result, extra fields and all.
+    let result = f.home.path().join("result.json");
+    std::fs::write(
+        &result,
+        serde_json::json!({
+            "findings": [
+                { "severity": "must-fix", "summary": "a real problem", "file": "a.rs", "line": 3,
+                  "scenario": "s", "fix": "f", "kind": "bug", "unverified": false },
+                { "severity": "nit", "summary": "a nit" },
+            ],
+            "raw": 3, "refuted": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ns = "repos/proj/codereviews/r1";
+    let file_args = [
+        "task",
+        "review",
+        "file",
+        "--findings",
+        ns,
+        "--from",
+        result.to_str().unwrap(),
+    ];
+    let filed = remote(&file_args, None);
+    assert!(filed.status.success(), "{filed:?}");
+    assert!(
+        String::from_utf8_lossy(&filed.stdout).contains("filed 2 finding(s)"),
+        "{filed:?}"
+    );
+    let again = remote(&file_args, None);
+    assert!(!again.status.success(), "a review is filed once: {again:?}");
+    let clean = remote(
+        &[
+            "--json",
+            "task",
+            "review",
+            "file",
+            "--findings",
+            "repos/proj/codereviews/r2",
+            "--from",
+            "-",
+        ],
+        Some(r#"{"findings": []}"#),
+    );
+    assert!(clean.status.success(), "{clean:?}");
+    let v: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(v["clean"], true, "{v}");
+
+    let recorded = remote(
+        &[
+            "--json",
+            "task",
+            "review",
+            "record",
+            "--branch",
+            &branch,
+            "--findings",
+            ns,
+        ],
+        None,
+    );
+    assert!(recorded.status.success(), "{recorded:?}");
+    let v: serde_json::Value = serde_json::from_slice(&recorded.stdout).unwrap();
+    assert_eq!(v["tasks"][0]["uid"], uid.as_str(), "{v}");
+    assert_eq!(v["tasks"][0]["moved_to_review"], true, "{v}");
+    assert_eq!(f.status_of(&uid), "needs_review");
+    // The must-fix finding filed from the container is what the gate now reads.
+    let gated = remote(&["task", "land", &uid, "--gate", "true"], None);
+    assert!(!gated.status.success(), "{gated:?}");
+    assert!(
+        String::from_utf8_lossy(&gated.stderr).contains("a real problem — a.rs:3"),
+        "{gated:?}"
+    );
+}
+
+/// **A container recovers a crashed claim and reads its doctor report through the daemon** (tasks S6.4
+/// stage 5): owners are probed where the command runs, and doctor's host-only parts are neither printed
+/// nor offered.
+#[test]
+fn a_container_reclaims_and_checks_health_through_the_daemon() {
+    let f = Fixture::new();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| container_jkb(&f.repo, &url, &token, args, None);
+
+    // A claim of a process gone from the container is freed; one of the host's is not the container's
+    // to judge.
+    let (dead, hosts) = (f.add_task("crashed"), f.add_task("host-held"));
+    for (task, owner) in [(&dead, "container:4194000"), (&hosts, "host:4194001")] {
+        f.jkb()
+            .args(["task", "claim", task, "--owner", owner])
+            .assert()
+            .success();
+    }
+    let reclaimed = remote(&["--json", "task", "reclaim"]);
+    assert!(reclaimed.status.success(), "{reclaimed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&reclaimed.stdout).unwrap();
+    assert_eq!(v["reclaimed"], serde_json::json!([dead]), "{v}");
+    assert!(
+        v["unverifiable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == hosts.as_str()),
+        "{v}"
+    );
+    assert_eq!(claim_of(&f.db, &dead), None);
+    assert_eq!(claim_of(&f.db, &hosts).as_deref(), Some("host:4194001"));
+
+    let doctor = remote(&["doctor"]);
+    assert!(doctor.status.success(), "{doctor:?}");
+    let out = String::from_utf8_lossy(&doctor.stdout);
+    for expected in [
+        "fts integrity: ok",
+        "schema user_version:",
+        "task claims: 1 held by an owner whose liveness cannot be checked here",
+    ] {
+        assert!(out.contains(expected), "{expected}: {out}");
+    }
+    for host_only in ["embedder:", "db location:"] {
+        assert!(!out.contains(host_only), "{host_only}: {out}");
+    }
+    let fix = remote(&["doctor", "--fix"]);
+    assert!(!fix.status.success(), "{fix:?}");
+}

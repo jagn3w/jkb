@@ -29,9 +29,12 @@ use jkb_types::Embedder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod claims;
+pub mod health;
 pub mod ingest;
 pub mod kb;
 pub mod removals;
+pub mod review;
 pub mod sessions;
 pub mod tasks;
 
@@ -583,6 +586,24 @@ pub enum Request {
         /// The review namespaces.
         namespaces: Vec<String>,
     },
+    /// File a review's findings as tasks ([`review::file`]).
+    #[serde(rename = "task.review_file")]
+    TaskReviewFile(review::FileAsk),
+    /// Record a review against a branch ([`review::record`]).
+    #[serde(rename = "task.review_record")]
+    TaskReviewRecord(review::RecordAsk),
+    /// Every held task claim ([`claims::claims`]).
+    #[serde(rename = "task.claims")]
+    TaskClaims {},
+    /// Free the claims of owners the client proved gone ([`claims::reclaim`]).
+    #[serde(rename = "task.reclaim")]
+    TaskReclaim {
+        /// The owners.
+        dead: Vec<String>,
+    },
+    /// The database side of `jkb doctor` ([`health::health`]).
+    #[serde(rename = "kb.health")]
+    KbHealth {},
 }
 
 /// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
@@ -950,6 +971,11 @@ impl Request {
         "task.land",
         "task.landed",
         "task.review_findings",
+        "task.review_file",
+        "task.review_record",
+        "task.claims",
+        "task.reclaim",
+        "kb.health",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -1016,6 +1042,11 @@ impl Request {
             Self::TaskLand { .. } => "task.land",
             Self::TaskLanded { .. } => "task.landed",
             Self::TaskReviewFindings { .. } => "task.review_findings",
+            Self::TaskReviewFile(_) => "task.review_file",
+            Self::TaskReviewRecord(_) => "task.review_record",
+            Self::TaskClaims {} => "task.claims",
+            Self::TaskReclaim { .. } => "task.reclaim",
+            Self::KbHealth {} => "kb.health",
         }
     }
 
@@ -1048,6 +1079,7 @@ impl Request {
             | Self::TaskFacts { .. }
             | Self::TaskByBranch { .. }
             | Self::TaskReviewFindings { .. }
+            | Self::TaskClaims {}
             | Self::RepoGate { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -1092,7 +1124,12 @@ impl Request {
             | Self::LeaseRelease { .. }
             | Self::LeaseBreak { .. }
             | Self::TaskLand { .. }
-            | Self::TaskLanded { .. } => false,
+            | Self::TaskLanded { .. }
+            | Self::TaskReviewFile(_)
+            | Self::TaskReviewRecord(_)
+            | Self::TaskReclaim { .. }
+            // FTS5's integrity check is an `INSERT`, which the `query_only` reader refuses.
+            | Self::KbHealth {} => false,
         }
     }
 }
@@ -1372,6 +1409,38 @@ pub enum Response {
         /// The holder it displaced, if any.
         holder: Option<String>,
     },
+    /// A `task.review_file`.
+    ReviewFiled {
+        /// What it filed.
+        #[serde(flatten)]
+        filed: review::Filed,
+    },
+    /// A `task.review_record`.
+    ReviewRecorded {
+        /// What it recorded.
+        #[serde(flatten)]
+        recording: review::Recording,
+    },
+    /// A `task.claims`.
+    Claims {
+        /// The held claims.
+        claims: Vec<claims::Claim>,
+        /// Cut short at [`claims::MAX_CLAIMS`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    /// A `task.reclaim`.
+    Reclaimed {
+        /// What it freed.
+        #[serde(flatten)]
+        reclaimed: claims::Reclaimed,
+    },
+    /// A `kb.health`.
+    Health {
+        /// What it found.
+        #[serde(flatten)]
+        health: health::Health,
+    },
     /// A `task.show`.
     Task {
         /// The task.
@@ -1395,6 +1464,7 @@ impl Response {
             | Self::Children { truncated, .. }
             | Self::SearchHits { truncated, .. }
             | Self::Task { truncated, .. }
+            | Self::Claims { truncated, .. }
             | Self::History { truncated, .. } => *truncated,
             Self::GrepHits { answer } => answer.truncated,
             Self::Created { .. }
@@ -1431,6 +1501,10 @@ impl Response {
             | Self::RemovalsCancelled { .. }
             | Self::Landing { .. }
             | Self::ReviewFindings { .. }
+            | Self::ReviewFiled { .. }
+            | Self::ReviewRecorded { .. }
+            | Self::Reclaimed { .. }
+            | Self::Health { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
@@ -1468,6 +1542,7 @@ impl Response {
             | Self::GrepHits { .. }
             | Self::SearchHits { .. }
             | Self::Task { .. }
+            | Self::Claims { .. }
             | Self::Applied {}
             | Self::Added { .. }
             | Self::Unplaced { .. }
@@ -1488,6 +1563,10 @@ impl Response {
             | Self::RemovalsCancelled { .. }
             | Self::Landing { .. }
             | Self::ReviewFindings { .. }
+            | Self::ReviewFiled { .. }
+            | Self::ReviewRecorded { .. }
+            | Self::Reclaimed { .. }
+            | Self::Health { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
@@ -2313,6 +2392,42 @@ impl Backend for LocalBackend {
                     })?,
                 }
             }
+            Request::TaskReviewFile(ask) => Response::ReviewFiled {
+                filed: db.write_txn_with(actor, move |c, m| review::file(c, m, &ask))?,
+            },
+            Request::TaskReviewRecord(ask) => {
+                let roots = self.file_roots.clone();
+                Response::ReviewRecorded {
+                    recording: db.write_txn_with(actor, move |c, m| {
+                        review::record(c, m, &ask, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::TaskClaims {} => {
+                let (claims, truncated) = db.read_with(claims::claims)?;
+                Response::Claims { claims, truncated }
+            }
+            Request::TaskReclaim { dead } => {
+                let roots = self.file_roots.clone();
+                Response::Reclaimed {
+                    reclaimed: db.write_txn_with(actor, move |c, m| {
+                        // Served with file roots means served to a client of `jkb serve`, which runs
+                        // here: this process's host is the daemon's.
+                        let server_host = jkb_core::host::name();
+                        let asker = match &roots {
+                            Some(roots) => claims::Asker::Remote {
+                                server_host: &server_host,
+                                roots,
+                            },
+                            None => claims::Asker::Local,
+                        };
+                        claims::reclaim(c, m, &dead, asker)
+                    })?,
+                }
+            }
+            Request::KbHealth {} => Response::Health {
+                health: db.read_with(health::health)?,
+            },
             Request::TaskReviewFindings { namespaces } => Response::ReviewFindings {
                 findings: db.read_with(move |c| sessions::review_findings(c, &namespaces))?,
             },

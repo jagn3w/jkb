@@ -240,7 +240,8 @@ The robustness pass on the agent swarm that drives jkb task execution (design
   (`owner.rs`, `ps -p` liveness probe — `kill -0` exits non-zero on `EPERM` for a foreign-owned
   but live process, so it would reclaim a running agent's claim). `doctor` reports orphaned
   claims (owner gone);
-  `doctor --fix` and `task reclaim --keep <owner>` run the owner-existence reclaim.
+  `doctor --fix` and `task reclaim --keep <owner>` run the owner-existence reclaim — the owners
+  probed by the command, freed by the `task.reclaim` op (`docs/message-queue.md`).
 - **Four-state lifecycle (D27.7).** `open → in_progress → needs_review → done` reusing the
   existing `TaskStatus` (no new variant). **`needs_review` no longer unblocks dependents** —
   `unblocks_dependents()` is now just the terminal set `{done, cancelled}` (a task under

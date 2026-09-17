@@ -43,6 +43,13 @@ pub const fn support(command: &Command) -> Support {
         Command::Mount { .. }
         | Command::Sync { .. }
         | Command::Service { .. }
+        // A repair and a copy of the database change the host (design-s6-4.md I); the report does not.
+        | Command::Doctor {
+            fix: true, ..
+        }
+        | Command::Doctor {
+            backup: Some(_), ..
+        }
         // Breaking a land lease is the host operator's escape: nothing here can prove its holder gone.
         | Command::Task {
             cmd: TaskCmd::Land {
@@ -63,6 +70,7 @@ pub const fn support(command: &Command) -> Support {
         | Command::Cat { .. }
         // Parsed here, stored there (tasks S6.3): the daemon is sent only the extracted text.
         | Command::Ingest { .. }
+        | Command::Doctor { .. }
         | Command::Task {
             cmd:
                 TaskCmd::Next { .. }
@@ -94,6 +102,9 @@ pub const fn support(command: &Command) -> Support {
                     ..
                 }
                 | TaskCmd::Landed { .. }
+                // A review's findings and its record, and crash recovery, probed here (stage 5).
+                | TaskCmd::Review { .. }
+                | TaskCmd::Reclaim { .. }
                 | TaskCmd::Gate {
                     cmd: None,
                     clear: false,
@@ -114,7 +125,6 @@ pub const fn support(command: &Command) -> Support {
         | Command::View { .. }
         | Command::Undo { .. }
         | Command::Index { .. }
-        | Command::Doctor { .. }
         | Command::Mcp
         | Command::Stat { .. }
         | Command::Item { .. }
@@ -359,16 +369,28 @@ mod tests {
             vec!["mount", "ls"],
             vec!["service", "install"],
             vec!["serve"],
+            vec!["doctor", "--fix"],
+            vec!["doctor", "--backup", "/tmp/x.db"],
+            vec!["undo"],
+            vec!["task", "mirror"],
         ] {
             assert!(
                 matches!(support(&parse(&host_only).command), Support::Refused(_)),
                 "{host_only:?} must be refused remotely"
             );
         }
-        assert!(matches!(
-            support(&parse(&["task", "reclaim"]).command),
-            Support::Refused(_)
-        ));
+        for ported in [
+            vec!["doctor"],
+            vec!["task", "reclaim"],
+            vec!["task", "review", "record", "--findings", "r"],
+            vec!["task", "review", "file", "--findings", "r", "--from", "-"],
+        ] {
+            assert_eq!(
+                support(&parse(&ported).command),
+                Support::Ported,
+                "{ported:?}"
+            );
+        }
     }
 
     #[test]
@@ -415,6 +437,10 @@ mod tests {
             vec!["task", "abandon", "u"],
             vec!["task", "sessions"],
             vec!["task", "reclaim"],
+            vec!["task", "review", "record", "--findings", "r"],
+            vec!["task", "review", "file", "--findings", "r", "--from", "-"],
+            vec!["doctor"],
+            vec!["doctor", "--fix"],
             vec!["task", "mirror"],
             vec!["stat", "u"],
             vec!["ns", "ls"],

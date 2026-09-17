@@ -17,7 +17,7 @@ use jkb_core::{item, tag, Db};
 
 use crate::gitrepo;
 
-pub(crate) use jkb_core::location::{set_facet, FACET_BRANCH};
+pub(crate) use jkb_core::location::FACET_BRANCH;
 
 /// The values recorded for one facet.
 pub(crate) fn facet_values<'a>(

@@ -19,6 +19,7 @@ pub mod claude_session;
 pub mod containment;
 pub mod dsl;
 pub mod edge;
+pub mod host;
 pub mod ingestion;
 pub mod investigation;
 pub mod item;

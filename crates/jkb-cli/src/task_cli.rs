@@ -11,7 +11,7 @@ use jkb_api::tasks::{AddAsk, TagMode};
 use jkb_api::{Request, Response};
 
 use super::ops_cli::{unexpected, Ops};
-use super::{TaskCmd, TaskTagCmd};
+use super::{TaskCmd, TaskReviewCmd, TaskTagCmd};
 
 /// Run one of the task writes [`super::ops_cli::handles`] names.
 ///
@@ -90,6 +90,22 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             &onto,
             ops.json,
         ),
+        TaskCmd::Review { cmd } => {
+            let kb = crate::session_cli::Kb::from_ops(ops);
+            match cmd {
+                TaskReviewCmd::File { findings, from } => {
+                    crate::review::file_cmd(&kb, &findings, &from, ops.json)
+                }
+                TaskReviewCmd::Record {
+                    branch,
+                    sha,
+                    findings,
+                } => crate::review::record_cmd(&kb, branch, sha, &findings, ops.json),
+            }
+        }
+        TaskCmd::Reclaim { keep } => {
+            crate::doctor::reclaim(&crate::session_cli::Kb::from_ops(ops), &keep, ops.json)
+        }
         TaskCmd::Sessions => {
             let kb = crate::session_cli::Kb::from_ops(ops);
             let stores = crate::archive::Stores::new(kb, ops.db_path);

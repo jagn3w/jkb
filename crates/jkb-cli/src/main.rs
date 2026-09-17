@@ -9,6 +9,7 @@
 mod archive;
 mod atomic;
 mod commands;
+mod doctor;
 mod gitrepo;
 mod mq_cli;
 mod notify;
@@ -36,9 +37,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use jkb_api::kb::SearchRoute;
 
 use jkb_core::lifecycle;
-use jkb_core::transition::{self, Reclaimed};
 use jkb_core::{
-    binding, blob, claim, edge, investigation, item, mount, ns, nstype, tag, task, undo, view, Db,
+    binding, blob, edge, investigation, item, mount, ns, nstype, tag, task, undo, view, Db,
 };
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_fsm::Fact;
@@ -884,7 +884,7 @@ enum TaskCmd {
         #[arg(long, conflicts_with_all = ["gate", "no_gate", "keep_worktree", "no_review"])]
         break_lock: bool,
     },
-    /// Record that a code review ran, so `task land` can require one.
+    /// File a code review's findings, and record that it ran so `task land` can require one.
     Review {
         #[command(subcommand)]
         cmd: TaskReviewCmd,
@@ -1023,6 +1023,18 @@ enum TaskCmd {
 
 #[derive(Subcommand)]
 enum TaskReviewCmd {
+    /// File a review's findings as tasks under a namespace of their own, one section per severity
+    /// (`must-fix` blocks landing). Reads the reviewer workflow's result — a JSON object with a
+    /// `findings` array of `{severity, summary, file, line, scenario, fix}` — from a file, or from
+    /// stdin with `-`.
+    File {
+        /// The namespace to file them under, e.g. `repos/<repo>/codereviews/<folder>`. Must be new.
+        #[arg(long)]
+        findings: String,
+        /// The workflow's result, as JSON (`-` for stdin).
+        #[arg(long)]
+        from: PathBuf,
+    },
     /// Record a review against a branch: tags every task working that branch with the
     /// reviewed SHA and the findings namespace, and moves `in_progress` to `needs_review`.
     Record {
@@ -1323,7 +1335,18 @@ fn run(cli: Cli) -> Result<()> {
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
         Command::Index { sweep } => cmd_index(&db, sweep),
-        Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
+        Command::Doctor { backup, fix } => {
+            let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
+            doctor::run(
+                &session_cli::Kb::new(&backend),
+                Some(&doctor::Host {
+                    db: &db,
+                    path: &db_path,
+                }),
+                backup.as_deref(),
+                fix,
+            )
+        }
         Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
         Command::Mq { cmd } => {
             mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
@@ -3261,7 +3284,9 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Land {
             break_lock: false, ..
         }
-        | TaskCmd::Landed { .. } => {
+        | TaskCmd::Landed { .. }
+        | TaskCmd::Review { .. }
+        | TaskCmd::Reclaim { .. } => {
             anyhow::bail!("internal: a task verb served as an op missed ops_cli's dispatch")
         }
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
@@ -3311,15 +3336,11 @@ fn cmd_task_mirror(db: &Db, json: bool) -> Result<()> {
 /// `bind`/`claim`/`release`) — the D27.3 write surface. Each is a thin edge over an
 /// existing audited, cycle-checked `jkb-core` seam through the writer-actor.
 fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
-    match cmd {
-        TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
-        other => cmd_task_landing(db, other, json)?,
-    }
-    Ok(())
+    cmd_task_landing(db, cmd, json)
 }
 
-/// The verbs about a task's **work** rather than its fields: where it is being done, what proves
-/// it landed, and what a review found.
+/// The verbs about a task's **work** rather than its fields that still run only here: what proves
+/// it landed (`task pr` is dispatched separately, `task review` through the ops).
 ///
 /// Split from [`cmd_task_mutate`] because they read a git checkout and a pull request, where the
 /// field setters read only the database — and because one dispatch holding every task verb had
@@ -3327,7 +3348,6 @@ fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
 fn cmd_task_landing(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
         TaskCmd::CloseMerged { repo, dry_run } => cmd_task_close_merged(db, repo, dry_run, json)?,
-        TaskCmd::Review { cmd } => cmd_task_review(db, cmd, json)?,
         // The read and session subcommands are dispatched by `cmd_task` and never reach here.
         // Listed rather than caught by `_`, so a new variant is a compile error instead of an
         // `unreachable!` at run time.
@@ -3356,6 +3376,7 @@ fn cmd_task_landing(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Start { .. }
         | TaskCmd::Release { .. }
         | TaskCmd::Reap { .. }
+        | TaskCmd::Review { .. }
         | TaskCmd::Reclaim { .. } => unreachable!(),
     }
     Ok(())
@@ -4991,7 +5012,7 @@ fn fix_worktree_removals(stores: &archive::Stores<'_>) {
     }
 }
 
-fn report_sessions(db: &Db) {
+fn report_sessions(kb: &session_cli::Kb<'_>) {
     let Ok(ctx) = repo::repo_ctx() else { return };
     let Ok(sessions) = session::discover(&ctx.root) else {
         return;
@@ -4999,10 +5020,7 @@ fn report_sessions(db: &Db) {
     if sessions.is_empty() {
         return;
     }
-    let backend = jkb_api::LocalBackend::new(db.clone());
-    let by_branch = session_cli::Kb::new(&backend)
-        .by_branch(&ctx.key)
-        .unwrap_or_default();
+    let by_branch = kb.by_branch(&ctx.key).unwrap_or_default();
     println!("task sessions: {} in flight", sessions.len());
     for s in &sessions {
         match by_branch
@@ -5279,34 +5297,6 @@ fn report_close_merged(verdicts: &[CloseVerdict], dry_run: bool, json: bool) {
 /// exposed so the coordinator can run it SQL-free. Clears claims whose owner pid is
 /// gone, preserving `keep` owners (the live run passes its own owner so it never
 /// reclaims its own in-flight work).
-fn cmd_task_reclaim(db: &Db, keep: &[String], json: bool) -> Result<()> {
-    let (held, found) = reclaim_orphaned(db, keep, true)?;
-    if json {
-        let uids: Vec<&str> = found.cleared.iter().map(|c| c.uid.as_str()).collect();
-        let held_open: Vec<&str> = found.unverifiable.iter().map(|c| c.uid.as_str()).collect();
-        println!(
-            "{}",
-            serde_json::json!({"held": held, "reclaimed": uids, "unverifiable": held_open})
-        );
-    } else {
-        println!("reclaimed {} of {held} claim(s)", found.cleared.len());
-        for c in &found.cleared {
-            println!("  {} (dead owner {})", c.uid, c.owner);
-        }
-        // Reported, never freed: an owner whose liveness cannot be established from here keeps
-        // its claim, because reclaiming on an unestablished answer frees a live agent's task
-        // (design S3.2). Of the two ways to be wrong, this is the one that costs a command.
-        for c in &found.unverifiable {
-            println!(
-                "  {} still held by {} — liveness cannot be checked from here; \
-                 `jkb task release {} --owner {}` if you know it is gone",
-                c.uid, c.owner, c.uid, c.owner
-            );
-        }
-    }
-    Ok(())
-}
-
 /// Print a short human/JSON confirmation for a task mutation.
 fn report(json: bool, uid: &str, action: &str) {
     if json {
@@ -5314,64 +5304,6 @@ fn report(json: bool, uid: &str, action: &str) {
     } else {
         println!("{action}: {uid}");
     }
-}
-
-/// The owner-existence reclaim (design D27.1/D27.2): clear every claim whose owner
-/// process no longer exists, keeping claims whose pid is alive plus any `keep` owners.
-/// Returns `(total_held, cleared_or_orphaned_claims)`. Used by `task reclaim`,
-/// `doctor` (report), and `doctor --fix`.
-///
-/// When `fix` is false this is **report-only**: it returns the held claims that *would*
-/// be reclaimed (a stale-snapshot read is fine — nothing is written). When `fix` is true
-/// the reclaim runs **inside the write transaction** (via [`claim::reclaim_dead`]) so
-/// liveness is re-evaluated against the current claim set, closing the race where a claim
-/// acquired concurrently by a live owner could be reclaimed from a snapshot.
-///
-/// # Errors
-/// Errors if a database read/write fails.
-fn reclaim_orphaned(db: &Db, keep: &[String], fix: bool) -> Result<(usize, Reclaimed)> {
-    let held = db.read(claim::claimed)?;
-    let total = held.len();
-    if !fix {
-        return Ok((total, orphaned_claims(held, keep)));
-    }
-    let keep = keep.to_vec();
-    let found = db.write_txn("cli", move |conn, meta| {
-        transition::reclaim_dead(conn, meta, &keep, owner::is_alive)
-    })?;
-    Ok((total, found))
-}
-
-/// The held claims sorted into *proven gone* and *cannot be established*, without writing.
-///
-/// The second bucket is the S3.2 behaviour change made visible: an externally-minted `agent:`
-/// owner, or a `claimant_id` in a shape this binary cannot read, is **not** reclaimable, because
-/// treating an unestablished answer as "dead" silently frees a live agent's task. It is reported
-/// so a person can decide, and `jkb task release <uid> --owner <owner>` is how they say so —
-/// there is deliberately no `--force`, because a blanket override would free the whole bucket on
-/// the strength of one judgement about one owner.
-///
-/// Owners in `keep` are alive by fiat and never probed; each **distinct** owner is probed at
-/// most once via [`owner::is_alive`] — the same rule the txn-internal probe in
-/// [`transition::reclaim_dead`] applies.
-fn orphaned_claims(held: Vec<claim::ClaimInfo>, keep: &[String]) -> Reclaimed {
-    let mut alive: std::collections::HashMap<String, Fact> = std::collections::HashMap::new();
-    let mut out = Reclaimed::default();
-    for c in held {
-        let live = *alive.entry(c.owner.clone()).or_insert_with(|| {
-            if keep.iter().any(|o| o == &c.owner) {
-                Fact::Yes
-            } else {
-                owner::is_alive(&c.owner)
-            }
-        });
-        match live {
-            Fact::No => out.cleared.push(c),
-            Fact::Unknown => out.unverifiable.push(c),
-            Fact::Yes => {}
-        }
-    }
-    out
 }
 
 /// Resolve a task reference (full `task:<slug>` uid or bare slug) to its item id.
@@ -5485,140 +5417,18 @@ fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
     Ok(())
 }
 
-/// The claims half of `jkb doctor` (design D27.1/D27.2, S3.2).
-///
-/// Extracted from `cmd_doctor` so the two buckets can be reported at length without the command
-/// growing past what one function should hold.
-///
-/// A bare run reports; `--fix` clears claims whose owner is **proven** gone. The reclaim re-probes
-/// inside the write transaction — that repeat is deliberate: the race-free clear must evaluate
-/// liveness against the current claim set, not the report's snapshot.
-///
-/// # Errors
-/// Errors if a database read or write fails.
-fn report_claims(db: &Db, fix: bool) -> Result<()> {
-    let (held_count, orphaned) = reclaim_orphaned(db, &[], false)?;
-    if held_count == 0 {
-        println!("task claims: none held");
-        return Ok(());
-    }
-    if orphaned.cleared.is_empty() && orphaned.unverifiable.is_empty() {
-        println!("task claims: {held_count} held, all owners alive");
-    } else {
-        if !orphaned.cleared.is_empty() {
-            println!(
-                "task claims: {} orphaned (owner gone) of {held_count} held",
-                orphaned.cleared.len(),
-            );
-            for c in &orphaned.cleared {
-                println!("  {} claimed by dead owner {}", c.uid, c.owner);
-            }
-            if fix {
-                let (_, found) = reclaim_orphaned(db, &[], true)?;
-                println!("  cleared {} orphaned claim(s)", found.cleared.len());
-            } else {
-                println!("  run `jkb doctor --fix` to clear them");
-            }
-        }
-        // Its own bucket, because it is its own answer: not "the owner is gone" but "nothing
-        // here can tell". `--fix` deliberately does not touch these (design S3.2).
-        if !orphaned.unverifiable.is_empty() {
-            println!(
-                "task claims: {} held by an owner whose liveness cannot be checked here",
-                orphaned.unverifiable.len(),
-            );
-            for c in &orphaned.unverifiable {
-                println!("  {} claimed by {}", c.uid, c.owner);
-            }
-            println!(
-                "  these are NOT auto-reclaimed — `jkb task release <uid> --owner <owner>` \
-                 once you know the owner is gone"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Result<()> {
-    // FIRST, before any diagnostic and before `--fix` mutates anything. `--backup` is the
-    // safety copy you take *before* a repair; taken at the end it held post-repair state, so
-    // `jkb doctor --backup ~/pre-fix.db --fix` produced a file that was the opposite of what its
-    // name and its help said.
-    if let Some(dest) = backup {
-        db.backup(dest)?;
-        println!("backup written to {}", dest.display());
-    }
-
-    // Embedder health.
+/// The embedder half of `jkb doctor`: whether the model answers, and how much waits for it. Host-only:
+/// `jkb serve` calls no model.
+fn report_embedder(db: &Db) {
     let embed_status = match embedder().and_then(|e| e.health_check().map_err(Into::into)) {
         Ok(()) => "ok".to_owned(),
         Err(e) => format!("unavailable: {e}"),
     };
     println!("embedder: {embed_status}");
-
-    // FTS integrity.
-    let fts = db.read(|conn| {
-        let indexer = jkb_index::FtsIndexer::new();
-        Ok(indexer.integrity_check(conn).is_ok())
-    })?;
-    println!("fts integrity: {}", if fts { "ok" } else { "FAILED" });
-
-    // Schema version.
-    let user_version: i64 =
-        db.read(|conn| Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?))?;
-    println!("schema user_version: {user_version}");
-
-    // Un-embedded backlog.
-    match embedder() {
-        Ok(e) => {
-            let pending = Pipeline::new(e).unembedded_count(db)?;
-            println!("un-embedded items: {pending}");
-        }
+    match embedder().and_then(|e| Ok(Pipeline::new(e).unembedded_count(db)?)) {
+        Ok(pending) => println!("un-embedded items: {pending}"),
         Err(e) => println!("un-embedded items: unknown ({e})"),
     }
-
-    // Files needing sync attention: conflicts and quarantined parse failures (D25).
-    let flagged = db.read(jkb_core::sync_state::needs_attention)?;
-    if flagged.is_empty() {
-        println!("sync journal: ok");
-    } else {
-        println!("sync journal: {} file(s) need attention", flagged.len());
-        for s in &flagged {
-            let detail = s.parse_error.as_deref().unwrap_or("both sides changed");
-            println!("  {} [{}]: {detail}", s.uri, s.status);
-        }
-    }
-
-    // Stale task claims: owner-existence reclaim (design D27.2). For each claimed task
-    // probe whether the recorded owner still exists (`ps -p`, see `owner::is_alive`); a claim
-    // whose owner is gone is orphaned (no time-based staleness — a paused-but-alive owner is
-    // retained).
-    // A bare run reports; `--fix` clears orphaned claims so their tasks return to the
-    // ready frontier.
-    // One `reclaim_orphaned(.., false)` computes the report (shared with `task reclaim`,
-    // no rule duplication). On `--fix` the reclaim re-probes inside the write txn — that
-    // repeat is deliberate: the race-free clear must evaluate liveness against the current
-    // claim set, not the report's snapshot.
-    report_claims(db, fix)?;
-
-    report_vector_index(db, fix)?;
-
-    // Task sessions in this repo (design D36.6). A session's worktree keeps its claim on
-    // purpose — the half-written branch is still there — so a session is never reported as
-    // orphaned. Doctor lists every one, because nothing observable distinguishes a session
-    // you are working in from one you walked away from.
-    report_sessions(db);
-
-    report_worktree_removals(db, db_path, fix);
-
-    // Cloud-sync-folder warning (design D23).
-    match jkb_core::cloud_sync_warning(db_path) {
-        Some(w) => println!("warning: {w}"),
-        None => println!("db location: ok ({})", db_path.display()),
-    }
-
-    Ok(())
 }
 
 // ---- small formatting helpers ---------------------------------------------
@@ -5729,148 +5539,6 @@ fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
-}
-
-/// `jkb task review record` — record that a review ran against a branch (design D38.4).
-fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
-    let TaskReviewCmd::Record {
-        branch,
-        sha,
-        findings,
-    } = cmd;
-    let ctx = repo::repo_ctx()?;
-    let cwd = std::env::current_dir()?;
-    let branch = match branch {
-        Some(b) => b,
-        None => gitrepo::current_branch(&cwd)?
-            .context("not on a branch here (detached HEAD?) — pass --branch")?,
-    };
-    let sha = match sha {
-        Some(s) => Some(s),
-        None => gitrepo::rev(&ctx.root, &branch)?,
-    };
-
-    // Refuse a findings namespace that holds nothing, here, where the caller can still fix it.
-    // A review recorded against an empty namespace is a review whose findings never reached
-    // the KB — a quarantined `tasks.md`, a typo, a namespace renamed since — and the land gate
-    // must never read that as a clean review. It is caught at both ends deliberately: this is
-    // the actionable moment, the gate is the one that must not be bypassed.
-    let found = review::findings_in(db, std::slice::from_ref(&findings))?;
-    anyhow::ensure!(
-        found.total > 0,
-        "no findings found under `{findings}` — nothing was recorded. A review whose findings \
-         never reached the KB must not be recorded as one: check the namespace exists \
-         (`jkb ls {findings}`), that `jkb sync` imported the review's tasks.md, and that it \
-         was not quarantined (`jkb doctor`)."
-    );
-
-    let review::Recording {
-        recorded,
-        skipped_unlanded,
-        unusable,
-    } = review::record(db, &ctx.key, &branch, sha.as_deref(), &findings)?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "branch": branch,
-                "sha": sha,
-                "findings": findings,
-                "tasks": recorded.iter().map(|r| serde_json::json!({
-                    "uid": r.uid, "moved_to_review": r.moved_to_review,
-                })).collect::<Vec<_>>(),
-                "skipped_unlanded": skipped_unlanded,
-                "unusable": unusable,
-            })
-        );
-        return Ok(());
-    }
-    if recorded.is_empty() {
-        // Reviewing an arbitrary range is a legitimate thing to do, so this is a note and
-        // not an error (design D38.4). But "no task records this branch" and "tasks record it
-        // and every one was skipped" are different facts, and printing the first while the
-        // skipped list appears directly beneath it contradicted the very next line.
-        if skipped_unlanded.is_empty() && unusable.is_empty() {
-            println!("no task records branch={branch} — nothing to tag (review still filed)");
-        } else {
-            println!("nothing tagged for branch={branch} — every matching task was skipped, below (review still filed)");
-        }
-    } else {
-        println!(
-            "recorded review of {branch}@{} -> {findings}",
-            sha.as_deref().unwrap_or("unknown")
-        );
-        for r in &recorded {
-            let moved = if r.moved_to_review {
-                " (now needs_review)"
-            } else {
-                ""
-            };
-            println!("  {}{moved}", r.uid);
-        }
-    }
-    // Said out loud for the same reason as the buckets below: silence reads as "everything was
-    // tagged", and a task skipped here is one `task land` will refuse as never reviewed.
-    if !unusable.is_empty() {
-        println!(
-            "not tagged — a recorded branch cannot be handed to git at all, so nothing about them \
-             could be checked (`jkb task tag rm <uid> branch=<value>`):"
-        );
-        for uid in &unusable {
-            println!("  {uid}");
-        }
-    }
-    // Said out loud, because a task landing on this branch whose work is not in it yet has
-    // NOT been reviewed, and silence would read as "everything was tagged".
-    if !skipped_unlanded.is_empty() {
-        println!(
-            "not tagged — landing on {branch}, but jkb has not grafted their work onto it yet, \
-             so this review did not see it:"
-        );
-        for uid in &skipped_unlanded {
-            println!("  {uid}");
-        }
-        println!("  review each in its own session (`/jkb-review-log` there), or land first.");
-    }
-    Ok(())
-}
-
-/// Report — and with `--fix`, sweep — derived-index rows whose item is gone.
-///
-/// A `vec0` virtual table cannot carry a foreign key to `items`, so a deleted item leaves its
-/// vector behind. Since D40 (`items.id AUTOINCREMENT`) that row is **stale, not dangerous** —
-/// the freed id is never reissued, so no new item can inherit its embedding — which is why
-/// this reads as housekeeping rather than corruption, and why nothing sweeps implicitly.
-fn report_vector_index(db: &Db, fix: bool) -> Result<()> {
-    // What counts as one of our derived-index tables, and what counts as stale in one, are
-    // `jkb-index`'s to say — the CLI asks. It used to carry its own copy of both queries,
-    // including the `vec0` shadow-table filter that is the non-obvious part, so `doctor`'s
-    // report and `doctor --fix`'s delete were two statements that had to be kept in step.
-    let tables =
-        db.read_with::<Vec<String>, anyhow::Error, _>(|conn| Ok(jkb_index::vector_tables(conn)?))?;
-    if tables.is_empty() {
-        println!("vector index: no vector table yet");
-    } else if fix {
-        println!(
-            "vector index: removed {} stale row(s)",
-            sweep_stale(db)?.vectors
-        );
-    } else {
-        let stale =
-            db.read_with::<_, anyhow::Error, _>(|conn| Ok(jkb_index::count_stale(conn)?))?;
-        if stale.is_empty() {
-            println!("vector index: ok");
-        } else {
-            println!(
-                "vector index: {} stale row(s) whose item is gone",
-                stale.vectors
-            );
-            println!("  run `jkb index --sweep` (or `jkb doctor --fix`) to remove them");
-        }
-    }
-
     Ok(())
 }
 

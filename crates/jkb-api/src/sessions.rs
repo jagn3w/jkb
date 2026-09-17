@@ -33,7 +33,7 @@ use crate::{ApiError, ErrorCode};
 /// facet value and a transition label.
 pub const MAX_NAME_BYTES: usize = 255;
 
-fn check_name(what: &str, value: &str) -> Result<(), ApiError> {
+pub(crate) fn check_name(what: &str, value: &str) -> Result<(), ApiError> {
     if value.is_empty() || value.len() > MAX_NAME_BYTES || value.chars().any(char::is_control) {
         return Err(ApiError::with_code(
             ErrorCode::Invalid,

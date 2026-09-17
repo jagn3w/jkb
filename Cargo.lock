@@ -1899,6 +1899,7 @@ dependencies = [
  "jkb-core",
  "jkb-embed",
  "jkb-fsm",
+ "jkb-index",
  "jkb-ingest",
  "jkb-search",
  "jkb-sync",

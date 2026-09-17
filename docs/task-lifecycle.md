@@ -728,8 +728,9 @@ coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
   the swarm supplies no value it could get wrong (see the measurement rules under D46). The land
   target cannot be recorded at claim, because at that point the group has no branch and the target
   is a fact about a branch. `staging ls` then shows swarm work and
-  hand-driven work in one view rather than the half it was told about. `/review-log` calls
-  `jkb task review record` after mounting its findings, and says whether the branch can land.
+  hand-driven work in one view rather than the half it was told about. `/review-log` files its
+  findings with `jkb task review file` (tasks, never a mounted file — see `docs/message-queue.md`),
+  calls `jkb task review record`, and says whether the branch can land.
 - **No review gate in `scripts/merge-queue.sh`** — deliberately, and that is the only sense in
   which D38 left it alone (it gained a `jkb task landed` call under D46).
   The swarm already runs a fresh REVIEWER before a group reaches the queue (D27.6) — that *is* its

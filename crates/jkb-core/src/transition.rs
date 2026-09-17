@@ -605,21 +605,35 @@ pub fn reclaim_dead(
     keep: &[String],
     probe: impl Fn(&str) -> Fact,
 ) -> Result<Reclaimed> {
-    let held = claim::claimed(conn)?;
     let mut alive: std::collections::HashMap<String, Fact> = std::collections::HashMap::new();
-    for c in &held {
-        if !alive.contains_key(&c.owner) {
-            let live = if keep.iter().any(|o| o == &c.owner) {
+    reclaim_judged(conn, meta, |c| {
+        *alive.entry(c.owner.clone()).or_insert_with(|| {
+            if keep.iter().any(|o| o == &c.owner) {
                 Fact::Yes
             } else {
                 probe(&c.owner)
-            };
-            alive.insert(c.owner.clone(), live);
-        }
-    }
+            }
+        })
+    })
+}
+
+/// Free every held claim `judge` answers [`Fact::No`] for, through the lifecycle's
+/// `ObservedOwnerGone`, and report the ones it answers [`Fact::Unknown`] for — [`reclaim_dead`]
+/// with the judgement handed in per claim, for a caller whose answer depends on the task as well as
+/// its owner (`jkb-api`'s `task.reclaim`, which leaves alone a task its client may not write).
+///
+/// The claim set is read inside the transaction, so a claim released meanwhile is not touched.
+///
+/// # Errors
+/// Returns a database error if a query fails.
+pub fn reclaim_judged(
+    conn: &Connection,
+    meta: &WriteMeta,
+    mut judge: impl FnMut(&claim::ClaimInfo) -> Fact,
+) -> Result<Reclaimed> {
     let mut out = Reclaimed::default();
-    for c in held {
-        match alive[&c.owner] {
+    for c in claim::claimed(conn)? {
+        match judge(&c) {
             Fact::No => {
                 let facts = TaskFacts {
                     claimant: Some(AgentId::parse(&c.owner)),
