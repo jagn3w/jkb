@@ -4882,3 +4882,53 @@ fn a_container_records_a_pull_request_and_holds_an_unproven_close() {
     assert_eq!(v["held"][0]["pr"], 7, "{v}");
     assert_eq!(f.status_of(&uid), "in_progress");
 }
+
+/// **A pull request found by discovery closes its task in the same run** (stage-5 review, round 6):
+/// `close-merged` records the number it found and the op's history check sees it, through the daemon,
+/// with a stub `gh` answering as GitHub would.
+#[test]
+fn a_discovered_merged_pull_request_closes_its_task_in_one_run() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let bin = f.home.path().join("stub-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pr = r#"{"number":45,"state":"MERGED","mergedAt":"2999-01-01T00:00:00Z","baseRefName":"main","headRefName":"BRANCH"}"#;
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \"$2\" in\n  list) printf '[%s]' '{pr}' ;;\n  view) printf '%s' '{pr}' ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env("PATH", &path)
+            .env_remove("JKB_DB")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap()
+    };
+    let uid = f.add_task("merged elsewhere");
+    let opened = remote(&["--json", "task", "work", &uid]);
+    assert!(opened.status.success(), "{opened:?}");
+    let closed = remote(&["--json", "task", "close-merged"]);
+    assert!(closed.status.success(), "{closed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&closed.stdout).unwrap();
+    assert_eq!(v["closed"][0]["uid"], uid.as_str(), "{v}");
+    assert_eq!(v["closed"][0]["pr"], 45, "{v}");
+    assert_eq!(f.status_of(&uid), "done");
+}

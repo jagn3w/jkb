@@ -313,6 +313,39 @@ pub fn evidence_edges(conn: &Connection, item: ItemId) -> Result<Vec<EvidenceEdg
 }
 
 /// [`evidence_edges`], the `limit` with the largest contribution either way — so a cut keeps the
+/// decisive contradictions as well as the decisive support — ordered as [`evidence_edges`] orders, and
+/// whether there were more, from one statement.
+///
+/// # Errors
+/// As [`evidence_edges`].
+pub fn evidence_edges_capped(
+    conn: &Connection,
+    item: ItemId,
+    limit: usize,
+) -> Result<(Vec<EvidenceEdge>, bool)> {
+    let mut edges = evidence_edges_limited(conn, item, limit.saturating_add(1))?;
+    let cut = edges.len() > limit;
+    if cut {
+        // The row the magnitude order ranks last: the smallest contribution, the highest source id
+        // among equals.
+        if let Some(weakest) = edges
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.contribution
+                    .abs()
+                    .total_cmp(&b.contribution.abs())
+                    .then(b.src.get().cmp(&a.src.get()))
+            })
+            .map(|(i, _)| i)
+        {
+            edges.remove(weakest);
+        }
+    }
+    Ok((edges, cut))
+}
+
+/// [`evidence_edges`], the `limit` with the largest contribution either way — so a cut keeps the
 /// decisive contradictions as well as the decisive support — ordered as [`evidence_edges`] orders.
 ///
 /// # Errors
@@ -439,15 +472,13 @@ pub fn walk_limited(
                 // A node's edges are read a page at a time, in id order through the (endpoint, id)
                 // indexes (V021), until they run out or the walk is full. Paged rather than cut by one
                 // LIMIT, because one neighbour can be several edges (one per type) and a cut by rows
-                // dropped neighbours unseen. A page holds what the walk can still use plus as many rows
-                // as it has seen, so edges to already-seen items rarely cost a page of their own; a hub
-                // whose edges all lead to seen items still costs its degree, read in index order.
+                // dropped neighbours unseen. A hub whose edges all lead to seen items still costs its
+                // degree, read in index order a page at a time.
                 let mut after = 0_i64;
                 loop {
-                    let page = limit
-                        .saturating_sub(out.len())
-                        .saturating_add(seen.len())
-                        .saturating_add(1);
+                    // Enough for the walk to fill up even if every row it has already seen comes
+                    // first: `seen` is `out` plus the start, so this is the cap plus two.
+                    let page = limit.saturating_add(2);
                     let rows = neighbours(conn, node, types, *leg, after, page)?;
                     let Some((last, ..)) = rows.last() else { break };
                     after = *last;

@@ -203,17 +203,26 @@ pub(crate) fn close_merged(
     );
     // Finished tasks are left out by the op: the `post-merge` hook runs this on every `git pull`.
     let mut verdicts = Vec::new();
+    let mut failed = 0;
     for uid in kb.open_in_repo(&repo)? {
         // One task's failure — deleted while `gh` ran for the others, say — is that task's verdict,
-        // not the run's: the rest still close.
-        let verdict = close_one(kb, &ctx.root, &uid, dry_run).unwrap_or_else(|e| CloseVerdict {
-            uid: uid.clone(),
-            pr: None,
-            held: Some(format!("{e:#}")),
+        // and the rest still close. The run still fails at the end, so a failure that was the run's
+        // (the daemon gone) is not reported as a quiet hold.
+        let verdict = close_one(kb, &ctx.root, &uid, dry_run).unwrap_or_else(|e| {
+            failed += 1;
+            CloseVerdict {
+                uid: uid.clone(),
+                pr: None,
+                held: Some(format!("could not be decided: {e:#}")),
+            }
         });
         verdicts.push(verdict);
     }
     report(&verdicts, dry_run, json);
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} task(s) could not be decided (listed above); the rest were"
+    );
     Ok(())
 }
 

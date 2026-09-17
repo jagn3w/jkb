@@ -179,3 +179,41 @@ fn a_rooted_move_is_bounded() {
         assert_eq!(e.code, ErrorCode::Forbidden, "{root}: {e:?}");
     }
 }
+
+/// A client's move that would leave a filed task's line unreadable is refused and moves nothing; a line
+/// that was already unreadable does not block it.
+#[test]
+fn a_rooted_move_is_held_to_the_lines_it_rewrites() {
+    let (db, _inside, ..) = crate::tests::mutate_fixture();
+    let host = LocalBackend::new(db.clone());
+    let rooted = crate::tests::rooted(&db);
+    // Filed in repos/in's tasks.md, and also placed under `scratch`, which its line carries.
+    let placed = match call(
+        &host,
+        json!({ "op": "task.add", "text": "placed +repos/in" }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    call(
+        &host,
+        json!({ "op": "task.place", "uid": placed, "ns": "scratch" }),
+    )
+    .unwrap();
+    let e = call(
+        &rooted,
+        json!({ "op": "ns.mv", "from": "scratch", "to": "scr atch" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert!(e.message.contains("would not come back"), "{e:?}");
+    assert!(list(&rooted, None).contains(&"scratch".to_owned()));
+    // A move that keeps the line readable goes through.
+    call(
+        &rooted,
+        json!({ "op": "ns.mv", "from": "scratch", "to": "scratch2" }),
+    )
+    .unwrap();
+}
