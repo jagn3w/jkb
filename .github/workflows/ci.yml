@@ -21,6 +21,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The SAME code check.sh runs, not a second copy of the list: the two hand-written
+      # copies drifted by a `*.md` skip within one commit of each other — green locally, red
+      # here, on the same tree. A broken PreToolUse hook is the sharp case: bash exits 2 on a
+      # syntax error and a PreToolUse hook exiting 2 reads as DENY, so it does not fail open
+      # the way its header promises.
+      - name: shell syntax
+        run: bash -c '. scripts/lib.sh; check_shell_syntax "$PWD"'
+
+      # setup.sh's installs are not reachable from a Rust test, and one of them replaces the
+      # very hook that runs it. No `-e` guard on the glob, unlike check.sh: here, finding no
+      # tests is a failure.
+      - name: shell tests
+        run: for t in scripts/tests/*.test.sh; do bash "$t"; done
+
       # The workspace pulls heavy transitive deps (fastembed/ONNX, headless_chrome,
       # rav1e/image) and builds them twice (default + --features fastembed) plus a
       # --all-features cargo-deny graph, which overflows the runner's ~14 GB free disk
@@ -295,3 +309,9 @@ jobs:
       # a clean checkout nothing produces that .d.ts and the adapter cannot resolve it.)
       - name: build (type-checks)
         run: pnpm run build
+
+      # The adapter's tests. They bundle the module under test themselves (with `vscode`
+      # stubbed), so they need no VS Code and no dist — but they do need a node new enough
+      # for `node --test`, which is why this job pins one rather than taking the runner's.
+      - name: test
+        run: pnpm run test

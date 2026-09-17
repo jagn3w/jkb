@@ -96,7 +96,7 @@ n_declared="$(printf '%s\n' "$declared_pairs" | grep -c . || true)"
 if [ "$n_declared" -eq 0 ]; then
     bad "no --security-opt pairs could be read out of container.json's runArgs — every check over them below would pass having compared nothing"
 fi
-declares_security_opt() { printf '%s\n' "$declared_pairs" | grep -qxF -- "$1"; }
+declares_security_opt() { grep -qxF -- "$1" <<<"$declared_pairs"; }
 
 # WHAT IS DECLARED is a different question from what the control carries, and both are asked. This
 # one goes red when the profile is removed from container.json; the control guard below cannot,
@@ -321,6 +321,24 @@ fi
 # container healthy. The rule is generic — the path every site names must be the same one, and it
 # must fall under a posture write root — so a future edit to any single site is caught here rather
 # than by a build dying inside a container.
+# EVERY named volume's target must be pre-created in the Dockerfile, not just CARGO_TARGET_DIR's.
+# The rule was checked for that one path, and the next volume added (jkb-kb-local, for the
+# container-local knowledge base, since retired) skipped it: Docker created it root-owned and `jkb` could not
+# create its database. A rule checked for one call site is a rule the next one forgets.
+precreated="$(awk '/^RUN mkdir -p /{on=1} on{print} on&&!/\\$/{on=0}' "$here/Dockerfile" \
+    | tr ' \\' '\n\n' | grep '^/' | sort -u)"
+unprecreated=()
+while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ "$(dc_type_for_target "$here/container.json" "$t")" = volume ] || continue
+    grep -qx "$t" <<<"$precreated" || unprecreated+=("$t")
+done <<<"$mount_targets"
+if [ ${#unprecreated[@]} -eq 0 ]; then
+    ok "every named volume's target is pre-created in the Dockerfile"
+else
+    bad "Dockerfile does not pre-create volume target(s) ${unprecreated[*]} — Docker creates them root-owned and the container user cannot write them"
+fi
+
 posture="$here/../scripts/auto-mode-posture.json"
 user="$(jq -r '.remoteUser // "root"' <<<"$dc")"
 home="/home/$user"
@@ -450,28 +468,18 @@ else
     bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
 fi
 
-# ...AND THE IDIOM THAT MADE THAT GUARD LIE, refused everywhere rather than fixed at the one site.
-# `dc_strip_comments <file> | grep -q <pat>` is the natural way to ask "does this script contain
-# X", and it is a race: grep -q exits at the first match, sed dies on the unwritten tail with
-# EPIPE, and `set -o pipefail` reports the SUCCESSFUL match as a failed pipeline. It passed on
-# macOS and failed on the CI runner for identical bytes, accusing run.sh of not invoking verify.sh
-# while the invocation sat at byte 23501 of 25810.
+# ...AND THE IDIOM THAT MADE THAT GUARD LIE is refused for the whole repository, in
+# `scripts/tests/dev-scripts.test.sh`, not here. The scan that stood in this place covered
+# `"$here"/*.sh` and matched only the `dc_strip_comments | grep -q` spelling, so it could not
+# have caught the instance that shipped in `scripts/hooks/post-merge` — a different spelling in a
+# directory it did not read. Two half-guards with the bug in the gap between them is what this
+# repository's doc rules call the defect; one home, one glob (`shell_sources`, 41 files across all
+# five script directories), one message.
 #
-# THE PATTERN IS ASSEMBLED FROM TWO HALVES so this guard does not match its own source line -- a
-# check that fails on itself is the first thing a reader deletes. Narrow ON PURPOSE: it covers the
-# dc_strip_comments idiom, which is the one that recurs here, and NOT every file-reader piped into
-# grep -q. `printf "$var" | grep -q` is safe (a single write completes before grep can exit), so a
-# blanket rule would be mostly false positives. Stated rather than implied: this does not cover the
-# whole class, only the shape that has bitten.
-racy_lhs='dc_strip_comments[^|]*'
-racy_rhs='[[:space:]]*grep[[:space:]]+-[a-zA-Z]*q'
-racy="$(printf '%s\\|%s' "$racy_lhs" "$racy_rhs")"
-racy_hits="$(grep -nE "$racy" "$here"/*.sh 2>/dev/null | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)"
-if [ -z "$racy_hits" ]; then
-    ok "no script pipes dc_strip_comments into grep -q (that race reports a found match as a failure)"
-else
-    bad "a script pipes dc_strip_comments into grep -q — grep -q exits at the first match and sed dies on the tail, so under pipefail a SUCCESSFUL match reports as a failed pipeline (use stripped_matches): $(printf '%s' "$racy_hits" | head -2 | tr '\n' ' ')"
-fi
+# Its narrowing argument is also corrected there: this block exempted `printf "$var" | grep -q` as
+# "a single write, safe", and post-merge was exactly that shape. Measured, bash 5.2.21, 30 trials:
+# 0/30 failures at 16 KB and 28-30/30 at 32-82 KB, with `pipefail` set and 0/30 without it at any
+# size. The deciding condition is `pipefail`, not the producer.
 
 # THE ENTRYPOINT LINE ITSELF. `ENTRYPOINT [\"/usr/local/bin/entrypoint.sh\"]` appears exactly once
 # and was referenced by no check: delete it in a rebase or a base-image bump and the build
@@ -520,6 +528,143 @@ else
         done
     done
     [ "$states_ok" -eq 1 ] && ok "both readers handle every verdict state ($verdict_states)"
+fi
+
+# THE HOST DAEMON'S OPENING (design r3.2 H5), four properties no container is needed to read.
+#
+# `repo_top`, not `root`: `root` is reassigned by the allowWrite loop above, and a check reading it
+# here would look for the daemon's source under a posture path and report the port unreadable.
+repo_top="$(cd "$here/.." && pwd)"
+
+# 1. verify.sh handles every daemon state — the VERDICT_STATES rule, for the second vocabulary.
+daemon_states="$(grep -oE '^(readonly )?DAEMON_STATES="[^"]*"' "$here/egress-lib.sh" 2>/dev/null \
+                 | head -1 | sed 's/.*="//; s/"$//')"
+if [ -z "$daemon_states" ]; then
+    bad "egress-lib.sh no longer declares DAEMON_STATES — the check that verify.sh handles every daemon state is now checking nothing"
+else
+    dstates_ok=1
+    for st in $daemon_states; do
+        grep -qE "^[[:space:]]*(\*\|)?$st\)" "$here/verify.sh" 2>/dev/null \
+            || { bad "verify.sh has no case arm for the '$st' daemon state — it would report it as unestablished"; dstates_ok=0; }
+    done
+    [ "$dstates_ok" -eq 1 ] && ok "verify.sh handles every daemon state ($daemon_states)"
+fi
+
+# 2. The port the firewall opens is the port the daemon binds. Two spellings in two languages, so
+#    one is read out of each and compared; an empty read on either side is a failure, never a match.
+fw_port="$(grep -oE '^DAEMON_PORT=[0-9]+$' "$here/egress-lib.sh" 2>/dev/null | head -1 | cut -d= -f2)"
+rs_port="$(grep -oE 'DEFAULT_ADDR: &str = "127\.0\.0\.1:[0-9]+"' "$repo_top/crates/jkb-daemon/src/lib.rs" 2>/dev/null \
+           | head -1 | sed 's/.*://; s/"$//')"
+if [ -z "$fw_port" ] || [ -z "$rs_port" ]; then
+    bad "could not read the daemon port from both egress-lib.sh (DAEMON_PORT='$fw_port') and jkb-daemon's DEFAULT_ADDR ('$rs_port') — the check that the firewall opens the port jkb serve binds is checking nothing"
+elif [ "$fw_port" != "$rs_port" ]; then
+    bad "egress-lib.sh opens DAEMON_PORT=$fw_port but jkb serve binds $rs_port (crates/jkb-daemon/src/lib.rs) — the container could not reach the daemon"
+else
+    ok "the firewall opens the port jkb serve binds ($fw_port)"
+fi
+
+# 2b. The daemon's file root is the container's bind. A task write from the container may have the
+#    host's sync write a file only under $HOME/<CLIENT_FILE_ROOT> (jkb-daemon), because that is the
+#    host directory the container sees — which is true only while container.json binds exactly that
+#    directory at the same place under the container's home. Read out of the Rust source, not copied.
+client_root="$(grep -oE 'pub const CLIENT_FILE_ROOT: &str = "[^"]+"' "$repo_top/crates/jkb-daemon/src/lib.rs" 2>/dev/null \
+               | head -1 | sed 's/.*"\(.*\)"$/\1/')"
+bind_srcs="$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*$//p')"
+if [ -z "$client_root" ]; then
+    bad "could not read CLIENT_FILE_ROOT from crates/jkb-daemon/src/lib.rs — the check that the daemon admits file-backed writes only where the container can see is checking nothing"
+elif ! grep -qxF "\${localEnv:HOME}/$client_root" <<<"$bind_srcs" || ! grep -qxF "/home/vscode/$client_root" <<<"$mount_targets"; then
+    bad "jkb serve admits a client's file-backed task writes under \$HOME/$client_root (CLIENT_FILE_ROOT), but container.json does not bind \${localEnv:HOME}/$client_root at /home/vscode/$client_root — the daemon would judge a directory the container does not see"
+else
+    ok "the daemon's client file root is the directory the container binds (~/$client_root)"
+fi
+
+# 3. The nested sandbox can reach it: its proxy tunnels only to allowedDomains, and the firewall
+#    keeps that same entry out of the IP allowlist by address, so the one entry serves both layers.
+fw_host="$(grep -oE '^DAEMON_HOST=[A-Za-z0-9.-]+$' "$here/egress-lib.sh" 2>/dev/null | head -1 | cut -d= -f2)"
+if [ -z "$fw_host" ]; then
+    bad "egress-lib.sh no longer declares DAEMON_HOST — the check that the sandbox may reach the daemon is checking nothing"
+elif jq -e --arg h "$fw_host" '.require.sandbox.network.allowedDomains | index($h)' \
+        "$repo_top/scripts/auto-mode-posture.json" >/dev/null 2>&1; then
+    ok "the posture lets the nested sandbox's proxy reach the host daemon ($fw_host)"
+else
+    bad "scripts/auto-mode-posture.json's allowedDomains does not name $fw_host — jkb run from Bash in the nested sandbox could not reach the host daemon"
+fi
+
+# 3b. A Linux engine resolves that name only through --add-host, so the pinned flag must name the
+#     host the firewall looks up; a rename on one side leaves CI's raise `unresolved` with every
+#     static gate green.
+dc_args_h="$(dc_run_args "$here/container.json" "$repo_top" 2>/dev/null)" || dc_args_h=""
+add_host="$(sed -n 's/^--add-host=\([^:]*\):host-gateway$/\1/p' <<<"$dc_args_h" | head -1)"
+if [ -z "$add_host" ]; then
+    bad "container.json's runArgs pin no --add-host=<name>:host-gateway — a Linux engine would not resolve ${fw_host:-the daemon host}, and the firewall's daemon rule would hold no address"
+elif [ "$add_host" != "${fw_host:-}" ]; then
+    bad "container.json pins --add-host for $add_host but egress-lib.sh looks up DAEMON_HOST=${fw_host:-<unread>} — on a Linux engine the daemon rule would hold no address"
+else
+    ok "the pinned --add-host names the host the firewall looks up ($add_host)"
+fi
+
+# 4. VS Code does not forward the daemon's port. Measured on the Mac, 2026-09-14: after something in
+#    here listened on 7117, VS Code held the HOST'S 127.0.0.1:7117, so com.jkb.serve crash-looped on
+#    EADDRINUSE and connections hung. Attaching reads no `portsAttributes` from this file, so it is
+#    carried as the `devcontainer.metadata` label on the container, which attaching does read.
+dc_args="$(dc_run_args "$here/container.json" "$repo_top" 2>/dev/null)" || dc_args=""
+dc_meta="$(grep -A1 -xF -- '--label' <<<"$dc_args" | sed -n 's/^devcontainer\.metadata=//p' | head -1)"
+if [ -z "$dc_meta" ]; then
+    bad "container.json's runArgs carry no devcontainer.metadata label — VS Code would auto-forward the daemon port and take the host's 127.0.0.1:${fw_port:-7117} from com.jkb.serve"
+elif jq -e --arg p "${fw_port:-}" 'any(.[]; .portsAttributes[$p].onAutoForward == "ignore")' <<<"$dc_meta" >/dev/null 2>&1; then
+    ok "VS Code is told not to forward the daemon port (${fw_port})"
+else
+    bad "the devcontainer.metadata label does not set portsAttributes.\"${fw_port:-?}\".onAutoForward to ignore — VS Code would auto-forward the daemon port and take the host's 127.0.0.1:${fw_port:-?} from com.jkb.serve"
+fi
+
+# 5. The container is in remote mode, at the address the firewall opens (tasks S6.5). Every `jkb` in
+#    here and the notification hook reach the daemon through REMOTE_VAR; without it the hook looks
+#    on the container's OWN loopback — where nothing listens, so every notification is lost with
+#    nothing on screen to say so — and every other command opens a database of its own. Held to
+#    the same two constants the firewall reads, not to a copy of them — and the variable's NAME is
+#    read out of the binary's source, because the hook's address drifted once (JKB_DAEMON_URL in
+#    the code, nothing in the config) with every check here green.
+dc_env="$(dc_container_env "$here/container.json" "$repo_top" 2>/dev/null)" || dc_env=""
+remote_var="$(grep -oE 'pub const REMOTE_VAR: &str = "[A-Z_]+"' "$repo_top/crates/jkb-cli/src/remote.rs" 2>/dev/null \
+    | head -1 | sed 's/.*"\([A-Z_]*\)"/\1/')"
+daemon_addr="$( [ -n "$remote_var" ] && sed -n "s/^$remote_var=//p" <<<"$dc_env" | head -1)"
+if [ -z "$remote_var" ]; then
+    bad "could not read REMOTE_VAR from crates/jkb-cli/src/remote.rs — the check that the container is in remote mode is checking nothing"
+elif [ -z "$daemon_addr" ]; then
+    bad "container.json's containerEnv sets no $remote_var (the variable that switches remote mode on) — jkb in the container would open a database of its own, and the notification hook would look for jkb serve on the container's own loopback"
+elif [ "$daemon_addr" != "${fw_host:-?}:${fw_port:-?}" ]; then
+    bad "container.json's $remote_var is $daemon_addr but the firewall opens ${fw_host:-<unread>}:${fw_port:-<unread>} (egress-lib.sh) — every jkb command and notification would be refused"
+else
+    ok "remote mode is pointed at the address the firewall opens ($daemon_addr)"
+fi
+
+# 6. ...and nothing gives it a database of its own. Remote mode refuses JKB_DB outright, so one left
+#    in containerEnv fails every command; and a volume at the old container-local KB's path keeps a
+#    second knowledge base alive for anything that is not jkb to write into.
+if grep -q '^JKB_DB=' <<<"$dc_env"; then
+    bad "container.json's containerEnv sets JKB_DB — remote mode refuses every jkb command with JKB_DB set, and the container must not name a database"
+elif [ -n "$dc_env" ]; then
+    ok "the container names no database of its own (no JKB_DB)"
+fi
+# JKB_VERIFY_NO_DAEMON is for a harness with no host daemon behind it (mutate-verify.sh). Declared
+# here it turns "no jkb command in this container can reach the knowledge base" into a note in the
+# real container, so it is refused. (An empty containerEnv already fails section 5.)
+# Every place the image or the launcher can set a variable: containerEnv, runArgs, the Dockerfile.
+if grep -q '^JKB_VERIFY_NO_DAEMON=' <<<"$dc_env"; then
+    bad "container.json's containerEnv sets JKB_VERIFY_NO_DAEMON — that is the mutation harness's statement that no host daemon exists, and in the real container it hides a knowledge base nothing can reach"
+elif grep -q 'JKB_VERIFY_NO_DAEMON' <<<"$dc_args"; then
+    bad "container.json's runArgs set JKB_VERIFY_NO_DAEMON — the mutation harness's waiver, which in the real container hides a knowledge base nothing can reach"
+elif grep -qE '^[[:space:]]*(ENV|ARG)[[:space:]].*JKB_VERIFY_NO_DAEMON' "$here/Dockerfile"; then
+    bad "the Dockerfile sets JKB_VERIFY_NO_DAEMON — the mutation harness's waiver, baked into every container"
+elif [ -n "$dc_env" ] && [ -n "$dc_args" ]; then
+    ok "the container does not waive the daemon check (no JKB_VERIFY_NO_DAEMON)"
+fi
+# By source name AND by target: a renamed volume at the old path is the same second database.
+if grep -q '^jkb-kb-local|' <<<"$(dc_mount_sources "$here/container.json")" \
+    || grep -qx '/home/vscode/.local/state/jkb' <<<"$mount_targets"; then
+    bad "container.json still mounts the container-local knowledge base (jkb-kb-local, or a mount at /home/vscode/.local/state/jkb) — it was retired at the cutover (tasks S6.5)"
+else
+    ok "the retired container-local knowledge base volume is not mounted"
 fi
 
 # THE PROBE LOOKS FOR THE RULE THE RAISE INSTALLS. init-firewall.sh installs the chain with
@@ -666,7 +811,7 @@ while IFS= read -r hit; do
     case "$line" in
         *'#'*dc_require_apparmor_profile*) continue ;;   # prose about it, not a call
     esac
-    if ! printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="\$\(dc_require_apparmor_profile '; then
+    if ! grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="\$\(dc_require_apparmor_profile ' <<<"$line"; then
         bad "$f:$n calls dc_require_apparmor_profile somewhere its \`exit 1\` cannot stop the script — it must be a plain assignment (\`name=\"\$(dc_require_apparmor_profile …)\"\`), or the empty name it refuses reaches docker as \`apparmor=\`, which is docker-default"
         shape_ok=0
     fi
@@ -827,7 +972,7 @@ for f in "$here"/*.sh; do
 done
 [ "${#callers[@]}" -gt 0 ] || bad "no script here calls init-firewall.sh — the derivation below is checking nothing"
 for want in setup.sh run.sh entrypoint.sh; do
-    printf '%s\n' "${callers[@]##*/}" | grep -qxF "$want" \
+    grep -qxF "$want" <<<"$(printf '%s\n' "${callers[@]##*/}")" \
         || bad "$want no longer reaches the firewall-argument guard (did it stop calling init-firewall.sh?)"
 done
 for caller in ${callers[@]+"${callers[@]}"}; do

@@ -5,55 +5,52 @@
 //! async runtime — then wraps the JSON result in a `CallToolResult`. `jkb-core`
 //! errors become MCP `ErrorData` (client-input errors → `invalid_params`).
 
-use std::sync::Arc;
-
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
-use serde_json::Value;
-
-use jkb_core::Db;
-use jkb_types::Embedder;
 
 use crate::error::{Error, Result as LogicResult};
 use crate::logic::{
     self, GetContextArgs, IngestArgs, QueryArgs, RunViewArgs, SearchArgs, TaskCreateArgs,
-    TaskUpdateArgs,
+    TaskUpdateArgs, Tools,
 };
 
-type Embed = Arc<dyn Embedder + Send + Sync>;
-
-/// The jkb MCP server: shares the CLI's [`Db`] and embedder.
+/// The jkb MCP server: every tool an operation on the backend the CLI chose ([`Tools`]).
 ///
 /// `#[tool_handler]` calls the generated `Self::tool_router()` per request, so the
 /// router is not stored on the struct.
 pub struct JkbServer {
-    db: Db,
-    embedder: Embed,
+    tools: Tools,
 }
 
 impl JkbServer {
-    /// Build a server over `db` and `embedder`.
+    /// Build a server over `tools`.
     #[must_use]
-    pub fn new(db: Db, embedder: Embed) -> Self {
-        Self { db, embedder }
+    pub const fn new(tools: Tools) -> Self {
+        Self { tools }
     }
 
     /// Run blocking logic `f` on a worker thread and wrap its JSON as a tool result.
     async fn run<F>(&self, f: F) -> Result<CallToolResult, ErrorData>
     where
-        F: FnOnce(Db, Embed) -> LogicResult<Value> + Send + 'static,
+        F: FnOnce(Tools) -> LogicResult<logic::Answer> + Send + 'static,
     {
-        let db = self.db.clone();
-        let embedder = self.embedder.clone();
-        let out = tokio::task::spawn_blocking(move || f(db, embedder))
+        let tools = self.tools.clone();
+        let out = tokio::task::spawn_blocking(move || f(tools))
             .await
             .map_err(|e| ErrorData::internal_error(format!("worker task failed: {e}"), None))?;
-        match out {
-            Ok(value) => Ok(CallToolResult::success(vec![ContentBlock::json(value)?])),
-            Err(err) => Err(to_error_data(&err)),
-        }
+        out.map_err(|err| to_error_data(&err)).and_then(tool_result)
     }
+}
+
+/// A tool's answer as MCP content: its JSON, and a note when it was cut short, so an agent never reads
+/// a partial list as every match.
+fn tool_result(answer: logic::Answer) -> Result<CallToolResult, ErrorData> {
+    let mut content = vec![ContentBlock::json(answer.value)?];
+    if answer.truncated {
+        content.push(ContentBlock::text(logic::TRUNCATED_NOTE));
+    }
+    Ok(CallToolResult::success(content))
 }
 
 /// Map a logic error to MCP error data: client-input errors are `invalid_params`,
@@ -70,11 +67,10 @@ fn to_error_data(err: &Error) -> ErrorData {
 impl JkbServer {
     /// Search the knowledge base.
     #[tool(
-        description = "Search the knowledge base (routes: vector, fts, hybrid). Returns ranked items with namespace path and source document for citation."
+        description = "Search the knowledge base (routes: vector, fts, hybrid; hybrid by default where the server embeds, and only fts in the dev container). Returns ranked items with namespace path and source document for citation."
     )]
     async fn search(&self, params: Parameters<SearchArgs>) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, embedder| logic::search(&db, &embedder, &params.0))
-            .await
+        self.run(move |t| logic::search(&t, &params.0)).await
     }
 
     /// Expand a hit into its neighbouring chunks.
@@ -85,8 +81,7 @@ impl JkbServer {
         &self,
         params: Parameters<GetContextArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, embedder| logic::get_context(&db, &embedder, &params.0))
-            .await
+        self.run(move |t| logic::get_context(&t, &params.0)).await
     }
 
     /// Structured query over the item substrate.
@@ -94,19 +89,19 @@ impl JkbServer {
         description = "Run a structured query (DSL: kind:, status:, ns:.../**, tag:, is:ready, ...) and return matching items."
     )]
     async fn query(&self, params: Parameters<QueryArgs>) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::query(&db, &params.0)).await
+        self.run(move |t| logic::query(&t, &params.0)).await
     }
 
     /// List saved views.
     #[tool(description = "List saved views (named queries).")]
     async fn list_views(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::list_views(&db)).await
+        self.run(move |t| logic::list_views(&t)).await
     }
 
     /// Run a saved view.
     #[tool(description = "Run a saved view by name and return its items.")]
     async fn run_view(&self, params: Parameters<RunViewArgs>) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::run_view(&db, &params.0)).await
+        self.run(move |t| logic::run_view(&t, &params.0)).await
     }
 
     /// The ready-frontier tasks.
@@ -114,31 +109,30 @@ impl JkbServer {
         description = "List the ready task frontier (unblocked, non-terminal), ordered by priority then due. Optional DSL scope/tags."
     )]
     async fn task_next(&self, params: Parameters<QueryArgs>) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::task_next(&db, &params.0))
-            .await
+        self.run(move |t| logic::task_next(&t, &params.0)).await
     }
 
     /// Ingest a local file (audited).
     #[tool(
-        description = "Ingest a local file into the KB (captured + embedded via the audited pipeline)."
+        description = "Ingest a local file into the KB (captured, and embedded where the server embeds, via the audited pipeline)."
     )]
     async fn ingest_path(
         &self,
         params: Parameters<IngestArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, embedder| logic::ingest_path(&db, &embedder, &params.0))
+        self.run(move |t| logic::ingest(&t, &params.0, logic::SourceKind::Path))
             .await
     }
 
     /// Ingest a URL (rendered via a headless browser).
     #[tool(
-        description = "Ingest a URL into the KB. The page is rendered in a headless browser (JavaScript runs) before its text is captured + embedded via the audited pipeline."
+        description = "Ingest a URL into the KB. The page is rendered in a headless browser (JavaScript runs) where the server runs, and its text is captured, and embedded where the server embeds, via the audited pipeline."
     )]
     async fn ingest_url(
         &self,
         params: Parameters<IngestArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, embedder| logic::ingest_url(&db, &embedder, &params.0))
+        self.run(move |t| logic::ingest(&t, &params.0, logic::SourceKind::Url))
             .await
     }
 
@@ -150,8 +144,7 @@ impl JkbServer {
         &self,
         params: Parameters<TaskCreateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::task_create(&db, &params.0))
-            .await
+        self.run(move |t| logic::task_create(&t, &params.0)).await
     }
 
     /// Update a task's status/priority/due (audited).
@@ -162,8 +155,7 @@ impl JkbServer {
         &self,
         params: Parameters<TaskUpdateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |db, _| logic::task_update(&db, &params.0))
-            .await
+        self.run(move |t| logic::task_update(&t, &params.0)).await
     }
 }
 
@@ -185,7 +177,25 @@ impl ServerHandler for JkbServer {
 
 #[cfg(test)]
 mod tests {
-    use super::JkbServer;
+    use super::{tool_result, JkbServer};
+
+    /// A cut answer carries the note; a whole one does not.
+    #[test]
+    fn a_cut_answer_is_marked_to_the_agent() {
+        for truncated in [true, false] {
+            let result = tool_result(crate::logic::Answer {
+                value: serde_json::json!([]),
+                truncated,
+            })
+            .unwrap();
+            let text = serde_json::to_string(&result).unwrap();
+            assert_eq!(
+                text.contains(crate::logic::TRUNCATED_NOTE),
+                truncated,
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn tool_router_advertises_all_tools() {

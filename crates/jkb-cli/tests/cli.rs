@@ -12,10 +12,26 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+mod common;
+use common::isolate_git_env;
+
 /// A `jkb` invocation against database `db`.
 fn jkb(db: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("jkb").unwrap();
+    let mut cmd = jkb_bare();
     cmd.arg("--db").arg(db);
+    cmd
+}
+
+/// A `jkb` invocation naming no database — for remote mode, which refuses `--db`. The one place
+/// this file spawns `jkb`, so the isolation below covers every invocation.
+fn jkb_bare() -> Command {
+    let mut cmd = Command::cargo_bin("jkb").unwrap();
+    // jkb spawns git, and these tests inherit the developer's shell, so an exported `GIT_DIR`
+    // reached every one of those spawns through this process. This fixture had NO isolation at
+    // all — invisible to the crate-wide guard, which keyed on `Command::new(` while this builds
+    // its process with `cargo_bin`. Pinned by `the_cli_fixture_does_not_inherit_a_repository`.
+    isolate_git_env(&mut cmd);
+    common::isolate_remote_env(&mut cmd);
     // Pin the host these tests' owner ids are compared against. A `host:<pid>` owner is only
     // probed for liveness on the host that issued it — a pid means nothing without one, and
     // `~/.jkb` is shared across the container boundary on purpose — so `host:1234` has to name
@@ -663,8 +679,15 @@ fn sync_with_no_mounts_is_a_clean_noop() {
 fn help_advertises_the_mcp_subcommand() {
     // `mcp` now launches the stdio server (covered by jkb-mcp's own tests); here we
     // just confirm the CLI advertises it rather than blocking a test on stdio I/O.
-    Command::cargo_bin("jkb")
-        .unwrap()
+    //
+    // Through the fixture, not a bare `cargo_bin`. It was the one `jkb` spawn in this file
+    // inheriting the developer's whole git environment, and it bought that with an entry in
+    // `NOT_REPO_AWARE` — an exemption that keys on the ENCLOSING FUNCTION, so it would have
+    // covered any spawn later added to this body, and whose stated reason ("clap exits inside
+    // `parse()` before `run()`") nothing checks. One line of isolation costs less than an
+    // allowlist entry that has to stay true.
+    let tmp = TempDir::new().unwrap();
+    jkb(&tmp.path().join("help.db"))
         .arg("--help")
         .assert()
         .success()
@@ -1005,6 +1028,49 @@ fn item_show_bounds_the_preview() {
         .success()
         .stdout(predicate::str::contains("\"content_chars\": 500"))
         .stdout(predicate::str::contains("\"preview_truncated\": true"));
+}
+
+/// `jkb item edit` and `jkb task edit` share one edit rule: on an item filed in a tasks.md a result
+/// that would not read back is refused, and an append joins with one newline.
+#[test]
+fn item_edit_holds_a_tasks_md_item_to_the_task_edit_rule() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = dir.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir_all(&repo).unwrap();
+    jkb(&db)
+        .args([
+            "mount",
+            "create",
+            "repos/proj",
+            repo.to_str().unwrap(),
+            "--serializer",
+            "tasks",
+        ])
+        .assert()
+        .success();
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "filed +repos/proj"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uid = v["uid"].as_str().unwrap().to_owned();
+    assert_cmd::Command::from_std(jkb(&db))
+        .args(["item", "edit", &uid, "--stdin"])
+        .write_stdin("filed\n\ndetached")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("would not come back"));
+    jkb(&db)
+        .args(["item", "edit", &uid, "--append", "more"])
+        .assert()
+        .success();
+    let shown = jkb(&db)
+        .args(["--json", "task", "show", &uid])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(v["content"], "filed\nmore", "{v}");
 }
 
 #[test]
@@ -2115,6 +2181,24 @@ fn blob_archive_recovers_a_previous_version_of_a_synced_file() {
         .failure()
         .stderr(predicate::str::contains("no blob with hash prefix"));
 
+    // Bytes that are not text come back as they are, on the host: the archive holds ingested
+    // PDFs too, and `blob cat > file` is how one is recovered.
+    let binary = vec![0x25, 0x50, 0xff, 0xfe, 0x00, 0x0a];
+    let bin_hash = jkb_core::blob::hash_bytes(&binary);
+    {
+        let store = jkb_core::Db::open(&db).unwrap();
+        let (h, b) = (bin_hash.clone(), binary.clone());
+        store
+            .write_txn("t", move |c, _| jkb_core::blob::store(c, &h, &b, None))
+            .unwrap();
+    }
+    let raw = jkb(&db)
+        .args(["blob", "cat", &bin_hash[..16]])
+        .output()
+        .unwrap();
+    assert!(raw.status.success(), "{raw:?}");
+    assert_eq!(raw.stdout, binary);
+
     // `jkb history` lists that file's settled versions, newest first.
     jkb(&db)
         .args(["history", file.to_str().unwrap()])
@@ -2874,4 +2958,1574 @@ fn sync_keeps_two_tasks_files_in_one_directory_apart() {
         !after.contains("do it"),
         "design.md was given tasks.md's items: {after}"
     );
+}
+
+/// The fixture above must not hand the developer's repository selection to the `jkb` it spawns,
+/// and thence to every `git` that `jkb` spawns. Named at THIS call site, not at
+/// `isolate_git_env`: a test of the helper alone stayed green with the call deleted.
+#[test]
+fn the_cli_fixture_does_not_inherit_a_repository() {
+    let tmp = TempDir::new().unwrap();
+    let cmd = jkb(&tmp.path().join("x.db"));
+    common::assert_jkb_isolated("the cli fixture", &cmd);
+    // ...and the database-less form remote mode uses, which is where the spawn now lives.
+    common::assert_jkb_isolated("the bare cli fixture", &jkb_bare());
+}
+
+/// `notify` never opens a database.
+///
+/// It fires after EVERY tool call, and `open_db` verifies the migrations and starts the writer
+/// thread — measured at 110 ms against the real database, the cost design N7 rejected. The sharper
+/// half is correctness: when a newer branch's migration locks an older binary out of the database,
+/// opening it fails, and a hook that opened it first would never withdraw, leaving a sticky
+/// notification on screen for good. Since r3.2 N1 the hook is only a client of `jkb serve`, so this
+/// also pins that it stays one: pointed at a file that is not a database at all, with the daemon
+/// unreachable, it exits 0, prints nothing, and logs why.
+#[test]
+fn notify_needs_no_database() {
+    let dir = TempDir::new().expect("tempdir");
+    let not_a_db = dir.path().join("not-a-database");
+    std::fs::write(&not_a_db, b"this is not a sqlite file").expect("write");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    // Wrapped in `assert_cmd::Command` because the payload arrives on stdin, but built by the
+    // `jkb` fixture so the spawn inherits no repository selection.
+    assert_cmd::Command::from_std(jkb(&not_a_db))
+        .args(["notify", "hook"])
+        .env("HOME", dir.path())
+        .env("JKB_REMOTE", closed.to_string())
+        .write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(
+        std::fs::read(&not_a_db).unwrap(),
+        b"this is not a sqlite file",
+        "the file named as a database is untouched"
+    );
+    let log = std::fs::read_to_string(dir.path().join(".jkb/logs/notify-hook.log"))
+        .expect("the failure is logged");
+    assert!(log.contains("notify.event: Unavailable"), "{log}");
+}
+
+/// Run `jkb notify hook` on a `Stop` payload with `envs` set and a home holding a token, against a
+/// listener that records the one request it is sent. Returns what the listener received, and the home.
+fn notify_hook_request(
+    envs: &[(&str, &str)],
+    addr_env: &dyn Fn(&str) -> Vec<(String, String)>,
+) -> (String, TempDir) {
+    use std::io::{Read as _, Write as _};
+    let dir = TempDir::new().expect("tempdir");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Where a daemon on that port writes its token: the client finds it by the port it was sent to.
+    let token_dir = dir.path().join(format!(".jkb/daemon/{}", addr.port()));
+    std::fs::create_dir_all(&token_dir).unwrap();
+    std::fs::write(token_dir.join("token"), "tok").unwrap();
+    // Non-blocking with a deadline: a hook that looked anywhere else must fail its test, not hang it.
+    listener.set_nonblocking(true).unwrap();
+    let seen = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => return String::from("<no request reached the named daemon>"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = vec![0u8; 16 * 1024];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let body = r#"{"result":"notified","state":"absent","moved":true,"effects":[],"sent":0}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    });
+    let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+    cmd.args(["notify", "hook"])
+        .env("HOME", dir.path())
+        .env("JKB_HOOK_OWNER", "4242");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    for (k, v) in addr_env(&addr.to_string()) {
+        cmd.env(k, v);
+    }
+    cmd.write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
+        .assert()
+        .success()
+        .stdout("");
+    (seen.join().unwrap(), dir)
+}
+
+/// The hook finds the daemon where the environment says — `JKB_REMOTE` as bare `host:port`, which is
+/// how the dev container points it at the host — and presents the token from `~/.jkb/daemon/<port>/token`. Checked
+/// through the real binary against a listener that records the request, since a hook that looked
+/// anywhere else would fail just as silently as one that found nothing.
+#[test]
+fn notify_hook_sends_to_the_daemon_the_environment_names() {
+    let (request, home) = notify_hook_request(&[], &|addr| {
+        vec![("JKB_REMOTE".to_owned(), addr.to_owned())]
+    });
+    assert!(request.starts_with("POST /v1/op "), "{request}");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer tok"),
+        "{request}"
+    );
+    assert!(request.contains(r#""op":"notify.event""#), "{request}");
+    assert!(request.contains(r#""event":"turn_ended""#), "{request}");
+    assert!(
+        !home.path().join(".jkb/logs/notify-hook.log").exists(),
+        "an answered request logs nothing"
+    );
+}
+
+/// With `JKB_REMOTE` and `JKB_DB` both set — remote mode's refusal for every other command — the hook
+/// still runs: it opens no database, and a refusal at dispatch exits before it can log, on a stderr
+/// the shim throws away. Found by the stage-5 review.
+#[test]
+fn notify_hook_runs_under_remote_mode_s_refusals() {
+    let (request, _home) = notify_hook_request(&[("JKB_DB", "/nonexistent/jkb.db")], &|addr| {
+        vec![("JKB_REMOTE".to_owned(), format!("http://{addr}"))]
+    });
+    assert!(request.contains(r#""op":"notify.event""#), "{request}");
+}
+
+/// **The registry end to end, through the real binaries** (tasks S6.4): the hook, fed a session's
+/// start and end, records both in `jkb serve`'s registry, and `jkb notify sessions` reads it back.
+/// The end's `notify.event` is refused — this database has no `claude/notify` topic — and the
+/// registry end is still sent, so one failing request does not cost the other.
+#[test]
+fn the_hook_feeds_the_session_registry_that_notify_sessions_lists() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = dir.path().join("jkb.db");
+    let token = dir.path().join("daemon/token");
+    let (_serve, url) = Daemon::start(&db, &token);
+    // Any pid the hook accepts as an owner: neither the hook itself nor its parent. The start's own
+    // sweep never judges the session that is starting, so it need not be alive.
+    let owner_pid = "4242".to_owned();
+    let client = || {
+        let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+        cmd.env("HOME", dir.path())
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("JKB_HOOK_OWNER", &owner_pid)
+            .env_remove("JKB_DB");
+        cmd
+    };
+    let hook = |payload: serde_json::Value| {
+        client()
+            .args(["notify", "hook"])
+            .write_stdin(payload.to_string())
+            .assert()
+            .success()
+            .stdout("");
+    };
+    let listed = |all: bool| -> serde_json::Value {
+        let mut cmd = client();
+        cmd.args(["--json", "notify", "sessions"]);
+        if all {
+            cmd.arg("--all");
+        }
+        let out = cmd.assert().success().get_output().stdout.clone();
+        serde_json::from_slice(&out).expect("sessions JSON")
+    };
+
+    hook(serde_json::json!({
+        "hook_event_name": "SessionStart", "session_id": "s-1", "source": "startup", "cwd": "/w",
+    }));
+    let live = listed(false);
+    assert_eq!(live.as_array().map(Vec::len), Some(1), "{live}");
+    assert_eq!(live[0]["session"], "s-1");
+    assert_eq!(live[0]["pid"], owner_pid.as_str());
+    assert_eq!(live[0]["start_source"], "startup");
+    let human = client()
+        .args(["notify", "sessions"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.starts_with("s-1  live (startup)  pid ") && human.trim_end().ends_with("/w"),
+        "{human}"
+    );
+
+    hook(serde_json::json!({
+        "hook_event_name": "SessionEnd", "session_id": "s-1", "reason": "prompt_input_exit",
+    }));
+    assert_eq!(listed(false), serde_json::json!([]));
+    let all = listed(true);
+    assert_eq!(all[0]["end_reason"], "prompt_input_exit", "{all}");
+    let log = std::fs::read_to_string(dir.path().join(".jkb/logs/notify-hook.log"))
+        .expect("the refused notify.event is logged");
+    assert!(log.contains("notify.event: NoSuchTopic"), "{log}");
+    assert!(!log.contains("session."), "{log}");
+}
+
+/// `subscribe`'s stdout is its event stream, so the `--json` error line every other verb prints is
+/// not added to it — even for its one non-event failure, a backend answering with the wrong response.
+#[test]
+fn mq_subscribe_keeps_json_error_lines_out_of_its_event_stream() {
+    use std::io::{Read as _, Write as _};
+    // A "daemon" answering every request `{"result":"sent","seq":1}`: fine for `group_create`, which
+    // ignores the body, and the wrong response for `mq.poll`.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"result":"sent","seq":1}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let tmp = TempDir::new().unwrap();
+    let token = tmp.path().join("token");
+    std::fs::write(&token, "t").unwrap();
+    let mut child = jkb_bare()
+        .args(["--json", "mq", "subscribe", "t", "--group", "g"])
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env("HOME", tmp.path())
+        .env_remove("JKB_DB")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open: EOF on stdin is a clean end, and would come before the poll this test is about.
+    let _stdin = child.stdin.take();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected response to mq.poll"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(r#""error""#),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Under `--json` a refused `jkb mq` verb puts the refusal on stdout as well as exiting 1 — including
+/// one the CLI finds itself rather than an operation refusing (a topic missing from `mq.inspect`).
+#[test]
+fn mq_refusals_are_on_stdout_under_json() {
+    let tmp = TempDir::new().unwrap();
+    let db = db_path(&tmp);
+    for args in [
+        &["--json", "mq", "group", "ls", "nope"][..],
+        &[
+            "--json",
+            "mq",
+            "send",
+            "nope",
+            "--key",
+            "k",
+            "--kind",
+            "k.m",
+            "--payload",
+            "{}",
+        ],
+    ] {
+        let out = jkb(&db).args(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&out.stdout)));
+        assert_eq!(stdout["error"]["code"], "no_such_topic", "{args:?}");
+    }
+    // Invalid input, found before any operation is called: `bad_request`, on stdout the same way.
+    let out = jkb(&db)
+        .args([
+            "--json",
+            "mq",
+            "send",
+            "nope",
+            "--key",
+            "k",
+            "--kind",
+            "k.m",
+            "--payload",
+            "{nope",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(stdout["error"]["code"], "bad_request", "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--payload is not valid JSON"),
+        "stderr keeps the prose"
+    );
+    // A database a newer jkb migrated, met before any operation runs: `schema_newer`, on stdout too.
+    let newer = tmp.path().join("newer.db");
+    {
+        let opened = jkb_core::Db::open(&newer).unwrap();
+        let future = jkb_core::supported_schema_version() + 1;
+        opened
+            .write_txn("test", move |conn, _| {
+                conn.execute(
+                    "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                     VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                    [future],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let out = jkb(&newer)
+        .args(["--json", "mq", "topic", "ls"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(stdout["error"]["code"], "schema_newer", "{stdout}");
+    // ...but not onto `subscribe`'s event stream, whose failure to start has no event.
+    let out = jkb(&newer)
+        .args(["--json", "mq", "subscribe", "t", "--group", "g"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // A database that will not open for any other reason: `unavailable`.
+    let not_a_dir = tmp.path().join("a-file");
+    std::fs::write(&not_a_dir, "x").unwrap();
+    let out = jkb(&not_a_dir.join("jkb.db"))
+        .args(["--json", "mq", "topic", "ls"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(stdout["error"]["code"], "unavailable", "{stdout}");
+    // `jkb service` reads no rows, so a newer database does not stop it — setup.sh depends on that
+    // to start, and then ask, the daemon.
+    let out = jkb(&newer).args(["service", "serve-url"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `jkb mq` end to end through a real binary: create a topic, send, and consume through
+/// `jkb mq subscribe`'s NDJSON protocol over pipes, acking on stdin. A second subscription resumes
+/// after the ack, which is the at-least-once contract a daemon in another language relies on.
+#[test]
+#[allow(clippy::too_many_lines)] // one protocol walk-through, kept in order
+fn mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("x.db");
+    let run = |args: &[&str]| {
+        let out = jkb(&db).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&[
+        "mq",
+        "topic",
+        "create",
+        "claude/notify",
+        "--max-messages",
+        "100",
+    ]);
+    let again = run(&[
+        "mq",
+        "topic",
+        "create",
+        "claude/notify",
+        "--max-messages",
+        "100",
+    ]);
+    assert!(again.contains("already exists"), "{again}");
+    run(&[
+        "mq",
+        "group",
+        "create",
+        "claude/notify",
+        "reader",
+        "--from-start",
+    ]);
+    let mut seqs = Vec::new();
+    for n in 0..3 {
+        let out = run(&[
+            "mq",
+            "send",
+            "claude/notify",
+            "--key",
+            "host/h/session/s1",
+            "--kind",
+            "notify.post",
+            "--payload",
+            &format!(r#"{{"n":{n}}}"#),
+        ]);
+        seqs.push(out.trim().parse::<i64>().unwrap());
+    }
+
+    let subscribe = || {
+        let mut cmd = jkb(&db);
+        cmd.args([
+            "mq",
+            "subscribe",
+            "claude/notify",
+            "--group",
+            "reader",
+            "--interval-ms",
+            "20",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        cmd.spawn().unwrap()
+    };
+    let mut child = subscribe();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let event: serde_json::Value =
+            serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(event["event"], "message");
+        got.push(event["message"]["seq"].as_i64().unwrap());
+    }
+    assert_eq!(got, seqs);
+    // Ack only the first, then close stdin: the subscription ends cleanly.
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, r#"{{"ack":{}}}"#, seqs[0]).unwrap();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+
+    let mut child = subscribe();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut again = Vec::new();
+    for _ in 0..2 {
+        let event: serde_json::Value =
+            serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        again.push(event["message"]["seq"].as_i64().unwrap());
+    }
+    assert_eq!(again, seqs[1..], "what was not acked is delivered again");
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+
+    let tail = run(&["--json", "mq", "tail", "claude/notify", "--limit", "1"]);
+    let tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+    assert_eq!(tail[0]["seq"], seqs[2]);
+    let groups = run(&["--json", "mq", "group", "ls", "claude/notify"]);
+    let groups: serde_json::Value = serde_json::from_str(&groups).unwrap();
+    assert_eq!(
+        (
+            groups[0]["position"].as_i64(),
+            groups[0]["backlog"].as_i64()
+        ),
+        (Some(seqs[0]), Some(2))
+    );
+}
+
+/// The reap service compacts the queue on its pass — and a database it cannot open stops only the
+/// compaction, never the sweep: not a garbage file, but a real database carrying a migration this
+/// binary does not know, which is the divergence the sweep was made schema-independent for.
+#[test]
+fn task_reap_compacts_the_message_queue() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("x.db");
+    let run = |db: &std::path::Path, args: &[&str]| {
+        let out = jkb(db).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(
+        &db,
+        &["mq", "topic", "create", "t", "--default-ttl-ms", "1"],
+    );
+    run(&db, &["mq", "group", "create", "t", "g", "--from-start"]);
+    let seq = run(
+        &db,
+        &[
+            "mq",
+            "send",
+            "t",
+            "--key",
+            "k",
+            "--kind",
+            "k.m",
+            "--payload",
+            "1",
+        ],
+    );
+    // Ack through a short subscription: the ack line is read before EOF ends it.
+    let mut child = jkb(&db)
+        .args([
+            "mq",
+            "subscribe",
+            "t",
+            "--group",
+            "g",
+            "--interval-ms",
+            "10",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, r#"{{"ack":{}}}"#, seq.trim()).unwrap();
+    }
+    assert!(child.wait().unwrap().success());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let reap = run(&db, &["task", "reap"]);
+    assert!(
+        reap.contains("nothing to reap"),
+        "the sweep reported: {reap}"
+    );
+    assert!(reap.contains("mq compact: reaped 1 message(s)"), "{reap}");
+
+    // `--json` is ONE document, with the compaction inside it.
+    let json = run(&db, &["--json", "task", "reap"]);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("a single JSON document");
+    assert!(v.get("mq_compact").is_some(), "{v}");
+
+    // A database from a newer binary: refinery refuses to open it. The sweep's records are in it
+    // (tasks S6.4 stage 3), so a one-shot sweep cannot run and says why; the service keeps running.
+    let newer = tmp.path().join("newer.db");
+    run(&newer, &["mq", "topic", "ls"]);
+    // Through jkb_core::Db, never a raw rusqlite open: db::open is the one sanctioned opener.
+    jkb_core::Db::open(&newer)
+        .unwrap()
+        .write_txn("test", |conn, _| {
+            conn.execute(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (9999, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let out = jkb(&newer).args(["task", "reap"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a sweep that could not run is not a success"
+    );
+    assert!(stderr.contains("newer jkb"), "{stderr}");
+
+    // And under --watch, where compaction runs FIRST each pass, its failure does not end the service.
+    let mut watch = jkb(&newer)
+        .args(["task", "reap", "--watch", "--interval-secs", "60"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(watch.stdout.take().unwrap()));
+    let first = lines.next().unwrap().unwrap();
+    assert!(first.contains("mq compact: not run"), "{first}");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        watch.try_wait().unwrap().is_none(),
+        "the service is still running"
+    );
+    watch.kill().unwrap();
+    let _ = watch.wait();
+}
+
+/// A `jkb serve` child, killed when dropped — so a failed assertion does not leave a daemon running
+/// past the test.
+struct Daemon(std::process::Child);
+
+impl Daemon {
+    /// Start `jkb serve` on an ephemeral port; the daemon and its `http://` address.
+    fn start(db: &Path, token: &Path) -> (Self, String) {
+        let mut cmd = jkb(db);
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(token);
+        Self::spawn(cmd)
+    }
+
+    /// Start `jkb serve` from `cmd` (already carrying its arguments).
+    fn spawn(mut cmd: std::process::Command) -> (Self, String) {
+        use std::io::BufRead as _;
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let daemon = Self(child);
+        let banner = std::io::BufReader::new(stdout)
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        let url = banner
+            .split_whitespace()
+            .find(|w| w.starts_with("http://"))
+            .unwrap_or_else(|| panic!("no address in {banner}"))
+            .to_owned();
+        (daemon, url)
+    }
+
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// `jkb service units` and `jkb service token-path` are what setup.sh activates and waits for, so they
+/// are checked against the real thing: every unit `install` wrote is listed at the path it was written
+/// to, and `jkb serve` with no `--token-file` writes its token exactly where `token-path` says.
+#[test]
+fn service_units_and_token_path_name_what_install_and_serve_actually_write() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let db = tmp.path().join("kb/jkb.db");
+    let run = |args: &[&str]| {
+        let out = jkb(&db).args(args).env("HOME", &home).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&["service", "install"]);
+    let units = run(&["service", "units"]);
+    let mut written = 0;
+    for line in units.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [label, path, role] = fields[..] else {
+            panic!("not label<TAB>path<TAB>role: {line}")
+        };
+        assert_eq!(
+            role,
+            if label == "com.jkb.serve" {
+                "serve"
+            } else {
+                "watcher"
+            },
+            "{line}"
+        );
+        let path = Path::new(path);
+        assert!(
+            path.is_file(),
+            "{label}: listed at {} but not written there",
+            path.display()
+        );
+        assert_eq!(path.file_stem().unwrap().to_str().unwrap(), label);
+        written += 1;
+    }
+    let on_disk = walkdir_count(&home);
+    assert_eq!(
+        written, on_disk,
+        "every unit written is listed, and nothing else: {units}"
+    );
+    assert!(units.contains("com.jkb.serve\t"), "{units}");
+
+    // The unit passes no `--addr`, which is what makes serve's default the address to ask.
+    let serve_unit = units
+        .lines()
+        .find_map(|l| l.strip_prefix("com.jkb.serve\t"))
+        .and_then(|rest| rest.split('\t').next())
+        .unwrap();
+    assert!(!std::fs::read_to_string(serve_unit)
+        .unwrap()
+        .contains("--addr"));
+    assert_eq!(
+        run(&["service", "serve-url"]).trim(),
+        format!("http://{}", jkb_daemon::DEFAULT_ADDR)
+    );
+
+    let token = run(&["service", "token-path"]);
+    let token = Path::new(token.trim());
+    // The documented place, and the one remote mode and the notification hook assume when
+    // JKB_REMOTE_TOKEN_FILE is unset — in the home, keyed by the unit's port, NOT beside this
+    // non-default database, which no client can know.
+    let default_port = jkb_daemon::DEFAULT_ADDR.rsplit(':').next().unwrap();
+    assert_eq!(
+        token,
+        home.join(format!(".jkb/daemon/{default_port}/token"))
+    );
+    // ...and a daemon writes where that rule says for ITS port — so two in one home cannot overwrite
+    // each other's live token. The unit's own port is not bound here, so a free one is (port 0 has no
+    // default token path and is refused without --token-file).
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut cmd = jkb(&db);
+    cmd.args(["serve", "--addr", &format!("127.0.0.1:{port}")])
+        .env("HOME", &home)
+        .env_remove("JKB_NS_MARKER");
+    let (mut serve, _) = Daemon::spawn(cmd);
+    let written = home.join(format!(".jkb/daemon/{port}/token"));
+    assert!(written.is_file(), "no token at {}", written.display());
+    serve.stop();
+}
+
+/// How many files are under `dir`, recursively.
+fn walkdir_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                walkdir_count(&path)
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// A database a newer jkb migrated does not stop `jkb serve`: exiting would put its supervisor into a
+/// restart loop and tell clients only `unavailable`. It binds and answers every request with why.
+#[test]
+fn serve_answers_schema_newer_rather_than_exiting_on_a_newer_database() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("host.db");
+    {
+        let opened = jkb_core::Db::open(&db).unwrap();
+        let future = jkb_core::supported_schema_version() + 1;
+        opened
+            .write_txn("test", move |conn, _| {
+                conn.execute(
+                    "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                    [future],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let token = tmp.path().join("daemon/token");
+    let (mut serve, url) = Daemon::start(&db, &token);
+    let out = {
+        let mut cmd = jkb_bare();
+        cmd.args(["--json", "mq", "topic", "ls"])
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", tmp.path())
+            .env_remove("JKB_DB");
+        cmd.output().unwrap()
+    };
+    assert!(
+        !out.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The code, not only the words: `unavailable` would say the same sentence and send a
+    // subscriber into retrying something no retry fixes.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(r#""code":"schema_newer""#), "{stdout}");
+    assert!(
+        serve.0.try_wait().unwrap().is_none(),
+        "the daemon is still up"
+    );
+    serve.stop();
+}
+
+/// The agent read set (tasks S6.1) answers through `jkb serve` byte-for-byte as it does on the host —
+/// from a client whose home and working directory are the container's, not the host's. Equal output
+/// is the claim, because both sides run the same op; the ambient checks are what show the scope was
+/// actually applied on each side rather than dropped on both.
+#[test]
+#[allow(clippy::too_many_lines)] // one walk: fixture, then every read on both sides
+fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let host_home = root.join("host-home");
+    let client_home = root.join("container-home");
+    let host_repo = host_home.join("repos/proj");
+    let client_repo = client_home.join("repos/proj");
+    std::fs::create_dir_all(&host_repo).unwrap();
+    std::fs::create_dir_all(&client_repo).unwrap();
+    let db = root.join("host.db");
+    let token = root.join("daemon/token");
+
+    let host = |args: &[&str], cwd: &Path| {
+        jkb(&db)
+            .args(args)
+            .env("HOME", &host_home)
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+    let host_ok = |args: &[&str], cwd: &Path| {
+        let out = host(args, cwd);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    host_ok(
+        &["mount", "create", "repos/proj", host_repo.to_str().unwrap()],
+        &root,
+    );
+    let parent: serde_json::Value = serde_json::from_str(&host_ok(
+        &["--json", "task", "add", "parent with a needle !p1"],
+        &host_repo,
+    ))
+    .unwrap();
+    let parent = parent["uid"].as_str().unwrap().to_owned();
+    host_ok(&["task", "add", "child", "--under", &parent], &host_repo);
+    host_ok(&["task", "add", "sibling needle !p2"], &host_repo);
+    host_ok(&["task", "add", "outside the repo"], &root);
+    host_ok(
+        &["inv", "new", "debugging", "bug", "--goal", "it crashes"],
+        &host_repo,
+    );
+
+    let (mut serve, url) = Daemon::spawn({
+        let mut cmd = jkb(&db);
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(&token)
+            .env("HOME", &host_home);
+        cmd
+    });
+    let remote = |args: &[&str], cwd: &Path| {
+        jkb_bare()
+            .args(args)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env_remove("JKB_DB")
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+
+    let reads: Vec<Vec<&str>> = vec![
+        vec!["--json", "ls"],
+        vec!["ls", "tasks", "-R", "-l"],
+        vec!["--json", "tree", "tasks"],
+        vec!["tree"],
+        vec!["--json", "query", "kind:task"],
+        vec!["query", "kind:task", "--count"],
+        vec!["--json", "find", "--kind", "task"],
+        vec!["--json", "--global", "recent"],
+        vec!["--global", "recent", "--limit", "2"],
+        vec!["--json", "--global", "grep", "needle"],
+        vec!["--global", "grep", "-l", "needle"],
+        vec!["--json", "--global", "grep", "-c", "needle"],
+        vec!["grep", "-i", "NEEDLE", "tasks"],
+        vec!["cat", &parent],
+        vec!["--json", "--global", "search", "needle", "--route", "fts"],
+        vec!["--json", "task", "next"],
+        vec!["task", "next"],
+        vec!["--json", "task", "show", &parent],
+        vec!["task", "show", &parent],
+        vec!["--json", "task", "subtasks", &parent],
+        vec!["--json", "item", "show", &parent],
+        vec!["item", "show", &parent, "--preview", "6"],
+        vec!["--json", "stat", &parent],
+        vec!["stat", &parent],
+        vec!["--json", "related", &parent],
+        vec!["related", &parent, "--depth", "2"],
+        vec!["--json", "blob", "ls"],
+        vec!["--json", "history", "tasks.md"],
+        vec!["history", "tasks.md"],
+        vec!["--json", "inv", "ls"],
+        vec!["inv", "ls"],
+        vec!["inv", "verbs", "memory/proj/bug"],
+        vec!["--json", "inv", "kinds", "memory/proj/bug"],
+        vec!["--json", "inv", "frontier", "memory/proj/bug"],
+        vec!["inv", "frontier", "memory/proj/bug"],
+        vec!["inv", "tombstones", "memory/proj/bug"],
+        vec!["inv", "digest", "memory/proj/bug", "--dry-run"],
+        vec!["--json", "ns", "ls"],
+        vec!["ns", "ls", "tasks"],
+    ];
+    for args in &reads {
+        let (h, r) = (host(args, &host_repo), remote(args, &client_repo));
+        assert!(
+            h.status.success() && r.status.success(),
+            "{args:?}: host {}; remote {}",
+            String::from_utf8_lossy(&h.stderr),
+            String::from_utf8_lossy(&r.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout),
+            String::from_utf8_lossy(&h.stdout),
+            "{args:?}: the daemon answered differently from the host"
+        );
+    }
+
+    // An investigation started from the container is homed by the repo it runs in, as on the host.
+    let started = remote(&["--json", "inv", "new", "debugging", "bug2"], &client_repo);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(v["ns"], "memory/proj/bug2", "{v}");
+
+    // A namespace moved from the container moves on the host.
+    let moved = remote(
+        &["ns", "mv", "memory/proj/bug2", "memory/proj/bug3"],
+        &client_repo,
+    );
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert!(host_ok(&["ns", "ls", "memory/proj"], &root).contains("memory/proj/bug3"));
+
+    // The ambient scope was applied through the daemon, not dropped: inside the repo `task next`
+    // lists the repo's tasks and not the one captured outside it; `--global` lists that one too.
+    let next = String::from_utf8(remote(&["task", "next"], &client_repo).stdout).unwrap();
+    assert!(next.contains("sibling needle"), "{next}");
+    assert!(!next.contains("outside the repo"), "{next}");
+    let global =
+        String::from_utf8(remote(&["--global", "task", "next"], &client_repo).stdout).unwrap();
+    assert!(global.contains("outside the repo"), "{global}");
+    let grep = remote(&["grep", "needle"], &client_repo);
+    assert!(
+        grep.stdout.is_empty() && grep.status.code() == Some(1),
+        "grep's ambient scope is the repo's namespace, which holds no items — exit 1, like grep: {}",
+        String::from_utf8_lossy(&grep.stdout)
+    );
+
+    // Search defaults to FTS through the daemon, which embeds nothing; asking for more is refused.
+    let out = remote(&["search", "needle"], &client_repo);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = remote(&["search", "needle", "--route", "hybrid"], &client_repo);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only --route fts"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = remote(&["task", "mirror"], &client_repo);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("jkb task mirror: not available"),
+        "a partly served group names the verb it refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = remote(&["cat", "task:nope"], &client_repo);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no item with uid `task:nope`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !client_home.join(".jkb/jkb.db").exists(),
+        "no read opened a database of its own"
+    );
+    serve.stop();
+}
+
+/// The task-mutate set (tasks S6.2) through `jkb serve`, from a client with the container's home and
+/// working directory: the writes land in the host's database and print what the host CLI prints, and
+/// the ones that would have the host's sync write a file outside `~/repos` — the only host directory
+/// the container sees — are refused.
+#[test]
+#[allow(clippy::too_many_lines)] // one walk: fixture, writes, their effects, refusals
+fn the_task_writes_go_through_the_daemon_and_stop_at_the_container_s_view() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let host_home = root.join("host-home");
+    let client_home = root.join("container-home");
+    let host_repo = host_home.join("repos/proj");
+    let client_repo = client_home.join("repos/proj");
+    let notes = host_home.join("Documents/notes");
+    for dir in [&host_repo, &client_repo, &notes] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let db = root.join("host.db");
+    let token = root.join("daemon/token");
+    let host = |args: &[&str], cwd: &Path| {
+        jkb(&db)
+            .args(args)
+            .env("HOME", &host_home)
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+    let text = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).into_owned();
+    let ok = |out: std::process::Output, what: &str| {
+        assert!(
+            out.status.success(),
+            "{what}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    for (ns, dir) in [("repos/proj", &host_repo), ("docs/notes", &notes)] {
+        ok(
+            host(
+                &[
+                    "mount",
+                    "create",
+                    ns,
+                    dir.to_str().unwrap(),
+                    "--serializer",
+                    "tasks",
+                ],
+                &root,
+            ),
+            "mount",
+        );
+    }
+    let uid_of = |out: &std::process::Output| -> String {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["uid"].as_str().unwrap().to_owned()
+    };
+    let outside = uid_of(&ok(
+        host(&["--json", "task", "add", "a note +docs/notes"], &root),
+        "host add outside",
+    ));
+    let dep = uid_of(&ok(
+        host(&["--json", "task", "add", "a dependency"], &host_repo),
+        "host add dep",
+    ));
+
+    let (mut serve, url) = Daemon::spawn({
+        let mut cmd = jkb(&db);
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(&token)
+            .env("HOME", &host_home);
+        cmd
+    });
+    let remote = |args: &[&str]| {
+        jkb_bare()
+            .args(args)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env_remove("JKB_DB")
+            .current_dir(&client_repo)
+            .output()
+            .unwrap()
+    };
+
+    // A task added from the container with no placement is homed by the container's directory, as on
+    // the host.
+    let ambient = ok(
+        remote(&["--json", "task", "add", "captured here"]),
+        "remote add",
+    );
+    let v: serde_json::Value = serde_json::from_slice(&ambient.stdout).unwrap();
+    assert_eq!(v["home"], "tasks/repos/proj/inbox", "{v}");
+    // One placed in the repo's namespace is filed in its tasks.md — under ~/repos, so served.
+    let added = ok(
+        remote(&["--json", "task", "add", "remote work !p3 +repos/proj"]),
+        "remote add filed",
+    );
+    let v: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    assert_eq!(v["home"], "repos/proj", "{v}");
+    assert_eq!(
+        v["binding"],
+        format!("file://{}/tasks.md", host_repo.display()),
+        "{v}"
+    );
+    let uid = v["uid"].as_str().unwrap().to_owned();
+
+    // Each write prints what the host CLI prints for the same write.
+    for args in [
+        vec!["task", "set", &uid, "--priority", "1"],
+        vec!["task", "tag", "add", &uid, "size=s"],
+        vec!["--json", "task", "tag", "add", &uid, "area=api"],
+        vec!["task", "edit", &uid, "--append", "more", "detail"],
+        vec!["task", "depend", &uid, &dep],
+        vec!["--json", "task", "place", &uid, "views/mine"],
+    ] {
+        let from_client = ok(remote(&args), &format!("remote {args:?}"));
+        let from_host = ok(host(&args, &host_repo), &format!("host {args:?}"));
+        assert_eq!(text(&from_client), text(&from_host), "{args:?}");
+    }
+    // Unplacing twice is not the same write twice — the second removes nothing — so it is checked
+    // on its own.
+    let unplaced = ok(remote(&["task", "unplace", &uid, "views/mine"]), "unplace");
+    assert!(
+        text(&unplaced).contains("(1 mirror(s) removed)"),
+        "{}",
+        text(&unplaced)
+    );
+    let claimed = ok(
+        remote(&[
+            "--json",
+            "task",
+            "claim",
+            &uid,
+            "--owner",
+            "agent:container",
+        ]),
+        "claim",
+    );
+    let v: serde_json::Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    assert_eq!(v["acquired"], true, "{v}");
+    let refused = remote(&["--json", "task", "claim", &uid, "--owner", "agent:other"]);
+    let v: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(v["acquired"], false, "a held task is not taken: {v}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("agent:container"),
+        "the lifecycle's reason names the holder: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let why = ok(remote(&["--json", "task", "why", &uid]), "why");
+    assert_eq!(
+        text(&why),
+        text(&ok(
+            host(&["--json", "task", "why", &uid], &host_repo),
+            "host why"
+        ))
+    );
+    ok(
+        remote(&["task", "release", &uid, "--owner", "agent:container"]),
+        "release",
+    );
+
+    // The host sees every write.
+    let shown: serde_json::Value = serde_json::from_slice(
+        &ok(host(&["--json", "task", "show", &uid], &host_repo), "show").stdout,
+    )
+    .unwrap();
+    assert_eq!(shown["priority"], 1, "{shown}");
+    assert!(
+        shown["content"].as_str().unwrap().ends_with("more detail"),
+        "{shown}"
+    );
+    let tags: Vec<String> = shown["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            format!(
+                "{}={}",
+                t["facet"].as_str().unwrap(),
+                t["value"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert!(
+        tags.contains(&"size=s".to_owned()) && tags.contains(&"area=api".to_owned()),
+        "{tags:?}"
+    );
+
+    // What would have the host's sync write outside ~/repos is refused, before anything changes.
+    let refusals: Vec<Vec<&str>> = vec![
+        vec!["task", "set", &outside, "--priority", "1"],
+        vec!["task", "edit", &outside, "rewritten"],
+        vec!["task", "claim", &outside, "--owner", "agent:container"],
+        vec!["task", "add", "into the notes +docs/notes"],
+        vec!["task", "bind", &uid, "--sync", "file:///etc/tasks.md#x"],
+    ];
+    for args in &refusals {
+        let out = remote(args);
+        assert!(!out.status.success(), "{args:?} was served");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("host files to be written") || err.contains("refused through the daemon"),
+            "{args:?}: {err}"
+        );
+    }
+    let untouched: serde_json::Value = serde_json::from_slice(
+        &ok(
+            host(&["--json", "task", "show", &outside], &root),
+            "show outside",
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert!(untouched["priority"].is_null(), "{untouched}");
+    // The same task added --managed files nothing, so it is served.
+    ok(
+        remote(&["task", "add", "into the notes +docs/notes", "--managed"]),
+        "managed add outside",
+    );
+    serve.stop();
+    // The audit trail says where each write came from: the container's through the daemon, the host's
+    // from its command line.
+    let actors = jkb_core::Db::open(&db)
+        .unwrap()
+        .read(move |c| {
+            let mut stmt = c.prepare("SELECT DISTINCT actor FROM changelog")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert!(
+        actors.contains(&"serve".to_owned()) && actors.contains(&"cli".to_owned()),
+        "{actors:?}"
+    );
+}
+
+/// The dev container's path to the knowledge base, end to end through real binaries: `jkb serve` on
+/// one side, `jkb` with `JKB_REMOTE` on the other. Ported commands work through the daemon; every
+/// other command, `--db` and `JKB_DB`, is refused before it does anything — no database is created.
+#[test]
+#[allow(clippy::too_many_lines)] // one end-to-end walk through serve, client and refusals
+fn remote_mode_reaches_the_daemon_and_refuses_everything_else() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("host.db");
+    let token = tmp.path().join("daemon/token");
+    let (mut serve, url) = Daemon::start(&db, &token);
+
+    let client_home = tmp.path().join("container-home");
+    std::fs::create_dir_all(&client_home).unwrap();
+    let remote = |args: &[&str]| {
+        let mut cmd = jkb_bare();
+        cmd.args(args)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env_remove("JKB_DB");
+        cmd.output().unwrap()
+    };
+    let ok = |args: &[&str]| {
+        let out = remote(args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    ok(&["mq", "topic", "create", "claude/notify"]);
+    let seq = ok(&[
+        "mq",
+        "send",
+        "claude/notify",
+        "--key",
+        "k",
+        "--kind",
+        "notify.post",
+        "--payload",
+        "{}",
+    ]);
+    let tail = ok(&["--json", "mq", "tail", "claude/notify"]);
+    let tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+    assert_eq!(tail[0]["seq"].to_string(), seq.trim());
+
+    for refused in [
+        &["task", "mirror"][..],
+        &["doctor", "--fix"],
+        &["sync"],
+        &["mount", "ls"],
+        &["serve"],
+    ] {
+        let out = remote(refused);
+        assert!(
+            !out.status.success(),
+            "{refused:?} must be refused remotely"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not available with JKB_REMOTE set"),
+            "{refused:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = remote(&[
+        "--db",
+        tmp.path().join("container.db").to_str().unwrap(),
+        "mq",
+        "topic",
+        "ls",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--db is refused"));
+    // The same refusal keeps `--json`'s rule: an error line on stdout.
+    let out = remote(&[
+        "--json",
+        "--db",
+        tmp.path().join("container.db").to_str().unwrap(),
+        "mq",
+        "topic",
+        "ls",
+    ]);
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(stdout["error"]["code"], "bad_request", "{stdout}");
+    let out = {
+        let mut cmd = jkb_bare();
+        cmd.args(["mq", "topic", "ls"])
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env("JKB_DB", tmp.path().join("container.db"));
+        cmd.output().unwrap()
+    };
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("JKB_DB is set alongside JKB_REMOTE"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !tmp.path().join("container.db").exists(),
+        "the refusal came before any open"
+    );
+    assert!(
+        !client_home.join(".jkb/jkb.db").exists(),
+        "remote mode never opened a default database"
+    );
+
+    serve.stop();
+    // The daemon is gone: the client says so, and remembers it briefly.
+    let out = remote(&["mq", "topic", "ls"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot reach jkb serve"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = remote(&["mq", "topic", "ls"]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unreachable less than"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `jkb ingest` in the container reads and parses its own file and sends the daemon only the text: the
+/// document lands in the host's database, keyword-searchable and unembedded, and a source too large for
+/// one request is refused with where to run it instead.
+#[test]
+fn ingest_through_the_daemon_sends_text_and_the_host_stores_it() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let client_home = root.join("container-home");
+    std::fs::create_dir_all(&client_home).unwrap();
+    let db = root.join("host.db");
+    let token = root.join("daemon/token");
+    let note = client_home.join("notes.md");
+    std::fs::write(
+        &note,
+        "# Heading\n\nOnly the container can read this file: zanzibar.\n",
+    )
+    .unwrap();
+
+    let (mut serve, url) = Daemon::spawn({
+        let mut cmd = jkb(&db);
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(&token)
+            .env("HOME", root.join("host-home"));
+        cmd
+    });
+    let remote = |args: &[&str]| {
+        jkb_bare()
+            .args(args)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOME", &client_home)
+            .env_remove("JKB_DB")
+            .current_dir(&client_home)
+            .output()
+            .unwrap()
+    };
+    let out = remote(&[
+        "--json",
+        "ingest",
+        note.to_str().unwrap(),
+        "--ns",
+        "references/notes",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["embedded"], false, "{v}");
+    assert!(v["warnings"].to_string().contains("index --pending"), "{v}");
+
+    let found = remote(&["search", "--route", "fts", "zanzibar"]);
+    assert!(
+        String::from_utf8_lossy(&found.stdout).contains("references/notes"),
+        "found through the daemon: {}{}",
+        String::from_utf8_lossy(&found.stdout),
+        String::from_utf8_lossy(&found.stderr)
+    );
+
+    // Past the cap: refused before it is sent — a body many times the cap otherwise reached the client as
+    // a daemon that could not be reached.
+    let big = client_home.join("big.txt");
+    std::fs::write(&big, "word ".repeat(300_000)).unwrap();
+    let out = remote(&["ingest", big.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("-byte request, more than")
+            && String::from_utf8_lossy(&out.stderr).contains("run it on the host"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serve.stop();
+
+    // Stored by the host: the document is there, and nothing of the container's file but its text.
+    let blob_count = || {
+        let out = jkb(&db).args(["--json", "blob", "ls"]).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+        v.as_array().map_or(0, Vec::len)
+    };
+    assert_eq!(blob_count(), 0, "no source blob from the container");
+    let listed = jkb(&db)
+        .args(["--global", "query", "kind:document"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("Heading"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    // The host's own ingest of the file still addresses it by its bytes and keeps them.
+    let out = jkb(&db)
+        .args(["ingest", note.to_str().unwrap(), "--ns", "references/notes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(blob_count(), 1, "the host's ingest stores its source");
+}
+
+/// **`jkb mcp` runs in the dev container** (tasks S6.4, design-s6-4.md K): every tool is an op through
+/// `jkb serve`, a task it creates is on the host, and search defaults to the route the daemon serves.
+#[test]
+fn the_mcp_server_serves_its_tools_through_the_daemon() {
+    use std::io::{BufRead as _, Write as _};
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("host.db");
+    let token = tmp.path().join("daemon/token");
+    let (serve, url) = Daemon::start(&db, &token);
+    let client_home = tmp.path().join("container-home");
+    std::fs::create_dir_all(&client_home).unwrap();
+
+    let mut child = jkb_bare()
+        .arg("mcp")
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env("HOME", &client_home)
+        .env_remove("JKB_DB")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut ask = |msg: serde_json::Value, answered: bool| -> Option<serde_json::Value> {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+        answered.then(|| serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap())
+    };
+    let init = ask(
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" } } }),
+        true,
+    )
+    .unwrap();
+    assert!(init.get("result").is_some(), "{init}");
+    ask(
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        false,
+    );
+    let created = ask(
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "task_create",
+                        "arguments": { "title": "from the container !p1", "priority": 2 } } }),
+        true,
+    )
+    .unwrap();
+    let text = created["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    let body: serde_json::Value =
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("{created}"));
+    let uid = body["uid"].as_str().unwrap().to_owned();
+    let found = ask(
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "search", "arguments": { "query": "container" } } }),
+        true,
+    )
+    .unwrap();
+    assert!(
+        found["result"]["isError"] != true && found.get("error").is_none(),
+        "search defaults to the route the daemon serves: {found}"
+    );
+    let hybrid = ask(
+        serde_json::json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "search",
+                        "arguments": { "query": "container", "route": "hybrid" } } }),
+        true,
+    )
+    .unwrap();
+    assert!(
+        hybrid.get("error").is_some() || hybrid["result"]["isError"] == true,
+        "the daemon embeds nothing: {hybrid}"
+    );
+    drop(stdin);
+    let _ = child.wait();
+
+    // On the host: the title word for word, and the priority given.
+    let shown = jkb(&db)
+        .args(["--json", "task", "show", &uid])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(v["content"], "from the container !p1", "{v}");
+    assert_eq!(v["priority"], 2, "{v}");
+    drop(serve);
 }

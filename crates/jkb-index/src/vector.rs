@@ -19,6 +19,9 @@ use jkb_types::{CatalogIdentity, Embedder, Error as TypesError, ItemId};
 
 use crate::{IndexItem, Indexer, Result};
 
+/// How many ids one vector lookup binds — far under `SQLite`'s 32,766-variable limit.
+const VECTOR_LOOKUP_BATCH: usize = 4096;
+
 /// Delete vector rows whose item no longer exists, across **every** `vec_items_<dim>` table.
 ///
 /// The vec tables are derived indexes (D9) but cannot carry a foreign key — they are virtual
@@ -355,23 +358,29 @@ impl VectorIndexer {
         if ids.is_empty() || !self.table_exists(conn)? {
             return Ok(out);
         }
-        // Placeholders are generated from a count; the ids themselves are bound.
-        let placeholders = (1..=ids.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT item_id, embedding FROM {} WHERE item_id IN ({placeholders})",
-            self.table
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(ids.iter().map(|i| i.get())),
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        )?;
-        for row in rows {
-            let (id, bytes) = row?;
-            out.insert(ItemId::new(id), bytes_to_embedding(&bytes, self.dim)?);
+        // In batches, each with a placeholder per id: one `IN` over every id of a large document's
+        // chunks passed SQLite's 32,766-variable limit, so resuming a capture of a ~30 MB source failed
+        // every time. Not one `json_each` parameter, as other lists are bound: the vec0 table is then
+        // scanned whole for each call, where an `IN` over its key is looked up.
+        for batch in ids.chunks(VECTOR_LOOKUP_BATCH) {
+            // Placeholders are generated from a count; the ids themselves are bound.
+            let placeholders = (1..=batch.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT item_id, embedding FROM {} WHERE item_id IN ({placeholders})",
+                self.table
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(batch.iter().map(|i| i.get())),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )?;
+            for row in rows {
+                let (id, bytes) = row?;
+                out.insert(ItemId::new(id), bytes_to_embedding(&bytes, self.dim)?);
+            }
         }
         Ok(out)
     }

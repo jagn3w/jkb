@@ -42,6 +42,12 @@ seed() {
     # has none — so without this the mutation below could not be watched failing.
     mkdir -p "$work/t/ui/vscode"
     cp "$repo/ui/vscode/package.json" "$work/t/ui/vscode/"
+    # ...and jkb-daemon's DEFAULT_ADDR, which check-config.sh holds the firewall's daemon port to.
+    mkdir -p "$work/t/crates/jkb-daemon/src"
+    cp "$repo/crates/jkb-daemon/src/lib.rs" "$work/t/crates/jkb-daemon/src/"
+    # ...and jkb-cli's remote.rs, which names the variable the notification hook reads.
+    mkdir -p "$work/t/crates/jkb-cli/src"
+    cp "$repo/crates/jkb-cli/src/remote.rs" "$work/t/crates/jkb-cli/src/"
     # The manifest is what lets mutated() see a DELETION or a MODE CHANGE. Taken here rather than
     # derived from a list, so it still covers a file added to seed() tomorrow.
     tree_manifest > "$work/manifest"
@@ -115,7 +121,7 @@ judge() { # judge <label> <expect> <output> <rc>
     # Fixed-string, because the regex form escaped only some ERE metacharacters and silently
     # mis-matched "host bind source(s) parsed"; `-e`, because an expect may start with a dash,
     # which grep would otherwise read as an option.
-    if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
+    if [ "$rc" -ne 0 ] && grep -q "FAIL" <<<"$(grep -F -e "$expect" <<<"$out")"; then
         printf '  CAUGHT   %s\n' "$label"
     else
         fails=$((fails+1))
@@ -260,23 +266,6 @@ open(p, 'w').write("".join(l for l in open(p) if not l.startswith("ENTRYPOINT"))
 PYX
 run "the image stops running entrypoint.sh" "does not set ENTRYPOINT"
 
-# THE RACING IDIOM, REINTRODUCED. `dc_strip_comments <file> | grep -q` reports a FOUND match as a
-# failed pipeline under pipefail, because grep -q exits first and sed dies on the tail with EPIPE.
-# It is a race, so it passed on macOS and failed on the CI runner for identical bytes -- which is
-# exactly why a static refusal is worth having: nothing about running it locally would catch it.
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]
-# ASSEMBLED FROM TWO HALVES, for the same reason check-config.sh assembles the pattern it
-# searches with: this file has to CONTAIN the idiom in order to inject it, and a guard that
-# flags the harness injecting it is a guard that fails on an unmutated tree. The negative
-# control found exactly that -- which is what the negative control is for.
-lhs = 'dc_strip_comments "$here/run.sh" '
-rhs = '| grep -qE "verify" || true'
-open(p, "a").write("\n" + lhs + rhs + "\n")
-PYX
-run "a script pipes dc_strip_comments into grep -q" "pipes dc_strip_comments into grep -q"
-
 # THERE ARE NO REAPER-PATH MUTATIONS HERE, exactly as there are no verdict-path ones below: the
 # path is single-sourced as `ENV JKB_REAPER`, so there is no agreement between two spellings to
 # break. What DOES get mutated is the handover itself, one file over -- `entrypoint.sh --self-test`
@@ -307,6 +296,136 @@ p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('VERDICT_STATES="allowlisted', 'NOT_THE_STATES="allowlisted', 1))
 PYX
 run "the library stops declaring its states" "no longer declares VERDICT_STATES"
+
+# THE HOST DAEMON'S OPENING (design r3.2 H5). One mutation per property check-config.sh holds, and
+# the port and host ones mutate ONE side so the pair disagrees rather than moving together.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert "    wide)       $dm_bad " in s, "mutation target absent"
+open(p, 'w').write(s.replace("    wide)       $dm_bad ", "    broad)      $dm_bad ", 1))
+PYX
+run "verify.sh loses the arm for a daemon state" "has no case arm for the 'wide' daemon state"
+
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert 'DAEMON_STATES="port' in s, "mutation target absent"
+open(p, 'w').write(s.replace('DAEMON_STATES="port', 'NOT_DAEMON_STATES="port', 1))
+PYX
+run "the library stops declaring the daemon states" "no longer declares DAEMON_STATES"
+
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert "\nDAEMON_PORT=7117\n" in s, "mutation target absent"
+open(p, 'w').write(s.replace("\nDAEMON_PORT=7117\n", "\nDAEMON_PORT=7118\n", 1))
+PYX
+run "the firewall opens a port the daemon does not bind" "but jkb serve binds 7117"
+
+seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert 'DEFAULT_ADDR: &str = "127.0.0.1:' in s, "mutation target absent"
+open(p, 'w').write(s.replace('DEFAULT_ADDR: &str = "127.0.0.1:', 'DEFAULT_ADDR: &str = "localhost:', 1))
+PYX
+run "the daemon's port can no longer be read" "could not read the daemon port"
+
+seed; python3 - "$work/t/.container/init-firewall.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "iptables -w 5 -A OUTPUT $RULE_DAEMON"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "iptables -w 5 -A OUTPUT -p tcp -m set --match-set jkb-daemon dst -j ACCEPT", 1))
+PYX
+run "the raise spells the daemon rule itself, without its port" "init-firewall.sh spells an OUTPUT rule inline"
+
+seed; jq '.require.sandbox.network.allowedDomains |= map(select(. != "host.docker.internal"))' \
+    "$work/t/scripts/auto-mode-posture.json" > "$work/p.json" && mv "$work/p.json" "$work/t/scripts/auto-mode-posture.json"
+run "the posture stops naming the host daemon" "does not name host.docker.internal"
+
+seed; python3 - "$work/t/.container/egress-lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert "\nDAEMON_HOST=host.docker.internal\n" in s, "mutation target absent"
+open(p, 'w').write(s.replace("\nDAEMON_HOST=host.docker.internal\n", "\nDAEMON_HOST=\"$(printf host.docker.internal)\"\n", 1))
+PYX
+run "the daemon's host can no longer be read" "no longer declares DAEMON_HOST"
+
+seed; sub_dc '"--add-host=host.docker.internal:host-gateway",' '"--add-host=host.internal:host-gateway",'
+run "the pinned --add-host names a different host" "but egress-lib.sh looks up DAEMON_HOST"
+
+seed; sub_dc '"--add-host=host.docker.internal:host-gateway",' ''
+run "the --add-host pin is dropped" "pin no --add-host"
+
+seed; jq_dc '.runArgs |= map(select(. != "--label" and (startswith("devcontainer.metadata=") | not)))'
+run "the VS Code metadata label is dropped" "carry no devcontainer.metadata label"
+
+seed; sub_dc '\"onAutoForward\":\"ignore\"' '\"onAutoForward\":\"notify\"'
+run "the label lets VS Code forward the daemon port" "does not set portsAttributes"
+
+seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' '"JKB_REMOTE": "host.docker.internal:7118",'
+run "remote mode is pointed at a port the firewall does not open" "but the firewall opens host.docker.internal:7117"
+
+seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' ''
+run "the container is not in remote mode" "sets no JKB_REMOTE"
+
+seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' '"JKB_REMOTE": "host.docker.internal:7117", "JKB_DB": "/home/vscode/.local/state/jkb/jkb.db",'
+run "the container is given a database of its own" "containerEnv sets JKB_DB"
+
+seed; jq_dc '.mounts += ["source=jkb-kb-local,target=/home/vscode/.local/state/jkb,type=volume"]'
+run "the retired container-local knowledge base volume is mounted again" "still mounts the container-local knowledge base"
+
+seed; jq_dc '.mounts += ["source=jkb-kb,target=/home/vscode/.local/state/jkb,type=volume"]'
+run "the retired knowledge base comes back under another volume name" "still mounts the container-local knowledge base"
+
+seed; jq_dc '.mounts += ["source=jkb-kb-local,target=/home/vscode/.jkb-local,type=volume"]'
+run "the retired knowledge base volume comes back at another path" "still mounts the container-local knowledge base"
+
+seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' '"JKB_REMOTE": "host.docker.internal:7117", "JKB_VERIFY_NO_DAEMON": "1",'
+run "the real container waives the daemon check" "sets JKB_VERIFY_NO_DAEMON"
+
+seed; jq_dc '.runArgs += ["--env", "JKB_VERIFY_NO_DAEMON=1"]'
+run "the launcher waives the daemon check" "runArgs set JKB_VERIFY_NO_DAEMON"
+
+seed; printf '\nENV JKB_VERIFY_NO_DAEMON=1\n' >> "$work/t/.container/Dockerfile"
+run "the image waives the daemon check" "Dockerfile sets JKB_VERIFY_NO_DAEMON"
+
+seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'pub const CLIENT_FILE_ROOT: &str = "repos";'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'pub const CLIENT_FILE_ROOT: &str = "projects";', 1))
+PYX
+run "the daemon admits file-backed writes under a directory the container does not bind" "does not bind \${localEnv:HOME}/projects"
+
+seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'pub const CLIENT_FILE_ROOT: &str = "repos";'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'pub const CLIENT_FILE_ROOT: &str = concat!("re", "pos");', 1))
+PYX
+run "the daemon's client file root can no longer be read" "could not read CLIENT_FILE_ROOT"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/remote.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'pub const REMOTE_VAR: &str = "JKB_REMOTE";'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'pub const REMOTE_VAR: &str = "JKB_REMOTE_URL";', 1))
+PYX
+run "remote mode is read from a variable the container does not set" "sets no JKB_REMOTE_URL"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/remote.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'pub const REMOTE_VAR: &str = "JKB_REMOTE";'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'pub const REMOTE_VAR: &str = concat!("JKB_", "REMOTE");', 1))
+PYX
+run "remote mode's variable name can no longer be read" "could not read REMOTE_VAR"
 
 # THE PROBE AND THE RAISE MUST STATE ONE RULE. Re-inlining the spec on the probe side is exactly
 # what shipped: `--match-set allowed-new` is the staging set, destroyed before the raise returns, so
@@ -669,6 +788,15 @@ open(p, 'w').write(s.replace('mkdir -p /home/vscode/.cargo/target', 'mkdir -p /h
 PYX
 run "the Dockerfile stops pre-creating CARGO_TARGET_DIR" "does not pre-create"
 
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '             /home/vscode/.claude-state \\\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the Dockerfile stops pre-creating a volume that is not CARGO_TARGET_DIR" "does not pre-create volume target"
+
 seed; printf '\nif then fi\n' >> "$work/t/.container/setup.sh"
 run "a container script gains a syntax error" "has a syntax error"
 
@@ -849,7 +977,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=72
+PINNED_BAD_SITES=92
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

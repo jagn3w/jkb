@@ -12,7 +12,7 @@ database directly. Anything the UI does, the terminal can do (design D31).
 | Package | What it is |
 |---------|------------|
 | **`core/`** (`@jkb/core`) | Portable TypeScript — **no `vscode`, no Node APIs**. The `JkbClient` transport interface (`client.ts`), domain models (`model.ts`: `NodeRef` / `TreeChild` / `NodeDetails` / `MutationIntent`), the node-kind **registry** (`registry.ts`), row colour policy (`decoration.ts`), detail HTML rendering (`details.ts`), per-folder count formatting (`summary.ts`), and the staging/In-Flight row shapes and labels (`staging.ts`). Reused verbatim by any host. |
-| **`vscode/`** (`jkb-explorer`) | The VS Code extension: `cliClient.ts` (spawns `jkb --json` — the only Node-specific transport), `tree.ts` (the Explorer `TreeDataProvider`), `inflight.ts` (the In Flight `TreeDataProvider`), `detailsPanel.ts` (the Webview details host), `decorations.ts` (row colours/badges), and `extension.ts` (command wiring). |
+| **`vscode/`** (`jkb-explorer`) | The VS Code extension: `cliClient.ts` (spawns `jkb --json` — the only Node-specific transport), `tree.ts` (the Explorer `TreeDataProvider`), `inflight.ts` (the In Flight `TreeDataProvider`), `detailsPanel.ts` (the Webview details host), `decorations.ts` (row colours/badges), `claude.ts` (starting a session in the Claude Code extension), and `extension.ts` (command wiring). |
 
 A future web app is a third package that reuses `@jkb/core` with an HTTP-backed `JkbClient`
 — no rewrite of the models, registry, staging labels, or rendering.
@@ -25,11 +25,18 @@ Uses **pnpm only** (never npm).
 pnpm install          # from this ui/ directory
 pnpm run build        # build @jkb/core, then bundle the extension
 pnpm run typecheck    # typecheck both packages
+pnpm run test         # node --test; no framework, no new dependency
 ```
 
 `pnpm run build` is the real gate (and what `scripts/check.sh` and CI run): esbuild strips
 types *without* checking them, so each package type-checks before it emits, and `pnpm -r`
 runs topologically so `@jkb/core` emits its `.d.ts` before the adapter checks against it.
+
+`pnpm run test` runs beside it, in both. It is `node --test` over `vscode/test/*.test.mjs` —
+no framework and no new dependency. A test bundles the module it covers with esbuild (already
+here for the extension bundle), aliasing `vscode` to a stub, so it needs neither a running
+VS Code nor `dist/`. That suits glue over an API we do not own: what it pins is our half —
+which command is asked for, with which arguments, and the state kept between two windows.
 
 ## Run the extension
 
@@ -42,7 +49,8 @@ runs topologically so `@jkb/core` emits its `.d.ts` before the adapter checks ag
    and edit tasks/namespaces inline) and **In Flight** (staging branches and the tasks
    landing on them).
 
-Settings: `jkb.cliPath` (default `jkb`) and `jkb.dbPath` (blank = `$JKB_DB` / `~/.jkb/jkb.db`).
+Settings: `jkb.cliPath` (default `jkb`), `jkb.dbPath` (blank = `$JKB_DB` / `~/.jkb/jkb.db`),
+and `jkb.taskLauncher` — `auto` (default), `extension`, or `terminal`; see below.
 
 ## What works
 
@@ -70,8 +78,26 @@ Settings: `jkb.cliPath` (default `jkb`) and `jkb.dbPath` (blank = `$JKB_DB` / `~
 - **Search** (view-title): run a query DSL string and jump to a result's details.
 - **Work a task with Claude**: right-click a task → pick which staging branch its work
   should land on → opens its isolated session (`jkb task work`: a git worktree and branch,
-  with the task claimed) and starts `claude` in it, seeded with a prompt. Clicking twice
-  returns the same session rather than forking the work.
+  with the task claimed) as **its own VS Code window**, with a Claude Code chat seeded with
+  the task's prompt. Clicking twice returns the same session rather than forking the work.
+  It is a window because the Claude Code extension runs in the window's first workspace
+  folder and takes no directory argument — so the worktree has to *be* that folder, or
+  Claude would work the main checkout.
+  - **`jkb.taskLauncher` decides how**, because the extension is the better surface and not
+    an obligation. `auto` (default) uses it when installed and runs `claude` in a terminal
+    otherwise; `extension` always uses it and *says why* if it cannot, rather than handing
+    you the thing you ruled out; `terminal` always runs `claude` in the worktree and never
+    opens a window.
+  - **Clicking twice asks nothing**, because whether an agent is live on a checkout is not
+    observable — no API reports another window's folder. On the terminal surface the second
+    click shows the session's existing `claude` terminal and sends nothing, and says so. A
+    second click that opens a window *focuses* the one already on that worktree (VS Code
+    reuses a window per folder, measured), and since nothing activates in a focused window the
+    extension **watches** the prompt queue rather than only reading it at startup — so the
+    prompt lands in the window you were just sent to. That means the *window* surface converges
+    on one window but still opens a fresh chat per click, as the session's own window does;
+    only the terminal surface is fully idempotent. On the extension surfaces a handed-over
+    prompt waits **unsent** until someone presses enter; the terminal surface runs it.
 - **Land this task**: runs `jkb task land` in a terminal — the gate is a build, so its
   output is watchable.
 

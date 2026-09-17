@@ -5,10 +5,12 @@
 #   1. installs the `jkb` binary to ~/.cargo/bin (cargo install)
 #   2. scaffolds the standard KB namespace roots (repos/ tasks/ media/ references/ memory/)
 #   3. builds + installs the VS Code extension (pnpm; skipped if VS Code/pnpm absent)
-#   4. installs + activates the background services (file-sync watcher and worktree
-#      reaper) as OS services (launchd/systemd)
+#   4. installs + activates the background services (file-sync watcher, worktree reaper, and
+#      the jkb serve daemon) as OS services (launchd/systemd)
 #   5. installs the repo's post-merge git hook into this repo's .git/hooks — and, when
 #      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
+#   6. builds + installs the notifier behind sticky Claude Code notifications, and reports
+#      the two things it cannot do for you: the one-time Allow, and the Alerts style
 #
 # Flags: --no-extension, --no-service, --no-scaffold, --link-memory, --db <path>, -h/--help.
 #
@@ -20,10 +22,24 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+# `install_exec` — every file this script installs is written atomically, because the
+# post-merge hook runs this script and is itself one of them. See scripts/lib.sh.
+# shellcheck source=scripts/lib.sh
+. "$repo_root/scripts/lib.sh"
 do_extension=1
 do_service=1
 do_scaffold=1
 link_memory=0
+# One state word per section, rendered at the end by `render_setup_summary` in lib.sh. Each
+# means what actually happened, not what was attempted: `watcher=running` is set to `failed`
+# by every arm that reports a failed or absent activation, not just by a failed write, and
+# `scaffold` distinguishes "skipped by flag" from "an existing KB was left untouched" from
+# "creating them failed" — a boolean could not, and the summary asserted five roots in two of
+# the three.
+scaffold_state=created
+extension_state=installed
+watcher_state=running
+serve_state=unchecked
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -44,7 +60,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+# `warn` comes from lib.sh, which renders the git-hook report and needs it too.
 
 # --- 1. jkb binary -----------------------------------------------------------
 # Re-running this after `git pull` is the supported way to refresh the binary — the
@@ -76,55 +92,61 @@ echo "installed: $(command -v jkb) ($(jkb --version))"
 # shared/cloud-synced path). The DB + migrations are created on first open; `_sys/`
 # comes from the migrations, these are the reserved semantic roots (design D32).
 if [ "$do_scaffold" -eq 0 ]; then
+  scaffold_state=skipped
   warn "skipping KB scaffold (--no-scaffold)"
 elif [ -f "$db" ]; then
+  scaffold_state=untouched
   say "existing KB detected ($db) — left untouched"
 else
   say "scaffold KB namespaces ($db)"
-  mkdir -p "$(dirname "$db")"
-  jkb --db "$db" ns mk repos tasks media references memory
+  # Wrapped for the same reason as the two steps below it. THE RULE, stated where it can be
+  # checked against the file: everything after the binary is non-fatal, because the git-hooks
+  # section is what installs the hook that re-runs this script after a later pull — a machine
+  # that dies before it never installs the hook, and no `git pull` will then repair that. The
+  # binary itself is the one hard precondition and is deliberately still fatal: every step
+  # after it needs `jkb`, so skipping the hook section is the accepted cost there, and a
+  # machine whose `cargo install` fails has nothing working to repair anyway. On the
+  # unattended pull path the hook is already installed from an earlier run, so it survives.
+  if mkdir -p "$(dirname "$db")" && jkb --db "$db" ns mk repos tasks media references memory; then :; else
+    scaffold_state=failed
+    warn "could not scaffold the KB at $db — continuing to the git hooks."
+  fi
 fi
 
 # --- 3. VS Code extension ----------------------------------------------------
 if [ "$do_extension" -eq 1 ]; then
   say "build + install VS Code extension"
   if "$repo_root/scripts/install-extension.sh"; then :; else
+    extension_state=failed
     warn "extension install skipped/failed (VS Code or pnpm missing?) — continuing."
   fi
 else
+  extension_state=skipped
   warn "skipping VS Code extension (--no-extension)"
 fi
 
 # --- 4. file-sync watcher service -------------------------------------------
 if [ "$do_service" -eq 1 ]; then
-  say "install + activate background services (file sync, worktree reaper)"
-  jkb --db "$db" service install
-  # BOTH units `service install` writes. The reaper is what finishes a landing whose session
-  # could not archive its own worktree, so a unit that is written and never loaded means those
-  # worktrees accumulate for ever — visible only as `jkb doctor` output nobody reads.
-  case "$(uname -s)" in
-    Darwin)
-      for label in com.jkb.sync com.jkb.reap; do
-        plist="$HOME/Library/LaunchAgents/$label.plist"
-        launchctl unload "$plist" 2>/dev/null || true   # idempotent reload
-        if launchctl load "$plist"; then echo "$label loaded (launchd)"; else
-          warn "could not load $label; activate manually: launchctl load $plist"
-        fi
-      done ;;
-    Linux)
-      if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user daemon-reload || true
-        for label in com.jkb.sync com.jkb.reap; do
-          if systemctl --user enable --now "$label"; then echo "$label enabled (systemd)"; else
-            warn "could not enable $label; activate manually: systemctl --user enable --now $label"
-          fi
-        done
-      else
-        warn "systemctl not found; activate the printed units manually."
-      fi ;;
-    *) warn "unsupported OS for auto-activation; the units were written — activate them manually." ;;
-  esac
+  say "install + activate background services (file sync, worktree reaper, jkb serve)"
+  # Wrapped, like the extension step above it. A bare statement under `set -euo pipefail`
+  # ends the script here — so a unit that could not be written (an uncreatable
+  # ~/.config/systemd/user, a full disk, no HOME in the post-merge hook's environment) took
+  # the git-hook section below with it, and the repo kept whatever stale or missing
+  # post-merge hook it had. The hooks are the one section a partial setup must still reach.
+  # The activation lives in lib.sh (`activate_services`) so a test can run it against stub
+  # service managers — see scripts/tests/services.test.sh.
+  if jkb --db "$db" service install; then
+    activate_services "$db"
+  else
+    # A distinct variable, not `do_service=0`: that is the flag, and reusing it would make the
+    # summary below report a failure as "--no-service" — the user's choice, which it was not.
+    watcher_state=failed
+    serve_state=unchecked
+    warn "could not write the service units — continuing to the git hooks."
+  fi
 else
+  watcher_state=skipped
+  serve_state=skipped
   warn "skipping watcher service (--no-service)"
 fi
 
@@ -139,40 +161,20 @@ fi
 say "installing git hooks"
 hooks_src="$repo_root/scripts/hooks/post-merge"
 if [ -f "$hooks_src" ]; then
-  git_dir="$(git -C "$repo_root" rev-parse --git-dir 2>/dev/null || true)"
-  if [ -n "$git_dir" ]; then
-    case "$git_dir" in /*) ;; *) git_dir="$repo_root/$git_dir" ;; esac
-    mkdir -p "$git_dir/hooks"
-    cp "$hooks_src" "$git_dir/hooks/post-merge"
-    chmod +x "$git_dir/hooks/post-merge"
-    echo "  • repo hook:  $git_dir/hooks/post-merge"
-
-    global_hooks="$(git config --get core.hooksPath || true)"
-    if [ -n "$global_hooks" ]; then
-      global_hooks="${global_hooks/#\~/$HOME}"
-      mkdir -p "$global_hooks"
-      chainer="$global_hooks/post-merge"
-      if [ ! -f "$chainer" ]; then
-        cat > "$chainer" <<'CHAIN'
-#!/bin/sh
-# Global post-merge chainer. `core.hooksPath` bypasses .git/hooks, so dispatch to the
-# repo-local hook if one exists (mirrors the commit-msg chainer).
-repo_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/post-merge"
-[ -x "$repo_hook" ] && exec "$repo_hook" "$@"
-exit 0
-CHAIN
-        chmod +x "$chainer"
-        echo "  • chainer:    $chainer (core.hooksPath is set, so this is required)"
-      else
-        # Something is already there; do not clobber it, but say so, because a chainer that
-        # does not dispatch means the repo hook never runs.
-        grep -q "hooks/post-merge" "$chainer" 2>/dev/null \
-          || warn "$chainer exists but may not chain to the repo hook — check it by hand"
-      fi
-    fi
-  else
-    warn "not a git repo; skipping hook install"
-  fi
+  # BOTH halves live in lib.sh — the installer and its rendering. Leaving the rendering
+  # inline drew the seam one level too low: nothing runs setup.sh, so its `case` arms were
+  # reachable from no test, and two review findings lived in them with the gate green.
+  #
+  # `< <(…)`, not a pipe and not `|| true`: a process substitution's exit status is never
+  # checked, so a failing installer cannot kill this script, and nothing here is load-bearing
+  # for the report arriving. `install_git_hooks` is itself `set -e`-safe (see lib.sh's header)
+  # — it used to depend on an incidental `|| true` right here for that.
+  render_git_hooks_report < <(install_git_hooks "$repo_root" "$hooks_src")
+else
+  # A header followed by nothing reads exactly like a stage that ran — the vacuity this file
+  # and check.sh have both grown guards against. This is the one stage a partial setup must
+  # reach, so it may not be the one that disappears quietly.
+  warn "no hook source at $hooks_src — the post-merge hook was NOT installed."
 fi
 
 # --- shared claude memory (opt-in) -------------------------------------------
@@ -182,9 +184,73 @@ if [ "$link_memory" -eq 1 ]; then
   "$repo_root/scripts/link-claude-memory.sh" || warn "some repos could not be linked (see above)"
 fi
 
+# --- notifications -------------------------------------------------------------------
+# `.claude/hooks/notify-sticky.sh` makes Claude Code's "needs your permission" notification stay
+# on screen and withdraws it when you answer. The hook tells `jkb serve`, whose notification machine
+# sends posts and withdrawals on a queue topic (design r3.2 N1); on macOS `jkb-notifier serve`
+# consumes it. Withdrawing needs a notifier we own (macos/notifier, on Apple's UserNotifications
+# framework), so this builds it — no third-party binary, no download.
+#
+# The TOPIC is created on every platform: a producer never creates one, and the hook in a Linux dev
+# container still reaches a Mac's daemon. Nothing fills it where nobody consumes — the machine sends
+# only to a topic with a consumer group, and the group is the notifier's, so only a Mac has one.
+say "notification topic"
+provision_notify_topic "$db"
+[ "$notify_topic_state" = ready ] && echo "  • $notify_topic ready"
+#
+# The two things this CANNOT do for you are reported rather than assumed, because a hook that
+# posts nothing, or posts self-hiding banners, looks exactly like a broken hook:
+#   - authorization is a one-time user grant, and the prompt dies with the process that raised it,
+#     so it must be requested interactively rather than in passing here;
+#   - the sticky "Alerts" style is a per-app setting no API can set.
+notifier_state=not-macos
+notifier_pid=""
+if [ "$(uname -s)" = "Darwin" ]; then
+  say "sticky notifications"
+  # "Did this build succeed" and "what notifier is installed, in what state" are separate
+  # questions, and only the second is worth reporting. They used to be fused: a failed build
+  # asserted that notifications would auto-hide — untrue whenever a working bundle is already
+  # installed, which is the usual case, since build-notifier.sh bails at its `swiftc` guard before
+  # touching the existing one — and it suppressed the two manual-step instructions, so a machine
+  # that really was unauthorized was told nothing.
+  #
+  build_notifier "$repo_root/scripts/build-notifier.sh" "$db" "$do_service" \
+    || warn "could not rebuild the notifier (any existing one is untouched)"
+
+  # Asked about the binary the AGENT runs (`--notifier-path`), not whichever bundle `--find-notifier`
+  # would pick: the agent is what displays, and a second bundle elsewhere is not.
+  nb=$(bash "$repo_root/.claude/hooks/notify-sticky.sh" --notifier-path 2>/dev/null || true)
+  state=$([ -x "$nb" ] && "$nb" status 2>/dev/null || true)
+  if [ ! -x "$nb" ]; then
+    warn "no notifier installed at $nb — permission notifications will not be shown"
+  else
+    case "$state" in
+      *authorization=authorized*) ;;
+      *) warn "not yet allowed to notify — run once and click Allow:"
+         echo "      '$nb' authorize" ;;
+    esac
+    case "$state" in
+      *alert-style=alert*) ;;
+      *) echo "  • for STICKY notifications, set: System Settings > Notifications >"
+         echo "    jkb Notifier > Alerts  (banners auto-hide; only Alerts waits for you)" ;;
+    esac
+  fi
+  report_notifier "$db" "$notify_topic_state" "$notify_topic" \
+    "$(bash "$repo_root/scripts/build-notifier.sh" --agent-label)" "$do_service"
+fi
+
 say "setup complete"
-echo "  • jkb:        $(command -v jkb)"
-echo "  • database:   $db"
-echo "  • roots:      repos/ tasks/ media/ references/ memory/ (+ _sys/)"
-[ "$do_extension" -eq 1 ] && echo "  • extension:  reload VS Code ('Developer: Reload Window') to activate"
-[ "$do_service" -eq 1 ] && echo "  • watcher:    running; file edits under mounts auto-sync"
+# The report, rendered by lib.sh so the arms are reachable from a test. Inline, this block
+# produced a finding in three consecutive review rounds and every one of them was invisible to
+# a green gate. `< <(…)`, not a pipe: a process substitution's status is never checked, so
+# nothing here can fail the script at its last statement.
+render_setup_summary < <(
+  printf 'jkb=%s\n' "$(command -v jkb)"
+  printf 'database=%s\n' "$db"
+  printf 'scaffold=%s %s\n' "$scaffold_state" "$db"
+  printf 'extension=%s\n' "$extension_state"
+  printf 'watcher=%s\n' "$watcher_state"
+  printf 'serve=%s\n' "$serve_state"
+  printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
+  printf 'notifier=%s %s\n' "$notifier_state" "${notifier_pid:-}"
+)

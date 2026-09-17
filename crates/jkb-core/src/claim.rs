@@ -12,14 +12,14 @@
 //! Liveness is by **owner-existence**, never by a claim's age: there is no TTL and no
 //! agent heartbeat, precisely so a paused-but-alive agent (e.g. blocked on a permission
 //! prompt) is never reclaimed. The `claimant_id` is a liveness-checkable owner id
-//! (`host:pid`+run, or `session:<pid>:<worktree>`); the probe lives at the CLI/coordinator
+//! (`host:pid`+run, or `session:<pid>[@<claude session>]:<worktree>`); the probe lives at the CLI/coordinator
 //! edge (`owner::is_alive` — `kill(pid, 0)` for a process owner, worktree existence for a
 //! session owner) — this
 //! module only records who holds what. Every seam here is **changelogged** (op
 //! `claim`/`release`) for audit; they are not auto-reverted by undo (which inverts only
 //! `insert` ops).
 //!
-//! The crash-recovery net moved out, to [`crate::transition::reclaim_dead`]: freeing a dead
+//! The crash-recovery net moved out, to [`crate::transition::reclaim_judged`]: freeing a dead
 //! owner's claim is a lifecycle transition (`observed_owner_gone`) like any other, and routing
 //! it through the machine is what makes it appear in a task's history and what stops it firing
 //! on an owner whose liveness merely could not be established.
@@ -286,6 +286,17 @@ pub fn release(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Who holds `item`'s claim, **as stored** — the exact bytes [`clear_if`] and [`release`] compare
+/// against. A re-rendered owner id is not safe to compare: a claim written outside the lifecycle need
+/// not be in `AgentId`'s canonical spelling, and a caller that sent back the canonical form would never
+/// match it.
+///
+/// # Errors
+/// A database error.
+pub fn holder(conn: &Connection, item: ItemId) -> Result<Option<String>> {
+    Ok(read_before(conn, item)?.and_then(|b| b.claimant_id))
 }
 
 /// Every task that currently holds a claim (`claimant_id IS NOT NULL`).

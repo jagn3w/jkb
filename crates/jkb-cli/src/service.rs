@@ -30,6 +30,11 @@ pub const LABEL: &str = "com.jkb.sync";
 /// something (design D49).
 pub const REAP_LABEL: &str = "com.jkb.reap";
 
+/// ...and for `jkb serve`, the daemon that owns the database for processes that must not open it
+/// themselves — the dev container's `jkb` (design r3.2 H3). A third unit, not a job inside another:
+/// a crashed file watcher must not take the container's access to the knowledge base with it.
+pub const SERVE_LABEL: &str = "com.jkb.serve";
+
 /// Which OS service manager to target (chosen by `cfg!` at the call site).
 #[derive(Clone, Copy)]
 enum Manager {
@@ -66,18 +71,42 @@ pub fn print(db: &Path) -> Result<()> {
 /// # Errors
 /// Returns an error on an unsupported platform, or if a file can't be written.
 pub fn install(db: &Path) -> Result<()> {
-    let manager = manager()?;
-    for (label, path, unit) in units_for_platform(db)? {
+    install_units(manager()?, units_for_platform(db)?)
+}
+
+/// Write each unit to its own path and say how to activate it.
+///
+/// Split from [`install`] so the destinations are an ARGUMENT rather than something derived
+/// from `$HOME` inside `units_for_platform`. That derivation is the reason nothing could
+/// reach this code: reverting its `atomic::write` to `std::fs::write` passed the whole gate,
+/// because `atomic::write`'s own tests exercise the seam in isolation and no test could get
+/// here to assert that this caller goes through it. Same split, for the same reason, as
+/// `commands::install_into`.
+///
+/// # Errors
+/// Returns an error if a unit's directory cannot be created or the unit cannot be written.
+fn install_units(manager: Manager, units: Vec<Unit>) -> Result<()> {
+    for (label, path, unit) in units {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::write(&path, unit).with_context(|| format!("writing {}", path.display()))?;
+        // `atomic::write`, never `fs::write`: a supervisor may be reading this unit as we
+        // replace it (`launchctl load` / `systemctl daemon-reload`), and setup.sh re-runs
+        // `service install` on every pull that touched `scripts/`.
+        crate::atomic::write(&path, unit.as_bytes())?;
         println!("wrote {}", path.display());
+        // A RESTART, not `load` / `enable --now`: those leave an already-running unit on the old
+        // binary, and a daemon older than the database refuses every request (schema_newer). The
+        // same rule as setup.sh's `activate_services`.
         match manager {
-            Manager::Launchd => println!("activate with: launchctl load {}", path.display()),
+            Manager::Launchd => println!(
+                "activate with: launchctl unload {path} 2>/dev/null; launchctl load {path}",
+                path = path.display()
+            ),
             Manager::Systemd => println!(
-                "activate with: systemctl --user daemon-reload && systemctl --user enable --now {label}"
+                "activate with: systemctl --user daemon-reload && systemctl --user enable {label} \
+                 && systemctl --user restart {label}"
             ),
         }
     }
@@ -109,6 +138,42 @@ pub fn uninstall(db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Print every unit [`install`] writes for this platform, one per line, tab-separated: its label, the
+/// path it is installed at, and its role — `serve` for the daemon, `watcher` for the rest — so
+/// setup.sh activates exactly these, derives no path of its own, and reports the daemon on its own
+/// line.
+///
+/// # Errors
+/// As [`install`], for an unsupported platform or no `HOME`.
+pub fn units(db: &Path) -> Result<()> {
+    for (label, path, _) in units_for_platform(db)? {
+        let role = if label == SERVE_LABEL {
+            "serve"
+        } else {
+            "watcher"
+        };
+        println!("{label}\t{}\t{role}", path.display());
+    }
+    Ok(())
+}
+
+/// Where `jkb serve` listening on `port` writes its token when not told otherwise:
+/// `~/.jkb/daemon/<port>/token`, **whichever database it serves**. The daemon writes it only once its
+/// port is bound, which is what setup.sh waits for.
+///
+/// **Keyed by what a client knows.** A client knows the daemon's address and never its database:
+/// the notification hook opens none, and the dev container sees the host's `~/.jkb` through a bind
+/// while its own `JKB_DB` names a container-local file. Beside the database, a host set up with
+/// `--db ~/kb/jkb.db` wrote `~/kb/daemon/token` where no client looked. One path per home instead let
+/// a second daemon on another port overwrite the first's live token, locking out every client of
+/// the first (both found by the stage-5 reviews). The port is what separates two daemons in one home.
+#[must_use]
+pub fn serve_token_path(port: u16) -> PathBuf {
+    std::env::var_os("HOME")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join(format!(".jkb/daemon/{port}/token"))
+}
+
 /// Every `(label, install path, contents)` for the current platform.
 fn units_for_platform(db: &Path) -> Result<Vec<Unit>> {
     let exe = std::env::current_exe().context("resolving the jkb executable path")?;
@@ -130,6 +195,12 @@ fn units_for_platform(db: &Path) -> Result<Vec<Unit>> {
                     .join(format!("{REAP_LABEL}.plist")),
                 launchd_reap_plist(&exe, &db),
             ),
+            (
+                SERVE_LABEL,
+                home.join("Library/LaunchAgents")
+                    .join(format!("{SERVE_LABEL}.plist")),
+                launchd_serve_plist(&exe, &db),
+            ),
         ],
         Manager::Systemd => vec![
             (
@@ -143,6 +214,12 @@ fn units_for_platform(db: &Path) -> Result<Vec<Unit>> {
                 home.join(".config/systemd/user")
                     .join(format!("{REAP_LABEL}.service")),
                 systemd_reap_unit(&exe, &db),
+            ),
+            (
+                SERVE_LABEL,
+                home.join(".config/systemd/user")
+                    .join(format!("{SERVE_LABEL}.service")),
+                systemd_serve_unit(&exe, &db),
             ),
         ],
     })
@@ -282,6 +359,59 @@ fn systemd_reap_unit(exe: &Path, db: &Path) -> String {
     )
 }
 
+/// A launchd agent plist running `jkb serve`, kept alive, logging beside the database.
+fn launchd_serve_plist(exe: &Path, db: &Path) -> String {
+    let exe = xml_escape(&exe.to_string_lossy());
+    let log_dir = db.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let log = xml_escape(&log_dir.join("serve.log").to_string_lossy());
+    let db = xml_escape(&db.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{SERVE_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>--db</string>
+        <string>{db}</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// A systemd **user** unit running `jkb serve`, restarted on failure.
+fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
+    let exe = exe.to_string_lossy();
+    let db = db.to_string_lossy();
+    format!(
+        "[Unit]\n\
+         Description=jkb knowledge base daemon (serves the dev container)\n\
+         After=default.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} --db {db} serve\n\
+         Restart=on-failure\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
 /// Minimal XML escaping for text that goes inside plist `<string>` elements.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -294,8 +424,8 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        launchd_plist, launchd_reap_plist, systemd_reap_unit, systemd_unit, xml_escape, LABEL,
-        REAP_LABEL,
+        install_units, launchd_plist, launchd_reap_plist, launchd_serve_plist, systemd_reap_unit,
+        systemd_serve_unit, systemd_unit, xml_escape, Manager, LABEL, REAP_LABEL, SERVE_LABEL,
     };
     use std::path::Path;
 
@@ -342,10 +472,76 @@ mod tests {
     }
 
     #[test]
+    fn the_serve_units_run_the_daemon_under_their_own_label() {
+        let plist = launchd_serve_plist(
+            Path::new("/usr/local/bin/jkb"),
+            Path::new("/home/u/.jkb/jkb.db"),
+        );
+        assert!(plist.contains(&format!("<string>{SERVE_LABEL}</string>")));
+        assert!(![LABEL, REAP_LABEL].contains(&SERVE_LABEL));
+        assert!(plist.contains("<string>serve</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("serve.log"));
+        let unit = systemd_serve_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
+        assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db serve"));
+        assert!(unit.contains("Restart=on-failure"));
+    }
+
+    #[test]
     fn systemd_reap_unit_runs_the_reaper() {
         let unit = systemd_reap_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
         assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
+    }
+
+    /// Pins the CALLER, not the seam. `atomic::write` has its own test, and it stays green
+    /// when this function is reverted to `std::fs::write` — writing works; it is the reader
+    /// mid-`launchctl load` that an in-place rewrite corrupts. So this holds a handle open
+    /// across a reinstall, the way a supervisor does, and asserts it still sees the whole old
+    /// unit. Reverting `install_units`'s `atomic::write` fails it with "the reinstall rewrote
+    /// a unit a supervisor was already reading".
+    ///
+    /// It can exist at all only because `install_units` takes its destinations as an
+    /// argument. While `install` derived them from `$HOME`, this call site was unreachable.
+    #[test]
+    #[cfg(unix)]
+    fn installing_a_unit_replaces_it_by_rename_never_rewriting_it_in_place() {
+        use std::io::Read;
+        const PREVIOUS: &str = "<!-- the unit that was installed before this upgrade -->\n";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sub").join(format!("{LABEL}.plist"));
+        let unit = || {
+            vec![(
+                LABEL,
+                path.clone(),
+                launchd_plist(Path::new("/usr/local/bin/jkb"), Path::new("/home/u/jkb.db")),
+            )]
+        };
+
+        install_units(Manager::Launchd, unit()).expect("first install");
+        assert!(path.is_file(), "install_units created no unit");
+        // Stand the installed unit in for an older version of itself. The generators are
+        // deterministic, so a second install writes identical bytes and the assertion below
+        // could not tell a rename from a truncate-and-rewrite.
+        std::fs::write(&path, PREVIOUS).expect("plant an older version");
+
+        let mut supervisor = std::fs::File::open(&path).expect("open the installed unit");
+        install_units(Manager::Launchd, unit()).expect("reinstall");
+
+        let mut seen = String::new();
+        supervisor
+            .read_to_string(&mut seen)
+            .expect("read through the open handle");
+        assert_eq!(
+            seen, PREVIOUS,
+            "the reinstall rewrote a unit a supervisor was already reading"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            launchd_plist(Path::new("/usr/local/bin/jkb"), Path::new("/home/u/jkb.db")),
+            "the upgrade did not land"
+        );
     }
 
     #[test]

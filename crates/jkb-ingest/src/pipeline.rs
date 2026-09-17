@@ -39,6 +39,7 @@ pub struct Pipeline {
     embedder: Arc<dyn Embedder + Send + Sync>,
     chunking: ChunkConfig,
     version: i64,
+    actor: &'static str,
 }
 
 /// The result of ingesting one source.
@@ -51,7 +52,8 @@ pub struct Outcome {
     /// Whether the source's items are vector-embedded (false if the embedder was
     /// down — the source is still captured and keyword-searchable).
     pub embedded: bool,
-    /// True if this source was already fully ingested (the call was a no-op).
+    /// True if an earlier run captured this source, so this call wrote no items — it may still have
+    /// written vectors, or marked a capture embedded since complete.
     pub already_ingested: bool,
     /// Non-fatal warnings (e.g. near-empty extraction, embedder unavailable).
     pub warnings: Vec<String>,
@@ -69,6 +71,8 @@ enum Capture {
         document: ItemId,
         chunk_count: usize,
         items: Vec<(ItemId, String)>,
+        /// Captured by an earlier run, so this one wrote no items.
+        resumed: bool,
     },
 }
 
@@ -80,7 +84,15 @@ impl Pipeline {
             embedder,
             chunking: ChunkConfig::default(),
             version: 1,
+            actor: "ingest",
         }
+    }
+
+    /// Record the capture in the changelog as `actor`'s write (`jkb serve` records `serve`).
+    #[must_use]
+    pub const fn with_actor(mut self, actor: &'static str) -> Self {
+        self.actor = actor;
+        self
     }
 
     /// Override the chunking configuration.
@@ -107,7 +119,7 @@ impl Pipeline {
     pub fn ingest_path(&self, db: &Db, path: &Path, namespace: &str) -> Result<Outcome> {
         let bytes = std::fs::read(path)?;
         let parsed = adapter::parse(path, &bytes)?;
-        self.ingest(db, &bytes, &parsed, namespace)
+        self.ingest(db, Some(&bytes), &parsed, namespace)
     }
 
     /// Ingest a URL (design D18): render it in a headless browser (so client-side
@@ -122,22 +134,29 @@ impl Pipeline {
     pub fn ingest_url(&self, db: &Db, url: &str, namespace: &str) -> Result<Outcome> {
         let html = crate::fetch::render_url(url)?;
         let parsed = adapter::HtmlAdapter.parse(html.as_bytes())?;
-        self.ingest(db, html.as_bytes(), &parsed, namespace)
+        self.ingest(db, Some(html.as_bytes()), &parsed, namespace)
     }
 
-    /// Ingest already-read `raw` bytes with their `parsed` document (the seam
-    /// [`Pipeline::ingest_url`] reuses: fetch → parse → `ingest`).
+    /// Ingest a `parsed` document, with the `raw` bytes it was parsed from when the caller has them
+    /// (the seam [`Pipeline::ingest_url`] and `jkb_api`'s `ingest.text` reuse).
+    ///
+    /// With `raw`, the source is content-addressed by those bytes and they are stored as its blob. Without
+    /// — text parsed by a client that did not send its source, as the dev container's `jkb ingest`
+    /// through `jkb serve` — it is addressed by [`text_address`], a hash in a domain of its own, and no
+    /// blob is stored. Not by the text's plain hash: a UTF-8 file's text is its bytes, so a client that
+    /// sent a host file's bytes as text took the document the host's own ingest of that file resumes
+    /// into — under the client's namespace and mime, unparsed, and `already ingested` ever after.
     ///
     /// # Errors
     /// See [`Pipeline::ingest_path`].
     pub fn ingest(
         &self,
         db: &Db,
-        raw: &[u8],
+        raw: Option<&[u8]>,
         parsed: &ParsedDocument,
         namespace: &str,
     ) -> Result<Outcome> {
-        let source_hash = blob::hash_bytes(raw);
+        let source_hash = raw.map_or_else(|| text_address(&parsed.text), blob::hash_bytes);
         let mut warnings = Vec::new();
         if parsed.text.trim().chars().count() < MIN_USABLE_CHARS {
             warnings.push(format!(
@@ -148,7 +167,7 @@ impl Pipeline {
         let chunks = chunk::chunk_text(&parsed.text, &self.chunking);
 
         let capture = self.capture(db, raw, parsed, namespace, &source_hash, chunks)?;
-        let (document, chunk_count, items) = match capture {
+        let (document, chunk_count, items, resumed) = match capture {
             Capture::Complete {
                 document,
                 chunk_count,
@@ -165,8 +184,23 @@ impl Pipeline {
                 document,
                 chunk_count,
                 items,
-            } => (document, chunk_count, items),
+                resumed,
+            } => (document, chunk_count, items, resumed),
         };
+
+        // A resumed capture whose every item already has a vector was embedded since — by `jkb index
+        // --pending`, which writes vectors but keys no ingestion. It is complete, and a repeat run says so
+        // rather than resuming it forever.
+        if resumed && self.all_embedded(db, &items)? {
+            self.mark_complete(db, &source_hash)?;
+            return Ok(Outcome {
+                document,
+                chunk_count,
+                embedded: true,
+                already_ingested: true,
+                warnings,
+            });
+        }
 
         // Embed stage — off the writer thread. If the embedder is down, capture still
         // stands (keyword-searchable); leave it for `index_pending` (D21).
@@ -178,7 +212,8 @@ impl Pipeline {
                 document,
                 chunk_count,
                 embedded: false,
-                already_ingested: false,
+                // Resumed and not embedded: this run wrote nothing.
+                already_ingested: resumed,
                 warnings,
             });
         }
@@ -197,13 +232,13 @@ impl Pipeline {
     fn capture(
         &self,
         db: &Db,
-        raw: &[u8],
+        raw: Option<&[u8]>,
         parsed: &ParsedDocument,
         namespace: &str,
         source_hash: &str,
         chunks: Vec<String>,
     ) -> Result<Capture> {
-        let raw = raw.to_vec();
+        let raw = raw.map(<[u8]>::to_vec);
         let text = parsed.text.clone();
         let mime = parsed.mime.clone();
         let namespace = namespace.to_owned();
@@ -212,7 +247,7 @@ impl Pipeline {
         let model = self.embedder.model().to_owned();
         let pipeline_version = self.version;
 
-        db.write_txn_with::<Capture, Error, _>("ingest", move |conn, meta| {
+        db.write_txn_with::<Capture, Error, _>(self.actor, move |conn, meta| {
             let key = ingestion::Key {
                 source_hash: &hash,
                 pipeline_version,
@@ -252,6 +287,11 @@ impl Pipeline {
                 None => None,
             };
 
+            // Whatever the state, a run that has the source bytes keeps them, so a blob removed out of band
+            // is restored by the next ingest of its source.
+            if let Some(raw) = &raw {
+                blob::store(conn, &hash, raw, Some(&mime))?;
+            }
             match status.as_deref() {
                 Some("complete") => Ok(Capture::Complete {
                     document: document_id(conn, &hash)?,
@@ -264,10 +304,10 @@ impl Pipeline {
                         document,
                         chunk_count: items.len().saturating_sub(1),
                         items,
+                        resumed: true,
                     })
                 }
                 None => {
-                    blob::store(conn, &hash, &raw, Some(&mime))?;
                     let ns_id = ns::ensure(conn, &namespace)?;
                     let document = item::upsert(
                         conn,
@@ -326,6 +366,7 @@ impl Pipeline {
                         document,
                         chunk_count,
                         items,
+                        resumed: false,
                     })
                 }
             }
@@ -372,6 +413,42 @@ impl Pipeline {
             for (id, embedding) in &embeddings {
                 vector.upsert_vector(conn, *id, embedding)?;
             }
+            ingestion::mark_complete(
+                conn,
+                ingestion::Key {
+                    source_hash: &hash,
+                    pipeline_version,
+                    strategy: &strategy,
+                    embedder_model: &model,
+                },
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether every one of `items` already has a vector in this pipeline's index.
+    fn all_embedded(&self, db: &Db, items: &[(ItemId, String)]) -> Result<bool> {
+        let ids: Vec<ItemId> = items
+            .iter()
+            .filter(|(_, content)| !content.trim().is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let vector = VectorIndexer::new(self.embedder.clone());
+        let found =
+            db.read_with::<usize, Error, _>(move |conn| Ok(vector.vectors_for(conn, &ids)?.len()))?;
+        Ok(found == items.iter().filter(|(_, c)| !c.trim().is_empty()).count())
+    }
+
+    /// Mark the ingestion of `source_hash` complete.
+    fn mark_complete(&self, db: &Db, source_hash: &str) -> Result<()> {
+        let hash = source_hash.to_owned();
+        let strategy = self.strategy();
+        let model = self.embedder.model().to_owned();
+        let pipeline_version = self.version;
+        db.write_txn_with::<(), Error, _>("ingest-embed", move |conn, _meta| {
             ingestion::mark_complete(
                 conn,
                 ingestion::Key {
@@ -606,6 +683,19 @@ impl IndexReport {
             self.first_error = Some(message.to_owned());
         }
     }
+}
+
+/// The address of a document known only by its `text`: blake3 in key-derivation mode under a context of
+/// its own, which no plain blake3 of any bytes can equal — so a client's text and a host file are two
+/// documents even when the file's text is its bytes, and a client cannot take the uid, the ingestion row
+/// or the resume a host file's ingest would use. A hash of a prefix and the text was not that: a file
+/// whose bytes began with the prefix hashed to the same address, and one the container wrote for the host
+/// to ingest later landed in the container's capture (stage-6.3 review 2).
+#[must_use]
+pub fn text_address(text: &str) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("jkb 2026-09-15 ingest.text document address");
+    hasher.update(text.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// The chunk items derived from `document`, via the `derived_from` edge ingest writes.

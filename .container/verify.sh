@@ -107,7 +107,7 @@ missing_extensions() { # missing_extensions <declared, one per line> <installed,
     while read -r ext; do
         [ -n "$ext" ] || continue
         id="${ext%@*}"
-        printf '%s\n' "$installed" | grep -qiFx "$id" || out="$out $id"
+        grep -qiFx "$id" <<<"$installed" || out="$out $id"
     done <<<"$declared"
     printf '%s' "$out"
 }
@@ -268,7 +268,7 @@ reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <f
 if [ "$SELF_TEST" = yes ]; then
     st_fail=0
     st() { # st <mount point> <owned|checked>
-        if printf '%s' "$1" | grep -Eq "$RUNTIME_OWNED"; then got=owned; else got=checked; fi
+        if grep -Eq "$RUNTIME_OWNED" <<<"$1"; then got=owned; else got=checked; fi
         if [ "$got" = "$2" ]; then printf '  \033[32mok\033[0m   %-24s %s\n' "$1" "$2"
         else printf '  \033[31mFAIL\033[0m %-24s is %s, wanted %s\n' "$1" "$got" "$2"; st_fail=$((st_fail+1)); fi
     }
@@ -778,7 +778,7 @@ if ! declared_env="$(dc_container_env "$cfg_path" "$cfg_root" 2>/dev/null)"; the
 elif [ -z "$declared_env" ]; then
     note "container.json declares no containerEnv (asserting nothing about the environment)"
 else
-    env_missing=""; env_wrong=""; env_n=0
+    env_missing=""; env_wrong=""; env_armed=""; env_n=0
     while IFS= read -r decl; do
         [ -n "$decl" ] || continue
         env_n=$((env_n+1))
@@ -786,6 +786,11 @@ else
         # `printenv` rather than `[ -z "${!k}" ]`: an empty declared value is a legitimate
         # declaration, and indirect expansion cannot tell it from an unset name.
         if ! got="$(printenv "$k")"; then env_missing="$env_missing $k"
+        elif [ "$k" = JKB_EGRESS_ACCEPT_UNFILTERED ] && [ "$got" = 1 ]; then
+            # The documented escape (D50.6) is armed at `docker run`, which is the only way to arm
+            # it: an ACCEPTED failure, like the disarmed boot gate it causes, or a container run
+            # with the override exits 1 and is told to fix the condition it chose.
+            env_armed="$env_armed $k(=$got, declared $want)"
         elif [ "$got" != "$want" ]; then env_wrong="$env_wrong $k(=$got, declared $want)"
         fi
     done <<<"$declared_env"
@@ -796,8 +801,12 @@ else
         # an override set at `docker run` beats containerEnv silently. Reported as a difference
         # rather than as an absence, because those have different causes and different repairs.
         bad "container.json's environment reached this container with different values:$env_wrong — something overrode the declaration at run time"
-    else
+    elif [ -z "$env_armed" ]; then
         ok "every declared environment entry reached this container ($env_n checked)"
+    fi
+    # Reported beside a real difference as well as alone, so arming the override never hides one.
+    if [ -n "$env_armed" ]; then
+        accept_bad "container.json's environment reached this container with different values:$env_armed — the egress override was armed at run time"
     fi
 fi
 
@@ -1193,7 +1202,7 @@ esac
 ws_mounted=no
 while IFS= read -r m; do
     [ -n "$m" ] || continue
-    printf '%s\n' "$EXPECTED" | grep -qx "$m" || continue
+    grep -qx "$m" <<<"$EXPECTED" || continue
     case "$mem_repo" in "$m"|"$m"/?*) ws_mounted=yes; break ;; *) ;; esac
 done <<<"$actual"
 assert "$mem_repo is inside a declared mount point" "$ws_mounted"
@@ -1209,6 +1218,71 @@ while IFS= read -r m; do
     [ "$m" = /home/vscode/.jkb ] && { kb_mounted=yes; break; }
 done <<<"$actual"
 assert "knowledge base is mounted" "$kb_mounted"
+
+# REMOTE MODE, NOT A DATABASE OF ITS OWN (tasks S6.5). The container reaches the knowledge base only
+# through jkb serve on the host. It had its own once — JKB_DB on the jkb-kb-local volume, which
+# came up root-owned the first time so every `jkb` verb died creating it — and before that JKB_DB
+# pointed through the ~/.jkb bind at the host's database, which a process on each kernel corrupts
+# (.container/sqlite-share-probe.py). Both are gone; what is left to hold is that nothing brought
+# either back. Remote mode refuses JKB_DB outright, so one set here fails every command anyway —
+# asserted by name so the failure says why.
+assert "JKB_REMOTE names the host daemon (${JKB_REMOTE:-unset})" \
+    "$([ -n "${JKB_REMOTE:-}" ] && echo yes || echo no)"
+assert "JKB_DB is not set (the container has no database of its own)" \
+    "$([ -z "${JKB_DB:-}" ] && echo yes || echo no)"
+# Behind remote mode, jkb-core's own refusals. Asked of the INSTALLED jkb, not of a third copy of
+# the filesystem rule: jkb-core refuses a database on a filesystem shared with another kernel and
+# any `file:` URI (crates/jkb-core/src/shared_fs.rs). A binary built before a given refusal still
+# opens the host's database from in here — a review measured one — so the binary itself is asked.
+# Those two probes run with remote mode off for that one process (`env -u JKB_REMOTE`): with it on,
+# `--db` is refused before jkb-core sees the path, and they would pass testing nothing.
+#
+# Two things are conditional, and each for a stated reason:
+#   - no `jkb` on PATH is a NOTE: the image does not install one (setup.sh does), and the mutation
+#     harness runs this file against that bare image, where two FAILs made its control fail;
+#   - the bind refusal is required only when the bind IS a shared filesystem, asked of lib.sh's
+#     `shared_fs_kind` (the list shared_fs.rs is checked against). On a native Linux Docker host the
+#     bind is same-kernel ext4, where opening is correct and refusing would be the bug.
+# The `file:` refusal is required everywhere, because Rust refuses URIs on every filesystem.
+kb_lib="$(cd "$(dirname "$0")/.." && pwd)/scripts/lib.sh"
+kb_probe_dir="/home/vscode/.jkb/.verify-refusal-probe-$$"
+if ! command -v jkb >/dev/null 2>&1; then
+    note "no jkb installed here, so the installed-binary refusal checks did not run (setup.sh installs it)"
+else
+    kb_uri_refused=no
+    if ! kb_out="$(env -u JKB_REMOTE jkb --db "file:$kb_probe_dir/uri.db" ns ls 2>&1)" \
+        && grep -q "never \`file:\` URIs" <<<"$kb_out"; then
+        kb_uri_refused=yes
+    fi
+    assert "the installed jkb refuses a file: URI database (rebuild it if not: setup.sh)" "$kb_uri_refused"
+
+    kb_magic="$(stat -f -c %t /home/vscode/.jkb 2>/dev/null || true)"
+    kb_kind="$(bash -c '. "$1" && shared_fs_kind "$2"' _ "$kb_lib" "$kb_magic" 2>/dev/null || true)"
+    if [ -n "$kb_kind" ]; then
+        kb_refused=no
+        if ! kb_out="$(env -u JKB_REMOTE jkb --db "$kb_probe_dir/jkb.db" ns ls 2>&1)" \
+            && grep -q "refusing to open a database" <<<"$kb_out" \
+            && [ ! -e "$kb_probe_dir/jkb.db" ]; then
+            kb_refused=yes
+        fi
+        assert "the installed jkb refuses a database on the $kb_kind host bind (rebuild it if not: setup.sh)" "$kb_refused"
+    else
+        note "the ~/.jkb bind is not a shared filesystem here (magic ${kb_magic:-unreadable}), so there is nothing for jkb to refuse on it"
+    fi
+    # ...and the installed jkb is in remote mode: it refuses to name a database at all. Asked without
+    # the daemon, which this check must not need (mutate-verify.sh's containers have none).
+    # Only with JKB_REMOTE set and JKB_DB unset (asserted above; `env -u` besides): otherwise this jkb
+    # is not in remote mode, and the probe would open a database rather than be refused.
+    kb_remote=no
+    if [ -n "${JKB_REMOTE:-}" ] \
+        && ! kb_out="$(env -u JKB_DB jkb --db "$kb_probe_dir/remote.db" ns ls 2>&1)" \
+        && grep -q "refused with JKB_REMOTE set" <<<"$kb_out" \
+        && [ ! -e "$kb_probe_dir/remote.db" ]; then
+        kb_remote=yes
+    fi
+    assert "the installed jkb is in remote mode and refuses to open a database (rebuild it if not: setup.sh)" "$kb_remote"
+fi
+rm -rf -- "$kb_probe_dir" "$PWD/file:"
 
 # 5. Egress default-deny. Asserted in BOTH directions: a firewall that blocks everything passes a
 #    one-sided test while having broken the container.
@@ -1286,6 +1360,92 @@ if curl -sS -m 15 -o /dev/null https://api.anthropic.com/ 2>/dev/null \
     ok "egress to an allowlisted host still works"
 else
     bad "egress to an allowlisted host is blocked — the firewall is too tight to work in"
+fi
+
+# 5b. The one opening to the host: `jkb serve` (design r3.2 H5). The kernel's answer first, for the
+#     same reason as above: a daemon that is down and a rule that is missing look identical from a
+#     curl.
+#
+# `wide` is the one that matters most and the one no curl to the daemon's port can see: the daemon
+# answers either way, and every OTHER port on the host's loopback answers too. That is also why
+# there is no "another host port is refused" probe here. One was written (curl to :7118 expecting a
+# refusal) and could not be shown to fire: on a Linux engine a closed host port answers with a
+# refusal whether or not the rule is wide, so it passed in exactly the state it existed for. The
+# other direction is asserted where it can be — the `wide` state, read from the live sets.
+#
+# WHERE THE IMAGE SAYS THE DAEMON IS. egress-status.sh runs the image's egress-lib.sh, and this
+# script runs the checkout's; after a pull without a rebuild the two can name different ports, and a
+# probe of the checkout's port would then blame com.jkb.serve for a rule on another one. So the
+# address probed below is the one the kernel's answer was about.
+eg_daemon="$(kv_field daemon "$eg_probe")"
+daemon_at="$(kv_field daemon_at "$eg_probe")"
+[ -n "$daemon_at" ] || daemon_at="$DAEMON_HOST:$DAEMON_PORT"
+
+# THE OVERRIDE, AGAIN (D51.5). With JKB_EGRESS_ACCEPT_UNFILTERED=1 and no firewall at all there is no
+# daemon rule either, and that absence is a consequence of the state the operator accepted — so it is
+# an accepted failure like the reachability check above, or verify.sh exits 1 and run.sh tells the
+# operator to fix something they chose.
+dm_bad=bad; [ "$eg_accept" = 1 ] && [ "$eg_state" = unfiltered ] && dm_bad=accept_bad
+case "$eg_daemon" in
+    port)       ok "the firewall opens the host daemon's port ($daemon_at) and no other host port beyond DNS" ;;
+    unresolved) $dm_bad "${daemon_at%:*} did not resolve when the firewall was raised, so no address is open for jkb serve on the host — re-run init-firewall.sh; on Linux add --add-host=${daemon_at%:*}:host-gateway" ;;
+    absent)     $dm_bad "the firewall has no rule for jkb serve on the host ($daemon_at), so this container cannot reach the knowledge base" ;;
+    wide)       $dm_bad "the host's address is in the egress allowlist, which opens EVERY port on the host's loopback to this container — jkb serve must be reached through its port-only rule alone" ;;
+    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
+esac
+
+# ...and what actually answers. The token is read from the ~/.jkb bind, where the host's daemon
+# writes it, which is also what the container's `jkb` in remote mode will read — so this is the
+# whole path a client takes, not just the port. `--noproxy '*'`: this runs outside the nested
+# sandbox, and a proxy variable in the environment would test the proxy instead of the rule.
+# The header goes through a file descriptor so the token is never in this process's argv.
+# Keyed by the daemon's port (`~/.jkb/daemon/<port>/token`), which is how a client finds it.
+daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb/daemon/${daemon_at##*:}/token}"
+# NO TOKEN IS A FAILURE since the cutover (tasks S6.5): every jkb command in here goes to the daemon,
+# so a container that cannot authenticate to it has no knowledge base at all. The one exception is
+# a harness that builds a correct container with no host daemon behind it — mutate-verify.sh's
+# scratch ~/.jkb, a CI runner — which says so with JKB_VERIFY_NO_DAEMON=1; the kernel's answer
+# above is still asserted there. A NOTE then, never silence.
+#
+# ABSENT, not unreadable. A token that exists but this user cannot read (a uid mismatch across the
+# bind) is a failure either way: remote mode cannot authenticate.
+if [ ! -e "$daemon_token" ] && [ "${JKB_VERIFY_NO_DAEMON:-0}" = 1 ]; then
+    note "there is no daemon token at $daemon_token and JKB_VERIFY_NO_DAEMON=1 says no host daemon is expected, so jkb serve was not asked"
+elif [ ! -e "$daemon_token" ]; then
+    bad "there is no daemon token at $daemon_token, so no jkb command in this container can reach the knowledge base — run ./scripts/setup.sh on the host to install com.jkb.serve"
+elif [ ! -r "$daemon_token" ]; then
+    bad "the daemon token at $daemon_token exists but this user cannot read it, so remote mode could not authenticate to jkb serve on the host ($(stat -c '%U:%G %a' "$daemon_token" 2>/dev/null || echo 'owner unreadable'))"
+else
+    daemon_hello="$(curl -sS --noproxy '*' -m 5 \
+        -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$daemon_token" 2>/dev/null)") \
+        "http://$daemon_at/v1/hello" 2>/dev/null)" || daemon_hello=""
+    case "$daemon_hello" in
+        *'"protocol"'*)
+            ok "jkb serve on the host answers this container, authenticated by the token on the ~/.jkb bind"
+            # ...and the INSTALLED jkb gets there too. curl proves the path, not the binary: one built
+            # before `JKB_REMOTE` accepted bare host:port reads the address as a URL scheme and fails
+            # every command, while the `--db` refusal above passes on it. A read no database is needed
+            # for, as setup.sh's activation asks it.
+            # Never without JKB_REMOTE: this jkb would then open the database behind the bind — the
+            # host's live one, on a native-Linux engine where nothing refuses it. And JKB_REMOTE must
+            # name the address curl just reached: the firewall's opening is the IMAGE's, the variable
+            # the checkout's, and after a port change without a rebuild they differ — which a
+            # reinstall of jkb does not fix.
+            jkb_remote_at="${JKB_REMOTE:-}"; jkb_remote_at="${jkb_remote_at#http://}"; jkb_remote_at="${jkb_remote_at%/}"
+            if [ -z "$jkb_remote_at" ] || ! command -v jkb >/dev/null 2>&1; then
+                :   # asserted above: remote mode unset fails there, no jkb is a note there
+            elif [ "$jkb_remote_at" != "$daemon_at" ]; then
+                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ./.container/run.sh --rm && ./.container/run.sh --build"
+            else
+                if jkb_answer="$(env -u JKB_DB jkb --json mq topic ls 2>&1)"; then
+                    ok "the installed jkb reaches jkb serve through JKB_REMOTE"
+                else
+                    $dm_bad "the installed jkb cannot reach jkb serve through JKB_REMOTE=${JKB_REMOTE:-unset} although curl can — rebuild it (setup.sh): $(head -c 300 <<<"$jkb_answer")"
+                fi
+            fi
+            ;;
+        *) $dm_bad "jkb serve on the host does not answer at http://$daemon_at with the token from $daemon_token — is com.jkb.serve running there? Its log is ~/.jkb/serve.log on the host; a VS Code port forward holding ${daemon_at##*:} on the host is one measured cause" ;;
+    esac
 fi
 
 # 6. The inner posture. `check` is the drift rule from D48; here it also proves the posture

@@ -129,6 +129,27 @@ pub fn grep(
     scope: Option<&str>,
     ignore_case: bool,
 ) -> Result<Vec<GrepRow>> {
+    let mut out = Vec::new();
+    grep_each(conn, pattern, scope, ignore_case, |row| {
+        out.push(row);
+        true
+    })?;
+    Ok(out)
+}
+
+/// [`grep`], handing each matching item to `each` as it is read instead of collecting them, so a
+/// caller that keeps only part of each (the matching lines, a count) never holds every item's content
+/// at once. `each` returns whether to continue.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn grep_each(
+    conn: &Connection,
+    pattern: &str,
+    scope: Option<&str>,
+    ignore_case: bool,
+    mut each: impl FnMut(GrepRow) -> bool,
+) -> Result<()> {
     use rusqlite::types::Value;
     let mut sql = String::from(
         "SELECT i.id, i.uid, i.kind, i.content FROM items i WHERE i.content IS NOT NULL",
@@ -161,7 +182,6 @@ pub fn grep(
             content: r.get(3)?,
         })
     })?;
-    let mut out = Vec::new();
     for row in rows {
         let row = row?;
         // For `-i`, keep only rows that actually contain the needle under a Unicode fold —
@@ -169,9 +189,11 @@ pub fn grep(
         if ignore_case && !row.content.to_lowercase().contains(&needle) {
             continue;
         }
-        out.push(row);
+        if !each(row) {
+            break;
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A full item row (metadata + content) for detail views (`jkb item show`).
@@ -202,6 +224,131 @@ pub struct ItemMeta {
     pub created_at: String,
     /// Last-update timestamp (ISO).
     pub updated_at: String,
+}
+
+/// Whether `line` ends a task's body in a `tasks.md`: blank once trimmed. The one copy — the `tasks`
+/// serializer closes a body on it, and an edit that would put one inside a body is refused by
+/// [`edit_content`], because the text after it would come back from the file as section prose.
+#[must_use]
+pub fn ends_task_body(line: &str) -> bool {
+    line.trim().is_empty()
+}
+
+/// Whether an item's content is written into a file by the `tasks` serializer — decided by the
+/// serializer that owns its binding ([`crate::binding::serializer_for`]), not by how the uri is
+/// spelled: a `#` in a document's own filename (`C#.md`) made a whole-file note read as a task.
+///
+/// # Errors
+/// Returns an error if the read fails.
+pub fn in_tasks_file(conn: &Connection, item: ItemId) -> Result<bool> {
+    Ok(crate::binding::serializer_for(conn, item)?.as_deref() == Some("tasks"))
+}
+
+/// Replace an item's content with `text`, or append it, through [`set_content`] — the one rule for an
+/// edit, shared by `jkb task edit` (`jkb_api::tasks::edit`) and `jkb item edit`. An item in a tasks
+/// file ([`in_tasks_file`]) appends with a single newline (its body is contiguous indented lines) and
+/// refuses a result `tasks_problem` names — the tasks serializer's own round trip
+/// (`jkb_sync::task_content_problem`), handed in because core does not depend on it: a blank line
+/// ending the body, an indented checkbox becoming a child task, a trailing `^x` or `@x` becoming an
+/// identity or a due date. The *result* is judged, not the text sent. Any other item appends after a
+/// blank line. With `max_bytes`, a result longer than that is refused. Answers whether the item is in
+/// a tasks file.
+///
+/// # Errors
+/// A validation error for a refused result, [`jkb_types::Error::NotFound`] via [`set_content`], or a
+/// failed read or write.
+pub fn edit_content(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    text: &str,
+    append: bool,
+    max_bytes: Option<usize>,
+    tasks_problem: &dyn Fn(&str) -> Option<String>,
+) -> Result<bool> {
+    let tasks_file = in_tasks_file(conn, item)?;
+    let content = if append {
+        let separator = if tasks_file { "\n" } else { "\n\n" };
+        match get_content(conn, item)? {
+            Some(existing) if !existing.is_empty() => format!("{existing}{separator}{text}"),
+            _ => text.to_owned(),
+        }
+    } else {
+        text.to_owned()
+    };
+    // The size first: the round-trip probe parses the whole text, inside the writer's transaction.
+    if let Some(max) = max_bytes {
+        if content.len() > max {
+            return Err(TypeError::Validation(format!(
+                "an item's content of at most {max} bytes ({} after this edit)",
+                content.len()
+            ))
+            .into());
+        }
+    }
+    if tasks_file {
+        if let Some(problem) = tasks_problem(&content) {
+            return Err(TypeError::Validation(format!(
+                "this task is written into a tasks.md, and its text would not come back from the file \
+                 as written: {problem}"
+            ))
+            .into());
+        }
+    }
+    set_content(conn, meta, item, &content, None)?;
+    Ok(tasks_file)
+}
+
+/// The first non-blank line of `content`, trimmed and untruncated.
+///
+/// The **one** copy of this derivation. There were four, at three different truncation
+/// lengths, over content that carries checkbox and quick-add syntax (`- [ ] … !p1 ^id`) for
+/// every finding and every serializer-imported task — so the first change to it, such as
+/// stripping the trailing `^id`, had to be made in four places with nothing forcing the
+/// fourth, after which a staging row, a gate refusal and `jkb task show` would disagree
+/// about one task's name. Truncation is deliberately left to each caller: a listing, a
+/// staging row and a refusal message have genuinely different widths. It lives here rather
+/// than in the CLI because the typed operations (`jkb-api`) name items too.
+#[must_use]
+pub fn first_nonblank(content: &str) -> &str {
+    content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+}
+
+/// The first non-blank line of `content` in at most `max` characters, a cut one ending in `…` — the
+/// one-line snippet `related`, `inv` and the CLI's one-line reports print. The ops that send one cut it
+/// with this and the CLI renders with it, so such a line is never cut twice to two lengths. (The
+/// listing rows of `kb.*` keep their own 80-character snippet, which the explorer parses.)
+#[must_use]
+pub fn snippet(content: &str, max: usize) -> String {
+    let line = first_nonblank(content);
+    if line.chars().count() <= max {
+        return line.to_owned();
+    }
+    let head: String = line.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+/// The width of a listing's snippet, in characters.
+pub const SNIPPET_CHARS: usize = 100;
+
+/// An item's display title: its first non-blank line, falling back to the uid for an item
+/// with no body. Untruncated — see [`first_nonblank`].
+#[must_use]
+pub fn title_of(meta: &ItemMeta) -> String {
+    title_from(&meta.uid, meta.content.as_deref())
+}
+
+/// [`title_of`] from an item's uid and content, for a caller holding a row other than [`ItemMeta`].
+#[must_use]
+pub fn title_from(uid: &str, content: Option<&str>) -> String {
+    match content.map(first_nonblank) {
+        Some(line) if !line.is_empty() => line.to_owned(),
+        _ => uid.to_owned(),
+    }
 }
 
 /// Fetch an item's full row by id, or `None` if it does not exist.
@@ -247,18 +394,12 @@ pub fn get_many(conn: &Connection, items: &[ItemId]) -> Result<HashMap<ItemId, I
     if items.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; items.len()].join(", ");
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, uid, kind, content, content_hash, mime, status, resolution, priority, due,
                 created_at, updated_at
-         FROM items WHERE id IN ({placeholders})"
-    );
-    let params: Vec<rusqlite::types::Value> = items
-        .iter()
-        .map(|id| rusqlite::types::Value::Integer(id.get()))
-        .collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+         FROM items WHERE id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = stmt.query_map([crate::sql::json_ids(items.iter().map(|i| i.get()))], |r| {
         Ok(ItemMeta {
             id: ItemId::new(r.get(0)?),
             uid: r.get(1)?,
@@ -654,20 +795,14 @@ pub fn derived_from(
     if children.is_empty() {
         return Ok(out);
     }
-    let placeholders = (1..=children.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Placeholders are generated from a count; every value is bound.
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT src_item_id, dst_item_id FROM edges
-          WHERE type = 'derived_from' AND src_item_id IN ({placeholders})"
-    );
-    let params: Vec<rusqlite::types::Value> = children.iter().map(|c| c.get().into()).collect();
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-    })?;
+          WHERE type = 'derived_from' AND src_item_id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = stmt.query_map(
+        [crate::sql::json_ids(children.iter().map(|c| c.get()))],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    )?;
     for row in rows {
         let (child, source) = row?;
         out.entry(ItemId::new(child))
@@ -753,21 +888,15 @@ pub fn derived_kind_counts(
     if parents.is_empty() {
         return Ok(out);
     }
-    // Placeholders are generated from a count; every value is bound.
-    let placeholders = (2..2 + parents.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT e.dst_item_id, COUNT(*) FROM edges e
          JOIN items i ON i.id = e.src_item_id
-         WHERE e.type = 'derived_from' AND i.kind = ?1 AND e.dst_item_id IN ({placeholders})
-         GROUP BY e.dst_item_id"
-    );
-    let mut params: Vec<rusqlite::types::Value> = vec![kind.to_owned().into()];
-    params.extend(parents.iter().map(|p| p.get().into()));
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+         WHERE e.type = 'derived_from' AND i.kind = ?1
+           AND e.dst_item_id IN (SELECT value FROM json_each(?2))
+         GROUP BY e.dst_item_id",
+    )?;
+    let ids = crate::sql::json_ids(parents.iter().map(|p| p.get()));
+    let rows = stmt.query_map(params![kind, ids], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
     })?;
     for row in rows {

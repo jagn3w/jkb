@@ -17,7 +17,36 @@
 # hand values from the embedded python back to bash, and deletes them again as it consumes them.
 set -euo pipefail
 
+# The caller's repository selection, dropped before the first git runs. `rev-parse
+# --show-toplevel` with an exported `GIT_DIR`/`GIT_WORK_TREE` answers about THAT repository, so
+# `$REPO` — which every listing below is scoped to — would name a repo the operator never asked
+# about, and the status display would be confidently about the wrong tree. Read-only here, so this
+# is wrong information rather than the data loss `merge-queue.sh` had, but it is the same variable
+# and the same one-line fix.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
+      GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+# `stat` IS NOT PORTABLE, and the two spellings do different things rather than failing. GNU
+# coreutils reads `-c '%Y %n'` for mtime+name; BSD/macOS reads `-f '%m %N'`. On Linux `-f` means
+# "filesystem status", so the no-argument path — `./scripts/swarm-status.sh` with no run named —
+# produced the wrong answer on Linux. Probed once rather than guessed from uname.
+#
+# NOT "silently found nothing and reported no runs at all", which this line claimed until the
+# `find_run_dir` comment below was written in the same commit and contradicted it: the script
+# printed nothing on either stream because `find` over a missing root aborted the whole run under
+# `pipefail`. A silent death looks exactly like an empty result, and describing one as the other
+# is how the abort went unexamined for a round.
+if stat -c '%Y' . >/dev/null 2>&1; then
+    STAT_FLAG=-c; STAT_FMT='%Y %n'          # GNU coreutils
+else
+    STAT_FLAG=-f; STAT_FMT='%m %N'          # BSD / macOS
+fi
+
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# `jkb_sqlite` — every database read here goes through it, so a run inside the dev container refuses
+# the host's database instead of checkpointing a WAL the host is writing (scripts/lib.sh).
+# shellcheck source=scripts/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 # =====================================================================
 # FILE view — per-task disk marker vs KB status for one tasks.md
@@ -30,6 +59,9 @@ file_view() {
     fi
     [ -f "$file" ] || { echo "no such file: $file" >&2; exit 1; }
     [ -f "$db" ]   || { echo "no such db: $db" >&2; exit 1; }
+    # Once, up front: the per-query refusals would otherwise read as "no sync_state row" and as KB
+    # data captured into $kb, which is a wrong answer rather than a refusal.
+    refuse_shared_db "$db" || exit 3
 
     local abs uri uri_sql
     abs=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
@@ -42,20 +74,18 @@ file_view() {
     echo
 
     echo "=== sync_state ==="
-    sqlite3 -header -column "$db" \
-        "SELECT status, substr(last_synced_hash,1,12) AS last_hash,
+    jkb_sqlite "$db" "SELECT status, substr(last_synced_hash,1,12) AS last_hash,
                 substr(base_blob_hash,1,12)  AS base_hash,
                 substr(quarantine_blob_hash,1,12) AS quar_hash,
                 parse_error, updated_at
-         FROM sync_state WHERE uri = '$uri_sql';" 2>&1 \
+         FROM sync_state WHERE uri = '$uri_sql';" -header -column 2>&1 \
       || echo "(no sync_state row — file not yet synced)"
     echo
 
     local kb
-    kb=$(sqlite3 -separator $'\t' "$db" \
-        "SELECT substr(b.uri, instr(b.uri,'#')+1) AS frag, i.status
+    kb=$(jkb_sqlite "$db" "SELECT substr(b.uri, instr(b.uri,'#')+1) AS frag, i.status
          FROM bindings b JOIN items i ON i.id = b.item_id
-         WHERE b.uri LIKE '$uri_sql#%' AND i.kind = 'task';" 2>&1 || true)
+         WHERE b.uri LIKE '$uri_sql#%' AND i.kind = 'task';" -separator $'\t' 2>&1 || true)
 
     echo "=== tasks (disk marker | kb status) ==="
     printf '%-4s  %-13s  %s\n' "DISK" "KB-STATUS" "TASK"
@@ -94,20 +124,53 @@ file_view() {
 find_run_dir() {
     local arg="$1"
     if [ -n "$arg" ] && [ -d "$arg" ]; then printf '%s\n' "$arg"; return; fi
-    local roots=("$HOME/.claude/projects")
+    local roots=("$HOME/.claude/projects") present=()
     [ -n "${CLAUDE_CONFIG_DIR:-}" ] && roots=("$CLAUDE_CONFIG_DIR/projects" "${roots[@]}")
+    # ONLY THE ROOTS THAT EXIST, and a pipeline that cannot abort the caller.
+    #
+    # `find` exits non-zero when any argument is missing or any directory under it is unreadable,
+    # and `set -euo pipefail` at the top of this file turns that into an abort INSIDE the command
+    # substitution that calls this function — so the script printed zero bytes and exited 1, and
+    # the "no swarm run found" message below was unreachable. Measured here: CLAUDE_CONFIG_DIR
+    # unset and `$HOME/.claude/projects` absent, `./scripts/swarm-status.sh` produced no output at
+    # all on either stream.
+    #
+    # That also explains why the BSD-`stat` bug one round ago was described as "found nothing and
+    # reported no runs": it never reported anything. The same abort swallowed the report, which is
+    # why the abort itself went unexamined — a silent death looks exactly like an empty result.
+    # The success path is no safer: one unreadable sibling directory makes `find` print the right
+    # answer and still exit 1, and `pipefail` then discards it.
+    local r
+    for r in "${roots[@]}"; do [ -d "$r" ] && present+=("$r"); done
+    if [ "${#present[@]}" -eq 0 ]; then return 1; fi
     if [ -n "$arg" ]; then
-        find "${roots[@]}" -type d -name "$arg" 2>/dev/null | head -1
+        # `sed -n 1p`, not `head -1`: head EXITS after its line, find dies on the unwritten
+        # tail, and `set -euo pipefail` two dozen lines up turns that into an abort with no
+        # message. Measured: `producer | sort -rn | head -1` aborted 20/20 at 3000 lines,
+        # `| sed -n 1p` 0/20 — sed reads to EOF, so there is no early exit to race.
+        { find "${present[@]}" -type d -name "$arg" 2>/dev/null || true; } | sed -n 1p
     else
-        find "${roots[@]}" -type d -name 'wf_*' -path '*/subagents/workflows/*' \
-            2>/dev/null -exec stat -f '%m %N' {} + 2>/dev/null \
-            | sort -rn | head -1 | cut -d' ' -f2-
+        # THE JOURNAL'S MTIME, NOT THE DIRECTORY'S, because this script writes into the
+        # directory. `run_view` drops `.swarm-base` and `.swarm-scope` into `$run_dir` and
+        # removes them again — four directory-modifying operations — so inspecting a finished
+        # run by name once bumped that run's mtime above the live one, and every later
+        # no-argument invocation picked the finished run FOR EVER. Measured with two runs
+        # 1.1s apart: correct before, permanently wrong after a single `swarm-status wf_OLD`.
+        # Appending to `journal.jsonl` does not touch the parent directory, which is exactly
+        # why the directory was the wrong thing to ask and the journal is the right one: it is
+        # the file the harness writes and this script only reads.
+        { find "${present[@]}" -type f -name journal.jsonl -path '*/subagents/workflows/wf_*' \
+            2>/dev/null -exec stat "$STAT_FLAG" "$STAT_FMT" {} + 2>/dev/null || true; } \
+            | sort -rn | sed -n 1p | cut -d' ' -f2- | sed 's|/journal\.jsonl$||'
     fi
 }
 
 run_view() {
     local run_dir
-    run_dir="$(find_run_dir "${1:-}")"
+    # `|| run_dir=""`, because a bare assignment from a command substitution is subject to
+    # `errexit`: `find_run_dir` returning non-zero — which it now does when no search root exists
+    # — would abort here, before the message below that exists to explain exactly that.
+    run_dir="$(find_run_dir "${1:-}")" || run_dir=""
     if [ -z "$run_dir" ] || [ ! -f "$run_dir/journal.jsonl" ]; then
         echo "no swarm run found (arg='${1:-}'). Pass a run id (wf_...) or transcript dir." >&2
         exit 1
@@ -118,7 +181,22 @@ run_view() {
 
     JOURNAL="$run_dir/journal.jsonl" SCOPE_OUT="$run_dir/.swarm-scope" BASE_OUT="$run_dir/.swarm-base" python3 - <<'PY'
 import json, os, re
-rows = [json.loads(l) for l in open(os.environ["JOURNAL"]) if l.strip()]
+# A PARTIAL LAST LINE IS THE NORMAL STATE OF A LIVE RUN. This was a list comprehension over
+# `json.loads`, so one malformed line — most often the final line of a journal still being
+# written, caught mid-flush — raised and replaced the entire report with a traceback and exit 1.
+# The whole point of this view is watching a run that is still going. Unparseable lines are
+# counted and mentioned, never fatal.
+rows, skipped = [], 0
+for l in open(os.environ["JOURNAL"]):
+    if not l.strip():
+        continue
+    try:
+        rows.append(json.loads(l))
+    except ValueError:
+        skipped += 1
+if skipped:
+    print(f"(note: {skipped} journal line(s) could not be parsed — a run still being written "
+          f"usually has one, and it is the last)")
 # New swarm shape (D27): SCHEDULER groups → IMPLEMENTER → REVIEWER → merge queue.
 sched, impls, reviews, merges, started = [], [], [], [], 0
 for e in rows:
@@ -132,7 +210,8 @@ for e in rows:
     if "groups" in r:          sched.append(r)
     elif "outcome" in r:       impls.append(r)         # IMPL {outcome, branch, summary}
     elif "verdict" in r:       reviews.append(r)       # REVIEW {verdict, notes, handoff}
-    elif "landed" in r:        merges.append(r)        # MERGE {landed, detail}
+    elif "exit" in r:          merges.append(r)        # MERGE {exit, detail}
+    elif "landed" in r:        merges.append(r)        # MERGE, pre-2026-09-12 shape
 
 namespaces, base = [], None
 for s in sched:
@@ -144,8 +223,30 @@ n_groups = sum(len(s.get("groups", [])) for s in sched)
 n_impl_ok = sum(1 for r in impls if r.get("outcome") == "ready")
 n_approve = sum(1 for r in reviews if r.get("verdict") == "approve")
 n_reqchg  = sum(1 for r in reviews if r.get("verdict") == "request_changes")
-n_land = sum(1 for r in merges if r.get("landed"))
-n_eject = sum(1 for r in merges if not r.get("landed"))
+# THE SAME THREE WORDS THE WORKFLOW USES. The runner's result shape changed from
+# {landed: bool} to {exit, detail} and this chain still keyed on "landed", so every merge result
+# was dropped: the counts read 0/0 over an empty list, the outcome table vanished, and the
+# base-branch derivation below — and the `git log` that depends on it — went dead. Read a journal
+# written before that change and the old key still works, because a status view of a finished run
+# must not stop being able to read it.
+#
+# THREE words, not two. `classifyMerge` in task-swarm.js is the authority: 0 lands, 1 and 2 are
+# the implementer's to fix, everything else stalls for an operator. Collapsing stall into eject
+# here would repeat, on the reporting surface, exactly the two-way collapse the workflow was just
+# fixed to stop making.
+def merge_outcome(r):
+    if "exit" not in r:
+        return "landed" if r.get("landed") else "eject"
+    code = r.get("exit")
+    if code == 0:
+        return "landed"
+    if code in (1, 2):
+        return "eject"
+    return "stall"
+
+n_land = sum(1 for r in merges if merge_outcome(r) == "landed")
+n_eject = sum(1 for r in merges if merge_outcome(r) == "eject")
+n_stall = sum(1 for r in merges if merge_outcome(r) == "stall")
 
 print(f"scheduler passes: {len(sched)}   agents started: {started}")
 if sched:
@@ -153,16 +254,23 @@ if sched:
     print(f"last pass: groups={len(last.get('groups',[]))} remaining={last.get('remaining')}")
 print(f"groups scheduled: {n_groups}   implemented(ok): {n_impl_ok}")
 print(f"reviews: approve={n_approve} request_changes={n_reqchg}")
-print(f"merge queue: landed={n_land} eject={n_eject}")
+print(f"merge queue: landed={n_land} eject={n_eject} stalled={n_stall}")
+if n_stall:
+    print("  ** a stalled merge needs a person: the branch is not at fault and nothing will retry it **")
 if merges:
     print()
     hdr = f"{'merge outcome':14} {'detail':60}"
     print(hdr); print("-" * len(hdr))
     for m in merges:
-        out = "landed" if m.get("landed") else "eject"
+        out = merge_outcome(m)
         print(f"{out:14} {str(m.get('detail',''))[:60]:60}")
-        # Parse the base branch from a "landed: <branch> -> <base> in …" line.
-        mm = re.search(r'->\s*(\S+)', str(m.get("detail","")))
+        # Parse the base branch from a "landed: <branch> → <base> in …" line.
+        #
+        # BOTH ARROWS. `merge-queue.sh` prints U+2192; this matched only ASCII `->`, so `mm` was
+        # always None, `.swarm-base` was never written, and the run view reported "no landed
+        # merges recorded yet" however many branches had landed. Accepting both costs nothing and
+        # means a future edit to either spelling does not silently break the other.
+        mm = re.search(r'(?:->|\u2192)\s*(\S+)', str(m.get("detail","")))
         if mm and not base:
             base = mm.group(1)
 if base:

@@ -13,33 +13,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use jkb_core::{item, tag, Db};
-use jkb_types::ItemId;
 
 use crate::gitrepo;
 
-/// The facet recording which branch a task is being done on, and which repo that branch is
-/// in. Plain tags (design D34.1): no migration, and queryable as `tag:branch=<name>`.
-pub(crate) const FACET_BRANCH: &str = "branch";
-pub(crate) const FACET_REPO: &str = "repo";
-
-/// The branch a session's work lands on used to be a facet here (`onto=`). It is now
-/// a label on the task's transition history: it is a statement about a moment, so two tasks told
-/// different targets are two entries with timestamps rather than one row silently keeping
-/// whichever wrote last. See `jkb_core::transition::land_target`.
-/// A task's facet tags, **every** value per facet.
-///
-/// Tags are a multi-map: `tag::apply` adds, so a task can legitimately carry two `branch=`
-/// values — one from `jkb task start` (D34) and one from `task work`. Collapsing them to a
-/// single value silently picks one, and picking the wrong `branch=` makes `task work` mint a
-/// second session for a task that already has one.
-pub(crate) fn task_tags(db: &Db, id: ItemId) -> Result<BTreeMap<String, Vec<String>>> {
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (facet, value) in db.read(move |conn| tag::applications(conn, id))? {
-        out.entry(facet).or_default().push(value);
-    }
-    Ok(out)
-}
+pub(crate) use jkb_core::location::FACET_BRANCH;
 
 /// The values recorded for one facet.
 pub(crate) fn facet_values<'a>(
@@ -58,82 +35,6 @@ pub(crate) fn facet_one<'a>(
     facet: &str,
 ) -> Option<&'a String> {
     facet_values(tags, facet).first()
-}
-
-/// Set a facet to exactly one value, removing any others it already had.
-///
-/// `tag::apply` is additive, which is right for open-ended facets and wrong for the ones that
-/// answer "where is this being worked" — a second value there is not extra information, it is
-/// a contradiction the readers have to guess their way through.
-pub(crate) fn set_facet(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    facet: &str,
-    value: &str,
-) -> jkb_core::Result<()> {
-    for (f, v) in tag::applications(conn, id)? {
-        if f == facet && v != value {
-            tag::remove(conn, meta, id, &f, &v)?;
-        }
-    }
-    tag::apply(conn, meta, id, facet, value)
-}
-
-/// Where a task is being worked. Every field is single-valued by nature: a second `branch=`
-/// is a contradiction, not extra information (design D36.6).
-///
-/// There is deliberately **no cut point** here, and no longer anywhere. It existed so that a
-/// branch adding nothing to trunk could be told apart from one that never started — a question
-/// only the commit-graph inference had to ask, and one a merged pull request answers directly.
-#[derive(Default)]
-pub(crate) struct Location<'a> {
-    pub(crate) branch: Option<&'a str>,
-    pub(crate) repo: Option<&'a str>,
-    /// The branch this one lands on. Recorded as a **label on the transition**, not as a
-    /// property of the branch kept in agreement with git.
-    pub(crate) onto: Option<&'a str>,
-}
-
-/// Whether a branch value joins the ones a task already records, or replaces them.
-#[derive(Clone, Copy)]
-pub(crate) enum BranchWrite {
-    /// The task is being *moved* to this branch — `task work`, `task start`. A second `branch=`
-    /// there is a contradiction (D36.6).
-    Set,
-    /// This branch is *additional*. A task can legitimately record two, and every reader indexes
-    /// both, because deciding a task has landed on the strength of one while the other is live is
-    /// how work gets buried.
-    Add,
-}
-
-/// Put `branch` on the task.
-///
-/// This used to do two things — write the facet **and** measure and store the branch's cut point
-/// — because those two facts written apart is what every incident in this area had in common. The
-/// cut point is gone: it existed only to make the commit-graph inference answerable, and that
-/// inference has been replaced by a pull request lookup. So one write is all that is left, and the
-/// pairing rule it enforced has nothing to pair.
-///
-/// # Errors
-/// Returns an error if the name is not usable as a git ref, or the tag write fails.
-pub(crate) fn record_branch(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    branch: &str,
-    how: BranchWrite,
-) -> jkb_core::Result<()> {
-    // Refuse a name git would read as an option **before it is stored**. A hostile value entered
-    // the store cleanly and then poisoned every later reader — and a reader that refuses is a whole
-    // `close-merged` run failing on one bad row. The store is the boundary worth defending;
-    // `gitrepo::valid_ref` at the git call is the backstop for values that predate this.
-    crate::gitrepo::valid_ref(branch).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
-    match how {
-        BranchWrite::Set => set_facet(conn, meta, id, FACET_BRANCH, branch)?,
-        BranchWrite::Add => tag::apply(conn, meta, id, FACET_BRANCH, branch)?,
-    }
-    Ok(())
 }
 
 /// Which of a task's recorded branches its work is on — the **one** rule, shared by the In Flight
@@ -199,38 +100,6 @@ pub(crate) fn work_for(ctx: &RepoCtx, tags: &BTreeMap<String, Vec<String>>) -> R
     Ok(Work { session, branch })
 }
 
-/// Record where a task is being worked — `task work` and `task start`.
-///
-/// They had a writer each: `task work` set the facets, `task start` added them with `tag::apply`.
-/// A task that saw both — which the guide encourages, since `start` tags from the ambient repo —
-/// ended up carrying two `branch=` values, and every reader that collapses the multi-map to one
-/// then picked whichever came first.
-///
-/// The **land target is not written here.** It used to be a `branch_records` column that had to
-/// be kept in agreement with git; it is now a label on the `start` transition, written by the
-/// same call that records the transition, so there is nothing to keep in agreement and nothing
-/// for two tasks on one branch to disagree about — they are two entries, with timestamps.
-///
-/// # Errors
-/// Returns an error if a name is not usable as a git ref, or a tag write fails.
-pub(crate) fn set_location_facets(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    loc: &Location<'_>,
-) -> jkb_core::Result<()> {
-    if let Some(onto) = loc.onto {
-        crate::gitrepo::valid_ref(onto).map_err(|e| jkb_types::Error::Validation(e.to_string()))?;
-    }
-    if let Some(repo) = loc.repo {
-        set_facet(conn, meta, id, FACET_REPO, repo)?;
-    }
-    if let Some(branch) = loc.branch {
-        record_branch(conn, meta, id, branch, BranchWrite::Set)?;
-    }
-    Ok(())
-}
-
 /// What the session commands need to know about the repo they are running in.
 pub(crate) struct RepoCtx {
     /// The **main** copy's root — where `.jkb/` lives, even when invoked from inside a
@@ -263,108 +132,11 @@ pub(crate) fn repo_ctx() -> Result<RepoCtx> {
     Ok(RepoCtx { root, key, trunk })
 }
 
-/// One task, as far as the session commands care.
-pub(crate) struct SessionTask {
-    pub(crate) uid: String,
-    pub(crate) status: String,
-    /// Where **this** branch lands, from its own record.
-    ///
-    /// Per branch rather than per task, which is what it always was in substance: a task carrying
-    /// two branches had one `onto=` facet, so whichever branch you looked up got the other's
-    /// answer.
-    pub(crate) onto: Option<String>,
-}
-
-/// This repo's tasks indexed by **every** branch each records.
-///
-/// `branch=` is the only link from a worktree back to its task — there is deliberately no
-/// session state file to fall out of step with git (design D36.2). A task carrying two of
-/// them is indexed under both, so a worktree is found whichever one names it.
-pub(crate) fn tasks_by_branch(db: &Db, repo_key: &str) -> Result<BTreeMap<String, SessionTask>> {
-    let mut out = BTreeMap::new();
-    for t in repo_tasks(db, repo_key)? {
-        let id = t.meta.id;
-        let onto = db.read(move |conn| jkb_core::transition::land_target(conn, id))?;
-        for branch in facet_values(&t.tags, FACET_BRANCH) {
-            out.insert(
-                branch.clone(),
-                SessionTask {
-                    uid: t.meta.uid.clone(),
-                    status: t.meta.status.clone().unwrap_or_default(),
-                    onto: onto.clone(),
-                },
-            );
-        }
-    }
-    Ok(out)
-}
-
-/// Every task tagged `repo=<repo_key>`, as a **typed** query.
-///
-/// Built rather than parsed from `format!("kind:task tag:repo={key}")`: the key is a
-/// directory basename, so a repo cloned into `~/dev/my project` produced `tag:repo=my` plus
-/// a bare FTS term, which matches nothing. Every staging surface then reported empty — no
-/// staging branches, no batch to join, no task recording the branch a review ran on — while
-/// the tags themselves were stored correctly and nothing errored. Same reasoning as
-/// `review::findings_in`, which was fixed for the namespace and left here.
-pub(crate) fn tasks_in_repo(repo_key: &str) -> jkb_core::query::Query {
-    use jkb_core::query::{CmpOp, Query, TagPred};
-    Query {
-        kind: Some("task".to_owned()),
-        tags: vec![TagPred {
-            facet: FACET_REPO.to_owned(),
-            op: CmpOp::Eq,
-            value: repo_key.to_owned(),
-        }],
-        ..Query::default()
-    }
-}
-
-/// One of this repo's tasks with everything the session and staging reads need.
-pub(crate) struct RepoTask {
-    pub(crate) meta: jkb_core::item::ItemMeta,
-    pub(crate) tags: BTreeMap<String, Vec<String>>,
-}
-
-impl RepoTask {
-    /// The first line of the task's body — what a human calls the task.
-    pub(crate) fn title(&self) -> String {
-        crate::output::title_of(&self.meta)
-    }
-}
-
-/// Every task tagged `repo=<repo_key>`, with its rows and tags, in **one** database read.
-///
-/// The previous shape issued the query, then a `tag::applications` *and* an `item::get` per
-/// task — each a round-trip serialized on the writer thread, over a set that grows with every
-/// task ever worked in this repo. That is fine for `task sessions` at three sessions and not
-/// fine for a view that redraws on every database write (design D38.2).
-pub(crate) fn repo_tasks(db: &Db, repo_key: &str) -> Result<Vec<RepoTask>> {
-    let query = tasks_in_repo(repo_key);
-    Ok(db.read(move |conn| {
-        let ids = query.evaluate(conn)?;
-        let metas = item::get_many(conn, &ids)?;
-        let tags = tag::applications_for(conn, &ids)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            let Some(meta) = metas.get(&id) else { continue };
-            let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for (facet, value) in tags.get(&id).cloned().unwrap_or_default() {
-                grouped.entry(facet).or_default().push(value);
-            }
-            out.push(RepoTask {
-                meta: meta.clone(),
-                tags: grouped,
-            });
-        }
-        Ok(out)
-    })?)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{facet_values, set_location_facets, task_tags, Location, FACET_BRANCH};
+    use super::{facet_values, FACET_BRANCH};
     use jkb_core::item::NewItem;
+    use jkb_core::location::{set_location_facets, Location};
     use jkb_core::Db;
 
     /// `branch=` is *set*, not added, by this writer: a second value is a contradiction rather
@@ -406,7 +178,13 @@ mod tests {
             })
             .unwrap();
 
-        let tags = task_tags(&db, id).unwrap();
+        let mut tags = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for (facet, value) in db
+            .read(move |conn| jkb_core::tag::applications(conn, id))
+            .unwrap()
+        {
+            tags.entry(facet).or_default().push(value);
+        }
         assert_eq!(facet_values(&tags, FACET_BRANCH), ["task/b".to_owned()]);
     }
 }

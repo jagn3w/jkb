@@ -159,6 +159,9 @@ const SUBTASK_CLAUSE: &str = "
                        AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
                  )";
 
+/// The most `tag:`/`-tag:` terms one query evaluates ([`Query::evaluate`]).
+pub const MAX_TAG_TERMS: usize = 64;
+
 impl Query {
     /// Evaluate the structured filter (plus any FTS `match`) and return the matching
     /// item ids, ordered by id. The `~"…"` vector term is ignored here (see the
@@ -167,6 +170,15 @@ impl Query {
     /// # Errors
     /// Returns an error if a scope path is malformed or a statement fails.
     pub fn evaluate(&self, conn: &Connection) -> Result<Vec<ItemId>> {
+        // Each tag term is its own subquery, and SQLite refuses an expression deeper than 1000 — a
+        // query a client wrote with ~1000 `tag:` terms (8 KiB) came back an internal error. A tag term
+        // is not a list to bind as one parameter, so the count is what is bounded.
+        let tag_terms = self.tags.len() + self.exclude_tags.len();
+        if tag_terms > MAX_TAG_TERMS {
+            return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
+                "a query of at most {MAX_TAG_TERMS} tag terms ({tag_terms} given)"
+            ))));
+        }
         let mut clauses: Vec<String> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 
@@ -206,20 +218,21 @@ impl Query {
             clauses.push("i.kind = ?".to_owned());
             params.push(Value::Text(kind.clone()));
         }
+        // Bound as one list each: a query's kinds come from DSL text a client wrote, so they are as
+        // long as it likes (`sql::json_ids`).
         if !self.kinds.is_empty() {
-            let placeholders = vec!["?"; self.kinds.len()].join(", ");
-            clauses.push(format!("i.kind IN ({placeholders})"));
-            params.extend(self.kinds.iter().cloned().map(Value::Text));
+            clauses.push("i.kind IN (SELECT value FROM json_each(?))".to_owned());
+            params.push(Value::Text(crate::sql::json_strings(&self.kinds)));
         }
         if !self.exclude_kinds.is_empty() {
-            let placeholders = vec!["?"; self.exclude_kinds.len()].join(", ");
-            clauses.push(format!("i.kind NOT IN ({placeholders})"));
-            params.extend(self.exclude_kinds.iter().cloned().map(Value::Text));
+            clauses.push("i.kind NOT IN (SELECT value FROM json_each(?))".to_owned());
+            params.push(Value::Text(crate::sql::json_strings(&self.exclude_kinds)));
         }
         if !self.ids.is_empty() {
-            let placeholders = vec!["?"; self.ids.len()].join(", ");
-            clauses.push(format!("i.id IN ({placeholders})"));
-            params.extend(self.ids.iter().map(|id| Value::Integer(id.get())));
+            clauses.push("i.id IN (SELECT value FROM json_each(?))".to_owned());
+            params.push(Value::Text(crate::sql::json_ids(
+                self.ids.iter().map(|id| id.get()),
+            )));
         }
         if let Some(status) = &self.status {
             clauses.push("i.status = ?".to_owned());
@@ -284,11 +297,12 @@ impl Query {
                 // A scope that resolves to no namespaces matches nothing.
                 clauses.push("1 = 0".to_owned());
             } else {
-                let placeholders = vec!["?"; ids.len()].join(", ");
-                clauses.push(format!(
-                    "i.id IN (SELECT item_id FROM placements WHERE namespace_id IN ({placeholders}))"
-                ));
-                params.extend(ids.into_iter().map(Value::Integer));
+                clauses.push(
+                    "i.id IN (SELECT item_id FROM placements
+                              WHERE namespace_id IN (SELECT value FROM json_each(?)))"
+                        .to_owned(),
+                );
+                params.push(Value::Text(crate::sql::json_ids(ids)));
             }
         }
         Ok(())

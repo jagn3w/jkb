@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::ItemId;
@@ -39,6 +39,10 @@ pub fn define_facet(conn: &Connection, facet: &str, value_kind: &str) -> Result<
     Ok(())
 }
 
+/// The longest tag, facet and value together, that [`apply`] stores. A request body or a synced line
+/// could otherwise put a megabyte into a row every listing of the item then carries.
+pub const MAX_TAG_BYTES: usize = 1024;
+
 /// Apply `facet = value` to `item` (auto-declaring the facet as `string` if new).
 /// Idempotent on `(item, facet, value)`.
 ///
@@ -51,6 +55,14 @@ pub fn apply(
     facet: &str,
     value: &str,
 ) -> Result<()> {
+    // Every writer of a new tag comes through here — a quick-add line, a synced tasks.md, `task tag`,
+    // the MCP server — so the bound is here (and [`rename_facet`] holds a renamed facet's tags to it),
+    // and not on `remove`, which must be able to take away any tag that exists.
+    if facet.len() + value.len() > MAX_TAG_BYTES {
+        return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
+            "a tag of at most {MAX_TAG_BYTES} bytes"
+        ))));
+    }
     define_facet(conn, facet, "string")?;
     // Idempotent means the second call updates a row that was already there, and logging that as
     // an insert made `jkb undo` remove a tag application the transaction had not created.
@@ -193,20 +205,20 @@ pub fn applications_for(
     if items.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; items.len()].join(", ");
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT item_id, facet, value FROM tag_applications
-         WHERE item_id IN ({placeholders}) ORDER BY item_id, facet, value"
-    );
-    let params: Vec<Value> = items.iter().map(|id| Value::Integer(id.get())).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
-        Ok((
-            ItemId::new(r.get::<_, i64>(0)?),
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
+         WHERE item_id IN (SELECT value FROM json_each(?1)) ORDER BY item_id, facet, value",
+    )?;
+    let rows = stmt.query_map(
+        [crate::sql::json_ids(items.iter().map(|id| id.get()))],
+        |r| {
+            Ok((
+                ItemId::new(r.get::<_, i64>(0)?),
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    )?;
     for row in rows {
         let (id, facet, value) = row?;
         out.entry(id).or_default().push((facet, value));
@@ -242,10 +254,27 @@ pub fn items_with(conn: &Connection, facet: &str, value: &str) -> Result<Vec<Ite
 /// this defect, one entry naming the root's old path, and the fix was to log what actually
 /// changed rather than to hand-write an inverse.
 ///
+/// A rename that would make any of the facet's tags longer than [`MAX_TAG_BYTES`] is refused: the
+/// tag would outgrow what [`apply`] stores, and re-applying it — a tasks.md reconcile of the line
+/// carrying it — would then fail the whole file.
+///
 /// # Errors
-/// Returns an error if a statement fails (e.g. the new facet collides with an
-/// existing application on the same item and value).
+/// A validation error for a rename past [`MAX_TAG_BYTES`], or an error if a statement fails (e.g. the
+/// new facet collides with an existing application on the same item and value).
 pub fn rename_facet(conn: &Connection, meta: &WriteMeta, old: &str, new: &str) -> Result<usize> {
+    let longest_value: i64 = conn
+        .prepare_cached(
+            "SELECT coalesce(max(length(CAST(value AS BLOB))), 0) FROM tag_applications WHERE facet = ?1",
+        )?
+        .query_row(params![old], |r| r.get(0))?;
+    if new.len() + usize::try_from(longest_value).unwrap_or(usize::MAX) > MAX_TAG_BYTES {
+        return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
+            "a tag of at most {MAX_TAG_BYTES} bytes: renamed to `{}`, the facet's longest tag would be \
+             {} bytes",
+            new.chars().take(64).collect::<String>(),
+            new.len() + usize::try_from(longest_value).unwrap_or(usize::MAX)
+        ))));
+    }
     // Read the row ids BEFORE the update: afterwards nothing selects them by `old`.
     let rowids = |table: &str| -> Result<Vec<i64>> {
         let sql = if table == "tag_defs" {
@@ -302,6 +331,45 @@ pub fn facets(conn: &Connection) -> Result<Vec<(String, String)>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tag_past_the_limit_is_refused_and_any_tag_can_still_be_removed() {
+        let db = crate::Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            let id = crate::item::upsert(
+                c,
+                m,
+                &crate::item::NewItem {
+                    uid: "i".into(),
+                    kind: "note".into(),
+                    content: None,
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            assert!(super::apply(c, m, id, "f", &"v".repeat(super::MAX_TAG_BYTES)).is_err());
+            super::apply(c, m, id, "f", "short")?;
+            // Renamed so the facet's longest tag would be one byte over, refused, and nothing renamed.
+            let over = "g".repeat(super::MAX_TAG_BYTES - "short".len() + 1);
+            assert!(super::rename_facet(c, m, "f", &over).is_err());
+            assert_eq!(
+                super::rename_facet(c, m, "f", &over[1..])?,
+                1,
+                "at the limit it renames"
+            );
+            super::rename_facet(c, m, &over[1..], "f")?;
+            // A tag stored before the limit, as an older version or a rename could leave one.
+            c.execute(
+                "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, 'f', ?2)",
+                rusqlite::params![id.get(), "v".repeat(super::MAX_TAG_BYTES)],
+            )?;
+            super::remove(c, m, id, "f", &"v".repeat(super::MAX_TAG_BYTES))?;
+            super::remove(c, m, id, "f", "short")?;
+            assert!(super::applications(c, id)?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
     use super::{applications, apply, facets, items_with, reconcile_tags, rename_facet};
     use crate::item::{upsert, NewItem};
     use crate::Db;

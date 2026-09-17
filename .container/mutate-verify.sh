@@ -123,7 +123,11 @@ mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 # from the host would need root.
 chmod 0777 "$scratch/jkb"
 printf '{}' > "$scratch/home/settings.json"
-BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb)
+# JKB_VERIFY_NO_DAEMON: the scratch ~/.jkb has no daemon token and there is no host daemon behind
+# these containers, which since the cutover (tasks S6.5) verify.sh fails unless it is told so. A
+# mutation below drops it and watches that failure fire.
+BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb
+      -e JKB_VERIFY_NO_DAEMON=1)
 # A mutation is CAUGHT only when verify.sh both FAILS and says why. Matching the label alone was
 # useless: `assert()` prints the same text on the ok and FAIL paths, so `grep "not a host mount"`
 # matched `ok  ~/.claude is the container's own, not a host mount` — two of five mutations
@@ -207,7 +211,7 @@ HEALTHY=("${POSTURE[@]}" ${ACCEPT_ENV[@]+"${ACCEPT_ENV[@]}"} "${BASE[@]}")
 # AppArmor mutations below are skipped as a group when there is none, and skipping them on a
 # DIFFERENT answer from the one the container was started with is a guard reporting about another
 # machine.
-control_has() { printf '%s\n' "${HEALTHY[@]}" | grep -qF -- "$1"; }
+control_has() { grep -qF -- "$1" <<<"$(printf '%s\n' "${HEALTHY[@]}")"; }
 control_has_apparmor() { control_has 'apparmor='; }
 
 # A MUTATION CHANGES EXACTLY ONE THING, and hand-spelling the reduced flag set is how that stopped
@@ -403,13 +407,16 @@ run() { # run <label> <expect-substring> <docker args...>
 # container, the second hit a DNS blip on verify.sh's live curl, and the matcher was then shown a
 # BROKEN container while the harness printed "shown to discriminate".
 judge() { # judge <label> <expect> <output> <rc>
-  local label="$1" expect="$2" out="$3" rc="$4"
+  local label="$1" expect="$2" out="$3" rc="$4" want_rc="${WANT_RC:-}"
   # A mutation is CAUGHT only when the subject FAILS and says why, with both on the SAME line:
   # `assert()` prints the same label on its ok and fail paths, so matching the label alone reported
   # guards as caught while they were deleted. Fixed-string, because the regex form escaped only
   # some ERE metacharacters and silently mis-matched "host bind source(s) parsed"; `-e`, because an
   # expect may start with a dash, which grep would otherwise read as an option.
-  if [ "$rc" -ne 0 ] && grep -F -e "$expect" <<<"$out" | grep -q "FAIL"; then
+  # ...and, where the run names one (WANT_RC), with that exit code: verify.sh's 3 means every failure
+  # was accepted, and a check that forgets to say so turns it into 1 with the same FAIL lines.
+  if [ "$rc" -ne 0 ] && { [ -z "$want_rc" ] || [ "$rc" = "$want_rc" ]; } \
+     && grep -q "FAIL" <<<"$(grep -F -e "$expect" <<<"$out")"; then
     caught=$((caught+1))
     # The EXPECT, not the count. Coverage is a property of which failure paths in verify.sh were
     # driven, and several mutations legitimately share one — so counting mutations answers a
@@ -418,7 +425,7 @@ judge() { # judge <label> <expect> <output> <rc>
     printf '  CAUGHT   %s\n' "$label"
   else
     fails=$((fails+1))
-    printf '  MISSED   %s  (verify.sh exit %s; wanted a FAIL line mentioning: %s)\n' "$label" "$rc" "$expect"
+    printf '  MISSED   %s  (verify.sh exit %s%s; wanted a FAIL line mentioning: %s)\n' "$label" "$rc" "${want_rc:+, wanted exit $want_rc}" "$expect"
     sed 's/^/           /' <<<"$out" | grep -E "FAIL|passed|failed" | head -3
   fi
 }
@@ -501,7 +508,10 @@ fi
 # never run, and this mutation would report MISSED for ever — the tooling outcome its own comment
 # above says it exists to avoid. Dropped as a unit and re-added last instead, so there is one.
 without 'NET_ADMIN' 'JKB_EGRESS_ACCEPT_UNFILTERED'
-run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)" "NON-allowlisted host was permitted" \
+# EXIT 3, not merely non-zero: every failure on this container is a consequence of the override, so
+# verify.sh must report "accepted" (3) rather than "fix them" (1). A new check that forgot accept_bad
+# here — the host-daemon arms did, in bc0228a — leaves the FAIL line in place and only moves the code.
+WANT_RC=3 run "no NET_ADMIN, override armed (verify.sh must notice egress is unrestricted)" "NON-allowlisted host was permitted" \
     "${MUT[@]}" --env JKB_EGRESS_ACCEPT_UNFILTERED=1
 # The one REPLACEMENT rather than a subtraction: `--user` is removed as a unit and re-added, so a
 # second `--user` cannot be left for docker's last-wins rule to resolve.
@@ -533,7 +543,16 @@ run "runs as a user the declaration does not name" "container.json declares remo
 # at `docker run` beats containerEnv silently), and subtracting the flag would test a container
 # nobody starts.
 run "a declared environment entry is overridden at run time" "reached this container with different values" \
-    "${HEALTHY[@]}" --env JKB_DB=/tmp/not-the-declared-path
+    "${HEALTHY[@]}" --env JKB_REMOTE=host.docker.internal:7118
+
+# REMOTE MODE (tasks S6.5). A database named at run time, remote mode switched off, and a container
+# with no daemon token and no statement that none is expected.
+run "the container is given a database of its own at run time" "JKB_DB is not set" \
+    "${HEALTHY[@]}" --env JKB_DB=/tmp/jkb.db
+run "remote mode is switched off at run time" "JKB_REMOTE names the host daemon" \
+    "${HEALTHY[@]}" --env JKB_REMOTE=
+without 'JKB_VERIFY_NO_DAEMON'
+run "no daemon token, and a daemon is expected" "there is no daemon token" "${MUT[@]}"
 
 # The nested-bind exception must not be usable as a general one. A `--declare` naming anything
 # OUTSIDE every declared target is the shape that would turn it into a hole — `/host` is the
@@ -589,6 +608,49 @@ run "auto-memory is not linked into the shared store" "auto-memory is not linked
 # the honest report is "the firewall is too tight", not silence.
 run "the firewall cannot resolve any allowlisted domain" "the live chain denies everything and has no allowlist" \
     --dns 127.0.0.1 "${HEALTHY[@]}"
+
+# THE HOST DAEMON'S OPENING (design r3.2 H5), broken the three ways the raise can get it wrong and
+# watched by verify.sh's kernel-state arm for each. Mutants of the INSTALLED scripts, because what
+# is being broken is what root runs at start, which no docker flag reaches. Each checks its own edit
+# landed (`! cmp`) and still parses, so a moved target is BUILD-FAILED rather than an unmutated image
+# reported as a guard that did not fire.
+#
+# WIDE: the raise stops keeping the daemon's address out of `allowed` — both halves of the keep-out,
+# the alias skipped by name and any address in the daemon set skipped by address, because either one
+# alone still holds the posture's alias out. The posture names the alias (so the nested sandbox's
+# proxy can reach it), so without the keep-out the address lands in a port-less set and every port
+# on the host's loopback is open to the container.
+mutant jkb-dev-daemon-wide "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig && sed -i -e 's|if ipset test \"\$DAEMON_SET-new\" \"\$ip\" >/dev/null 2>&1; then|if false; then|' -e '/^ *\"\$DAEMON_HOST\") skipped+=/d' /usr/local/bin/init-firewall.sh && ! grep -q 'DAEMON_HOST\") skipped' /usr/local/bin/init-firewall.sh && grep -q 'if false; then' /usr/local/bin/init-firewall.sh && bash -n /usr/local/bin/init-firewall.sh"
+run "the firewall puts the host daemon's address in the allowlist" "opens EVERY port on the host's loopback" \
+    "${HEALTHY[@]}"
+
+# ABSENT: the raise never installs the port rule.
+mutant jkb-dev-daemon-absent "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig && sed -i '/-A OUTPUT \$RULE_DAEMON/d' /usr/local/bin/init-firewall.sh && ! cmp -s /tmp/fw.orig /usr/local/bin/init-firewall.sh && bash -n /usr/local/bin/init-firewall.sh"
+run "the firewall installs no rule for the host daemon" "has no rule for jkb serve on the host" \
+    "${HEALTHY[@]}"
+
+# UNRESOLVED: the RAISE's lookup of the daemon's address comes back empty, and nothing else changes —
+# the probe still resolves the real alias. Only init-firewall.sh's lookup is mutated: mutating the
+# shared library's DAEMON_HOST moved the probe too, so a raise that had widened `allowed` through the
+# posture's alias was reported as `unresolved` rather than `wide` (review of bc0228a). Not done by
+# dropping --add-host either: Docker Desktop resolves the alias without it (measured), so that would
+# change nothing on the machine this is developed on. With the alias also skipped by name, an empty
+# lookup must leave the host out of `allowed` — `unresolved`, and never `wide`.
+mutant jkb-dev-daemon-unresolved "cp /usr/local/bin/init-firewall.sh /tmp/fw.orig && sed -i 's|getent ahostsv4 \"\$DAEMON_HOST\"|getent ahostsv4 no-such-host.invalid|' /usr/local/bin/init-firewall.sh && ! cmp -s /tmp/fw.orig /usr/local/bin/init-firewall.sh && bash -n /usr/local/bin/init-firewall.sh"
+run "the host daemon's name does not resolve at the raise" "did not resolve when the firewall was raised" \
+    "${HEALTHY[@]}"
+
+# A TOKEN THAT DOES NOT AUTHENTICATE. The control's scratch ~/.jkb has no token, so the answer check
+# is a note there; planting a wrong one makes it ask, and nothing that answers — the Mac's real daemon
+# with a 401, or no daemon at all on a CI runner — may be reported as jkb serve answering. Same image
+# and flags as the control; the only difference is a file in the scratch knowledge-base bind.
+# At the path a client of the firewall's daemon port reads (`~/.jkb/daemon/<port>/token`).
+daemon_port="$(sed -n 's/^DAEMON_PORT=\([0-9][0-9]*\)$/\1/p' "$REPO/.container/egress-lib.sh" | head -1)"
+[ -n "$daemon_port" ] || { echo "could not read DAEMON_PORT from egress-lib.sh" >&2; exit 2; }
+mkdir -p "$scratch/jkb/daemon/$daemon_port" && printf 'not-the-token\n' > "$scratch/jkb/daemon/$daemon_port/token"
+run "the daemon token on the bind does not authenticate" "does not answer at" \
+    "${HEALTHY[@]}"
+rm -rf "$scratch/jkb/daemon"
 
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
 # firewall, its snapshot and the pinned sudoers argument all bypassable with one sudo. The
@@ -744,7 +806,7 @@ if ! grep -qF -e "$control_label" <<<"$control_out"; then
   self_ok=0
   echo "  MATCHER PROVES NOTHING: a healthy container's output never mentions \"$control_label\","
   echo "  so every CAUGHT above matched a string this harness cannot show discriminates."
-elif grep -F -e "$control_label" <<<"$control_out" | grep -q "FAIL"; then
+elif grep -q "FAIL" <<<"$(grep -F -e "$control_label" <<<"$control_out")"; then
   self_ok=0
   echo "  MATCHER IS BROKEN: that label is on a FAIL line in a HEALTHY container, so a CAUGHT"
   echo "  above means nothing — the matcher fires when nothing is wrong."

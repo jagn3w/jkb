@@ -22,4 +22,29 @@ mod fetch;
 mod pipeline;
 
 pub use error::{Error, Result};
-pub use pipeline::{Outcome, Pipeline};
+pub use pipeline::{text_address, Outcome, Pipeline};
+
+/// Read and parse a source named on the command line: an `http(s)` URL is rendered in a headless
+/// browser and its DOM parsed as HTML; anything else is a file, parsed by its extension. Returns the raw
+/// bytes with the parsed document.
+///
+/// The client half of `jkb ingest`, so it runs where the command runs: in the dev container the file
+/// is the container's and the URL is fetched through the container's egress firewall, and the host
+/// daemon is sent only the extracted text — never a path to read, a page to fetch, or bytes for its
+/// PDF and HTML parsers (design H4).
+///
+/// # Errors
+/// [`Error::Fetch`] for a page that cannot be rendered, [`Error::Io`] for a file that cannot be read,
+/// or the adapter's parse error.
+pub fn read_source(source: &str) -> Result<(Vec<u8>, adapter::ParsedDocument)> {
+    use adapter::SourceAdapter as _;
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let html = fetch::render_url(source)?;
+        let parsed = adapter::HtmlAdapter.parse(html.as_bytes())?;
+        return Ok((html.into_bytes(), parsed));
+    }
+    let path = std::path::Path::new(source);
+    let bytes = std::fs::read(path)?;
+    let parsed = adapter::parse(path, &bytes)?;
+    Ok((bytes, parsed))
+}

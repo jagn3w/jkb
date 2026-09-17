@@ -4,7 +4,11 @@
 //!
 //! Events carry the paths that changed, so a burst reconciles just those files via
 //! [`crate::sync_paths`] rather than re-scanning the whole mount — important once a
-//! mount backs a large tree. Only two situations fall back to a full [`crate::sync`]:
+//! mount backs a large tree. A change made in the **database** raises no filesystem event, so after
+//! each iteration the watcher also asks the changelog whether anyone but sync has written since its last
+//! look (at most once per debounce), and if so reconciles the bound files whose knowledge-base side
+//! changed ([`crate::sync_kb_changes`]), at most once per three debounces.
+//! Only two situations fall back to a full [`crate::sync`]:
 //! the initial reconcile on startup (to catch drift from while the watcher was off),
 //! and a watcher error or dropped-events signal (`need_rescan`), where we can no
 //! longer trust the incremental path list.
@@ -22,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use notify::{Event, RecursiveMode, Watcher};
 
-use jkb_core::{mount, Db};
+use jkb_core::{mount, sync_state, Db};
 
 use crate::{engine, Error, Result};
 
@@ -41,14 +45,29 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
     let dir = engine::backing_dir(db, mount_ns)?;
 
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = notify::recommended_watcher(move |res| {
-        // A closed receiver just means we're shutting down; ignore the send error.
-        let _ = tx.send(res);
-    })?;
+    // Links are not followed: a directory link planted inside a mount — a dev container can write
+    // inside the directories it binds — made the recursive watch walk and subscribe to the host
+    // directories it pointed at, and turned their activity into events under the mount.
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |res: notify::Result<Event>| {
+            // A read changes nothing, and is dropped here rather than in the loop: counted there,
+            // any process reading a file under the mount — an editor, a grep, this watcher's own
+            // reconcile — kept the debounce from ever going quiet, so the idle tick that asks about
+            // database changes never came.
+            if res.as_ref().is_ok_and(|event| is_read_only(event.kind)) {
+                return;
+            }
+            // A closed receiver just means we're shutting down; ignore the send error.
+            let _ = tx.send(res);
+        },
+        notify::Config::default().with_follow_symlinks(false),
+    )?;
     // Recursive: the OS only lets us subscribe to a directory subtree, not a glob, so
     // relevance filtering happens in `sync_paths` against the mount's include/exclude.
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
+    // Read before the first pass, so a write that lands during it is still seen afterwards.
+    let mut database = DatabaseWrites::new(db.read(sync_state::latest_write)?);
     let mut debt = RetryDebt::new(
         run_pass(mount_ns, || engine::sync(db, mount_ns)),
         debounce.saturating_mul(RETRY_TICKS),
@@ -60,8 +79,15 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
             Ok(first) => {
                 let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
                 let mut rescan = collect(first, &mut paths);
-                // Coalesce: keep draining until the filesystem is quiet for `debounce`.
-                while let Ok(next) = rx.recv_timeout(debounce) {
+                // Coalesce: keep draining until the filesystem is quiet for `debounce` — or for at
+                // most a burst's worth of it. Under churn that never pauses (a build, git, a task
+                // worktree writing under a repo mount) an unbounded drain never returned, so neither
+                // the paths it had gathered nor anything after this loop ever ran.
+                let burst = Instant::now();
+                while burst.elapsed() < debounce.saturating_mul(BURST_TICKS) {
+                    let Ok(next) = rx.recv_timeout(debounce) else {
+                        break;
+                    };
                     rescan |= collect(next, &mut paths);
                 }
                 // A dropped-event rescan is immediate; a RETRY waits for the backoff. Without
@@ -93,6 +119,17 @@ pub fn watch(db: &Db, mount_ns: &str, debounce: Duration, stop: &Arc<AtomicBool>
                 }));
             }
             None => {}
+        }
+
+        // Then the database, whatever this iteration did: nothing on the filesystem reports a task
+        // edited through `jkb`, and asked only on an idle tick it waited out any file churn.
+        database.poll(db, mount_ns, debounce);
+        if database.pass_due(debounce.saturating_mul(EXPORT_TICKS)) {
+            let judged = &mut database.judged;
+            debt.targeted_pass(run_pass(mount_ns, || {
+                engine::sync_kb_changes(db, mount_ns, judged)
+            }));
+            database.passed();
         }
     }
     Ok(())
@@ -154,6 +191,78 @@ impl RetryDebt {
         self.owed |= failed;
     }
 }
+
+/// What a watcher knows about writes to the database that no filesystem event reports.
+///
+/// The changelog is asked at most once per debounce and a pass is run at most once per spacing, with a
+/// write seen in between kept owed rather than dropped: without the spacing a fleet writing to any part
+/// of the knowledge base had every mount render every bound file on each tick, on the single writer
+/// thread. A changelog that cannot be read is said once per failing stretch, not on every tick.
+struct DatabaseWrites {
+    /// The newest changelog id looked at.
+    seen: i64,
+    /// Something other than sync wrote since the last pass.
+    owed: bool,
+    polled: Instant,
+    passed: Option<Instant>,
+    failing: bool,
+    /// What each flagged bound file was last judged on, so it is reconciled once per change.
+    judged: engine::FlaggedJudgements,
+}
+
+impl DatabaseWrites {
+    fn new(seen: i64) -> Self {
+        Self {
+            seen,
+            owed: false,
+            polled: Instant::now(),
+            passed: None,
+            failing: false,
+            judged: engine::FlaggedJudgements::default(),
+        }
+    }
+
+    /// Ask the changelog what was written since the last look, if a debounce has passed.
+    fn poll(&mut self, db: &Db, mount_ns: &str, every: Duration) {
+        if self.polled.elapsed() < every {
+            return;
+        }
+        self.polled = Instant::now();
+        let after = self.seen;
+        match db.read(move |conn| sync_state::writes_since(conn, after)) {
+            Ok(writes) => {
+                self.seen = writes.latest;
+                self.owed |= writes.by_others;
+                self.failing = false;
+            }
+            Err(e) => {
+                if !self.failing {
+                    eprintln!("sync {mount_ns}: cannot read the changelog ({e}); retrying");
+                }
+                self.failing = true;
+            }
+        }
+    }
+
+    /// Whether a pass over database changes is owed and `spacing` has passed since the last one ended.
+    fn pass_due(&self, spacing: Duration) -> bool {
+        self.owed && self.passed.is_none_or(|at| at.elapsed() >= spacing)
+    }
+
+    /// A pass has run: the debt is discharged — a write during it is owed again by the next poll, which
+    /// reads past the mark taken before it — and the spacing is measured from **now**, when it ended.
+    /// From its start, a pass longer than the spacing was followed at once by the next, the unspaced
+    /// cost the spacing exists to prevent ([`RetryDebt`] measures from the finish for the same reason).
+    fn passed(&mut self) {
+        self.owed = false;
+        self.passed = Some(Instant::now());
+    }
+}
+
+/// How many debounce intervals one burst of filesystem events is coalesced for, at most.
+const BURST_TICKS: u32 = 10;
+/// How many debounce intervals apart passes over database changes run, at least.
+const EXPORT_TICKS: u32 = 3;
 
 /// How many debounce intervals to wait before retrying a failed pass.
 const RETRY_TICKS: u32 = 10;
@@ -306,6 +415,22 @@ fn collect(res: notify::Result<Event>, paths: &mut BTreeSet<PathBuf>) -> bool {
     }
 }
 
+/// Whether `kind` is an access that cannot have changed the file: an open, a read, a close after
+/// reading. A close after writing is not — it ends a write.
+///
+/// Linux's inotify backend subscribes to opens, so the reconcile's own read of a file raised an event
+/// asking for another reconcile of it, at every debounce, for as long as the watcher ran. That loop
+/// re-reconciled every recently read file, which hid on Linux that nothing exported a change made in
+/// the database; on macOS, whose events carry no opens, the edit simply never reached the file.
+fn is_read_only(kind: notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    matches!(
+        kind,
+        notify::EventKind::Access(access)
+            if !matches!(access, AccessKind::Close(AccessMode::Write))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RetryDebt, MAX_RETRY};
@@ -368,6 +493,50 @@ mod tests {
             debt.full_pass(true);
         }
         assert_eq!(debt.after, MAX_RETRY, "backoff did not settle at the cap");
+    }
+
+    /// Opening or reading a file is not a change to it; closing it after a write is.
+    #[test]
+    fn a_read_only_access_is_not_a_change() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, EventKind};
+        assert!(super::is_read_only(EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(super::is_read_only(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!super::is_read_only(EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(!super::is_read_only(EventKind::Create(CreateKind::File)));
+    }
+
+    /// A database write is owed until a pass takes it, and passes are spaced: a write inside the spacing
+    /// is kept for the next one, not dropped.
+    #[test]
+    fn database_passes_are_spaced_and_a_write_between_them_is_kept() {
+        let mut writes = super::DatabaseWrites::new(0);
+        assert!(!writes.pass_due(BASE), "nothing written, nothing owed");
+        writes.owed = true;
+        assert!(writes.pass_due(BASE), "the first owed pass runs at once");
+        // A pass that takes longer than the spacing: the next is measured from its end.
+        std::thread::sleep(BASE * 2);
+        writes.passed();
+        writes.owed = true;
+        assert!(
+            !writes.pass_due(BASE),
+            "a second inside the spacing after the last pass ENDED waits"
+        );
+        assert!(writes.owed, "and stays owed");
+        std::thread::sleep(BASE);
+        assert!(writes.pass_due(BASE), "then runs");
+        writes.passed();
+        assert!(!writes.owed);
+        writes.owed = true;
+        assert!(
+            !writes.pass_due(BASE),
+            "every pass restarts the spacing, not only the first"
+        );
     }
 
     /// A debt nothing owes is never due, however long the watcher idles.

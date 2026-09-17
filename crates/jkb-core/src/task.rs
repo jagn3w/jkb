@@ -14,8 +14,7 @@
 //! [`QuickAdd`], which [`NewTask::from_quick_add`] lifts into a create spec with the
 //! default home (`tasks/inbox`) and `managed:` binding.
 
-use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use jkb_types::{EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, TaskStatus};
@@ -143,13 +142,27 @@ pub struct TaskRow {
     pub due: Option<String>,
 }
 
+/// The longest due date a task stores — every writer (`create`, [`set_due`]) is held to it.
+pub const MAX_DUE_BYTES: usize = 1024;
+
+fn check_due(due: Option<&str>) -> Result<()> {
+    if due.is_some_and(|d| d.len() > MAX_DUE_BYTES) {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "a due date of at most {MAX_DUE_BYTES} bytes"
+        ))));
+    }
+    Ok(())
+}
+
 /// Create a task: insert the item (status `open`), place it under its home (and any
 /// mirrors), set its binding, apply tags, and link its `depends_on` dependencies.
 ///
 /// # Errors
 /// Returns a validation error if a named dependency uid does not exist or a
-/// dependency edge would create a cycle; otherwise a database error.
+/// dependency edge would create a cycle, or the due date is over [`MAX_DUE_BYTES`];
+/// otherwise a database error.
 pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<ItemId> {
+    check_due(task.due.as_deref())?;
     let status = TaskStatus::Open;
     let id: i64 = conn
         .prepare_cached(
@@ -227,6 +240,14 @@ pub fn ensure_task_mirror(
     let Some(mirror) = tasks_mirror_ns(home) else {
         return Ok(false);
     };
+    // A home at the namespace limits can leave its mirror one segment or a few bytes past them; say
+    // so, rather than report the user's own path as the one too deep.
+    if let Err(e) = ns::normalize(&mirror) {
+        return Err(TypeError::Validation(format!(
+            "a task homed at `{home}` needs the mirror `{mirror}`, which a namespace cannot be: {e}"
+        ))
+        .into());
+    }
     let ns_id = ns::ensure(conn, &mirror)?;
     let exists = conn
         .prepare_cached(
@@ -350,6 +371,24 @@ pub fn add_subtask(
 /// # Errors
 /// Returns an error if the query fails.
 pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
+    let mut out = Vec::new();
+    subtasks_each(conn, parent, |row| {
+        out.push(row);
+        true
+    })?;
+    Ok(out)
+}
+
+/// [`subtasks`], handing each row to `each` as it is read — so a caller keeping only part of each
+/// (a title) holds one body at a time. `each` returns whether to continue.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn subtasks_each(
+    conn: &Connection,
+    parent: ItemId,
+    mut each: impl FnMut(TaskRow) -> bool,
+) -> Result<()> {
     // Reads containment, not the edge: containment is where a node lives (design D35).
     let mut stmt = conn.prepare_cached(
         "SELECT i.id, i.uid, i.content, i.status, i.priority, i.due
@@ -367,8 +406,12 @@ pub fn subtasks(conn: &Connection, parent: ItemId) -> Result<Vec<TaskRow>> {
             due: r.get(5)?,
         })
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    for row in rows {
+        if !each(row?) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Whether every subtask of `parent` has reached a terminal status (`done`/`cancelled`).
@@ -626,6 +669,7 @@ pub fn set_priority(
 /// Returns [`jkb_types::Error::NotFound`] if `task` does not exist; otherwise a
 /// database error.
 pub fn set_due(conn: &Connection, meta: &WriteMeta, task: ItemId, due: Option<&str>) -> Result<()> {
+    check_due(due)?;
     let before: Option<String> = conn
         .prepare_cached("SELECT due FROM items WHERE id = ?1")?
         .query_row([task.get()], |row| row.get::<_, Option<String>>(0))
@@ -671,6 +715,32 @@ pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
     Ok(hit.is_some())
 }
 
+/// A task reference as a user types it, made a uid: a `:`-bearing reference is a uid already, a
+/// bare slug gets `task:` in front.
+#[must_use]
+pub fn canonical_uid(reference: &str) -> String {
+    if reference.contains(':') {
+        reference.to_owned()
+    } else {
+        format!("task:{reference}")
+    }
+}
+
+/// The item a task reference names: a full uid, or a bare slug tried as `task:<slug>` first and
+/// then as itself. `None` when neither exists.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Option<ItemId>> {
+    if reference.contains(':') {
+        return item::id_for_uid(conn, reference);
+    }
+    match item::id_for_uid(conn, &canonical_uid(reference))? {
+        Some(id) => Ok(Some(id)),
+        None => item::id_for_uid(conn, reference),
+    }
+}
+
 /// The **ready frontier**: tasks (`kind = 'task'`) whose status is non-terminal and
 /// which have no `depends_on` edge to a non-terminal task, optionally narrowed to a
 /// `scope` and `tags`. Ordered by priority (ascending, nulls last) then due date
@@ -683,32 +753,28 @@ pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
 /// # Errors
 /// Returns an error if evaluation or the ordered load fails.
 pub fn ready(conn: &Connection, scope: Scope, tags: &[TagPred]) -> Result<Vec<TaskRow>> {
-    let query = Query {
-        kind: Some("task".to_owned()),
-        ready: true,
-        scope,
-        tags: tags.to_vec(),
-        ..Query::default()
-    };
-    let ids = query.evaluate(conn)?;
+    let ids = ready_query(scope, tags).evaluate(conn)?;
     load_ordered(conn, &ids)
 }
+
+/// The ready frontier's order: priority (ascending, nulls last), then due date (ascending, nulls
+/// last), then id. One copy, for [`load_ordered`] and [`ready_ids`].
+const READY_ORDER: &str = "priority IS NULL, priority ASC, due IS NULL, date(due) ASC, id";
 
 /// Load the given items as [`TaskRow`]s, ordered by priority then due (nulls last).
 fn load_ordered(conn: &Connection, ids: &[ItemId]) -> Result<Vec<TaskRow>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = vec!["?"; ids.len()].join(", ");
+    // One bound list (`sql::json_ids`), never a placeholder per id.
     let sql = format!(
         "SELECT id, uid, content, status, priority, due FROM items
-         WHERE id IN ({placeholders})
-         ORDER BY priority IS NULL, priority ASC, due IS NULL, date(due) ASC, id"
+         WHERE id IN (SELECT value FROM json_each(?1))
+         ORDER BY {READY_ORDER}"
     );
-    let params: Vec<Value> = ids.iter().map(|id| Value::Integer(id.get())).collect();
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
-        .query_map(params_from_iter(params.iter()), |row| {
+        .query_map([ids_json(ids)], |row| {
             Ok(TaskRow {
                 id: ItemId::new(row.get(0)?),
                 uid: row.get(1)?,
@@ -717,6 +783,47 @@ fn load_ordered(conn: &Connection, ids: &[ItemId]) -> Result<Vec<TaskRow>> {
                 priority: row.get(4)?,
                 due: row.get(5)?,
             })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The frontier's structural filter — the one [`ready`] and [`ready_ids`] both evaluate.
+fn ready_query(scope: Scope, tags: &[TagPred]) -> Query {
+    Query {
+        kind: Some("task".to_owned()),
+        ready: true,
+        scope,
+        tags: tags.to_vec(),
+        ..Query::default()
+    }
+}
+
+fn ids_json(ids: &[ItemId]) -> String {
+    crate::sql::json_ids(ids.iter().map(|id| id.get()))
+}
+
+/// The ready frontier's ids, in [`ready`]'s order, at most `limit` of them — ordered and cut in SQL
+/// without loading a single body, for a caller that loads the rows it keeps one at a time.
+///
+/// # Errors
+/// Returns an error if evaluation or the ordering query fails.
+pub fn ready_ids(
+    conn: &Connection,
+    scope: Scope,
+    tags: &[TagPred],
+    limit: Option<usize>,
+) -> Result<Vec<ItemId>> {
+    let ids = ready_query(scope, tags).evaluate(conn)?;
+    let limit = limit.map_or(-1, |l| i64::try_from(l).unwrap_or(i64::MAX));
+    let sql = format!(
+        "SELECT id FROM items WHERE id IN (SELECT value FROM json_each(?1))
+         ORDER BY {READY_ORDER} LIMIT ?2"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(params![ids_json(&ids), limit], |row| {
+            Ok(ItemId::new(row.get(0)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
@@ -804,6 +911,46 @@ fn bad(token: &str, expected: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// `ready_ids` is the frontier `ready` lists, in `ready`'s order, cut by its limit — over mixed
+    /// priorities, due dates and nulls, where the tie-breaks are. And `ready`'s own load takes more
+    /// ids than `SQLite` has variables.
+    #[test]
+    fn ready_ids_orders_and_limits_as_ready_does() {
+        use crate::query::Scope;
+        let db = crate::Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            for (uid, priority, due) in [
+                ("task:a", Some(2), Some("2026-10-01")),
+                ("task:b", Some(2), None),
+                ("task:c", None, Some("2026-09-01")),
+                ("task:d", Some(1), Some("2026-12-01")),
+                ("task:e", None, None),
+                ("task:f", Some(2), Some("2026-09-15")),
+                ("task:g", Some(1), Some("2026-12-01")),
+            ] {
+                let mut t = super::NewTask::new(uid, uid);
+                t.priority = priority;
+                t.due = due.map(str::to_owned);
+                super::create(c, m, &t)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        db.read(|c| {
+            let listed: Vec<_> = super::ready(c, Scope::All, &[])?
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(listed.len(), 7);
+            assert_eq!(super::ready_ids(c, Scope::All, &[], None)?, listed);
+            assert_eq!(super::ready_ids(c, Scope::All, &[], Some(3))?, listed[..3]);
+            let many: Vec<_> = (1..=40_000).map(jkb_types::ItemId::new).collect();
+            assert_eq!(super::load_ordered(c, &many)?.len(), 7);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// A finished task must not keep a claim. `jkb task start` claims and
     /// `jkb task close-merged` completes, so without this every auto-closed task turned up
     /// as an orphaned claim in `doctor` — the manual cleanup that automation was removing.

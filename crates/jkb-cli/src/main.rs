@@ -7,39 +7,43 @@
 //! current directory (design D19), overridable with `--global`.
 
 mod archive;
+mod atomic;
 mod commands;
+mod doctor;
 mod gitrepo;
+mod inv_cli;
+mod item_cli;
+mod mq_cli;
+mod notify;
+mod ops_cli;
 mod output;
 mod owner;
 mod pr;
+mod pr_cli;
 mod presence;
+mod remote;
 mod repo;
 mod review;
 mod service;
 mod session;
+mod session_cli;
 mod staging;
+mod task_cli;
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use jkb_api::kb::SearchRoute;
 
-use jkb_core::lifecycle;
-use jkb_core::query::{Query, Scope};
-use jkb_core::transition::{self, Reclaimed};
-use jkb_core::{
-    binding, blob, claim, edge, investigation, item, mount, ns, nstype, placement, tag, task, undo,
-    view, Db,
-};
+use jkb_core::{edge, mount, ns, nstype, tag, task, undo, view, Db};
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_fsm::Fact;
 use jkb_ingest::Pipeline;
-use jkb_search::{Route, Searcher};
-use jkb_types::{ConflictPolicy, EdgeType, Embedder, ItemId, PlacementRole, Resolution, SyncMode};
+use jkb_types::{ConflictPolicy, Embedder, SyncMode};
 
 /// A local-first, agent-native knowledge base.
 #[derive(Parser)]
@@ -56,6 +60,28 @@ struct Cli {
     global: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+/// `jkb notify` verbs.
+#[derive(Subcommand)]
+enum NotifyCmd {
+    /// Read a hook payload on stdin and send it to `jkb serve`, which decides what the notification
+    /// does; at `SessionStart`, withdraw what provably-gone sessions left. What the hook shim calls.
+    /// Silent: failures go to `~/.jkb/logs/notify-hook.log`.
+    Hook,
+    /// Print the Claude Code hook events this command answers to, for the registration
+    /// cross-check in `scripts/tests/notify-hook.test.sh`.
+    Events,
+    /// Print the queue topic notifications are sent on, for `scripts/setup.sh` (which creates it) and
+    /// `scripts/build-notifier.sh` (whose agent subscribes to it) — so the name is spelled once.
+    Topic,
+    /// List the Claude Code sessions the daemon's registry holds, one line per process holding one:
+    /// the live ones, or with `--all` the ended ones too. Asked of `jkb serve`, like the hook.
+    Sessions {
+        /// Include ended rows, most recently seen first.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -85,9 +111,10 @@ enum Command {
         /// Query DSL terms; `~"…"` is the vector term, bare words are FTS.
         #[arg(required = true, num_args = 1..)]
         terms: Vec<String>,
-        /// Which route to use.
-        #[arg(long, value_enum, default_value_t = RouteArg::Hybrid)]
-        route: RouteArg,
+        /// Which route to use (default: hybrid; fts with `JKB_REMOTE` set, since the daemon embeds
+        /// no query text).
+        #[arg(long, value_enum)]
+        route: Option<RouteArg>,
         /// Maximum number of hits.
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -172,8 +199,34 @@ enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// Decide what a Claude Code notification hook event should do, from the payload on stdin.
+    ///
+    /// Runs before the database is opened, because it needs none and fires after every tool call
+    /// (design N7).
+    Notify {
+        #[command(subcommand)]
+        cmd: NotifyCmd,
+    },
     /// Run the MCP server over stdio (read + audited write tools).
     Mcp,
+    /// The message queue: topics, sends, NDJSON subscriptions (design r3.2 Q6).
+    Mq {
+        #[command(subcommand)]
+        cmd: mq_cli::MqCmd,
+    },
+    /// Serve the knowledge base's operations over HTTP for processes that must not open the
+    /// database themselves — the dev container's `jkb` (design r3.2 H3). Runs on the host, usually as
+    /// the `com.jkb.serve` service; writes a fresh bearer token beside the database each start.
+    Serve {
+        /// Where to listen. An unspecified address (0.0.0.0, ::) is refused.
+        #[arg(long, default_value = jkb_daemon::DEFAULT_ADDR)]
+        addr: std::net::SocketAddr,
+        /// Where to write the token (default: `~/.jkb/daemon/<port>/token`, whichever database is
+        /// served; refused on a filesystem shared with another kernel, such as the dev container's
+        /// view of the host's `~/.jkb`).
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
     /// List the direct children of a namespace (sub-namespaces + items homed there) —
     /// the lazy tree-expansion primitive for the UI. Omit `path` for top-level namespaces.
     Ls {
@@ -810,7 +863,8 @@ enum TaskCmd {
     /// green mark the task done and clean the session up. Serialized per repo.
     Land {
         /// The task uid.
-        uid: String,
+        #[arg(required_unless_present = "break_lock")]
+        uid: Option<String>,
         /// The command that verifies the integrated result (remembered for this repo).
         #[arg(long)]
         gate: Option<String>,
@@ -824,8 +878,13 @@ enum TaskCmd {
         /// bypass is visible rather than invisible.
         #[arg(long)]
         no_review: bool,
+        /// Drop this repo's land lease, whoever holds it, and land nothing — for a holder that is
+        /// gone for good but cannot be proven so (another machine, a session never seen to end).
+        /// Host only.
+        #[arg(long, conflicts_with_all = ["gate", "no_gate", "keep_worktree", "no_review"])]
+        break_lock: bool,
     },
-    /// Record that a code review ran, so `task land` can require one.
+    /// File a code review's findings, and record that it ran so `task land` can require one.
     Review {
         #[command(subcommand)]
         cmd: TaskReviewCmd,
@@ -896,7 +955,9 @@ enum TaskCmd {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Archive session worktrees a landing could not move, and delete aged-out archives.
+    /// Archive session worktrees a landing could not move, and delete aged-out archives. Also
+    /// compacts the message queue (idle groups, consumed-and-expired messages); `--dry-run` skips
+    /// the compaction, and a database that cannot be opened stops only the compaction.
     ///
     /// A session cannot remove its OWN worktree — Claude Code protects a project's `.claude`
     /// policy files from the agent whose policy they are, and the refusal propagates up to the
@@ -910,7 +971,7 @@ enum TaskCmd {
         /// Report what would happen and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Remove a sweep lock whose holder is gone for good.
+        /// Drop the sweep's lease when its holder is gone for good.
         ///
         /// There is no automatic escape and there should not be: a holder on another host
         /// cannot be probed, and breaking a live sweeper's lock is what the lock prevents. A
@@ -962,6 +1023,18 @@ enum TaskCmd {
 
 #[derive(Subcommand)]
 enum TaskReviewCmd {
+    /// File a review's findings as tasks under a namespace of their own, one section per severity
+    /// (`must-fix` blocks landing). Reads the reviewer workflow's result — a JSON object with a
+    /// `findings` array of `{severity, summary, file, line, scenario, fix}` — from a file, or from
+    /// stdin with `-`.
+    File {
+        /// The namespace to file them under, e.g. `repos/<repo>/codereviews/<folder>`. Must be new.
+        #[arg(long)]
+        findings: String,
+        /// The workflow's result, as JSON (`-` for stdin).
+        #[arg(long)]
+        from: PathBuf,
+    },
     /// Record a review against a branch: tags every task working that branch with the
     /// reviewed SHA and the findings namespace, and moves `in_progress` to `needs_review`.
     Record {
@@ -1013,6 +1086,13 @@ enum ServiceCmd {
     Install,
     /// Remove the installed service unit.
     Uninstall,
+    /// Print every unit `install` writes, one per line as `label<TAB>path<TAB>role` — what setup.sh
+    /// activates, so neither the list nor the paths are copied into it by hand.
+    Units,
+    /// Print where `jkb serve` writes its token for this database (it does so once it is listening).
+    TokenPath,
+    /// Print the address the `com.jkb.serve` unit listens on, as a `JKB_REMOTE` URL.
+    ServeUrl,
 }
 
 #[derive(Subcommand)]
@@ -1046,12 +1126,12 @@ enum RouteArg {
     Hybrid,
 }
 
-impl From<RouteArg> for Route {
+impl From<RouteArg> for SearchRoute {
     fn from(r: RouteArg) -> Self {
         match r {
-            RouteArg::Vector => Route::Vector,
-            RouteArg::Fts => Route::Fts,
-            RouteArg::Hybrid => Route::Hybrid,
+            RouteArg::Vector => Self::Vector,
+            RouteArg::Fts => Self::Fts,
+            RouteArg::Hybrid => Self::Hybrid,
         }
     }
 }
@@ -1099,6 +1179,28 @@ fn main() {
 
 #[allow(clippy::too_many_lines)] // a flat command dispatcher; one arm per subcommand
 fn run(cli: Cli) -> Result<()> {
+    // THE ORDER, in one place. (1) `notify`, in every mode — the one dispatch, not one per mode.
+    // (2) Remote mode, before anything else with a side effect. (3) Everything that opens a database.
+    //
+    // (1) `notify` touches no database in any mode, so it is safe ahead of remote mode — its only
+    // writes are its own log and the daemon-unreachable marker. It must be: `open_db` verifies the migrations and spawns the writer thread — 110 ms
+    // against the real database — and `notify hook` runs after EVERY tool call, the cost design N7
+    // measured and rejected; and when a newer branch's migration locks an older binary out of the
+    // database, `open_db` fails and nothing would ever withdraw. Ahead of remote mode because remote
+    // mode's refusals (`JKB_DB` beside `JKB_REMOTE`) exit before the hook can log, onto a stderr
+    // the shim discards — every notification lost silently (stage-5 review).
+    if let Command::Notify { cmd } = &cli.command {
+        return notify::run(cmd, cli.json);
+    }
+
+    // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
+    // kernel that is the host's `jkb.db`, which a process on each side of the bind corrupts — so
+    // every other command either goes to the daemon or is refused here, at dispatch, before it has
+    // run git, written a file or opened anything.
+    if let Some(remote) = remote::target() {
+        return remote::run(cli, &remote);
+    }
+
     // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
     // (best-effort, silent). Skipped for explicit `jkb commands …` so it never fights the
     // user's own install/uninstall.
@@ -1107,12 +1209,14 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
-    // THE SWEEP TOUCHES NO ROWS, so it must not be stopped by a schema it never reads. `open_db`
-    // runs the migrations, which refuse outright when the shared `~/.jkb/jkb.db` carries one this
-    // binary does not know — routine across branches here. The host's `com.jkb.reap` unit is
-    // whichever binary `setup.sh` last installed, so that divergence turned the one process that
-    // finishes every deferred landing into a launchd restart-loop, with the only symptom in
-    // reap.log. It works from the record store beside the database, and needs nothing else.
+    // THE SWEEP OPENS THE DATABASE PER PASS, never before the loop. `open_db` runs the migrations,
+    // which refuse outright when the shared `~/.jkb/jkb.db` carries one this binary does not know —
+    // routine across branches here. The host's `com.jkb.reap` unit is whichever binary `setup.sh`
+    // last installed, so an open up front turned the one process that finishes every deferred
+    // landing into a launchd restart-loop, with the only symptom in reap.log. The sweep's records
+    // were beside the database for that reason; they are in it now (tasks S6.4 stage 3), so each
+    // pass opens it (`reap_once`), as the queue's compaction does (`compact_queue`), and a failure is
+    // reported and never stops the service.
     if let Command::Task {
         cmd: cmd @ TaskCmd::Reap { .. },
     } = cli.command
@@ -1139,31 +1243,73 @@ fn run(cli: Cli) -> Result<()> {
             cli.json,
         );
     }
-    let db = open_db(&db_path)?;
+    // The daemon opens the database itself, so that a database it cannot serve still gets a daemon
+    // that says why rather than a supervisor restart-loop — see `cmd_serve`.
+    if let Command::Serve { addr, token_file } = cli.command {
+        return cmd_serve(&db_path, addr, token_file);
+    }
+    // `jkb service` writes and describes units; it reads no rows. Opened first, a database a newer jkb
+    // migrated stopped setup.sh at `service install` — so it never started the daemon that would
+    // have said `schema_newer`, and reported the watcher as unwritable instead.
+    if let Command::Service { cmd } = cli.command {
+        return match cmd {
+            ServiceCmd::Print => service::print(&db_path),
+            ServiceCmd::Install => service::install(&db_path),
+            ServiceCmd::Uninstall => service::uninstall(&db_path),
+            ServiceCmd::Units => service::units(&db_path),
+            ServiceCmd::ServeUrl => {
+                // The unit passes no `--addr`, so it listens on serve's default.
+                println!("http://{}", jkb_daemon::DEFAULT_ADDR);
+                Ok(())
+            }
+            ServiceCmd::TokenPath => {
+                // The unit passes no `--addr`, so its token is keyed by serve's default port.
+                let port = jkb_daemon::DEFAULT_ADDR
+                    .parse::<std::net::SocketAddr>()
+                    .map_or(7117, |a| a.port());
+                println!("{}", service::serve_token_path(port).display());
+                Ok(())
+            }
+        };
+    }
+    let db = match open_db(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            // `jkb mq`'s `--json` rule covers a database that will not open too: a scripted producer
+            // branches on `schema_newer` whichever side of the open it meets it on.
+            if let Command::Mq { cmd } = &cli.command {
+                if cli.json {
+                    let code = mq_cli::open_failure_code(&e);
+                    mq_cli::print_failure(cmd, &mq_cli::refused(code, format!("{e:#}")));
+                }
+            }
+            return Err(e);
+        }
+    };
     let json = cli.json;
     let global = cli.global;
 
     match cli.command {
-        Command::Ingest { path, ns } => cmd_ingest(&db, &path, ns.as_deref(), global, json),
-        Command::Query {
-            terms,
-            limit,
-            count,
-        } => cmd_query(&db, &terms.join(" "), limit, count, global, json),
-        Command::Search {
-            terms,
-            route,
-            limit,
-            context,
-        } => cmd_search(
-            &db,
-            &terms.join(" "),
-            route.into(),
-            limit,
-            context,
-            global,
-            json,
-        ),
+        // Dispatched above, before the database is opened — this arm is the correct answer if
+        // that ever stops happening, not a silent fallthrough to the database path. Which of the
+        // two runs is pinned by `notify_needs_no_database` in tests/cli.rs, so the fast path is
+        // load-bearing rather than an optimisation someone can quietly drop.
+        Command::Notify { cmd } => notify::run(&cmd, json),
+        // Ahead of every other arm, and asked through the same predicate remote mode dispatches on:
+        // a read ported later is then served by its op here too, rather than by an arm below that
+        // still compiles.
+        cmd if ops_cli::handles(&cmd) => local_ops(&db, &db_path, cmd, global, json),
+        Command::Query { .. }
+        | Command::Search { .. }
+        | Command::Find { .. }
+        | Command::Recent { .. }
+        | Command::Ls { .. }
+        | Command::Tree { .. }
+        | Command::Grep { .. }
+        | Command::Cat { .. }
+        | Command::Ingest { .. } => {
+            anyhow::bail!("internal: a read-set command missed ops_cli's dispatch")
+        }
         Command::Ns { cmd } => cmd_ns(&db, cmd, json),
         Command::Tag { cmd } => cmd_tag(&db, cmd, json),
         Command::Mount { cmd } => cmd_mount(&db, cmd, json),
@@ -1177,270 +1323,54 @@ fn run(cli: Cli) -> Result<()> {
             watch,
             conflict.map(ConflictPolicy::from),
         ),
-        Command::Staging { cmd } => match cmd {
-            StagingCmd::Ls { all } => cmd_staging_ls(&db, all, cli.json),
-        },
-        Command::Service { cmd } => match cmd {
-            ServiceCmd::Print => service::print(&db_path),
-            ServiceCmd::Install => service::install(&db_path),
-            ServiceCmd::Uninstall => service::uninstall(&db_path),
-        },
+        Command::Staging { .. }
+        | Command::Stat { .. }
+        | Command::Item { .. }
+        | Command::Related { .. }
+        | Command::Blob { .. }
+        | Command::History { .. }
+        | Command::Inv { .. } => {
+            anyhow::bail!("internal: a command served as an op missed ops_cli's dispatch")
+        }
         Command::Commands { cmd } => match cmd {
             CommandsCmd::Install => commands::install(),
             CommandsCmd::Uninstall => commands::uninstall(),
             CommandsCmd::List => commands::list(),
         },
-        Command::Task { cmd } => cmd_task(&db, &db_path, cmd, global, json),
+        Command::Task { cmd } => cmd_task(&db, &db_path, cmd, json),
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
         Command::Index { sweep } => cmd_index(&db, sweep),
-        Command::Doctor { backup, fix } => cmd_doctor(&db, &db_path, backup.as_deref(), fix),
-        Command::Mcp => jkb_mcp::run_stdio(db, embedder()?),
-        Command::Ls {
-            path,
-            all,
-            long,
-            recursive,
-            time,
-        } => cmd_ls(
-            &db,
-            path.as_deref(),
-            LsOpts {
-                all,
-                long,
-                recursive,
-                time,
-            },
-            json,
-        ),
-        Command::Grep {
-            pattern,
-            path,
-            ignore_case,
-            names_only,
-            count,
-        } => cmd_grep(
-            &db,
-            &pattern,
-            path.as_deref(),
-            GrepOpts {
-                ignore_case,
-                names_only,
-                count,
-            },
-            global,
-            json,
-        ),
-        Command::Cat { uid } => cmd_cat(&db, &uid),
-        Command::Tree { path, all, depth } => cmd_tree(&db, path.as_deref(), all, depth, json),
-        Command::Find {
-            path,
-            kind,
-            tags,
-            status,
-            limit,
-        } => cmd_find(
-            &db,
-            path.as_deref(),
-            kind.as_deref(),
-            &tags,
-            status.as_deref(),
-            limit,
-            global,
-            json,
-        ),
-        Command::Recent { path, limit } => cmd_recent(&db, path.as_deref(), limit, global, json),
-        Command::Stat { uid } => cmd_stat(&db, &uid, json),
+        Command::Doctor { backup, fix } => {
+            let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
+            doctor::run(
+                &session_cli::Kb::new(&backend),
+                Some(&doctor::Host {
+                    db: &db,
+                    path: &db_path,
+                }),
+                backup.as_deref(),
+                fix,
+            )
+        }
+        Command::Mcp => jkb_mcp::run_stdio(jkb_mcp::Tools {
+            backend: std::sync::Arc::new(
+                jkb_api::LocalBackend::new(db)
+                    .with_actor("mcp")
+                    .with_embedder(embedder()?),
+            ),
+        }),
+        Command::Mq { cmd } => {
+            mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
+        }
+        Command::Serve { .. } | Command::Service { .. } => {
+            unreachable!("dispatched before the database is opened")
+        }
         Command::Guide => {
             cmd_guide();
             Ok(())
         }
-        Command::Item { cmd } => match cmd {
-            ItemCmd::Show { uid, preview } => cmd_item_show(&db, &uid, preview, json),
-            ItemCmd::Rm { uid, force } => cmd_item_rm(&db, &uid, force, json),
-            ItemCmd::Edit {
-                uid,
-                text,
-                stdin,
-                append,
-            } => cmd_item_edit(&db, &uid, &text, stdin, append, json),
-        },
-        Command::Related {
-            uid,
-            edges,
-            depth,
-            direction,
-        } => cmd_related(&db, &uid, &edges, depth, direction.into(), json),
-        Command::Inv { cmd } => cmd_inv(&db, cmd, global, json),
-        Command::Blob { cmd } => match cmd {
-            BlobCmd::Ls { contains, limit } => cmd_blob_ls(&db, contains.as_deref(), limit, json),
-            BlobCmd::Cat { hash } => cmd_blob_cat(&db, &hash),
-        },
-        Command::History { path } => cmd_history(&db, &path, json),
     }
-}
-
-/// `jkb blob ls` — list the archive, optionally searching blob bytes.
-fn cmd_blob_ls(db: &Db, contains: Option<&str>, limit: usize, json: bool) -> Result<()> {
-    let needle = contains.map(|s| s.as_bytes().to_vec());
-    let blobs = db.read(move |conn| blob::list(conn, needle.as_deref(), limit))?;
-    if json {
-        let arr: Vec<serde_json::Value> = blobs
-            .iter()
-            .map(|b| {
-                serde_json::json!({
-                    "hash": b.hash, "size": b.size, "mime": b.mime, "created_at": b.created_at,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if blobs.is_empty() {
-        println!("(no matching blobs)");
-    } else {
-        for b in &blobs {
-            println!(
-                "{}  {:>9}  {}",
-                &b.hash[..16.min(b.hash.len())],
-                b.size,
-                b.created_at
-            );
-        }
-    }
-    Ok(())
-}
-
-/// `jkb blob cat <hash>` — raw bytes to stdout, accepting a unique hash prefix.
-fn cmd_blob_cat(db: &Db, hash: &str) -> Result<()> {
-    use std::io::Write as _;
-    let prefix = hash.to_owned();
-    // A full hash is 64 hex chars; anything shorter is treated as a prefix and must be
-    // unambiguous, so `cat` can never print the wrong version.
-    let matches = db.read(move |conn| {
-        let all = blob::list(conn, None, usize::MAX)?;
-        Ok(all
-            .into_iter()
-            .filter(|b| b.hash.starts_with(&prefix))
-            .collect::<Vec<_>>())
-    })?;
-    let found = match matches.as_slice() {
-        [one] => one.hash.clone(),
-        [] => anyhow::bail!("no blob with hash prefix `{hash}`"),
-        many => anyhow::bail!("`{hash}` matches {} blobs; use a longer prefix", many.len()),
-    };
-    let bytes = db
-        .read(move |conn| blob::load(conn, &found))?
-        .with_context(|| format!("blob `{hash}` vanished between listing and reading"))?;
-    std::io::stdout().write_all(&bytes)?;
-    Ok(())
-}
-
-/// Resolve a path the way the sync journal's uris were built: canonicalized.
-///
-/// `canonicalize` needs the file to exist, which is precisely what `jkb history` is often asked
-/// about, and plain absolutisation resolves no symlinks — so on macOS a deleted file under
-/// `/tmp` or `/var` produced a uri the journal never wrote. Canonicalizing the deepest ancestor
-/// that DOES exist (normally the parent) and rejoining the rest gets both: the symlinks are
-/// resolved and the missing leaf is preserved.
-fn resolve_for_journal(path: &std::path::Path) -> std::path::PathBuf {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real;
-    }
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut rest = Vec::new();
-    let mut cur = abs.as_path();
-    while let Some(parent) = cur.parent() {
-        if let Some(name) = cur.file_name() {
-            rest.push(name.to_owned());
-        }
-        if let Ok(real) = std::fs::canonicalize(parent) {
-            let mut out = real;
-            for part in rest.iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        cur = parent;
-    }
-    abs
-}
-
-/// `jkb history <path>` — every synced version of a file, newest first.
-fn cmd_history(db: &Db, path: &str, json: bool) -> Result<()> {
-    // Accept a bare path or a `file://` uri, and canonicalize so a relative path matches the
-    // absolute uri the journal stores.
-    let uri = if path.starts_with("file://") {
-        path.to_owned()
-    } else {
-        // Absolutised WITHOUT requiring the file to exist, then keyed with `jkb-sync`'s own
-        // spelling. `canonicalize` fails for a deleted file, which left a relative uri that
-        // matched no journal row — so `jkb history <deleted file>` reported "no recorded
-        // history" and blamed the build version, on exactly the recovery path the archive
-        // exists to serve.
-        // Canonicalize when the file is there — the journal's uris come from a canonicalized
-        // mount directory, so on macOS `/var/...` must become `/private/var/...` to match — and
-        // fall back to plain absolutisation when it is not, which is the case `jkb history`
-        // exists for. Using only one of the two fails half the time: `canonicalize` alone left a
-        // *relative* uri for a deleted file, and `absolute` alone misses the symlink.
-        jkb_sync::file_uri(&resolve_for_journal(std::path::Path::new(path)))
-    };
-
-    let versions = db.read({
-        let uri = uri.clone();
-        move |conn| {
-            // The journal's changelog carries one entry per settle, each naming the blob
-            // holding that version's bytes.
-            let mut stmt = conn.prepare(
-                "SELECT ts, after FROM changelog
-                 WHERE entity_type = 'sync_state' AND entity_id = ?1 AND after IS NOT NULL
-                 ORDER BY id DESC",
-            )?;
-            let rows = stmt.query_map([&uri], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            let mut out: Vec<(String, String, String)> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for row in rows {
-                let (ts, after) = row?;
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&after) else {
-                    continue;
-                };
-                let Some(hash) = v.get("base_blob_hash").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let status = v
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("ok")
-                    .to_owned();
-                if seen.insert(hash.to_owned()) {
-                    out.push((ts, hash.to_owned(), status));
-                }
-            }
-            Ok(out)
-        }
-    })?;
-
-    if json {
-        let arr: Vec<serde_json::Value> = versions
-            .iter()
-            .map(|(ts, hash, status)| {
-                serde_json::json!({ "ts": ts, "blob": hash, "status": status })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if versions.is_empty() {
-        println!(
-            "(no recorded history for {uri})\n\
-             Versions synced before this build did not journal their blob hash — search the \
-             archive instead: jkb blob ls --contains \"<a line you remember>\""
-        );
-    } else {
-        for (ts, hash, status) in &versions {
-            println!("{ts}  {}  [{status}]", &hash[..16.min(hash.len())]);
-        }
-        println!("\nRead one with: jkb blob cat <hash>");
-    }
-    Ok(())
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -1469,51 +1399,17 @@ fn embedder() -> Result<Arc<dyn Embedder + Send + Sync>> {
     Ok(Arc::new(e))
 }
 
-/// The ambient namespace for the current directory, unless `--global`.
-fn ambient(db: &Db, global: bool) -> Result<Option<String>> {
-    if global {
-        return Ok(None);
+/// The agent read set on this host (`ops_cli`): through a `LocalBackend` over `db`, the same op
+/// `jkb serve` answers the dev container with, so the two cannot list different things.
+fn local_ops(db: &Db, db_path: &Path, command: Command, global: bool, json: bool) -> Result<()> {
+    let mut backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
+    // Only a search or an ingest embeds; building the embedder is not a cost `ls` should pay.
+    if matches!(command, Command::Search { .. } | Command::Ingest { .. }) {
+        backend = backend.with_embedder(embedder()?);
     }
-    let cwd = std::env::current_dir()?;
-    Ok(db.read(move |conn| mount::ambient_namespace(conn, &cwd))?)
-}
-
-/// If a query has no explicit scope, default it to the ambient namespace subtree.
-fn apply_ambient(query: &mut Query, db: &Db, global: bool) -> Result<()> {
-    if query.scope == Scope::All {
-        if let Some(path) = ambient(db, global)? {
-            query.scope = Scope::Subtree(path);
-        }
-    }
-    Ok(())
-}
-
-/// The ambient repo key: the full namespace path of the `file://` mount covering the
-/// current directory (design D26.2), or `None` outside any mount. Tasks home under
-/// `tasks/<repo>/…` using this key. Unlike [`ambient`], `--global` does not apply — homing
-/// always reflects where the task was captured.
-fn ambient_repo(db: &Db) -> Result<Option<String>> {
-    let cwd = std::env::current_dir()?;
-    Ok(db.read(move |conn| mount::ambient_namespace(conn, &cwd))?)
-}
-
-/// Default an unscoped task query to the ambient repo's task tree (`tasks/<repo>/**`) when
-/// inside a repo, else the global `tasks/**` tree (design D26, open-question 4). `--global`
-/// forces the global tree.
-fn apply_ambient_tasks(query: &mut Query, db: &Db, global: bool) -> Result<()> {
-    if query.scope == Scope::All {
-        let root = task::DEFAULT_ROOT;
-        let base = if global {
-            root.to_owned()
-        } else {
-            match ambient_repo(db)? {
-                Some(repo) => format!("{root}/{repo}"),
-                None => root.to_owned(),
-            }
-        };
-        query.scope = Scope::Subtree(base);
-    }
-    Ok(())
+    ops_cli::Ops::new(&backend, global, json, false)
+        .with_local(db, db_path)
+        .run(command)
 }
 
 /// Confirm a global `tasks/.backlog` fallback when `--backlog` is used outside any repo
@@ -1534,1598 +1430,9 @@ fn confirm_global_backlog() -> Result<bool> {
 
 // ---- commands -------------------------------------------------------------
 
-fn cmd_ingest(db: &Db, path: &str, ns: Option<&str>, global: bool, json: bool) -> Result<()> {
-    let namespace = match ns {
-        Some(n) => n.to_owned(),
-        None => ambient(db, global)?.unwrap_or_else(|| "inbox".to_owned()),
-    };
-    let pipeline = Pipeline::new(embedder()?);
-    let is_url = path.starts_with("http://") || path.starts_with("https://");
-    let outcome = if is_url {
-        pipeline.ingest_url(db, path, &namespace)?
-    } else {
-        pipeline.ingest_path(db, Path::new(path), &namespace)?
-    };
-
-    if json {
-        let v = serde_json::json!({
-            "document": outcome.document.get(),
-            "chunk_count": outcome.chunk_count,
-            "embedded": outcome.embedded,
-            "already_ingested": outcome.already_ingested,
-            "warnings": outcome.warnings,
-        });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else {
-        let state = if outcome.already_ingested {
-            "already ingested"
-        } else if outcome.embedded {
-            "ingested + embedded"
-        } else {
-            "captured (not embedded)"
-        };
-        println!(
-            "{state}: document {} under {namespace} ({} chunks)",
-            outcome.document, outcome.chunk_count
-        );
-        for w in &outcome.warnings {
-            println!("  warning: {w}");
-        }
-    }
-    Ok(())
-}
-
-fn cmd_query(
-    db: &Db,
-    dsl: &str,
-    limit: Option<usize>,
-    count: bool,
-    global: bool,
-    json: bool,
-) -> Result<()> {
-    let mut query = jkb_core::query::parse(dsl)?;
-    apply_ambient(&mut query, db, global)?;
-    // `--count` reports the total; `--limit` only caps a listing.
-    if !count {
-        if let Some(limit) = limit {
-            query.limit = Some(limit);
-        }
-    }
-    let ids = db.read(move |conn| query.evaluate(conn))?;
-    if count {
-        if json {
-            println!("{}", serde_json::json!({ "count": ids.len() }));
-        } else {
-            println!("{}", ids.len());
-        }
-        return Ok(());
-    }
-    let items = output::fetch_items(db, &ids)?;
-    output::print_items(&items, json);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_search(
-    db: &Db,
-    dsl: &str,
-    route: Route,
-    limit: usize,
-    context: Option<usize>,
-    global: bool,
-    json: bool,
-) -> Result<()> {
-    let mut query = jkb_core::query::parse(dsl)?;
-    apply_ambient(&mut query, db, global)?;
-    let searcher = Searcher::new(embedder()?);
-    let hits = searcher.search(db, &query, route, limit)?;
-
-    if json {
-        // Resolve every hit (and every `source_document`) to a real item before emitting.
-        // A search result identified only by a row id is not interpretable by the agent that
-        // asked for it: `jkb query --json` returns uid/kind/snippet, and search — the
-        // flagship read — must not be the one surface that answers in opaque integers.
-        let mut ids: Vec<ItemId> = hits.iter().map(|h| h.item).collect();
-        ids.extend(hits.iter().filter_map(|h| h.source_document));
-        ids.sort_unstable_by_key(|i| i.get());
-        ids.dedup_by_key(|i| i.get());
-        let resolved: std::collections::HashMap<i64, output::DisplayItem> =
-            output::fetch_items(db, &ids)?
-                .into_iter()
-                .map(|i| (i.id, i))
-                .collect();
-
-        let mut arr = Vec::new();
-        for hit in &hits {
-            let ctx: Vec<serde_json::Value> = match context {
-                Some(n) => searcher
-                    .get_context(db, hit.item, n)?
-                    .into_iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "item": c.item.get(),
-                            "position": c.position,
-                            "is_hit": c.is_hit,
-                            "content": c.content,
-                        })
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
-            let item = resolved.get(&hit.item.get());
-            let source = hit
-                .source_document
-                .and_then(|d| resolved.get(&d.get()))
-                .map(|d| serde_json::json!({ "id": d.id, "uid": d.uid, "kind": d.kind }));
-            arr.push(serde_json::json!({
-                "item": hit.item.get(),
-                "uid": item.map(|i| i.uid.clone()),
-                "kind": item.map(|i| i.kind.clone()),
-                "status": item.and_then(|i| i.status.clone()),
-                "snippet": item.and_then(|i| i.snippet.clone()),
-                "route": hit.route.as_str(),
-                "score": hit.score,
-                "distance": hit.distance,
-                "namespace": hit.namespace_path,
-                "source_document": source,
-                "context": ctx,
-            }));
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::Value::Array(arr))?
-        );
-        return Ok(());
-    }
-
-    if hits.is_empty() {
-        println!("(no results)");
-        return Ok(());
-    }
-    // Resolved BY ID, never by position — the JSON branch above already does this. `fetch_items`
-    // drops rows it cannot find, so zipping made one missing item print nothing at all (and exit
-    // 0), and a gap mid-list mislabelled every hit after it (design D42.4). Never pair two lists
-    // by index when one of them can be shorter.
-    let ids: Vec<ItemId> = hits.iter().map(|h| h.item).collect();
-    let by_id: std::collections::HashMap<i64, output::DisplayItem> = output::fetch_items(db, &ids)?
-        .into_iter()
-        .map(|i| (i.id, i))
-        .collect();
-    for hit in &hits {
-        let Some(item) = by_id.get(&hit.item.get()) else {
-            // A hit whose item is gone should be unreachable now that `knn_live` filters them,
-            // so say so rather than skipping silently — a search that quietly drops results is
-            // the failure this fix exists to remove.
-            eprintln!(
-                "warning: search hit {} has no item row; run `jkb index --sweep`",
-                hit.item.get()
-            );
-            continue;
-        };
-        println!(
-            "[{} {:.3}] {}",
-            hit.route.as_str(),
-            hit.score,
-            output_line(item)
-        );
-        if let Some(n) = context {
-            for c in searcher.get_context(db, hit.item, n)? {
-                let marker = if c.is_hit { "»" } else { " " };
-                println!("    {marker} {}: {}", c.position, first_line(&c.content));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A direct child of a namespace in the tree: a sub-namespace, or an item homed there.
-struct Child {
-    kind: String,
-    reference: String,
-    label: String,
-    has_children: bool,
-    status: Option<String>,
-    priority: Option<i64>,
-    /// For namespaces: count of visible item leaves anywhere in the subtree (respecting the
-    /// terminal-status toggle). `None` for item children. Lets the pane flag which folders
-    /// lead to real content. This is the sum of [`Child::leaf_kinds`].
-    leaf_count: Option<i64>,
-    /// For namespaces: the same leaves broken down by item `kind`, ordered by kind name.
-    /// A folder holding 8 tasks and 4 documents is not described by "12", and calling that
-    /// 12 tasks is simply wrong — so the breakdown, not the total, is what a tree renders.
-    leaf_kinds: Option<BTreeMap<String, i64>>,
-    /// For namespaces: the type recorded on **this** namespace, if any. Deliberately its
-    /// *own* type rather than the inherited one — a label on every namespace under a typed
-    /// root would be noise, and the interesting fact is where the type was applied.
-    ns_type: Option<String>,
-    /// The one-line description of [`Child::ns_type`], for a tooltip.
-    ns_type_about: Option<String>,
-    /// For a task with subtasks: `(total, open)`. A parent with open subtasks is held off
-    /// the ready frontier, so the tree must be able to show it as a container rather than
-    /// as one more pickable task sitting beside its own children.
-    subtasks: Option<(i64, i64)>,
-    /// For an item that others were derived from: how many `chunk` items came out of it.
-    /// Chunks are index units, not content — the tree hides them and shows their count here,
-    /// against the document they belong to. `None` when there are none.
-    chunk_count: Option<i64>,
-    /// The item's `updated_at` (for `ls -t`); `None` for namespaces.
-    updated: Option<String>,
-}
-
-/// The item kind ingest produces per document fragment. Chunks are derived index units:
-/// they are rebuildable from the VFS, nothing links *to* them, and listing them buries each
-/// ingested document under its own pieces. The tree hides them unless `--all` and surfaces
-/// their count against the document they came from.
-const KIND_CHUNK: &str = "chunk";
-
-/// Render a per-kind leaf breakdown as `8 task · 4 document`, ordered by kind name.
-///
-/// Kinds are **not** pluralized: they are `items.kind` values verbatim, and English
-/// pluralization of an open vocabulary goes wrong fast (`hypothesis` → `hypothesiss`). The
-/// count in front makes the reading unambiguous without it.
-fn format_leaf_kinds(kinds: &BTreeMap<String, i64>) -> String {
-    kinds
-        .iter()
-        .filter(|(_, n)| **n > 0)
-        .map(|(kind, n)| format!("{n} {kind}"))
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-impl Child {
-    /// The item's hidden chunk count as a suffix, e.g. ` (3 chunks)`, or empty. Shows where
-    /// the fragments went for a document the tree no longer expands into.
-    fn chunk_label(&self) -> String {
-        self.chunk_count
-            .filter(|n| *n > 0)
-            .map(|n| format!(" ({n} chunk{})", if n == 1 { "" } else { "s" }))
-            .unwrap_or_default()
-    }
-
-    /// The namespace's own type as a bracketed label, e.g. ` [tasks]`, or empty.
-    fn type_label(&self) -> String {
-        self.ns_type
-            .as_deref()
-            .map(|t| format!(" [{t}]"))
-            .unwrap_or_default()
-    }
-
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "kind": self.kind,
-            "ref": self.reference,
-            "label": self.label,
-            "has_children": self.has_children,
-            "status": self.status,
-            "priority": self.priority,
-            "leaf_count": self.leaf_count,
-            "leaf_kinds": self.leaf_kinds,
-            "type": self.ns_type,
-            "type_about": self.ns_type_about,
-            "chunk_count": self.chunk_count,
-            "subtask_count": self.subtasks.map(|(total, _)| total),
-            "open_subtask_count": self.subtasks.map(|(_, open)| open),
-            "updated": self.updated,
-        })
-    }
-
-    /// Ordering key: namespaces first, then tasks (most important — lowest priority
-    /// number — first), then other items; ties broken by label. Nulls sort last.
-    fn sort_key(&self) -> (u8, i64, String) {
-        let group = match self.kind.as_str() {
-            "namespace" => 0,
-            "task" => 1,
-            _ => 2,
-        };
-        (
-            group,
-            self.priority.unwrap_or(i64::MAX),
-            self.label.to_lowercase(),
-        )
-    }
-}
-
-/// A short label for an item: its first non-empty content line (≤80 chars), else its uid.
-fn item_label(meta: &item::ItemMeta) -> String {
-    // The derivation is `output::title_of` — the one copy. Only the width is this function's
-    // own, which is the split that helper's doc describes: a tree row, a staging row and a
-    // gate refusal have different widths but must agree on what the task is *called*. This
-    // was the fourth surviving copy, and the one that names tasks in the explorer tree.
-    let title = output::title_of(meta);
-    truncate(&title, 80)
-}
-
-/// The children of any item that contains others — the container behaviour a node takes on
-/// (design D35).
-///
-/// One read for every container. A task's subtasks and a document's chunks are the same
-/// query because containment is recorded the same way for both: on the placement. Nothing
-/// here branches on what kind of node it is.
-fn contained_children(
-    conn: &rusqlite::Connection,
-    parent: jkb_types::ItemId,
-    all: bool,
-) -> jkb_core::Result<Vec<Child>> {
-    let ids = jkb_core::containment::children(conn, parent)?;
-    let subtask_counts = jkb_core::containment::child_counts(conn, &ids)?;
-    let chunk_counts = item::derived_kind_counts(conn, &ids, KIND_CHUNK)?;
-    let mut out = Vec::new();
-    for id in ids {
-        let Some(meta) = item::get(conn, id)? else {
-            continue;
-        };
-        if !all && jkb_types::TaskStatus::is_terminal_str(meta.status.as_deref()) {
-            continue;
-        }
-        let subtasks = subtask_counts.get(&id).copied();
-        let chunks = chunk_counts.get(&id).copied().unwrap_or(0);
-        out.push(Child {
-            label: item_label(&meta),
-            kind: meta.kind,
-            reference: meta.uid,
-            // Containment nests: a child that contains in turn expands in turn.
-            has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks > 0,
-            status: meta.status,
-            priority: meta.priority,
-            leaf_count: None,
-            leaf_kinds: None,
-            ns_type: None,
-            ns_type_about: None,
-            chunk_count: (chunks > 0).then_some(chunks),
-            subtasks,
-            updated: Some(meta.updated_at),
-        });
-    }
-    Ok(out)
-}
-
-/// The direct children of `path` (or top-level namespaces when `None`): sub-namespaces
-/// followed by items whose **primary** placement is `path`. Terminal (`done`/`cancelled`)
-/// tasks are hidden unless `all`.
-fn list_children(
-    conn: &rusqlite::Connection,
-    path: Option<&str>,
-    all: bool,
-) -> jkb_core::Result<Vec<Child>> {
-    // "Container" is a behaviour, not a node kind. A pure namespace is a node that ONLY
-    // contains; a parent task both is a task and contains its subtasks. So `ls` resolves a
-    // namespace first (the common case, and the historical meaning) and falls back to an
-    // item uid — one command lists the children of anything that has any.
-    if let Some(p) = path {
-        if ns::get(conn, p)?.is_none() {
-            if let Some(id) = item::id_for_uid(conn, p)? {
-                return contained_children(conn, id, all);
-            }
-        }
-    }
-    let mut out = Vec::new();
-
-    let ns_children = match path {
-        None => ns::roots(conn)?,
-        Some(p) => ns::children(conn, p)?,
-    };
-    // All children's subtree leaf counts in one grouped recursive query, rather than a
-    // separate descendant walk per child (an N+1 the tree hit on every expand).
-    let leaf_counts = ns::subtree_leaf_counts(conn, path, all)?;
-    for (ns_id, ns_path) in ns_children {
-        let label = ns_path.rsplit('/').next().unwrap_or(&ns_path).to_owned();
-        let has_sub = !ns::children(conn, &ns_path)?.is_empty();
-        let mut leaf_kinds = leaf_counts.get(&ns_id).cloned().unwrap_or_default();
-        if !all {
-            // Chunks are hidden below, so they must not be counted here either — a folder
-            // reporting "1 chunk" that shows nothing when opened is worse than no count.
-            leaf_kinds.remove(KIND_CHUNK);
-        }
-        let leaf_count: i64 = leaf_kinds.values().sum();
-        // The namespace's OWN type, not `effective_type`: labelling every namespace under a
-        // typed root would be noise, and where the type was *applied* is the useful fact.
-        let ns_type = ns::get_type_by_id(conn, ns_id)?;
-        let ns_type_about = ns_type
-            .as_deref()
-            .and_then(|name| nstype::resolve(name).ok())
-            .map(|t| t.about().to_owned());
-        out.push(Child {
-            kind: "namespace".to_owned(),
-            reference: ns_path,
-            label,
-            has_children: has_sub || leaf_count > 0,
-            status: None,
-            priority: None,
-            leaf_count: Some(leaf_count),
-            leaf_kinds: Some(leaf_kinds),
-            ns_type,
-            ns_type_about,
-            chunk_count: None,
-            subtasks: None,
-            updated: None,
-        });
-    }
-
-    if let Some(p) = path {
-        if let Some(ns_id) = ns::get(conn, p)? {
-            // Any placement role: a `tasks/…` mirror surfaces the task even though its
-            // primary home is elsewhere (the symbolic-link view).
-            // Directly placed only: a contained node is listed under its container, not
-            // beside it. It is still IN this namespace — `ns:` scoping finds it — which is
-            // exactly why the placement keeps both the namespace and the parent.
-            let placed = placement::items_directly_in(conn, ns_id)?;
-            // One grouped query for every document's chunk count, not one per document.
-            let chunk_counts = item::derived_kind_counts(conn, &placed, KIND_CHUNK)?;
-            let subtask_counts = jkb_core::containment::child_counts(conn, &placed)?;
-            for item_id in placed {
-                let Some(meta) = item::get(conn, item_id)? else {
-                    continue;
-                };
-                // Hide any terminal-status item (done/cancelled) unless `all` — like
-                // ignored files, revealed only on explicit toggle.
-                let terminal = jkb_types::TaskStatus::is_terminal_str(meta.status.as_deref());
-                if !all && terminal {
-                    continue;
-                }
-                let subtasks = subtask_counts.get(&item_id).copied();
-                let chunks = chunk_counts.get(&item_id).copied().unwrap_or(0);
-                out.push(Child {
-                    label: item_label(&meta),
-                    kind: meta.kind,
-                    reference: meta.uid,
-                    // Anything that contains expands: a task into its subtasks, a document
-                    // into its chunks.
-                    has_children: subtasks.is_some_and(|(total, _)| total > 0) || chunks > 0,
-                    status: meta.status,
-                    priority: meta.priority,
-                    leaf_count: None,
-                    leaf_kinds: None,
-                    ns_type: None,
-                    ns_type_about: None,
-                    chunk_count: chunk_counts.get(&item_id).copied(),
-                    subtasks,
-                    updated: Some(meta.updated_at.clone()),
-                });
-            }
-        }
-    }
-    out.sort_by_key(Child::sort_key);
-    Ok(out)
-}
-
-/// Flags for `jkb ls` (the ergonomic listing verb).
-#[derive(Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)] // a CLI flags bag, not state
-#[derive(Default)]
-struct LsOpts {
-    all: bool,
-    long: bool,
-    recursive: bool,
-    time: bool,
-}
-
-/// `jkb ls [path]` — namespaces + items under a namespace (the lazy tree primitive plus
-/// familiar `-l`/`-R`/`-t` ergonomics). `-R` walks the subtree depth-first; without it,
-/// just the direct children.
-fn cmd_ls(db: &Db, path: Option<&str>, opts: LsOpts, json: bool) -> Result<()> {
-    let owned = path.map(str::to_owned);
-    let all = opts.all;
-    let recursive = opts.recursive;
-    // (namespace shown as the row's "parent", child) pairs — the parent gives `-l`/`-R`
-    // rows a stable location column even when descending.
-    let rows: Vec<(Option<String>, Child)> = db.read(move |conn| {
-        let mut acc = Vec::new();
-        collect_ls(conn, owned.as_deref(), all, recursive, &mut acc)?;
-        Ok(acc)
-    })?;
-
-    let mut rows = rows;
-    if opts.time {
-        // Most-recently-updated first; rows without an `updated` (namespaces) sort last.
-        rows.sort_by(|a, b| b.1.updated.cmp(&a.1.updated));
-    }
-
-    if json {
-        let children: Vec<_> = rows.iter().map(|(_, c)| c.to_json()).collect();
-        let v = serde_json::json!({ "path": path, "children": children });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else if rows.is_empty() {
-        println!("(empty)");
-    } else {
-        for (parent, c) in &rows {
-            print_ls_row(parent.as_deref(), c, opts);
-        }
-    }
-    Ok(())
-}
-
-/// Accumulate `ls` rows, optionally recursing into sub-namespaces depth-first. Each row is
-/// `(parent namespace path, child)`.
-fn collect_ls(
-    conn: &rusqlite::Connection,
-    path: Option<&str>,
-    all: bool,
-    recursive: bool,
-    acc: &mut Vec<(Option<String>, Child)>,
-) -> jkb_core::Result<()> {
-    let children = list_children(conn, path, all)?;
-    for c in children {
-        let is_ns = c.kind == "namespace";
-        let ns_path = c.reference.clone();
-        acc.push((path.map(str::to_owned), c));
-        if recursive && is_ns {
-            collect_ls(conn, Some(&ns_path), all, recursive, acc)?;
-        }
-    }
-    Ok(())
-}
-
-/// One human-readable `ls` row. `-l` adds kind/status and the location (namespace path for a
-/// sub-namespace, or `parent → uid` for an item); the default is the compact tree row.
-fn print_ls_row(parent: Option<&str>, c: &Child, opts: LsOpts) {
-    let status = c
-        .status
-        .as_deref()
-        .map(|s| format!(" ({s})"))
-        .unwrap_or_default();
-    if opts.long {
-        let loc = if c.kind == "namespace" {
-            c.reference.clone()
-        } else {
-            match parent {
-                Some(p) => format!("{p} → {}", c.reference),
-                None => c.reference.clone(),
-            }
-        };
-        let updated = c.updated.as_deref().unwrap_or("");
-        println!(
-            "{:<10} {:<12} {:<24} {}{}{status}",
-            c.kind,
-            updated,
-            loc,
-            c.label,
-            c.type_label()
-        );
-    } else {
-        let arrow = if c.has_children { "▸" } else { " " };
-        // When recursing, prefix items with their namespace so the flattened list stays legible.
-        let loc = match (opts.recursive, parent, c.kind.as_str()) {
-            (true, Some(p), k) if k != "namespace" => format!("{p}/"),
-            _ => String::new(),
-        };
-        println!(
-            "{arrow} {:<10} {loc}{}{}{}{status}",
-            c.kind,
-            c.label,
-            c.type_label(),
-            c.chunk_label()
-        );
-    }
-}
-
-/// Flags for `jkb grep`.
-#[derive(Clone, Copy)]
-struct GrepOpts {
-    ignore_case: bool,
-    names_only: bool,
-    count: bool,
-}
-
-/// `jkb grep <pattern> [path]` — literal-substring content search over a namespace subtree.
-/// Prints `uid:line` per matching line (or just uids with `-l`, or a count with `-c`), and
-/// **exits 1 when nothing matched** so it composes in scripts like real grep.
-fn cmd_grep(
-    db: &Db,
-    pattern: &str,
-    path: Option<&str>,
-    opts: GrepOpts,
-    global: bool,
-    json: bool,
-) -> Result<()> {
-    // Explicit path wins; otherwise scope to the ambient namespace (nothing = search all).
-    let scope = match path {
-        Some(p) => Some(p.to_owned()),
-        None => ambient(db, global)?,
-    };
-    let (pat, scope2) = (pattern.to_owned(), scope.clone());
-    let hits = db.read(move |conn| item::grep(conn, &pat, scope2.as_deref(), opts.ignore_case))?;
-
-    // Extract the matching lines per item (the SQL already confirmed a match exists).
-    let needle = if opts.ignore_case {
-        pattern.to_lowercase()
-    } else {
-        pattern.to_owned()
-    };
-    let matches_line = |line: &str| {
-        if opts.ignore_case {
-            line.to_lowercase().contains(&needle)
-        } else {
-            line.contains(&needle)
-        }
-    };
-
-    if opts.count {
-        let n = hits.len();
-        if json {
-            println!("{}", serde_json::json!({ "count": n }));
-        } else {
-            println!("{n}");
-        }
-        if n == 0 {
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-
-    if json {
-        let arr: Vec<_> = hits
-            .iter()
-            .map(|h| {
-                let lines: Vec<_> = h
-                    .content
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, l)| matches_line(l))
-                    .map(|(i, l)| serde_json::json!({ "line": i + 1, "text": l }))
-                    .collect();
-                serde_json::json!({ "uid": h.uid, "kind": h.kind, "matches": lines })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if opts.names_only {
-        for h in &hits {
-            println!("{}", h.uid);
-        }
-    } else {
-        for h in &hits {
-            for (i, line) in h.content.lines().enumerate() {
-                if matches_line(line) {
-                    println!("{}:{}:{}", h.uid, i + 1, line.trim_end());
-                }
-            }
-        }
-    }
-
-    if hits.is_empty() {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-/// `jkb cat <uid>` — print an item's full content to stdout (no metadata, no truncation),
-/// so a task/note/document body pipes cleanly into another tool or an agent's context.
-fn cmd_cat(db: &Db, uid: &str) -> Result<()> {
-    let u = uid.to_owned();
-    let content = db.read(move |conn| {
-        let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(None);
-        };
-        item::get_content(conn, id).map(Some)
-    })?;
-    match content {
-        None => anyhow::bail!("no item with uid `{uid}`"),
-        Some(c) => print!("{}", c.unwrap_or_default()),
-    }
-    Ok(())
-}
-
-/// `jkb find [path] --kind --tag --status` — structured item search: familiar flags that
-/// compile to the query DSL (the typed complement to `grep`). Empty filters = list the
-/// scope (like `find .`); scope defaults to the ambient namespace.
-#[allow(clippy::too_many_arguments)]
-fn cmd_find(
-    db: &Db,
-    path: Option<&str>,
-    kind: Option<&str>,
-    tags: &[String],
-    status: Option<&str>,
-    limit: Option<usize>,
-    global: bool,
-    json: bool,
-) -> Result<()> {
-    // Refuse the one footgun: no filter, no path, no ambient scope, no limit would list the
-    // entire KB. Any filter / path / --limit (or being inside a mounted repo) makes it fine.
-    let unfiltered = kind.is_none() && tags.is_empty() && status.is_none() && path.is_none();
-    if unfiltered && limit.is_none() && ambient(db, global)?.is_none() {
-        anyhow::bail!(
-            "`find` with no filters would list the entire KB — add --kind/--tag/--status, a path, or --limit"
-        );
-    }
-
-    let mut terms: Vec<String> = Vec::new();
-    if let Some(k) = kind {
-        terms.push(format!("kind:{k}"));
-    }
-    for t in tags {
-        terms.push(format!("tag:{t}"));
-    }
-    if let Some(s) = status {
-        terms.push(format!("status:{s}"));
-    }
-    if let Some(p) = path {
-        terms.push(format!("ns:{p}/**"));
-    }
-    cmd_query(db, &terms.join(" "), limit, false, global, json)
-}
-
-/// `jkb recent [path]` — the most-recently-updated items in a subtree, newest first.
-fn cmd_recent(db: &Db, path: Option<&str>, limit: usize, global: bool, json: bool) -> Result<()> {
-    let dsl = path.map(|p| format!("ns:{p}/**")).unwrap_or_default();
-    let mut query = jkb_core::query::parse(&dsl)?;
-    apply_ambient(&mut query, db, global)?;
-    let ids = db.read(move |conn| query.evaluate(conn))?;
-    let mut items = output::fetch_items(db, &ids)?;
-    // Newest first; missing timestamps (shouldn't happen) sort last.
-    items.sort_by(|a, b| b.updated.cmp(&a.updated));
-    items.truncate(limit);
-    output::print_items(&items, json);
-    Ok(())
-}
-
-/// `jkb stat <uid>` — compact metadata for one item (no body).
-fn cmd_stat(db: &Db, uid: &str, json: bool) -> Result<()> {
-    let u = uid.to_owned();
-    let found = db.read(move |conn| {
-        let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(None);
-        };
-        let Some(meta) = item::get(conn, id)? else {
-            return Ok(None);
-        };
-        let binding = binding::get(conn, id)?.map(|b| b.uri);
-        let tags = tag::applications(conn, id)?;
-        let namespace = primary_ns(conn, id)?;
-        Ok(Some((meta, binding, tags, namespace)))
-    })?;
-    let Some((meta, binding, tags, namespace)) = found else {
-        anyhow::bail!("no item with uid `{uid}`");
-    };
-    let chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "uid": meta.uid, "kind": meta.kind, "status": meta.status,
-                "resolution": meta.resolution,
-                "priority": meta.priority, "due": meta.due, "mime": meta.mime,
-                "namespace": namespace, "binding": binding, "content_chars": chars,
-                "tags": tags.iter().map(|(f, v)| serde_json::json!({"facet": f, "value": v})).collect::<Vec<_>>(),
-                "created_at": meta.created_at, "updated_at": meta.updated_at,
-            })
-        );
-    } else {
-        print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
-        println!("content:   {chars} chars");
-    }
-    Ok(())
-}
-
-/// One node in the `jkb tree` output: a listed child plus its recursively-listed children.
-struct TreeNode {
-    child: Child,
-    children: Vec<TreeNode>,
-}
-
-fn tree_nodes(
-    conn: &rusqlite::Connection,
-    path: Option<&str>,
-    all: bool,
-    depth_left: Option<usize>,
-) -> jkb_core::Result<Vec<TreeNode>> {
-    let mut out = Vec::new();
-    for child in list_children(conn, path, all)? {
-        // Descend into any container, not just namespaces — otherwise de-duplicating a
-        // subtask out of its namespace listing would make it unreachable in `tree`.
-        let descend = child.has_children && depth_left != Some(0);
-        let children = if descend {
-            tree_nodes(conn, Some(&child.reference), all, depth_left.map(|d| d - 1))?
-        } else {
-            Vec::new()
-        };
-        out.push(TreeNode { child, children });
-    }
-    Ok(out)
-}
-
-fn tree_to_json(node: &TreeNode) -> serde_json::Value {
-    let mut v = node.child.to_json();
-    if !node.children.is_empty() {
-        v["children"] = node.children.iter().map(tree_to_json).collect();
-    }
-    v
-}
-
-/// Depth `jkb tree` descends by default before eliding deeper folders with `…` — deep
-/// enough to map any real subtree, shallow enough to bound the output and the per-namespace
-/// query fan-out (each level lists its children). `--depth` overrides.
-const DEFAULT_TREE_DEPTH: usize = 4;
-
-/// Render one tree level with box-drawing prefixes (`├─`/`└─`); a namespace elided by the
-/// depth cap (it has children we didn't descend into) gets a trailing `…`.
-fn print_tree(nodes: &[TreeNode], prefix: &str) {
-    for (i, node) in nodes.iter().enumerate() {
-        let last = i + 1 == nodes.len();
-        let (branch, cont) = if last {
-            ("└─ ", "   ")
-        } else {
-            ("├─ ", "│  ")
-        };
-        // Show WHAT is in the subtree, not just how much: a bare number invites reading
-        // every leaf as a task, which is what this display used to claim.
-        let leaves = node
-            .child
-            .leaf_kinds
-            .as_ref()
-            .filter(|_| node.child.kind == "namespace")
-            .map(|kinds| match format_leaf_kinds(kinds) {
-                s if s.is_empty() => String::new(),
-                s => format!(" ({s})"),
-            })
-            .unwrap_or_default();
-        let ns_type = node.child.type_label();
-        let status = node
-            .child
-            .status
-            .as_deref()
-            .map(|s| format!(" [{s}]"))
-            .unwrap_or_default();
-        let elided = if node.children.is_empty()
-            && node.child.has_children
-            && node.child.kind == "namespace"
-        {
-            " …"
-        } else {
-            ""
-        };
-        println!(
-            "{prefix}{branch}{}{ns_type}{leaves}{}{status}{elided}",
-            node.child.label,
-            node.child.chunk_label()
-        );
-        print_tree(&node.children, &format!("{prefix}{cont}"));
-    }
-}
-
-/// `jkb tree [path]` — a recursive map of the namespace subtree with per-folder counts.
-fn cmd_tree(
-    db: &Db,
-    path: Option<&str>,
-    all: bool,
-    depth: Option<usize>,
-    json: bool,
-) -> Result<()> {
-    let owned = path.map(str::to_owned);
-    let depth = Some(depth.unwrap_or(DEFAULT_TREE_DEPTH));
-    let nodes = db.read(move |conn| tree_nodes(conn, owned.as_deref(), all, depth))?;
-    if json {
-        let v = serde_json::json!({
-            "path": path,
-            "tree": nodes.iter().map(tree_to_json).collect::<Vec<_>>(),
-        });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else {
-        println!("{}", path.unwrap_or("."));
-        print_tree(&nodes, "");
-    }
-    Ok(())
-}
-
-/// `jkb item rm <uid>` — delete an item and its cascade, reversibly.
-fn cmd_item_rm(db: &Db, uid: &str, force: bool, json: bool) -> Result<()> {
-    let id = require_uid(db, uid)?;
-    // Deliberately no vector sweep, and none is needed: the `vec_items_<dim>_gc` trigger
-    // (D42.2) removes the vector with the item, in the same statement, for every connection and
-    // every caller. Two belts remain behind that brace — an id is never reissued (D40), so even
-    // a row that somehow survives cannot be inherited, and `jkb index --sweep` collects rows
-    // written before the trigger existed.
-    let removed = db.write_txn("cli", move |conn, meta| item::remove(conn, meta, id, force))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "uid": removed.uid,
-                "kind": removed.kind,
-                "placements": removed.placements,
-                "edges": removed.edges,
-                "tags": removed.tags,
-            })
-        );
-    } else {
-        println!(
-            "removed {} [{}] — {} placement(s), {} edge(s), {} tag(s)",
-            removed.uid, removed.kind, removed.placements, removed.edges, removed.tags
-        );
-        println!("`jkb undo` restores it, including its edges.");
-    }
-    Ok(())
-}
-
 // ---- `jkb related` + `jkb inv …` (investigations, design Dmem.5/Dmem.9) ----
 
-/// Parse `--edge <type>` values into [`EdgeType`]s, rejecting unknown names with the list.
-fn parse_edge_types(names: &[String]) -> Result<Vec<EdgeType>> {
-    names
-        .iter()
-        .map(|name| {
-            EdgeType::from_str_opt(name).with_context(|| {
-                format!(
-                    "unknown edge type `{name}`; available: {}",
-                    EdgeType::ALL
-                        .iter()
-                        .map(|e| e.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-        })
-        .collect()
-}
-
 /// Parse repeated `facet=value` arguments.
-fn parse_tag_args(tags: &[String]) -> Result<Vec<(String, String)>> {
-    tags.iter()
-        .map(|t| {
-            let (facet, value) = t
-                .split_once('=')
-                .with_context(|| format!("tag `{t}` must be `facet=value`"))?;
-            if facet.is_empty() {
-                anyhow::bail!("tag `{t}` needs a facet before `=`");
-            }
-            Ok((facet.to_owned(), value.to_owned()))
-        })
-        .collect()
-}
-
-/// Look up an item by uid or fail with a message naming it.
-fn require_uid(db: &Db, uid: &str) -> Result<ItemId> {
-    let owned = uid.to_owned();
-    db.read(move |conn| item::id_for_uid(conn, &owned))?
-        .with_context(|| format!("no item with uid `{uid}`"))
-}
-
-/// `jkb related <uid>` — walk the typed edge graph out from one item.
-fn cmd_related(
-    db: &Db,
-    uid: &str,
-    edge_names: &[String],
-    depth: usize,
-    direction: edge::Direction,
-    json: bool,
-) -> Result<()> {
-    let types = parse_edge_types(edge_names)?;
-    let start = require_uid(db, uid)?;
-    let hops = db.read(move |conn| edge::walk(conn, start, &types, depth, direction))?;
-
-    let mut rows = Vec::new();
-    for hop in &hops {
-        let id = hop.item;
-        let Some(meta) = db.read(move |conn| item::get(conn, id))? else {
-            continue;
-        };
-        rows.push((hop, meta));
-    }
-
-    if json {
-        let arr: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|(hop, meta)| {
-                serde_json::json!({
-                    "uid": meta.uid,
-                    "kind": meta.kind,
-                    "status": meta.status,
-                    "resolution": meta.resolution,
-                    "depth": hop.depth,
-                    "via": hop.via.as_str(),
-                    "direction": match hop.direction {
-                        edge::Direction::Out => "out",
-                        edge::Direction::In => "in",
-                        edge::Direction::Both => "both",
-                    },
-                    "snippet": meta.content.as_deref().map(first_line),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if rows.is_empty() {
-        println!("(no related items)");
-    } else {
-        for (hop, meta) in &rows {
-            let arrow = match hop.direction {
-                edge::Direction::In => "<-",
-                edge::Direction::Out | edge::Direction::Both => "->",
-            };
-            println!(
-                "{:>2}  {arrow} {:<26} [{}]{} — {}",
-                hop.depth,
-                format!("{} {}", hop.via.as_str(), meta.uid),
-                meta.kind,
-                meta.resolution
-                    .as_deref()
-                    .map(|r| format!(" ({r})"))
-                    .unwrap_or_default(),
-                meta.content.as_deref().map(first_line).unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Resolve `jkb inv new`'s namespace: an explicit `memory/…` path is used as given; a bare
-/// name is homed under the ambient repo (`memory/<repo>/<name>`, mirroring task homing,
-/// design D26/D32) or at `memory/<name>` outside a repo or with `--global`.
-fn investigation_path(db: &Db, name: &str, global: bool) -> Result<String> {
-    let root = investigation::MEMORY_ROOT;
-    if name == root || name.starts_with(&format!("{root}/")) {
-        return Ok(name.to_owned());
-    }
-    if global {
-        return Ok(format!("{root}/{name}"));
-    }
-    // The ambient mount namespace is e.g. `repos/jkb/openspec`; the repo *key* is the first
-    // segment after `repos/`, so every investigation about a repo lands under one root.
-    let repo = ambient_repo(db)?.and_then(|mount| {
-        mount
-            .strip_prefix("repos/")
-            .unwrap_or(&mount)
-            .split('/')
-            .next()
-            .map(str::to_owned)
-    });
-    Ok(match repo {
-        Some(repo) => format!("{root}/{repo}/{name}"),
-        None => format!("{root}/{name}"),
-    })
-}
-
-/// Print a bucket of investigation units, human or JSON.
-fn print_units(units: &[investigation::UnitRow], json: bool, show_rank: bool) {
-    if json {
-        let arr: Vec<serde_json::Value> = units
-            .iter()
-            .map(|u| {
-                serde_json::json!({
-                    "uid": u.uid,
-                    "kind": u.kind,
-                    "resolution": u.resolution,
-                    "rank": u.rank,
-                    "evidence": u.evidence,
-                    "namespace": u.namespace,
-                    "snippet": u.content.as_deref().map(first_line),
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::Value::Array(arr)).unwrap_or_default()
-        );
-    } else if units.is_empty() {
-        println!("(empty)");
-    } else {
-        for u in units {
-            let rank = if show_rank {
-                format!(" rank {:.2}", u.rank)
-            } else {
-                String::new()
-            };
-            let evidence = if u.evidence.abs() < f64::EPSILON {
-                String::new()
-            } else {
-                format!(" ev {:+.2}", u.evidence)
-            };
-            println!(
-                "{:<34} [{}]{rank}{evidence} — {}",
-                u.uid,
-                u.kind,
-                u.content.as_deref().map(first_line).unwrap_or_default(),
-            );
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)] // a flat dispatcher; one arm per `jkb inv` subcommand
-fn cmd_inv(db: &Db, cmd: InvCmd, global: bool, json: bool) -> Result<()> {
-    match cmd {
-        InvCmd::Ls => {
-            let rows = db.read(investigation::list)?;
-            if json {
-                let arr: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "ns": r.ns_path, "type": r.type_name, "units": r.units,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&arr)?);
-            } else if rows.is_empty() {
-                println!(
-                    "(no investigations yet) available types: {}",
-                    nstype::AVAILABLE.join(", ")
-                );
-            } else {
-                for r in &rows {
-                    println!("{:<40} [{}] {} unit(s)", r.ns_path, r.type_name, r.units);
-                }
-            }
-            Ok(())
-        }
-        InvCmd::New {
-            type_name,
-            path,
-            goal,
-            accept,
-            goal_kind,
-        } => {
-            let strategy = nstype::resolve_strategy(&type_name)?;
-            let ns_path = investigation_path(db, &path, global)?;
-            // Default the goal unit to the strategy's own goal kind (`symptom`,
-            // `conjecture`, …) so the seeded unit reads naturally in its investigation.
-            let goal_kind = goal_kind.unwrap_or_else(|| {
-                strategy
-                    .node_kinds()
-                    .iter()
-                    .find(|k| k.base == nstype::BaseKind::Goal)
-                    .map_or(nstype::KIND_GOAL, |k| k.kind)
-                    .to_owned()
-            });
-            let mut body = goal.join(" ");
-            if body.trim().is_empty() {
-                body = format!("(state the goal for {ns_path} here)");
-            }
-            let mut tags = Vec::new();
-            if let Some(preset) = accept {
-                // The presets belong to the STRATEGY, so one strategy's predicate can never
-                // be stamped onto another's goal (a `debugging` symptom must not acquire the
-                // mathematical proof bar, which its `goal_predicate` would then ignore).
-                let presets = strategy.acceptance_presets();
-                anyhow::ensure!(
-                    !presets.is_empty(),
-                    "the `{}` strategy has no acceptance presets, so --accept does not apply \
-                     to it; state the bar in --goal instead",
-                    strategy.name()
-                );
-                let text = strategy.acceptance_text(&preset).with_context(|| {
-                    format!(
-                        "unknown acceptance preset `{preset}` for `{}`; expected one of {}",
-                        strategy.name(),
-                        presets.join(", ")
-                    )
-                })?;
-                // The acceptance predicate lives IN the goal body: the investigation
-                // terminates on it, so every agent that picks this up must read the same bar.
-                body = format!("{body}\n\n{text}");
-                tags.push((nstype::conjecture::FACET_ACCEPTANCE.to_owned(), preset));
-            }
-            let (ns_for_txn, body_for_txn) = (ns_path.clone(), body.clone());
-            let (uid, existed) = db.write_txn("cli", move |conn, meta| {
-                // Whether this namespace was ALREADY an investigation decides the wording
-                // below: `create` is idempotent, so a re-run must not claim to have created
-                // anything.
-                let existed = ns::get_type(conn, &ns_for_txn)?.is_some();
-                let id = investigation::create(
-                    conn,
-                    meta,
-                    &ns_for_txn,
-                    &type_name,
-                    &goal_kind,
-                    &body_for_txn,
-                    &tags,
-                )?;
-                Ok((
-                    item::get(conn, id)?.map(|m| m.uid).unwrap_or_default(),
-                    existed,
-                ))
-            })?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ns": ns_path, "goal_uid": uid, "type": strategy.name(),
-                        "created": !existed,
-                    })
-                );
-            } else if existed {
-                println!(
-                    "investigation {ns_path} [{}] already exists — left as it is",
-                    strategy.name()
-                );
-                println!("goal: {uid}");
-                println!("next: jkb inv digest {ns_path}");
-            } else {
-                println!("created investigation {ns_path} [{}]", strategy.name());
-                println!("goal: {uid}");
-                println!("next: jkb inv verbs {ns_path}");
-            }
-            Ok(())
-        }
-        InvCmd::Verbs { ns } => {
-            let strategy = investigation_strategy(db, &ns)?;
-            if json {
-                let arr: Vec<serde_json::Value> = strategy
-                    .verbs()
-                    .iter()
-                    .map(|v| {
-                        serde_json::json!({
-                            "verb": v.verb, "creates": v.kind, "about": v.about,
-                            "edge": v.edge.map(EdgeType::as_str),
-                            "target": match v.target {
-                                nstype::TargetRule::Required => "required",
-                                nstype::TargetRule::Optional => "optional",
-                                nstype::TargetRule::Forbidden => "none",
-                            },
-                            "resolves_target": v.resolves_target.map(Resolution::as_str),
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&arr)?);
-            } else {
-                println!("{} [{}]\n{}", ns, strategy.name(), strategy.about());
-                for v in strategy.verbs() {
-                    let target = match v.target {
-                        nstype::TargetRule::Required => " --on <uid>",
-                        nstype::TargetRule::Optional => " [--on <uid>]",
-                        nstype::TargetRule::Forbidden => "",
-                    };
-                    println!("  {:<24}{target:<14} {}", v.verb, v.about);
-                }
-            }
-            Ok(())
-        }
-        InvCmd::Kinds { ns } => {
-            let strategy = investigation_strategy(db, &ns)?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "type": strategy.name(),
-                        "base_kinds": nstype::BASE_KINDS,
-                        "kinds": strategy.node_kinds().iter().map(|k| serde_json::json!({
-                            "kind": k.kind, "about": k.about,
-                        })).collect::<Vec<_>>(),
-                        "edges": strategy.edge_types().iter().map(|e| e.as_str())
-                            .collect::<Vec<_>>(),
-                    }))?
-                );
-            } else {
-                println!("{} [{}]", ns, strategy.name());
-                println!("base kinds: {}", nstype::BASE_KINDS.join(", "));
-                for k in strategy.node_kinds() {
-                    println!("  {:<24} {}", k.kind, k.about);
-                }
-                println!(
-                    "edges: {}",
-                    strategy
-                        .edge_types()
-                        .iter()
-                        .map(|e| e.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            Ok(())
-        }
-        InvCmd::Frontier { ns, all, limit } => {
-            let units = db.read(move |conn| investigation::frontier(conn, &ns, all, limit))?;
-            print_units(&units, json, true);
-            Ok(())
-        }
-        InvCmd::Core { ns } => {
-            let units = db.read(move |conn| investigation::confirmed_core(conn, &ns))?;
-            print_units(&units, json, false);
-            Ok(())
-        }
-        InvCmd::Tombstones { ns } => {
-            let tombs = db.read(move |conn| investigation::tombstones(conn, &ns))?;
-            if json {
-                let arr: Vec<serde_json::Value> = tombs
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "uid": t.unit.uid,
-                            "kind": t.unit.kind,
-                            "resolution": t.unit.resolution,
-                            "snippet": t.unit.content.as_deref().map(first_line),
-                            "killed_by": t.killed_by.iter().map(|(e, uid, body)| {
-                                serde_json::json!({
-                                    "edge": e.as_str(), "uid": uid,
-                                    "snippet": body.as_deref().map(first_line),
-                                })
-                            }).collect::<Vec<_>>(),
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&arr)?);
-            } else if tombs.is_empty() {
-                println!("(no dead ends recorded yet)");
-            } else {
-                for t in &tombs {
-                    println!(
-                        "{:<34} [{}] {} — {}",
-                        t.unit.uid,
-                        t.unit.kind,
-                        t.unit.resolution.as_deref().unwrap_or("unresolved"),
-                        t.unit
-                            .content
-                            .as_deref()
-                            .map(first_line)
-                            .unwrap_or_default(),
-                    );
-                    for (edge_type, uid, body) in &t.killed_by {
-                        println!(
-                            "    {} by {uid}: {}",
-                            edge_type.as_str(),
-                            body.as_deref().map(first_line).unwrap_or_default()
-                        );
-                    }
-                    if t.killed_by.is_empty() {
-                        println!("    (no edge records why — link what killed it)");
-                    }
-                }
-            }
-            Ok(())
-        }
-        InvCmd::Retread { uid, depth } => {
-            let start = require_uid(db, &uid)?;
-            let units = db.read(move |conn| investigation::anti_retread(conn, start, depth))?;
-            if !json && units.is_empty() {
-                println!("(nothing related has been ruled out — clear to proceed)");
-                return Ok(());
-            }
-            print_units(&units, json, false);
-            Ok(())
-        }
-        InvCmd::Evidence { uid } => {
-            let id = require_uid(db, &uid)?;
-            let (total, edges) = db.read(move |conn| {
-                Ok((
-                    edge::evidence_for(conn, id)?,
-                    edge::evidence_edges(conn, id)?,
-                ))
-            })?;
-            let mut rows = Vec::new();
-            for e in &edges {
-                let src = e.src;
-                if let Some(meta) = db.read(move |conn| item::get(conn, src))? {
-                    rows.push((e, meta));
-                }
-            }
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "uid": uid,
-                        "balance": total,
-                        "edges": rows.iter().map(|(e, meta)| serde_json::json!({
-                            "edge": e.edge_type.as_str(),
-                            "uid": meta.uid,
-                            "contribution": e.contribution,
-                            "snippet": meta.content.as_deref().map(first_line),
-                        })).collect::<Vec<_>>(),
-                    }))?
-                );
-            } else {
-                println!("{uid}: balance {total:+.2}");
-                for (e, meta) in &rows {
-                    println!(
-                        "  {:+.2} {:<12} {:<30} {}",
-                        e.contribution,
-                        e.edge_type.as_str(),
-                        meta.uid,
-                        meta.content.as_deref().map(first_line).unwrap_or_default()
-                    );
-                }
-                if rows.is_empty() {
-                    println!("  (no supports/contradicts edges)");
-                }
-            }
-            Ok(())
-        }
-        InvCmd::Digest { ns, dry_run } => {
-            if dry_run {
-                let body = db.read(move |conn| Ok(investigation::digest(conn, &ns)?.render()))?;
-                print!("{body}");
-                return Ok(());
-            }
-            let (uid, body) = db.write_txn("cli", move |conn, meta| {
-                let (id, body) = investigation::write_digest(conn, meta, &ns)?;
-                Ok((
-                    item::get(conn, id)?.map(|m| m.uid).unwrap_or_default(),
-                    body,
-                ))
-            })?;
-            if json {
-                println!("{}", serde_json::json!({"uid": uid, "digest": body}));
-            } else {
-                print!("{body}");
-                println!("\n(written to {uid})");
-            }
-            Ok(())
-        }
-        InvCmd::Rollup { ns } => {
-            let changed = db.write_txn("cli", move |conn, meta| {
-                investigation::roll_up(conn, meta, &ns)
-            })?;
-            if json {
-                let arr: Vec<serde_json::Value> = changed
-                    .iter()
-                    .map(|(uid, from, to)| {
-                        serde_json::json!({
-                            "uid": uid, "from": from.as_str(), "to": to.as_str(),
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&arr)?);
-            } else if changed.is_empty() {
-                println!("(every resolution already matches its edges)");
-            } else {
-                for (uid, from, to) in &changed {
-                    println!("{uid}: {} -> {}", from.as_str(), to.as_str());
-                }
-            }
-            Ok(())
-        }
-        InvCmd::Do {
-            ns,
-            verb,
-            text,
-            target,
-            weight,
-            tags,
-        } => {
-            let tags = parse_tag_args(&tags)?;
-            let content = text.join(" ");
-            let outcome = db.write_txn("cli", move |conn, meta| {
-                let call = investigation::VerbCall {
-                    verb: &verb,
-                    content: &content,
-                    target_uid: target.as_deref(),
-                    weight,
-                    tags: &tags,
-                };
-                investigation::apply_verb(conn, meta, &ns, &call)
-            })?;
-            let resolved = outcome.target_resolution.map(Resolution::as_str);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "uid": outcome.uid, "target_resolution": resolved,
-                    })
-                );
-            } else {
-                println!("{}", outcome.uid);
-                if let Some(r) = resolved {
-                    println!("target resolution -> {r}");
-                }
-            }
-            Ok(())
-        }
-        InvCmd::Add {
-            ns,
-            kind,
-            text,
-            edges,
-            weight,
-            tags,
-        } => {
-            let tags = parse_tag_args(&tags)?;
-            let mut parsed_edges = Vec::new();
-            for spec in &edges {
-                let (type_name, target) = spec
-                    .split_once(':')
-                    .with_context(|| format!("edge `{spec}` must be `<type>:<target-uid>`"))?;
-                let edge_type = EdgeType::from_str_opt(type_name)
-                    .with_context(|| format!("unknown edge type `{type_name}`"))?;
-                parsed_edges.push((edge_type, target.to_owned(), weight));
-            }
-            let content = text.join(" ");
-            let uid = db.write_txn("cli", move |conn, meta| {
-                let unit = investigation::NewUnit {
-                    kind,
-                    content,
-                    namespace: ns,
-                    tags,
-                    edges: parsed_edges,
-                    reverse_edges: Vec::new(),
-                };
-                let id = investigation::add(conn, meta, &unit)?;
-                Ok(item::get(conn, id)?.map(|m| m.uid).unwrap_or_default())
-            })?;
-            if json {
-                println!("{}", serde_json::json!({"uid": uid}));
-            } else {
-                println!("{uid}");
-            }
-            Ok(())
-        }
-        InvCmd::Link {
-            src,
-            edge: edge_name,
-            dst,
-            weight,
-        } => {
-            let edge_type = EdgeType::from_str_opt(&edge_name).with_context(|| {
-                format!(
-                    "unknown edge type `{edge_name}`; available: {}",
-                    EdgeType::ALL
-                        .iter()
-                        .map(|e| e.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?;
-            db.write_txn("cli", move |conn, meta| {
-                investigation::link(conn, meta, &src, edge_type, &dst, weight)
-            })?;
-            if !json {
-                println!("linked");
-            }
-            Ok(())
-        }
-        InvCmd::Promise { uid, value } => {
-            db.write_txn("cli", move |conn, meta| {
-                investigation::set_promise(conn, meta, &uid, value)
-            })?;
-            if !json {
-                println!("promise = {value}");
-            }
-            Ok(())
-        }
-        InvCmd::Resolve { uid, resolution } => {
-            // `resolve_unit` owns the guard (a task's lifecycle is `status`, not
-            // `resolution`) so every caller inherits it, not just this one.
-            db.write_txn("cli", move |conn, meta| {
-                investigation::resolve_unit(conn, meta, &uid, &resolution)
-            })?;
-            if !json {
-                println!("resolution set (the unit is retained — link what changed it)");
-            }
-            Ok(())
-        }
-        InvCmd::Reopen { route, mechanism } => {
-            // The whole operation (strategy check, gate, edges, gap supersession) lives in
-            // the engine so it is testable and every caller inherits the gate.
-            let outcome = db.write_txn("cli", move |conn, meta| {
-                investigation::reopen(conn, meta, &route, &mechanism)
-            })?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "mechanism_kind": outcome.mechanism_kind,
-                        "superseded_gaps": outcome.superseded_gaps,
-                        "reopened": !outcome.superseded_gaps.is_empty(),
-                    })
-                );
-            } else if outcome.superseded_gaps.is_empty() {
-                // Nothing was blocking it, so nothing was reopened — say so plainly rather
-                // than reporting a state change that did not happen.
-                println!(
-                    "nothing to reopen: no open gap was blocking it (recorded the {} as \
-                     informing the route)",
-                    outcome.mechanism_kind
-                );
-            } else {
-                println!("reopened on a new {}", outcome.mechanism_kind);
-                for uid in &outcome.superseded_gaps {
-                    println!("  superseded gap {uid}");
-                }
-            }
-            Ok(())
-        }
-        InvCmd::Stale { ns, window } => {
-            let marked = db.write_txn("cli", move |conn, meta| {
-                nstype::debugging::mark_stale_observations(conn, meta, &ns, &window)
-            })?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&marked)?);
-            } else if marked.is_empty() {
-                println!("(no observations went stale)");
-            } else {
-                for uid in &marked {
-                    println!("{uid} -> staleness=stale (excluded, not deleted)");
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
 /// The cheat-sheet itself. A constant rather than a literal inside [`cmd_guide`], because it is
 /// **data**: as a function body it counted against `clippy::too_many_lines`, so every line added
 /// to the guide was priced against a limit that has nothing to say about a block of text.
@@ -3178,8 +1485,8 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               must-fix finding open — anything at priority <= 1, so !p0 blocks
                               as well as !p1. --no-review records a waiver.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
-  jkb task reap               finish landings that could not move their own worktree, and
-                              delete archives past 30 days. A session may not unlink its own
+  jkb task reap               finish landings that could not move their own worktree, delete
+                              archives past 30 days, and compact the message queue. A session may not unlink its own
                               .claude policy files, so it cannot archive itself — land records
                               it and this, run anywhere else, finishes it. The watcher service
                               installed by `jkb service install` runs it on a timer.
@@ -3263,208 +1570,10 @@ fn cmd_guide() {
 }
 
 /// The item's primary (home) namespace path, if placed.
-fn primary_ns(conn: &rusqlite::Connection, id: ItemId) -> jkb_core::Result<Option<String>> {
-    use rusqlite::OptionalExtension;
-    Ok(conn
-        .prepare_cached(
-            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-             WHERE p.item_id = ?1 ORDER BY (p.role = 'primary') DESC, p.position LIMIT 1",
-        )?
-        .query_row([id.get()], |r| r.get::<_, String>(0))
-        .optional()?)
-}
-
-/// Whether an item's content is human-readable text worth showing in full (task notes,
-/// prose, markdown) versus a heavy blob (PDF/image) that should stay a bounded preview.
-fn is_text_like(kind: &str, mime: Option<&str>) -> bool {
-    matches!(kind, "task" | "text" | "note" | "view")
-        || mime.is_some_and(|m| m.starts_with("text/") || m.contains("markdown"))
-}
-
-/// Default content cap (chars) for text-like kinds (task notes, prose, markdown, ingested
-/// text documents). Generous, but finite — the details pane shows a **bounded** preview,
-/// never the whole document, so a multi-MB ingested doc can't spike webview latency/memory
-/// (ui/README). Override with `--preview <n>` to read more.
-const TEXT_PREVIEW_MAX: usize = 100_000;
-
-/// Default content cap (chars) for heavy kinds (PDF/image blobs) — a short excerpt only.
-const HEAVY_PREVIEW_MAX: usize = 800;
-
-/// `jkb item show <uid>` — generic, kind-aware item details + content. `preview_arg` caps
-/// the content; when `None`, text-like kinds cap at [`TEXT_PREVIEW_MAX`] and heavy kinds at
-/// [`HEAVY_PREVIEW_MAX`]. A larger document is truncated (flagged `preview_truncated`);
-/// override with `--preview <n>`.
-fn cmd_item_show(db: &Db, uid: &str, preview_arg: Option<usize>, json: bool) -> Result<()> {
-    let u = uid.to_owned();
-    let found = db.read(move |conn| {
-        let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(None);
-        };
-        let Some(meta) = item::get(conn, id)? else {
-            return Ok(None);
-        };
-        let binding = binding::get(conn, id)?.map(|b| b.uri);
-        let tags = tag::applications(conn, id)?;
-        let namespace = primary_ns(conn, id)?;
-        Ok(Some((meta, binding, tags, namespace)))
-    })?;
-    let Some((meta, binding, tags, namespace)) = found else {
-        anyhow::bail!("no item with uid `{uid}`");
-    };
-
-    let preview_max = preview_arg.unwrap_or_else(|| {
-        if is_text_like(&meta.kind, meta.mime.as_deref()) {
-            TEXT_PREVIEW_MAX
-        } else {
-            HEAVY_PREVIEW_MAX
-        }
-    });
-    let content_chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
-    let preview: String = meta
-        .content
-        .as_deref()
-        .unwrap_or("")
-        .chars()
-        .take(preview_max)
-        .collect();
-    let preview_truncated = content_chars > preview_max;
-
-    if json {
-        let v = serde_json::json!({
-            "uid": meta.uid,
-            "kind": meta.kind,
-            "status": meta.status,
-            "resolution": meta.resolution,
-            "priority": meta.priority,
-            "due": meta.due,
-            "mime": meta.mime,
-            "binding": binding,
-            "namespace": namespace,
-            "content_chars": content_chars,
-            "content_hash": meta.content_hash,
-            "created_at": meta.created_at,
-            "updated_at": meta.updated_at,
-            "tags": tags
-                .iter()
-                .map(|(f, v)| serde_json::json!({"facet": f, "value": v}))
-                .collect::<Vec<_>>(),
-            "preview": preview,
-            "preview_truncated": preview_truncated,
-        });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else {
-        print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
-        println!(
-            "content:   {content_chars} chars{}",
-            if preview_truncated {
-                " (preview truncated)"
-            } else {
-                ""
-            }
-        );
-        if !preview.is_empty() {
-            println!("\n{preview}");
-        }
-    }
-    Ok(())
-}
-
-/// Human-readable header lines for `item show`.
-fn print_item_detail(
-    meta: &item::ItemMeta,
-    binding: Option<&str>,
-    namespace: Option<&str>,
-    tags: &[(String, String)],
-) {
-    println!("uid:       {}", meta.uid);
-    println!("kind:      {}", meta.kind);
-    if let Some(s) = &meta.status {
-        println!("status:    {s}");
-    }
-    if let Some(r) = &meta.resolution {
-        println!("resolution: {r}");
-    }
-    if let Some(ns) = namespace {
-        println!("namespace: {ns}");
-    }
-    if let Some(m) = &meta.mime {
-        println!("mime:      {m}");
-    }
-    if let Some(b) = binding {
-        println!("binding:   {b}");
-    }
-    if !tags.is_empty() {
-        let t: Vec<String> = tags.iter().map(|(f, v)| format!("{f}={v}")).collect();
-        println!("tags:      {}", t.join(", "));
-    }
-    println!("updated:   {}", meta.updated_at);
-}
-
-/// `item edit <uid>` — replace (or `--append` to) any item's content through the audited
-/// `item::set_content` seam (`content_hash` cleared, like `task edit`).
-fn cmd_item_edit(
-    db: &Db,
-    uid: &str,
-    text: &[String],
-    stdin: bool,
-    append: bool,
-    json: bool,
-) -> Result<()> {
-    let new_text = if stdin {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-            .context("reading item content from stdin")?;
-        buf.trim_end().to_owned()
-    } else if text.is_empty() {
-        anyhow::bail!("provide new content as arguments, or pass --stdin");
-    } else {
-        text.join(" ")
-    };
-    let u = uid.to_owned();
-    let found = db.write_txn("cli", move |conn, meta| {
-        let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(false);
-        };
-        let content = if append {
-            match item::get_content(conn, id)? {
-                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{new_text}"),
-                _ => new_text,
-            }
-        } else {
-            new_text
-        };
-        item::set_content(conn, meta, id, &content, None)?;
-        Ok(true)
-    })?;
-    if !found {
-        anyhow::bail!("no item with uid `{uid}`");
-    }
-    report(json, uid, if append { "appended" } else { "edited" });
-    if uid.starts_with("file://") && !json {
-        eprintln!(
-            "note: this is a file-backed item; run `jkb sync` to propagate the edit to its file."
-        );
-    }
-    Ok(())
-}
-
 fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
     match cmd {
-        NsCmd::Ls { scope } => {
-            let paths = match scope {
-                Some(path) => db.read(move |conn| ns::children(conn, &path))?,
-                None => db.read(ns::roots)?,
-            };
-            if json {
-                let arr: Vec<_> = paths.iter().map(|(_, p)| p.clone()).collect();
-                println!("{}", serde_json::to_string_pretty(&arr)?);
-            } else if paths.is_empty() {
-                println!("(no namespaces)");
-            } else {
-                for (_, p) in paths {
-                    println!("{p}");
-                }
-            }
+        NsCmd::Ls { .. } | NsCmd::Mv { .. } => {
+            anyhow::bail!("internal: an ns verb served as an op missed ops_cli's dispatch")
         }
         NsCmd::Mk { paths } => {
             let to_make = paths.clone();
@@ -3477,13 +1586,6 @@ fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
             for p in &paths {
                 report(json, p, "namespace ready");
             }
-        }
-        NsCmd::Mv { from, to } => {
-            let (from2, to2) = (from.clone(), to.clone());
-            let moved = db.write_txn("cli", move |conn, meta| {
-                ns::move_subtree(conn, meta, &from2, &to2)
-            })?;
-            println!("moved {moved} namespace(s): {from} -> {to}");
         }
         NsCmd::Rm { path } => {
             let p = path.clone();
@@ -3498,24 +1600,6 @@ fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
         } => cmd_ns_type(db, path, type_name, list, clear, json)?,
     }
     Ok(())
-}
-
-/// The investigation strategy governing `ns`, refusing an untyped namespace and one typed
-/// with a *contract* (design D33.1) — a contract type has no verbs, frontier or acceptance
-/// predicate, so `jkb inv` on one is a user error, not an empty listing.
-fn investigation_strategy(db: &Db, ns: &str) -> Result<&'static dyn nstype::NamespaceType> {
-    let owned = ns.to_owned();
-    let (source, strategy) = db
-        .read(move |conn| nstype::for_namespace(conn, &owned))?
-        .with_context(|| format!("`{ns}` is not an investigation namespace"))?;
-    anyhow::ensure!(
-        strategy.role() == nstype::TypeRole::Investigation,
-        "`{ns}` is typed `{}` (from `{source}`), a contract that {} — it is not an \
-         investigation, so it has no verbs or frontier",
-        strategy.name(),
-        strategy.about()
-    );
-    Ok(strategy)
 }
 
 /// `jkb ns type` — show, set, or list namespace types (design D33).
@@ -4012,260 +2096,44 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     Ok(unhealthy)
 }
 
-/// The `--backlog`/`--sync`/`--managed` flags of `task add`, grouped so the helper
-/// signatures stay under the bool-argument lint.
-struct AddFlags {
-    backlog: bool,
-    sync: bool,
-    managed: bool,
-    /// An explicit home namespace, taken verbatim rather than lexed out of the quick-add
-    /// line — see the `--home` flag.
-    home: Option<String>,
-}
-
-/// Derive a task's home namespace from `--backlog` and the ambient repo (design D26),
-/// mutating `spec.home`/`spec.mirrors`. `had_explicit` is set when an explicit `+<ns>`
-/// already chose the home.
-fn resolve_task_home(
-    db: &Db,
-    spec: &mut task::NewTask,
-    flags: &AddFlags,
-    had_explicit: bool,
-) -> Result<()> {
-    if had_explicit {
-        if flags.backlog {
-            anyhow::bail!(
-                "--backlog conflicts with an explicit placement (`--home`, or a `+<ns>` in the \
-                 task line)"
-            );
-        }
-    } else if flags.backlog {
-        let root = task::DEFAULT_ROOT;
-        match ambient_repo(db)? {
-            Some(repo) => spec.home = format!("{root}/{repo}/.backlog"),
-            None if confirm_global_backlog()? => spec.home = format!("{root}/.backlog"),
-            None => anyhow::bail!(
-                "--backlog needs an ambient repo; run inside a mounted repo or use `+<ns>`"
-            ),
-        }
-    } else if let Some(repo) = ambient_repo(db)? {
-        // Inside a repo with no target: home at the per-repo inbox, mirrored into
-        // the global inbox so it stays a complete capture view (D26.3).
-        spec.home = format!("{}/{repo}/inbox", task::DEFAULT_ROOT);
-        spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
-    }
-    // else: outside a repo with no target → the home stays `DEFAULT_HOME`.
-    Ok(())
-}
-
-/// Derive a task's storage binding (design D26.5), setting `spec.binding` and returning
-/// the synced `file://` uri if one applies. `--managed` forces KB-only; `--sync` requires
-/// a covering `tasks` mount.
-fn resolve_task_binding(
-    db: &Db,
-    spec: &mut task::NewTask,
-    flags: &AddFlags,
-    uid: &str,
-) -> Result<Option<String>> {
-    let synced_file = if flags.managed {
-        None
-    } else {
-        jkb_sync::tasks_mount_file(db, &spec.home)?
-    };
-    match &synced_file {
-        Some(bare) => {
-            let local_id = uid.strip_prefix("task:").unwrap_or(uid);
-            spec.binding = format!("{bare}#{local_id}");
-        }
-        None if flags.sync => anyhow::bail!(
-            "--sync: no `tasks`-serializer file mount covers the home `{}`",
-            spec.home
-        ),
-        None => {} // spec.binding stays `managed:` (from_quick_add default)
-    }
-    Ok(synced_file)
-}
-
-/// Handle `task add`: parse the quick-add line, derive the home (design D26 homing) and
-/// the storage binding (D26.5), then create the task through the writer-actor.
-fn cmd_task_add(
-    db: &Db,
-    text: &[String],
-    flags: &AddFlags,
-    under: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    let input = text.join(" ");
-    let qa = task::parse_quick_add(&input)?;
-    // `#branch=` and `#onto=` reach `tag::apply` from here, below the checks the other writers
-    // apply, so this was the one route by which a value git reads as an option could still enter
-    // the store — `#branch=--upload-pack=x`.
-    let mut qa = qa;
-    for (facet, value) in &qa.tags {
-        // A land target is a fact about a *branch* and lives in that branch's record, so a facet
-        // named `onto` reaches no reader at all. Refused rather than stored inert: a user who
-        // typed it expecting effect deserves an answer, not silence. (`base=` needs no such
-        // refusal — nothing reads that name either, and every message about a cut point must
-        // avoid naming a verb that takes a sha, which is how three passes of findings started.)
-        anyhow::ensure!(
-            facet != "onto",
-            "`#onto=` records where a *branch* lands, not where a task is, so it cannot be set \
-             from a task line. Use `jkb task work <uid> --onto <branch>` or `jkb task start \
-             <uid> --branch <b> --onto <branch>`."
-        );
-        if facet == repo::FACET_BRANCH {
-            gitrepo::valid_ref(value)?;
-        }
-    }
-    // `branch=` is lifted out of the quick-add tags and applied afterwards through
-    // `repo::record_branch`, which is what pairs a branch with its cut point. Left here it went
-    // straight to `tag::apply`, so this entry point silently opted out of the pairing CLAUDE.md
-    // calls the architecture of this area.
-    //
-    // The `retain` is routing, not a guard: `tag::apply` is idempotent on `(item, facet, value)`,
-    // so leaving the tag in place would write the same row and change nothing observable. What it
-    // buys is that "`record_branch` is the only writer of `branch=` in this crate" holds without
-    // an exception the next reader has to carry. It is a convention, not an enforced invariant:
-    // `branch=` is an ordinary facet and the store will take one from anyone — `jkb_core::tag`
-    // reserves nothing, deliberately, and says why in its module doc. The cut point is recorded by
-    // the call below either way, and that is the part with a test.
-    let quick_add_branches: Vec<String> = qa
-        .tags
-        .iter()
-        .filter(|(f, _)| f == repo::FACET_BRANCH)
-        .map(|(_, v)| v.clone())
-        .collect();
-    qa.tags.retain(|(f, _)| f != repo::FACET_BRANCH);
-    let mut had_explicit_placement = !qa.placements.is_empty();
-    let uid = task::mint_uid(&qa.title);
-    let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
-
-    // `--home` wins over a `+<ns>` in the line: it is the unambiguous form, and it is the
-    // only one that can carry a path containing whitespace.
-    if let Some(home) = &flags.home {
-        spec.home.clone_from(home);
-        had_explicit_placement = true;
-    }
-
-    // A subtask defaults to living beside its parent: splitting a task should not scatter
-    // the pieces across namespaces, and `--under` is the only signal about where it belongs.
-    let parent = match under {
-        Some(p) => {
-            let pid = resolve_task_uid(db, p)?;
-            if !had_explicit_placement {
-                if let Some(home) = db.read(move |conn| item::primary_namespace(conn, pid))? {
-                    spec.home = home;
-                    had_explicit_placement = true;
-                }
-            }
-            Some(pid)
-        }
-        None => None,
-    };
-
-    resolve_task_home(db, &mut spec, flags, had_explicit_placement)?;
-    let synced_file = resolve_task_binding(db, &mut spec, flags, &uid)?;
-
-    let home = spec.home.clone();
-    let id = db.write_txn("cli", move |conn, meta| {
-        let id = task::create(conn, meta, &spec)?;
-        if let Some(parent) = parent {
-            task::add_subtask(conn, meta, parent, id)?;
-        }
-        Ok(id)
-    })?;
-    // Any `#branch=` from the quick-add line. A second transaction rather than a field on
-    // `NewTask` only because `task::create` has just written the row this reads back.
-    if !quick_add_branches.is_empty() {
-        let branches = quick_add_branches.clone();
-        db.write_txn("cli", move |conn, meta| {
-            for branch in &branches {
-                repo::record_branch(conn, meta, id, branch, repo::BranchWrite::Add)?;
-            }
-            Ok(())
-        })?;
-    }
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"id": id.get(), "uid": uid, "home": home,
-                "binding": synced_file.as_deref().unwrap_or("managed:")})
-        );
-    } else {
-        println!("added task {uid} (item {id}) at {home}");
-        if synced_file.is_some() {
-            println!("  synced binding — run `jkb sync` to write it to the file");
-        }
-    }
-    Ok(())
-}
-
-fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, global: bool, json: bool) -> Result<()> {
+fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::Add {
-            text,
-            backlog,
-            sync,
-            managed,
-            under,
-            home,
-        } => cmd_task_add(
-            db,
-            &text,
-            &AddFlags {
-                backlog,
-                sync,
-                managed,
-                home,
-            },
-            under.as_deref(),
-            json,
-        )?,
-        TaskCmd::Next { terms, limit } => {
-            let mut query = jkb_core::query::parse(&terms.join(" "))?;
-            apply_ambient_tasks(&mut query, db, global)?;
-            let (scope, tags) = (query.scope.clone(), query.tags.clone());
-            let mut rows = db.read(move |conn| task::ready(conn, scope, &tags))?;
-            if let Some(limit) = limit {
-                rows.truncate(limit);
-            }
-            let ids: Vec<ItemId> = rows.iter().map(|r| r.id).collect();
-            let items = output::fetch_items(db, &ids)?;
-            output::print_items(&items, json);
-        }
-        TaskCmd::Show { uid } => {
-            let id = resolve_task_uid(db, &uid)?;
-            let extra = task_branch_extra(db, id)?;
-            output::print_item_full(db, id, json, &extra)?;
-            // Subtasks are shown after the body: a parent is off the ready frontier until
-            // they are all terminal, so "why isn't this actionable?" must be answerable
-            // from the same command that shows the task.
-            let subs = db.read(move |conn| task::subtasks(conn, id))?;
-            if !subs.is_empty() && !json {
-                let open = subs
-                    .iter()
-                    .filter(|t| !jkb_types::TaskStatus::is_terminal_str(t.status.as_deref()))
-                    .count();
-                println!("\nsubtasks ({open} open of {}):", subs.len());
-                for t in &subs {
-                    let status = t.status.as_deref().unwrap_or("?");
-                    let title = t.title.as_deref().unwrap_or("");
-                    println!("  [{status:^12}] {} — {}", t.uid, first_line(title));
-                }
-                if open > 0 {
-                    println!("this task is held off the ready frontier until they are done");
-                }
-            }
-        }
-        TaskCmd::Subtasks { uid, all } => cmd_task_subtasks(db, &uid, all, json)?,
-        TaskCmd::Mirror => cmd_task_mirror(db, json)?,
-        TaskCmd::Why { uid } => cmd_task_why(db, &uid, json)?,
-        TaskCmd::Pr { uid, number } => cmd_task_pr(db, &uid, number, json)?,
-        cmd @ (TaskCmd::Work { .. }
-        | TaskCmd::Land { .. }
+        TaskCmd::Next { .. }
+        | TaskCmd::Show { .. }
+        | TaskCmd::Subtasks { .. }
+        | TaskCmd::Why { .. }
+        | TaskCmd::Add { .. }
+        | TaskCmd::Set { .. }
+        | TaskCmd::Edit { .. }
+        | TaskCmd::Tag { .. }
+        | TaskCmd::Depend { .. }
+        | TaskCmd::Undepend { .. }
+        | TaskCmd::Place { .. }
+        | TaskCmd::Unplace { .. }
+        | TaskCmd::Bind { .. }
+        | TaskCmd::Claim { .. }
+        | TaskCmd::Release { .. }
+        | TaskCmd::Start { .. }
+        | TaskCmd::Work { .. }
         | TaskCmd::Abandon { .. }
         | TaskCmd::Sessions
-        | TaskCmd::Gate { .. }) => cmd_task_session(db, db_path, cmd, json)?,
+        | TaskCmd::Land {
+            break_lock: false, ..
+        }
+        | TaskCmd::Landed { .. }
+        | TaskCmd::Review { .. }
+        | TaskCmd::Reclaim { .. }
+        | TaskCmd::Pr { .. }
+        | TaskCmd::CloseMerged { .. } => {
+            anyhow::bail!("internal: a task verb served as an op missed ops_cli's dispatch")
+        }
+        TaskCmd::Mirror => cmd_task_mirror(db, json)?,
+        cmd @ (TaskCmd::Gate { .. }
+        | TaskCmd::Land {
+            break_lock: true, ..
+        }) => {
+            cmd_task_session(db, db_path, cmd, json)?;
+        }
         TaskCmd::Reap {
             retain_days,
             dry_run,
@@ -4283,82 +2151,6 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, global: bool, json: bool) -> 
             },
             json,
         )?,
-        other => cmd_task_mutate(db, other, json)?,
-    }
-    Ok(())
-}
-
-/// What this task's branches record — the cut point, the land target, and any landing jkb itself
-/// performed — for `jkb task show`.
-///
-/// Read for **every** branch the task names, keyed by branch: that is what the record is keyed by,
-/// and a task legitimately carries two. The old shape — a `base=<branch>:<sha>` tag among the
-/// task's tags — showed the same thing by accident of the encoding, and is what a dozen call sites
-/// then had to take apart.
-///
-/// The repository is the task's own `repo=`, so this reads correctly from anywhere; the database
-/// is global across repos (D32) and a namesake branch elsewhere is a different branch.
-fn task_branch_extra(db: &Db, id: ItemId) -> Result<output::Extra> {
-    let rows = db.read(move |conn| jkb_core::transition::history(conn, id))?;
-    let mut extra = output::Extra::default();
-    let mut json_rows = Vec::new();
-    // The task's history, not a per-branch record: what is worth showing here is what happened
-    // to this task, and every entry is a statement about a moment rather than a projection that
-    // has to be kept in agreement with git.
-    for r in rows
-        .iter()
-        .rev()
-        .take(5)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        let mut line = format!("  {} {} -> {}", r.at, r.event, r.to_status);
-        if let Some(b) = &r.labels.branch {
-            let _ = write!(line, " on {b}");
-        }
-        if let Some(o) = &r.labels.onto {
-            let _ = write!(line, " onto {o}");
-        }
-        if let Some(n) = r.labels.pr_number {
-            let _ = write!(line, " #{n}");
-        }
-        extra.lines.push(line);
-        json_rows.push(serde_json::json!({
-            "at": r.at,
-            "event": r.event,
-            "to": r.to_status,
-            "branch": r.labels.branch,
-            "onto": r.labels.onto,
-            "pr": r.labels.pr_number,
-        }));
-    }
-    if !extra.lines.is_empty() {
-        extra
-            .lines
-            .insert(0, "recent transitions (`jkb task why` for all):".to_owned());
-    }
-    extra
-        .json
-        .insert("transitions".to_owned(), json_rows.into());
-    Ok(extra)
-}
-
-/// Remove a task's reference (mirror) placement under `ns` (inverse of `task place`). A
-/// missing namespace or absent mirror is a no-op that reports `0` removed.
-fn cmd_task_unplace(db: &Db, uid: &str, ns: &str, json: bool) -> Result<()> {
-    let id = resolve_task_uid(db, uid)?;
-    let ns_path = ns.to_owned();
-    let removed = db.write_txn("cli", move |conn, meta| {
-        match jkb_core::ns::get(conn, &ns_path)? {
-            Some(ns_id) => placement::unplace(conn, meta, id, ns_id),
-            None => Ok(0),
-        }
-    })?;
-    if json {
-        println!("{}", serde_json::json!({ "uid": uid, "removed": removed }));
-    } else {
-        println!("unplaced {uid} from {ns} ({removed} mirror(s) removed)");
     }
     Ok(())
 }
@@ -4376,653 +2168,6 @@ fn cmd_task_mirror(db: &Db, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Handle the task mutation subcommands (`set`/`tag`/`depend`/`undepend`/`place`/`unplace`/
-/// `bind`/`claim`/`release`) — the D27.3 write surface. Each is a thin edge over an
-/// existing audited, cycle-checked `jkb-core` seam through the writer-actor.
-fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
-    match cmd {
-        TaskCmd::Set {
-            uid,
-            status,
-            priority,
-            due,
-        } => cmd_task_set(db, &uid, status, priority, due, json)?,
-        TaskCmd::Edit {
-            uid,
-            text,
-            stdin,
-            append,
-        } => cmd_task_edit(db, &uid, &text, stdin, append, json)?,
-        TaskCmd::Tag { cmd } => cmd_task_tag(db, cmd, json)?,
-        TaskCmd::Depend { uid, dep } => {
-            let id = resolve_task_uid(db, &uid)?;
-            let dep_uid = canonical_task_uid(&dep);
-            db.write_txn("cli", move |conn, meta| {
-                task::add_dependency(conn, meta, id, &dep_uid)
-            })?;
-            report(json, &uid, "depends_on set");
-        }
-        TaskCmd::Undepend { uid, dep } => {
-            let id = resolve_task_uid(db, &uid)?;
-            let dep_id = resolve_task_uid(db, &dep)?;
-            db.write_txn("cli", move |conn, meta| {
-                edge::unlink(conn, meta, id, dep_id, EdgeType::DependsOn)
-            })?;
-            report(json, &uid, "depends_on removed");
-        }
-        TaskCmd::Place { uid, ns, home } => {
-            let id = resolve_task_uid(db, &uid)?;
-            let ns_path = ns.clone();
-            db.write_txn("cli", move |conn, meta| {
-                let ns_id = jkb_core::ns::ensure(conn, &ns_path)?;
-                if home {
-                    task::set_primary_home(conn, meta, id, ns_id, 0)
-                } else {
-                    placement::place(conn, meta, id, ns_id, PlacementRole::Reference, 0)
-                }
-            })?;
-            report(json, &uid, "placed");
-        }
-        TaskCmd::Unplace { uid, ns } => cmd_task_unplace(db, &uid, &ns, json)?,
-        TaskCmd::Bind { uid, managed, sync } => {
-            let (uri, mode) = match (managed, sync) {
-                (_, Some(uri)) => (uri, Some(SyncMode::Bidirectional)),
-                (true, None) => (task::MANAGED_BINDING.to_owned(), None),
-                (false, None) => {
-                    anyhow::bail!("pass --managed or --sync <uri>");
-                }
-            };
-            let id = resolve_task_uid(db, &uid)?;
-            db.write_txn("cli", move |conn, meta| {
-                binding::set(conn, meta, id, &uri, mode, None)
-            })?;
-            report(json, &uid, "bound");
-        }
-        TaskCmd::Claim { uid, owner } => cmd_task_claim(db, &uid, owner, true, json)?,
-        TaskCmd::Start {
-            uid,
-            branch,
-            onto,
-            repo,
-            owner,
-        } => cmd_task_start(
-            db,
-            &uid,
-            StartWhere {
-                branch,
-                onto,
-                repo,
-                owner,
-            },
-            json,
-        )?,
-        TaskCmd::Release { uid, owner } => cmd_task_claim(db, &uid, owner, false, json)?,
-        TaskCmd::Reclaim { keep } => cmd_task_reclaim(db, &keep, json)?,
-        other => cmd_task_landing(db, other, json)?,
-    }
-    Ok(())
-}
-
-/// The verbs about a task's **work** rather than its fields: where it is being done, what proves
-/// it landed, and what a review found.
-///
-/// Split from [`cmd_task_mutate`] because they read a git checkout and a pull request, where the
-/// field setters read only the database — and because one dispatch holding every task verb had
-/// grown past what one function should.
-fn cmd_task_landing(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
-    match cmd {
-        TaskCmd::CloseMerged { repo, dry_run } => cmd_task_close_merged(db, repo, dry_run, json)?,
-        TaskCmd::Landed { branch, onto } => cmd_task_landed(db, &branch, &onto, json)?,
-        TaskCmd::Review { cmd } => cmd_task_review(db, cmd, json)?,
-        // The read and session subcommands are dispatched by `cmd_task` and never reach here.
-        // Listed rather than caught by `_`, so a new variant is a compile error instead of an
-        // `unreachable!` at run time.
-        TaskCmd::Add { .. }
-        | TaskCmd::Next { .. }
-        | TaskCmd::Show { .. }
-        | TaskCmd::Subtasks { .. }
-        | TaskCmd::Mirror
-        | TaskCmd::Why { .. }
-        | TaskCmd::Pr { .. }
-        | TaskCmd::Work { .. }
-        | TaskCmd::Land { .. }
-        | TaskCmd::Abandon { .. }
-        | TaskCmd::Sessions
-        | TaskCmd::Gate { .. }
-        | TaskCmd::Set { .. }
-        | TaskCmd::Edit { .. }
-        | TaskCmd::Tag { .. }
-        | TaskCmd::Depend { .. }
-        | TaskCmd::Undepend { .. }
-        | TaskCmd::Place { .. }
-        | TaskCmd::Unplace { .. }
-        | TaskCmd::Bind { .. }
-        | TaskCmd::Claim { .. }
-        | TaskCmd::Start { .. }
-        | TaskCmd::Release { .. }
-        | TaskCmd::Reap { .. }
-        | TaskCmd::Reclaim { .. } => unreachable!(),
-    }
-    Ok(())
-}
-
-/// `task why <uid>` — the lifecycle history: what moved this task, who moved it, and on what
-/// evidence.
-///
-/// The history is append-only (`task_transitions`), so a transition later reverted by `jkb undo`
-/// still appears: it did happen, and the undo is its own entry in the changelog. That is the
-/// honest reading of a record of the past, and it is what makes this usable for the question it
-/// exists to answer — *why is this task here?*
-///
-/// # Errors
-/// Errors if the uid does not resolve or the read fails.
-fn cmd_task_why(db: &Db, uid: &str, json: bool) -> Result<()> {
-    let id = resolve_task_uid(db, uid)?;
-    let rows = db.read(move |conn| jkb_core::transition::history(conn, id))?;
-    if json {
-        let arr: Vec<_> = rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "at": r.at,
-                    "txn": r.txn_id,
-                    "event": r.event,
-                    "from": r.from_status,
-                    "to": r.to_status,
-                    "agent": r.agent_id.as_ref().map(jkb_types::AgentId::as_str),
-                    "branch": r.labels.branch,
-                    "onto": r.labels.onto,
-                    "pr": r.labels.pr_number,
-                    "evidence": r.evidence
-                        .as_deref()
-                        .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok()),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::json!({"uid": uid, "history": arr}));
-        return Ok(());
-    }
-    if rows.is_empty() {
-        // Distinguished from "nothing happened": a task created before this history existed has
-        // none, and saying so is not the same as saying it was never touched.
-        println!(
-            "no recorded transitions — this task predates the lifecycle history, or has \
-                  not moved since"
-        );
-        return Ok(());
-    }
-    for r in &rows {
-        let from = r.from_status.as_deref().unwrap_or("?");
-        print!("{}  {from} -> {}  {}", r.at, r.to_status, r.event);
-        if let Some(a) = &r.agent_id {
-            print!("  by {a}");
-        }
-        if let Some(b) = &r.labels.branch {
-            print!("  on {b}");
-        }
-        if let Some(o) = &r.labels.onto {
-            print!("  onto {o}");
-        }
-        if let Some(n) = r.labels.pr_number {
-            print!("  #{n}");
-        }
-        println!();
-        if let Some(e) = &r.evidence {
-            // Only the facts that were actually established are worth printing: a wall of
-            // `unknown` is what a guard was refused *for*, not what it fired on.
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(e) {
-                let shown: Vec<String> = map
-                    .iter()
-                    .filter(|(_, v)| !matches!(v.as_str(), None | Some("unknown")))
-                    .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("?")))
-                    .collect();
-                if !shown.is_empty() {
-                    println!("      {}", shown.join(" "));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `task pr <uid> [number]` — show, or record, the pull request that proves this work landed.
-///
-/// With a number, records it. Without, discovers it from the task's recorded branch and records
-/// what it finds — **once**. After that the number is what is consulted, and the branch name
-/// never is: a number is minted by GitHub and never reused, so a branch deleted, renamed or
-/// reused afterwards cannot change the answer. That property is the whole reason this replaced
-/// the commit-graph inference.
-///
-/// # Errors
-/// Errors if the uid does not resolve, or a read or write fails.
-fn cmd_task_pr(db: &Db, uid: &str, number: Option<i64>, json: bool) -> Result<()> {
-    let id = resolve_task_uid(db, uid)?;
-    let recorded = db.read(move |conn| Ok(jkb_core::transition::landing(conn, id)?.pr_number()))?;
-    let number = match number {
-        Some(n) => Some(n),
-        None if recorded.is_some() => recorded,
-        None => discover_pr(db, id)?,
-    };
-    let Some(number) = number else {
-        if json {
-            println!("{}", serde_json::json!({"uid": uid, "pr": null}));
-        }
-        return Ok(());
-    };
-    if recorded != Some(number) {
-        record_pr(db, id, number)?;
-    }
-    let ctx = repo::repo_ctx().ok();
-    let (merged, why) = ctx.as_ref().map_or_else(
-        || (Fact::Unknown, Some("not in a git repository".to_owned())),
-        // `None`: this verb reports a fact about the pull request — *did it merge* — and is not
-        // deciding whether to close anything. The staleness rule belongs to the close decision,
-        // where the question is whether the merge speaks for the work in flight.
-        |c| pr::merged_fact(&c.root, Some(number), None),
-    );
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"uid": uid, "pr": number, "merged": merged.as_str(), "why": why})
-        );
-    } else {
-        println!(
-            "{uid}: pull request #{number} — merged: {}",
-            merged.as_str()
-        );
-        if let Some(why) = why {
-            println!("  {why}");
-        }
-    }
-    Ok(())
-}
-
-/// Find the pull request for a task's recorded branch, refusing to guess when a reused branch
-/// name matches more than one.
-fn discover_pr(db: &Db, id: ItemId) -> Result<Option<i64>> {
-    let Ok(ctx) = repo::repo_ctx() else {
-        anyhow::bail!(
-            "not in a git repository, so there is no branch to look a pull request up by"
-        );
-    };
-    let branch = db
-        .read(move |conn| jkb_core::transition::latest_with_branch(conn, id))?
-        .and_then(|r| r.labels.branch);
-    let Some(branch) = branch else {
-        anyhow::bail!(
-            "this task records no branch, so there is nothing to look a pull request up by — \
-             pass the number: `jkb task pr <uid> <number>`"
-        );
-    };
-    match pr::discover(&ctx.root, &branch) {
-        pr::Discovery::One(found) => Ok(Some(found.number)),
-        pr::Discovery::None => {
-            println!("no pull request has `{branch}` as its head branch");
-            Ok(None)
-        }
-        // The recycled-name case, reported rather than guessed. Picking one is exactly how the
-        // inference this replaced closed work that had not landed.
-        pr::Discovery::Ambiguous(numbers) => anyhow::bail!(
-            "`{branch}` is the head branch of more than one pull request ({}) — that branch name \
-             has been reused, so which one is this task's work is not something to guess. Pass \
-             the number: `jkb task pr <uid> <number>`",
-            numbers
-                .iter()
-                .map(|n| format!("#{n}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        // The remedy `gh` itself names — "close the task by hand" — is `close-merged`'s, and
-        // this is not that command: what to do *here* is name the number, which needs no `gh` at
-        // all. A message carried through from where it was written is how advice comes to be
-        // about somebody else's problem.
-        pr::Discovery::Unavailable(why) => anyhow::bail!(
-            "{why}\n  ...or name it directly: `jkb task pr <uid> <number>`, which needs no `gh`."
-        ),
-    }
-}
-
-/// Record a task's pull request number as a transition, so it lands in the history beside
-/// everything else that happened to the task.
-fn record_pr(db: &Db, id: ItemId, number: i64) -> Result<()> {
-    let branch = db
-        .read(move |conn| jkb_core::transition::latest_with_branch(conn, id))?
-        .and_then(|r| r.labels.branch);
-    db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        let facts = task::observe(conn, id)?;
-        let labels = jkb_core::transition::Labels {
-            branch: branch.clone(),
-            pr_number: Some(number),
-            ..jkb_core::transition::Labels::default()
-        };
-        jkb_core::transition::note(conn, meta, id, &facts, &labels)?;
-        Ok(())
-    })
-}
-
-/// `task subtasks <uid>` — a parent's children, shaped exactly like `jkb ls` output.
-///
-/// Sharing the shape is the point: the tree expands a namespace and a parent task with one
-/// parser, so nesting subtasks costs the UI a different *command*, not a different model.
-fn cmd_task_subtasks(db: &Db, uid: &str, all: bool, json: bool) -> Result<()> {
-    // A thin alias over the container read: `jkb ls <task-uid>` is the same call. It exists
-    // for discoverability from the task surface, not as a second implementation.
-    let id = resolve_task_uid(db, uid)?;
-    let children = db.read(move |conn| contained_children(conn, id, all))?;
-    if json {
-        let arr: Vec<_> = children.iter().map(Child::to_json).collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "path": uid, "children": arr }))?
-        );
-    } else if children.is_empty() {
-        println!("(no subtasks)");
-    } else {
-        for c in &children {
-            print_ls_row(None, c, LsOpts::default());
-        }
-    }
-    Ok(())
-}
-
-/// Where `task start` is being told the work is happening. Grouped so the signature stays under
-/// clap's and clippy's argument-count limits.
-struct StartWhere {
-    branch: Option<String>,
-    onto: Option<String>,
-    repo: Option<String>,
-    owner: Option<String>,
-}
-
-/// May this run take a claim somebody else holds, and if not, may it leave it in place?
-///
-/// **Liveness, not string equality** (D27.1). The bare `claim::claim` CAS accepts only a free
-/// task or a byte-identical owner, so using its answer as a refusal meant `task start` refused
-/// its own second run under a new pid, and refused after `task work` — the very sequence the
-/// facet writing exists for, since a session claims as `session:<pid>:<worktree>`.
-///
-/// Returns whether the existing claim should be **kept**.
-///
-/// # Errors
-/// Errors when a live owner other than this one holds the task.
-fn judge_existing_claim(held: Option<&str>, owner: &str, uid: &str, cwd: &Path) -> Result<bool> {
-    let Some(prev) = held else { return Ok(false) };
-    // Refuse unless the holder is **proven** gone. An owner whose liveness cannot be established
-    // (an externally-minted `agent:` id) keeps its claim: taking it away on an unestablished
-    // answer is how a live agent's work gets started twice (design S3.2).
-    if prev == owner || owner::is_alive(prev).is_no() {
-        return Ok(false);
-    }
-    // A live session for this task that we are standing **inside** keeps its claim: replacing a
-    // `session:` owner with this one-second process's `host:pid` would make the task read as
-    // dead to `doctor --fix` the moment it exits, freeing a session someone is working in
-    // (D36.6). Any other live owner is someone else.
-    let inside = owner::session_worktree(prev).is_some_and(|w| session::is_within(cwd, &w));
-    anyhow::ensure!(
-        inside,
-        "{uid} is already claimed by {prev}, which is still alive — nothing was changed. \
-         Finish or abandon that work, or use `jkb task release {uid} --owner {prev}` if you \
-         are sure it is gone."
-    );
-    Ok(true)
-}
-
-/// `task start` — claim the task and record where the work is happening.
-///
-/// Claiming and tagging together is the point: "I am starting this" and "here is the branch
-/// that will finish it" are the same moment, and splitting them is how the tag ends up
-/// missing on exactly the tasks that needed it.
-fn cmd_task_start(db: &Db, uid: &str, where_: StartWhere, json: bool) -> Result<()> {
-    let StartWhere {
-        branch,
-        onto,
-        repo,
-        owner,
-    } = where_;
-    let cwd = std::env::current_dir()?;
-    let branch = match branch {
-        Some(b) => b,
-        None => gitrepo::current_branch(&cwd)?.context(
-            "not on a branch here (detached HEAD?) — pass --branch, or run inside a git repo",
-        )?,
-    };
-    // Through the MAIN copy, never `key(&cwd)`: inside a `jkb task work` session that is the
-    // session's own directory, so the key came out as the session name — and now that these
-    // facets are *set* rather than added, that replaced the real `repo=` instead of sitting
-    // beside it. Every `repo=`-keyed surface (`staging ls`, In Flight, `task sessions`,
-    // `batch_onto`, `task review record`) then stopped seeing the task, and `review record`
-    // matching nothing is indistinguishable from a review that was never run.
-    //
-    // Resolved **once**. It was built three times here, each discarding the `trunk` it had just
-    // spawned git to find, and two of those sat inside the write transaction — which holds the
-    // single writer thread while git runs.
-    let here = repo::repo_ctx().ok();
-    let repo = match repo {
-        Some(r) => r,
-        None => here
-            .as_ref()
-            .context("not inside a git repo — pass --repo, or run this from the repo")?
-            .key
-            .clone(),
-    };
-    // Only *this* repo's rules may be applied to the branch, so a `--repo <other>` run skips them
-    // rather than judging one repo's branch by another's trunk.
-    let ours = here.as_ref().filter(|c| c.key == repo);
-    let Land {
-        target: land_target,
-        dropped_trunk,
-    } = land_target_for(ours, &branch, onto.as_deref())?;
-
-    let id = resolve_task_uid(db, uid)?;
-    let owner = owner.unwrap_or_else(owner::preferred_owner);
-    let (o, b, r) = (owner.clone(), branch.clone(), repo.clone());
-    let n = land_target.clone();
-    let held = current_claim(db, id)?;
-    let keep_claim = judge_existing_claim(held.as_deref(), &owner, uid, &cwd)?;
-    let displaced = held.clone();
-    db.write_txn("cli", move |conn, meta| {
-        // The CAS answer is checked rather than discarded: losing it means someone claimed the
-        // task between the probe and here, and reporting "started" while writing this session's
-        // branch onto their task is exactly the confusion the liveness guard above prevents.
-        if !keep_claim
-            && !swap_claim(
-                conn,
-                meta,
-                id,
-                displaced.as_deref(),
-                &o,
-                &jkb_core::transition::Labels {
-                    branch: Some(b.clone()),
-                    onto: n.clone(),
-                    ..jkb_core::transition::Labels::default()
-                },
-            )?
-        {
-            return Err(jkb_types::Error::Validation(
-                "the task was claimed by someone else while this command was checking — \
-                 nothing was changed; run it again"
-                    .to_owned(),
-            )
-            .into());
-        }
-        // Through the one location-facet writer, exactly as `task work` does. These were
-        // additive here, so `task work` followed by `task start` — which the guide encourages
-        // — left the task carrying two `branch=` values for one worktree.
-        repo::set_location_facets(
-            conn,
-            meta,
-            id,
-            &repo::Location {
-                branch: Some(&b),
-                repo: Some(&r),
-                onto: n.as_deref(),
-            },
-        )?;
-        // The branch and its land target are recorded as **labels on the transition**, which is
-        // the same write that starts the task. There is no second store to keep in step: a task
-        // told a different target later simply has a later entry, with a timestamp.
-        let facts = task::observe(conn, id)?;
-        jkb_core::transition::note(
-            conn,
-            meta,
-            id,
-            &facts,
-            &jkb_core::transition::Labels {
-                branch: Some(b.clone()),
-                onto: n.clone(),
-                ..jkb_core::transition::Labels::default()
-            },
-        )?;
-        Ok(())
-    })?;
-    report_started(
-        db,
-        &Started {
-            uid,
-            branch: &branch,
-            repo: &repo,
-            owner: &owner,
-            dropped_trunk,
-        },
-        json,
-    )
-}
-
-/// What `task start` has just recorded, for reporting it.
-struct Started<'a> {
-    uid: &'a str,
-    branch: &'a str,
-    repo: &'a str,
-    owner: &'a str,
-    /// `--onto` named trunk, so it is deliberately not recorded as a land target.
-    dropped_trunk: bool,
-}
-
-/// Report a `task start`, on **both** output paths.
-///
-/// The human note was added first and alone, which left a JSON consumer — the UI, a workflow —
-/// with no way to tell that no cut point was recorded and the task will therefore never
-/// auto-close. A fact worth saying out loud is worth saying to whoever is actually reading.
-fn report_started(db: &Db, s: &Started<'_>, json: bool) -> Result<()> {
-    let Started {
-        uid,
-        branch,
-        repo,
-        owner,
-        dropped_trunk,
-    } = *s;
-    let id = resolve_task_uid(db, uid)?;
-    let onto = db.read(move |conn| jkb_core::transition::land_target(conn, id))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "uid": uid,
-                "branch": branch,
-                "repo": repo,
-                "owner": owner,
-                "onto": onto,
-                // A dropped land target is a thing that HAPPENED, so it is on both paths. The
-                // human note alone left a `--json` consumer unable to tell "trunk was named and
-                // dropped" from "no target was ever given".
-                "onto_dropped_trunk": dropped_trunk,
-            })
-        );
-        return Ok(());
-    }
-    println!("started {uid} on {repo}@{branch} (owner {owner})");
-    if dropped_trunk {
-        println!(
-            "  note: {branch} was cut from trunk, so trunk is not recorded as a land target — \
-             a task landing on trunk would read as merged the moment anything landed."
-        );
-    }
-    Ok(())
-}
-
-/// What `--onto` should be **recorded** as, given what it was passed — and the trunk rule.
-///
-/// Trunk is an unacceptable land target (D34.3): a task recorded as landing on trunk reads as
-/// merged the moment anything lands there, and `jkb staging ls` would offer trunk as a batch. So
-/// `--onto <trunk>` is accepted — it is an ordinary thing to say about a branch cut from trunk —
-/// and simply not recorded, which the caller is told.
-///
-/// Refusing the flag outright was the first version, and it left the caller nothing to say about
-/// a branch genuinely cut from trunk.
-fn land_target_for(ctx: Option<&repo::RepoCtx>, branch: &str, onto: Option<&str>) -> Result<Land> {
-    let Some(ctx) = ctx else {
-        // Not in the task's repository, so neither the trunk rule nor the existence check can be
-        // applied. The caller's word is taken for the record — a land target is a name, not a
-        // measurement, so there is nothing here this checkout could honestly establish.
-        return Ok(Land {
-            target: onto.map(str::to_owned),
-            dropped_trunk: false,
-        });
-    };
-    if let Some(trunk_name) = ctx.trunk_name() {
-        anyhow::ensure!(
-            branch != trunk_name,
-            "`{branch}` is this repo's trunk — start work on a feature branch, or the task would \
-             auto-close immediately"
-        );
-    }
-    // A land target this repository does not have is refused rather than stored. Storing it took
-    // the task out of `jkb staging ls` — the one read behind the picker and In Flight — and made
-    // `task land` fail later claiming the branch "no longer exists", which is not what happened.
-    // `task work --onto` may name a branch that does not exist yet because it *creates* it; this
-    // verb only records, so there is nothing here to make the name true.
-    //
-    // Asked as "is this a **branch**", not "does this revision resolve". The two come apart on
-    // exactly the values that hurt: `origin/<batch>` and a tag both resolve, and both were
-    // accepted and stored — the first under a key `staging ls` cannot look up (its map is keyed by
-    // bare short name), so the task vanished from the listing the guard exists to keep it in, and
-    // `land_preflight`'s `adopt_remote` later cut a junk local branch literally called
-    // `origin/<batch>`. What is recorded is the map key, never the caller's spelling.
-    //
-    // **Before** the trunk comparison below, not after: that compared the caller's spelling
-    // against trunk's short name and full ref, which is two spellings of one branch guessed at by
-    // hand. Canonicalizing first leaves it one comparison against one name, so `--onto origin/main`
-    // is recognised as trunk in a repository whose trunk ref is the bare `main` too.
-    let target = match onto {
-        None => None,
-        Some(onto) => match gitrepo::branch_name(&ctx.root, onto)? {
-            gitrepo::BranchName::Is(name) => Some(name),
-            gitrepo::BranchName::Unknown => anyhow::bail!(
-                "`{onto}` is not a branch in {} — a land target has to exist, or the task drops \
-                 out of `jkb staging ls` and `jkb task land` fails on it later. Create it first, \
-                 or name the branch {branch} was really cut from.",
-                ctx.key
-            ),
-            gitrepo::BranchName::NotABranch => anyhow::bail!(
-                "`{onto}` resolves in {} but is not a branch — a tag, an object id or `HEAD` \
-                 cannot be a land target, because every reader looks one up by branch name and \
-                 the task would simply disappear from `jkb staging ls`.",
-                ctx.key
-            ),
-        },
-    };
-    if let Some(trunk_name) = ctx.trunk_name() {
-        if target.as_deref() == Some(trunk_name) {
-            return Ok(Land {
-                target: None,
-                dropped_trunk: true,
-            });
-        }
-    }
-    Ok(Land {
-        target,
-        dropped_trunk: false,
-    })
-}
-
-/// What `--onto` resolved to: the land target to record, and whether trunk was dropped as one.
-struct Land {
-    target: Option<String>,
-    /// Trunk was named, so it is measured against but not recorded. Reported on **both** output
-    /// paths — a `--json` consumer could not otherwise tell a dropped target from one never given.
-    dropped_trunk: bool,
-}
-
 /// `task landed <branch> --onto <target>` — the merge queue reporting a graft it performed.
 ///
 /// **It does not verify the graft, and no longer claims to.** The predecessor refused unless the
@@ -5035,7 +2180,12 @@ struct Land {
 /// # Errors
 /// Errors if either name is not usable as a git ref, if this is not a git repository, or if no
 /// task in it records `branch`.
-fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> {
+pub(crate) fn cmd_task_landed(
+    kb: &session_cli::Kb<'_>,
+    branch: &str,
+    onto: &str,
+    json: bool,
+) -> Result<()> {
     gitrepo::valid_ref(branch)?;
     gitrepo::valid_ref(onto)?;
     let ctx = repo::repo_ctx()?;
@@ -5048,11 +2198,12 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
     // Every task recorded on this branch. The queue lands a whole group at once, so this is
     // many-to-one by nature — and it needs no per-branch record to find them, because a task's
     // own facets say which branch it is on.
-    let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
+    let by_branch = kb.by_branch(&ctx.key)?;
     let uids: Vec<String> = by_branch
-        .iter()
-        .filter(|(b, _)| b.as_str() == branch)
-        .map(|(_, t)| t.uid.clone())
+        .get(branch)
+        .into_iter()
+        .flatten()
+        .map(|t| t.uid.clone())
         .collect();
     anyhow::ensure!(
         !uids.is_empty(),
@@ -5063,79 +2214,22 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
     let mut recorded = Vec::new();
     let mut not_closed = Vec::new();
     for uid in &uids {
-        let id = resolve_task_uid(db, uid)?;
-        let labels = jkb_core::transition::Labels {
-            branch: Some(branch.to_owned()),
-            onto: Some(onto.to_owned()),
-            ref_commit: head.clone(),
-            ..jkb_core::transition::Labels::default()
-        };
-        let labels_for_note = labels.clone();
-        let outcome = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-            // `landed_elsewhere` is **asserted by the caller**, and the caller is the merge queue
-            // reporting a graft it performed and gated itself (D38: the swarm's REVIEWER is that
-            // gate, and it is stricter than the land gate). That is why this is
-            // `observed_landed` and not `land`: `land`'s guard asks whether jkb *may perform*
-            // the graft — is the checkout clean, did a review pass — and the graft is already
-            // done. Conflating the two would let this verb bypass the review gate on the human
-            // path, since they would be one set of preconditions.
-            let facts = lifecycle::TaskFacts {
-                landed_elsewhere: Fact::Yes,
-                ..task::observe(conn, id)?
-            };
-            Ok(jkb_core::transition::perform(
-                conn,
-                meta,
-                id,
-                &facts,
-                lifecycle::TaskEvent::ObservedLanded,
-                &labels,
-            )?)
-        })?;
-        match outcome.refusal() {
+        // `task.landed` states `landed_elsewhere` — the merge queue performed and gated the graft
+        // itself (D38), which is why this is `observed_landed` and not `land`, whose guard asks
+        // whether jkb may *perform* it. A guard's refusal still records the landing, as an entry
+        // that moves nothing; an event the task's state does not define (an abandoned task, which
+        // keeps `branch=`) records nothing. See `jkb_api::sessions::landed`.
+        let outcome = kb.landed(
+            uid,
+            jkb_api::sessions::Landed {
+                branch: branch.to_owned(),
+                onto: onto.to_owned(),
+                head: head.clone(),
+            },
+        )?;
+        match outcome.refusal {
             None => recorded.push(uid.clone()),
-            Some(why) => {
-                // **The graft still happened, so it is still recorded** — but only when the
-                // refusal was a *guard* denying. `perform` writes a history row only when it
-                // moves, and a group task held for an open subtask would otherwise store nothing
-                // about a landing the queue really performed: the subtask finishes later, nothing
-                // re-runs this verb, and `close-merged` finds no landing and no pull request (the
-                // queue grafts locally, so there is none) — held for ever on "no pull request has
-                // that branch as its head".
-                //
-                // `Undefined` is the other refusal and means the opposite: this machine has no
-                // `observed_landed` from where the task is, so the event did not apply to this
-                // task at all. That is what an **abandoned** task looks like here — `abandon` does
-                // not clear `branch=`, so it is still selected — and recording a landing for it
-                // put an `onto` back into its history, where `land_target` reads the newest one
-                // and would have answered with a target the abandon had just retired. The task
-                // reappears in `jkb staging ls` as live work, and its batch never counts as spent.
-                //
-                // Recorded under the event's own name rather than as a `note`, so it is legible
-                // as a landing: `note` is bookkeeping that asserts nothing, and `jkb task start
-                // --onto` writes one carrying the same labels.
-                if !matches!(outcome, jkb_fsm::Outcome::Refused { .. }) {
-                    not_closed.push((uid.clone(), why));
-                    continue;
-                }
-                let labels = labels_for_note.clone();
-                db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-                    let facts = jkb_core::lifecycle::TaskFacts {
-                        landed_elsewhere: Fact::Yes,
-                        ..task::observe(conn, id)?
-                    };
-                    jkb_core::transition::observed(
-                        conn,
-                        meta,
-                        id,
-                        &facts,
-                        lifecycle::TaskEvent::ObservedLanded,
-                        &labels,
-                    )?;
-                    Ok(())
-                })?;
-                not_closed.push((uid.clone(), why));
-            }
+            Some(why) => not_closed.push((uid.clone(), why)),
         }
     }
 
@@ -5165,612 +2259,52 @@ fn cmd_task_landed(db: &Db, branch: &str, onto: &str, json: bool) -> Result<()> 
     Ok(())
 }
 
-/// `task tag add|rm <uid> <facet>=<value>` — apply or remove one facet tag.
-fn cmd_task_tag(db: &Db, cmd: TaskTagCmd, json: bool) -> Result<()> {
-    let (uid, facet_value, mode) = match cmd {
-        TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, TagMode::Add),
-        TaskTagCmd::Set { uid, facet_value } => (uid, facet_value, TagMode::Set),
-        TaskTagCmd::Rm { uid, facet_value } => (uid, facet_value, TagMode::Rm),
-    };
-    let (facet, value) = facet_value
-        .split_once('=')
-        .context("tag must be `facet=value`, e.g. `size=small`")?;
-    // A land target is a fact about a *branch* and lives in that branch's record, so a facet named
-    // `onto` reaches no reader. Refused rather than stored inert — a user who typed it expecting
-    // effect deserves an answer, not silence.
-    //
-    // `rm` is deliberately **not** refused. The refusal exists to stop a value nothing reads being
-    // *set*; removing one is always safe, and there is a route that still creates them — a synced
-    // `tasks.md` line carrying `#onto=` goes through `tag::reconcile_tags`, which is inert by
-    // design (B3) but real. Refusing `rm` left the only command that could remove such a tag
-    // declining on the grounds that it could not exist.
-    anyhow::ensure!(
-        facet != "onto" || matches!(mode, TagMode::Rm),
-        "`onto` records where a *branch* lands, not where a task is, so it is no longer a tag. \
-         Use `jkb task work <uid> --onto <branch>`, or `jkb task start <uid> --branch <b> \
-         --onto <branch>`."
-    );
-    // The ref-valued facet is read back and handed to git, so the same rule applies here as at
-    // the location writer: a value git would read as an option must not reach the store.
-    if facet == repo::FACET_BRANCH && !matches!(mode, TagMode::Rm) {
-        gitrepo::valid_ref(value)?;
-    }
-    let id = resolve_task_uid(db, &uid)?;
-    // `add` still appends and `set` still replaces: a task can legitimately record two branches
-    // and every reader indexes both, so a command called `add` must not silently delete one.
-    if facet == repo::FACET_BRANCH && !matches!(mode, TagMode::Rm) {
-        let how = match mode {
-            TagMode::Add => repo::BranchWrite::Add,
-            _ => repo::BranchWrite::Set,
-        };
-        let branch = value.to_owned();
-        db.write_txn("cli", move |conn, meta| {
-            repo::record_branch(conn, meta, id, &branch, how)
-        })?;
-        if json {
-            println!("{}", serde_json::json!({"uid": uid, "action": "tagged"}));
-            return Ok(());
-        }
-        println!("tagged: {uid}");
-        return Ok(());
-    }
-    let (facet, value) = (facet.to_owned(), value.to_owned());
-    db.write_txn("cli", move |conn, meta| {
-        match mode {
-            // `add` is additive, honest to its name: an open-ended facet legitimately holds
-            // several values, and a command called `add` must not silently delete one.
-            TagMode::Add => tag::apply(conn, meta, id, &facet, &value),
-            // `set` replaces the facet's other values. Right for the facets answering "where
-            // is this being worked" — `repo=` is the one left here, and a second value for it is
-            // a contradiction, not extra information, which a reader collapsing the multi-map
-            // resolves at random (D36.6). (`onto=` is refused above; `branch=` is routed through
-            // `repo::record_branch`, which honours the same mode.)
-            TagMode::Set => repo::set_facet(conn, meta, id, &facet, &value),
-            TagMode::Rm => tag::remove(conn, meta, id, &facet, &value),
-        }
-    })?;
-    report(
-        json,
-        &uid,
-        match mode {
-            TagMode::Add | TagMode::Set => "tagged",
-            TagMode::Rm => "untagged",
-        },
-    );
-    Ok(())
-}
-
-/// Dispatch the parallel-session subcommands (design D36): open a session, land it, drop it,
-/// list what is in flight, or configure the gate that guards a landing.
+/// The host-only session verbs: configure the gate that guards a landing (design D36.5), and break a
+/// repo's land lease. The other session verbs are served as ops (`task_cli`), in both modes.
 fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
+    let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
+    let kb = session_cli::Kb::new(&backend);
     match cmd {
-        TaskCmd::Work { uid, onto } => cmd_task_work(db, db_path, &uid, onto.as_deref(), json),
         TaskCmd::Land {
-            uid,
-            gate,
-            no_gate,
-            keep_worktree,
-            no_review,
+            break_lock: true, ..
         } => cmd_task_land(
-            db,
-            db_path,
-            &uid,
+            &kb,
+            &archive::Stores::new(kb, Some(db_path)),
+            Some(db),
+            None,
             LandFlags {
-                gate: gate.clone(),
-                no_gate,
-                keep_worktree,
-                no_review,
+                gate: None,
+                no_gate: false,
+                keep_worktree: false,
+                no_review: false,
+                break_lock: true,
             },
             json,
         ),
-        TaskCmd::Abandon {
-            uid,
-            force,
-            delete_branch,
-        } => cmd_task_abandon(db, db_path, &uid, force, delete_branch, json),
-        TaskCmd::Sessions => cmd_task_sessions(db, db_path, json),
-        TaskCmd::Gate { cmd, clear } => cmd_task_gate(db, cmd.as_deref(), clear, json),
+        // Storing a gate is a host command (decision A), so it is done here, against the database,
+        // and never through an op. Showing one is served as an op in both modes.
+        TaskCmd::Gate { cmd, clear } => {
+            let ctx = repo::repo_ctx()?;
+            if clear {
+                session::set_gate(db, &ctx.key, None)?;
+            } else if let Some(cmd) = &cmd {
+                session::set_gate(db, &ctx.key, Some(cmd))?;
+            }
+            session_cli::gate(&kb, json)
+        }
         _ => unreachable!("cmd_task_mutate routes only session subcommands here"),
     }
 }
 
-/// How `task tag` should write a facet.
-#[derive(Clone, Copy)]
-enum TagMode {
-    /// Append a value, keeping any others.
-    Add,
-    /// Make this the facet's only value.
-    Set,
-    /// Remove this value.
-    Rm,
-}
-
-/// `task work` — open (or return) an isolated session for a task (design D36.2).
-///
-/// Idempotent by construction: the task's own `branch=` tag names its session, so a second
-/// invocation hands back the same worktree instead of forking the work onto a second branch.
-fn cmd_task_work(db: &Db, db_path: &Path, uid: &str, onto: Option<&str>, json: bool) -> Result<()> {
-    let ctx = repo::repo_ctx()?;
-    let cwd = std::env::current_dir()?;
-    let id = resolve_task_uid(db, uid)?;
-
-    // Asked of the lifecycle rather than re-stated here: `start` has no transition out of a
-    // terminal status, so this is the same refusal `jkb task start` and the In Flight row give.
-    // Only the *state* half is checked now — everything a session needs is established below,
-    // and asking about it before the worktree exists would be asking about facts that are not
-    // yet true.
-    let held = db.read(move |conn| task::observe(conn, id))?;
-    if let Some(why) = lifecycle::apply(&held, lifecycle::TaskEvent::Start).refusal() {
-        if held.status.is_terminal() {
-            anyhow::bail!("{uid}: {why}");
-        }
-    }
-
-    // Session worktrees live inside the repo, so the first one must not make it dirty.
-    session::ensure_excluded(&ctx.root)?;
-
-    let tags = repo::task_tags(db, id)?;
-    let sessions = session::discover(&ctx.root)?;
-    // A session already recorded on the task keeps its name, so a second invocation returns
-    // the same worktree instead of forking the work onto a second branch. A task may record
-    // more than one branch (a `jkb task start` before a `task work`, or an earlier `--onto`),
-    // so prefer the one that has a live worktree over merely the first that parses.
-    let recorded = repo::facet_values(&tags, repo::FACET_BRANCH);
-    let existing = recorded
-        .iter()
-        .find(|b| sessions.iter().any(|s| s.branch == **b))
-        .or_else(|| {
-            recorded
-                .iter()
-                .find(|b| session::name_from_branch(b).is_some())
-        })
-        .and_then(|b| session::name_from_branch(b));
-    let name = if let Some(existing) = existing {
-        existing.to_owned()
-    } else {
-        let taken: std::collections::HashSet<String> =
-            sessions.iter().map(|s| s.name.clone()).collect();
-        session::mint_name(uid, |n| {
-            taken.contains(n) || session::worktree_path(&ctx.root, n).exists()
-        })
-    };
-    let branch = session::branch_for(&name);
-    let worktree = session::worktree_path(&ctx.root, &name);
-    let onto = resolve_onto(db, &ctx, &cwd, id, onto, &name)?;
-
-    // Claim first: if someone else is on this task, stop before making a worktree they
-    // would have to clean up.
-    //
-    // The branch and its land target ride along **on the `start` transition**, because both are
-    // already known here and `start` is the entry a reader looks at first — a history whose
-    // opening line does not say where the work is sends them to the next line to find out.
-    let owner = owner::session_owner(&worktree);
-    claim_session(
-        db,
-        id,
-        uid,
-        &owner,
-        &worktree,
-        &jkb_core::transition::Labels {
-            branch: Some(branch.clone()),
-            onto: Some(onto.clone()),
-            ..jkb_core::transition::Labels::default()
-        },
-    )?;
-
-    // CANCELLED FIRST, and a refusal stops the verb.
-    //
-    // `revoke` takes the sweep lock, so a refusal means a sweep is in flight working from a
-    // snapshot that still lists this worktree — and its checks all pass, because the tree is
-    // registered, on the recorded HEAD and clean. Printing a note and handing the session back
-    // anyway licensed that sweep to archive the checkout the operator was just told to work in
-    // and force-delete its branch. `revoke`'s own doc already said the honest outcome is to
-    // refuse and have the operator re-run; this makes the caller obey it.
-    //
-    // Before `open_worktree`, so a sweep sees either no worktree or no record — never a live
-    // checkout it still holds a licence for.
-    archive::revoke(db_path, &worktree)
-        .map(|cancelled| {
-            if cancelled {
-                println!("cancelled the pending removal of {}", worktree.display());
-            }
-        })
-        .with_context(|| {
-            format!(
-                "cannot open the session for {uid}: its pending removal could not be cancelled, \
-                 and opening it anyway would let that sweep archive the checkout you were about \
-                 to work in"
-            )
-        })?;
-
-    let resumed = sessions.iter().any(|s| s.branch == branch);
-    if !resumed {
-        open_worktree(db, id, &ctx.root, &worktree, &branch, &onto)?;
-    }
-
-    // Record where the work is happening, exactly as `task start` does (D34.1), plus the
-    // land target so `land` and a resumed `work` agree on it. The two facets are *set*, not
-    // added: a second value would be a contradiction rather than extra information, and is how
-    // a task ends up with two branches and one worktree.
-    //
-    // The land target itself is recorded on the `start` transition above, not here: it is a
-    // label on the moment somebody said so, and there is no second store for a resume to find
-    // out of step. A **resumed** session re-asserts the claim, which is idempotent and writes no
-    // second row, so the facets are what this transaction is for.
-    let (b, r, o) = (branch.clone(), ctx.key.clone(), onto.clone());
-    db.write_txn("cli", move |conn, meta| {
-        repo::set_location_facets(
-            conn,
-            meta,
-            id,
-            &repo::Location {
-                branch: Some(&b),
-                repo: Some(&r),
-                onto: Some(&o),
-            },
-        )
-    })?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "uid": uid,
-                "session": name,
-                "worktree": worktree,
-                "branch": branch,
-                "onto": onto,
-                "resumed": resumed,
-                "owner": owner,
-            })
-        );
-    } else {
-        let verb = if resumed { "resumed" } else { "opened" };
-        println!("{verb} session {name} for {uid}");
-        println!("  worktree: {}", worktree.display());
-        println!("  branch:   {branch} (lands on {onto})");
-        println!("  next:     cd {} && claude", worktree.display());
-        println!("  finish:   jkb task land {uid}");
-    }
-    Ok(())
-}
-
-/// Make the session's worktree, returning whether its **branch** had to be created.
-///
-/// Split out of `cmd_task_work` for length.
-///
-/// **Every** failure path releases the claim. `claim_session` has already written a
-/// `session:<pid>:<worktree>` owner, and `owner::is_alive` judges one solely by whether that
-/// directory exists (D36.6) — so a bail-out caused by the directory being in the way leaves a
-/// claim that reads as alive forever, freed by neither `doctor --fix` nor `task reclaim`. Only the
-/// `worktree_add` arm used to release, while the doc claimed all of them did.
-fn open_worktree(
-    db: &Db,
-    id: ItemId,
-    root: &Path,
-    worktree: &Path,
-    branch: &str,
-    onto: &str,
-) -> Result<()> {
-    let opened = open_worktree_inner(root, worktree, branch, onto);
-    if opened.is_err() {
-        let _ = db.write_txn("cli", move |conn, m| claim::clear(conn, m, id));
-    }
-    opened
-}
-
-/// The fallible half of [`open_worktree`], so one `Err` covers every way it can fail.
-fn open_worktree_inner(root: &Path, worktree: &Path, branch: &str, onto: &str) -> Result<()> {
-    if let Some(parent) = worktree.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    anyhow::ensure!(
-        !worktree.exists(),
-        "{} exists but git does not know it as a worktree — remove it, or run \
-         `git worktree prune`",
-        worktree.display()
-    );
-    gitrepo::worktree_add(root, worktree, branch, onto)
-}
-
-/// Decide which branch this session's work will land on (design D36.3).
-fn resolve_onto(
-    db: &Db,
-    ctx: &repo::RepoCtx,
-    cwd: &Path,
-    id: ItemId,
-    flag: Option<&str>,
-    session_name: &str,
-) -> Result<String> {
-    if let Some(flag) = flag {
-        // The bare branch name the flag refers to, before anything acts on it. Unlike `task
-        // start`, this verb may legitimately be handed a branch that does not exist yet — it
-        // creates one — so `Unknown` is accepted and taken literally. What is refused is a name
-        // that resolves to something *else*: `git branch <tag> <tag>` would otherwise cut a branch
-        // named after a tag, and `--onto origin/<batch>` cut one literally called
-        // `origin/<batch>`, which no reader of a land target can ever look up.
-        let branch = match gitrepo::branch_name(&ctx.root, flag)? {
-            gitrepo::BranchName::Is(name) => name,
-            gitrepo::BranchName::Unknown => flag.to_owned(),
-            gitrepo::BranchName::NotABranch => anyhow::bail!(
-                "`{flag}` resolves in {} but is not a branch — a tag, an object id or `HEAD` \
-                 cannot be a land target, because every reader looks one up by branch name and \
-                 the session would simply disappear from `jkb staging ls`.",
-                ctx.key
-            ),
-        };
-        anyhow::ensure!(
-            Some(branch.as_str()) != ctx.trunk_name(),
-            "refusing to land on {branch}: it is this repo's trunk, and a task tagged with \
-             it would read as merged the moment anything lands"
-        );
-        // Adopt an existing branch — including one that exists only on `origin/` — rather than
-        // replacing it with an empty namesake cut from trunk. The start point is resolved **only**
-        // if there is nothing to adopt: computing it eagerly made every `task work` fail in a repo
-        // whose trunk cannot be discovered, including the `--onto` escape hatch the error
-        // recommends.
-        if !gitrepo::adopt_remote(&ctx.root, &branch)? {
-            gitrepo::create_branch(&ctx.root, &branch, &batch_start(ctx, cwd)?)?;
-        }
-        return Ok(branch);
-    }
-    // A session that already has a target keeps it — counting the remote-tracking copy, or a
-    // batch whose local ref was pruned would silently retarget the session somewhere else.
-    //
-    // Read from the task's own history — the last time anybody said where its work lands. The
-    // session branch is minted before this runs, so on a resume the target is whatever the
-    // previous run recorded, whichever branch it recorded it against.
-    if let Some(branch) = db.read(move |conn| jkb_core::transition::land_target(conn, id))? {
-        if gitrepo::adopt_remote(&ctx.root, &branch)? {
-            return Ok(branch);
-        }
-    }
-    // Join the batch the other live sessions are landing on.
-    if let Some(branch) = batch_onto(db, ctx)? {
-        return Ok(branch);
-    }
-    // The branch you invoked from — unless that is trunk (landing there closes tasks
-    // instantly, D34.3) or another session's branch (that would stack sessions).
-    if let Some(branch) = gitrepo::current_branch(cwd)? {
-        if Some(branch.as_str()) != ctx.trunk_name() && session::name_from_branch(&branch).is_none()
-        {
-            return Ok(branch);
-        }
-    }
-    // Cut the batch branch from trunk, named after this task — the first of the batch.
-    // `create_branch`, deliberately: this is cutting a NEW batch at a known start point, so a
-    // same-named branch left on the remote by an earlier, possibly already-merged batch must not
-    // be adopted in its place.
-    gitrepo::create_branch(&ctx.root, session_name, &batch_start(ctx, cwd)?)?;
-    Ok(session_name.to_owned())
-}
-
-/// The commit a new batch branch is cut from.
-///
-/// The **local** trunk when that is where you are standing, and only otherwise the trunk ref
-/// — which is usually `origin/main`. A local trunk ahead of its remote is the ordinary case
-/// (you just merged a PR and pulled, or you commit locally first), and cutting the batch from
-/// the remote ref there would silently start the work behind commits you already have, then
-/// land it as if it were on top of them.
-fn batch_start(ctx: &repo::RepoCtx, cwd: &Path) -> Result<String> {
-    if let Some(branch) = gitrepo::current_branch(cwd)? {
-        if Some(branch.as_str()) == ctx.trunk_name() {
-            return Ok(branch);
-        }
-    }
-    ctx.trunk.clone().context(
-        "could not determine this repo's trunk, so there is nothing to cut a branch from \
-         — pass --onto <branch> naming one that exists",
-    )
-}
-
-/// The land target the repo's other live sessions share, if they agree on one.
-///
-/// This is what makes a second session started from trunk join the first one's batch instead
-/// of cutting a branch of its own. Sessions that disagree are left alone: guessing which of
-/// two batches a new task belongs to is worse than asking for `--onto`.
-fn batch_onto(db: &Db, ctx: &repo::RepoCtx) -> Result<Option<String>> {
-    let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
-    let mut found: Option<String> = None;
-    for s in session::discover(&ctx.root)? {
-        let Some(onto) = by_branch.get(&s.branch).and_then(|t| t.onto.clone()) else {
-            continue;
-        };
-        // Remote-aware for the same reason: a live batch whose local ref is gone must still be
-        // joinable, or the next session cuts a second batch beside it. **Materialised**, not just
-        // detected — a bare branch name that only exists under `refs/remotes` is not a valid start
-        // point, so merely counting it as live handed `git branch <session> <batch>` a name it
-        // could not resolve and aborted the command.
-        if !gitrepo::adopt_remote(&ctx.root, &onto)? {
-            continue;
-        }
-        match &found {
-            None => found = Some(onto),
-            Some(f) if *f == onto => {}
-            Some(_) => return Ok(None),
-        }
-    }
-    if found.is_none() {
-        // No sessions right now, but a batch checkout may survive from an earlier round —
-        // you landed one task and are starting the next. Join it only while that batch is
-        // still LIVE: once it has merged (or never had a commit), holding on would both
-        // attract new work onto a dead branch and keep `git branch -d` from deleting it. So
-        // a merged batch's checkout is released here rather than reused.
-        if let Some(branch) = base_branch(ctx)? {
-            if !batch_is_spent(db, ctx, &branch)? {
-                return Ok(Some(branch));
-            }
-            release_base_worktree(ctx)?;
-        }
-    }
-    Ok(found)
-}
-
-/// The branch checked out in `.jkb/base`, if that worktree exists.
-fn base_branch(ctx: &repo::RepoCtx) -> Result<Option<String>> {
-    let base = session::base_worktree(&ctx.root);
-    // "no branch recorded for `.jkb/base`" either way, which is what a caller does with an
-    // unregistered base anyway.
-    Ok(gitrepo::worktrees(&ctx.root)?
-        .unwrap_or_default()
-        .into_iter()
-        .find(|w| session::same_path(&w.path, &base))
-        .and_then(|w| w.branch))
-}
-
-/// Whether a batch branch has nothing left to give: every task recorded on it has finished,
-/// one way or the other.
-///
-/// The same rule `staging::collect` uses to decide a batch is spent, so the picker and the
-/// checkout cache cannot disagree about which batches are live. It used to ask `merge-tree`
-/// whether the branch added anything to trunk, and then had to hand-correct the answer, because
-/// a branch that adds nothing is either landed *or* freshly cut and still empty and refs cannot
-/// tell those apart.
-///
-/// A batch nothing records is **not** spent: an unknown batch is more likely one this repo has
-/// no tasks for than one that is finished, and losing a live batch is worse than reusing a
-/// spent one.
-fn batch_is_spent(db: &Db, ctx: &repo::RepoCtx, branch: &str) -> Result<bool> {
-    let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
-    let mut any = false;
-    for t in by_branch.values() {
-        if t.onto.as_deref() != Some(branch) {
-            continue;
-        }
-        any = true;
-        if !jkb_types::TaskStatus::is_terminal_str(Some(t.status.as_str())) {
-            return Ok(false);
-        }
-    }
-    Ok(any)
-}
-
-/// Remove `.jkb/base`, freeing the branch it holds. It is only ever a checkout cache; `land`
-/// makes a new one on demand.
-fn release_base_worktree(ctx: &repo::RepoCtx) -> Result<()> {
-    let base = session::base_worktree(&ctx.root);
-    if base.exists() {
-        gitrepo::worktree_remove(&ctx.root, &base, true)?;
-    }
-    Ok(())
-}
-
-/// Who holds `id` right now, or `None` if it is free.
-///
-/// The read half of every claim takeover: the owner string this returns is the one the caller
-/// judges (liveness, same-session, same-worktree) and the one [`swap_claim`] must later CAS
-/// against, so the two always talk about the same claim.
-fn current_claim(db: &Db, id: ItemId) -> Result<Option<String>> {
-    Ok(db
-        .read(claim::claimed)?
-        .into_iter()
-        .find(|c| c.id == id)
-        .map(|c| c.owner))
-}
-
-/// Move the claim on `id` to `owner`, atomically against `displaced` — the **exact** owner
-/// [`current_claim`] returned and the caller judged. `Ok(false)` means the claim changed hands
-/// in between and nothing was written; every caller turns that into "run it again".
-///
-/// Clearing first is what lets a resumed session re-take its own claim under a new pid: the CAS
-/// in [`claim::claim`] accepts only a free task or a byte-identical owner. Clearing only the
-/// *judged* owner is what stops it from throwing away a claim it never looked at — the liveness
-/// probe forks `ps` outside the transaction, and a `jkb task work` landing in that window would
-/// otherwise lose its fresh claim to a decision taken about a different, dead owner.
-///
-/// The one rendering of that dance. It was written twice, and the copies had already drifted:
-/// one checked the CAS answer and one did not, so half the callers could report success while
-/// writing this session's branch onto somebody else's task.
-///
-/// # Errors
-/// Returns an error if either claim write fails.
-fn swap_claim(
-    conn: &rusqlite::Connection,
-    meta: &jkb_core::WriteMeta,
-    id: ItemId,
-    displaced: Option<&str>,
-    owner: &str,
-    labels: &jkb_core::transition::Labels,
-) -> jkb_core::Result<bool> {
-    if let Some(prev) = displaced {
-        if !claim::clear_if(conn, meta, id, prev)? {
-            return Ok(false);
-        }
-    }
-    // Through the machine, so **starting a task is in its history** — with who started it and
-    // what was recorded alongside. Taking the claim directly was a hole exactly where it hurts:
-    // `jkb task work` is the commonest way a task starts, so `jkb task why` said nothing about
-    // the one event every later question is asked relative to.
-    //
-    // The displaced owner is already cleared above, so the guard sees a free slot; what it still
-    // decides is that a terminal task cannot be started, which is the same refusal `task work`
-    // gives before it gets here.
-    let facts = jkb_core::lifecycle::TaskFacts {
-        actor: Some(jkb_types::AgentId::parse(owner)),
-        ..jkb_core::task::observe(conn, id)?
-    };
-    let outcome = jkb_core::transition::perform(
-        conn,
-        meta,
-        id,
-        &facts,
-        jkb_core::lifecycle::TaskEvent::Start,
-        labels,
-    )?;
-    match outcome.refusal() {
-        Some(why) => Err(jkb_types::Error::Validation(why).into()),
-        // An already-started task claimed by the same owner is `Idempotent`, which writes
-        // nothing and is not a failure — asking twice is not an error (D48/S1.6).
-        None => Ok(true),
-    }
-}
-
-/// Take the session's claim, taking over from this session's own previous process (a resume)
-/// or from a dead owner, and refusing any other live owner **by name** (design D36.6).
-fn claim_session(
-    db: &Db,
-    id: ItemId,
-    uid: &str,
-    owner: &str,
-    worktree: &Path,
-    labels: &jkb_core::transition::Labels,
-) -> Result<()> {
-    let held = current_claim(db, id)?;
-    if let Some(prev) = &held {
-        let same_session =
-            owner::session_worktree(prev).is_some_and(|w| session::same_path(&w, worktree));
-        // Proven gone, or we do not take it. See `cmd_task_start` for why unestablished holds.
-        if !same_session && !owner::is_alive(prev).is_no() {
-            let where_ = owner::session_worktree(prev).map_or_else(
-                || format!("owner {prev}"),
-                |w| format!("a session in {}", w.display()),
-            );
-            anyhow::bail!(
-                "{uid} is already being worked by {where_} — finish or abandon that session, \
-                 or work a different task"
-            );
-        }
-    }
-    let (o, displaced, labels) = (owner.to_owned(), held.clone(), labels.clone());
-    let ok = db.write_txn("cli", move |conn, meta| {
-        swap_claim(conn, meta, id, displaced.as_deref(), &o, &labels)
-    })?;
-    anyhow::ensure!(
-        ok,
-        "{uid} was claimed by someone else while this command was checking — nothing was \
-         changed; run it again"
-    );
-    Ok(())
-}
-
 /// `task land` — the merge queue for one session (design D36.4).
 /// The flags of `task land`, grouped so the signature stays under the bool-argument lint.
-struct LandFlags {
-    gate: Option<String>,
-    no_gate: bool,
-    keep_worktree: bool,
-    no_review: bool,
+#[allow(clippy::struct_excessive_bools)] // a command's flags, not state
+pub(crate) struct LandFlags {
+    pub(crate) gate: Option<String>,
+    pub(crate) no_gate: bool,
+    pub(crate) keep_worktree: bool,
+    pub(crate) no_review: bool,
+    pub(crate) break_lock: bool,
 }
 
 /// What `land` needs from the task and its session once every precondition has held.
@@ -5793,20 +2327,15 @@ struct Preflight {
 /// dirty check that used to sit on the other side of the lock closed no window and was simply a
 /// second wording of one rule.
 fn land_preflight(
-    db: &Db,
     ctx: &repo::RepoCtx,
     uid: &str,
-    id: ItemId,
-    tags: &BTreeMap<String, Vec<String>>,
+    facts: &jkb_api::sessions::TaskState,
 ) -> Result<Preflight> {
+    let tags = &facts.tags;
     // The task's own pipeline state, mapped by the one function that does that — so the
     // terminal arm of `land_blocker` below is the arm that actually fires here, rather than a
     // second bail beside it saying the same thing in its own words.
-    let state = staging::State::from_status(
-        &db.read(move |conn| item::get(conn, id))?
-            .and_then(|m| m.status)
-            .unwrap_or_default(),
-    );
+    let state = staging::State::from_status(&facts.status);
     anyhow::ensure!(
         !repo::facet_values(tags, repo::FACET_BRANCH).is_empty(),
         "{uid} has no session — run `jkb task work {uid}` first"
@@ -5829,8 +2358,9 @@ fn land_preflight(
     } = repo::work_for(ctx, tags)?;
     let branch = branch.context("this task records no branch")?;
     // Where this task's work lands, from its own history — the last time anybody said so.
-    let onto = db
-        .read(move |conn| jkb_core::transition::land_target(conn, id))?
+    let onto = facts
+        .land_target
+        .clone()
         .context("this session records no land target — re-run `jkb task work` with --onto")?;
     // The same question the session paths ask, and materialised for the same reason: the land
     // path checks the target out, so a target that exists only on `origin/` is usable — refusing
@@ -5896,7 +2426,7 @@ fn land_preflight(
     // The same question the machine's `land` guard asks, asked **before** the graft. Both read
     // `containment`, which is where the answer lives (D35), so the row, the command and the
     // machine cannot disagree about which parents are held.
-    let open_subtasks = !db.read(move |conn| task::subtasks_all_terminal(conn, id))?;
+    let open_subtasks = facts.open_subtasks;
     if let Some(reason) = staging::land_blocker(&staging::LandFacts {
         state,
         open_subtasks,
@@ -5969,17 +2499,35 @@ fn land_preflight(
     })
 }
 
-fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: bool) -> Result<()> {
+///
+/// Served as ops in both modes (tasks S6.4 stage 4): its git work runs here, its database work
+/// through `kb`. `store` is this process's own database, when it has one — the only way a gate is
+/// stored (decision A); a client of `jkb serve` runs the gate it is given or finds, and stores none.
+pub(crate) fn cmd_task_land(
+    kb: &session_cli::Kb<'_>,
+    stores: &archive::Stores<'_>,
+    store: Option<&Db>,
+    uid: Option<&str>,
+    flags: LandFlags,
+    json: bool,
+) -> Result<()> {
     let LandFlags {
         gate: gate_flag,
         no_gate,
         keep_worktree,
         no_review,
+        break_lock,
     } = flags;
     let gate_flag = gate_flag.as_deref();
     let ctx = repo::repo_ctx()?;
-    let id = resolve_task_uid(db, uid)?;
-    let tags = repo::task_tags(db, id)?;
+    if break_lock {
+        return break_land_lease(kb, &ctx.key, json);
+    }
+    let uid = uid.context("a task to land")?;
+    // Asked before anything moves: a task this client may not write would otherwise be grafted and
+    // its session disposed of, and only then refused its record — landed, in progress, sessionless.
+    let facts = kb.facts_for_write(uid)?;
+    let tags = facts.tags.clone();
 
     // The lock is taken **before** anything is checked, not just before the graft.
     //
@@ -5993,40 +2541,53 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
     // Acquiring costs nothing here: it fails fast rather than waiting, and every other precondition
     // below is equally worth serialising against a concurrent land.
     //
-    // The lock file lives in `.jkb/`, and taking it this early means a land that is about to be
-    // *refused* creates that directory too — in a repo where `task work` has never run, and so has
-    // never excluded it. A lock file stranded by a kill would then show up as untracked and make
-    // the user's tree dirty. Excluded first, in `.git/info/exclude` exactly as `task work` does it:
-    // local to this clone, never their committed `.gitignore` (D36.2).
+    // `.jkb/` is excluded first, in `.git/info/exclude` exactly as `task work` does it — local to this
+    // clone, never their committed `.gitignore` (D36.2) — because a land may create `.jkb/base` and
+    // `.jkb/archive` in a repo where `task work` has never run. The lock itself is a database lease
+    // now, and leaves nothing on disk.
     session::ensure_excluded(&ctx.root)?;
-    let _lock = session::LandLock::acquire(&ctx.root)?;
+    let _lock = session_cli::LandLease::acquire(kb, &ctx.key)?;
 
     let Preflight {
         sess,
         branch,
         onto,
         ahead,
-    } = land_preflight(db, &ctx, uid, id, &tags)?;
+    } = land_preflight(&ctx, uid, &facts)?;
 
     // The review gate (design D38.5), before the graft: a refusal must not have moved a
     // branch first. Concerns and nits do not block — only must-fix findings do. A waiver is
     // only *owed* here; it is written after the landing actually happens, so a land that then
     // fails on the graft or the gate build leaves no waiver for something that never occurred.
     let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
-    let waiver_owed = review::enforce(db, uid, &tags, no_review, json)?;
+    let waiver_owed = review::enforce(kb, uid, &tags, no_review, json)?;
 
     let land_dir = land_dir_for(&ctx, &onto)?;
 
     let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
-    let gitrepo::Graft::Landed { grafted } = outcome else {
-        anyhow::bail!(
+    // TWO FAILURES, TWO REMEDIES. They were one arm, and the message it printed was written for
+    // the rebase conflict — so a refused fast-forward sent the user to rebase a branch that had
+    // rebased cleanly, which reproduces every time it is tried. `scripts/merge-queue.sh` splits
+    // the same pair (exit 1 against exit 4) and for the same reason: only one of them is the
+    // branch's fault.
+    let grafted = match outcome {
+        gitrepo::Graft::Landed { grafted } => grafted,
+        gitrepo::Graft::Conflict => anyhow::bail!(
             "{branch} does not rebase cleanly onto {onto} — nothing changed. Rebase it where \
              the context is: cd {} && git rebase {onto}, fix the conflict, then land again",
             sess.worktree.display()
-        );
+        ),
+        gitrepo::Graft::CouldNotAdvance { why } => anyhow::bail!(
+            "{branch} rebased onto {onto} cleanly, but {onto} could not be advanced onto the \
+             result. Nothing changed, and the branch is fine — rebasing it will not help. This is \
+             usually transient: something else moved or held {onto} while the graft ran. git \
+             said: {why}\n\nTry landing again; if it repeats, look at what else is writing to \
+             {onto} (`git worktree list`, a running watcher, a held index.lock in {})",
+            land_dir.display()
+        ),
     };
 
-    let (gate, source) = session::resolve_gate(db, &ctx.root, &ctx.key, gate_flag, no_gate)?;
+    let (gate, source) = session::resolve_gate(store, kb, &ctx.root, &ctx.key, gate_flag, no_gate)?;
     if !json {
         println!(
             "gate: {} ({})",
@@ -6051,9 +2612,9 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
     }
 
     settle_landing(
-        db,
-        db_path,
-        id,
+        kb,
+        stores,
+        &facts.uid,
         &ctx,
         &sess,
         Landed {
@@ -6069,10 +2630,30 @@ fn cmd_task_land(db: &Db, db_path: &Path, uid: &str, flags: LandFlags, json: boo
             // Only a real commit id: `head` falls back to the literal "unknown" for the waiver
             // string, and a landing event whose `landed_head` is not a commit can never be
             // credited — it would silently mean "never credited" rather than "not recorded".
-            head: Some(head.as_str()),
+            head: (head != "unknown").then_some(head.as_str()),
         },
         json,
     )
+}
+
+/// `task land --break-lock`: drop this repo's land lease, whoever holds it.
+fn break_land_lease(kb: &session_cli::Kb<'_>, repo_key: &str, json: bool) -> Result<()> {
+    let broken = session_cli::LandLease::break_held(kb, repo_key)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "repo": repo_key,
+                "broken_holder": broken.as_ref().map(|(raw, _)| raw),
+            })
+        );
+    } else {
+        match broken {
+            Some((_, holder)) => println!("broke {repo_key}'s land lease held by {holder}"),
+            None => println!("no land lease was held for {repo_key}"),
+        }
+    }
+    Ok(())
 }
 
 /// What a successful graft produced, for the bookkeeping that follows it.
@@ -6098,9 +2679,9 @@ struct Landed<'a> {
 
 /// Mark the task done, free the claim, and dispose of the session (design D36.4).
 fn settle_landing(
-    db: &Db,
-    db_path: &Path,
-    id: ItemId,
+    kb: &session_cli::Kb<'_>,
+    stores: &archive::Stores<'_>,
+    task_uid: &str,
     ctx: &repo::RepoCtx,
     sess: &session::Session,
     landed: Landed<'_>,
@@ -6114,10 +2695,7 @@ fn settle_landing(
     // is also recorded for a task somebody finished during the gate: the waived landing is what
     // it describes, not the status.
     if let Some(sha) = landed.waiver {
-        let sha = sha.to_owned();
-        db.write_txn("cli", move |conn, meta| {
-            repo::set_facet(conn, meta, id, review::FACET_REVIEW_WAIVED, &sha)
-        })?;
+        kb.set_facet(task_uid, review::FACET_REVIEW_WAIVED, sha)?;
     }
 
     // Is the session still there at all? `git status` in a directory that no longer exists
@@ -6156,14 +2734,14 @@ fn settle_landing(
         uid = landed.uid,
     );
 
-    let disposal = dispose_session(db_path, ctx, sess, &landed, disposed_already)?;
+    let disposal = dispose_session(stores, ctx, sess, &landed, disposed_already)?;
 
     // Landed: the task is done, the claim is free, and the session branch is a duplicate of
     // commits now in `onto`.
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (`LandLock` only excludes a second land). Writing `Done` over a cancellation made
+    // land (the land lease only excludes a second land). Writing `Done` over a cancellation made
     // this the one transition the guard exists to prevent. Same reasoning as `review::record`.
     // Whether the status was left as somebody else set it during the gate. Reported, not
     // returned as an error: the session HAS been disposed of by this point, so bailing left
@@ -6177,7 +2755,7 @@ fn settle_landing(
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (`LandLock` only excludes a second land). The machine has no `land` from `cancelled`,
+    // land (the land lease only excludes a second land). The machine has no `land` from `cancelled`,
     // so a cancellation that arrived during the gate is not overwritten — and it says so rather
     // than being silently skipped.
     //
@@ -6185,41 +2763,22 @@ fn settle_landing(
     // its own second run (`Defect::Unrepeatable`). Nothing is lost by that here — the plan
     // re-asserts the status it already has and re-releases a freed claim — and re-landing is
     // refused far earlier anyway, by `staging::land_blocker`, before any graft happens.
-    let (branch_owned, onto_owned) = (landed.branch.to_owned(), landed.onto.to_owned());
-    let head_owned = landed.head.map(str::to_owned);
-    let kept_status = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        let facts = lifecycle::TaskFacts {
-            // Stated by the caller: this command has just performed the graft and its gate was
-            // green, so it is asserting facts it established rather than re-deriving them.
-            session_exists: Fact::Yes,
-            work_dirty: Fact::No,
-            has_commits: Fact::Yes,
-            target_ready: Fact::Yes,
-            review_waived: Fact::Yes,
-            ..task::observe(conn, id)?
-        };
-        let outcome = jkb_core::transition::perform(
-            conn,
-            meta,
-            id,
-            &facts,
-            lifecycle::TaskEvent::Land,
-            &jkb_core::transition::Labels {
-                branch: Some(branch_owned),
-                onto: Some(onto_owned),
-                ref_commit: head_owned,
-                ..jkb_core::transition::Labels::default()
-            },
-        )?;
-        Ok(outcome.refusal().map(|why| (facts.status, why)))
-    })?;
+    // Through `task.land`, which states the facts this command established — the graft, the green
+    // gate, the disposal — and re-reads the status in its own transaction.
+    let outcome = kb.land(
+        task_uid,
+        jkb_api::sessions::Landed {
+            branch: landed.branch.to_owned(),
+            onto: landed.onto.to_owned(),
+            head: landed.head.map(str::to_owned),
+        },
+    )?;
+    let kept_status = outcome.refusal.map(|why| (outcome.status, why));
     if let Some((status, why)) = &kept_status {
         eprintln!(
-            "note: {} was left `{}` — {why} Its commits are on {}, and its session has been \
+            "note: {} was left `{status}` — {why} Its commits are on {}, and its session has been \
              disposed of.",
-            landed.uid,
-            jkb_fsm::State::name(*status),
-            landed.onto
+            landed.uid, landed.onto
         );
     }
 
@@ -6267,14 +2826,14 @@ fn report_landing(
     sess: &session::Session,
     disposal: &Disposal,
     branch_fate: BranchFate,
-    kept_status: Option<&(jkb_types::TaskStatus, String)>,
+    kept_status: Option<&(String, String)>,
     json: bool,
 ) {
     // Reported from what actually happened, never from what was intended. Two claims here were
     // simply false: `"{uid} is done"` after a status this transaction deliberately left as
     // `cancelled`, and "removed session and its branch" in the arm that only ran
     // `git worktree prune` because somebody else had already removed the directory.
-    let status = kept_status.map_or("done", |(s, _)| jkb_fsm::State::name(*s));
+    let status = kept_status.map_or("done", |(s, _)| s.as_str());
     if json {
         println!(
             "{}",
@@ -6354,9 +2913,9 @@ fn report_landing(
 /// `task reap` — archive worktrees a landing could not move, then delete archives past the
 /// retention window (design D49).
 ///
-/// Takes the database **path** rather than a handle: it touches no rows. The records live beside
-/// the database precisely so this needs no repo context and one service sweeps every repo on the
-/// machine.
+/// Takes the database **path** rather than a handle, and opens it per pass (`reap_once`), so a
+/// database this binary cannot open fails a pass rather than the service. The records need no repo
+/// context, so one service sweeps every repo on the machine.
 #[derive(Clone, Copy)]
 struct ReapFlags {
     retain_days: u64,
@@ -6375,26 +2934,35 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         interval_secs,
     } = flags;
     if break_lock {
+        let db = open_db(db_path)?;
+        let backend = jkb_api::LocalBackend::new(db).with_actor("reap");
+        let stores = archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path));
         // `--dry-run` promises to change nothing, and this ran before that was consulted — so
         // `--dry-run --break-lock` removed a live sweeper's lock while saying it would not.
+        // On stderr under `--json`, whose stdout is the one report document.
+        let say = |line: String| {
+            if json {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        };
         if dry_run {
-            match archive::lock_holder(db_path)? {
-                Some(holder) => println!("would break the sweep lock held by {holder}"),
-                None => println!("no sweep lock is held"),
-            }
+            say(match archive::lock_holder(&stores)? {
+                Some(holder) => format!("would break the sweep lease held by {holder}"),
+                None => "no sweep lease is held".to_owned(),
+            });
         } else {
-            match archive::break_lock(db_path)? {
-                Some(holder) => println!("broke the sweep lock held by {holder}"),
-                None => println!("no sweep lock was held"),
-            }
+            say(match archive::break_lock(&stores)? {
+                Some(holder) => format!("broke the sweep lease held by {holder}"),
+                None => "no sweep lease was held".to_owned(),
+            });
         }
     }
     if !watch {
-        report_reap(
-            &archive::reap(db_path, retain_days, dry_run)?,
-            dry_run,
-            json,
-        );
+        let report = reap_once(db_path, retain_days, dry_run)?;
+        let compaction = (!dry_run).then(|| compact_queue(db_path));
+        report_reap(&report, dry_run, json, compaction.as_ref());
         return Ok(());
     }
     // The service form. Ctrl-C stops it, the same shared-flag shape `sync --watch` uses.
@@ -6408,18 +2976,47 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     // is a log nobody reads the rest of; saying it once, and again when it changes, is the whole
     // of the signal.
     let mut last_observed = String::new();
+    let mut last_compaction_failure = String::new();
+    let mut last_sweep_failure = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        match archive::reap(db_path, retain_days, dry_run) {
+        // The queue's compaction rides the same timer (design r3.2 Q3). Work done is always
+        // printed — two passes that each reaped one message are two events, not a repeat. Only a
+        // FAILURE is silenced while unchanged, for the same reason as the sweep's silence below.
+        if !dry_run {
+            let c = compact_queue(db_path);
+            match &c {
+                Compaction::Failed(why) if *why == last_compaction_failure => {}
+                Compaction::Failed(why) => {
+                    last_compaction_failure.clone_from(why);
+                    print_compaction(&c, json);
+                }
+                Compaction::Did(_) => {
+                    last_compaction_failure.clear();
+                    print_compaction(&c, json);
+                }
+                Compaction::Quiet => last_compaction_failure.clear(),
+            }
+        }
+        match reap_once(db_path, retain_days, dry_run) {
             // Silence when there is nothing to say: this runs every quarter hour for ever, and a
             // log that says "nothing to do" 96 times a day is a log nobody reads the rest of.
-            Ok(r) if r.is_empty() && r.observed() == last_observed => {}
+            Ok(r) if r.is_empty() && r.observed() == last_observed => last_sweep_failure.clear(),
             Ok(r) => {
+                last_sweep_failure.clear();
                 last_observed = r.observed();
-                report_reap(&r, dry_run, json);
+                report_reap(&r, dry_run, json, None);
             }
             // A sweep that failed must not stop the service — the next one may well succeed, and
-            // this is the process that finishes every deferred landing on the machine.
-            Err(e) => eprintln!("reap: {e:#}"),
+            // this is the process that finishes every deferred landing on the machine. Said once
+            // while it stays the same, as the compaction's failure is: a database a newer jkb
+            // migrated fails every pass until that jkb's `setup.sh` replaces this one.
+            Err(e) => {
+                let why = format!("{e:#}");
+                if why != last_sweep_failure {
+                    eprintln!("reap: {why}");
+                    last_sweep_failure = why;
+                }
+            }
         }
         // Slept in slices so Ctrl-C is answered promptly rather than up to `interval` later.
         let deadline = std::time::Instant::now() + interval;
@@ -6432,11 +3029,186 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
+/// One sweep, with the database opened for it and closed after.
+///
+/// **Per sweep, not once for the service**, for the reason the queue's compaction is: the records are
+/// in the database now (tasks S6.4 stage 3), and a database this binary cannot open — one a newer jkb
+/// migrated, routine across branches here — must fail this pass, not the process. The service loop
+/// reports the failure and tries again next interval, where exiting put launchd into a restart loop.
+fn reap_once(db_path: &Path, retain_days: u64, dry_run: bool) -> Result<archive::Report> {
+    let db = open_db(db_path)?;
+    let backend = jkb_api::LocalBackend::new(db).with_actor("reap");
+    let stores = archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path));
+    archive::reap(&stores, retain_days, dry_run)
+}
+
+/// `jkb serve`: run the daemon until Ctrl-C.
+///
+/// A database this build cannot open does not stop it. Exiting would put launchd/systemd into a
+/// restart loop — the reap unit's history with a newer branch's migration — and leave every client
+/// with `unavailable` and no hint. Instead it binds, writes the token, answers each request with the
+/// reason — `schema_newer` when a newer jkb migrated the database (setup.sh restarts the daemon from
+/// that jkb), `unavailable` for any other failure to open it — and tries the open again every few
+/// seconds, so a failure that passes (a lock held past the busy timeout) needs no restart
+/// (`jkb_daemon::server::spawn_opening`).
+fn cmd_serve(
+    db_path: &Path,
+    addr: std::net::SocketAddr,
+    token_file: Option<PathBuf>,
+) -> Result<()> {
+    let token_path = serve_token_for(
+        token_file,
+        addr.port(),
+        std::env::var_os("JKB_NS_MARKER").is_some(),
+        jkb_core::refuse_shared_filesystem,
+    )?;
+    let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
+    let path = db_path.to_path_buf();
+    let open: jkb_daemon::server::Opener = Box::new(move || {
+        open_db(&path).map_err(|e| {
+            jkb_api::ApiError::with_code(
+                mq_cli::open_failure_code(&e),
+                format!("jkb serve cannot open the database: {e:#}"),
+            )
+        })
+    });
+    let handle = jkb_daemon::server::spawn_opening(open, &cfg).context("starting jkb serve")?;
+    // One line, flushed, that a supervisor log and a test can both read: the address actually
+    // bound (a `:0` port is resolved) and where the token went.
+    println!(
+        "jkb serve listening on http://{} (token: {})",
+        handle.addr,
+        token_path.display()
+    );
+    {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    });
+    let _ = rx.recv();
+    handle.shutdown();
+    Ok(())
+}
+
+/// The token path `jkb serve` writes: the one it was given, or the default for its port.
+///
+/// The default is refused in two cases, and an explicit `--token-file` in neither — it is the
+/// caller's own decision.
+///
+/// * **Inside the dev container** (its image sets `JKB_NS_MARKER`), or **on a filesystem shared with
+///   another kernel.** There `~/.jkb` IS the host's, through a bind, so a `jkb serve` run inside (an
+///   agent's smoke test, say) replaced the host daemon's live token: the host daemon kept the old one
+///   in memory, and every client — the Mac's notifier, every hook — was refused until it restarted.
+///   The filesystem type alone misses a native-Linux engine, whose bind is the host's own ext4
+///   (stage-5 review); the marker is the container saying what it is. Residual: another container,
+///   with no marker, on a native-Linux bind.
+/// * **Port 0.** The port is chosen at bind, so `daemon/0/token` is a path no client can derive, and
+///   two such daemons would overwrite each other's.
+fn serve_token_for(
+    explicit: Option<PathBuf>,
+    port: u16,
+    in_container: bool,
+    refuse: impl Fn(&Path) -> jkb_core::Result<()>,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if port == 0 {
+        anyhow::bail!(
+            "jkb serve on port 0 has no default token path a client could find (the port is chosen \
+             at bind); pass --token-file"
+        );
+    }
+    let path = service::serve_token_path(port);
+    if in_container {
+        anyhow::bail!(
+            "jkb serve would write its token to {}, and this is the dev container (JKB_NS_MARKER is \
+             set), whose ~/.jkb is the host's — the host's jkb serve owns that token; run jkb serve \
+             on the host, or pass --token-file",
+            path.display()
+        );
+    }
+    refuse(&path).with_context(|| {
+        format!(
+            "jkb serve would write its token to {}, which another kernel's jkb serve may own (the \
+             dev container sees the host's ~/.jkb); run jkb serve on the host, or pass --token-file",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+/// What one compaction pass of the message queue did.
+enum Compaction {
+    /// Nothing to reap or remove.
+    Quiet,
+    /// Reaped or removed something; the summary.
+    Did(String),
+    /// Could not run; why.
+    Failed(String),
+}
+
+fn print_compaction(c: &Compaction, json: bool) {
+    let (outcome, detail) = match c {
+        Compaction::Quiet => return,
+        Compaction::Did(d) => ("compacted", d),
+        Compaction::Failed(d) => ("failed", d),
+    };
     if json {
         println!(
             "{}",
+            serde_json::json!({ "mq_compact": { "outcome": outcome, "detail": detail } })
+        );
+    } else {
+        println!("mq compact: {detail}");
+    }
+}
+
+/// One compaction pass of the message queue, for the reap service.
+///
+/// It opens the database itself and never lets that failure reach the sweep. The sweep deliberately
+/// does not open the database — a schema this binary does not know would put the service into a
+/// restart loop — and compaction must not reintroduce that dependency through the back door.
+/// Compaction is a no-op for a topic compacted within its own interval, so asking every pass is
+/// cheap; "every few days" is the queue's rule, not this timer's.
+fn compact_queue(db_path: &Path) -> Compaction {
+    use jkb_api::{Backend as _, Response};
+    let db = match open_db(db_path) {
+        Ok(db) => db,
+        Err(e) => return Compaction::Failed(format!("not run ({e:#})")),
+    };
+    match jkb_api::LocalBackend::new(db)
+        .with_actor("reap")
+        .call(jkb_api::Request::MqCompact { force: false })
+    {
+        Ok(Response::Compacted {
+            messages_reaped,
+            groups_removed,
+            ..
+        }) if messages_reaped > 0 || groups_removed > 0 => Compaction::Did(format!(
+            "reaped {messages_reaped} message(s), removed {groups_removed} idle group(s)"
+        )),
+        Ok(_) => Compaction::Quiet,
+        Err(e) => Compaction::Failed(e.message),
+    }
+}
+
+fn report_reap(r: &archive::Report, dry_run: bool, json: bool, compaction: Option<&Compaction>) {
+    if json {
+        // The queue's compaction rides in the same object: a second JSON document after this one
+        // made `jkb --json task reap`'s stdout neither JSON nor NDJSON.
+        let mq_compact = match compaction {
+            None | Some(Compaction::Quiet) => serde_json::Value::Null,
+            Some(Compaction::Did(d)) => serde_json::json!({ "outcome": "compacted", "detail": d }),
+            Some(Compaction::Failed(d)) => serde_json::json!({ "outcome": "failed", "detail": d }),
+        };
+        println!(
+            "{}",
             serde_json::json!({
+                "mq_compact": mq_compact,
                 "dry_run": dry_run,
                 "archived": r.archived.iter()
                     .map(|(uid, p)| serde_json::json!({ "uid": uid, "archive": p.display().to_string() }))
@@ -6450,12 +3222,12 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
                     .map(|(uid, why)| serde_json::json!({ "uid": uid, "reason": why }))
                     .collect::<Vec<_>>(),
                                 "skipped": r.skipped.as_ref().map(|h| serde_json::json!({
-                    "lock": h.path.display().to_string(),
+                    "lock": jkb_api::removals::SWEEP_LEASE,
                     "holder": h.holder,
                 })),
+                "old_records": r.old_records,
                 "retained": r.retained.len(),
                 "retained_bytes": r.retained.iter().map(|p| archive::dir_size(p)).sum::<u64>(),
-                "unreadable": r.unreadable.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             })
         );
         return;
@@ -6489,16 +3261,16 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
     for (uid, why) in &r.held {
         println!("held {uid}: {why}");
     }
-    for path in &r.unreadable {
-        println!("unreadable record {} (left alone)", path.display());
+    for line in &r.old_records {
+        println!("{line}");
     }
     if let Some(held) = &r.skipped {
         // Named in full: an owner on another host is Unknown and unknown frees nothing, so a lock
         // left by a container that has since been rebuilt is respected for ever by every sweep on
         // both sides. `--break-lock` is the way out, and it needs something to point at.
         println!(
-            "another sweep holds {} ({}); this one looked at nothing",
-            held.path.display(),
+            "another sweep holds the `{}` lease ({}); this one looked at nothing",
+            jkb_api::removals::SWEEP_LEASE,
             if held.holder.is_empty() {
                 "holder unknown"
             } else {
@@ -6518,6 +3290,9 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
             human_bytes(r.retained.iter().map(|p| archive::dir_size(p)).sum())
         );
     }
+    if let Some(c) = compaction {
+        print_compaction(c, false);
+    }
 }
 
 /// What becomes of the session worktree once its commits are on the target.
@@ -6526,7 +3301,7 @@ fn report_reap(r: &archive::Report, dry_run: bool, json: bool) {
 /// runs BEFORE the task's plan is applied, so a refusal leaves the task exactly where it was and
 /// the verb is re-runnable (D48).
 fn dispose_session(
-    db_path: &Path,
+    stores: &archive::Stores<'_>,
     ctx: &repo::RepoCtx,
     sess: &session::Session,
     landed: &Landed<'_>,
@@ -6546,9 +3321,9 @@ fn dispose_session(
     // Deleting it is a separate, later decision, taken by `jkb task reap` once it has aged out.
     let mut disposal = Disposal::Kept;
     if disposed_already {
-        // Somebody removed it while the gate ran. Nothing to dispose of, and prune the
-        // registration so git stops listing a worktree whose directory is gone.
-        let _ = gitrepo::prune_worktrees(&ctx.root);
+        // Somebody removed it while the gate ran. Nothing to dispose of; its registration is dropped,
+        // by path, so git stops listing a worktree whose directory is gone.
+        let _ = gitrepo::forget_worktree(&ctx.root, &sess.worktree);
         disposal = Disposal::AlreadyGone;
     } else if landed.keep_worktree {
         // `graft` rebased a detached HEAD, so the branch ref still points at its pre-rebase
@@ -6578,7 +3353,7 @@ fn dispose_session(
         // The one disposal both `land` and `abandon` call — see `archive::dispose` for why that
         // matters. A landing's branch is a duplicate of commits now in the target, so it goes.
         match archive::dispose(
-            db_path,
+            stores,
             &ctx.root,
             &sess.worktree,
             landed.branch,
@@ -6678,8 +3453,8 @@ fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
     }
     anyhow::ensure!(
         !base.exists(),
-        "{} exists but git does not know it as a worktree — remove it, or run \
-         `git worktree prune`",
+        "{} exists but git does not know it as a worktree — look at it, then move it \
+         out of the way (not `git worktree prune`, which drops every checkout this side cannot see)",
         base.display()
     );
     if let Some(parent) = base.parent() {
@@ -6695,307 +3470,6 @@ fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
 fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
-}
-
-/// `task abandon` — drop a session without landing it (design D36.6).
-fn cmd_task_abandon(
-    db: &Db,
-    db_path: &Path,
-    uid: &str,
-    force: bool,
-    delete_branch: bool,
-    json: bool,
-) -> Result<()> {
-    let ctx = repo::repo_ctx()?;
-    let id = resolve_task_uid(db, uid)?;
-    // Abandon does two separable things: it **disposes of the session**, and it **reopens the
-    // task**. Only the second is wrong for a terminal task — a landed one is already merged
-    // and a cancelled one was deliberately dropped, so putting either back on the ready
-    // frontier (still tagged with its branch, re-dispatchable to the swarm) is the harm.
-    //
-    // Refusing outright was the first fix, and it stranded the session instead: `task set
-    // --status cancelled` leaves the worktree, branch and claim in place, no other verb
-    // removes them, and the workaround the refusal suggested — reopen, then abandon — caused
-    // exactly the reopening it was guarding against. So the cleanup runs and the status is
-    // left alone. The decision is taken inside the transaction below, against the status as
-    // it is *then* — not against a snapshot from before a worktree removal that can take
-    // long enough for a concurrent land to finish.
-    let tags = repo::task_tags(db, id)?;
-    // Through the one rule (`repo::work_for`), not a third theory of it. This used to prefer the
-    // session's branch and otherwise take the *first* recorded value — and `tag::applications`
-    // orders by value, so a task carrying a stale `a-old` beside a live `z-live` had this command
-    // delete `a-old` and forget its cut point under `--delete-branch`, while `jkb staging ls` and
-    // `jkb task land` both named `z-live` as the branch the row was about. Abandon acted on a
-    // branch the user was never shown, and reported it as though it were the one they clicked.
-    let repo::Work {
-        session: sess,
-        branch,
-    } = repo::work_for(&ctx, &tags)?;
-    let branch = branch.with_context(|| format!("{uid} has no session"))?;
-
-    // Abandoning is for **this** session's work. Since the swarm now records `branch=` and its
-    // branch's land target so its tasks appear in the same views (D38), a task another IMPLEMENTER is
-    // actively building is one right-click away — and `claim::clear` has no owner CAS, so it
-    // would free a live claim and let the next SCHEDULER pass dispatch a second builder while
-    // the first keeps going. Refuse a claim this session does not hold unless forced.
-    let held = current_claim(db, id)?;
-    if let Some(owner) = &held {
-        let mine = sess.as_ref().is_some_and(|s| {
-            owner::session_worktree(owner).is_some_and(|w| session::same_path(&w, &s.worktree))
-        });
-        // **Liveness**, the same rule `task work` and `task start` follow (D27.1/D36.6) —
-        // not owner-string identity. Judging by name refused a claim left behind by a crashed
-        // implementer or a session whose worktree was deleted by hand, so the one command that
-        // exists to clean a session up was blocked by the wreckage it was there to remove, and
-        // pointed the user at `jkb task release` for an owner that provably no longer exists.
-        // What must be protected is work someone is *still doing*.
-        if !mine && !owner::is_alive(owner).is_no() && !force {
-            anyhow::bail!(
-                "{uid} is claimed by {owner}, which is still alive — abandoning it would free \
-                 a claim someone is working under (or is an owner whose liveness cannot be \
-                 checked from here). Finish or abandon that work, use `jkb task release {uid} \
-                 --owner {owner}` if you are sure it is gone, or pass --force."
-            );
-        }
-    }
-
-    let deferred = abandon_session(
-        db_path,
-        &ctx,
-        sess.as_ref(),
-        &branch,
-        uid,
-        delete_branch,
-        force,
-    )?;
-    // Deleting the branch leaves the history alone, and that is correct: an entry says what
-    // happened at a moment, and a branch deleted afterwards does not make it untrue. Nothing is
-    // keyed by the name, so the next `jkb task work` cutting a **new** branch under the same
-    // name cannot inherit anything from the old one — which is what the cut point this used to
-    // have to forget was for.
-    // NOT while the worktree still holds it. When the disposal deferred, the checkout is still
-    // there with this branch checked out, and `git branch -D` refuses outright — which `?` turned
-    // into a bail BEFORE the claim was released, leaving the task `in_progress`, claimed by a
-    // session whose worktree still exists (so `is_alive` says Yes) and therefore reclaimable by
-    // nothing. Re-running failed identically. The decision is already in the record's `Plan`, and
-    // `delete_branch_if_any` applies it once the tree is out of the way.
-    // `is_yes()`: delete only a branch proven to be there. An unestablished answer leaves it
-    // alone, which costs a `git branch -D` and never an unrecoverable one.
-    if delete_branch && deferred.is_none() && gitrepo::has_branch(&ctx.root, &branch)?.is_yes() {
-        gitrepo::delete_branch(&ctx.root, &branch, true)?;
-    }
-    // Read from git rather than from what this function did: `dispose` deletes the branch itself
-    // when it archived the tree, so a flag set here would report `false` for a branch that is
-    // gone. Asked once, after everything that could have removed it.
-    // Read from git rather than from what this function did — `dispose` deletes the branch itself
-    // when it archived the tree — and folded into ONE value, so no two lines can disagree.
-    // Three-valued, and an unestablished answer is reported as still there rather than as gone:
-    // saying a branch was deleted when git could not say is what stops somebody looking for it.
-    // `deferred.is_some()` is passed because "the reaper will delete it" is a claim about the
-    // RECORD, not about the branch: with the tree archived (or already gone) there is no record,
-    // so nothing will ever apply the plan and the operator has to do it themselves.
-    let still_there = gitrepo::has_branch(&ctx.root, &branch)?;
-    let branch_fate = branch_fate(
-        delete_branch,
-        still_there,
-        deferred
-            .as_ref()
-            .is_some_and(archive::Deferral::will_be_swept),
-    );
-
-    // Release, and reopen unless the task is already finished.
-    //
-    // The land target is cleared **only** when the task is reopened, which is exactly when it
-    // stops being true: an abandoned task is no longer landing on that batch, and leaving it
-    // made the task keep rendering as live `implementing` work — which in turn kept its staging
-    // branch classified unmerged and offered as a land target long after the batch was spent
-    // (D36.3). For a task that stays `done` or `cancelled` it is history: it records which batch
-    // the work went to (or was dropped from), and the In Flight view reads it.
-    //
-    // The status is re-read inside the transaction, so a task that finished while this
-    // command was removing a worktree is not reopened by a decision taken before that.
-    // Reported from what the transaction actually did, not from the snapshot taken before the
-    // worktree removal: a task that finished while this command was running was correctly
-    // left alone, and then announced as "open again" with `"reopened": true`, which the
-    // extension believes.
-    let observed = held.clone();
-    let (reopened, final_status, shared) = db.write_txn("cli", move |conn, meta| {
-        // Only the claim judged above, and nothing at all when there was none. `held` was read
-        // before two git subprocesses (`worktree remove`, `delete-branch`) — a far wider window
-        // than the `ps` fork that motivated `clear_if` — so a claim taken in the meantime
-        // belongs to a worker whose claim this command never looked at. An unconditional clear
-        // freed a task the next SCHEDULER pass had just handed to an implementer, and then
-        // reopened it, which is how two builders end up on one task.
-        // Also covers the case the guard above missed: no claim was observed before the git
-        // subprocesses, but one exists now. `set_status(Open)` is non-terminal so `task.rs:446`
-        // does not fire and the new owner's claim survives either way — the harm is a cleared
-        // land target and a `"reopened": true` that is not true, rather than two builders on one
-        // task, since `ready` requires `claimant_id IS NULL`.
-        if observed.is_none() && claim::claimed(conn)?.iter().any(|c| c.id == id) {
-            let current = item::get(conn, id)?
-                .and_then(|m| m.status)
-                .unwrap_or_default();
-            return Ok((false, current, Vec::new()));
-        }
-        if let Some(prev) = &observed {
-            if !claim::clear_if(conn, meta, id, prev)? {
-                // The claim changed hands while the worktrees were being removed. Whoever
-                // holds it now was never judged by this command, so reopening the task and
-                // clearing its land target would take work off a live worker — the same reasoning
-                // that makes the clear itself a CAS. Report what is true and change nothing.
-                let current = item::get(conn, id)?
-                    .and_then(|m| m.status)
-                    .unwrap_or_default();
-                return Ok((false, current, Vec::new()));
-            }
-        }
-        let current = item::get(conn, id)?
-            .and_then(|m| m.status)
-            .unwrap_or_default();
-        // Through the machine, and **only** the machine: a terminal task simply has no `abandon`
-        // transition, so the refusal that used to be re-stated here is the same refusal the In
-        // Flight row shows. A second copy of a rule reads as protection while diverging from the
-        // one that actually decides — which is how one click came to reopen a task that had
-        // already merged.
-        //
-        // The claim is not re-judged here either. If it changed hands while the worktrees were
-        // being removed, the arm above has already returned; past that point the machine's plan
-        // releases the claim with the status, as one value.
-        let facts = lifecycle::TaskFacts {
-            // Stated by the caller, and it is entitled to state it: reaching this line means
-            // either the guard above proved the checkout clean (`is_dirty(...).is_no()`, which
-            // an unreadable checkout now fails) or the operator passed `--force`, which is them
-            // supplying the fact — the same decision `Plan::accept_dirty` records for the sweep.
-            //
-            // So `abandon_guard`'s own dirty denial is unreachable from here by construction.
-            // That is deliberate rather than an oversight: the CLI refuses earlier, with a
-            // remedy naming this worktree and the `--force` that overrides it, and `--force`
-            // must not then be vetoed by a second copy of the rule it just answered.
-            work_dirty: Fact::No,
-            ..task::observe(conn, id)?
-        };
-        let outcome = jkb_core::transition::perform(
-            conn,
-            meta,
-            id,
-            &facts,
-            lifecycle::TaskEvent::Abandon,
-            &jkb_core::transition::Labels::default(),
-        )?;
-        match outcome.refusal() {
-            Some(_) => Ok((false, current, Vec::new())),
-            None => Ok((true, "open".to_owned(), Vec::new())),
-        }
-    })?;
-    let _: Vec<()> = shared;
-
-    report_abandon(
-        uid,
-        &branch,
-        &AbandonOutcome {
-            reopened,
-            final_status: &final_status,
-            worktree_removed: sess.is_some() && deferred.is_none(),
-            deferred: deferred.as_ref(),
-            branch: branch_fate,
-        },
-        json,
-    );
-    Ok(())
-}
-
-/// Dispose of an abandoned session, if there is one, and say why not when it could not be moved.
-///
-/// Split out so `cmd_task_abandon` stays readable; the decision itself is the caller's and is
-/// recorded in the [`archive::Plan`], which is what the sweep applies later.
-fn abandon_session(
-    db_path: &Path,
-    ctx: &repo::RepoCtx,
-    sess: Option<&session::Session>,
-    branch: &str,
-    uid: &str,
-    delete_branch: bool,
-    force: bool,
-) -> Result<Option<archive::Deferral>> {
-    let Some(sess) = sess else { return Ok(None) };
-    // ALREADY GONE is its own outcome, not a deferral. Without this arm `dispose` reported that
-    // the tree "could not be archived from in here" — true, but because there was nothing to
-    // archive — and handed `--delete-branch` to a sweep with nothing to do, so the branch was
-    // never deleted here and never deleted there. `land` has had this arm since D36.4.
-    // PROVEN gone, not merely un-stat-able. `Path::exists()` reports `false` for any stat error,
-    // so an untraversable `.jkb/work` took this shortcut for a session that was still there —
-    // skipping `dispose`, so no record was written, and returning to a caller that then deletes
-    // the branch on `--delete-branch`. An abandoned branch holds the only copy of its commits (as
-    // the comment below says), so that pair is: commits deleted, checkout orphaned, nothing
-    // tracking it. `Unknown` falls through instead, where the dirty check refuses with something
-    // the operator can act on, and `--force` reaches `dispose`, which records rather than bails.
-    if presence::present_under(&sess.worktree, &ctx.root)
-        .fact()
-        .is_no()
-    {
-        let _ = gitrepo::prune_worktrees(&ctx.root);
-        return Ok(None);
-    }
-    {
-        if !force {
-            // `--force` is the answer to both a dirty tree and an unreadable one: it records
-            // that the operator accepts whatever is in there (`Plan::accept_dirty`), which is
-            // the same decision either way.
-            anyhow::ensure!(
-                gitrepo::is_dirty(&sess.worktree, &ctx.root)?.is_no(),
-                "{} could not be established as having no uncommitted changes — commit them, \
-                 or pass --force to discard whatever is there",
-                sess.worktree.display()
-            );
-        }
-        // ARCHIVED, not removed — the same rule `land` follows, through the same function.
-        // `git worktree remove` unlinks the tree and stops at the first refusal, so run from
-        // inside a sandboxed session this verb gutted the checkout it was asked to drop. It is
-        // also the verb an operator naturally reaches for to clear the directory a deferred
-        // landing leaves behind, which made it the likeliest route to that state.
-        //
-        // The branch is deleted only below, and only when asked: an abandoned branch holds the
-        // only copy of real work, which is why `--force` here discards a dirty tree but never
-        // the commits.
-        if let archive::Disposed::Deferred(d) = archive::dispose(
-            db_path,
-            &ctx.root,
-            &sess.worktree,
-            branch,
-            uid,
-            archive::Plan {
-                // THE OPERATOR'S decision, recorded so the sweep applies it rather than
-                // land's. An abandoned branch holds the only copy of real work, and the
-                // reaper used to force-delete it a quarter of an hour after this verb had
-                // printed "branch kept".
-                delete_branch,
-                // `--force` means exactly "I accept what is uncommitted in there".
-                // Unrecorded, the sweep's own dirty check held the record for ever over the
-                // question the operator had already answered.
-                accept_dirty: force,
-            },
-        )? {
-            return Ok(Some(d));
-        }
-    }
-    Ok(None)
-}
-
-/// What `abandon` actually did, so the report is built from outcomes rather than from the flags
-/// that were asked for.
-struct AbandonOutcome<'a> {
-    reopened: bool,
-    final_status: &'a str,
-    /// The checkout is no longer where it was — archived, or there was none.
-    worktree_removed: bool,
-    /// Why the checkout could not be archived from here, and what will become of the record —
-    /// so the sentence about `jkb task reap` is derived rather than assumed.
-    deferred: Option<&'a archive::Deferral>,
-    /// What became of the branch. One value rather than "was it asked for" beside "did it
-    /// happen", because the report printed both "branch kept — delete it with `git branch -D`"
-    /// and the deferred-deletion sentence from those two, which contradict — and the first's
-    /// remedy cannot work anyway while the deferred worktree still holds the branch.
-    branch: BranchFate,
 }
 
 /// What happened to a disposed session's branch. Shared by `land` and `abandon`, which asked the
@@ -7056,211 +3530,6 @@ fn branch_fate(asked_to_delete: bool, present: Fact, reaper_will_act: bool) -> B
     }
 }
 
-fn report_abandon(uid: &str, branch: &str, out: &AbandonOutcome<'_>, json: bool) {
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "uid": uid, "abandoned": true, "branch": branch, "reopened": out.reopened,
-                "status": out.final_status,
-                // What happened, not what was asked for: `--delete-branch` on a branch that was
-                // already gone deletes nothing.
-                "worktree_removed": out.worktree_removed,
-                "branch_deleted": out.branch == BranchFate::Deleted,
-                "branch_owed_to_reaper": out.branch == BranchFate::OwedToTheReaper,
-                "worktree_deferred": out.deferred.map(|d| d.why.clone()),
-                "worktree_deferred_sweepable": out.deferred.map(archive::Deferral::will_be_swept),
-            })
-        );
-    } else {
-        if out.reopened {
-            println!("abandoned {uid}; it is open again");
-        } else {
-            println!(
-                "abandoned the session for {uid}; it stays {}",
-                out.final_status
-            );
-        }
-        // DERIVED from the verdict on the record, not from the fact that one was written. See
-        // `report_landing` for the same correction: a record the sweep cannot act on was being
-        // reported as work in hand.
-        if let Some(d) = out.deferred {
-            println!(
-                "  the checkout could not be archived from in here ({}), so {}",
-                d.why,
-                d.outlook()
-            );
-        }
-        // ONE line about the branch, from one value.
-        match out.branch {
-            BranchFate::Deleted | BranchFate::Absent => {}
-            BranchFate::OwedToTheReaper => println!(
-                "  branch {branch} will be deleted when `jkb task reap` archives the checkout"
-            ),
-            BranchFate::Kept => {
-                println!("  branch {branch} kept — delete it with `git branch -D {branch}`");
-            }
-        }
-    }
-}
-
-/// `task sessions` — what is in flight in this repo.
-fn cmd_task_sessions(db: &Db, db_path: &Path, json: bool) -> Result<()> {
-    let ctx = repo::repo_ctx()?;
-    let sessions = session::discover(&ctx.root)?;
-    let by_branch = repo::tasks_by_branch(db, &ctx.key)?;
-    // Which checkouts are finished and merely waiting to be moved. In the container EVERY landing
-    // produces one — a session cannot archive its own worktree — so without this the listing an
-    // operator reads to find live work is mostly finished work, in rows identical to it.
-    // FROM THE VERDICT, not from the existence of a record. `[awaiting archive]` means "work
-    // already done that nothing has moved yet"; a record the sweep is going to HOLD means the
-    // opposite, and rendering the two the same is the hand-written "a sweep will finish this"
-    // claim the verdict seam exists to stop. `pending_outlook` also applies supersession, so a
-    // withdrawn record does not put a badge on a live session.
-    //
-    // ONE read, partitioned — not two filtered reads of the same thing. Each `pending_outlook`
-    // re-observes every record, which means a `git worktree list` and a `git status` per pending
-    // checkout; asked twice they can disagree, and a worktree that changed underneath between the
-    // two calls would land in BOTH sets or in NEITHER. Two answers to one question, which is the
-    // shape `pending_outlook` was just introduced to remove from these two surfaces.
-    //
-    // Held records get their own set rather than being folded into the one above, so the listing
-    // can say a checkout needs attention rather than silently omitting it — an absent badge reads
-    // as "nothing outstanding".
-    let (stuck, awaiting): (std::collections::BTreeSet<PathBuf>, _) =
-        archive::pending_outlook(db_path)
-            .map(|rows| {
-                let (held, moving): (Vec<_>, Vec<_>) = rows
-                    .into_iter()
-                    .partition(|(_, v)| matches!(v, archive::Verdict::Hold(_)));
-                let paths = |rs: Vec<(archive::Entry, archive::Verdict)>| {
-                    rs.into_iter().map(|(e, _)| e.worktree).collect()
-                };
-                (paths(held), paths(moving))
-            })
-            .unwrap_or_default();
-
-    let mut rows = Vec::new();
-    for s in &sessions {
-        let task = by_branch.get(&s.branch);
-        let onto = task.and_then(|t| t.onto.clone());
-        // Resolved first: a recorded land target whose branch has since been deleted cannot be
-        // counted against, and `ahead_count` refuses an operand it cannot resolve rather than
-        // answering zero.
-        let onto_ref = match &onto {
-            Some(o) => gitrepo::branch_ref(&ctx.root, o, gitrepo::Prefer::Local)?,
-            None => None,
-        };
-        // `None`, never `0`: a recorded land target that no longer exists makes the count
-        // unknowable, and zero already means "nothing to land" to every other reader. This is the
-        // fourth call site of `ahead_count` and the last one still folding the two together.
-        let ahead = match &onto_ref {
-            Some(reference) => Some(gitrepo::ahead_count(&ctx.root, reference, &s.branch)?),
-            None => None,
-        };
-        // Deliberately no "attended" flag: nothing here can observe whether anyone is sitting
-        // in a session. The owner's pid belongs to the one-second `jkb task work` process, so
-        // a flag built on it reads "unattended" for the session you are working in and tells
-        // you to abandon it. What IS observable — uncommitted work, commits ahead — is
-        // reported instead (design D36.6).
-        rows.push(serde_json::json!({
-            "session": s.name,
-            "worktree": s.worktree,
-            "branch": s.branch,
-            "onto": onto,
-            "uid": task.map(|t| t.uid.clone()),
-            "status": task.map(|t| t.status.clone()),
-            // Three-valued, like every other reader of this: `"unknown"` is a checkout git
-            // could not read, which `jkb task land` refuses and which a listing must not
-            // render as the clean, landable `false`.
-            "dirty": gitrepo::is_dirty(&s.worktree, &ctx.root)?.as_str(),
-            "commits": ahead,
-            "awaiting_archive": awaiting.iter().any(|w| session::same_path(w, &s.worktree)),
-            // Distinct from the above rather than folded into it: "nothing will move this until
-            // you act" is a different fact from "something will", and a consumer that saw only
-            // one flag could not tell either from "there is no record at all".
-            "archive_blocked": stuck.iter().any(|w| session::same_path(w, &s.worktree)),
-        }));
-    }
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-    } else if rows.is_empty() {
-        println!("(no sessions in {})", ctx.key);
-    } else {
-        for r in &rows {
-            // Three-valued, like the field it reads. `as_bool` here would have quietly dropped
-            // the badge the moment `dirty` became a string, and an unreadable checkout must not
-            // render as the clean, landable case — it is the one `jkb task land` refuses.
-            let dirty = match r["dirty"].as_str() {
-                Some("yes") => " [uncommitted]",
-                Some("unknown") => " [unreadable]",
-                _ => "",
-            };
-            // Said in the row, because it is the difference between work to pick up and work
-            // already done that nothing has moved yet.
-            let awaiting = if r["archive_blocked"].as_bool().unwrap_or(false) {
-                " [archive blocked — see `jkb doctor`]"
-            } else if r["awaiting_archive"].as_bool().unwrap_or(false) {
-                " [awaiting archive]"
-            } else {
-                ""
-            };
-            // Three states, not two: a count, a target that has been deleted, and a session that
-            // never recorded one. Folding the last into the second sent people looking for a
-            // branch nobody had removed.
-            let commits = match (r["commits"].as_u64(), r["onto"].as_str()) {
-                (Some(n), _) => format!("{n} commit(s)"),
-                (None, Some(onto)) => format!("commits unknown ({onto} no longer exists)"),
-                (None, None) => "commits unknown (no land target recorded)".to_owned(),
-            };
-            println!(
-                "{:<28} {} → {}  {commits}{dirty}{awaiting}",
-                r["session"].as_str().unwrap_or("?"),
-                r["branch"].as_str().unwrap_or("?"),
-                r["onto"].as_str().unwrap_or("?"),
-            );
-            if let Some(uid) = r["uid"].as_str() {
-                println!("  {uid} ({})", r["status"].as_str().unwrap_or("?"));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `task gate` — show, set, or clear the command that verifies a landing here (D36.5).
-fn cmd_task_gate(db: &Db, cmd: Option<&str>, clear: bool, json: bool) -> Result<()> {
-    let ctx = repo::repo_ctx()?;
-    if clear {
-        session::set_gate(db, &ctx.key, None)?;
-    } else if let Some(cmd) = cmd {
-        session::set_gate(db, &ctx.key, Some(cmd))?;
-    }
-    let stored = session::stored_gate(db, &ctx.key)?;
-    let detected = if stored.is_none() {
-        session::autodetect_gate(&ctx.root)
-    } else {
-        None
-    };
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"repo": ctx.key, "gate": stored, "would_detect": detected})
-        );
-    } else {
-        match (&stored, &detected) {
-            (Some(g), _) => println!("gate for {}: {g}", ctx.key),
-            (None, Some(d)) => println!("gate for {}: (none stored; would use {d})", ctx.key),
-            (None, None) => println!(
-                "gate for {}: (none — landings here are UNVERIFIED; set one with \
-                 `jkb task gate '<cmd>'`)",
-                ctx.key
-            ),
-        }
-    }
-    Ok(())
-}
-
 /// The `doctor` line for this repo's task sessions. Best-effort: `doctor` is often run
 /// outside a git repo entirely, and that is not a fault to report.
 ///
@@ -7272,17 +3541,23 @@ fn cmd_task_gate(db: &Db, cmd: Option<&str>, clear: bool, json: bool) -> Result<
 /// Reported by `doctor` because both halves are otherwise invisible: a deferred removal is a
 /// session directory sitting where a completed landing left it, and an archive is disk that will
 /// be deleted on a schedule nobody was told about. `--fix` runs the same sweep the service runs,
-/// which is the whole point of the record living beside the database rather than in a repo.
-fn report_worktree_removals(db_path: &Path, fix: bool) {
-    let store = match archive::entries(db_path) {
+/// which is the whole point of the record living in the database rather than in a repo.
+fn report_worktree_removals(db: &Db, db_path: &Path, fix: bool) {
+    let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
+    let stores = archive::Stores::new(session_cli::Kb::new(&backend), Some(db_path));
+    let store = match archive::entries(&stores) {
         Ok(s) => s,
         Err(e) => {
             println!("worktree removals: unknown ({e})");
             return;
         }
     };
-    if store.records.is_empty() && store.unreadable.is_empty() && store.rejected.is_empty() {
+    let legacy = store.legacy.lines();
+    if store.records.is_empty() && store.rejected.is_empty() && legacy.is_empty() {
         println!("worktree removals: none pending");
+        if fix {
+            fix_worktree_removals(&stores);
+        }
         return;
     }
     let archived: Vec<_> = store
@@ -7374,26 +3649,41 @@ fn report_worktree_removals(db_path: &Path, fix: bool) {
             );
         }
     }
-    for path in &store.unreadable {
-        println!("  unreadable record {}", path.display());
+    // The old file store: what an older jkb left there, for the operator to judge.
+    for line in &legacy {
+        println!("  {line}");
     }
     // Refused records were invisible here while `reap` reported them held — so a store holding
     // nothing BUT refused records read as "none pending", which is the one state a person needs
     // to be told about.
     for r in &store.rejected {
-        println!("  {} — REFUSED: {} ({})", r.uid, r.why, r.marker.display());
+        println!("  {} — REFUSED: {} ({})", r.uid, r.why, r.marker);
     }
     if fix {
-        match archive::reap(db_path, archive::RETAIN_DAYS, false) {
-            Ok(r) => report_reap(&r, false, false),
-            Err(e) => println!("  sweep failed: {e}"),
-        }
+        fix_worktree_removals(&stores);
     } else if !awaiting.is_empty() {
         println!("  run `jkb doctor --fix` or `jkb task reap` (the watcher service runs it)");
     }
 }
 
-fn report_sessions(db: &Db) {
+/// `doctor --fix`'s sweep — the one the service runs.
+fn fix_worktree_removals(stores: &archive::Stores<'_>) {
+    match archive::reap(stores, archive::RETAIN_DAYS, false) {
+        // The old store was listed a few lines above; once is enough.
+        Ok(r) => report_reap(
+            &archive::Report {
+                old_records: Vec::new(),
+                ..r
+            },
+            false,
+            false,
+            None,
+        ),
+        Err(e) => println!("  sweep failed: {e}"),
+    }
+}
+
+fn report_sessions(kb: &session_cli::Kb<'_>) {
     let Ok(ctx) = repo::repo_ctx() else { return };
     let Ok(sessions) = session::discover(&ctx.root) else {
         return;
@@ -7401,455 +3691,29 @@ fn report_sessions(db: &Db) {
     if sessions.is_empty() {
         return;
     }
-    let by_branch = repo::tasks_by_branch(db, &ctx.key).unwrap_or_default();
+    let by_branch = kb.by_branch(&ctx.key).unwrap_or_default();
     println!("task sessions: {} in flight", sessions.len());
     for s in &sessions {
-        let uid = by_branch
+        match by_branch
             .get(&s.branch)
-            .map_or("(no task)", |t| t.uid.as_str());
-        println!(
-            "  {} — {uid}: resume with `cd {}`, land it with `jkb task land {uid}`, or drop \
-             it with `jkb task abandon {uid}`",
-            s.name,
-            s.worktree.display()
-        );
-    }
-}
-
-/// One task's verdict in a `close-merged` run.
-struct CloseVerdict {
-    uid: String,
-    /// The pull request consulted, when there was one.
-    pr: Option<i64>,
-    /// Why it was **not** closed, or `None` if it was.
-    held: Option<String>,
-}
-
-/// `task close-merged`: close every task in this repo whose pull request has merged.
-///
-/// **A lookup, not an inference.** This used to ask the commit graph *"does this branch add
-/// anything to trunk?"*, which cannot distinguish a branch whose work was squash-merged away
-/// from one that never started — so making it answerable needed a stored cut point per branch,
-/// a reflog-derived anchor saying which *instance* of a reusable name that cut point described,
-/// and a supersede rule for when the name changed hands. Roughly a quarter of the
-/// `staging-workflow` review corpus's must-fix findings lived in that apparatus, and it is gone:
-/// a pull request number is minted by GitHub and never reused, so there is nothing to
-/// disambiguate.
-///
-/// It closes nothing it cannot prove. No number recorded, no `gh`, no network, a branch name
-/// that matches two pull requests — every one of those is [`Fact::Unknown`], the lifecycle holds
-/// the task, and the reason is printed. A missed close costs one command; a wrong one buries
-/// work still in flight (design D34.4).
-///
-/// # Errors
-/// Errors if the repo cannot be resolved or a database read or write fails.
-fn cmd_task_close_merged(db: &Db, repo: Option<String>, dry_run: bool, json: bool) -> Result<()> {
-    let ctx = repo::repo_ctx().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let repo = repo.unwrap_or_else(|| ctx.key.clone());
-    // **Refused when `--repo` names somewhere else.** Pull request numbers are per-repository
-    // and low ones collide by construction, so resolving another repo's task against *this*
-    // checkout asks `gh pr view 31` here and closes on an unrelated merge — D34.4's "a wrong
-    // close buries work still in flight". The predecessor refused this outright; deleting the
-    // whole inference took its guard with it.
-    anyhow::ensure!(
-        repo == ctx.key,
-        "`--repo {repo}` names a different repository from this checkout ({}), and pull request \
-         numbers are per-repository — asking `gh` here would resolve {}'s numbers against {}'s. \
-         Run it from {repo}'s checkout.",
-        ctx.key,
-        repo,
-        ctx.key,
-    );
-    // Typed, not interpolated into the DSL: `--repo` is user-typed, and a value with whitespace
-    // would re-tokenize into a different query that matches nothing — closing no task and
-    // reporting no error.
-    let query = repo::tasks_in_repo(&repo);
-    let ids = db.read(move |conn| query.evaluate(conn))?;
-
-    let mut verdicts = Vec::new();
-    for id in ids {
-        // A finished task costs nothing. `tasks_in_repo` deliberately keeps terminal tasks (the
-        // staging view needs them), so the filter lives here — without it this fired a `gh`
-        // subprocess and a write transaction per long-`done` task on **every `git pull`**, via
-        // the `post-merge` hook, and then reported them under "closed N task(s)" because
-        // `Outcome::Idempotent` has no refusal to print.
-        let status = db
-            .read(move |conn| item::get(conn, id))?
-            .and_then(|m| m.status);
-        if jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
-            continue;
-        }
-        verdicts.push(close_one(db, &ctx.root, id, dry_run)?);
-    }
-    report_close_merged(&verdicts, dry_run, json);
-    Ok(())
-}
-
-/// Decide one task, and close it if a merged pull request proves it landed.
-///
-/// The decision is the lifecycle's, not this function's: it gathers facts and asks for
-/// [`lifecycle::TaskEvent::ObservedLanded`], whose guard requires the merge **proven** and no
-/// open subtasks. Everything this used to decide for itself — is a missing branch a landing? is
-/// a zero-commit branch merged? does this record describe this branch? — was a question only the
-/// graph inference had to ask.
-fn close_one(db: &Db, root: &Path, id: ItemId, dry_run: bool) -> Result<CloseVerdict> {
-    let uid = db
-        .read(move |conn| item::get(conn, id))?
-        .map(|m| m.uid)
-        .unwrap_or_default();
-    // **A landing jkb itself recorded is asked about first**, because when the merge queue
-    // grafted locally it is the only evidence that exists — there is no pull request to ask
-    // about. A task held for an open subtask has exactly that entry (see `cmd_task_landed`), and
-    // asking GitHub first meant it was never reached: `discover_quietly` returns a hold whenever
-    // it cannot name a pull request, which is always for such a branch.
-    //
-    // One read of the history for all of it — the landing, whether it still counts, when the task
-    // was last put back to work, and any recorded pull request number.
-    let landing = db.read(move |conn| jkb_core::transition::landing(conn, id))?;
-
-    // **A superseded landing is context, never a verdict.** It says the local graft is stale; it
-    // says nothing about whether the work reached its destination another way. Returning early on
-    // it left a task whose work was redone and merged as a pull request permanently unclosable —
-    // printing "it will close when the new work lands" after the new work had landed. So it falls
-    // through to the pull-request evidence and only colours the reason if that proves nothing
-    // either.
-    let superseded = landing.superseded().map(|(landed, resumed)| {
-        format!(
-            "its earlier landing onto {} was superseded when the task went back to work ({} at {})",
-            landed.labels.onto.as_deref().unwrap_or("its target"),
-            resumed.event,
-            resumed.at
-        )
-    });
-    let with_context = |why: String| match &superseded {
-        Some(note) => format!("{why}; {note}"),
-        None => why,
-    };
-
-    let (number, merged, why) = if landing.live().is_some() {
-        // The evidence used was the recorded landing, so no pull request number is reported: this
-        // path never asked about one, and printing "closed (pull request #N)" would credit a
-        // number that had no part in the decision.
-        (None, Fact::Yes, None)
-    } else {
-        // Discover once, from the branch, and record what is found — after which the number is
-        // what is consulted and the branch name never is again.
-        let number = match landing.pr_number() {
-            Some(n) => Some(n),
-            None => match discover_quietly(db, root, id)? {
-                Ok(found) => found,
-                Err(why) => {
-                    return Ok(CloseVerdict {
-                        uid,
-                        pr: None,
-                        held: Some(with_context(why)),
-                    })
-                }
-            },
-        };
-        // A merge older than the last resumption is not proof about the work in flight. Both
-        // evidence paths answer to the one rule.
-        let (merged, why) = pr::merged_fact(root, number, landing.resumed_at());
-        (number, merged, why.map(with_context))
-    };
-    let outcome = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        // The status is re-read **inside** the transaction. This snapshots every candidate up
-        // front and then runs a subprocess per task, and it runs from a post-merge hook over all
-        // of them at once — long enough for a `jkb task set --status cancelled` to land in
-        // between and be silently overwritten with `done`.
-        let facts = lifecycle::TaskFacts {
-            landed_elsewhere: merged,
-            ..task::observe(conn, id)?
-        };
-        if dry_run {
-            return Ok(lifecycle::apply(
-                &facts,
-                lifecycle::TaskEvent::ObservedLanded,
-            ));
-        }
-        Ok(jkb_core::transition::perform(
-            conn,
-            meta,
-            id,
-            &facts,
-            lifecycle::TaskEvent::ObservedLanded,
-            &jkb_core::transition::Labels {
-                pr_number: number,
-                ..jkb_core::transition::Labels::default()
-            },
-        )?)
-    })?;
-    // A refusal carries its own sentence; `why` explains an unobtainable answer, which the
-    // guard can only report as "not proven". Both, when there are both: the guard says what it
-    // needed and `why` says what stopped us getting it.
-    let held = outcome.refusal().map(|r| match &why {
-        Some(w) => format!("{r} ({w})"),
-        None => r,
-    });
-    Ok(CloseVerdict {
-        uid,
-        pr: number,
-        held,
-    })
-}
-
-/// Try to find this task's pull request from its recorded branch, without failing the run.
-///
-/// `Err` is a *reason to hold this task*, not an error: `close-merged` runs over every task in a
-/// repo from a `post-merge` hook, and one task with no branch, an ambiguous branch name or no
-/// `gh` must not stop the rest from closing. That was a real must-fix here — a single malformed
-/// value aborted the entire run, silently.
-fn discover_quietly(db: &Db, root: &Path, id: ItemId) -> Result<Result<Option<i64>, String>> {
-    let branch = db
-        .read(move |conn| jkb_core::transition::latest_with_branch(conn, id))?
-        .and_then(|r| r.labels.branch);
-    let Some(branch) = branch else {
-        return Ok(Err(
-            "no branch recorded, so there is no pull request to look up —              `jkb task pr <uid> <number>` to name one"
-                .to_owned(),
-        ));
-    };
-    Ok(match pr::discover(root, &branch) {
-        pr::Discovery::One(found) => {
-            let number = found.number;
-            record_pr(db, id, number)?;
-            Ok(Some(number))
-        }
-        pr::Discovery::None => Err(format!("no pull request has `{branch}` as its head branch")),
-        // The recycled-name case, held rather than guessed — which is what the old inference
-        // could not do, because a name was all it had.
-        pr::Discovery::Ambiguous(numbers) => Err(format!(
-            "`{branch}` is the head branch of {} pull requests — pick one with              `jkb task pr <uid> <number>`",
-            numbers.len()
-        )),
-        pr::Discovery::Unavailable(why) => Err(why),
-    })
-}
-
-/// Print what a `close-merged` run decided.
-///
-/// Two buckets, where there used to be six. The five hold-reasons the old version distinguished
-/// — no cut point, an unusable one, a stale record, a gone branch, genuinely in flight — were
-/// five ways for one inference to fail, and each needed its own remedy sentence. A held task now
-/// carries the reason the guard gave.
-fn report_close_merged(verdicts: &[CloseVerdict], dry_run: bool, json: bool) {
-    let (closed, held): (Vec<_>, Vec<_>) = verdicts.iter().partition(|v| v.held.is_none());
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "dry_run": dry_run,
-                "closed": closed.iter().map(|v| serde_json::json!({"uid": v.uid, "pr": v.pr}))
-                    .collect::<Vec<_>>(),
-                "held": held.iter().map(|v| serde_json::json!({
-                    "uid": v.uid, "pr": v.pr, "reason": v.held
-                })).collect::<Vec<_>>(),
-            })
-        );
-        return;
-    }
-    let verb = if dry_run { "would close" } else { "closed" };
-    println!("{verb} {} task(s)", closed.len());
-    for v in &closed {
-        match v.pr {
-            Some(n) => println!("  {} (pull request #{n})", v.uid),
-            None => println!("  {}", v.uid),
+            .and_then(|ts| session_cli::task_on(ts))
+        {
+            Some(t) => println!(
+                "  {} — {uid}: resume with `cd {}`, land it with `jkb task land {uid}`, or drop \
+                 it with `jkb task abandon {uid}`",
+                s.name,
+                s.worktree.display(),
+                uid = t.uid
+            ),
+            // No task records this branch — a `task work` that stopped before recording where it
+            // was, typically. The task's own `task work` or `task abandon` finds it through its claim.
+            None => println!(
+                "  {} — no task records {}; `jkb task work <uid>` resumes it, `jkb task abandon \
+                 <uid>` drops it, for the task that opened it",
+                s.name, s.branch
+            ),
         }
     }
-    if !held.is_empty() {
-        println!("held {}:", held.len());
-        for v in &held {
-            println!("  {} — {}", v.uid, v.held.as_deref().unwrap_or(""));
-        }
-    }
-}
-
-/// `task set`: update any of a task's `--status`/`--priority`/`--due` in one txn.
-fn cmd_task_set(
-    db: &Db,
-    uid: &str,
-    status: Option<String>,
-    priority: Option<i64>,
-    due: Option<String>,
-    json: bool,
-) -> Result<()> {
-    if status.is_none() && priority.is_none() && due.is_none() {
-        anyhow::bail!("nothing to set: pass at least one of --status/--priority/--due");
-    }
-    let id = resolve_task_uid(db, uid)?;
-    db.write_txn("cli", move |conn, meta| {
-        if let Some(s) = &status {
-            task::set_status_str(conn, meta, id, s)?;
-        }
-        if let Some(p) = priority {
-            task::set_priority(conn, meta, id, Some(p))?;
-        }
-        if let Some(d) = &due {
-            task::set_due(conn, meta, id, Some(d))?;
-        }
-        Ok(())
-    })?;
-    report(json, uid, "updated");
-    Ok(())
-}
-
-/// `task edit`: replace (or `--append` to) a task's body text through the audited
-/// `item::set_content` seam. Content comes from `text` or, with `stdin`, from stdin.
-fn cmd_task_edit(
-    db: &Db,
-    uid: &str,
-    text: &[String],
-    stdin: bool,
-    append: bool,
-    json: bool,
-) -> Result<()> {
-    let new_text = if stdin {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-            .context("reading task content from stdin")?;
-        buf.trim_end().to_owned()
-    } else if text.is_empty() {
-        anyhow::bail!("provide new content as arguments, or pass --stdin");
-    } else {
-        text.join(" ")
-    };
-    let id = resolve_task_uid(db, uid)?;
-    // A file-backed task is no longer a single line: the `tasks` serializer renders content
-    // after the first line as the task's indented **body**, so `--append` round-trips. One
-    // limit remains — a BLANK line closes a body on re-parse, so anything after it would
-    // detach from the task and drift into section prose. Refuse that precisely, rather than
-    // refusing every multi-line edit.
-    let file_backed = uid.starts_with("file://");
-    if file_backed && new_text.contains("\n\n") {
-        anyhow::bail!(
-            "`{uid}` is a file-backed task: a blank line ends its body in the source file, so \
-             text after one would detach from the task on sync. Use single newlines, or edit \
-             the source file directly and run `jkb sync`."
-        );
-    }
-    db.write_txn("cli", move |conn, meta| {
-        let content = if append {
-            // A file-backed task's body is contiguous indented lines, so append with a single
-            // newline; a managed task's content is free-form, so keep the blank-line break.
-            let separator = if file_backed { "\n" } else { "\n\n" };
-            match item::get_content(conn, id)? {
-                Some(existing) if !existing.is_empty() => {
-                    format!("{existing}{separator}{new_text}")
-                }
-                _ => new_text,
-            }
-        } else {
-            new_text
-        };
-        item::set_content(conn, meta, id, &content, None)
-    })?;
-    report(json, uid, if append { "appended" } else { "edited" });
-    if file_backed && !json {
-        eprintln!(
-            "note: this is a file-backed task; run `jkb sync` to propagate the edit to its file."
-        );
-    }
-    Ok(())
-}
-
-/// `task reclaim` (design D27.1/D27.6.6b): the deterministic owner-existence scan,
-/// exposed so the coordinator can run it SQL-free. Clears claims whose owner pid is
-/// gone, preserving `keep` owners (the live run passes its own owner so it never
-/// reclaims its own in-flight work).
-fn cmd_task_reclaim(db: &Db, keep: &[String], json: bool) -> Result<()> {
-    let (held, found) = reclaim_orphaned(db, keep, true)?;
-    if json {
-        let uids: Vec<&str> = found.cleared.iter().map(|c| c.uid.as_str()).collect();
-        let held_open: Vec<&str> = found.unverifiable.iter().map(|c| c.uid.as_str()).collect();
-        println!(
-            "{}",
-            serde_json::json!({"held": held, "reclaimed": uids, "unverifiable": held_open})
-        );
-    } else {
-        println!("reclaimed {} of {held} claim(s)", found.cleared.len());
-        for c in &found.cleared {
-            println!("  {} (dead owner {})", c.uid, c.owner);
-        }
-        // Reported, never freed: an owner whose liveness cannot be established from here keeps
-        // its claim, because reclaiming on an unestablished answer frees a live agent's task
-        // (design S3.2). Of the two ways to be wrong, this is the one that costs a command.
-        for c in &found.unverifiable {
-            println!(
-                "  {} still held by {} — liveness cannot be checked from here; \
-                 `jkb task release {} --owner {}` if you know it is gone",
-                c.uid, c.owner, c.uid, c.owner
-            );
-        }
-    }
-    Ok(())
-}
-
-/// `task claim` / `task release` (design D27.3): CAS-acquire or clear a task's claim
-/// through the 17.2 core seams, so the coordinator never touches SQL. `owner` defaults
-/// to this process's liveness-checkable `host:pid` id. `claim` also flips the task to
-/// `in_progress`.
-fn cmd_task_claim(
-    db: &Db,
-    uid: &str,
-    owner: Option<String>,
-    acquire: bool,
-    json: bool,
-) -> Result<()> {
-    let owner = owner.unwrap_or_else(owner::preferred_owner);
-    let id = resolve_task_uid(db, uid)?;
-    let owner2 = owner.clone();
-    // Acquiring goes through the machine, like `task work` and `task start`. It is the **third**
-    // claim verb and the busiest — `/task-swarm` runs it on every task in every group — so a
-    // bare `claim::claim` here meant swarm work had no `start` entry in its history at all, and
-    // meant this verb and `jkb task start` answered `needs_review` oppositely: one flipped it to
-    // `in_progress`, the other refused.
-    //
-    // Releasing stays owner-scoped and outside the machine: giving up a claim you hold is not a
-    // lifecycle move, and `release` is deliberately a CAS on the owner so one agent cannot drop
-    // another's.
-    let ok = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        if !acquire {
-            return Ok(claim::release(conn, meta, id, &owner2)?);
-        }
-        let facts = lifecycle::TaskFacts {
-            actor: Some(jkb_types::AgentId::parse(&owner2)),
-            ..task::observe(conn, id)?
-        };
-        let outcome = jkb_core::transition::perform(
-            conn,
-            meta,
-            id,
-            &facts,
-            lifecycle::TaskEvent::Start,
-            &jkb_core::transition::Labels::default(),
-        )?;
-        match outcome.refusal() {
-            // A refusal is reported, not raised: the caller asked whether it could have the
-            // task, and "no, because …" is an answer. The swarm reads the boolean.
-            Some(why) => {
-                eprintln!("{why}");
-                Ok(false)
-            }
-            None => Ok(true),
-        }
-    })?;
-    let key = if acquire { "acquired" } else { "released" };
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"uid": uid, "owner": owner, key: ok})
-        );
-    } else {
-        match (acquire, ok) {
-            (true, true) => println!("claimed {uid} for {owner} (now in_progress)"),
-            // The machine's own sentence has already gone to stderr, so this does not restate a
-            // reason it does not know: the refusal may be a live owner, or a terminal task.
-            (true, false) => println!("{uid} was not claimed (see above)"),
-            (false, true) => println!("released {uid} (was held by {owner})"),
-            (false, false) => println!("{uid} was not claimed by {owner}"),
-        }
-    }
-    Ok(())
 }
 
 /// Print a short human/JSON confirmation for a task mutation.
@@ -7859,95 +3723,6 @@ fn report(json: bool, uid: &str, action: &str) {
     } else {
         println!("{action}: {uid}");
     }
-}
-
-/// The owner-existence reclaim (design D27.1/D27.2): clear every claim whose owner
-/// process no longer exists, keeping claims whose pid is alive plus any `keep` owners.
-/// Returns `(total_held, cleared_or_orphaned_claims)`. Used by `task reclaim`,
-/// `doctor` (report), and `doctor --fix`.
-///
-/// When `fix` is false this is **report-only**: it returns the held claims that *would*
-/// be reclaimed (a stale-snapshot read is fine — nothing is written). When `fix` is true
-/// the reclaim runs **inside the write transaction** (via [`claim::reclaim_dead`]) so
-/// liveness is re-evaluated against the current claim set, closing the race where a claim
-/// acquired concurrently by a live owner could be reclaimed from a snapshot.
-///
-/// # Errors
-/// Errors if a database read/write fails.
-fn reclaim_orphaned(db: &Db, keep: &[String], fix: bool) -> Result<(usize, Reclaimed)> {
-    let held = db.read(claim::claimed)?;
-    let total = held.len();
-    if !fix {
-        return Ok((total, orphaned_claims(held, keep)));
-    }
-    let keep = keep.to_vec();
-    let found = db.write_txn("cli", move |conn, meta| {
-        transition::reclaim_dead(conn, meta, &keep, owner::is_alive)
-    })?;
-    Ok((total, found))
-}
-
-/// The held claims sorted into *proven gone* and *cannot be established*, without writing.
-///
-/// The second bucket is the S3.2 behaviour change made visible: an externally-minted `agent:`
-/// owner, or a `claimant_id` in a shape this binary cannot read, is **not** reclaimable, because
-/// treating an unestablished answer as "dead" silently frees a live agent's task. It is reported
-/// so a person can decide, and `jkb task release <uid> --owner <owner>` is how they say so —
-/// there is deliberately no `--force`, because a blanket override would free the whole bucket on
-/// the strength of one judgement about one owner.
-///
-/// Owners in `keep` are alive by fiat and never probed; each **distinct** owner is probed at
-/// most once via [`owner::is_alive`] — the same rule the txn-internal probe in
-/// [`transition::reclaim_dead`] applies.
-fn orphaned_claims(held: Vec<claim::ClaimInfo>, keep: &[String]) -> Reclaimed {
-    let mut alive: std::collections::HashMap<String, Fact> = std::collections::HashMap::new();
-    let mut out = Reclaimed::default();
-    for c in held {
-        let live = *alive.entry(c.owner.clone()).or_insert_with(|| {
-            if keep.iter().any(|o| o == &c.owner) {
-                Fact::Yes
-            } else {
-                owner::is_alive(&c.owner)
-            }
-        });
-        match live {
-            Fact::No => out.cleared.push(c),
-            Fact::Unknown => out.unverifiable.push(c),
-            Fact::Yes => {}
-        }
-    }
-    out
-}
-
-/// Canonicalize a task uid: leave a `:`-bearing uid alone, else prefix `task:`.
-fn canonical_task_uid(uid: &str) -> String {
-    if uid.contains(':') {
-        uid.to_owned()
-    } else {
-        format!("task:{uid}")
-    }
-}
-
-/// Resolve a task reference (full `task:<slug>` uid or bare slug) to its item id.
-///
-/// # Errors
-/// Errors if no item matches either the given uid or `task:<uid>`.
-fn resolve_task_uid(db: &Db, uid: &str) -> Result<ItemId> {
-    // Accept either the full `task:<slug>` uid or the bare slug.
-    let candidates = if uid.contains(':') {
-        vec![uid.to_owned()]
-    } else {
-        vec![format!("task:{uid}"), uid.to_owned()]
-    };
-    let id = db.read(move |conn| {
-        for cand in &candidates {
-            if let Some(id) = jkb_core::item::id_for_uid(conn, cand)? {
-                return Ok(Some(id));
-            }
-        }
-        Ok(None)
-    })?;
-    id.ok_or_else(|| anyhow::anyhow!("no item with uid {uid}"))
 }
 
 fn cmd_view(db: &Db, cmd: ViewCmd, json: bool) -> Result<()> {
@@ -8051,140 +3826,18 @@ fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
     Ok(())
 }
 
-/// The claims half of `jkb doctor` (design D27.1/D27.2, S3.2).
-///
-/// Extracted from `cmd_doctor` so the two buckets can be reported at length without the command
-/// growing past what one function should hold.
-///
-/// A bare run reports; `--fix` clears claims whose owner is **proven** gone. The reclaim re-probes
-/// inside the write transaction — that repeat is deliberate: the race-free clear must evaluate
-/// liveness against the current claim set, not the report's snapshot.
-///
-/// # Errors
-/// Errors if a database read or write fails.
-fn report_claims(db: &Db, fix: bool) -> Result<()> {
-    let (held_count, orphaned) = reclaim_orphaned(db, &[], false)?;
-    if held_count == 0 {
-        println!("task claims: none held");
-        return Ok(());
-    }
-    if orphaned.cleared.is_empty() && orphaned.unverifiable.is_empty() {
-        println!("task claims: {held_count} held, all owners alive");
-    } else {
-        if !orphaned.cleared.is_empty() {
-            println!(
-                "task claims: {} orphaned (owner gone) of {held_count} held",
-                orphaned.cleared.len(),
-            );
-            for c in &orphaned.cleared {
-                println!("  {} claimed by dead owner {}", c.uid, c.owner);
-            }
-            if fix {
-                let (_, found) = reclaim_orphaned(db, &[], true)?;
-                println!("  cleared {} orphaned claim(s)", found.cleared.len());
-            } else {
-                println!("  run `jkb doctor --fix` to clear them");
-            }
-        }
-        // Its own bucket, because it is its own answer: not "the owner is gone" but "nothing
-        // here can tell". `--fix` deliberately does not touch these (design S3.2).
-        if !orphaned.unverifiable.is_empty() {
-            println!(
-                "task claims: {} held by an owner whose liveness cannot be checked here",
-                orphaned.unverifiable.len(),
-            );
-            for c in &orphaned.unverifiable {
-                println!("  {} claimed by {}", c.uid, c.owner);
-            }
-            println!(
-                "  these are NOT auto-reclaimed — `jkb task release <uid> --owner <owner>` \
-                 once you know the owner is gone"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn cmd_doctor(db: &Db, db_path: &Path, backup: Option<&Path>, fix: bool) -> Result<()> {
-    // FIRST, before any diagnostic and before `--fix` mutates anything. `--backup` is the
-    // safety copy you take *before* a repair; taken at the end it held post-repair state, so
-    // `jkb doctor --backup ~/pre-fix.db --fix` produced a file that was the opposite of what its
-    // name and its help said.
-    if let Some(dest) = backup {
-        db.backup(dest)?;
-        println!("backup written to {}", dest.display());
-    }
-
-    // Embedder health.
+/// The embedder half of `jkb doctor`: whether the model answers, and how much waits for it. Host-only:
+/// `jkb serve` calls no model.
+fn report_embedder(db: &Db) {
     let embed_status = match embedder().and_then(|e| e.health_check().map_err(Into::into)) {
         Ok(()) => "ok".to_owned(),
         Err(e) => format!("unavailable: {e}"),
     };
     println!("embedder: {embed_status}");
-
-    // FTS integrity.
-    let fts = db.read(|conn| {
-        let indexer = jkb_index::FtsIndexer::new();
-        Ok(indexer.integrity_check(conn).is_ok())
-    })?;
-    println!("fts integrity: {}", if fts { "ok" } else { "FAILED" });
-
-    // Schema version.
-    let user_version: i64 =
-        db.read(|conn| Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?))?;
-    println!("schema user_version: {user_version}");
-
-    // Un-embedded backlog.
-    match embedder() {
-        Ok(e) => {
-            let pending = Pipeline::new(e).unembedded_count(db)?;
-            println!("un-embedded items: {pending}");
-        }
+    match embedder().and_then(|e| Ok(Pipeline::new(e).unembedded_count(db)?)) {
+        Ok(pending) => println!("un-embedded items: {pending}"),
         Err(e) => println!("un-embedded items: unknown ({e})"),
     }
-
-    // Files needing sync attention: conflicts and quarantined parse failures (D25).
-    let flagged = db.read(jkb_core::sync_state::needs_attention)?;
-    if flagged.is_empty() {
-        println!("sync journal: ok");
-    } else {
-        println!("sync journal: {} file(s) need attention", flagged.len());
-        for s in &flagged {
-            let detail = s.parse_error.as_deref().unwrap_or("both sides changed");
-            println!("  {} [{}]: {detail}", s.uri, s.status);
-        }
-    }
-
-    // Stale task claims: owner-existence reclaim (design D27.2). For each claimed task
-    // probe whether the recorded owner still exists (`ps -p`, see `owner::is_alive`); a claim
-    // whose owner is gone is orphaned (no time-based staleness — a paused-but-alive owner is
-    // retained).
-    // A bare run reports; `--fix` clears orphaned claims so their tasks return to the
-    // ready frontier.
-    // One `reclaim_orphaned(.., false)` computes the report (shared with `task reclaim`,
-    // no rule duplication). On `--fix` the reclaim re-probes inside the write txn — that
-    // repeat is deliberate: the race-free clear must evaluate liveness against the current
-    // claim set, not the report's snapshot.
-    report_claims(db, fix)?;
-
-    report_vector_index(db, fix)?;
-
-    // Task sessions in this repo (design D36.6). A session's worktree keeps its claim on
-    // purpose — the half-written branch is still there — so a session is never reported as
-    // orphaned. Doctor lists every one, because nothing observable distinguishes a session
-    // you are working in from one you walked away from.
-    report_sessions(db);
-
-    report_worktree_removals(db_path, fix);
-
-    // Cloud-sync-folder warning (design D23).
-    match jkb_core::cloud_sync_warning(db_path) {
-        Some(w) => println!("warning: {w}"),
-        None => println!("db location: ok ({})", db_path.display()),
-    }
-
-    Ok(())
 }
 
 // ---- small formatting helpers ---------------------------------------------
@@ -8202,19 +3855,18 @@ fn output_line(item: &output::DisplayItem) -> String {
     format!("{}{ns}{snip}", item.uid)
 }
 
-/// The first line of a body, for a one-line report. The derivation is `output::first_nonblank`
-/// (the one copy); only the width is this function's own.
+/// The first line of a body, for a one-line report ([`jkb_core::item::snippet`], the one copy).
 fn first_line(content: &str) -> String {
-    truncate(output::first_nonblank(content), 100)
+    jkb_core::item::snippet(content, jkb_core::item::SNIPPET_CHARS)
 }
 
 /// `jkb staging ls` — the staging branches in this repo and what is landing on each.
 ///
 /// The one read behind both the explorer's branch picker and its In Flight view (design
 /// D38.2), so the two cannot disagree about what is live.
-fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
+pub(crate) fn cmd_staging_ls(kb: &session_cli::Kb<'_>, all: bool, json: bool) -> Result<()> {
     let ctx = repo::repo_ctx()?;
-    let rows = staging::collect(db, &ctx, all)?;
+    let rows = staging::collect(kb, &ctx, all)?;
 
     if json {
         let v: Vec<_> = rows
@@ -8298,148 +3950,6 @@ fn cmd_staging_ls(db: &Db, all: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `jkb task review record` — record that a review ran against a branch (design D38.4).
-fn cmd_task_review(db: &Db, cmd: TaskReviewCmd, json: bool) -> Result<()> {
-    let TaskReviewCmd::Record {
-        branch,
-        sha,
-        findings,
-    } = cmd;
-    let ctx = repo::repo_ctx()?;
-    let cwd = std::env::current_dir()?;
-    let branch = match branch {
-        Some(b) => b,
-        None => gitrepo::current_branch(&cwd)?
-            .context("not on a branch here (detached HEAD?) — pass --branch")?,
-    };
-    let sha = match sha {
-        Some(s) => Some(s),
-        None => gitrepo::rev(&ctx.root, &branch)?,
-    };
-
-    // Refuse a findings namespace that holds nothing, here, where the caller can still fix it.
-    // A review recorded against an empty namespace is a review whose findings never reached
-    // the KB — a quarantined `tasks.md`, a typo, a namespace renamed since — and the land gate
-    // must never read that as a clean review. It is caught at both ends deliberately: this is
-    // the actionable moment, the gate is the one that must not be bypassed.
-    let found = review::findings_in(db, std::slice::from_ref(&findings))?;
-    anyhow::ensure!(
-        found.total > 0,
-        "no findings found under `{findings}` — nothing was recorded. A review whose findings \
-         never reached the KB must not be recorded as one: check the namespace exists \
-         (`jkb ls {findings}`), that `jkb sync` imported the review's tasks.md, and that it \
-         was not quarantined (`jkb doctor`)."
-    );
-
-    let review::Recording {
-        recorded,
-        skipped_unlanded,
-        unusable,
-    } = review::record(db, &ctx.key, &branch, sha.as_deref(), &findings)?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "branch": branch,
-                "sha": sha,
-                "findings": findings,
-                "tasks": recorded.iter().map(|r| serde_json::json!({
-                    "uid": r.uid, "moved_to_review": r.moved_to_review,
-                })).collect::<Vec<_>>(),
-                "skipped_unlanded": skipped_unlanded,
-                "unusable": unusable,
-            })
-        );
-        return Ok(());
-    }
-    if recorded.is_empty() {
-        // Reviewing an arbitrary range is a legitimate thing to do, so this is a note and
-        // not an error (design D38.4). But "no task records this branch" and "tasks record it
-        // and every one was skipped" are different facts, and printing the first while the
-        // skipped list appears directly beneath it contradicted the very next line.
-        if skipped_unlanded.is_empty() && unusable.is_empty() {
-            println!("no task records branch={branch} — nothing to tag (review still filed)");
-        } else {
-            println!("nothing tagged for branch={branch} — every matching task was skipped, below (review still filed)");
-        }
-    } else {
-        println!(
-            "recorded review of {branch}@{} -> {findings}",
-            sha.as_deref().unwrap_or("unknown")
-        );
-        for r in &recorded {
-            let moved = if r.moved_to_review {
-                " (now needs_review)"
-            } else {
-                ""
-            };
-            println!("  {}{moved}", r.uid);
-        }
-    }
-    // Said out loud for the same reason as the buckets below: silence reads as "everything was
-    // tagged", and a task skipped here is one `task land` will refuse as never reviewed.
-    if !unusable.is_empty() {
-        println!(
-            "not tagged — a recorded branch cannot be handed to git at all, so nothing about them \
-             could be checked (`jkb task tag rm <uid> branch=<value>`):"
-        );
-        for uid in &unusable {
-            println!("  {uid}");
-        }
-    }
-    // Said out loud, because a task landing on this branch whose work is not in it yet has
-    // NOT been reviewed, and silence would read as "everything was tagged".
-    if !skipped_unlanded.is_empty() {
-        println!(
-            "not tagged — landing on {branch}, but jkb has not grafted their work onto it yet, \
-             so this review did not see it:"
-        );
-        for uid in &skipped_unlanded {
-            println!("  {uid}");
-        }
-        println!("  review each in its own session (`/jkb-review-log` there), or land first.");
-    }
-    Ok(())
-}
-
-/// Report — and with `--fix`, sweep — derived-index rows whose item is gone.
-///
-/// A `vec0` virtual table cannot carry a foreign key to `items`, so a deleted item leaves its
-/// vector behind. Since D40 (`items.id AUTOINCREMENT`) that row is **stale, not dangerous** —
-/// the freed id is never reissued, so no new item can inherit its embedding — which is why
-/// this reads as housekeeping rather than corruption, and why nothing sweeps implicitly.
-fn report_vector_index(db: &Db, fix: bool) -> Result<()> {
-    // What counts as one of our derived-index tables, and what counts as stale in one, are
-    // `jkb-index`'s to say — the CLI asks. It used to carry its own copy of both queries,
-    // including the `vec0` shadow-table filter that is the non-obvious part, so `doctor`'s
-    // report and `doctor --fix`'s delete were two statements that had to be kept in step.
-    let tables =
-        db.read_with::<Vec<String>, anyhow::Error, _>(|conn| Ok(jkb_index::vector_tables(conn)?))?;
-    if tables.is_empty() {
-        println!("vector index: no vector table yet");
-    } else if fix {
-        println!(
-            "vector index: removed {} stale row(s)",
-            sweep_stale(db)?.vectors
-        );
-    } else {
-        let stale =
-            db.read_with::<_, anyhow::Error, _>(|conn| Ok(jkb_index::count_stale(conn)?))?;
-        if stale.is_empty() {
-            println!("vector index: ok");
-        } else {
-            println!(
-                "vector index: {} stale row(s) whose item is gone",
-                stale.vectors
-            );
-            println!("  run `jkb index --sweep` (or `jkb doctor --fix`) to remove them");
-        }
-    }
-
-    Ok(())
-}
-
 /// Shorten `s` to `n` characters with an ellipsis, for one-line listings.
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -8451,6 +3961,37 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `jkb serve`'s default token path is refused where the refusal says so, and an explicit one is
+    /// the caller's decision. The refusal itself is `jkb_core`'s shared-filesystem rule, measured in
+    /// the dev container against the `~/.jkb` bind (FUSE).
+    #[test]
+    fn a_default_token_on_a_shared_filesystem_is_refused_and_an_explicit_one_is_not() {
+        let shared = |p: &std::path::Path| -> jkb_core::Result<()> {
+            Err(jkb_core::Error::SharedFilesystem {
+                path: p.to_path_buf(),
+                kind: "FUSE",
+            })
+        };
+        let local = |_: &std::path::Path| -> jkb_core::Result<()> { Ok(()) };
+        let err = super::serve_token_for(None, 7117, false, shared).unwrap_err();
+        assert!(format!("{err:#}").contains("--token-file"), "{err:#}");
+        assert!(super::serve_token_for(None, 7117, false, local)
+            .unwrap()
+            .ends_with(".jkb/daemon/7117/token"));
+        let err = super::serve_token_for(None, 7117, true, local).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("dev container"),
+            "the container marker refuses on a local filesystem too (a native-Linux bind): {err:#}"
+        );
+        let err = super::serve_token_for(None, 0, false, local).unwrap_err();
+        assert!(format!("{err:#}").contains("port 0"), "{err:#}");
+        let given = std::path::PathBuf::from("/x/token");
+        assert_eq!(
+            super::serve_token_for(Some(given.clone()), 0, true, shared).unwrap(),
+            given
+        );
+    }
+
     use super::GUIDE;
     use jkb_types::TaskStatus;
 

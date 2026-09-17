@@ -470,8 +470,60 @@
    "args": [
     {
      "index": 0,
-     "value": 40,
-     "op": "SCMP_CMP_GT"
+     "value": 41,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 42,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 43,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 44,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 45,
+     "op": "SCMP_CMP_EQ"
     }
    ]
   },
@@ -819,5 +871,5 @@
    "action": "SCMP_ACT_ALLOW"
   }
  ],
- "comment": "Docker default seccomp profile + unconditional allow for the namespace/mount syscalls bubblewrap needs, so Claude Code's sandbox can run nested inside this container. GENERATED FILE -- DO NOT EDIT; run .container/generate-seccomp.sh. Source: https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json upstream-sha256: 536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74"
+ "comment": "Docker default seccomp profile + unconditional allow for the namespace/mount syscalls bubblewrap needs, so Claude Code's sandbox can run nested inside this container. GENERATED FILE -- DO NOT EDIT; run .container/generate-seccomp.sh. Source: https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json upstream-sha256: 785b2429264afba4d594320337cb17f144f3c7d51585f9805eef72e28f4f9334"
 }

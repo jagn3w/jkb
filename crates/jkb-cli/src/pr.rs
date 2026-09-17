@@ -241,25 +241,61 @@ enum Staleness {
     Undecidable(String),
 }
 
+/// The variables that select a repository FOR GH, which git's three do not cover.
+///
+/// `gh` finds the repository through git, so `scrub_repo_selection` is necessary — and not
+/// sufficient. `GH_REPO` names an `[HOST/]OWNER/REPO` outright and takes precedence over the
+/// repository discovered from the working directory, so with one leaked `jkb task close-merged`
+/// asks GitHub about another repository's pull requests, and closes tasks on that answer if the
+/// number happens to exist there and be MERGED. That is verbatim the harm this spawn's scrub
+/// exists to prevent, through a door the git list does not cover, in the direction D34.4
+/// forbids — a wrong close buries work in flight.
+///
+/// `GH_HOST` is here for the same reason one step out: it selects the GitHub *instance*, so a
+/// leaked one sends the query to another host, where the pull-request number either does not
+/// exist (a refusal, harmless) or names somebody else's PR entirely (a wrong close). Weaker than
+/// the `GH_REPO` case and argued rather than measured, which is why it is said out loud instead
+/// of being carried along by the name of the list.
+///
+/// **Not verified against the tool here**: `gh` is not installed in this sandbox, so both rest
+/// on gh's documented environment rather than on a measurement, which this project's own rule
+/// says to check with `gh help environment`. Removing them is safe either way — jkb always
+/// means the repository it is standing in — so the unverified direction costs nothing.
+const GH_SELECTION_VARS: &[&str] = &["GH_REPO", "GH_HOST"];
+
+/// Build the `gh` invocation for `dir`.
+///
+/// Separate from [`gh`] so the scrubbing below is pinned at THIS call site: a test of
+/// `scrub_repo_selection` alone stayed green with this line deleted.
+fn gh_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("gh");
+    cmd.args(args).current_dir(dir);
+    // `gh` finds the repository through git, so `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`
+    // outrank `current_dir` here exactly as they do for git itself. Left in, an exported one
+    // makes this ask GitHub about an unrelated repository's pull requests — and
+    // `close-merged` closes tasks on the answer.
+    crate::gitrepo::scrub_repo_selection(&mut cmd);
+    for var in GH_SELECTION_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Run `gh` in `dir`, returning stdout or a sentence explaining why we could not ask.
 ///
 /// Deliberately shells out rather than speaking HTTP: `gh` already holds the user's
 /// authentication, and adding an HTTP client plus a token story to `jkb-cli` for one query is a
 /// dependency and a secret this tool does not otherwise need.
 fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("gh")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "`gh` is not installed, so a pull request cannot be checked from here — \
+    let out = gh_cmd(dir, args).output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "`gh` is not installed, so a pull request cannot be checked from here — \
                  install it (`brew install gh`) or close the task by hand"
-                    .to_owned()
-            } else {
-                format!("could not run `gh`: {e}")
-            }
-        })?;
+                .to_owned()
+        } else {
+            format!("could not run `gh`: {e}")
+        }
+    })?;
     if !out.status.success() {
         // Collapsed to one line. `gh`'s own messages are multi-line — the unauthenticated one is
         // two sentences on two lines — and this string is carried as a *reason* into a report
@@ -278,6 +314,26 @@ fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The `gh` spawn drops the caller's repository selection.
+    ///
+    /// Pinned HERE, at the call site, not only where the rule is defined: with the scrub line
+    /// deleted from this file, a test of `scrub_repo_selection` alone was perfectly green.
+    #[test]
+    fn the_gh_spawn_does_not_inherit_a_repository_selection() {
+        let cmd = super::gh_cmd(std::path::Path::new("/somewhere"), &["pr", "view"]);
+        // gh's OWN selectors go through the same assertion, as `also`. NAMED LITERALLY, not read
+        // from the constant this is guarding: iterating `GH_SELECTION_VARS` meant both loops
+        // shrank together — editing the const to `&["GH_REPO"]`, the likeliest edit since GH_HOST
+        // rests on unverified documentation, reopened the hole with the test green, and `&[]`
+        // asserted nothing at all while production removed nothing.
+        //
+        // The paragraph that stood here also said `REPO_SELECTION_VARS` "is a SEPARATE expectation
+        // list from the `.env_remove` calls it checks". That stopped being true in round 24, when
+        // `scrub_repo_selection` was changed to iterate it — and round 25 measured the hole that
+        // opened. `assert_scrubbed` now holds its own literal, so this file's rule and the crate's
+        // are the same rule again, which is why the hand-rolled loop below is gone.
+        crate::gitrepo::assert_scrubbed("gh", &cmd, &["GH_REPO", "GH_HOST"]);
+    }
     use super::{spent, Discovery, PullRequest, Staleness};
     use jkb_fsm::Fact;
 

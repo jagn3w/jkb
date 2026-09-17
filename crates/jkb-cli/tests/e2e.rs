@@ -101,7 +101,7 @@ fn uid_of(db: &Db, id: ItemId) -> String {
 #[test]
 fn end_to_end_full_flow() {
     let db = db();
-    let repo = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let guide = repo.path().join("guide.md");
     std::fs::write(&guide, "# Guide\nfile-backed content").unwrap();
 
@@ -276,7 +276,7 @@ fn end_to_end_full_flow() {
 #[test]
 fn ingest_and_sync_are_idempotent_and_audited() {
     let db = db();
-    let repo = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     std::fs::write(repo.path().join("readme.md"), "stable content").unwrap();
 
     let repo_dir = repo.path().to_string_lossy().into_owned();
@@ -336,6 +336,11 @@ fn mcp_smoke_flow() {
     use jkb_mcp::logic;
 
     let db = db();
+    let tools = jkb_mcp::Tools {
+        backend: std::sync::Arc::new(
+            jkb_api::LocalBackend::new(db.clone()).with_embedder(embedder()),
+        ),
+    };
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("note.md");
     std::fs::write(
@@ -343,20 +348,19 @@ fn mcp_smoke_flow() {
         "# Note\nA searchable distinctive term for the agent.",
     )
     .unwrap();
-    logic::ingest_path(
-        &db,
-        &embedder(),
+    logic::ingest(
+        &tools,
         &logic::IngestArgs {
             source: file.to_string_lossy().into_owned(),
             namespace: Some("docs".to_owned()),
         },
+        logic::SourceKind::Path,
     )
     .unwrap();
 
     // search → get_context.
     let hits = logic::search(
-        &db,
-        &embedder(),
+        &tools,
         &logic::SearchArgs {
             query: "distinctive".to_owned(),
             route: Some("fts".to_owned()),
@@ -364,23 +368,22 @@ fn mcp_smoke_flow() {
         },
     )
     .unwrap();
-    let hits = hits.as_array().unwrap();
+    let hits = hits.value.as_array().unwrap();
     assert!(!hits.is_empty());
     let item_id = hits[0]["item"].as_i64().unwrap();
     let context = logic::get_context(
-        &db,
-        &embedder(),
+        &tools,
         &logic::GetContextArgs {
             item_id,
             n: Some(1),
         },
     )
     .unwrap();
-    assert!(!context.as_array().unwrap().is_empty());
+    assert!(!context.value.as_array().unwrap().is_empty());
 
     // task_create → appears in task_next → is undoable.
     let created = logic::task_create(
-        &db,
+        &tools,
         &logic::TaskCreateArgs {
             title: "follow up on the note".to_owned(),
             priority: Some(1),
@@ -389,10 +392,10 @@ fn mcp_smoke_flow() {
         },
     )
     .unwrap();
-    let new_uid = created["uid"].as_str().unwrap().to_owned();
+    let new_uid = created.value["uid"].as_str().unwrap().to_owned();
 
     let next = logic::task_next(
-        &db,
+        &tools,
         &logic::QueryArgs {
             query: String::new(),
             limit: None,
@@ -400,6 +403,7 @@ fn mcp_smoke_flow() {
     )
     .unwrap();
     let next_uids: Vec<&str> = next
+        .value
         .as_array()
         .unwrap()
         .iter()

@@ -334,7 +334,29 @@ ipset create -exist allowed hash:net
 ipset create -exist allowed-new hash:net
 ipset flush allowed-new
 
+# THE HOST DAEMON'S ADDRESSES, resolved FIRST, because the allowlist loop below needs them to refuse
+# them. Staged and swapped like `allowed`, so a refusal below leaves the live set as it was.
+#
+# The opening is port-only (see RULE_DAEMON in egress-lib.sh): Docker Desktop forwards this alias to
+# the host's loopback on every port, so the same address in `allowed` would open all of them. Keeping
+# it out is done HERE, by address, rather than by skipping one name in the loop — a posture domain
+# spelled differently, or any name that happens to resolve to the host, reaches the same address, and
+# a rule keyed on a spelling is a rule a second spelling walks past.
+#
+# Not resolving is not a refusal. It leaves the container unable to reach the knowledge base, which
+# verify.sh reports as `unresolved`; it leaves egress exactly as bounded as before, which is what this
+# script decides. `|| daemon_ips=""` for the same ERR-trap reason as the lookup in the loop below.
+ipset create -exist "$DAEMON_SET" hash:ip
+ipset create -exist "$DAEMON_SET-new" hash:ip
+ipset flush "$DAEMON_SET-new"
+daemon_ips="$(getent ahostsv4 "$DAEMON_HOST" 2>/dev/null | awk '{print $1}' | sort -u)" || daemon_ips=""
+daemon_n=0
+while IFS= read -r ip; do
+    [ -n "$ip" ] && ipset add "$DAEMON_SET-new" "$ip" 2>/dev/null && daemon_n=$((daemon_n + 1))
+done <<<"$daemon_ips"
+
 skipped=()
+kept_out=()
 resolved=0
 while IFS= read -r domain; do
     [ -n "$domain" ] || continue
@@ -343,6 +365,12 @@ while IFS= read -r domain; do
         # precisely by hostname, and inventing an IP range here would be a guess presented as a rule.
         \**) skipped+=("$domain"); continue ;;
         localhost|127.0.0.1|::1) continue ;;   # loopback never leaves the container
+        # The host daemon's alias, BY NAME as well as by address (below). The address check alone
+        # has a hole exactly when it matters least visibly: if the daemon lookup above came back
+        # empty (a transient resolver failure) while this one succeeds, there is no address to keep
+        # out, and the host lands in `allowed` open on every port. The name is the one entry the
+        # posture carries on purpose, so it never reaches `allowed` whatever the lookups did.
+        "$DAEMON_HOST") skipped+=("$domain (the host daemon: port $DAEMON_PORT only)"); continue ;;
     esac
     # `|| ips=""` IS THE WHOLE POINT of this line, not tidiness. `getent` exits 2 for a name with
     # no A record and `pipefail` carries that out of the pipeline; a BARE assignment is a simple
@@ -358,7 +386,14 @@ while IFS= read -r domain; do
     ips="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)" || ips=""
     if [ -z "$ips" ]; then skipped+=("$domain (no A record)"); continue; fi
     while IFS= read -r ip; do
-        [ -n "$ip" ] && ipset add allowed-new "$ip" 2>/dev/null && resolved=$((resolved + 1))
+        [ -n "$ip" ] || continue
+        # The host daemon's address never enters `allowed` (see above). In an `if`, so the non-zero
+        # `ipset test` returns for an address that is NOT the daemon's is not an ERR-trap abort.
+        if ipset test "$DAEMON_SET-new" "$ip" >/dev/null 2>&1; then
+            kept_out+=("$domain ($ip)")
+            continue
+        fi
+        ipset add allowed-new "$ip" 2>/dev/null && resolved=$((resolved + 1))
     done <<<"$ips"
 done <<<"$(jq -r '.require.sandbox.network.allowedDomains[]?' "$POSTURE")"
 
@@ -386,8 +421,17 @@ fi
 # not be established, which is the opposite of what this layer is for.
 ipset swap allowed-new allowed
 ipset destroy allowed-new 2>/dev/null || true
+ipset swap "$DAEMON_SET-new" "$DAEMON_SET"
+ipset destroy "$DAEMON_SET-new" 2>/dev/null || true
 say "allowed $resolved addresses from $declared domains"
 [ ${#skipped[@]} -eq 0 ] || say "not pinned at the IP layer (the sandbox matches these by name): ${skipped[*]}"
+[ ${#kept_out[@]} -eq 0 ] || say "kept out of the allowlist, as the host daemon's port-only address: ${kept_out[*]}"
+if [ "$daemon_n" -gt 0 ]; then
+    say "the host daemon (jkb serve) is reachable on $DAEMON_HOST:$DAEMON_PORT — no other host port beyond DNS (53, open to any address)"
+else
+    say "NOTE: $DAEMON_HOST did not resolve, so jkb serve on the host is unreachable from here."
+    say "      Egress is otherwise unchanged. On Linux, add --add-host=$DAEMON_HOST:host-gateway."
+fi
 
 # Flush first so a re-run is idempotent rather than additive.
 iptables -w 5 -F OUTPUT
@@ -413,6 +457,7 @@ iptables -w 5 -A OUTPUT -p tcp --dport 53 -j ACCEPT
 iptables -w 5 -A OUTPUT -o lo -j ACCEPT
 iptables -w 5 -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 iptables -w 5 -A OUTPUT $RULE_ALLOWLIST
+iptables -w 5 -A OUTPUT $RULE_DAEMON
 iptables -w 5 -A OUTPUT $RULE_V4_REJECT
 
 # Fail loudly rather than leave a half-applied policy that reads as protection.

@@ -3,11 +3,79 @@
 # commit; CI runs the same thing.
 set -euo pipefail
 
+# Parse every shell file in the repo before running anything. NOTHING executes setup.sh, so a
+# control-flow edit there reached the gate unchecked — and setup.sh is what the post-merge hook
+# runs unattended after a pull. The same is true of the PreToolUse hooks, and there it is
+# sharper: bash exits 2 on a syntax error, and a PreToolUse hook exiting 2 reads as DENY, so a
+# broken hook does not fail open the way its header promises — it blocks every Bash tool call
+# for everyone after a pull. First, because it needs no toolchain and takes a second.
+#
+# The list and the loop both live in lib.sh, so CI runs this exact code rather than a second
+# hand-written copy of it — the two copies had already drifted by a `*.md` skip.
+echo "==> shell syntax"
+# shellcheck source=scripts/lib.sh
+. "$(dirname "$0")/lib.sh"
+check_shell_syntax "$(cd "$(dirname "$0")/.." && pwd)"
+
+# The toolchain, the same way every other cargo wrapper here gets it. THIS SCRIPT DID NOT, and
+# it is the one CLAUDE.md names as the gate to run before every commit: in a non-interactive
+# shell — an agent's, a hook's, a `sh -c` — `cargo` is not on PATH, so line 21 exited 127 with
+# `cargo: command not found` and NOTHING after the shell-syntax step ran. Not rustfmt, not
+# clippy, not the shell tests, not `cargo test`, not cargo-deny, not the ui build. Measured: two
+# review rounds were reported green over a `clippy -D warnings` that was already failing, which
+# is precisely the "a header followed by nothing reads exactly like a gate that ran" failure
+# this file's own comments were written to prevent — one step earlier than they were looking.
+#
+# Sourced only when present, because CI images install rust system-wide and this must not become
+# a hard dependency. Written as an `if` rather than `[ -f … ] && source …`: measured, the `&&`
+# form is safe under `set -e` here (a non-final command in an `&&` list is exempt), but it is
+# safe by a rule you have to know and stops being safe the moment it is the last line of a
+# block. The `if` needs no such argument.
+if [ -f ~/.cargo/env ]; then
+    # shellcheck disable=SC1090
+    source ~/.cargo/env
+fi
+
+# `macos/notifier/main.swift` is code no other gate reaches — `cargo` does not know it exists and
+# CI runs on Ubuntu, where swiftc does not. This is the same trap the `ui` gate exists for (esbuild
+# strips types without checking them), with one difference worth stating: that one is covered by a
+# CI job, and this one CANNOT be, because there is no macOS runner. So it is a local-only gate, and
+# a broken notifier reaches CI green. Anyone touching main.swift is running macOS by definition.
+echo "==> macos notifier (swift typecheck)"
+if [ "$(uname -s)" = "Darwin" ] && command -v swiftc >/dev/null 2>&1; then
+    swiftc -typecheck -swift-version 5 "$(dirname "$0")/../macos/notifier/main.swift"
+else
+    echo "   (skipped: needs macOS + swiftc; CI has no macOS runner, so nothing else covers this)"
+fi
+
 echo "==> rustfmt (check)"
 cargo fmt --all -- --check
 
 echo "==> clippy (warnings are errors)"
 cargo clippy --all-targets --all-features -- -D warnings
+
+# The shell tests ask this checkout's `target/debug/jkb` (notify-hook.test.sh diffs its
+# `notify events` against the hook), and nothing above builds it: clippy writes metadata only. In
+# `jkb task land`'s base checkout that binary was whatever the TARGET branch last built — one with no
+# `notify` at all — so the gate failed on the integrated result while the same tree passed in the
+# session, whose binary was fresh (measured on the Mac, 2026-09-17). Built here, so the shell tests
+# judge the tree they are in.
+echo "==> build jkb (for the shell tests)"
+cargo build -p jkb-cli --bin jkb
+
+# The shell under scripts/ is part of the codebase too, and setup.sh's installs are not
+# reachable from a Rust test. Each *.test.sh is self-contained and runs in a temp dir.
+echo "==> shell tests (scripts/tests)"
+ran=0
+for t in "$(dirname "$0")"/tests/*.test.sh; do
+    [ -e "$t" ] || break
+    bash "$t"
+    ran=$((ran + 1))
+done
+# Say it, like the cargo-deny and pnpm branches below. A header followed by nothing, then
+# "All checks passed", reads exactly like a gate that ran — which is what this file exists
+# to stop. Unlike those two, nothing here is optional: CI has no guard and fails instead.
+[ "$ran" -gt 0 ] || echo "   (skipped: no scripts/tests/*.test.sh found — CI treats this as a failure)"
 
 echo "==> tests"
 cargo test --all
@@ -27,7 +95,7 @@ fi
 # strips types WITHOUT checking them — so `esbuild` alone would happily ship a type error).
 # `pnpm -r` runs topologically, which also guarantees @jkb/core emits its .d.ts before the
 # adapter type-checks against it.
-echo "==> ui (typecheck + build)"
+echo "==> ui (typecheck + build + tests)"
 # pnpm lives under PNPM_HOME, which ~/.zshrc only exports for interactive shells — put it on
 # PATH here, the same way the other scripts self-source ~/.cargo/env, so this works when run
 # directly.
@@ -37,7 +105,9 @@ case ":$PATH:" in
     *) export PATH="$PNPM_HOME/bin:$PATH" ;;
 esac
 if command -v pnpm >/dev/null 2>&1; then
-    (cd "$(dirname "$0")/../ui" && pnpm run build)
+    # `test` after `build`: the tests bundle their own module, so they do not need dist — but
+    # a type error is the cheaper failure to read, so it is the one reported first.
+    (cd "$(dirname "$0")/../ui" && pnpm run build && pnpm run test)
 else
     echo "   (skipped: pnpm not found — install it, or set PNPM_HOME; CI runs this gate)"
 fi

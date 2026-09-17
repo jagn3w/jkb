@@ -300,10 +300,14 @@ fn settle_out_of_scope(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<usize> {
             // parse failure quarantines before `apply_doc` runs, so it has no bindings at
             // all). Using `accepts_bound` for it left a narrowed `--include` unable to clear
             // the very row it was narrowed to escape.
+            //
+            // And an unbound file reached through a link below the mount is out of scope, as it is
+            // for `discover`, whose walk never enters a link — kept in scope, its flag could never
+            // be reconciled or cleared. A bound one stays in scope, so its refusal stays reported.
             let in_scope = if bound.contains(&path) {
                 filter.accepts_bound(&ctx.dir, &path)
             } else {
-                filter.accepts(&ctx.dir, &path)
+                filter.accepts(&ctx.dir, &path) && !through_link(&ctx.dir, &path)
             };
             !in_scope || (!path.exists() && !bound.contains(&path))
         })
@@ -312,7 +316,7 @@ fn settle_out_of_scope(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<usize> {
     if stale.is_empty() {
         return Ok(0);
     }
-    db.write_txn_with::<usize, Error, _>("sync", move |conn, meta| {
+    db.write_txn_with::<usize, Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
         let mut cleared = 0;
         for uri in &stale {
             if sync_state::settle(conn, meta, uri)? {
@@ -335,12 +339,190 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
     let filter = Filter::build(&read_globs(db, mount_ns)?)?;
     let mut relevant: Vec<PathBuf> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut bound: Option<BTreeSet<PathBuf>> = None;
     for path in paths {
-        if filter.accepts(&ctx.dir, path) && seen.insert(path.clone()) {
-            relevant.push(path.clone());
+        if !filter.accepts(&ctx.dir, path) || seen.contains(path) {
+            continue;
         }
+        if through_link(&ctx.dir, path) {
+            if bound.is_none() {
+                bound = Some(bound_paths(db, &ctx)?);
+            }
+            if !bound.as_ref().is_some_and(|b| b.contains(path)) {
+                continue;
+            }
+        }
+        seen.insert(path.clone());
+        relevant.push(path.clone());
     }
     reconcile_all(db, &ctx, relevant)
+}
+
+/// What a caller of [`sync_kb_changes`] last judged each **flagged** bound file on, so a file that
+/// stays flagged is reconciled once per change to it rather than on every pass.
+///
+/// A flagged file's knowledge-base side cannot be judged against its last-synced hash — the refusal or
+/// failure that flagged it is why that hash is stale — so it was reconciled on every pass: re-archived,
+/// refused again and logged, about once a second for as long as a fleet kept writing (stage-6.3a review
+/// 2). Keyed on everything a refusal reads from the database — the render's hash (or the check's error),
+/// each bound item with whether it has a primary placement, and the mount's direction — so any remedy
+/// is re-judged: restoring the placement, unbinding or removing the item it names, or switching the
+/// mount (review 3; the render alone missed the last two). An entry is kept only for a file the pass left
+/// flagged, so it never stands in for a flag raised later by another process. Kept by the watcher for as
+/// long as it runs; a fresh one re-judges every flagged file once. Other routes that re-judge a flag —
+/// the watcher's backed-off full-sync retry — still reconcile it; `sync_state::upsert` makes their
+/// unchanged re-flag write nothing.
+#[derive(Debug, Default)]
+pub struct FlaggedJudgements {
+    seen: HashMap<PathBuf, String>,
+}
+
+/// Reconcile the bound files under `mount_ns` whose knowledge-base side has changed since they were last
+/// synced — a task edited by `jkb task` on the host, or by a dev container through `jkb serve` — and
+/// no others.
+///
+/// A file watcher hears only the filesystem. A change made in the database raises no event, so before
+/// this the edit sat in the knowledge base until that file happened to change on disk or the watcher
+/// restarted, while the file went on showing the old line: an F1 edited on the host through `jkb` never
+/// reached the `tasks.md` the dev container was reading. [`crate::watch`] runs this when the changelog
+/// shows a write by anyone but sync.
+///
+/// Which files is decided read-only, one short read per file so writers interleave, by the file's
+/// journal state ([`FileState::from_journal`]):
+/// - `Settled`: its knowledge-base render hashed against its last-synced hash; reconciled if they differ,
+///   so a write elsewhere costs a render per bound file, not an archive and a transaction each.
+/// - `Untracked` (never synced): reconciled.
+/// - `Blocked` — a refusal, or a failure: reconciled when what it is judged on (its render's hash, or
+///   its check's error) differs from `judged`'s record of the last time. Its remedy is a database write
+///   (`jkb task place … --home` after an undo dropped a placement), so skipping it outright left the flag
+///   standing after the user did what it said; reconciling it every time re-flagged it every pass.
+/// - `Conflicted`, `Quarantined`: left to a disk change or a full sync, whose remedies are on disk.
+///
+/// A `Settled` file whose check fails is judged like a flagged one, so the reconcile records the failure
+/// against it once, rather than the pass ending before the files after it.
+///
+/// # Errors
+/// As [`sync`]. Per-file failures are in the report.
+pub fn sync_kb_changes(
+    db: &Db,
+    mount_ns: &str,
+    judged: &mut FlaggedJudgements,
+) -> Result<SyncReport> {
+    let ctx = load_ctx(db, mount_ns)?;
+    if !ctx.exports() {
+        return Ok(SyncReport::default());
+    }
+    let filter = Filter::build(&read_globs(db, mount_ns)?)?;
+    let bound: Vec<PathBuf> = bound_paths(db, &ctx)?
+        .into_iter()
+        .filter(|path| filter.accepts_bound(&ctx.dir, path))
+        .collect();
+    let mut changed = Vec::new();
+    for path in bound {
+        let (at, file) = (ctx.clone(), path.clone());
+        let verdict =
+            db.read_with::<KbSide, Error, _>(move |conn| Ok(judge_kb_side(conn, &at, &file)))?;
+        match verdict {
+            KbSide::Unchanged => {
+                judged.seen.remove(&path);
+            }
+            // Recorded as it is reconciled: if the reconcile flags it, the next pass judging it on the
+            // same render leaves it alone rather than reconciling it once more.
+            KbSide::Changed(key) => {
+                judged.seen.insert(path.clone(), key);
+                changed.push(path);
+            }
+            KbSide::Flagged(key) => {
+                if judged.seen.get(&path) != Some(&key) {
+                    judged.seen.insert(path.clone(), key);
+                    changed.push(path);
+                }
+            }
+        }
+    }
+    if changed.is_empty() {
+        return Ok(SyncReport::default());
+    }
+    let report = reconcile_all(db, &ctx, changed)?;
+    for result in &report.results {
+        let still_flagged = matches!(
+            result.outcome,
+            Outcome::Failed | Outcome::Refused | Outcome::Conflict | Outcome::Quarantined
+        );
+        if !still_flagged {
+            judged.seen.remove(&result.path);
+        }
+    }
+    Ok(report)
+}
+
+/// What a database pass concludes about one bound file's knowledge-base side.
+enum KbSide {
+    /// Nothing to reconcile.
+    Unchanged,
+    /// Reconcile it; judged on this key.
+    Changed(String),
+    /// Flagged, or its check failed: reconcile it if this key differs from the last judgement's.
+    Flagged(String),
+}
+
+/// Judge `path`'s knowledge-base side — see [`sync_kb_changes`].
+fn judge_kb_side(conn: &Connection, ctx: &Ctx, path: &Path) -> KbSide {
+    let bare_uri = file_uri(path);
+    let render = |journal: Option<&sync_state::SyncState>| -> Result<String> {
+        let (_, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
+        let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal)?;
+        Ok(hash(&serializer.render(&kb_doc)?))
+    };
+    let key = |rendered: Result<String>| {
+        let judged = match rendered {
+            Ok(hash) => format!("render {hash}"),
+            Err(e) => format!("error {e}"),
+        };
+        // What else a refusal reads from the database: which items are bound to the file, whether each
+        // still has a primary placement, and which way the mount syncs.
+        let bindings = (|| -> Result<String> {
+            let uris = binding::synced_uris_for_file(conn, &bare_uri)?;
+            let ids = binding::items_for_uris(conn, &uris)?;
+            let items: Vec<ItemId> = ids.values().copied().collect();
+            let placed = primary_placements_for(conn, &items)?;
+            Ok(uris
+                .iter()
+                .map(|uri| {
+                    let homed = ids.get(uri).is_some_and(|id| placed.contains_key(id));
+                    format!("{uri}={homed}")
+                })
+                .collect::<Vec<_>>()
+                .join(" "))
+        })()
+        .unwrap_or_else(|e| format!("error {e}"));
+        format!("{judged} | {bindings} | {}", ctx.sync_mode)
+    };
+    let journal = match sync_state::get(conn, &bare_uri) {
+        Ok(journal) => journal,
+        Err(e) => return KbSide::Flagged(key(Err(e.into()))),
+    };
+    let state = FileState::from_journal(
+        journal.as_ref().map(|j| j.status.as_str()),
+        journal
+            .as_ref()
+            .is_some_and(|j| j.quarantine_blob_hash.is_some()),
+    );
+    match state {
+        FileState::Untracked => KbSide::Changed(key(render(None))),
+        FileState::Conflicted | FileState::Quarantined => KbSide::Unchanged,
+        FileState::Blocked => KbSide::Flagged(key(render(journal.as_ref()))),
+        FileState::Settled => match render(journal.as_ref()) {
+            Ok(rendered)
+                if journal.as_ref().and_then(|j| j.last_synced_hash.as_deref())
+                    == Some(rendered.as_str()) =>
+            {
+                KbSide::Unchanged
+            }
+            Ok(rendered) => KbSide::Changed(key(Ok(rendered))),
+            Err(e) => KbSide::Flagged(key(Err(e))),
+        },
+    }
 }
 
 /// Reconcile each path in its own audited transaction, collecting the outcomes.
@@ -368,11 +550,12 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
             Err(e) => {
                 let reason = format!("could not archive the current bytes before syncing: {e}");
                 let (p2, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
-                let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
-                    let uri = file_uri(&p2);
-                    let prev = sync_state::get(conn, &uri)?;
-                    flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-                });
+                let _ =
+                    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+                        let uri = file_uri(&p2);
+                        let prev = sync_state::get(conn, &uri)?;
+                        flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
+                    });
                 results.push(FileResult {
                     path,
                     outcome: Outcome::Failed,
@@ -389,9 +572,10 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         // mount, whose serializer does not quarantine — returned `Err` out of the watcher
         // thread. `watch_all` then blocked joining the other threads until stop, launchd never
         // restarted the still-alive process, and that mount silently stopped syncing forever.
-        let outcome = db.write_txn_with::<Outcome, Error, _>("sync", move |conn, meta| {
-            reconcile(conn, meta, &ctx, &p, archived)
-        });
+        let outcome = db
+            .write_txn_with::<Outcome, Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+                reconcile(conn, meta, &ctx, &p, archived)
+            });
         let (outcome, reason) = match outcome {
             Ok(o) => (o, outcome_reason(db, &path)?),
             Err(e) => {
@@ -400,11 +584,12 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
                 // `jkb doctor` — leaving one stderr line under the watcher as its only trace.
                 let (p2, msg) = (path.clone(), e.to_string());
                 let ser = ser_name.clone();
-                let _ = db.write_txn_with::<(), Error, _>("sync", move |conn, meta| {
-                    let uri = file_uri(&p2);
-                    let prev = sync_state::get(conn, &uri)?;
-                    flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-                });
+                let _ =
+                    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+                        let uri = file_uri(&p2);
+                        let prev = sync_state::get(conn, &uri)?;
+                        flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
+                    });
                 (Outcome::Failed, Some(e.to_string()))
             }
         };
@@ -420,7 +605,7 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
     // its own commit and spin (the file-watch feedback loop).
     let imported = results.iter().any(|r| brought_items_in(r.outcome));
     if imported {
-        db.write_txn_with::<usize, Error, _>("sync", |conn, meta| {
+        db.write_txn_with::<usize, Error, _>(sync_state::SYNC_ACTOR, |conn, meta| {
             Ok(task::ensure_all_mirrors(conn, meta)?)
         })?;
     }
@@ -449,16 +634,16 @@ fn archive_current_bytes(db: &Db, path: &Path) -> Result<Option<Vec<u8>>> {
     // permissions, an I/O error — is a failure, because the reconcile is about to overwrite
     // bytes we could not copy. Swallowing every `fs::read` error put the hole back one layer
     // below where the caller just closed it.
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+    // Never through a symlink (`jkb_core::nofollow`): a link planted at a bound file would otherwise
+    // have its target archived here and overwritten below.
+    let Some(bytes) = jkb_core::nofollow::read(path)? else {
+        return Ok(None);
     };
     if bytes.is_empty() {
         return Ok(Some(bytes));
     }
     let stored = bytes.clone();
-    db.write_txn_with::<(), Error, _>("sync", move |conn, _meta| {
+    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, _meta| {
         blob::store(conn, &blob::hash_bytes(&stored), &stored, None)?;
         Ok(())
     })?;
@@ -550,7 +735,8 @@ mod write_seam {
     /// call and cannot be opened deterministically from outside it.
     #[test]
     fn refuses_when_the_file_changed_since_the_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let path = dir.path().join("tasks.md");
         std::fs::write(&path, b"v2").unwrap();
 
@@ -575,7 +761,8 @@ mod write_seam {
     /// would be recoverable from nothing — the archive stored no bytes for it.
     #[test]
     fn refuses_when_an_absent_file_has_appeared() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let path = dir.path().join("restored.md");
         std::fs::write(&path, b"git restored me").unwrap();
 
@@ -642,25 +829,97 @@ pub fn backing_dir(db: &Db, mount_ns: &str) -> Result<PathBuf> {
 /// Returns an error if a database read fails.
 pub fn tasks_mount_file(db: &Db, home_ns: &str) -> Result<Option<String>> {
     let home = home_ns.to_owned();
-    let uri = db.read(move |conn| {
-        let mut cur = Some(home);
-        while let Some(path) = cur {
-            if let Some(ns_id) = ns::get(conn, &path)? {
-                if let Some(m) = mount::get(conn, ns_id)? {
-                    if m.serializer == "tasks" {
-                        if let Some(dir) = m.backing_uri.strip_prefix("file://") {
-                            let dir = dir.trim_end_matches('/');
-                            return Ok(Some(format!("file://{dir}/tasks.md")));
-                        }
-                    }
-                    return Ok(None);
-                }
-            }
-            cur = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+    Ok(db.read(move |conn| mount::tasks_file_for(conn, &home))?)
+}
+
+/// Why the task `item` would not come back from the tasks.md it is written into as the knowledge base
+/// now holds it — `None` when it would, or when it is in no tasks file. Its line is assembled exactly as
+/// an export would assemble it ([`assemble_kb_doc`]: its real local id, text, status, due date, tags,
+/// out-of-file placements and in-file dependencies) and asked of [`crate::task_line_problem`].
+///
+/// Asked by `jkb_api` after every task write, inside the write's transaction, so a value the file
+/// cannot carry is refused whichever field it arrived in. Checking only the text let `task set --due
+/// "2026-07-15 17:00"` through, and the next import from the file cleared the due date and rewrote the
+/// title.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn filed_task_problem(conn: &Connection, item: ItemId) -> Result<Option<String>> {
+    problem_with(conn, item, &mut HashMap::new())
+}
+
+/// [`filed_task_problem`] for each of `items`, rendering each tasks.md they are filed in once: a
+/// caller judging many tasks of one file (a namespace move) otherwise renders the whole file per task.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn filed_task_problems(conn: &Connection, items: &[ItemId]) -> Result<Vec<Option<String>>> {
+    let mut docs = HashMap::new();
+    items
+        .iter()
+        .map(|item| problem_with(conn, *item, &mut docs))
+        .collect()
+}
+
+/// [`filed_task_problem`], with the files already rendered in `docs`.
+fn problem_with(
+    conn: &Connection,
+    item: ItemId,
+    docs: &mut HashMap<PathBuf, SyncDoc>,
+) -> Result<Option<String>> {
+    if binding::serializer_for(conn, item)?.as_deref() != Some("tasks") {
+        return Ok(None);
+    }
+    let Some(bound) = binding::get(conn, item)? else {
+        return Ok(None);
+    };
+    let Some(file) = binding::file_of(conn, &bound.uri)? else {
+        return Ok(None);
+    };
+    // Nothing keeps a uri to one item, and the assembly below finds a line by uri: bound onto a uri
+    // another task holds, this task's line would be judged by that task's.
+    let holders: i64 = conn
+        .prepare_cached("SELECT count(*) FROM bindings WHERE uri = ?1")?
+        .query_row([&bound.uri], |r| r.get(0))?;
+    if holders > 1 {
+        return Ok(Some(format!(
+            "its binding `{}` is already another task's line",
+            bound.uri
+        )));
+    }
+    let path = PathBuf::from(file);
+    let Some((mount_ns, mount)) = mount::covering(conn, &path, Some("tasks"))? else {
+        return Ok(None);
+    };
+    let Some(dir) = mount.backing_uri.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    let ctx = Ctx {
+        mount_ns,
+        dir: PathBuf::from(dir.trim_end_matches('/')),
+        sync_mode: mount.sync_mode,
+        conflict_policy: mount.conflict_policy,
+        serializer: "tasks".to_owned(),
+    };
+    let bare = file_uri(&path);
+    let local = local_of(&bare, &bound.uri);
+    let journal = sync_state::get(conn, &bare)?;
+    let kb = match docs.entry(path.clone()) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(assemble_kb_doc(conn, &ctx, &path, &bare, journal.as_ref())?)
         }
-        Ok(None)
-    })?;
-    Ok(uri)
+    };
+    let Some(line) = kb.items.iter().find(|i| i.local_id == local) else {
+        return Ok(None);
+    };
+    let deps: Vec<String> = kb
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::DependsOn && e.src == local)
+        .map(|e| e.dst.clone())
+        .collect();
+    Ok(crate::task_line_problem(line, &deps))
 }
 
 /// Load the mount configuration into an owned [`Ctx`].
@@ -729,6 +988,7 @@ impl Filter {
         let rel = rel_str(dir, path);
         self.include.as_ref().is_none_or(|m| m.is_match(&rel))
             && !self.exclude.as_ref().is_some_and(|m| m.is_match(&rel))
+            && !is_temp(path)
     }
 
     /// Like [`Self::accepts`] but ignoring `include` — for already-bound files.
@@ -738,7 +998,37 @@ impl Filter {
                 .exclude
                 .as_ref()
                 .is_some_and(|m| m.is_match(rel_str(dir, path)))
+            && !is_temp(path)
     }
+}
+
+/// Whether `path` is one of `nofollow::write`'s temporary files, which sync never takes up: an
+/// interrupted write leaves one, and importing it duplicated every task in the file it was replacing.
+fn is_temp(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(jkb_core::nofollow::is_temp_name)
+}
+
+/// Whether `path` (under `dir`) is reached through a symlink below the mount directory.
+///
+/// Asked of paths nothing is bound to, by the watch filter and by the full sync's out-of-scope sweep
+/// (which settles such a row, since `discover` never yields it). The watcher no longer follows links,
+/// but an event can still name such a path, and reconciling one only to have `nofollow` refuse it
+/// wrote a `needs_attention` row per event for files outside the mount. A **bound** file reached
+/// through a link is reconciled, never skipped — `nofollow` refuses it and the journal names the link,
+/// where skipping it had the full sync's out-of-scope sweep settle its row to `ok` and the file stop
+/// syncing with nothing reported. A full sync's walk needs no such check: `WalkDir` does not follow
+/// links, so every path it yields is link-free below the (canonical) mount directory.
+fn through_link(dir: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(dir) else {
+        return false;
+    };
+    let mut at = dir.to_path_buf();
+    rel.components().any(|component| {
+        at.push(component);
+        // A component that does not exist yet (a file about to be created) is not a link.
+        std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink())
+    })
 }
 
 /// The set of files to reconcile: those on disk matching the globs, unioned with the
@@ -778,16 +1068,15 @@ fn discover(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<Vec<PathBuf>> {
 /// line, so a file with 262 tasks yielded 262 identical paths to whatever came next.
 fn bound_paths(db: &Db, ctx: &Ctx) -> Result<BTreeSet<PathBuf>> {
     let mount_ns = ctx.mount_ns.clone();
-    let uris = db.read(move |conn| binding::synced_uris_under(conn, &mount_ns))?;
-    let mut out = BTreeSet::new();
-    for uri in uris {
-        let Some(raw) = uri.strip_prefix("file://") else {
-            continue;
-        };
-        let bare = raw.split_once('#').map_or(raw, |(p, _)| p);
-        out.insert(PathBuf::from(bare));
-    }
-    Ok(out)
+    Ok(db.read(move |conn| {
+        let mut out = BTreeSet::new();
+        for uri in binding::synced_uris_under(conn, &mount_ns)? {
+            if let Some(path) = binding::file_of(conn, &uri)? {
+                out.insert(PathBuf::from(path));
+            }
+        }
+        Ok(out)
+    })?)
 }
 
 /// The journal's explanation for `path`, when it has one — the reason a reconcile refused.
@@ -1281,7 +1570,10 @@ fn export_blocker(
     // KB and there is no import to recover through, so refusing would wedge it on every run
     // while telling the user to perform an operation the mount's mode forbids.
     let structure_known = journal.and_then(|j| j.document.as_deref()).is_some();
-    let disk_has_content = std::fs::read(path).is_ok_and(|b| !b.trim_ascii().is_empty());
+    let disk_has_content = jkb_core::nofollow::read(path)
+        .ok()
+        .flatten()
+        .is_some_and(|b| !b.trim_ascii().is_empty());
     if ctx.imports() && !structure_known && disk_has_content {
         return Ok(Some(
             "this file has content on disk but no recorded structure, so exporting would write \
@@ -1444,9 +1736,9 @@ fn populate_document(
         Ok(Some(doc)) => Some(doc),
         // A base that will not parse is not a reason to abort the whole run; fall through to the
         // file, and if that fails too the export guard refuses rather than writing.
-        Ok(None) | Err(_) => match std::fs::read(path) {
-            Ok(bytes) => serializer.parse(&bytes).ok(),
-            Err(_) => None,
+        Ok(None) | Err(_) => match jkb_core::nofollow::read(path) {
+            Ok(Some(bytes)) => serializer.parse(&bytes).ok(),
+            Ok(None) | Err(_) => None,
         },
     };
     let Some(doc) = recovered else {
@@ -2685,7 +2977,7 @@ fn hash(bytes: &[u8]) -> String {
     blob::hash_bytes(bytes)
 }
 
-/// Write `bytes` to `path`, creating parent directories as needed.
+/// Write `bytes` to `path`, creating parent directories as needed, never through a symlink.
 fn write_file(path: &Path, bytes: &[u8], snapshot: Option<&[u8]>) -> Result<()> {
     // REFUSE to write if the file is no longer what this pass reconciled.
     //
@@ -2700,11 +2992,10 @@ fn write_file(path: &Path, bytes: &[u8], snapshot: Option<&[u8]>) -> Result<()> 
     // blob archive, so a mismatch costs a retry. `None` means the file was ABSENT when this pass
     // started and nothing was preserved — so a file that has appeared since (a `git restore`,
     // an editor writing late) is the one overwrite that would be recoverable from nothing.
-    let current = match std::fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
+    // Both the read and the write go through `jkb_core::nofollow`: the host's sync writes whatever the
+    // knowledge base says, a dev container can change that through `jkb serve`, and it can also plant
+    // a symlink inside the directories it binds — so no link on the path is ever followed.
+    let current = jkb_core::nofollow::read(path)?;
     if current.as_deref() != snapshot {
         return Err(Error::Types(TypeError::Validation(format!(
             "{} changed on disk while it was being synced; nothing was written. It will be \
@@ -2713,10 +3004,7 @@ fn write_file(path: &Path, bytes: &[u8], snapshot: Option<&[u8]>) -> Result<()> 
         ))));
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, bytes)?;
+    jkb_core::nofollow::write(path, bytes)?;
     Ok(())
 }
 

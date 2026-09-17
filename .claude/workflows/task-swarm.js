@@ -123,13 +123,54 @@ const REVIEW = {
   required: ['verdict', 'notes'],
 }
 
+// THE SCRIPT OWNS THE CONTRACT, so the runner reports the raw exit code and this file decides
+// what it means. It used to ask the agent for `landed: boolean` against a list that enumerated
+// 0/1/2/3 — and when merge-queue.sh grew a fourth code, the agent was being asked to map a value
+// the list did not cover. Both guesses it could make are wrong: `landed=true` marks a whole group
+// done with the base never advanced (the phantom landing the queue was reworked to abolish), and
+// `landed=false` sends the implementer to "rebase and fix" a branch the script's own header says
+// is not at fault. A judgement an agent has to infer from an incomplete list is the defect; the
+// number is a fact, so the number is what it returns.
 const MERGE = {
   type: 'object',
   properties: {
-    landed: { type: 'boolean' },
-    detail: { type: 'string' }, // the script's one-line status (or eject reason)
+    exit: { type: 'integer' }, // the script's exit status, verbatim
+    detail: { type: 'string' }, // its last line of output
   },
-  required: ['landed', 'detail'],
+  required: ['exit', 'detail'],
+}
+
+// The one place that reads the contract merge-queue.sh's header declares. An UNKNOWN code stalls
+// rather than falling through to any of the three actions — a fifth code added later must reach a
+// human, not be silently sorted into the nearest bucket, which is exactly how the fourth arrived.
+function classifyMerge(code) {
+  switch (code) {
+    case 0:
+      return { outcome: 'landed' }
+    case 1:
+    case 2:
+      return { outcome: 'eject' } // rebase conflict, or red gate: the implementer's to fix
+    case 3:
+      return { outcome: 'stall', why: 'setup error — bad branch or worktree; nothing changed' }
+    case 5:
+      return {
+        outcome: 'stall',
+        why: 'the branch is already an ancestor of the base — either an earlier entry landed its work and it was rebased since, or it was never committed to. The graph cannot tell those apart, so a person closes it or sends it back',
+      }
+    case 4:
+      return {
+        outcome: 'stall',
+        // THE THREE ARMS DO NOT ALL MEAN THE GRAFT PASSED, and this sentence used to say they
+        // did. One of them is "the gate went RED and the worktree could not be returned to the
+        // base", which leaves it detached at an UNGATED commit — an operator who believes the
+        // graft passed does the obvious repair, fast-forwards the base onto that commit, and
+        // lands code that failed the gate. The script says which arm it is in its own last line,
+        // so this defers to it rather than asserting the common case.
+        why: 'the base could not be advanced — see the detail line for which arm: the gate may have passed and the base be held elsewhere, or the GATE MAY HAVE FAILED and left the worktree detached at an ungated commit. NOT the branch\'s fault, so it is not handed back to the implementer',
+      }
+    default:
+      return { outcome: 'stall', why: `unknown exit ${code} — merge-queue.sh grew a code this workflow does not classify` }
+  }
 }
 
 const ACK = {
@@ -215,12 +256,9 @@ function mergeRunnerPrompt(branch) {
 
 Run EXACTLY: \`cd ${INTEGRATION_WT} && ${QUEUE_ENV}${REPO}/scripts/merge-queue.sh ${branch} ${INTEGRATION} ${INTEGRATION_WT}\` (use ./scripts/merge-queue.sh if that path is right for this repo).
 
-The script rebases ${branch} onto the current ${INTEGRATION} tip, fast-forwards (linear, no merge commit), and runs the gate. Do NOT resolve conflicts, edit code, or retry — just run it once and read its exit code:
-- exit 0 → landed=true, detail = the script's "landed: …" line.
-- exit 1 or 2 → landed=false, detail = the script's "eject: …" line (rebase conflict or red gate).
-- exit 3 → landed=false, detail = the setup error.
+The script rebases ${branch} onto the current ${INTEGRATION} tip, runs the gate, and on green fast-forwards. Do NOT resolve conflicts, edit code, retry, or interpret the result.
 
-Return {landed, detail}. Do not touch the main copy at ${REPO}.`
+Run it ONCE and return {exit, detail}: \`exit\` is the script's exit status verbatim, \`detail\` is its last line of output. Do not map the code to a meaning — this workflow does that, and the script's own header is where the meanings are written down. Do not touch the main copy at ${REPO}.`
 }
 
 function completePrompt(group) {
@@ -337,9 +375,14 @@ log(`swarm start · scope ${scopeExpr} · integration ${INTEGRATION} (${INTEGRAT
 
 const landed = [] // uids of completed (landed + marked done) tasks
 const gaveUp = [] // uids the swarm exhausted RETRY_CAP on
+// Groups whose merge could neither land nor be blamed on the branch. Reported in the run summary
+// rather than swallowed, because nothing downstream will ever retry them on its own.
+const stalled = []
+// ...and their uids, which the re-dispatch guard consults so a stalled group is not re-offered.
+const stalledUids = []
 const dispatched = new Set() // group signatures already in flight or finished
 const inFlight = new Set() // live group-chain promises
-const stats = { groups: 0, land: 0, eject: 0, requestChanges: 0 }
+const stats = { groups: 0, land: 0, eject: 0, requestChanges: 0, stall: 0 }
 let round = 0
 
 // The serial merge queue: one integration at a time (D27.6). Every approved branch chains
@@ -358,7 +401,9 @@ async function enqueueMerge(branch) {
     () => {},
     () => {},
   ) // keep the chain alive regardless of this run's outcome
-  return (await run) || { landed: false, detail: 'merge runner returned nothing' }
+  // A runner that returns nothing is not a rejection either: it is an unobtainable answer, and
+  // the queue must not turn it into an eject the implementer is blamed for.
+  return (await run) || { exit: -1, detail: 'merge runner returned nothing' }
 }
 
 const groupSig = (group) => group.tasks.map((t) => t.uid).sort().join('|')
@@ -435,11 +480,24 @@ async function processGroup(group) {
 
       // APPROVED → the serial merge queue (deterministic, no agent reasoning).
       const merge = await enqueueMerge(branch)
-      if (merge.landed) {
+      const verdict = classifyMerge(merge.exit)
+      if (verdict.outcome === 'landed') {
         stats.land++
         await agent(completePrompt(group), { label: `done:${label}`, phase: 'Merge', schema: ACK, model: 'haiku' })
         group.tasks.forEach((t) => landed.push(t.uid))
         log(`group ${label}: landed → done · ${merge.detail}`)
+        return
+      }
+      // STALL → not the branch's fault, so it is neither completed nor handed back. The group
+      // keeps its state and its retry budget untouched and a human is told, because every
+      // stalling code means something only a person can clear: a bad worktree, a branch another
+      // checkout holds, or a code this workflow has never heard of. Sending it round the eject
+      // loop would burn RETRY_CAP and reset a perfectly good group to `open`.
+      if (verdict.outcome === 'stall') {
+        stats.stall++
+        log(`group ${label}: MERGE STALLED — ${verdict.why} · ${merge.detail}`)
+        stalled.push({ group: label, branch, exit: merge.exit, why: verdict.why, detail: merge.detail })
+        group.tasks.forEach((t) => stalledUids.push(t.uid))
         return
       }
       // EJECT (rebase conflict or red gate) → SAME implementer pulls the updated feature
@@ -526,7 +584,13 @@ while (inFlight.size > 0 && round < ROUND_CAP) {
     // Skip groups already in flight/finished, or any task already dispatched (claims keep
     // the frontier from re-offering in-flight tasks, but guard against races anyway).
     if (dispatched.has(sig)) continue
-    if (g.tasks.some((t) => landed.includes(t.uid) || gaveUp.includes(t.uid))) continue
+    // STALLED UIDS TOO. A stalled group is released and its tasks sit at `needs_review`, which
+    // is on the ready frontier — so without this the next scheduler pass re-offers the same work
+    // inside the same run, an implementer rebuilds it, and it queues behind the very condition
+    // that stalled it. `landed` and `gaveUp` were excluded and this third outcome was not,
+    // because it did not exist when this line was written.
+    if (g.tasks.some((t) => landed.includes(t.uid) || gaveUp.includes(t.uid) || stalledUids.includes(t.uid)))
+      continue
     dispatched.add(sig)
     startGroup(g)
     added++
@@ -540,8 +604,15 @@ while (inFlight.size > 0 && round < ROUND_CAP) {
 await Promise.allSettled([...inFlight])
 
 log(
-  `swarm done · passes ${round} · groups ${stats.groups} · landed ${stats.land} · ejects ${stats.eject} · request_changes ${stats.requestChanges}`,
+  `swarm done · passes ${round} · groups ${stats.groups} · landed ${stats.land} · ejects ${stats.eject} · stalled ${stats.stall} · request_changes ${stats.requestChanges}`,
 )
+// A STALL IS THE ONE OUTCOME NOTHING WILL RETRY, so it is said again, in words, where a human
+// reads. It reached `stats` and the returned JSON but not this line, and a run in which three
+// groups stalled read exactly like a run in which nothing went wrong.
+if (stalled.length) {
+  log(`** ${stalled.length} group(s) STALLED and need a person — nothing will pick them up:`)
+  for (const st of stalled) log(`   ${st.group} (${st.branch}) exit ${st.exit}: ${st.detail}`)
+}
 
 return {
   scope: scopeExpr,
@@ -551,6 +622,10 @@ return {
   // Landed on the feature branch and marked done in jkb; dependents unblocked.
   completed: landed,
   gave_up: gaveUp,
-  merge_queue: { landed: stats.land, ejects: stats.eject },
+  // NAMED, not just counted. The stall count reached `stats` and the log, but the uids did not
+  // reach the returned lists — so a caller relaying the run's outcome could say three groups
+  // stalled and not say WHICH tasks, which is the only thing a person can act on.
+  stalled_tasks: stalledUids,
+  merge_queue: { landed: stats.land, ejects: stats.eject, stalled: stats.stall, stalls: stalled },
   reviews: { request_changes: stats.requestChanges },
 }

@@ -196,17 +196,13 @@ pub fn edges_from_many(
     if srcs.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; srcs.len()].join(", ");
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT src_item_id, dst_item_id FROM edges
-         WHERE type = ? AND src_item_id IN ({placeholders})
-         ORDER BY src_item_id, dst_item_id"
-    );
-    let mut params: Vec<SqlValue> = Vec::with_capacity(srcs.len() + 1);
-    params.push(SqlValue::Text(edge_type.as_str().to_owned()));
-    params.extend(srcs.iter().map(|id| SqlValue::Integer(id.get())));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
+         WHERE type = ?1 AND src_item_id IN (SELECT value FROM json_each(?2))
+         ORDER BY src_item_id, dst_item_id",
+    )?;
+    let ids = crate::sql::json_ids(srcs.iter().map(|id| id.get()));
+    let rows = stmt.query_map(rusqlite::params![edge_type.as_str(), ids], |r| {
         Ok((
             ItemId::new(r.get::<_, i64>(0)?),
             ItemId::new(r.get::<_, i64>(1)?),
@@ -313,18 +309,66 @@ pub struct EvidenceEdge {
 /// # Errors
 /// Returns an error if the query fails or an unexpected edge type is stored.
 pub fn evidence_edges(conn: &Connection, item: ItemId) -> Result<Vec<EvidenceEdge>> {
+    evidence_edges_limited(conn, item, usize::MAX)
+}
+
+/// [`evidence_edges`], the `limit` with the largest contribution either way — so a cut keeps the
+/// decisive contradictions as well as the decisive support — ordered as [`evidence_edges`] orders, and
+/// whether there were more, from one statement.
+///
+/// # Errors
+/// As [`evidence_edges`].
+pub fn evidence_edges_capped(
+    conn: &Connection,
+    item: ItemId,
+    limit: usize,
+) -> Result<(Vec<EvidenceEdge>, bool)> {
+    let mut edges = evidence_edges_limited(conn, item, limit.saturating_add(1))?;
+    let cut = edges.len() > limit;
+    if cut {
+        // The row the magnitude order ranks last: the smallest contribution, the highest source id
+        // among equals.
+        if let Some(weakest) = edges
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.contribution
+                    .abs()
+                    .total_cmp(&b.contribution.abs())
+                    .then(b.src.get().cmp(&a.src.get()))
+            })
+            .map(|(i, _)| i)
+        {
+            edges.remove(weakest);
+        }
+    }
+    Ok((edges, cut))
+}
+
+/// [`evidence_edges`], the `limit` with the largest contribution either way — so a cut keeps the
+/// decisive contradictions as well as the decisive support — ordered as [`evidence_edges`] orders.
+///
+/// # Errors
+/// As [`evidence_edges`].
+pub fn evidence_edges_limited(
+    conn: &Connection,
+    item: ItemId,
+    limit: usize,
+) -> Result<Vec<EvidenceEdge>> {
     // Ordered by the SIGNED contribution, not the raw magnitude: "strongest first" has to
     // mean strongest *support* first, or `jkb inv evidence` leads with the most damaging
     // item under a heading that promises the opposite.
     let mut stmt = conn.prepare_cached(
-        "SELECT e.src_item_id, e.type, COALESCE(e.weight, 1.0)
-         FROM edges e
-         WHERE e.dst_item_id = ?1 AND e.type IN ('supports', 'contradicts')
-         ORDER BY (CASE e.type WHEN 'supports' THEN 1.0 ELSE -1.0 END
-                   * COALESCE(e.weight, 1.0)) DESC,
-                  e.src_item_id",
+        "SELECT src, type, weight FROM (
+             SELECT e.src_item_id AS src, e.type AS type, COALESCE(e.weight, 1.0) AS weight
+             FROM edges e
+             WHERE e.dst_item_id = ?1 AND e.type IN ('supports', 'contradicts')
+             ORDER BY ABS(COALESCE(e.weight, 1.0)) DESC, e.src_item_id
+             LIMIT ?2)
+         ORDER BY (CASE type WHEN 'supports' THEN 1.0 ELSE -1.0 END * weight) DESC, src",
     )?;
-    let rows = stmt.query_map([item.get()], |r| {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = stmt.query_map(rusqlite::params![item.get(), limit], |r| {
         Ok((
             ItemId::new(r.get::<_, i64>(0)?),
             r.get::<_, String>(1)?,
@@ -393,8 +437,30 @@ pub fn walk(
     depth: usize,
     direction: Direction,
 ) -> Result<Vec<Related>> {
+    Ok(walk_limited(conn, start, types, depth, direction, usize::MAX)?.0)
+}
+
+/// [`walk`], stopping once `limit` items are reached — the walk itself, not only its answer: a
+/// connected knowledge base reaches every item at a modest depth. Whether it stopped early is the
+/// second value.
+///
+/// # Errors
+/// As [`walk`].
+pub fn walk_limited(
+    conn: &Connection,
+    start: ItemId,
+    types: &[EdgeType],
+    depth: usize,
+    direction: Direction,
+    limit: usize,
+) -> Result<(Vec<Related>, bool)> {
     use std::collections::HashSet;
 
+    let legs: &[Direction] = match direction {
+        Direction::Out => &[Direction::Out],
+        Direction::In => &[Direction::In],
+        Direction::Both => &[Direction::Out, Direction::In],
+    };
     let mut seen: HashSet<i64> = HashSet::from([start.get()]);
     let mut out: Vec<Related> = Vec::new();
     let mut frontier = vec![start];
@@ -402,17 +468,40 @@ pub fn walk(
     for hop in 1..=depth {
         let mut next = Vec::new();
         for node in frontier {
-            for (neighbour, edge_type, dir) in neighbours(conn, node, types, direction)? {
-                if !seen.insert(neighbour.get()) {
-                    continue;
+            for leg in legs {
+                // A node's edges are read a page at a time, in id order through the (endpoint, id)
+                // indexes (V021), until they run out or the walk is full. Paged rather than cut by one
+                // LIMIT, because one neighbour can be several edges (one per type) and a cut by rows
+                // dropped neighbours unseen. A hub whose edges all lead to seen items still costs its
+                // degree, read in index order a page at a time.
+                let mut after = 0_i64;
+                loop {
+                    // Enough for the walk to fill up even if every row it has already seen comes
+                    // first: `seen` is `out` plus the start, so this is the cap plus two.
+                    let page = limit.saturating_add(2);
+                    let rows = neighbours(conn, node, types, *leg, after, page)?;
+                    let Some((last, ..)) = rows.last() else { break };
+                    after = *last;
+                    let full = rows.len() == page;
+                    for (_, neighbour, edge_type) in rows {
+                        if !seen.insert(neighbour.get()) {
+                            continue;
+                        }
+                        if out.len() == limit {
+                            return Ok((out, true));
+                        }
+                        out.push(Related {
+                            item: neighbour,
+                            depth: hop,
+                            via: edge_type,
+                            direction: *leg,
+                        });
+                        next.push(neighbour);
+                    }
+                    if !full {
+                        break;
+                    }
                 }
-                out.push(Related {
-                    item: neighbour,
-                    depth: hop,
-                    via: edge_type,
-                    direction: dir,
-                });
-                next.push(neighbour);
             }
         }
         if next.is_empty() {
@@ -420,53 +509,54 @@ pub fn walk(
         }
         frontier = next;
     }
-    Ok(out)
+    Ok((out, false))
 }
 
-/// The direct neighbours of `node` in `direction`, restricted to `types` (empty = any).
+/// The edges of `node` on `leg`, restricted to `types` (empty = any), with ids above `after`, in id
+/// order, at most `page`: `(edge id, neighbour, type)`.
 fn neighbours(
     conn: &Connection,
     node: ItemId,
     types: &[EdgeType],
-    direction: Direction,
-) -> Result<Vec<(ItemId, EdgeType, Direction)>> {
+    leg: Direction,
+    after: i64,
+    page: usize,
+) -> Result<Vec<(i64, ItemId, EdgeType)>> {
     let type_filter = if types.is_empty() {
         String::new()
     } else {
         // Placeholders only — the type strings themselves are bound as parameters.
         format!(" AND type IN ({})", vec!["?"; types.len()].join(", "))
     };
-    let mut out = Vec::new();
-    let legs: &[Direction] = match direction {
-        Direction::Out => &[Direction::Out],
-        Direction::In => &[Direction::In],
-        Direction::Both => &[Direction::Out, Direction::In],
+    let (from_col, to_col) = match leg {
+        Direction::In => ("dst_item_id", "src_item_id"),
+        // `Both` is expanded into its two legs by the caller and never reaches here.
+        Direction::Out | Direction::Both => ("src_item_id", "dst_item_id"),
     };
-    for leg in legs {
-        let (from_col, to_col) = match leg {
-            Direction::In => ("dst_item_id", "src_item_id"),
-            // `Both` is expanded into its two legs above and never reaches here.
-            Direction::Out | Direction::Both => ("src_item_id", "dst_item_id"),
-        };
-        let sql = format!(
-            "SELECT {to_col}, type FROM edges
-             WHERE {from_col} = ?{type_filter} ORDER BY id"
-        );
-        let mut params: Vec<SqlValue> = vec![SqlValue::Integer(node.get())];
-        params.extend(types.iter().map(|t| SqlValue::Text(t.as_str().to_owned())));
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
-            Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
+    let sql = format!(
+        "SELECT id, {to_col}, type FROM edges
+         WHERE {from_col} = ? AND id > ?{type_filter} ORDER BY id LIMIT ?"
+    );
+    let mut params: Vec<SqlValue> = vec![SqlValue::Integer(node.get()), SqlValue::Integer(after)];
+    params.extend(types.iter().map(|t| SqlValue::Text(t.as_str().to_owned())));
+    params.push(SqlValue::Integer(i64::try_from(page).unwrap_or(i64::MAX)));
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            ItemId::new(r.get::<_, i64>(1)?),
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, neighbour, type_str) = row?;
+        let edge_type = EdgeType::from_str_opt(&type_str).ok_or_else(|| {
+            crate::Error::Types(TypeError::Validation(format!(
+                "unknown edge type `{type_str}` stored on an edge"
+            )))
         })?;
-        for row in rows {
-            let (neighbour, type_str) = row?;
-            let edge_type = EdgeType::from_str_opt(&type_str).ok_or_else(|| {
-                crate::Error::Types(TypeError::Validation(format!(
-                    "unknown edge type `{type_str}` stored on an edge"
-                )))
-            })?;
-            out.push((neighbour, edge_type, *leg));
-        }
+        out.push((id, neighbour, edge_type));
     }
     Ok(out)
 }

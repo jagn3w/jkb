@@ -579,10 +579,9 @@ fn append(
     Ok(())
 }
 
-/// Free every claim whose owner is **proven** gone, one lifecycle transition each.
-///
-/// The crash-recovery net (design D27.1/D27.2), now routed through the machine so it appears in
-/// each task's history and obeys the same evidence rule as everything else.
+/// Free every claim whose owner is **proven** gone, one lifecycle transition each — a test helper
+/// over [`reclaim_judged`], which the crash-recovery net (`jkb_api::claims::reclaim`) calls with the
+/// owners its client probed.
 ///
 /// The probe answers a [`Fact`], and only [`Fact::No`] reclaims. An owner whose liveness cannot
 /// be established — an externally-minted `agent:` id, or a `claimant_id` in a shape this binary
@@ -592,34 +591,48 @@ fn append(
 /// (`jkb task release <uid> --owner <owner>`, once you know that owner is gone); reclaiming it
 /// wrongly costs the work.
 ///
-/// Liveness is evaluated **inside the write transaction** against the freshly-read claim set,
-/// which closes the race where a claim acquired concurrently by a live owner is reclaimed from a
-/// stale snapshot. Each distinct owner is probed at most once; owners in `keep` are alive by
+/// Liveness is evaluated here **inside the write transaction**; each distinct owner is probed at
+/// most once; owners in `keep` are alive by
 /// fiat and never probed, so a live coordinator passing its own id never reclaims its own work.
 ///
 /// # Errors
 /// Returns a database error if a query fails.
-pub fn reclaim_dead(
+#[cfg(test)]
+pub(crate) fn reclaim_dead(
     conn: &Connection,
     meta: &WriteMeta,
     keep: &[String],
     probe: impl Fn(&str) -> Fact,
 ) -> Result<Reclaimed> {
-    let held = claim::claimed(conn)?;
     let mut alive: std::collections::HashMap<String, Fact> = std::collections::HashMap::new();
-    for c in &held {
-        if !alive.contains_key(&c.owner) {
-            let live = if keep.iter().any(|o| o == &c.owner) {
+    reclaim_judged(conn, meta, |c| {
+        *alive.entry(c.owner.clone()).or_insert_with(|| {
+            if keep.iter().any(|o| o == &c.owner) {
                 Fact::Yes
             } else {
                 probe(&c.owner)
-            };
-            alive.insert(c.owner.clone(), live);
-        }
-    }
+            }
+        })
+    })
+}
+
+/// Free every held claim `judge` answers [`Fact::No`] for, through the lifecycle's
+/// `ObservedOwnerGone`, and report the ones it answers [`Fact::Unknown`] for — `reclaim_dead`
+/// with the judgement handed in per claim, for a caller whose answer depends on the task as well as
+/// its owner (`jkb-api`'s `task.reclaim`, which leaves alone a task its client may not write).
+///
+/// The claim set is read inside the transaction, so a claim released meanwhile is not touched.
+///
+/// # Errors
+/// Returns a database error if a query fails.
+pub fn reclaim_judged(
+    conn: &Connection,
+    meta: &WriteMeta,
+    mut judge: impl FnMut(&claim::ClaimInfo) -> Fact,
+) -> Result<Reclaimed> {
     let mut out = Reclaimed::default();
-    for c in held {
-        match alive[&c.owner] {
+    for c in claim::claimed(conn)? {
+        match judge(&c) {
             Fact::No => {
                 let facts = TaskFacts {
                     claimant: Some(AgentId::parse(&c.owner)),
@@ -650,8 +663,7 @@ pub fn reclaim_dead(
 pub struct Reclaimed {
     /// Claims whose owner was proven gone, now freed.
     pub cleared: Vec<claim::ClaimInfo>,
-    /// Claims held by an owner whose liveness could not be established. **Not** freed — see
-    /// [`reclaim_dead`].
+    /// Claims held by an owner whose liveness could not be established. **Not** freed.
     pub unverifiable: Vec<claim::ClaimInfo>,
 }
 

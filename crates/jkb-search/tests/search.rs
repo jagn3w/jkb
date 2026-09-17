@@ -85,7 +85,7 @@ fn doc(text: &str) -> ParsedDocument {
 
 fn ingest(db: &Db, text: &str, namespace: &str) -> ItemId {
     pipeline()
-        .ingest(db, text.as_bytes(), &doc(text), namespace)
+        .ingest(db, Some(text.as_bytes()), &doc(text), namespace)
         .unwrap()
         .document
 }

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The bundle wrapper for jkb-notifier. `UNUserNotificationCenter.current()` refuses a process
+  whose main bundle has no CFBundleIdentifier, so the binary cannot be installed bare.
+
+  CFBundleName is what appears in System Settings > Notifications, where the user has to find it
+  to switch the alert style to "Alerts". It says jkb rather than anything Claude-branded on
+  purpose: this is our helper, and labelling it as someone else's software would be a lie told to
+  the one screen where the user decides whether to trust it.
+
+  NSUserNotificationAlertStyle is deliberately ABSENT. It is the legacy key that used to preset
+  the sticky style, and it is ignored by the UserNotifications framework — measured, not assumed.
+  Leaving it in would read as though stickiness were handled.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>dev.jkb.notifier</string>
+  <key>CFBundleName</key><string>jkb Notifier</string>
+  <key>CFBundleExecutable</key><string>jkb-notifier</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <!-- Agent-style: no Dock icon, no menu bar. A one-shot verb posts and exits; `serve` runs under
+       launchd (com.jkb.notifier) and consumes jkb's notification queue. -->
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>

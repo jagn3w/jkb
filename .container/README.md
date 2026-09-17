@@ -745,13 +745,158 @@ is the VM's memory limit, not a broken toolchain. Raise the runtime's memory (Do
 Resources pane, `colima start --memory`), or cap parallelism with `CARGO_BUILD_JOBS=2`, which
 lowers peak usage far more than it costs in wall-clock.
 
-## `~/.jkb` is shared with the host, deliberately
+## The container never opens the knowledge base — measured, not assumed
 
-The knowledge base is bind-mounted, so the container and the host see the same database — which is
-the point, and every write goes through the audited writer-actor, so damage is undoable. The
-consequence to know about is the usual one: the DB migrates in place, so a container `jkb` built
-from a branch with a newer migration will lock the host binary out until it is rebuilt. Point
-`JKB_DB` at a container-local path if you would rather they were independent.
+`~/.jkb` is still bind-mounted (auto-memory, worktree archives, logs, the daemon's token), but no
+process in here opens `jkb.db`. Since the cutover (tasks S6.5) the container is in **remote mode**:
+`JKB_REMOTE=host.docker.internal:7117` (`containerEnv`), so every `jkb` command reaches the host's
+knowledge base through `jkb serve` (next section) or is refused, and there is no database of the
+container's own. Before the cutover there was one — `JKB_DB` on a `jkb-kb-local` volume, empty at
+first and never seeing the host's tasks. **Upgrading a container that had it:** there is no
+export verb, so before rebuilding, look through it from the old container (`jkb query kind:task`,
+`jkb ns ls`) for anything the host's knowledge base lacks — tasks filed in a checkout's `tasks.md`
+are already there through the host's own sync — and recreate it on the host. Then remove the volume
+with `docker volume rm jkb-kb-local` once the new container is up. The installed `jkb` must be from
+the cutover or later (setup.sh reinstalls it on a rebuild): an older one reads the bare
+`host:port` as a URL scheme and every command fails — `verify.sh` asks the installed binary through
+the daemon for that reason. **Unmutated, stated:** that probe and the `--db` refusal probe beside it
+have not been watched failing — `mutate-verify.sh`'s containers have no `jkb` installed and no
+daemon, so both are skipped there.
+
+The original decision was to share `~/.jkb/jkb.db` across the bind, and it was reversed because sharing it corrupts it.
+SQLite's WAL mode needs every process to share two things: POSIX advisory locks on the database
+and its `-shm` file, and a `MAP_SHARED` mapping of `-shm` (the wal-index). Across this bind mount
+(virtiofs, Docker Desktop on macOS), `.container/sqlite-share-probe.py` measured both, with one process on
+each kernel, on 2026-09-13:
+
+| probe | same kernel | container → macOS |
+|---|---|---|
+| fcntl write lock held; other side asks `F_GETLK` and tries `F_SETLK` | seen, refused | **unlocked, acquired** |
+| counter written 2,514 times through `MAP_SHARED`; other side samples its mapping | all seen | **2 distinct values, ended at 10** |
+| 4 writers + a checkpointer per side, jkb's pragmas, 45 s | 100k+ rows, `integrity_check` ok | **malformed after 38 commits** |
+
+A rollback journal does not help — it relies on the same locks. And a container *reader* is not
+safe either: `jkb` opens read-write, and closing a WAL connection that believes it is the last one
+checkpoints and truncates a WAL the host is still writing.
+
+So **the host owns `jkb.db`** and the container reaches it through the host daemon over one allowed
+TCP port, sending typed database operations (never whole CLI commands, which would run gates and git
+on the host, outside this sandbox). What a command cannot do that way is refused in remote mode —
+`docs/message-queue.md` lists the host-only commands.
+
+**Enforced, not just configured.** Remote mode refuses `--db` and a non-empty `JKB_DB` before
+anything opens, and `check-config.sh` / `verify.sh` fail on `JKB_DB` being set or the old volume
+coming back. Behind that, the rule also lives where a database is created or opened: `jkb-core`'s `db::open` and `Db::backup` refuse any `file:` URI, and
+any database that would touch a FUSE, 9p, NFS or SMB filesystem (`crates/jkb-core/src/shared_fs.rs`).
+What is asked: the directory the files will be created in (symlinks followed, dangling ones
+included, since SQLite creates the database at a dangling link's target; the nearest existing
+ancestor for a path that does not exist yet), **and** the database file and its `-wal`/`-shm`/
+`-journal` when they exist, because a single file bind-mounted into a local directory is invisible
+to statfs of that directory. A statfs that cannot answer refuses — except for a file that is gone by
+the time it is asked, which is skipped while its directory still judges: SQLite deletes `-wal`/`-shm`
+when another process closes its last connection, and an open beside one that was just exiting was
+refused as "cannot tell what filesystem" (met by a CLI test under a parallel run, 2026-09-15; both the
+Rust and the shell copy skip it, each pinned by a test). Every script's database read goes
+through `jkb_sqlite` in
+`scripts/lib.sh`, which applies the same magic set — `scripts/tests/dev-scripts.test.sh` case11 fails
+on a bare call, on the two sets drifting, and inside the container on the live bind not being
+refused. So a process with remote mode switched off and `--db ~/.jkb/jkb.db` (or no `--db` at all), gets a
+refusal instead of the host's database — **once the installed `jkb` carries the refusal**: a binary built before it opens
+the host's database from in here (a review measured exactly that), so `setup.sh` must have rebuilt it,
+and `verify.sh` asks the installed binary to open a probe on the bind and requires the refusal.
+`db::open` also refuses any `file:` string: the bundled SQLite is compiled with `-DSQLITE_USE_URI`,
+and `--db file:/home/vscode/.jkb/jkb.db` opened the host's database past a guard that judged a
+relative path — measured, it listed the host's namespaces and touched its `-shm` before this fix. Measured in the container: `jkb --db ~/.jkb/refusal-probe/jkb.db ns ls` exits 1
+naming the FUSE bind and creates no database file (the CLI's `create_dir_all` of the parent still runs
+first, leaving an empty directory).
+
+**Residual, stated.** The guard covers jkb and `jkb_sqlite`. Any *other* SQLite client run in the
+container — `python3 -c 'import sqlite3; sqlite3.connect(".../.jkb/jkb.db")'`, a hand-typed database
+shell — is not jkb and is not refused; `.claude/hooks/block-raw-sqlite.sh` matches only the shell,
+only for agent tool calls, and fails open. What would close that for good is the container not
+seeing the host's database file at all; the bind still carries it, because `~/.jkb` holds the token
+and the other shared state (`openspec/changes/jkb-message-queue/design-r3.md`).
+
+## The one opening to the host: `jkb serve` on port 7117
+
+The host's `jkb serve` (`com.jkb.serve`, installed by `scripts/setup.sh` on the host) listens on the
+host's `127.0.0.1:7117` and nowhere else. The container reaches it as `host.docker.internal:7117`.
+Measured on the Mac, 2026-09-14, Docker Desktop 4.87.0:
+
+| probe | result |
+|---|---|
+| plain `curlimages/curl` container → `host.docker.internal:7117/v1/hello`, no token | `401` — Docker Desktop forwards the alias to the host's **loopback**, so the daemon need not listen on anything wider |
+| the same with `-4`, and with `--add-host=host.docker.internal:host-gateway` | `401`, `401` |
+| `getent ahostsv4 host.docker.internal`, plain container and `jkb-dev` | `192.168.65.254` in both (v6 `fdc4:f303:9324::254` first) |
+| `jkb-dev` before the rule, `curl -4` | "Connection refused" after 1 ms — this firewall's REJECT |
+| inside the Claude Bash sandbox | the alias does not resolve (`getent` exit 2); its proxy resolves on the sandbox's behalf |
+| the same sandbox, through its proxy, rebuilt container, alias in the installed posture | `/v1/hello` `401` without the token, the hello JSON with it; `:7118` `502`; `jkb --json mq topic ls` in remote mode `[]` |
+
+**Port-only, never a posture domain's address.** Docker Desktop forwards that alias to the host's
+loopback on *every* port, and the IP allowlist (`allowed`) is `hash:net` with no port. So the host's
+address in `allowed` would open every service listening on the Mac's loopback to this container.
+`init-firewall.sh` resolves the alias into its own set (`jkb-daemon`) first, installs
+`RULE_DAEMON` (`-p tcp --dport 7117 -m set --match-set jkb-daemon dst -j ACCEPT`), and keeps the host
+out of `allowed` two ways: the alias **by name** (it never reaches `allowed`, even when the daemon
+lookup came back empty while the posture's lookup of the same name did not — the hole a review of
+`bc0228a` found), and any address in the daemon set **by address**, so a second name for the host
+cannot walk past a rule keyed on one spelling. **Residual:** a *different* name resolving to the host
+during a raise whose daemon lookup failed still lands in `allowed`; `verify.sh` reports that as
+`wide`, because the probe re-resolves the alias. The alias is still in the posture's `allowedDomains`:
+that is what lets the nested sandbox's proxy tunnel to it, and the firewall is what stops the same
+entry widening the coarse layer. `egress-status.sh` reports the opening as
+`daemon=port|unresolved|absent|wide` and the `daemon_at` it is about, and `verify.sh` fails on
+anything but `port`. "No other host port" means beyond DNS: the older rules accept 53 to any address,
+the host's included.
+
+**Everything in here uses it** (tasks S6.5): `JKB_REMOTE` (`containerEnv`,
+`host.docker.internal:7117` — `host:port` with no scheme, which `jkb` reads as `http://`, because
+`lib.sh`'s `dc_strip` cannot tell a URL's `//` from a comment) puts every `jkb` command in remote
+mode, and `jkb notify hook` posts to the same address (design r3.2 N1). Before the cutover the hook
+alone used it, through a `JKB_DAEMON_ADDR` that is gone. Without it the hook would look on the
+container's own loopback — every notification lost with nothing to say so — and every other command
+would look for a database. `check-config.sh` holds the value to `DAEMON_HOST`/`DAEMON_PORT` and the
+variable's name to `remote.rs`'s `REMOTE_VAR`, and `mutate-config.sh` drifts and drops each. Changing
+it needs a rebuild, like the rest of `containerEnv`. See [docs/notifications.md](../docs/notifications.md).
+
+**What `verify.sh` asks.** The kernel's answer above, at the address the *image* names; then the
+daemon's own answer (`/v1/hello` with the token from the `~/.jkb` bind — the path remote mode takes).
+A missing token is a **failure**, since the container depends on the daemon for every command
+(tasks S6.5) — unless `JKB_VERIFY_NO_DAEMON=1` says none is expected, which `mutate-verify.sh` sets
+because its scratch `~/.jkb` has no daemon (a CI runner would too); it is a note then, and a mutation
+drops the variable and watches the failure. A token that exists but cannot be read is a failure. With the egress override
+armed and no firewall, the daemon failures are accepted ones, so `verify.sh` still exits 3.
+
+**The other direction is the kernel's `wide` answer, not a curl.** A probe of `host.docker.internal:7118`
+expecting a refusal was written and removed: on a Linux engine a closed host port refuses whether or
+not the rule is wide, so it passed in exactly the state it existed for, and no mutation could show it
+firing. The `wide` state is read from the live sets instead — `ipset test` against `allowed`, where a
+read that fails for any reason but "is NOT in set" counts as wide.
+
+**`--add-host=host.docker.internal:host-gateway` is pinned** although Docker Desktop does not need it
+(measured, above): a Linux engine resolves the alias only with it, and CI raises this firewall on one.
+On a Linux *host* the daemon would also have to listen where the bridge can reach it, which is not done.
+
+**VS Code must not forward 7117.** Measured on the Mac, 2026-09-14: something in the container
+listened on 7117, VS Code auto-forwarded it, and so held the **host's** `127.0.0.1:7117` ("Code
+Helper" in `lsof`). `com.jkb.serve` crash-looped on `Address already in use` in `~/.jkb/serve.log`,
+and connections to the port hung. The container therefore carries a `devcontainer.metadata` label
+setting `portsAttributes."7117".onAutoForward` to `ignore`, which attaching reads (it reads nothing
+from `container.json`) — **whether attaching honours it is not yet measured**. `jkb serve` names the
+condition itself now: the refusal gives the `lsof` command and this cause.
+
+**The probe must not trip a caller's ERR trap on the Mac.** `egress-lib.sh --self-test` (in `check.sh`)
+runs every probe under `set -eE` with an ERR trap, on whatever machine runs the gate. On the Mac,
+2026-09-16, `daemon_state` tripped it and the other probes did not. The Mac has neither `ipset` nor
+`getent`, and its bash is 3.2. `daemon_state` was the only probe written `x="$(failing …)" || x=""`,
+and that `||` guards only the assignment in the outer shell, not the failure inside the substitution's
+subshell, to which `set -E` hands the trap. bash 5.2 in the container, with the tools present and
+also with them hidden from `PATH`, did not fire it. So the mechanism is inferred, not reproduced.
+Every fallback is now inside its substitution, and statuses are read by `ipset_rc`, which takes them
+in an `&&`/`||` list inside the subshell.
+
+Changing any of this takes a **rebuild** (`./.container/run.sh --rm && ./.container/run.sh --build`):
+the firewall, its library and the posture snapshot are installed into the image and read at create.
 
 ## A session worktree is an ordinary folder in here
 

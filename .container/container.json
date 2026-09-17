@@ -62,7 +62,21 @@
     // should not take the machine down with it. PID 1 REAPS so that this is a bound on runaway
     // work rather than one ordinary use walks into on its own — see entrypoint.sh's exec, and
     // note that `--init` is deliberately NOT the way that is done here.
-    "--pids-limit", "4096"
+    "--pids-limit", "4096",
+
+    // The host alias, pinned. Docker Desktop resolves it without this (measured on the Mac,
+    // 2026-09-14: `401` from the daemon with and without the flag, the same 192.168.65.254 either
+    // way), so there it changes nothing; a Linux engine resolves it ONLY with it, and that is where
+    // CI raises this firewall. egress-lib.sh's DAEMON_HOST is this name.
+    "--add-host=host.docker.internal:host-gateway",
+
+    // VS Code must NOT forward the host daemon's port. Measured on the Mac, 2026-09-14: something in
+    // here listened on 7117, VS Code auto-forwarded it and so held the HOST'S 127.0.0.1:7117, and
+    // `jkb serve` (com.jkb.serve) crash-looped on "Address already in use" while every connection to
+    // the port hung. Attaching reads nothing from this file, but it does read the
+    // `devcontainer.metadata` label on the container, which is where this goes. The port is
+    // egress-lib.sh's DAEMON_PORT, and check-config.sh holds the label to it.
+    "--label", "devcontainer.metadata=[{\"portsAttributes\":{\"7117\":{\"label\":\"jkb serve (host)\",\"onAutoForward\":\"ignore\"}}}]"
   ],
 
   // THE MOUNT LIST IS THE SECURITY BOUNDARY. Everything absent from it does not exist inside the
@@ -82,8 +96,12 @@
     // open whichever checkout you want, including a `jkb task work` session inside one.
     "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
 
-    // The knowledge base. Shared with the host deliberately — it is the point of jkb — and every
-    // write to it goes through the audited writer-actor, so damage here is undoable.
+    // The host's ~/.jkb: auto-memory (`claude-memory/`), worktree archives, logs, and the daemon's
+    // token. NOT the knowledge base: the container reaches that only through `jkb serve` on the host
+    // (JKB_REMOTE below), and has no database of its own. A SQLite database cannot be shared across
+    // this bind: measured (.container/sqlite-share-probe.py, 2026-09-13), an fcntl lock taken in here is
+    // invisible on macOS and a MAP_SHARED mapping is not shared, so WAL's write lock and wal-index
+    // both break, and two writers corrupted a scratch database within 38 commits.
     "source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb,type=bind,consistency=cached",
 
     // NO credential mount, deliberately. `~/.claude/.credentials.json` is Linux/WSL-only — on
@@ -109,8 +127,17 @@
   ],
 
   "containerEnv": {
-    // Keep the posture's own paths meaningful inside the container.
-    "JKB_DB": "/home/vscode/.jkb/jkb.db",
+    // Remote mode (tasks S6.5): every `jkb` in here reaches the knowledge base through `jkb serve` on
+    // the host, and the notification hook posts there too (both resolve it in
+    // crates/jkb-cli/src/remote.rs). There is no container-local database any more, and none may be
+    // opened: remote mode refuses --db and JKB_DB, and a process that somehow opened ~/.jkb/jkb.db
+    // through the bind is refused by jkb-core's db::open, which rejects a database on a FUSE
+    // filesystem (crates/jkb-core/src/shared_fs.rs) — a process on each side of the bind corrupts it,
+    // and even a read is unsafe. check-config.sh holds this address to egress-lib.sh's DAEMON_HOST
+    // and DAEMON_PORT, the one opening init-firewall.sh makes. host:port with no scheme, like
+    // jkb serve's own --addr: this file's comment stripper (lib.sh dc_strip) cannot tell a URL's //
+    // from a comment. The token is read from ~/.jkb/daemon/<port>/token, through the bind.
+    "JKB_REMOTE": "host.docker.internal:7117",
     // See the target/ volume above: keeps cargo's output off the bind mount.
     "CARGO_TARGET_DIR": "/home/vscode/.cargo/target",
     // THE ONE ESCAPE FROM THE EGRESS BOOT GATE (D50.6), off by default and declared here on

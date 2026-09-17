@@ -19,9 +19,77 @@ pub fn like_escape(s: &str) -> String {
     out
 }
 
+/// A list of ids bound as ONE parameter: pair it with `IN (SELECT value FROM json_each(?))`.
+///
+/// **Every unbounded list goes through this or [`json_strings`]**, not a placeholder per element.
+/// `SQLite` refuses a statement with more than 32,766 variables, so a placeholder list failed outright
+/// for a namespace or a frontier that large — a read that should have come back cut short came back
+/// an internal error — and a statement whose text grows with its list defeats `prepare_cached`, one
+/// cached statement per length. Only a list bounded by construction — a path's ancestors — may still
+/// use placeholders; anything a client's text can lengthen may not (a query's kinds were exempted once,
+/// and `kind:a,a,…` from a request body refused its statement). Terms that are clauses rather than
+/// list elements — a query's tags — cannot be bound this way and are bounded by count instead
+/// (`query::MAX_TAG_TERMS`).
+#[must_use]
+pub fn json_ids(ids: impl IntoIterator<Item = i64>) -> String {
+    let ids: Vec<i64> = ids.into_iter().collect();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// [`json_ids`] for a list of strings.
+#[must_use]
+pub fn json_strings(values: &[String]) -> String {
+    serde_json::to_string(values).unwrap_or_else(|_| "[]".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::like_escape;
+
+    /// Every list query takes more ids than `SQLite`'s 32,766-variable limit — the ids need not exist;
+    /// a placeholder per id refused the statement before it looked.
+    #[test]
+    fn every_list_query_takes_more_ids_than_sqlite_has_variables() {
+        use jkb_types::{EdgeType, ItemId};
+        let db = crate::Db::open_in_memory().unwrap();
+        db.read(|c| {
+            let ids: Vec<ItemId> = (1..=40_000).map(ItemId::new).collect();
+            let uris: Vec<String> = (1..=40_000).map(|i| format!("file:///{i}")).collect();
+            assert!(crate::item::get_many(c, &ids)?.is_empty());
+            assert!(crate::item::derived_from(c, &ids)?.is_empty());
+            assert!(crate::item::derived_kind_counts(c, &ids, "chunk")?.is_empty());
+            assert!(crate::containment::child_counts(c, &ids)?.is_empty());
+            assert!(crate::edge::edges_from_many(c, &ids, EdgeType::DependsOn)?.is_empty());
+            assert!(crate::tag::applications_for(c, &ids)?.is_empty());
+            assert!(crate::binding::items_for_uris(c, &uris)?.is_empty());
+            let q = crate::query::Query {
+                ids: ids.clone(),
+                ..crate::query::Query::default()
+            };
+            assert!(q.evaluate(c)?.is_empty());
+            let kinds: Vec<String> = (1..=40_000).map(|i| format!("k{i}")).collect();
+            let q = crate::query::Query {
+                kinds: kinds.clone(),
+                exclude_kinds: kinds,
+                ..crate::query::Query::default()
+            };
+            assert!(q.evaluate(c)?.is_empty());
+            let tags = (0..1000)
+                .map(|i| format!("tag:f{i}=v"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let refused = crate::query::parse(&tags)?.evaluate(c).unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    crate::Error::Types(jkb_types::Error::Validation(_))
+                ),
+                "too many tag terms is a refusal, not SQLite's expression-depth error: {refused}"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn escapes_like_metacharacters() {

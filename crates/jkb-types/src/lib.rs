@@ -14,7 +14,7 @@ mod error;
 mod id;
 mod traits;
 
-pub use agent::{AgentId, Liveness};
+pub use agent::{is_session_id, is_session_id_byte, AgentId, Liveness, MAX_SESSION_ID_BYTES};
 pub use catalog::{check_version_drift, ensure_compatible, CatalogIdentity, VersionDrift};
 pub use enums::{
     ConflictPolicy, EdgeType, NamespaceKind, PlacementRole, Resolution, SyncMode, TaskStatus,

@@ -14,14 +14,39 @@ use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
+/// The longest namespace path, in bytes, and the most segments one may have. [`ensure`] writes a row
+/// for every ancestor, so a path's cost grows with the square of its depth, and a client of `jkb
+/// serve` names namespaces in request bodies up to a megabyte: `a/a/a/…` there was roughly half a
+/// million rows of rising length in one transaction on the writer every other request waits on
+/// (stage-6.2 review). Far past any real layout — a synced directory tree included.
+pub const MAX_PATH_BYTES: usize = 4096;
+/// See [`MAX_PATH_BYTES`].
+pub const MAX_DEPTH: usize = 128;
+
 /// Normalize and validate a logical namespace path: reject empty paths/segments,
-/// `.`/`..` traversal, and control characters; apply Unicode NFC to each segment.
+/// `.`/`..` traversal, control characters, and a path longer than [`MAX_PATH_BYTES`] or deeper than
+/// [`MAX_DEPTH`]; apply Unicode NFC to each segment.
 ///
 /// # Errors
 /// Returns [`crate::Error::Types`] wrapping a validation error for any violation.
 pub fn normalize(path: &str) -> Result<String> {
     if path.is_empty() {
         return Err(TypeError::Validation("namespace path is empty".to_owned()).into());
+    }
+    // Before any per-segment work, so an oversized path costs nothing to refuse.
+    if path.len() > MAX_PATH_BYTES {
+        return Err(TypeError::Validation(format!(
+            "namespace path of {} bytes; at most {MAX_PATH_BYTES}",
+            path.len()
+        ))
+        .into());
+    }
+    let depth = path.split('/').count();
+    if depth > MAX_DEPTH {
+        return Err(TypeError::Validation(format!(
+            "namespace path {depth} segments deep; at most {MAX_DEPTH}"
+        ))
+        .into());
     }
     let mut segments = Vec::new();
     for segment in path.split('/') {
@@ -36,7 +61,28 @@ pub fn normalize(path: &str) -> Result<String> {
         }
         segments.push(segment.nfc().collect::<String>());
     }
-    Ok(segments.join("/"))
+    let normalized = segments.join("/");
+    // Again after NFC, which can lengthen a segment several-fold: a path accepted here must be one
+    // every later lookup of the stored form accepts too.
+    if normalized.len() > MAX_PATH_BYTES {
+        return Err(TypeError::Validation(format!(
+            "namespace path of {} bytes once normalized; at most {MAX_PATH_BYTES}",
+            normalized.len()
+        ))
+        .into());
+    }
+    Ok(normalized)
+}
+
+/// The top-level roots the D32 layout reserves, which readers find by their fixed paths (`memory`
+/// for investigations, `tasks` for the task index, `_sys` for views and journals, …).
+pub const RESERVED_ROOTS: &[&str] = &["repos", "tasks", "media", "references", "memory", "_sys"];
+
+/// Whether moving `path`, or moving something onto it, would move what a reader finds by its fixed
+/// path: a [`RESERVED_ROOTS`] root itself, or anything under `_sys`.
+#[must_use]
+pub fn is_fixed(path: &str) -> bool {
+    RESERVED_ROOTS.contains(&path) || path.starts_with("_sys/")
 }
 
 /// Whether `path` denotes a system namespace (`_sys` or below).
@@ -502,12 +548,23 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
         return Err(TypeError::Validation(format!("target '{to}' already exists")).into());
     }
 
+    let rows = subtree(conn, &from)?;
+    // Every path the move would write, judged before any is: a move to a near-limit target lengthens
+    // each descendant by the same amount, and a stored path `normalize` refuses can never be named.
+    for (_, path) in &rows {
+        let moved = format!("{to}{}", &path[from.len()..]);
+        normalize(&moved).map_err(|e| {
+            TypeError::Validation(format!(
+                "moving '{from}' to '{to}' would make '{moved}': {e}"
+            ))
+        })?;
+    }
+    // Only once every path is known to be nameable: `ensure` writes the target's ancestors.
     let new_parent: Option<i64> = match to.rsplit_once('/') {
         Some((parent, _)) => Some(ensure(conn, parent)?.get()),
         None => None,
     };
 
-    let rows = subtree(conn, &from)?;
     // ONE ENTRY PER ROW THIS MOVES. It used to log a single entry naming the root's old `path`,
     // which describes a fraction of what changed: `undo` restoring that one row would leave every
     // descendant under the new path, so the move was not reversible at all and `jkb undo` after a
@@ -622,6 +679,37 @@ mod tests {
     use crate::{placement, Db};
     use jkb_types::PlacementRole;
     use serde_json::json;
+
+    #[test]
+    fn a_move_that_would_push_a_descendant_past_the_limits_writes_nothing() {
+        let db = crate::Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            super::ensure(c, "notes/a/b")?;
+            let target = vec!["x"; super::MAX_DEPTH - 1].join("/");
+            assert!(super::move_subtree(c, m, "notes", &target).is_err());
+            assert!(super::get(c, "notes/a/b")?.is_some(), "nothing moved");
+            assert!(
+                super::get(c, "x")?.is_none(),
+                "not even the target's ancestors, which a caller handling the error would commit"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_path_too_long_or_too_deep_is_refused() {
+        let deepest = vec!["a"; super::MAX_DEPTH].join("/");
+        assert!(super::normalize(&deepest).is_ok());
+        assert!(super::normalize(&format!("{deepest}/a")).is_err());
+        assert!(super::normalize(&"x".repeat(super::MAX_PATH_BYTES)).is_ok());
+        assert!(super::normalize(&"x".repeat(super::MAX_PATH_BYTES + 1)).is_err());
+        // U+1D160 is four bytes that NFC decomposes into twelve: under the cap as sent, over it as
+        // stored — and a stored path every later lookup refused could never be named again.
+        let expands = "\u{1D160}".repeat(super::MAX_PATH_BYTES / 4);
+        assert_eq!(expands.len(), super::MAX_PATH_BYTES);
+        assert!(super::normalize(&expands).is_err());
+    }
 
     #[test]
     fn subtree_leaf_count_spans_descendants_dedups_and_honours_terminal() {
@@ -971,6 +1059,14 @@ mod tests {
             .read(|conn| for_namespace(conn, "memory/oops"))
             .unwrap()
             .is_none());
+    }
+
+    /// Every namespace the layout types by its fixed path is one a client may not move.
+    #[test]
+    fn every_reserved_type_path_is_fixed() {
+        for (path, _) in crate::nstype::RESERVED_TYPES {
+            assert!(super::is_fixed(path), "{path}");
+        }
     }
 
     /// A type is **not** a location marker (design D33.5): nothing resolves "which namespace

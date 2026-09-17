@@ -1545,6 +1545,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hyper"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1558,6 +1564,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -1886,6 +1893,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jkb-api"
+version = "0.1.0"
+dependencies = [
+ "jkb-core",
+ "jkb-embed",
+ "jkb-fsm",
+ "jkb-index",
+ "jkb-ingest",
+ "jkb-search",
+ "jkb-sync",
+ "jkb-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "jkb-cli"
 version = "0.1.0"
 dependencies = [
@@ -1893,7 +1919,9 @@ dependencies = [
  "assert_cmd",
  "clap",
  "ctrlc",
+ "jkb-api",
  "jkb-core",
+ "jkb-daemon",
  "jkb-embed",
  "jkb-fsm",
  "jkb-index",
@@ -1920,10 +1948,32 @@ dependencies = [
  "proptest",
  "refinery",
  "rusqlite",
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror",
  "unicode-normalization",
+]
+
+[[package]]
+name = "jkb-daemon"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "getrandom 0.2.17",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "jkb-api",
+ "jkb-core",
+ "reqwest 0.13.4",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1975,11 +2025,10 @@ name = "jkb-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jkb-api",
  "jkb-core",
- "jkb-embed",
  "jkb-index",
  "jkb-ingest",
- "jkb-search",
  "jkb-types",
  "rmcp",
  "schemars",
@@ -3411,9 +3460,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.41"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -3435,9 +3484,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -3705,6 +3754,16 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
 
 [[package]]
 name = "simd-adler32"
@@ -4065,6 +4124,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

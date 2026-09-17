@@ -13,9 +13,13 @@ D27):
   and stays with the group through review/fix.
 - **REVIEWER** — a **fresh** reviewer per pass checks the branch against the **whole
   group**; `approve` → merge queue, `request_changes` → back to the same implementer.
-- **merge queue** — *deterministic, no agent* (`scripts/merge-queue.sh`): rebase +
-  fast-forward each approved branch onto the feature branch, run the gate, and on green
-  mark the group **`done`**; on conflict/red **eject** back to the implementer to rebase.
+- **merge queue** — *deterministic, no agent* (`scripts/merge-queue.sh`): rebase each
+  approved branch onto the feature branch, **run the gate on the rebased commit while it is
+  still detached**, and only on green fast-forward the feature branch onto it and mark the
+  group **`done`**. The feature branch therefore never points at an ungated commit, not even
+  briefly. On conflict or red gate, **eject** back to the implementer to rebase; on a failure
+  that is not the branch's fault — the graft passed but the feature branch could not be
+  advanced — the group **stalls** for an operator rather than being handed back.
 
 The pipeline runs Implement → Review → merge **without a per-round barrier**; the merge
 queue is the one serial stage; newly-ready groups feed in as dependents unblock.

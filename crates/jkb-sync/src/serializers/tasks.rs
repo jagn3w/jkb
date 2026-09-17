@@ -88,9 +88,9 @@ fn parse_text(text: &str) -> Result<SyncDoc> {
 struct ParseState {
     doc: SyncDoc,
     /// Every minted/claimed `local_id` (tasks and text), so none collide.
-    used_ids: HashSet<String>,
+    used_ids: Taken,
     /// Every section slug path, so none collide.
-    used_sections: HashSet<String>,
+    used_sections: Taken,
     /// `(header level, slug path)` of the open section ancestry.
     sec_stack: Vec<(usize, String)>,
     /// The current section's slug path (`None` before the first header).
@@ -121,7 +121,7 @@ impl ParseState {
             return false;
         };
         let indent = line.len() - line.trim_start().len();
-        if line.trim().is_empty() || indent <= task_indent {
+        if jkb_core::item::ends_task_body(line) || indent <= task_indent {
             self.open_task = None;
             return false;
         }
@@ -159,7 +159,7 @@ impl ParseState {
             Some(p) => format!("{p}/{}", section_slug(header_text)),
             None => section_slug(header_text),
         };
-        let path = uniquify(base, &mut self.used_sections);
+        let path = self.used_sections.unique(base);
         self.sec_stack.push((level, path.clone()));
         self.current_section = Some(path.clone());
         self.doc.layout.push(SyncBlock::Section(path.clone()));
@@ -177,7 +177,7 @@ impl ParseState {
             // `classify` already guaranteed uri-safety; only a duplicate id (two lines
             // claiming the same identity) is a genuine error.
             Some(id) => {
-                if !self.used_ids.insert(id.clone()) {
+                if !self.used_ids.claim(&id) {
                     return Err(bad(&format!("duplicate task id `^{id}`")));
                 }
                 id
@@ -478,6 +478,213 @@ fn classify(token: &str) -> Option<Modifier> {
     None
 }
 
+/// Why a task whose content is `content` would not come back from its `tasks.md` as that content —
+/// `None` when it would. Asked by rendering the task as a one-task file and parsing it back with this
+/// serializer, so the answer is this serializer's own rules rather than a copy of them: a blank line
+/// ending the body, an indented checkbox becoming a child task, a trailing `^x` or `@x` or `#f=v`
+/// becoming an identity, a due date or a tag. Handed to `jkb_core::item::edit_content`, and asked first by
+/// [`task_line_problem`], the whole-line check `jkb_api` runs after every task write.
+#[must_use]
+pub fn task_content_problem(content: &str) -> Option<String> {
+    const PROBE: &str = "jkb-content-probe";
+    let mut item = SyncItem::new(PROBE, "task", content);
+    item.status = Some("open".to_owned());
+    let doc = SyncDoc {
+        items: vec![item],
+        layout: vec![SyncBlock::Item(PROBE.to_owned())],
+        ..SyncDoc::default()
+    };
+    let Ok(bytes) = TasksSerializer.render(&doc) else {
+        return Some("it cannot be written as a task line".to_owned());
+    };
+    let Ok(back) = TasksSerializer.parse(&bytes) else {
+        return Some("the task line it makes does not parse".to_owned());
+    };
+    if back.items.len() > 1 {
+        return Some(
+            "a line of it would be read back as a task of its own (a checkbox line)".to_owned(),
+        );
+    }
+    let Some(task) = back.items.iter().find(|i| i.local_id == PROBE) else {
+        return Some("a trailing `^id` would be read back as the task's identity".to_owned());
+    };
+    if back.layout.iter().any(|b| !matches!(b, SyncBlock::Item(_))) {
+        return Some(
+            "a blank line (or one of only whitespace) would end the task's body, and what follows would be \
+             read back as section prose"
+                .to_owned(),
+        );
+    }
+    let mut trailing = Vec::new();
+    if task.priority.is_some() {
+        trailing.push("`!p` priority");
+    }
+    if task.due.is_some() {
+        trailing.push("`@due` date");
+    }
+    if !task.tags.is_empty() {
+        trailing.push("`#f=v` tag");
+    }
+    if !task.mirrors.is_empty() {
+        trailing.push("`+ns` placement");
+    }
+    if !back.edges.is_empty() {
+        trailing.push("`needs:^id` dependency");
+    }
+    if !trailing.is_empty() {
+        return Some(format!(
+            "trailing tokens would be read back as a {} rather than as text",
+            trailing.join(", ")
+        ));
+    }
+    (task.content != content).then(|| {
+        const SHOWN: usize = 200;
+        let mut shown: String = task.content.chars().take(SHOWN).collect();
+        if task.content.chars().nth(SHOWN).is_some() {
+            shown.push('…');
+        }
+        format!(
+            "it would be read back as {shown:?} (quotes are dropped, runs of spaces and tabs close \
+             up, spaces are taken off the ends of the title and the start of every body line, and a \
+             trailing `^id` becomes the task's identity) — `task edit` with the text as it should \
+             read replaces it"
+        )
+    })
+}
+
+/// Why `item`'s line in a `tasks.md` would not come back as `item` — `None` when it would. `deps` are the
+/// `local_id`s it `needs:`. The whole line is asked, not only the text: a due date, a tag or a
+/// namespace with a space in it, a tag facet with an `=`, or a local id that is not lowercase letters,
+/// digits and dashes each rendered a line this serializer read back as something else, and the next
+/// import from the file then rewrote the title and cleared the field. The line is rendered alone (its
+/// dependencies as stub tasks), so no other line in the file decides its answer.
+#[must_use]
+pub fn task_line_problem(item: &SyncItem, deps: &[String]) -> Option<String> {
+    if let Some(problem) = task_content_problem(&item.content) {
+        return Some(problem);
+    }
+    let whole = line_difference(item, deps)?;
+    // A modifier the parser does not take as one is read back as words of the title, taking every
+    // modifier rendered before it along — so the field named is the first that fails on its own.
+    let bare = {
+        let mut bare = SyncItem::new(item.local_id.clone(), "task", item.content.clone());
+        bare.status.clone_from(&item.status);
+        bare
+    };
+    let alone = [
+        SyncItem {
+            priority: item.priority,
+            ..bare.clone()
+        },
+        SyncItem {
+            due: item.due.clone(),
+            ..bare.clone()
+        },
+        SyncItem {
+            tags: item.tags.clone(),
+            ..bare.clone()
+        },
+        SyncItem {
+            mirrors: item.mirrors.clone(),
+            ..bare.clone()
+        },
+    ];
+    alone
+        .iter()
+        .find_map(|one| line_difference(one, &[]))
+        .or_else(|| line_difference(&bare, deps))
+        .or(Some(whole))
+        .map(|(what, want, got)| {
+            format!(
+                "its {what} {want} would be read back as {got} (a modifier is one word, with no \
+                 spaces or quotes, and a local id is lowercase letters, digits and dashes)"
+            )
+        })
+}
+
+/// The first field of `item`'s rendered line (with `deps` as stub tasks) that parses back different,
+/// as `(field, rendered, read back)`; `None` when the line comes back whole.
+fn line_difference(item: &SyncItem, deps: &[String]) -> Option<(&'static str, String, String)> {
+    let mut alone = item.clone();
+    alone.parent = None;
+    alone.section = None;
+    let mut doc = SyncDoc {
+        layout: vec![SyncBlock::Item(item.local_id.clone())],
+        items: vec![alone],
+        ..SyncDoc::default()
+    };
+    for dep in deps {
+        let mut stub = SyncItem::new(dep.clone(), "task", "dependency");
+        stub.status = Some("open".to_owned());
+        doc.layout.push(SyncBlock::Item(dep.clone()));
+        doc.items.push(stub);
+        doc.edges.push(SyncEdge {
+            src: item.local_id.clone(),
+            dst: dep.clone(),
+            edge_type: EdgeType::DependsOn,
+        });
+    }
+    let Ok(bytes) = TasksSerializer.render(&doc) else {
+        return Some((
+            "line",
+            String::new(),
+            "nothing: it cannot be written".to_owned(),
+        ));
+    };
+    let back = match TasksSerializer.parse(&bytes) {
+        Ok(back) => back,
+        Err(e) => return Some(("line", String::new(), format!("a parse error: {e}"))),
+    };
+    let Some(got) = back.items.iter().find(|i| i.local_id == item.local_id) else {
+        return Some((
+            "identity",
+            format!("`^{}`", item.local_id),
+            "the title's words".to_owned(),
+        ));
+    };
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    let mut want_tags = item.tags.clone();
+    want_tags.sort();
+    let mut got_tags = got.tags.clone();
+    got_tags.sort();
+    let got_deps: Vec<String> = back
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::DependsOn && e.src == item.local_id)
+        .map(|e| e.dst.clone())
+        .collect();
+    let show = |v: &dyn std::fmt::Debug| format!("{v:?}");
+    if got.priority != item.priority {
+        Some(("priority", show(&item.priority), show(&got.priority)))
+    } else if got.due != item.due {
+        Some(("due date", show(&item.due), show(&got.due)))
+    } else if got_tags != want_tags {
+        Some(("tags", show(&want_tags), show(&got_tags)))
+    } else if sorted(&got.mirrors) != sorted(&item.mirrors) {
+        Some((
+            "placements",
+            show(&sorted(&item.mirrors)),
+            show(&sorted(&got.mirrors)),
+        ))
+    } else if sorted(&got_deps) != sorted(deps) {
+        Some((
+            "dependencies",
+            show(&sorted(deps)),
+            show(&sorted(&got_deps)),
+        ))
+    } else if got.status != item.status {
+        Some(("status", show(&item.status), show(&got.status)))
+    } else if got.content != item.content {
+        Some(("text", show(&item.content), show(&got.content)))
+    } else {
+        None
+    }
+}
+
 /// Parse the text after a task checkbox: the maximal run of well-formed [`Modifier`]s
 /// at the **end** of the line is metadata; everything before it is the (verbatim)
 /// title. Never fails — malformed or mid-line sigils are treated as ordinary words,
@@ -558,11 +765,16 @@ fn split_trailing_anchor(rest: &str) -> (&str, Option<String>) {
     }
 }
 
-/// Whether `s` is a uri-safe local id: non-empty lowercase letters, digits, and dashes.
+/// Whether `s` is a local id: non-empty, every character a dash or one [`slug`] emits
+/// ([`jkb_core::dsl::is_slug_char`]), since [`mint_id`] builds an id from a slug. ASCII-only, this
+/// rejected the ids it had just minted for `Café`, `修复` or `İstanbul`: each sync read the stamped
+/// `^id` back as title words, minted another and stamped that too, so the task changed identity on
+/// every pass. Emoji, punctuation, uppercase and format characters still end an id, so a title's
+/// trailing `^🎉` stays text as it always was.
 fn is_uri_safe(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            .all(|c| c == '-' || jkb_core::dsl::is_slug_char(c))
 }
 
 /// Parse a header line `#{1,6} text`, returning `(level, text)`. Only lines starting
@@ -654,7 +866,7 @@ fn section_slug(text: &str) -> String {
 /// within the file with a numeric suffix. Pure — no RNG or clock. The base is the shared
 /// [`slug`] (so a task synced from a file and one added via the CLI derive the same slug
 /// from the same title), capped at 24 characters with a `"task"` fallback.
-fn mint_id(title: &str, used: &mut HashSet<String>) -> String {
+fn mint_id(title: &str, used: &mut Taken) -> String {
     let base: String = slug(title).chars().take(24).collect();
     let trimmed = base.trim_matches('-');
     let base = if trimmed.is_empty() {
@@ -663,29 +875,41 @@ fn mint_id(title: &str, used: &mut HashSet<String>) -> String {
         trimmed.to_owned()
     };
     let short = &blob::hash_bytes(title.as_bytes())[..6];
-    let candidate = format!("{base}-{short}");
-    let mut id = candidate.clone();
-    let mut n = 2;
-    while used.contains(&id) {
-        id = format!("{candidate}-{n}");
-        n += 1;
-    }
-    used.insert(id.clone());
-    id
+    used.unique(format!("{base}-{short}"))
 }
 
-/// Ensure a section path is unique within the file, suffixing `-2`, `-3`, … on clash.
-fn uniquify(base: String, used: &mut HashSet<String>) -> String {
-    if used.insert(base.clone()) {
-        return base;
+/// The names taken within one file, where a clashing name is suffixed `-2`, `-3`, … to the first
+/// free one.
+///
+/// The next suffix to try is kept per base, so a file of N identical lines costs N probes rather
+/// than N²/2: counting up from `-2` for every clash made 16k duplicate checkbox lines (128 KiB)
+/// take 11 s, and the round-trip probe parses edit text inside the single writer's transaction.
+/// Names are only ever added, so resuming from the kept suffix finds the same first free name.
+#[derive(Default)]
+struct Taken {
+    names: HashSet<String>,
+    next: HashMap<String, usize>,
+}
+
+impl Taken {
+    /// Take `name` as it is, reporting `false` when it was already taken.
+    fn claim(&mut self, name: &str) -> bool {
+        self.names.insert(name.to_owned())
     }
-    let mut n = 2;
-    loop {
-        let candidate = format!("{base}-{n}");
-        if used.insert(candidate.clone()) {
-            return candidate;
+
+    /// Take `base`, or its first free suffixed form when `base` is taken.
+    fn unique(&mut self, base: String) -> String {
+        if self.names.insert(base.clone()) {
+            return base;
         }
-        n += 1;
+        let n = self.next.entry(base.clone()).or_insert(2);
+        loop {
+            let candidate = format!("{base}-{n}");
+            *n += 1;
+            if self.names.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
     }
 }
 
@@ -696,6 +920,99 @@ fn bad(msg: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// What an edit may leave in a task filed in a tasks.md is what this serializer reads back as
+    /// written; each of these came back as something else.
+    #[test]
+    fn task_content_that_would_not_round_trip_is_named() {
+        use super::task_content_problem;
+        assert_eq!(task_content_problem("Fix login"), None);
+        assert_eq!(task_content_problem("Fix login\nstep one\nstep two"), None);
+        for (reshaped, named) in [
+            ("Fix login\n\nsecond paragraph", "section prose"),
+            ("Fix login\n   \nafter a whitespace line", "section prose"),
+            ("Fix login\n- [ ] also check logout", "a task of its own"),
+            ("Refactor ^parser", "identity"),
+            ("Ship it #size=small", "`#f=v` tag"),
+            ("Ship it !p1", "`!p` priority"),
+            ("Ship it @friday", "`@due` date"),
+            ("Ship it +repos/app", "`+ns` placement"),
+            (
+                "Handle \"Retry-After\" header",
+                "read back as \"Handle Retry-After header\"",
+            ),
+            ("Fix  login", "read back as \"Fix login\""),
+            ("Ping\tteam", "read back as \"Ping team\""),
+            ("Steps:\n  1. build", "start of every body line"),
+            (" Fix login", "ends of the title"),
+        ] {
+            let problem = task_content_problem(reshaped);
+            assert!(
+                problem.as_deref().is_some_and(|p| p.contains(named)),
+                "{reshaped:?} would not come back as written, and the reason names {named:?}: {problem:?}"
+            );
+        }
+    }
+
+    /// An id minted from a title in any script is read back as the task's identity, so the file settles
+    /// after one stamp; a line an older version stamped again and again collapses to its first id.
+    #[test]
+    fn a_title_in_any_script_keeps_one_id_across_syncs() {
+        let text = "## A\n- [ ] Café résumé cleanup\n- [ ] 修复\n- [ ] İstanbul\n";
+        let first = TasksSerializer.parse(text.as_bytes()).unwrap();
+        let stamped = TasksSerializer.render(&first).unwrap();
+        let second = TasksSerializer.parse(&stamped).unwrap();
+        assert_eq!(
+            first.items,
+            second.items,
+            "{}",
+            String::from_utf8_lossy(&stamped)
+        );
+        assert_eq!(
+            TasksSerializer.render(&second).unwrap(),
+            stamped,
+            "byte-stable"
+        );
+
+        // A letter with no lowercase form is in a minted id, so it is read back too.
+        let proof = TasksSerializer
+            .parse("- [ ] Prove ℝ is complete\n".as_bytes())
+            .unwrap();
+        let restamped = TasksSerializer
+            .parse(&TasksSerializer.render(&proof).unwrap())
+            .unwrap();
+        assert_eq!(proof.items, restamped.items);
+        // What no slug holds is title text as before, so a file an older version settled keeps its ids.
+        let party = TasksSerializer
+            .parse(
+                "- [ ] Celebrate launch ^🎉 ^celebrate-launch-208309\n- [ ] Tell the team ^🎉\n"
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(party.items[0].local_id, "celebrate-launch-208309");
+        assert_eq!(party.items[0].content, "Celebrate launch ^🎉");
+        assert_eq!(party.items[1].content, "Tell the team ^🎉");
+
+        let churned = "- [ ] 修复 ^修复-108866 ^修复-修复-108866-85d000\n";
+        let healed = TasksSerializer.parse(churned.as_bytes()).unwrap();
+        assert_eq!(healed.items[0].local_id, "修复-108866");
+        assert_eq!(healed.items[0].content, "修复");
+        // Still not an id: uppercase in any script, punctuation, emoji.
+        for title in [
+            "Fix ^Fix",
+            "Fix ^fix_login",
+            "Fix ^Über",
+            "Fix ^修复。",
+            "Fix ^—",
+            "Rank ^1\u{fe0f}\u{20e3}",
+            "Fix ^e\u{301}",
+        ] {
+            let doc = TasksSerializer
+                .parse(format!("- [ ] {title}\n").as_bytes())
+                .unwrap();
+            assert_eq!(doc.items[0].content, title, "{title:?}");
+        }
+    }
+
     use super::{SyncBlock, SyncDoc, SyncSerializer, TasksSerializer};
 
     /// The document's prose blocks, in order — prose lives inline in the layout.

@@ -128,6 +128,23 @@ impl Db {
         Self { tx, path }
     }
 
+    /// A second handle on this database for reads only, with its own connection and thread, so a
+    /// long read through it does not wait behind — or hold up — this handle's writes. Its connection
+    /// is `query_only` (a `write_txn` through it fails) and runs no migrations. An in-memory database
+    /// has no second connection to open, so there it is this handle.
+    ///
+    /// # Errors
+    /// A failed open (see `db::open_reader`).
+    pub fn reader(&self) -> Result<Self> {
+        match &self.path {
+            None => Ok(self.clone()),
+            Some(path) => Ok(Self::from_connection(
+                db::open_reader(path)?,
+                Some(path.clone()),
+            )),
+        }
+    }
+
     /// Hand `f` to the writer thread and block until it returns.
     fn submit<R, F>(&self, f: F) -> Result<R>
     where
@@ -176,7 +193,8 @@ impl Db {
     /// passed via [`WriteMeta`]; the transaction commits iff `f` returns `Ok`.
     ///
     /// # Errors
-    /// Propagates any error from `f` or the transaction machinery.
+    /// [`Error::SchemaNewer`] once a newer jkb has migrated the database; otherwise propagates any
+    /// error from `f` or the transaction machinery.
     pub fn write_txn<T, F>(&self, actor: impl Into<String>, f: F) -> Result<T>
     where
         F: FnOnce(&Connection, &WriteMeta) -> Result<T> + Send + 'static,
@@ -215,6 +233,10 @@ impl Db {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(Error::from)?;
+            // Under the write lock, so no migration commits between this and `f`'s writes: a
+            // process started before a newer jkb migrated the database stops writing here rather
+            // than putting this build's row shapes into a schema it does not know.
+            crate::migrate::refuse_newer(&tx)?;
             let txn_id: i64 = tx
                 .query_row(
                     "SELECT COALESCE(MAX(txn_id), 0) + 1 FROM changelog",
@@ -235,9 +257,10 @@ impl Db {
     /// the copy and the destination reflects all committed state.
     ///
     /// # Errors
-    /// Returns an error for an in-memory database, if `dest` resolves to the live database or
-    /// one of its `-wal`/`-shm` siblings, if the vacuum fails, or if the finished backup cannot
-    /// be renamed over `dest`.
+    /// Returns an error for an in-memory database, if `dest` is a `file:` URI or on a filesystem
+    /// shared with another kernel, if `dest` resolves to the live database or one of its
+    /// `-wal`/`-shm` siblings, if the vacuum fails, or if the finished backup cannot be renamed over
+    /// `dest`.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         let Some(src) = self.path.clone() else {
             return Err(jkb_types::Error::Validation(
@@ -246,6 +269,14 @@ impl Db {
             .into());
         };
         let dest = dest.as_ref().to_path_buf();
+
+        // A backup WRITES a database file, so it answers to the same rule as `db::open`: not on a
+        // filesystem shared with another kernel, and never a `file:` URI (the bundled SQLite parses
+        // `VACUUM INTO 'file:…'` as one). Without it, `jkb doctor --backup ~/.jkb/jkb.db` run in the
+        // dev container renamed a fresh file over the HOST's live database — the comparison below
+        // only knows this process's own `src` — while host processes kept committing to the
+        // unlinked inode.
+        crate::shared_fs::refuse(&dest)?;
 
         // Refuse to write over the live database, its `-wal`/`-shm` siblings included.
         //
@@ -352,6 +383,63 @@ impl Db {
 mod tests {
     use super::Db;
     use crate::item::{upsert, NewItem};
+
+    /// The guard is asked under the write lock, not before taking it. `stale` starts its write while
+    /// `newer` holds the lock mid-migration, and blocks; `newer` then commits the migration. Asked
+    /// before the lock, `stale` would have read the old history, passed, and written after the
+    /// migration committed — exactly the window the guard exists to close.
+    #[test]
+    fn the_schema_guard_is_asked_under_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jkb.db");
+        let (newer, stale) = (Db::open(&path).unwrap(), Db::open(&path).unwrap());
+        let future = crate::migrate::supported_version() + 1;
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let migrating = std::thread::spawn(move || {
+            newer
+                .write_txn("newer jkb", move |conn, _| {
+                    conn.execute(
+                        "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                         VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                        [future],
+                    )?;
+                    locked_tx.send(()).unwrap();
+                    // Long enough for `stale` to reach its own write and wait on the lock.
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    Ok(())
+                })
+                .unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let err = stale.write_txn("stale", |_, _| Ok(())).unwrap_err();
+        migrating.join().unwrap();
+        assert!(matches!(err, crate::Error::SchemaNewer { .. }), "{err}");
+    }
+
+    /// A process opened before a newer jkb migrated the database stops WRITING — checked inside the
+    /// write transaction, so no migration can land between the check and the write — and can still
+    /// read. `PRAGMA user_version` would not do: it is stamped only after every migration finishes.
+    #[test]
+    fn a_write_after_a_newer_migration_is_refused_and_a_read_is_not() {
+        let db = Db::open_in_memory().unwrap();
+        let future = crate::migrate::supported_version() + 1;
+        db.write_txn("newer jkb", move |conn, _| {
+            conn.execute(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+                [future],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let err = db.write_txn("stale", |_, _| Ok(())).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::SchemaNewer { found, .. } if found == future),
+            "{err}"
+        );
+        db.read(|conn| Ok(conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?))
+            .expect("reads still work");
+    }
 
     /// A backup to the same path twice must work — `jkb doctor --backup ~/.jkb/backup.db` is a
     /// fixed path, which is what the flag invites and what any cron or pre-migration script
@@ -523,6 +611,26 @@ mod tests {
     /// Backing up ONTO the live database must be refused. `VACUUM INTO` used to make this
     /// impossible by refusing any existing destination; temp-and-rename removed that, so the
     /// precondition has to be stated rather than inherited.
+    #[test]
+    fn a_backup_to_a_uri_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("jkb.db")).unwrap();
+        let err = db
+            .backup("file:/nonexistent/backup.db")
+            .expect_err("VACUUM INTO would parse a file: destination as a URI");
+        assert!(matches!(err, crate::Error::UriPath { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_uri_database_is_refused_by_db_open_itself() {
+        // Behavioural, not a text scan: a commented-out or discarded refusal inside `db::open`
+        // satisfies a search for the call, and this does not.
+        let Err(err) = Db::open("file:/nonexistent/jkb.db") else {
+            panic!("a file: URI must not open");
+        };
+        assert!(matches!(err, crate::Error::UriPath { .. }), "{err}");
+    }
+
     #[test]
     fn backup_refuses_to_overwrite_the_live_database() {
         let dir = tempfile::tempdir().unwrap();

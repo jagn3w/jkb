@@ -17,6 +17,9 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+mod common;
+use common::isolate_git_env;
+
 /// A scratch repo plus a database kept *outside* it — a db file inside the repo would show
 /// up as an untracked change and make every land refuse a dirty tree.
 struct Fixture {
@@ -45,20 +48,8 @@ impl Fixture {
     /// A `jkb` invocation rooted in the repo, with git's global config neutralized for the
     /// `git` subprocesses jkb itself spawns.
     fn jkb(&self) -> Command {
-        let mut cmd = Command::cargo_bin("jkb").unwrap();
-        cmd.arg("--db")
-            .arg(&self.db)
-            .current_dir(&self.repo)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
-            // probed for liveness on the host that issued it, so an unpinned name makes every
-            // claim fixture `Unknown` and nothing is ever reclaimed.
-            .env("HOSTNAME", "host")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t");
+        let mut cmd = jkb(Some(&self.db));
+        cmd.current_dir(&self.repo);
         cmd
     }
 
@@ -101,6 +92,24 @@ impl Fixture {
     }
 }
 
+/// A `jkb` invocation with `--db db`, or none for remote mode (which refuses `--db`) — the one place
+/// this file spawns `jkb`, so the isolation below covers every invocation.
+fn jkb(db: Option<&Path>) -> Command {
+    let mut cmd = Command::cargo_bin("jkb").unwrap();
+    if let Some(db) = db {
+        cmd.arg("--db").arg(db);
+    }
+    // The same isolation the fixture's own git calls get: jkb spawns git, so the
+    // developer's shell reaches it through this process just as directly.
+    isolate_git_env(&mut cmd);
+    common::isolate_remote_env(&mut cmd);
+    // Pins the host that `host:<pid>` owner ids below are judged against: a pid is only
+    // probed for liveness on the host that issued it, so an unpinned name makes every
+    // claim fixture `Unknown` and nothing is ever reclaimed.
+    cmd.env("HOSTNAME", "host");
+    cmd
+}
+
 /// Run `git` in `dir` with the developer's global config neutralized. This machine sets
 /// `core.hooksPath` and commit signing globally; either would fail the fixture for reasons
 /// that have nothing to do with sessions.
@@ -108,19 +117,23 @@ fn git(dir: &Path, args: &[&str]) -> String {
     run_git(git_cmd(dir, args), args)
 }
 
+/// The isolation really covers BOTH halves — selection and configuration.
+///
+/// It was exempted in `gitrepo.rs`'s crate-wide spawn guard on a comment saying it was pinned
+/// by a test of its own, and it was not: deleting its `env_remove` calls left everything green.
+/// A claimed pin that does not exist is worse than no claim, because the guard reads as covered.
+#[test]
+fn the_fixture_isolation_covers_selection_and_config() {
+    let cmd = git_cmd(Path::new("/somewhere"), &["status"]);
+    common::assert_isolated("the sessions git fixture", &cmd);
+}
+
 /// The one place the fixture's git environment is set, so [`git`] and [`git_at`] cannot drift into
 /// running against different configuration.
 fn git_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t");
+    cmd.arg("-C").arg(dir).args(args);
+    isolate_git_env(&mut cmd);
     cmd
 }
 
@@ -3388,4 +3401,1534 @@ fn a_parent_with_an_open_subtask_is_refused_before_the_graft() {
         "the session was disposed of before the refusal"
     );
     assert_eq!(f.status_of(&parent), "in_progress");
+}
+
+/// `Fixture::jkb` must not hand the developer's repository selection to the `jkb` it spawns.
+/// Named at THIS call site: deleting the `isolate_git_env` line inside `Fixture::jkb` left the
+/// entire suite green, including the crate-wide spawn guard, which could not see a spawn built
+/// with `cargo_bin`.
+#[test]
+fn the_session_fixture_jkb_does_not_inherit_a_repository() {
+    let fx = Fixture::new();
+    // Through the shared assertion, like its two siblings. Left hand-iterating `MUST_DROP` it
+    // checked only the REMOVALS — exactly the half-coverage `assert_isolated` was written to
+    // end, on the pin guarding every `jkb` spawn in this file.
+    common::assert_jkb_isolated("Fixture::jkb", &fx.jkb());
+}
+
+/// The repository-selection scrub, observed by ITS HARM rather than by agreeing lists.
+///
+/// Every other guard on this rule compares one written-down thing against another: production
+/// iterates `REPO_SELECTION_VARS`, `assert_scrubbed` holds a literal, and the crate-wide spawn
+/// scan checks that each site calls the scrubber. That is three artifacts and they are checked
+/// pairwise — which is exactly as strong as the weakest editor who touches two of them at once.
+/// Round 25 measured that: with the assertion iterating the same list production did, deleting one
+/// name from it left 260 tests green while every spawn inherited the variable. The literal closed
+/// that; this closes the next one, where somebody edits the literal too.
+///
+/// So this asserts nothing about any list. It exports the variable a caller would really have
+/// exported, runs a real `jkb task work`, and asks whether the session landed in the repository
+/// jkb was RUN IN and whether the other repository was left alone. `.env()` after
+/// `isolate_git_env` overrides that fixture's `env_remove`, which is precisely the attack.
+///
+/// `GIT_DIR` redirects the SESSION, not merely the ref store, and the containment assertion below
+/// is what catches it. Measured on git 2.51.1: delete `"GIT_DIR"` from `REPO_SELECTION_VARS` and
+/// this test fails on `starts_with`, never reaching the snapshot compare. The earlier version of
+/// this paragraph had it backwards — it said the cwd "still reads as the toplevel, so a naive
+/// assertion passes". Half true and the wrong half: `GIT_DIR=<foreign>/.git git -C proj rev-parse
+/// --show-toplevel` does answer `proj`, but `session` does not ask that. `gitrepo::main_root`
+/// takes the parent of `rev-parse --path-format=absolute --git-common-dir`, which answers
+/// `<foreign>/.git`, so the session is placed under `foreign` outright.
+///
+/// The snapshot is still the second assertion, for the writes containment would not see — a
+/// session that landed in the right place while creating branches in the wrong repository.
+///
+/// TWO OF THE THREE, and the third is named rather than quietly folded in. Each variable was
+/// measured by removing it from `REPO_SELECTION_VARS` and re-running: `GIT_DIR` and
+/// `GIT_COMMON_DIR` both fail here, and `GIT_WORK_TREE` does NOT — traced with the real binary,
+/// an exported and unscrubbed `GIT_WORK_TREE` leaves `task work` landing in the repository jkb was
+/// run in, with the other repository's files and branches untouched. It selects a work tree, not a
+/// repository, so this path gives it nothing to redirect. It stays in the scrub because the harm
+/// it does is elsewhere — `git -C <dir> init` with one exported re-initialises the OTHER
+/// repository, which is what `isolate_git_env`'s own comment records — and that belongs to a probe
+/// of `init`, not of sessions. Writing it into this loop would have produced an iteration that
+/// passes for the same reason a deleted assertion does.
+#[test]
+fn an_exported_repository_selection_cannot_redirect_a_session() {
+    for var in ["GIT_DIR", "GIT_COMMON_DIR"] {
+        let f = Fixture::new();
+        let foreign = f.home.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        git(&foreign, &["init", "-q", "-b", "main"]);
+        std::fs::write(foreign.join("F.md"), "foreign\n").unwrap();
+        git(&foreign, &["add", "-A"]);
+        git(&foreign, &["commit", "-qm", "foreign base"]);
+
+        // What a session would disturb if it resolved to this repository: its branches and its
+        // registered worktrees. Both are what `task work` writes.
+        let snapshot = |p: &Path| {
+            (
+                git(p, &["branch", "--list", "--format=%(refname)"]),
+                git(p, &["worktree", "list", "--porcelain"]),
+            )
+        };
+        let before = snapshot(&foreign);
+
+        let value = foreign.join(".git");
+        let uid = f.add_task("redirect probe !p2");
+        let out = f
+            .jkb()
+            .env(var, &value)
+            .args(["task", "work", &uid, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{var}: `task work` failed outright: {out:?}"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        // CANONICALIZED, both sides. `git rev-parse --show-toplevel` resolves symlinks, so the
+        // reported worktree carries the `/private/var/...` spelling on macOS while `f.repo` holds
+        // the `/var/folders/...` one the TempDir handed out — and `Path::starts_with` is purely
+        // lexical. The failure that produces is BYTE-IDENTICAL to a genuine break, so the gate
+        // this project mandates before every commit would be permanently red on the platform it
+        // is developed on, accusing the repository-selection scrub of a hole it does not have.
+        // `session::is_within` records the same hazard; the integration crate cannot import it.
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let worktree = canon(Path::new(v["worktree"].as_str().unwrap()));
+        // BOUND ONCE and used in both the comparison and the message. Printing the canonicalized
+        // worktree against a raw `f.repo` made a genuine break on a symlinked TMPDIR show two
+        // different path prefixes — the exact visual signature of the symlink false positive the
+        // canonicalization just removed, so a reader would conclude the fix was incomplete rather
+        // than that the scrub was broken.
+        let repo = canon(&f.repo);
+        assert!(
+            worktree.starts_with(&repo),
+            "{var}: an exported repository selection moved the session out of the repository jkb \
+             was run in — it landed at {worktree:?}, not under {repo:?}"
+        );
+        assert_eq!(
+            before,
+            snapshot(&foreign),
+            "{var}: opening a session wrote into a repository the caller merely had selected in \
+             their environment. Nothing in this test reads REPO_SELECTION_VARS: if it fails, a \
+             spawn stopped scrubbing, whatever the lists say."
+        );
+    }
+}
+
+/// The claim a task is held under, read from the database.
+fn claim_of(db: &Path, uid: &str) -> Option<String> {
+    let db = jkb_core::Db::open(db).unwrap();
+    let uid = uid.to_owned();
+    db.read(move |conn| {
+        let id = jkb_core::task::resolve_ref(conn, &uid)?.expect("task");
+        Ok(jkb_core::claim::claimed(conn)?
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| c.owner))
+    })
+    .unwrap()
+}
+
+/// Hold the removal sweep's lease for `holder` (`None` frees it), as a sweep in flight would.
+fn sweep_lease(db: &Path, holder: Option<&str>) {
+    set_lease(db, jkb_api::removals::SWEEP_LEASE, holder);
+}
+
+/// Hold the lease `name` for `holder` (`None` frees it).
+fn set_lease(db: &Path, name: &str, holder: Option<&str>) {
+    let db = jkb_core::Db::open(db).unwrap();
+    let (name, holder) = (name.to_owned(), holder.map(str::to_owned));
+    db.write_txn("t", move |conn, meta| {
+        jkb_core::lease::break_lease(conn, meta, &name)?;
+        if let Some(h) = holder {
+            assert!(jkb_core::lease::take(conn, meta, &name, &h, None, 0)?);
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn lease_of(db: &Path, name: &str) -> Option<String> {
+    let db = jkb_core::Db::open(db).unwrap();
+    let name = name.to_owned();
+    db.read(move |conn| jkb_core::lease::get(conn, &name))
+        .unwrap()
+        .map(|l| l.holder)
+}
+
+/// Mark a Claude Code session live (or ended) in the registry, as the hook would.
+fn registry(db: &Path, session: &str, live: bool) {
+    let db = jkb_core::Db::open(db).unwrap();
+    let session = session.to_owned();
+    db.write_txn("t", move |conn, meta| {
+        let p = jkb_core::claude_session::Process {
+            session: &session,
+            pid: "4242",
+            instance: "host",
+        };
+        if live {
+            jkb_core::claude_session::started(conn, meta, &p, "/w", "startup", 0)?;
+        } else {
+            jkb_core::claude_session::ended(conn, meta, &p, "other", 1)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// **A session worktree is named home-relative** (tasks S6.4, decision E): the host and the dev
+/// container see the same `~/repos` under different homes, so a `~/` owner is one both can judge. The
+/// session is still judged live by its checkout, and still recognised as this session's by `abandon`.
+#[test]
+fn a_session_owner_names_its_worktree_under_the_home() {
+    let f = Fixture::new();
+    let uid = f.add_task("homed session");
+    // A home whose `repos` — the directory both sides of the bind share — holds the fixture repo.
+    let home = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(f.home.path(), home.path().join("repos")).unwrap();
+    let out = f
+        .jkb()
+        .env("HOME", home.path())
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .args(["task", "work", &uid, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let owner = claim_of(&f.db, &uid).expect("claimed");
+    assert!(
+        owner.contains(":~/repos/proj/.jkb/work/"),
+        "the worktree is written under the home's repos: {owner}"
+    );
+    // Live by its checkout: nothing reclaims it.
+    f.jkb()
+        .env("HOME", home.path())
+        .args(["task", "reclaim"])
+        .assert()
+        .success();
+    assert_eq!(claim_of(&f.db, &uid).as_deref(), Some(owner.as_str()));
+    // And the session's own abandon recognises it as this session's claim.
+    f.jkb()
+        .env("HOME", home.path())
+        .args(["task", "abandon", &uid])
+        .assert()
+        .success();
+    assert_eq!(claim_of(&f.db, &uid), None);
+    assert_eq!(f.status_of(&uid), "open");
+}
+
+/// **A checkout another Claude Code session is still working in is not taken over** (decision E) —
+/// by another session the registry also knows to be running. The opener resumes it; a process with no
+/// session, and a session the registry does not know (a subagent has an id of its own), are let
+/// through, and keep the opener they found rather than clearing it; once the opener has ended, a
+/// running session may take the checkout over and is recorded as its opener.
+#[test]
+fn a_session_opened_by_a_running_claude_session_is_not_taken_over() {
+    let f = Fixture::new();
+    let uid = f.add_task("one session at a time");
+    let work_as = |session: Option<&str>| {
+        let mut cmd = f.jkb();
+        cmd.args(["task", "work", &uid, "--json"]);
+        match session {
+            Some(s) => cmd.env("CLAUDE_CODE_SESSION_ID", s),
+            None => cmd.env_remove("CLAUDE_CODE_SESSION_ID"),
+        };
+        cmd.output().unwrap()
+    };
+    let opener = || {
+        let owner = claim_of(&f.db, &uid).expect("claimed");
+        owner
+            .split_once('@')
+            .and_then(|(_, rest)| rest.split_once(':'))
+            .map(|(by, _)| by.to_owned())
+    };
+    let first = work_as(Some("opener-1"));
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(
+        opener().as_deref(),
+        Some("opener-1"),
+        "the opener is recorded"
+    );
+
+    // A resume by a session the registry does not know keeps the opener it found.
+    assert!(work_as(Some("other-2")).status.success());
+    assert_eq!(opener().as_deref(), Some("opener-1"));
+
+    // `opener-1` is running, and so is `third-3`: the second top-level session is refused.
+    registry(&f.db, "opener-1", true);
+    registry(&f.db, "third-3", true);
+    let refused = work_as(Some("third-3"));
+    assert!(!refused.status.success(), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("still running"), "{stderr}");
+    assert!(stderr.contains("opener-1"), "{stderr}");
+    assert_eq!(opener().as_deref(), Some("opener-1"), "unchanged");
+
+    // A subagent (unknown to the registry) and a process with no session are let through, and the
+    // opener survives them — so the running `third-3` is still refused afterwards.
+    for caller in [Some("subagent-4"), None] {
+        assert!(work_as(caller).status.success(), "{caller:?}");
+        assert_eq!(opener().as_deref(), Some("opener-1"), "{caller:?}");
+        assert!(!work_as(Some("third-3")).status.success(), "{caller:?}");
+    }
+    // The opener, running, resumes its own checkout.
+    assert!(work_as(Some("opener-1")).status.success());
+    assert_eq!(opener().as_deref(), Some("opener-1"));
+
+    // Once `opener-1` has ended, the running `third-3` takes the checkout over, as its opener.
+    registry(&f.db, "opener-1", false);
+    assert!(work_as(Some("third-3")).status.success());
+    assert_eq!(opener().as_deref(), Some("third-3"));
+}
+
+/// **A `~/` owner is judged from any home that reaches its checkout** (decision E): a session opened
+/// under one home is live, and then — once its checkout is gone — reclaimable, as judged by a process
+/// whose home reaches the same repo by another path. That is the host and the dev container.
+#[test]
+fn a_home_relative_owner_is_reclaimed_from_another_home() {
+    let f = Fixture::new();
+    let uid = f.add_task("judged across homes");
+    // Two homes whose `repos` both reach the fixture repo, by different paths.
+    let first = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(f.home.path(), first.path().join("repos")).unwrap();
+    let out = f
+        .jkb()
+        .env("HOME", first.path())
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .args(["task", "work", &uid, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let worktree = PathBuf::from(v["worktree"].as_str().unwrap());
+    let owner = claim_of(&f.db, &uid).expect("claimed");
+    assert!(owner.contains(":~/repos/proj/.jkb/work/"), "{owner}");
+
+    let other = TempDir::new().unwrap();
+    std::fs::create_dir_all(other.path().join("repos")).unwrap();
+    std::os::unix::fs::symlink(&f.repo, other.path().join("repos/proj")).unwrap();
+    let reclaim = || {
+        f.jkb()
+            .env("HOME", other.path())
+            .args(["task", "reclaim"])
+            .assert()
+            .success();
+    };
+    reclaim();
+    assert_eq!(
+        claim_of(&f.db, &uid).as_deref(),
+        Some(owner.as_str()),
+        "live, seen from the other home"
+    );
+    std::fs::remove_dir_all(&worktree).unwrap();
+    reclaim();
+    assert_eq!(
+        claim_of(&f.db, &uid),
+        None,
+        "gone, seen from the other home: reclaimed"
+    );
+}
+
+/// `jkb serve` on the fixture's database, stopped when dropped.
+struct Serve(std::process::Child);
+
+impl Serve {
+    /// Start it on an ephemeral port; the daemon and its `http://` address.
+    fn start(f: &Fixture, token: &Path) -> (Self, String) {
+        Self::spawn(f.jkb(), token)
+    }
+
+    /// [`Self::start`], with the daemon's home — whose `repos` is what its clients may name — at `home`.
+    fn start_in(f: &Fixture, token: &Path, home: &Path) -> (Self, String) {
+        let mut cmd = f.jkb();
+        cmd.env("HOME", home);
+        Self::spawn(cmd, token)
+    }
+
+    fn spawn(mut cmd: Command, token: &Path) -> (Self, String) {
+        use std::io::BufRead as _;
+        let mut child = cmd
+            .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(token)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let serve = Self(child);
+        let banner = std::io::BufReader::new(stdout)
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        let url = banner
+            .split_whitespace()
+            .find(|w| w.starts_with("http://"))
+            .unwrap_or_else(|| panic!("no address in {banner}"))
+            .to_owned();
+        (serve, url)
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// **`task start` and the gate read go through the daemon** (tasks S6.4): the git half runs where the
+/// command runs, the database half as ops, and the host sees the claim, the facets and the history.
+/// Storing a gate is refused there — a stored gate is a command the host runs (decision A).
+#[test]
+fn start_and_the_gate_read_go_through_the_daemon() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "feature"]);
+    let uid = f.add_task("started from the container");
+    f.jkb()
+        .args(["task", "gate", "make test"])
+        .assert()
+        .success();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env_remove("JKB_DB")
+            .output()
+            .unwrap()
+    };
+
+    let started = remote(&["--json", "task", "start", &uid]);
+    assert!(started.status.success(), "{started:?}");
+    let v: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(
+        (&v["branch"], &v["repo"]),
+        (&"feature".into(), &"proj".into()),
+        "{v}"
+    );
+    let owner = v["owner"].as_str().unwrap();
+    assert!(owner.starts_with("container:"), "{v}");
+    assert_eq!(claim_of(&f.db, &uid).as_deref(), Some(owner));
+    assert_eq!(f.status_of(&uid), "in_progress");
+    let why = f
+        .jkb()
+        .args(["--global", "task", "why", &uid, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&why.stdout).contains("\"feature\""),
+        "the branch is in the history: {why:?}"
+    );
+
+    let gate = remote(&["--json", "task", "gate"]);
+    assert!(gate.status.success(), "{gate:?}");
+    let v: serde_json::Value = serde_json::from_slice(&gate.stdout).unwrap();
+    assert_eq!(v["gate"], "make test", "{v}");
+
+    for args in [
+        vec!["task", "gate", "rm -rf ~"],
+        vec!["task", "gate", "--clear"],
+        vec!["task", "reap"],
+    ] {
+        let out = remote(&args);
+        assert!(!out.status.success(), "{args:?} was served: {out:?}");
+    }
+    let still: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--json", "task", "gate"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(still["gate"], "make test", "the stored gate is untouched");
+}
+
+/// **A container session's deferred disposal is finished by the host** (tasks S6.4 stage 3). `work`,
+/// `sessions` and `abandon` run through the daemon; the record of a checkout the container could not
+/// move is written to the database with `~/repos` paths, which the daemon checks against its own home;
+/// and the host's reap, under a different home, finds the same checkout and archives it. A sweep in
+/// flight on the host — a holder the container cannot probe — holds a resume back.
+#[test]
+fn a_container_session_s_deferred_disposal_is_finished_by_the_host() {
+    let f = Fixture::new();
+    let uid = f.add_task("from the container");
+    // Two homes whose `repos` is the one directory both sides share: the fixture's.
+    let host_home = TempDir::new().unwrap();
+    let box_home = TempDir::new().unwrap();
+    for h in [&host_home, &box_home] {
+        std::os::unix::fs::symlink(f.home.path(), h.path().join("repos")).unwrap();
+    }
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start_in(&f, &token, host_home.path());
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env("HOME", box_home.path())
+            .env_remove("JKB_DB")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap()
+    };
+
+    let opened = remote(&["--json", "task", "work", &uid]);
+    assert!(opened.status.success(), "{opened:?}");
+    let v: serde_json::Value = serde_json::from_slice(&opened.stdout).unwrap();
+    let worktree = PathBuf::from(v["worktree"].as_str().unwrap());
+    let name = v["session"].as_str().unwrap().to_owned();
+    let listed = remote(&["--json", "task", "sessions"]);
+    assert!(listed.status.success(), "{listed:?}");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains(&name),
+        "{listed:?}"
+    );
+
+    // The host's sweep is in flight: the container cannot probe its holder, so it waits.
+    sweep_lease(&f.db, Some("host:1 nonce"));
+    let blocked = remote(&["task", "work", &uid]);
+    assert!(!blocked.status.success(), "{blocked:?}");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("sweep is running"),
+        "{blocked:?}"
+    );
+    sweep_lease(&f.db, None);
+
+    // Nothing can be moved into a regular file, so the container defers.
+    std::fs::write(f.repo.join(".jkb/archive"), b"in the way").unwrap();
+    let rows = || {
+        jkb_core::Db::open(&f.db)
+            .unwrap()
+            .read(jkb_core::removal::list_all)
+            .unwrap()
+    };
+    let abandon = || {
+        let abandoned = remote(&["--json", "task", "abandon", &uid]);
+        assert!(abandoned.status.success(), "{abandoned:?}");
+        assert!(worktree.exists(), "deferred, so still there");
+    };
+    abandon();
+    assert_eq!(rows().len(), 1);
+    // Brought back to life from the container: the pending record is cancelled, found by the path
+    // this side resolves it to.
+    let resumed = remote(&["--json", "task", "work", &uid]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert!(
+        rows().is_empty(),
+        "the resume cancelled the pending removal"
+    );
+    abandon();
+    let rows = rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (
+            rows[0].removal.worktree.as_str(),
+            rows[0].removal.repo_root.as_str(),
+            rows[0].written_via.as_str()
+        ),
+        (
+            format!("~/repos/proj/.jkb/work/{name}").as_str(),
+            "~/repos/proj",
+            "serve"
+        ),
+        "named as both sides can resolve it, by the daemon"
+    );
+
+    // The host finishes it, from its own home.
+    std::fs::remove_file(f.repo.join(".jkb/archive")).unwrap();
+    let reaped = f
+        .jkb()
+        .env("HOME", host_home.path())
+        .args(["--json", "task", "reap"])
+        .output()
+        .unwrap();
+    assert!(reaped.status.success(), "{reaped:?}");
+    let r: serde_json::Value = serde_json::from_slice(&reaped.stdout).unwrap();
+    assert_eq!(r["archived"].as_array().map(Vec::len), Some(1), "{r}");
+    assert!(!worktree.exists(), "archived by the host");
+    let rows = jkb_core::Db::open(&f.db)
+        .unwrap()
+        .read(jkb_core::removal::list_all)
+        .unwrap();
+    assert!(
+        rows[0]
+            .removal
+            .archive
+            .as_deref()
+            .is_some_and(|a| a.starts_with("~/repos/proj/.jkb/archive/")),
+        "{rows:?}"
+    );
+}
+
+/// **A record an older jkb left beside the database is reported, and nothing acts on it** (tasks S6.4
+/// stage 3): the records moved into the database, the old directory is the dev container's to write,
+/// and a pending removal written before the move may name a checkout somebody has since gone back to.
+#[test]
+fn a_record_in_the_old_file_store_is_reported_and_left_alone() {
+    let f = Fixture::new();
+    let uid = f.add_task("recorded before the move");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let head = git(&wt, &["rev-parse", "HEAD"]);
+    let store = f.db.parent().unwrap().join("worktree-removals");
+    std::fs::create_dir_all(&store).unwrap();
+    let marker = store.join("legacy-0001.json");
+    std::fs::write(
+        &marker,
+        serde_json::to_vec(&serde_json::json!({
+            "worktree": wt, "repo_root": f.repo, "branch": s["branch"], "uid": uid,
+            "recorded_at": 1, "head": head,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let doctor = f.jkb().args(["doctor"]).output().unwrap();
+    let said = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        said.contains("older jkb") && said.contains("legacy-0001.json"),
+        "{doctor:?}"
+    );
+    for args in [
+        vec!["task", "work", &uid],
+        vec!["task", "reap"],
+        vec!["doctor", "--fix"],
+    ] {
+        let out = f.jkb().args(&args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    }
+    assert!(marker.exists() && wt.exists(), "nothing acted on it");
+}
+
+/// **A session whose checkout vanished is opened again, not reported as resumed** — the state a sweep
+/// that archived it, or a hand removal, leaves while git still registers the path.
+#[test]
+fn a_registered_but_vanished_checkout_is_opened_again() {
+    let f = Fixture::new();
+    let uid = f.add_task("gone from under it");
+    let first = f.work(&uid);
+    let worktree = PathBuf::from(first["worktree"].as_str().unwrap());
+    std::fs::remove_dir_all(&worktree).unwrap();
+    assert!(
+        git(&f.repo, &["worktree", "list", "--porcelain"]).contains(worktree.to_str().unwrap()),
+        "the premise: git still registers it"
+    );
+    // Another session, opened on the other side of the bind: its gitdir names a path this side
+    // cannot see. Unregistering the vanished checkout must leave it registered.
+    let other = f.add_task("opened elsewhere");
+    let there = f.work(&other);
+    let name = there["session"].as_str().unwrap();
+    let admin = f.repo.join(".git/worktrees").join(name);
+    std::fs::write(
+        admin.join("gitdir"),
+        format!("/nonexistent/other-side/{name}/.git\n"),
+    )
+    .unwrap();
+
+    let again = f.work(&uid);
+    assert_eq!(again["resumed"], false, "{again}");
+    assert!(worktree.join(".git").exists(), "a checkout is there again");
+    assert!(claim_of(&f.db, &uid).is_some(), "and the claim is held");
+    assert!(admin.exists(), "the other side's registration is untouched");
+}
+
+/// **Landing is serialised by a database lease, freed only when its holder is proven gone** (tasks
+/// S6.4 stage 4, decision D): its process dead on this host, or the Claude Code session it names
+/// ended. A holder nothing can judge is respected until `--break-lock`.
+#[test]
+fn landing_is_serialised_by_a_lease_freed_only_when_its_holder_is_proven_gone() {
+    const SESSION: &str = "0b8f2c1e-1111-4222-8333-444455556666";
+    let f = Fixture::new();
+    let uid = f.add_task("leased landing");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "l.txt",
+        "x\n",
+        "add l",
+    );
+    let land = || {
+        f.jkb()
+            .args(["task", "land", &uid, "--no-gate", "--no-review"])
+            .output()
+            .unwrap()
+    };
+    let refused = |out: &std::process::Output| {
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("another `jkb task land` is running"),
+            "{out:?}"
+        );
+    };
+    let name = "land:proj";
+
+    // pid 1 on this host is alive — whatever became of the session it names.
+    set_lease(&f.db, name, Some("host:1 n -"));
+    refused(&land());
+    registry(&f.db, SESSION, false);
+    set_lease(&f.db, name, Some(&format!("host:1 n {SESSION}")));
+    refused(&land());
+    // Another machine, in a session the registry knows to be live: nothing can say it is gone.
+    registry(&f.db, SESSION, true);
+    set_lease(&f.db, name, Some(&format!("elsewhere:5 n {SESSION}")));
+    refused(&land());
+    // No session to ask either: only the operator can end it.
+    set_lease(&f.db, name, Some("elsewhere:5 n -"));
+    refused(&land());
+    let broke = f
+        .jkb()
+        .args(["--json", "task", "land", "--break-lock"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&broke.stdout).unwrap();
+    assert_eq!(
+        v["broken_holder"], "elsewhere:5 n -",
+        "the holder as stored: {v}"
+    );
+    assert_eq!(lease_of(&f.db, name), None);
+
+    // The session it names has ended: taken over, and released once the landing is done.
+    registry(&f.db, SESSION, false);
+    set_lease(&f.db, name, Some(&format!("elsewhere:5 n {SESSION}")));
+    let out = land();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(f.status_of(&uid), "done");
+    assert_eq!(lease_of(&f.db, name), None, "released");
+}
+
+/// **A container session lands through the daemon** (tasks S6.4 stage 4): the graft and the gate run
+/// where the command runs, the record through `task.land`, and a gate given there is run and never
+/// stored — a stored gate is a command the host runs (decision A). The merge queue's `task landed`
+/// goes through too, and breaking a lease does not.
+#[test]
+fn a_container_session_lands_through_the_daemon() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "batch"]);
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env_remove("JKB_DB")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap()
+    };
+    let uid = f.add_task("landed from the container");
+    let opened = remote(&["--json", "task", "work", &uid]);
+    assert!(opened.status.success(), "{opened:?}");
+    let v: serde_json::Value = serde_json::from_slice(&opened.stdout).unwrap();
+    commit_in(
+        Path::new(v["worktree"].as_str().unwrap()),
+        "c.txt",
+        "from the container\n",
+        "add c",
+    );
+
+    // The review gate is read through the daemon: an open must-fix finding refuses the landing.
+    let branch = v["branch"].as_str().unwrap().to_owned();
+    f.add_finding("reviews/remote", "found from the container");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/remote"])
+        .assert()
+        .success();
+    let gated = remote(&["task", "land", &uid, "--gate", "true"]);
+    assert!(!gated.status.success(), "{gated:?}");
+    assert!(
+        String::from_utf8_lossy(&gated.stderr).contains("found from the container"),
+        "{gated:?}"
+    );
+    assert_eq!(f.status_of(&uid), "needs_review", "not landed");
+
+    let landed = remote(&[
+        "--json",
+        "task",
+        "land",
+        &uid,
+        "--gate",
+        "true",
+        "--no-review",
+    ]);
+    assert!(landed.status.success(), "{landed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&landed.stdout).unwrap();
+    assert!(
+        v["gate_source"]
+            .as_str()
+            .unwrap()
+            .contains("not remembered"),
+        "{v}"
+    );
+    assert_eq!(f.status_of(&uid), "done");
+    let shown: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--global", "--json", "task", "show", &uid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        shown["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["facet"] == "review-waived"),
+        "the waiver was recorded through the daemon: {shown}"
+    );
+    let stored: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--json", "task", "gate"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(stored["gate"].is_null(), "no gate was stored: {stored}");
+    assert_eq!(lease_of(&f.db, "land:proj"), None);
+    assert!(git(&f.repo, &["log", "--format=%s", "batch"]).contains("add c"));
+
+    let broke = remote(&["task", "land", "--break-lock"]);
+    assert!(!broke.status.success(), "{broke:?}");
+    assert!(
+        String::from_utf8_lossy(&broke.stderr).contains("on the host"),
+        "{broke:?}"
+    );
+}
+
+/// **The merge queue's landing is recorded through the daemon** (tasks S6.4 stage 4): `task landed`
+/// finds every task on the branch and records the graft for each.
+#[test]
+fn the_queue_s_landing_is_recorded_through_the_daemon() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "batch"]);
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env_remove("JKB_DB")
+            .output()
+            .unwrap()
+    };
+    // The merge queue's record, for a task on a branch it grafted itself.
+    let other = f.add_task("queued elsewhere");
+    f.jkb()
+        .args(["task", "tag", "set", &other, "branch=task/queued"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "tag", "set", &other, "repo=proj"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "set", &other, "--status", "in_progress"])
+        .assert()
+        .success();
+    let queued = remote(&["--json", "task", "landed", "task/queued", "--onto", "batch"]);
+    assert!(queued.status.success(), "{queued:?}");
+    let v: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(1), "{v}");
+}
+
+/// **A task this client may not write is refused before any git work** (stage-4 review): landed or
+/// abandoned through the daemon, a task filed outside its roots would otherwise be grafted, or have its
+/// checkout and branch removed, and only then be refused its record.
+#[test]
+fn a_task_the_client_may_not_write_is_refused_before_git_moves() {
+    let f = Fixture::new();
+    let uid = f.add_task("filed elsewhere");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(&wt, "e.txt", "e\n", "add e");
+    f.jkb()
+        .args([
+            "task",
+            "bind",
+            &uid,
+            "--sync",
+            "file:///nowhere-the-daemon-serves/tasks.md",
+        ])
+        .assert()
+        .success();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env_remove("JKB_DB")
+            .output()
+            .unwrap()
+    };
+    let before = git(&f.repo, &["rev-parse", &onto]);
+    for args in [
+        vec!["task", "land", &uid, "--no-gate", "--no-review"],
+        vec!["task", "abandon", &uid, "--force", "--delete-branch"],
+    ] {
+        let out = remote(&args);
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("run it on the host"),
+            "{out:?}"
+        );
+    }
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &onto]),
+        before,
+        "nothing grafted"
+    );
+    assert!(wt.exists(), "the checkout is still there");
+    assert!(
+        !git(&f.repo, &["branch", "--list", &branch]).is_empty(),
+        "and its branch"
+    );
+    assert_eq!(f.status_of(&uid), "in_progress");
+}
+
+/// **A session that cannot be opened leaves no claim behind** — and the release is the run's own
+/// claim only (`task.release` with its owner), where it used to clear whatever claim the task had.
+/// Something in the way of the worktree is the failure that must not strand a claim: a session owner
+/// is judged live by that very directory, so nothing would ever free it.
+#[test]
+fn a_session_that_cannot_be_opened_releases_its_claim() {
+    let f = Fixture::new();
+    let uid = f.add_task("blocked checkout");
+    let first = f.work(&uid);
+    let worktree = PathBuf::from(first["worktree"].as_str().unwrap());
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force"])
+        .assert()
+        .success();
+    assert!(!worktree.exists(), "the checkout was moved away");
+    // Something else now sits where the session's checkout goes.
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("stray"), "not a checkout").unwrap();
+
+    f.jkb()
+        .args(["task", "work", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "git does not know it as a worktree",
+        ));
+    assert_eq!(
+        claim_of(&f.db, &uid),
+        None,
+        "the failed run's claim is gone"
+    );
+}
+
+/// **A session whose pending removal cannot be cancelled is not opened, and leaves no claim.** A sweep
+/// in flight (its lock held by a live process) may still be acting on the checkout, so `task work`
+/// refuses — and releases the claim it took, which nothing else would free.
+#[test]
+fn a_session_blocked_by_a_running_sweep_leaves_no_claim() {
+    let f = Fixture::new();
+    let uid = f.add_task("swept under");
+    // pid 1 on this host always exists, so the sweep is live.
+    sweep_lease(&f.db, Some("host:1 nonce"));
+    // The task already records where its work was; a refused run must leave that alone.
+    f.jkb()
+        .args(["task", "tag", "set", &uid, "branch=feat"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "work", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("sweep is running"));
+    assert_eq!(claim_of(&f.db, &uid), None);
+    let shown: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--global", "--json", "task", "show", &uid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let branches: Vec<&str> = shown["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["facet"] == "branch")
+        .map(|t| t["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        branches,
+        ["feat"],
+        "the recorded branch is untouched: {shown}"
+    );
+    // Nor does its history name a branch or a land target nobody made.
+    let why: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--global", "--json", "task", "why", &uid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        why["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["branch"].is_null() && e["onto"].is_null()),
+        "{why}"
+    );
+}
+
+/// **A session whose location was never recorded is resumed, not forked** — the state a `task work`
+/// stopped between its claim and its record leaves: a claim on a checkout, and no `branch=` naming it.
+/// The claim is what names it, so a re-run resumes that checkout and records it, and `abandon` finds it.
+#[test]
+fn a_session_whose_location_was_never_recorded_is_resumed_not_forked() {
+    let f = Fixture::new();
+    let uid = f.add_task("stopped half way");
+    let first = f.work(&uid);
+    let branch = first["branch"].as_str().unwrap().to_owned();
+    let forget = || {
+        f.jkb()
+            .args(["task", "tag", "rm", &uid, &format!("branch={branch}")])
+            .assert()
+            .success();
+    };
+    forget();
+    // The checkout is found only through the claim, so where it lands is the operator's to say — even
+    // though the task still carries the land target of the run that made it.
+    f.jkb()
+        .args(["task", "work", &uid])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--onto"));
+    let again = f.work_onto(&uid, first["onto"].as_str().unwrap());
+    assert_eq!(again["worktree"], first["worktree"], "the same checkout");
+    assert_eq!(again["resumed"], true);
+    let shown: serde_json::Value = serde_json::from_slice(
+        &f.jkb()
+            .args(["--global", "--json", "task", "show", &uid])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        shown["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["facet"] == "branch" && t["value"] == branch.as_str()),
+        "recorded again: {shown}"
+    );
+
+    forget();
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force"])
+        .assert()
+        .success();
+    assert!(!PathBuf::from(first["worktree"].as_str().unwrap()).exists());
+    assert_eq!(claim_of(&f.db, &uid), None);
+}
+
+/// **A claim-only checkout keeps its claim when a running sweep blocks the resume.** The claim is the
+/// only record of that checkout, so releasing it would have the re-run fork a second session and
+/// `abandon` find neither (stage-2 review, round 7).
+#[test]
+fn a_blocked_resume_of_a_claim_only_checkout_keeps_the_claim() {
+    let f = Fixture::new();
+    let uid = f.add_task("blocked resume");
+    let first = f.work(&uid);
+    let branch = first["branch"].as_str().unwrap().to_owned();
+    let onto = first["onto"].as_str().unwrap().to_owned();
+    f.jkb()
+        .args(["task", "tag", "rm", &uid, &format!("branch={branch}")])
+        .assert()
+        .success();
+    let held = claim_of(&f.db, &uid);
+    assert!(held.is_some());
+    // pid 1 on this host always exists, so the sweep is live.
+    sweep_lease(&f.db, Some("host:1 nonce"));
+    f.jkb()
+        .args(["task", "work", &uid, "--onto", &onto])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("sweep is running"));
+    assert!(claim_of(&f.db, &uid).is_some(), "the claim is kept");
+
+    sweep_lease(&f.db, None);
+    let again = f.work_onto(&uid, &onto);
+    assert_eq!(again["worktree"], first["worktree"], "the same checkout");
+}
+
+/// **Every task on a branch the queue landed is recorded** — the queue lands a group at once, and two
+/// tasks can record one branch.
+#[test]
+fn every_task_on_a_landed_branch_is_recorded() {
+    let f = Fixture::new();
+    let first = f.add_task("first of the group");
+    let s = f.work(&first);
+    let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "g.txt", "group work\n", "group work");
+    let second = f.add_task("second of the group");
+    f.jkb()
+        .args([
+            "task", "start", &second, "--branch", &branch, "--onto", &onto,
+        ])
+        .assert()
+        .success();
+
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", &onto])
+        .assert()
+        .success();
+    for uid in [&first, &second] {
+        assert_eq!(f.status_of(uid), "done", "{uid}");
+    }
+}
+
+/// Remove a recorded branch from a task.
+fn untag_branch(f: &Fixture, uid: &str, branch: &str) {
+    f.jkb()
+        .args(["task", "tag", "rm", uid, &format!("branch={branch}")])
+        .assert()
+        .success();
+}
+
+fn has_branch(f: &Fixture, branch: &str) -> bool {
+    git_cmd(
+        &f.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .status()
+    .unwrap()
+    .success()
+}
+
+/// **`abandon` finds an unrecorded session through the claim whatever branches the task records** —
+/// a `task start` on `feat` before an interrupted `task work` leaves `branch=feat`, which is not the
+/// session's — and deletes only the session's branch.
+#[test]
+fn abandon_finds_a_session_only_the_claim_names_beside_another_recorded_branch() {
+    let f = Fixture::new();
+    let uid = f.add_task("started, then worked, then stopped");
+    git(&f.repo, &["branch", "feat"]);
+    let s = f.work(&uid);
+    let session_branch = s["branch"].as_str().unwrap().to_owned();
+    let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+    untag_branch(&f, &uid, &session_branch);
+    f.jkb()
+        .args(["task", "tag", "add", &uid, "branch=feat"])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force", "--delete-branch"])
+        .assert()
+        .success();
+    assert!(
+        !worktree.exists(),
+        "the session found through the claim is gone"
+    );
+    assert!(!has_branch(&f, &session_branch), "its branch is deleted");
+    assert!(
+        has_branch(&f, "feat"),
+        "the other recorded branch is not the session's"
+    );
+    assert_eq!(claim_of(&f.db, &uid), None);
+}
+
+/// **A checkout another task has recorded is not recovered through a claim that names its path** —
+/// session names are minted from slugs, so two tasks can reach one path; the recorded one owns it.
+#[test]
+fn a_claim_naming_another_task_s_checkout_recovers_nothing() {
+    let f = Fixture::new();
+    let a = f.add_task("first claimant");
+    let b = f.add_task("the checkout's task");
+    let s = f.work(&a);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+    untag_branch(&f, &a, &branch);
+    // Recorded the way `task work` records a session: the branch, in this repo.
+    for tag in [format!("branch={branch}"), "repo=proj".to_owned()] {
+        f.jkb()
+            .args(["task", "tag", "set", &b, &tag])
+            .assert()
+            .success();
+    }
+
+    f.jkb()
+        .args(["task", "abandon", &a, "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has no session"));
+    assert!(worktree.exists(), "the other task's checkout is untouched");
+}
+
+/// **A checkout found only through the claim, with no land target on record, needs `--onto`** — the
+/// run that made it never recorded where it lands, and a guess could land its branch somewhere it was
+/// not cut from. Named, the checkout is resumed.
+#[test]
+fn a_claimed_checkout_with_no_recorded_target_needs_onto() {
+    let f = Fixture::new();
+    let a = f.add_task("made the checkout");
+    let b = f.add_task("holds its claim");
+    let s = f.work(&a);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let owner = claim_of(&f.db, &a).unwrap();
+    untag_branch(&f, &a, &branch);
+    f.jkb()
+        .args(["task", "release", &a, "--owner", &owner])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "claim", &b, "--owner", &owner])
+        .assert()
+        .success();
+
+    f.jkb()
+        .args(["task", "work", &b])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--onto"));
+    let resumed = f.work_onto(&b, &onto);
+    assert_eq!(resumed["worktree"], s["worktree"]);
+    assert_eq!(resumed["resumed"], true);
+}
+
+/// A `jkb` run in remote mode against `url`, as the dev container runs it, in `dir`, with `stdin`.
+fn container_jkb(
+    dir: &Path,
+    url: &str,
+    token: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> std::process::Output {
+    let mut cmd = jkb(None);
+    cmd.args(args)
+        .current_dir(dir)
+        .env("JKB_REMOTE", url)
+        .env("JKB_REMOTE_TOKEN_FILE", token)
+        .env("HOSTNAME", "container")
+        .env_remove("JKB_DB")
+        .env_remove("CLAUDE_CODE_SESSION_ID");
+    match stdin {
+        Some(text) => assert_cmd::Command::from_std(cmd)
+            .write_stdin(text)
+            .output()
+            .unwrap(),
+        None => cmd.output().unwrap(),
+    }
+}
+
+/// **A container files and records a review through the daemon** (tasks S6.4 stage 5): the workflow's
+/// result becomes tasks the land gate reads, filed once, and the record credits the session's task.
+#[test]
+fn a_container_files_and_records_a_review_through_the_daemon() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "batch"]);
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote =
+        |args: &[&str], stdin: Option<&str>| container_jkb(&f.repo, &url, &token, args, stdin);
+    let uid = f.add_task("reviewed from the container");
+    let opened = remote(&["--json", "task", "work", &uid], None);
+    assert!(opened.status.success(), "{opened:?}");
+    let v: serde_json::Value = serde_json::from_slice(&opened.stdout).unwrap();
+    let branch = v["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(v["worktree"].as_str().unwrap()),
+        "r.txt",
+        "reviewed\n",
+        "add r",
+    );
+
+    // The workflow's own result, extra fields and all.
+    let result = f.home.path().join("result.json");
+    std::fs::write(
+        &result,
+        serde_json::json!({
+            "findings": [
+                { "severity": "must-fix", "summary": "a real problem", "file": "a.rs", "line": 3,
+                  "scenario": "s", "fix": "f", "kind": "bug", "unverified": false },
+                { "severity": "nit", "summary": "a nit" },
+            ],
+            "raw": 3, "refuted": 1, "reviewers": 2, "returned": 2,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ns = "repos/proj/codereviews/r1";
+    let file_args = [
+        "task",
+        "review",
+        "file",
+        "--findings",
+        ns,
+        "--from",
+        result.to_str().unwrap(),
+    ];
+    let filed = remote(&file_args, None);
+    assert!(filed.status.success(), "{filed:?}");
+    assert!(
+        String::from_utf8_lossy(&filed.stdout).contains("filed 2 finding(s)"),
+        "{filed:?}"
+    );
+    let again = remote(&file_args, None);
+    assert!(!again.status.success(), "a review is filed once: {again:?}");
+    let clean = remote(
+        &[
+            "--json",
+            "task",
+            "review",
+            "file",
+            "--findings",
+            "repos/proj/codereviews/r2",
+            "--from",
+            "-",
+        ],
+        Some(r#"{"findings": [], "reviewers": 2, "returned": 2}"#),
+    );
+    assert!(clean.status.success(), "{clean:?}");
+    let v: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(v["clean"], true, "{v}");
+
+    let recorded = remote(
+        &[
+            "--json",
+            "task",
+            "review",
+            "record",
+            "--branch",
+            &branch,
+            "--findings",
+            ns,
+        ],
+        None,
+    );
+    assert!(recorded.status.success(), "{recorded:?}");
+    let v: serde_json::Value = serde_json::from_slice(&recorded.stdout).unwrap();
+    assert_eq!(v["tasks"][0]["uid"], uid.as_str(), "{v}");
+    assert_eq!(v["tasks"][0]["moved_to_review"], true, "{v}");
+    assert_eq!(f.status_of(&uid), "needs_review");
+    // The staging listing reads the same findings, through the daemon.
+    let listed = remote(&["--json", "staging", "ls"], None);
+    assert!(listed.status.success(), "{listed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let row = &v[0]["tasks"][0];
+    assert_eq!(v[0]["branch"], "batch", "{v}");
+    assert_eq!(row["uid"], uid.as_str(), "{v}");
+    assert_eq!(row["open_must_fix"], 1, "{v}");
+    assert_eq!(row["commits"], 1, "{v}");
+    assert_eq!(row["title"], "reviewed from the container", "{v}");
+    // The must-fix finding filed from the container is what the gate now reads.
+    let gated = remote(&["task", "land", &uid, "--gate", "true"], None);
+    assert!(!gated.status.success(), "{gated:?}");
+    assert!(
+        String::from_utf8_lossy(&gated.stderr).contains("a real problem — a.rs:3"),
+        "{gated:?}"
+    );
+}
+
+/// **A container recovers a crashed claim and reads its doctor report through the daemon** (tasks S6.4
+/// stage 5): owners are probed where the command runs, and doctor's host-only parts are neither printed
+/// nor offered.
+#[test]
+fn a_container_reclaims_and_checks_health_through_the_daemon() {
+    let f = Fixture::new();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| container_jkb(&f.repo, &url, &token, args, None);
+
+    // A claim of a process gone from the container is freed; one of the host's is not the container's
+    // to judge.
+    let (dead, hosts) = (f.add_task("crashed"), f.add_task("host-held"));
+    for (task, owner) in [(&dead, "container:4194000"), (&hosts, "host:4194001")] {
+        f.jkb()
+            .args(["task", "claim", task, "--owner", owner])
+            .assert()
+            .success();
+    }
+    let reclaimed = remote(&["--json", "task", "reclaim"]);
+    assert!(reclaimed.status.success(), "{reclaimed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&reclaimed.stdout).unwrap();
+    assert_eq!(v["reclaimed"], serde_json::json!([dead]), "{v}");
+    assert_eq!(v["unverifiable"], serde_json::json!([hosts]), "{v}");
+    assert_eq!(v["held_back"], serde_json::json!([]), "{v}");
+    assert_eq!(claim_of(&f.db, &dead), None);
+    assert_eq!(claim_of(&f.db, &hosts).as_deref(), Some("host:4194001"));
+
+    let doctor = remote(&["doctor"]);
+    assert!(doctor.status.success(), "{doctor:?}");
+    let out = String::from_utf8_lossy(&doctor.stdout);
+    for expected in [
+        "fts integrity: ok",
+        "schema user_version:",
+        "task claims: 1 held by an owner whose liveness cannot be checked here",
+    ] {
+        assert!(out.contains(expected), "{expected}: {out}");
+    }
+    for host_only in ["embedder:", "db location:"] {
+        assert!(!out.contains(host_only), "{host_only}: {out}");
+    }
+    let fix = remote(&["doctor", "--fix"]);
+    assert!(!fix.status.success(), "{fix:?}");
+}
+
+/// **A review that did not run is not filed as a clean one** (stage-5a review): an empty result the
+/// workflow marked failed, or read by no reviewer, is refused and files nothing.
+#[test]
+fn a_review_that_did_not_run_is_not_filed() {
+    let f = Fixture::new();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote =
+        |args: &[&str], stdin: Option<&str>| container_jkb(&f.repo, &url, &token, args, stdin);
+    // A review that did not run is not a clean one.
+    for failed in [
+        r#"{"findings": [], "reviewers": 0, "error": "survey failed", "note": "nothing was reviewed; re-run"}"#,
+        r#"{"findings": [], "reviewers": 0, "note": "no findings"}"#,
+        r#"{"findings": [], "reviewers": 3, "returned": 0, "raw": 0}"#,
+        r#"{"findings": [], "reviewers": 3, "raw": 0}"#,
+        r#"{"findings": [{"severity": "nit", "summary": "x"}], "reviewers": 3, "returned": 2}"#,
+    ] {
+        let out = remote(
+            &[
+                "task",
+                "review",
+                "file",
+                "--findings",
+                "repos/proj/codereviews/failed",
+                "--from",
+                "-",
+            ],
+            Some(failed),
+        );
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("nothing was filed"),
+            "{out:?}"
+        );
+    }
+    let listed = remote(&["--json", "ls", "repos/proj/codereviews/failed"], None);
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("task:"),
+        "nothing was filed: {listed:?}"
+    );
+}
+
+/// **`task pr` and `task close-merged` run in the container** (tasks S6.4 stage 5): the number is
+/// recorded through the daemon, and a task nothing proves merged is held with the reason.
+#[test]
+fn a_container_records_a_pull_request_and_holds_an_unproven_close() {
+    let f = Fixture::new();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| container_jkb(&f.repo, &url, &token, args, None);
+    let uid = f.add_task("proven by a pull request");
+    let opened = remote(&["--json", "task", "work", &uid]);
+    assert!(opened.status.success(), "{opened:?}");
+
+    let recorded = remote(&["--json", "task", "pr", &uid, "7"]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let v: serde_json::Value = serde_json::from_slice(&recorded.stdout).unwrap();
+    assert_eq!(v["pr"], 7, "{v}");
+    let why = f
+        .jkb()
+        .args(["--json", "task", "why", &uid])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&why.stdout).contains("\"pr\":7"),
+        "the number is in the history the host reads: {}",
+        String::from_utf8_lossy(&why.stdout)
+    );
+
+    let closed = remote(&["--json", "task", "close-merged", "--dry-run"]);
+    assert!(closed.status.success(), "{closed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&closed.stdout).unwrap();
+    assert_eq!(v["closed"], serde_json::json!([]), "{v}");
+    assert_eq!(v["held"][0]["uid"], uid.as_str(), "{v}");
+    assert_eq!(v["held"][0]["pr"], 7, "{v}");
+    assert_eq!(f.status_of(&uid), "in_progress");
+}
+
+/// **A pull request found by discovery closes its task in the same run** (stage-5 review, round 6):
+/// `close-merged` records the number it found and the op's history check sees it, through the daemon,
+/// with a stub `gh` answering as GitHub would.
+#[test]
+fn a_discovered_merged_pull_request_closes_its_task_in_one_run() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let bin = f.home.path().join("stub-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pr = r#"{"number":45,"state":"MERGED","mergedAt":"2999-01-01T00:00:00Z","baseRefName":"main","headRefName":"BRANCH"}"#;
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \"$2\" in\n  list) printf '[%s]' '{pr}' ;;\n  view) printf '%s' '{pr}' ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let remote = |args: &[&str]| {
+        jkb(None)
+            .args(args)
+            .current_dir(&f.repo)
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("HOSTNAME", "container")
+            .env("PATH", &path)
+            .env_remove("JKB_DB")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap()
+    };
+    let uid = f.add_task("merged elsewhere");
+    let opened = remote(&["--json", "task", "work", &uid]);
+    assert!(opened.status.success(), "{opened:?}");
+    let closed = remote(&["--json", "task", "close-merged"]);
+    assert!(closed.status.success(), "{closed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&closed.stdout).unwrap();
+    assert_eq!(v["closed"][0]["uid"], uid.as_str(), "{v}");
+    assert_eq!(v["closed"][0]["pr"], 45, "{v}");
+    assert_eq!(f.status_of(&uid), "done");
 }

@@ -16,13 +16,334 @@ use jkb_fsm::Fact;
 /// Branch names tried, in order, when a repo does not say which branch is its trunk.
 const DEFAULT_TRUNKS: &[&str] = &["main", "master", "trunk", "develop"];
 
+/// `git -C <dir> <args…>`, with the caller's repository selection stripped out.
+///
+/// EVERY git spawn in this module is built here. `GIT_DIR`, `GIT_WORK_TREE` and
+/// `GIT_COMMON_DIR` outrank `-C`, so with `GIT_WORK_TREE` exported — the standard
+/// bare-dotfiles shell recipe — `rev-parse --show-toplevel` answers somebody else's tree.
+/// `repo::main_root` would then resolve that repository as "the repo", and `jkb task work`
+/// creates a worktree under it and adds `/.jkb/` to its `.git/info/exclude`. jkb runs inside
+/// other people's professional repositories and must not decorate them — the same rule that
+/// keeps it from writing a git ref (D46). `scripts/lib.sh::_git` is this rule's shell half.
+///
+/// Everything that names a repository or a PART of one — six variables, not the three this
+/// sentence claimed until round 28, when `jkb task work` was measured rewriting a foreign
+/// repository's index through an inherited `GIT_INDEX_FILE`. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject
+/// configuration and are deliberately left alone: this project's own dev container uses them
+/// to carry `safe.directory` grants, and stripping those makes git refuse the checkout
+/// outright.
+fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    scrub_repo_selection(&mut cmd);
+    cmd
+}
+
+/// Remove the environment variables that select a repository, so the working directory decides
+/// which one.
+///
+/// The rule lives here rather than at each call site, because it has three of them in three
+/// modules: this module's git spawns, [`crate::pr`]'s `gh` (which resolves the repository
+/// through git exactly as git does, so a leak makes it ask GitHub about somebody else's pull
+/// requests — and `close-merged` then closes tasks on that answer), and [`crate::session`]'s
+/// gate runner (whose verdict decides a landing). Anything else that shells out to a
+/// repository-aware tool belongs here too.
+///
+/// Everything that names a repository or a PART of one — six variables, not the three this
+/// sentence claimed until round 28, when `jkb task work` was measured rewriting a foreign
+/// repository's index through an inherited `GIT_INDEX_FILE`. `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject
+/// configuration and are deliberately left alone: this project's own dev container carries
+/// `safe.directory` grants in them, and stripping those makes git refuse the checkout.
+pub(crate) fn scrub_repo_selection(cmd: &mut Command) -> &mut Command {
+    for key in REPO_SELECTION_VARS {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+/// The variables [`scrub_repo_selection`] removes — and the list it ITERATES to remove them, so
+/// the rule and the list cannot come to say different things.
+///
+/// It was three literal `env_remove` calls beside a `#[cfg(test)]` copy of the same three names,
+/// which reads as a pinned list and is a mirror: a fourth variable added to the function would
+/// have left every test green, since each only ever asked that the named three were gone. The
+/// `cfg(test)` gate was what forced the duplication, and it bought nothing — three `&'static str`
+/// in the binary is not a cost worth a second copy of a security rule.
+pub(crate) const REPO_SELECTION_VARS: &[&str] = &[
+    // Which repository.
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    // ...and which PARTS of one. Added in round 28 after the reason for leaving them out was
+    // measured false. The comment that kept them out said production "must not discard a
+    // component a caller legitimately handed it (git exports `GIT_INDEX_FILE` to hook
+    // processes)". Measured on git 2.51.1, dumping `env | grep ^GIT_` from real hooks:
+    // `post-merge` — the only hook jkb installs, and the one that runs `close-merged` — is handed
+    // NO component selector at all, and `pre-commit` is handed `GIT_INDEX_FILE=.git/index`,
+    // RELATIVE, which is meaningless to a `git -C <other dir>` call anyway.
+    //
+    // The harm is not hypothetical and it is reached through a user-facing command. With
+    // `GIT_INDEX_FILE=<victim>/.git/index` exported, `worktree_add`'s `git -C <proj> worktree add`
+    // — `jkb task work` — rewrote the victim's index (md5 changed) and left `git status` there
+    // failing with `fatal: unable to read <sha>`. That is the same corruption round 27 fixed on
+    // the fixture side, reached from the product.
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
+/// The integration crates' fixture isolation, COMPILED INTO THIS CRATE'S TEST BUILD TOO.
+///
+/// `jkb-cli` is bin-only, so an integration test cannot import anything from here and this file
+/// used to carry its own copy of the list — `FIXTURE_CONFIG` — with a test that parsed both out of
+/// their source files and compared them. That test was deleted with the copy: it compared two
+/// pieces of TEXT rather than two environments (round 24 measured a function drifting from a list
+/// both copies agreed on), and its failure message said the lists "disagree", which reads as an
+/// instruction to sync them — the precise edit round 25 measured as reopening the scrub hole.
+///
+/// One source text, three compilations, no parity to check. `tests/common/mod.rs` uses only
+/// `std`, so it compiles here unchanged.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub(crate) mod fixture_env;
+
+/// The oracle for [`scrub_repo_selection`], written down rather than computed.
+///
+/// A LITERAL on purpose, and never [`REPO_SELECTION_VARS`]. Production iterates that list, so an
+/// assertion that also read it would shrink with it: measured in round 25, deleting
+/// `"GIT_WORK_TREE"` from the list left 260 tests passing while every `git` and `gh` spawn in the
+/// crate inherited an exported one. That is the whole reason a test's expected value is a thing
+/// somebody wrote down — two artifacts, one production and one test, never the same source.
+///
+/// Round 24 had the opposite defect and the fix for it created this one: the applying function
+/// restated the names instead of iterating them, so it could quietly scrub MORE than the list
+/// said. Both directions are now closed, by iterating on the production side and comparing for
+/// EQUALITY here — a name added to the list forces an edit next to this paragraph, which is where
+/// the reason lives.
+#[cfg(test)]
+const EXPECT_SELECTION_REMOVED: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
+/// Assert that `cmd` removes EXACTLY the repository selectors, plus `also` where a tool has its
+/// own (`gh` names a repository outright through `GH_REPO`).
+///
+/// Equality, not a superset. A superset check cannot see a list that grew, and "it scrubs at
+/// least these" is how a blanket sweep gets in — `config_injection_is_left_alone` names the two
+/// variables this deliberately does NOT remove, and that test would have gone on passing beside a
+/// removal of them.
+#[cfg(test)]
+pub(crate) fn assert_scrubbed(what: &str, cmd: &Command, also: &[&str]) {
+    let mut removed: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    let mut want: Vec<String> = EXPECT_SELECTION_REMOVED
+        .iter()
+        .chain(also)
+        .map(|s| (*s).to_owned())
+        .collect();
+    removed.sort();
+    want.sort();
+    assert_eq!(
+        removed, want,
+        "{what}: the removed set must be exactly the repository selectors. A missing one outranks \
+         the working directory and points the tool at another repository; an extra one is a \
+         blanket sweep, which this crate refuses deliberately (see \
+         `config_injection_is_left_alone`). Do not reconcile this by editing the list it is \
+         checked against — that is the edit measured to reopen the hole."
+    );
+}
+
+/// Blank every comment and string literal, so a source-scanning test sees code and not text.
+///
+/// **There is a second Rust scanner in this crate** — `commands::tests::string_literals`, which
+/// EXTRACTS literals rather than blanking them, for a check about what the binary prints. They
+/// are not one function today, and that is a known cost rather than an oversight: unifying them
+/// means rewriting a passing check in a file this change does not otherwise touch. Two scanners
+/// that must both be right about Rust's syntax is exactly the drift shape this project warns
+/// about, so it is written down here. (Noted while doing this: `string_literals` does NOT handle
+/// raw strings, so `r#"…"#` fragments for it — harmless for its purpose, and the reason this
+/// one does handle them is that a raw string mentioning `Command::new(` would otherwise be
+/// reported as an unscrubbed spawn.)
+///
+/// Returns `src` with every comment and string literal blanked to spaces, newlines preserved so
+/// line numbers survive. Handles line and (nested) block comments, ordinary strings with escapes
+/// and line continuations, raw strings (`r"…"`, `r#"…"#`, `br#"…"#`), and char literals — a char
+/// literal may hold a quote (`'"'`) while a lifetime never closes, so the latter falls through
+/// as ordinary text.
+///
+/// It exists because a scan of raw LINES cannot see a spawn whose call is split by rustfmt:
+///
+/// ```ignore
+/// let mut c = Command::new(
+///     "git",
+/// );
+/// ```
+///
+/// Measured — that form evaded the spawn guard below, while a block comment and a closure did
+/// not. Matching code rather than text also retires the guard's previous special cases (skip
+/// lines starting with `//`, skip lines containing an escaped quote), which existed only to stop
+/// the guard's own source from matching itself.
+#[cfg(test)]
+pub(crate) fn code_only(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out: Vec<char> = vec![' '; chars.len()];
+    let mut at = 0usize;
+    while at < chars.len() {
+        // A raw string first: its body may contain anything, quotes and `*/` included.
+        if let Some(end) = lex::raw_string_end(&chars, at) {
+            lex::blank_span(&chars, &mut out, at, end);
+            at = end;
+            continue;
+        }
+        let end = match chars[at] {
+            '/' if chars.get(at + 1) == Some(&'/') => lex::line_comment_end(&chars, at),
+            '/' if chars.get(at + 1) == Some(&'*') => lex::block_comment_end(&chars, at),
+            '"' => lex::string_end(&chars, at),
+            '\'' => {
+                // A quote that opens a LIFETIME, not a literal, is ordinary code.
+                let Some(end) = lex::char_literal_end(&chars, at) else {
+                    out[at] = chars[at];
+                    at += 1;
+                    continue;
+                };
+                end
+            }
+            ch => {
+                out[at] = ch;
+                at += 1;
+                continue;
+            }
+        };
+        lex::blank_span(&chars, &mut out, at, end);
+        at = end;
+    }
+    out.into_iter().collect()
+}
+
+#[cfg(test)]
+mod lex {
+    //! `code_only`'s scanners, one per literal form. Split out of a single 107-line function
+    //! that clippy refused on both length and six single-character bindings at once; each half
+    //! is now named after the thing it skips, and the index arithmetic that made the short
+    //! names tempting is confined to one scanner apiece.
+
+    /// Blank `src[from..to]` in `out`, keeping newlines so every line number is preserved.
+    pub(super) fn blank_span(src: &[char], out: &mut [char], from: usize, to: usize) {
+        for k in from..to.min(src.len()) {
+            if src[k] == '\n' {
+                out[k] = '\n';
+            }
+        }
+    }
+
+    /// If a raw string (`r"…"`, `r#"…"#`, `br#"…"#`) opens at `start`, the index just past its
+    /// close — or past the end of input when it never closes, which is what the single-pass
+    /// scanner did before and keeps an unterminated literal from being re-scanned as code.
+    ///
+    /// `starts_token` is why an `r` inside an identifier (`var"` never happens, but `for r#x`
+    /// and `let br = …` do) is not read as a literal opener.
+    pub(super) fn raw_string_end(src: &[char], start: usize) -> Option<usize> {
+        let mut open = start;
+        if src[open] == 'b' {
+            open += 1;
+        }
+        if src.get(open) != Some(&'r') {
+            return None;
+        }
+        let mut hashes = 0usize;
+        let mut probe = open + 1;
+        while src.get(probe) == Some(&'#') {
+            hashes += 1;
+            probe += 1;
+        }
+        let starts_token =
+            start == 0 || !(src[start - 1].is_alphanumeric() || src[start - 1] == '_');
+        if src.get(probe) != Some(&'"') || !starts_token {
+            return None;
+        }
+        let mut pos = probe + 1;
+        while pos < src.len() {
+            if src[pos] == '"' {
+                let mut seen = 0usize;
+                let mut after = pos + 1;
+                while seen < hashes && src.get(after) == Some(&'#') {
+                    seen += 1;
+                    after += 1;
+                }
+                if seen == hashes {
+                    return Some(after);
+                }
+            }
+            pos += 1;
+        }
+        Some(src.len())
+    }
+
+    /// The index just past the block comment opening at `start`, honouring nesting.
+    pub(super) fn block_comment_end(src: &[char], start: usize) -> usize {
+        let mut depth = 1usize;
+        let mut pos = start + 2;
+        while pos < src.len() && depth > 0 {
+            if src[pos] == '/' && src.get(pos + 1) == Some(&'*') {
+                depth += 1;
+                pos += 2;
+            } else if src[pos] == '*' && src.get(pos + 1) == Some(&'/') {
+                depth -= 1;
+                pos += 2;
+            } else {
+                pos += 1;
+            }
+        }
+        pos
+    }
+
+    /// The index just past the line comment opening at `start` (its newline is not consumed).
+    pub(super) fn line_comment_end(src: &[char], start: usize) -> usize {
+        let mut pos = start;
+        while pos < src.len() && src[pos] != '\n' {
+            pos += 1;
+        }
+        pos
+    }
+
+    /// The index just past the ordinary string literal opening at `start`.
+    pub(super) fn string_end(src: &[char], start: usize) -> usize {
+        let mut pos = start + 1;
+        while pos < src.len() {
+            if src[pos] == '\\' {
+                pos += 2;
+                continue;
+            }
+            if src[pos] == '"' {
+                pos += 1;
+                break;
+            }
+            pos += 1;
+        }
+        pos
+    }
+
+    /// The index just past a char literal opening at `start`, or `None` when the quote opens a
+    /// LIFETIME instead — `'a` never closes, so it has to fall through as ordinary text while
+    /// `'"'` must not.
+    pub(super) fn char_literal_end(src: &[char], start: usize) -> Option<usize> {
+        let close = start + 2 + usize::from(src.get(start + 1) == Some(&'\\'));
+        (src.get(close) == Some(&'\'')).then_some(close + 1)
+    }
+}
+
 /// Run `git` in `dir`, returning trimmed stdout. `Ok(None)` when git exits non-zero — the
 /// common "this ref does not exist" case, which is a fact rather than a failure.
 fn git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
     if !out.status.success() {
@@ -44,7 +365,7 @@ pub fn root(dir: &Path) -> Result<Option<PathBuf>> {
 /// The **main** working copy's root, even when `dir` is inside a linked worktree.
 ///
 /// [`root`] answers "which checkout am I in", which is the wrong question for anything that
-/// belongs to the repository as a whole: session worktrees and the land lock all live under
+/// belongs to the repository as a whole: session worktrees and archives all live under
 /// the main copy's `.jkb/`, or a session that ran `jkb` from inside another session would
 /// nest its own `.jkb/work` inside a checkout.
 ///
@@ -154,16 +475,11 @@ pub fn trunk(dir: &Path) -> Result<Option<String>> {
 /// # Errors
 /// Returns an error if `name` cannot be passed to git as an operand.
 pub fn valid_ref(name: &str) -> Result<()> {
-    anyhow::ensure!(
-        !name.is_empty(),
-        "an empty branch or revision name cannot be passed to git"
-    );
-    anyhow::ensure!(
-        !name.starts_with('-'),
-        "`{name}` cannot be used as a branch or revision: git reads a leading `-` as an option, \
-         and no valid ref name begins with one"
-    );
-    Ok(())
+    // The rule and its sentence are `jkb_core::location::ref_problem`'s, shared with the store.
+    match jkb_core::location::ref_problem(name) {
+        Some(why) => Err(anyhow::Error::msg(why)),
+        None => Ok(()),
+    }
 }
 
 /// The commit `reference` resolves to, if any.
@@ -182,10 +498,7 @@ pub fn rev(dir: &Path, reference: &str) -> Result<Option<String>> {
 /// # Errors
 /// Returns an error if `git` cannot be executed at all.
 fn git_run(dir: &Path, args: &[&str]) -> Result<(bool, String)> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -264,15 +577,30 @@ pub fn worktree_for_branch(dir: &Path, branch: &str) -> Result<Option<PathBuf>> 
         .map(|w| w.path))
 }
 
-/// Drop git's registrations for worktrees whose directories are gone (`git worktree prune`).
+/// Drop git's registration of the worktree at `path`, whose directory is gone.
 ///
-/// Needed when something outside this process removed a session directory — `git worktree
-/// list` keeps reporting it, and its branch stays locked to a checkout that is not there.
+/// **This path only — never `git worktree prune`.** Prune drops every registration whose directory
+/// this process cannot see, and across the host/container bind that is every session opened on the
+/// other side: their gitdirs name paths that do not exist here, so one side's prune unregistered the
+/// other side's live checkouts (stage-3 review, round 3). `git worktree remove` on a missing directory
+/// only drops its registration (measured, git 2.51.1).
+///
+/// Refused while the directory is there: `worktree remove` would delete a clean one.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed.
-pub fn prune_worktrees(dir: &Path) -> Result<()> {
-    git_must(dir, &["worktree", "prune"])?;
+/// Returns an error if the directory is present or cannot be examined, or git refuses — including
+/// for a path it does not register.
+pub fn forget_worktree(dir: &Path, path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!(
+            "{} is still there, so its registration is kept",
+            path.display()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("examining {}", path.display())),
+    }
+    let path_s = path.to_string_lossy().into_owned();
+    git_must(dir, &["worktree", "remove", "--", &path_s])?;
     Ok(())
 }
 
@@ -304,9 +632,14 @@ pub fn worktree_add(dir: &Path, path: &Path, branch: &str, start: &str) -> Resul
     Ok(())
 }
 
-/// Remove the worktree at `path` and prune the administrative entry. `force` discards
+/// Remove the worktree at `path`, which also drops its own administrative entry. `force` discards
 /// uncommitted changes; without it git refuses a dirty worktree, which is the check the
 /// caller wants.
+///
+/// **No `git worktree prune` after it.** Prune drops every registration whose directory this side
+/// cannot see — across the host/container bind, every session opened on the other side (stage-3
+/// review, round 4). `worktree remove` needs no prune to unregister its own path (measured, git
+/// 2.51.1).
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to remove the worktree.
@@ -318,7 +651,6 @@ pub fn worktree_remove(dir: &Path, path: &Path, force: bool) -> Result<()> {
     }
     args.push(&path_s);
     git_must(dir, &args)?;
-    let _ = git_run(dir, &["worktree", "prune"])?;
     Ok(())
 }
 
@@ -782,6 +1114,28 @@ pub enum Graft {
     Landed { grafted: String },
     /// The rebase hit a conflict; nothing changed. The branch's author must rebase it.
     Conflict,
+    /// The graft is good — the rebase was clean — but `onto` could not be advanced onto it: it
+    /// moved under us, another checkout holds it, or the working tree has something the
+    /// fast-forward would overwrite. **Not the branch's fault**, which is the whole reason this
+    /// is not [`Graft::Conflict`].
+    ///
+    /// It used to be. A refused fast-forward ran `reset_hard` and returned `Conflict`, so
+    /// `jkb task land` told the user "does not rebase cleanly onto {onto} — nothing changed.
+    /// Rebase it…" — and all three claims were false: the rebase WAS clean so the advice is
+    /// unfollowable and reproduces every time, "nothing changed" was asserted immediately after a
+    /// `git reset --hard`, and if `onto` had moved forward the reset dragged it back. The shell
+    /// twin (`scripts/merge-queue.sh`, exit 4) split this case out with its own wording for
+    /// exactly these reasons; this is the Rust spelling of it.
+    ///
+    /// No rollback on this arm, for the reason the shell deleted both of its own: nothing has
+    /// moved, so there is nothing to restore and a reset can only destroy.
+    ///
+    /// Carries git's own explanation, because the caller cannot infer it: the checkout of `onto`
+    /// has already succeeded by the time this can fire, so "another worktree holds it" is exactly
+    /// what it is NOT, and the cause that does reach here — a held `index.lock`, a tracked file
+    /// the fast-forward would overwrite, `onto` moved on by a concurrent writer — is whatever git
+    /// says it is.
+    CouldNotAdvance { why: String },
 }
 
 /// Rebase `branch` onto the live tip of `onto` and fast-forward `onto` to the result, in the
@@ -802,6 +1156,37 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     git_must(dir, &["switch", onto])?;
     let pre = rev(dir, "HEAD")?.context("target branch has no commits to graft onto")?;
 
+    // NOTHING TO GRAFT IS NOT A LANDING. A branch sitting at `onto`'s tip rebases to a no-op and
+    // `merge --ff-only` then answers "Already up to date." with exit 0 — so this returned
+    // `Graft::Landed` and the caller marked every task recording that branch done, dependents
+    // unblocked, with not one commit added to `onto`. Reachable whenever a worker reports success
+    // without committing: the branch exists, so every check that asks whether it exists passes.
+    //
+    // Measured before the rebase, which is what separates this from the legitimate case. A branch
+    // that HAD commits and whose rebase drops them all as empty — because an earlier landing
+    // carried the same content — is a real landing of that content and still returns `Landed`.
+    //
+    // THIS COUNTS COMMITS, NOT CONTENT, and the two are not the same question. Measured on git
+    // 2.51.1: `git rebase` drops a commit that BECOMES empty but keeps one that STARTED empty, so
+    // a branch carrying a single `git commit --allow-empty` passes this check and advances `onto`
+    // by a commit that changes nothing. `scripts/merge-queue.sh` asks the content
+    // question at ENTRY, against the merge-base, and EJECTS a branch that diverged and
+    // contributes nothing rather than reporting it as a landing — an earlier shape of that check
+    // did report it as one, and this comment described that shape for a commit after it was
+    // replaced. The queue also STALLS a branch already an ancestor of the base, because the graph
+    // cannot say whether an earlier entry landed its work or it was never committed to. The
+    // twins disagree here, deliberately and for now — the shell queue closes whole groups
+    // unattended, which is where the harm was, and the same fix here needs a `Graft` variant and
+    // a `do_land` arm deciding whether a task with no content should be marked done at all. Filed
+    // rather than guessed at.
+    if ahead_count(dir, onto, branch)? == 0 {
+        anyhow::bail!(
+            "{branch} has no commits ahead of {onto} — there is nothing to land. If its work is \
+             already in {onto} under someone else's commit, close it with `jkb task landed \
+             {branch} --onto {onto}`; if the work was never committed, it is still in the session."
+        );
+    }
+
     if !git_run(dir, &["checkout", "--detach", branch])?.0 {
         git_must(dir, &["switch", onto])?;
         return Ok((Graft::Conflict, pre));
@@ -813,9 +1198,31 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     }
     let grafted = rev(dir, "HEAD")?.context("rebase produced no commit")?;
     git_must(dir, &["switch", onto])?;
-    if !git_run(dir, &["merge", "--ff-only", &grafted])?.0 {
-        reset_hard(dir, &pre)?;
-        return Ok((Graft::Conflict, pre));
+    // HOOKS OFF FOR THE FAST-FORWARD, the same rule `scripts/merge-queue.sh` states at its own
+    // graft. A fast-forward fires `post-merge`, which in this repository runs setup.sh —
+    // cargo-installing the jkb binary, rebuilding the VS Code extension, reinstalling the watcher
+    // service. `jkb task land` does not run its gate until after this returns, so the human path
+    // was installing a binary built from a candidate that could go red seconds later and be rolled
+    // back by `reset_hard`, leaving the operator's `jkb` newer than any branch carries.
+    //
+    // The suppression belongs HERE, with the graft, rather than with one of its two callers: the
+    // shell queue had it and this did not, which is the twinned-rule drift this branch has now
+    // paid for on three separate pairs.
+    // GIT'S OWN TEXT TRAVELS WITH THE REFUSAL. The first version of this arm dropped it and the
+    // caller then guessed at causes — naming two that cannot reach this line, because
+    // `git_must(switch onto)` has already succeeded just above, and omitting the one that can.
+    let (advanced, why) = git_run(
+        dir,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "merge",
+            "--ff-only",
+            &grafted,
+        ],
+    )?;
+    if !advanced {
+        return Ok((Graft::CouldNotAdvance { why }, pre));
     }
     Ok((Graft::Landed { grafted }, pre))
 }
@@ -967,30 +1374,556 @@ pub fn adopt_remote(dir: &Path, branch: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_branch, deletions_only, is_dirty, key, trunk};
+    use super::{current_branch, deletions_only, git_cmd, is_dirty, key, trunk};
     use jkb_fsm::Fact;
     use std::path::Path;
     use std::process::Command;
+
+    /// Configuration injection is deliberately NOT stripped: the dev container carries
+    /// `safe.directory` grants in `GIT_CONFIG_PARAMETERS`, and removing those makes git refuse
+    /// the checkout. Pinned so the list is not "tidied" into a blanket sweep.
+    #[test]
+    fn config_injection_is_left_alone() {
+        let cmd = git_cmd(Path::new("/somewhere"), &["status"]);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for keep in ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
+            assert!(
+                !removed.iter().any(|k| k == keep),
+                "{keep} must not be stripped — it carries safe.directory grants"
+            );
+        }
+    }
+
+    /// How a process gets BUILT here — every spelling, because the guard is about the
+    /// spawn and not about one way of writing it. Keyed on `Command::new(` alone, the
+    /// three `Command::cargo_bin("jkb")` fixtures were invisible: deleting the
+    /// `isolate_git_env` line from `Fixture::jkb` left this guard and the whole suite
+    /// green, while the doc above claimed NO SPAWN IN THE CRATE goes unscrubbed. Measured.
+    const SPAWN_FORMS: &[&str] = &["Command::new(", "cargo_bin("];
+
+    /// `(file, fn)` — each of these is separately asserted to scrub, by the test named.
+    const SCRUBBERS: &[(&str, &str)] = &[
+        ("src/gitrepo.rs", "git_cmd"), // every_git_call_drops_the_callers_repository_selection
+        ("src/gitrepo.rs", "fixture_git"), // the_test_fixtures_do_not_reach_another_repository
+        ("src/pr.rs", "gh_cmd"),       // the_gh_spawn_does_not_inherit_a_repository_selection
+        ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
+        ("src/archive.rs", "fixture_git"), // the_archive_fixture_does_not_reach_another_repository
+        // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
+        // the spawn is, since that is what the scan can see.
+        ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config
+        ("tests/sessions.rs", "jkb"),     // the_session_fixture_jkb_does_not_inherit_a_repository
+        ("tests/cli.rs", "jkb_bare"),     // the_cli_fixture_does_not_inherit_a_repository
+    ];
+    /// `(file, fn)` — spawns that do NOT resolve a repository, listed so that adding one
+    /// is a decision rather than an omission.
+    const NOT_REPO_AWARE: &[(&str, &str, &str)] = &[
+        (
+            "src/owner.rs",
+            "a_reaped_child_is_established_dead",
+            "spawns a shell purely to own a pid; it is never asked about a repository",
+        ),
+        (
+            "src/archive.rs",
+            "the_old_store_s_files_are_never_opened",
+            "spawns `mkfifo` on a temp path; it is never asked about a repository",
+        ),
+    ];
+
+    /// The function a declaration line declares, or `UNPARSED` when the line declares one
+    /// in a shape this scan does not model. `None` when it is not a declaration at all.
+    ///
+    /// Qualifiers are enumerated rather than guessed at, and anything else before `fn`
+    /// makes the answer `UNPARSED` — the honest third value.
+    const UNPARSED: &str = "<unparsed declaration>";
+    fn declared_fn(trimmed: &str) -> Option<&str> {
+        // `fn` must be a whole token: `fn foo`, never `fn(u8) -> u8` (a fn-pointer type).
+        let at = trimmed
+            .match_indices("fn ")
+            .find(|(i, _)| *i == 0 || trimmed.as_bytes()[i - 1] == b' ')?;
+        let before = &trimmed[..at.0];
+        let known = before.split_whitespace().all(|tok| {
+            matches!(
+                tok,
+                "pub" | "const" | "async" | "unsafe" | "extern" | "default"
+            ) || tok.starts_with("pub(")
+                || (tok.starts_with('"') && tok.ends_with('"'))
+        });
+        if !known {
+            return Some(UNPARSED);
+        }
+        let rest = &trimmed[at.0 + 3..];
+        let name = rest.split(['(', '<']).next().unwrap_or(rest).trim();
+        if name.is_empty() {
+            Some(UNPARSED)
+        } else {
+            Some(name)
+        }
+    }
+
+    /// EVERY EXEMPTION NAMES A TEST, AND THAT TEST EXISTS — lifted out of the guard above so
+    /// the guard stays readable and this stays one question. `src/archive.rs` was exempted on
+    /// a trailing comment naming `the_archive_fixture_does_not_reach_another_repository`,
+    /// which existed nowhere in the crate — so that fixture was exempt by location with
+    /// nothing observing it, and deleting its scrub left the whole suite green. That is the
+    /// "a claimed pin that does not exist is worse than no claim" defect, granted BY the
+    /// allowlist whose doc asserts each entry is separately checked. So the comment is the
+    /// machine-checked part now and cannot rot into a false claim.
+    fn every_exemption_names_a_test_that_observes_it(
+        root: &Path,
+        files: &[std::path::PathBuf],
+        scrubbers: &[(&str, &str)],
+    ) {
+        let all_src: String = files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .collect();
+        let code_src = super::code_only(&all_src);
+        // Assembled, never written whole: see the anchor below.
+        let marker = ["const ", "SCRUBBERS"].concat();
+        let mut unpinned: Vec<String> = Vec::new();
+        let mut parsed: Vec<(String, String)> = Vec::new();
+        let mut in_list = false;
+        let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
+        for line in self_src.lines() {
+            // THE DECLARATION, and the needle is ASSEMBLED AT RUN TIME so that this line
+            // cannot be it.
+            //
+            // WHEN THE CONST LIVED INSIDE THIS TEST, BELOW the scan, a literal
+            // `line.contains("const SCRUBBERS")` matched its OWN source first — it reached the
+            // right entries only because nothing in between happened to trim to `];` or start
+            // with `(`, and one `vec![…];` in this function ended the scan on the wrong list.
+            // Adding `&& line.contains("= &[")` did NOT fix it: that predicate is also true of
+            // the line spelling it. Measured, both ways.
+            //
+            // The const has since moved to module scope ABOVE the scan, so a literal needle
+            // would find the const first today and the bug would not reproduce. That is a fact
+            // about the current layout, not a property of the scan: moving either block back
+            // restores it. The assembled marker is what makes the anchor about the LIST rather
+            // than about where this scanner happens to sit, and the identity assertion below is
+            // what would notice if it stopped being.
+            if line.contains(&marker) && line.contains("= &[") {
+                in_list = true;
+                continue;
+            }
+            if !in_list {
+                continue;
+            }
+            if line.trim() == "];" {
+                break;
+            }
+            // An ENTRY line, whatever it carries — counted before the comment is looked for, so
+            // that an entry written without one is a failure rather than a silent skip. Written
+            // the other way round (find the comment, then check the entry), a comment-less entry
+            // `continue`d and its exemption was granted with no named test at all: the archive.rs
+            // defect this check exists to close, one shape over.
+            if !line.trim_start().starts_with('(') {
+                continue;
+            }
+            // The (file, fn) pair this line declares, so the premise below can be about
+            // IDENTITY rather than arity — a count matches for any six lines at all.
+            let pair = line
+                .trim()
+                .trim_start_matches('(')
+                .split_once(')')
+                .map_or("", |(inner, _)| inner);
+            let mut halves = pair
+                .split(',')
+                .map(|h| h.trim().trim_matches('"').to_owned());
+            parsed.push((
+                halves.next().unwrap_or_default(),
+                halves.next().unwrap_or_default(),
+            ));
+            let Some((_, named)) = line.split_once("// ") else {
+                unpinned.push(format!("{} names no test at all", line.trim()));
+                continue;
+            };
+            let named = named.trim();
+            // CODE, not text — the same rule the spawn scan above had to learn, and it matters
+            // more here: these tests carry long comment blocks that name the very constructor
+            // they are vouching for, so a prose scan would accept a test that only TALKS about
+            // it. `code_only` blanks in place, so indices into it are indices into `all_src`.
+            let Some(at) = code_src.find(&format!("fn {named}(")) else {
+                unpinned.push(format!(
+                    "{} names `{named}`, which is not a function here",
+                    line.trim()
+                ));
+                continue;
+            };
+            // ...and the named test must OBSERVE the constructor it is named beside. Existing
+            // somewhere in the crate is not evidence about this entry — a test could be named
+            // here and assert something else entirely, which is the same "reads as pinned and
+            // is not" shape one level up.
+            //
+            // The body ends at the first closing brace AT THE FUNCTION'S OWN INDENTATION, which
+            // is DERIVED rather than assumed. `\n    }` was hard-coded, on the assumption that
+            // every test here sits inside `mod tests`; `tests/sessions.rs` holds its tests at
+            // top level, so the pattern matched the first brace NESTED inside the function
+            // instead. Measured on `the_fixture_isolation_covers_selection_and_config`: the
+            // body stopped at its inner `for … { … }`, six characters short of the real end.
+            // Harmless there only because the constructor is called on the line above it — a
+            // constructor used after that block would have been reported missing when it is
+            // not, and the `map_or(body, …)` fallback fails the other way, handing `contains`
+            // the rest of the crate so that it is true of almost anything. So both are gone:
+            // the indentation is read off the declaration, and a body with no end is a failure.
+            let line_start = code_src[..at].rfind('\n').map_or(0, |i| i + 1);
+            let indent: String = code_src[line_start..at]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            let Some(end) = code_src[at..].find(&format!("\n{indent}}}")) else {
+                unpinned.push(format!(
+                    "{} names `{named}`, whose body has no end at its own indentation",
+                    line.trim()
+                ));
+                continue;
+            };
+            let body = &code_src[at..at + end];
+            // An entry whose constructor cannot be read is a failure too. `map_or("", …)` plus
+            // an `is_empty` skip granted the exemption with nothing checked — the same silent
+            // skip the comment-less entry above had to be turned into a failure.
+            let Some(ctor) = line
+                .split_once(", \"")
+                .and_then(|(_, r)| r.split_once('"'))
+                .map(|(n, _)| n)
+                .filter(|n| !n.is_empty())
+            else {
+                unpinned.push(format!(
+                    "{} names no constructor we could read",
+                    line.trim()
+                ));
+                continue;
+            };
+            if !body.contains(ctor) {
+                unpinned.push(format!(
+                    "{} names `{named}`, which never mentions `{ctor}` in code",
+                    line.trim()
+                ));
+            }
+        }
+        // The premise, and it is about IDENTITY. `scrubbers.len() >= 6` was `6 >= 6` on a const
+        // array of six, so it could not fail whatever the parse did; counting what was parsed
+        // instead fixed the arity but still said nothing about WHICH six lines were read — any
+        // six would have satisfied it, including six from a different list that happened to sit
+        // where the scan landed. The pairs the scan reads must BE the pairs the compiler saw.
+        let declared: Vec<(String, String)> = scrubbers
+            .iter()
+            .map(|(f, c)| ((*f).to_owned(), (*c).to_owned()))
+            .collect();
+        assert_eq!(
+            parsed, declared,
+            "the SCRUBBERS parse did not read the list the compiler saw; the block moved, was \
+             renamed or was reformatted, so the entries checked were not its entries"
+        );
+        assert!(
+            unpinned.is_empty(),
+            "a SCRUBBERS entry grants an exemption while naming no test, a test that does not \
+             exist, or one that never mentions the constructor it exempts: {unpinned:?}"
+        );
+    }
+
+    /// NO SPAWN IN THE CRATE — production or test — resolves a repository from
+    /// the environment without going through a scrubbing constructor.
+    ///
+    /// It began as a check that every git spawn in THIS MODULE is built by `git_cmd` — added
+    /// because the behavioural test observes `git_cmd` only, so reverting `git()` to a bare
+    /// `Command::new("git")` left the suite green while the doc claimed otherwise. That check
+    /// is now a special case of this one and has been retired; its distinctive premise (this
+    /// file holds exactly one production git spawn, so an empty result is not a broken walk)
+    /// is asserted below.
+    ///
+    /// The rules it had to learn, each from a defect it had missed:
+    ///
+    /// 1. **Test code counts.** The first version cut every file at its `mod tests`, so it could
+    ///    not see that this module's OWN four fixtures scrubbed nothing. Measured: with
+    ///    `GIT_DIR`/`GIT_WORK_TREE` exported and a dirty checkout at the other end, running
+    ///    `gitrepo::tests` commits into that repository, creates branches `deep/er` and
+    ///    `mergecommit` in it, and moves its HEAD. A guard that exempts the half where the
+    ///    damage was is not a guard.
+    /// 2. **Exempt by LOCATION, not by name.** Keyed on the bare name `git_cmd`, a new module
+    ///    copying the idiom — name included, which is the likeliest way a fifth spawn gets
+    ///    written, since two files already spell it that way — was exempt on arrival.
+    /// 3. **Every spawn is classified.** A program that does not resolve a repository is listed
+    ///    too, with its reason, so adding one forces the decision either way rather than
+    ///    defaulting to silence.
+    #[test]
+    fn no_spawn_in_the_crate_resolves_a_repository_unscrubbed() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        // The CRATE ROOT, so the claim "every .rs under the crate" is true — a `build.rs` git
+        // spawn was outside a `src/` + `tests/` walk while the doc said coverage was complete.
+        // `target/` is skipped: it holds generated sources that are not ours to classify.
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        // Finding no files means the walk is broken, and an empty result would read exactly
+        // like a clean sweep — the `check_shell_syntax` lesson.
+        assert!(
+            files.len() >= 5,
+            "walked {} source files under {}; the walk is broken, not the code",
+            files.len(),
+            root.display()
+        );
+
+        let mut stray: Vec<String> = Vec::new();
+        let mut exempted: std::collections::HashSet<(&str, &str)> =
+            std::collections::HashSet::new();
+        let mut found = 0usize;
+        for path in &files {
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            // CODE, not text. A raw-line scan cannot see a call rustfmt has split across lines
+            // (measured: that form evaded this guard, while a block comment and a closure did
+            // not), and it needed two special cases — skip `//` lines, skip lines carrying an
+            // escaped quote — that existed only to stop the guard's own source matching itself.
+            // Blanking comments and literals removes the blind spot and both special cases.
+            let scanned = super::code_only(&src);
+            let mut enclosing = "<no enclosing fn>";
+            for (i, line) in scanned.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // AN UNRECOGNIZED DECLARATION IS NOT THE PREVIOUS FUNCTION. A three-prefix list
+                // (`pub fn`/`pub(crate) fn`/`fn`) did not match `pub(super) fn`, so `enclosing`
+                // kept the name above it — and an unscrubbed `gh` spawn written immediately
+                // after `gh_cmd` inherited `gh_cmd`'s exemption and passed. Measured. That is
+                // exempt-on-arrival reproduced inside the mechanism that exists to stop it, and
+                // it is this project's central rule broken in its own enforcement: an unknown
+                // must never be spelled as a definite answer.
+                //
+                // So a line is classified in three ways, not two: not a declaration (carry on),
+                // a declaration whose name we parsed, or a declaration in a shape we do not
+                // model — which becomes a sentinel no allowlist entry can equal, so the spawn
+                // below it is REPORTED rather than exempted. Adding a spelling is then a
+                // failing test, never a silent hole.
+                if let Some(name) = declared_fn(trimmed) {
+                    enclosing = name;
+                }
+                if !SPAWN_FORMS.iter().any(|f| line.contains(f)) {
+                    continue;
+                }
+                found += 1;
+                let here = (rel.as_str(), enclosing);
+                if SCRUBBERS.iter().any(|&(f, n)| f == here.0 && n == here.1) {
+                    continue;
+                }
+                if let Some(&(f, n, why)) = NOT_REPO_AWARE
+                    .iter()
+                    .find(|&&(f, n, _)| f == here.0 && n == here.1)
+                {
+                    let _ = why;
+                    exempted.insert((f, n));
+                    continue;
+                }
+                stray.push(format!("{rel}:{} in `{enclosing}`", i + 1));
+            }
+        }
+        assert!(
+            found >= 6,
+            "found {found} spawns; the scan is broken, not the code"
+        );
+        // An exemption that matched no spawn is not harmless: it pre-approves whatever spawn is
+        // next written under that (file, fn) name. One outlived its test's deletion this way, with
+        // the scan green (stage-5 review).
+        let stale: Vec<_> = NOT_REPO_AWARE
+            .iter()
+            .filter(|&&(f, n, _)| !exempted.contains(&(f, n)))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "NOT_REPO_AWARE names spawns that no longer exist; remove them: {stale:?}"
+        );
+
+        every_exemption_names_a_test_that_observes_it(root, &files, SCRUBBERS);
+
+        let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
+
+        // The retired per-module check's distinctive premise: this file holds exactly ONE
+        // production git spawn, in `git_cmd`. It is what makes an empty `stray` above mean
+        // "nothing bypasses" rather than "the slice was wrong" for the file that matters most.
+        let self_prod = match self_src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(cut) => &self_src[..cut],
+            None => panic!("this module has a `mod tests`, which marks the end of production code"),
+        };
+        assert_eq!(
+            SPAWN_FORMS
+                .iter()
+                .map(|f| super::code_only(self_prod).matches(f).count())
+                .sum::<usize>(),
+            1,
+            "expected exactly one production git spawn in gitrepo.rs (in `git_cmd`); the scan is \
+             looking at the wrong slice or the spawn has been respelled"
+        );
+        assert!(
+            stray.is_empty(),
+            "a tool is spawned outside any scrubbing constructor, so it inherits the caller's \
+             repository selection and may act on an unrelated repository. Route it through one \
+             of {SCRUBBERS:?}, or list it in NOT_REPO_AWARE with the reason: {stray:?}"
+        );
+    }
+
+    /// Everything production SELECTS is also dropped by the fixtures.
+    ///
+    /// The two were coupled by construction until round 26: both `fixture_git` builders called
+    /// `scrub_repo_selection` on top of the config isolation, so a name added to
+    /// `REPO_SELECTION_VARS` reached the fixtures automatically. That call was removed because it
+    /// had become redundant AND was pinning nothing — but removing it also removed the coupling,
+    /// and nothing replaced it: measured in round 27, adding `"GIT_OBJECT_DIRECTORY"` to
+    /// `REPO_SELECTION_VARS` and `EXPECT_SELECTION_REMOVED` left 118 tests passing while the two
+    /// library fixtures no longer dropped it, and with that variable exported they wrote loose
+    /// objects into a foreign object store.
+    ///
+    /// This is containment, not parity. `MUST_DROP` is deliberately WIDER by three names, for two
+    /// different reasons: the `GIT_CONFIG_*` channels, because production must not discard the
+    /// `safe.directory` grants this container carries there; and `GIT_TEMPLATE_DIR`, because
+    /// production never runs `git init`. So the assertion is one-directional and production may
+    /// grow without the fixture list being wrong. It reads the constants the compiler saw, not
+    /// their source text, which is what the deleted parity test did wrong.
+    #[test]
+    fn the_fixtures_drop_everything_production_selects() {
+        let missing: Vec<&str> = super::REPO_SELECTION_VARS
+            .iter()
+            .filter(|v| !super::fixture_env::MUST_DROP.contains(v))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "production selects {missing:?} but the test fixtures do not drop them, so every \
+             fixture `git` would inherit them from the developer's shell. Add each to \
+             `MUST_DROP` and to `EXPECT_DROPPED` in tests/common/mod.rs — that is the edit, and \
+             it is not the same as editing `REPO_SELECTION_VARS` back down."
+        );
+    }
+
+    /// Every git spawn in this module drops the caller's repository selection.
+    ///
+    /// Asserted on the built `Command` rather than by exporting the variables, because
+    /// `std::env::set_var` is process-global and would race every other test in this binary —
+    /// the assertion would then be flaky in exactly the direction that reads as a pass.
+    /// That git honours these over `-C` is git's own documented precedence, measured for the
+    /// shell half in `scripts/tests/git-hooks.test.sh::case6p`; what can drift here, and what
+    /// this pins, is whether jkb still asks it to.
+    #[test]
+    fn every_git_call_drops_the_callers_repository_selection() {
+        super::assert_scrubbed(
+            "git",
+            &git_cmd(Path::new("/somewhere"), &["rev-parse", "--show-toplevel"]),
+            &[],
+        );
+    }
+
+    /// The ONE builder for every git spawn in this test module.
+    ///
+    /// The fixtures used to neutralize the developer's git CONFIG and not the three variables
+    /// that SELECT a repository — and those outrank `-C`. Measured on this branch: with
+    /// `GIT_DIR`/`GIT_WORK_TREE` exported (the bare-dotfiles shell recipe), running these tests
+    /// commits into the developer's unrelated repository, creates branches `deep/er` and
+    /// `mergecommit` in it, and moves its HEAD off `main`. That is `./scripts/check.sh` — the
+    /// gate `jkb task land` and the merge queue trust — writing to somebody else's repo.
+    ///
+    /// The identical incident had already been fixed in `tests/sessions.rs` and `archive.rs`
+    /// and left live HERE, in the file that hosts the guard against it, under a doc comment
+    /// claiming these fixtures "scrub by hand". One builder, so there is nothing to remember.
+    fn fixture_git(at: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(at).args(args);
+        // ONE call, and the selection is inside it. This used to be two — a
+        // `scrub_repo_selection` for the three selectors and then the config isolation — and the
+        // doc above pinned the first by saying its deletion was caught. It stopped being caught
+        // the moment `isolate_git_env` became the shared applier, because `MUST_DROP` is a
+        // SUPERSET of `REPO_SELECTION_VARS`: measured in round 26, deleting the scrub line left
+        // every test passing. A claimed pin that does not exist is worse than no claim, which
+        // this cluster has already paid for once in `archive.rs`.
+        //
+        // It also coupled the fixtures' equality oracle to the PRODUCTION list: adding a fourth
+        // selector to `REPO_SELECTION_VARS` — the edit `EXPECT_SELECTION_REMOVED`'s own doc asks
+        // for — failed these fixture tests with a message forbidding the edit that reconciles
+        // them. A fixture must not be able to fail because production got stricter.
+        super::fixture_env::isolate_git_env(&mut cmd);
+        cmd
+    }
+
+    /// `fixture_git` really scrubs — the SCRUBBERS entry above claims it, so something must
+    /// check it. Deleting the `isolate_git_env` call inside it fails here: measured, the removed
+    /// set comes back empty against a nine-name oracle.
+    ///
+    /// The sentence this replaces named `scrub_repo_selection`, a call `fixture_git` has not
+    /// contained since round 26 — so the pin a reader was told to verify by reverting could not
+    /// be verified at all. A claimed pin that does not exist is worse than no claim, which is the
+    /// shape this cluster has now paid for three times.
+    #[test]
+    fn the_test_fixtures_do_not_reach_another_repository() {
+        super::fixture_env::assert_isolated(
+            "gitrepo fixture",
+            &fixture_git(Path::new("/somewhere"), &["status"]),
+        );
+    }
+
+    /// Unregistering one worktree — removed, or already gone — leaves a registration whose directory
+    /// this side cannot see: the other side of the host/container bind's session.
+    #[test]
+    fn unregistering_one_worktree_leaves_the_other_side_s() {
+        use super::{forget_worktree, worktree_add, worktree_remove};
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        for name in ["mine", "gone", "theirs"] {
+            worktree_add(
+                &dir,
+                &dir.join(".jkb/work").join(name),
+                &format!("task/{name}"),
+                "main",
+            )
+            .unwrap();
+        }
+        let admin = dir.join(".git/worktrees/theirs");
+        std::fs::write(
+            admin.join("gitdir"),
+            "/nonexistent/other-side/theirs/.git\n",
+        )
+        .unwrap();
+
+        worktree_remove(&dir, &dir.join(".jkb/work/mine"), true).unwrap();
+        assert!(admin.exists(), "a removal prunes nothing else");
+        assert!(!dir.join(".git/worktrees/mine").exists());
+
+        std::fs::remove_dir_all(dir.join(".jkb/work/gone")).unwrap();
+        forget_worktree(&dir, &dir.join(".jkb/work/gone")).unwrap();
+        assert!(admin.exists(), "nor does forgetting a vanished one");
+        assert!(!dir.join(".git/worktrees/gone").exists());
+        assert!(
+            forget_worktree(&dir, &dir.join(".jkb/work/theirs")).is_err(),
+            "a directory that is there is not forgotten"
+        );
+    }
 
     /// Build a throwaway repo exercising all three GitHub merge strategies plus an
     /// unmerged control. Each branch touches its own file so the merges do not conflict.
     fn fixture(dir: &Path) {
         let run = |args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                // Neutralize the developer's git config wholesale. This machine sets
-                // core.hooksPath globally and signs commits; either would make the fixture
-                // fail for reasons that have nothing to do with merge detection.
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .output()
-                .unwrap();
+            let ok = fixture_git(dir, args).output().unwrap();
             assert!(ok.status.success(), "git {args:?}: {ok:?}");
         };
         run(&["init", "-q", "-b", "main"]);
@@ -1063,14 +1996,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         fixture(&dir);
         let run = |at: &Path, args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(at)
-                .args(args)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .unwrap();
+            let ok = fixture_git(at, args).output().unwrap();
             assert!(ok.status.success(), "git {args:?}: {ok:?}");
         };
         run(tmp.path(), &["init", "-q", "--bare", "remote.git"]);
@@ -1117,14 +2043,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         fixture(&dir);
         let run = |at: &Path, args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(at)
-                .args(args)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .unwrap();
+            let ok = fixture_git(at, args).output().unwrap();
             assert!(ok.status.success(), "git {args:?}: {ok:?}");
         };
         run(tmp.path(), &["init", "-q", "--bare", "remote.git"]);
@@ -1342,13 +2261,8 @@ mod tests {
         // A linked worktree, then its `.git` file removed — a part-way `git worktree remove`.
         let wt = root.join(".jkb/work/x");
         std::fs::create_dir_all(wt.parent().expect("parent")).expect("mkdir");
-        let add = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["worktree", "add", "-q", "--detach"])
+        let add = fixture_git(root, &["worktree", "add", "-q", "--detach"])
             .arg(&wt)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .expect("git worktree add");
         assert!(add.status.success(), "{add:?}");
