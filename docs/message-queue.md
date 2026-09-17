@@ -591,7 +591,11 @@ host.
 firewall's one opening and names no database, and the container-local knowledge base it had until
 then (`JKB_DB` on the `jkb-kb-local` volume) is gone. Decided with the user (2026-09-15) to wait until
 nothing the container's agents use is refused — the session verbs above all, since `jkb task work`
-makes the worktrees agents run in. `.container/README.md` records the path and what checks it.
+makes the worktrees agents run in. What still is refused and named by an agent command is
+`mount`/`sync` (host-only): `/jkb-review-log` files findings with `task review file` instead, and
+`/next-task` and `/design-pass` leave a file-backed task's edit to the host's sync watcher — the
+cutover lands together with those command changes. `.container/README.md` records the path and what
+checks it.
 
 The table is an exhaustive `match` (`crates/jkb-cli/src/remote.rs`), so a new subcommand does not
 compile until it says which it is. A daemon that cannot be reached is remembered for 5 seconds

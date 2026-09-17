@@ -643,10 +643,16 @@ fi
 #    second knowledge base alive for anything that is not jkb to write into.
 if grep -q '^JKB_DB=' <<<"$dc_env"; then
     bad "container.json's containerEnv sets JKB_DB — remote mode refuses every jkb command with JKB_DB set, and the container must not name a database"
-elif [ -z "$dc_env" ]; then
-    bad "container.json's containerEnv parsed to nothing — the JKB_DB check above saw no environment"
 else
     ok "the container names no database of its own (no JKB_DB)"
+fi
+# JKB_VERIFY_NO_DAEMON is for a harness with no host daemon behind it (mutate-verify.sh). Declared
+# here it turns "no jkb command in this container can reach the knowledge base" into a note in the
+# real container, so it is refused. (An empty containerEnv already fails section 5.)
+if grep -q '^JKB_VERIFY_NO_DAEMON=' <<<"$dc_env"; then
+    bad "container.json's containerEnv sets JKB_VERIFY_NO_DAEMON — that is the mutation harness's statement that no host daemon exists, and in the real container it hides a knowledge base nothing can reach"
+else
+    ok "the container does not waive the daemon check (no JKB_VERIFY_NO_DAEMON)"
 fi
 # By source name AND by target: a renamed volume at the old path is the same second database.
 if grep -q '^jkb-kb-local|' <<<"$(dc_mount_sources "$here/container.json")" \

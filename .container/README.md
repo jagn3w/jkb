@@ -756,7 +756,10 @@ first and never seeing the host's tasks. **Upgrading a container that had it:** 
 export verb, so before rebuilding, look through it from the old container (`jkb query kind:task`,
 `jkb ns ls`) for anything the host's knowledge base lacks — tasks filed in a checkout's `tasks.md`
 are already there through the host's own sync — and recreate it on the host. Then remove the volume
-with `docker volume rm jkb-kb-local` once the new container is up.
+with `docker volume rm jkb-kb-local` once the new container is up. The installed `jkb` must be from
+the cutover or later (setup.sh reinstalls it on a rebuild): an older one reads the bare
+`host:port` as a URL scheme and every command fails — `verify.sh` asks the installed binary through
+the daemon for that reason.
 
 The original decision was to share `~/.jkb/jkb.db` across the bind, and it was reversed because sharing it corrupts it.
 SQLite's WAL mode needs every process to share two things: POSIX advisory locks on the database

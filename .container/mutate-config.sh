@@ -379,6 +379,12 @@ run "the retired container-local knowledge base volume is mounted again" "still 
 seed; jq_dc '.mounts += ["source=jkb-kb,target=/home/vscode/.local/state/jkb,type=volume"]'
 run "the retired knowledge base comes back under another volume name" "still mounts the container-local knowledge base"
 
+seed; jq_dc '.mounts += ["source=jkb-kb-local,target=/home/vscode/.jkb-local,type=volume"]'
+run "the retired knowledge base volume comes back at another path" "still mounts the container-local knowledge base"
+
+seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' '"JKB_REMOTE": "host.docker.internal:7117", "JKB_VERIFY_NO_DAEMON": "1",'
+run "the real container waives the daemon check" "sets JKB_VERIFY_NO_DAEMON"
+
 seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()

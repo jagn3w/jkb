@@ -1408,7 +1408,20 @@ else
         -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$daemon_token" 2>/dev/null)") \
         "http://$daemon_at/v1/hello" 2>/dev/null)" || daemon_hello=""
     case "$daemon_hello" in
-        *'"protocol"'*) ok "jkb serve on the host answers this container, authenticated by the token on the ~/.jkb bind" ;;
+        *'"protocol"'*)
+            ok "jkb serve on the host answers this container, authenticated by the token on the ~/.jkb bind"
+            # ...and the INSTALLED jkb gets there too. curl proves the path, not the binary: one built
+            # before `JKB_REMOTE` accepted bare host:port reads the address as a URL scheme and fails
+            # every command, while the `--db` refusal above passes on it. A read no database is needed
+            # for, as setup.sh's activation asks it.
+            if command -v jkb >/dev/null 2>&1; then
+                if jkb_answer="$(jkb --json mq topic ls 2>&1)"; then
+                    ok "the installed jkb reaches jkb serve through JKB_REMOTE"
+                else
+                    $dm_bad "the installed jkb cannot reach jkb serve through JKB_REMOTE=${JKB_REMOTE:-unset} although curl can — rebuild it (setup.sh): $(head -c 300 <<<"$jkb_answer")"
+                fi
+            fi
+            ;;
         *) $dm_bad "jkb serve on the host does not answer at http://$daemon_at with the token from $daemon_token — is com.jkb.serve running there? Its log is ~/.jkb/serve.log on the host; a VS Code port forward holding ${daemon_at##*:} on the host is one measured cause" ;;
     esac
 fi
