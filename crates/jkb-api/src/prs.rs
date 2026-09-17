@@ -30,17 +30,27 @@ pub struct PrFacts {
     pub superseded: Option<(Option<String>, String, String)>,
     /// When the task was last put back to work.
     pub resumed_at: Option<String>,
+    /// Whether this client may write the task — `false` for one filed outside `jkb serve`'s file
+    /// roots, which `close-merged` holds rather than failing the whole run on.
+    pub writable: bool,
 }
 
 /// `task.pr_facts`.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`], or a failed read.
-pub fn facts(conn: &Connection, reference: &str) -> Result<PrFacts, ApiError> {
+pub fn facts(
+    conn: &Connection,
+    reference: &str,
+    roots: Option<&FileRoots>,
+) -> Result<PrFacts, ApiError> {
     let id = task::resolve_ref(conn, reference)?.ok_or_else(|| no_item(reference))?;
-    let uid = item::get(conn, id)?
-        .ok_or_else(|| no_item(reference))?
-        .uid;
+    let writable = match writable(conn, reference, roots) {
+        Ok(_) => true,
+        Err(e) if e.code == ErrorCode::Forbidden => false,
+        Err(e) => return Err(e),
+    };
+    let uid = item::get(conn, id)?.ok_or_else(|| no_item(reference))?.uid;
     let landing = transition::landing(conn, id)?;
     Ok(PrFacts {
         uid,
@@ -55,6 +65,7 @@ pub fn facts(conn: &Connection, reference: &str) -> Result<PrFacts, ApiError> {
             )
         }),
         resumed_at: landing.resumed_at().map(str::to_owned),
+        writable,
     })
 }
 

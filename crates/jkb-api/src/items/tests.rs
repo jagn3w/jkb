@@ -101,7 +101,9 @@ fn related_walks_the_edges_it_is_asked_to() {
     call(&b, json!({ "op": "task.depend", "uid": a, "dep": c })).unwrap();
     call(&b, json!({ "op": "task.depend", "uid": c, "dep": d })).unwrap();
     let related = |r: serde_json::Value| match call(&b, r).unwrap() {
-        Response::Related { rows, truncated } => {
+        Response::Related {
+            rows, truncated, ..
+        } => {
             assert!(!truncated);
             rows.into_iter()
                 .map(|r| (r.uid, r.depth, r.direction))
@@ -128,7 +130,9 @@ fn related_walks_the_edges_it_is_asked_to() {
     }
     let tight = LocalBackend::new(db).with_read_budget(1);
     match call(&tight, json!({ "op": "kb.related", "uid": a, "depth": 2 })).unwrap() {
-        Response::Related { rows, truncated } => assert!(rows.is_empty() && truncated),
+        Response::Related {
+            rows, truncated, ..
+        } => assert!(rows.is_empty() && truncated),
         other => panic!("{other:?}"),
     }
 }
@@ -205,9 +209,13 @@ fn a_related_walk_is_capped() {
     )
     .unwrap()
     {
-        Response::Related { rows, truncated } => {
+        Response::Related {
+            rows,
+            truncated,
+            at_node_cap,
+        } => {
             assert_eq!(rows.len(), super::MAX_RELATED_NODES);
-            assert!(truncated);
+            assert!(at_node_cap && !truncated);
         }
         other => panic!("{other:?}"),
     }

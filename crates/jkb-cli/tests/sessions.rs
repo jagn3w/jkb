@@ -4683,7 +4683,7 @@ fn a_container_files_and_records_a_review_through_the_daemon() {
                   "scenario": "s", "fix": "f", "kind": "bug", "unverified": false },
                 { "severity": "nit", "summary": "a nit" },
             ],
-            "raw": 3, "refuted": 1,
+            "raw": 3, "refuted": 1, "reviewers": 2, "returned": 2,
         })
         .to_string(),
     )
@@ -4820,6 +4820,7 @@ fn a_review_that_did_not_run_is_not_filed() {
         r#"{"findings": [], "reviewers": 0, "note": "no findings"}"#,
         r#"{"findings": [], "reviewers": 3, "returned": 0, "raw": 0}"#,
         r#"{"findings": [], "reviewers": 3, "raw": 0}"#,
+        r#"{"findings": [{"severity": "nit", "summary": "x"}], "reviewers": 3, "returned": 2}"#,
     ] {
         let out = remote(
             &[
@@ -4835,7 +4836,7 @@ fn a_review_that_did_not_run_is_not_filed() {
         );
         assert!(!out.status.success(), "{out:?}");
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("did not run"),
+            String::from_utf8_lossy(&out.stderr).contains("nothing was filed"),
             "{out:?}"
         );
     }
@@ -4844,4 +4845,40 @@ fn a_review_that_did_not_run_is_not_filed() {
         !String::from_utf8_lossy(&listed.stdout).contains("task:"),
         "nothing was filed: {listed:?}"
     );
+}
+
+/// **`task pr` and `task close-merged` run in the container** (tasks S6.4 stage 5): the number is
+/// recorded through the daemon, and a task nothing proves merged is held with the reason.
+#[test]
+fn a_container_records_a_pull_request_and_holds_an_unproven_close() {
+    let f = Fixture::new();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+    let remote = |args: &[&str]| container_jkb(&f.repo, &url, &token, args, None);
+    let uid = f.add_task("proven by a pull request");
+    let opened = remote(&["--json", "task", "work", &uid]);
+    assert!(opened.status.success(), "{opened:?}");
+
+    let recorded = remote(&["--json", "task", "pr", &uid, "7"]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let v: serde_json::Value = serde_json::from_slice(&recorded.stdout).unwrap();
+    assert_eq!(v["pr"], 7, "{v}");
+    let why = f
+        .jkb()
+        .args(["--json", "task", "why", &uid])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&why.stdout).contains("\"pr\":7"),
+        "the number is in the history the host reads: {}",
+        String::from_utf8_lossy(&why.stdout)
+    );
+
+    let closed = remote(&["--json", "task", "close-merged", "--dry-run"]);
+    assert!(closed.status.success(), "{closed:?}");
+    let v: serde_json::Value = serde_json::from_slice(&closed.stdout).unwrap();
+    assert_eq!(v["closed"], serde_json::json!([]), "{v}");
+    assert_eq!(v["held"][0]["uid"], uid.as_str(), "{v}");
+    assert_eq!(v["held"][0]["pr"], 7, "{v}");
+    assert_eq!(f.status_of(&uid), "in_progress");
 }

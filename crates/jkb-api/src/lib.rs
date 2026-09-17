@@ -35,6 +35,8 @@ pub mod ingest;
 pub mod inv;
 pub mod items;
 pub mod kb;
+pub mod namespaces;
+pub mod prs;
 pub mod removals;
 pub mod review;
 pub mod sessions;
@@ -673,6 +675,55 @@ pub enum Request {
     /// An investigation write ([`inv::write`]).
     #[serde(rename = "inv.write")]
     InvWrite(inv::InvWrite),
+    /// What a task's history says about its landing ([`prs::facts`]).
+    #[serde(rename = "task.pr_facts")]
+    TaskPrFacts {
+        /// A task uid or bare slug.
+        uid: String,
+    },
+    /// A repo's unfinished tasks ([`prs::open_in_repo`]).
+    #[serde(rename = "task.open_in_repo")]
+    TaskOpenInRepo {
+        /// The repo key.
+        repo: String,
+    },
+    /// Record a task's pull request ([`prs::record`]).
+    #[serde(rename = "task.pr_record")]
+    TaskPrRecord {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The pull request's number.
+        number: i64,
+    },
+    /// Close a task whose work merged ([`prs::close_merged`]).
+    #[serde(rename = "task.close_merged")]
+    TaskCloseMerged {
+        /// A task uid or bare slug.
+        uid: String,
+        /// Whether the client established that it merged.
+        merged: prs::Merged,
+        /// The pull request that proved it.
+        #[serde(default)]
+        pr: Option<i64>,
+        /// Judge only.
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// A namespace's children, or the top level ([`namespaces::list`]).
+    #[serde(rename = "ns.list")]
+    NsList {
+        /// The parent; the top level when absent.
+        #[serde(default)]
+        scope: Option<String>,
+    },
+    /// Move a namespace subtree ([`namespaces::mv`]).
+    #[serde(rename = "ns.mv")]
+    NsMv {
+        /// The subtree.
+        from: String,
+        /// Its new path.
+        to: String,
+    },
     /// A synced file's versions ([`items::history`]).
     #[serde(rename = "kb.history")]
     KbHistory {
@@ -1062,6 +1113,12 @@ impl Request {
         "kb.blob",
         "inv.read",
         "inv.write",
+        "task.pr_facts",
+        "task.open_in_repo",
+        "task.pr_record",
+        "task.close_merged",
+        "ns.list",
+        "ns.mv",
         "kb.history",
     ];
 
@@ -1143,6 +1200,12 @@ impl Request {
             Self::InvRead(_) => "inv.read",
             Self::InvWrite(_) => "inv.write",
             Self::KbHistory { .. } => "kb.history",
+            Self::NsList { .. } => "ns.list",
+            Self::NsMv { .. } => "ns.mv",
+            Self::TaskPrFacts { .. } => "task.pr_facts",
+            Self::TaskOpenInRepo { .. } => "task.open_in_repo",
+            Self::TaskPrRecord { .. } => "task.pr_record",
+            Self::TaskCloseMerged { .. } => "task.close_merged",
         }
     }
 
@@ -1183,6 +1246,9 @@ impl Request {
             | Self::KbBlob { .. }
             | Self::KbHistory { .. }
             | Self::InvRead(_)
+            | Self::TaskPrFacts { .. }
+            | Self::TaskOpenInRepo { .. }
+            | Self::NsList { .. }
             | Self::RepoGate { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -1234,7 +1300,10 @@ impl Request {
             // FTS5's integrity check is an `INSERT`, which the `query_only` reader refuses.
             | Self::KbHealth {}
             | Self::ItemRm { .. }
-            | Self::InvWrite(_) => false,
+            | Self::InvWrite(_)
+            | Self::TaskPrRecord { .. }
+            | Self::TaskCloseMerged { .. }
+            | Self::NsMv { .. } => false,
         }
     }
 }
@@ -1572,6 +1641,9 @@ pub enum Response {
         /// Cut short at the read's budget.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
+        /// The walk stopped at [`items::MAX_RELATED_NODES`], which is the same everywhere.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        at_node_cap: bool,
     },
     /// A `kb.blobs`.
     Blobs {
@@ -1602,6 +1674,35 @@ pub enum Response {
     Inv {
         /// What it answered.
         answer: inv::InvAnswer,
+        /// Cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    /// A `task.pr_facts`.
+    PrFacts {
+        /// The facts.
+        #[serde(flatten)]
+        facts: prs::PrFacts,
+    },
+    /// A `task.open_in_repo`.
+    Uids {
+        /// The tasks.
+        uids: Vec<String>,
+    },
+    /// An `ns.list`.
+    Namespaces {
+        /// The paths.
+        paths: Vec<String>,
+    },
+    /// An `ns.mv`.
+    Moved {
+        /// How many namespaces moved.
+        count: usize,
+    },
+    /// A `task.close_merged`.
+    Closed {
+        /// Why it was held, if it was.
+        refusal: Option<String>,
     },
     /// A `task.show`.
     Task {
@@ -1627,6 +1728,7 @@ impl Response {
             | Self::SearchHits { truncated, .. }
             | Self::Task { truncated, .. }
             | Self::StagingTasks { truncated, .. }
+            | Self::Inv { truncated, .. }
             | Self::Related { truncated, .. }
             | Self::Blobs { truncated, .. }
             | Self::Versions { truncated, .. }
@@ -1671,7 +1773,11 @@ impl Response {
             | Self::Reclaimed { .. }
             | Self::Health { .. }
             | Self::Claims { .. }
-            | Self::Inv { .. }
+            | Self::PrFacts { .. }
+            | Self::Uids { .. }
+            | Self::Closed { .. }
+            | Self::Namespaces { .. }
+            | Self::Moved { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
             | Self::Blob { .. }
@@ -1741,6 +1847,11 @@ impl Response {
             | Self::Reclaimed { .. }
             | Self::Health { .. }
             | Self::Claims { .. }
+            | Self::PrFacts { .. }
+            | Self::Uids { .. }
+            | Self::Closed { .. }
+            | Self::Namespaces { .. }
+            | Self::Moved { .. }
             | Self::Inv { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
@@ -2627,11 +2738,16 @@ impl Backend for LocalBackend {
                 depth,
                 direction,
             } => {
-                let (rows, truncated) = db.read_with(move |c| {
-                    let rows = items::related(c, &uid, &edges, depth, direction, &mut budget)?;
-                    Ok::<_, ApiError>((rows, budget.exhausted()))
+                let (rows, truncated, at_node_cap) = db.read_with(move |c| {
+                    let (rows, capped) =
+                        items::related(c, &uid, &edges, depth, direction, &mut budget)?;
+                    Ok::<_, ApiError>((rows, budget.exhausted(), capped))
                 })?;
-                Response::Related { rows, truncated }
+                Response::Related {
+                    rows,
+                    truncated,
+                    at_node_cap,
+                }
             }
             Request::KbBlobs { contains, limit } => {
                 let (blobs, truncated) = db.read_with(move |c| {
@@ -2644,14 +2760,59 @@ impl Backend for LocalBackend {
                 let (hash, text) = db.read_with(move |c| items::blob_text(c, &prefix))?;
                 Response::Blob { hash, text }
             }
-            Request::InvRead(ask) => Response::Inv {
-                answer: db.read_with(move |c| inv::read(c, &ask))?,
-            },
+            Request::InvRead(ask) => {
+                let (answer, truncated) = db.read_with(move |c| {
+                    let answer = inv::read(c, &ask, &mut budget)?;
+                    Ok::<_, ApiError>((answer, budget.exhausted()))
+                })?;
+                Response::Inv { answer, truncated }
+            }
             Request::InvWrite(ask) => {
                 let roots = self.file_roots.clone();
                 Response::Inv {
                     answer: db.write_txn_with(actor, move |c, m| {
                         inv::write(c, m, &ask, roots.as_ref())
+                    })?,
+                    truncated: false,
+                }
+            }
+            Request::TaskPrFacts { uid } => {
+                let roots = self.file_roots.clone();
+                Response::PrFacts {
+                    facts: db.read_with(move |c| prs::facts(c, &uid, roots.as_ref()))?,
+                }
+            }
+            Request::TaskOpenInRepo { repo } => Response::Uids {
+                uids: db.read_with(move |c| prs::open_in_repo(c, &repo))?,
+            },
+            Request::TaskPrRecord { uid, number } => {
+                let roots = self.file_roots.clone();
+                task_write(db, actor, uid, move |c, m, uid| {
+                    prs::record(c, m, uid, number, roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskCloseMerged {
+                uid,
+                merged,
+                pr,
+                dry_run,
+            } => {
+                let roots = self.file_roots.clone();
+                Response::Closed {
+                    refusal: task_write(db, actor, uid, move |c, m, uid| {
+                        prs::close_merged(c, m, uid, merged, pr, dry_run, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::NsList { scope } => Response::Namespaces {
+                paths: db.read_with(move |c| namespaces::list(c, scope.as_deref()))?,
+            },
+            Request::NsMv { from, to } => {
+                let roots = self.file_roots.clone();
+                Response::Moved {
+                    count: db.write_txn_with(actor, move |c, m| {
+                        namespaces::mv(c, m, &from, &to, roots.as_ref())
                     })?,
                 }
             }

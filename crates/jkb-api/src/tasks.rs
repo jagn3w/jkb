@@ -156,6 +156,38 @@ pub(crate) fn writable_id(
     Ok(())
 }
 
+/// Refuse a write into namespace `path` under `roots` when the nearest mount at or above it is a file
+/// mount outside them: what is placed there is exported into that directory.
+pub(crate) fn ns_writable(
+    conn: &Connection,
+    path: &str,
+    roots: Option<&FileRoots>,
+) -> Result<(), ApiError> {
+    let Some(roots) = roots else {
+        return Ok(());
+    };
+    let mut cur = Some(jkb_core::ns::normalize(path)?);
+    while let Some(p) = cur {
+        if let Some(id) = jkb_core::ns::get(conn, &p)? {
+            if let Some(m) = jkb_core::mount::get(conn, id)? {
+                if !roots.admits(&m.backing_uri) {
+                    return Err(ApiError::with_code(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "`{path}` is written to {} by a mount, outside the directories this \
+                             client may cause host files to be written in. Run it on the host.",
+                            m.backing_uri
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+        }
+        cur = p.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+    }
+    Ok(())
+}
+
 /// The largest body a task write may leave. An append loop otherwise grew one item — and its
 /// changelog, which logs the before-state each round — without bound.
 pub const MAX_CONTENT_BYTES: usize = 256 * 1024;

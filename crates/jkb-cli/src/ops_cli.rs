@@ -18,7 +18,7 @@ use jkb_api::kb::{
 };
 use jkb_api::{ApiError, Backend, ErrorCode, Request, Response};
 
-use super::{first_line, output, output_line, Command, TaskCmd};
+use super::{first_line, output, output_line, Command, NsCmd, TaskCmd};
 
 /// Depth `jkb tree` descends by default before eliding deeper folders with `…` — deep enough to map
 /// any real subtree, shallow enough to bound the output and the per-namespace query fan-out.
@@ -46,6 +46,9 @@ pub const fn handles(command: &Command) -> bool {
         | Command::Blob { .. }
         | Command::History { .. }
         | Command::Inv { .. }
+        | Command::Ns {
+            cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. },
+        }
         // The report; a repair or a backup changes the host, and `main` runs it with the database.
         | Command::Doctor {
             fix: false,
@@ -79,6 +82,8 @@ pub const fn handles(command: &Command) -> bool {
                 | TaskCmd::Landed { .. }
                 | TaskCmd::Review { .. }
                 | TaskCmd::Reclaim { .. }
+                | TaskCmd::Pr { .. }
+                | TaskCmd::CloseMerged { .. }
                 | TaskCmd::Gate {
                     cmd: None,
                     clear: false
@@ -210,6 +215,12 @@ impl<'a> Ops<'a> {
             Command::Blob { cmd } => crate::item_cli::blob(self, cmd),
             Command::History { path } => crate::item_cli::history(self, &path),
             Command::Inv { cmd } => crate::inv_cli::run(self, cmd, self.global),
+            Command::Ns {
+                cmd: NsCmd::Ls { scope },
+            } => self.ns_ls(scope),
+            Command::Ns {
+                cmd: NsCmd::Mv { from, to },
+            } => self.ns_mv(&from, &to),
             Command::Staging {
                 cmd: super::StagingCmd::Ls { all },
             } => crate::cmd_staging_ls(&crate::session_cli::Kb::from_ops(self), all, self.json),
@@ -232,6 +243,38 @@ impl<'a> Ops<'a> {
                 cmd => super::task_cli::run(self, cmd),
             },
             _ => bail!("internal: a command the read set does not handle"),
+        }
+    }
+
+    /// `jkb ns ls [scope]`.
+    fn ns_ls(&self, scope: Option<String>) -> Result<()> {
+        let paths = match self.call(Request::NsList { scope })? {
+            Response::Namespaces { paths } => paths,
+            other => return unexpected("ns.list", &other),
+        };
+        if self.json {
+            println!("{}", serde_json::to_string_pretty(&paths)?);
+        } else if paths.is_empty() {
+            println!("(no namespaces)");
+        } else {
+            for p in paths {
+                println!("{p}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `jkb ns mv <from> <to>`.
+    fn ns_mv(&self, from: &str, to: &str) -> Result<()> {
+        match self.call(Request::NsMv {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        })? {
+            Response::Moved { count } => {
+                println!("moved {count} namespace(s): {from} -> {to}");
+                Ok(())
+            }
+            other => unexpected("ns.mv", &other),
         }
     }
 
@@ -261,6 +304,12 @@ impl<'a> Ops<'a> {
             } => Some(format!(
                 "jkb: this tree stopped at {} nodes — root it at a path, or lower --depth",
                 jkb_api::kb::MAX_TREE_NODES
+            )),
+            Response::Related {
+                at_node_cap: true, ..
+            } => Some(format!(
+                "jkb: this walk stopped at {} items — lower --depth, or name the --edge types",
+                jkb_api::items::MAX_RELATED_NODES
             )),
             r if r.truncated() && self.remote => Some(
                 "jkb: this answer was cut short at the daemon's read budget — narrow it, or run it on \

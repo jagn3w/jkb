@@ -11,21 +11,20 @@
 //! held to its round trip.
 
 use jkb_core::investigation::{self, UnitRow};
-use jkb_core::{edge, item, mount, ns, nstype, WriteMeta};
+use jkb_core::{edge, item, ns, nstype, WriteMeta};
 use jkb_types::EdgeType;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::tasks::{check_line, line_problem, writable_id, FileRoots};
+use crate::kb::Budget;
+use crate::tasks::{
+    check_line, line_problem, ns_writable, writable_id, FileRoots, MAX_QUICK_ADD_MODIFIERS,
+};
 use crate::{ApiError, ErrorCode};
 
 fn invalid(why: impl Into<String>) -> ApiError {
     ApiError::with_code(ErrorCode::Invalid, why)
 }
-
-/// The longest snippet a unit row carries, in characters: one past the 100 a listing shows, so the
-/// listing can still tell a longer line and mark the cut.
-const SNIPPET_CHARS: usize = 101;
 
 /// One investigation unit, as the bucket listings show it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,12 +46,7 @@ pub struct Unit {
 }
 
 fn snippet(content: Option<&str>) -> Option<String> {
-    content.map(|c| {
-        item::first_nonblank(c)
-            .chars()
-            .take(SNIPPET_CHARS)
-            .collect()
-    })
+    content.map(|c| item::snippet(c, item::SNIPPET_CHARS))
 }
 
 impl From<UnitRow> for Unit {
@@ -301,6 +295,9 @@ pub enum InvAnswer {
     Units {
         /// The units.
         units: Vec<Unit>,
+        /// The walk behind them stopped at [`crate::items::MAX_RELATED_NODES`] (`retread`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        at_node_cap: bool,
     },
     /// The dead ends.
     Tombstones {
@@ -309,10 +306,14 @@ pub enum InvAnswer {
     },
     /// A unit's evidence.
     Evidence {
-        /// The signed balance.
+        /// The signed balance, over every edge.
         balance: f64,
-        /// The edges behind it.
+        /// The edges behind it, strongest first — the first
+        /// [`crate::items::MAX_RELATED_NODES`].
         edges: Vec<Evidence>,
+        /// More edges than that point at the unit.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        at_node_cap: bool,
     },
     /// A digest.
     Digest {
@@ -376,24 +377,38 @@ fn require_id(conn: &Connection, uid: &str) -> Result<jkb_types::ItemId, ApiErro
     })
 }
 
-/// `inv.read`.
+/// Keep the prefix of `rows` that fits `budget`.
+fn within<T: Serialize>(rows: impl IntoIterator<Item = T>, budget: &mut Budget) -> Vec<T> {
+    rows.into_iter().take_while(|r| budget.take(r)).collect()
+}
+
+/// `inv.read`, each listing within `budget` and each walk within
+/// [`crate::items::MAX_RELATED_NODES`].
+///
+/// **Residual, stated:** a bucket (`frontier`, `core`, `tombstones`) is computed over its whole
+/// investigation before the budget cuts the answer — the engine's work is proportional to the units one
+/// investigation holds, as it is on the host.
 ///
 /// # Errors
 /// The engine's refusal (an untyped namespace, an unknown uid), or a failed read.
-pub fn read(conn: &Connection, ask: &InvRead) -> Result<InvAnswer, ApiError> {
-    let units = |rows: Vec<UnitRow>| InvAnswer::Units {
-        units: rows.into_iter().map(Unit::from).collect(),
+pub fn read(conn: &Connection, ask: &InvRead, budget: &mut Budget) -> Result<InvAnswer, ApiError> {
+    let cap = crate::items::MAX_RELATED_NODES;
+    let mut units = |rows: Vec<UnitRow>, at_node_cap: bool| InvAnswer::Units {
+        units: within(rows.into_iter().map(Unit::from), budget),
+        at_node_cap,
     };
     Ok(match ask {
         InvRead::Ls {} => InvAnswer::List {
-            rows: investigation::list(conn)?
-                .into_iter()
-                .map(|r| Investigation {
-                    ns: r.ns_path,
-                    type_name: r.type_name.to_owned(),
-                    units: r.units,
-                })
-                .collect(),
+            rows: within(
+                investigation::list(conn)?
+                    .into_iter()
+                    .map(|r| Investigation {
+                        ns: r.ns_path,
+                        type_name: r.type_name.to_owned(),
+                        units: r.units,
+                    }),
+                budget,
+            ),
         },
         InvRead::Type { ns } => {
             let found = nstype::for_namespace(conn, ns)?;
@@ -403,25 +418,27 @@ pub fn read(conn: &Connection, ask: &InvRead) -> Result<InvAnswer, ApiError> {
             }
         }
         InvRead::Frontier { ns, all, limit } => {
-            units(investigation::frontier(conn, ns, *all, *limit)?)
+            units(investigation::frontier(conn, ns, *all, *limit)?, false)
         }
-        InvRead::Core { ns } => units(investigation::confirmed_core(conn, ns)?),
+        InvRead::Core { ns } => units(investigation::confirmed_core(conn, ns)?, false),
         InvRead::Tombstones { ns } => InvAnswer::Tombstones {
-            rows: investigation::tombstones(conn, ns)?
-                .into_iter()
-                .map(|t| Tombstone {
-                    unit: t.unit.into(),
-                    killed_by: t
-                        .killed_by
-                        .into_iter()
-                        .map(|(e, uid, body)| Killer {
-                            edge: e.as_str().to_owned(),
-                            uid,
-                            snippet: snippet(body.as_deref()),
-                        })
-                        .collect(),
-                })
-                .collect(),
+            rows: within(
+                investigation::tombstones(conn, ns)?
+                    .into_iter()
+                    .map(|t| Tombstone {
+                        unit: t.unit.into(),
+                        killed_by: t
+                            .killed_by
+                            .into_iter()
+                            .map(|(e, uid, body)| Killer {
+                                edge: e.as_str().to_owned(),
+                                uid,
+                                snippet: snippet(body.as_deref()),
+                            })
+                            .collect(),
+                    }),
+                budget,
+            ),
         },
         InvRead::Retread { uid, depth } => {
             if *depth > crate::items::MAX_RELATED_DEPTH {
@@ -430,29 +447,30 @@ pub fn read(conn: &Connection, ask: &InvRead) -> Result<InvAnswer, ApiError> {
                     crate::items::MAX_RELATED_DEPTH
                 )));
             }
-            units(investigation::anti_retread(
-                conn,
-                require_id(conn, uid)?,
-                *depth,
-            )?)
+            let (rows, at_cap) =
+                investigation::anti_retread_limited(conn, require_id(conn, uid)?, *depth, cap)?;
+            units(rows, at_cap)
         }
         InvRead::Evidence { uid } => {
             let id = require_id(conn, uid)?;
-            let edges = edge::evidence_edges(conn, id)?;
+            let mut edges = edge::evidence_edges(conn, id)?;
+            let at_node_cap = edges.len() > cap;
+            edges.truncate(cap);
             let metas = item::get_many(conn, &edges.iter().map(|e| e.src).collect::<Vec<_>>())?;
             InvAnswer::Evidence {
                 balance: edge::evidence_for(conn, id)?,
-                edges: edges
-                    .iter()
-                    .filter_map(|e| {
+                edges: within(
+                    edges.iter().filter_map(|e| {
                         metas.get(&e.src).map(|m| Evidence {
                             edge: e.edge_type.as_str().to_owned(),
                             uid: m.uid.clone(),
                             contribution: e.contribution,
                             snippet: snippet(m.content.as_deref()),
                         })
-                    })
-                    .collect(),
+                    }),
+                    budget,
+                ),
+                at_node_cap,
             }
         }
         InvRead::Digest { ns } => InvAnswer::Digest {
@@ -460,34 +478,6 @@ pub fn read(conn: &Connection, ask: &InvRead) -> Result<InvAnswer, ApiError> {
             text: investigation::digest(conn, ns)?.render(),
         },
     })
-}
-
-/// Refuse a write into namespace `path` under `roots` when the nearest mount at or above it is a file
-/// mount outside them: what is placed there is exported into that directory.
-fn ns_writable(conn: &Connection, path: &str, roots: Option<&FileRoots>) -> Result<(), ApiError> {
-    let Some(roots) = roots else {
-        return Ok(());
-    };
-    let mut cur = Some(ns::normalize(path)?);
-    while let Some(p) = cur {
-        if let Some(id) = ns::get(conn, &p)? {
-            if let Some(m) = mount::get(conn, id)? {
-                if !roots.admits(&m.backing_uri) {
-                    return Err(ApiError::with_code(
-                        ErrorCode::Forbidden,
-                        format!(
-                            "`{path}` is written to {} by a mount, outside the directories this \
-                             client may cause host files to be written in. Run it on the host.",
-                            m.backing_uri
-                        ),
-                    ));
-                }
-                return Ok(());
-            }
-        }
-        cur = p.rsplit_once('/').map(|(parent, _)| parent.to_owned());
-    }
-    Ok(())
 }
 
 /// [`writable_id`] for a unit named by uid, and its tasks.md line's problem before the write.
@@ -499,6 +489,17 @@ fn unit_writable(
     let id = require_id(conn, uid)?;
     writable_id(conn, id, uid, roots)?;
     line_problem(conn, uid)
+}
+
+/// Refuse more than [`MAX_QUICK_ADD_MODIFIERS`] edges or tags on one write: each edge target is judged
+/// against the roots and its tasks.md line checked, twice, in the writer's transaction.
+fn check_counts(edges: usize, tags: usize) -> Result<(), ApiError> {
+    if edges > MAX_QUICK_ADD_MODIFIERS || tags > MAX_QUICK_ADD_MODIFIERS {
+        return Err(invalid(format!(
+            "at most {MAX_QUICK_ADD_MODIFIERS} edges and {MAX_QUICK_ADD_MODIFIERS} tags on one unit"
+        )));
+    }
+    Ok(())
 }
 
 /// `inv.write`, in the caller's transaction.
@@ -523,6 +524,7 @@ pub fn write(
             goal,
             tags,
         } => {
+            check_counts(0, tags.len())?;
             ns_writable(conn, path, roots)?;
             let existed = ns::get_type(conn, path)?.is_some();
             let id = investigation::create(conn, meta, path, type_name, goal_kind, goal, tags)?;
@@ -556,6 +558,7 @@ pub fn write(
             weight,
             tags,
         } => {
+            check_counts(0, tags.len())?;
             ns_writable(conn, path, roots)?;
             let before = on
                 .as_deref()
@@ -614,11 +617,15 @@ fn add_unit(
     else {
         return Err(ApiError::with_code(ErrorCode::Internal, "not an add"));
     };
+    check_counts(edges.len(), tags.len())?;
     ns_writable(conn, path, roots)?;
     let mut parsed = Vec::with_capacity(edges.len());
-    let mut befores = Vec::new();
+    let mut befores = std::collections::BTreeMap::new();
     for e in edges {
-        befores.push((e.target.clone(), unit_writable(conn, &e.target, roots)?));
+        if !befores.contains_key(&e.target) {
+            let before = unit_writable(conn, &e.target, roots)?;
+            befores.insert(e.target.clone(), before);
+        }
         parsed.push((edge_type(&e.edge)?, e.target.clone(), *weight));
     }
     let id = investigation::add(

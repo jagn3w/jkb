@@ -11,7 +11,7 @@ fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
 
 fn inv(b: &LocalBackend, r: serde_json::Value) -> Result<super::InvAnswer, ApiError> {
     match call(b, r)? {
-        Response::Inv { answer } => Ok(answer),
+        Response::Inv { answer, .. } => Ok(answer),
         other => panic!("{other:?}"),
     }
 }
@@ -73,7 +73,7 @@ fn an_investigation_is_worked_and_read_through_the_ops() {
     )
     .unwrap()
     {
-        super::InvAnswer::Units { units } => {
+        super::InvAnswer::Units { units, .. } => {
             let row = units
                 .iter()
                 .find(|u| u.uid == hypothesis)
@@ -140,8 +140,32 @@ fn digest_and_refusals(b: &LocalBackend, hypothesis: &str) {
 fn a_rooted_investigation_write_stays_inside_its_roots() {
     let (db, inside, outside, _managed) = crate::tests::mutate_fixture();
     let rooted = crate::tests::rooted(&db);
-    // `docs/out` is mounted from a directory outside the roots.
+    // A unit inside the roots, to name as the other end.
+    let host = LocalBackend::new(db.clone());
+    let goal = match inv(
+        &host,
+        json!({ "op": "inv.write", "write": "new", "type_name": "conjecture-attack",
+                "ns": "memory/in-roots", "goal_kind": "conjecture", "goal": "x" }),
+    )
+    .unwrap()
+    {
+        super::InvAnswer::Created { goal_uid, .. } => goal_uid,
+        other => panic!("{other:?}"),
+    };
+    // `docs/out` is mounted from a directory outside the roots, and `outside` is filed there. One
+    // write per `InvWrite` variant, so a guard dropped from any arm fails here.
     for write in [
+        json!({ "op": "inv.write", "write": "digest", "ns": "docs/out" }),
+        json!({ "op": "inv.write", "write": "do", "ns": "docs/out", "verb": "hypothesize",
+                "text": "t" }),
+        json!({ "op": "inv.write", "write": "do", "ns": "memory/in-roots", "verb": "hypothesize",
+                "text": "t", "on": outside }),
+        json!({ "op": "inv.write", "write": "add", "ns": "docs/out", "kind": "node", "text": "t" }),
+        json!({ "op": "inv.write", "write": "add", "ns": "memory/in-roots", "kind": "node",
+                "text": "t", "edges": [{ "edge": "references", "target": outside }] }),
+        json!({ "op": "inv.write", "write": "reopen", "route": outside, "mechanism": goal }),
+        json!({ "op": "inv.write", "write": "reopen", "route": goal, "mechanism": outside }),
+        json!({ "op": "inv.write", "write": "stale", "ns": "docs/out", "window": "w" }),
         json!({ "op": "inv.write", "write": "new", "type_name": "debugging",
                 "ns": "docs/out/bug", "goal_kind": "symptom", "goal": "x" }),
         json!({ "op": "inv.write", "write": "rollup", "ns": "docs/out" }),
@@ -153,6 +177,17 @@ fn a_rooted_investigation_write_stays_inside_its_roots() {
         let e = inv(&rooted, write.clone()).unwrap_err();
         assert_eq!(e.code, ErrorCode::Forbidden, "{write}: {e:?}");
     }
+    // Too many edges or tags on one unit is refused before any is judged.
+    let many: Vec<_> = (0..=crate::tasks::MAX_QUICK_ADD_MODIFIERS)
+        .map(|_| json!({ "edge": "references", "target": goal }))
+        .collect();
+    let e = inv(
+        &rooted,
+        json!({ "op": "inv.write", "write": "add", "ns": "memory/in-roots", "kind": "node",
+                "text": "t", "edges": many }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
     // The same kind of write inside the roots is served.
     inv(
         &rooted,

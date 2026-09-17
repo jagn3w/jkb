@@ -35,8 +35,9 @@ pub struct StagingTask {
 /// `task.staging`: the tasks of `repo` (`repo=`) with a land target, in id order, within `budget`.
 ///
 /// **A spent batch is left out unless `all`** — one whose every task has finished, the rule
-/// `jkb staging ls` hides it by — so the answer grows with the work in flight, not with every task ever
-/// landed in the repo. Only tasks with a land target are loaded.
+/// `jkb staging ls` hides it by — so the answer, and the bodies read for it, grow with the work in
+/// flight. **Residual, stated:** whether a batch is spent needs every task's land target, which is one
+/// indexed history read per task the repo has ever worked.
 ///
 /// # Errors
 /// [`crate::ErrorCode::Invalid`] for a malformed repo key, or a failed read.
@@ -47,43 +48,43 @@ pub fn staging(
     budget: &mut Budget,
 ) -> Result<Vec<StagingTask>, ApiError> {
     check_name("repo key", repo)?;
+    // Status first, without bodies, for every task that has a land target: what decides a batch is
+    // spent. Bodies, tags and subtasks are read only for the rows kept.
+    let mut status_of = conn
+        .prepare_cached("SELECT status FROM items WHERE id = ?1")
+        .map_err(jkb_core::Error::from)?;
     let mut targeted = Vec::new();
     for id in jkb_core::location::tasks_in_repo(repo).evaluate(conn)? {
         if let Some(target) = transition::land_target(conn, id)? {
-            targeted.push((id, target));
+            let status: Option<String> = status_of
+                .query_row([id.get()], |r| r.get(0))
+                .map_err(jkb_core::Error::from)?;
+            targeted.push((id, target, status.unwrap_or_default()));
         }
     }
-    let ids: Vec<_> = targeted.iter().map(|(id, _)| *id).collect();
-    let metas = item::get_many(conn, &ids)?;
-    let status = |id| {
-        metas
-            .get(id)
-            .and_then(|m: &item::ItemMeta| m.status.clone())
-            .unwrap_or_default()
-    };
-    let mut spent: BTreeMap<&str, bool> = BTreeMap::new();
-    for (id, target) in &targeted {
-        let done = jkb_types::TaskStatus::is_terminal_str(Some(status(id).as_str()));
-        *spent.entry(target.as_str()).or_insert(true) &= done;
+    let mut spent: BTreeMap<String, bool> = BTreeMap::new();
+    for (_, target, status) in &targeted {
+        let done = jkb_types::TaskStatus::is_terminal_str(Some(status.as_str()));
+        *spent.entry(target.clone()).or_insert(true) &= done;
     }
+    targeted.retain(|(_, target, _)| all || !spent.get(target).copied().unwrap_or(false));
+    let ids: Vec<_> = targeted.iter().map(|(id, _, _)| *id).collect();
+    let metas = item::get_many(conn, &ids)?;
     let mut tags = tag::applications_for(conn, &ids)?;
     let mut out = Vec::new();
-    for (id, land_target) in &targeted {
-        let Some(meta) = metas.get(id) else { continue };
-        if !all && spent.get(land_target.as_str()).copied().unwrap_or(false) {
-            continue;
-        }
+    for (id, land_target, status) in targeted {
+        let Some(meta) = metas.get(&id) else { continue };
         let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (facet, value) in tags.remove(id).unwrap_or_default() {
+        for (facet, value) in tags.remove(&id).unwrap_or_default() {
             grouped.entry(facet).or_default().push(value);
         }
         let row = StagingTask {
             uid: meta.uid.clone(),
             title: item::title_of(meta),
-            status: meta.status.clone().unwrap_or_default(),
+            status,
             tags: grouped,
-            land_target: land_target.clone(),
-            open_subtasks: !task::subtasks_all_terminal(conn, *id)?,
+            land_target,
+            open_subtasks: !task::subtasks_all_terminal(conn, id)?,
         };
         if !budget.take(&row) {
             break;

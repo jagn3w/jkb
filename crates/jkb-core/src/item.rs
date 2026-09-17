@@ -318,6 +318,22 @@ pub fn first_nonblank(content: &str) -> &str {
         .trim()
 }
 
+/// The first non-blank line of `content` in at most `max` characters, a cut one ending in `…` — the
+/// one-line snippet listings print. The one copy: the CLI renders with it, and the ops that send a
+/// snippet cut it with it, so a line is never cut twice to two different lengths.
+#[must_use]
+pub fn snippet(content: &str, max: usize) -> String {
+    let line = first_nonblank(content);
+    if line.chars().count() <= max {
+        return line.to_owned();
+    }
+    let head: String = line.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+/// The width of a listing's snippet, in characters.
+pub const SNIPPET_CHARS: usize = 100;
+
 /// An item's display title: its first non-blank line, falling back to the uid for an item
 /// with no body. Untruncated — see [`first_nonblank`].
 #[must_use]

@@ -16,7 +16,7 @@ fn file(
 ) -> Result<super::Filed, ApiError> {
     match call(
         b,
-        json!({ "op": "task.review_file", "ns": ns, "findings": findings }),
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": ns, "findings": findings }),
     )? {
         Response::ReviewFiled { filed } => Ok(filed),
         other => panic!("{other:?}"),
@@ -89,6 +89,36 @@ fn findings_are_filed_by_severity_where_the_gate_reads_them() {
     }
 }
 
+/// Only a review every reviewer came back from is filed.
+#[test]
+fn only_a_review_that_ran_fully_is_filed() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    for (i, run) in [
+        json!({ "reviewers": 3, "returned": 2 }),
+        json!({ "reviewers": 0, "returned": 0 }),
+        json!({ "reviewers": 1, "returned": 1, "error": "survey failed" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ns = format!("reviews/partial{i}");
+        let e = call(
+            &b,
+            json!({ "op": "task.review_file", "run": run, "ns": ns,
+                    "findings": [{ "severity": "must-fix", "summary": "x" }] }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{run}: {e:?}");
+        assert!(e.message.contains("did not run fully"), "{e:?}");
+        assert_eq!(findings(&b, &ns).total, 0);
+    }
+    // A request that does not say how the review ran is not a request at all.
+    assert!(serde_json::from_value::<crate::Request>(
+        json!({ "op": "task.review_file", "ns": "r", "findings": [] })
+    )
+    .is_err());
+}
+
 /// A clean review still leaves something to record against, and it does not block.
 #[test]
 fn a_clean_review_files_one_finished_item() {
@@ -132,8 +162,8 @@ fn a_filing_is_refused_where_it_would_mix_runs_or_reach_a_file() {
     assert_eq!(findings(&b, "reviews/bad").total, 0);
     // An unknown severity, or a field the op does not take, is not a request at all.
     for bad in [
-        json!({ "op": "task.review_file", "ns": "r", "findings": [{ "severity": "major", "summary": "x" }] }),
-        json!({ "op": "task.review_file", "ns": "r", "findings": [{ "severity": "nit", "summary": "x", "kind": "bug" }] }),
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "r", "findings": [{ "severity": "major", "summary": "x" }] }),
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "r", "findings": [{ "severity": "nit", "summary": "x", "kind": "bug" }] }),
     ] {
         assert!(serde_json::from_value::<crate::Request>(bad).is_err());
     }
@@ -278,7 +308,7 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
     let mut one = vec![super::Finding {
         severity: super::Severity::Nit,
         summary: "s".repeat(super::MAX_SUMMARY_BYTES + 10),
-        file: None,
+        file: Some("f".repeat(super::MAX_SUMMARY_BYTES + 10)),
         line: None,
         scenario: Some("z".repeat(super::MAX_DETAIL_BYTES + 10)),
         fix: None,

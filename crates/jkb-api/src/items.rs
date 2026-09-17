@@ -241,13 +241,10 @@ pub const MAX_RELATED_NODES: usize = 1000;
 /// How much of an item's body is read for its snippet, in bytes.
 const SNIPPET_SOURCE_BYTES: i64 = 4096;
 
-/// The longest snippet a related row carries, in characters: one past the 100 a listing shows, so the
-/// listing can still tell a longer line and mark the cut.
-const SNIPPET_CHARS: usize = 101;
-
 /// `kb.related`: the items reached from `uid` over `edges` (any type when empty), breadth-first up to
-/// `depth`, each once at its shortest depth — the first [`MAX_RELATED_NODES`], within `budget`, each
-/// read without its body past its first [`SNIPPET_SOURCE_BYTES`].
+/// `depth`, each once at its shortest depth — the walk stopped at [`MAX_RELATED_NODES`], which the
+/// second value reports, and the answer within `budget`, each item read without its body past its
+/// first [`SNIPPET_SOURCE_BYTES`].
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`], an unknown edge type or too deep a walk ([`ErrorCode::Invalid`]), or a
@@ -259,7 +256,7 @@ pub fn related(
     depth: usize,
     direction: Direction,
     budget: &mut Budget,
-) -> Result<Vec<RelatedRow>, ApiError> {
+) -> Result<(Vec<RelatedRow>, bool), ApiError> {
     if depth > MAX_RELATED_DEPTH {
         return Err(invalid(format!(
             "a walk of at most {MAX_RELATED_DEPTH} edges"
@@ -281,9 +278,14 @@ pub fn related(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let start = item::id_for_uid(conn, uid)?.ok_or_else(|| not_found(uid))?;
-    let mut hops = edge::walk(conn, start, &types, depth, direction.into())?;
-    let cut = hops.len() > MAX_RELATED_NODES;
-    hops.truncate(MAX_RELATED_NODES);
+    let (hops, cut) = edge::walk_limited(
+        conn,
+        start,
+        &types,
+        depth,
+        direction.into(),
+        MAX_RELATED_NODES,
+    )?;
     let mut stmt = conn
         .prepare_cached(
             "SELECT uid, kind, status, resolution, substr(content, 1, ?2) FROM items WHERE id = ?1",
@@ -317,23 +319,16 @@ pub fn related(
             depth: hop.depth,
             via: hop.via.as_str().to_owned(),
             direction: direction_name(hop.direction).to_owned(),
-            snippet: head.as_deref().map(|c| {
-                item::first_nonblank(c)
-                    .chars()
-                    .take(SNIPPET_CHARS)
-                    .collect()
-            }),
+            snippet: head
+                .as_deref()
+                .map(|c| item::snippet(c, item::SNIPPET_CHARS)),
         };
         if !budget.take(&row) {
-            return Ok(out);
+            return Ok((out, cut));
         }
         out.push(row);
     }
-    if cut {
-        // Marked as the budget marks a cut, so the client says the answer is partial.
-        budget.exhaust();
-    }
-    Ok(out)
+    Ok((out, cut))
 }
 
 /// One blob in the archive.

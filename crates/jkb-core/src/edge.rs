@@ -389,6 +389,23 @@ pub fn walk(
     depth: usize,
     direction: Direction,
 ) -> Result<Vec<Related>> {
+    Ok(walk_limited(conn, start, types, depth, direction, usize::MAX)?.0)
+}
+
+/// [`walk`], stopping once `limit` items are reached — the walk itself, not only its answer: a
+/// connected knowledge base reaches every item at a modest depth. Whether it stopped early is the
+/// second value.
+///
+/// # Errors
+/// As [`walk`].
+pub fn walk_limited(
+    conn: &Connection,
+    start: ItemId,
+    types: &[EdgeType],
+    depth: usize,
+    direction: Direction,
+    limit: usize,
+) -> Result<(Vec<Related>, bool)> {
     use std::collections::HashSet;
 
     let mut seen: HashSet<i64> = HashSet::from([start.get()]);
@@ -401,6 +418,9 @@ pub fn walk(
             for (neighbour, edge_type, dir) in neighbours(conn, node, types, direction)? {
                 if !seen.insert(neighbour.get()) {
                     continue;
+                }
+                if out.len() == limit {
+                    return Ok((out, true));
                 }
                 out.push(Related {
                     item: neighbour,
@@ -416,7 +436,7 @@ pub fn walk(
         }
         frontier = next;
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// The direct neighbours of `node` in `direction`, restricted to `types` (empty = any).

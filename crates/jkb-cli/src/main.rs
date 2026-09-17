@@ -19,6 +19,7 @@ mod ops_cli;
 mod output;
 mod owner;
 mod pr;
+mod pr_cli;
 mod presence;
 mod remote;
 mod repo;
@@ -38,12 +39,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use jkb_api::kb::SearchRoute;
 
-use jkb_core::lifecycle;
-use jkb_core::{edge, item, mount, ns, nstype, tag, task, undo, view, Db};
+use jkb_core::{edge, mount, ns, nstype, tag, task, undo, view, Db};
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_fsm::Fact;
 use jkb_ingest::Pipeline;
-use jkb_types::{ConflictPolicy, Embedder, ItemId, SyncMode};
+use jkb_types::{ConflictPolicy, Embedder, SyncMode};
 
 /// A local-first, agent-native knowledge base.
 #[derive(Parser)]
@@ -1566,21 +1566,8 @@ fn cmd_guide() {
 /// The item's primary (home) namespace path, if placed.
 fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
     match cmd {
-        NsCmd::Ls { scope } => {
-            let paths = match scope {
-                Some(path) => db.read(move |conn| ns::children(conn, &path))?,
-                None => db.read(ns::roots)?,
-            };
-            if json {
-                let arr: Vec<_> = paths.iter().map(|(_, p)| p.clone()).collect();
-                println!("{}", serde_json::to_string_pretty(&arr)?);
-            } else if paths.is_empty() {
-                println!("(no namespaces)");
-            } else {
-                for (_, p) in paths {
-                    println!("{p}");
-                }
-            }
+        NsCmd::Ls { .. } | NsCmd::Mv { .. } => {
+            anyhow::bail!("internal: an ns verb served as an op missed ops_cli's dispatch")
         }
         NsCmd::Mk { paths } => {
             let to_make = paths.clone();
@@ -1593,13 +1580,6 @@ fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
             for p in &paths {
                 report(json, p, "namespace ready");
             }
-        }
-        NsCmd::Mv { from, to } => {
-            let (from2, to2) = (from.clone(), to.clone());
-            let moved = db.write_txn("cli", move |conn, meta| {
-                ns::move_subtree(conn, meta, &from2, &to2)
-            })?;
-            println!("moved {moved} namespace(s): {from} -> {to}");
         }
         NsCmd::Rm { path } => {
             let p = path.clone();
@@ -2136,11 +2116,12 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
         }
         | TaskCmd::Landed { .. }
         | TaskCmd::Review { .. }
-        | TaskCmd::Reclaim { .. } => {
+        | TaskCmd::Reclaim { .. }
+        | TaskCmd::Pr { .. }
+        | TaskCmd::CloseMerged { .. } => {
             anyhow::bail!("internal: a task verb served as an op missed ops_cli's dispatch")
         }
         TaskCmd::Mirror => cmd_task_mirror(db, json)?,
-        TaskCmd::Pr { uid, number } => cmd_task_pr(db, &uid, number, json)?,
         cmd @ (TaskCmd::Gate { .. }
         | TaskCmd::Land {
             break_lock: true, ..
@@ -2164,7 +2145,6 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
             },
             json,
         )?,
-        other => cmd_task_mutate(db, other, json)?,
     }
     Ok(())
 }
@@ -2180,171 +2160,6 @@ fn cmd_task_mirror(db: &Db, json: bool) -> Result<()> {
         println!("added {added} tasks/ mirror(s)");
     }
     Ok(())
-}
-
-/// Handle the task mutation subcommands (`set`/`tag`/`depend`/`undepend`/`place`/`unplace`/
-/// `bind`/`claim`/`release`) — the D27.3 write surface. Each is a thin edge over an
-/// existing audited, cycle-checked `jkb-core` seam through the writer-actor.
-fn cmd_task_mutate(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
-    cmd_task_landing(db, cmd, json)
-}
-
-/// The verbs about a task's **work** rather than its fields that still run only here: what proves
-/// it landed (`task pr` is dispatched separately, `task review` through the ops).
-///
-/// Split from [`cmd_task_mutate`] because they read a git checkout and a pull request, where the
-/// field setters read only the database — and because one dispatch holding every task verb had
-/// grown past what one function should.
-fn cmd_task_landing(db: &Db, cmd: TaskCmd, json: bool) -> Result<()> {
-    match cmd {
-        TaskCmd::CloseMerged { repo, dry_run } => cmd_task_close_merged(db, repo, dry_run, json)?,
-        // The read and session subcommands are dispatched by `cmd_task` and never reach here.
-        // Listed rather than caught by `_`, so a new variant is a compile error instead of an
-        // `unreachable!` at run time.
-        TaskCmd::Add { .. }
-        | TaskCmd::Next { .. }
-        | TaskCmd::Show { .. }
-        | TaskCmd::Subtasks { .. }
-        | TaskCmd::Mirror
-        | TaskCmd::Why { .. }
-        | TaskCmd::Pr { .. }
-        | TaskCmd::Work { .. }
-        | TaskCmd::Land { .. }
-        | TaskCmd::Landed { .. }
-        | TaskCmd::Abandon { .. }
-        | TaskCmd::Sessions
-        | TaskCmd::Gate { .. }
-        | TaskCmd::Set { .. }
-        | TaskCmd::Edit { .. }
-        | TaskCmd::Tag { .. }
-        | TaskCmd::Depend { .. }
-        | TaskCmd::Undepend { .. }
-        | TaskCmd::Place { .. }
-        | TaskCmd::Unplace { .. }
-        | TaskCmd::Bind { .. }
-        | TaskCmd::Claim { .. }
-        | TaskCmd::Start { .. }
-        | TaskCmd::Release { .. }
-        | TaskCmd::Reap { .. }
-        | TaskCmd::Review { .. }
-        | TaskCmd::Reclaim { .. } => unreachable!(),
-    }
-    Ok(())
-}
-
-/// `task pr <uid> [number]` — show, or record, the pull request that proves this work landed.
-///
-/// With a number, records it. Without, discovers it from the task's recorded branch and records
-/// what it finds — **once**. After that the number is what is consulted, and the branch name
-/// never is: a number is minted by GitHub and never reused, so a branch deleted, renamed or
-/// reused afterwards cannot change the answer. That property is the whole reason this replaced
-/// the commit-graph inference.
-///
-/// # Errors
-/// Errors if the uid does not resolve, or a read or write fails.
-fn cmd_task_pr(db: &Db, uid: &str, number: Option<i64>, json: bool) -> Result<()> {
-    let id = resolve_task_uid(db, uid)?;
-    let recorded = db.read(move |conn| Ok(jkb_core::transition::landing(conn, id)?.pr_number()))?;
-    let number = match number {
-        Some(n) => Some(n),
-        None if recorded.is_some() => recorded,
-        None => discover_pr(db, id)?,
-    };
-    let Some(number) = number else {
-        if json {
-            println!("{}", serde_json::json!({"uid": uid, "pr": null}));
-        }
-        return Ok(());
-    };
-    if recorded != Some(number) {
-        record_pr(db, id, number)?;
-    }
-    let ctx = repo::repo_ctx().ok();
-    let (merged, why) = ctx.as_ref().map_or_else(
-        || (Fact::Unknown, Some("not in a git repository".to_owned())),
-        // `None`: this verb reports a fact about the pull request — *did it merge* — and is not
-        // deciding whether to close anything. The staleness rule belongs to the close decision,
-        // where the question is whether the merge speaks for the work in flight.
-        |c| pr::merged_fact(&c.root, Some(number), None),
-    );
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"uid": uid, "pr": number, "merged": merged.as_str(), "why": why})
-        );
-    } else {
-        println!(
-            "{uid}: pull request #{number} — merged: {}",
-            merged.as_str()
-        );
-        if let Some(why) = why {
-            println!("  {why}");
-        }
-    }
-    Ok(())
-}
-
-/// Find the pull request for a task's recorded branch, refusing to guess when a reused branch
-/// name matches more than one.
-fn discover_pr(db: &Db, id: ItemId) -> Result<Option<i64>> {
-    let Ok(ctx) = repo::repo_ctx() else {
-        anyhow::bail!(
-            "not in a git repository, so there is no branch to look a pull request up by"
-        );
-    };
-    let branch = db
-        .read(move |conn| jkb_core::transition::latest_with_branch(conn, id))?
-        .and_then(|r| r.labels.branch);
-    let Some(branch) = branch else {
-        anyhow::bail!(
-            "this task records no branch, so there is nothing to look a pull request up by — \
-             pass the number: `jkb task pr <uid> <number>`"
-        );
-    };
-    match pr::discover(&ctx.root, &branch) {
-        pr::Discovery::One(found) => Ok(Some(found.number)),
-        pr::Discovery::None => {
-            println!("no pull request has `{branch}` as its head branch");
-            Ok(None)
-        }
-        // The recycled-name case, reported rather than guessed. Picking one is exactly how the
-        // inference this replaced closed work that had not landed.
-        pr::Discovery::Ambiguous(numbers) => anyhow::bail!(
-            "`{branch}` is the head branch of more than one pull request ({}) — that branch name \
-             has been reused, so which one is this task's work is not something to guess. Pass \
-             the number: `jkb task pr <uid> <number>`",
-            numbers
-                .iter()
-                .map(|n| format!("#{n}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        // The remedy `gh` itself names — "close the task by hand" — is `close-merged`'s, and
-        // this is not that command: what to do *here* is name the number, which needs no `gh` at
-        // all. A message carried through from where it was written is how advice comes to be
-        // about somebody else's problem.
-        pr::Discovery::Unavailable(why) => anyhow::bail!(
-            "{why}\n  ...or name it directly: `jkb task pr <uid> <number>`, which needs no `gh`."
-        ),
-    }
-}
-
-/// Record a task's pull request number as a transition, so it lands in the history beside
-/// everything else that happened to the task.
-fn record_pr(db: &Db, id: ItemId, number: i64) -> Result<()> {
-    let branch = db
-        .read(move |conn| jkb_core::transition::latest_with_branch(conn, id))?
-        .and_then(|r| r.labels.branch);
-    db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        let facts = task::observe(conn, id)?;
-        let labels = jkb_core::transition::Labels {
-            branch: branch.clone(),
-            pr_number: Some(number),
-            ..jkb_core::transition::Labels::default()
-        };
-        jkb_core::transition::note(conn, meta, id, &facts, &labels)?;
-        Ok(())
-    })
 }
 
 /// `task landed <branch> --onto <target>` — the merge queue reporting a graft it performed.
@@ -3895,254 +3710,6 @@ fn report_sessions(kb: &session_cli::Kb<'_>) {
     }
 }
 
-/// One task's verdict in a `close-merged` run.
-struct CloseVerdict {
-    uid: String,
-    /// The pull request consulted, when there was one.
-    pr: Option<i64>,
-    /// Why it was **not** closed, or `None` if it was.
-    held: Option<String>,
-}
-
-/// `task close-merged`: close every task in this repo whose pull request has merged.
-///
-/// **A lookup, not an inference.** This used to ask the commit graph *"does this branch add
-/// anything to trunk?"*, which cannot distinguish a branch whose work was squash-merged away
-/// from one that never started — so making it answerable needed a stored cut point per branch,
-/// a reflog-derived anchor saying which *instance* of a reusable name that cut point described,
-/// and a supersede rule for when the name changed hands. Roughly a quarter of the
-/// `staging-workflow` review corpus's must-fix findings lived in that apparatus, and it is gone:
-/// a pull request number is minted by GitHub and never reused, so there is nothing to
-/// disambiguate.
-///
-/// It closes nothing it cannot prove. No number recorded, no `gh`, no network, a branch name
-/// that matches two pull requests — every one of those is [`Fact::Unknown`], the lifecycle holds
-/// the task, and the reason is printed. A missed close costs one command; a wrong one buries
-/// work still in flight (design D34.4).
-///
-/// # Errors
-/// Errors if the repo cannot be resolved or a database read or write fails.
-fn cmd_task_close_merged(db: &Db, repo: Option<String>, dry_run: bool, json: bool) -> Result<()> {
-    let ctx = repo::repo_ctx().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let repo = repo.unwrap_or_else(|| ctx.key.clone());
-    // **Refused when `--repo` names somewhere else.** Pull request numbers are per-repository
-    // and low ones collide by construction, so resolving another repo's task against *this*
-    // checkout asks `gh pr view 31` here and closes on an unrelated merge — D34.4's "a wrong
-    // close buries work still in flight". The predecessor refused this outright; deleting the
-    // whole inference took its guard with it.
-    anyhow::ensure!(
-        repo == ctx.key,
-        "`--repo {repo}` names a different repository from this checkout ({}), and pull request \
-         numbers are per-repository — asking `gh` here would resolve {}'s numbers against {}'s. \
-         Run it from {repo}'s checkout.",
-        ctx.key,
-        repo,
-        ctx.key,
-    );
-    // Typed, not interpolated into the DSL: `--repo` is user-typed, and a value with whitespace
-    // would re-tokenize into a different query that matches nothing — closing no task and
-    // reporting no error.
-    let query = jkb_core::location::tasks_in_repo(&repo);
-    let ids = db.read(move |conn| query.evaluate(conn))?;
-
-    let mut verdicts = Vec::new();
-    for id in ids {
-        // A finished task costs nothing. `tasks_in_repo` deliberately keeps terminal tasks (the
-        // staging view needs them), so the filter lives here — without it this fired a `gh`
-        // subprocess and a write transaction per long-`done` task on **every `git pull`**, via
-        // the `post-merge` hook, and then reported them under "closed N task(s)" because
-        // `Outcome::Idempotent` has no refusal to print.
-        let status = db
-            .read(move |conn| item::get(conn, id))?
-            .and_then(|m| m.status);
-        if jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
-            continue;
-        }
-        verdicts.push(close_one(db, &ctx.root, id, dry_run)?);
-    }
-    report_close_merged(&verdicts, dry_run, json);
-    Ok(())
-}
-
-/// Decide one task, and close it if a merged pull request proves it landed.
-///
-/// The decision is the lifecycle's, not this function's: it gathers facts and asks for
-/// [`lifecycle::TaskEvent::ObservedLanded`], whose guard requires the merge **proven** and no
-/// open subtasks. Everything this used to decide for itself — is a missing branch a landing? is
-/// a zero-commit branch merged? does this record describe this branch? — was a question only the
-/// graph inference had to ask.
-fn close_one(db: &Db, root: &Path, id: ItemId, dry_run: bool) -> Result<CloseVerdict> {
-    let uid = db
-        .read(move |conn| item::get(conn, id))?
-        .map(|m| m.uid)
-        .unwrap_or_default();
-    // **A landing jkb itself recorded is asked about first**, because when the merge queue
-    // grafted locally it is the only evidence that exists — there is no pull request to ask
-    // about. A task held for an open subtask has exactly that entry (see `cmd_task_landed`), and
-    // asking GitHub first meant it was never reached: `discover_quietly` returns a hold whenever
-    // it cannot name a pull request, which is always for such a branch.
-    //
-    // One read of the history for all of it — the landing, whether it still counts, when the task
-    // was last put back to work, and any recorded pull request number.
-    let landing = db.read(move |conn| jkb_core::transition::landing(conn, id))?;
-
-    // **A superseded landing is context, never a verdict.** It says the local graft is stale; it
-    // says nothing about whether the work reached its destination another way. Returning early on
-    // it left a task whose work was redone and merged as a pull request permanently unclosable —
-    // printing "it will close when the new work lands" after the new work had landed. So it falls
-    // through to the pull-request evidence and only colours the reason if that proves nothing
-    // either.
-    let superseded = landing.superseded().map(|(landed, resumed)| {
-        format!(
-            "its earlier landing onto {} was superseded when the task went back to work ({} at {})",
-            landed.labels.onto.as_deref().unwrap_or("its target"),
-            resumed.event,
-            resumed.at
-        )
-    });
-    let with_context = |why: String| match &superseded {
-        Some(note) => format!("{why}; {note}"),
-        None => why,
-    };
-
-    let (number, merged, why) = if landing.live().is_some() {
-        // The evidence used was the recorded landing, so no pull request number is reported: this
-        // path never asked about one, and printing "closed (pull request #N)" would credit a
-        // number that had no part in the decision.
-        (None, Fact::Yes, None)
-    } else {
-        // Discover once, from the branch, and record what is found — after which the number is
-        // what is consulted and the branch name never is again.
-        let number = match landing.pr_number() {
-            Some(n) => Some(n),
-            None => match discover_quietly(db, root, id)? {
-                Ok(found) => found,
-                Err(why) => {
-                    return Ok(CloseVerdict {
-                        uid,
-                        pr: None,
-                        held: Some(with_context(why)),
-                    })
-                }
-            },
-        };
-        // A merge older than the last resumption is not proof about the work in flight. Both
-        // evidence paths answer to the one rule.
-        let (merged, why) = pr::merged_fact(root, number, landing.resumed_at());
-        (number, merged, why.map(with_context))
-    };
-    let outcome = db.write_txn_with::<_, anyhow::Error, _>("cli", move |conn, meta| {
-        // The status is re-read **inside** the transaction. This snapshots every candidate up
-        // front and then runs a subprocess per task, and it runs from a post-merge hook over all
-        // of them at once — long enough for a `jkb task set --status cancelled` to land in
-        // between and be silently overwritten with `done`.
-        let facts = lifecycle::TaskFacts {
-            landed_elsewhere: merged,
-            ..task::observe(conn, id)?
-        };
-        if dry_run {
-            return Ok(lifecycle::apply(
-                &facts,
-                lifecycle::TaskEvent::ObservedLanded,
-            ));
-        }
-        Ok(jkb_core::transition::perform(
-            conn,
-            meta,
-            id,
-            &facts,
-            lifecycle::TaskEvent::ObservedLanded,
-            &jkb_core::transition::Labels {
-                pr_number: number,
-                ..jkb_core::transition::Labels::default()
-            },
-        )?)
-    })?;
-    // A refusal carries its own sentence; `why` explains an unobtainable answer, which the
-    // guard can only report as "not proven". Both, when there are both: the guard says what it
-    // needed and `why` says what stopped us getting it.
-    let held = outcome.refusal().map(|r| match &why {
-        Some(w) => format!("{r} ({w})"),
-        None => r,
-    });
-    Ok(CloseVerdict {
-        uid,
-        pr: number,
-        held,
-    })
-}
-
-/// Try to find this task's pull request from its recorded branch, without failing the run.
-///
-/// `Err` is a *reason to hold this task*, not an error: `close-merged` runs over every task in a
-/// repo from a `post-merge` hook, and one task with no branch, an ambiguous branch name or no
-/// `gh` must not stop the rest from closing. That was a real must-fix here — a single malformed
-/// value aborted the entire run, silently.
-fn discover_quietly(db: &Db, root: &Path, id: ItemId) -> Result<Result<Option<i64>, String>> {
-    let branch = db
-        .read(move |conn| jkb_core::transition::latest_with_branch(conn, id))?
-        .and_then(|r| r.labels.branch);
-    let Some(branch) = branch else {
-        return Ok(Err(
-            "no branch recorded, so there is no pull request to look up —              `jkb task pr <uid> <number>` to name one"
-                .to_owned(),
-        ));
-    };
-    Ok(match pr::discover(root, &branch) {
-        pr::Discovery::One(found) => {
-            let number = found.number;
-            record_pr(db, id, number)?;
-            Ok(Some(number))
-        }
-        pr::Discovery::None => Err(format!("no pull request has `{branch}` as its head branch")),
-        // The recycled-name case, held rather than guessed — which is what the old inference
-        // could not do, because a name was all it had.
-        pr::Discovery::Ambiguous(numbers) => Err(format!(
-            "`{branch}` is the head branch of {} pull requests — pick one with              `jkb task pr <uid> <number>`",
-            numbers.len()
-        )),
-        pr::Discovery::Unavailable(why) => Err(why),
-    })
-}
-
-/// Print what a `close-merged` run decided.
-///
-/// Two buckets, where there used to be six. The five hold-reasons the old version distinguished
-/// — no cut point, an unusable one, a stale record, a gone branch, genuinely in flight — were
-/// five ways for one inference to fail, and each needed its own remedy sentence. A held task now
-/// carries the reason the guard gave.
-fn report_close_merged(verdicts: &[CloseVerdict], dry_run: bool, json: bool) {
-    let (closed, held): (Vec<_>, Vec<_>) = verdicts.iter().partition(|v| v.held.is_none());
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "dry_run": dry_run,
-                "closed": closed.iter().map(|v| serde_json::json!({"uid": v.uid, "pr": v.pr}))
-                    .collect::<Vec<_>>(),
-                "held": held.iter().map(|v| serde_json::json!({
-                    "uid": v.uid, "pr": v.pr, "reason": v.held
-                })).collect::<Vec<_>>(),
-            })
-        );
-        return;
-    }
-    let verb = if dry_run { "would close" } else { "closed" };
-    println!("{verb} {} task(s)", closed.len());
-    for v in &closed {
-        match v.pr {
-            Some(n) => println!("  {} (pull request #{n})", v.uid),
-            None => println!("  {}", v.uid),
-        }
-    }
-    if !held.is_empty() {
-        println!("held {}:", held.len());
-        for v in &held {
-            println!("  {} — {}", v.uid, v.held.as_deref().unwrap_or(""));
-        }
-    }
-}
-
 /// Print a short human/JSON confirmation for a task mutation.
 fn report(json: bool, uid: &str, action: &str) {
     if json {
@@ -4150,16 +3717,6 @@ fn report(json: bool, uid: &str, action: &str) {
     } else {
         println!("{action}: {uid}");
     }
-}
-
-/// Resolve a task reference (full `task:<slug>` uid or bare slug) to its item id.
-///
-/// # Errors
-/// Errors if no item matches either the given uid or `task:<uid>`.
-fn resolve_task_uid(db: &Db, uid: &str) -> Result<ItemId> {
-    let reference = uid.to_owned();
-    let id = db.read(move |conn| task::resolve_ref(conn, &reference))?;
-    id.ok_or_else(|| anyhow::anyhow!("no item with uid {uid}"))
 }
 
 fn cmd_view(db: &Db, cmd: ViewCmd, json: bool) -> Result<()> {
@@ -4292,10 +3849,9 @@ fn output_line(item: &output::DisplayItem) -> String {
     format!("{}{ns}{snip}", item.uid)
 }
 
-/// The first line of a body, for a one-line report. The derivation is `output::first_nonblank`
-/// (the one copy); only the width is this function's own.
+/// The first line of a body, for a one-line report ([`jkb_core::item::snippet`], the one copy).
 fn first_line(content: &str) -> String {
-    truncate(output::first_nonblank(content), 100)
+    jkb_core::item::snippet(content, jkb_core::item::SNIPPET_CHARS)
 }
 
 /// `jkb staging ls` — the staging branches in this repo and what is landing on each.

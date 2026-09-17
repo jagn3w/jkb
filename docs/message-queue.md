@@ -80,7 +80,7 @@ routinely built from different checkouts.
 | `task.why` | `uid` | `history` {`entries`} (budgeted) |
 | `task.add` | `text`, `home?`, `under?`, `backlog?`, `global_backlog?`, `sync?`, `managed?`, `cwd?`, `client_home?` | `added` {`id`, `uid`, `home`, `binding`}, or `needs_global_backlog_assent` |
 | `task.set` | `uid`, `status?`, `priority?`, `due?` | `applied` |
-| `task.edit` | `uid`, `text`, `append?` | `edited` {`file_backed`} |
+| `task.edit` | `uid` (any item's), `text`, `append?` | `edited` {`file_backed`} — the result is capped at 256 KiB for a task, and for any item a client of `jkb serve` edits |
 | `task.tag` | `uid`, `facet_value`, `mode` (`add`\|`set`\|`rm`) | `applied` |
 | `task.depend` / `task.undepend` | `uid`, `dep` | `applied` |
 | `task.place` | `uid`, `ns`, `home?` | `applied` |
@@ -96,19 +96,25 @@ routinely built from different checkouts.
 | `task.land` | `uid`, `landed` {`branch`, `onto`, `head?`} | `landing` {`moved`, `refusal?`, `status`} — the facts the caller established (graft, green gate, disposal) are stated |
 | `task.landed` | `uid`, `landed` | `landing` — `observed_landed`; a guard's refusal is still recorded, an event the task's state does not define is not |
 | `task.review_findings` | `namespaces` (≤64; a client asks in pieces) | `review_findings` {`total`, `open_count`, `open_must_fix` (≤100 {`uid`, `title` (≤200 chars)})} — refused past 10 000 tasks examined |
-| `task.review_file` | `ns` (must hold nothing; no `tasks` mount may cover it), `findings` (≤1000 [{`severity` (`must-fix`\|`concern`\|`nit`), `summary` (≤2 KiB), `file?`, `line?`, `scenario?`, `fix?` (≤32 KiB each)}], ≤768 KiB serialized — one request; `jkb task review file` trims the longest texts to fit) | `review_filed` {`ns`, `uids`, `clean`} — `managed:` tasks under `<ns>/<severity>` at priority 1/2/3; no findings files one `done` "clean review" task |
+| `task.review_file` | `run` {`reviewers`, `returned`, `error?`} (refused unless no error and every reviewer came back), `ns` (must hold nothing; no `tasks` mount may cover it), `findings` (≤1000 [{`severity` (`must-fix`\|`concern`\|`nit`), `summary` (≤2 KiB), `file?`, `line?`, `scenario?`, `fix?` (≤32 KiB each)}], ≤768 KiB serialized — one request; `jkb task review file` trims the longest texts to fit) | `review_filed` {`ns`, `uids`, `clean`} — `managed:` tasks under `<ns>/<severity>` at priority 1/2/3; no findings files one `done` "clean review" task |
 | `task.review_record` | `repo`, `branch`, `sha?` (letters and digits, ≤64), `findings` (must hold at least one item) | `review_recorded` {`recorded` [{`uid`, `moved_to_review`}], `skipped_unlanded`, `unusable`, `unwritable`} — one transaction |
 | `task.claims` | `after?` (a page's `next`) | `claims` {`claims` [{`uid`, `owner`}] (≤1000 a page, task order), `next?`} |
 | `task.reclaim` | `dead` (≤1000 owners the client proved gone) | `reclaimed` {`cleared`, `refused` [{`owner`, `reason`}], `unwritable`} — frees, through `observed_owner_gone`, claims still held by exactly one of `dead` |
 | `kb.health` | — | `health` {`schema_version`, `fts_ok`, `flagged` (≤200 {`uri`, `status`, `detail?`}), `flagged_count`, `vector_tables`, `stale_vectors`} — on the writer: FTS5's integrity check is an `INSERT`. The un-embedded count is not here: which vector table counts depends on the host's embedder, so `doctor` prints it on the host only |
-| `task.staging` | `repo` | `staging_tasks` {`tasks` [{`uid`, `title`, `status`, `tags`, `land_target`, `open_subtasks`}] (only tasks with a land target), `truncated`} — `staging ls` asks git the rest |
+| `task.staging` | `repo`, `all?` | `staging_tasks` {`tasks` [{`uid`, `title`, `status`, `tags`, `land_target`, `open_subtasks`}] (tasks with a land target; a spent batch only with `all`), `truncated`} (budgeted) — `staging ls` asks git the rest |
 | `item.show` | `uid`, `preview?` (characters; by kind when absent, ≤1 000 000) | `item` {`item` {`uid`, `kind`, `status?`, `resolution?`, `priority?`, `due?`, `mime?`, `binding?`, `namespace?`, `content_chars`, `content_hash?`, `created_at`, `updated_at`, `tags` [{`facet`, `value`}], `preview`, `preview_truncated`}} |
 | `item.rm` | `uid` (full), `force?` | `item_removed` {`uid`, `kind`, `placements`, `edges`, `tags`} — refused under the file roots for an item filed outside them |
-| `kb.related` | `uid`, `edges?`, `depth` (≤16), `direction?` (`out`\|`in`\|`both`) | `related` {`rows` [{`uid`, `kind`, `status?`, `resolution?`, `depth`, `via`, `direction`, `snippet?`}], `truncated`} (budgeted) |
+| `kb.related` | `uid`, `edges?`, `depth` (≤16), `direction?` (`out`\|`in`\|`both`) | `related` {`rows` [{`uid`, `kind`, `status?`, `resolution?`, `depth`, `via`, `direction`, `snippet?`}], `truncated` (budget), `at_node_cap`} — the walk stops at 1000 items, everywhere |
 | `kb.blobs` | `contains?` (non-empty), `limit` (≤10 000) | `blobs` {`blobs` [{`hash`, `size`, `mime?`, `created_at`}], `truncated`} (budgeted) |
-| `kb.blob` | `prefix` (4–64 hex digits, unique) | `blob` {`hash`, `text`} — a blob that is not UTF-8 is refused |
-| `inv.read` | `read`: `ls` \| `type` {`ns`} \| `frontier` {`ns`, `all?`, `limit?`} \| `core` {`ns`} \| `tombstones` {`ns`} \| `retread` {`uid`, `depth` (≤16)} \| `evidence` {`uid`} \| `digest` {`ns`} | `inv` {`answer`: tagged `answer` — `list`, `type` {`source?`, `type_name?`}, `units`, `tombstones`, `evidence`, `digest`} — units carry a 101-character snippet, never their body; a strategy's verbs and kinds are looked up by the client from `type` |
-| `inv.write` | `write`: `new` \| `digest` \| `rollup` \| `do` \| `add` \| `link` \| `promise` \| `resolve` \| `reopen` \| `stale` (the `jkb inv` verbs' fields) | `inv` {`answer`} — refused under the file roots when the namespace's nearest mount is a file mount outside them, or a named unit is filed outside them; a task's line is held to its round trip |
+| `kb.blob` | `prefix` (4–64 hex digits, unique) | `blob` {`hash`, `text`} — a blob that is not UTF-8, or over 8 MiB, is refused; `jkb blob cat` on the host reads any blob in-process |
+| `inv.read` | `read`: `ls` \| `type` {`ns`} \| `frontier` {`ns`, `all?`, `limit?`} \| `core` {`ns`} \| `tombstones` {`ns`} \| `retread` {`uid`, `depth` (≤16)} \| `evidence` {`uid`} \| `digest` {`ns`} | `inv` {`answer`: tagged `answer` — `list`, `type` {`source?`, `type_name?`}, `units`, `tombstones`, `evidence`, `digest`} — budgeted; `retread` walks and `evidence` lists at most 1000 (`at_node_cap`); units carry a 100-character snippet, never their body; a strategy's verbs and kinds are looked up by the client from `type` |
+| `inv.write` | `write`: `new` \| `digest` \| `rollup` \| `do` \| `add` \| `link` \| `promise` \| `resolve` \| `reopen` \| `stale` (the `jkb inv` verbs' fields; at most 64 edges and 64 tags) | `inv` {`answer`} — refused under the file roots when the namespace's nearest mount is a file mount outside them, or a named unit is filed outside them; a task's line is held to its round trip |
+| `task.pr_facts` | `uid` | `pr_facts` {`uid`, `pr?`, `branch?`, `live_landing`, `superseded?`, `resumed_at?`, `writable`} |
+| `task.open_in_repo` | `repo` | `uids` {`uids`} — the repo's unfinished tasks |
+| `task.pr_record` | `uid`, `number` (> 0) | `applied` — a `note` in the task's history |
+| `task.close_merged` | `uid`, `merged` (`yes`\|`no`\|`unknown`, the client's `gh` answer), `pr?`, `dry_run?` | `closed` {`refusal?`} — `observed_landed`, judged in the op's transaction |
+| `ns.list` | `scope?` | `namespaces` {`paths`} |
+| `ns.mv` | `from`, `to` | `moved` {`count`} — refused under the file roots unless every mount at, above or below the subtree and every item in it is inside them; each task's line is held to its round trip |
 | `kb.history` | `path` (absolute, the client's), `home?` (the client's `$HOME`, re-rooted to the host's as `kb.ambient` does) | `versions` {`uri`, `versions` [{`ts`, `blob`, `status`}], `truncated`} (budgeted) |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
@@ -616,8 +622,9 @@ migration's lock),
 - The rest of the container's commands, then the cutover — stages S6.4/S6.5. The read set (S6.1), the
   task-mutate set (S6.2), ingest (S6.3), the session verbs, and (stage 5) `staging ls`, `stat`,
   `item`, `related`, `blob`, `history`, `inv`, `doctor`'s report, `task review` and `task reclaim` are
-  served; `view`, `ns`, `tag`, `index`, `task mirror`/`pr`/`close-merged` and `jkb mcp` are still
-  refused remotely, and `undo` always will be (design-s6-4.md J).
+  served, and so are `ns ls`/`mv`, `task pr` and `task close-merged`; `view`, `tag`, `ns mk`/`rm`/`type`
+  and `jkb mcp` are still refused remotely, and `undo`, `index` and `task mirror` always will be (they
+  revert the host's own writes, call its model, and sweep every task).
 - Embedding what the container ingests (tasks F5): captured and keyword-searchable, it stays unembedded
   until `jkb index --pending` runs on the host, and nothing runs it on a schedule.
 - The MCP server's read tools (`jkb-mcp/src/logic.rs`) still read the database directly rather than

@@ -332,6 +332,11 @@ fn samples() -> Vec<Request> {
         },
         Request::TaskReviewFile(super::review::FileAsk {
             ns: "reviews/sample".into(),
+            run: super::review::ReviewRun {
+                reviewers: 1,
+                returned: 1,
+                error: None,
+            },
             findings: Vec::new(),
         }),
         Request::TaskReviewRecord(super::review::RecordAsk {
@@ -378,6 +383,23 @@ fn samples() -> Vec<Request> {
         Request::KbHistory {
             path: "/tmp/x".into(),
             home: String::new(),
+        },
+        Request::TaskPrFacts { uid: "u".into() },
+        Request::NsList { scope: None },
+        Request::NsMv {
+            from: "a".into(),
+            to: "b".into(),
+        },
+        Request::TaskOpenInRepo { repo: "r".into() },
+        Request::TaskPrRecord {
+            uid: "u".into(),
+            number: 7,
+        },
+        Request::TaskCloseMerged {
+            uid: "u".into(),
+            merged: super::prs::Merged::Unknown,
+            pr: None,
+            dry_run: true,
         },
     ]
 }
@@ -1404,6 +1426,9 @@ const READS: &[&str] = &[
     "kb.blob",
     "kb.history",
     "inv.read",
+    "task.pr_facts",
+    "task.open_in_repo",
+    "ns.list",
 ];
 
 #[test]
@@ -1823,7 +1848,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 19, "every write naming an item was asked");
+    assert_eq!(checked, 21, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {
@@ -1852,7 +1877,7 @@ fn many_task_writes_leave_a_task_outside_the_roots_alone(db: &Db, inside: &str, 
     // `task.review_file` files only `managed:` tasks, so it has no task of anyone's to leave alone.
     let Response::ReviewFiled { filed } = call(
         &b,
-        json!({ "op": "task.review_file", "ns": "reviews/many",
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "reviews/many",
                 "findings": [{ "severity": "nit", "summary": "x" }] }),
     )
     .unwrap() else {
@@ -2177,11 +2202,13 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
                 "landed": { "branch": "b2", "onto": "o", "head": "abcd" } }),
         json!({ "op": "task.land", "uid": inside,
                 "landed": { "branch": "b2", "onto": "o" } }),
-        json!({ "op": "task.review_file", "ns": "reviews/rt",
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "reviews/rt",
                 "findings": [{ "severity": "nit", "summary": "x" }] }),
         json!({ "op": "task.review_record", "repo": "r", "branch": "b2", "findings": "reviews/rt" }),
         json!({ "op": "task.claim", "uid": inside, "owner": "box:4" }),
         json!({ "op": "task.reclaim", "dead": ["box:4"] }),
+        json!({ "op": "task.pr_record", "uid": inside, "number": 12 }),
+        json!({ "op": "task.close_merged", "uid": inside, "merged": "unknown", "dry_run": true }),
     ];
     // Every task write the wire accepts is here; `task.add` checks the task it makes, below.
     let mut covered: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();

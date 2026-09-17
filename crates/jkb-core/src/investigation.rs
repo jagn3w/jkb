@@ -528,7 +528,21 @@ pub fn tombstones(conn: &Connection, ns_path: &str) -> Result<Vec<Tombstone>> {
 /// # Errors
 /// Returns an error if a query fails.
 pub fn anti_retread(conn: &Connection, node: ItemId, depth: usize) -> Result<Vec<UnitRow>> {
-    let related = edge::walk(
+    Ok(anti_retread_limited(conn, node, depth, usize::MAX)?.0)
+}
+
+/// [`anti_retread`], walking at most `limit` related units; whether the walk stopped early is the
+/// second value.
+///
+/// # Errors
+/// As [`anti_retread`].
+pub fn anti_retread_limited(
+    conn: &Connection,
+    node: ItemId,
+    depth: usize,
+    limit: usize,
+) -> Result<(Vec<UnitRow>, bool)> {
+    let (related, cut) = edge::walk_limited(
         conn,
         node,
         &[
@@ -543,10 +557,11 @@ pub fn anti_retread(conn: &Connection, node: ItemId, depth: usize) -> Result<Vec
         ],
         depth,
         edge::Direction::Both,
+        limit,
     )?;
     let ids: Vec<ItemId> = related.iter().map(|r| r.item).collect();
     if ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), cut));
     }
     // Apply the tombstone predicate to exactly the reached ids. Restricting the query rather
     // than filtering its output afterwards matters: this read sits on the path an agent runs
@@ -559,7 +574,7 @@ pub fn anti_retread(conn: &Connection, node: ItemId, depth: usize) -> Result<Vec
         ..Query::default()
     }
     .evaluate(conn)?;
-    rows_for(conn, &kept, None)
+    Ok((rows_for(conn, &kept, None)?, cut))
 }
 
 /// Recompute and store every unit's resolution from its edges (the strategy's

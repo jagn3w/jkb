@@ -103,6 +103,18 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
                 } => crate::review::record_cmd(&kb, branch, sha, &findings, ops.json),
             }
         }
+        TaskCmd::Pr { uid, number } => crate::pr_cli::pr(
+            &crate::session_cli::Kb::from_ops(ops),
+            &uid,
+            number,
+            ops.json,
+        ),
+        TaskCmd::CloseMerged { repo, dry_run } => crate::pr_cli::close_merged(
+            &crate::session_cli::Kb::from_ops(ops),
+            repo,
+            dry_run,
+            ops.json,
+        ),
         TaskCmd::Reclaim { keep } => {
             crate::doctor::reclaim(&crate::session_cli::Kb::from_ops(ops), &keep, ops.json)
         }

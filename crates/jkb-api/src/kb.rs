@@ -90,11 +90,6 @@ impl Budget {
         true
     }
 
-    /// Mark the answer cut for a reason of its own (a node cap), so it reads as truncated.
-    pub const fn exhaust(&mut self) {
-        self.exhausted = true;
-    }
-
     /// Whether something did not fit.
     #[must_use]
     pub const fn exhausted(&self) -> bool {

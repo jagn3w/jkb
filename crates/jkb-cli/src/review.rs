@@ -315,34 +315,23 @@ pub(crate) fn file_cmd(
              (must-fix|concern|nit), summary, file, line, scenario, fix}}"
         )
     })?;
-    let why_not_run = result.error.clone().or_else(|| {
-        if result.reviewers == Some(0) {
-            return Some("no reviewer read the change".to_owned());
-        }
-        if !result.findings.is_empty() {
-            return None;
-        }
-        match result.returned {
-            Some(0) => Some("no reviewer returned".to_owned()),
-            Some(_) => None,
-            None => Some(
-                "it does not say whether any reviewer returned, so an empty result cannot be told \
-                 from a run whose reviewers all failed — update `.claude/workflows/code-review.js`"
-                    .to_owned(),
-            ),
-        }
-    });
-    if let Some(why) = why_not_run {
+    // Whether the review ran fully is the op's to judge (`ReviewRun::refusal`); what a result must
+    // say for it to judge is checked here, where the file can be named.
+    let (Some(reviewers), Some(returned)) = (result.reviewers, result.returned) else {
         anyhow::bail!(
-            "{what} is from a review that did not run ({why}{}) — nothing was filed, because an \
-             empty result filed as a clean review would let `jkb task land` pass. Re-run the review.",
-            result
-                .note
-                .as_deref()
-                .map(|n| format!(": {n}"))
-                .unwrap_or_default()
+            "{what} does not say how many reviewers ran and came back (`reviewers`, `returned`), so a \
+             review that read part of the change cannot be told from one that read all of it — \
+             nothing was filed; update `.claude/workflows/code-review.js`"
         );
-    }
+    };
+    let run = jkb_api::review::ReviewRun {
+        reviewers,
+        returned,
+        error: result.error.clone().map(|e| match &result.note {
+            Some(note) => format!("{e}: {note}"),
+            None => e,
+        }),
+    };
     let mut findings: Vec<jkb_api::review::Finding> = result
         .findings
         .into_iter()
@@ -362,6 +351,7 @@ pub(crate) fn file_cmd(
     }
     let filed = kb.review_file(jkb_api::review::FileAsk {
         ns: findings_ns.to_owned(),
+        run,
         findings,
     })?;
     if json {

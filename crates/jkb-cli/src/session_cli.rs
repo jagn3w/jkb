@@ -52,7 +52,7 @@ impl<'a> Kb<'a> {
         }
     }
 
-    fn call(&self, request: Request) -> Result<Response> {
+    pub(crate) fn call(&self, request: Request) -> Result<Response> {
         self.backend
             .call(request)
             .map_err(|e| op_error(e, self.remote))

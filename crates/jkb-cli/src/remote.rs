@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
-use super::{Cli, Command, CommandsCmd, TaskCmd};
+use super::{Cli, Command, CommandsCmd, NsCmd, TaskCmd};
 
 /// How a command behaves with `JKB_REMOTE` set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +43,8 @@ pub const fn support(command: &Command) -> Support {
         Command::Mount { .. }
         | Command::Sync { .. }
         | Command::Service { .. }
+        // It embeds with the host's model (tasks F5).
+        | Command::Index { .. }
         // A repair and a copy of the database change the host (design-s6-4.md I); the report does not.
         | Command::Doctor {
             fix: true, ..
@@ -50,12 +52,14 @@ pub const fn support(command: &Command) -> Support {
         | Command::Doctor {
             backup: Some(_), ..
         }
-        // Breaking a land lease is the host operator's escape: nothing here can prove its holder gone.
         | Command::Task {
-            cmd: TaskCmd::Land {
-                break_lock: true,
-                ..
-            },
+            // A sweep over every task; and breaking a land lease is the host operator's escape:
+            // nothing here can prove its holder gone.
+            cmd: TaskCmd::Mirror
+                | TaskCmd::Land {
+                    break_lock: true,
+                    ..
+                },
         } => Support::Refused(HOST_ONLY),
         // The queue, and the agent read set (tasks S6.1). `ops_cli::handles` names the same reads for
         // dispatch; `the_ported_reads_are_the_ones_ops_cli_handles` holds the two together.
@@ -80,6 +84,9 @@ pub const fn support(command: &Command) -> Support {
         | Command::Blob { .. }
         | Command::History { .. }
         | Command::Inv { .. }
+        | Command::Ns {
+            cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. },
+        }
         | Command::Task {
             cmd:
                 TaskCmd::Next { .. }
@@ -114,6 +121,9 @@ pub const fn support(command: &Command) -> Support {
                 // A review's findings and its record, and crash recovery, probed here (stage 5).
                 | TaskCmd::Review { .. }
                 | TaskCmd::Reclaim { .. }
+                // `gh` and git here, the history through the ops (stage 5).
+                | TaskCmd::Pr { .. }
+                | TaskCmd::CloseMerged { .. }
                 | TaskCmd::Gate {
                     cmd: None,
                     clear: false,
@@ -131,9 +141,11 @@ pub const fn support(command: &Command) -> Support {
         | Command::Tag { .. }
         | Command::Task { .. }
         | Command::View { .. }
-        | Command::Undo { .. }
-        | Command::Index { .. }
         | Command::Mcp => Support::Refused(NOT_YET),
+        // It reverts any transaction, the host's own included (design-s6-4.md J).
+        Command::Undo { .. } => Support::Refused(
+            "it reverts any transaction, the host's own included, so it runs only on the host",
+        ),
     }
 }
 
@@ -450,6 +462,10 @@ mod tests {
             vec!["history", "x.md"],
             vec!["item", "rm", "u"],
             vec!["inv", "ls"],
+            vec!["task", "pr", "u"],
+            vec!["task", "close-merged"],
+            vec!["ns", "ls"],
+            vec!["ns", "mv", "a", "b"],
             vec!["inv", "do", "memory/x", "hypothesize", "t"],
             vec!["task", "mirror"],
             vec!["stat", "u"],

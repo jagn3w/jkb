@@ -61,7 +61,7 @@ fn trim(text: &mut String, max: usize) -> bool {
     true
 }
 
-/// Fit `findings` to one filing: every summary to [`MAX_SUMMARY_BYTES`] and every scenario and fix to
+/// Fit `findings` to one filing: every summary and file to [`MAX_SUMMARY_BYTES`] and every scenario and fix to
 /// [`MAX_DETAIL_BYTES`], then the scenarios and fixes further, halving their allowance each round down
 /// to [`MIN_TRIMMED_BYTES`], until the whole serializes within [`MAX_FILING_BYTES`]. Returns whether
 /// anything was cut. A review that still does not fit — a thousand long summaries — is left for
@@ -71,6 +71,9 @@ pub fn fit(findings: &mut [Finding]) -> bool {
     let mut cut = false;
     for f in findings.iter_mut() {
         cut |= trim(&mut f.summary, MAX_SUMMARY_BYTES);
+        if let Some(file) = &mut f.file {
+            cut |= trim(file, MAX_SUMMARY_BYTES);
+        }
         for text in [&mut f.scenario, &mut f.fix].into_iter().flatten() {
             cut |= trim(text, MAX_DETAIL_BYTES);
         }
@@ -177,12 +180,49 @@ fn fold(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// How the review ran, as the reviewer workflow reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewRun {
+    /// How many reviewers were launched.
+    pub reviewers: u64,
+    /// How many of them came back.
+    pub returned: u64,
+    /// Why the review did not run, when it did not.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl ReviewRun {
+    /// Why this run is not a review the land gate may rely on: it reported an error, no reviewer ran,
+    /// or not every reviewer came back — a partly read change with no findings reads as clean, and one
+    /// with findings as complete.
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        if let Some(e) = &self.error {
+            return Some(e.clone());
+        }
+        if self.reviewers == 0 {
+            return Some("no reviewer read the change".to_owned());
+        }
+        (self.returned != self.reviewers).then(|| {
+            format!(
+                "{} of {} reviewers came back, so part of the change was not read",
+                self.returned, self.reviewers
+            )
+        })
+    }
+}
+
 /// `task.review_file`'s request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAsk {
     /// The review's namespace, e.g. `repos/<repo>/codereviews/<folder>`. Must hold nothing yet.
     pub ns: String,
+    /// How the review ran. A review that did not run fully is refused: filed, it would let
+    /// `task land` pass work nobody read.
+    pub run: ReviewRun,
     /// What the reviewer found. Empty files one finished "clean review" item, so the review is on
     /// record: `task.review_record` refuses a findings namespace that holds nothing.
     pub findings: Vec<Finding>,
@@ -219,14 +259,21 @@ fn check_bytes(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
 /// `task.review_file`: file a review's findings as `managed:` tasks under `ask.ns`, one section per
 /// severity (`must-fix`, `concern`, `nit`), each mirrored into `tasks/` like any task homed outside it.
 ///
-/// Refused when the namespace already holds anything — a second filing into one review would mix two
-/// runs, and the gate reads them as one — and when a `tasks` mount covers a section, where the host's
-/// sync would write the findings into a file.
+/// Refused when the review did not run fully ([`ReviewRun::refusal`]), when the namespace already
+/// holds anything — a second filing into one review would mix two runs, and the gate reads them as
+/// one — and when a `tasks` mount covers a section, where the host's sync would write the findings
+/// into a file.
 ///
 /// # Errors
 /// [`ErrorCode::Invalid`] for a malformed or occupied namespace, a covered section, or an oversized
 /// finding; or a failed write.
 pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed, ApiError> {
+    if let Some(why) = ask.run.refusal() {
+        return Err(invalid(format!(
+            "this review did not run fully ({why}) — nothing was filed, because it would read as a \
+             review of the whole change. Re-run the review."
+        )));
+    }
     let root = ns::normalize(&ask.ns)?;
     if ask.findings.len() > MAX_FINDINGS {
         return Err(invalid(format!(

@@ -12,14 +12,14 @@ use crate::{first_line, InvCmd};
 
 fn read(ops: &Ops<'_>, ask: InvRead) -> Result<InvAnswer> {
     match ops.call(Request::InvRead(ask))? {
-        Response::Inv { answer } => Ok(answer),
+        Response::Inv { answer, .. } => Ok(answer),
         other => unexpected("inv.read", &other),
     }
 }
 
 fn write(ops: &Ops<'_>, ask: InvWrite) -> Result<InvAnswer> {
     match ops.call(Request::InvWrite(ask))? {
-        Response::Inv { answer } => Ok(answer),
+        Response::Inv { answer, .. } => Ok(answer),
         other => unexpected("inv.write", &other),
     }
 }
@@ -30,7 +30,12 @@ fn wrong(op: &str, answer: &InvAnswer) -> anyhow::Error {
 
 fn units(ops: &Ops<'_>, ask: InvRead) -> Result<Vec<Unit>> {
     match read(ops, ask)? {
-        InvAnswer::Units { units } => Ok(units),
+        InvAnswer::Units { units, at_node_cap } => {
+            if at_node_cap {
+                eprintln!("{}", node_cap_notice());
+            }
+            Ok(units)
+        }
         other => Err(wrong("inv.read", &other)),
     }
 }
@@ -141,6 +146,13 @@ fn parse_tag_args(tags: &[String]) -> Result<Vec<(String, String)>> {
             Ok((facet.to_owned(), value.to_owned()))
         })
         .collect()
+}
+
+fn node_cap_notice() -> String {
+    format!(
+        "jkb: stopped at {} items — the walk and the edge list are capped there everywhere",
+        jkb_api::items::MAX_RELATED_NODES
+    )
 }
 
 fn edge_names() -> String {
@@ -584,9 +596,17 @@ fn evidence(ops: &Ops<'_>, uid: &str) -> Result<()> {
             uid: uid.to_owned(),
         },
     )?;
-    let InvAnswer::Evidence { balance, edges } = answer else {
+    let InvAnswer::Evidence {
+        balance,
+        edges,
+        at_node_cap,
+    } = answer
+    else {
         return Err(wrong("inv.read", &answer));
     };
+    if at_node_cap {
+        eprintln!("{}", node_cap_notice());
+    }
     if ops.json {
         println!(
             "{}",
