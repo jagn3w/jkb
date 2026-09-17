@@ -429,7 +429,7 @@ pub fn ambient(
     mount::ambient_namespace(conn, &cwd)
 }
 
-fn rerooted(cwd: &Path, client_home: &str, server_home: Option<&Path>) -> PathBuf {
+pub(crate) fn rerooted(cwd: &Path, client_home: &str, server_home: Option<&Path>) -> PathBuf {
     match (client_home, server_home) {
         ("", _) | (_, None) => cwd.to_path_buf(),
         (client, Some(server)) => cwd

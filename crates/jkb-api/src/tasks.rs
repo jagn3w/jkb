@@ -117,8 +117,21 @@ pub(crate) fn writable(
     roots: Option<&FileRoots>,
 ) -> Result<ItemId, ApiError> {
     let id = task::resolve_ref(conn, reference)?.ok_or_else(|| no_item(reference))?;
+    writable_id(conn, id, reference, roots)?;
+    Ok(id)
+}
+
+/// Refuse item `id` (named `reference` in the refusal) under `roots` when its binding, or the `file://`
+/// uid it was parsed with, is a file outside them — the rule [`writable`] applies to a task, for any
+/// item.
+pub(crate) fn writable_id(
+    conn: &Connection,
+    id: ItemId,
+    reference: &str,
+    roots: Option<&FileRoots>,
+) -> Result<(), ApiError> {
     let Some(roots) = roots else {
-        return Ok(id);
+        return Ok(());
     };
     let refuse = |file: &str| {
         forbidden(format!(
@@ -140,7 +153,7 @@ pub(crate) fn writable(
             return Err(refuse(&meta.uid));
         }
     }
-    Ok(id)
+    Ok(())
 }
 
 /// The largest body a task write may leave. An append loop otherwise grew one item — and its

@@ -40,6 +40,11 @@ pub const fn handles(command: &Command) -> bool {
         | Command::Cat { .. }
         | Command::Ingest { .. }
         | Command::Staging { .. }
+        | Command::Stat { .. }
+        | Command::Item { .. }
+        | Command::Related { .. }
+        | Command::Blob { .. }
+        | Command::History { .. }
         // The report; a repair or a backup changes the host, and `main` runs it with the database.
         | Command::Doctor {
             fix: false,
@@ -193,6 +198,16 @@ impl<'a> Ops<'a> {
             } => self.grep(&pattern, path.as_deref(), ignore_case, names_only, count),
             Command::Cat { uid } => self.cat(&uid),
             Command::Ingest { path, ns } => self.ingest(&path, ns.as_deref()),
+            Command::Stat { uid } => crate::item_cli::stat(self, &uid),
+            Command::Item { cmd } => crate::item_cli::run(self, cmd),
+            Command::Related {
+                uid,
+                edges,
+                depth,
+                direction,
+            } => crate::item_cli::related(self, &uid, &edges, depth, direction),
+            Command::Blob { cmd } => crate::item_cli::blob(self, cmd),
+            Command::History { path } => crate::item_cli::history(self, &path),
             Command::Staging {
                 cmd: super::StagingCmd::Ls { all },
             } => crate::cmd_staging_ls(&crate::session_cli::Kb::from_ops(self), all, self.json),

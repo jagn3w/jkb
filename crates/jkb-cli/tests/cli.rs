@@ -3843,6 +3843,15 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
         vec!["--json", "task", "show", &parent],
         vec!["task", "show", &parent],
         vec!["--json", "task", "subtasks", &parent],
+        vec!["--json", "item", "show", &parent],
+        vec!["item", "show", &parent, "--preview", "6"],
+        vec!["--json", "stat", &parent],
+        vec!["stat", &parent],
+        vec!["--json", "related", &parent],
+        vec!["related", &parent, "--depth", "2"],
+        vec!["--json", "blob", "ls"],
+        vec!["--json", "history", "tasks.md"],
+        vec!["history", "tasks.md"],
     ];
     for args in &reads {
         let (h, r) = (host(args, &host_repo), remote(args, &client_repo));

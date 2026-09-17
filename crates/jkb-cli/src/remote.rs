@@ -73,6 +73,12 @@ pub const fn support(command: &Command) -> Support {
         | Command::Doctor { .. }
         // git here, the tasks and findings through the ops (stage 5).
         | Command::Staging { .. }
+        // Any item, the edge walk and the sync archive (stage 5).
+        | Command::Stat { .. }
+        | Command::Item { .. }
+        | Command::Related { .. }
+        | Command::Blob { .. }
+        | Command::History { .. }
         | Command::Task {
             cmd:
                 TaskCmd::Next { .. }
@@ -127,12 +133,7 @@ pub const fn support(command: &Command) -> Support {
         | Command::Undo { .. }
         | Command::Index { .. }
         | Command::Mcp
-        | Command::Stat { .. }
-        | Command::Item { .. }
-        | Command::Related { .. }
-        | Command::Inv { .. }
-        | Command::Blob { .. }
-        | Command::History { .. } => Support::Refused(NOT_YET),
+        | Command::Inv { .. } => Support::Refused(NOT_YET),
     }
 }
 
@@ -443,6 +444,11 @@ mod tests {
             vec!["doctor"],
             vec!["doctor", "--fix"],
             vec!["staging", "ls"],
+            vec!["related", "u"],
+            vec!["blob", "ls"],
+            vec!["blob", "cat", "abcd"],
+            vec!["history", "x.md"],
+            vec!["item", "rm", "u"],
             vec!["task", "mirror"],
             vec!["stat", "u"],
             vec!["ns", "ls"],

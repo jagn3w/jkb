@@ -346,6 +346,31 @@ fn samples() -> Vec<Request> {
         },
         Request::KbHealth {},
         Request::TaskStaging { repo: "r".into() },
+        Request::ItemShow {
+            uid: "u".into(),
+            preview: None,
+        },
+        Request::ItemRm {
+            uid: "u".into(),
+            force: false,
+        },
+        Request::KbRelated {
+            uid: "u".into(),
+            edges: Vec::new(),
+            depth: 1,
+            direction: super::items::Direction::Out,
+        },
+        Request::KbBlobs {
+            contains: None,
+            limit: 10,
+        },
+        Request::KbBlob {
+            prefix: "abcd".into(),
+        },
+        Request::KbHistory {
+            path: "/tmp/x".into(),
+            home: String::new(),
+        },
     ]
 }
 
@@ -1365,6 +1390,11 @@ const READS: &[&str] = &[
     "task.review_findings",
     "task.claims",
     "task.staging",
+    "item.show",
+    "kb.related",
+    "kb.blobs",
+    "kb.blob",
+    "kb.history",
 ];
 
 #[test]

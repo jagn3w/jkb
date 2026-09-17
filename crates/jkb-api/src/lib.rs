@@ -32,6 +32,7 @@ use serde_json::Value;
 pub mod claims;
 pub mod health;
 pub mod ingest;
+pub mod items;
 pub mod kb;
 pub mod removals;
 pub mod review;
@@ -611,6 +612,62 @@ pub enum Request {
         /// The repo key.
         repo: String,
     },
+    /// Any item's details ([`items::show`]).
+    #[serde(rename = "item.show")]
+    ItemShow {
+        /// The item's uid.
+        uid: String,
+        /// How many characters of its content to carry.
+        #[serde(default)]
+        preview: Option<usize>,
+    },
+    /// Delete an item ([`items::remove`]).
+    #[serde(rename = "item.rm")]
+    ItemRm {
+        /// The item's uid.
+        uid: String,
+        /// Past the memory and synced-file guards.
+        #[serde(default)]
+        force: bool,
+    },
+    /// The items an item's edges reach ([`items::related`]).
+    #[serde(rename = "kb.related")]
+    KbRelated {
+        /// The start item's uid.
+        uid: String,
+        /// The edge types to follow; any when empty.
+        #[serde(default)]
+        edges: Vec<String>,
+        /// How many edges deep.
+        depth: usize,
+        /// Which way.
+        #[serde(default)]
+        direction: items::Direction,
+    },
+    /// The sync archive's blobs ([`items::blobs`]).
+    #[serde(rename = "kb.blobs")]
+    KbBlobs {
+        /// Only blobs holding this text.
+        #[serde(default)]
+        contains: Option<String>,
+        /// At most this many.
+        limit: usize,
+    },
+    /// One archived blob's text ([`items::blob_text`]).
+    #[serde(rename = "kb.blob")]
+    KbBlob {
+        /// A unique hash prefix.
+        prefix: String,
+    },
+    /// A synced file's versions ([`items::history`]).
+    #[serde(rename = "kb.history")]
+    KbHistory {
+        /// The file, absolute in the client's filesystem.
+        path: String,
+        /// The client's `$HOME`.
+        #[serde(default)]
+        home: String,
+    },
 }
 
 /// A hook event on the wire. `session_gone` is deliberately not one: only `notify.gone` asserts it,
@@ -984,6 +1041,12 @@ impl Request {
         "task.reclaim",
         "kb.health",
         "task.staging",
+        "item.show",
+        "item.rm",
+        "kb.related",
+        "kb.blobs",
+        "kb.blob",
+        "kb.history",
     ];
 
     /// This request's op name — the `"op"` tag it serializes with. Exhaustive, so a new op must be
@@ -1056,6 +1119,12 @@ impl Request {
             Self::TaskReclaim { .. } => "task.reclaim",
             Self::KbHealth {} => "kb.health",
             Self::TaskStaging { .. } => "task.staging",
+            Self::ItemShow { .. } => "item.show",
+            Self::ItemRm { .. } => "item.rm",
+            Self::KbRelated { .. } => "kb.related",
+            Self::KbBlobs { .. } => "kb.blobs",
+            Self::KbBlob { .. } => "kb.blob",
+            Self::KbHistory { .. } => "kb.history",
         }
     }
 
@@ -1090,6 +1159,11 @@ impl Request {
             | Self::TaskReviewFindings { .. }
             | Self::TaskClaims {}
             | Self::TaskStaging { .. }
+            | Self::ItemShow { .. }
+            | Self::KbRelated { .. }
+            | Self::KbBlobs { .. }
+            | Self::KbBlob { .. }
+            | Self::KbHistory { .. }
             | Self::RepoGate { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -1139,7 +1213,8 @@ impl Request {
             | Self::TaskReviewRecord(_)
             | Self::TaskReclaim { .. }
             // FTS5's integrity check is an `INSERT`, which the `query_only` reader refuses.
-            | Self::KbHealth {} => false,
+            | Self::KbHealth {}
+            | Self::ItemRm { .. } => false,
         }
     }
 }
@@ -1459,6 +1534,50 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
+    /// An `item.show`.
+    Item {
+        /// The item.
+        item: Box<items::ItemInfo>,
+    },
+    /// An `item.rm`.
+    ItemRemoved {
+        /// What went.
+        #[serde(flatten)]
+        removed: items::Removed,
+    },
+    /// A `kb.related`.
+    Related {
+        /// The items reached.
+        rows: Vec<items::RelatedRow>,
+        /// Cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    /// A `kb.blobs`.
+    Blobs {
+        /// The blobs.
+        blobs: Vec<items::BlobRow>,
+        /// Cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    /// A `kb.blob`.
+    Blob {
+        /// The blob's full hash.
+        hash: String,
+        /// Its text.
+        text: String,
+    },
+    /// A `kb.history`.
+    Versions {
+        /// The file's journal uri.
+        uri: String,
+        /// Its versions, newest first.
+        versions: Vec<items::Version>,
+        /// Cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
     /// A `task.show`.
     Task {
         /// The task.
@@ -1484,6 +1603,9 @@ impl Response {
             | Self::Task { truncated, .. }
             | Self::Claims { truncated, .. }
             | Self::StagingTasks { truncated, .. }
+            | Self::Related { truncated, .. }
+            | Self::Blobs { truncated, .. }
+            | Self::Versions { truncated, .. }
             | Self::History { truncated, .. } => *truncated,
             Self::GrepHits { answer } => answer.truncated,
             Self::Created { .. }
@@ -1524,6 +1646,9 @@ impl Response {
             | Self::ReviewRecorded { .. }
             | Self::Reclaimed { .. }
             | Self::Health { .. }
+            | Self::Item { .. }
+            | Self::ItemRemoved { .. }
+            | Self::Blob { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
@@ -1563,6 +1688,9 @@ impl Response {
             | Self::Task { .. }
             | Self::Claims { .. }
             | Self::StagingTasks { .. }
+            | Self::Related { .. }
+            | Self::Blobs { .. }
+            | Self::Versions { .. }
             | Self::Applied {}
             | Self::Added { .. }
             | Self::Unplaced { .. }
@@ -1587,6 +1715,9 @@ impl Response {
             | Self::ReviewRecorded { .. }
             | Self::Reclaimed { .. }
             | Self::Health { .. }
+            | Self::Item { .. }
+            | Self::ItemRemoved { .. }
+            | Self::Blob { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
@@ -2448,6 +2579,53 @@ impl Backend for LocalBackend {
             Request::TaskStaging { repo } => {
                 let (tasks, truncated) = db.read_with(move |c| staging::staging(c, &repo))?;
                 Response::StagingTasks { tasks, truncated }
+            }
+            Request::ItemShow { uid, preview } => Response::Item {
+                item: Box::new(db.read_with(move |c| items::show(c, &uid, preview))?),
+            },
+            Request::ItemRm { uid, force } => {
+                let roots = self.file_roots.clone();
+                Response::ItemRemoved {
+                    removed: db.write_txn_with(actor, move |c, m| {
+                        items::remove(c, m, &uid, force, roots.as_ref())
+                    })?,
+                }
+            }
+            Request::KbRelated {
+                uid,
+                edges,
+                depth,
+                direction,
+            } => {
+                let (rows, truncated) = db.read_with(move |c| {
+                    let rows = items::related(c, &uid, &edges, depth, direction, &mut budget)?;
+                    Ok::<_, ApiError>((rows, budget.exhausted()))
+                })?;
+                Response::Related { rows, truncated }
+            }
+            Request::KbBlobs { contains, limit } => {
+                let (blobs, truncated) = db.read_with(move |c| {
+                    let blobs = items::blobs(c, contains.as_deref(), limit, &mut budget)?;
+                    Ok::<_, ApiError>((blobs, budget.exhausted()))
+                })?;
+                Response::Blobs { blobs, truncated }
+            }
+            Request::KbBlob { prefix } => {
+                let (hash, text) = db.read_with(move |c| items::blob_text(c, &prefix))?;
+                Response::Blob { hash, text }
+            }
+            Request::KbHistory { path, home } => {
+                let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let (uri, versions, truncated) = db.read_with(move |c| {
+                    let (uri, versions) =
+                        items::history(c, &path, &home, server_home.as_deref(), &mut budget)?;
+                    Ok::<_, ApiError>((uri, versions, budget.exhausted()))
+                })?;
+                Response::Versions {
+                    uri,
+                    versions,
+                    truncated,
+                }
             }
             Request::KbHealth {} => Response::Health {
                 health: db.read_with(health::health)?,

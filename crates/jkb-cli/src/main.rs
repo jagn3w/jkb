@@ -11,6 +11,7 @@ mod atomic;
 mod commands;
 mod doctor;
 mod gitrepo;
+mod item_cli;
 mod mq_cli;
 mod notify;
 mod ops_cli;
@@ -37,9 +38,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use jkb_api::kb::SearchRoute;
 
 use jkb_core::lifecycle;
-use jkb_core::{
-    binding, blob, edge, investigation, item, mount, ns, nstype, tag, task, undo, view, Db,
-};
+use jkb_core::{edge, investigation, item, mount, ns, nstype, tag, task, undo, view, Db};
 use jkb_embed::{OllamaConfig, OllamaEmbedder};
 use jkb_fsm::Fact;
 use jkb_ingest::Pipeline;
@@ -1323,8 +1322,13 @@ fn run(cli: Cli) -> Result<()> {
             watch,
             conflict.map(ConflictPolicy::from),
         ),
-        Command::Staging { .. } => {
-            anyhow::bail!("internal: staging missed ops_cli's dispatch")
+        Command::Staging { .. }
+        | Command::Stat { .. }
+        | Command::Item { .. }
+        | Command::Related { .. }
+        | Command::Blob { .. }
+        | Command::History { .. } => {
+            anyhow::bail!("internal: a command served as an op missed ops_cli's dispatch")
         }
         Command::Commands { cmd } => match cmd {
             CommandsCmd::Install => commands::install(),
@@ -1354,197 +1358,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Serve { .. } | Command::Service { .. } => {
             unreachable!("dispatched before the database is opened")
         }
-        Command::Stat { uid } => cmd_stat(&db, &uid, json),
         Command::Guide => {
             cmd_guide();
             Ok(())
         }
-        Command::Item { cmd } => match cmd {
-            ItemCmd::Show { uid, preview } => cmd_item_show(&db, &uid, preview, json),
-            ItemCmd::Rm { uid, force } => cmd_item_rm(&db, &uid, force, json),
-            ItemCmd::Edit {
-                uid,
-                text,
-                stdin,
-                append,
-            } => cmd_item_edit(&db, &uid, &text, stdin, append, json),
-        },
-        Command::Related {
-            uid,
-            edges,
-            depth,
-            direction,
-        } => cmd_related(&db, &uid, &edges, depth, direction.into(), json),
         Command::Inv { cmd } => cmd_inv(&db, cmd, global, json),
-        Command::Blob { cmd } => match cmd {
-            BlobCmd::Ls { contains, limit } => cmd_blob_ls(&db, contains.as_deref(), limit, json),
-            BlobCmd::Cat { hash } => cmd_blob_cat(&db, &hash),
-        },
-        Command::History { path } => cmd_history(&db, &path, json),
     }
-}
-
-/// `jkb blob ls` — list the archive, optionally searching blob bytes.
-fn cmd_blob_ls(db: &Db, contains: Option<&str>, limit: usize, json: bool) -> Result<()> {
-    let needle = contains.map(|s| s.as_bytes().to_vec());
-    let blobs = db.read(move |conn| blob::list(conn, needle.as_deref(), limit))?;
-    if json {
-        let arr: Vec<serde_json::Value> = blobs
-            .iter()
-            .map(|b| {
-                serde_json::json!({
-                    "hash": b.hash, "size": b.size, "mime": b.mime, "created_at": b.created_at,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if blobs.is_empty() {
-        println!("(no matching blobs)");
-    } else {
-        for b in &blobs {
-            println!(
-                "{}  {:>9}  {}",
-                &b.hash[..16.min(b.hash.len())],
-                b.size,
-                b.created_at
-            );
-        }
-    }
-    Ok(())
-}
-
-/// `jkb blob cat <hash>` — raw bytes to stdout, accepting a unique hash prefix.
-fn cmd_blob_cat(db: &Db, hash: &str) -> Result<()> {
-    use std::io::Write as _;
-    let prefix = hash.to_owned();
-    // A full hash is 64 hex chars; anything shorter is treated as a prefix and must be
-    // unambiguous, so `cat` can never print the wrong version.
-    let matches = db.read(move |conn| {
-        let all = blob::list(conn, None, usize::MAX)?;
-        Ok(all
-            .into_iter()
-            .filter(|b| b.hash.starts_with(&prefix))
-            .collect::<Vec<_>>())
-    })?;
-    let found = match matches.as_slice() {
-        [one] => one.hash.clone(),
-        [] => anyhow::bail!("no blob with hash prefix `{hash}`"),
-        many => anyhow::bail!("`{hash}` matches {} blobs; use a longer prefix", many.len()),
-    };
-    let bytes = db
-        .read(move |conn| blob::load(conn, &found))?
-        .with_context(|| format!("blob `{hash}` vanished between listing and reading"))?;
-    std::io::stdout().write_all(&bytes)?;
-    Ok(())
-}
-
-/// Resolve a path the way the sync journal's uris were built: canonicalized.
-///
-/// `canonicalize` needs the file to exist, which is precisely what `jkb history` is often asked
-/// about, and plain absolutisation resolves no symlinks — so on macOS a deleted file under
-/// `/tmp` or `/var` produced a uri the journal never wrote. Canonicalizing the deepest ancestor
-/// that DOES exist (normally the parent) and rejoining the rest gets both: the symlinks are
-/// resolved and the missing leaf is preserved.
-fn resolve_for_journal(path: &std::path::Path) -> std::path::PathBuf {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real;
-    }
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut rest = Vec::new();
-    let mut cur = abs.as_path();
-    while let Some(parent) = cur.parent() {
-        if let Some(name) = cur.file_name() {
-            rest.push(name.to_owned());
-        }
-        if let Ok(real) = std::fs::canonicalize(parent) {
-            let mut out = real;
-            for part in rest.iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        cur = parent;
-    }
-    abs
-}
-
-/// `jkb history <path>` — every synced version of a file, newest first.
-fn cmd_history(db: &Db, path: &str, json: bool) -> Result<()> {
-    // Accept a bare path or a `file://` uri, and canonicalize so a relative path matches the
-    // absolute uri the journal stores.
-    let uri = if path.starts_with("file://") {
-        path.to_owned()
-    } else {
-        // Absolutised WITHOUT requiring the file to exist, then keyed with `jkb-sync`'s own
-        // spelling. `canonicalize` fails for a deleted file, which left a relative uri that
-        // matched no journal row — so `jkb history <deleted file>` reported "no recorded
-        // history" and blamed the build version, on exactly the recovery path the archive
-        // exists to serve.
-        // Canonicalize when the file is there — the journal's uris come from a canonicalized
-        // mount directory, so on macOS `/var/...` must become `/private/var/...` to match — and
-        // fall back to plain absolutisation when it is not, which is the case `jkb history`
-        // exists for. Using only one of the two fails half the time: `canonicalize` alone left a
-        // *relative* uri for a deleted file, and `absolute` alone misses the symlink.
-        jkb_sync::file_uri(&resolve_for_journal(std::path::Path::new(path)))
-    };
-
-    let versions = db.read({
-        let uri = uri.clone();
-        move |conn| {
-            // The journal's changelog carries one entry per settle, each naming the blob
-            // holding that version's bytes.
-            let mut stmt = conn.prepare(
-                "SELECT ts, after FROM changelog
-                 WHERE entity_type = 'sync_state' AND entity_id = ?1 AND after IS NOT NULL
-                 ORDER BY id DESC",
-            )?;
-            let rows = stmt.query_map([&uri], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            let mut out: Vec<(String, String, String)> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for row in rows {
-                let (ts, after) = row?;
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&after) else {
-                    continue;
-                };
-                let Some(hash) = v.get("base_blob_hash").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let status = v
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("ok")
-                    .to_owned();
-                if seen.insert(hash.to_owned()) {
-                    out.push((ts, hash.to_owned(), status));
-                }
-            }
-            Ok(out)
-        }
-    })?;
-
-    if json {
-        let arr: Vec<serde_json::Value> = versions
-            .iter()
-            .map(|(ts, hash, status)| {
-                serde_json::json!({ "ts": ts, "blob": hash, "status": status })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if versions.is_empty() {
-        println!(
-            "(no recorded history for {uri})\n\
-             Versions synced before this build did not journal their blob hash — search the \
-             archive instead: jkb blob ls --contains \"<a line you remember>\""
-        );
-    } else {
-        for (ts, hash, status) in &versions {
-            println!("{ts}  {}  [{status}]", &hash[..16.min(hash.len())]);
-        }
-        println!("\nRead one with: jkb blob cat <hash>");
-    }
-    Ok(())
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -1613,94 +1432,7 @@ fn confirm_global_backlog() -> Result<bool> {
 
 // ---- commands -------------------------------------------------------------
 
-/// `jkb stat <uid>` — compact metadata for one item (no body).
-fn cmd_stat(db: &Db, uid: &str, json: bool) -> Result<()> {
-    let u = uid.to_owned();
-    let found = db.read(move |conn| {
-        let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(None);
-        };
-        let Some(meta) = item::get(conn, id)? else {
-            return Ok(None);
-        };
-        let binding = binding::get(conn, id)?.map(|b| b.uri);
-        let tags = tag::applications(conn, id)?;
-        let namespace = primary_ns(conn, id)?;
-        Ok(Some((meta, binding, tags, namespace)))
-    })?;
-    let Some((meta, binding, tags, namespace)) = found else {
-        anyhow::bail!("no item with uid `{uid}`");
-    };
-    let chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "uid": meta.uid, "kind": meta.kind, "status": meta.status,
-                "resolution": meta.resolution,
-                "priority": meta.priority, "due": meta.due, "mime": meta.mime,
-                "namespace": namespace, "binding": binding, "content_chars": chars,
-                "tags": tags.iter().map(|(f, v)| serde_json::json!({"facet": f, "value": v})).collect::<Vec<_>>(),
-                "created_at": meta.created_at, "updated_at": meta.updated_at,
-            })
-        );
-    } else {
-        print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
-        println!("content:   {chars} chars");
-    }
-    Ok(())
-}
-
-/// `jkb item rm <uid>` — delete an item and its cascade, reversibly.
-fn cmd_item_rm(db: &Db, uid: &str, force: bool, json: bool) -> Result<()> {
-    let id = require_uid(db, uid)?;
-    // Deliberately no vector sweep, and none is needed: the `vec_items_<dim>_gc` trigger
-    // (D42.2) removes the vector with the item, in the same statement, for every connection and
-    // every caller. Two belts remain behind that brace — an id is never reissued (D40), so even
-    // a row that somehow survives cannot be inherited, and `jkb index --sweep` collects rows
-    // written before the trigger existed.
-    let removed = db.write_txn("cli", move |conn, meta| item::remove(conn, meta, id, force))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "uid": removed.uid,
-                "kind": removed.kind,
-                "placements": removed.placements,
-                "edges": removed.edges,
-                "tags": removed.tags,
-            })
-        );
-    } else {
-        println!(
-            "removed {} [{}] — {} placement(s), {} edge(s), {} tag(s)",
-            removed.uid, removed.kind, removed.placements, removed.edges, removed.tags
-        );
-        println!("`jkb undo` restores it, including its edges.");
-    }
-    Ok(())
-}
-
 // ---- `jkb related` + `jkb inv …` (investigations, design Dmem.5/Dmem.9) ----
-
-/// Parse `--edge <type>` values into [`EdgeType`]s, rejecting unknown names with the list.
-fn parse_edge_types(names: &[String]) -> Result<Vec<EdgeType>> {
-    names
-        .iter()
-        .map(|name| {
-            EdgeType::from_str_opt(name).with_context(|| {
-                format!(
-                    "unknown edge type `{name}`; available: {}",
-                    EdgeType::ALL
-                        .iter()
-                        .map(|e| e.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-        })
-        .collect()
-}
 
 /// Parse repeated `facet=value` arguments.
 fn parse_tag_args(tags: &[String]) -> Result<Vec<(String, String)>> {
@@ -1725,75 +1457,6 @@ fn require_uid(db: &Db, uid: &str) -> Result<ItemId> {
 }
 
 /// `jkb related <uid>` — walk the typed edge graph out from one item.
-fn cmd_related(
-    db: &Db,
-    uid: &str,
-    edge_names: &[String],
-    depth: usize,
-    direction: edge::Direction,
-    json: bool,
-) -> Result<()> {
-    let types = parse_edge_types(edge_names)?;
-    let start = require_uid(db, uid)?;
-    let hops = db.read(move |conn| edge::walk(conn, start, &types, depth, direction))?;
-
-    let mut rows = Vec::new();
-    for hop in &hops {
-        let id = hop.item;
-        let Some(meta) = db.read(move |conn| item::get(conn, id))? else {
-            continue;
-        };
-        rows.push((hop, meta));
-    }
-
-    if json {
-        let arr: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|(hop, meta)| {
-                serde_json::json!({
-                    "uid": meta.uid,
-                    "kind": meta.kind,
-                    "status": meta.status,
-                    "resolution": meta.resolution,
-                    "depth": hop.depth,
-                    "via": hop.via.as_str(),
-                    "direction": match hop.direction {
-                        edge::Direction::Out => "out",
-                        edge::Direction::In => "in",
-                        edge::Direction::Both => "both",
-                    },
-                    "snippet": meta.content.as_deref().map(first_line),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if rows.is_empty() {
-        println!("(no related items)");
-    } else {
-        for (hop, meta) in &rows {
-            let arrow = match hop.direction {
-                edge::Direction::In => "<-",
-                edge::Direction::Out | edge::Direction::Both => "->",
-            };
-            println!(
-                "{:>2}  {arrow} {:<26} [{}]{} — {}",
-                hop.depth,
-                format!("{} {}", hop.via.as_str(), meta.uid),
-                meta.kind,
-                meta.resolution
-                    .as_deref()
-                    .map(|r| format!(" ({r})"))
-                    .unwrap_or_default(),
-                meta.content.as_deref().map(first_line).unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Resolve `jkb inv new`'s namespace: an explicit `memory/…` path is used as given; a bare
-/// name is homed under the ambient repo (`memory/<repo>/<name>`, mirroring task homing,
-/// design D26/D32) or at `memory/<name>` outside a repo or with `--global`.
 fn investigation_path(db: &Db, name: &str, global: bool) -> Result<String> {
     let root = investigation::MEMORY_ROOT;
     if name == root || name.starts_with(&format!("{root}/")) {
@@ -2509,193 +2172,6 @@ fn cmd_guide() {
 }
 
 /// The item's primary (home) namespace path, if placed.
-fn primary_ns(conn: &rusqlite::Connection, id: ItemId) -> jkb_core::Result<Option<String>> {
-    use rusqlite::OptionalExtension;
-    Ok(conn
-        .prepare_cached(
-            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-             WHERE p.item_id = ?1 ORDER BY (p.role = 'primary') DESC, p.position LIMIT 1",
-        )?
-        .query_row([id.get()], |r| r.get::<_, String>(0))
-        .optional()?)
-}
-
-/// Whether an item's content is human-readable text worth showing in full (task notes,
-/// prose, markdown) versus a heavy blob (PDF/image) that should stay a bounded preview.
-fn is_text_like(kind: &str, mime: Option<&str>) -> bool {
-    matches!(kind, "task" | "text" | "note" | "view")
-        || mime.is_some_and(|m| m.starts_with("text/") || m.contains("markdown"))
-}
-
-/// Default content cap (chars) for text-like kinds (task notes, prose, markdown, ingested
-/// text documents). Generous, but finite — the details pane shows a **bounded** preview,
-/// never the whole document, so a multi-MB ingested doc can't spike webview latency/memory
-/// (ui/README). Override with `--preview <n>` to read more.
-const TEXT_PREVIEW_MAX: usize = 100_000;
-
-/// Default content cap (chars) for heavy kinds (PDF/image blobs) — a short excerpt only.
-const HEAVY_PREVIEW_MAX: usize = 800;
-
-/// `jkb item show <uid>` — generic, kind-aware item details + content. `preview_arg` caps
-/// the content; when `None`, text-like kinds cap at [`TEXT_PREVIEW_MAX`] and heavy kinds at
-/// [`HEAVY_PREVIEW_MAX`]. A larger document is truncated (flagged `preview_truncated`);
-/// override with `--preview <n>`.
-fn cmd_item_show(db: &Db, uid: &str, preview_arg: Option<usize>, json: bool) -> Result<()> {
-    let u = uid.to_owned();
-    let found = db.read(move |conn| {
-        let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(None);
-        };
-        let Some(meta) = item::get(conn, id)? else {
-            return Ok(None);
-        };
-        let binding = binding::get(conn, id)?.map(|b| b.uri);
-        let tags = tag::applications(conn, id)?;
-        let namespace = primary_ns(conn, id)?;
-        Ok(Some((meta, binding, tags, namespace)))
-    })?;
-    let Some((meta, binding, tags, namespace)) = found else {
-        anyhow::bail!("no item with uid `{uid}`");
-    };
-
-    let preview_max = preview_arg.unwrap_or_else(|| {
-        if is_text_like(&meta.kind, meta.mime.as_deref()) {
-            TEXT_PREVIEW_MAX
-        } else {
-            HEAVY_PREVIEW_MAX
-        }
-    });
-    let content_chars = meta.content.as_ref().map_or(0, |c| c.chars().count());
-    let preview: String = meta
-        .content
-        .as_deref()
-        .unwrap_or("")
-        .chars()
-        .take(preview_max)
-        .collect();
-    let preview_truncated = content_chars > preview_max;
-
-    if json {
-        let v = serde_json::json!({
-            "uid": meta.uid,
-            "kind": meta.kind,
-            "status": meta.status,
-            "resolution": meta.resolution,
-            "priority": meta.priority,
-            "due": meta.due,
-            "mime": meta.mime,
-            "binding": binding,
-            "namespace": namespace,
-            "content_chars": content_chars,
-            "content_hash": meta.content_hash,
-            "created_at": meta.created_at,
-            "updated_at": meta.updated_at,
-            "tags": tags
-                .iter()
-                .map(|(f, v)| serde_json::json!({"facet": f, "value": v}))
-                .collect::<Vec<_>>(),
-            "preview": preview,
-            "preview_truncated": preview_truncated,
-        });
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else {
-        print_item_detail(&meta, binding.as_deref(), namespace.as_deref(), &tags);
-        println!(
-            "content:   {content_chars} chars{}",
-            if preview_truncated {
-                " (preview truncated)"
-            } else {
-                ""
-            }
-        );
-        if !preview.is_empty() {
-            println!("\n{preview}");
-        }
-    }
-    Ok(())
-}
-
-/// Human-readable header lines for `item show`.
-fn print_item_detail(
-    meta: &item::ItemMeta,
-    binding: Option<&str>,
-    namespace: Option<&str>,
-    tags: &[(String, String)],
-) {
-    println!("uid:       {}", meta.uid);
-    println!("kind:      {}", meta.kind);
-    if let Some(s) = &meta.status {
-        println!("status:    {s}");
-    }
-    if let Some(r) = &meta.resolution {
-        println!("resolution: {r}");
-    }
-    if let Some(ns) = namespace {
-        println!("namespace: {ns}");
-    }
-    if let Some(m) = &meta.mime {
-        println!("mime:      {m}");
-    }
-    if let Some(b) = binding {
-        println!("binding:   {b}");
-    }
-    if !tags.is_empty() {
-        let t: Vec<String> = tags.iter().map(|(f, v)| format!("{f}={v}")).collect();
-        println!("tags:      {}", t.join(", "));
-    }
-    println!("updated:   {}", meta.updated_at);
-}
-
-/// `item edit <uid>` — replace (or `--append` to) any item's content through the audited
-/// `item::set_content` seam (`content_hash` cleared, like `task edit`).
-fn cmd_item_edit(
-    db: &Db,
-    uid: &str,
-    text: &[String],
-    stdin: bool,
-    append: bool,
-    json: bool,
-) -> Result<()> {
-    let new_text = if stdin {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-            .context("reading item content from stdin")?;
-        buf.trim_end().to_owned()
-    } else if text.is_empty() {
-        anyhow::bail!("provide new content as arguments, or pass --stdin");
-    } else {
-        text.join(" ")
-    };
-    let u = uid.to_owned();
-    // Through `item::edit_content`, the one edit rule `jkb task edit` uses too: an item in a tasks.md
-    // appends with one newline and refuses a line that would end its body. This command kept its own
-    // copy, which judged by the uid's spelling and always appended after a blank line.
-    let found = db.write_txn("cli", move |conn, meta| {
-        let Some(id) = item::id_for_uid(conn, &u)? else {
-            return Ok(None);
-        };
-        Ok(Some(item::edit_content(
-            conn,
-            meta,
-            id,
-            &new_text,
-            append,
-            None,
-            &jkb_sync::task_content_problem,
-        )?))
-    })?;
-    let Some(in_tasks_file) = found else {
-        anyhow::bail!("no item with uid `{uid}`");
-    };
-    report(json, uid, if append { "appended" } else { "edited" });
-    if (in_tasks_file || uid.starts_with("file://")) && !json {
-        eprintln!(
-            "note: this is a file-backed item; run `jkb sync` to propagate the edit to its file."
-        );
-    }
-    Ok(())
-}
-
 fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
     match cmd {
         NsCmd::Ls { scope } => {
