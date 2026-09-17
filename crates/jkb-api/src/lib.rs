@@ -616,6 +616,9 @@ pub enum Request {
     TaskStaging {
         /// The repo key.
         repo: String,
+        /// Spent batches too.
+        #[serde(default)]
+        all: bool,
     },
     /// Any item's details ([`items::show`]).
     #[serde(rename = "item.show")]
@@ -1547,7 +1550,7 @@ pub enum Response {
     StagingTasks {
         /// The tasks.
         tasks: Vec<staging::StagingTask>,
-        /// Cut short at [`staging::MAX_STAGING_TASKS`].
+        /// Cut short at the read's budget.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
@@ -2600,8 +2603,11 @@ impl Backend for LocalBackend {
                     })?,
                 }
             }
-            Request::TaskStaging { repo } => {
-                let (tasks, truncated) = db.read_with(move |c| staging::staging(c, &repo))?;
+            Request::TaskStaging { repo, all } => {
+                let (tasks, truncated) = db.read_with(move |c| {
+                    let tasks = staging::staging(c, &repo, all, &mut budget)?;
+                    Ok::<_, ApiError>((tasks, budget.exhausted()))
+                })?;
                 Response::StagingTasks { tasks, truncated }
             }
             Request::ItemShow { uid, preview } => Response::Item {

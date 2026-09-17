@@ -520,9 +520,9 @@ pub fn set(
     Ok(())
 }
 
-/// `task.edit`: replace a task's body, or append to it, by `item::edit_content`'s rule — a task in a
+/// `task.edit`: replace any item's body, or append to it, by `item::edit_content`'s rule — an item in a
 /// tasks file refuses a *result* the tasks serializer would not read back as written — within
-/// [`MAX_CONTENT_BYTES`].
+/// [`MAX_CONTENT_BYTES`] for a task, and for any item under `roots`.
 ///
 /// Answers whether the task is file-backed, so a client can say its file is written by the host's sync.
 ///
@@ -540,13 +540,18 @@ pub fn edit(
     roots: Option<&FileRoots>,
 ) -> Result<bool, ApiError> {
     let id = writable(conn, reference, roots)?;
+    // A task's body is bounded everywhere. Any other item — an ingested document can be megabytes —
+    // is bounded only for a client of `jkb serve`, whose request the host did not choose; on the host
+    // an edit was never capped.
+    let is_task = item::get(conn, id)?.is_some_and(|m| m.kind == "task");
+    let cap = (is_task || roots.is_some()).then_some(MAX_CONTENT_BYTES);
     Ok(item::edit_content(
         conn,
         meta,
         id,
         text,
         append,
-        Some(MAX_CONTENT_BYTES),
+        cap,
         &jkb_sync::task_content_problem,
     )?)
 }

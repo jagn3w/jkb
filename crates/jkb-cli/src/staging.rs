@@ -166,7 +166,7 @@ pub(crate) fn collect(kb: &Kb<'_>, ctx: &RepoCtx, include_merged: bool) -> Resul
     // evidence that a branch is there.)
     //
     // **One** read for the whole listing, not one per task: this view redraws on every database write.
-    let tasks = kb.staging(&ctx.key)?;
+    let tasks = kb.staging(&ctx.key, include_merged)?;
     let sessions = session::discover(&ctx.root)?;
     let mut by_onto: BTreeMap<String, Vec<&StagingTask>> = BTreeMap::new();
     for t in &tasks {

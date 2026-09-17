@@ -227,8 +227,9 @@ The robustness pass on the agent swarm that drives jkb task execution (design
   a **property of the task** — two nullable `items` columns (`claimant_id`, `claimed_at`),
   **not** a side table, never encoded in `status`. `claim(item, owner)` is a **CAS** that
   succeeds only if free or same-owner and **atomically sets `status='in_progress'`** (no
-  claimed-but-`open` window). `release` clears the claim (leaves `status`). `reclaim_dead(
-  live_owners)` NULLs **only** claims whose owner ∉ the verified-alive set, writing **only**
+  claimed-but-`open` window). `release` clears the claim (leaves `status`). The reclaim
+  (`transition::reclaim_judged`, driven by `task.reclaim` with the owners the client proved gone) NULLs
+  **only** claims whose owner is proven gone, writing **only**
   claim columns — so it never clashes with a status transition and a live run never reclaims
   its own work. **Liveness is by owner-existence, never age**: no TTL, no heartbeat — a
   paused-but-alive agent keeps its claim. All three are **changelogged** (op

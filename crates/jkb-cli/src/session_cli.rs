@@ -348,17 +348,23 @@ impl<'a> Kb<'a> {
         }
     }
 
-    /// `task.staging`, refused when the answer was cut: a listing of part of a repo's batches would
-    /// call the rest spent.
-    pub(crate) fn staging(&self, repo: &str) -> Result<Vec<jkb_api::staging::StagingTask>> {
+    /// `task.staging`, refused when the answer was cut: a listing of part of a batch would misstate
+    /// what is landing on it.
+    pub(crate) fn staging(
+        &self,
+        repo: &str,
+        all: bool,
+    ) -> Result<Vec<jkb_api::staging::StagingTask>> {
         match self.call(Request::TaskStaging {
             repo: repo.to_owned(),
+            all,
         })? {
             Response::StagingTasks { tasks, truncated } => {
                 anyhow::ensure!(
                     !truncated,
-                    "{repo} has more than {} tasks with a land target",
-                    jkb_api::staging::MAX_STAGING_TASKS
+                    "{repo}'s staging listing is larger than one answer through `jkb serve`; \
+                     run `jkb staging ls{}` on the host",
+                    if all { " --all" } else { "" }
                 );
                 Ok(tasks)
             }

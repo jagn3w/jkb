@@ -2181,6 +2181,24 @@ fn blob_archive_recovers_a_previous_version_of_a_synced_file() {
         .failure()
         .stderr(predicate::str::contains("no blob with hash prefix"));
 
+    // Bytes that are not text come back as they are, on the host: the archive holds ingested
+    // PDFs too, and `blob cat > file` is how one is recovered.
+    let binary = vec![0x25, 0x50, 0xff, 0xfe, 0x00, 0x0a];
+    let bin_hash = jkb_core::blob::hash_bytes(&binary);
+    {
+        let store = jkb_core::Db::open(&db).unwrap();
+        let (h, b) = (bin_hash.clone(), binary.clone());
+        store
+            .write_txn("t", move |c, _| jkb_core::blob::store(c, &h, &b, None))
+            .unwrap();
+    }
+    let raw = jkb(&db)
+        .args(["blob", "cat", &bin_hash[..16]])
+        .output()
+        .unwrap();
+    assert!(raw.status.success(), "{raw:?}");
+    assert_eq!(raw.stdout, binary);
+
     // `jkb history` lists that file's settled versions, newest first.
     jkb(&db)
         .args(["history", file.to_str().unwrap()])

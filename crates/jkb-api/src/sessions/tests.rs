@@ -796,9 +796,11 @@ fn the_staging_read_lists_the_repo_s_landing_tasks() {
                 "place": { "branch": "x", "repo": "other", "onto": "batch" } }),
     )
     .unwrap();
-    let Response::StagingTasks { tasks, truncated } =
-        call(&b, json!({ "op": "task.staging", "repo": "proj" })).unwrap()
-    else {
+    let Response::StagingTasks { tasks, truncated } = call(
+        &b,
+        json!({ "op": "task.staging", "repo": "proj", "all": true }),
+    )
+    .unwrap() else {
         panic!("staging")
     };
     assert!(!truncated);
@@ -824,4 +826,28 @@ fn the_staging_read_lists_the_repo_s_landing_tasks() {
     assert_eq!(tasks[0].status, "in_progress");
     let e = call(&b, json!({ "op": "task.staging", "repo": "" })).unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
+
+    // A spent batch — every task on it finished — is left out unless asked for.
+    let old = add(&b, "shipped long ago");
+    assert!(start_on(&b, &old, "host:1", None, "f3", "old-batch").unwrap());
+    call(
+        &b,
+        json!({ "op": "task.set", "uid": old, "status": "done" }),
+    )
+    .unwrap();
+    let targets = |all: bool| match call(
+        &b,
+        json!({ "op": "task.staging", "repo": "proj", "all": all }),
+    )
+    .unwrap()
+    {
+        Response::StagingTasks { tasks, .. } => tasks
+            .into_iter()
+            .map(|t| t.land_target)
+            .collect::<std::collections::BTreeSet<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert!(!targets(false).contains("old-batch"));
+    assert!(targets(true).contains("old-batch"));
+    assert!(targets(false).contains("batch"), "a live batch is listed");
 }

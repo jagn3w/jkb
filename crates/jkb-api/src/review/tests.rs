@@ -274,6 +274,19 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
     );
     let filed = file(&b, "reviews/big", &serde_json::to_value(&findings).unwrap()).unwrap();
     assert_eq!(filed.uids.len(), 150);
+    // A single field past its own cap is cut to it, however small the whole review.
+    let mut one = vec![super::Finding {
+        severity: super::Severity::Nit,
+        summary: "s".repeat(super::MAX_SUMMARY_BYTES + 10),
+        file: None,
+        line: None,
+        scenario: Some("z".repeat(super::MAX_DETAIL_BYTES + 10)),
+        fix: None,
+    }];
+    assert!(super::fit(&mut one));
+    assert!(one[0].summary.len() <= super::MAX_SUMMARY_BYTES);
+    assert!(one[0].scenario.as_ref().unwrap().len() <= super::MAX_DETAIL_BYTES);
+    file(&b, "reviews/one", &serde_json::to_value(&one).unwrap()).unwrap();
     // A review that already fits is left alone.
     let mut small = findings[..1].to_vec();
     small[0].scenario = Some("s".to_owned());

@@ -47,26 +47,40 @@ const MIN_TRIMMED_BYTES: usize = 256;
 /// What [`fit`] appends to a text it cut.
 pub const TRIMMED: &str = " … (cut to fit one filing; the reviewer's result holds the rest)";
 
-/// Trim `findings`' scenarios and fixes, longest allowance first, until they serialize within
-/// [`MAX_FILING_BYTES`] — halving the allowance each round, down to [`MIN_TRIMMED_BYTES`]. Returns
-/// whether anything was cut. A review that still does not fit is left for [`file`] to refuse.
+/// Cut `text` to at most `max` bytes, marked with [`TRIMMED`]; whether it was cut.
+fn trim(text: &mut String, max: usize) -> bool {
+    if text.len() <= max {
+        return false;
+    }
+    let mut end = max.saturating_sub(TRIMMED.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(TRIMMED);
+    true
+}
+
+/// Fit `findings` to one filing: every summary to [`MAX_SUMMARY_BYTES`] and every scenario and fix to
+/// [`MAX_DETAIL_BYTES`], then the scenarios and fixes further, halving their allowance each round down
+/// to [`MIN_TRIMMED_BYTES`], until the whole serializes within [`MAX_FILING_BYTES`]. Returns whether
+/// anything was cut. A review that still does not fit — a thousand long summaries — is left for
+/// [`file`] to refuse.
 pub fn fit(findings: &mut [Finding]) -> bool {
     let size = |f: &[Finding]| serde_json::to_vec(f).map_or(usize::MAX, |v| v.len());
     let mut cut = false;
+    for f in findings.iter_mut() {
+        cut |= trim(&mut f.summary, MAX_SUMMARY_BYTES);
+        for text in [&mut f.scenario, &mut f.fix].into_iter().flatten() {
+            cut |= trim(text, MAX_DETAIL_BYTES);
+        }
+    }
     let mut allowance = MAX_DETAIL_BYTES;
     while size(findings) > MAX_FILING_BYTES && allowance > MIN_TRIMMED_BYTES {
         allowance /= 2;
         for f in findings.iter_mut() {
             for text in [&mut f.scenario, &mut f.fix].into_iter().flatten() {
-                if text.len() > allowance + TRIMMED.len() {
-                    let mut end = allowance;
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                    text.push_str(TRIMMED);
-                    cut = true;
-                }
+                cut |= trim(text, allowance);
             }
         }
     }
@@ -236,8 +250,8 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
     let size = serde_json::to_vec(&ask.findings).map_or(usize::MAX, |v| v.len());
     if size > MAX_FILING_BYTES {
         return Err(invalid(format!(
-            "these findings take {size} bytes and one filing takes at most {MAX_FILING_BYTES}; \
-             shorten their scenarios and fixes (`jkb task review file` does this itself)"
+            "these findings take {size} bytes and one filing takes at most {MAX_FILING_BYTES}, \
+             even with their scenarios and fixes cut short; file fewer findings, or shorter summaries"
         )));
     }
     let held = Query {

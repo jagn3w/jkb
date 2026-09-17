@@ -4717,7 +4717,7 @@ fn a_container_files_and_records_a_review_through_the_daemon() {
             "--from",
             "-",
         ],
-        Some(r#"{"findings": []}"#),
+        Some(r#"{"findings": [], "reviewers": 2, "returned": 2}"#),
     );
     assert!(clean.status.success(), "{clean:?}");
     let v: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
@@ -4818,6 +4818,8 @@ fn a_review_that_did_not_run_is_not_filed() {
     for failed in [
         r#"{"findings": [], "reviewers": 0, "error": "survey failed", "note": "nothing was reviewed; re-run"}"#,
         r#"{"findings": [], "reviewers": 0, "note": "no findings"}"#,
+        r#"{"findings": [], "reviewers": 3, "returned": 0, "raw": 0}"#,
+        r#"{"findings": [], "reviewers": 3, "raw": 0}"#,
     ] {
         let out = remote(
             &[

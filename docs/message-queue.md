@@ -614,9 +614,10 @@ migration's lock),
   verbs above all, since `jkb task work` makes the worktrees agents run in. The network path
   it will take already exists; see `.container/README.md`, "The one opening to the host".
 - The rest of the container's commands, then the cutover — stages S6.4/S6.5. The read set (S6.1), the
-  task-mutate set (S6.2) and ingest (S6.3) are done; `stat`, `item show`/`edit`/`rm`, `related`, `inv`, `view`, `ns`, `tag`, `undo`,
-  `history`, `blob`, and the session verbs other than `task start` and `task gate` (show) are still
-  refused remotely.
+  task-mutate set (S6.2), ingest (S6.3), the session verbs, and (stage 5) `staging ls`, `stat`,
+  `item`, `related`, `blob`, `history`, `inv`, `doctor`'s report, `task review` and `task reclaim` are
+  served; `view`, `ns`, `tag`, `index`, `task mirror`/`pr`/`close-merged` and `jkb mcp` are still
+  refused remotely, and `undo` always will be (design-s6-4.md J).
 - Embedding what the container ingests (tasks F5): captured and keyword-searchable, it stays unembedded
   until `jkb index --pending` runs on the host, and nothing runs it on a schedule.
 - The MCP server's read tools (`jkb-mcp/src/logic.rs`) still read the database directly rather than

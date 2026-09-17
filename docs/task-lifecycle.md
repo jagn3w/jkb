@@ -512,8 +512,9 @@ more and found two rules that existed only in the shape of a function:
   `Unrecognized`. Each declares what would prove it via `Liveness`, a **closed enum**, so a new
   shape cannot be added without the compiler demanding a probe for it.
 - **`owner::is_alive` returns `Fact`.** An `agent:` id and an id we cannot read are
-  `Fact::Unknown` — *unestablished*, never *dead*. `transition::reclaim_dead` frees only claims
-  **proven** gone and returns the rest in an `unverifiable` bucket that `jkb doctor` and
+  `Fact::Unknown` — *unestablished*, never *dead*. `transition::reclaim_judged` frees only claims
+  **proven** gone (the owners probed where the command runs, `task.reclaim` — see
+  `docs/message-queue.md`) and returns the rest in an `unverifiable` bucket that `jkb doctor` and
   `jkb task reclaim` report but never clear. That is a behaviour change: the old predicate treated
   an unreadable owner as reclaimable, which silently frees a live agent's task. Of the two ways to
   be wrong, the one that costs a command wins (D34.4).

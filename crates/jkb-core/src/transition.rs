@@ -579,10 +579,9 @@ fn append(
     Ok(())
 }
 
-/// Free every claim whose owner is **proven** gone, one lifecycle transition each.
-///
-/// The crash-recovery net (design D27.1/D27.2), now routed through the machine so it appears in
-/// each task's history and obeys the same evidence rule as everything else.
+/// Free every claim whose owner is **proven** gone, one lifecycle transition each — a test helper
+/// over [`reclaim_judged`], which the crash-recovery net (`jkb_api::claims::reclaim`) calls with the
+/// owners its client probed.
 ///
 /// The probe answers a [`Fact`], and only [`Fact::No`] reclaims. An owner whose liveness cannot
 /// be established — an externally-minted `agent:` id, or a `claimant_id` in a shape this binary
@@ -592,9 +591,8 @@ fn append(
 /// (`jkb task release <uid> --owner <owner>`, once you know that owner is gone); reclaiming it
 /// wrongly costs the work.
 ///
-/// Liveness is evaluated **inside the write transaction** against the freshly-read claim set,
-/// which closes the race where a claim acquired concurrently by a live owner is reclaimed from a
-/// stale snapshot. Each distinct owner is probed at most once; owners in `keep` are alive by
+/// Liveness is evaluated here **inside the write transaction**; each distinct owner is probed at
+/// most once; owners in `keep` are alive by
 /// fiat and never probed, so a live coordinator passing its own id never reclaims its own work.
 ///
 /// # Errors
@@ -665,8 +663,7 @@ pub fn reclaim_judged(
 pub struct Reclaimed {
     /// Claims whose owner was proven gone, now freed.
     pub cleared: Vec<claim::ClaimInfo>,
-    /// Claims held by an owner whose liveness could not be established. **Not** freed — see
-    /// [`reclaim_dead`].
+    /// Claims held by an owner whose liveness could not be established. **Not** freed.
     pub unverifiable: Vec<claim::ClaimInfo>,
 }
 

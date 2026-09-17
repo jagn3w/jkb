@@ -1,8 +1,8 @@
 //! Any item, not only a task (tasks S6.4 stage 5): `jkb item show`/`rm`, `stat`, `related`, and the
 //! sync archive's `blob ls`/`cat` and `history`.
 //!
-//! Reads, except `item.rm`, which is held to the task-write rules (a client under file roots may not
-//! delete an item filed outside them, and a tasks.md line is held to its round trip).
+//! Reads, except `item.rm`, which is held to the file roots: a client under them may not delete an item
+//! filed outside them. (A deleted item leaves no line to judge, so there is no round trip to hold.)
 
 use std::path::Path;
 
@@ -234,12 +234,20 @@ const fn direction_name(d: edge::Direction) -> &'static str {
 /// The deepest `kb.related` walks.
 pub const MAX_RELATED_DEPTH: usize = 16;
 
+/// The most items one `kb.related` answer reads. The walk has no bound of its own, and a knowledge
+/// base whose documents, chunks and tasks are all connected reaches every item at depth 16.
+pub const MAX_RELATED_NODES: usize = 1000;
+
+/// How much of an item's body is read for its snippet, in bytes.
+const SNIPPET_SOURCE_BYTES: i64 = 4096;
+
 /// The longest snippet a related row carries, in characters: one past the 100 a listing shows, so the
 /// listing can still tell a longer line and mark the cut.
 const SNIPPET_CHARS: usize = 101;
 
 /// `kb.related`: the items reached from `uid` over `edges` (any type when empty), breadth-first up to
-/// `depth`, each once at its shortest depth, within `budget`.
+/// `depth`, each once at its shortest depth — the first [`MAX_RELATED_NODES`], within `budget`, each
+/// read without its body past its first [`SNIPPET_SOURCE_BYTES`].
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`], an unknown edge type or too deep a walk ([`ErrorCode::Invalid`]), or a
@@ -273,22 +281,43 @@ pub fn related(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let start = item::id_for_uid(conn, uid)?.ok_or_else(|| not_found(uid))?;
-    let hops = edge::walk(conn, start, &types, depth, direction.into())?;
-    let metas = item::get_many(conn, &hops.iter().map(|h| h.item).collect::<Vec<_>>())?;
+    let mut hops = edge::walk(conn, start, &types, depth, direction.into())?;
+    let cut = hops.len() > MAX_RELATED_NODES;
+    hops.truncate(MAX_RELATED_NODES);
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT uid, kind, status, resolution, substr(content, 1, ?2) FROM items WHERE id = ?1",
+        )
+        .map_err(jkb_core::Error::from)?;
     let mut out = Vec::new();
     for hop in hops {
-        let Some(meta) = metas.get(&hop.item) else {
+        let found = stmt
+            .query_row(
+                rusqlite::params![hop.item.get(), SNIPPET_SOURCE_BYTES],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(jkb_core::Error::from)?;
+        let Some((uid, kind, status, resolution, head)) = found else {
             continue;
         };
         let row = RelatedRow {
-            uid: meta.uid.clone(),
-            kind: meta.kind.clone(),
-            status: meta.status.clone(),
-            resolution: meta.resolution.clone(),
+            uid,
+            kind,
+            status,
+            resolution,
             depth: hop.depth,
             via: hop.via.as_str().to_owned(),
             direction: direction_name(hop.direction).to_owned(),
-            snippet: meta.content.as_deref().map(|c| {
+            snippet: head.as_deref().map(|c| {
                 item::first_nonblank(c)
                     .chars()
                     .take(SNIPPET_CHARS)
@@ -296,9 +325,13 @@ pub fn related(
             }),
         };
         if !budget.take(&row) {
-            break;
+            return Ok(out);
         }
         out.push(row);
+    }
+    if cut {
+        // Marked as the budget marks a cut, so the client says the answer is partial.
+        budget.exhaust();
     }
     Ok(out)
 }
@@ -357,15 +390,55 @@ pub fn blobs(
 /// The shortest hash prefix `kb.blob` takes.
 pub const MIN_BLOB_PREFIX: usize = 4;
 
+/// The largest blob `kb.blob` answers, in bytes: one answer, held whole in the daemon.
+pub const MAX_BLOB_TEXT_BYTES: i64 = 8 * 1024 * 1024;
+
 /// `kb.blob`: the text of the one blob whose hash starts with `prefix`.
 ///
-/// **Text only.** A blob that is not UTF-8 (a PDF an ingest archived) is refused: the answer is JSON,
-/// and the command that asks writes the bytes to a terminal.
+/// **Text only, and at most [`MAX_BLOB_TEXT_BYTES`].** The answer is JSON: a blob that is not UTF-8
+/// (a PDF an ingest archived) cannot be carried as text, and a larger one would be held whole in the
+/// daemon. `jkb blob cat` on the host reads either in-process ([`blob_bytes`]).
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`] for no match, [`ErrorCode::Invalid`] for a short, malformed or ambiguous
-/// prefix or a binary blob, or a failed read.
+/// prefix, a binary blob or a large one, or a failed read.
 pub fn blob_text(conn: &Connection, prefix: &str) -> Result<(String, String), ApiError> {
+    let hash = blob_hash(conn, prefix)?;
+    let size: i64 = conn
+        .prepare_cached("SELECT size FROM blobs WHERE hash = ?1")
+        .map_err(jkb_core::Error::from)?
+        .query_row([&hash], |r| r.get(0))
+        .map_err(jkb_core::Error::from)?;
+    if size > MAX_BLOB_TEXT_BYTES {
+        return Err(invalid(format!(
+            "blob `{hash}` is {size} bytes, more than one answer carries \
+             ({MAX_BLOB_TEXT_BYTES}); `jkb blob cat` it on the host"
+        )));
+    }
+    let (hash, bytes) = blob_bytes(conn, &hash)?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        invalid(format!(
+            "blob `{hash}` is not text; `jkb blob cat` it on the host"
+        ))
+    })?;
+    Ok((hash, text))
+}
+
+/// The bytes of the one blob whose hash starts with `prefix`, whatever they are — for a process holding
+/// the database, which writes them straight out.
+///
+/// # Errors
+/// As [`blob_text`], less the text and size refusals.
+pub fn blob_bytes(conn: &Connection, prefix: &str) -> Result<(String, Vec<u8>), ApiError> {
+    let hash = blob_hash(conn, prefix)?;
+    let bytes = blob::load(conn, &hash)?.ok_or_else(|| {
+        ApiError::with_code(ErrorCode::NotFound, format!("blob `{hash}` is gone"))
+    })?;
+    Ok((hash, bytes))
+}
+
+/// The full hash of the one blob whose hash starts with `prefix`.
+fn blob_hash(conn: &Connection, prefix: &str) -> Result<String, ApiError> {
     if prefix.len() < MIN_BLOB_PREFIX
         || prefix.len() > 64
         || !prefix.bytes().all(|b| b.is_ascii_hexdigit())
@@ -383,29 +456,16 @@ pub fn blob_text(conn: &Connection, prefix: &str) -> Result<(String, String), Ap
         .map_err(jkb_core::Error::from)?
         .collect::<rusqlite::Result<_>>()
         .map_err(jkb_core::Error::from)?;
-    let hash = match matches.as_slice() {
-        [one] => one.clone(),
-        [] => {
-            return Err(ApiError::with_code(
-                ErrorCode::NotFound,
-                format!("no blob with hash prefix `{prefix}`"),
-            ))
-        }
-        _ => {
-            return Err(invalid(format!(
-                "`{prefix}` matches more than one blob; use a longer prefix"
-            )))
-        }
-    };
-    let bytes = blob::load(conn, &hash)?.ok_or_else(|| {
-        ApiError::with_code(ErrorCode::NotFound, format!("blob `{hash}` is gone"))
-    })?;
-    let text = String::from_utf8(bytes).map_err(|_| {
-        invalid(format!(
-            "blob `{hash}` is not text; `jkb blob cat` it on the host"
-        ))
-    })?;
-    Ok((hash, text))
+    match matches.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(ApiError::with_code(
+            ErrorCode::NotFound,
+            format!("no blob with hash prefix `{prefix}`"),
+        )),
+        _ => Err(invalid(format!(
+            "`{prefix}` matches more than one blob; use a longer prefix"
+        ))),
+    }
 }
 
 /// One synced version of a file.

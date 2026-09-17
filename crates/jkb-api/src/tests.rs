@@ -345,7 +345,10 @@ fn samples() -> Vec<Request> {
             dead: vec!["box:1".into()],
         },
         Request::KbHealth {},
-        Request::TaskStaging { repo: "r".into() },
+        Request::TaskStaging {
+            repo: "r".into(),
+            all: false,
+        },
         Request::ItemShow {
             uid: "u".into(),
             preview: None,
@@ -1796,18 +1799,17 @@ fn the_task_writes_do_what_their_commands_did() {
 fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_roots() {
     // Driven by the one-sample-per-op list, not a list of its own: an op added later without the file
     // guard fails here, because `every_op_names_its_own_wire_tag_and_is_advertised` makes it add a
-    // sample first.
+    // sample first. Chosen by what a write names — a `task.*` op, or any write carrying a `uid`
+    // (`item.rm`, `inv.write`) — not by its prefix alone, which let a port under another name slip by.
     let (db, inside, outside, _managed) = mutate_fixture();
     let b = rooted(&db);
     let mut checked = 0;
     for request in samples() {
-        if !request.op().starts_with("task.")
-            || request.is_agent_read()
-            || MANY_TASK_WRITES.contains(&request.op())
-        {
+        let mut wire = serde_json::to_value(&request).unwrap();
+        let names_an_item = request.op().starts_with("task.") || wire.get("uid").is_some();
+        if !names_an_item || request.is_agent_read() || MANY_TASK_WRITES.contains(&request.op()) {
             continue;
         }
-        let mut wire = serde_json::to_value(&request).unwrap();
         if wire.get("uid").is_some() {
             wire["uid"] = json!(outside);
         }
@@ -1821,7 +1823,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 17, "every task write was asked");
+    assert_eq!(checked, 19, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {

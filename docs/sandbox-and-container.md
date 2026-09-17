@@ -718,7 +718,7 @@ The container follow-up bucket. Design in `.container/README.md`; the container 
   - *Which variant carries the host question.* `Liveness::Process` was host-qualified in round 3
     and `Liveness::Worktree` was not — same enum, same boundary. A host session claims as
     `session:<pid>:/Users/…`; in the container that path is absent, `try_exists` said `false`, and
-    `reclaim_dead` freed the claim of a session running on the host. The session id carries no
+    the reclaim freed the claim of a session running on the host. The session id carries no
     host, so the question is asked of the filesystem: **an absence is only proof where the place
     it would be is visible** — the parent directory must exist. That is the archive sweep's
     reachability rule, one level down, and it needs no change to an id format already in databases.

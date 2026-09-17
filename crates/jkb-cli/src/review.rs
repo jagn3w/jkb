@@ -257,9 +257,13 @@ struct WorkflowResult {
     /// not a clean review, and filing them as one would let the land gate pass unreviewed work.
     #[serde(default)]
     error: Option<String>,
-    /// How many reviewers read the change: none means nothing was reviewed, whatever the findings say.
+    /// How many reviewers were launched: none means nothing was reviewed.
     #[serde(default)]
     reviewers: Option<u64>,
+    /// How many of them came back. An empty result is only a clean review when one did: a run whose
+    /// reviewers all died also returns no findings.
+    #[serde(default)]
+    returned: Option<u64>,
     #[serde(default)]
     note: Option<String>,
 }
@@ -312,7 +316,21 @@ pub(crate) fn file_cmd(
         )
     })?;
     let why_not_run = result.error.clone().or_else(|| {
-        (result.reviewers == Some(0)).then(|| "no reviewer read the change".to_owned())
+        if result.reviewers == Some(0) {
+            return Some("no reviewer read the change".to_owned());
+        }
+        if !result.findings.is_empty() {
+            return None;
+        }
+        match result.returned {
+            Some(0) => Some("no reviewer returned".to_owned()),
+            Some(_) => None,
+            None => Some(
+                "it does not say whether any reviewer returned, so an empty result cannot be told \
+                 from a run whose reviewers all failed — update `.claude/workflows/code-review.js`"
+                    .to_owned(),
+            ),
+        }
     });
     if let Some(why) = why_not_run {
         anyhow::bail!(

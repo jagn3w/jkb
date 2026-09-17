@@ -184,6 +184,84 @@ fn blobs_are_listed_and_read_back_as_text() {
     }
 }
 
+/// A walk reaching more items than one answer reads is cut, and says so.
+#[test]
+fn a_related_walk_is_capped() {
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let hub = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:hub", "hub"))?;
+        for i in 0..=super::MAX_RELATED_NODES {
+            let uid = format!("task:n{i}");
+            let n = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new(&uid, "n"))?;
+            jkb_core::edge::link(c, m, hub, n, jkb_types::EdgeType::Informs, None)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    match call(
+        &b,
+        json!({ "op": "kb.related", "uid": "task:hub", "depth": 1 }),
+    )
+    .unwrap()
+    {
+        Response::Related { rows, truncated } => {
+            assert_eq!(rows.len(), super::MAX_RELATED_NODES);
+            assert!(truncated);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A blob larger than one answer is refused as text, and read whole in-process.
+#[test]
+fn a_large_blob_is_read_whole_only_in_process() {
+    let db = Db::open_in_memory().unwrap();
+    let big = vec![b'a'; usize::try_from(super::MAX_BLOB_TEXT_BYTES).unwrap() + 1];
+    let hash = jkb_core::blob::hash_bytes(&big);
+    let (h, bytes) = (hash.clone(), big.clone());
+    db.write_txn("t", move |c, _| jkb_core::blob::store(c, &h, &bytes, None))
+        .unwrap();
+    let b = LocalBackend::new(db.clone());
+    let e = call(&b, json!({ "op": "kb.blob", "prefix": &hash[..8] })).unwrap_err();
+    assert!(e.message.contains("more than one answer carries"), "{e:?}");
+    let prefix = hash[..8].to_owned();
+    let (full, read) = db
+        .read_with(move |c| super::blob_bytes(c, &prefix))
+        .unwrap();
+    assert_eq!((full, read.len()), (hash, big.len()));
+}
+
+/// Editing any item is bounded for a client of `jkb serve`; on the host only a task's body is.
+#[test]
+fn an_edit_is_bounded_for_a_task_and_for_any_client_item() {
+    let (db, ..) = crate::tests::mutate_fixture();
+    db.write_txn("t", |c, m| {
+        jkb_core::item::upsert(
+            c,
+            m,
+            &jkb_core::item::NewItem {
+                uid: "note:big".into(),
+                kind: "text".into(),
+                content: Some("x".into()),
+                content_hash: None,
+                mime: None,
+            },
+        )
+    })
+    .unwrap();
+    let big = "y".repeat(crate::tasks::MAX_CONTENT_BYTES + 1);
+    let host = LocalBackend::new(db.clone());
+    let edit = |b: &LocalBackend, uid: &str| {
+        call(b, json!({ "op": "task.edit", "uid": uid, "text": big }))
+    };
+    edit(&host, "note:big").expect("the host edits any item unbounded");
+    let e = edit(&crate::tests::rooted(&db), "note:big").unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    let task = add(&host, "a task");
+    assert_eq!(edit(&host, &task).unwrap_err().code, ErrorCode::Invalid);
+}
+
 /// A file's versions are found by the path the client names, re-rooted from the client's home.
 #[test]
 fn a_file_s_history_is_found_from_the_client_s_path() {
