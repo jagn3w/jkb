@@ -270,6 +270,41 @@ fn a_walk_counts_neighbours_not_edges() {
     }
 }
 
+/// Past the cap, a walk over neighbours of several edges each stops at the cap and says so.
+#[test]
+fn a_multi_edge_walk_is_capped() {
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let hub = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:hub", "hub"))?;
+        for i in 0..=super::MAX_RELATED_NODES {
+            let uid = format!("task:n{i}");
+            let n = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new(&uid, "n"))?;
+            for ty in [
+                jkb_types::EdgeType::References,
+                jkb_types::EdgeType::DerivedFrom,
+            ] {
+                jkb_core::edge::link(c, m, hub, n, ty, None)?;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    match call(
+        &LocalBackend::new(db),
+        json!({ "op": "kb.related", "uid": "task:hub", "depth": 1 }),
+    )
+    .unwrap()
+    {
+        Response::Related {
+            rows, at_node_cap, ..
+        } => {
+            assert_eq!(rows.len(), super::MAX_RELATED_NODES);
+            assert!(at_node_cap);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// A blob larger than one answer is refused as text, and read whole in-process.
 #[test]
 fn a_large_blob_is_read_whole_only_in_process() {

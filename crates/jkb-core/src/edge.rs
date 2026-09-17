@@ -312,7 +312,8 @@ pub fn evidence_edges(conn: &Connection, item: ItemId) -> Result<Vec<EvidenceEdg
     evidence_edges_limited(conn, item, usize::MAX)
 }
 
-/// [`evidence_edges`], the strongest `limit` only.
+/// [`evidence_edges`], the `limit` with the largest contribution either way — so a cut keeps the
+/// decisive contradictions as well as the decisive support — ordered as [`evidence_edges`] orders.
 ///
 /// # Errors
 /// As [`evidence_edges`].
@@ -325,13 +326,13 @@ pub fn evidence_edges_limited(
     // mean strongest *support* first, or `jkb inv evidence` leads with the most damaging
     // item under a heading that promises the opposite.
     let mut stmt = conn.prepare_cached(
-        "SELECT e.src_item_id, e.type, COALESCE(e.weight, 1.0)
-         FROM edges e
-         WHERE e.dst_item_id = ?1 AND e.type IN ('supports', 'contradicts')
-         ORDER BY (CASE e.type WHEN 'supports' THEN 1.0 ELSE -1.0 END
-                   * COALESCE(e.weight, 1.0)) DESC,
-                  e.src_item_id
-         LIMIT ?2",
+        "SELECT src, type, weight FROM (
+             SELECT e.src_item_id AS src, e.type AS type, COALESCE(e.weight, 1.0) AS weight
+             FROM edges e
+             WHERE e.dst_item_id = ?1 AND e.type IN ('supports', 'contradicts')
+             ORDER BY ABS(COALESCE(e.weight, 1.0)) DESC, e.src_item_id
+             LIMIT ?2)
+         ORDER BY (CASE type WHEN 'supports' THEN 1.0 ELSE -1.0 END * weight) DESC, src",
     )?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows = stmt.query_map(rusqlite::params![item.get(), limit], |r| {
@@ -435,13 +436,18 @@ pub fn walk_limited(
         let mut next = Vec::new();
         for node in frontier {
             for leg in legs {
-                // A node's edges are read a page at a time, each page as large as the walk could
-                // still use, until they run out: a hub item with a million edges costs about the
-                // limit, not its degree. Paged rather than cut by one LIMIT, because one neighbour
-                // can be several edges (one per type) — a cut by rows dropped neighbours unseen.
+                // A node's edges are read a page at a time, in id order through the (endpoint, id)
+                // indexes (V021), until they run out or the walk is full. Paged rather than cut by one
+                // LIMIT, because one neighbour can be several edges (one per type) and a cut by rows
+                // dropped neighbours unseen. A page holds what the walk can still use plus as many rows
+                // as it has seen, so edges to already-seen items rarely cost a page of their own; a hub
+                // whose edges all lead to seen items still costs its degree, read in index order.
                 let mut after = 0_i64;
                 loop {
-                    let page = limit.saturating_sub(out.len()).saturating_add(1);
+                    let page = limit
+                        .saturating_sub(out.len())
+                        .saturating_add(seen.len())
+                        .saturating_add(1);
                     let rows = neighbours(conn, node, types, *leg, after, page)?;
                     let Some((last, ..)) = rows.last() else { break };
                     after = *last;

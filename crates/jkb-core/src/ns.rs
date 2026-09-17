@@ -1061,6 +1061,14 @@ mod tests {
             .is_none());
     }
 
+    /// Every namespace the layout types by its fixed path is one a client may not move.
+    #[test]
+    fn every_reserved_type_path_is_fixed() {
+        for (path, _) in crate::nstype::RESERVED_TYPES {
+            assert!(super::is_fixed(path), "{path}");
+        }
+    }
+
     /// A type is **not** a location marker (design D33.5): nothing resolves "which namespace
     /// carries the `tasks` contract" to find the tasks root, so several namespaces may carry
     /// the same contract without one silently winning. `tasks/` is the tasks root because

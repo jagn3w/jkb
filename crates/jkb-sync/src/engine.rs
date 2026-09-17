@@ -845,6 +845,28 @@ pub fn tasks_mount_file(db: &Db, home_ns: &str) -> Result<Option<String>> {
 /// # Errors
 /// Returns an error if a read fails.
 pub fn filed_task_problem(conn: &Connection, item: ItemId) -> Result<Option<String>> {
+    problem_with(conn, item, &mut HashMap::new())
+}
+
+/// [`filed_task_problem`] for each of `items`, rendering each tasks.md they are filed in once: a
+/// caller judging many tasks of one file (a namespace move) otherwise renders the whole file per task.
+///
+/// # Errors
+/// Returns an error if a read fails.
+pub fn filed_task_problems(conn: &Connection, items: &[ItemId]) -> Result<Vec<Option<String>>> {
+    let mut docs = HashMap::new();
+    items
+        .iter()
+        .map(|item| problem_with(conn, *item, &mut docs))
+        .collect()
+}
+
+/// [`filed_task_problem`], with the files already rendered in `docs`.
+fn problem_with(
+    conn: &Connection,
+    item: ItemId,
+    docs: &mut HashMap<PathBuf, SyncDoc>,
+) -> Result<Option<String>> {
     if binding::serializer_for(conn, item)?.as_deref() != Some("tasks") {
         return Ok(None);
     }
@@ -882,7 +904,12 @@ pub fn filed_task_problem(conn: &Connection, item: ItemId) -> Result<Option<Stri
     let bare = file_uri(&path);
     let local = local_of(&bare, &bound.uri);
     let journal = sync_state::get(conn, &bare)?;
-    let kb = assemble_kb_doc(conn, &ctx, &path, &bare, journal.as_ref())?;
+    let kb = match docs.entry(path.clone()) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(assemble_kb_doc(conn, &ctx, &path, &bare, journal.as_ref())?)
+        }
+    };
     let Some(line) = kb.items.iter().find(|i| i.local_id == local) else {
         return Ok(None);
     };

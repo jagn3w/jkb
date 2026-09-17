@@ -10,7 +10,7 @@ use jkb_core::{ns, WriteMeta};
 use rusqlite::Connection;
 
 use crate::kb::Budget;
-use crate::tasks::{check_line, line_problem, ns_writable, writable_id, FileRoots};
+use crate::tasks::{ns_writable, writable_id, FileRoots};
 use crate::{ApiError, ErrorCode};
 
 /// `ns.list`: the child namespaces of `scope`, or the top-level ones, by path, within `budget`.
@@ -40,9 +40,19 @@ pub const MAX_MOVED_ITEMS: usize = 1000;
 /// The most namespaces a client's `ns.mv` may carry: each is a row rewritten and logged.
 pub const MAX_MOVED_NAMESPACES: usize = 1000;
 
-/// The most tasks filed in a tasks.md a client's `ns.mv` may carry: each one's line is checked by
-/// rendering its whole file, before the move and after.
+/// The most tasks filed in a tasks.md a client's `ns.mv` may carry: each one's line is checked, from
+/// its file rendered before the move and after.
 pub const MAX_MOVED_FILED: usize = 64;
+
+fn sync_problems(
+    conn: &Connection,
+    ids: &[jkb_types::ItemId],
+) -> Result<Vec<Option<String>>, ApiError> {
+    jkb_sync::filed_task_problems(conn, ids).map_err(|e| match e {
+        jkb_sync::Error::Core(e) => ApiError::from(e),
+        other => ApiError::with_code(ErrorCode::Internal, other.to_string()),
+    })
+}
 
 fn invalid(why: String) -> ApiError {
     ApiError::with_code(ErrorCode::Invalid, why)
@@ -113,24 +123,28 @@ pub fn mv(
             .query_row([id.get()], |r| r.get(0))
             .map_err(jkb_core::Error::from)?;
         writable_id(conn, *id, &uid, Some(roots))?;
-        if jkb_core::binding::get(conn, *id)?.is_some_and(|b| b.uri.starts_with("file://")) {
-            filed.push(uid);
+        if jkb_core::binding::serializer_for(conn, *id)?.as_deref() == Some("tasks") {
+            filed.push((*id, uid));
         }
     }
     if filed.len() > MAX_MOVED_FILED {
         return Err(invalid(format!(
-            "`{from_path}` holds more than {MAX_MOVED_FILED} items filed in a file, each of whose \
-             lines a client's move checks; move it on the host"
+            "`{from_path}` holds more than {MAX_MOVED_FILED} tasks filed in a tasks.md, each of \
+             whose lines a client's move checks; move it on the host"
         )));
     }
-    let mut lines = Vec::with_capacity(filed.len());
-    for uid in filed {
-        let before = line_problem(conn, &uid)?;
-        lines.push((uid, before));
-    }
+    // Each file rendered once before the move and once after, not once per task.
+    let filed_ids: Vec<_> = filed.iter().map(|(id, _)| *id).collect();
+    let before = sync_problems(conn, &filed_ids)?;
     let moved = ns::move_subtree(conn, meta, &from_path, &to_path)?;
-    for (uid, before) in lines {
-        check_line(conn, &uid, before.as_deref())?;
+    let after = sync_problems(conn, &filed_ids)?;
+    for (((_, uid), was), now) in filed.iter().zip(before).zip(after) {
+        if let (None, Some(problem)) = (was, now) {
+            return Err(invalid(format!(
+                "{uid} is written into a tasks.md, and its line would not come back from the file \
+                 as written: {problem}"
+            )));
+        }
     }
     Ok(moved)
 }

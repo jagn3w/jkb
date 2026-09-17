@@ -126,8 +126,9 @@ mod tests {
         // V017 the message queue (mq_topics, mq_messages, mq_groups),
         // V018 the notification record (notify_sessions),
         // V019 the Claude Code session registry (claude_sessions),
-        // V020 the worktree-removal records and the leases (worktree_removals, leases).
-        assert_eq!(user_version, 20);
+        // V020 the worktree-removal records and the leases (worktree_removals, leases),
+        // V021 the edge indexes a paged walk reads by.
+        assert_eq!(user_version, 21);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -291,7 +292,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 20);
+        assert_eq!(user_version, 21);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

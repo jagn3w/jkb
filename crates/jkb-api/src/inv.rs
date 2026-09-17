@@ -454,9 +454,13 @@ pub fn read(conn: &Connection, ask: &InvRead, budget: &mut Budget) -> Result<Inv
         }
         InvRead::Evidence { uid } => {
             let id = require_id(conn, uid)?;
+            // One more than the cap says whether it is cut; a cut list is read again at the cap, so
+            // what is dropped is chosen by magnitude, not by the signed order it is shown in.
             let mut edges = edge::evidence_edges_limited(conn, id, cap + 1)?;
             let at_node_cap = edges.len() > cap;
-            edges.truncate(cap);
+            if at_node_cap {
+                edges = edge::evidence_edges_limited(conn, id, cap)?;
+            }
             let mut rows = Vec::new();
             for e in &edges {
                 let Some((uid, _, _, _, snippet)) = crate::items::light_row(conn, e.src)? else {

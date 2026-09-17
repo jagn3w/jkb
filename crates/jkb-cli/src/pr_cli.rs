@@ -204,7 +204,14 @@ pub(crate) fn close_merged(
     // Finished tasks are left out by the op: the `post-merge` hook runs this on every `git pull`.
     let mut verdicts = Vec::new();
     for uid in kb.open_in_repo(&repo)? {
-        verdicts.push(close_one(kb, &ctx.root, &uid, dry_run)?);
+        // One task's failure — deleted while `gh` ran for the others, say — is that task's verdict,
+        // not the run's: the rest still close.
+        let verdict = close_one(kb, &ctx.root, &uid, dry_run).unwrap_or_else(|e| CloseVerdict {
+            uid: uid.clone(),
+            pr: None,
+            held: Some(format!("{e:#}")),
+        });
+        verdicts.push(verdict);
     }
     report(&verdicts, dry_run, json);
     Ok(())
@@ -214,7 +221,7 @@ pub(crate) fn close_merged(
 /// landed. The decision is the lifecycle's (`observed_landed`, whose guard requires the merge
 /// **proven** and no open subtasks); this gathers the facts.
 fn close_one(kb: &Kb<'_>, root: &Path, uid: &str, dry_run: bool) -> Result<CloseVerdict> {
-    let facts = kb.pr_facts(uid)?;
+    let mut facts = kb.pr_facts(uid)?;
     // Held, not failed: one task this client may not write must not stop the rest closing.
     if !facts.writable {
         return Ok(CloseVerdict {
@@ -250,7 +257,11 @@ fn close_one(kb: &Kb<'_>, root: &Path, uid: &str, dry_run: bool) -> Result<Close
         let number = match facts.pr {
             Some(n) => Some(n),
             None => match discover_quietly(kb, root, &facts)? {
-                Ok(found) => found,
+                Ok(found) => {
+                    // Recorded just now, so the history the op compares against says so.
+                    facts.pr = found;
+                    found
+                }
                 Err(why) => {
                     return Ok(CloseVerdict {
                         uid: facts.uid,

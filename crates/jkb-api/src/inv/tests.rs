@@ -201,3 +201,61 @@ fn a_rooted_investigation_write_stays_inside_its_roots() {
     )
     .is_err());
 }
+
+/// An evidence list past the cap keeps the largest contributions of either sign, and says it was cut.
+#[test]
+fn an_evidence_list_is_capped_by_magnitude() {
+    let db = Db::open_in_memory().unwrap();
+    let cap = crate::items::MAX_RELATED_NODES;
+    db.write_txn("t", move |c, m| {
+        let h = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("note:h", "h"))?;
+        for i in 0..cap {
+            let s = jkb_core::task::create(
+                c,
+                m,
+                &jkb_core::task::NewTask::new(format!("note:s{i}"), "weak"),
+            )?;
+            jkb_core::edge::link_weighted(
+                c,
+                m,
+                s,
+                h,
+                jkb_types::EdgeType::Supports,
+                Some(0.1),
+                None,
+            )?;
+        }
+        let k = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("note:k", "decisive"))?;
+        jkb_core::edge::link_weighted(
+            c,
+            m,
+            k,
+            h,
+            jkb_types::EdgeType::Contradicts,
+            Some(10.0),
+            None,
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    match inv(
+        &b,
+        json!({ "op": "inv.read", "read": "evidence", "uid": "note:h" }),
+    )
+    .unwrap()
+    {
+        super::InvAnswer::Evidence {
+            edges, at_node_cap, ..
+        } => {
+            assert!(at_node_cap);
+            assert_eq!(edges.len(), cap);
+            assert_eq!(
+                edges.last().unwrap().uid,
+                "note:k",
+                "the contradiction is kept, last"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
