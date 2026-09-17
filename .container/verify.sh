@@ -778,7 +778,7 @@ if ! declared_env="$(dc_container_env "$cfg_path" "$cfg_root" 2>/dev/null)"; the
 elif [ -z "$declared_env" ]; then
     note "container.json declares no containerEnv (asserting nothing about the environment)"
 else
-    env_missing=""; env_wrong=""; env_n=0
+    env_missing=""; env_wrong=""; env_armed=""; env_n=0
     while IFS= read -r decl; do
         [ -n "$decl" ] || continue
         env_n=$((env_n+1))
@@ -786,6 +786,11 @@ else
         # `printenv` rather than `[ -z "${!k}" ]`: an empty declared value is a legitimate
         # declaration, and indirect expansion cannot tell it from an unset name.
         if ! got="$(printenv "$k")"; then env_missing="$env_missing $k"
+        elif [ "$k" = JKB_EGRESS_ACCEPT_UNFILTERED ] && [ "$got" = 1 ]; then
+            # The documented escape (D50.6) is armed at `docker run`, which is the only way to arm
+            # it: an ACCEPTED failure, like the disarmed boot gate it causes, or a container run
+            # with the override exits 1 and is told to fix the condition it chose.
+            env_armed="$env_armed $k(=$got, declared $want)"
         elif [ "$got" != "$want" ]; then env_wrong="$env_wrong $k(=$got, declared $want)"
         fi
     done <<<"$declared_env"
@@ -796,8 +801,12 @@ else
         # an override set at `docker run` beats containerEnv silently. Reported as a difference
         # rather than as an absence, because those have different causes and different repairs.
         bad "container.json's environment reached this container with different values:$env_wrong — something overrode the declaration at run time"
-    else
+    elif [ -z "$env_armed" ]; then
         ok "every declared environment entry reached this container ($env_n checked)"
+    fi
+    # Reported beside a real difference as well as alone, so arming the override never hides one.
+    if [ -n "$env_armed" ]; then
+        accept_bad "container.json's environment reached this container with different values:$env_armed — the egress override was armed at run time"
     fi
 fi
 
