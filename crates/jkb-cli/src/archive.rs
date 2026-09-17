@@ -4565,7 +4565,9 @@ mod tests {
     #[test]
     fn removable_says_yes_for_an_ordinary_non_empty_directory() {
         let t = tempfile::tempdir().expect("tempdir");
-        let d = t.path().join("d");
+        // Canonical: the probe walks without following a link, and on macOS the temp dir is under
+        // `/var`, a link to `/private/var` — so the uncanonical path is refused, not probed.
+        let d = t.path().canonicalize().expect("canonical").join("d");
         fs::create_dir_all(d.join("inner")).expect("mk");
         assert!(
             removable(&d).is_ok(),
