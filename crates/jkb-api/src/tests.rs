@@ -398,6 +398,10 @@ fn samples() -> Vec<Request> {
         Request::TaskCloseMerged {
             uid: "u".into(),
             merged: super::prs::Merged::Unknown,
+            observed: super::prs::Observed {
+                live_landing: false,
+                resumed_at: None,
+            },
             pr: None,
             dry_run: true,
         },
@@ -1856,6 +1860,10 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
             Response::TaskState { state } => assert_eq!(state.writable, writable, "{uid}"),
             other => panic!("{other:?}"),
         }
+        match call(&b, json!({ "op": "task.pr_facts", "uid": uid })).unwrap() {
+            Response::PrFacts { facts } => assert_eq!(facts.writable, writable, "{uid}"),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
@@ -2208,7 +2216,8 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         json!({ "op": "task.claim", "uid": inside, "owner": "box:4" }),
         json!({ "op": "task.reclaim", "dead": ["box:4"] }),
         json!({ "op": "task.pr_record", "uid": inside, "number": 12 }),
-        json!({ "op": "task.close_merged", "uid": inside, "merged": "unknown", "dry_run": true }),
+        json!({ "op": "task.close_merged", "uid": inside, "merged": "unknown", "dry_run": true,
+                "observed": { "live_landing": false } }),
     ];
     // Every task write the wire accepts is here; `task.add` checks the task it makes, below.
     let mut covered: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();

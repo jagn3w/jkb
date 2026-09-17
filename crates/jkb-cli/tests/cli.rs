@@ -3911,8 +3911,15 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
     assert_eq!(v["ns"], "memory/proj/bug2", "{v}");
 
     // A namespace moved from the container moves on the host.
-    let moved = remote(&["ns", "mv", "memory/proj/bug2", "memory/proj/bug3"], &client_repo);
-    assert!(moved.status.success(), "{}", String::from_utf8_lossy(&moved.stderr));
+    let moved = remote(
+        &["ns", "mv", "memory/proj/bug2", "memory/proj/bug3"],
+        &client_repo,
+    );
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
     assert!(host_ok(&["ns", "ls", "memory/proj"], &root).contains("memory/proj/bug3"));
 
     // The ambient scope was applied through the daemon, not dropped: inside the repo `task next`

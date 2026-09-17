@@ -249,7 +249,7 @@ impl<'a> Ops<'a> {
     /// `jkb ns ls [scope]`.
     fn ns_ls(&self, scope: Option<String>) -> Result<()> {
         let paths = match self.call(Request::NsList { scope })? {
-            Response::Namespaces { paths } => paths,
+            Response::Namespaces { paths, .. } => paths,
             other => return unexpected("ns.list", &other),
         };
         if self.json {
@@ -307,6 +307,16 @@ impl<'a> Ops<'a> {
             )),
             Response::Related {
                 at_node_cap: true, ..
+            }
+            | Response::Inv {
+                answer:
+                    jkb_api::inv::InvAnswer::Units {
+                        at_node_cap: true, ..
+                    }
+                    | jkb_api::inv::InvAnswer::Evidence {
+                        at_node_cap: true, ..
+                    },
+                ..
             } => Some(format!(
                 "jkb: this walk stopped at {} items — lower --depth, or name the --edge types",
                 jkb_api::items::MAX_RELATED_NODES
@@ -1108,6 +1118,27 @@ mod tests {
                     children: Vec::new(),
                     truncated: true,
                 },
+                // Depth 3 asks for a node-cap cut, as `tree` does.
+                Request::KbRelated { depth, .. } => Response::Related {
+                    rows: Vec::new(),
+                    truncated: depth != 3,
+                    at_node_cap: depth == 3,
+                },
+                Request::InvRead(ask) => Response::Inv {
+                    answer: jkb_api::inv::InvAnswer::Units {
+                        units: Vec::new(),
+                        at_node_cap: matches!(ask, jkb_api::inv::InvRead::Retread { depth: 3, .. }),
+                    },
+                    truncated: !matches!(ask, jkb_api::inv::InvRead::Retread { depth: 3, .. }),
+                },
+                Request::NsList { .. } => Response::Namespaces {
+                    paths: Vec::new(),
+                    truncated: true,
+                },
+                Request::KbBlobs { .. } => Response::Blobs {
+                    blobs: Vec::new(),
+                    truncated: true,
+                },
                 other => {
                     return Err(ApiError::bad_request(format!(
                         "not scripted: {}",
@@ -1135,6 +1166,12 @@ mod tests {
             vec!["task", "show", "t"],
             vec!["task", "subtasks", "t"],
             vec!["task", "why", "t"],
+            vec!["related", "u"],
+            vec!["related", "u", "--depth", "3"],
+            vec!["inv", "frontier", "memory/x"],
+            vec!["inv", "retread", "u", "--depth", "3"],
+            vec!["ns", "ls"],
+            vec!["blob", "ls"],
         ] {
             for remote in [true, false] {
                 let cli = Cli::try_parse_from(std::iter::once("jkb").chain(args.iter().copied()))
@@ -1145,14 +1182,14 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{args:?}: {e:#}"));
                 let notices = reads.notices.borrow();
                 assert_eq!(notices.len(), 1, "{args:?} (remote {remote}): {notices:?}");
-                let node_cap = args == ["tree", "--depth", "3"];
+                let node_cap = args.ends_with(&["--depth", "3"]);
                 assert_eq!(
                     notices[0].contains("run it on the host"),
                     remote && !node_cap,
                     "{args:?}: only the daemon's budget is lifted by running it on the host"
                 );
                 assert_eq!(
-                    notices[0].contains("nodes"),
+                    notices[0].contains("stopped at"),
                     node_cap,
                     "{args:?}: {notices:?}"
                 );

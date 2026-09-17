@@ -11,6 +11,7 @@ use jkb_fsm::Fact;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::kb::Budget;
 use crate::sessions::check_name;
 use crate::tasks::{no_item, writable, FileRoots};
 use crate::{ApiError, ErrorCode};
@@ -69,20 +70,36 @@ pub fn facts(
     })
 }
 
-/// `task.open_in_repo`: the uids of the repo's (`repo=`) tasks that are not finished, in id order.
+/// `task.open_in_repo`: the uids of the repo's (`repo=`) tasks that are not finished, in id order,
+/// within `budget`.
 ///
 /// # Errors
 /// [`ErrorCode::Invalid`] for a malformed repo key, or a failed read.
-pub fn open_in_repo(conn: &Connection, repo: &str) -> Result<Vec<String>, ApiError> {
+pub fn open_in_repo(
+    conn: &Connection,
+    repo: &str,
+    budget: &mut Budget,
+) -> Result<Vec<String>, ApiError> {
     check_name("repo key", repo)?;
-    let ids = jkb_core::location::tasks_in_repo(repo).evaluate(conn)?;
-    let metas = item::get_many(conn, &ids)?;
-    Ok(ids
-        .iter()
-        .filter_map(|id| metas.get(id))
-        .filter(|m| !jkb_types::TaskStatus::is_terminal_str(m.status.as_deref()))
-        .map(|m| m.uid.clone())
-        .collect())
+    // Uid and status only: the post-merge hook asks this on every `git pull`, over every task the
+    // repo has ever had.
+    let mut row = conn
+        .prepare_cached("SELECT uid, status FROM items WHERE id = ?1")
+        .map_err(jkb_core::Error::from)?;
+    let mut out = Vec::new();
+    for id in jkb_core::location::tasks_in_repo(repo).evaluate(conn)? {
+        let (uid, status): (String, Option<String>) = row
+            .query_row([id.get()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(jkb_core::Error::from)?;
+        if jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
+            continue;
+        }
+        if !budget.take(&uid) {
+            break;
+        }
+        out.push(uid);
+    }
+    Ok(out)
 }
 
 fn check_number(number: i64) -> Result<(), ApiError> {
@@ -119,6 +136,32 @@ pub fn record(
     Ok(())
 }
 
+/// What the client read of a task's landing before it asked `gh` — compared again in
+/// `task.close_merged`'s transaction, so a task put back to work while `gh` ran is not closed on a
+/// merge that no longer speaks for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observed {
+    /// [`PrFacts::live_landing`], as read.
+    pub live_landing: bool,
+    /// [`PrFacts::resumed_at`], as read.
+    #[serde(default)]
+    pub resumed_at: Option<String>,
+}
+
+/// What `task.close_merged` is asked, beside the task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseAsk {
+    /// Whether the client established that the work merged.
+    pub merged: Merged,
+    /// The landing history it judged that from.
+    pub observed: Observed,
+    /// The pull request that proved it.
+    pub pr: Option<i64>,
+    /// Judge only.
+    pub dry_run: bool,
+}
+
 /// Whether the client established that the work merged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,8 +195,9 @@ impl From<Fact> for Merged {
 }
 
 /// `task.close_merged`: ask the lifecycle for `observed_landed` with `merged` as the landing fact —
-/// judged only, without writing, when `dry_run`. The status is read in the op's transaction, so a
-/// task cancelled while the client asked `gh` is not overwritten. The reason it was held, if it was.
+/// judged only, without writing, when `dry_run`. The status and the landing history are read in the
+/// op's transaction: a task cancelled, or put back to work (`observed` no longer matching), while the
+/// client asked `gh` is held rather than closed. The reason it was held, if it was.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`] under `roots`, or a failed write.
@@ -161,15 +205,30 @@ pub fn close_merged(
     conn: &Connection,
     meta: &WriteMeta,
     reference: &str,
-    merged: Merged,
-    pr: Option<i64>,
-    dry_run: bool,
+    ask: &CloseAsk,
     roots: Option<&FileRoots>,
 ) -> Result<Option<String>, ApiError> {
+    let CloseAsk {
+        merged,
+        observed,
+        pr,
+        dry_run,
+    } = ask;
+    let (merged, pr, dry_run) = (*merged, *pr, *dry_run);
     if let Some(n) = pr {
         check_number(n)?;
     }
     let id = writable(conn, reference, roots)?;
+    let landing = transition::landing(conn, id)?;
+    if landing.live().is_some() != observed.live_landing
+        || landing.resumed_at() != observed.resumed_at.as_deref()
+    {
+        return Ok(Some(
+            "its landing history changed while the merge was being checked; run close-merged \
+             again"
+                .to_owned(),
+        ));
+    }
     let facts = lifecycle::TaskFacts {
         landed_elsewhere: merged.into(),
         ..task::observe(conn, id)?

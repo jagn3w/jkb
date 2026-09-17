@@ -702,6 +702,8 @@ pub enum Request {
         uid: String,
         /// Whether the client established that it merged.
         merged: prs::Merged,
+        /// The landing history the client judged it from.
+        observed: prs::Observed,
         /// The pull request that proved it.
         #[serde(default)]
         pr: Option<i64>,
@@ -1688,11 +1690,17 @@ pub enum Response {
     Uids {
         /// The tasks.
         uids: Vec<String>,
+        /// Cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// An `ns.list`.
     Namespaces {
         /// The paths.
         paths: Vec<String>,
+        /// Cut short at the read's budget.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// An `ns.mv`.
     Moved {
@@ -1729,6 +1737,8 @@ impl Response {
             | Self::Task { truncated, .. }
             | Self::StagingTasks { truncated, .. }
             | Self::Inv { truncated, .. }
+            | Self::Namespaces { truncated, .. }
+            | Self::Uids { truncated, .. }
             | Self::Related { truncated, .. }
             | Self::Blobs { truncated, .. }
             | Self::Versions { truncated, .. }
@@ -1774,9 +1784,7 @@ impl Response {
             | Self::Health { .. }
             | Self::Claims { .. }
             | Self::PrFacts { .. }
-            | Self::Uids { .. }
             | Self::Closed { .. }
-            | Self::Namespaces { .. }
             | Self::Moved { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
@@ -2782,9 +2790,13 @@ impl Backend for LocalBackend {
                     facts: db.read_with(move |c| prs::facts(c, &uid, roots.as_ref()))?,
                 }
             }
-            Request::TaskOpenInRepo { repo } => Response::Uids {
-                uids: db.read_with(move |c| prs::open_in_repo(c, &repo))?,
-            },
+            Request::TaskOpenInRepo { repo } => {
+                let (uids, truncated) = db.read_with(move |c| {
+                    let uids = prs::open_in_repo(c, &repo, &mut budget)?;
+                    Ok::<_, ApiError>((uids, budget.exhausted()))
+                })?;
+                Response::Uids { uids, truncated }
+            }
             Request::TaskPrRecord { uid, number } => {
                 let roots = self.file_roots.clone();
                 task_write(db, actor, uid, move |c, m, uid| {
@@ -2795,19 +2807,30 @@ impl Backend for LocalBackend {
             Request::TaskCloseMerged {
                 uid,
                 merged,
+                observed,
                 pr,
                 dry_run,
             } => {
                 let roots = self.file_roots.clone();
+                let ask = prs::CloseAsk {
+                    merged,
+                    observed,
+                    pr,
+                    dry_run,
+                };
                 Response::Closed {
                     refusal: task_write(db, actor, uid, move |c, m, uid| {
-                        prs::close_merged(c, m, uid, merged, pr, dry_run, roots.as_ref())
+                        prs::close_merged(c, m, uid, &ask, roots.as_ref())
                     })?,
                 }
             }
-            Request::NsList { scope } => Response::Namespaces {
-                paths: db.read_with(move |c| namespaces::list(c, scope.as_deref()))?,
-            },
+            Request::NsList { scope } => {
+                let (paths, truncated) = db.read_with(move |c| {
+                    let paths = namespaces::list(c, scope.as_deref(), &mut budget)?;
+                    Ok::<_, ApiError>((paths, budget.exhausted()))
+                })?;
+                Response::Namespaces { paths, truncated }
+            }
             Request::NsMv { from, to } => {
                 let roots = self.file_roots.clone();
                 Response::Moved {

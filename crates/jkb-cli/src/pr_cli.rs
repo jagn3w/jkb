@@ -29,7 +29,14 @@ impl Kb<'_> {
         match self.call(Request::TaskOpenInRepo {
             repo: repo.to_owned(),
         })? {
-            Response::Uids { uids } => Ok(uids),
+            Response::Uids { uids, truncated } => {
+                anyhow::ensure!(
+                    !truncated,
+                    "{repo} has more unfinished tasks than one answer through `jkb serve` carries; \
+                     run `jkb task close-merged` on the host"
+                );
+                Ok(uids)
+            }
             other => unexpected("task.open_in_repo", &other),
         }
     }
@@ -48,14 +55,18 @@ impl Kb<'_> {
     /// `task.close_merged`: why the task was held, if it was.
     fn close_merged(
         &self,
-        uid: &str,
+        facts: &PrFacts,
         merged: Fact,
         pr: Option<i64>,
         dry_run: bool,
     ) -> Result<Option<String>> {
         match self.call(Request::TaskCloseMerged {
-            uid: uid.to_owned(),
+            uid: facts.uid.clone(),
             merged: Merged::from(merged),
+            observed: jkb_api::prs::Observed {
+                live_landing: facts.live_landing,
+                resumed_at: facts.resumed_at.clone(),
+            },
             pr,
             dry_run,
         })? {
@@ -253,7 +264,7 @@ fn close_one(kb: &Kb<'_>, root: &Path, uid: &str, dry_run: bool) -> Result<Close
         (number, merged, why.map(with_context))
     };
     // The status is read in the op's transaction, so a task cancelled while `gh` ran is not closed.
-    let refusal = kb.close_merged(&facts.uid, merged, number, dry_run)?;
+    let refusal = kb.close_merged(&facts, merged, number, dry_run)?;
     let held = refusal.map(|r| match &why {
         Some(w) => format!("{r} ({w})"),
         None => r,

@@ -319,8 +319,9 @@ pub fn first_nonblank(content: &str) -> &str {
 }
 
 /// The first non-blank line of `content` in at most `max` characters, a cut one ending in `…` — the
-/// one-line snippet listings print. The one copy: the CLI renders with it, and the ops that send a
-/// snippet cut it with it, so a line is never cut twice to two different lengths.
+/// one-line snippet `related`, `inv` and the CLI's one-line reports print. The ops that send one cut it
+/// with this and the CLI renders with it, so such a line is never cut twice to two lengths. (The
+/// listing rows of `kb.*` keep their own 80-character snippet, which the explorer parses.)
 #[must_use]
 pub fn snippet(content: &str, max: usize) -> String {
     let line = first_nonblank(content);

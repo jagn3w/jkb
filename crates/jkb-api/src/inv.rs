@@ -456,20 +456,25 @@ pub fn read(conn: &Connection, ask: &InvRead, budget: &mut Budget) -> Result<Inv
             let mut edges = edge::evidence_edges(conn, id)?;
             let at_node_cap = edges.len() > cap;
             edges.truncate(cap);
-            let metas = item::get_many(conn, &edges.iter().map(|e| e.src).collect::<Vec<_>>())?;
+            let mut rows = Vec::new();
+            for e in &edges {
+                let Some((uid, _, _, _, snippet)) = crate::items::light_row(conn, e.src)? else {
+                    continue;
+                };
+                let row = Evidence {
+                    edge: e.edge_type.as_str().to_owned(),
+                    uid,
+                    contribution: e.contribution,
+                    snippet,
+                };
+                if !budget.take(&row) {
+                    break;
+                }
+                rows.push(row);
+            }
             InvAnswer::Evidence {
                 balance: edge::evidence_for(conn, id)?,
-                edges: within(
-                    edges.iter().filter_map(|e| {
-                        metas.get(&e.src).map(|m| Evidence {
-                            edge: e.edge_type.as_str().to_owned(),
-                            uid: m.uid.clone(),
-                            contribution: e.contribution,
-                            snippet: snippet(m.content.as_deref()),
-                        })
-                    }),
-                    budget,
-                ),
+                edges: rows,
                 at_node_cap,
             }
         }

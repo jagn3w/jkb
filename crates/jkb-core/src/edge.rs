@@ -415,7 +415,11 @@ pub fn walk_limited(
     for hop in 1..=depth {
         let mut next = Vec::new();
         for node in frontier {
-            for (neighbour, edge_type, dir) in neighbours(conn, node, types, direction)? {
+            // A node's edges are read only as far as the walk could still use them: each one read is
+            // either new or already seen, so `room` rows are enough. A hub item with a million edges
+            // then costs no more than the limit.
+            let room = limit.saturating_sub(out.len()).saturating_add(seen.len());
+            for (neighbour, edge_type, dir) in neighbours(conn, node, types, direction, room)? {
                 if !seen.insert(neighbour.get()) {
                     continue;
                 }
@@ -439,12 +443,14 @@ pub fn walk_limited(
     Ok((out, false))
 }
 
-/// The direct neighbours of `node` in `direction`, restricted to `types` (empty = any).
+/// The direct neighbours of `node` in `direction`, restricted to `types` (empty = any), at most `limit`
+/// per leg.
 fn neighbours(
     conn: &Connection,
     node: ItemId,
     types: &[EdgeType],
     direction: Direction,
+    limit: usize,
 ) -> Result<Vec<(ItemId, EdgeType, Direction)>> {
     let type_filter = if types.is_empty() {
         String::new()
@@ -466,10 +472,11 @@ fn neighbours(
         };
         let sql = format!(
             "SELECT {to_col}, type FROM edges
-             WHERE {from_col} = ?{type_filter} ORDER BY id"
+             WHERE {from_col} = ?{type_filter} ORDER BY id LIMIT ?"
         );
         let mut params: Vec<SqlValue> = vec![SqlValue::Integer(node.get())];
         params.extend(types.iter().map(|t| SqlValue::Text(t.as_str().to_owned())));
+        params.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
         let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
             Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))

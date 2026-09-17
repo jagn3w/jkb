@@ -110,11 +110,11 @@ routinely built from different checkouts.
 | `inv.read` | `read`: `ls` \| `type` {`ns`} \| `frontier` {`ns`, `all?`, `limit?`} \| `core` {`ns`} \| `tombstones` {`ns`} \| `retread` {`uid`, `depth` (≤16)} \| `evidence` {`uid`} \| `digest` {`ns`} | `inv` {`answer`: tagged `answer` — `list`, `type` {`source?`, `type_name?`}, `units`, `tombstones`, `evidence`, `digest`} — budgeted; `retread` walks and `evidence` lists at most 1000 (`at_node_cap`); units carry a 100-character snippet, never their body; a strategy's verbs and kinds are looked up by the client from `type` |
 | `inv.write` | `write`: `new` \| `digest` \| `rollup` \| `do` \| `add` \| `link` \| `promise` \| `resolve` \| `reopen` \| `stale` (the `jkb inv` verbs' fields; at most 64 edges and 64 tags) | `inv` {`answer`} — refused under the file roots when the namespace's nearest mount is a file mount outside them, or a named unit is filed outside them; a task's line is held to its round trip |
 | `task.pr_facts` | `uid` | `pr_facts` {`uid`, `pr?`, `branch?`, `live_landing`, `superseded?`, `resumed_at?`, `writable`} |
-| `task.open_in_repo` | `repo` | `uids` {`uids`} — the repo's unfinished tasks |
-| `task.pr_record` | `uid`, `number` (> 0) | `applied` — a `note` in the task's history |
-| `task.close_merged` | `uid`, `merged` (`yes`\|`no`\|`unknown`, the client's `gh` answer), `pr?`, `dry_run?` | `closed` {`refusal?`} — `observed_landed`, judged in the op's transaction |
-| `ns.list` | `scope?` | `namespaces` {`paths`} |
-| `ns.mv` | `from`, `to` | `moved` {`count`} — refused under the file roots unless every mount at, above or below the subtree and every item in it is inside them; each task's line is held to its round trip |
+| `task.open_in_repo` | `repo` (≤255 bytes) | `uids` {`uids`, `truncated`} — the repo's unfinished tasks, uid and status read only (budgeted) |
+| `task.pr_record` | `uid`, `number` (> 0) | `applied` — a `note` in the task's history; refused under the file roots for a task filed outside them, and held to its line's round trip |
+| `task.close_merged` | `uid`, `merged` (`yes`\|`no`\|`unknown`, the client's `gh` answer), `observed` {`live_landing`, `resumed_at?`} (the history it judged from), `pr?`, `dry_run?` | `closed` {`refusal?`} — `observed_landed`, judged in the op's transaction; held if the history no longer matches `observed`; refused under the file roots like `pr_record` |
+| `ns.list` | `scope?` | `namespaces` {`paths`, `truncated`} (budgeted) |
+| `ns.mv` | `from`, `to` | `moved` {`count`} — under the file roots only: refused for a reserved namespace (`_sys/…`, `tasks`), past 1000 items or 1000 namespaces, unless every mount at, above or below the subtree and every item in it is inside the roots, and when a task's line would not come back; on the host, the core's move alone |
 | `kb.history` | `path` (absolute, the client's), `home?` (the client's `$HOME`, re-rooted to the host's as `kb.ambient` does) | `versions` {`uri`, `versions` [{`ts`, `blob`, `status`}], `truncated`} (budgeted) |
 | `task.abandon` | `uid`, `observed?` (the claim read before the git work) | `abandoned` {`released`, `reopened`, `status`} — `released` is false only when someone else holds the task |
 | `repo.gate` | `repo` | `gate` {`gate?`} — read-only: no op stores a gate |
@@ -186,8 +186,8 @@ Two decisions in it:
   priority, due date, tags, out-of-file placements, in-file dependencies — rendered alone and parsed
   back, and a write that makes a readable line come back different is refused, naming the first field
   that fails on its own. A line that was already unreadable does not block later writes: writers outside
-  the typed operations do not ask the file (the MCP server's `task_update`, `jkb ns mv`, `jkb tag
-  rename`; the session verbs' ops do, since S6.4), and refusing every write after one of them left the task
+  the typed operations do not ask the file (the MCP server's `task_update`, `jkb ns mv` on the host, `jkb tag
+  rename`; the session verbs' ops and a client's `ns.mv` do, since S6.4), and refusing every write after one of them left the task
   unable to be released. Except a write that moves the task to another line (`task.bind`), which is
   judged as a new line: excused by the old line's problem, a bind from an unreadable line onto another
   task's `#id` put two tasks on one line, and the next export dropped one. Checking only the text let `task set --due "2026-07-15 17:00"`, a tag value or a

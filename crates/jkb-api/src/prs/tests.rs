@@ -62,14 +62,14 @@ fn a_task_closes_on_a_merge_its_client_established() {
     assert_eq!(e.code, ErrorCode::Invalid);
 
     match call(&b, json!({ "op": "task.open_in_repo", "repo": "proj" })).unwrap() {
-        Response::Uids { uids } => assert_eq!(uids, vec![uid.clone()]),
+        Response::Uids { uids, .. } => assert_eq!(uids, vec![uid.clone()]),
         other => panic!("{other:?}"),
     }
 
     let close = |merged: &str, dry_run: bool| match call(
         &b,
         json!({ "op": "task.close_merged", "uid": uid, "merged": merged, "pr": 31,
-                "dry_run": dry_run }),
+                "dry_run": dry_run, "observed": { "live_landing": false } }),
     )
     .unwrap()
     {
@@ -83,10 +83,23 @@ fn a_task_closes_on_a_merge_its_client_established() {
     assert_eq!(status(&b, &uid), "in_progress");
     assert_eq!(close("yes", true), None, "the dry run would close it");
     assert_eq!(status(&b, &uid), "in_progress", "and wrote nothing");
+    // A history that moved since the client read it holds the task.
+    let e = match call(
+        &b,
+        json!({ "op": "task.close_merged", "uid": uid, "merged": "yes", "pr": 31,
+                "observed": { "live_landing": true } }),
+    )
+    .unwrap()
+    {
+        Response::Closed { refusal } => refusal,
+        other => panic!("{other:?}"),
+    };
+    assert!(e.is_some_and(|r| r.contains("history changed")));
+    assert_eq!(status(&b, &uid), "in_progress");
     assert_eq!(close("yes", false), None);
     assert_eq!(status(&b, &uid), "done");
     match call(&b, json!({ "op": "task.open_in_repo", "repo": "proj" })).unwrap() {
-        Response::Uids { uids } => assert!(uids.is_empty()),
+        Response::Uids { uids, .. } => assert!(uids.is_empty()),
         other => panic!("{other:?}"),
     }
 }

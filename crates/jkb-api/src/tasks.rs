@@ -769,7 +769,7 @@ pub fn line_problem(conn: &Connection, reference: &str) -> Result<Option<String>
 /// bound `#Fix_Login`, reached the file as a line the next import read back as a different task.
 ///
 /// Only a write that makes a readable line unreadable is refused (`before` is the problem the line had
-/// already). Writers outside the typed operations — the MCP server's `task_update`, `jkb ns mv`, `jkb tag
+/// already). Writers outside the typed operations — the MCP server's `task_update`, `jkb ns mv` on the host, `jkb tag
 /// rename` — do not ask the file, and refusing every later write to a line
 /// one of them had broken left the task unable even to be released. A write that takes the offending
 /// value away passes, like any other. The exception is a write that moves the task to another line

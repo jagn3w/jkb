@@ -238,13 +238,47 @@ pub const MAX_RELATED_DEPTH: usize = 16;
 /// base whose documents, chunks and tasks are all connected reaches every item at depth 16.
 pub const MAX_RELATED_NODES: usize = 1000;
 
-/// How much of an item's body is read for its snippet, in bytes.
-const SNIPPET_SOURCE_BYTES: i64 = 4096;
+/// How much of an item's body is read for its snippet, in characters.
+const SNIPPET_SOURCE_CHARS: i64 = 4096;
+
+/// A light item row: uid, kind, status, resolution and snippet.
+type LightRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// An item's light row, reading no more of its body than a snippet needs; `None` for a missing item.
+pub(crate) fn light_row(
+    conn: &Connection,
+    id: jkb_types::ItemId,
+) -> Result<Option<LightRow>, ApiError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT uid, kind, status, resolution, substr(content, 1, ?2) FROM items WHERE id = ?1",
+        )
+        .map_err(jkb_core::Error::from)?;
+    Ok(stmt
+        .query_row(rusqlite::params![id.get(), SNIPPET_SOURCE_CHARS], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?
+                    .map(|c| item::snippet(&c, item::SNIPPET_CHARS)),
+            ))
+        })
+        .optional()
+        .map_err(jkb_core::Error::from)?)
+}
 
 /// `kb.related`: the items reached from `uid` over `edges` (any type when empty), breadth-first up to
 /// `depth`, each once at its shortest depth — the walk stopped at [`MAX_RELATED_NODES`], which the
 /// second value reports, and the answer within `budget`, each item read without its body past its
-/// first [`SNIPPET_SOURCE_BYTES`].
+/// first [`SNIPPET_SOURCE_CHARS`].
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`], an unknown edge type or too deep a walk ([`ErrorCode::Invalid`]), or a
@@ -286,29 +320,9 @@ pub fn related(
         direction.into(),
         MAX_RELATED_NODES,
     )?;
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT uid, kind, status, resolution, substr(content, 1, ?2) FROM items WHERE id = ?1",
-        )
-        .map_err(jkb_core::Error::from)?;
     let mut out = Vec::new();
     for hop in hops {
-        let found = stmt
-            .query_row(
-                rusqlite::params![hop.item.get(), SNIPPET_SOURCE_BYTES],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(jkb_core::Error::from)?;
-        let Some((uid, kind, status, resolution, head)) = found else {
+        let Some((uid, kind, status, resolution, snippet)) = light_row(conn, hop.item)? else {
             continue;
         };
         let row = RelatedRow {
@@ -319,9 +333,7 @@ pub fn related(
             depth: hop.depth,
             via: hop.via.as_str().to_owned(),
             direction: direction_name(hop.direction).to_owned(),
-            snippet: head
-                .as_deref()
-                .map(|c| item::snippet(c, item::SNIPPET_CHARS)),
+            snippet,
         };
         if !budget.take(&row) {
             return Ok((out, cut));
