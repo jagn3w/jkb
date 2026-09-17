@@ -80,9 +80,15 @@ Only after the work is complete and verified:
   `^<local_id>` in the source file (`<abs-path>` from the uid), then reconcile so the KB
   status follows:
 
+  On the host:
+
   ```sh
   jkb sync            # reconciles every mount; or `jkb sync <mount-root-ns>` for just one
   ```
+
+  In the dev container (`JKB_REMOTE` set) `jkb sync` is refused — it runs only on the host. The
+  host's sync watcher reconciles the edit on its own; confirm with `jkb task show <uid>` after a few
+  seconds, and if the status has not followed, ask the user to run `jkb sync` on the host.
 
 - **Managed task (no backing file):** close it on the CLI, which is audited and undoable:
 
