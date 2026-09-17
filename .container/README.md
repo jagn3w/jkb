@@ -759,7 +759,9 @@ are already there through the host's own sync — and recreate it on the host. T
 with `docker volume rm jkb-kb-local` once the new container is up. The installed `jkb` must be from
 the cutover or later (setup.sh reinstalls it on a rebuild): an older one reads the bare
 `host:port` as a URL scheme and every command fails — `verify.sh` asks the installed binary through
-the daemon for that reason.
+the daemon for that reason. **Unmutated, stated:** that probe and the `--db` refusal probe beside it
+have not been watched failing — `mutate-verify.sh`'s containers have no `jkb` installed and no
+daemon, so both are skipped there.
 
 The original decision was to share `~/.jkb/jkb.db` across the bind, and it was reversed because sharing it corrupts it.
 SQLite's WAL mode needs every process to share two things: POSIX advisory locks on the database

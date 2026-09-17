@@ -1262,8 +1262,11 @@ else
     fi
     # ...and the installed jkb is in remote mode: it refuses to name a database at all. Asked without
     # the daemon, which this check must not need (mutate-verify.sh's containers have none).
+    # Only with JKB_REMOTE set and JKB_DB unset (asserted above; `env -u` besides): otherwise this jkb
+    # is not in remote mode, and the probe would open a database rather than be refused.
     kb_remote=no
-    if ! kb_out="$(jkb --db "$kb_probe_dir/remote.db" ns ls 2>&1)" \
+    if [ -n "${JKB_REMOTE:-}" ] \
+        && ! kb_out="$(env -u JKB_DB jkb --db "$kb_probe_dir/remote.db" ns ls 2>&1)" \
         && grep -q "refused with JKB_REMOTE set" <<<"$kb_out" \
         && [ ! -e "$kb_probe_dir/remote.db" ]; then
         kb_remote=yes
@@ -1414,8 +1417,18 @@ else
             # before `JKB_REMOTE` accepted bare host:port reads the address as a URL scheme and fails
             # every command, while the `--db` refusal above passes on it. A read no database is needed
             # for, as setup.sh's activation asks it.
-            if command -v jkb >/dev/null 2>&1; then
-                if jkb_answer="$(jkb --json mq topic ls 2>&1)"; then
+            # Never without JKB_REMOTE: this jkb would then open the database behind the bind — the
+            # host's live one, on a native-Linux engine where nothing refuses it. And JKB_REMOTE must
+            # name the address curl just reached: the firewall's opening is the IMAGE's, the variable
+            # the checkout's, and after a port change without a rebuild they differ — which a
+            # reinstall of jkb does not fix.
+            jkb_remote_at="${JKB_REMOTE:-}"; jkb_remote_at="${jkb_remote_at#http://}"; jkb_remote_at="${jkb_remote_at%/}"
+            if [ -z "$jkb_remote_at" ] || ! command -v jkb >/dev/null 2>&1; then
+                :   # asserted above: remote mode unset fails there, no jkb is a note there
+            elif [ "$jkb_remote_at" != "$daemon_at" ]; then
+                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ./.container/run.sh --rm && ./.container/run.sh --build"
+            else
+                if jkb_answer="$(env -u JKB_DB jkb --json mq topic ls 2>&1)"; then
                     ok "the installed jkb reaches jkb serve through JKB_REMOTE"
                 else
                     $dm_bad "the installed jkb cannot reach jkb serve through JKB_REMOTE=${JKB_REMOTE:-unset} although curl can — rebuild it (setup.sh): $(head -c 300 <<<"$jkb_answer")"

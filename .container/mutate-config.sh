@@ -385,6 +385,12 @@ run "the retired knowledge base volume comes back at another path" "still mounts
 seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' '"JKB_REMOTE": "host.docker.internal:7117", "JKB_VERIFY_NO_DAEMON": "1",'
 run "the real container waives the daemon check" "sets JKB_VERIFY_NO_DAEMON"
 
+seed; jq_dc '.runArgs += ["--env", "JKB_VERIFY_NO_DAEMON=1"]'
+run "the launcher waives the daemon check" "runArgs set JKB_VERIFY_NO_DAEMON"
+
+seed; printf '\nENV JKB_VERIFY_NO_DAEMON=1\n' >> "$work/t/.container/Dockerfile"
+run "the image waives the daemon check" "Dockerfile sets JKB_VERIFY_NO_DAEMON"
+
 seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -971,7 +977,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=90
+PINNED_BAD_SITES=92
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

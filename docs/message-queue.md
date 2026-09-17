@@ -593,8 +593,10 @@ then (`JKB_DB` on the `jkb-kb-local` volume) is gone. Decided with the user (202
 nothing the container's agents use is refused — the session verbs above all, since `jkb task work`
 makes the worktrees agents run in. What still is refused and named by an agent command is
 `mount`/`sync` (host-only): `/jkb-review-log` files findings with `task review file` instead, and
-`/next-task` and `/design-pass` leave a file-backed task's edit to the host's sync watcher — the
-cutover lands together with those command changes. `.container/README.md` records the path and what
+`/next-task` and `/design-pass` leave a file-backed task's edit to the host's sync watcher. Those
+command changes live under `.claude/`, which an agent cannot write, so they are a patch the user
+applies; **the cutover must not merge before that patch does** (`jkb commands install` embeds the
+same files, so a binary built without it hands out the refused workflow too). `.container/README.md` records the path and what
 checks it.
 
 The table is an exhaustive `match` (`crates/jkb-cli/src/remote.rs`), so a new subcommand does not

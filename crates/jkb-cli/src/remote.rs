@@ -160,11 +160,13 @@ pub fn target() -> Option<String> {
     target_from(std::env::var(REMOTE_VAR).ok())
 }
 
-/// The variable that switches remote mode on. Spelled once: `.container/check-config.sh` reads the
-/// name from this line and holds `container.json`'s `containerEnv` to it, because a rename here with
-/// the config left behind puts every `jkb` in the container back on a database of its own — or, since
+/// The variable that switches remote mode on. `.container/check-config.sh` reads the name from this
+/// line and holds `container.json`'s `containerEnv` to it, because a rename here with the config
+/// left behind puts every `jkb` in the container back on a database of its own — or, since
 /// the cutover dropped that database, on none — silently. The notification hook's address drifted
-/// that way once, as `JKB_DAEMON_URL` in the code and nothing in the config.
+/// that way once, as `JKB_DAEMON_URL` in the code and nothing in the config. It is not the only
+/// spelling: the refusal messages below, `scripts/lib.sh`'s activation probe and its stub test name
+/// `JKB_REMOTE` literally, and a rename must change them too.
 pub const REMOTE_VAR: &str = "JKB_REMOTE";
 
 fn target_from(value: Option<String>) -> Option<String> {
@@ -186,7 +188,11 @@ fn target_from(value: Option<String>) -> Option<String> {
 /// the host's own loopback.
 #[must_use]
 pub fn daemon_url() -> String {
-    target().unwrap_or_else(|| format!("http://{}", jkb_daemon::DEFAULT_ADDR))
+    daemon_url_from(target())
+}
+
+fn daemon_url_from(target: Option<String>) -> String {
+    target.unwrap_or_else(|| format!("http://{}", jkb_daemon::DEFAULT_ADDR))
 }
 
 /// The file whose recent modification means the daemon at `url` was just unreachable, shared by
@@ -332,7 +338,7 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use super::{port_of, subcommand_name, support, target_from, Support};
+    use super::{daemon_url_from, port_of, subcommand_name, support, target_from, Support};
     use crate::Cli;
 
     #[test]
@@ -370,6 +376,16 @@ mod tests {
         assert_eq!(target_from(s(" c:2 ")).as_deref(), Some("http://c:2"));
         assert_eq!(target_from(s("  ")), None, "an empty setting is no setting");
         assert_eq!(target_from(None), None);
+        assert_eq!(
+            daemon_url_from(target_from(s("c:2"))),
+            "http://c:2",
+            "the hook posts where remote mode would"
+        );
+        assert_eq!(
+            daemon_url_from(target_from(None)),
+            format!("http://{}", jkb_daemon::DEFAULT_ADDR),
+            "no remote mode: this host's own daemon"
+        );
     }
 
     fn parse(args: &[&str]) -> Cli {
