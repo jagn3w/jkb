@@ -2996,7 +2996,7 @@ fn notify_needs_no_database() {
     assert_cmd::Command::from_std(jkb(&not_a_db))
         .args(["notify", "hook"])
         .env("HOME", dir.path())
-        .env("JKB_DAEMON_ADDR", closed.to_string())
+        .env("JKB_REMOTE", closed.to_string())
         .write_stdin(r#"{"hook_event_name":"Stop","session_id":"s1"}"#)
         .assert()
         .success()
@@ -3072,14 +3072,14 @@ fn notify_hook_request(
     (seen.join().unwrap(), dir)
 }
 
-/// The hook finds the daemon where the environment says — `JKB_DAEMON_ADDR`, which is how the dev
-/// container points it at the host — and presents the token from `~/.jkb/daemon/<port>/token`. Checked
+/// The hook finds the daemon where the environment says — `JKB_REMOTE` as bare `host:port`, which is
+/// how the dev container points it at the host — and presents the token from `~/.jkb/daemon/<port>/token`. Checked
 /// through the real binary against a listener that records the request, since a hook that looked
 /// anywhere else would fail just as silently as one that found nothing.
 #[test]
 fn notify_hook_sends_to_the_daemon_the_environment_names() {
     let (request, home) = notify_hook_request(&[], &|addr| {
-        vec![("JKB_DAEMON_ADDR".to_owned(), addr.to_owned())]
+        vec![("JKB_REMOTE".to_owned(), addr.to_owned())]
     });
     assert!(request.starts_with("POST /v1/op "), "{request}");
     assert!(

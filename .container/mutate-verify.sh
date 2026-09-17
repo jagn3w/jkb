@@ -123,7 +123,11 @@ mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 # from the host would need root.
 chmod 0777 "$scratch/jkb"
 printf '{}' > "$scratch/home/settings.json"
-BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb)
+# JKB_VERIFY_NO_DAEMON: the scratch ~/.jkb has no daemon token and there is no host daemon behind
+# these containers, which since the cutover (tasks S6.5) verify.sh fails unless it is told so. A
+# mutation below drops it and watches that failure fire.
+BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb
+      -e JKB_VERIFY_NO_DAEMON=1)
 # A mutation is CAUGHT only when verify.sh both FAILS and says why. Matching the label alone was
 # useless: `assert()` prints the same text on the ok and FAIL paths, so `grep "not a host mount"`
 # matched `ok  ~/.claude is the container's own, not a host mount` — two of five mutations
@@ -539,7 +543,16 @@ run "runs as a user the declaration does not name" "container.json declares remo
 # at `docker run` beats containerEnv silently), and subtracting the flag would test a container
 # nobody starts.
 run "a declared environment entry is overridden at run time" "reached this container with different values" \
-    "${HEALTHY[@]}" --env JKB_DB=/tmp/not-the-declared-path
+    "${HEALTHY[@]}" --env JKB_REMOTE=host.docker.internal:7118
+
+# REMOTE MODE (tasks S6.5). A database named at run time, remote mode switched off, and a container
+# with no daemon token and no statement that none is expected.
+run "the container is given a database of its own at run time" "JKB_DB is not set" \
+    "${HEALTHY[@]}" --env JKB_DB=/tmp/jkb.db
+run "remote mode is switched off at run time" "JKB_REMOTE names the host daemon" \
+    "${HEALTHY[@]}" --env JKB_REMOTE=
+without 'JKB_VERIFY_NO_DAEMON'
+run "no daemon token, and a daemon is expected" "there is no daemon token" "${MUT[@]}"
 
 # The nested-bind exception must not be usable as a general one. A `--declare` naming anything
 # OUTSIDE every declared target is the shape that would turn it into a hole — `/host` is the

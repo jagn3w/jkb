@@ -82,9 +82,11 @@ contradicted N7 and the pinned test, and was not built.
 **Bounded and silent.** 200 ms to connect, 1 s per request (`RemoteBackend::with_deadlines`, pinned
 against a daemon that accepts and never answers), nothing on stdout, and every failure appended to
 `~/.jkb/logs/notify-hook.log`, which is moved aside to `.log.1` at 256 KiB so a daemon that stays down
-cannot fill the disk. The address is `JKB_REMOTE` if set, else `JKB_DAEMON_ADDR` (the dev container
-sets it to `host.docker.internal:7117`; `.container/check-config.sh` reads that variable's name out of
-`remote.rs` and holds the value to the firewall's opening), else `jkb serve`'s default loopback. The
+cannot fill the disk. The address is remote mode's, `JKB_REMOTE`, if set (the dev container sets it
+to `host.docker.internal:7117`; `.container/check-config.sh` reads that variable's name out of
+`remote.rs` and holds the value to the firewall's opening), else `jkb serve`'s default loopback. Until
+the container's cutover to remote mode (tasks S6.5) the hook had its own variable, `JKB_DAEMON_ADDR`,
+because the container was not yet in remote mode; one variable now names the daemon for both. The
 token is `~/.jkb/daemon/<port>/token`, **keyed by what a client knows** — the daemon's address, never
 its database: beside the database, a host set up with `--db` wrote it where no client looked, and one
 path per home let a second daemon on another port overwrite the first's live token. `jkb serve`

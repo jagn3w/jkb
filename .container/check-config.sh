@@ -323,7 +323,7 @@ fi
 # than by a build dying inside a container.
 # EVERY named volume's target must be pre-created in the Dockerfile, not just CARGO_TARGET_DIR's.
 # The rule was checked for that one path, and the next volume added (jkb-kb-local, for the
-# container-local knowledge base) skipped it: Docker created it root-owned and `jkb` could not
+# container-local knowledge base, since retired) skipped it: Docker created it root-owned and `jkb` could not
 # create its database. A rule checked for one call site is a rule the next one forgets.
 precreated="$(awk '/^RUN mkdir -p /{on=1} on{print} on&&!/\\$/{on=0}' "$here/Dockerfile" \
     | tr ' \\' '\n\n' | grep '^/' | sort -u)"
@@ -617,24 +617,43 @@ else
     bad "the devcontainer.metadata label does not set portsAttributes.\"${fw_port:-?}\".onAutoForward to ignore — VS Code would auto-forward the daemon port and take the host's 127.0.0.1:${fw_port:-?} from com.jkb.serve"
 fi
 
-# 5. The notification hook is told the address the firewall opens. `jkb notify hook` reaches the
-#    daemon at JKB_DAEMON_ADDR and, without it, at the container's OWN loopback — where nothing listens,
-#    so every notification from in here is lost with nothing on screen to say so (the hook is silent
-#    by design). Held to the same two constants the firewall reads, not to a copy of them — and the
-#    variable's NAME is read out of the binary's source, because it drifted once (JKB_DAEMON_URL in
+# 5. The container is in remote mode, at the address the firewall opens (tasks S6.5). Every `jkb` in
+#    here and the notification hook reach the daemon through REMOTE_VAR; without it the hook looks
+#    on the container's OWN loopback — where nothing listens, so every notification is lost with
+#    nothing on screen to say so — and every other command opens a database of its own. Held to
+#    the same two constants the firewall reads, not to a copy of them — and the variable's NAME is
+#    read out of the binary's source, because the hook's address drifted once (JKB_DAEMON_URL in
 #    the code, nothing in the config) with every check here green.
 dc_env="$(dc_container_env "$here/container.json" "$repo_top" 2>/dev/null)" || dc_env=""
-addr_var="$(grep -oE 'pub const DAEMON_ADDR_VAR: &str = "[A-Z_]+"' "$repo_top/crates/jkb-cli/src/remote.rs" 2>/dev/null \
+remote_var="$(grep -oE 'pub const REMOTE_VAR: &str = "[A-Z_]+"' "$repo_top/crates/jkb-cli/src/remote.rs" 2>/dev/null \
     | head -1 | sed 's/.*"\([A-Z_]*\)"/\1/')"
-daemon_addr="$( [ -n "$addr_var" ] && sed -n "s/^$addr_var=//p" <<<"$dc_env" | head -1)"
-if [ -z "$addr_var" ]; then
-    bad "could not read DAEMON_ADDR_VAR from crates/jkb-cli/src/remote.rs — the check that the container names the daemon in the variable the hook reads is checking nothing"
+daemon_addr="$( [ -n "$remote_var" ] && sed -n "s/^$remote_var=//p" <<<"$dc_env" | head -1)"
+if [ -z "$remote_var" ]; then
+    bad "could not read REMOTE_VAR from crates/jkb-cli/src/remote.rs — the check that the container is in remote mode is checking nothing"
 elif [ -z "$daemon_addr" ]; then
-    bad "container.json's containerEnv sets no $addr_var (the variable jkb notify hook reads) — the notification hook would look for jkb serve on the container's own loopback and every notification from the container would be lost"
+    bad "container.json's containerEnv sets no $remote_var (the variable that switches remote mode on) — jkb in the container would open a database of its own, and the notification hook would look for jkb serve on the container's own loopback"
 elif [ "$daemon_addr" != "${fw_host:-?}:${fw_port:-?}" ]; then
-    bad "container.json's $addr_var is $daemon_addr but the firewall opens ${fw_host:-<unread>}:${fw_port:-<unread>} (egress-lib.sh) — the notification hook would be refused"
+    bad "container.json's $remote_var is $daemon_addr but the firewall opens ${fw_host:-<unread>}:${fw_port:-<unread>} (egress-lib.sh) — every jkb command and notification would be refused"
 else
-    ok "the notification hook is pointed at the address the firewall opens ($daemon_addr)"
+    ok "remote mode is pointed at the address the firewall opens ($daemon_addr)"
+fi
+
+# 6. ...and nothing gives it a database of its own. Remote mode refuses JKB_DB outright, so one left
+#    in containerEnv fails every command; and a volume at the old container-local KB's path keeps a
+#    second knowledge base alive for anything that is not jkb to write into.
+if grep -q '^JKB_DB=' <<<"$dc_env"; then
+    bad "container.json's containerEnv sets JKB_DB — remote mode refuses every jkb command with JKB_DB set, and the container must not name a database"
+elif [ -z "$dc_env" ]; then
+    bad "container.json's containerEnv parsed to nothing — the JKB_DB check above saw no environment"
+else
+    ok "the container names no database of its own (no JKB_DB)"
+fi
+# By source name AND by target: a renamed volume at the old path is the same second database.
+if grep -q '^jkb-kb-local|' <<<"$(dc_mount_sources "$here/container.json")" \
+    || grep -qx '/home/vscode/.local/state/jkb' <<<"$mount_targets"; then
+    bad "container.json still mounts the container-local knowledge base (jkb-kb-local, or a mount at /home/vscode/.local/state/jkb) — it was retired at the cutover (tasks S6.5)"
+else
+    ok "the retired container-local knowledge base volume is not mounted"
 fi
 
 # THE PROBE LOOKS FOR THE RULE THE RAISE INSTALLS. init-firewall.sh installs the chain with

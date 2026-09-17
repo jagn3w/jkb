@@ -1210,17 +1210,23 @@ while IFS= read -r m; do
 done <<<"$actual"
 assert "knowledge base is mounted" "$kb_mounted"
 
-# The container's OWN database (JKB_DB) must be writable by this user, and must not sit on the
-# host bind. Both failed silently once: the jkb-kb-local volume came up root-owned, so every `jkb`
-# verb died creating the database, and before that JKB_DB pointed through the ~/.jkb bind at the
-# host's database, which a process on each kernel corrupts (.container/sqlite-share-probe.py).
-kb_dir="$(dirname "${JKB_DB:-/nonexistent/jkb.db}")"
-assert "JKB_DB's directory ($kb_dir) is writable by $(id -un)" \
-    "$([ -d "$kb_dir" ] && [ -w "$kb_dir" ] && echo yes || echo no)"
-# Asked of the INSTALLED jkb, not of a third copy of the filesystem rule: jkb-core refuses a database
-# on a filesystem shared with another kernel and any `file:` URI (crates/jkb-core/src/shared_fs.rs).
-# A binary built before a given refusal still opens the host's database from in here — a review
-# measured one — so the binary itself is asked.
+# REMOTE MODE, NOT A DATABASE OF ITS OWN (tasks S6.5). The container reaches the knowledge base only
+# through jkb serve on the host. It had its own once — JKB_DB on the jkb-kb-local volume, which
+# came up root-owned the first time so every `jkb` verb died creating it — and before that JKB_DB
+# pointed through the ~/.jkb bind at the host's database, which a process on each kernel corrupts
+# (.container/sqlite-share-probe.py). Both are gone; what is left to hold is that nothing brought
+# either back. Remote mode refuses JKB_DB outright, so one set here fails every command anyway —
+# asserted by name so the failure says why.
+assert "JKB_REMOTE names the host daemon (${JKB_REMOTE:-unset})" \
+    "$([ -n "${JKB_REMOTE:-}" ] && echo yes || echo no)"
+assert "JKB_DB is not set (the container has no database of its own)" \
+    "$([ -z "${JKB_DB:-}" ] && echo yes || echo no)"
+# Behind remote mode, jkb-core's own refusals. Asked of the INSTALLED jkb, not of a third copy of
+# the filesystem rule: jkb-core refuses a database on a filesystem shared with another kernel and
+# any `file:` URI (crates/jkb-core/src/shared_fs.rs). A binary built before a given refusal still
+# opens the host's database from in here — a review measured one — so the binary itself is asked.
+# Those two probes run with remote mode off for that one process (`env -u JKB_REMOTE`): with it on,
+# `--db` is refused before jkb-core sees the path, and they would pass testing nothing.
 #
 # Two things are conditional, and each for a stated reason:
 #   - no `jkb` on PATH is a NOTE: the image does not install one (setup.sh does), and the mutation
@@ -1235,7 +1241,7 @@ if ! command -v jkb >/dev/null 2>&1; then
     note "no jkb installed here, so the installed-binary refusal checks did not run (setup.sh installs it)"
 else
     kb_uri_refused=no
-    if ! kb_out="$(jkb --db "file:$kb_probe_dir/uri.db" ns ls 2>&1)" \
+    if ! kb_out="$(env -u JKB_REMOTE jkb --db "file:$kb_probe_dir/uri.db" ns ls 2>&1)" \
         && grep -q "never \`file:\` URIs" <<<"$kb_out"; then
         kb_uri_refused=yes
     fi
@@ -1245,7 +1251,7 @@ else
     kb_kind="$(bash -c '. "$1" && shared_fs_kind "$2"' _ "$kb_lib" "$kb_magic" 2>/dev/null || true)"
     if [ -n "$kb_kind" ]; then
         kb_refused=no
-        if ! kb_out="$(jkb --db "$kb_probe_dir/jkb.db" ns ls 2>&1)" \
+        if ! kb_out="$(env -u JKB_REMOTE jkb --db "$kb_probe_dir/jkb.db" ns ls 2>&1)" \
             && grep -q "refusing to open a database" <<<"$kb_out" \
             && [ ! -e "$kb_probe_dir/jkb.db" ]; then
             kb_refused=yes
@@ -1254,8 +1260,15 @@ else
     else
         note "the ~/.jkb bind is not a shared filesystem here (magic ${kb_magic:-unreadable}), so there is nothing for jkb to refuse on it"
     fi
-    assert "the installed jkb opens JKB_DB (${JKB_DB:-unset})" \
-        "$([ -n "${JKB_DB:-}" ] && jkb ns ls >/dev/null 2>&1 && echo yes || echo no)"
+    # ...and the installed jkb is in remote mode: it refuses to name a database at all. Asked without
+    # the daemon, which this check must not need (mutate-verify.sh's containers have none).
+    kb_remote=no
+    if ! kb_out="$(jkb --db "$kb_probe_dir/remote.db" ns ls 2>&1)" \
+        && grep -q "refused with JKB_REMOTE set" <<<"$kb_out" \
+        && [ ! -e "$kb_probe_dir/remote.db" ]; then
+        kb_remote=yes
+    fi
+    assert "the installed jkb is in remote mode and refuses to open a database (rebuild it if not: setup.sh)" "$kb_remote"
 fi
 rm -rf -- "$kb_probe_dir" "$PWD/file:"
 
@@ -1376,16 +1389,18 @@ esac
 # The header goes through a file descriptor so the token is never in this process's argv.
 # Keyed by the daemon's port (`~/.jkb/daemon/<port>/token`), which is how a client finds it.
 daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb/daemon/${daemon_at##*:}/token}"
-# NO TOKEN IS A NOTE, NOT A FAILURE, for as long as nothing in here depends on the daemon: until the
-# cutover (tasks S6) the container's jkb uses its own database, so a host that never ran setup.sh is
-# not a broken container. It is also what mutate-verify.sh's scratch ~/.jkb and the CI runner look
-# like — neither has a host daemon — and the kernel's answer above is still asserted there.
+# NO TOKEN IS A FAILURE since the cutover (tasks S6.5): every jkb command in here goes to the daemon,
+# so a container that cannot authenticate to it has no knowledge base at all. The one exception is
+# a harness that builds a correct container with no host daemon behind it — mutate-verify.sh's
+# scratch ~/.jkb, a CI runner — which says so with JKB_VERIFY_NO_DAEMON=1; the kernel's answer
+# above is still asserted there. A NOTE then, never silence.
 #
-# ABSENT, not unreadable. A token that EXISTS is a host that installed the daemon; one this user
-# cannot read (a uid mismatch across the bind) means remote mode cannot authenticate either, which
-# is a failure, not a daemon nobody asked.
-if [ ! -e "$daemon_token" ]; then
-    note "there is no daemon token at $daemon_token, so jkb serve on the host was not asked — run ./scripts/setup.sh on the host to install com.jkb.serve"
+# ABSENT, not unreadable. A token that exists but this user cannot read (a uid mismatch across the
+# bind) is a failure either way: remote mode cannot authenticate.
+if [ ! -e "$daemon_token" ] && [ "${JKB_VERIFY_NO_DAEMON:-0}" = 1 ]; then
+    note "there is no daemon token at $daemon_token and JKB_VERIFY_NO_DAEMON=1 says no host daemon is expected, so jkb serve was not asked"
+elif [ ! -e "$daemon_token" ]; then
+    bad "there is no daemon token at $daemon_token, so no jkb command in this container can reach the knowledge base — run ./scripts/setup.sh on the host to install com.jkb.serve"
 elif [ ! -r "$daemon_token" ]; then
     bad "the daemon token at $daemon_token exists but this user cannot read it, so remote mode could not authenticate to jkb serve on the host ($(stat -c '%U:%G %a' "$daemon_token" 2>/dev/null || echo 'owner unreadable'))"
 else

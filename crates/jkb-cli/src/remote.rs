@@ -1,6 +1,6 @@
 //! Remote mode: `jkb` in a process that must not open a database (design r3.2 H2).
 //!
-//! Set `JKB_REMOTE=http://<host>:<port>` and every command either reaches the knowledge base through
+//! Set `JKB_REMOTE=http://<host>:<port>` (or bare `<host>:<port>`) and every command either reaches the knowledge base through
 //! `jkb serve` or is refused — before it has done anything. It is for the dev container, because a
 //! process on the container's kernel opening the host's `jkb.db` corrupts it — but the container
 //! does not set it yet: that waits for the cutover (tasks S6), since remote mode refuses `JKB_DB` and
@@ -151,39 +151,42 @@ pub const fn support(command: &Command) -> Support {
     }
 }
 
-/// The daemon address from `JKB_REMOTE`, if remote mode is on.
+/// The daemon address from [`REMOTE_VAR`], if remote mode is on, as a URL. `host:port` with no
+/// scheme is taken as `http://host:port` — the shape of `jkb serve --addr`, and the one the dev
+/// container sets, because `.container/container.json`'s comment stripper (`lib.sh` `dc_strip`)
+/// cannot tell a URL's `//` from a comment.
 #[must_use]
 pub fn target() -> Option<String> {
-    std::env::var("JKB_REMOTE")
-        .ok()
+    target_from(std::env::var(REMOTE_VAR).ok())
+}
+
+/// The variable that switches remote mode on. Spelled once: `.container/check-config.sh` reads the
+/// name from this line and holds `container.json`'s `containerEnv` to it, because a rename here with
+/// the config left behind puts every `jkb` in the container back on a database of its own — or, since
+/// the cutover dropped that database, on none — silently. The notification hook's address drifted
+/// that way once, as `JKB_DAEMON_URL` in the code and nothing in the config.
+pub const REMOTE_VAR: &str = "JKB_REMOTE";
+
+fn target_from(value: Option<String>) -> Option<String> {
+    value
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
+        .map(|v| {
+            if v.contains("://") {
+                v
+            } else {
+                format!("http://{v}")
+            }
+        })
 }
 
 /// Where `jkb serve` is, for a process that talks to it without being in remote mode — the
-/// notification hook, which never opens a database in any mode. `JKB_REMOTE` when set; else
-/// [`DAEMON_ADDR_VAR`] (`host:port`, the shape of `jkb serve --addr`), which the dev container sets to
-/// the host (`.container/container.json`, checked against the firewall's opening by
-/// `.container/check-config.sh`); else the address `jkb serve` binds by default, the host's own
-/// loopback.
+/// notification hook, which never opens a database in any mode: remote mode's daemon when
+/// [`REMOTE_VAR`] is set (the dev container's case), else the address `jkb serve` binds by default,
+/// the host's own loopback.
 #[must_use]
 pub fn daemon_url() -> String {
-    daemon_url_from(target(), std::env::var(DAEMON_ADDR_VAR).ok())
-}
-
-/// The variable naming the daemon's address for a process not in remote mode. Spelled once:
-/// `.container/check-config.sh` reads the name from this line and holds `container.json`'s
-/// `containerEnv` to it, because a rename here with the config left behind sends every hook in the
-/// container to its own loopback, silently — which happened once, mid-change, as
-/// `JKB_DAEMON_URL`.
-pub const DAEMON_ADDR_VAR: &str = "JKB_DAEMON_ADDR";
-
-fn daemon_url_from(remote: Option<String>, addr: Option<String>) -> String {
-    let addr = addr
-        .map(|v| v.trim().to_owned())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| jkb_daemon::DEFAULT_ADDR.to_owned());
-    remote.unwrap_or_else(|| format!("http://{addr}"))
+    target().unwrap_or_else(|| format!("http://{}", jkb_daemon::DEFAULT_ADDR))
 }
 
 /// The file whose recent modification means the daemon at `url` was just unreachable, shared by
@@ -329,7 +332,7 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use super::{daemon_url_from, port_of, subcommand_name, support, Support};
+    use super::{port_of, subcommand_name, support, target_from, Support};
     use crate::Cli;
 
     #[test]
@@ -357,19 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_is_remote_mode_s_then_the_configured_one_then_this_host_s() {
+    fn a_remote_address_without_a_scheme_is_http() {
         let s = |v: &str| Some(v.to_owned());
-        assert_eq!(daemon_url_from(s("http://r:1"), s("c:2")), "http://r:1");
-        assert_eq!(daemon_url_from(None, s(" c:2 ")), "http://c:2");
+        assert_eq!(target_from(s("http://r:1")).as_deref(), Some("http://r:1"));
         assert_eq!(
-            daemon_url_from(None, s("  ")),
-            format!("http://{}", jkb_daemon::DEFAULT_ADDR),
-            "an empty setting is no setting"
+            target_from(s("https://r:1")).as_deref(),
+            Some("https://r:1")
         );
-        assert_eq!(
-            daemon_url_from(None, None),
-            format!("http://{}", jkb_daemon::DEFAULT_ADDR)
-        );
+        assert_eq!(target_from(s(" c:2 ")).as_deref(), Some("http://c:2"));
+        assert_eq!(target_from(s("  ")), None, "an empty setting is no setting");
+        assert_eq!(target_from(None), None);
     }
 
     fn parse(args: &[&str]) -> Cli {

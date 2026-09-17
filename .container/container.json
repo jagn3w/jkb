@@ -96,17 +96,13 @@
     // open whichever checkout you want, including a `jkb task work` session inside one.
     "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
 
-    // The host's ~/.jkb: auto-memory (`claude-memory/`), worktree archives, logs. NOT the knowledge
-    // base any more — see the volume below and JKB_DB. A SQLite database cannot be shared across
+    // The host's ~/.jkb: auto-memory (`claude-memory/`), worktree archives, logs, and the daemon's
+    // token. NOT the knowledge base: the container reaches that only through `jkb serve` on the host
+    // (JKB_REMOTE below), and has no database of its own. A SQLite database cannot be shared across
     // this bind: measured (.container/sqlite-share-probe.py, 2026-09-13), an fcntl lock taken in here is
     // invisible on macOS and a MAP_SHARED mapping is not shared, so WAL's write lock and wal-index
     // both break, and two writers corrupted a scratch database within 38 commits.
     "source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb,type=bind,consistency=cached",
-
-    // The container's OWN knowledge base, until the host owns jkb.db and the container reaches it
-    // through a host daemon. A volume, so it survives a rebuild and reaches nothing of the host's.
-    // It starts empty: tasks and namespaces in the host's KB are not visible in here.
-    "source=jkb-kb-local,target=/home/vscode/.local/state/jkb,type=volume",
 
     // NO credential mount, deliberately. `~/.claude/.credentials.json` is Linux/WSL-only — on
     // macOS the credentials live in the Keychain and the file does not exist, and a bind mount
@@ -131,21 +127,17 @@
   ],
 
   "containerEnv": {
-    // The container-local knowledge base (the jkb-kb-local volume), NEVER the host's
-    // ~/.jkb/jkb.db: a jkb process on each side of the bind corrupts it (see the mounts above).
-    // Even a read is unsafe — jkb opens read-write, and closing a WAL connection it believes is the
-    // last one checkpoints and truncates a WAL the host is still using. A process with JKB_DB unset
-    // falls back to ~/.jkb/jkb.db and is REFUSED there: jkb-core's db::open rejects a database on a
-    // FUSE filesystem (crates/jkb-core/src/shared_fs.rs).
-    "JKB_DB": "/home/vscode/.local/state/jkb/jkb.db",
-    // Where the notification hook reaches `jkb serve` on the host (`jkb notify hook`; resolved by
-    // daemon_url in crates/jkb-cli/src/remote.rs). NOT remote mode — that is JKB_REMOTE, at the S6
-    // cutover — only the address of the one opening init-firewall.sh makes, and check-config.sh
-    // holds it to egress-lib.sh's DAEMON_HOST and DAEMON_PORT. Without it the hook would look for
-    // the daemon on the container's own loopback and every notification from in here would be
-    // lost, silently. host:port with no scheme, like jkb serve's own --addr: this file's comment
-    // stripper (lib.sh dc_strip) cannot tell a URL's // from a comment.
-    "JKB_DAEMON_ADDR": "host.docker.internal:7117",
+    // Remote mode (tasks S6.5): every `jkb` in here reaches the knowledge base through `jkb serve` on
+    // the host, and the notification hook posts there too (both resolve it in
+    // crates/jkb-cli/src/remote.rs). There is no container-local database any more, and none may be
+    // opened: remote mode refuses --db and JKB_DB, and a process that somehow opened ~/.jkb/jkb.db
+    // through the bind is refused by jkb-core's db::open, which rejects a database on a FUSE
+    // filesystem (crates/jkb-core/src/shared_fs.rs) — a process on each side of the bind corrupts it,
+    // and even a read is unsafe. check-config.sh holds this address to egress-lib.sh's DAEMON_HOST
+    // and DAEMON_PORT, the one opening init-firewall.sh makes. host:port with no scheme, like
+    // jkb serve's own --addr: this file's comment stripper (lib.sh dc_strip) cannot tell a URL's //
+    // from a comment. The token is read from ~/.jkb/daemon/<port>/token, through the bind.
+    "JKB_REMOTE": "host.docker.internal:7117",
     // See the target/ volume above: keeps cargo's output off the bind mount.
     "CARGO_TARGET_DIR": "/home/vscode/.cargo/target",
     // THE ONE ESCAPE FROM THE EGRESS BOOT GATE (D50.6), off by default and declared here on

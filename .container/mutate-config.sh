@@ -364,11 +364,20 @@ run "the VS Code metadata label is dropped" "carry no devcontainer.metadata labe
 seed; sub_dc '\"onAutoForward\":\"ignore\"' '\"onAutoForward\":\"notify\"'
 run "the label lets VS Code forward the daemon port" "does not set portsAttributes"
 
-seed; sub_dc '"JKB_DAEMON_ADDR": "host.docker.internal:7117",' '"JKB_DAEMON_ADDR": "host.docker.internal:7118",'
-run "the notification hook is pointed at a port the firewall does not open" "but the firewall opens host.docker.internal:7117"
+seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' '"JKB_REMOTE": "host.docker.internal:7118",'
+run "remote mode is pointed at a port the firewall does not open" "but the firewall opens host.docker.internal:7117"
 
-seed; sub_dc '"JKB_DAEMON_ADDR": "host.docker.internal:7117",' ''
-run "the notification hook is not told where the daemon is" "sets no JKB_DAEMON_ADDR"
+seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' ''
+run "the container is not in remote mode" "sets no JKB_REMOTE"
+
+seed; sub_dc '"JKB_REMOTE": "host.docker.internal:7117",' '"JKB_REMOTE": "host.docker.internal:7117", "JKB_DB": "/home/vscode/.local/state/jkb/jkb.db",'
+run "the container is given a database of its own" "containerEnv sets JKB_DB"
+
+seed; jq_dc '.mounts += ["source=jkb-kb-local,target=/home/vscode/.local/state/jkb,type=volume"]'
+run "the retired container-local knowledge base volume is mounted again" "still mounts the container-local knowledge base"
+
+seed; jq_dc '.mounts += ["source=jkb-kb,target=/home/vscode/.local/state/jkb,type=volume"]'
+run "the retired knowledge base comes back under another volume name" "still mounts the container-local knowledge base"
 
 seed; python3 - "$work/t/crates/jkb-daemon/src/lib.rs" <<'PYX'
 import sys
@@ -391,20 +400,20 @@ run "the daemon's client file root can no longer be read" "could not read CLIENT
 seed; python3 - "$work/t/crates/jkb-cli/src/remote.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'pub const DAEMON_ADDR_VAR: &str = "JKB_DAEMON_ADDR";'
+old = 'pub const REMOTE_VAR: &str = "JKB_REMOTE";'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'pub const DAEMON_ADDR_VAR: &str = "JKB_DAEMON_HOST";', 1))
+open(p, 'w').write(s.replace(old, 'pub const REMOTE_VAR: &str = "JKB_REMOTE_URL";', 1))
 PYX
-run "the hook reads a variable the container does not set" "sets no JKB_DAEMON_HOST"
+run "remote mode is read from a variable the container does not set" "sets no JKB_REMOTE_URL"
 
 seed; python3 - "$work/t/crates/jkb-cli/src/remote.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'pub const DAEMON_ADDR_VAR: &str = "JKB_DAEMON_ADDR";'
+old = 'pub const REMOTE_VAR: &str = "JKB_REMOTE";'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'pub const DAEMON_ADDR_VAR: &str = concat!("JKB_", "DAEMON_ADDR");', 1))
+open(p, 'w').write(s.replace(old, 'pub const REMOTE_VAR: &str = concat!("JKB_", "REMOTE");', 1))
 PYX
-run "the hook's variable name can no longer be read" "could not read DAEMON_ADDR_VAR"
+run "remote mode's variable name can no longer be read" "could not read REMOTE_VAR"
 
 # THE PROBE AND THE RAISE MUST STATE ONE RULE. Re-inlining the spec on the probe side is exactly
 # what shipped: `--match-set allowed-new` is the staging set, destroyed before the raise returns, so
@@ -770,7 +779,9 @@ run "the Dockerfile stops pre-creating CARGO_TARGET_DIR" "does not pre-create"
 seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('             /home/vscode/.local/state/jkb \\\n', '', 1))
+old = '             /home/vscode/.claude-state \\\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
 PYX
 run "the Dockerfile stops pre-creating a volume that is not CARGO_TARGET_DIR" "does not pre-create volume target"
 
@@ -954,7 +965,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=87
+PINNED_BAD_SITES=90
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

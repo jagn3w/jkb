@@ -572,7 +572,8 @@ poll budget).
 What bounds the agent is the operation set: nothing in it touches a file, a URL or a process on the
 host.
 
-**Remote mode.** With `JKB_REMOTE=http://<host>:<port>` set (and `JKB_REMOTE_TOKEN_FILE`, default
+**Remote mode.** With `JKB_REMOTE=http://<host>:<port>` — or bare `<host>:<port>`, read as
+`http://`, which is how the dev container sets it — (and `JKB_REMOTE_TOKEN_FILE`, default
 `~/.jkb/daemon/<port>/token` for that URL's port), `jkb`:
 
 - runs `jkb mq …`, the agent read set, the task-mutate set, `jkb ingest`, the session verbs, the review
@@ -585,6 +586,12 @@ host.
   at once, and silently obeying one hides the other;
 - treats an error body that is not the daemon's (a proxy's `502`, say) as `unavailable`, and re-reads
   the token only when the daemon itself answered `unauthorized`.
+
+**The dev container is in remote mode** (tasks S6.5): `containerEnv` sets `JKB_REMOTE` to the
+firewall's one opening and names no database, and the container-local knowledge base it had until
+then (`JKB_DB` on the `jkb-kb-local` volume) is gone. Decided with the user (2026-09-15) to wait until
+nothing the container's agents use is refused — the session verbs above all, since `jkb task work`
+makes the worktrees agents run in. `.container/README.md` records the path and what checks it.
 
 The table is an exhaustive `match` (`crates/jkb-cli/src/remote.rs`), so a new subcommand does not
 compile until it says which it is. A daemon that cannot be reached is remembered for 5 seconds
@@ -618,12 +625,7 @@ migration's lock),
 
 ## Not yet
 
-- `JKB_REMOTE` set in the container — at the cutover (tasks S6.5), not before: remote mode refuses
-  `JKB_DB` and every unported command, and the container's agents still need both. Decided with the user
-  (2026-09-15): the cutover waits until nothing the container's agents use is refused — the session
-  verbs above all, since `jkb task work` makes the worktrees agents run in. The network path
-  it will take already exists; see `.container/README.md`, "The one opening to the host".
-- The rest of the container's commands, then the cutover — stages S6.4/S6.5. The read set (S6.1), the
+- The rest of the container's commands — stage S6.4. The read set (S6.1), the
   task-mutate set (S6.2), ingest (S6.3), the session verbs, and (stage 5) `staging ls`, `stat`,
   `item`, `related`, `blob`, `history`, `inv`, `doctor`'s report, `task review` and `task reclaim` are
   served, and so are `ns ls`/`mv`, `task pr` and `task close-merged`; `jkb mcp` is served (every tool
