@@ -12,6 +12,40 @@ conventions every session is expected to know.
   touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
   `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
+- **In the dev container, `setup.sh` rebuilds the binary and stops** (`JKB_REMOTE` set). Once the
+  container ran the host's hooks (`.container/README.md`, "Git runs the host's hooks"), `post-merge`
+  would run this host installer in there after every pull that touches code. Nearly everything
+  after step 1 belongs to the machine serving the knowledge base, and fails or misleads in the
+  container (the two exceptions are below). The
+  scaffold and the notification topic go through `ns mk` and `--db`, which remote mode refuses.
+  Services have no service manager. The hooks install would try to write the chainer into the
+  read-only mirror of the host's hooks directory. The rule sits in `setup.sh` rather than in
+  `post-merge`, so a hand-run in the container gets the same answer. It is an early exit, not a
+  fourth `skipped` state, because every `skipped` line in the summary names a flag
+  (`--no-service`), and that would be false here. Two steps are exceptions: `--link-memory` is valid in the container and
+  is honoured, and the VS Code extension has a container counterpart (the explorer
+  `.container/install-extensions.sh` builds), which the exit names instead of calling it the host's. Pinned by
+  `scripts/tests/container-hooks.test.sh`, which runs `setup.sh` with stub `cargo` and `jkb`, and
+  asserts `jkb` was asked nothing but its version. That case runs a **copy** of `setup.sh` in a
+  scratch repository, with every service manager stubbed. Watching it fail means deleting the very
+  guard under test, and the unconfined version then ran the host installer against the developer's
+  machine.
+  - **It warns about version skew when the binary changed.** Every run was the first version, and a
+    review pointed out that a pull touching only `scripts/` rebuilds byte-identical `jkb` and then
+    falsely calls the host older, which teaches you to ignore it. `setup.sh` checksums the binary
+    before and after `cargo install`, and says it only when they differ. It also compares the
+    installed `<git-common-dir>/hooks/post-merge` with the checkout's, because that is the one
+    host-installed artifact a pull changes without changing the binary. Only the host's
+    `setup.sh` installs it, and the host's own pull finds nothing to merge. A pull in the container rebuilds the container's
+    `jkb` but not the host's, and not the host's `jkb serve`, and nothing checks client/daemon
+    versions. The checkout is shared, so a later `git pull` on the host finds nothing to merge, and
+    its `post-merge` never fires: the warning says to run `setup.sh` there by hand. The opposite
+    skew is older than this change and still unwarned: a pull on the host rebuilds the host and
+    leaves the container's client at its create-time commit. **Correction:** an earlier version of
+    this bullet said that, before the container ran `post-merge`, "neither side rebuilt, so they
+    always matched". That was false, and a review caught it: the host side always rebuilt. Both
+    directions are what the version check is for
+    (`task:jkb-client-and-jkb-serve-have-no-18d662f006f023a8`).
 - **A hook goes in `--git-common-dir`, never `--git-dir`** (`scripts/lib.sh`'s `git_hooks_dir`).
   In a linked worktree the latter is `<repo>/.git/worktrees/<name>`, which holds no hooks — git
   resolves `hooks/` against the common dir. Since D36 puts *every* `jkb task work` session in a

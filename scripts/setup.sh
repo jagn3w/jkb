@@ -12,6 +12,9 @@
 #   6. builds + installs the notifier behind sticky Claude Code notifications, and reports
 #      the two things it cannot do for you: the one-time Allow, and the Alerts style
 #
+# With JKB_REMOTE set (the dev container) only step 1 runs: the rest belongs to the machine
+# that serves the knowledge base.
+#
 # Flags: --no-extension, --no-service, --no-scaffold, --link-memory, --db <path>, -h/--help.
 #
 # --link-memory is opt-in, and deliberately not the default: it writes symlinks under
@@ -74,6 +77,11 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "error: cargo not found. Install Rust via https://rustup.rs then re-run." >&2
   exit 1
 fi
+# What was installed before, so remote mode below can tell a rebuild that changed the binary from
+# one that did not (a pull touching only scripts/ rebuilds byte for byte the same jkb).
+# Braced, so a first run with no jkb yet is quiet: the redirection fails before a trailing 2>
+# on cksum itself would apply.
+jkb_before="$({ cksum < "${CARGO_HOME:-$HOME/.cargo}/bin/jkb"; } 2>/dev/null || true)"
 # --force so a re-run always refreshes from the current checkout; --locked for reproducibility.
 (cd "$repo_root" && cargo install --path crates/jkb-cli --locked --force)
 
@@ -85,6 +93,62 @@ if ! command -v jkb >/dev/null 2>&1; then
   exit 1
 fi
 echo "installed: $(command -v jkb) ($(jkb --version))"
+
+# --- remote mode: the dev container stops here --------------------------------
+# JKB_REMOTE means this jkb reaches a knowledge base served from another machine: the dev
+# container, reaching the host's `jkb serve`. `.container/container.json` is the only thing that
+# sets it today. A second kind of remote client would need its own answer for the git-hooks step
+# at least, since only the container has run.sh copying the host's hooks in.
+# The steps below belong to the machine that holds the database, with two exceptions handled here.
+# The scaffold and the notification topic go through `ns mk` and `--db`, which remote mode refuses.
+# The services have no service manager in a container. The git hooks are the host's, and
+# .container/run.sh copies them in, read-only, where a chainer install here would fail on them.
+# The notifier is a Mac app. The exceptions: `--link-memory` is valid in here and is honoured, and
+# the VS Code extension has a container counterpart, the explorer .container/install-extensions.sh
+# builds, which is named rather than rebuilt (it needs the attached VS Code's CLI).
+# Decided HERE and not in post-merge, so that setup.sh run by hand in the container gets the same
+# answer as the hook does (a rule the caller has to remember is the defect this repo keeps finding).
+if [ -n "${JKB_REMOTE:-}" ]; then
+  say "remote mode (JKB_REMOTE=$JKB_REMOTE) — the binary is what belongs here"
+  if [ "$link_memory" -eq 1 ]; then
+    "$repo_root/scripts/link-claude-memory.sh" || warn "some repos could not be linked (see above)"
+  fi
+  echo "  • skipped: KB scaffold, services, git hooks, notification topic, notifier. The machine"
+  echo "    serving the knowledge base owns them; run setup.sh there. In the dev container,"
+  echo "    .container/run.sh mirrors that machine's git hooks."
+  echo "  • the container's explorer extension is not rebuilt: after a pull that touches ui/, run"
+  echo "    .container/install-extensions.sh from an attached terminal."
+  # SAID WHEN THE BINARY CHANGED, because nothing else will say it: this rebuilt the client, not
+  # the host's jkb or its `jkb serve`, and there is no version handshake between them. The checkout
+  # is SHARED (the container mounts ~/repos), so a `git pull` on the host then finds nothing to
+  # merge and its post-merge never fires: the host has to run setup.sh by hand. Not said for a
+  # rebuild that produced the same bytes, since a warning on every pull is one nobody reads. The
+  # opposite direction predates this and still exists: a pull on the host leaves this client old.
+  # Both are what the client/daemon version check is for
+  # (task:jkb-client-and-jkb-serve-have-no-18d662f006f023a8).
+  # CONDITIONAL, because this side cannot know the other's build. A rebuild here that only catches
+  # up with a host that already rebuilt changes the binary too, and "the host is behind" was then
+  # false (round 5). Knowing it takes the version check, not a guess.
+  if [ "$({ cksum < "$cargo_bin/jkb"; } 2>/dev/null || true)" != "$jkb_before" ]; then
+    warn "this jkb changed. If the machine serving the knowledge base has not been rebuilt from this"
+    warn "commit, it and its jkb serve are older than this client: run ./scripts/setup.sh there (a"
+    warn "git pull there finds nothing to merge in the shared checkout, so its post-merge will not)."
+  fi
+  # ...and the one host-installed artifact a pull can change WITHOUT changing the binary: the repo's
+  # post-merge hook, in the shared .git. Only the host's setup.sh installs it (the git-hooks step is
+  # skipped here), and the host's own pull finds nothing to merge, so after a pull here that touches
+  # only the hook, both sides run the old one until the host runs setup.sh. Round 6 found the
+  # binary-only check silent there. Compared with what the chainer dispatches to:
+  # <git-common-dir>/hooks/post-merge.
+  hook_common="$(_git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null || true)"
+  case "$hook_common" in ""|/*) ;; *) hook_common="$repo_root/$hook_common" ;; esac
+  if [ -n "$hook_common" ] && ! cmp -s "$repo_root/scripts/hooks/post-merge" "$hook_common/hooks/post-merge"; then
+    warn "the post-merge hook installed in $hook_common/hooks is not scripts/hooks/post-merge as checked"
+    warn "out now, and only setup.sh on the machine serving the knowledge base installs it: run"
+    warn "./scripts/setup.sh there."
+  fi
+  exit 0
+fi
 
 # --- 2. scaffold the KB ------------------------------------------------------
 # ONLY on a fresh machine: if a KB already exists we leave it completely untouched
