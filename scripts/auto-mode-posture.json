@@ -69,7 +69,9 @@
           "static.rust-lang.org",
           "registry.npmjs.org",
           "get.pnpm.io",
-          "registry.ollama.ai"
+          "registry.ollama.ai",
+          "rubygems.org",
+          "index.rubygems.org"
         ]
       },
       "filesystem": {

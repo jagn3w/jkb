@@ -39,6 +39,69 @@ RUN apt-get update -qq \
     && test -x "$JKB_REAPER" \
     && rm -rf /var/lib/apt/lists/*
 
+# --- sibling-repo toolchain: Ruby + PostgreSQL (for ~/repos/contextual-translate) ----------------
+# This container serves every repo under ~/repos, and nothing can be installed into it at runtime:
+# root is unreachable and egress is allowlisted. So a sibling's toolchain is baked in HERE, where
+# the build has ordinary egress. README.md, "Sibling-repo toolchains", has how to use it.
+#
+# ON BY DEFAULT, OFF IN CI. `run.sh --build` takes the default, so the container you attach to has
+# it. CI passes JKB_WITH_RUBY=0: a from-source Ruby compile and two more build-time hosts
+# (github.com/rbenv, cache.ruby-lang.org) are a cost and an outage surface that jkb's own container
+# job gains nothing from. Nothing the CI job verifies is touched by this layer: it adds root-owned
+# files under /opt and root-owned links in /usr/local/bin, and changes no directory's ownership.
+#
+# PINNED, not "latest in the series": a cached layer's RUN text never changes, so a floating
+# version would give a Mac that built last month a different Ruby from a fresh build today, and
+# nothing would record which. Bundler is Ruby's own default gem, so the Ruby pin pins it too. Rails
+# is deliberately NOT installed globally: a project's Gemfile.lock owns its gem versions, including
+# the one `rails new` runs from (README.md has the bootstrap).
+#
+# Three placement choices, one reason each:
+#  - ROOT-OWNED under /opt: the agent can run the interpreter but not replace it. Gems go in
+#    BUNDLE_PATH (below), never in /opt.
+#  - OUTSIDE $HOME: the nested sandbox denies reads of ~ except an allowlist, so a Ruby under
+#    ~/.local/share/mise (the usual mise layout) could not even be executed from the agent's Bash.
+#  - LINKED INTO /usr/local/bin rather than put on ENV PATH: a Claude Code session can inherit a
+#    PATH that never saw this image's ENV (observed 2026-09-18: a session whose PATH was the Mac
+#    host's, while every other image ENV, JKB_NS_MARKER included, did arrive), and /usr/local/bin
+#    is on every PATH, that one included. Only the named executables are linked; a project's own
+#    come from `bundle exec` or its binstubs.
+#
+# The distro's `postgresql` would create a root-managed `main` cluster that nothing here can start
+# (starting a service needs root), so it is suppressed and each user runs their own with pg_ctl.
+# `install -d`, not `mkdir -p`: check-config.sh reads every `RUN mkdir -p` as a volume pre-create.
+ARG JKB_WITH_RUBY=1
+ARG JKB_RUBY_VERSION=3.4.10
+ARG JKB_RUBY_BUILD_TAG=v20260917
+RUN if [ "$JKB_WITH_RUBY" != 1 ]; then echo "JKB_WITH_RUBY=$JKB_WITH_RUBY: no Ruby/Postgres layer"; exit 0; fi \
+    && install -d /etc/postgresql-common/createcluster.d \
+    && printf 'create_main_cluster = false\n' > /etc/postgresql-common/createcluster.d/no-main.conf \
+    && apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        autoconf bison libyaml-dev libpq-dev libffi-dev zlib1g-dev libreadline-dev libgmp-dev \
+        libjemalloc2 postgresql postgresql-client \
+    && git clone --quiet --depth 1 --branch "$JKB_RUBY_BUILD_TAG" \
+         https://github.com/rbenv/ruby-build.git /tmp/ruby-build \
+    && /tmp/ruby-build/bin/ruby-build "$JKB_RUBY_VERSION" "/opt/ruby-$JKB_RUBY_VERSION" \
+    && ln -s "/opt/ruby-$JKB_RUBY_VERSION" /opt/ruby \
+    # `ln -s` without -f: a name that already exists in /usr/local/bin fails the build rather than
+    # silently shadowing whatever was there.
+    && for exe in ruby gem bundle bundler irb; do ln -s "/opt/ruby/bin/$exe" /usr/local/bin/; done \
+    && pg_bin="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -n 1)" \
+    && ln -s "$pg_bin/pg_ctl" "$pg_bin/initdb" "$pg_bin/postgres" /usr/local/bin/ \
+    && /usr/local/bin/ruby -v && /usr/local/bin/bundle -v && /usr/local/bin/pg_ctl --version \
+    && rm -rf /tmp/ruby-build /var/lib/apt/lists/*
+
+# WHERE GEMS GO: container-local, never the project directory. ~/repos is a bind mount from the
+# Mac, so a `vendor/bundle` there would put Linux-built native extensions (pg, bootsnap) and a
+# `.bundle/config` where the host's own `bundle` reads them -- the same reason CARGO_TARGET_DIR
+# keeps target/ off the bind. ~/.cache is in the sandbox posture's allowRead AND allowWrite, so the
+# agent's Bash can install there. BUNDLE_USER_HOME moves Bundler's own cache and config off ~, which
+# the sandbox cannot read. Image ENV does reach sessions (only PATH was seen replaced). Not a volume:
+# a rebuild re-runs `bundle install`, which is minutes, against a lockfile, so nothing is lost.
+ENV BUNDLE_PATH=/home/vscode/.cache/bundle \
+    BUNDLE_USER_HOME=/home/vscode/.cache/bundle-home
+
 # The firewall script is installed INTO THE IMAGE, root-owned, and sudoers grants exactly that one
 # path. It must never be run from the mounted workspace: a script the agent can edit, that the
 # agent can also sudo, is a root shell with extra steps.

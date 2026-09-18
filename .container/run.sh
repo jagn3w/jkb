@@ -6,6 +6,8 @@
 #   ./.container/run.sh --open [path]   ...and open a VS Code window attached to it
 #   ./.container/run.sh --stop          stop the container (the volumes and image survive)
 #   ./.container/run.sh --rm            stop AND remove it, so the next run redoes setup
+#                                    (both move a login written since the start into the state
+#                                    volume first; see lib.sh's dc_persist_login)
 #   ./.container/run.sh --dry-run       print the docker command instead of running it
 #   ./.container/run.sh --consumed-keys list the container.json keys this tooling reads
 #   ./.container/run.sh --print-args [--posture] [<repo-root>]
@@ -92,6 +94,32 @@ container_path() { # container_path <host-path>
         done
     done
     return 1
+}
+
+# Carry a login written since the container started into the state volume, before the container
+# stops or goes (lib.sh's dc_persist_login says why the link alone does not). Never fatal: a stop or
+# remove you asked for still happens, and what could not be carried is said, not swallowed.
+#
+# A STOPPED CONTAINER IS STARTED FOR THIS. It used to be skipped, on the grounds that it had carried
+# its login at its last start through here. That misses a token refreshed after the start, which is
+# exactly what a container stopped by a reboot or Docker Desktop is holding. The recreate this
+# script tells you to run (`--rm && run.sh`) is aimed at that container, so skipping it lost the
+# refreshed token on the one path that promised to keep it. Starting raises the firewall and can be
+# refused (the egress boot gate), in which case the exec fails and the warning says what was lost.
+# The caller stops or removes the container straight after, so it does not stay up.
+persist_login() {
+    local state ctr
+    state="$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" || return 0
+    if ! ctr="$(container_path "$repo")"; then
+        echo "warning: $repo is not under $HOST_REPOS, so the container cannot see lib.sh; a login written since $NAME started was not moved into the state volume" >&2
+        return 0
+    fi
+    if [ "$state" != "true" ] && ! docker start "$NAME" >/dev/null 2>&1; then
+        echo "warning: could not start $NAME to move its login into the state volume; if you are logged out after this, that is why" >&2
+        return 0
+    fi
+    docker exec -w "$ctr" "$NAME" bash -c '. .container/lib.sh && dc_persist_login' \
+        || echo "warning: could not move $NAME's login into the state volume; if a rebuild logs you out, this is why" >&2
 }
 
 # A fingerprint of the DERIVED arguments — not of the file, so a comment edit does not force a
@@ -521,8 +549,10 @@ while [ $# -gt 0 ]; do
                              || die "container.json could not be read; refusing to print a partial declaration"
                          [ -n "$args_out" ] || die "the assembly produced no arguments"
                          printf '%s\n' "$args_out"; exit 0 ;;
-        --stop)          docker stop "$NAME" >/dev/null 2>&1 && echo "stopped $NAME" || echo "$NAME was not running"; exit 0 ;;
-        --rm)            docker rm -f "$NAME" >/dev/null 2>&1 && echo "removed $NAME" || echo "$NAME did not exist"; exit 0 ;;
+        --stop)          persist_login
+                         docker stop "$NAME" >/dev/null 2>&1 && echo "stopped $NAME" || echo "$NAME was not running"; exit 0 ;;
+        --rm)            persist_login
+                         docker rm -f "$NAME" >/dev/null 2>&1 && echo "removed $NAME" || echo "$NAME did not exist"; exit 0 ;;
         *)               die "unknown argument '$1' (see the header of $0)" ;;
     esac
 done
@@ -936,6 +966,14 @@ if [ "$setup_done" -eq 0 ]; then
     say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
     in_container -w "$ctr_repo" "$NAME" bash .container/setup.sh
 fi
+
+# THE LOGIN, CARRIED ON EVERY START. A container that was stopped outside this script (Docker
+# Desktop, `docker stop`) may hold a token written since its last start; this is the first chance
+# to move it into the state volume, and it happens before verify.sh looks at the links. Not fatal:
+# verify.sh below reports whatever state it leaves.
+say "login state"
+in_container -w "$ctr_repo" "$NAME" bash -c '. .container/lib.sh && dc_persist_login' \
+    || say "the login could not be moved into the state volume — verify.sh below reports what state it is in"
 
 # THE REAP RUNS BEFORE THE VERIFY, and independently of it. It was after, and verify.sh exits 1 on
 # any failing assertion under `set -e` — so one assertion about something else disabled the only

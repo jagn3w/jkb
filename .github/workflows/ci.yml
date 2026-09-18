@@ -216,8 +216,10 @@ jobs:
             echo "AppArmor is not enabled on this runner — nothing to load, and run.sh adds no profile"
           fi
 
+      # Without the sibling-repo Ruby/Postgres layer: a from-source Ruby compile this job verifies
+      # nothing about (the Dockerfile says why it is on by default and off here).
       - name: Build the image
-        run: docker build -t jkb-dev .container
+        run: docker build --build-arg JKB_WITH_RUBY=0 -t jkb-dev .container
 
       # ONE HEALTHY CONTAINER, with the real flags and the real preamble. Deliberately reuses
       # mutate-verify.sh's own --control rather than spelling a `docker run` here: a hand-rolled
