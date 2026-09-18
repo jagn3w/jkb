@@ -107,13 +107,16 @@ if [ -n "${JKB_REMOTE:-}" ]; then
   echo "    The machine serving the knowledge base owns them; run setup.sh there. In the dev container,"
   echo "    .container/run.sh mirrors that machine's git hooks and .container/install-extensions.sh"
   echo "    installs the extensions."
-  # SAID EVERY TIME, because nothing else will say it. A pull here rebuilds this client; the host
-  # has not merged, so its jkb and its `jkb serve` still run the code from before, and there is no
-  # version handshake between them. Before the container ran post-merge, neither side rebuilt, so
-  # the two always matched. A client/daemon version check is the real fix, filed separately.
+  # SAID EVERY TIME, because nothing else will say it. A pull here rebuilds this client and not the
+  # host's jkb or its `jkb serve`, and there is no version handshake between them. The checkout is
+  # SHARED (the container mounts ~/repos), so a `git pull` on the host now finds nothing to merge and
+  # its post-merge never fires: the host has to run setup.sh by hand. The opposite direction existed
+  # before this and still does: a pull on the host rebuilds the host and leaves this client old.
+  # Both are what the client/daemon version check is for
+  # (task:jkb-client-and-jkb-serve-have-no-18d662f006f023a8).
   warn "the machine serving the knowledge base still runs the jkb it was built with, and so does its"
-  warn "jkb serve. This client is now newer: pull and run scripts/setup.sh there too, or an operation"
-  warn "this client sends may be one that server does not understand."
+  warn "jkb serve. This client is now newer: run ./scripts/setup.sh there (a git pull there finds"
+  warn "nothing to merge, since the checkout is shared, so its post-merge will not do it for you)."
   exit 0
 fi
 

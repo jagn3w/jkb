@@ -599,10 +599,20 @@ repository, which is already mounted, so there is nothing to copy. The work is `
   or from `~/.config/git/config`, is invisible in here unless that file also resolves in here. A
   review caught round 1's include fix mirroring such a value while git in here saw none, and 3e
   calling that "unset", ok. So each start writes what the host resolved, and from which file, to
-  `/run/jkb/host-hookspath`. The host step warns when that file is not `~/.gitconfig`, and 3e fails
-  when git in here reads nothing (`not-seen`) or something else (`diverged`, a stale copy). The
-  record is writable from in here, but a forged one can only cause a false failure, because 3e
-  passes only when it agrees with git's own answer.
+  `/run/jkb/host-hookspath`. The host step warns when that file is not `~/.gitconfig`. 3e fails
+  when the copied `~/.gitconfig` is present and sets nothing the host sets (`not-seen`), because
+  that lasts for as long as the setting stays where it is. Three states heal on their own, so 3e
+  reports them without failing:
+  - `awaiting`: no `~/.gitconfig` yet, because VS Code copies it on **attach**, which is after
+    `run.sh` verifies, so every fresh container starts in this state. Round 2 failed it, and
+    `run.sh --open` then refused to open the very window whose attach would have fixed it.
+  - `stale`: the host dropped the setting and the copy still has it.
+  - `diverged`: the host changed it.
+
+  Only a record written since this start counts. The entrypoint rewrites `/run/jkb/ns` on every
+  start and `run.sh` writes the record after that, so an older record is from a start that
+  bypassed `run.sh`. The record is writable from in here, but a forged one can only make 3e
+  report a disagreement, never pass one.
 - **A copy, not a bind mount.** The mount list is the security boundary, and `verify.sh` asserts it
   exactly. A mount whose source is missing stops the container starting, and not every host has a
   global hooks directory. A copy needs neither, and cannot write back to the host. The cost is
@@ -614,7 +624,12 @@ repository, which is already mounted, so there is nothing to copy. The work is `
   is not the host's at all, and is reported.
 - **Root-owned, and not writable from in here.** A hook runs whenever git does, including from the
   attached terminal, which is not sandboxed. A hooks directory the agent could write would let a
-  sandboxed command plant code that runs outside the sandbox on your next commit.
+  sandboxed command plant code that runs outside the sandbox on your next commit. **It is only as
+  strong as its parent directory**: anything that can write the parent, and it is not sticky, can
+  rename the mirror away and put another directory in its place. For a `~/` path that is the
+  container user. The sandbox can do it only where its posture grants writes, which `~/.config`
+  (the usual place) does not, but `~/.cache` does. 3e notes a writable parent rather than failing
+  it, since `run.sh` cannot change who owns your home.
 - **Only its own directory is ever replaced**: a real directory, owned by root, carrying the marker
   `.jkb-host-mirror`. The marker alone proves nothing. A review found the forgery: any process that
   can write a directory can put a file of that name in it. Anything else at that path is refused

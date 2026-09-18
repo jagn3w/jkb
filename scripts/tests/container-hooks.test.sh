@@ -237,10 +237,11 @@ case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops() {
     local calls; calls="$(tr '\n' ';' < "$d/calls")"
     if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --path crates/jkb-cli --locked --force;"* ]] \
        && [ "$(grep -c '^jkb ' "$d/calls")" = "$(grep -c '^jkb --version$' "$d/calls")" ] \
-       && [[ "$out" == *"remote mode"* ]] && [[ "$out" != *"installing git hooks"* ]]; then
-        ok "setup.sh with JKB_REMOTE rebuilds the binary, asks jkb nothing but its version, and stops before the hooks"
+       && [[ "$out" == *"remote mode"* ]] && [[ "$out" != *"installing git hooks"* ]] \
+       && [[ "$out" == *"run ./scripts/setup.sh there"* ]]; then
+        ok "setup.sh with JKB_REMOTE rebuilds the binary, asks jkb nothing but its version, warns the server is older, and stops before the hooks"
     else
-        fail "setup.sh with JKB_REMOTE rebuilds the binary, asks jkb nothing but its version, and stops before the hooks" \
+        fail "setup.sh with JKB_REMOTE rebuilds the binary, asks jkb nothing but its version, warns the server is older, and stops before the hooks" \
              "rc=$rc calls=$calls out=$(tail -5 <<<"$out")"
     fi
 }
@@ -410,6 +411,41 @@ case15_the_host_value_is_recorded_on_every_start() {
     else fail "every start records the host's value and origin, and 'unset' replaces it when the host drops it" "set=$set_ok unset=$unset_ok record=$(cat "$rec" 2>&1)"; fi
 }
 
+
+# The record and the origin warning, with NO root step, so they are tested on a Mac without GNU
+# tools too (the mirroring cases that also check them are skipped there). A value from an included
+# file: recorded with that origin, and said. The hooks directory does not exist, so nothing is
+# copied and the root step never runs.
+case16_an_included_value_is_recorded_and_flagged_without_a_root_step() {
+    make_stub
+    local cfg="$HOME/.gitconfig" inc="$work/included-$RANDOM" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" out
+    rm -f "$cfg"
+    git config --file "$inc" core.hooksPath "$work/no-such-hooks"
+    git config --file "$cfg" include.path "$inc"
+    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
+    if grep -qx "value=$work/no-such-hooks" "$rec" && grep -qx "origin=$inc" "$rec" \
+       && [[ "$out" == *"sets core.hooksPath in $inc, not in ~/.gitconfig"* ]] && ! grep -q '^root ' "$DOCKER_LOG"; then
+        ok "a value from an included file is recorded with its origin and flagged, with no root step"
+    else
+        fail "a value from an included file is recorded with its origin and flagged, with no root step" "out=$out record=$(cat "$rec" 2>&1)"
+    fi
+}
+
+# ...and quiet when the value IS in ~/.gitconfig, which is the common case: a warning that fires
+# for everyone is one nobody reads. Then `unset` replaces the record when the host drops it.
+case17_a_value_in_gitconfig_is_not_flagged_and_unset_replaces_the_record() {
+    make_stub
+    local cfg="$HOME/.gitconfig" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" out quiet=no unset=no
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$work/no-such-hooks"
+    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
+    [[ "$out" != *"not in ~/.gitconfig"* ]] && grep -qx "origin=$cfg" "$rec" && quiet=yes
+    : > "$cfg"
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    [ "$(cat "$rec")" = unset ] && unset=yes
+    if [ "$quiet$unset" = yesyes ]; then ok "a value in ~/.gitconfig is recorded without the origin warning, and 'unset' replaces it"
+    else fail "a value in ~/.gitconfig is recorded without the origin warning, and 'unset' replaces it" "quiet=$quiet unset=$unset out=$out record=$(cat "$rec" 2>&1)"; fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -424,5 +460,7 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case12_a_hooks_path_set_through_an_include_is_found \
           case13_an_empty_value_is_not_unset \
           case14_a_symlinked_target_is_refused \
-          case15_the_host_value_is_recorded_on_every_start
+          case15_the_host_value_is_recorded_on_every_start \
+          case16_an_included_value_is_recorded_and_flagged_without_a_root_step \
+          case17_a_value_in_gitconfig_is_not_flagged_and_unset_replaces_the_record
 finish

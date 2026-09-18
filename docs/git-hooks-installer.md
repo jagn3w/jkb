@@ -28,10 +28,15 @@ conventions every session is expected to know.
   guard under test, and the unconfined version then ran the host installer against the developer's
   machine.
   - **It warns about version skew every time.** A pull in the container rebuilds the container's
-    `jkb` but not the host's, and not the host's `jkb serve`. Nothing checks client/daemon versions,
-    and before the container ran `post-merge`, neither side rebuilt, so they always matched. Until
-    a version check exists (`task:jkb-client-and-jkb-serve-have-no-18d662f006f023a8`), the early exit says the host must be rebuilt
-    too.
+    `jkb` but not the host's, and not the host's `jkb serve`, and nothing checks client/daemon
+    versions. The checkout is shared, so a later `git pull` on the host finds nothing to merge, and
+    its `post-merge` never fires: the warning says to run `setup.sh` there by hand. The opposite
+    skew is older than this change and still unwarned: a pull on the host rebuilds the host and
+    leaves the container's client at its create-time commit. **Correction:** an earlier version of
+    this bullet said that, before the container ran `post-merge`, "neither side rebuilt, so they
+    always matched". That was false, and a review caught it: the host side always rebuilt. Both
+    directions are what the version check is for
+    (`task:jkb-client-and-jkb-serve-have-no-18d662f006f023a8`).
 - **A hook goes in `--git-common-dir`, never `--git-dir`** (`scripts/lib.sh`'s `git_hooks_dir`).
   In a linked worktree the latter is `<repo>/.git/worktrees/<name>`, which holds no hooks — git
   resolves `hooks/` against the common dir. Since D36 puts *every* `jkb task work` session in a

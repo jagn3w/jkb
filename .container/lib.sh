@@ -630,11 +630,15 @@ dc_mirror_hooks() {
 }
 
 # _dc_record_host_hooks <name> <docker> <text> -- write DC_HOST_HOOKS_RECORD in the container, as the
-# container user. Best effort: a missing record makes verify.sh skip the comparison, nothing worse.
+# container user. The old record is removed FIRST, so a write that fails leaves no record (which
+# verify.sh reads as nothing to compare) rather than the previous start's (which it would compare
+# against, and report a disagreement nobody made). A failure is said, not swallowed. verify.sh also
+# ignores a record older than this start, for the starts that do not come through here at all.
 _dc_record_host_hooks() { # _dc_record_host_hooks <name> <docker> <text>
     # shellcheck disable=SC2016
-    printf '%s\n' "$3" | "$2" exec -i "$1" sh -c 'mkdir -p "$(dirname "$1")" && cat > "$1"' sh "$DC_HOST_HOOKS_RECORD" \
-        >/dev/null 2>&1 || true
+    printf '%s\n' "$3" | "$2" exec -i "$1" sh -c 'rm -f "$1" && mkdir -p "$(dirname "$1")" && cat > "$1"' sh "$DC_HOST_HOOKS_RECORD" \
+        >/dev/null 2>&1 \
+        || echo "warning: could not record the host's core.hooksPath in $1, so verify.sh cannot compare it with what git in there reads" >&2
 }
 
 # dc_mirror_host_hooks <container name> <container.json> [docker command] -- run.sh's step, ON THE
