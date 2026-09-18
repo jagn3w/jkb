@@ -980,7 +980,7 @@ in_container -w "$ctr_repo" "$NAME" bash -c '. .container/lib.sh && dc_persist_l
 # the host, because the host's hooks directory is exactly what the container cannot see. Never
 # fatal: verify.sh below reports a hooks directory git cannot find.
 say "git hooks"
-dc_mirror_host_hooks "$NAME"
+dc_mirror_host_hooks "$NAME" "$CONFIG"
 
 # THE REAP RUNS BEFORE THE VERIFY, and independently of it. It was after, and verify.sh exits 1 on
 # any failing assertion under `set -e` — so one assertion about something else disabled the only

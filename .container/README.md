@@ -583,29 +583,49 @@ hook runs. Observed 2026-09-18. Commits made in the container carried a `Co-Auth
 that the host's hooks stop, and `post-merge` never ran on a pull. Nothing reported either, because
 nothing looked.
 
-**The fix is a copy, made on every start.** `run.sh` reads the host's **global** `core.hooksPath`
-and copies that directory to the path git in here resolves the same raw value to. An absolute
-path stays the same path, so `/Users/<you>/...` really exists in here. `~/…` maps to
-`/home/vscode/…`. A relative value resolves inside each repository, which is already mounted, so
-there is nothing to copy. The work is `lib.sh`'s `dc_mirror_host_hooks`, and `run.sh`'s "git
-hooks" step calls it.
+**The fix is a copy, made on every start.** `run.sh` reads the host's **global**
+`core.hooksPath` and copies that directory to the path git in here resolves the same raw value to.
+An absolute path stays the same path, so `/Users/<you>/...` really exists in here. `~/…` maps to
+`/home/vscode/…`, and trailing slashes are dropped. A relative value resolves inside each
+repository, which is already mounted, so there is nothing to copy. The work is `lib.sh`'s
+`dc_mirror_host_hooks`, and `run.sh`'s "git hooks" step calls it.
 
-- **A copy, not a bind mount.** The mount list is the security boundary, and `verify.sh` asserts
-  it exactly. A mount whose source is missing stops the container starting, and not every host has
-  a global hooks directory. A copy needs neither, and cannot write back to the host. The cost is
+- **One reader of the setting.** `dc_global_hooks_path` is used by the copy on the host and by
+  `verify.sh` in here. It reads with `--includes`, because a split config sets the value from an
+  included file and `--global` reads none without it. It tells *unset* apart from *set to the empty
+  string*, which git reads as `/` and so runs nothing from.
+- **A copy, not a bind mount.** The mount list is the security boundary, and `verify.sh` asserts it
+  exactly. A mount whose source is missing stops the container starting, and not every host has a
+  global hooks directory. A copy needs neither, and cannot write back to the host. The cost is
   staleness: a hook edited on the host arrives at the next `run.sh` start.
-- **Root-owned, and not writable from in here.** A hook runs whenever git does, including from
-  the attached terminal, which is not sandboxed. A hooks directory the agent could write would let
-  a sandboxed command plant code that runs outside the sandbox on your next commit.
-- **Replaced whole, never merged, and only if it is the mirror's own.** Each start swaps in a fresh
-  copy, so a hook deleted on the host goes. A directory at that path without the mirror's marker
-  (`.jkb-host-mirror`) was not made by the mirror, so it is refused and reported, never replaced.
-- **Symlinks are dereferenced**, because a hook linked to a host path would dangle in here.
+- **Not copied when it is already here.** A hooks path inside a bind (under `~/repos` or `~/.jkb`)
+  already IS the host's own directory, live. The copy leaves it alone, and `verify.sh` reports it
+  as shared, noting that it is as writable in here as that bind is. It never suggests moving it
+  aside, since that would move the host's real hooks. A path inside one of the container's volumes
+  is not the host's at all, and is reported.
+- **Root-owned, and not writable from in here.** A hook runs whenever git does, including from the
+  attached terminal, which is not sandboxed. A hooks directory the agent could write would let a
+  sandboxed command plant code that runs outside the sandbox on your next commit.
+- **Only its own directory is ever replaced**: a real directory, owned by root, carrying the marker
+  `.jkb-host-mirror`. The marker alone proves nothing. A review found the forgery: any process that
+  can write a directory can put a file of that name in it. Anything else at that path is refused
+  and reported, never touched. `verify.sh` applies the same three tests.
+- **The root step trusts nothing it can be handed.** The copy is assembled in a fresh root-only
+  `mktemp -d`, never beside the target, where a symlink raced into the staging name could steer
+  the extraction and the `chmod` elsewhere. A parent reached through a symlink is refused, and
+  `mv -T` replaces the target name without following it.
+- **Built whole, or not sent.** The archive is made on the host first, and a failed `tar` sends
+  nothing, so a partial copy is never installed over a good one. Symlinks are dereferenced,
+  because a hook linked to a host path would dangle in here.
 
-`verify.sh` (3e) asks git where it will look and fails loudly on the two states that matter: a path
-with nothing there, which is the silent defect above, and a mirror writable from here.
-`scripts/tests/container-hooks.test.sh` runs the copy against a stub `docker`, and
-`verify.sh --self-test` covers the classification.
+`verify.sh` (3e) asks git where it will look. It fails the states in which no hooks, or the wrong
+ones, run: a path with nothing there (the silent defect above), an empty value, an unreadable
+config, a path git cannot expand, a directory that is not the mirror, and a mirror writable from
+here. `scripts/tests/container-hooks.test.sh` covers the copy against a stub `docker`, whose root
+step emulates root's `chown`, `stat` and `tar`. Each guard was watched failing with its code
+removed. `verify.sh --self-test` covers the classification. `mutate-verify.sh` watches the missing
+path and the forged mirror fail in a real container. That needs a Docker host, and has not yet
+been run.
 
 **What the hooks do in here.** `post-merge` runs `scripts/setup.sh` after a pull that touches
 code. With `JKB_REMOTE` set, `setup.sh` rebuilds the `jkb` binary and stops. The scaffold, the
@@ -613,7 +633,19 @@ services, the git-hooks install and the notifier belong to the host
 (`docs/git-hooks-installer.md` records that profile). `jkb task close-merged` then runs through
 the daemon as usual. The host's own hooks, such as `commit-msg`, run unchanged, and they must work
 on Linux: a hook that calls a macOS-only tool fails here, and a failing `commit-msg` refuses the
-commit.
+commit. Verified 2026-09-18: the host's `commit-msg` rejects a `Co-authored-by:` trailer in here,
+and a plain commit goes through.
+
+**Residual, stated rather than claimed away.** Keeping the hooks directory read-only stops a planted
+*hook*. It does not stop sandbox-written code from running unsandboxed, because the hooks run
+repository code. `post-merge` runs `scripts/setup.sh`, and `setup.sh` runs `cargo install`, which
+executes build scripts and proc-macros. Both `scripts/` and `crates/` are writable from the
+sandbox (`.git/hooks` and `.git/config` are not; measured by a review with `test -w` under bwrap).
+So a sandboxed edit there runs unsandboxed the next time you pull, in an attached terminal, code
+that touches those paths. The host has always had the same exposure: it runs the same hook over
+the same checkout. What this change adds is that the path is now reachable from inside the
+container too. The mitigation is the one that already applies on the host: review what an agent
+changed before you pull over it.
 
 ## Sibling-repo toolchains: Ruby and PostgreSQL
 

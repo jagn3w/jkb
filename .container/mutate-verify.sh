@@ -151,6 +151,9 @@ PREAMBLE='
       sudo -n /usr/local/bin/init-firewall.sh >/dev/null 2>&1
       . ./.container/lib.sh && dc_link_state /home/vscode
       [ -n "${JKB_SKIP_MEMORY_LINK:-}" ] || ./scripts/link-claude-memory.sh >/dev/null 2>&1
+      unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+      [ -z "${JKB_MUT_HOOKSPATH:-}" ] || git config --global core.hooksPath "$JKB_MUT_HOOKSPATH"
+      [ -z "${JKB_MUT_FORGE_HOOKS:-}" ] || { mkdir -p "$JKB_MUT_HOOKSPATH" && : > "$JKB_MUT_HOOKSPATH/.jkb-host-mirror" && chmod 555 "$JKB_MUT_HOOKSPATH"; }
       ./scripts/auto-mode.sh install --force >/dev/null 2>&1'
 SUBJECT="$PREAMBLE"'
       ./.container/verify.sh --declare "${JKB_VERIFY_DECLARE:-/home/vscode/repos/jkb}"'
@@ -594,6 +597,17 @@ fi
 # container reports healthy while everything an agent learns in here dies with it.
 run "auto-memory is not linked into the shared store" "auto-memory is not linked" \
     -e JKB_SKIP_MEMORY_LINK=1 "${HEALTHY[@]}"
+
+# Assertion 3e, watched failing against the real container (its arms are also driven by
+# verify.sh --self-test, but only here do the live git reads and the bad() wiring run). The first
+# is the defect 3e exists for: a global core.hooksPath with nothing there, so git runs no hooks and
+# says nothing. The second is the forgery a review found: the mirror's marker, and `chmod 555`, in
+# a directory root does not own, which a check on the marker and `-w` alone read as the mirror.
+# Both are set by the preamble from these variables, and the control sets neither.
+run "the global core.hooksPath names a directory that is not there" "git runs NO hooks in here" \
+    -e JKB_MUT_HOOKSPATH=/nonexistent/jkb-hooks "${HEALTHY[@]}"
+run "a forged mirror: the marker, in a directory root does not own" "carries the mirror's marker but is not owned by root" \
+    -e JKB_MUT_HOOKSPATH=/tmp/jkb-forged-hooks -e JKB_MUT_FORGE_HOOKS=1 "${HEALTHY[@]}"
 
 # THE FIREWALL'S OWN REFUSAL PATH, which nothing else here drives. Every other case exercises the
 # raise succeeding or never starting; this one makes it run and decide it cannot establish an
