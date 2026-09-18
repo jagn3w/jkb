@@ -583,40 +583,49 @@ hook runs. Observed 2026-09-18. Commits made in the container carried a `Co-Auth
 that the host's hooks stop, and `post-merge` never ran on a pull. Nothing reported either, because
 nothing looked.
 
-**The fix is a copy, made on every start.** `run.sh` reads the host's **global**
-`core.hooksPath` and copies that directory to the path git in here resolves the same raw value to.
-An absolute path stays the same path, so `/Users/<you>/...` really exists in here. `~/…` maps to
-`/home/vscode/…`, and trailing slashes are dropped. A relative value resolves inside each
-repository, which is already mounted, so there is nothing to copy. The work is `lib.sh`'s
-`dc_mirror_host_hooks`, and `run.sh`'s "git hooks" step calls it.
+**The fix is a copy, made on every start, and a config that points git at it.** `run.sh` reads
+the hooks path git on the host uses, and copies that directory to the path the same raw value
+means in here. An absolute path stays the same path, so `/Users/<you>/...` really exists in here.
+`~/…` maps to `/home/vscode/…`, and trailing slashes are dropped. A relative value resolves inside
+each repository, which is already mounted, so there is nothing to copy. The same root step then
+writes the container's `~/.config/git/config` (root-owned, marked `# jkb:host-hooks`), naming the
+copy. The work is `lib.sh`'s `dc_mirror_host_hooks`, and `run.sh`'s "git hooks" step calls it.
 
-- **One reader of the setting.** `dc_global_hooks_path` is used by the copy on the host and by
-  `verify.sh` in here. It reads with `--includes`, because a split config sets the value from an
-  included file and `--global` reads none without it. It tells *unset* apart from *set to the empty
-  string*, which git reads as `/` and so runs nothing from.
-- **…but the host and the container read different files, so the host's answer is recorded.**
-  VS Code copies `~/.gitconfig` and nothing else. A value the host takes from an `[include]`d file,
-  or from `~/.config/git/config`, is invisible in here unless that file also resolves in here. A
-  review caught round 1's include fix mirroring such a value while git in here saw none, and 3e
-  calling that "unset", ok. So each start writes what the host resolved, and from which file, to
-  `/run/jkb/host-hookspath`. The host step warns when that file is not `~/.gitconfig`. 3e fails
-  when the copied `~/.gitconfig` is present and sets nothing the host sets (`not-seen`), because
-  that lasts for as long as the setting stays where it is. Three states heal on their own, so 3e
-  reports them without failing:
-  - `awaiting`: no `~/.gitconfig` yet, because VS Code copies it on **attach**, which is after
-    `run.sh` verifies, so every fresh container starts in this state. Round 2 failed it, and
-    `run.sh --open` then refused to open the very window whose attach would have fixed it.
-  - `stale`: the host dropped the setting and the copy still has it.
-  - `diverged`: the host changed it.
-
-  Only a record written since this start counts. The entrypoint rewrites `/run/jkb/ns` on every
-  start and `run.sh` writes the record after that, so an older record is from a start that
-  bypassed `run.sh`. The record is writable from in here, but a forged one can only make 3e
-  report a disagreement, never pass one.
+- **Why run.sh writes a config, and does not leave it to VS Code's copy.** Four review rounds found
+  the same shape. VS Code's copy of `~/.gitconfig` arrives only on **attach**, which is after
+  `run.sh` verifies. It never carries an `[include]`d file. And it goes stale when the host
+  changes. Each round patched one edge and the next found another. Git reads
+  `~/.config/git/config` whenever `~/.gitconfig` does not set the key, and lets `~/.gitconfig` win
+  when it does, which with a current copy names the same directory. Measured on git 2.51.1,
+  2026-09-18: with only that file setting it, the effective read and
+  `rev-parse --git-path hooks` in a repository both answer its value, including when a
+  `~/.gitconfig` without the key exists; with both set, `~/.gitconfig` wins. So the host's hooks
+  run in here before the first attach, and when the host takes the value from an include.
+- **One reader, of what git actually uses.** `dc_global_hooks_path` serves both the host step and
+  `verify.sh`. It is the value git uses outside any repository, includes followed. It is not
+  `git config --global`, which, measured on the same git, stops reading `~/.config/git/config` as
+  soon as `~/.gitconfig` exists. It tells *unset* apart from *set to the empty string*, which git
+  reads as `/` and so runs nothing from.
+- **What the host resolved is recorded, root-owned.** The record says the value, the file it came
+  from and whether this start's mirror succeeded. It lives at `/run/jkb-host/hookspath`, written
+  by the root step in a root-owned directory, so nothing running as the container user can forge
+  or delete it. Round 4 found the `vscode`-owned first version able to hide a failure. It counts
+  only if it was written since this start: the entrypoint rewrites `/run/jkb/ns` on every start,
+  and `run.sh` writes the record after that. `verify.sh` compares it with what git in here uses:
+  - `not-applied` **fails**: the host sets a path and git in here uses none, so the config `run.sh`
+    writes is gone or was refused. Its remedy is re-running `run.sh`, which is always possible.
+  - `stale` (the host dropped the setting) and `diverged` (the host changed it) are **notes**. Both
+    come from a VS Code copy that predates the host's change. Each note gives the fix that does not
+    wait for VS Code: `git config --global --unset core.hooksPath` in here, after which the value
+    `run.sh` wrote applies. A failure would make `run.sh --open` refuse the window you fix it in,
+    which rounds 3 and 4 found twice, with `awaiting` and `not-seen`, the states this replaced.
 - **A copy, not a bind mount.** The mount list is the security boundary, and `verify.sh` asserts it
   exactly. A mount whose source is missing stops the container starting, and not every host has a
   global hooks directory. A copy needs neither, and cannot write back to the host. The cost is
-  staleness: a hook edited on the host arrives at the next `run.sh` start.
+  staleness. A hook edited on the host arrives at the next `run.sh` start. A **changed hooks path**
+  needs one too: until then the copy of the new directory does not exist in here, and if VS Code
+  reattaches first, its fresh `~/.gitconfig` points git at that missing directory, and git runs
+  no hooks. `verify.sh` fails that as `missing`, with the remedy of re-running `run.sh`.
 - **Not copied when it is already here.** A hooks path inside a bind (under `~/repos` or `~/.jkb`)
   already IS the host's own directory, live. The copy leaves it alone, and `verify.sh` reports it
   as shared, noting that it is as writable in here as that bind is. It never suggests moving it
@@ -644,8 +653,9 @@ repository, which is already mounted, so there is nothing to copy. The work is `
 
 `verify.sh` (3e) asks git where it will look. It fails the states in which no hooks, or the wrong
 ones, run: a path with nothing there (the silent defect above), an empty value, an unreadable
-config, a path git cannot expand, a directory that is not the mirror, and a mirror writable from
-here. `scripts/tests/container-hooks.test.sh` covers the copy against a stub `docker`, whose root
+config, a path git cannot expand, a directory that is not the mirror, a mirror writable from here,
+and a host path that was not applied. When this start's mirror failed and an earlier copy is
+still in place, it says so. `scripts/tests/container-hooks.test.sh` covers the copy against a stub `docker`, whose root
 step emulates root's `chown`, `stat` and `tar`. Each guard was watched failing with its code
 removed. The root step is GNU code, because the container is Ubuntu. The stub hands it GNU's tools
 (Homebrew's `gmv`/`gstat`/`gtar` on a Mac), and without them those cases skip, naming what to

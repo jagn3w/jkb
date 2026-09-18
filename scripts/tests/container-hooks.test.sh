@@ -183,18 +183,19 @@ case4_a_directory_it_did_not_make_is_left_alone() {
 }
 
 # run.sh's step, reading the host's GLOBAL config. Driven through GIT_CONFIG_GLOBAL so the test's
-# git config is its own. Unset and relative values mirror nothing, and no root step runs.
+# git config is its own. Unset and relative values mirror nothing: no archive is ever extracted.
 case5_the_host_step_reads_the_global_value() {
+    need_gnu || return 0   # every host step ends in the root step that writes the record
     need_gnu || return 0
     make_stub; host_hooks
     local cfg="$HOME/.gitconfig" out
     rm -f "$cfg"
     : > "$cfg"
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    local unset_ok=no; [[ "$out" == *"no global core.hooksPath"* ]] && ! grep -q "^root " "$DOCKER_LOG" && unset_ok=yes
+    local unset_ok=no; [[ "$out" == *"no core.hooksPath on the host"* ]] && [ ! -s "$TAR_LOG" ] && unset_ok=yes
     git config --file "$cfg" core.hooksPath .githooks
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    local rel_ok=no; [[ "$out" == *"needs no mirror"* ]] && ! grep -q "^root " "$DOCKER_LOG" && rel_ok=yes
+    local rel_ok=no; [[ "$out" == *"needs no mirror"* ]] && [ ! -s "$TAR_LOG" ] && rel_ok=yes
     git config --file "$cfg" core.hooksPath "$src"
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
     local abs_ok=no; [ "$("$CTR_ROOT$src/commit-msg" 2>/dev/null)" = "commit-msg ran" ] && abs_ok=yes
@@ -213,36 +214,60 @@ case5_the_host_step_reads_the_global_value() {
 # binary and stop: scaffold and topic need a local database, services a service manager, and the
 # git-hooks step would try to write a chainer into the read-only mirror. Stubbed cargo and jkb log
 # every call, so "stopped" is observed rather than inferred from the message.
+# remote_setup <1 if the stub cargo changes the binary, 0 if not> -- run a COPY of setup.sh in remote
+# mode (see CONFINED below) and set $out, $rc, $calls and $d.
+remote_setup() {
+    local t
+    d="$work/setup-$RANDOM"
+    mkdir -p "$d/home" "$d/cargo/bin" "$d/repo/scripts/hooks"
+    cp "$repo_root/scripts/setup.sh" "$repo_root/scripts/lib.sh" "$d/repo/scripts/"
+    cp "$repo_root/scripts/hooks/post-merge" "$d/repo/scripts/hooks/"
+    git init -q "$d/repo"
+    printf '#!/bin/sh\necho "jkb $*" >> "%s"\necho "jkb 0.0.0-stub"\n' "$d/calls" > "$d/cargo/bin/jkb"
+    # The stub cargo "installs" by appending to the jkb stub when asked to change it, which is what
+    # a rebuild from changed sources does to the binary's bytes.
+    if [ "$1" = 1 ]; then
+        printf '#!/bin/sh\necho "cargo $*" >> "%s"\necho "# rebuilt" >> "%s"\n' "$d/calls" "$d/cargo/bin/jkb" > "$d/cargo/bin/cargo"
+    else
+        printf '#!/bin/sh\necho "cargo $*" >> "%s"\n' "$d/calls" > "$d/cargo/bin/cargo"
+    fi
+    for t in systemctl launchctl pnpm code; do
+        printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 1\n' "$t" "$d/calls" > "$d/cargo/bin/$t"
+    done
+    chmod +x "$d/cargo/bin/"*
+    : > "$d/calls"
+    rc=0
+    out="$(HOME="$d/home" CARGO_HOME="$d/cargo" PATH="$d/cargo/bin:$PATH" JKB_REMOTE=host.docker.internal:7117 \
+           bash "$d/repo/scripts/setup.sh" --no-extension --no-service 2>&1)" || rc=$?
+    calls="$(tr '\n' ';' < "$d/calls")"
+}
+
 # CONFINED, because the watch-it-fail step deletes the very guard under test, and then setup.sh runs
 # its host installer for real (a review found that: services restarted, VS Code's extension
 # installed, hooks written into this checkout). So it runs a COPY of setup.sh in a scratch repo, with
 # --no-extension --no-service, and with every service manager and installer it could reach on PATH
 # as a stub that fails and logs. Mutated, it can only write under $d.
 case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops() {
-    local d="$work/setup-$RANDOM" t
-    mkdir -p "$d/home" "$d/cargo/bin" "$d/repo/scripts/hooks"
-    cp "$repo_root/scripts/setup.sh" "$repo_root/scripts/lib.sh" "$d/repo/scripts/"
-    cp "$repo_root/scripts/hooks/post-merge" "$d/repo/scripts/hooks/"
-    git init -q "$d/repo"
-    printf '#!/bin/sh\necho "cargo $*" >> "%s"\n' "$d/calls" > "$d/cargo/bin/cargo"
-    printf '#!/bin/sh\necho "jkb $*" >> "%s"\necho "jkb 0.0.0-stub"\n' "$d/calls" > "$d/cargo/bin/jkb"
-    for t in systemctl launchctl pnpm code; do
-        printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 1\n' "$t" "$d/calls" > "$d/cargo/bin/$t"
-    done
-    chmod +x "$d/cargo/bin/"*
-    : > "$d/calls"
-    local out rc
-    out="$(HOME="$d/home" CARGO_HOME="$d/cargo" PATH="$d/cargo/bin:$PATH" JKB_REMOTE=host.docker.internal:7117 \
-           bash "$d/repo/scripts/setup.sh" --no-extension --no-service 2>&1)"; rc=$?
-    local calls; calls="$(tr '\n' ';' < "$d/calls")"
+    remote_setup 1
     if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --path crates/jkb-cli --locked --force;"* ]] \
        && [ "$(grep -c '^jkb ' "$d/calls")" = "$(grep -c '^jkb --version$' "$d/calls")" ] \
        && [[ "$out" == *"remote mode"* ]] && [[ "$out" != *"installing git hooks"* ]] \
-       && [[ "$out" == *"run ./scripts/setup.sh there"* ]]; then
-        ok "setup.sh with JKB_REMOTE rebuilds the binary, asks jkb nothing but its version, warns the server is older, and stops before the hooks"
+       && [[ "$out" == *"this jkb changed"* ]] && [[ "$out" == *".container/install-extensions.sh"* ]]; then
+        ok "setup.sh with JKB_REMOTE rebuilds the binary, asks jkb nothing but its version, warns when it changed, names the container's extension step, and stops before the hooks"
     else
-        fail "setup.sh with JKB_REMOTE rebuilds the binary, asks jkb nothing but its version, warns the server is older, and stops before the hooks" \
-             "rc=$rc calls=$calls out=$(tail -5 <<<"$out")"
+        fail "setup.sh with JKB_REMOTE rebuilds the binary, asks jkb nothing but its version, warns when it changed, names the container's extension step, and stops before the hooks" \
+             "rc=$rc calls=$calls out=$(tail -8 <<<"$out")"
+    fi
+}
+
+# ...and stays quiet when the rebuild produced the same binary (a pull touching only scripts/):
+# a warning on every pull is one nobody reads.
+case19_setup_sh_in_remote_mode_is_quiet_when_the_binary_did_not_change() {
+    remote_setup 0
+    if [ "$rc" -eq 0 ] && [[ "$out" == *"remote mode"* ]] && [[ "$out" != *"this jkb changed"* ]]; then
+        ok "setup.sh with JKB_REMOTE does not warn about the server when the rebuild changed nothing"
+    else
+        fail "setup.sh with JKB_REMOTE does not warn about the server when the rebuild changed nothing" "rc=$rc out=$(tail -8 <<<"$out")"
     fi
 }
 
@@ -269,18 +294,19 @@ case7_a_trailing_slash_mirrors_and_re_mirrors() {
 }
 
 # A hooksPath inside a bind (here ~/repos) IS the host's own directory in there. Nothing is copied,
-# no root step runs, and nothing says hooks are missing.
+# nothing is extracted, and nothing says hooks are missing.
 case8_a_hooks_path_inside_a_bind_is_left_to_the_bind() {
+    need_gnu || return 0   # every host step ends in the root step that writes the record
     make_stub
     local cfg="$HOME/.gitconfig" out
     rm -f "$cfg"
     git config --file "$cfg" core.hooksPath "~/repos/dotfiles/hooks"
     mkdir -p "$HOME/repos/dotfiles/hooks"
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    if ! grep -q "^root " "$DOCKER_LOG" && [[ "$out" == *"already runs the host's own copy"* ]]; then
-        ok "a hooksPath inside a bind mount is left to the bind: no copy, no root step"
+    if [ ! -s "$TAR_LOG" ] && [[ "$out" == *"already runs the host's own copy"* ]]; then
+        ok "a hooksPath inside a bind mount is left to the bind: nothing copied"
     else
-        fail "a hooksPath inside a bind mount is left to the bind: no copy, no root step" "out=$out log=$(tr '\n' ';' < "$DOCKER_LOG")"
+        fail "a hooksPath inside a bind mount is left to the bind: nothing copied" "out=$out log=$(tr '\n' ';' < "$DOCKER_LOG")"
     fi
 }
 
@@ -335,31 +361,31 @@ case11_a_symlinked_parent_is_refused() {
 }
 
 
-# A split config: ~/.gitconfig includes another file, and THAT sets core.hooksPath. `--global`
-# reads no include without `--includes`, so the value was invisible and nothing was mirrored.
+# A split config: ~/.gitconfig includes another file, and THAT sets core.hooksPath. The effective
+# read follows includes; the container cannot see the included file, so the value reaches git in
+# there through the ~/.config/git/config the root step writes, not through VS Code's copy.
 case12_a_hooks_path_set_through_an_include_is_found() {
     need_gnu || return 0
     make_stub; host_hooks
-    local cfg="$HOME/.gitconfig" inc="$work/included-$RANDOM" got out
+    local cfg="$HOME/.gitconfig" inc="$work/included-$RANDOM" got xdg
     rm -f "$cfg"
     git config --file "$inc" core.hooksPath "$src"
     git config --file "$cfg" include.path "$inc"
     got="$(GIT_CONFIG_GLOBAL="$cfg" dc_global_hooks_path)"
-    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    # ...and SAYS that the container sees it only if the included file resolves in there: VS Code
-    # copies ~/.gitconfig alone. verify.sh compares the record with git's answer in there.
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    xdg="$(git config --file "$CTR_ROOT$DC_HOOKS_XDG_CONFIG" --get core.hooksPath 2>/dev/null)"
     if [ "$got" = "$src" ] && [ "$("$CTR_ROOT$src/commit-msg" 2>/dev/null)" = "commit-msg ran" ] \
-       && [[ "$out" == *"sets core.hooksPath in $inc, not in ~/.gitconfig"* ]] \
-       && grep -qx "origin=$inc" "$CTR_ROOT$DC_HOST_HOOKS_RECORD"; then
-        ok "a hooksPath set in an included file is read, mirrored, recorded with its origin, and flagged as invisible to VS Code's copy"
+       && [ "$xdg" = "$src" ] && grep -qx "origin=$inc" "$CTR_ROOT$DC_HOST_HOOKS_RECORD"; then
+        ok "a hooksPath from an included file is read, mirrored, recorded with its origin, and written to the container's ~/.config/git/config"
     else
-        fail "a hooksPath set in an included file is read, mirrored, recorded with its origin, and flagged as invisible to VS Code's copy" "got=$got out=$out record=$(cat "$CTR_ROOT$DC_HOST_HOOKS_RECORD" 2>&1)"
+        fail "a hooksPath from an included file is read, mirrored, recorded with its origin, and written to the container's ~/.config/git/config" "got=$got xdg=$xdg record=$(cat "$CTR_ROOT$DC_HOST_HOOKS_RECORD" 2>&1)"
     fi
 }
 
 # Set to the empty string, git reads "/" and runs nothing: that is said, and nothing is copied. The
 # reader tells it apart from unset by its exit status, which is what verify.sh's `empty` arm needs.
 case13_an_empty_value_is_not_unset() {
+    need_gnu || return 0   # every host step ends in the root step that writes the record
     make_stub
     local cfg="$HOME/.gitconfig" out rc_empty rc_unset
     rm -f "$cfg"
@@ -368,7 +394,7 @@ case13_an_empty_value_is_not_unset() {
     git config --file "$cfg" core.hooksPath ""
     GIT_CONFIG_GLOBAL="$cfg" dc_global_hooks_path >/dev/null; rc_empty=$?
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    if [ "$rc_unset" -eq 1 ] && [ "$rc_empty" -eq 0 ] && [[ "$out" == *"empty string"* ]] && ! grep -q "^root " "$DOCKER_LOG"; then
+    if [ "$rc_unset" -eq 1 ] && [ "$rc_empty" -eq 0 ] && [[ "$out" == *"empty string"* ]] && [ ! -s "$TAR_LOG" ]; then
         ok "an empty hooksPath reads as set (rc 0), not unset (rc 1), and is reported without a copy"
     else
         fail "an empty hooksPath reads as set (rc 0), not unset (rc 1), and is reported without a copy" "unset=$rc_unset empty=$rc_empty out=$out"
@@ -395,55 +421,91 @@ case14_a_symlinked_target_is_refused() {
 }
 
 
-# The record verify.sh compares against: what the host resolved and where from, rewritten on every
-# start, so a host that drops the setting does not leave a stale value behind.
+# Every start rewrites the record, root-owned, and the container's ~/.config/git/config with it: a
+# host that drops the setting leaves neither a stale value in the record nor one in that file.
 case15_the_host_value_is_recorded_on_every_start() {
     need_gnu || return 0
     make_stub; host_hooks
-    local cfg="$HOME/.gitconfig" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" set_ok=no unset_ok=no
+    local cfg="$HOME/.gitconfig" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG" set_ok=no unset_ok=no
     rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
     GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
-    grep -qx "value=$src" "$rec" && grep -qx "origin=$cfg" "$rec" && set_ok=yes
+    grep -qx "state=value" "$rec" && grep -qx "value=$src" "$rec" && grep -qx "origin=$cfg" "$rec" \
+        && grep -qx "mirror=ok" "$rec" && [ "$(head -1 "$xdg")" = "$DC_HOOKS_XDG_MARK — written by .container/run.sh on every start from the host core.hooksPath; edit the host" ] \
+        && set_ok=yes
     : > "$cfg"
     GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
-    [ "$(cat "$rec")" = unset ] && unset_ok=yes
-    if [ "$set_ok$unset_ok" = yesyes ]; then ok "every start records the host's value and origin, and 'unset' replaces it when the host drops it"
-    else fail "every start records the host's value and origin, and 'unset' replaces it when the host drops it" "set=$set_ok unset=$unset_ok record=$(cat "$rec" 2>&1)"; fi
+    [ "$(cat "$rec")" = state=unset ] && [ ! -e "$xdg" ] && unset_ok=yes
+    if [ "$set_ok$unset_ok" = yesyes ]; then ok "every start records the host's state, value, origin and mirror outcome, and writes or removes the container's hooks config"
+    else fail "every start records the host's state, value, origin and mirror outcome, and writes or removes the container's hooks config" "set=$set_ok unset=$unset_ok record=$(cat "$rec" 2>&1) xdg=$(cat "$xdg" 2>&1)"; fi
 }
 
 
-# The record and the origin warning, with NO root step, so they are tested on a Mac without GNU
-# tools too (the mirroring cases that also check them are skipped there). A value from an included
-# file: recorded with that origin, and said. The hooks directory does not exist, so nothing is
-# copied and the root step never runs.
-case16_an_included_value_is_recorded_and_flagged_without_a_root_step() {
-    make_stub
-    local cfg="$HOME/.gitconfig" inc="$work/included-$RANDOM" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" out
-    rm -f "$cfg"
-    git config --file "$inc" core.hooksPath "$work/no-such-hooks"
-    git config --file "$cfg" include.path "$inc"
+# The record's READER, which verify.sh uses, against the format its writer emits. Pure file reads,
+# so it runs on a Mac without GNU tools. The round-4 review found nothing covered it: not the -nt
+# freshness guard, not the parse.
+case16_the_record_reader() {
+    local d="$work/rec-$RANDOM" got bad=""
+    mkdir -p "$d"; : > "$d/marker"; sleep 1
+    printf 'state=value\nvalue=\norigin=/h/.gitconfig\nmirror=failed\n' > "$d/rec"
+    got="$(dc_read_host_record "$d/rec" "$d/marker" | tr '\037' '|')"
+    [ "$got" = "value||/h/.gitconfig|failed" ] || bad="$bad [empty value: $got]"
+    printf 'state=unset\n' > "$d/rec"
+    got="$(dc_read_host_record "$d/rec" "$d/marker" | tr '\037' '|')"
+    [ "$got" = "unset|||" ] || bad="$bad [unset: $got]"
+    got="$(dc_read_host_record "$d/rec" "$d/no-marker" | tr '\037' '|')"
+    [ "$got" = "unset|||" ] || bad="$bad [no marker: $got]"
+    sleep 1; : > "$d/marker"   # a start after the record was written
+    got="$(dc_read_host_record "$d/rec" "$d/marker" | tr '\037' '|')"
+    [ "$got" = "none|||" ] || bad="$bad [older than this start: $got]"
+    got="$(dc_read_host_record "$d/absent" "$d/marker" | tr '\037' '|')"
+    [ "$got" = "none|||" ] || bad="$bad [absent: $got]"
+    if [ -z "$bad" ]; then ok "the record reader keeps empty fields, and reads a record older than this start, or none, as none"
+    else fail "the record reader keeps empty fields, and reads a record older than this start, or none, as none" "$bad"; fi
+}
+
+# The container's ~/.config/git/config is written only when it is run.sh's own: a file the user
+# made there is refused and left exactly as it was, the same rule as the mirror directory.
+case17_a_foreign_hooks_config_is_refused() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local cfg="$HOME/.gitconfig" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG" out
+    mkdir -p "$(dirname "$xdg")"; printf '[user]\n\tname = mine\n' > "$xdg"
+    # Root-owned, as far as the root step can tell, so the MARKER is the only thing that refuses it
+    # (a user-owned file would be refused on ownership first, and the marker check would go untested).
+    stat -c %i "$xdg" >> "$ROOT_SHIM/../root-inodes"
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    if grep -qx "value=$work/no-such-hooks" "$rec" && grep -qx "origin=$inc" "$rec" \
-       && [[ "$out" == *"sets core.hooksPath in $inc, not in ~/.gitconfig"* ]] && ! grep -q '^root ' "$DOCKER_LOG"; then
-        ok "a value from an included file is recorded with its origin and flagged, with no root step"
+    if [ "$(cat "$xdg")" = "$(printf '[user]\n\tname = mine')" ] && [[ "$out" == *"was not written by run.sh; left alone"* ]] \
+       && grep -qx "state=value" "$CTR_ROOT$DC_HOST_HOOKS_RECORD"; then
+        ok "a ~/.config/git/config run.sh did not write is refused and left alone, and the record is still written"
     else
-        fail "a value from an included file is recorded with its origin and flagged, with no root step" "out=$out record=$(cat "$rec" 2>&1)"
+        fail "a ~/.config/git/config run.sh did not write is refused and left alone, and the record is still written" "out=$out xdg=$(cat "$xdg")"
     fi
 }
 
-# ...and quiet when the value IS in ~/.gitconfig, which is the common case: a warning that fires
-# for everyone is one nobody reads. Then `unset` replaces the record when the host drops it.
-case17_a_value_in_gitconfig_is_not_flagged_and_unset_replaces_the_record() {
-    make_stub
-    local cfg="$HOME/.gitconfig" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" out quiet=no unset=no
-    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$work/no-such-hooks"
-    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    [[ "$out" != *"not in ~/.gitconfig"* ]] && grep -qx "origin=$cfg" "$rec" && quiet=yes
-    : > "$cfg"
+# The writer and the reader agree: the root step's real output, read back by the function verify.sh
+# uses, yields the fields it was given.
+case18_the_writer_and_reader_agree() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local cfg="$HOME/.gitconfig" got
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
     GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
-    [ "$(cat "$rec")" = unset ] && unset=yes
-    if [ "$quiet$unset" = yesyes ]; then ok "a value in ~/.gitconfig is recorded without the origin warning, and 'unset' replaces it"
-    else fail "a value in ~/.gitconfig is recorded without the origin warning, and 'unset' replaces it" "quiet=$quiet unset=$unset out=$out record=$(cat "$rec" 2>&1)"; fi
+    got="$(dc_read_host_record "$CTR_ROOT$DC_HOST_HOOKS_RECORD" "$work/no-marker" | tr '\037' '|')"
+    if [ "$got" = "value|$src|$cfg|ok" ]; then ok "the record the root step writes reads back field for field"
+    else fail "the record the root step writes reads back field for field" "got=$got"; fi
+}
+
+
+# The reader answers what git uses OUTSIDE any repository, whatever directory it is called from: a
+# repository's own core.hooksPath travels with the repository and is not the host's setting.
+case20_the_reader_ignores_the_repository_it_is_called_from() {
+    local r="$work/repo-$RANDOM" cfg="$HOME/.gitconfig" got
+    git init -q "$r"; git -C "$r" config core.hooksPath .local-hooks
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath /global/hooks
+    got="$(cd "$r" && GIT_CONFIG_GLOBAL="$cfg" dc_global_hooks_path)"
+    if [ "$got" = /global/hooks ]; then ok "the reader answers the setting outside any repository, even when called from inside one that sets its own"
+    else fail "the reader answers the setting outside any repository, even when called from inside one that sets its own" "got=$got"; fi
 }
 
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
@@ -461,6 +523,9 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case13_an_empty_value_is_not_unset \
           case14_a_symlinked_target_is_refused \
           case15_the_host_value_is_recorded_on_every_start \
-          case16_an_included_value_is_recorded_and_flagged_without_a_root_step \
-          case17_a_value_in_gitconfig_is_not_flagged_and_unset_replaces_the_record
+          case16_the_record_reader \
+          case17_a_foreign_hooks_config_is_refused \
+          case18_the_writer_and_reader_agree \
+          case19_setup_sh_in_remote_mode_is_quiet_when_the_binary_did_not_change \
+          case20_the_reader_ignores_the_repository_it_is_called_from
 finish
