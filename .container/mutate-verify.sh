@@ -599,7 +599,11 @@ run "auto-memory is not linked into the shared store" "auto-memory is not linked
     -e JKB_SKIP_MEMORY_LINK=1 "${HEALTHY[@]}"
 
 # Assertion 3e against the real container: its arms are driven by verify.sh --self-test, but only
-# here do the live git reads and the bad() wiring run. NOT YET RUN: added without a Docker host.
+# here do the live git reads and the bad() wiring run. NOT YET RUN: added without a Docker host,
+# and CI runs only `--control` and `--ladder` (ci.yml), not the mutations. The record-driven half of
+# 3e (not-applied, apply-failed, the notes) is not here: no test container starts through run.sh, so
+# none has a record. verify.sh --self-test drives it from real record files instead
+# (hooks_record_verdict).
 # Each expect string is one only its own arm prints, so a CAUGHT here credits that arm alone. The first
 # is the defect 3e exists for: a global core.hooksPath with nothing there, so git runs no hooks and
 # says nothing. The second is the forgery a review found: the mirror's marker, and `chmod 555`, in

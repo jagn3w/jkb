@@ -621,6 +621,10 @@ and `run.sh`'s "git hooks" step calls it.
   or delete it. Round 4 found the `vscode`-owned first version able to hide a failure. It counts
   only if it was written since this start: the entrypoint rewrites `/run/jkb/ns` on every start,
   and `run.sh` writes the record after that. `verify.sh` compares it with what git in here uses:
+  - `apply-failed` **fails**: `run.sh` could not set the key (a leftover `config.lock` is the
+    measured cause). It is its own word, because `-` means "the host sets none", and round 6 found
+    a failed write reading as that and passing. An unreadable host config records `kept` and
+    leaves the key as the last good start set it, rather than turning "unknown" into "no hooks".
   - `not-applied` **fails**: `run.sh` applied a value and git in here uses none. Its remedy is
     re-running `run.sh`, which is always possible. 3e compares against what was *applied*, not
     against a value derived again. Round 5 found a relative host value applied as nothing while
@@ -672,7 +676,9 @@ removed. The root step is GNU code, because the container is Ubuntu. The stub ha
 (Homebrew's `gmv`/`gstat`/`gtar` on a Mac), and without them those cases skip, naming what to
 install, rather than fail on a flag the container never lacks. Linux CI always runs them. `verify.sh --self-test` covers the classification. `mutate-verify.sh` watches the missing
 path and the forged mirror fail in a real container. That needs a Docker host, and has not yet
-been run.
+been run. CI runs only its `--control` and `--ladder`. The record-driven verdicts (`not-applied`,
+`apply-failed`, the notes) are driven by `verify.sh --self-test` from real record files through
+`hooks_record_verdict`, since no test container starts through `run.sh`.
 
 **What the hooks do in here.** `post-merge` runs `scripts/setup.sh` after a pull that touches
 code. With `JKB_REMOTE` set, `setup.sh` rebuilds the `jkb` binary and stops. The scaffold, the

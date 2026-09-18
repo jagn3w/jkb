@@ -223,6 +223,9 @@ remote_setup() { # remote_setup <0|1> [setup.sh flags...]
     cp "$repo_root/scripts/setup.sh" "$repo_root/scripts/lib.sh" "$d/repo/scripts/"
     cp "$repo_root/scripts/hooks/post-merge" "$d/repo/scripts/hooks/"
     git init -q "$d/repo"
+    # REMOTE_HOOK_INSTALLED=1: the shared .git already holds this checkout's post-merge, as it does
+    # once the host's setup.sh has run since the last change to the hook.
+    [ "${REMOTE_HOOK_INSTALLED:-0}" = 1 ] && cp "$repo_root/scripts/hooks/post-merge" "$d/repo/.git/hooks/post-merge"
     printf '#!/bin/sh\necho "jkb $*" >> "%s"\necho "jkb 0.0.0-stub"\n' "$d/calls" > "$d/cargo/bin/jkb"
     # The stub cargo "installs" by appending to the jkb stub when asked to change it, which is what
     # a rebuild from changed sources does to the binary's bytes.
@@ -365,7 +368,8 @@ case11_a_symlinked_parent_is_refused() {
 
 # A split config: ~/.gitconfig includes another file, and THAT sets core.hooksPath. The effective
 # read follows includes; the container cannot see the included file, so the value reaches git in
-# there through the ~/.config/git/config the root step writes, not through VS Code's copy.
+# there through the key run.sh sets, as the container user, in ~/.config/git/config, not through
+# VS Code's copy.
 case12_a_hooks_path_set_through_an_include_is_found() {
     need_gnu || return 0
     make_stub; host_hooks
@@ -431,6 +435,12 @@ case15_the_host_value_is_recorded_on_every_start() {
     local cfg="$HOME/.gitconfig" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG" set_ok=no unset_ok=no
     rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
     GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    # WHO does each step, which is round 5's fix: the copy as root, the config key as the container
+    # user (as root, a later `git config --global` in there handed the file to that user and the
+    # next start refused it), the record as root. A review flipped the config step to `-u root` and
+    # every case stayed green until this was asserted.
+    local order; order="$(tr '\n' ';' < "$DOCKER_LOG")"
+    [ "$order" = "root sh;vscode sh;root sh;" ] || { fail "every start records the host's state, value, origin and mirror outcome, and sets or unsets the key in the container's hooks config" "docker calls: $order (wanted the copy as root, the config as vscode, the record as root)"; return; }
     grep -qx "state=value" "$rec" && grep -qx "value=$src" "$rec" && grep -qx "origin=$cfg" "$rec" \
         && grep -qx "mirror=ok" "$rec" && grep -qx "applied=$src" "$rec" \
         && [ "$(git config --file "$xdg" --get core.hooksPath)" = "$src" ] && set_ok=yes
@@ -560,6 +570,72 @@ case23_setup_sh_in_remote_mode_honours_link_memory() {
     fi
 }
 
+
+# A host config git cannot read leaves the container's key EXACTLY as the last good start set it:
+# "unknown" must not become "no hooks" in there (round 6).
+case24_an_unreadable_host_config_keeps_the_container_key() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local cfg="$HOME/.gitconfig" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" out
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    printf '[core\n\thooksPath = broken\n' > "$cfg"   # a syntax error git refuses to read
+    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
+    # This read ignores the (deliberately broken) global file: git parses it at startup even with --file.
+    if [ "$(GIT_CONFIG_GLOBAL=/dev/null git config --file "$xdg" --get core.hooksPath)" = "$src" ] && [ "$(head -1 "$rec")" = state=unreadable ] \
+       && grep -qx "applied=kept" "$rec" && [[ "$out" == *"could not read"* ]]; then
+        ok "an unreadable host config keeps the container's hooks path, and records the state as unreadable, kept"
+    else
+        fail "an unreadable host config keeps the container's hooks path, and records the state as unreadable, kept" "out=$out xdg=$(cat "$xdg") rec=$(cat "$rec")"
+    fi
+}
+
+# A write that did not happen is recorded as `failed`, never as `-`, which means "the host sets
+# none" and passed (round 6). A leftover config.lock is the measured cause.
+case25_a_failed_config_write_is_recorded_as_failed() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local cfg="$HOME/.gitconfig" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" out
+    mkdir -p "$(dirname "$xdg")"; : > "$xdg.lock"
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
+    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
+    if grep -qx "applied=failed" "$rec" && [[ "$out" == *"could not set core.hooksPath"* ]]; then
+        ok "a config write blocked by a leftover lock is recorded as applied=failed, and said"
+    else
+        fail "a config write blocked by a leftover lock is recorded as applied=failed, and said" "out=$out rec=$(cat "$rec")"
+    fi
+}
+
+# A host path that lands inside one of the container's volumes is not the host's there: nothing is
+# copied, the key is removed rather than pointed into the volume, and it is said.
+case26_a_hooks_path_inside_a_volume_is_not_mirrored() {
+    need_gnu || return 0
+    make_stub
+    local cfg="$HOME/.gitconfig" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" out
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "~/.claude-state/hooks"
+    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
+    if [ ! -s "$TAR_LOG" ] && grep -qx "applied=-" "$rec" && grep -qx "mirror=skipped" "$rec" \
+       && [[ "$out" == *"inside one of the container's volumes"* ]]; then
+        ok "a hooks path inside a container volume is not mirrored, the key is removed, and it is said"
+    else
+        fail "a hooks path inside a container volume is not mirrored, the key is removed, and it is said" "out=$out rec=$(cat "$rec" 2>&1)"
+    fi
+}
+
+
+# The installed repo hook, the one host artifact a pull changes without changing the binary: said
+# when the shared .git holds a different one, quiet when it holds this checkout's (round 6).
+case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale() {
+    local stale quiet
+    REMOTE_HOOK_INSTALLED=0 remote_setup 0; stale="$out"
+    REMOTE_HOOK_INSTALLED=1 remote_setup 0; quiet="$out"
+    if [[ "$stale" == *"post-merge hook installed in"* ]] && [[ "$quiet" != *"post-merge hook installed in"* ]]; then
+        ok "setup.sh with JKB_REMOTE says when the installed post-merge hook differs from the checkout's, and not when it matches"
+    else
+        fail "setup.sh with JKB_REMOTE says when the installed post-merge hook differs from the checkout's, and not when it matches" "stale=$(tail -4 <<<"$stale") quiet=$(tail -4 <<<"$quiet")"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -582,5 +658,9 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case20_the_reader_ignores_the_repository_it_is_called_from \
           case21_a_user_write_to_the_config_does_not_freeze_the_hooks_path \
           case22_a_relative_value_is_applied_as_it_is \
-          case23_setup_sh_in_remote_mode_honours_link_memory
+          case23_setup_sh_in_remote_mode_honours_link_memory \
+          case24_an_unreadable_host_config_keeps_the_container_key \
+          case25_a_failed_config_write_is_recorded_as_failed \
+          case26_a_hooks_path_inside_a_volume_is_not_mirrored \
+          case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale
 finish

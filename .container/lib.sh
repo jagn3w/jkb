@@ -521,8 +521,9 @@ dc_global_hooks_path() ( # dc_global_hooks_path [--path|--show-origin]
 # dc_read_host_record <record> <start marker> -- the record's fields on one line, separated by the
 # ASCII unit separator (0x1f), for `IFS=$'\x1f' read`:
 #   <state> <value> <origin> <mirror> <applied>
-# <applied> is what this start set core.hooksPath to in DC_HOOKS_XDG_CONFIG: a value, or `-` when it
-# set nothing (the host sets none, or a value no container path can mean, such as ~otheruser/).
+# <applied> is what this start did to core.hooksPath in DC_HOOKS_XDG_CONFIG: the value it set, `-`
+# when it removed it (the host sets none, or a value no container path can mean, such as
+# ~otheruser/), `kept` when it left it alone (the host's answer was unknown), or `failed`.
 # NOT tabs: tab is IFS whitespace, so `read` merges consecutive ones and an empty field (an empty
 # value, an unknown origin) shifts every later field left. Measured: `value<TAB><TAB>/origin<TAB>ok`
 # read as value=/origin, origin=ok.
@@ -676,27 +677,31 @@ dc_mirror_hooks() {
     echo "mirrored the host's git hooks ($src) to $dst"
 }
 
-# _dc_apply_host_hooks <name> <docker> <value or "-"> <record text> -- set core.hooksPath in the
-# container's ~/.config/git/config to <value> (or unset it, given "-"), AS THE CONTAINER USER and
-# with `git config --file`, so one key changes and nothing else in the file does. Then write the
-# record, as ROOT, into a root-owned directory, with what was applied appended, so nothing running
-# as the container user can forge or remove it. Failures are said; a start does not stop over them.
+# _dc_apply_host_hooks <name> <docker> <set|unset|keep> <value> <record text> -- set core.hooksPath
+# in the container's ~/.config/git/config to <value> (set), remove it (unset), or leave it exactly as
+# it is (keep: the host's answer is unknown, and "unknown" must not become "no hooks" in there, which
+# round 6 found the unreadable arm doing). Done AS THE CONTAINER USER with `git config --file`, so one
+# key changes and nothing else in the file does. Then the record is written, as ROOT, into a
+# root-owned directory, with what was applied appended: the value, `-` for nothing, `kept`, or
+# `failed` when the write did not happen. `failed` is its own word because `-` also means "the host
+# sets none", and round 6 found a failed write (a leftover config.lock) reading as that, and passing.
 # The value travels on stdin, not as an argument: every argument here names a place to act on.
-_dc_apply_host_hooks() { # _dc_apply_host_hooks <name> <docker> <value or "-"> <record text>
-    local name="$1" docker="$2" value="$3" record="$4" applied="$3"
+_dc_apply_host_hooks() { # _dc_apply_host_hooks <name> <docker> <set|unset|keep> <value> <record>
+    local name="$1" docker="$2" mode="$3" value="$4" record="$5" applied
+    case "$mode" in set) applied="$value" ;; unset) applied=- ;; *) applied=kept ;; esac
     # shellcheck disable=SC2016
-    if ! printf '%s\n' "$value" | "$docker" exec -i "$name" sh -c '
+    if [ "$mode" != keep ] && ! printf '%s\n' "$value" | "$docker" exec -i "$name" sh -c '
         IFS= read -r v || v=""
         mkdir -p "$(dirname "$1")" || exit 1
-        if [ "$v" = - ]; then
+        if [ "$2" = unset ]; then
             git config --file "$1" --unset-all core.hooksPath 2>/dev/null; rc=$?
             [ "$rc" -eq 0 ] || [ "$rc" -eq 5 ]   # 5: there was nothing to unset
         else
             git config --file "$1" core.hooksPath "$v"
         fi
-    ' sh "$DC_HOOKS_XDG_CONFIG" >/dev/null 2>&1; then
-        applied=-
-        echo "warning: could not set core.hooksPath in $DC_HOOKS_XDG_CONFIG in $name; verify.sh reports what git in there uses" >&2
+    ' sh "$DC_HOOKS_XDG_CONFIG" "$mode" >/dev/null 2>&1; then
+        applied=failed
+        echo "warning: could not set core.hooksPath in $DC_HOOKS_XDG_CONFIG in $name (a leftover config.lock beside it is one cause); verify.sh reports it" >&2
     fi
     # shellcheck disable=SC2016
     printf '%s\napplied=%s\n' "$record" "$applied" | "$docker" exec -i -u root "$name" sh -c '
@@ -716,13 +721,13 @@ _dc_apply_host_hooks() { # _dc_apply_host_hooks <name> <docker> <value or "-"> <
 # A repository's own core.hooksPath is not this step's business: it travels with the repository,
 # which is mounted, and a relative one resolves inside it.
 dc_mirror_host_hooks() { # dc_mirror_host_hooks <name> <container.json> [docker]
-    local name="$1" config="$2" docker="${3:-docker}" raw src dst="" rc=0 origin="" mirror=""
+    local name="$1" config="$2" docker="${3:-docker}" raw src dst="" rc=0 origin="" mirror="" mode
     raw="$(dc_global_hooks_path)" || rc=$?
     case "$rc" in
         0) ;;
-        1) _dc_apply_host_hooks "$name" "$docker" - "state=unset"
+        1) _dc_apply_host_hooks "$name" "$docker" unset "" "state=unset"
            echo "no core.hooksPath on the host; git in the container uses each repository's .git/hooks"; return 0 ;;
-        *) _dc_apply_host_hooks "$name" "$docker" - "state=unreadable"
+        *) _dc_apply_host_hooks "$name" "$docker" keep "" "state=unreadable"
            echo "warning: git on the host could not read its core.hooksPath, so no hooks were mirrored (run: $DC_HOOKS_SHOW_ORIGIN)" >&2; return 0 ;;
     esac
     origin="$(dc_global_hooks_path --show-origin 2>/dev/null)" || origin=""
@@ -759,7 +764,8 @@ dc_mirror_host_hooks() { # dc_mirror_host_hooks <name> <container.json> [docker]
                 fi ;;
         esac
     fi
-    _dc_apply_host_hooks "$name" "$docker" "$applied" \
+    if [ "$applied" = - ]; then mode=unset; else mode=set; fi
+    _dc_apply_host_hooks "$name" "$docker" "$mode" "$applied" \
         "$(printf 'state=value\nvalue=%s\norigin=%s\nmirror=%s' "$raw" "$origin" "$mirror")"
     return 0
 }

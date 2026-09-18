@@ -33,7 +33,10 @@ conventions every session is expected to know.
   - **It warns about version skew when the binary changed.** Every run was the first version, and a
     review pointed out that a pull touching only `scripts/` rebuilds byte-identical `jkb` and then
     falsely calls the host older, which teaches you to ignore it. `setup.sh` checksums the binary
-    before and after `cargo install`, and says it only when they differ. A pull in the container rebuilds the container's
+    before and after `cargo install`, and says it only when they differ. It also compares the
+    installed `<git-common-dir>/hooks/post-merge` with the checkout's, because that is the one
+    host-installed artifact a pull changes without changing the binary. Only the host's
+    `setup.sh` installs it, and the host's own pull finds nothing to merge. A pull in the container rebuilds the container's
     `jkb` but not the host's, and not the host's `jkb serve`, and nothing checks client/daemon
     versions. The checkout is shared, so a later `git pull` on the host finds nothing to merge, and
     its `post-merge` never fires: the warning says to run `setup.sh` there by hand. The opposite

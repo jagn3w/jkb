@@ -134,6 +134,19 @@ if [ -n "${JKB_REMOTE:-}" ]; then
     warn "commit, it and its jkb serve are older than this client: run ./scripts/setup.sh there (a"
     warn "git pull there finds nothing to merge in the shared checkout, so its post-merge will not)."
   fi
+  # ...and the one host-installed artifact a pull can change WITHOUT changing the binary: the repo's
+  # post-merge hook, in the shared .git. Only the host's setup.sh installs it (the git-hooks step is
+  # skipped here), and the host's own pull finds nothing to merge, so after a pull here that touches
+  # only the hook, both sides run the old one until the host runs setup.sh. Round 6 found the
+  # binary-only check silent there. Compared with what the chainer dispatches to:
+  # <git-common-dir>/hooks/post-merge.
+  hook_common="$(_git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null || true)"
+  case "$hook_common" in ""|/*) ;; *) hook_common="$repo_root/$hook_common" ;; esac
+  if [ -n "$hook_common" ] && ! cmp -s "$repo_root/scripts/hooks/post-merge" "$hook_common/hooks/post-merge"; then
+    warn "the post-merge hook installed in $hook_common/hooks is not scripts/hooks/post-merge as checked"
+    warn "out now, and only setup.sh on the machine serving the knowledge base installs it: run"
+    warn "./scripts/setup.sh there."
+  fi
   exit 0
 fi
 
