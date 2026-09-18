@@ -380,6 +380,13 @@ model is wrong. `scripts/auto-mode.sh` + `scripts/auto-mode-posture.json`; desig
     too, dangling until first write. The residual is stated rather than designed away: a writer
     that replaces a file by temp-and-rename would drop the link, which costs one re-login at the
     next create and can never reach the host.
+    **Superseded (2026-09-18):** that residual was understated. Claude Code 2.1.276 does replace
+    the credential link when it saves a login, so it was not one re-login. EVERY login and token
+    refresh left the credentials in the writable layer, and `verify.sh` failed from then on.
+    `dc_persist_login` now moves the file back into the volume at setup, at every `run.sh` start,
+    and before `--stop`/`--rm`. The measurements, the remaining residual, and why a volume at
+    `~/.claude` was rejected are in `.container/README.md` ("The mount list is the security
+    boundary").
 - **Stated residuals, not guaranteed over.** In-process tools are bounded by permission rules and
   not by the kernel, so a path nobody named is Read-able. MCP servers and hooks are unsandboxed
   processes with no posture key to reach them (use `--strict-mcp-config` in a repo that is not

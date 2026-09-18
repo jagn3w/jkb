@@ -257,6 +257,22 @@ reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <f
         *)                printf 'never-exited' ;;
     esac
 }
+# One login file's state, for assertion 3c: <link> <file in the state volume> -> one word.
+#   linked     a link to the volume file (it may still dangle: nobody has logged in yet)
+#   pending    a regular file: a login or refresh replaced the link, and run.sh has not yet moved it
+#   elsewhere  a link to anywhere else
+#   notfile    exists but is neither (a directory): dc_persist_login refuses it
+#   missing    nothing there at all: setup never linked it
+# A function rather than inline so that --self-test reaches every arm; no container harness can
+# produce most of them on purpose.
+login_link_state() { # login_link_state <link> <want>
+    if [ -L "$1" ]; then
+        if [ "$(readlink "$1")" = "$2" ]; then printf 'linked'; else printf 'elsewhere'; fi
+    elif [ -f "$1" ]; then printf 'pending'
+    elif [ -e "$1" ]; then printf 'notfile'
+    else printf 'missing'
+    fi
+}
 # --self-test: the exclusion list, exercised with no container. Run by ./scripts/check.sh.
 #
 # It is the one part of the mount boundary that widens by a TYPO rather than by an edit anyone
@@ -408,6 +424,15 @@ if [ "$SELF_TEST" = yes ]; then
     st2 "an orphan still running was never there to be reaped" \
         "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 S)" "never-exited"
 
+
+    echo "==> verify.sh self-test: login_link_state"
+    lt="$(mktemp -d)"; want="$lt/volume/.credentials.json"; mkdir -p "$lt/volume"
+    ln -s "$want" "$lt/linked";            st2 "a link to the volume file, even dangling" "$(login_link_state "$lt/linked" "$want")" linked
+    printf x > "$lt/pending";              st2 "a regular file"                           "$(login_link_state "$lt/pending" "$want")" pending
+    ln -s "$lt/other" "$lt/elsewhere";     st2 "a link to anywhere else"                  "$(login_link_state "$lt/elsewhere" "$want")" elsewhere
+    mkdir "$lt/dir";                       st2 "a directory"                              "$(login_link_state "$lt/dir" "$want")" notfile
+                                           st2 "nothing at all"                           "$(login_link_state "$lt/none" "$want")" missing
+    rm -rf "$lt"
 
     echo
     [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
@@ -1071,19 +1096,36 @@ for d in projects sessions history file-history shell-snapshots todos statsig; d
         links_ok=0
     fi
 done
-for pair in "/home/vscode/.claude/.credentials.json:/home/vscode/.claude-state/.credentials.json" \
-            "/home/vscode/.claude.json:/home/vscode/.claude-state/claude.json"; do
+#     The two whole-file ones come from lib.sh, the same list dc_persist_login links.
+#     A REGULAR FILE at a link site is NOT a failure, and that was a reversal. Claude Code replaces
+#     the credential link when it saves a login or a refreshed token (see dc_persist_login), so
+#     after any login this state is the normal one, and failing it meant every healthy container
+#     failed this check once someone logged in. The login is not lost: run.sh moves the file back
+#     into the volume on its next start, `--stop` and `--rm`. What stays a failure is state that
+#     will not be carried: a link missing entirely, a directory, or a link to anywhere else.
+login_pending=""
+while IFS= read -r pair; do
     link="${pair%%:*}"; want="${pair##*:}"
-    if [ ! -L "$link" ]; then
-        # A regular file here means the login is NOT persisted — the exact failure, not cosmetic.
-        bad "$link is $( [ -e "$link" ] && echo "a regular file" || echo "missing" ), not a link into the state volume — a login here would not survive a rebuild"
-        links_ok=0
-    elif [ "$(readlink "$link")" != "$want" ]; then
-        bad "$link points at $(readlink "$link"), not $want"
-        links_ok=0
-    fi
-done
-[ "$links_ok" -eq 1 ] && ok "login state is linked into the persistent volume"
+    case "$(login_link_state "$link" "$want")" in
+        linked)    ;;
+        pending)   login_pending="$login_pending $link" ;;
+        elsewhere) bad "$link points at $(readlink "$link"), not $want"; links_ok=0 ;;
+        notfile)   bad "$link is not a file or a link — dc_persist_login cannot carry it into the state volume"; links_ok=0 ;;
+        *)         bad "$link is missing, not a link into the state volume — a login here would not survive a rebuild"; links_ok=0 ;;
+    esac
+done <<LOGIN_FILES
+$(dc_login_files /home/vscode)
+LOGIN_FILES
+#     ...but "pending" is only true while the mover can still move it. dc_persist_login records
+#     a failed move, so a file it could not carry is reported as the failure it is, and not as a
+#     note that repeats, green, on every start.
+if [ -f "/home/vscode/$DC_LOGIN_CARRY_FAILED" ]; then
+    bad "the last attempt to move the login into the state volume failed: $(tr '\n' ' ' < "/home/vscode/$DC_LOGIN_CARRY_FAILED")— it stays in the writable layer until that is fixed"
+    links_ok=0
+elif [ -n "$login_pending" ]; then
+    note "written since this container started, so not yet in the state volume:$login_pending — run.sh moves it there on its next start, --stop or --rm; removing the container any other way loses it"
+fi
+[ "$links_ok" -eq 1 ] && ok "login state is linked into the persistent volume${login_pending:+, or waiting for run.sh to move it there}"
 
 # 3d. Auto-memory reaches the host, and the state volume does NOT give you this: Claude Code keys
 #     memory by the project's ABSOLUTE PATH, so this container's /home/vscode/repos/jkb is a

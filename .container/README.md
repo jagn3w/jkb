@@ -393,9 +393,53 @@ paths that ought to be absent, because a list of absences can never be complete.
 
 **Nothing** under `~/.claude` is mounted from the host — not `settings.json`, which **is** the
 posture and which a process the posture bounds must not be able to read or write, and not the
-credential file either. Authenticate inside the container (`claude auth login`); `setup.sh` links
-the credential and account-state files into the `.claude-state` volume, so a login survives a
-rebuild without anything of the host's being visible.
+credential file either. Authenticate inside the container (`claude auth login`). The credential
+and account-state files are kept in the `.claude-state` volume, so a login survives a rebuild
+without anything of the host's being visible.
+
+**The link does not survive a login, so the login is moved, not only linked.** `setup.sh` links
+both files into the volume while they still dangle, on the theory that Claude Code writes through
+the link. It does for `~/.claude.json`, but not for the credential file. After an in-container
+login, `verify.sh` found a regular file at `~/.claude/.credentials.json` (observed 2026-09-18, Claude
+Code 2.1.276), so the login sat in the writable layer and a rebuild would lose it. The saver writes
+a temporary file first, which makes a rename over the link the likely mechanism. That part is
+inferred: triggering a real save needs a real OAuth exchange. Reading does follow the link, which
+was measured: `claude auth status` reported `loggedIn: true` through a symlinked credential file
+(dummy credentials, scratch `CLAUDE_CONFIG_DIR`, same day).
+
+So `lib.sh`'s `dc_persist_login` moves a regular file found at either link site back into the
+volume and links it again. **Which copy wins depends on whether this container has linked the file
+before**, and a marker in the writable layer (`~/.claude/.jkb-login-linked`) records that:
+
+- Once linked, a regular file can only be a Claude Code write that replaced the link, so the home
+  copy is newer and moves into the volume.
+- Before the first link (a fresh container at setup), a regular file came with the image or
+  predates setup. The volume's copy is the login carried from the last container, so it wins, and
+  the home file is set aside as `<file>.pre-link`, not deleted.
+
+The first version of this rule said the home copy is always newer. A review caught that at setup
+this would move an image-shipped `~/.claude.json` over the carried one on every rebuild. The plain
+`ln -sfn` it replaced had kept the carried copy in that case.
+
+It runs in `setup.sh`, on every `run.sh` start, and before `run.sh --stop` and `--rm`. For those two,
+a **stopped container is started** first, because a container stopped by a reboot or by Docker
+Desktop is exactly the one holding a refreshed token, and `--rm && run.sh` is the recreate this
+script tells you to run. If the start is refused, it warns and carries on.
+
+`verify.sh` reports a regular file there as a `note`, not a failure, because after any login or
+token refresh it is the normal state. It fails when the last move failed
+(`~/.claude/.jkb-login-carry-failed`, written by the mover and cleared by its next clean run), and
+it fails a link that is missing, points elsewhere, or is a directory.
+`scripts/tests/container-login.test.sh` covers the mover and `run.sh`'s `--stop`/`--rm` calls
+against a stub `docker`. `verify.sh --self-test` covers the classification. The call on the
+start path is not tested, because reaching it needs a whole container.
+
+**Residual:** if the container is removed some other way (plain `docker rm`, Docker Desktop) after a
+token refresh, the volume keeps the previous token. Refresh tokens rotate, so that can mean one
+more login after the rebuild. It never exposes anything. A volume mounted at `~/.claude` would make
+the file a plain file inside the volume and close this entirely, but `verify.sh` refuses any mount
+at or under `~/.claude`, which is what keeps the host's `settings.json` away from the agent. That
+guard is worth more than one login.
 
 The expected set is **derived** from `container.json`, so adding a mount is a one-file change
 and cannot drift out of step with the verifier. It used to be transcribed into `verify.sh` as

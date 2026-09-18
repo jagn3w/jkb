@@ -264,11 +264,98 @@ dc_link_state() { # dc_link_state [home]
         fi
         ln -sfn "$h/.claude-state/$d" "$h/.claude/$d" 2>/dev/null || true
     done
-    # The two whole-file pieces of login state, linked while still dangling: Claude Code creates
-    # each on first write and follows the symlink into the volume.
-    ln -sfn "$h/.claude-state/.credentials.json" "$h/.claude/.credentials.json" 2>/dev/null || true
-    ln -sfn "$h/.claude-state/claude.json"       "$h/.claude.json"              2>/dev/null || true
+    # The two whole-file pieces of login state. Not fatal here, as the links above are not:
+    # verify.sh reports what state they were left in.
+    dc_persist_login "$h" || true
 }
+
+# THE LOGIN FILES, one statement of them: "<link in the home>:<file in the state volume>" per line.
+# dc_persist_login makes them and verify.sh asserts them, so the two cannot disagree about which
+# files a login is.
+dc_login_files() { # dc_login_files [home]
+    local h="${1:-/home/vscode}"
+    printf '%s:%s\n' "$h/.claude/.credentials.json" "$h/.claude-state/.credentials.json" \
+                     "$h/.claude.json"              "$h/.claude-state/claude.json"
+}
+
+# Put the login back in the state volume, and link it there again.
+#
+# THE LINK DOES NOT SURVIVE A LOGIN. Each file is linked while it still dangles, on the theory that
+# Claude Code creates it on first write by following the link into the volume. For the credential
+# file it does not: after an in-container login, verify.sh found a REGULAR FILE at
+# ~/.claude/.credentials.json (observed 2026-09-18, Claude Code 2.1.276). The write replaced the
+# link instead of following it, and the saver writes a temporary file first, so a rename over the
+# link is the likely mechanism. Reading, by contrast, follows the link: `claude auth status`
+# reported `loggedIn: true` through a symlinked credential file (measured the same day, with dummy
+# credentials in a scratch CLAUDE_CONFIG_DIR). So every login and every token refresh moves the
+# credentials out of the volume and into the container's writable layer, and a rebuild loses them.
+#
+# So this does not rely on the link surviving. It runs at the moments that matter, and moves a
+# regular file found at a link site back into the volume. The file in the home is always the newer
+# one: it exists only because something replaced the link after the volume copy was last written.
+# setup.sh runs it through dc_link_state, run.sh runs it on every start and before `--stop` and
+# `--rm`, so a rebuild through run.sh carries the newest token. The residual is stated in README.md.
+#
+# WHICH COPY IS NEWER is decided by whether this container has linked the file before, and that is
+# recorded in DC_LOGIN_LINKED, a marker in ~/.claude, which is the writable layer, not the volume:
+#   - marker PRESENT: a link was made here and something replaced it. That can only be a Claude Code
+#     write, so the home file is newer, and it moves into the volume.
+#   - marker ABSENT: nothing here has linked it yet (a fresh container at setup). A regular file now
+#     came with the image or predates setup. If the volume already holds a copy, that copy is the
+#     login carried from the last container, and it wins. The home file is set aside as
+#     `<file>.pre-link` rather than deleted, because it could be a login made before setup
+#     finished. Only when the volume has no copy does the home file move in.
+# "The home file is always newer" was the first version of this rule. It is false at setup: moving
+# an image-shipped ~/.claude.json over the volume's would lose the carried account state on every
+# rebuild, where the plain `ln -sfn` it replaced had kept it.
+#
+# A FAILED MOVE IS RECORDED in DC_LOGIN_CARRY_FAILED (also in the layer) and cleared by the next
+# clean run, so verify.sh can tell a file waiting to be carried from one that could not be.
+#
+# Prints one line per file moved or set aside. Returns 1 if any file could not be moved or linked.
+dc_persist_login() { # dc_persist_login [home]
+    local h="${1:-/home/vscode}" pair link want rc=0 errs=""
+    local linked="$h/$DC_LOGIN_LINKED" failed="$h/$DC_LOGIN_CARRY_FAILED"
+    mkdir -p "$h/.claude-state" "$h/.claude" || return 1
+    while IFS= read -r pair; do
+        link="${pair%%:*}"; want="${pair##*:}"
+        if [ -d "$link" ] && [ ! -L "$link" ]; then
+            # `ln -sfn` onto a real directory makes a link INSIDE it and succeeds, so this would
+            # otherwise report the file linked while nothing was.
+            errs="$errs$link is a directory, not a file; left alone. "
+            rc=1; continue
+        fi
+        if [ -f "$link" ] && [ ! -L "$link" ]; then
+            if [ ! -e "$linked" ] && [ -f "$want" ]; then
+                if ! mv -f "$link" "$link.pre-link"; then
+                    errs="${errs}could not set $link aside. "
+                    rc=1; continue
+                fi
+                echo "kept the state volume's $want; set aside $link as $link.pre-link"
+            elif ! mv -f "$link" "$want"; then
+                errs="${errs}could not move $link into the state volume. "
+                rc=1; continue
+            else
+                echo "moved $link into the state volume"
+            fi
+        fi
+        ln -sfn "$want" "$link" 2>/dev/null || { errs="${errs}could not link $link. "; rc=1; }
+    done <<EOF
+$(dc_login_files "$h")
+EOF
+    if [ "$rc" -eq 0 ]; then
+        : > "$linked" || rc=1
+        rm -f "$failed"
+    else
+        echo "dc_persist_login: $errs" >&2
+        printf '%s\n' "$errs" > "$failed" 2>/dev/null || true
+    fi
+    return "$rc"
+}
+
+# The two markers above, relative to the home, named once for lib.sh and verify.sh.
+DC_LOGIN_LINKED=".claude/.jkb-login-linked"
+DC_LOGIN_CARRY_FAILED=".claude/.jkb-login-carry-failed"
 
 # THE SETUP-COMPLETE MARKER, named once for the two scripts that use it (D52.5).
 #
