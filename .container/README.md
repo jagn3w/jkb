@@ -530,6 +530,99 @@ permitted, so a blanket grant re-added by any route fails.
 The cost is real and intended: you cannot `sudo apt install` inside the container. Add packages to
 the Dockerfile and rebuild, or `docker exec -u root` from the host.
 
+## Sibling-repo toolchains: Ruby and PostgreSQL
+
+One container serves every repo under `~/repos`, so when a sibling needs a toolchain, it goes in
+the image. The first is `contextual-translate` (Rails 8 + Postgres). The Dockerfile builds a
+**pinned** Ruby (`JKB_RUBY_VERSION`, with `ruby-build` at `JKB_RUBY_BUILD_TAG`) into a root-owned
+`/opt/ruby`, and installs the distro's PostgreSQL with no `main` cluster. It links exactly
+`ruby`, `gem`, `bundle`, `bundler`, `irb`, `pg_ctl`, `initdb` and `postgres` into `/usr/local/bin`.
+The Dockerfile comment says why each is placed where it is. The layer is **on by default and off
+in CI** (`JKB_WITH_RUBY=0`), because jkb's container job verifies nothing about it.
+
+**Rails is not installed globally.** A project's `Gemfile.lock` owns its gem versions, including
+the one that generates the app. To bootstrap a new app:
+
+    bundle init && bundle add rails --version '~> 8.0' && bundle exec rails new . --force --database=postgresql
+
+**Gems go in `~/.cache/bundle`, never the project.** The image sets `BUNDLE_PATH` there, and
+`BUNDLE_USER_HOME` beside it. Do not `bundle config set --local path vendor/bundle`: `~/repos` is
+the Mac's directory, and Linux-built native gems plus a `.bundle/config` there would be read by the
+host's own `bundle`. That is the same reason `target/` is kept off the bind.
+
+**The allowlist change reaches the Mac too.** `rubygems.org` and `index.rubygems.org` are in
+`scripts/auto-mode-posture.json`, which is the host posture as well as the container's. They are
+concrete names so that the firewall, which skips wildcards, allows them too. On the host, re-run
+`./scripts/auto-mode.sh install` after pulling this, or `auto-mode.sh run` refuses on posture drift.
+Once installed, host sessions can reach RubyGems as well. That is intended: it is a package
+registry, like `registry.npmjs.org` and `crates.io` beside it.
+
+**Postgres is per user, and the agent cannot reach yours.** Nothing here can start a system
+service, so you run a cluster yourself with `initdb` + `pg_ctl`. The agent's Bash runs each command
+in its **own network namespace**, whose only live interface is its own `lo`. Its seccomp filter
+also refuses `socket(AF_UNIX)`. A server you start on the container's `127.0.0.1:5432` is therefore
+invisible to it. Measured 2026-09-18 from a sandboxed Bash call:
+
+- `/proc/net/dev` listed `lo` and the kernel's inert tunnel stubs (`tunl0`, `gre0`, …), and no `eth0`;
+- `socket(AF_UNIX)` raised `PermissionError: [Errno 1] Operation not permitted`;
+- a listener on `127.0.0.1:0` accepted a connection from the same Python process.
+
+The `127.0.0.1` entry in `allowedDomains` does not help, because it governs only what the sandbox's
+HTTP proxy will tunnel to. The sandbox exports the proxy as `HTTP(S)_PROXY`/`ALL_PROXY` and lists
+`127.0.0.1` in `NO_PROXY`, and libpq reads none of them. `excludedCommands` is the usual way out,
+and the posture requires it to be empty. So the agent starts a throwaway server **inside the same
+command** as the tests, in a fresh data directory, and stops it on the way out:
+
+    pg=$(mktemp -d) && initdb -D "$pg" --auth=trust >/dev/null \
+      && pg_ctl -D "$pg" -l "$pg/log" -w \
+           -o "-c listen_addresses=127.0.0.1 -c unix_socket_directories=''" start \
+      || exit 1
+    trap 'pg_ctl -D "$pg" -m immediate stop >/dev/null; rm -rf "$pg"' EXIT
+    export PGHOST=127.0.0.1
+    RAILS_ENV=test bin/rails db:prepare && bin/rails test
+
+Every piece of it is there for a reason:
+
+- **The fresh directory** means a run killed before its `trap` leaves nothing behind for the next
+  run to trip on: no half-finished `initdb` and no stale `postmaster.pid`. Two agents at once also
+  never share a cluster. Each command has its own network namespace, so two servers both on
+  port 5432 do not collide either.
+- **`PGHOST`** is needed because the server has no socket. A stock `database.yml` names no `host:`,
+  so libpq would try `/var/run/postgresql` and fail with a message pointing away from the cause.
+- **`|| exit 1`** is needed because tests run against no server fail with a connection error, not
+  with the reason.
+
+Verified 2026-09-18 on the rebuilt image (Ruby 3.4.10, PostgreSQL 16.15), all from a sandboxed
+Bash call:
+
+- `bundle install` of `pg` resolved through the allowlist and installed into `BUNDLE_PATH`, both as
+  the prebuilt `aarch64-linux` gem and, with `BUNDLE_FORCE_RUBY_PLATFORM=true`, compiled against
+  `libpq-dev`.
+- The recipe above started a server. `PG.connect` created a database and read `select version()`
+  back, and the `trap` stopped the server and removed the directory.
+- With `PGHOST` unset, the same connect raised `PG::ConnectionBad` with an **empty message**, which
+  is the misleading failure the `PGHOST` line exists to prevent.
+
+**The dev server is a different recipe, not the same one with another directory.** The test
+recipe always runs `initdb` and deletes its directory on exit, so reusing it with
+`~/.cache/pg-dev` would throw the database away when the terminal closes. And leaving out only the
+cleanup would fail the next time at `initdb` (the directory is not empty), with `|| exit 1` then
+closing your terminal. So, from an attached VS Code terminal, which is not sandboxed:
+
+    pg=~/.cache/pg-dev
+    [ -f "$pg/PG_VERSION" ] || initdb -D "$pg" --auth=trust >/dev/null
+    pg_ctl -D "$pg" -l "$pg/log" -w \
+      -o "-c listen_addresses=127.0.0.1 -c unix_socket_directories=''" start
+    export PGHOST=127.0.0.1
+    bin/rails s          # and `pnpm dev` in another terminal, with the same PGHOST
+
+Stop it with `pg_ctl -D ~/.cache/pg-dev stop`. The gate is `PG_VERSION`, not the directory. Either
+way, a half-finished `initdb` then fails loudly, at `initdb` or at `start`, and never becomes a
+database that is silently empty. The socket flag
+is needed here too: the distro's socket directory, `/var/run/postgresql`, belongs to `postgres`.
+`~/.cache` is in the container's writable layer, so a rebuild drops the dev database. VS Code
+forwards the Vite port to the Mac. No port publishing and no permission change is involved.
+
 ## Verifying it
 
 - `verify.sh` — inside the container: non-root, **PID 1 reaps what it adopts**, bwrap works, the
