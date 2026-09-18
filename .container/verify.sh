@@ -273,6 +273,28 @@ login_link_state() { # login_link_state <link> <want>
     else printf 'missing'
     fi
 }
+# Where git in here looks for hooks, for assertion 3e: <raw global core.hooksPath> <git's expansion
+# of it> -> one word.
+#   unset      no global value: every repository's own .git/hooks runs, and that is mounted
+#   in-repo    relative: git resolves it inside each repository, which is mounted too
+#   mirrored   the host's directory, copied in by run.sh, and not writable from here
+#   missing    set, but nothing is there: git runs NO hooks, silently (the defect this exists for)
+#   unmarked   something is there that run.sh did not put there, so it is not the host's hooks
+#   writable   the mirror, but writable from here, so a sandboxed command could plant a hook that
+#              runs outside the sandbox the next time you commit from an attached terminal
+# A function rather than inline so that --self-test reaches every arm.
+hooks_dir_state() { # hooks_dir_state <raw> <expanded>
+    case "$1" in
+        "")        printf 'unset'; return ;;
+        /*|"~"*)   ;;   # ~user too: git expands it or fails, and either way the check below answers
+        *)         printf 'in-repo'; return ;;
+    esac
+    if [ ! -d "$2" ]; then printf 'missing'
+    elif [ ! -e "$2/$DC_HOOKS_MIRROR_MARKER" ]; then printf 'unmarked'
+    elif [ -w "$2" ]; then printf 'writable'
+    else printf 'mirrored'
+    fi
+}
 # --self-test: the exclusion list, exercised with no container. Run by ./scripts/check.sh.
 #
 # It is the one part of the mount boundary that widens by a TYPO rather than by an edit anyone
@@ -433,6 +455,25 @@ if [ "$SELF_TEST" = yes ]; then
     mkdir "$lt/dir";                       st2 "a directory"                              "$(login_link_state "$lt/dir" "$want")" notfile
                                            st2 "nothing at all"                           "$(login_link_state "$lt/none" "$want")" missing
     rm -rf "$lt"
+
+    echo "==> verify.sh self-test: hooks_dir_state"
+    # shellcheck source=lib.sh
+    . "$(dirname "$0")/lib.sh"   # the marker's name; the main path sources it further down
+    ht="$(mktemp -d)"; mkdir -p "$ht/mirror" "$ht/bare"; : > "$ht/mirror/$DC_HOOKS_MIRROR_MARKER"
+    st2 "no global hooksPath"                    "$(hooks_dir_state "" "")" unset
+    st2 "a relative hooksPath"                   "$(hooks_dir_state ".githooks" "")" in-repo
+    st2 "a path with nothing there"              "$(hooks_dir_state "$ht/none" "$ht/none")" missing
+    st2 "a ~ path with nothing there"            "$(hooks_dir_state "~/.config/git/hooks" "$ht/none")" missing
+    st2 "another user's home, unexpandable"      "$(hooks_dir_state "~nosuchuser/hooks" "")" missing
+    st2 "a directory run.sh did not make"        "$(hooks_dir_state "$ht/bare" "$ht/bare")" unmarked
+    st2 "the mirror, writable from here"         "$(hooks_dir_state "$ht/mirror" "$ht/mirror")" writable
+    chmod 555 "$ht/mirror"
+    if [ -w "$ht/mirror" ]; then
+        printf '  \033[33mskip\033[0m the mirror, read-only (running as root: nothing is unwritable)\n'
+    else
+        st2 "the mirror, read-only from here"    "$(hooks_dir_state "$ht/mirror" "$ht/mirror")" mirrored
+    fi
+    chmod 755 "$ht/mirror"; rm -rf "$ht"
 
     echo
     [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
@@ -1221,6 +1262,26 @@ case "$mem_state" in
         bad "auto-memory is not linked into the shared store (state: ${mem_state:-unknown}) — memory written in here would be invisible on the host; run scripts/link-claude-memory.sh and read what it says" ;;
     *)
         bad "scripts/link-claude-memory.sh --status answered '$mem_state', which this check does not recognise" ;;
+esac
+
+# 3e. Git runs the hooks the host runs. VS Code copies the host's ~/.gitconfig in on attach, so a
+#     global core.hooksPath names a host directory; run.sh mirrors it (lib.sh's
+#     dc_mirror_host_hooks). If the mirror is missing, git runs NO hooks and says nothing, which is
+#     how commits made in here slipped past the host's hooks for as long as nobody looked. Asked of
+#     git, not of a file: whatever ~/.gitconfig says, `--path` is where git will look.
+# The caller's repository selection is dropped first, the repository-wide rule for any script that
+# runs git (docs/git-hooks-installer.md). verify.sh runs no git before this line.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+hooks_raw="$(git config --global --get core.hooksPath 2>/dev/null || true)"
+hooks_dir="$(git config --global --path --get core.hooksPath 2>/dev/null || true)"
+case "$(hooks_dir_state "$hooks_raw" "$hooks_dir")" in
+    unset)    ok "no global core.hooksPath: each repository's own .git/hooks runs" ;;
+    in-repo)  ok "the global core.hooksPath ($hooks_raw) resolves inside each repository, which is mounted" ;;
+    mirrored) ok "git's hooks directory ($hooks_dir) is the host's, mirrored, and not writable from here" ;;
+    missing)  bad "git runs NO hooks in here: core.hooksPath is $hooks_raw and $hooks_dir does not exist — run.sh mirrors the host's on start; re-run it, and read its 'git hooks' step" ;;
+    unmarked) bad "$hooks_dir is not the host's hooks: run.sh did not put it there, so it refuses to replace it — move it aside and re-run run.sh" ;;
+    writable) bad "$hooks_dir is writable from here, so a sandboxed command could plant a hook that runs unsandboxed on your next commit — re-run run.sh, which makes it root-owned" ;;
+    *)        bad "the hooks-directory check answered something it does not recognise" ;;
 esac
 
 # 4. ...and these must be present, or the container is merely empty rather than confined.

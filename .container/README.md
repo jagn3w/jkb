@@ -574,6 +574,47 @@ permitted, so a blanket grant re-added by any route fails.
 The cost is real and intended: you cannot `sudo apt install` inside the container. Add packages to
 the Dockerfile and rebuild, or `docker exec -u root` from the host.
 
+## Git runs the host's hooks, from a read-only copy
+
+**The defect.** VS Code copies the host's `~/.gitconfig` into the container every time you attach.
+The copy includes its `core.hooksPath`, which on the Mac is `/Users/<you>/.config/git/hooks`, a path
+that does not exist in here. Git treats a missing hooks directory as an empty one: no error, and no
+hook runs. Observed 2026-09-18. Commits made in the container carried a `Co-Authored-By` trailer
+that the host's hooks stop, and `post-merge` never ran on a pull. Nothing reported either, because
+nothing looked.
+
+**The fix is a copy, made on every start.** `run.sh` reads the host's **global** `core.hooksPath`
+and copies that directory to the path git in here resolves the same raw value to. An absolute
+path stays the same path, so `/Users/<you>/...` really exists in here. `~/…` maps to
+`/home/vscode/…`. A relative value resolves inside each repository, which is already mounted, so
+there is nothing to copy. The work is `lib.sh`'s `dc_mirror_host_hooks`, and `run.sh`'s "git
+hooks" step calls it.
+
+- **A copy, not a bind mount.** The mount list is the security boundary, and `verify.sh` asserts
+  it exactly. A mount whose source is missing stops the container starting, and not every host has
+  a global hooks directory. A copy needs neither, and cannot write back to the host. The cost is
+  staleness: a hook edited on the host arrives at the next `run.sh` start.
+- **Root-owned, and not writable from in here.** A hook runs whenever git does, including from
+  the attached terminal, which is not sandboxed. A hooks directory the agent could write would let
+  a sandboxed command plant code that runs outside the sandbox on your next commit.
+- **Replaced whole, never merged, and only if it is the mirror's own.** Each start swaps in a fresh
+  copy, so a hook deleted on the host goes. A directory at that path without the mirror's marker
+  (`.jkb-host-mirror`) was not made by the mirror, so it is refused and reported, never replaced.
+- **Symlinks are dereferenced**, because a hook linked to a host path would dangle in here.
+
+`verify.sh` (3e) asks git where it will look and fails loudly on the two states that matter: a path
+with nothing there, which is the silent defect above, and a mirror writable from here.
+`scripts/tests/container-hooks.test.sh` runs the copy against a stub `docker`, and
+`verify.sh --self-test` covers the classification.
+
+**What the hooks do in here.** `post-merge` runs `scripts/setup.sh` after a pull that touches
+code. With `JKB_REMOTE` set, `setup.sh` rebuilds the `jkb` binary and stops. The scaffold, the
+services, the git-hooks install and the notifier belong to the host
+(`docs/git-hooks-installer.md` records that profile). `jkb task close-merged` then runs through
+the daemon as usual. The host's own hooks, such as `commit-msg`, run unchanged, and they must work
+on Linux: a hook that calls a macOS-only tool fails here, and a failing `commit-msg` refuses the
+commit.
+
 ## Sibling-repo toolchains: Ruby and PostgreSQL
 
 One container serves every repo under `~/repos`, so when a sibling needs a toolchain, it goes in

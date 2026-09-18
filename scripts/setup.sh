@@ -12,6 +12,9 @@
 #   6. builds + installs the notifier behind sticky Claude Code notifications, and reports
 #      the two things it cannot do for you: the one-time Allow, and the Alerts style
 #
+# With JKB_REMOTE set (the dev container) only step 1 runs: the rest belongs to the machine
+# that serves the knowledge base.
+#
 # Flags: --no-extension, --no-service, --no-scaffold, --link-memory, --db <path>, -h/--help.
 #
 # --link-memory is opt-in, and deliberately not the default: it writes symlinks under
@@ -85,6 +88,27 @@ if ! command -v jkb >/dev/null 2>&1; then
   exit 1
 fi
 echo "installed: $(command -v jkb) ($(jkb --version))"
+
+# --- remote mode: the dev container stops here --------------------------------
+# JKB_REMOTE means this jkb reaches a knowledge base served from another machine: the dev
+# container, reaching the host's `jkb serve`. `.container/container.json` is the only thing that
+# sets it today. A second kind of remote client would need its own answer for the git-hooks step
+# at least, since only the container has run.sh copying the host's hooks in. Every step below belongs to the machine that holds
+# the database. The scaffold and the notification topic go through `ns mk` and `--db`, which
+# remote mode refuses. The services have no service manager in a container. The git hooks are the
+# host's, and .container/run.sh copies them in, read-only, where a chainer install here would fail
+# on them. The notifier is a Mac app. So here this script rebuilds the binary, which is what
+# post-merge needs after a pull, and stops, saying so.
+# Decided HERE and not in post-merge, so that setup.sh run by hand in the container gets the same
+# answer as the hook does (a rule the caller has to remember is the defect this repo keeps finding).
+if [ -n "${JKB_REMOTE:-}" ]; then
+  say "remote mode (JKB_REMOTE=$JKB_REMOTE) — the binary is all that belongs here"
+  echo "  • skipped: KB scaffold, VS Code extension, services, git hooks, notification topic, notifier."
+  echo "    The machine serving the knowledge base owns them; run setup.sh there. In the dev container,"
+  echo "    .container/run.sh mirrors that machine's git hooks and .container/install-extensions.sh"
+  echo "    installs the extensions."
+  exit 0
+fi
 
 # --- 2. scaffold the KB ------------------------------------------------------
 # ONLY on a fresh machine: if a KB already exists we leave it completely untouched

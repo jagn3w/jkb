@@ -12,6 +12,18 @@ conventions every session is expected to know.
   touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
   `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
+- **In the dev container, `setup.sh` rebuilds the binary and stops** (`JKB_REMOTE` set). Once the
+  container ran the host's hooks (`.container/README.md`, "Git runs the host's hooks"), `post-merge`
+  would run this host installer in there after every pull that touches code. Everything after step
+  1 belongs to the machine serving the knowledge base, and fails or misleads in the container. The
+  scaffold and the notification topic go through `ns mk` and `--db`, which remote mode refuses.
+  Services have no service manager. The hooks install would try to write the chainer into the
+  read-only mirror of the host's hooks directory. The rule sits in `setup.sh` rather than in
+  `post-merge`, so a hand-run in the container gets the same answer. It is an early exit, not a
+  fourth `skipped` state, because every `skipped` line in the summary names a flag
+  (`--no-service`), and that would be false here. Pinned by
+  `scripts/tests/container-hooks.test.sh`, which runs `setup.sh` with stub `cargo` and `jkb`, and
+  asserts `jkb` was asked nothing but its version.
 - **A hook goes in `--git-common-dir`, never `--git-dir`** (`scripts/lib.sh`'s `git_hooks_dir`).
   In a linked worktree the latter is `<repo>/.git/worktrees/<name>`, which holds no hooks — git
   resolves `hooks/` against the common dir. Since D36 puts *every* `jkb task work` session in a

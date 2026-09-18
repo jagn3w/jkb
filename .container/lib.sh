@@ -438,3 +438,120 @@ dc_apparmor_profile() { # dc_apparmor_profile <profile file> -> the declared pro
     # callers spend on `docker run --security-opt apparmor=`. Quotes optional, never captured.
     sed -n 's/^profile[[:space:]]\{1,\}"\{0,1\}\([A-Za-z0-9_.-]\{1,\}\)"\{0,1\}[[:space:]].*/\1/p' "$1" 2>/dev/null | head -1
 }
+
+# ---------------------------------------------------------------------------------------------
+# THE HOST'S GLOBAL GIT HOOKS, MIRRORED INTO THE CONTAINER
+# ---------------------------------------------------------------------------------------------
+# VS Code copies the host's ~/.gitconfig into the container on every attach, `core.hooksPath`
+# included. When that names a global hooks directory (the Mac's is /Users/<you>/.config/git/hooks),
+# the path does not exist in here, and git treats a missing hooks directory as an empty one: no
+# error, and no hook runs. Observed 2026-09-18: in here `core.hooksPath` named
+# /Users/jagnew/.config/git/hooks, which does not exist, so commits made here carried a trailer the
+# host's hooks stop, and `post-merge` never ran on a pull. So run.sh copies the host's directory to
+# the path git in here will resolve, on every start.
+#
+# A COPY, NOT A BIND MOUNT. The mount list is the security boundary and verify.sh asserts it
+# exactly. A mount whose source is missing is a hard error that stops the container starting, and
+# not every host has a global hooks directory. A copy needs neither, and cannot write back to the
+# host. The cost is staleness: a hook edited on the host arrives at the next run.sh start.
+#
+# ROOT-OWNED AND READ-ONLY. A hook runs whenever git does, including from the terminal you attach,
+# which is not sandboxed. A hooks directory the agent could write would let a sandboxed command
+# plant code that runs outside the sandbox on your next commit. verify.sh asserts it is not
+# writable here.
+#
+# Only a directory carrying DC_HOOKS_MIRROR_MARKER is ever replaced, so a directory somebody made
+# by hand at that path is refused and reported, never clobbered.
+DC_HOOKS_MIRROR_MARKER=".jkb-host-mirror"
+
+# dc_container_hooks_dir <raw core.hooksPath> -> the absolute path git in the container resolves it
+# to, or nothing (rc 1) when there is nothing to mirror. The value is taken RAW, as the host stores
+# it, because the container's ~/.gitconfig is a byte copy and git in here expands it for itself:
+#   /abs/path    -> /abs/path, the same path in here
+#   ~/rel        -> /home/vscode/rel, because git expands ~ against the container's HOME
+#   ~user/...    -> nothing: user `user` has no home in here
+#   relative     -> nothing: git resolves it inside each repository, which is already mounted
+#   empty        -> nothing: git reads that as "/", and there is nothing to mirror
+dc_container_hooks_dir() { # dc_container_hooks_dir <raw>
+    case "$1" in
+        /*)    printf '%s' "$1" ;;
+        "~")   printf '/home/vscode' ;;
+        "~/"*) printf '/home/vscode/%s' "${1#\~/}" ;;
+        *)     return 1 ;;
+    esac
+}
+
+# dc_mirror_hooks <host dir> <container dir> <container name> [docker command]
+# Copy <host dir> into the running container at <container dir>, root-owned and not writable by
+# anyone else, with the marker added. Prints one line saying what it did. Returns 1 when it did not
+# mirror, with the reason on stderr. The docker command is a parameter so a test can stub it.
+dc_mirror_hooks() {
+    local src="$1" dst="$2" name="$3" docker="${4:-docker}" parent
+    [ -d "$src" ] || { echo "dc_mirror_hooks: $src is not a directory on the host" >&2; return 1; }
+    case "$dst" in /*) ;; *) echo "dc_mirror_hooks: $dst is not absolute" >&2; return 1 ;; esac
+    parent="$(dirname "$dst")"
+    # A parent under the container user's home is created AS that user, so a later `git config
+    # --global` or a tool writing ~/.config still owns its own directory. Elsewhere (/Users/...),
+    # only root can create it, and the root step below does.
+    case "$parent" in
+        /home/vscode/*) "$docker" exec "$name" mkdir -p "$parent" >/dev/null 2>&1 || true ;;
+    esac
+    # -h: a hook that is a symlink on the host would dangle in here, so its target is copied.
+    # COPYFILE_DISABLE and --no-xattrs keep macOS metadata out of the archive, which GNU tar
+    # would otherwise warn about, file by file, on every start.
+    # shellcheck disable=SC2016
+    if ! (cd "$src" && COPYFILE_DISABLE=1 tar -h --no-xattrs -cf - .) \
+        | "$docker" exec -i -u root "$name" sh -c '
+            set -e
+            dst="$1"; marker="$2"; new="$dst.jkb-new"
+            if [ -e "$dst" ] && [ ! -e "$dst/$marker" ]; then
+                echo "dc_mirror_hooks: $dst exists and was not made by this mirror; left alone" >&2
+                exit 3
+            fi
+            rm -rf "$new"; mkdir -p "$new"
+            tar -C "$new" -xf - --no-same-owner --warning=no-unknown-keyword
+            printf "%s\n" "Copied from the host by .container/run.sh on every start. Edit the host copy." > "$new/$marker"
+            chown -R 0:0 "$new"
+            chmod -R u+rwX,go+rX,go-w "$new"
+            mkdir -p "$(dirname "$dst")"
+            rm -rf "$dst"
+            mv "$new" "$dst"
+        ' sh "$dst" "$DC_HOOKS_MIRROR_MARKER"; then
+        echo "dc_mirror_hooks: could not copy $src into $name at $dst" >&2
+        return 1
+    fi
+    echo "mirrored the host's git hooks ($src) to $dst"
+}
+
+# dc_mirror_host_hooks <container name> [docker command] -- run.sh's step, ON THE HOST: read the
+# host's GLOBAL core.hooksPath and mirror that directory in. Prints one line saying what happened;
+# never fails the caller (returns 0 even when it mirrored nothing), because a start must not stop
+# over hooks. verify.sh is what reports a dead hooks directory.
+#
+# Global scope only, deliberately. A repository's own core.hooksPath travels with the repository,
+# which is mounted, and a relative one resolves inside it. The global one is the only kind that
+# names a host path the container cannot see.
+#
+# A SUBSHELL FUNCTION, so the scrub below cannot leak into run.sh. The caller's repository selection
+# is dropped before the first git call (the repository-wide rule, docs/git-hooks-installer.md):
+# `--global` reads no repository, but an exported GIT_DIR still makes git open one first.
+dc_mirror_host_hooks() ( # dc_mirror_host_hooks <name> [docker]
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    local name="$1" docker="${2:-docker}" raw src dst
+    if ! raw="$(git config --global --get core.hooksPath 2>/dev/null)"; then
+        echo "no global core.hooksPath on the host; git in the container uses each repository's .git/hooks"
+        return 0
+    fi
+    if ! dst="$(dc_container_hooks_dir "$raw")"; then
+        echo "the host's global core.hooksPath ($raw) needs no mirror, or cannot have one: git resolves it inside each repository, or it names another user's home"
+        return 0
+    fi
+    # The HOST's expansion of the same value is where the files are.
+    if ! src="$(git config --global --path --get core.hooksPath 2>/dev/null)" || [ ! -d "$src" ]; then
+        echo "warning: the host's global core.hooksPath ($raw) is not a directory here, so there is nothing to mirror, and git in the container runs no hooks" >&2
+        return 0
+    fi
+    dc_mirror_hooks "$src" "$dst" "$name" "$docker" \
+        || echo "warning: the host's git hooks were not mirrored into $name, so git in there runs none of them (see above)" >&2
+    return 0
+)
