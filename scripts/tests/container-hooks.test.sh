@@ -216,8 +216,8 @@ case5_the_host_step_reads_the_global_value() {
 # every call, so "stopped" is observed rather than inferred from the message.
 # remote_setup <1 if the stub cargo changes the binary, 0 if not> -- run a COPY of setup.sh in remote
 # mode (see CONFINED below) and set $out, $rc, $calls and $d.
-remote_setup() {
-    local t
+remote_setup() { # remote_setup <0|1> [setup.sh flags...]
+    local t changes="$1"; shift
     d="$work/setup-$RANDOM"
     mkdir -p "$d/home" "$d/cargo/bin" "$d/repo/scripts/hooks"
     cp "$repo_root/scripts/setup.sh" "$repo_root/scripts/lib.sh" "$d/repo/scripts/"
@@ -226,11 +226,13 @@ remote_setup() {
     printf '#!/bin/sh\necho "jkb $*" >> "%s"\necho "jkb 0.0.0-stub"\n' "$d/calls" > "$d/cargo/bin/jkb"
     # The stub cargo "installs" by appending to the jkb stub when asked to change it, which is what
     # a rebuild from changed sources does to the binary's bytes.
-    if [ "$1" = 1 ]; then
+    if [ "$changes" = 1 ]; then
         printf '#!/bin/sh\necho "cargo $*" >> "%s"\necho "# rebuilt" >> "%s"\n' "$d/calls" "$d/cargo/bin/jkb" > "$d/cargo/bin/cargo"
     else
         printf '#!/bin/sh\necho "cargo $*" >> "%s"\n' "$d/calls" > "$d/cargo/bin/cargo"
     fi
+    printf '#!/bin/sh\necho link-claude-memory >> "%s"\n' "$d/calls" > "$d/repo/scripts/link-claude-memory.sh"
+    chmod +x "$d/repo/scripts/link-claude-memory.sh"
     for t in systemctl launchctl pnpm code; do
         printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 1\n' "$t" "$d/calls" > "$d/cargo/bin/$t"
     done
@@ -238,7 +240,7 @@ remote_setup() {
     : > "$d/calls"
     rc=0
     out="$(HOME="$d/home" CARGO_HOME="$d/cargo" PATH="$d/cargo/bin:$PATH" JKB_REMOTE=host.docker.internal:7117 \
-           bash "$d/repo/scripts/setup.sh" --no-extension --no-service 2>&1)" || rc=$?
+           bash "$d/repo/scripts/setup.sh" --no-extension --no-service "$@" 2>&1)" || rc=$?
     calls="$(tr '\n' ';' < "$d/calls")"
 }
 
@@ -430,13 +432,14 @@ case15_the_host_value_is_recorded_on_every_start() {
     rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
     GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
     grep -qx "state=value" "$rec" && grep -qx "value=$src" "$rec" && grep -qx "origin=$cfg" "$rec" \
-        && grep -qx "mirror=ok" "$rec" && [ "$(head -1 "$xdg")" = "$DC_HOOKS_XDG_MARK — written by .container/run.sh on every start from the host core.hooksPath; edit the host" ] \
-        && set_ok=yes
+        && grep -qx "mirror=ok" "$rec" && grep -qx "applied=$src" "$rec" \
+        && [ "$(git config --file "$xdg" --get core.hooksPath)" = "$src" ] && set_ok=yes
     : > "$cfg"
     GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
-    [ "$(cat "$rec")" = state=unset ] && [ ! -e "$xdg" ] && unset_ok=yes
-    if [ "$set_ok$unset_ok" = yesyes ]; then ok "every start records the host's state, value, origin and mirror outcome, and writes or removes the container's hooks config"
-    else fail "every start records the host's state, value, origin and mirror outcome, and writes or removes the container's hooks config" "set=$set_ok unset=$unset_ok record=$(cat "$rec" 2>&1) xdg=$(cat "$xdg" 2>&1)"; fi
+    [ "$(head -1 "$rec")" = state=unset ] && grep -qx "applied=-" "$rec" \
+        && ! git config --file "$xdg" --get core.hooksPath >/dev/null 2>&1 && unset_ok=yes
+    if [ "$set_ok$unset_ok" = yesyes ]; then ok "every start records the host's state, value, origin and mirror outcome, and sets or unsets the key in the container's hooks config"
+    else fail "every start records the host's state, value, origin and mirror outcome, and sets or unsets the key in the container's hooks config" "set=$set_ok unset=$unset_ok record=$(cat "$rec" 2>&1) xdg=$(cat "$xdg" 2>&1)"; fi
 }
 
 
@@ -448,38 +451,37 @@ case16_the_record_reader() {
     mkdir -p "$d"; : > "$d/marker"; sleep 1
     printf 'state=value\nvalue=\norigin=/h/.gitconfig\nmirror=failed\n' > "$d/rec"
     got="$(dc_read_host_record "$d/rec" "$d/marker" | tr '\037' '|')"
-    [ "$got" = "value||/h/.gitconfig|failed" ] || bad="$bad [empty value: $got]"
+    [ "$got" = "value||/h/.gitconfig|failed|-" ] || bad="$bad [empty value, no applied line: $got]"
+    printf 'state=value\nvalue=.githooks\norigin=/h/.gitconfig\nmirror=\napplied=.githooks\n' > "$d/rec"
+    got="$(dc_read_host_record "$d/rec" "$d/marker" | tr '\037' '|')"
+    [ "$got" = "value|.githooks|/h/.gitconfig||.githooks" ] || bad="$bad [applied: $got]"
     printf 'state=unset\n' > "$d/rec"
     got="$(dc_read_host_record "$d/rec" "$d/marker" | tr '\037' '|')"
-    [ "$got" = "unset|||" ] || bad="$bad [unset: $got]"
+    [ "$got" = "unset||||-" ] || bad="$bad [unset: $got]"
     got="$(dc_read_host_record "$d/rec" "$d/no-marker" | tr '\037' '|')"
-    [ "$got" = "unset|||" ] || bad="$bad [no marker: $got]"
+    [ "$got" = "unset||||-" ] || bad="$bad [no marker: $got]"
     sleep 1; : > "$d/marker"   # a start after the record was written
     got="$(dc_read_host_record "$d/rec" "$d/marker" | tr '\037' '|')"
-    [ "$got" = "none|||" ] || bad="$bad [older than this start: $got]"
+    [ "$got" = "none||||-" ] || bad="$bad [older than this start: $got]"
     got="$(dc_read_host_record "$d/absent" "$d/marker" | tr '\037' '|')"
-    [ "$got" = "none|||" ] || bad="$bad [absent: $got]"
+    [ "$got" = "none||||-" ] || bad="$bad [absent: $got]"
     if [ -z "$bad" ]; then ok "the record reader keeps empty fields, and reads a record older than this start, or none, as none"
     else fail "the record reader keeps empty fields, and reads a record older than this start, or none, as none" "$bad"; fi
 }
 
-# The container's ~/.config/git/config is written only when it is run.sh's own: a file the user
-# made there is refused and left exactly as it was, the same rule as the mirror directory.
-case17_a_foreign_hooks_config_is_refused() {
+# The container's ~/.config/git/config is SHARED with whatever else lives there: run.sh sets one key
+# and leaves every other line as it was.
+case17_the_hooks_config_keeps_everything_else() {
     need_gnu || return 0
     make_stub; host_hooks
-    local cfg="$HOME/.gitconfig" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG" out
+    local cfg="$HOME/.gitconfig" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG"
     mkdir -p "$(dirname "$xdg")"; printf '[user]\n\tname = mine\n' > "$xdg"
-    # Root-owned, as far as the root step can tell, so the MARKER is the only thing that refuses it
-    # (a user-owned file would be refused on ownership first, and the marker check would go untested).
-    stat -c %i "$xdg" >> "$ROOT_SHIM/../root-inodes"
     rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
-    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    if [ "$(cat "$xdg")" = "$(printf '[user]\n\tname = mine')" ] && [[ "$out" == *"was not written by run.sh; left alone"* ]] \
-       && grep -qx "state=value" "$CTR_ROOT$DC_HOST_HOOKS_RECORD"; then
-        ok "a ~/.config/git/config run.sh did not write is refused and left alone, and the record is still written"
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    if [ "$(git config --file "$xdg" --get user.name)" = mine ] && [ "$(git config --file "$xdg" --get core.hooksPath)" = "$src" ]; then
+        ok "the hooks config keeps the other settings in the file and sets only core.hooksPath"
     else
-        fail "a ~/.config/git/config run.sh did not write is refused and left alone, and the record is still written" "out=$out xdg=$(cat "$xdg")"
+        fail "the hooks config keeps the other settings in the file and sets only core.hooksPath" "$(cat "$xdg")"
     fi
 }
 
@@ -492,7 +494,7 @@ case18_the_writer_and_reader_agree() {
     rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
     GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
     got="$(dc_read_host_record "$CTR_ROOT$DC_HOST_HOOKS_RECORD" "$work/no-marker" | tr '\037' '|')"
-    if [ "$got" = "value|$src|$cfg|ok" ]; then ok "the record the root step writes reads back field for field"
+    if [ "$got" = "value|$src|$cfg|ok|$src" ]; then ok "the record the root step writes reads back field for field"
     else fail "the record the root step writes reads back field for field" "got=$got"; fi
 }
 
@@ -506,6 +508,56 @@ case20_the_reader_ignores_the_repository_it_is_called_from() {
     got="$(cd "$r" && GIT_CONFIG_GLOBAL="$cfg" dc_global_hooks_path)"
     if [ "$got" = /global/hooks ]; then ok "the reader answers the setting outside any repository, even when called from inside one that sets its own"
     else fail "the reader answers the setting outside any repository, even when called from inside one that sets its own" "got=$got"; fi
+}
+
+
+# THE ROUND-5 MUST-FIX. In a container with no ~/.gitconfig yet, `git config --global` writes the
+# XDG file, rewriting it through a lock and a rename. With the file root-owned, that handed it to the
+# container user and every later start refused it. Driven with real git: after the user's write,
+# the next start still sets the key, keeps the user's line, and says nothing is wrong.
+case21_a_user_write_to_the_config_does_not_freeze_the_hooks_path() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local cfg="$HOME/.gitconfig" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG" out ctrhome="$CTR_ROOT/home/vscode"
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    # What the user does in there: no ~/.gitconfig, so --global means the XDG file.
+    env -u GIT_CONFIG_GLOBAL -u XDG_CONFIG_HOME HOME="$ctrhome" git config --global user.email me@example.com
+    printf '#!/bin/sh\necho edited\n' > "$src/commit-msg"
+    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
+    if [ "$(git config --file "$xdg" --get user.email)" = me@example.com ] \
+       && [ "$(git config --file "$xdg" --get core.hooksPath)" = "$src" ] \
+       && [ "$("$CTR_ROOT$src/commit-msg")" = edited ] && [[ "$out" != *warning* ]]; then
+        ok "after the user's own git config --global in there, the next start still sets the hooks path and keeps their setting"
+    else
+        fail "after the user's own git config --global in there, the next start still sets the hooks path and keeps their setting" "out=$out xdg=$(cat "$xdg")"
+    fi
+}
+
+# A relative host value means the same in there (git resolves it in each repository), so it is
+# applied as it is, and recorded as applied: round 5 found it applied as nothing, and 3e agreeing.
+case22_a_relative_value_is_applied_as_it_is() {
+    need_gnu || return 0
+    make_stub
+    local cfg="$HOME/.gitconfig" xdg="$CTR_ROOT$DC_HOOKS_XDG_CONFIG" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD"
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath .githooks
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    if [ "$(git config --file "$xdg" --get core.hooksPath)" = .githooks ] && grep -qx "applied=.githooks" "$rec" && [ ! -s "$TAR_LOG" ]; then
+        ok "a relative hooks path is applied as it is, recorded as applied, and nothing is copied"
+    else
+        fail "a relative hooks path is applied as it is, recorded as applied, and nothing is copied" "xdg=$(cat "$xdg" 2>&1) rec=$(cat "$rec" 2>&1)"
+    fi
+}
+
+# Remote mode honours --link-memory (valid in the container), before it stops.
+case23_setup_sh_in_remote_mode_honours_link_memory() {
+    remote_setup 0 --link-memory
+    if [ "$rc" -eq 0 ] && grep -qx "link-claude-memory" "$d/calls" && [[ "$out" == *"remote mode"* ]] \
+       && [[ "$out" != *"installing git hooks"* ]]; then
+        ok "setup.sh with JKB_REMOTE and --link-memory links memory, then stops"
+    else
+        fail "setup.sh with JKB_REMOTE and --link-memory links memory, then stops" "rc=$rc calls=$calls out=$(tail -5 <<<"$out")"
+    fi
 }
 
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
@@ -524,8 +576,11 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case14_a_symlinked_target_is_refused \
           case15_the_host_value_is_recorded_on_every_start \
           case16_the_record_reader \
-          case17_a_foreign_hooks_config_is_refused \
+          case17_the_hooks_config_keeps_everything_else \
           case18_the_writer_and_reader_agree \
           case19_setup_sh_in_remote_mode_is_quiet_when_the_binary_did_not_change \
-          case20_the_reader_ignores_the_repository_it_is_called_from
+          case20_the_reader_ignores_the_repository_it_is_called_from \
+          case21_a_user_write_to_the_config_does_not_freeze_the_hooks_path \
+          case22_a_relative_value_is_applied_as_it_is \
+          case23_setup_sh_in_remote_mode_honours_link_memory
 finish

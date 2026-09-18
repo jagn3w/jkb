@@ -310,41 +310,41 @@ hooks_dir_state() { # hooks_dir_state <read> <raw> <expanded> <mount> <root-uid>
     else printf 'mirrored'
     fi
 }
-# What git in here uses, against what run.sh recorded the HOST using, for assertion 3e. Compared as
-# CONTAINER PATHS: run.sh writes the host's value, mapped, into ~/.config/git/config, and VS Code's
-# copy of ~/.gitconfig names the same path while it is current.
+# What git in here uses, against what run.sh recorded APPLYING, for assertion 3e. run.sh sets
+# core.hooksPath in ~/.config/git/config on every start, and the record says to what (<applied>);
+# VS Code's copy of ~/.gitconfig names the same thing while it is current, and wins when present.
 #   <host-state> none | unset | unreadable | value (lib.sh's dc_read_host_record)
-#   <expect>     the container path the host's value maps to ("" when it maps to none)
-#   <host-raw>   the host's raw value;  <read> set | unset | unreadable;  <raw> git's value in here
+#   <applied>    what run.sh set (`-` when it set nothing)
+#   <read> <raw> what git in here answered (set | unset | unreadable) and its raw value
 #   <actual>     git's expansion in here, trailing slashes dropped
+# An absolute <applied> is compared with <actual> (the copy may spell the same place ~/...); any
+# other value is compared raw. Round 5 found a relative host value applied as nothing, and this
+# function reading "nothing expected" as agreement.
 # ->
-#   none         nothing to compare against (no record from this start, or the host could not read)
-#   agree        both sides mean the same directory
-#   not-applied  the host sets a path and git in here reads NONE: the config run.sh writes is gone
-#                or was refused. A FAILURE whose remedy is always open: re-run run.sh.
-#   stale        the host sets none, and git in here still reads one: VS Code's copy predates the
-#                change
-#   diverged     both set, to different directories: the copy predates a change on the host
+#   none         nothing to compare against (no record from this start, the host could not read,
+#                or its value means nothing in here)
+#   agree        git in here uses what run.sh applied
+#   not-applied  run.sh applied a value and git in here reads NONE. A FAILURE whose remedy is
+#                always open: re-run run.sh.
+#   stale        the host sets none, and git in here still reads one: VS Code's copy predates that
+#   diverged     git in here reads something else: VS Code's copy predates a change on the host
 # `stale` and `diverged` run hooks the host ran until recently and heal without a restart, so they
 # are reported, not failed: a failure would make `run.sh --open` refuse the window you fix them in.
 # Rounds 3 and 4 found the states before these (`awaiting`, `not-seen`) failing on every fresh
 # container and on a copy that merely predated a host edit, each with a remedy run.sh --open refused.
-hooks_host_compare() { # hooks_host_compare <host-state> <expect> <host-raw> <read> <raw> <actual>
+hooks_host_compare() { # hooks_host_compare <host-state> <applied> <read> <raw> <actual>
     case "$1" in none|unreadable) printf 'none'; return ;; esac
-    case "$4" in set|unset) ;; *) printf 'none'; return ;; esac
+    case "$3" in set|unset) ;; *) printf 'none'; return ;; esac
     if [ "$1" = unset ]; then
-        if [ "$4" = unset ]; then printf 'agree'; else printf 'stale'; fi
+        if [ "$3" = unset ]; then printf 'agree'; else printf 'stale'; fi
         return
     fi
-    if [ "$4" = unset ]; then
-        if [ -n "$2" ]; then printf 'not-applied'; else printf 'agree'; fi   # "" -> nothing to apply
-        return
-    fi
-    if [ -n "$2" ]; then
-        if [ "$6" = "$2" ]; then printf 'agree'; else printf 'diverged'; fi
-    else
-        if [ "$5" = "$3" ]; then printf 'agree'; else printf 'diverged'; fi
-    fi
+    [ "$2" != - ] || { printf 'none'; return; }
+    [ "$3" = set ] || { printf 'not-applied'; return; }
+    case "$2" in
+        /*) [ "$5" = "$2" ] && printf 'agree' || printf 'diverged' ;;
+        *)  [ "$4" = "$2" ] && printf 'agree' || printf 'diverged' ;;
+    esac
 }
 # --self-test: the exclusion list, exercised with no container. Run by ./scripts/check.sh.
 #
@@ -535,16 +535,18 @@ if [ "$SELF_TEST" = yes ]; then
 
     echo "==> verify.sh self-test: hooks_host_compare"
     hc() { hooks_host_compare "$@"; }
-    st2 "no record from this start"              "$(hc none "" "" set /h /h)" none
-    st2 "the host could not read its own"        "$(hc unreadable "" "" unset "" "")" none
-    st2 "neither side sets one"                  "$(hc unset "" "" unset "" "")" agree
-    st2 "the host dropped it, the copy has it"   "$(hc unset "" "" set /h /h)" stale
-    st2 "the host sets one, nothing applied here" "$(hc value /U/h /U/h unset "" "")" not-applied
-    st2 "a relative host value, none here"       "$(hc value "" .githooks unset "" "")" agree
-    st2 "the same directory on both sides"       "$(hc value /U/h /U/h set /U/h /U/h)" agree
-    st2 "~/ on the host, same place in here"     "$(hc value /home/vscode/h "~/h" set "~/h" /home/vscode/h)" agree
-    st2 "the copy predates a host change"        "$(hc value /U/new /U/new set /U/old /U/old)" diverged
-    st2 "a relative value that differs"          "$(hc value "" .githooks set .hooks "")" diverged
+    st2 "no record from this start"              "$(hc none - set /h /h)" none
+    st2 "the host could not read its own"        "$(hc unreadable - unset "" "")" none
+    st2 "neither side sets one"                  "$(hc unset - unset "" "")" agree
+    st2 "the host dropped it, the copy has it"   "$(hc unset - set /h /h)" stale
+    st2 "a value that means nothing in here"     "$(hc value - unset "" "")" none
+    st2 "applied, and git reads none"            "$(hc value /U/h unset "" "")" not-applied
+    st2 "a relative value, applied and read"     "$(hc value .githooks set .githooks "")" agree
+    st2 "a relative value, applied but not read" "$(hc value .githooks unset "" "")" not-applied
+    st2 "an empty value, applied and read"       "$(hc value "" set "" "")" agree
+    st2 "the same directory, spelled ~/ here"    "$(hc value /home/vscode/h set "~/h" /home/vscode/h)" agree
+    st2 "the copy predates a host change"        "$(hc value /U/new set /U/old /U/old)" diverged
+    st2 "a relative value that differs"          "$(hc value .githooks set .hooks "")" diverged
 
     echo
     [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
@@ -1349,13 +1351,11 @@ hooks_dir="$(dc_global_hooks_path --path 2>/dev/null)" || hooks_dir=""
 hooks_dir="$(dc_strip_slashes "$hooks_dir")"   # the mirror acts on the stripped path; so must this
 # What run.sh recorded the host using, and what this start did with it (lib.sh's
 # dc_read_host_record: `none` unless written since this start, by the root step, root-owned).
-IFS="$(printf '\037')" read -r hooks_host_state hooks_host hooks_origin hooks_mirror <<HOOKREC
+IFS="$(printf '\037')" read -r hooks_host_state hooks_host hooks_origin hooks_mirror hooks_applied <<HOOKREC
 $(dc_read_host_record "$DC_HOST_HOOKS_RECORD" "${JKB_NS_MARKER:-}")
 HOOKREC
-hooks_expect=""
-[ "$hooks_host_state" = value ] && hooks_expect="$(dc_container_hooks_dir "$hooks_host" 2>/dev/null || true)"
-case "$(hooks_host_compare "$hooks_host_state" "$hooks_expect" "$hooks_host" "$hooks_read" "$hooks_raw" "$hooks_dir")" in
-    not-applied) bad "the host sets core.hooksPath ($hooks_host, from ${hooks_origin:-an unknown file}) but git in here uses none: run.sh writes it to $DC_HOOKS_XDG_CONFIG on every start, and that is gone or was refused — re-run run.sh and read its 'git hooks' step" ;;
+case "$(hooks_host_compare "$hooks_host_state" "$hooks_applied" "$hooks_read" "$hooks_raw" "$hooks_dir")" in
+    not-applied) bad "the host sets core.hooksPath ($hooks_host, from ${hooks_origin:-an unknown file}) and run.sh set it to '$hooks_applied' in $DC_HOOKS_XDG_CONFIG, but git in here uses none — re-run run.sh and read its 'git hooks' step" ;;
     stale)       note "the host no longer sets core.hooksPath, but git in here still reads $hooks_raw from the ~/.gitconfig VS Code copied: it runs hooks the host has retired. To stop now: git config --global --unset core.hooksPath (in here); a reattach also refreshes the copy" ;;
     diverged)    note "the host's core.hooksPath is $hooks_host, but git in here reads $hooks_raw from the ~/.gitconfig VS Code copied, which predates the change. To use the host's now: git config --global --unset core.hooksPath (in here), and the value run.sh wrote to $DC_HOOKS_XDG_CONFIG applies; a reattach also refreshes the copy" ;;
 esac
@@ -1378,7 +1378,7 @@ case "$(hooks_dir_state "$hooks_read" "$hooks_raw" "$hooks_dir" "$hooks_mount" 0
                 fi ;;
     shared)     ok "git's hooks directory ($hooks_dir) is inside a bind: the host's own, live"
                 note "it is as writable in here as that bind is, so a sandboxed command can change hooks the host also runs — that is the host's configuration, not the mirror's" ;;
-    unreadable) bad "git could not read the global config, so which hooks run in here is unknown — run: git config --global --includes --show-origin --get core.hooksPath" ;;
+    unreadable) bad "git could not read its config, so which hooks run in here is unknown — run: $DC_HOOKS_SHOW_ORIGIN" ;;
     empty)      bad "git runs NO hooks in here: the global core.hooksPath is the empty string, which git reads as '/' — fix it on the host" ;;
     in-volume)  bad "the global core.hooksPath ($hooks_raw) is inside one of the container's volumes, so it is not the host's hooks and run.sh does not mirror it — point it elsewhere on the host" ;;
     unexpandable) bad "git cannot expand the global core.hooksPath ($hooks_raw) in here, so it runs NO hooks — use an absolute path or ~/ on the host" ;;

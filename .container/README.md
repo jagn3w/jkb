@@ -587,9 +587,10 @@ nothing looked.
 the hooks path git on the host uses, and copies that directory to the path the same raw value
 means in here. An absolute path stays the same path, so `/Users/<you>/...` really exists in here.
 `~/…` maps to `/home/vscode/…`, and trailing slashes are dropped. A relative value resolves inside
-each repository, which is already mounted, so there is nothing to copy. The same root step then
-writes the container's `~/.config/git/config` (root-owned, marked `# jkb:host-hooks`), naming the
-copy. The work is `lib.sh`'s `dc_mirror_host_hooks`, and `run.sh`'s "git hooks" step calls it.
+each repository, which is already mounted, so there is nothing to copy. Every start then sets
+`core.hooksPath` in the container's `~/.config/git/config` to the copy's path. A relative value is
+set as it is, since it means the same thing in here. The work is `lib.sh`'s `dc_mirror_host_hooks`,
+and `run.sh`'s "git hooks" step calls it.
 
 - **Why run.sh writes a config, and does not leave it to VS Code's copy.** Four review rounds found
   the same shape. VS Code's copy of `~/.gitconfig` arrives only on **attach**, which is after
@@ -601,19 +602,29 @@ copy. The work is `lib.sh`'s `dc_mirror_host_hooks`, and `run.sh`'s "git hooks" 
   `rev-parse --git-path hooks` in a repository both answer its value, including when a
   `~/.gitconfig` without the key exists; with both set, `~/.gitconfig` wins. So the host's hooks
   run in here before the first attach, and when the host takes the value from an include.
+- **One key, set as the container user, and never the file replaced as root.** The first version
+  wrote the whole file root-owned. A review then measured what git does to it: with no
+  `~/.gitconfig` (every container before its first attach), `git config --global user.email ...`
+  writes *this* file through a lock file and a rename, so it came back user-owned, `run.sh` refused
+  it on every later start, and the hooks path froze. Root ownership bought nothing here, because
+  the threat is a sandboxed command redirecting the hooks path, and the posture already denies the
+  sandbox writes to `~/.config` and `~/.gitconfig`. So `run.sh` sets the one key with
+  `git config --file`, which keeps every other line in the file.
 - **One reader, of what git actually uses.** `dc_global_hooks_path` serves both the host step and
   `verify.sh`. It is the value git uses outside any repository, includes followed. It is not
   `git config --global`, which, measured on the same git, stops reading `~/.config/git/config` as
   soon as `~/.gitconfig` exists. It tells *unset* apart from *set to the empty string*, which git
   reads as `/` and so runs nothing from.
 - **What the host resolved is recorded, root-owned.** The record says the value, the file it came
-  from and whether this start's mirror succeeded. It lives at `/run/jkb-host/hookspath`, written
+  from, whether this start's mirror succeeded, and what `run.sh` applied. It lives at `/run/jkb-host/hookspath`, written
   by the root step in a root-owned directory, so nothing running as the container user can forge
   or delete it. Round 4 found the `vscode`-owned first version able to hide a failure. It counts
   only if it was written since this start: the entrypoint rewrites `/run/jkb/ns` on every start,
   and `run.sh` writes the record after that. `verify.sh` compares it with what git in here uses:
-  - `not-applied` **fails**: the host sets a path and git in here uses none, so the config `run.sh`
-    writes is gone or was refused. Its remedy is re-running `run.sh`, which is always possible.
+  - `not-applied` **fails**: `run.sh` applied a value and git in here uses none. Its remedy is
+    re-running `run.sh`, which is always possible. 3e compares against what was *applied*, not
+    against a value derived again. Round 5 found a relative host value applied as nothing while
+    "nothing expected" read as agreement.
   - `stale` (the host dropped the setting) and `diverged` (the host changed it) are **notes**. Both
     come from a VS Code copy that predates the host's change. Each note gives the fix that does not
     wait for VS Code: `git config --global --unset core.hooksPath` in here, after which the value

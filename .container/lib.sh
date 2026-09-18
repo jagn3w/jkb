@@ -469,16 +469,26 @@ DC_HOOKS_MIRROR_MARKER=".jkb-host-mirror"
 
 # WHAT GIT IN THE CONTAINER USES IS WRITTEN BY run.sh, NOT LEFT TO VS CODE'S COPY. Four review
 # rounds found the same shape: the copied ~/.gitconfig arrives only on ATTACH (after run.sh
-# verifies), never carries an `[include]`d file, and goes stale when the host changes. So the root
-# step also writes the container's ~/.config/git/config, root-owned, naming the mirror. Git reads
-# that file whenever ~/.gitconfig does not set the key, and lets ~/.gitconfig win when it does,
-# which with VS Code's copy names the same path. Measured on git 2.51.1, 2026-09-18: with only the
-# XDG file setting it, the effective read and `rev-parse --git-path hooks` in a repository both
-# answer its value, including when a ~/.gitconfig without the key exists; when both set it,
-# ~/.gitconfig wins. Before the first attach, and for a host value from an include, the container
-# now runs the host's hooks anyway.
+# verifies), never carries an `[include]`d file, and goes stale when the host changes. So every
+# start sets `core.hooksPath` in the container's ~/.config/git/config. Git reads that file whenever
+# ~/.gitconfig does not set the key, and lets ~/.gitconfig win when it does, which with VS Code's
+# copy names the same path. Measured on git 2.51.1, 2026-09-18: with only the XDG file setting it,
+# the effective read and `rev-parse --git-path hooks` in a repository both answer its value,
+# including when a ~/.gitconfig without the key exists; when both set it, ~/.gitconfig wins.
+#
+# ONE KEY, SET AS THE CONTAINER USER, never the file replaced as root. The first version wrote the
+# whole file root-owned, and a review measured what git then does to it: with no ~/.gitconfig (every
+# container before its first attach), `git config --global user.email ...` writes THIS file, through
+# a lock file and a rename, so it came back owned by the container user, run.sh refused it on every
+# later start as "not written by run.sh", and the hooks path froze with no remedy that worked.
+# Root ownership bought nothing here: the threat is a sandboxed command redirecting the hooks path,
+# and the sandbox's posture already denies writes to ~/.config (and to ~/.gitconfig). So the key is
+# set with `git config --file`, which edits one key and keeps everything else in the file.
 DC_HOOKS_XDG_CONFIG="/home/vscode/.config/git/config"
-DC_HOOKS_XDG_MARK="# jkb:host-hooks"
+
+# The command that shows where git's hooks setting comes from, for every message that suggests it:
+# outside any repository and without `--global`, for the reason dc_global_hooks_path gives.
+DC_HOOKS_SHOW_ORIGIN="(cd / && git config --includes --show-origin --get-all core.hooksPath)"
 
 # WHAT THE HOST RESOLVED, and what this start did with it, recorded by the ROOT step in a ROOT-OWNED
 # directory, so nothing running as the container user can forge or delete it (round 4 found the
@@ -510,7 +520,9 @@ dc_global_hooks_path() ( # dc_global_hooks_path [--path|--show-origin]
 
 # dc_read_host_record <record> <start marker> -- the record's fields on one line, separated by the
 # ASCII unit separator (0x1f), for `IFS=$'\x1f' read`:
-#   <state> <value> <origin> <mirror>
+#   <state> <value> <origin> <mirror> <applied>
+# <applied> is what this start set core.hooksPath to in DC_HOOKS_XDG_CONFIG: a value, or `-` when it
+# set nothing (the host sets none, or a value no container path can mean, such as ~otheruser/).
 # NOT tabs: tab is IFS whitespace, so `read` merges consecutive ones and an empty field (an empty
 # value, an unknown origin) shifts every later field left. Measured: `value<TAB><TAB>/origin<TAB>ok`
 # read as value=/origin, origin=ok.
@@ -522,13 +534,14 @@ dc_global_hooks_path() ( # dc_global_hooks_path [--path|--show-origin]
 dc_read_host_record() { # dc_read_host_record <record> <start marker>
     local rec="$1" marker="$2" first
     if [ ! -f "$rec" ] || { [ -e "$marker" ] && [ ! "$rec" -nt "$marker" ]; }; then
-        printf 'none\037\037\037\n'; return 0
+        printf 'none\037\037\037\037-\n'; return 0
     fi
     first="$(head -1 "$rec")"
-    printf '%s\037%s\037%s\037%s\n' "${first#state=}" \
+    printf '%s\037%s\037%s\037%s\037%s\n' "${first#state=}" \
         "$(sed -n 's/^value=//p' "$rec" | head -1)" \
         "$(sed -n 's/^origin=//p' "$rec" | head -1)" \
-        "$(sed -n 's/^mirror=//p' "$rec" | head -1)"
+        "$(sed -n 's/^mirror=//p' "$rec" | head -1)" \
+        "$(grep -q '^applied=' "$rec" && sed -n 's/^applied=//p' "$rec" | head -1 || printf -- -)"
 }
 
 # dc_container_hooks_dir <raw core.hooksPath> -> the absolute path git in the container resolves it
@@ -663,46 +676,35 @@ dc_mirror_hooks() {
     echo "mirrored the host's git hooks ($src) to $dst"
 }
 
-# _dc_apply_host_hooks <name> <docker> <container path or ""> <record text> -- the second ROOT step:
-# write (or, given "", remove) the container's ~/.config/git/config naming <container path>, and
-# write the record. The same rules as the mirror's root step: the parent is entered and checked
-# (`pwd -P`) before anything is written, and an existing config is replaced only when it is ours
-# (root-owned, first line DC_HOOKS_XDG_MARK), so a file somebody wrote by hand is refused, not
-# overwritten. The value is written by `git config --file`, which quotes it, never by printf into
-# the file (docs/git-hooks-installer.md: "when the question is what git makes of this value, git
-# writes the fixture too"). Failures are said; a start does not stop over them.
-_dc_apply_host_hooks() { # _dc_apply_host_hooks <name> <docker> <path or ""> <record text>
-    local name="$1" docker="$2" path="$3" record="$4"
-    "$docker" exec "$name" mkdir -p "$(dirname "$DC_HOOKS_XDG_CONFIG")" >/dev/null 2>&1 || true
+# _dc_apply_host_hooks <name> <docker> <value or "-"> <record text> -- set core.hooksPath in the
+# container's ~/.config/git/config to <value> (or unset it, given "-"), AS THE CONTAINER USER and
+# with `git config --file`, so one key changes and nothing else in the file does. Then write the
+# record, as ROOT, into a root-owned directory, with what was applied appended, so nothing running
+# as the container user can forge or remove it. Failures are said; a start does not stop over them.
+# The value travels on stdin, not as an argument: every argument here names a place to act on.
+_dc_apply_host_hooks() { # _dc_apply_host_hooks <name> <docker> <value or "-"> <record text>
+    local name="$1" docker="$2" value="$3" record="$4" applied="$3"
     # shellcheck disable=SC2016
-    # The hooks path is a VALUE, so it travels on stdin (first line) with the record, not as an
-    # argument: every argument here names a place to act on, and only those.
-    { printf '%s\n' "$path"; printf '%s\n' "$record"; } | "$docker" exec -i -u root "$name" sh -c '
-        set -e
-        xdg="$1"; mark="$2"; rec="$3"
-        IFS= read -r path || path=""
-        # The record: a root-owned directory, a file replaced whole.
-        mkdir -p "$(dirname "$rec")"; chmod 755 "$(dirname "$rec")"
-        cat > "$rec.new"; chmod 644 "$rec.new"; mv -f "$rec.new" "$rec"
-        # The config file git reads when ~/.gitconfig does not set the key.
-        cd "$(dirname "$xdg")"
-        [ "$(pwd -P)" = "$(dirname "$xdg")" ] || { echo "_dc_apply_host_hooks: $(dirname "$xdg") is reached through a symlink; not writing $xdg" >&2; exit 3; }
-        base="$(basename "$xdg")"
-        if [ -e "$base" ] || [ -L "$base" ]; then
-            first="$(head -1 "$base")"
-            if [ -L "$base" ] || [ "$(stat -c %u "$base")" != 0 ] || [ "${first#"$mark"}" = "$first" ]; then
-                echo "_dc_apply_host_hooks: $xdg exists and was not written by run.sh; left alone, so it decides the hooks path unless ~/.gitconfig does" >&2
-                exit 3
-            fi
+    if ! printf '%s\n' "$value" | "$docker" exec -i "$name" sh -c '
+        IFS= read -r v || v=""
+        mkdir -p "$(dirname "$1")" || exit 1
+        if [ "$v" = - ]; then
+            git config --file "$1" --unset-all core.hooksPath 2>/dev/null; rc=$?
+            [ "$rc" -eq 0 ] || [ "$rc" -eq 5 ]   # 5: there was nothing to unset
+        else
+            git config --file "$1" core.hooksPath "$v"
         fi
-        if [ -z "$path" ]; then rm -f "./$base"; exit 0; fi
-        new="$(mktemp)"
-        printf "%s\n" "$mark — written by .container/run.sh on every start from the host core.hooksPath; edit the host" > "$new"
-        git config --file "$new" core.hooksPath "$path"
-        chown 0:0 "$new"; chmod 644 "$new"
-        mv -f -T "$new" "./$base"
-    ' sh "$DC_HOOKS_XDG_CONFIG" "$DC_HOOKS_XDG_MARK" "$DC_HOST_HOOKS_RECORD" \
-        || echo "warning: could not record the host's hooks path in $name, or write $DC_HOOKS_XDG_CONFIG there; verify.sh reports what git in there uses" >&2
+    ' sh "$DC_HOOKS_XDG_CONFIG" >/dev/null 2>&1; then
+        applied=-
+        echo "warning: could not set core.hooksPath in $DC_HOOKS_XDG_CONFIG in $name; verify.sh reports what git in there uses" >&2
+    fi
+    # shellcheck disable=SC2016
+    printf '%s\napplied=%s\n' "$record" "$applied" | "$docker" exec -i -u root "$name" sh -c '
+        set -e
+        mkdir -p "$(dirname "$1")"; chown 0:0 "$(dirname "$1")"; chmod 755 "$(dirname "$1")"
+        cat > "$1.new"; chmod 644 "$1.new"; mv -f "$1.new" "$1"
+    ' sh "$DC_HOST_HOOKS_RECORD" \
+        || echo "warning: could not record the host's hooks path in $name; verify.sh then has nothing to compare against" >&2
 }
 
 # dc_mirror_host_hooks <container name> <container.json> [docker command] -- run.sh's step, ON THE
@@ -718,23 +720,31 @@ dc_mirror_host_hooks() { # dc_mirror_host_hooks <name> <container.json> [docker]
     raw="$(dc_global_hooks_path)" || rc=$?
     case "$rc" in
         0) ;;
-        1) _dc_apply_host_hooks "$name" "$docker" "" "state=unset"
+        1) _dc_apply_host_hooks "$name" "$docker" - "state=unset"
            echo "no core.hooksPath on the host; git in the container uses each repository's .git/hooks"; return 0 ;;
-        *) _dc_apply_host_hooks "$name" "$docker" "" "state=unreadable"
-           echo "warning: git on the host could not read its core.hooksPath, so no hooks were mirrored (run: git config --includes --show-origin --get core.hooksPath, from outside any repository)" >&2; return 0 ;;
+        *) _dc_apply_host_hooks "$name" "$docker" - "state=unreadable"
+           echo "warning: git on the host could not read its core.hooksPath, so no hooks were mirrored (run: $DC_HOOKS_SHOW_ORIGIN)" >&2; return 0 ;;
     esac
     origin="$(dc_global_hooks_path --show-origin 2>/dev/null)" || origin=""
     origin="${origin%%$'\t'*}"; origin="${origin#file:}"
+    # What git in the container is told: the mirror's path for an absolute or ~/ value, the value
+    # itself when it means the same thing in there (relative: resolved in each repository; empty:
+    # "/", i.e. no hooks, as on the host), and nothing for ~otheruser/, which has no home in here.
+    # Round 5 found a relative value applied as nothing while 3e read that as agreement.
+    local applied=-
     if [ -z "$raw" ]; then
+        applied=""
         echo "warning: the host's core.hooksPath is set to the empty string, which git reads as '/': it runs no hooks there, and there is nothing to mirror" >&2
     elif ! dst="$(dc_container_hooks_dir "$raw")"; then
         dst=""
+        case "$raw" in "~"*) applied=- ;; *) applied="$raw" ;; esac
         echo "the host's core.hooksPath ($raw) needs no mirror, or cannot have one: git resolves it inside each repository, or it names another user's home"
     else
+        applied="$dst"
         case "$(dc_hooks_mount_verdict "$dst" "$config")" in
             bind)   mirror=skipped
                     echo "the host's core.hooksPath ($raw) is inside a directory the container mounts from the host, so git in there already runs the host's own copy; nothing to mirror" ;;
-            volume) mirror=skipped; dst=""
+            volume) mirror=skipped; dst=""; applied=-
                     echo "warning: the host's core.hooksPath ($raw) lands inside one of the container's volumes in there, so it is not mirrored, and git in the container runs whatever that volume holds" >&2 ;;
             *)
                 # The HOST's expansion of the same value is where the files are.
@@ -749,7 +759,7 @@ dc_mirror_host_hooks() { # dc_mirror_host_hooks <name> <container.json> [docker]
                 fi ;;
         esac
     fi
-    _dc_apply_host_hooks "$name" "$docker" "$dst" \
+    _dc_apply_host_hooks "$name" "$docker" "$applied" \
         "$(printf 'state=value\nvalue=%s\norigin=%s\nmirror=%s' "$raw" "$origin" "$mirror")"
     return 0
 }

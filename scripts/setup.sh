@@ -79,7 +79,9 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 # What was installed before, so remote mode below can tell a rebuild that changed the binary from
 # one that did not (a pull touching only scripts/ rebuilds byte for byte the same jkb).
-jkb_before="$(cksum < "${CARGO_HOME:-$HOME/.cargo}/bin/jkb" 2>/dev/null || true)"
+# Braced, so a first run with no jkb yet is quiet: the redirection fails before a trailing 2>
+# on cksum itself would apply.
+jkb_before="$({ cksum < "${CARGO_HOME:-$HOME/.cargo}/bin/jkb"; } 2>/dev/null || true)"
 # --force so a re-run always refreshes from the current checkout; --locked for reproducibility.
 (cd "$repo_root" && cargo install --path crates/jkb-cli --locked --force)
 
@@ -124,10 +126,13 @@ if [ -n "${JKB_REMOTE:-}" ]; then
   # opposite direction predates this and still exists: a pull on the host leaves this client old.
   # Both are what the client/daemon version check is for
   # (task:jkb-client-and-jkb-serve-have-no-18d662f006f023a8).
-  if [ "$(cksum < "$cargo_bin/jkb" 2>/dev/null || true)" != "$jkb_before" ]; then
-    warn "this jkb changed, and the machine serving the knowledge base still runs the one it was"
-    warn "built with, as does its jkb serve: run ./scripts/setup.sh there (a git pull there finds"
-    warn "nothing to merge, since the checkout is shared, so its post-merge will not do it for you)."
+  # CONDITIONAL, because this side cannot know the other's build. A rebuild here that only catches
+  # up with a host that already rebuilt changes the binary too, and "the host is behind" was then
+  # false (round 5). Knowing it takes the version check, not a guess.
+  if [ "$({ cksum < "$cargo_bin/jkb"; } 2>/dev/null || true)" != "$jkb_before" ]; then
+    warn "this jkb changed. If the machine serving the knowledge base has not been rebuilt from this"
+    warn "commit, it and its jkb serve are older than this client: run ./scripts/setup.sh there (a"
+    warn "git pull there finds nothing to merge in the shared checkout, so its post-merge will not)."
   fi
   exit 0
 fi
