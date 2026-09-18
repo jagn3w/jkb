@@ -28,6 +28,29 @@ isolate_git "$work/home"
 #   tar    extracts keeping each mode exactly (-p). As a normal user GNU tar applies the umask,
 #          which silently did the mirror's chmod for it: with the chmod deleted, this stayed green.
 # Each call is logged to $DOCKER_LOG as its user and verb.
+# THE ROOT STEP IS GNU CODE: it runs in the container, which is Ubuntu, and uses `mv -T`, `stat -c`
+# and `tar --warning`, none of which BSD's tools accept. So the stub hands it GNU's, found as
+# gmv/gstat/gtar (Homebrew's coreutils and gnu-tar) or as the plain names where those ARE GNU. On a
+# machine with neither, every case that reaches the root step SKIPS, loudly and with the reason,
+# instead of failing on a flag the container never lacks. A review found this suite red on the Mac,
+# where check.sh runs it, for exactly that. STUB_FORCE_NO_GNU=1 takes that arm on purpose.
+gnu_tool() { # gnu_tool <name> -> the path of a GNU build of it
+    local c p
+    [ "${STUB_FORCE_NO_GNU:-0}" = 1 ] && return 1
+    for c in "g$1" "$1"; do
+        p="$(command -v "$c" 2>/dev/null)" || continue
+        grep -q GNU <<<"$("$p" --version 2>/dev/null | head -1)" && { printf '%s' "$p"; return 0; }
+    done
+    return 1
+}
+gnu_mv="$(gnu_tool mv)" && gnu_stat="$(gnu_tool stat)" && gnu_tar="$(gnu_tool tar)" && have_gnu=1 || have_gnu=0
+# need_gnu -- first line of every case that reaches the root step.
+need_gnu() {
+    [ "$have_gnu" = 1 ] && return 0
+    skip "${FUNCNAME[1]}: the container's root step needs GNU mv, stat and tar (brew install coreutils gnu-tar); Linux CI runs it"
+    return 1
+}
+
 make_stub() {
     stub_dir="$work/stub-$RANDOM"; mkdir -p "$stub_dir/bin" "$stub_dir/shim" "$stub_dir/root/tmp"
     # Resolved, because the root step refuses a parent reached through a symlink, and on macOS the
@@ -36,12 +59,12 @@ make_stub() {
     : > "$stub_dir/root-inodes"
     cat > "$stub_dir/shim/chown" <<SHIM
 #!/bin/sh
-for a in "\$@"; do case "\$a" in /*) find "\$a" -exec $(command -v stat) -c %i {} + >> "$stub_dir/root-inodes" ;; esac; done
+for a in "\$@"; do case "\$a" in /*) find "\$a" -exec ${gnu_stat:-stat} -c %i {} + >> "$stub_dir/root-inodes" ;; esac; done
 exit 0
 SHIM
     cat > "$stub_dir/shim/stat" <<SHIM
 #!/bin/sh
-real=$(command -v stat)
+real=${gnu_stat:-stat}
 if [ "\$1" = -c ] && [ "\$2" = %u ]; then
     ino="\$("\$real" -c %i "\$3")" || exit 1
     grep -qx "\$ino" "$stub_dir/root-inodes" && { echo 0; exit 0; }
@@ -49,8 +72,9 @@ fi
 exec "\$real" "\$@"
 SHIM
     # ...and records the directory it extracts into, so a case can assert WHERE the copy is staged.
-    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec %s -p "$@"\n' "$stub_dir/tar-log" "$(command -v tar)" > "$stub_dir/shim/tar"
-    chmod +x "$stub_dir/shim/chown" "$stub_dir/shim/stat" "$stub_dir/shim/tar"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec %s -p "$@"\n' "$stub_dir/tar-log" "${gnu_tar:-tar}" > "$stub_dir/shim/tar"
+    printf '#!/bin/sh\nexec %s "$@"\n' "${gnu_mv:-mv}" > "$stub_dir/shim/mv"
+    chmod +x "$stub_dir/shim/chown" "$stub_dir/shim/stat" "$stub_dir/shim/tar" "$stub_dir/shim/mv"
     cat > "$stub_dir/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 [ "$1" = exec ] || { echo "stub docker: only exec" >&2; exit 2; }
@@ -109,6 +133,7 @@ case1_the_container_path_is_what_git_in_there_resolves() {
 # root's extraction and chmod anywhere. The race itself cannot be staged deterministically, so the
 # property that removes it is what is pinned.
 case2_a_mirror_arrives_runnable_marked_and_root_side() {
+    need_gnu || return 0
     make_stub; host_hooks
     local dst=/home/vscode/.config/git/hooks out rc
     out="$(dc_mirror_hooks "$src" "$dst" ctr "$docker_cmd" 2>&1)"; rc=$?
@@ -128,6 +153,7 @@ case2_a_mirror_arrives_runnable_marked_and_root_side() {
 # Every start re-mirrors: an edited hook arrives, a deleted one goes. A copy that only ever added
 # would keep running a hook the host had removed.
 case3_a_re_mirror_replaces_rather_than_merges() {
+    need_gnu || return 0
     make_stub; host_hooks
     local dst=/Users/me/.config/git/hooks
     dc_mirror_hooks "$src" "$dst" ctr "$docker_cmd" >/dev/null 2>&1
@@ -143,6 +169,7 @@ case3_a_re_mirror_replaces_rather_than_merges() {
 
 # A directory at the target that the mirror did not make is somebody's, and is refused untouched.
 case4_a_directory_it_did_not_make_is_left_alone() {
+    need_gnu || return 0
     make_stub; host_hooks
     local dst=/Users/me/.config/git/hooks d
     d="$CTR_ROOT$dst"; mkdir -p "$d"; printf 'mine\n' > "$d/pre-push"
@@ -156,16 +183,18 @@ case4_a_directory_it_did_not_make_is_left_alone() {
 }
 
 # run.sh's step, reading the host's GLOBAL config. Driven through GIT_CONFIG_GLOBAL so the test's
-# git config is its own. Unset and relative values mirror nothing and never call docker.
+# git config is its own. Unset and relative values mirror nothing, and no root step runs.
 case5_the_host_step_reads_the_global_value() {
+    need_gnu || return 0
     make_stub; host_hooks
-    local cfg="$work/gitconfig-$RANDOM" out
+    local cfg="$HOME/.gitconfig" out
+    rm -f "$cfg"
     : > "$cfg"
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    local unset_ok=no; [[ "$out" == *"no global core.hooksPath"* ]] && [ ! -s "$DOCKER_LOG" ] && unset_ok=yes
+    local unset_ok=no; [[ "$out" == *"no global core.hooksPath"* ]] && ! grep -q "^root " "$DOCKER_LOG" && unset_ok=yes
     git config --file "$cfg" core.hooksPath .githooks
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    local rel_ok=no; [[ "$out" == *"needs no mirror"* ]] && [ ! -s "$DOCKER_LOG" ] && rel_ok=yes
+    local rel_ok=no; [[ "$out" == *"needs no mirror"* ]] && ! grep -q "^root " "$DOCKER_LOG" && rel_ok=yes
     git config --file "$cfg" core.hooksPath "$src"
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
     local abs_ok=no; [ "$("$CTR_ROOT$src/commit-msg" 2>/dev/null)" = "commit-msg ran" ] && abs_ok=yes
@@ -184,15 +213,27 @@ case5_the_host_step_reads_the_global_value() {
 # binary and stop: scaffold and topic need a local database, services a service manager, and the
 # git-hooks step would try to write a chainer into the read-only mirror. Stubbed cargo and jkb log
 # every call, so "stopped" is observed rather than inferred from the message.
+# CONFINED, because the watch-it-fail step deletes the very guard under test, and then setup.sh runs
+# its host installer for real (a review found that: services restarted, VS Code's extension
+# installed, hooks written into this checkout). So it runs a COPY of setup.sh in a scratch repo, with
+# --no-extension --no-service, and with every service manager and installer it could reach on PATH
+# as a stub that fails and logs. Mutated, it can only write under $d.
 case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops() {
-    local d="$work/setup-$RANDOM"; mkdir -p "$d/home" "$d/cargo/bin"
+    local d="$work/setup-$RANDOM" t
+    mkdir -p "$d/home" "$d/cargo/bin" "$d/repo/scripts/hooks"
+    cp "$repo_root/scripts/setup.sh" "$repo_root/scripts/lib.sh" "$d/repo/scripts/"
+    cp "$repo_root/scripts/hooks/post-merge" "$d/repo/scripts/hooks/"
+    git init -q "$d/repo"
     printf '#!/bin/sh\necho "cargo $*" >> "%s"\n' "$d/calls" > "$d/cargo/bin/cargo"
     printf '#!/bin/sh\necho "jkb $*" >> "%s"\necho "jkb 0.0.0-stub"\n' "$d/calls" > "$d/cargo/bin/jkb"
-    chmod +x "$d/cargo/bin/cargo" "$d/cargo/bin/jkb"
+    for t in systemctl launchctl pnpm code; do
+        printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 1\n' "$t" "$d/calls" > "$d/cargo/bin/$t"
+    done
+    chmod +x "$d/cargo/bin/"*
     : > "$d/calls"
     local out rc
     out="$(HOME="$d/home" CARGO_HOME="$d/cargo" PATH="$d/cargo/bin:$PATH" JKB_REMOTE=host.docker.internal:7117 \
-           bash "$repo_root/scripts/setup.sh" 2>&1)"; rc=$?
+           bash "$d/repo/scripts/setup.sh" --no-extension --no-service 2>&1)"; rc=$?
     local calls; calls="$(tr '\n' ';' < "$d/calls")"
     if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --path crates/jkb-cli --locked --force;"* ]] \
        && [ "$(grep -c '^jkb ' "$d/calls")" = "$(grep -c '^jkb --version$' "$d/calls")" ] \
@@ -209,8 +250,10 @@ case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops() {
 # staging directory inside the target, and every start deleted both and left no hooks. Driven
 # through the host step, twice, because the second start is the one that replaces.
 case7_a_trailing_slash_mirrors_and_re_mirrors() {
+    need_gnu || return 0
     make_stub
-    local cfg="$work/gitconfig-$RANDOM" d="$CTR_ROOT/home/vscode/.config/git/hooks"
+    local cfg="$HOME/.gitconfig" d="$CTR_ROOT/home/vscode/.config/git/hooks"
+    rm -f "$cfg"
     mkdir -p "$HOME/.config/git/hooks"; printf '#!/bin/sh\necho slash ran\n' > "$HOME/.config/git/hooks/commit-msg"
     chmod 755 "$HOME/.config/git/hooks/commit-msg"
     git config --file "$cfg" core.hooksPath "~/.config/git/hooks/"
@@ -225,23 +268,25 @@ case7_a_trailing_slash_mirrors_and_re_mirrors() {
 }
 
 # A hooksPath inside a bind (here ~/repos) IS the host's own directory in there. Nothing is copied,
-# docker is never called, and nothing says hooks are missing.
+# no root step runs, and nothing says hooks are missing.
 case8_a_hooks_path_inside_a_bind_is_left_to_the_bind() {
     make_stub
-    local cfg="$work/gitconfig-$RANDOM" out
+    local cfg="$HOME/.gitconfig" out
+    rm -f "$cfg"
     git config --file "$cfg" core.hooksPath "~/repos/dotfiles/hooks"
     mkdir -p "$HOME/repos/dotfiles/hooks"
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    if [ ! -s "$DOCKER_LOG" ] && [[ "$out" == *"already runs the host's own copy"* ]]; then
-        ok "a hooksPath inside a bind mount is left to the bind: no copy, no docker call"
+    if ! grep -q "^root " "$DOCKER_LOG" && [[ "$out" == *"already runs the host's own copy"* ]]; then
+        ok "a hooksPath inside a bind mount is left to the bind: no copy, no root step"
     else
-        fail "a hooksPath inside a bind mount is left to the bind: no copy, no docker call" "out=$out log=$(tr '\n' ';' < "$DOCKER_LOG")"
+        fail "a hooksPath inside a bind mount is left to the bind: no copy, no root step" "out=$out log=$(tr '\n' ';' < "$DOCKER_LOG")"
     fi
 }
 
 # THE FORGERY. A directory carrying the marker but not owned by root is not the mirror: anything
 # that can write a directory can write a file of that name into it. Root must not replace it.
 case9_a_forged_marker_is_refused() {
+    need_gnu || return 0
     make_stub; host_hooks
     local dst=/Users/me/.config/git/hooks d
     d="$CTR_ROOT$dst"; mkdir -p "$d"; : > "$d/$DC_HOOKS_MIRROR_MARKER"; printf 'mine\n' > "$d/pre-push"
@@ -257,6 +302,7 @@ case9_a_forged_marker_is_refused() {
 # A host directory tar cannot read whole (a dangling symlink, measured) sends NOTHING: the previous
 # mirror stays exactly as it was, and no root step runs.
 case10_a_partial_archive_is_never_installed() {
+    need_gnu || return 0
     make_stub; host_hooks
     local dst=/Users/me/.config/git/hooks d="$CTR_ROOT/Users/me/.config/git/hooks"
     dc_mirror_hooks "$src" "$dst" ctr "$docker_cmd" >/dev/null 2>&1
@@ -274,10 +320,13 @@ case10_a_partial_archive_is_never_installed() {
 
 # A parent reached through a symlink would carry root's swap somewhere else, so it is refused.
 case11_a_symlinked_parent_is_refused() {
+    need_gnu || return 0
     make_stub; host_hooks
     mkdir -p "$CTR_ROOT/elsewhere" "$CTR_ROOT/Users"; ln -s "$CTR_ROOT/elsewhere" "$CTR_ROOT/Users/me"
-    local err; err="$(dc_mirror_hooks "$src" /Users/me/hooks ctr "$docker_cmd" 2>&1 >/dev/null)"; local rc=$?
-    if [ "$rc" -eq 1 ] && [ -z "$(ls -A "$CTR_ROOT/elsewhere")" ] && [[ "$err" == *"through a symlink"* ]]; then
+    # Two levels below the symlink, so `mkdir -p` (which follows it) would CREATE elsewhere/deep before
+    # any check ran; building the parent one component at a time refuses at /Users/me first.
+    local err; err="$(dc_mirror_hooks "$src" /Users/me/deep/hooks ctr "$docker_cmd" 2>&1 >/dev/null)"; local rc=$?
+    if [ "$rc" -eq 1 ] && [ -z "$(ls -A "$CTR_ROOT/elsewhere")" ] && [[ "$err" == *"/Users/me is a symlink"* ]]; then
         ok "a target whose parent is reached through a symlink is refused, and nothing is written there"
     else
         fail "a target whose parent is reached through a symlink is refused, and nothing is written there" "rc=$rc err=$err $(ls -la "$CTR_ROOT/elsewhere")"
@@ -288,16 +337,22 @@ case11_a_symlinked_parent_is_refused() {
 # A split config: ~/.gitconfig includes another file, and THAT sets core.hooksPath. `--global`
 # reads no include without `--includes`, so the value was invisible and nothing was mirrored.
 case12_a_hooks_path_set_through_an_include_is_found() {
+    need_gnu || return 0
     make_stub; host_hooks
-    local cfg="$work/gitconfig-$RANDOM" inc="$work/included-$RANDOM" got
+    local cfg="$HOME/.gitconfig" inc="$work/included-$RANDOM" got out
+    rm -f "$cfg"
     git config --file "$inc" core.hooksPath "$src"
     git config --file "$cfg" include.path "$inc"
     got="$(GIT_CONFIG_GLOBAL="$cfg" dc_global_hooks_path)"
-    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
-    if [ "$got" = "$src" ] && [ "$("$CTR_ROOT$src/commit-msg" 2>/dev/null)" = "commit-msg ran" ]; then
-        ok "a hooksPath set in an included file is read and mirrored"
+    out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
+    # ...and SAYS that the container sees it only if the included file resolves in there: VS Code
+    # copies ~/.gitconfig alone. verify.sh compares the record with git's answer in there.
+    if [ "$got" = "$src" ] && [ "$("$CTR_ROOT$src/commit-msg" 2>/dev/null)" = "commit-msg ran" ] \
+       && [[ "$out" == *"sets core.hooksPath in $inc, not in ~/.gitconfig"* ]] \
+       && grep -qx "origin=$inc" "$CTR_ROOT$DC_HOST_HOOKS_RECORD"; then
+        ok "a hooksPath set in an included file is read, mirrored, recorded with its origin, and flagged as invisible to VS Code's copy"
     else
-        fail "a hooksPath set in an included file is read and mirrored" "got=$got"
+        fail "a hooksPath set in an included file is read, mirrored, recorded with its origin, and flagged as invisible to VS Code's copy" "got=$got out=$out record=$(cat "$CTR_ROOT$DC_HOST_HOOKS_RECORD" 2>&1)"
     fi
 }
 
@@ -305,13 +360,14 @@ case12_a_hooks_path_set_through_an_include_is_found() {
 # reader tells it apart from unset by its exit status, which is what verify.sh's `empty` arm needs.
 case13_an_empty_value_is_not_unset() {
     make_stub
-    local cfg="$work/gitconfig-$RANDOM" out rc_empty rc_unset
+    local cfg="$HOME/.gitconfig" out rc_empty rc_unset
+    rm -f "$cfg"
     : > "$cfg"
     GIT_CONFIG_GLOBAL="$cfg" dc_global_hooks_path >/dev/null; rc_unset=$?
     git config --file "$cfg" core.hooksPath ""
     GIT_CONFIG_GLOBAL="$cfg" dc_global_hooks_path >/dev/null; rc_empty=$?
     out="$(GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" 2>&1)"
-    if [ "$rc_unset" -eq 1 ] && [ "$rc_empty" -eq 0 ] && [[ "$out" == *"empty string"* ]] && [ ! -s "$DOCKER_LOG" ]; then
+    if [ "$rc_unset" -eq 1 ] && [ "$rc_empty" -eq 0 ] && [[ "$out" == *"empty string"* ]] && ! grep -q "^root " "$DOCKER_LOG"; then
         ok "an empty hooksPath reads as set (rc 0), not unset (rc 1), and is reported without a copy"
     else
         fail "an empty hooksPath reads as set (rc 0), not unset (rc 1), and is reported without a copy" "unset=$rc_unset empty=$rc_empty out=$out"
@@ -322,6 +378,7 @@ case13_an_empty_value_is_not_unset() {
 # A target that is itself a symlink is not the mirror, even when it points at one and is owned by
 # root: the swap would be following a name, not replacing a directory it made.
 case14_a_symlinked_target_is_refused() {
+    need_gnu || return 0
     make_stub; host_hooks
     dc_mirror_hooks "$src" /Users/me/real ctr "$docker_cmd" >/dev/null 2>&1
     ln -s "$CTR_ROOT/Users/me/real" "$CTR_ROOT/Users/me/hooks"
@@ -334,6 +391,23 @@ case14_a_symlinked_target_is_refused() {
     else
         fail "a target that is a symlink is refused, even to a real mirror, and the link is left as it was" "rc=$rc err=$err"
     fi
+}
+
+
+# The record verify.sh compares against: what the host resolved and where from, rewritten on every
+# start, so a host that drops the setting does not leave a stale value behind.
+case15_the_host_value_is_recorded_on_every_start() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local cfg="$HOME/.gitconfig" rec="$CTR_ROOT$DC_HOST_HOOKS_RECORD" set_ok=no unset_ok=no
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "$src"
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    grep -qx "value=$src" "$rec" && grep -qx "origin=$cfg" "$rec" && set_ok=yes
+    : > "$cfg"
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    [ "$(cat "$rec")" = unset ] && unset_ok=yes
+    if [ "$set_ok$unset_ok" = yesyes ]; then ok "every start records the host's value and origin, and 'unset' replaces it when the host drops it"
+    else fail "every start records the host's value and origin, and 'unset' replaces it when the host drops it" "set=$set_ok unset=$unset_ok record=$(cat "$rec" 2>&1)"; fi
 }
 
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
@@ -349,5 +423,6 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case11_a_symlinked_parent_is_refused \
           case12_a_hooks_path_set_through_an_include_is_found \
           case13_an_empty_value_is_not_unset \
-          case14_a_symlinked_target_is_refused
+          case14_a_symlinked_target_is_refused \
+          case15_the_host_value_is_recorded_on_every_start
 finish

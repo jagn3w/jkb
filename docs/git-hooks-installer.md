@@ -23,7 +23,15 @@ conventions every session is expected to know.
   fourth `skipped` state, because every `skipped` line in the summary names a flag
   (`--no-service`), and that would be false here. Pinned by
   `scripts/tests/container-hooks.test.sh`, which runs `setup.sh` with stub `cargo` and `jkb`, and
-  asserts `jkb` was asked nothing but its version.
+  asserts `jkb` was asked nothing but its version. That case runs a **copy** of `setup.sh` in a
+  scratch repository, with every service manager stubbed. Watching it fail means deleting the very
+  guard under test, and the unconfined version then ran the host installer against the developer's
+  machine.
+  - **It warns about version skew every time.** A pull in the container rebuilds the container's
+    `jkb` but not the host's, and not the host's `jkb serve`. Nothing checks client/daemon versions,
+    and before the container ran `post-merge`, neither side rebuilt, so they always matched. Until
+    a version check exists (`task:jkb-client-and-jkb-serve-have-no-18d662f006f023a8`), the early exit says the host must be rebuilt
+    too.
 - **A hook goes in `--git-common-dir`, never `--git-dir`** (`scripts/lib.sh`'s `git_hooks_dir`).
   In a linked worktree the latter is `<repo>/.git/worktrees/<name>`, which holds no hooks — git
   resolves `hooks/` against the common dir. Since D36 puts *every* `jkb task work` session in a

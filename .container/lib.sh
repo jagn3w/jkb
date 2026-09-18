@@ -467,6 +467,17 @@ dc_apparmor_profile() { # dc_apparmor_profile <profile file> -> the declared pro
 # A directory that fails any of the three is refused and reported, never touched.
 DC_HOOKS_MIRROR_MARKER=".jkb-host-mirror"
 
+# WHAT THE HOST RESOLVED, recorded in the container on every start, so verify.sh can compare it with
+# what git in here resolves. They differ whenever the setting comes from a file VS Code does not
+# copy: it copies ~/.gitconfig alone, so a value from an `[include]`d file (or from
+# ~/.config/git/config) is invisible in here unless that file happens to resolve in here too. A
+# review found run.sh mirroring such a value while git in here saw none, and verify.sh calling that
+# "unset", ok. Lines: `unset`, `unreadable`, or `value=<raw>` and `origin=<file on the host>`.
+# In /run/jkb, which the image gives the container user (JKB_NS_MARKER lives there). Writable from
+# in here, so a forged record can only produce a false FAILURE, never hide one: verify.sh compares
+# it against git's own answer and passes only when they agree.
+DC_HOST_HOOKS_RECORD="/run/jkb/host-hookspath"
+
 # dc_global_hooks_path [--path] -- THE ONE READER of the global core.hooksPath, for run.sh on the
 # host and verify.sh in the container alike, so the two cannot disagree about what the setting is.
 # `--includes`: a `[include]` in ~/.gitconfig is how a split config sets it, and `--global` reads
@@ -505,6 +516,14 @@ dc_container_hooks_dir() { # dc_container_hooks_dir <raw>
         "~/"*) p="/home/vscode/${1#\~/}" ;;
         *)     return 1 ;;
     esac
+    dc_strip_slashes "$p"
+}
+
+# dc_strip_slashes <path> -- the path without trailing slashes ("/" stays "/"). ONE normaliser, used
+# by the mirror and by verify.sh: a review found verify.sh classifying `hooks/` while run.sh acted on
+# `hooks`, and `[ -L hooks/ ]` is false for a symlink, so the two disagreed about the same directory.
+dc_strip_slashes() { # dc_strip_slashes <path>
+    local p="$1"
     while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
     printf '%s' "$p"
 }
@@ -559,23 +578,35 @@ dc_mirror_hooks() {
     fi
     # THE ROOT STEP. Everything it trusts is checked, because it runs as root in a directory tree the
     # container user can partly write:
+    #   - the parent is built ONE COMPONENT AT A TIME, refusing any component that is a symlink, and
+    #     never with `mkdir -p`, which follows a planted symlink (/home/vscode/.config -> /etc)
+    #     before any check could see it;
+    #   - the step then works FROM INSIDE the parent: it `cd`s there, confirms the directory it is
+    #     in is the one it checked, and acts on the bare name. A cwd is pinned to a directory, so
+    #     swapping a component for a symlink after the check (a review's race) moves nothing;
     #   - the new copy is assembled in a fresh root-only mktemp directory, never beside the target,
     #     where a planted symlink could steer the extraction and the chmod elsewhere;
-    #   - the parent must resolve to itself, so no symlink in the path leads the swap somewhere else;
     #   - an existing target is replaced only when it is a real directory, owned by root, carrying
     #     the marker (see the section header for why the marker alone is not proof);
     #   - `mv -T` replaces the target NAME, so a symlink raced into its place is not followed.
+    # GNU tools (`stat -c`, `mv -T`, `tar --warning`): this runs in the container, which is Ubuntu.
     # shellcheck disable=SC2016
     "$docker" exec -i -u root "$name" sh -c '
         set -e
-        dst="$1"; marker="$2"; parent="$(dirname "$dst")"
-        mkdir -p "$parent"
-        if [ "$(cd "$parent" && pwd -P)" != "$parent" ]; then
-            echo "dc_mirror_hooks: $parent is reached through a symlink; not writing through it" >&2
-            exit 3
-        fi
-        if [ -e "$dst" ] || [ -L "$dst" ]; then
-            if [ -L "$dst" ] || [ ! -d "$dst" ] || [ ! -e "$dst/$marker" ] || [ "$(stat -c %u "$dst")" != 0 ]; then
+        dst="$1"; marker="$2"; parent="$(dirname "$dst")"; base="$(basename "$dst")"
+        refuse() { echo "dc_mirror_hooks: $*; not writing through it" >&2; exit 3; }
+        rest="${parent#/}"; cur=""
+        while [ -n "$rest" ]; do
+            c="${rest%%/*}"
+            case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+            cur="$cur/$c"
+            [ ! -L "$cur" ] || refuse "$cur is a symlink"
+            [ -d "$cur" ] || mkdir "$cur"
+        done
+        cd "$parent"
+        [ "$(pwd -P)" = "$parent" ] || refuse "$parent is reached through a symlink"
+        if [ -e "$base" ] || [ -L "$base" ]; then
+            if [ -L "$base" ] || [ ! -d "$base" ] || [ ! -e "$base/$marker" ] || [ "$(stat -c %u "$base")" != 0 ]; then
                 echo "dc_mirror_hooks: $dst exists and was not made by this mirror (it must be a root-owned directory carrying $marker); left alone" >&2
                 exit 3
             fi
@@ -586,8 +617,8 @@ dc_mirror_hooks() {
         printf "%s\n" "Copied from the host by .container/run.sh on every start. Edit the host copy." > "$new/$marker"
         chown -R 0:0 "$new"
         chmod -R u+rwX,go+rX,go-w "$new"
-        rm -rf "$dst"
-        mv -T "$new" "$dst"
+        rm -rf "./$base"
+        mv -T "$new" "./$base"
         trap - EXIT
     ' sh "$dst" "$DC_HOOKS_MIRROR_MARKER" < "$archive" || rc=$?
     rm -f "$archive"
@@ -598,6 +629,14 @@ dc_mirror_hooks() {
     echo "mirrored the host's git hooks ($src) to $dst"
 }
 
+# _dc_record_host_hooks <name> <docker> <text> -- write DC_HOST_HOOKS_RECORD in the container, as the
+# container user. Best effort: a missing record makes verify.sh skip the comparison, nothing worse.
+_dc_record_host_hooks() { # _dc_record_host_hooks <name> <docker> <text>
+    # shellcheck disable=SC2016
+    printf '%s\n' "$3" | "$2" exec -i "$1" sh -c 'mkdir -p "$(dirname "$1")" && cat > "$1"' sh "$DC_HOST_HOOKS_RECORD" \
+        >/dev/null 2>&1 || true
+}
+
 # dc_mirror_host_hooks <container name> <container.json> [docker command] -- run.sh's step, ON THE
 # HOST: read the host's GLOBAL core.hooksPath and mirror that directory in. Prints what happened;
 # always returns 0, because a start must not stop over hooks. verify.sh reports a dead hooks path.
@@ -606,13 +645,23 @@ dc_mirror_hooks() {
 # which is mounted, and a relative one resolves inside it. The global one is the only kind that
 # names a host path the container cannot see.
 dc_mirror_host_hooks() { # dc_mirror_host_hooks <name> <container.json> [docker]
-    local name="$1" config="$2" docker="${3:-docker}" raw src dst rc=0
+    local name="$1" config="$2" docker="${3:-docker}" raw src dst rc=0 origin=""
     raw="$(dc_global_hooks_path)" || rc=$?
     case "$rc" in
-        0) ;;
-        1) echo "no global core.hooksPath on the host; git in the container uses each repository's .git/hooks"; return 0 ;;
-        *) echo "warning: git on the host could not read its global core.hooksPath, so no hooks were mirrored (run: git config --global --includes --show-origin --get core.hooksPath)" >&2; return 0 ;;
+        0) origin="$(dc_global_hooks_path --show-origin 2>/dev/null)" || origin=""
+           origin="${origin%%$'\t'*}"; origin="${origin#file:}"
+           _dc_record_host_hooks "$name" "$docker" "$(printf 'value=%s\norigin=%s' "$raw" "$origin")" ;;
+        1) _dc_record_host_hooks "$name" "$docker" unset
+           echo "no global core.hooksPath on the host; git in the container uses each repository's .git/hooks"; return 0 ;;
+        *) _dc_record_host_hooks "$name" "$docker" unreadable
+           echo "warning: git on the host could not read its global core.hooksPath, so no hooks were mirrored (run: git config --global --includes --show-origin --get core.hooksPath)" >&2; return 0 ;;
     esac
+    # VS Code copies ~/.gitconfig and nothing else, so a value set anywhere else reaches git in the
+    # container only if the file that sets it resolves in there too. Mirrored anyway (harmless if
+    # unused), and said, because verify.sh will fail it if git in there does not see it.
+    if [ -n "$origin" ] && [ "$origin" != "$HOME/.gitconfig" ]; then
+        echo "warning: the host sets core.hooksPath in $origin, not in ~/.gitconfig, which is the only file VS Code copies into the container. Unless that file also resolves in there, git in the container will not see the setting; move it into ~/.gitconfig" >&2
+    fi
     if [ -z "$raw" ]; then
         echo "warning: the host's global core.hooksPath is set to the empty string, which git reads as '/': it runs no hooks there, and there is nothing to mirror" >&2
         return 0
@@ -627,7 +676,7 @@ dc_mirror_host_hooks() { # dc_mirror_host_hooks <name> <container.json> [docker]
     esac
     # The HOST's expansion of the same value is where the files are.
     if ! src="$(dc_global_hooks_path --path)" || [ ! -d "$src" ]; then
-        echo "warning: the host's global core.hooksPath ($raw) is not a directory here, so there is nothing to mirror, and git in the container runs no hooks" >&2
+        echo "warning: the host's global core.hooksPath ($raw) is not a directory here, so there is nothing to mirror. Whatever an earlier start mirrored stays in the container and keeps running" >&2
         return 0
     fi
     dc_mirror_hooks "$src" "$dst" "$name" "$docker" \

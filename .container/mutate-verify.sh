@@ -598,13 +598,14 @@ fi
 run "auto-memory is not linked into the shared store" "auto-memory is not linked" \
     -e JKB_SKIP_MEMORY_LINK=1 "${HEALTHY[@]}"
 
-# Assertion 3e, watched failing against the real container (its arms are also driven by
-# verify.sh --self-test, but only here do the live git reads and the bad() wiring run). The first
+# Assertion 3e against the real container: its arms are driven by verify.sh --self-test, but only
+# here do the live git reads and the bad() wiring run. NOT YET RUN: added without a Docker host.
+# Each expect string is one only its own arm prints, so a CAUGHT here credits that arm alone. The first
 # is the defect 3e exists for: a global core.hooksPath with nothing there, so git runs no hooks and
 # says nothing. The second is the forgery a review found: the mirror's marker, and `chmod 555`, in
 # a directory root does not own, which a check on the marker and `-w` alone read as the mirror.
 # Both are set by the preamble from these variables, and the control sets neither.
-run "the global core.hooksPath names a directory that is not there" "git runs NO hooks in here" \
+run "the global core.hooksPath names a directory that is not there" "does not exist, and run.sh mirrors the host's on start" \
     -e JKB_MUT_HOOKSPATH=/nonexistent/jkb-hooks "${HEALTHY[@]}"
 run "a forged mirror: the marker, in a directory root does not own" "carries the mirror's marker but is not owned by root" \
     -e JKB_MUT_HOOKSPATH=/tmp/jkb-forged-hooks -e JKB_MUT_FORGE_HOOKS=1 "${HEALTHY[@]}"

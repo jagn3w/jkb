@@ -594,6 +594,15 @@ repository, which is already mounted, so there is nothing to copy. The work is `
   `verify.sh` in here. It reads with `--includes`, because a split config sets the value from an
   included file and `--global` reads none without it. It tells *unset* apart from *set to the empty
   string*, which git reads as `/` and so runs nothing from.
+- **…but the host and the container read different files, so the host's answer is recorded.**
+  VS Code copies `~/.gitconfig` and nothing else. A value the host takes from an `[include]`d file,
+  or from `~/.config/git/config`, is invisible in here unless that file also resolves in here. A
+  review caught round 1's include fix mirroring such a value while git in here saw none, and 3e
+  calling that "unset", ok. So each start writes what the host resolved, and from which file, to
+  `/run/jkb/host-hookspath`. The host step warns when that file is not `~/.gitconfig`, and 3e fails
+  when git in here reads nothing (`not-seen`) or something else (`diverged`, a stale copy). The
+  record is writable from in here, but a forged one can only cause a false failure, because 3e
+  passes only when it agrees with git's own answer.
 - **A copy, not a bind mount.** The mount list is the security boundary, and `verify.sh` asserts it
   exactly. A mount whose source is missing stops the container starting, and not every host has a
   global hooks directory. A copy needs neither, and cannot write back to the host. The cost is
@@ -623,7 +632,9 @@ ones, run: a path with nothing there (the silent defect above), an empty value, 
 config, a path git cannot expand, a directory that is not the mirror, and a mirror writable from
 here. `scripts/tests/container-hooks.test.sh` covers the copy against a stub `docker`, whose root
 step emulates root's `chown`, `stat` and `tar`. Each guard was watched failing with its code
-removed. `verify.sh --self-test` covers the classification. `mutate-verify.sh` watches the missing
+removed. The root step is GNU code, because the container is Ubuntu. The stub hands it GNU's tools
+(Homebrew's `gmv`/`gstat`/`gtar` on a Mac), and without them those cases skip, naming what to
+install, rather than fail on a flag the container never lacks. Linux CI always runs them. `verify.sh --self-test` covers the classification. `mutate-verify.sh` watches the missing
 path and the forged mirror fail in a real container. That needs a Docker host, and has not yet
 been run.
 

@@ -279,9 +279,15 @@ login_link_state() { # login_link_state <link> <want>
 #   <raw>       the value as stored;  <expanded> git's own expansion of it ("" if it has none)
 #   <mount>     bind | volume | none: lib.sh's dc_hooks_mount_verdict for the expanded path
 #   <root-uid>  the uid that must own the mirror (0; the self-test passes its own)
+#   <host>      the value run.sh recorded the HOST resolving (lib.sh's DC_HOST_HOOKS_RECORD), or ""
+#               when there is no record or the host sets none
 # ->
-#   unset       no global value: every repository's own .git/hooks runs, and that is mounted
+#   unset       no global value, here or on the host: each repository's own .git/hooks runs
 #   unreadable  git could not read the global config at all
+#   not-seen    the host sets a value and git in here reads none: it comes from a file VS Code does
+#               not copy, so git in here runs none of the host's hooks (a review found this passing
+#               as `unset`)
+#   diverged    both set, but to different values: the copied ~/.gitconfig is out of date
 #   empty       set to "": git reads that as "/", and runs no hooks from there
 #   in-repo     relative: git resolves it inside each repository, which is mounted too
 #   shared      inside a bind: the host's own directory, live. Nothing is copied, nothing is wrong
@@ -294,8 +300,12 @@ login_link_state() { # login_link_state <link> <want>
 #               can write the directory, so this is a forgery or a copy that lost its owner
 #   writable    the mirror, but writable from here
 #   mirrored    the host's hooks, copied in by run.sh, owned by root and read-only here
-hooks_dir_state() { # hooks_dir_state <read> <raw> <expanded> <mount> <root-uid>
-    case "$1" in unset) printf 'unset'; return ;; set) ;; *) printf 'unreadable'; return ;; esac
+hooks_dir_state() { # hooks_dir_state <read> <raw> <expanded> <mount> <root-uid> <host>
+    case "$1" in
+        unset) if [ -n "${6:-}" ]; then printf 'not-seen'; else printf 'unset'; fi; return ;;
+        set)   [ -z "${6:-}" ] || [ "$2" = "$6" ] || { printf 'diverged'; return; } ;;
+        *)     printf 'unreadable'; return ;;
+    esac
     case "$2" in
         "")       printf 'empty'; return ;;
         /*|"~"*)  ;;   # ~user too: git expands it or fails, and either way the arms below answer
@@ -478,6 +488,9 @@ if [ "$SELF_TEST" = yes ]; then
     mkdir -p "$ht/mirror" "$ht/bare"; : > "$ht/mirror/$DC_HOOKS_MIRROR_MARKER"; ln -s "$ht/mirror" "$ht/link"
     hs() { hooks_dir_state "$@"; }
     st2 "no global hooksPath"                    "$(hs unset "" "" none 0)" unset
+    st2 "the host sets one, git in here sees none" "$(hs unset "" "" none 0 /Users/me/hooks)" not-seen
+    st2 "the host and git in here disagree"      "$(hs set /old/hooks /old/hooks none 0 /Users/me/hooks)" diverged
+    st2 "the host and git in here agree"         "$(hs set /h /h bind 0 /h)" shared
     st2 "git could not read the global config"   "$(hs unreadable "" "" none 0)" unreadable
     st2 "set to the empty string"                "$(hs set "" "" none 0)" empty
     st2 "a relative hooksPath"                   "$(hs set .githooks "" none 0)" in-repo
@@ -1297,9 +1310,19 @@ esac
 hooks_read=set
 hooks_raw="$(dc_global_hooks_path)" || { [ $? -eq 1 ] && hooks_read=unset || hooks_read=unreadable; }
 hooks_dir="$(dc_global_hooks_path --path 2>/dev/null)" || hooks_dir=""
+hooks_dir="$(dc_strip_slashes "$hooks_dir")"   # the mirror acts on the stripped path; so must this
+# What run.sh recorded the host resolving. No record (a container started some other way) means
+# nothing to compare against, which is not a failure.
+hooks_host=""; hooks_origin=""
+if [ -f "$DC_HOST_HOOKS_RECORD" ]; then
+    hooks_host="$(sed -n 's/^value=//p' "$DC_HOST_HOOKS_RECORD" | head -1)"
+    hooks_origin="$(sed -n 's/^origin=//p' "$DC_HOST_HOOKS_RECORD" | head -1)"
+fi
 hooks_mount=none
 [ -n "$hooks_dir" ] && hooks_mount="$(dc_hooks_mount_verdict "$hooks_dir" "$DC")"
-case "$(hooks_dir_state "$hooks_read" "$hooks_raw" "$hooks_dir" "$hooks_mount" 0)" in
+case "$(hooks_dir_state "$hooks_read" "$hooks_raw" "$hooks_dir" "$hooks_mount" 0 "$hooks_host")" in
+    not-seen)   bad "the host sets core.hooksPath ($hooks_host, in ${hooks_origin:-an unknown file}) but git in here reads none, so it runs none of the host's hooks — VS Code copies only ~/.gitconfig; move the setting there on the host" ;;
+    diverged)   bad "the host sets core.hooksPath to $hooks_host but git in here reads $hooks_raw — the ~/.gitconfig VS Code copied is out of date; reattach VS Code to the container" ;;
     unset)      ok "no global core.hooksPath: each repository's own .git/hooks runs" ;;
     in-repo)    ok "the global core.hooksPath ($hooks_raw) resolves inside each repository, which is mounted" ;;
     mirrored)   ok "git's hooks directory ($hooks_dir) is the host's, mirrored, owned by root and read-only here" ;;
@@ -1309,7 +1332,7 @@ case "$(hooks_dir_state "$hooks_read" "$hooks_raw" "$hooks_dir" "$hooks_mount" 0
     empty)      bad "git runs NO hooks in here: the global core.hooksPath is the empty string, which git reads as '/' — fix it on the host" ;;
     in-volume)  bad "the global core.hooksPath ($hooks_raw) is inside one of the container's volumes, so it is not the host's hooks and run.sh does not mirror it — point it elsewhere on the host" ;;
     unexpandable) bad "git cannot expand the global core.hooksPath ($hooks_raw) in here, so it runs NO hooks — use an absolute path or ~/ on the host" ;;
-    missing)    bad "git runs NO hooks in here: core.hooksPath is $hooks_raw and $hooks_dir does not exist — run.sh mirrors the host's on start; re-run it, and read its 'git hooks' step" ;;
+    missing)    bad "git runs NO hooks in here: core.hooksPath is $hooks_raw and $hooks_dir does not exist, and run.sh mirrors the host's on start — re-run it, and read its 'git hooks' step" ;;
     unmarked)   bad "$hooks_dir is not the host's hooks: run.sh did not put it there, so it refuses to replace it — move it aside and re-run run.sh" ;;
     not-root)   bad "$hooks_dir carries the mirror's marker but is not owned by root, so it is not the mirror: a marker can be forged by anything that can write there — move it aside and re-run run.sh" ;;
     writable)   bad "$hooks_dir is writable from here, so a sandboxed command could plant a hook that runs unsandboxed on your next commit — re-run run.sh, which makes it root-owned" ;;
