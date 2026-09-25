@@ -195,6 +195,7 @@ impl Request {
             | Self::LeaseGet { .. }
             | Self::RoleList { .. }
             | Self::RoleWhoami {}
+            | Self::RoleBind { .. }
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {} => OpPermission::Read,
             Self::MqTopicCreate { .. }
@@ -287,7 +288,8 @@ impl Request {
             | Self::TaskCloseMerged { uid, .. }
             | Self::WorkflowFire { uid, .. }
             | Self::WorkflowObserve { uid }
-            | Self::WorkflowSet { uid, .. } => Some(uid),
+            | Self::WorkflowSet { uid, .. }
+            | Self::RoleBind { uid } => Some(uid),
             Self::TaskStart(ask) => Some(&ask.uid),
             Self::TaskTake(ask) => Some(&ask.uid),
             Self::TaskAdd(ask) => ask.under.as_deref(),
@@ -613,6 +615,28 @@ pub fn authorize(
     let Some(reference) = request.target() else {
         if permission == OpPermission::Land {
             return Err(forbidden(format!("`{op}` refused: it names no task")));
+        }
+        // A caller held to one task adds tasks only under it: a new top-level task names no target,
+        // so without this the scope would stop exactly where a new task starts.
+        // ...and records a review only once it is bound: a review is keyed by branch, and
+        // `review::record` holds a scoped caller to its task — which an unbound one does not have.
+        if principal.scope.is_none()
+            && principal.attested_agent().is_some()
+            && matches!(request, Request::TaskReviewRecord(_))
+        {
+            return Err(forbidden(format!(
+                "`{op}` refused: {} has not bound to the task it reviews — run `jkb role bind \
+                 <uid>` first",
+                principal.label
+            )));
+        }
+        let scoped = principal.scope.is_some() || principal.attested_agent().is_some();
+        if scoped && matches!(request, Request::TaskAdd(_)) {
+            return Err(forbidden(format!(
+                "`{op}` refused: {} is held to one task, and adds tasks only under it (`--under \
+                 <uid>`)",
+                principal.label
+            )));
         }
         return Ok(Admit::Run);
     };

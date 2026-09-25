@@ -46,6 +46,12 @@ pub enum RoleCmd {
     },
     /// Who this caller is: its roles and scope.
     Whoami,
+    /// Bind this (attested) subagent to the task it works on. The first bind wins: a worker cannot
+    /// move on to another task afterwards.
+    Bind {
+        /// The task.
+        uid: String,
+    },
     /// Map a Claude Code agent type (a subagent definition's `name`) to the role an attested call from
     /// it holds. Operator only.
     Map {
@@ -263,6 +269,10 @@ pub fn role(b: &dyn Backend, cmd: RoleCmd, json_out: bool) -> Result<()> {
                 Ok(())
             }
             other => unexpected("role.whoami", &other),
+        },
+        RoleCmd::Bind { uid } => match call(b, Request::RoleBind { uid })? {
+            Response::Applied {} => Ok(()),
+            other => unexpected("role.bind", &other),
         },
         RoleCmd::Map {
             agent_type,

@@ -346,3 +346,38 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
     small[0].scenario = Some("s".to_owned());
     assert!(!super::fit(&mut small));
 }
+
+/// A caller held to one task records a review for that task only, even when another task records the
+/// same branch (D52.4): a round recorded against someone else's work is a review it did not get.
+#[test]
+fn a_scoped_caller_s_review_credits_only_its_own_task() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let mine = started(&b, "mine", "shared");
+    let theirs = started(&b, "theirs", "shared");
+    file(
+        &b,
+        "reviews/s1",
+        &json!([{ "severity": "nit", "summary": "x" }]),
+    )
+    .unwrap();
+    let token = match call(
+        &b,
+        json!({ "op": "role.grant", "role": "coordinator", "task": mine, "agent": "c" }),
+    )
+    .unwrap()
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let scoped = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
+    let got = record(&scoped, "shared", "reviews/s1").unwrap();
+    assert_eq!(
+        got.recorded
+            .iter()
+            .map(|r| r.uid.as_str())
+            .collect::<Vec<_>>(),
+        vec![mine.as_str()]
+    );
+    assert_eq!(got.unwritable, vec![theirs], "skipped, and said so");
+}

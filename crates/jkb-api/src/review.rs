@@ -408,7 +408,8 @@ pub struct Recording {
     /// Skipped because a recorded branch value cannot be handed to git at all. Reported, not fatal:
     /// one malformed tag must not stop the whole branch being credited.
     pub unusable: Vec<String>,
-    /// Skipped because this client may not write them (filed outside `jkb serve`'s file roots).
+    /// Skipped because this client may not write them (filed outside `jkb serve`'s file roots, or outside
+    /// the one task a scoped caller is held to).
     #[serde(default)]
     pub unwritable: Vec<String>,
 }
@@ -447,6 +448,7 @@ pub fn record(
     ask: &RecordAsk,
     roots: Option<&FileRoots>,
     actor: &str,
+    scope: Option<ItemId>,
 ) -> Result<Recording, ApiError> {
     check_name("repo key", &ask.repo)?;
     check_name("branch", &ask.branch)?;
@@ -504,6 +506,15 @@ pub fn record(
                 continue;
             }
             Err(e) => return Err(e),
+        }
+        // A caller held to one task (D52.4) records a review only for the work it is held to: a
+        // branch names whatever tasks record it, and a round recorded against another task's branch
+        // is a review that task did not get.
+        if let Some(s) = scope {
+            if !jkb_core::roles::in_scope(conn, s, id)? {
+                out.unwritable.push(m.uid.clone());
+                continue;
+            }
         }
         let before = line_problem(conn, &m.uid)?;
         jkb_core::reviews::record(conn, meta, id, &findings, sha, actor)?;

@@ -365,6 +365,9 @@ fn samples() -> Vec<Request> {
             all: false,
         },
         Request::RoleWhoami {},
+        Request::RoleBind {
+            uid: "task:x".into(),
+        },
         Request::RoleMap {
             agent_type: "reviewer".into(),
             role: None,
@@ -1923,7 +1926,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 26, "every write naming an item was asked");
+    assert_eq!(checked, 27, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {

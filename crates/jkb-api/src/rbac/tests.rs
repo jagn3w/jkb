@@ -377,3 +377,47 @@ fn rotating_with_keep_keeps_a_live_credential_and_replaces_anything_else() {
     let (_, other) = grant(&kb.op, "coordinator", Some(&a), "someone");
     assert_ne!(rotate(Some(&other)).1, other);
 }
+
+#[test]
+fn a_scoped_caller_adds_only_under_its_task_and_records_only_its_own_review() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let (_, coord) = grant(&kb.op, "coordinator", Some(&a), "c");
+    let c = kb.as_token(&coord);
+    let e = refused(&c, json!({ "op": "task.add", "text": "stray" }));
+    assert!(e.message.contains("only under it"), "{e:?}");
+    ok(
+        &c,
+        json!({ "op": "task.add", "text": "a subtask", "under": a }),
+    );
+
+    // An attested reviewer that has not bound yet may not record a review, and binding is explicit.
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "reviewer", "role": "reviewer" }),
+    );
+    let ticket = match ok(
+        &kb.as_token(&container),
+        json!({ "op": "attest.mint", "session": "s", "agent_id": "r1",
+                "agent_type": "reviewer", "tool_use_id": "t" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let rev = kb.as_token(&ticket);
+    let record = json!({ "op": "task.review_record", "repo": "r", "branch": "b",
+                         "findings": "reviews/x" });
+    let e = refused(&rev, record);
+    assert!(e.message.contains("jkb role bind"), "{e:?}");
+    ok(&rev, json!({ "op": "role.bind", "uid": a }));
+    match ok(&rev, json!({ "op": "role.whoami" })) {
+        Response::WhoAmI { whoami } => assert_eq!(whoami.task.as_deref(), Some(a.as_str())),
+        other => panic!("{other:?}"),
+    }
+    let other = add(&kb.op, "task b");
+    refused(&rev, json!({ "op": "role.bind", "uid": other }));
+}

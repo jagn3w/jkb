@@ -863,6 +863,18 @@ land gate — the candidate's own code — runs in the container through `docker
 under `~/repos` (exit status and output measured intact), settled before the graft;
 `--gate-on-host` is recorded.
 
+**Scope is enforced in the callee, not only at the target.** A principal held to one task writes
+only that task, its subtasks and its findings; an op naming no task cannot slip past that — a scoped
+caller adds tasks only `--under` its task, and `review::record` credits only in-scope tasks for a
+scoped caller (a branch names whatever tasks record it). An attested subagent binds to its task on
+its first task-targeted write, or explicitly with `jkb role bind <uid>`, and a reviewer must be
+bound before it records a review.
+
+**Swarm landings follow the task's strategy.** `scripts/merge-queue.sh` records a landing with
+`jkb task landed`, and under the default `design-reviewed` only the operator lands — so a batch
+the swarm lands on its own runs under a strategy whose `lands` toggle includes the coordinator
+(`jkb workflow set <uid> autonomous`, or a defined one), or the operator lands it.
+
 **Rejected, and why.**
 
 - *A role header beside the root bearer* (first draft): omitting it made the caller the operator.

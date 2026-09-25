@@ -646,6 +646,13 @@ pub enum Request {
     /// Who the caller is ([`rbac::whoami`]).
     #[serde(rename = "role.whoami")]
     RoleWhoami {},
+    /// Bind an attested subagent to the task it works on — first bind wins, and it cannot hop
+    /// ([`rbac::authorize`] does the binding; the op itself does nothing more).
+    #[serde(rename = "role.bind")]
+    RoleBind {
+        /// The task.
+        uid: String,
+    },
     /// Map a Claude Code agent type to a role, or clear it (operator; [`rbac::map`]).
     #[serde(rename = "role.map")]
     RoleMap {
@@ -1268,6 +1275,7 @@ impl Request {
         "role.revoke",
         "role.list",
         "role.whoami",
+        "role.bind",
         "role.map",
         "role.rotate_container",
         "workflow.show",
@@ -1373,6 +1381,7 @@ impl Request {
             Self::RoleRevoke { .. } => "role.revoke",
             Self::RoleList { .. } => "role.list",
             Self::RoleWhoami {} => "role.whoami",
+            Self::RoleBind { .. } => "role.bind",
             Self::RoleMap { .. } => "role.map",
             Self::RoleRotateContainer { .. } => "role.rotate_container",
             Self::WorkflowShow { .. } => "workflow.show",
@@ -1505,6 +1514,8 @@ impl Request {
             | Self::TaskRanOnHost { .. }
             | Self::RoleGrant { .. }
             | Self::RoleRevoke { .. }
+            // Its admission writes the binding, so it is served on the writer.
+            | Self::RoleBind { .. }
             | Self::RoleMap { .. }
             | Self::RoleRotateContainer { .. }
             | Self::WorkflowFire { .. }
@@ -3098,8 +3109,9 @@ impl Backend for LocalBackend {
                 Response::ReviewRecorded {
                     recording: {
                         let who = principal.label.clone();
+                        let scope = principal.scope;
                         db.write_txn_with(actor, move |c, m| {
-                            review::record(c, m, &ask, roots.as_ref(), &who)
+                            review::record(c, m, &ask, roots.as_ref(), &who, scope)
                         })?
                     },
                 }
@@ -3143,6 +3155,13 @@ impl Backend for LocalBackend {
                 Response::WhoAmI {
                     whoami: db.read_with(move |c| rbac::whoami(c, &p))?,
                 }
+            }
+            Request::RoleBind { uid } => {
+                // The binding was made by `admit`; what is left is to say the task is one this client
+                // may write at all.
+                let roots = self.file_roots.clone();
+                db.read_with(move |c| tasks::writable(c, &uid, roots.as_ref()).map(|_| ()))?;
+                Response::Applied {}
             }
             Request::RoleMap { agent_type, role } => {
                 db.write_txn_with(actor, move |c, m| {
