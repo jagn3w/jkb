@@ -1086,3 +1086,85 @@ fn an_unread_answer_holds_its_permit_until_the_write_deadline() {
     }
     drop(stalled);
 }
+
+/// Roles over the wire (design D52.3): a role token and a harness ticket reach the daemon as the
+/// bearer, are served as the principal they name and held to its role, and a token that names
+/// nothing is refused before the body is read. The root token stays the operator.
+#[test]
+fn a_role_token_and_a_ticket_are_served_as_their_principal_over_http() {
+    let f = Fixture::new();
+    let op = f.client();
+    let call = |b: &RemoteBackend, r: serde_json::Value| {
+        b.call(serde_json::from_value(r).expect("request parses"))
+    };
+    let Response::Added { added } =
+        call(&op, json!({ "op": "task.add", "text": "the work" })).unwrap()
+    else {
+        panic!("added")
+    };
+    let uid = added.uid;
+    let Response::Granted { token, .. } = call(
+        &op,
+        json!({ "op": "role.grant", "role": "reviewer", "task": uid, "agent": "rev" }),
+    )
+    .unwrap() else {
+        panic!("granted")
+    };
+    let reviewer = f.client().with_token(token.clone());
+    let Response::WhoAmI { whoami } = call(&reviewer, json!({ "op": "role.whoami" })).unwrap()
+    else {
+        panic!("whoami")
+    };
+    assert_eq!(whoami.roles, vec!["reviewer"]);
+    let e = call(
+        &reviewer,
+        json!({ "op": "task.edit", "uid": uid, "text": "x", "append": true }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+
+    // A token naming nothing is unauthorized — and not retried, having nothing fresher to try.
+    let nobody = f.client().with_token("0".repeat(64));
+    assert_eq!(
+        call(&nobody, json!({ "op": "kb.ls" })).unwrap_err().code,
+        ErrorCode::Unauthorized
+    );
+
+    // The container credential mints a ticket; the ticket authenticates; released, it does not.
+    let Response::Granted {
+        token: container, ..
+    } = call(&op, json!({ "op": "role.rotate_container" })).unwrap()
+    else {
+        panic!("rotated")
+    };
+    let hook = f.client().with_token(container);
+    let Response::Ticket { token: ticket } = call(
+        &hook,
+        json!({ "op": "attest.mint", "session": "s", "tool_use_id": "t1" }),
+    )
+    .unwrap() else {
+        panic!("ticket")
+    };
+    let main = f.client().with_token(ticket.clone());
+    call(&main, json!({ "op": "kb.ls" })).expect("a live ticket authenticates");
+    call(
+        &hook,
+        json!({ "op": "attest.release", "session": "s", "tool_use_id": "t1" }),
+    )
+    .unwrap();
+    assert_eq!(
+        call(&main, json!({ "op": "kb.ls" })).unwrap_err().code,
+        ErrorCode::Unauthorized
+    );
+
+    // A revoked grant is refused on its very next request, cache or no cache.
+    let Response::Grants { listing } = call(&op, json!({ "op": "role.list" })).unwrap() else {
+        panic!("listed")
+    };
+    let rev_id = listing.grants.iter().find(|g| g.agent == "rev").unwrap().id;
+    call(&op, json!({ "op": "role.revoke", "id": rev_id })).unwrap();
+    assert_eq!(
+        call(&reviewer, json!({ "op": "kb.ls" })).unwrap_err().code,
+        ErrorCode::Unauthorized
+    );
+}

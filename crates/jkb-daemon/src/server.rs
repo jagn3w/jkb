@@ -34,6 +34,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use jkb_api::rbac::Caller;
 use jkb_api::{ApiError, Backend as _, ErrorCode, LocalBackend, Request, Response};
 use jkb_core::Db;
 use serde_json::json;
@@ -200,7 +201,27 @@ struct State {
     max_wait: Duration,
     poll_floor: Duration,
     read_timeout: Duration,
+    /// The harness tickets this daemon minted (D52.9) — in memory, shared by every request's backend,
+    /// and kept across a database re-open.
+    tickets: jkb_api::rbac::SharedTickets,
+    /// Which bearer tokens name a live grant, for authenticating before the body is read.
+    grants: Mutex<GrantCache>,
 }
+
+/// The live grants' token hashes, so a bearer that is neither the root token nor a ticket is
+/// recognized without a database read per request (D52.3). A hit is only admission: every call
+/// resolves its principal from the database again, so a revocation is never served stale. A miss
+/// refreshes the set at most once per [`GRANT_REFRESH`], so a flood of wrong tokens costs one read a
+/// second, not one each. A grant this daemon mints clears the interval, so it authenticates at once;
+/// one the host CLI wrote directly may wait out one interval.
+#[derive(Default)]
+struct GrantCache {
+    hashes: HashSet<String>,
+    refreshed: Option<std::time::Instant>,
+}
+
+/// How often a miss may re-read the grants.
+const GRANT_REFRESH: Duration = Duration::from_secs(1);
 
 /// Bind, write a fresh token, and serve on a background thread.
 ///
@@ -359,6 +380,8 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         max_wait: cfg.max_wait,
         poll_floor: cfg.poll_floor,
         read_timeout: cfg.read_timeout,
+        tickets: Arc::default(),
+        grants: Mutex::default(),
     });
     let connections = Arc::new(Semaphore::new(connection_budget(cfg.max_connections)));
     let read_timeout = cfg.read_timeout;
@@ -455,12 +478,56 @@ pub const fn status_for(code: ErrorCode) -> StatusCode {
     }
 }
 
-fn authorized(state: &State, req: &hyper::Request<Incoming>) -> bool {
+/// The bearer token a request presents, trimmed.
+fn bearer(req: &hyper::Request<Incoming>) -> Option<String> {
     req.headers()
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|given| token::matches(&state.token, given.trim()))
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// Who `given` authenticates as: the operator for the root token (compared in constant time), a
+/// token-holding caller for a live ticket or grant, or nobody.
+async fn authenticate(state: &Arc<State>, given: &str) -> Result<Option<Caller>, ApiError> {
+    if token::matches(&state.token, given) {
+        return Ok(Some(Caller::Operator));
+    }
+    if given.starts_with(jkb_api::rbac::TICKET_PREFIX) {
+        return Ok(state
+            .tickets
+            .contains(given)
+            .then(|| Caller::Token(given.to_owned())));
+    }
+    let hash = jkb_core::roles::token_hash(given);
+    let lock = || {
+        state
+            .grants
+            .lock()
+            .map_err(|_| ApiError::with_code(ErrorCode::Internal, "grant cache poisoned"))
+    };
+    let refresh_due = {
+        let cache = lock()?;
+        if cache.hashes.contains(&hash) {
+            return Ok(Some(Caller::Token(given.to_owned())));
+        }
+        cache
+            .refreshed
+            .is_none_or(|at| at.elapsed() >= GRANT_REFRESH)
+    };
+    if !refresh_due {
+        return Ok(None);
+    }
+    let (_, db) = ready(state).await?;
+    let live = blocking_read(&db, jkb_core::roles::live_by_hash).await?;
+    let mut cache = lock()?;
+    cache.hashes = live.into_iter().map(|(h, _)| h).collect();
+    cache.refreshed = Some(std::time::Instant::now());
+    Ok(cache
+        .hashes
+        .contains(&hash)
+        .then(|| Caller::Token(given.to_owned())))
 }
 
 fn wait_ms(req: &hyper::Request<Incoming>) -> u64 {
@@ -815,17 +882,30 @@ async fn handle(
             route.0, route.1
         ))));
     }
-    if !authorized(&state, &req) {
-        return Ok(refuse_and_close(&ApiError::with_code(
+    let wrong = || {
+        refuse_and_close(&ApiError::with_code(
             ErrorCode::Unauthorized,
-            "missing or wrong bearer token (it is rotated each time jkb serve starts)",
-        )));
-    }
+            "missing or wrong bearer token (it is rotated each time jkb serve starts; a role token \
+             may have been revoked, a ticket released)",
+        ))
+    };
+    let Some(given) = bearer(&req) else {
+        return Ok(wrong());
+    };
+    let caller = match authenticate(&state, &given).await {
+        Ok(Some(caller)) => caller,
+        Ok(None) => return Ok(wrong()),
+        Err(e) => return Ok(refuse_and_close(&e)),
+    };
     authed.store(true, Ordering::SeqCst);
     let (backend, db) = match ready(&state).await {
         Ok(serving) => serving,
         Err(refusal) => return Ok(refuse(&refusal)),
     };
+    // This request's backend: the caller it authenticated as, and the daemon's one ticket store.
+    let backend = backend
+        .with_tickets(Arc::clone(&state.tickets))
+        .with_caller(caller);
     let (backend, db) = (&backend, &db);
     // Every request past authentication holds an op permit from here — through the schema read, the
     // body and the parse — so authenticated clients cannot pile up unbounded work before the budget
@@ -882,7 +962,16 @@ async fn handle(
     *held = Some(Arc::clone(&permit));
     Ok(
         match serve_op(&state, backend, db, request, wait, &permit).await {
-            Ok(response) => reply(StatusCode::OK, &json!(response)),
+            Ok(response) => {
+                // A grant this daemon just minted must authenticate on the very next request, not
+                // after the cache's refresh interval.
+                if matches!(response, Response::Granted { .. }) {
+                    if let Ok(mut cache) = state.grants.lock() {
+                        cache.refreshed = None;
+                    }
+                }
+                reply(StatusCode::OK, &json!(response))
+            }
             Err(e) => refuse(&e),
         },
     )
