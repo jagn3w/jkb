@@ -346,3 +346,34 @@ fn strategies_list_presets_then_definitions_and_name_the_default() {
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
 }
+
+#[test]
+fn rotating_with_keep_keeps_a_live_credential_and_replaces_anything_else() {
+    let kb = Kb::new();
+    let rotate = |keep: Option<&str>| match ok(
+        &kb.op,
+        json!({ "op": "role.rotate_container", "keep": keep }),
+    ) {
+        Response::Granted { grant, token } => (grant.id, token),
+        other => panic!("{other:?}"),
+    };
+    let (id, token) = rotate(None);
+    assert_eq!(
+        rotate(Some(&token)),
+        (id, token.clone()),
+        "live: kept as it is"
+    );
+    let (id2, token2) = rotate(Some("not-a-token"));
+    assert_ne!(token2, token, "unknown: rotated");
+    assert!(
+        call(&kb.as_token(&token), json!({ "op": "kb.ls" })).is_err(),
+        "and the old one revoked"
+    );
+    let (_, token3) = rotate(Some(&token));
+    assert_ne!(token3, token, "a revoked one is not kept");
+    assert_ne!(id2, 0);
+    // A live grant that is not the container's is never kept in its place.
+    let a = add(&kb.op, "a");
+    let (_, other) = grant(&kb.op, "coordinator", Some(&a), "someone");
+    assert_ne!(rotate(Some(&other)).1, other);
+}

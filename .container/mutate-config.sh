@@ -187,8 +187,14 @@ open(p, 'w').write(s)
 PY
 run "the generator's syscall list stops parsing" "no longer yields"
 
-seed; jq_dc 'del(.mounts[] | select(test("/home/vscode/.jkb")))'
-run "the knowledge-base mount is dropped" "declared mount set is missing"
+seed; jq_dc 'del(.mounts[] | select(test("/home/vscode/.jkb/")))'
+run "the narrowed ~/.jkb mounts are dropped" "declared mount set is missing"
+
+seed; jq_dc '.mounts += ["source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb-whole,type=bind"]'
+run "the whole host ~/.jkb is bound again (D52.8)" "the whole ~/.jkb: the operator's database and root token"
+
+seed; jq_dc '.mounts |= map(sub(",readonly$"; ""))'
+run "the container credential is bound writable" "the container credential mount is not read-only"
 
 # EVERY KEY IN container.json IS APPLIED BY SOMETHING. This replaced four mutations about
 # workspaceFolder and initializeCommand, which were Dev Containers' rules and are gone with it —
@@ -977,7 +983,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=92
+PINNED_BAD_SITES=93
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

@@ -657,7 +657,12 @@ pub enum Request {
     },
     /// Replace the dev container's credential (operator; [`jkb_core::roles::rotate_container`]).
     #[serde(rename = "role.rotate_container")]
-    RoleRotateContainer {},
+    RoleRotateContainer {
+        /// The credential written now: kept, and answered back, when it still names the live
+        /// container grant — so a re-run of setup does not revoke every worker minted from it.
+        #[serde(default)]
+        keep: Option<String>,
+    },
     /// A task's workflow: phase, strategy, who acts next ([`rbac::show`]).
     #[serde(rename = "workflow.show")]
     WorkflowShow {
@@ -1369,7 +1374,7 @@ impl Request {
             Self::RoleList { .. } => "role.list",
             Self::RoleWhoami {} => "role.whoami",
             Self::RoleMap { .. } => "role.map",
-            Self::RoleRotateContainer {} => "role.rotate_container",
+            Self::RoleRotateContainer { .. } => "role.rotate_container",
             Self::WorkflowShow { .. } => "workflow.show",
             Self::WorkflowFire { .. } => "workflow.fire",
             Self::WorkflowObserve { .. } => "workflow.observe",
@@ -1501,7 +1506,7 @@ impl Request {
             | Self::RoleGrant { .. }
             | Self::RoleRevoke { .. }
             | Self::RoleMap { .. }
-            | Self::RoleRotateContainer {}
+            | Self::RoleRotateContainer { .. }
             | Self::WorkflowFire { .. }
             | Self::WorkflowObserve { .. }
             | Self::WorkflowSet { .. }
@@ -3145,10 +3150,17 @@ impl Backend for LocalBackend {
                 })?;
                 Response::Applied {}
             }
-            Request::RoleRotateContainer {} => {
-                let (grant, token) = db.write_txn_with(actor, |c, m| {
+            Request::RoleRotateContainer { keep } => {
+                let (grant, token) = db.write_txn_with(actor, move |c, m| {
+                    if let Some(t) = keep {
+                        if let Some(g) = jkb_core::roles::resolve(c, &t)? {
+                            if g.agent == jkb_core::roles::CONTAINER_AGENT && g.parent.is_none() {
+                                return Ok::<_, ApiError>((g, t));
+                            }
+                        }
+                    }
                     let (row, token) = jkb_core::roles::rotate_container(c, m)?;
-                    Ok::<_, ApiError>((row, token))
+                    Ok((row, token))
                 })?;
                 let grant = db.read_with(move |c| {
                     rbac::list(c, None, false)

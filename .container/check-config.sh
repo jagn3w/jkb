@@ -239,7 +239,7 @@ fi
 # An empty or truncated result would make verify.sh's boundary assertion meaningless.
 mount_targets="$(dc_mount_targets "$here/container.json")"
 missing_mounts=()
-for m in /home/vscode/repos /home/vscode/.jkb; do
+for m in /home/vscode/repos /home/vscode/.jkb/claude-memory /home/vscode/.jkb/logs /home/vscode/.jkb-container; do
     grep -qx "$m" <<<"$mount_targets" || missing_mounts+=("$m")
 done
 if [ ${#missing_mounts[@]} -eq 0 ]; then
@@ -297,7 +297,11 @@ done <<<"$mount_targets"
 while IFS= read -r src; do
     [ -n "$src" ] || continue
     case "$src" in
-        '${localEnv:HOME}/repos'|'${localEnv:HOME}/.jkb') ;;
+        '${localEnv:HOME}/repos'|'${localEnv:HOME}/.jkb/claude-memory'|'${localEnv:HOME}/.jkb/logs'|'${localEnv:HOME}/.jkb-container') ;;
+        # The whole of ~/.jkb carries the operator's database, its backups and the daemon's root
+        # token: anything in the container could read the token that makes it the operator (D52.8).
+        '${localEnv:HOME}/.jkb'|'${localEnv:HOME}/.jkb/') forbidden+=("host source $src (the whole ~/.jkb: the operator's database and root token, D52.8)") ;;
+        '${localEnv:HOME}/.jkb/'*) forbidden+=("host source $src (only claude-memory and logs of ~/.jkb are reviewed, D52.8)") ;;
         *) forbidden+=("host source $src (not on the reviewed bind allowlist)") ;;
     esac
 done <<<"$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*$//p')"
@@ -306,9 +310,16 @@ done <<<"$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*
 # made "every declared mount is acceptable" pass with the host's ~/.ssh bound in — a guard that
 # fails OPEN. Excluding volumes instead means an unrecognised type is reviewed, not waved through.
 bind_sources="$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*$//p' | grep -c .)"
-if [ "$bind_sources" -lt 2 ]; then
-    bad "only $bind_sources host bind source(s) parsed — the workspace and ~/.jkb are both binds, so the review below saw less than the config declares"
+if [ "$bind_sources" -lt 4 ]; then
+    bad "only $bind_sources host bind source(s) parsed — the workspace, ~/.jkb's claude-memory and logs, and the container credential are all binds, so the review below saw less than the config declares"
 fi
+# THE CREDENTIAL IS READ-ONLY (D52.3). A writable bind would let anything in the container replace the
+# credential the host's hooks and clients read — with a token it minted for itself, say.
+cred_spec="$(dc_mount_specs "$here/container.json" | grep -F 'target=/home/vscode/.jkb-container' || true)"
+case ",$cred_spec," in
+    *,readonly,*|*,ro,*) ok "the container credential is bound read-only" ;;
+    *) bad "the container credential mount is not read-only: ${cred_spec:-(missing)}" ;;
+esac
 if [ ${#forbidden[@]} -eq 0 ]; then
     ok "every declared mount is acceptable (no posture directory, no docker socket, binds from the reviewed set)"
 else

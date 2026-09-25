@@ -763,3 +763,125 @@ undecided design. So design is separated from implementation by a tag gate (D28)
 - **Gate DSL gotcha:** use `tag:design=approved` (the query DSL). The `#facet=value` form is
   quick-add-only, and `task next` silently drops non-`tag:`/`ns:` terms — so `#design=approved`
   in a `task next` scope is ignored (parsed as dropped free text).
+
+## Roles, RBAC and task workflows (D52)
+
+The pattern `/task-swarm` and hand-driven sessions converged on — a **coordinator** that spawns a
+**designer**, then **implementers**, then **reviewers**, and a **systemic reviewer** when review
+keeps finding the same areas — lived only in prompts, so the operator typed "continue" and "run
+another review round", and nothing stopped an agent skipping a step. D52 makes the path forward a
+fact jkb states, holds each agent to the steps its role allows — **including an agent trying not
+to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-rbac-workflows/`
+(local), which also holds the probes and their raw results.
+
+**The pieces, and where they live.**
+
+- **`crates/jkb-rbac`** — RBAC as a checkable table, the sibling of `jkb-fsm` and as
+  dependency-free. `RoleTable` (static) and `OwnedTable` (built at runtime) share one `Grants`
+  trait: `check()` finds a role granted nothing, a permission nobody holds, a duplicate row;
+  `matrix()` renders it. `Authorizer` composes (`RoleBased`, `AllowAll`, `Both`, `FnAuthorizer`),
+  and a refusal names the roles that *would* be allowed. Nothing in it is about jkb.
+- **`jkb-core/src/roles.rs`** — the six roles (operator, coordinator, designer, implementer,
+  reviewer, `systemic_reviewer`); who may grant whom (a `RoleTable<Role, Role>`: a coordinator
+  grants workers, scoped inside its own scope); grants stored as **blake3 hashes** of 256-bit
+  tokens, revoked recursively, **not changelogged** (`jkb undo` reviving a revoked grant would
+  re-arm a credential); the operator's `agent_type → role` map; first-bind-wins agent bindings.
+- **`jkb-core/src/workflow/`** — one phase set (design, `design_review`, implement, review,
+  `systemic_review`, landable, landed, cancelled), two graphs as `jkb-fsm` tables that pass
+  `check()` and an `audit()` over every combination of facts. **A strategy is a composition**
+  (operator's clarification): a graph, permission **toggles** (`approves_design`, `lands`, each
+  bounded by a domain so none can hand an operator power to a worker) and **attributes**
+  (`repeated_area`). Presets `design-reviewed` (default), `coordinated`, `autonomous`; operator
+  definitions are versioned, and a task **pins a snapshot** so a redefinition never changes it
+  mid-flight. The log is append-only; permission is checked **in the callee** (`store::fire`).
+- **`jkb-core/src/reviews.rs`** (V023) — the land gate's review facts, **out of tags**.
+- **`jkb-api/src/rbac.rs`** — `Request::permission` (exhaustive), `OP_GRANTS`, principals,
+  the in-memory ticket store, `authorize` at the top of `LocalBackend::call` — the one dispatch
+  the daemon, the MCP server and host-local mode share — and the `role.*`, `workflow.*` and
+  `attest.*` ops.
+- **`jkb-cli/src/rbac_cli.rs`** — `jkb role`, `jkb workflow`, and `jkb attest hook`.
+
+**The loop is a graph, and only a clean round leaves it.** A review round that finds a must-fix
+sends the task back to an implementer (`review_failed`), through a systemic review first when
+must-fixes repeat an area (`review_repeated`, default: the same file in two consecutive rounds).
+The systemic reviewer ends it one of two ways, with a required written reason: `systemic_redesign`
+back to design (the fix changes how the operator understands the system — under the default, that
+is back to the operator) or `submit_systemic` back to implementation (a difficult code pattern).
+`jkb workflow observe` takes the one reconciliation the facts call for, so after a round the task
+moves with no human prompt; `jkb workflow next --stop-hook` sends a Stop back, **once per stop**,
+while the next actor is one the session drives.
+
+**The land gate gained its last-round clause.** The newest round must itself have found no
+must-fix: fixing a round's findings is not a review of the fix. A round is a review namespace,
+ordered by filing (the highest item id among its findings — no new table, and it covers every
+review recorded before this), and `must_fix` counts at **any** status. A daemon too old to report
+rounds refuses rather than skipping the clause.
+
+**Review facts are not tags (hole H3).** `reviewed=`, `review=` and `review-waived=` decided the
+gate, and a tag is content any writer may set — the sync engine included, applying a `tasks.md`
+line an agent in the dev container edited: `#review-waived=x` waived the gate. The answer is
+**not** a reserved facet: `tag.rs` records that apparatus being tried for `base` and six choke
+points failing to close it. The facts moved to an append-only `reviews` table (V023 migrated 11
+`reviewed=`, 35 `review=` and 28 `review-waived=` tags, measured on the live KB, and deleted them),
+and the gate reads only that, so a `reviewed=` tag is ordinary content nothing trusts.
+`task.facts`, `task.staging` and `task.show` carry it as a `review` field. Likewise **`landed`
+reads the landing transition, never `status = done`**, which a synced checkbox can write (H4).
+
+**Who is asking (D52.3).** One bearer per request: the root token (the operator — host only), the
+dev container's credential (a coordinator grant, its ceiling), a role grant, or a harness
+**ticket**. No credential no longer means operator. `remote::client` is the one place a client
+chooses: a command its ticket or role token, else the container credential if it can read it
+(a person at a container terminal can; the model's sandboxed tools cannot); a hook the container
+credential; `jkb mcp` only an operator-configured role token — never the container's ceiling on
+behalf of every agent it serves. The daemon caches grant hashes so a wrong token costs at most
+one read a second, clears the cache when it mints, and re-resolves every call from the database
+so a revocation is never served stale.
+
+**Harness attestation (D52.9) — the harness vouches, the agent holds no secret.** An in-process
+subagent cannot keep a secret from its parent (one process, one sandbox, one transcript), so
+instead Claude Code's hook — which the harness, not the model, feeds — mints a ticket per `jkb`
+tool call with the container credential, carrying the `session_id`, `agent_id` and `agent_type`
+the harness reported, and rewrites the command to export it. Measured on Claude Code 2.1.276:
+`agent_id`/`agent_type` appear for Agent-tool **and** Workflow-tool subagents and not for the main
+session; `updatedInput` reaches the shell; `PostToolUseFailure`, timed-out commands and
+`SubagentStop` all fire; one command cannot read another's `/proc/*/environ`; deny rules held from
+Bash, `Read`, a symlink and a subagent. Two measurements changed the design: **a workflow agent
+reports `workflow-subagent` unless its script passes `agentType`**, so roles come from explicit
+types and the generic ones map to nothing; and **a `PreToolUse` can be followed by no post-hook**
+(a permission refusal after the hook ran), so tickets are also released at `SubagentStop` and
+`SessionEnd`, with a 10-minute backstop.
+
+**The host must not run container-written code (H5, H6).** Git on the host runs what a repository's
+own `.git/config` names, and the container writes that file. Three layers, measured on Docker
+Desktop 29.7.2 and git 2.51.1: `run.sh` binds each repo's `.git/config` and `.git/hooks` read-only
+(a rename over the bind fails with EBUSY — writes fail closed); every jkb git call audits the repo's
+own config against an **allowlist** of repository-shape keys before it runs (`git config --list
+--show-origin --show-scope` executes nothing; `-c core.fsmonitor=false -c core.hooksPath=/dev/null`
+does *not* stop a planted filter, so the audit is what holds) and runs hooks-off; and the reap
+service audits every repo and session worktree each pass and posts a sticky notification. And the
+land gate — the candidate's own code — runs in the container through `docker exec` for a checkout
+under `~/repos` (exit status and output measured intact), settled before the graft;
+`--gate-on-host` is recorded.
+
+**Rejected, and why.**
+
+- *A role header beside the root bearer* (first draft): omitting it made the caller the operator.
+- *Workers as separate `claude -p` processes* (second draft): attestation holds in-process
+  subagents to their role without restructuring the swarm.
+- *A single-use ticket that expires in seconds*: breaks multi-op commands; bound to its tool
+  call's lifetime instead.
+- *Protecting the review facets with a check in `task.tag`*: sync, quick-add and MCP write tags
+  too — H3 at one door of four.
+- *A per-daemon-start container credential*: kills in-flight workers on every `setup.sh`;
+  `setup.sh` passes `--keep-live` instead.
+- *Phases folded into `TaskStatus`*: the status is the claim/land axis every frontier and synced
+  checkbox reads; the workflow is a second axis over it.
+
+**Not protected, stated.** Agents on the host run as the operator. A genuine worker told to lie by
+a hostile coordinator (a real reviewer filing a clean review on instruction) — mitigated by
+operator-owned agent definitions, rounds recording the attested reviewer, and landing staying the
+operator's under the default strategy. Git run *by hand* in a repository planted between reap
+passes. `/task-swarm`'s workflow agents hold no role until its script passes `agentType` (its
+`.claude/workflows` file was read-only to the session that built this); until then
+`jkb role map workflow-subagent coordinator` is the explicit, visible way to keep it working with
+worker isolation off.

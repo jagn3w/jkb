@@ -113,6 +113,30 @@ else
   fi
 fi
 
+# --- 2b. roles: the dev container's credential and the worker agent types (design D52) --------
+# The container reaches jkb serve with its own credential — a coordinator grant, its ceiling — never
+# the daemon's root token, which stays on this host. `--keep-live` keeps one that still resolves:
+# rotating on every run (this script runs after every pull) would revoke every worker grant minted
+# from it mid-task. Rotate deliberately with `jkb role rotate-container --write`.
+#
+# The agent types a coordinator spawns its workers as, mapped to their roles, so a harness-attested
+# call from one holds that role and nothing more (D52.9). Idempotent. An operator's own mapping of
+# the same type is overwritten; map a different type name to keep a custom one.
+#
+# Non-fatal, by this script's rule: the git hooks below must still be installed.
+setup_roles() {
+  jkb --db "$db" role rotate-container --write --keep-live || return 1
+  local t
+  for t in designer implementer reviewer; do
+    jkb --db "$db" role map "$t" "$t" || return 1
+  done
+  jkb --db "$db" role map systemic-reviewer systemic_reviewer || return 1
+}
+say "roles: the container credential and the worker agent types"
+if setup_roles; then :; else
+  warn "could not set up roles — the dev container cannot reach jkb serve without its credential (re-run, or: jkb role rotate-container --write)."
+fi
+
 # --- 3. VS Code extension ----------------------------------------------------
 if [ "$do_extension" -eq 1 ]; then
   say "build + install VS Code extension"

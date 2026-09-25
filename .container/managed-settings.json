@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.jkb-container/**)",
+      "Read(~/.jkb-container)",
+      "Read(~/.claude/projects/**/*.jsonl)",
+      "Read(~/.claude-state/projects/**/*.jsonl)",
+      "Edit(~/repos/**/.claude/settings.json)",
+      "Edit(~/repos/**/.claude/settings.local.json)",
+      "Edit(~/repos/**/.claude/hooks/**)",
+      "Edit(~/repos/**/.claude/agents/**)",
+      "Edit(~/repos/**/.claude/skills/**)",
+      "Edit(~/repos/**/.claude/workflows/**)",
+      "Edit(~/repos/**/.mcp.json)",
+      "Edit(~/.claude/agents/**)",
+      "Edit(~/.claude/skills/**)",
+      "Edit(~/.claude/hooks/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "jkb attest hook", "timeout": 10 }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "jkb attest hook", "timeout": 10 }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "jkb attest hook", "timeout": 10 }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "command": "jkb attest hook", "timeout": 10 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "jkb attest hook", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "jkb workflow next --stop-hook", "timeout": 20 }] }
+    ]
+  }
+}

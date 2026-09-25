@@ -230,6 +230,29 @@ docker_args() { # docker_args <config> <repo-root> [all|posture]  -> one argumen
             sub="$(dc_subst "$line" "$root")" || die "container.json's mounts could not be substituted"
             printf '%s\n' "--mount" "$sub"
         done <<<"$specs"
+
+        # EVERY REPOSITORY'S OWN GIT CONFIG AND HOOKS, READ-ONLY (design D52.11, hole H5). ~/repos is
+        # bound read-write, and git on the HOST runs whatever a repository's .git/config names
+        # (core.fsmonitor, hooks, filters) — so a container that can write those files can run code
+        # as the operator the next time they, or `jkb task land`, run git there. A read-only bind over
+        # each makes the write fail closed: git writes config by lock-and-rename, and a rename over a
+        # bind-mounted file fails (measured on Docker Desktop 29.7.2, 2026-09-25: EBUSY; the config
+        # was unchanged). Generated, not declared: container.json cannot list repositories. A
+        # repository cloned after the container starts is covered at its next start (the fingerprint
+        # changes); until then jkb's own git refuses it if it is planted, and the reap service reports
+        # it. What this costs inside: `git config --local`, `remote add`, and `--set-upstream-to` /
+        # `push -u` (which print an error and exit 0) — set those on the host.
+        local g rel
+        for g in "$HOST_REPOS"/*/.git; do
+            [ -d "$g" ] || continue
+            rel="${g#"$HOST_REPOS"/}"
+            case "$rel" in
+                *,*) printf 'warning: %s has a comma in its path, which a --mount cannot carry, so its git config stays writable from the container\n' "$g" >&2
+                     continue ;;
+            esac
+            [ -f "$g/config" ] && printf '%s\n' "--mount" "type=bind,source=$g/config,target=$CTR_REPOS/$rel/config,readonly"
+            [ -d "$g/hooks" ] && printf '%s\n' "--mount" "type=bind,source=$g/hooks,target=$CTR_REPOS/$rel/hooks,readonly"
+        done
     fi
 
     # Through the shared reader, read through `$( )` — the inline jq this replaces was itself a
@@ -605,6 +628,14 @@ fi
 
 command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
 docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
+
+# The narrowed ~/.jkb binds and the credential's directory must exist on the host: a bind whose source
+# is missing is a hard error (D52.8). The credential itself is written by `jkb role rotate-container
+# --write` (setup.sh); without one, the container's jkb cannot reach the daemon at all.
+mkdir -p "$HOME/.jkb/claude-memory" "$HOME/.jkb/logs" "$HOME/.jkb-container"
+chmod 0700 "$HOME/.jkb-container"
+[ -s "$HOME/.jkb-container/credential" ] \
+    || echo "warning: no container credential at ~/.jkb-container/credential — run ./scripts/setup.sh on the host (jkb role rotate-container --write)" >&2
 
 if [ "$BUILD" -eq 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     # `name` and `build.dockerfile` are READ here. They were listed as consumed keys while nothing

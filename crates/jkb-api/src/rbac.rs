@@ -255,7 +255,7 @@ impl Request {
             | Self::NsMv { .. }
             | Self::MqCompact { .. }
             | Self::RoleMap { .. }
-            | Self::RoleRotateContainer {}
+            | Self::RoleRotateContainer { .. }
             | Self::WorkflowSet { .. }
             | Self::WorkflowDefine { .. } => OpPermission::Admin,
         }

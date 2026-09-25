@@ -167,6 +167,19 @@ pub(crate) fn audit_repo_config(dir: &Path) -> Result<()> {
     {
         return Ok(());
     }
+    check_repo_config(dir)?;
+    if let Ok(mut seen) = AUDITED.lock() {
+        seen.push(dir.to_path_buf());
+    }
+    Ok(())
+}
+
+/// [`audit_repo_config`] without its per-process memory — for a long-running scan that must ask
+/// again every pass (`git_audit`).
+///
+/// # Errors
+/// As [`audit_repo_config`].
+pub(crate) fn check_repo_config(dir: &Path) -> Result<()> {
     let out = git_in(
         dir,
         &["config", "--list", "--show-origin", "--show-scope", "-z"],
@@ -200,9 +213,6 @@ pub(crate) fn audit_repo_config(dir: &Path) -> Result<()> {
                 dir.display()
             );
         }
-    }
-    if let Ok(mut seen) = AUDITED.lock() {
-        seen.push(dir.to_path_buf());
     }
     Ok(())
 }
@@ -1582,6 +1592,7 @@ mod tests {
         ("src/pr.rs", "gh_cmd"),      // the_gh_spawn_does_not_inherit_a_repository_selection
         ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
         ("src/archive.rs", "fixture_git"), // the_archive_fixture_does_not_reach_another_repository
+        ("src/git_audit.rs", "fixture_git"), // the_audit_fixture_does_not_reach_another_repository
         // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
         // the spawn is, since that is what the scan can see.
         ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config

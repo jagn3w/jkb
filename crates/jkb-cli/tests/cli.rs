@@ -4680,6 +4680,7 @@ fn a_role_token_is_served_as_its_role_through_the_daemon() {
 /// authenticates as the harness said — the main session as the container's coordinator, a subagent as
 /// its mapped type's role — and `PostToolUse` ends it. A command that does not run `jkb` is left alone.
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end scenario, read top to bottom
 fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
     let dir = TempDir::new().unwrap();
     let db = dir.path().join("jkb.db");
@@ -4691,6 +4692,14 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
         cmd.env("HOME", dir.path()).args(args).assert().success();
     };
     operator(&["role", "rotate-container", "--write"]);
+    // setup.sh re-runs keep a live credential rather than revoking every worker minted from it.
+    let mut again = assert_cmd::Command::from_std(jkb(&db));
+    again
+        .env("HOME", dir.path())
+        .args(["role", "rotate-container", "--write", "--keep-live"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is live; kept"));
     operator(&["role", "map", "reviewer", "reviewer"]);
     let credential = dir.path().join(".jkb-container/credential");
     assert!(

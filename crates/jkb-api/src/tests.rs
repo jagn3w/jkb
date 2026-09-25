@@ -369,7 +369,7 @@ fn samples() -> Vec<Request> {
             agent_type: "reviewer".into(),
             role: None,
         },
-        Request::RoleRotateContainer {},
+        Request::RoleRotateContainer { keep: None },
         Request::WorkflowShow {
             uid: "task:x".into(),
         },

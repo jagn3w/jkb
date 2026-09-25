@@ -174,6 +174,22 @@ ENV JKB_NS_MARKER=/run/jkb/ns
 # root-writable path to protect a fact ownership cannot protect anyway.
 RUN mkdir -p "$(dirname "$JKB_NS_MARKER")" && chown vscode:vscode "$(dirname "$JKB_NS_MARKER")"
 
+# THE HARNESS'S OWN RULES, WHERE THE MODEL CANNOT REACH THEM (design D52.9, P1). Claude Code reads
+# managed settings from this root-owned path, and nothing a session writes can override them. They
+# add, for every session in this container: the attestation hook that tells jkb serve which agent
+# made each `jkb` call, the workflow Stop hook, and deny rules keeping the model's in-process tools
+# (which the Bash sandbox does not confine) away from the container credential, from session
+# transcripts (a live tool call's ticket is written there), and from the files that configure the
+# harness itself — a hook, an agent definition or an MCP server it could add would run unsandboxed.
+COPY --chown=root:root managed-settings.json /etc/claude-code/managed-settings.json
+RUN chmod 0644 /etc/claude-code/managed-settings.json
+
+# The mount points of the narrowed ~/.jkb binds and of the credential (D52.8), owned by the container
+# user: docker creates a missing mount point root-owned, and ~/.jkb itself is no longer a bind — the
+# operator's database and root token do not exist in here at all.
+RUN mkdir -p /home/vscode/.jkb/claude-memory /home/vscode/.jkb/logs /home/vscode/.jkb-container \
+    && chown -R vscode:vscode /home/vscode/.jkb /home/vscode/.jkb-container
+
 # --- non-root from here on ------------------------------------------------------------------
 USER vscode
 ENV PATH=/home/vscode/.local/bin:/home/vscode/.cargo/bin:$PATH

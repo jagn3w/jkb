@@ -108,7 +108,7 @@ cleanup() {
     return 0
 }
 trap cleanup EXIT
-mkdir -p "$scratch/jkb" "$scratch/home/Documents"
+mkdir -p "$scratch/jkb/claude-memory" "$scratch/jkb/logs" "$scratch/jkb-container" "$scratch/home/Documents"
 # THE KNOWLEDGE-BASE BIND MUST BE WRITABLE BY THE CONTAINER'S USER, WHOEVER THAT IS ON THIS HOST.
 # This directory is created here, on the host, and bind-mounted at /home/vscode/.jkb -- so it
 # carries the HOST user's uid, while the container runs as vscode (uid 1000). Those agree on a
@@ -121,12 +121,19 @@ mkdir -p "$scratch/jkb" "$scratch/home/Documents"
 # This harness had never run on a non-1000 host, so the whole class was invisible. 0777 rather than
 # a chown: it is a throwaway mktemp directory removed on exit, and matching an arbitrary image uid
 # from the host would need root.
-chmod 0777 "$scratch/jkb"
+chmod 0777 "$scratch/jkb" "$scratch/jkb/claude-memory" "$scratch/jkb/logs"
+# What a whole-~/.jkb bind would carry in (D52.8): the mutation that binds it back is caught by the
+# database being visible, so there must be one to see.
+touch "$scratch/jkb/jkb.db"
 printf '{}' > "$scratch/home/settings.json"
 # JKB_VERIFY_NO_DAEMON: the scratch ~/.jkb has no daemon token and there is no host daemon behind
 # these containers, which since the cutover (tasks S6.5) verify.sh fails unless it is told so. A
 # mutation below drops it and watches that failure fire.
-BASE=(-v "$REPO":/home/vscode/repos/jkb -v "$scratch/jkb":/home/vscode/.jkb -w /home/vscode/repos/jkb
+BASE=(-v "$REPO":/home/vscode/repos/jkb
+      -v "$scratch/jkb/claude-memory":/home/vscode/.jkb/claude-memory
+      -v "$scratch/jkb/logs":/home/vscode/.jkb/logs
+      -v "$scratch/jkb-container":/home/vscode/.jkb-container:ro
+      -w /home/vscode/repos/jkb
       -e JKB_VERIFY_NO_DAEMON=1)
 # A mutation is CAUGHT only when verify.sh both FAILS and says why. Matching the label alone was
 # useless: `assert()` prints the same text on the ok and FAIL paths, so `grep "not a host mount"`
@@ -442,15 +449,21 @@ run "an undeclared host mount is added" "UNDECLARED mounts" \
 run "a host mount OUTSIDE /home/vscode (docker.sock-shaped)" "UNDECLARED mounts" \
     "${HEALTHY[@]}" \
     -v "$scratch/home":/host
-# THE ONE SUBTRACTIVE CASE THAT WAS MISSING. `BASE` supplies the `~/.jkb` bind unconditionally
-# and every mutation reuses it, so no run ever reached `kb_mounted=no` — the assertion added
-# because the old `[ -d /home/vscode/.jkb ]` form passed in a container where the bind was ABSENT
-# had itself never been watched failing. It isolates cleanly: a missing declared mount is not an
-# extra one, so the boundary check still passes, and the memory linker reports `linked` against a
-# container-local store that dies with the container. Unlike the paths the coverage note below
-# excuses, this one needs a docker flag and nothing else.
-without '/home/vscode/\.jkb$'
-run "the knowledge base is NOT mounted" "knowledge base is mounted" "${MUT[@]}"
+# THE SUBTRACTIVE CASE. `BASE` supplies the narrowed ~/.jkb binds unconditionally and every mutation
+# reuses them, so without this no run ever reaches `mem_mounted=no`. It isolates cleanly: a missing
+# declared mount is not an extra one, so the boundary check still passes, and the memory linker would
+# report `linked` against a container-local store that dies with the container.
+without '/home/vscode/\.jkb/claude-memory$'
+run "auto-memory is NOT mounted" "auto-memory and the hook logs are mounted from the host" "${MUT[@]}"
+# THE WHOLE ~/.jkb BACK (D52.8): its database is what a bind of the parent brings in, and the mount
+# table alone cannot be trusted to say so — the assertion asks the filesystem.
+run "the whole host ~/.jkb is mounted again" "the operator's database and root token are not in the container" \
+    "${HEALTHY[@]}" \
+    -v "$scratch/jkb":/home/vscode/.jkb
+without '/home/vscode/\.jkb-container'
+run "the container credential is mounted writable" "the container credential is bound read-only" \
+    "${MUT[@]}" \
+    -v "$scratch/jkb-container":/home/vscode/.jkb-container
 run "the host's ~/.claude is mounted in" "is a host mount" \
     "${HEALTHY[@]}" \
     -v "$scratch/home":/home/vscode/.claude

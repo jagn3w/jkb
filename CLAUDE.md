@@ -103,6 +103,19 @@ implementation checklist and the **source of truth for what's done**.
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
   See `openspec/changes/jkb-fleet-hardening/` and [docs/subsystems.md](docs/subsystems.md).
+- **Roles, RBAC and task workflows (D52) — built on `task/rbac-and-task-transitions`.** New crate
+  `jkb-rbac` (RBAC as checkable tables); `jkb-core` `roles.rs` (roles, hashed grant tokens, the
+  agent-type map), `workflow/` (one phase set, graphs as `jkb-fsm` tables; a strategy = graph +
+  permission toggles + attributes; presets `design-reviewed` (default), `coordinated`,
+  `autonomous`), `reviews.rs` (V023: the land gate's review facts moved **out of tags**); `jkb-api`
+  `rbac.rs` authorizes every op at the one dispatch; `jkb serve` authenticates role tokens and
+  per-tool-call harness tickets; `jkb role`/`jkb workflow`/`jkb attest hook`. The land gate now
+  also needs a clean **last** review round. The host no longer runs container-written code: jkb's
+  git audits each repo's own config against an allowlist and runs hooks-off, and the land gate runs
+  in the container. The dev container binds only `~/.jkb/{claude-memory,logs}`, a read-only
+  credential, and read-only `.git/config`/`hooks` per repo; its harness rules are managed settings
+  in the image. Full record: [docs/task-lifecycle.md](docs/task-lifecycle.md) (D52) and
+  [.container/README.md](.container/README.md).
 - **590 tests** green across the workspace (+2 `#[ignore]`: live-ollama, live-URL — both need an
   external service). `./scripts/check.sh` prints the per-binary breakdown; a count copied here
   goes stale within a pass, so treat this as an order of magnitude. `clippy -D warnings` clean
@@ -258,7 +271,7 @@ cost to learn, and which alternatives were rejected and why.
 | Read this | Before you touch | Why it exists |
 |---|---|---|
 | [docs/git-hooks-installer.md](docs/git-hooks-installer.md) | `scripts/lib.sh`, `scripts/setup.sh`, `scripts/hooks/post-merge`, `scripts/tests/*.test.sh`, and the repository-selection scrub in `gitrepo.rs`/`pr.rs`/`session.rs` | The longest defect cluster in the repo. Seventeen review rounds on one installer, and nearly every lesson generalizes. |
-| [docs/task-lifecycle.md](docs/task-lifecycle.md) | `jkb task *`, `jkb staging *`, `crates/jkb-fsm`, `crates/jkb-cli/src/{gitrepo,session,repo,archive,pr}.rs`, `scripts/merge-queue.sh` | Subtasks and containment (D34/D35), per-task worktrees (D36), the checkable state machine and transition log (D48), review-gated landing (D38), the design gate (D28). |
+| [docs/task-lifecycle.md](docs/task-lifecycle.md) | `jkb task *`, `jkb staging *`, `jkb role *`, `jkb workflow *`, `jkb attest`, `crates/jkb-fsm`, `crates/jkb-rbac`, `crates/jkb-core/src/{roles,reviews}.rs`, `crates/jkb-core/src/workflow/`, `crates/jkb-api/src/rbac.rs`, `crates/jkb-cli/src/{gitrepo,git_audit,session,repo,archive,pr,rbac_cli}.rs`, `scripts/merge-queue.sh` | Subtasks and containment (D34/D35), per-task worktrees (D36), the checkable state machine and transition log (D48), review-gated landing (D38), the design gate (D28), roles, RBAC, task workflows and harness attestation (D52). |
 | [docs/sandbox-and-container.md](docs/sandbox-and-container.md) | `scripts/auto-mode*`, and the boundary questions about `.container/` | The unattended-agent boundary (D48) and the container nested inside it (D49), plus the egress firewall and its verdict (D50/D51). The container's OWN internals — what each layer is for, the measurements under them, the mount list, how to run and verify it — are in [.container/README.md](.container/README.md), and that is the file which grows when `.container/` changes. |
 | [docs/namespaces-and-sync.md](docs/namespaces-and-sync.md) | `jkb-sync`, `jkb-core`'s namespace/item/undo code | The namespace layout (D32), typed namespaces (D33), investigations (Dmem), and the file-sync data-loss cluster (D45/D39/D40/D42/D47). |
 | [docs/subsystems.md](docs/subsystems.md) | a crate you need to orient in | What each finished subsystem is and how it is put together. Reference, not live decisions — so it is the *last* row to check, never the first: if another row names your file, that row governs. |

@@ -63,6 +63,11 @@ pub enum RoleCmd {
         /// Write it to `~/.jkb-container/credential` (0600) instead of printing it.
         #[arg(long)]
         write: bool,
+        /// Keep the credential already written there if it still names a live container grant, and
+        /// rotate only when it does not — what `setup.sh` runs after every pull, where rotating would
+        /// revoke every worker grant minted from the old one.
+        #[arg(long, requires = "write")]
+        keep_live: bool,
     },
     /// Print the role tables: which role runs which class of op, and who grants whom.
     Matrix,
@@ -272,28 +277,41 @@ pub fn role(b: &dyn Backend, cmd: RoleCmd, json_out: bool) -> Result<()> {
                 other => unexpected("role.map", &other),
             }
         }
-        RoleCmd::RotateContainer { write } => match call(b, Request::RoleRotateContainer {})? {
-            Response::Granted { grant, token } => {
-                if write {
-                    let path = remote::container_credential();
-                    jkb_daemon::token::write(&path, &token)
-                        .with_context(|| format!("writing {}", path.display()))?;
-                    print(json_out, &json!({ "grant": grant, "path": path }), || {
-                        println!(
-                            "container credential {} written to {}",
-                            grant.id,
-                            path.display()
-                        );
+        RoleCmd::RotateContainer { write, keep_live } => {
+            let keep = keep_live
+                .then(|| std::fs::read_to_string(remote::container_credential()).ok())
+                .flatten()
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty());
+            match call(b, Request::RoleRotateContainer { keep: keep.clone() })? {
+                Response::Granted { grant, token } if keep.as_deref() == Some(token.as_str()) => {
+                    print(json_out, &json!({ "kept": grant }), || {
+                        println!("container credential {} is live; kept", grant.id);
                     });
-                } else {
-                    print(json_out, &json!({ "grant": grant, "token": token }), || {
-                        println!("{token}");
-                    });
+                    Ok(())
                 }
-                Ok(())
+                Response::Granted { grant, token } => {
+                    if write {
+                        let path = remote::container_credential();
+                        jkb_daemon::token::write(&path, &token)
+                            .with_context(|| format!("writing {}", path.display()))?;
+                        print(json_out, &json!({ "grant": grant, "path": path }), || {
+                            println!(
+                                "container credential {} written to {}",
+                                grant.id,
+                                path.display()
+                            );
+                        });
+                    } else {
+                        print(json_out, &json!({ "grant": grant, "token": token }), || {
+                            println!("{token}");
+                        });
+                    }
+                    Ok(())
+                }
+                other => unexpected("role.rotate_container", &other),
             }
-            other => unexpected("role.rotate_container", &other),
-        },
+        }
         RoleCmd::Matrix => {
             use jkb_rbac::Grants as _;
             println!("## Which role runs which class of op\n");

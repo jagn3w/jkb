@@ -10,6 +10,7 @@ mod archive;
 mod atomic;
 mod commands;
 mod doctor;
+mod git_audit;
 mod gitrepo;
 mod inv_cli;
 mod item_cli;
@@ -1523,7 +1524,10 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               one land at a time, so a red gate means YOUR branch broke it.
                               REFUSES a task with no recorded review, or whose review left a
                               must-fix finding open — anything at priority <= 1, so !p0 blocks
-                              as well as !p1. --no-review records a waiver.
+                              as well as !p1 — or whose NEWEST round found any must-fix (fixing
+                              them is not a review of the fix: run another round). --no-review
+                              (operator only) records a waiver. The gate runs in the dev
+                              container for a checkout under ~/repos; --gate-on-host is recorded.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
   jkb task reap               finish landings that could not move their own worktree, delete
                               archives past 30 days, and compact the message queue. A session may not unlink its own
@@ -1533,6 +1537,20 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
   jkb task sessions           what is in flight here, with uncommitted work and commits ahead.
   jkb task gate ["<cmd>"]     show or set the command that verifies a landing in this repo.
       If you are inside a session, land is the human's call — commit, and say you are done.
+
+WORKFLOW AND ROLES (who does what next, and who may — design D52)
+  jkb workflow next [<uid>]   the phase, the role that acts next, and the one thing to do.
+                              Omit <uid> for the task this branch is for.
+  jkb workflow show <uid>     the strategy, what you may fire, the permission matrix, history.
+  jkb workflow fire <uid> <event> [--reason …]
+                              submit_design, approve_design, submit_work, submit_systemic,
+                              systemic_redesign (both need --reason), rework, cancel, reopen.
+  jkb workflow observe <uid>  after a review round: take the step the round calls for —
+                              landable, back to implement, or on to a systemic review.
+  jkb role grant <role> --task <uid> --export
+                              a token for a worker you spawn (coordinator: worker roles only).
+  jkb role whoami             who this caller is. Spawn workers with an explicit agent type
+                              (subagent_type / agentType): a generic one holds no role.
 
 STAGING BRANCHES (where a batch lands before trunk — the swarm's integration branch)
   jkb staging ls [--all]      every staging branch and the tasks landing on it: each task's state
@@ -3058,7 +3076,14 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     let mut last_observed = String::new();
     let mut last_compaction_failure = String::new();
     let mut last_sweep_failure = String::new();
+    let mut last_git_audit = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        // Repository config that could make this host run code (D52.11, layer 3): said, and
+        // notified, when the set of findings changes — posted when one appears, withdrawn when
+        // the last is gone.
+        if !dry_run {
+            git_audit_pass(db_path, &mut last_git_audit, json);
+        }
         // The queue's compaction rides the same timer (design r3.2 Q3). Work done is always
         // printed — two passes that each reaped one message are two events, not a repeat. Only a
         // FAILURE is silenced while unchanged, for the same reason as the sweep's silence below.
@@ -3107,6 +3132,31 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One pass of the git-config scan over `~/repos` ([`git_audit`]). Never fails the service.
+fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let findings = git_audit::scan(&home.join(jkb_daemon::CLIENT_FILE_ROOT));
+    let now = git_audit::summary(&findings);
+    if now == *last {
+        return;
+    }
+    for (dir, why) in &findings {
+        let line = format!("git-audit: {}: {why}", dir.display());
+        if json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    let sent = open_db(db_path).and_then(|db| git_audit::notify(&db, &findings));
+    match sent {
+        Ok(()) => *last = now,
+        Err(e) => eprintln!("git-audit: could not post its notification: {e:#}"),
+    }
 }
 
 /// One sweep, with the database opened for it and closed after.

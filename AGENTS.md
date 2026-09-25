@@ -112,7 +112,9 @@ A missed close costs one command; a wrong one buries work still in flight.
 **Landing is review-gated.** `jkb task land` refuses a task with no recorded review, or whose
 review left a must-fix finding open — anything at `priority <= 1`, so `!p0` blocks as well as
 `!p1` (concerns and nits never block). Fix or `jkb task set <uid> --status cancelled` each one,
-then land. `--no-review` overrides and records a visible `review-waived=` on the task.
+then land. The newest review round must itself have found no must-fix — fixing a round's findings
+is not a review of the fix, so run another round. `--no-review` (operator only) overrides and
+records a visible waiver in the task's review record (`jkb task show` prints it).
 
 If you are working *inside* a session, landing is the human's call: commit your work and say
 so. Do not mark the task done, and do not merge or rebase onto the target yourself.
