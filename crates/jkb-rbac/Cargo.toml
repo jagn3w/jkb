@@ -1,0 +1,15 @@
+[package]
+name = "jkb-rbac"
+description = "Role-based access control as checkable tables: roles, permissions, principals, and composable authorizers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately dependency-free, like `jkb-fsm`: a policy is a table plus a decision, and nothing
+# about deciding who may do what needs a database, a clock or a serializer. The daemon's op
+# authorization, the task workflows' event permissions and whatever comes next use it alike.
+[dependencies]
