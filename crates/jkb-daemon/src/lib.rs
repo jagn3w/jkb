@@ -31,6 +31,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// the container does not see.
 pub const CLIENT_FILE_ROOT: &str = "repos";
 
+/// Where, under `$HOME`, the dev container's credential lives (D52.3/D52.8): written on the host by
+/// `jkb role rotate-container --write`, bound read-only into the container at the same place, and
+/// hidden from the model's tools by the sandbox — so only the harness's hooks, and a person at a
+/// terminal, can read it. It is a coordinator grant: the container's ceiling.
+pub const CONTAINER_CREDENTIAL: &str = ".jkb-container/credential";
+
 /// The default address `jkb serve` binds and a client assumes.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7117";
 

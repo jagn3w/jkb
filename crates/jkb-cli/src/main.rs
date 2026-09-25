@@ -21,6 +21,7 @@ mod owner;
 mod pr;
 mod pr_cli;
 mod presence;
+mod rbac_cli;
 mod remote;
 mod repo;
 mod review;
@@ -209,6 +210,21 @@ enum Command {
     },
     /// Run the MCP server over stdio (read + audited write tools).
     Mcp,
+    /// Roles and grants: who may do what, and the tokens that say so (design D52).
+    Role {
+        #[command(subcommand)]
+        cmd: rbac_cli::RoleCmd,
+    },
+    /// A task's workflow: its phase, who acts next, and the steps each role may take (design D52).
+    Workflow {
+        #[command(subcommand)]
+        cmd: rbac_cli::WorkflowCmd,
+    },
+    /// Harness attestation: the Claude Code hook that tells jkb serve which agent made a tool call.
+    Attest {
+        #[command(subcommand)]
+        cmd: rbac_cli::AttestCmd,
+    },
     /// The message queue: topics, sends, NDJSON subscriptions (design r3.2 Q6).
     Mq {
         #[command(subcommand)]
@@ -1192,6 +1208,12 @@ fn run(cli: Cli) -> Result<()> {
     if let Command::Notify { cmd } = &cli.command {
         return notify::run(cmd, cli.json);
     }
+    // The attestation hook, likewise: the harness runs it on every tool call, and it talks only to
+    // `jkb serve`, with the container's credential.
+    if let Command::Attest { cmd } = &cli.command {
+        rbac_cli::attest(cmd);
+        return Ok(());
+    }
 
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
     // kernel that is the host's `jkb.db`, which a process on each side of the bind corrupts — so
@@ -1199,6 +1221,12 @@ fn run(cli: Cli) -> Result<()> {
     // run git, written a file or opened anything.
     if let Some(remote) = remote::target() {
         return remote::run(cli, &remote);
+    }
+    // A caller given a ticket or a role token is served as that principal (D52.3), and only `jkb serve`
+    // holds the tickets and checks every op — so it goes there, through the same table of what may run
+    // remotely, rather than opening the database as the operator.
+    if remote::scoped_token().is_some() {
+        return remote::run(cli, &remote::daemon_url());
     }
 
     // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
@@ -1363,6 +1391,13 @@ fn run(cli: Cli) -> Result<()> {
         Command::Mq { cmd } => {
             mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
         }
+        Command::Role { cmd } => {
+            rbac_cli::role(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
+        }
+        Command::Workflow { cmd } => {
+            rbac_cli::workflow(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
+        }
+        Command::Attest { .. } => unreachable!("dispatched before the database is opened"),
         Command::Serve { .. } | Command::Service { .. } => {
             unreachable!("dispatched before the database is opened")
         }
@@ -2527,6 +2562,18 @@ pub(crate) fn cmd_task_land(
     // Asked before anything moves: a task this client may not write would otherwise be grafted and
     // its session disposed of, and only then refused its record — landed, in progress, sessionless.
     let facts = kb.facts_for_write(uid)?;
+    // Waiving the review gate is the operator's alone (D52.4), and the waiver is written only after the
+    // graft — so a caller that may not waive is refused here, before anything moves, rather than after.
+    if no_review && remote::scoped_token().is_some() {
+        match kb.call(jkb_api::Request::RoleWhoami {})? {
+            jkb_api::Response::WhoAmI { whoami }
+                if whoami.roles.iter().any(|r| r == "operator") => {}
+            _ => anyhow::bail!(
+                "--no-review waives the review gate, which only the operator may do; run another \
+                 review round instead"
+            ),
+        }
+    }
 
     // The lock is taken **before** anything is checked, not just before the graft.
     //

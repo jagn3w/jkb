@@ -1928,6 +1928,7 @@ dependencies = [
  "jkb-index",
  "jkb-ingest",
  "jkb-mcp",
+ "jkb-rbac",
  "jkb-search",
  "jkb-sync",
  "jkb-types",
