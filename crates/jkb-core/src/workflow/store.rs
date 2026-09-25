@@ -22,9 +22,6 @@ use crate::roles::{self, Role};
 use crate::store::WriteMeta;
 use crate::{item, tag, transition, Error, Result};
 
-/// The facet a review round's findings namespace is recorded under on the task it reviewed.
-pub const FACET_REVIEW: &str = "review";
-
 /// The facet a finding's area (the file it is in) is recorded under.
 pub const FACET_AREA: &str = "area";
 
@@ -54,16 +51,12 @@ pub struct Round {
     pub areas: Vec<String>,
 }
 
-/// The review namespaces recorded against `task` — the one place that says where they live.
+/// The review namespaces recorded against `task`, in recording order ([`crate::reviews`]).
 ///
 /// # Errors
 /// A database error.
 pub fn review_namespaces(conn: &Connection, task: ItemId) -> Result<Vec<String>> {
-    Ok(tag::applications(conn, task)?
-        .into_iter()
-        .filter(|(f, _)| f == FACET_REVIEW)
-        .map(|(_, v)| v)
-        .collect())
+    Ok(crate::reviews::state(conn, task)?.namespaces)
 }
 
 /// The area a finding names: its `area=` facet, or — for a finding filed before that facet existed —

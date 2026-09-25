@@ -287,3 +287,81 @@ mod high_water_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod reviews_migration_tests {
+    use super::embedded;
+    use refinery::Target;
+    use rusqlite::Connection;
+
+    /// V023 moves the land gate's review facts out of tags (design D52.7). Migrated in two steps, like
+    /// the V011 test beside it, so the tags exist in the shapes a real store holds before V023 runs:
+    /// several rounds with one head, a head with no round, a waiver, and an unrelated tag to leave.
+    #[test]
+    fn v023_moves_review_facets_into_reviews_and_leaves_other_tags() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(22))
+            .run(&mut conn)
+            .unwrap();
+        for (id, uid) in [(1, "task:a"), (2, "task:b"), (3, "task:c")] {
+            conn.execute(
+                "INSERT INTO items (id, uid, kind) VALUES (?1, ?2, 'task')",
+                rusqlite::params![id, uid],
+            )
+            .unwrap();
+        }
+        for (item, facet, value) in [
+            (1, "review", "codereviews/20260821-2"),
+            (1, "review", "codereviews/20260820-1"),
+            (1, "reviewed", "51c459a"),
+            (1, "repo", "jkb"),
+            (2, "reviewed", "abc"),
+            (3, "review-waived", "def"),
+        ] {
+            conn.execute(
+                "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, ?2, ?3)",
+                rusqlite::params![item, facet, value],
+            )
+            .unwrap();
+        }
+        embedded::migrations::runner().run(&mut conn).unwrap();
+
+        let rows: Vec<(i64, String, Option<String>, String)> = conn
+            .prepare("SELECT item_id, kind, ns, sha FROM reviews ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let s = |v: &str| v.to_owned();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    s("recorded"),
+                    Some(s("codereviews/20260820-1")),
+                    s("51c459a")
+                ),
+                (
+                    1,
+                    s("recorded"),
+                    Some(s("codereviews/20260821-2")),
+                    s("51c459a")
+                ),
+                (2, s("recorded"), None, s("abc")),
+                (3, s("waived"), None, s("def")),
+            ],
+            "rounds in name (date) order, a bare head kept, the waiver kept"
+        );
+        let left: Vec<String> = conn
+            .prepare("SELECT facet FROM tag_applications ORDER BY facet")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, vec!["repo".to_owned()], "only the review facets go");
+    }
+}

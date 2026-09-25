@@ -35,6 +35,7 @@ pub mod nstype;
 pub mod placement;
 pub mod query;
 pub mod removal;
+pub mod reviews;
 pub mod roles;
 pub mod sql;
 pub mod sync_state;

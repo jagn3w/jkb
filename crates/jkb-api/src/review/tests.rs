@@ -5,6 +5,13 @@ use serde_json::json;
 use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 use jkb_core::Db;
 
+fn facts(b: &LocalBackend, uid: &str) -> crate::sessions::TaskState {
+    match call(b, json!({ "op": "task.facts", "uid": uid })).unwrap() {
+        Response::TaskState { state } => state,
+        other => panic!("{other:?}"),
+    }
+}
+
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
     b.call(serde_json::from_value(r).expect("request parses"))
 }
@@ -216,11 +223,28 @@ fn a_review_is_recorded_only_against_findings_that_exist() {
     );
     let shown = show(&b, &uid);
     assert_eq!(shown["item"]["status"], "needs_review");
+    let review = facts(&b, &uid).review;
+    assert_eq!(review.reviewed.as_deref(), Some("abc123"));
+    assert_eq!(review.namespaces, vec!["reviews/r1".to_owned()]);
     let tags = shown["item"]["tags"].to_string();
     assert!(
-        tags.contains("abc123") && tags.contains("reviews/r1"),
-        "{tags}"
+        !tags.contains("abc123") && !tags.contains("reviews/r1"),
+        "the review record is not a tag (D52.7): {tags}"
     );
+
+    // A tag spelled like the old record is ordinary content: it waives nothing, reviews nothing.
+    call(
+        &b,
+        json!({ "op": "task.tag", "uid": uid, "facet_value": "review-waived=forged", "mode": "add" }),
+    )
+    .unwrap();
+    assert_eq!(facts(&b, &uid).review.waived, None);
+    call(
+        &b,
+        json!({ "op": "task.review_waive", "uid": uid, "sha": "def456" }),
+    )
+    .unwrap();
+    assert_eq!(facts(&b, &uid).review.waived.as_deref(), Some("def456"));
 
     // A task landing on the reviewed branch whose work has not been grafted there is reported, and
     // a branch nobody records tags nothing.

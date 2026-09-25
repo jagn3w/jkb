@@ -2527,7 +2527,6 @@ pub(crate) fn cmd_task_land(
     // Asked before anything moves: a task this client may not write would otherwise be grafted and
     // its session disposed of, and only then refused its record — landed, in progress, sessionless.
     let facts = kb.facts_for_write(uid)?;
-    let tags = facts.tags.clone();
 
     // The lock is taken **before** anything is checked, not just before the graft.
     //
@@ -2560,7 +2559,7 @@ pub(crate) fn cmd_task_land(
     // only *owed* here; it is written after the landing actually happens, so a land that then
     // fails on the graft or the gate build leaves no waiver for something that never occurred.
     let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
-    let waiver_owed = review::enforce(kb, uid, &tags, no_review, json)?;
+    let waiver_owed = review::enforce(kb, uid, &facts.review, no_review, json)?;
 
     let land_dir = land_dir_for(&ctx, &onto)?;
 
@@ -2695,7 +2694,7 @@ fn settle_landing(
     // is also recorded for a task somebody finished during the gate: the waived landing is what
     // it describes, not the status.
     if let Some(sha) = landed.waiver {
-        kb.set_facet(task_uid, review::FACET_REVIEW_WAIVED, sha)?;
+        kb.review_waive(task_uid, sha)?;
     }
 
     // Is the session still there at all? `git status` in a directory that no longer exists

@@ -597,6 +597,15 @@ pub enum Request {
     /// Record a review against a branch ([`review::record`]).
     #[serde(rename = "task.review_record")]
     TaskReviewRecord(review::RecordAsk),
+    /// Record that a landing waived the review gate (`jkb task land --no-review`) — in the task's
+    /// review record, never a tag ([`jkb_core::reviews::waive`]).
+    #[serde(rename = "task.review_waive")]
+    TaskReviewWaive {
+        /// The task.
+        uid: String,
+        /// The head the waived landing grafted.
+        sha: String,
+    },
     /// A page of the held task claims ([`claims::claims`]).
     #[serde(rename = "task.claims")]
     TaskClaims {
@@ -1124,6 +1133,7 @@ impl Request {
         "task.review_findings",
         "task.review_file",
         "task.review_record",
+        "task.review_waive",
         "task.claims",
         "task.reclaim",
         "kb.health",
@@ -1213,6 +1223,7 @@ impl Request {
             Self::TaskReviewFindings { .. } => "task.review_findings",
             Self::TaskReviewFile(_) => "task.review_file",
             Self::TaskReviewRecord(_) => "task.review_record",
+            Self::TaskReviewWaive { .. } => "task.review_waive",
             Self::TaskClaims { .. } => "task.claims",
             Self::TaskReclaim { .. } => "task.reclaim",
             Self::KbHealth {} => "kb.health",
@@ -1327,6 +1338,7 @@ impl Request {
             | Self::TaskLanded { .. }
             | Self::TaskReviewFile(_)
             | Self::TaskReviewRecord(_)
+            | Self::TaskReviewWaive { .. }
             | Self::TaskReclaim { .. }
             // FTS5's integrity check is an `INSERT`, which the `query_only` reader refuses.
             | Self::KbHealth {}
@@ -2768,6 +2780,14 @@ impl Backend for LocalBackend {
                         review::record(c, m, &ask, roots.as_ref())
                     })?,
                 }
+            }
+            Request::TaskReviewWaive { uid, sha } => {
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    let id = tasks::writable(c, &uid, roots.as_ref())?;
+                    jkb_core::reviews::waive(c, m, id, &sha, &m.actor).map_err(ApiError::from)
+                })?;
+                Response::Applied {}
             }
             Request::TaskClaims { after } => {
                 let (claims, next) = db.read_with(move |c| claims::claims(c, after))?;

@@ -52,6 +52,10 @@ pub struct TaskState {
     pub status: String,
     /// Every facet value it carries, by facet — a multi-map, as the tags are.
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Its review record — what the land gate reads (D52.7). Not a tag: tags are content a synced
+    /// file can write. Absent from an older daemon, which reads as never reviewed: fail closed.
+    #[serde(default)]
+    pub review: jkb_core::reviews::ReviewState,
     /// Who holds its claim, if anyone.
     pub claim: Option<String>,
     /// Where its work lands, from its transition history.
@@ -97,6 +101,7 @@ pub fn facts(
         terminal,
         status,
         tags,
+        review: jkb_core::reviews::state(conn, id)?,
         claim: claim::holder(conn, id)?,
         land_target: transition::land_target(conn, id)?,
         open_subtasks: !task::subtasks_all_terminal(conn, id)?,
@@ -686,6 +691,27 @@ pub struct ReviewFindings {
     pub open_count: usize,
     /// The first [`MAX_LISTED_FINDINGS`] of them.
     pub open_must_fix: Vec<ReviewFinding>,
+    /// Each namespace that holds findings, as a review round, oldest filing first — what the land
+    /// gate's last-round clause and the workflow's repetition rule read (D52.6).
+    #[serde(default)]
+    pub rounds: Vec<ReviewRound>,
+    /// Whether `rounds` was reported at all. An older daemon omits both, and a gate that read the
+    /// empty list as "no round found a must-fix" would fail open.
+    #[serde(default)]
+    pub rounds_reported: bool,
+}
+
+/// One review round ([`jkb_core::workflow::store::Round`]) as `task.review_findings` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRound {
+    /// Its findings namespace.
+    pub ns: String,
+    /// Its filing order: the highest item id among its findings.
+    pub filed: i64,
+    /// How many must-fix findings it filed, at any status.
+    pub must_fix: usize,
+    /// The files its must-fix findings name.
+    pub areas: Vec<String>,
 }
 
 /// The most namespaces one `task.review_findings` names.
@@ -725,7 +751,10 @@ pub fn review_findings(
         check_name("review namespace", n)?;
     }
     if namespaces.is_empty() {
-        return Ok(ReviewFindings::default());
+        return Ok(ReviewFindings {
+            rounds_reported: true,
+            ..ReviewFindings::default()
+        });
     }
     let query = Query {
         kind: Some("task".to_owned()),
@@ -748,6 +777,16 @@ pub fn review_findings(
     let metas = item::get_many(conn, &ids)?;
     let mut out = ReviewFindings {
         total: ids.len(),
+        rounds: jkb_core::workflow::store::rounds_in(conn, namespaces)?
+            .into_iter()
+            .map(|r| ReviewRound {
+                ns: r.ns,
+                filed: r.filed,
+                must_fix: r.must_fix,
+                areas: r.areas,
+            })
+            .collect(),
+        rounds_reported: true,
         ..ReviewFindings::default()
     };
     for id in ids {

@@ -398,6 +398,9 @@ pub struct TaskDetail {
     pub transitions: Vec<TransitionSummary>,
     /// Its subtasks, in containment order.
     pub subtasks: Vec<SubtaskSummary>,
+    /// Its review record (D52.7) — shown beside the tags, and not among them.
+    #[serde(default)]
+    pub review: jkb_core::reviews::ReviewState,
 }
 
 fn not_found(what: impl Into<String>) -> ApiError {
@@ -1205,6 +1208,7 @@ pub fn task_show(
             })
             .collect(),
         subtasks: Vec::new(),
+        review: jkb_core::reviews::state(conn, id)?,
     };
     // The task itself is not charged: it is what was asked for, and charging a large body marked the
     // answer cut when no subtask had been dropped at all.

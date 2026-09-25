@@ -10,7 +10,7 @@
 
 use std::fmt::Write as _;
 
-use jkb_core::location::{set_facet, valid_ref, FACET_BRANCH};
+use jkb_core::location::{valid_ref, FACET_BRANCH};
 use jkb_core::query::{Query, Scope};
 use jkb_core::{item, mount, ns, tag, task, transition, WriteMeta};
 use jkb_types::{ItemId, TaskStatus};
@@ -21,10 +21,10 @@ use crate::sessions::{check_name, review_findings};
 use crate::tasks::{check_line, line_problem, writable, FileRoots};
 use crate::{ApiError, ErrorCode};
 
-/// The branch HEAD a review ran against.
-pub const FACET_REVIEWED: &str = "reviewed";
-/// The review's findings namespace, so the findings are one `jkb ls` away.
-pub const FACET_REVIEW: &str = "review";
+/// The facet a filed finding names its file under, so repeated review areas can be told apart
+/// (design D52.6). Content on the *finding*, never on the reviewed task: the review's own record
+/// is in [`jkb_core::reviews`], not in tags.
+pub const FACET_AREA: &str = jkb_core::workflow::store::FACET_AREA;
 
 /// The most findings one `task.review_file` files. A review has tens; a reviewer that returned
 /// thousands is broken, and each finding is a task, a mirror and a changelog entry.
@@ -315,6 +315,19 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
     }
 
     let clean = ask.findings.is_empty();
+    // The file each finding names, by position — its area, for telling repeated rounds apart.
+    let files: Vec<Option<String>> = ask
+        .findings
+        .iter()
+        .map(|f| {
+            f.file
+                .as_deref()
+                .map(fold)
+                // A path too long to be a tag is too long to be anyone's area; the finding is still
+                // filed, it just joins no repetition.
+                .filter(|f| !f.is_empty() && f.len() + FACET_AREA.len() <= tag::MAX_TAG_BYTES)
+        })
+        .collect();
     let entries: Vec<(String, i64, String)> = if clean {
         vec![("summary".to_owned(), 3, CLEAN_REVIEW.to_owned())]
     } else {
@@ -344,6 +357,9 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
         spec.priority = Some(priority);
         spec.home = home;
         let id = task::create(conn, meta, &spec)?;
+        if let Some(file) = files.get(i).and_then(Option::as_deref) {
+            tag::apply(conn, meta, id, FACET_AREA, file)?;
+        }
         if clean {
             task::set_status(conn, meta, id, TaskStatus::Done)?;
         }
@@ -417,9 +433,10 @@ const MAX_SHA_BYTES: usize = 64;
 /// (design D38.6). It all happens in the one transaction the op runs in, each task's status read inside
 /// it, so a task that landed meanwhile is not moved back, and an interrupted run tags nothing.
 ///
-/// `review=` is **added**, not set: a second run's findings do not retire the first run's still-open
-/// must-fix items (the gate unions every recorded namespace). `reviewed=` is set, since there is only
-/// one current HEAD.
+/// The round is **added** to the task's review record ([`jkb_core::reviews`]), never a tag: a second
+/// run's findings do not retire the first run's still-open must-fix items (the gate unions every
+/// recorded namespace), and the newest record's HEAD is the reviewed one. It is not a tag because a
+/// tag is content a synced file can write, and this decides the land gate (D52.7, hole H3).
 ///
 /// # Errors
 /// [`ErrorCode::Invalid`] for a malformed ask or an empty findings namespace, a tagged task whose
@@ -488,8 +505,7 @@ pub fn record(
             Err(e) => return Err(e),
         }
         let before = line_problem(conn, &m.uid)?;
-        set_facet(conn, meta, id, FACET_REVIEWED, sha)?;
-        tag::apply(conn, meta, id, FACET_REVIEW, &findings)?;
+        jkb_core::reviews::record(conn, meta, id, &findings, sha, &meta.actor)?;
         let moved = item::get(conn, id)?.and_then(|m| m.status).as_deref() == Some("in_progress");
         if moved {
             task::set_status(conn, meta, id, TaskStatus::NeedsReview)?;

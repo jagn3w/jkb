@@ -3,7 +3,7 @@ use jkb_types::{ItemId, TaskStatus};
 
 use super::{
     current, define, fire, observe, observe_facts, repeated, rounds, set_strategy, Actor, Moved,
-    Round, FACET_AREA, FACET_REVIEW,
+    Round, FACET_AREA,
 };
 use crate::roles::{self, Minter, Role};
 use crate::task::{create, set_status, NewTask};
@@ -59,7 +59,7 @@ fn file_round(db: &Db, id: ItemId, n: usize, findings: &[(i64, &str)]) {
                 tag::apply(c, m, f, FACET_AREA, area)?;
             }
         }
-        tag::apply(c, m, id, FACET_REVIEW, &ns)
+        crate::reviews::record(c, m, id, &ns, "abc", "test")
     })
     .unwrap();
 }
@@ -224,7 +224,7 @@ fn a_title_names_the_area_for_findings_filed_before_the_area_facet() {
         spec.home = "reviews/old/must-fix".into();
         spec.priority = Some(1);
         create(c, m, &spec)?;
-        tag::apply(c, m, id, FACET_REVIEW, "reviews/old")
+        crate::reviews::record(c, m, id, "reviews/old", "abc", "test")
     })
     .unwrap();
     let rs = db.read(move |c| rounds(c, id)).unwrap();

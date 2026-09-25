@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use jkb_fsm::Fact;
 
-use crate::repo::{facet_one, facet_values, RepoCtx, FACET_BRANCH};
+use crate::repo::{facet_values, RepoCtx, FACET_BRANCH};
 use crate::session_cli::Kb;
 use crate::{gitrepo, review, session};
 use jkb_api::staging::StagingTask;
@@ -400,14 +400,14 @@ fn stage_task(
     // say "reviewed" about a task the gate is about to refuse.
     // Every recorded review, not just the newest: a second `/review-log` run must not retire
     // the first run's still-open must-fix findings.
-    let review_nss = facet_values(&t.tags, review::FACET_REVIEW).to_vec();
+    let review_nss = t.review.namespaces.clone();
     let found = cache.findings(kb, &review_nss)?;
     // Read once for the whole listing, from `containment` — the same source the command and the
     // machine read, so the row and the land it describes cannot disagree about which parents are
     // held. Terminal work is past the question.
     let open_subtasks = !terminal && t.open_subtasks;
     let worktree = sess.map(|s| s.worktree.clone());
-    let verdict = review::gate_with(&found, &t.tags, &review_nss);
+    let verdict = review::gate_with(&found, &t.review);
     let review_ok = matches!(verdict, review::GateVerdict::Passed);
     let land_blocked = land_blocker(&LandFacts {
         state,
@@ -430,9 +430,9 @@ fn stage_task(
         worktree,
         dirty,
         commits,
-        reviewed: facet_one(&t.tags, review::FACET_REVIEWED).cloned(),
+        reviewed: t.review.reviewed.clone(),
         review_nss,
-        review_waived: facet_one(&t.tags, review::FACET_REVIEW_WAIVED).cloned(),
+        review_waived: t.review.waived.clone(),
         open_must_fix: found.open_count,
         review_ok,
         land_blocked,

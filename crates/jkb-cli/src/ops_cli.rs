@@ -936,45 +936,59 @@ fn print_tree(nodes: &[TreeNode], prefix: &str) {
 /// `jkb task show`: the task's fields, its recent transitions inside the header block, the body, and
 /// — human output only — its subtasks, since a parent is off the ready frontier until they are all
 /// terminal and "why isn't this actionable?" must be answerable from the command that shows it.
+/// A task's review record on one line, or `None` when it has none — the facts the land gate reads,
+/// printed beside the tags because they are not tags (D52.7).
+fn review_line(review: &jkb_core::reviews::ReviewState) -> Option<String> {
+    if review.reviewed.is_none() && review.waived.is_none() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(sha) = &review.reviewed {
+        parts.push(format!("reviewed={sha}"));
+    }
+    parts.extend(review.namespaces.iter().map(|ns| format!("round={ns}")));
+    if let Some(sha) = &review.waived {
+        parts.push(format!("review-waived={sha}"));
+    }
+    Some(parts.join(", "))
+}
+
+/// `task show --json`: the task, its transitions, its review record and its subtasks, in **one**
+/// document — a consumer reading one document must not get half the answer.
+fn task_json(task: &TaskDetail) -> serde_json::Value {
+    let item = &task.item;
+    serde_json::json!({
+        "id": item.id,
+        "uid": item.uid,
+        "kind": item.kind,
+        "status": item.status,
+        "priority": item.priority,
+        "due": item.due,
+        "namespace": item.namespace,
+        "content": item.content,
+        "tags": item.tags.iter()
+            .map(|t| serde_json::json!({ "facet": t.facet, "value": t.value }))
+            .collect::<Vec<_>>(),
+        "transitions": task.transitions.iter()
+            .map(|r| serde_json::json!({
+                "at": r.at, "event": r.event, "to": r.to,
+                "branch": r.branch, "onto": r.onto, "pr": r.pr,
+            }))
+            .collect::<Vec<_>>(),
+        // The review record the land gate reads (D52.7): not a tag, so it has its own key.
+        "review": task.review,
+        // Additive: a `--json` consumer can see why a task is off the frontier too, and a notice
+        // that the subtasks were cut refers to something in the document.
+        "subtasks": task.subtasks.iter()
+            .map(|t| serde_json::json!({ "uid": t.uid, "title": t.title, "status": t.status }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
     let item = &task.item;
-    let transitions: Vec<serde_json::Value> = task
-        .transitions
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "at": r.at,
-                "event": r.event,
-                "to": r.to,
-                "branch": r.branch,
-                "onto": r.onto,
-                "pr": r.pr,
-            })
-        })
-        .collect();
     if json {
-        // The transitions go in the SAME object: a `--json` consumer reading one document must not
-        // get half the answer.
-        let v = serde_json::json!({
-            "id": item.id,
-            "uid": item.uid,
-            "kind": item.kind,
-            "status": item.status,
-            "priority": item.priority,
-            "due": item.due,
-            "namespace": item.namespace,
-            "content": item.content,
-            "tags": item.tags.iter()
-                .map(|t| serde_json::json!({ "facet": t.facet, "value": t.value }))
-                .collect::<Vec<_>>(),
-            "transitions": transitions,
-            // Additive: a `--json` consumer can see why a task is off the frontier too, and a notice
-            // that the subtasks were cut refers to something in the document.
-            "subtasks": task.subtasks.iter()
-                .map(|t| serde_json::json!({ "uid": t.uid, "title": t.title, "status": t.status }))
-                .collect::<Vec<_>>(),
-        });
-        println!("{}", serde_json::to_string_pretty(&v)?);
+        println!("{}", serde_json::to_string_pretty(&task_json(task))?);
         return Ok(());
     }
     println!("uid:       {}", item.uid);
@@ -998,6 +1012,9 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
             .map(|t| format!("{}={}", t.facet, t.value))
             .collect();
         println!("tags:      {}", pairs.join(", "));
+    }
+    if let Some(line) = review_line(&task.review) {
+        println!("review:    {line}");
     }
     if !task.transitions.is_empty() {
         println!("recent transitions (`jkb task why` for all):");
@@ -1093,6 +1110,7 @@ mod tests {
                 },
                 Request::TaskShow { .. } => Response::Task {
                     task: Box::new(TaskDetail {
+                        review: jkb_core::reviews::ReviewState::default(),
                         item: ItemDetail {
                             id: 1,
                             uid: "task:t".into(),

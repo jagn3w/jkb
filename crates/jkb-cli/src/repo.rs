@@ -26,17 +26,6 @@ pub(crate) fn facet_values<'a>(
     tags.get(facet).map_or(&[], Vec::as_slice)
 }
 
-/// The single value of a facet that should only ever have one (`repo`).
-///
-/// Where a branch lands is not a facet at all — it is a label on the task's transition history —
-/// and where it was cut is not stored anywhere, so there is nothing here to collapse.
-pub(crate) fn facet_one<'a>(
-    tags: &'a BTreeMap<String, Vec<String>>,
-    facet: &str,
-) -> Option<&'a String> {
-    facet_values(tags, facet).first()
-}
-
 /// Which of a task's recorded branches its work is on — the **one** rule, shared by the In Flight
 /// row and `jkb task land`.
 ///

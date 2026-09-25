@@ -380,15 +380,14 @@ impl<'a> Kb<'a> {
         }
     }
 
-    /// `task.tag` with `set`: make `facet=value` the facet's only value.
-    pub(crate) fn set_facet(&self, uid: &str, facet: &str, value: &str) -> Result<()> {
-        match self.call(Request::TaskTag {
+    /// `task.review_waive`: record that a landing waived the review gate, in the task's review record.
+    pub(crate) fn review_waive(&self, uid: &str, sha: &str) -> Result<()> {
+        match self.call(Request::TaskReviewWaive {
             uid: uid.to_owned(),
-            facet_value: format!("{facet}={value}"),
-            mode: jkb_api::tasks::TagMode::Set,
+            sha: sha.to_owned(),
         })? {
             Response::Applied {} => Ok(()),
-            other => unexpected("task.tag", &other),
+            other => unexpected("task.review_waive", &other),
         }
     }
 

@@ -346,6 +346,10 @@ fn samples() -> Vec<Request> {
             sha: None,
             findings: "reviews/x".into(),
         }),
+        Request::TaskReviewWaive {
+            uid: "task:x".into(),
+            sha: "abc".into(),
+        },
         Request::TaskClaims { after: None },
         Request::TaskReclaim {
             dead: vec!["box:1".into()],
@@ -1863,7 +1867,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 21, "every write naming an item was asked");
+    assert_eq!(checked, 22, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {
@@ -2224,6 +2228,7 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "reviews/rt",
                 "findings": [{ "severity": "nit", "summary": "x" }] }),
         json!({ "op": "task.review_record", "repo": "r", "branch": "b2", "findings": "reviews/rt" }),
+        json!({ "op": "task.review_waive", "uid": inside, "sha": "abcd" }),
         json!({ "op": "task.claim", "uid": inside, "owner": "box:4" }),
         json!({ "op": "task.reclaim", "dead": ["box:4"] }),
         json!({ "op": "task.pr_record", "uid": inside, "number": 12 }),
