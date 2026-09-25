@@ -54,7 +54,10 @@ pub struct TaskState {
     pub tags: BTreeMap<String, Vec<String>>,
     /// Its review record — what the land gate reads (D52.7). Not a tag: tags are content a synced
     /// file can write. Absent from an older daemon, which reads as never reviewed: fail closed.
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "jkb_core::reviews::ReviewState::is_empty"
+    )]
     pub review: jkb_core::reviews::ReviewState,
     /// Who holds its claim, if anyone.
     pub claim: Option<String>,

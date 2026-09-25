@@ -26,15 +26,23 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewState {
     /// The HEAD the newest recorded review ran against.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed: Option<String>,
     /// Every recorded round's findings namespace, in recording order. The gate unions them: a newer
     /// round never retires an older round's open must-fix.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub namespaces: Vec<String>,
     /// The HEAD a `--no-review` landing waived the gate for, newest.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waived: Option<String>,
+}
+
+impl ReviewState {
+    /// Nothing recorded at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.reviewed.is_none() && self.namespaces.is_empty() && self.waived.is_none()
+    }
 }
 
 const MAX_TEXT: usize = 1024;

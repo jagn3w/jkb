@@ -2,9 +2,9 @@ use jkb_rbac::Grants as _;
 use jkb_types::ItemId;
 
 use super::{
-    agent_binding, agent_type_map, bind_agent, generation, list, live_by_hash, map_agent_type,
-    mint, resolve, revoke, role_for_agent_type, rotate_container, token_hash, Bound, Minter, Role,
-    CONTAINER_AGENT, GRANTABLE,
+    agent_binding, agent_type_map, bind_agent, descends_from, generation, in_scope, list,
+    live_by_hash, map_agent_type, mint, resolve, revoke, role_for_agent_type, rotate_container,
+    token_hash, Bound, Minter, Role, CONTAINER_AGENT, GRANTABLE,
 };
 use crate::task::{create, NewTask};
 use crate::Db;
@@ -189,4 +189,48 @@ fn an_attested_agent_binds_to_its_first_task_and_cannot_hop() {
         .unwrap();
     assert_eq!(other_session, Bound::To(b), "the binding is per session");
     assert_eq!(db.read(|c| agent_binding(c, "s1", "ag1")).unwrap(), Some(a));
+}
+
+#[test]
+fn scope_reaches_subtasks_and_the_task_s_own_findings_and_nothing_else() {
+    let db = Db::open_in_memory().unwrap();
+    let (a, b) = tasks(&db);
+    let (sub, finding, stray) = db
+        .write_txn("test", move |c, m| {
+            let sub = create(c, m, &NewTask::new("task:a1", "A1"))?;
+            crate::task::add_subtask(c, m, a, sub)?;
+            let mut f = NewTask::new("task:f", "a finding");
+            f.home = "reviews/a-1/must-fix".into();
+            let finding = create(c, m, &f)?;
+            let mut s = NewTask::new("task:s", "someone else's finding");
+            s.home = "reviews/a-10/must-fix".into();
+            let stray = create(c, m, &s)?;
+            crate::reviews::record(c, m, a, "reviews/a-1", "abc", "t")?;
+            Ok((sub, finding, stray))
+        })
+        .unwrap();
+    let reach = |t| db.read(move |c| in_scope(c, a, t)).unwrap();
+    assert!(reach(a));
+    assert!(reach(sub), "a subtask");
+    assert!(reach(finding), "a finding in the task's own round");
+    assert!(!reach(stray), "reviews/a-10 is not under reviews/a-1");
+    assert!(!reach(b), "another task");
+}
+
+#[test]
+fn a_grant_descends_from_whatever_minted_it() {
+    let db = Db::open_in_memory().unwrap();
+    let (a, _) = tasks(&db);
+    let (root, child, other) = db
+        .write_txn("test", move |c, m| {
+            let (root, _) = mint(c, m, Minter::Operator, Role::Coordinator, "c", Some(a))?;
+            let (child, _) = mint(c, m, Minter::Grant(&root), Role::Reviewer, "r", Some(a))?;
+            let (other, _) = mint(c, m, Minter::Operator, Role::Coordinator, "d", Some(a))?;
+            Ok((root.id, child.id, other.id))
+        })
+        .unwrap();
+    assert!(db.read(move |c| descends_from(c, child, root)).unwrap());
+    assert!(db.read(move |c| descends_from(c, root, root)).unwrap());
+    assert!(!db.read(move |c| descends_from(c, root, child)).unwrap());
+    assert!(!db.read(move |c| descends_from(c, child, other)).unwrap());
 }

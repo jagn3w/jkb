@@ -446,6 +446,7 @@ pub fn record(
     meta: &WriteMeta,
     ask: &RecordAsk,
     roots: Option<&FileRoots>,
+    actor: &str,
 ) -> Result<Recording, ApiError> {
     check_name("repo key", &ask.repo)?;
     check_name("branch", &ask.branch)?;
@@ -505,7 +506,7 @@ pub fn record(
             Err(e) => return Err(e),
         }
         let before = line_problem(conn, &m.uid)?;
-        jkb_core::reviews::record(conn, meta, id, &findings, sha, &meta.actor)?;
+        jkb_core::reviews::record(conn, meta, id, &findings, sha, actor)?;
         let moved = item::get(conn, id)?.and_then(|m| m.status).as_deref() == Some("in_progress");
         if moved {
             task::set_status(conn, meta, id, TaskStatus::NeedsReview)?;

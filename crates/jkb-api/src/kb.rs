@@ -399,7 +399,10 @@ pub struct TaskDetail {
     /// Its subtasks, in containment order.
     pub subtasks: Vec<SubtaskSummary>,
     /// Its review record (D52.7) — shown beside the tags, and not among them.
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "jkb_core::reviews::ReviewState::is_empty"
+    )]
     pub review: jkb_core::reviews::ReviewState,
 }
 

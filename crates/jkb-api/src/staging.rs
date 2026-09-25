@@ -28,7 +28,10 @@ pub struct StagingTask {
     pub tags: BTreeMap<String, Vec<String>>,
     /// Its review record — what the land gate reads (D52.7). Absent from an older daemon: fails
     /// closed, as never reviewed.
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "jkb_core::reviews::ReviewState::is_empty"
+    )]
     pub review: jkb_core::reviews::ReviewState,
     /// Where its work lands, from its transition history.
     pub land_target: String,

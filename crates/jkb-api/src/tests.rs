@@ -350,6 +350,54 @@ fn samples() -> Vec<Request> {
             uid: "task:x".into(),
             sha: "abc".into(),
         },
+        Request::RoleGrant {
+            role: "reviewer".into(),
+            task: None,
+            agent: "a".into(),
+        },
+        Request::RoleRevoke { id: 1 },
+        Request::RoleList {
+            task: None,
+            all: false,
+        },
+        Request::RoleWhoami {},
+        Request::RoleMap {
+            agent_type: "reviewer".into(),
+            role: None,
+        },
+        Request::RoleRotateContainer {},
+        Request::WorkflowShow {
+            uid: "task:x".into(),
+        },
+        Request::WorkflowFire {
+            uid: "task:x".into(),
+            event: "submit_work".into(),
+            reason: None,
+            to: None,
+        },
+        Request::WorkflowObserve {
+            uid: "task:x".into(),
+        },
+        Request::WorkflowSet {
+            uid: "task:x".into(),
+            strategy: "autonomous".into(),
+        },
+        Request::WorkflowDefine {
+            name: "mine".into(),
+            spec: json!({ "graph": "direct" }),
+        },
+        Request::WorkflowStrategies {},
+        Request::AttestMint {
+            session: "s".into(),
+            agent_id: None,
+            agent_type: None,
+            tool_use_id: "t".into(),
+        },
+        Request::AttestRelease {
+            session: "s".into(),
+            agent_id: None,
+            tool_use_id: None,
+        },
         Request::TaskClaims { after: None },
         Request::TaskReclaim {
             dead: vec!["box:1".into()],
@@ -1448,6 +1496,10 @@ const READS: &[&str] = &[
     "kb.context",
     "view.list",
     "view.run",
+    "role.list",
+    "role.whoami",
+    "workflow.show",
+    "workflow.strategies",
 ];
 
 #[test]
@@ -1867,7 +1919,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 22, "every write naming an item was asked");
+    assert_eq!(checked, 25, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {

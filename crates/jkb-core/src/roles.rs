@@ -588,5 +588,60 @@ pub fn agent_binding(conn: &Connection, session: &str, agent_id: &str) -> Result
         .map(ItemId::new))
 }
 
+/// The deepest containment chain [`in_scope`] walks before giving up — far past any real subtask tree,
+/// and a bound on a cycle a hand-edited database could hold.
+const MAX_SCOPE_DEPTH: usize = 64;
+
+/// Whether `target` is inside `scope`'s reach: the task itself, one of its subtasks at any depth, or
+/// a finding filed in one of its recorded review rounds. What a principal scoped to a task may write.
+///
+/// # Errors
+/// A database error.
+pub fn in_scope(conn: &Connection, scope: ItemId, target: ItemId) -> Result<bool> {
+    let mut at = Some(target);
+    for _ in 0..MAX_SCOPE_DEPTH {
+        match at {
+            Some(id) if id == scope => return Ok(true),
+            Some(id) => at = crate::containment::parent(conn, id)?,
+            None => break,
+        }
+    }
+    let rounds = crate::reviews::state(conn, scope)?.namespaces;
+    if rounds.is_empty() {
+        return Ok(false);
+    }
+    let homes: Vec<String> = conn
+        .prepare_cached(
+            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+             WHERE p.item_id = ?1",
+        )?
+        .query_map([target.get()], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(homes.iter().any(|h| {
+        rounds.iter().any(|ns| {
+            h == ns
+                || h.strip_prefix(ns.as_str())
+                    .is_some_and(|t| t.starts_with('/'))
+        })
+    }))
+}
+
+/// Whether grant `id` is `ancestor` or was minted, directly or not, by it — what a grant holder may
+/// revoke.
+///
+/// # Errors
+/// A database error.
+pub fn descends_from(conn: &Connection, id: i64, ancestor: i64) -> Result<bool> {
+    let mut at = Some(id);
+    for _ in 0..MAX_SCOPE_DEPTH {
+        match at {
+            Some(g) if g == ancestor => return Ok(true),
+            Some(g) => at = get(conn, g)?.and_then(|r| r.parent),
+            None => break,
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests;

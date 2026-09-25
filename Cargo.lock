@@ -1901,6 +1901,7 @@ dependencies = [
  "jkb-fsm",
  "jkb-index",
  "jkb-ingest",
+ "jkb-rbac",
  "jkb-search",
  "jkb-sync",
  "jkb-types",
