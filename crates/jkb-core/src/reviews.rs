@@ -35,13 +35,20 @@ pub struct ReviewState {
     /// The HEAD a `--no-review` landing waived the gate for, newest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waived: Option<String>,
+    /// The HEAD a landing ran its gate on the host for, rather than in the dev container
+    /// (`--gate-on-host`, D52.12), newest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_on_host: Option<String>,
 }
 
 impl ReviewState {
     /// Nothing recorded at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.reviewed.is_none() && self.namespaces.is_empty() && self.waived.is_none()
+        self.reviewed.is_none()
+            && self.namespaces.is_empty()
+            && self.waived.is_none()
+            && self.gate_on_host.is_none()
     }
 }
 
@@ -98,6 +105,22 @@ pub fn waive(
     insert(conn, meta, task, "waived", None, sha, actor)
 }
 
+/// Record that a landing of `task` at `sha` ran its gate on the host (`--gate-on-host`, D52.12): the
+/// candidate's own, container-written code, run as the operator — by the operator's choice, visibly.
+///
+/// # Errors
+/// [`Error::Types`] for an empty or oversized value, or a database error.
+pub fn gate_on_host(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    sha: &str,
+    actor: &str,
+) -> Result<()> {
+    check("sha", sha)?;
+    insert(conn, meta, task, "gate_on_host", None, sha, actor)
+}
+
 fn insert(
     conn: &Connection,
     meta: &WriteMeta,
@@ -150,9 +173,16 @@ pub fn state_for(conn: &Connection, tasks: &[ItemId]) -> Result<HashMap<ItemId, 
     for row in rows {
         let (id, kind, ns, sha) = row?;
         let s = out.entry(id).or_default();
-        if kind == "waived" {
-            s.waived = Some(sha);
-            continue;
+        match kind.as_str() {
+            "waived" => {
+                s.waived = Some(sha);
+                continue;
+            }
+            "gate_on_host" => {
+                s.gate_on_host = Some(sha);
+                continue;
+            }
+            _ => {}
         }
         s.reviewed = Some(sha);
         if let Some(ns) = ns {
@@ -180,7 +210,8 @@ mod tests {
             record(c, m, id, "reviews/2", "bbb", "reviewer@a1")?;
             record(c, m, id, "reviews/1", "aaa", "reviewer@a1")?;
             record(c, m, id, "reviews/1", "aaa", "reviewer@a1")?;
-            waive(c, m, id, "ccc", "operator")
+            waive(c, m, id, "ccc", "operator")?;
+            super::gate_on_host(c, m, id, "ddd", "operator")
         })
         .unwrap();
         let s = db.read(move |c| state(c, id)).unwrap();
@@ -195,6 +226,8 @@ mod tests {
             "the newest record's head"
         );
         assert_eq!(s.waived.as_deref(), Some("ccc"));
+        assert_eq!(s.gate_on_host.as_deref(), Some("ddd"));
+        assert_eq!(s.reviewed.as_deref(), Some("aaa"), "neither is a review");
         assert!(db
             .write_txn("t", move |c, m| record(c, m, id, "", "x", "a"))
             .is_err());

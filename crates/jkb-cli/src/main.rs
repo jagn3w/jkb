@@ -894,10 +894,15 @@ enum TaskCmd {
         /// bypass is visible rather than invisible.
         #[arg(long)]
         no_review: bool,
+        /// Run the gate here on the host rather than in the dev container, where it runs by default
+        /// for a checkout the container shares — it is the candidate's own, container-written code
+        /// (design D52.12). Recorded on the task.
+        #[arg(long, conflicts_with = "no_gate")]
+        gate_on_host: bool,
         /// Drop this repo's land lease, whoever holds it, and land nothing — for a holder that is
         /// gone for good but cannot be proven so (another machine, a session never seen to end).
         /// Host only.
-        #[arg(long, conflicts_with_all = ["gate", "no_gate", "keep_worktree", "no_review"])]
+        #[arg(long, conflicts_with_all = ["gate", "no_gate", "keep_worktree", "no_review", "gate_on_host"])]
         break_lock: bool,
     },
     /// File a code review's findings, and record that it ran so `task land` can require one.
@@ -2312,6 +2317,7 @@ fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result
                 no_gate: false,
                 keep_worktree: false,
                 no_review: false,
+                gate_on_host: false,
                 break_lock: true,
             },
             json,
@@ -2339,6 +2345,7 @@ pub(crate) struct LandFlags {
     pub(crate) no_gate: bool,
     pub(crate) keep_worktree: bool,
     pub(crate) no_review: bool,
+    pub(crate) gate_on_host: bool,
     pub(crate) break_lock: bool,
 }
 
@@ -2551,6 +2558,7 @@ pub(crate) fn cmd_task_land(
         no_gate,
         keep_worktree,
         no_review,
+        gate_on_host,
         break_lock,
     } = flags;
     let gate_flag = gate_flag.as_deref();
@@ -2609,6 +2617,7 @@ pub(crate) fn cmd_task_land(
     let waiver_owed = review::enforce(kb, uid, &facts.review, no_review, json)?;
 
     let land_dir = land_dir_for(&ctx, &onto)?;
+    let gate_place = gate_place_for(kb, uid, &head, &land_dir, no_gate, gate_on_host)?;
 
     let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
     // TWO FAILURES, TWO REMEDIES. They were one arm, and the message it printed was written for
@@ -2642,7 +2651,10 @@ pub(crate) fn cmd_task_land(
         );
     }
     if let Some(cmd) = &gate {
-        let (passed, output) = session::run_gate(&land_dir, cmd, json)?;
+        if let (session::GatePlace::Container { name, .. }, false) = (&gate_place, json) {
+            println!("gate: running in the dev container `{name}`");
+        }
+        let (passed, output) = session::run_gate(&land_dir, cmd, &gate_place, json)?;
         if !passed {
             gitrepo::reset_hard(&land_dir, &pre)?;
             let tail = output
@@ -2724,6 +2736,28 @@ struct Landed<'a> {
 }
 
 /// Mark the task done, free the claim, and dispose of the session (design D36.4).
+/// Where a landing's gate runs, settled BEFORE the graft so a refusal — no container to run the
+/// candidate's code in — has moved nothing (D52.12). Running it on the host instead is the operator's
+/// call, recorded on the task first: the op is operator-only, so a caller that may not make it is
+/// refused here too.
+fn gate_place_for(
+    kb: &session_cli::Kb<'_>,
+    uid: &str,
+    head: &str,
+    land_dir: &Path,
+    no_gate: bool,
+    gate_on_host: bool,
+) -> Result<session::GatePlace> {
+    if no_gate {
+        return Ok(session::GatePlace::Here);
+    }
+    let place = session::gate_place(land_dir, gate_on_host)?;
+    if gate_on_host {
+        kb.ran_on_host(uid, head)?;
+    }
+    Ok(place)
+}
+
 fn settle_landing(
     kb: &session_cli::Kb<'_>,
     stores: &archive::Stores<'_>,

@@ -12,7 +12,9 @@
 CREATE TABLE reviews (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id  INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-    kind     TEXT NOT NULL CHECK (kind IN ('recorded', 'waived')),
+    -- `recorded` a review round; `waived` a `--no-review` landing; `gate_on_host` a landing whose gate
+    -- the operator ran on the host rather than in the dev container (`--gate-on-host`, D52.12).
+    kind     TEXT NOT NULL CHECK (kind IN ('recorded', 'waived', 'gate_on_host')),
     -- The round's findings namespace; NULL only for a migrated `reviewed=` with no `review=` beside it.
     ns       TEXT,
     sha      TEXT NOT NULL,

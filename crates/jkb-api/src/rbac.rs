@@ -248,6 +248,7 @@ impl Request {
             Self::AttestMint { .. } | Self::AttestRelease { .. } => OpPermission::Attest,
             // Waiving the review gate is the operator's escape hatch, whoever the strategy lets land.
             Self::TaskReviewWaive { .. }
+            | Self::TaskRanOnHost { .. }
             | Self::TaskReclaim { .. }
             | Self::LeaseBreak { .. }
             | Self::ItemRm { .. }
@@ -280,6 +281,7 @@ impl Request {
             | Self::TaskLand { uid, .. }
             | Self::TaskLanded { uid, .. }
             | Self::TaskReviewWaive { uid, .. }
+            | Self::TaskRanOnHost { uid, .. }
             | Self::ItemRm { uid, .. }
             | Self::TaskPrRecord { uid, .. }
             | Self::TaskCloseMerged { uid, .. }

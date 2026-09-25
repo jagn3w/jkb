@@ -607,6 +607,15 @@ pub enum Request {
         /// The head the waived landing grafted.
         sha: String,
     },
+    /// Record that a landing ran its gate on the host rather than in the dev container
+    /// (`jkb task land --gate-on-host`; [`jkb_core::reviews::gate_on_host`]). Operator only.
+    #[serde(rename = "task.ran_on_host")]
+    TaskRanOnHost {
+        /// The task.
+        uid: String,
+        /// The head whose gate ran on the host.
+        sha: String,
+    },
     /// Mint a role grant ([`rbac::grant`]); its token is answered once, and only its hash kept.
     #[serde(rename = "role.grant")]
     RoleGrant {
@@ -1249,6 +1258,7 @@ impl Request {
         "task.review_file",
         "task.review_record",
         "task.review_waive",
+        "task.ran_on_host",
         "role.grant",
         "role.revoke",
         "role.list",
@@ -1353,6 +1363,7 @@ impl Request {
             Self::TaskReviewFile(_) => "task.review_file",
             Self::TaskReviewRecord(_) => "task.review_record",
             Self::TaskReviewWaive { .. } => "task.review_waive",
+            Self::TaskRanOnHost { .. } => "task.ran_on_host",
             Self::RoleGrant { .. } => "role.grant",
             Self::RoleRevoke { .. } => "role.revoke",
             Self::RoleList { .. } => "role.list",
@@ -1486,6 +1497,7 @@ impl Request {
             | Self::TaskReviewFile(_)
             | Self::TaskReviewRecord(_)
             | Self::TaskReviewWaive { .. }
+            | Self::TaskRanOnHost { .. }
             | Self::RoleGrant { .. }
             | Self::RoleRevoke { .. }
             | Self::RoleMap { .. }
@@ -3093,6 +3105,15 @@ impl Backend for LocalBackend {
                 db.write_txn_with(actor, move |c, m| {
                     let id = tasks::writable(c, &uid, roots.as_ref())?;
                     jkb_core::reviews::waive(c, m, id, &sha, &who).map_err(ApiError::from)
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskRanOnHost { uid, sha } => {
+                let roots = self.file_roots.clone();
+                let who = principal.label.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    let id = tasks::writable(c, &uid, roots.as_ref())?;
+                    jkb_core::reviews::gate_on_host(c, m, id, &sha, &who).map_err(ApiError::from)
                 })?;
                 Response::Applied {}
             }

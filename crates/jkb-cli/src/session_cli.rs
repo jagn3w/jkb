@@ -391,6 +391,17 @@ impl<'a> Kb<'a> {
         }
     }
 
+    /// `task.ran_on_host`: record that a landing ran its gate on the host (`--gate-on-host`).
+    pub(crate) fn ran_on_host(&self, uid: &str, sha: &str) -> Result<()> {
+        match self.call(Request::TaskRanOnHost {
+            uid: uid.to_owned(),
+            sha: sha.to_owned(),
+        })? {
+            Response::Applied {} => Ok(()),
+            other => unexpected("task.ran_on_host", &other),
+        }
+    }
+
     /// `session.state`.
     pub(crate) fn session_state(&self, session: &str) -> Result<SessionStateIs> {
         match self.call(Request::SessionState {

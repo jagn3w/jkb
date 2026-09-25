@@ -32,11 +32,179 @@ const DEFAULT_TRUNKS: &[&str] = &["main", "master", "trunk", "develop"];
 /// configuration and are deliberately left alone: this project's own dev container uses them
 /// to carry `safe.directory` grants, and stripping those makes git refuse the checkout
 /// outright.
+///
+/// **No hooks and no fsmonitor, ever** (design D52.11). A repository's own `.git/config` and
+/// `.git/hooks` are writable from the dev container, and git runs whatever they name; jkb's plumbing
+/// needs neither, and its only graft already ran hooks-off for its own reasons. What `-c` cannot
+/// neutralize — a planted filter, textconv or pager — [`audit_repo_config`] refuses before the first
+/// call in a directory.
 fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    git_in(
+        dir,
+        &[
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+            ],
+            args,
+        ]
+        .concat(),
+    )
+}
+
+/// The **one** production `git` spawn in this module: `git -C <dir> <args>`, repository selection
+/// scrubbed. [`git_cmd`] adds the neutralizers to it; [`audit_repo_config`] reads config through it.
+fn git_in(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
     scrub_repo_selection(&mut cmd);
     cmd
+}
+
+/// Whether `key` (as git lists it: section and name lower-cased, a subsection verbatim) may appear in
+/// a repository's own config — the **repository-shape** keys: where it fetches, what its branches
+/// track, how it is laid out, who commits. An allowlist, not a denylist, because git keeps growing
+/// keys that run programs (`core.fsmonitor`, `core.sshCommand`, `core.pager`, `*.textconv`, `filter.*`,
+/// `merge.*.driver`, `credential.*`, `gpg.program`, `alias.*`, `pager.*`, `submodule.*.update`,
+/// `include.*`) and a denylist fails open on the next one.
+pub(crate) fn config_key_allowed(key: &str) -> bool {
+    let (section, rest) = key.split_once('.').unwrap_or((key, ""));
+    let name = rest.rsplit('.').next().unwrap_or(rest);
+    let has_sub = rest.contains('.');
+    match section {
+        "core" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "repositoryformatversion"
+                        | "filemode"
+                        | "bare"
+                        | "logallrefupdates"
+                        | "ignorecase"
+                        | "precomposeunicode"
+                        | "symlinks"
+                        | "autocrlf"
+                        | "eol"
+                        | "safecrlf"
+                        | "abbrev"
+                        | "quotepath"
+                        | "sparsecheckout"
+                        | "sparsecheckoutcone"
+                        | "commitgraph"
+                        | "splitindex"
+                        | "untrackedcache"
+                        | "multipackindex"
+                        | "worktree"
+                )
+        }
+        "remote" => {
+            has_sub
+                && matches!(
+                    name,
+                    "url"
+                        | "fetch"
+                        | "pushurl"
+                        | "push"
+                        | "tagopt"
+                        | "prune"
+                        | "mirror"
+                        | "promisor"
+                        | "partialclonefilter"
+                )
+        }
+        "branch" => {
+            has_sub
+                && matches!(
+                    name,
+                    "remote" | "merge" | "rebase" | "pushremote" | "description"
+                        // VS Code's Git extension records a branch's merge base here.
+                        | "vscode-merge-base"
+                )
+        }
+        "submodule" => has_sub && matches!(name, "url" | "active" | "branch"),
+        "extensions" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "objectformat" | "refstorage" | "relativeworktrees" | "preciousobjects"
+                )
+        }
+        "worktree" => !has_sub && name == "userelativepaths",
+        // Scalar preferences with no program in them.
+        "user" | "init" | "pull" | "push" | "fetch" | "gc" | "jkb" | "rerere" | "advice"
+        | "color" | "log" | "status" | "commit" | "tag" | "index" | "pack" | "maintenance" => {
+            !has_sub || section == "color"
+        }
+        "merge" | "diff" => {
+            !has_sub && matches!(name, "conflictstyle" | "ff" | "renames" | "algorithm")
+        }
+        _ => false,
+    }
+}
+
+/// Directories whose repository config [`audit_repo_config`] has already passed, this process.
+static AUDITED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Refuse to run git in `dir` when its repository's **own** config — local, worktree, or a file those
+/// include — sets a key outside [`config_key_allowed`] (design D52.11, hole H5). Such a key can make
+/// git run a program, and that file is writable from the dev container, so on the host it is a way
+/// for anything in the container to run code as the operator.
+///
+/// Asked with `git config --list --show-origin --show-scope`, which reads config and executes nothing
+/// (measured on git 2.51.1 against a planted fsmonitor, hooks path, include, pager and filter). The
+/// operator's own scopes (`system`, `global`) and `command` (the environment's, e.g. the container's
+/// `safe.directory` grants) are theirs, not the repository's, and are not judged. Once per directory
+/// per process.
+///
+/// # Errors
+/// The refusal, naming the key, the file it is in, and how to remove it; or git not running at all.
+pub(crate) fn audit_repo_config(dir: &Path) -> Result<()> {
+    if AUDITED
+        .lock()
+        .is_ok_and(|seen| seen.iter().any(|d| d == dir))
+    {
+        return Ok(());
+    }
+    let out = git_in(
+        dir,
+        &["config", "--list", "--show-origin", "--show-scope", "-z"],
+    )
+    .output()
+    .with_context(|| format!("reading {}'s git config", dir.display()))?;
+    // Outside any repository `config --list` still lists the operator's own scopes and succeeds; a
+    // failure is a config git cannot parse, which is no more trustworthy than a planted one.
+    anyhow::ensure!(
+        out.status.success(),
+        "git could not read the config for {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut fields = text.split('\0');
+    while let (Some(scope), Some(origin), Some(entry)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        if matches!(scope, "system" | "global" | "command" | "") {
+            continue;
+        }
+        let key = entry.split('\n').next().unwrap_or_default();
+        if !config_key_allowed(key) {
+            let file = origin.strip_prefix("file:").unwrap_or(origin);
+            anyhow::bail!(
+                "refusing to run git in {}: its repository config sets `{key}` ({file}, {scope} \
+                 scope), which is not on jkb's list of repository-shape keys and can make git run a \
+                 program. That file is writable from the dev container (design D52.11). If you did not \
+                 put it there, remove it on the host: git config --file {file} --unset-all {key}",
+                dir.display()
+            );
+        }
+    }
+    if let Ok(mut seen) = AUDITED.lock() {
+        seen.push(dir.to_path_buf());
+    }
+    Ok(())
 }
 
 /// Remove the environment variables that select a repository, so the working directory decides
@@ -343,6 +511,7 @@ mod lex {
 /// Run `git` in `dir`, returning trimmed stdout. `Ok(None)` when git exits non-zero — the
 /// common "this ref does not exist" case, which is a fact rather than a failure.
 fn git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
+    audit_repo_config(dir)?;
     let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
@@ -498,6 +667,7 @@ pub fn rev(dir: &Path, reference: &str) -> Result<Option<String>> {
 /// # Errors
 /// Returns an error if `git` cannot be executed at all.
 fn git_run(dir: &Path, args: &[&str]) -> Result<(bool, String)> {
+    audit_repo_config(dir)?;
     let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
@@ -1407,9 +1577,9 @@ mod tests {
 
     /// `(file, fn)` — each of these is separately asserted to scrub, by the test named.
     const SCRUBBERS: &[(&str, &str)] = &[
-        ("src/gitrepo.rs", "git_cmd"), // every_git_call_drops_the_callers_repository_selection
+        ("src/gitrepo.rs", "git_in"), // every_git_call_drops_the_callers_repository_selection
         ("src/gitrepo.rs", "fixture_git"), // the_test_fixtures_do_not_reach_another_repository
-        ("src/pr.rs", "gh_cmd"),       // the_gh_spawn_does_not_inherit_a_repository_selection
+        ("src/pr.rs", "gh_cmd"),      // the_gh_spawn_does_not_inherit_a_repository_selection
         ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
         ("src/archive.rs", "fixture_git"), // the_archive_fixture_does_not_reach_another_repository
         // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
@@ -1430,6 +1600,12 @@ mod tests {
             "src/archive.rs",
             "the_old_store_s_files_are_never_opened",
             "spawns `mkfifo` on a temp path; it is never asked about a repository",
+        ),
+        (
+            "src/session.rs",
+            "gate_place",
+            "asks `docker inspect` whether the dev container is running; it is never asked about a \
+             repository (the gate itself runs through `gate_cmd`)",
         ),
     ];
 
@@ -1760,7 +1936,7 @@ mod tests {
         let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
 
         // The retired per-module check's distinctive premise: this file holds exactly ONE
-        // production git spawn, in `git_cmd`. It is what makes an empty `stray` above mean
+        // production git spawn, in `git_in`. It is what makes an empty `stray` above mean
         // "nothing bypasses" rather than "the slice was wrong" for the file that matters most.
         let self_prod = match self_src.find("\n#[cfg(test)]\nmod tests {") {
             Some(cut) => &self_src[..cut],
@@ -1772,7 +1948,7 @@ mod tests {
                 .map(|f| super::code_only(self_prod).matches(f).count())
                 .sum::<usize>(),
             1,
-            "expected exactly one production git spawn in gitrepo.rs (in `git_cmd`); the scan is \
+            "expected exactly one production git spawn in gitrepo.rs (in `git_in`); the scan is \
              looking at the wrong slice or the spawn has been respelled"
         );
         assert!(
@@ -1829,6 +2005,12 @@ mod tests {
         super::assert_scrubbed(
             "git",
             &git_cmd(Path::new("/somewhere"), &["rev-parse", "--show-toplevel"]),
+            &[],
+        );
+        // The config audit reads through the same spawn.
+        super::assert_scrubbed(
+            "git",
+            &super::git_in(Path::new("/somewhere"), &["config", "--list"]),
             &[],
         );
     }
@@ -2404,6 +2586,125 @@ mod tests {
             super::has_branch(root, "squash").expect("has_branch"),
             Fact::Unknown,
             "git could not answer, which is not the same as the branch being gone"
+        );
+    }
+
+    #[test]
+    fn the_config_allowlist_takes_repository_shape_and_nothing_that_runs_a_program() {
+        use super::config_key_allowed;
+        // Every local key found across the operator's nine real repos (measured 2026-09-25).
+        for ok in [
+            "core.repositoryformatversion",
+            "core.filemode",
+            "core.bare",
+            "core.logallrefupdates",
+            "core.ignorecase",
+            "core.precomposeunicode",
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "branch.main.remote",
+            "branch.main.merge",
+            "branch.task/x.vscode-merge-base",
+            "extensions.relativeworktrees",
+            "worktree.userelativepaths",
+            "user.email",
+            "pull.rebase",
+        ] {
+            assert!(config_key_allowed(ok), "{ok}");
+        }
+        for runs in [
+            "core.fsmonitor",
+            "core.hookspath",
+            "core.sshcommand",
+            "core.pager",
+            "core.editor",
+            "core.askpass",
+            "core.gitproxy",
+            "sequence.editor",
+            "include.path",
+            "includeif.gitdir:/x.path",
+            "filter.x.clean",
+            "filter.lfs.process",
+            "diff.external",
+            "diff.x.textconv",
+            "diff.x.command",
+            "merge.x.driver",
+            "credential.helper",
+            "credential.https://h.helper",
+            "gpg.program",
+            "gpg.ssh.program",
+            "alias.st",
+            "pager.log",
+            "submodule.x.update",
+            "remote.origin.uploadpack",
+            "remote.origin.receivepack",
+            "url.ext::sh.insteadof",
+            "protocol.ext.allow",
+            "core.remote.fsmonitor",
+        ] {
+            assert!(!config_key_allowed(runs), "{runs} must be refused");
+        }
+    }
+
+    /// A planted `core.fsmonitor` is what a plain `git status` on the host would run (measured). jkb's
+    /// git refuses the repository instead, naming the key and its file, and the program never runs.
+    #[test]
+    fn a_repository_whose_own_config_names_a_program_is_refused_before_git_runs() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let marker = t.path().join("ran");
+        let evil = t.path().join("evil.sh");
+        std::fs::write(&evil, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            super::root(&dir).unwrap().is_some(),
+            "a clean repository runs"
+        );
+        let planted = t.path().join("r2");
+        std::fs::create_dir_all(&planted).unwrap();
+        fixture(&planted);
+        let set = fixture_git(
+            &planted,
+            &["config", "core.fsmonitor", evil.to_str().unwrap()],
+        )
+        .status()
+        .unwrap();
+        assert!(set.success());
+        let e = super::root(&planted).unwrap_err().to_string();
+        assert!(
+            e.contains("core.fsmonitor") && e.contains(".git/config"),
+            "{e}"
+        );
+        let e = super::git_run(&planted, &["status"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("core.fsmonitor"), "{e}");
+        assert!(!marker.exists(), "the planted program never ran");
+    }
+
+    /// jkb's own git calls run no hooks and no fsmonitor, whatever the repository says.
+    #[test]
+    fn jkb_git_runs_hooks_off() {
+        let cmd = git_cmd(Path::new("/somewhere"), &["status"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "core.hooksPath=/dev/null"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "core.fsmonitor=false"),
+            "{args:?}"
         );
     }
 }

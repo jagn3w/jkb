@@ -65,6 +65,7 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             no_gate,
             keep_worktree,
             no_review,
+            gate_on_host,
             break_lock,
         } => {
             let kb = crate::session_cli::Kb::from_ops(ops);
@@ -79,6 +80,7 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
                     no_gate,
                     keep_worktree,
                     no_review,
+                    gate_on_host,
                     break_lock,
                 },
                 ops.json,
