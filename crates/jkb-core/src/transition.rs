@@ -404,6 +404,27 @@ pub fn resumed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>>
     Ok(resumption(&history(conn, task)?).cloned())
 }
 
+/// The pull request whose merge closed `task` — the `observed_landed` that moved it to `done` with a
+/// `pr_number` and no destination (`task close-merged`) — while nothing has put it back to work since.
+/// [`landing`] counts only a landing with a destination, which this one never has.
+///
+/// # Errors
+/// Returns a database error if the history cannot be read.
+pub fn merged_by_pr(conn: &Connection, task: ItemId) -> Result<Option<i64>> {
+    use jkb_fsm::Event as _;
+    let rows = history(conn, task)?;
+    let merged = rows.iter().rev().find(|r| {
+        r.event == TaskEvent::ObservedLanded.name()
+            && r.to_status == TaskStatus::Done.as_str()
+            && r.labels.pr_number.is_some()
+    });
+    Ok(match (merged, resumption(&rows)) {
+        (Some(m), Some(back)) if back.id > m.id => None,
+        (Some(m), _) => m.labels.pr_number,
+        (None, _) => None,
+    })
+}
+
 /// [`resumed`] over rows already in hand, so a caller needing both reads the history once.
 fn resumption(rows: &[TransitionRow]) -> Option<&TransitionRow> {
     rows.iter()

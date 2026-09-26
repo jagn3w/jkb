@@ -74,11 +74,29 @@ pub struct TaskState {
     /// Whether this client may write the task at all — `false` for one filed outside `jkb serve`'s
     /// file roots. A verb that does git work before its write asks this first.
     pub writable: bool,
-    /// The branch and destination of its live landing, if it has one — what tells `task landed` a
-    /// task it may not land again from one it already landed (review round 9). Absent from an older
-    /// daemon, which reads as no landing: nothing is then reported already landed.
+    /// Its live landing, if it has one — what tells `task landed` a task it may not land again from
+    /// one it already landed (review rounds 9–10). Absent from an older daemon, which reads as no
+    /// landing: nothing is then reported already landed. Boxed: `TaskState` rides in `Response`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub landed: Option<Box<(String, String)>>,
+    pub landed: Option<Box<LiveLanding>>,
+}
+
+/// Where a task's work landed, as far as its history says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveLanding {
+    /// Grafted: this branch onto this destination.
+    Grafted {
+        /// The branch.
+        branch: String,
+        /// Where it landed.
+        onto: String,
+    },
+    /// Merged as this pull request (`task close-merged`), which records no destination.
+    Merged {
+        /// The pull request.
+        pr: i64,
+    },
 }
 
 /// `task.facts`: what the session verbs read about a task, in one read.
@@ -114,10 +132,17 @@ pub fn facts(
         land_target: transition::land_target(conn, id)?,
         open_subtasks: !task::subtasks_all_terminal(conn, id)?,
         writable,
-        landed: transition::landing(conn, id)?
-            .live()
-            .and_then(|row| Some((row.labels.branch.clone()?, row.labels.onto.clone()?)))
-            .map(Box::new),
+        landed: match transition::landing(conn, id)?.live().and_then(|row| {
+            Some(LiveLanding::Grafted {
+                branch: row.labels.branch.clone()?,
+                onto: row.labels.onto.clone()?,
+            })
+        }) {
+            Some(grafted) => Some(Box::new(grafted)),
+            None => {
+                transition::merged_by_pr(conn, id)?.map(|pr| Box::new(LiveLanding::Merged { pr }))
+            }
+        },
         start_refusal: if terminal {
             lifecycle::apply(&observed, TaskEvent::Start).refusal()
         } else {

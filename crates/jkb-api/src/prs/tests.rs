@@ -115,6 +115,14 @@ fn a_task_closes_on_a_merge_its_client_established() {
         Response::Workflow { workflow } => assert_eq!(workflow.phase, "landed"),
         other => panic!("{other:?}"),
     }
+    // And the task's facts say what landed it, which has no destination (review round 10).
+    match call(&b, json!({ "op": "task.facts", "uid": uid })).unwrap() {
+        Response::TaskState { state } => assert_eq!(
+            state.landed.as_deref(),
+            Some(&crate::sessions::LiveLanding::Merged { pr: 31 })
+        ),
+        other => panic!("{other:?}"),
+    }
     let worker = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
     let e = call(&worker, json!({ "op": "role.whoami" })).unwrap_err();
     assert_eq!(e.code, ErrorCode::Unauthorized, "{e:?}");

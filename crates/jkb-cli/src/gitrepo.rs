@@ -482,22 +482,8 @@ fn findings_with(dir: &Path, template: Option<PathBuf>) -> Vec<String> {
         common,
         out: Vec::new(),
         judged: std::collections::HashSet::new(),
-        template: None,
+        template,
     };
-    // A template inside the tree that holds the repositories is the container's to write: a hook
-    // planted there and in a submodule byte for byte would pass as yours (review round 9).
-    if let Some(t) = template {
-        let resolved = fs::canonicalize(&t).unwrap_or_else(|_| t.clone());
-        match scan.top.parent() {
-            Some(repos) if resolved.starts_with(repos) => scan.out.push(format!(
-                "your init.templateDir ({}) lies in {}, beside the repositories the container \
-                 writes, so its hooks are not taken as yours",
-                t.display(),
-                repos.display()
-            )),
-            _ => scan.template = Some(t),
-        }
-    }
     let mut homes = vec![scan.common.join("modules")];
     if let Ok(entries) = fs::read_dir(scan.common.join("worktrees")) {
         for e in entries.flatten() {
@@ -588,6 +574,25 @@ impl Scan<'_> {
         true
     }
 
+    /// Whether `hook` is byte for byte the template hook `yours` — judged by where `yours` really is,
+    /// through every symlink: one inside the tree that holds the repositories is the container's to
+    /// write, so the same bytes planted there and in a submodule would pass as yours (review rounds
+    /// 9–10: first the whole template was judged, which a hook symlinked into the repositories
+    /// stepped around, and a standing finding against every repository hid a real one).
+    fn is_your_template_hook(&self, yours: &Path, hook: &Path) -> bool {
+        let Ok(real) = fs::canonicalize(yours) else {
+            return false;
+        };
+        if self
+            .top
+            .parent()
+            .is_some_and(|repos| real.starts_with(repos))
+        {
+            return false;
+        }
+        matches!((fs::read(&real), fs::read(hook)), (Ok(a), Ok(b)) if a == b)
+    }
+
     /// Report what could run from `gitdir`'s own `hooks/` for git you run there — measured on git
     /// 2.51.1, a planted `pre-commit` ran on `git -C sub commit` (review round 7). Git writes only
     /// `*.sample` files there, and copies your `init.templateDir`'s hooks in; anything else is
@@ -630,12 +635,9 @@ impl Scan<'_> {
             if name.to_string_lossy().ends_with(".sample") {
                 continue;
             }
-            let yours = template.as_ref().is_some_and(|t| {
-                matches!(
-                    (fs::read(t.join(&name)), fs::read(e.path())),
-                    (Ok(a), Ok(b)) if a == b
-                )
-            });
+            let yours = template
+                .as_ref()
+                .is_some_and(|t| self.is_your_template_hook(&t.join(&name), &e.path()));
             if !yours {
                 self.out.push(format!("{} is a hook", e.path().display()));
             }
@@ -3671,10 +3673,27 @@ mod tests {
         std::fs::create_dir_all(&beside).unwrap();
         std::fs::copy(hooks.join("pre-commit"), beside.join("pre-commit")).unwrap();
         let found = super::findings_with(&dir, Some(beside.clone())).join("; ");
-        assert!(
-            found.contains("pre-commit is a hook") && found.contains("beside the repositories"),
-            "{found}"
+        assert!(found.contains("pre-commit is a hook"), "{found}");
+        let clean = t.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        fixture(&clean);
+        assert_eq!(
+            super::findings_with(&clean, Some(beside.clone())),
+            Vec::<String>::new(),
+            "no standing finding against a repository with no hook"
         );
+        #[cfg(unix)]
+        {
+            // Nor one hook of your real template symlinked into the repositories' tree.
+            std::fs::remove_file(template.join("pre-commit")).unwrap();
+            std::os::unix::fs::symlink(beside.join("pre-commit"), template.join("pre-commit"))
+                .unwrap();
+            assert!(
+                with(&dir).contains("pre-commit is a hook"),
+                "{}",
+                with(&dir)
+            );
+        }
         #[cfg(unix)]
         {
             // A `hooks/` git can search but the scan cannot list still runs a hook by name.

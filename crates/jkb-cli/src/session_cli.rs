@@ -298,7 +298,10 @@ impl<'a> Kb<'a> {
     /// graft, so the same work asked about again is [`Verdict::Already`], which is what the queue's
     /// advice for a branch already in its base expects (rounds 8–9).
     pub(crate) fn landed(&self, uid: &str, landed: Landed) -> Result<Verdict> {
-        let same = (landed.branch.clone(), landed.onto.clone());
+        let same = jkb_api::sessions::LiveLanding::Grafted {
+            branch: landed.branch.clone(),
+            onto: landed.onto.clone(),
+        };
         let request = Request::TaskLanded {
             uid: uid.to_owned(),
             landed,
@@ -311,10 +314,17 @@ impl<'a> Kb<'a> {
             Ok(other) => unexpected("task.landed", &other),
             Err(e) if e.code == jkb_api::ErrorCode::Forbidden => {
                 // Already landed only where its live landing already records: the same branch onto
-                // the same destination, a head moved by the graft aside (round 9). A new
-                // destination, a cancelled task ticked `done`, a caller who may not land — refused.
+                // the same destination, a head moved by the graft aside (round 9), or a pull
+                // request that merged it (round 10). A new destination, or a cancelled task ticked
+                // `done`, is refused. So is the caller's own refusal — no role, no `lands` — on any
+                // other task; on one landed this way the answer is simply true.
                 let facts = self.facts(uid)?;
-                if facts.status == "done" && facts.landed.as_deref() == Some(&same) {
+                let already = match facts.landed.as_deref() {
+                    Some(jkb_api::sessions::LiveLanding::Merged { .. }) => true,
+                    Some(grafted) => *grafted == same,
+                    None => false,
+                };
+                if facts.status == "done" && already {
                     Ok(Verdict::Already)
                 } else {
                     Ok(Verdict::Refused(e.message))
@@ -1987,6 +1997,56 @@ mod tests {
                 super::Verdict::Refused(_)
             ),
             "a new destination is refused"
+        );
+    }
+
+    /// A task merged as a pull request records no destination, and is still already landed when
+    /// the queue asks about its branch (review round 10).
+    #[test]
+    fn a_task_merged_as_a_pull_request_is_already_landed() {
+        use jkb_api::{Backend as _, LocalBackend, Request, Response};
+        let db = jkb_core::Db::open_in_memory().unwrap();
+        let op = LocalBackend::new(db.clone());
+        let call = |b: &LocalBackend, r: serde_json::Value| {
+            b.call(serde_json::from_value::<Request>(r).unwrap())
+                .unwrap()
+        };
+        let Response::Granted { token, .. } = call(
+            &op,
+            serde_json::json!({ "op": "role.grant", "role": "coordinator", "agent": "coord" }),
+        ) else {
+            panic!("granted")
+        };
+        let coord = LocalBackend::new(db).with_caller(jkb_api::rbac::Caller::Token(token));
+        let kb = Kb::new(&coord);
+        let landed = || Landed {
+            branch: "b".into(),
+            onto: "o".into(),
+            head: None,
+        };
+        let merged = match call(
+            &op,
+            serde_json::json!({ "op": "task.add", "text": "merged", "managed": true }),
+        ) {
+            Response::Added { added } => added.uid,
+            other => panic!("{other:?}"),
+        };
+        call(
+            &op,
+            serde_json::json!({ "op": "workflow.set", "uid": merged, "strategy": "autonomous" }),
+        );
+        for step in [
+            serde_json::json!({ "op": "task.start", "uid": merged, "take": { "owner": "box:1" },
+                                "place": { "branch": "b", "repo": "proj" } }),
+            serde_json::json!({ "op": "task.pr_record", "uid": merged, "number": 31 }),
+            serde_json::json!({ "op": "task.close_merged", "uid": merged, "merged": "yes",
+                                "pr": 31, "observed": { "live_landing": false, "pr": 31 } }),
+        ] {
+            call(&op, step);
+        }
+        assert_eq!(
+            kb.landed(&merged, landed()).unwrap(),
+            super::Verdict::Already
         );
     }
 
