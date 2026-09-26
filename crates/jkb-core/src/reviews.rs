@@ -75,10 +75,10 @@ fn check(what: &str, v: &str) -> Result<()> {
 
 /// Which namespaces a caller may record as a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoundSource {
-    /// Only one `task.review_file` filed ([`record_filing`]); the round is exactly what it filed.
-    /// Anyone but the operator.
-    Filed,
+pub enum RoundSource<'a> {
+    /// Only one this principal's own `task.review_file` filed ([`record_filing`]); the round is exactly
+    /// what it filed. Anyone but the operator.
+    Filed(&'a str),
     /// Any namespace, its round being the tasks under it — the operator's `/review-log`, whose
     /// findings reach the KB through a mount rather than a filing.
     AnyNamespace,
@@ -97,7 +97,7 @@ pub fn record(
     ns: &str,
     sha: &str,
     actor: &str,
-    source: RoundSource,
+    source: RoundSource<'_>,
 ) -> Result<()> {
     check("findings namespace", ns)?;
     check("sha", sha)?;
@@ -162,18 +162,36 @@ fn insert(
     Ok(())
 }
 
-/// Record that `task.review_file` filed `items` into the new namespace `ns`.
+/// Record that `filed_by` filed `items` into the new namespace `ns` (`task.review_file`).
 ///
 /// # Errors
 /// [`Error::Types`] for an empty or oversized namespace, or a database error.
-pub fn record_filing(conn: &Connection, ns: &str, items: &[ItemId]) -> Result<()> {
+pub fn record_filing(conn: &Connection, ns: &str, items: &[ItemId], filed_by: &str) -> Result<()> {
     check("findings namespace", ns)?;
-    let mut stmt =
-        conn.prepare_cached("INSERT OR IGNORE INTO review_filings (ns, item_id) VALUES (?1, ?2)")?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO review_filings (ns, item_id, filed_by) VALUES (?1, ?2, ?3)",
+    )?;
     for id in items {
-        stmt.execute(params![ns, id.get()])?;
+        stmt.execute(params![ns, id.get(), filed_by])?;
     }
     Ok(())
+}
+
+/// The recorded round `ns` is, lies inside, or contains, if any. Filing there would put findings under
+/// a round another recording already fixed.
+///
+/// # Errors
+/// A database error.
+pub fn round_overlapping(conn: &Connection, ns: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT ns FROM review_rounds
+             WHERE ns = ?1 OR substr(?1, 1, length(ns) + 1) = ns || '/'
+                OR substr(ns, 1, length(?1) + 1) = ?1 || '/'
+             LIMIT 1",
+        )?
+        .query_row([ns], |r| r.get(0))
+        .optional()?)
 }
 
 /// The area a finding names: its `area=` facet, or — for a finding filed before that facet existed —
@@ -192,25 +210,35 @@ fn area_of(meta: &item::ItemMeta, tags: &[(String, String)]) -> Option<String> {
 }
 
 /// Snapshot the round `ns` if no recording has yet, returning its id (its recording order).
-fn snapshot_round(conn: &Connection, ns: &str, actor: &str, source: RoundSource) -> Result<i64> {
+fn snapshot_round(
+    conn: &Connection,
+    ns: &str,
+    actor: &str,
+    source: RoundSource<'_>,
+) -> Result<i64> {
     let existing: Option<i64> = conn
         .prepare_cached("SELECT id FROM review_rounds WHERE ns = ?1")?
         .query_row([ns], |r| r.get(0))
         .optional()?;
-    let filed: Vec<ItemId> = conn
-        .prepare_cached("SELECT item_id FROM review_filings WHERE ns = ?1 ORDER BY item_id")?
-        .query_map([ns], |r| r.get::<_, i64>(0))?
-        .map(|r| r.map(ItemId::new))
+    let filings: Vec<(ItemId, String)> = conn
+        .prepare_cached(
+            "SELECT item_id, filed_by FROM review_filings WHERE ns = ?1 ORDER BY item_id",
+        )?
+        .query_map([ns], |r| Ok((ItemId::new(r.get::<_, i64>(0)?), r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    if source == RoundSource::Filed && filed.is_empty() {
-        // Checked even for a round the operator already recorded: a caller that may record only
-        // filings must not ride on a namespace the operator chose.
-        return Err(Error::Types(TypeError::Validation(format!(
-            "`{ns}` is not a namespace `jkb task review file` filed — only the operator records a \
-             review whose findings reached the KB another way, because the round a task records \
-             decides which tasks its workers may write"
-        ))));
+    if let RoundSource::Filed(by) = source {
+        // Checked even for a round already recorded: a caller that may record only its own filings
+        // must not ride on a namespace the operator, or another worker, chose.
+        if filings.is_empty() || filings.iter().any(|(_, f)| f != by) {
+            return Err(Error::Types(TypeError::Validation(format!(
+                "`{ns}` is not a namespace this caller filed with `jkb task review file` — only the \
+                 operator records a review someone else filed, or whose findings reached the KB \
+                 another way, because the round a task records decides which tasks its workers may \
+                 write"
+            ))));
+        }
     }
+    let filed: Vec<ItemId> = filings.into_iter().map(|(id, _)| id).collect();
     if let Some(id) = existing {
         return Ok(id);
     }

@@ -267,7 +267,13 @@ fn check_bytes(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
 /// # Errors
 /// [`ErrorCode::Invalid`] for a malformed or occupied namespace, a covered section, or an oversized
 /// finding; or a failed write.
-pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed, ApiError> {
+pub fn file(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ask: &FileAsk,
+    filed_by: &str,
+    scope: Option<ItemId>,
+) -> Result<Filed, ApiError> {
     if let Some(why) = ask.run.refusal() {
         return Err(invalid(format!(
             "this review did not run fully ({why}) — nothing was filed, because it would read as a \
@@ -276,6 +282,17 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
     }
     let root = ns::normalize(&ask.ns)?;
     check_findings(ask)?;
+    // Never into, above or below a recorded round: its findings were fixed when it was recorded, and a
+    // must-fix filed beside them later would read as the round's (review round 2).
+    if let Some(round) = jkb_core::reviews::round_overlapping(conn, &root)? {
+        return Err(invalid(format!(
+            "`{root}` overlaps the recorded review round `{round}` — file a review into a namespace \
+             of its own"
+        )));
+    }
+    if let Some(scope) = scope {
+        check_filing_home(conn, scope, &root)?;
+    }
     let held = Query {
         scope: Scope::Subtree(root.clone()),
         ..Query::default()
@@ -343,12 +360,47 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
         ids.push(id);
     }
     // What this filing holds, so recording it makes exactly these a task's round (and its scope).
-    jkb_core::reviews::record_filing(conn, &root, &ids)?;
+    jkb_core::reviews::record_filing(conn, &root, &ids, filed_by)?;
     Ok(Filed {
         ns: root,
         uids,
         clean,
     })
+}
+
+/// A caller held to one task files only under its repository's `repos/<repo>/codereviews/`, found on
+/// the task or the nearest task above it that records a `repo=`. Findings are ordinary open tasks,
+/// mirrored into `tasks/` where a swarm picks work up, so a filing anywhere else is a new task on the
+/// shared frontier that `task.add --under` would have refused.
+fn check_filing_home(conn: &Connection, scope: ItemId, root: &str) -> Result<(), ApiError> {
+    let mut at = Some(scope);
+    let mut repo = None;
+    for _ in 0..64 {
+        let Some(id) = at else { break };
+        repo = tag::applications(conn, id)?
+            .into_iter()
+            .find(|(f, _)| f == jkb_core::location::FACET_REPO)
+            .map(|(_, v)| v);
+        if repo.is_some() {
+            break;
+        }
+        at = jkb_core::containment::parent(conn, id)?;
+    }
+    let Some(repo) = repo else {
+        return Err(ApiError::with_code(
+            ErrorCode::Forbidden,
+            "a caller held to one task files a review only under its repository's codereviews, and \
+             neither the task nor any task above it records a `repo=`",
+        ));
+    };
+    let home = format!("repos/{repo}/codereviews/");
+    if !root.starts_with(&home) {
+        return Err(ApiError::with_code(
+            ErrorCode::Forbidden,
+            format!("a caller held to one task files a review only under `{home}`, not `{root}`"),
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse findings too many, too large, or with an empty summary.
@@ -459,7 +511,7 @@ pub fn record(
     roots: Option<&FileRoots>,
     actor: &str,
     scope: Option<ItemId>,
-    source: jkb_core::reviews::RoundSource,
+    source: jkb_core::reviews::RoundSource<'_>,
 ) -> Result<Recording, ApiError> {
     check_name("repo key", &ask.repo)?;
     check_name("branch", &ask.branch)?;

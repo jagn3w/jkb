@@ -219,13 +219,13 @@ run "run.sh stops naming the keys it applies" "cannot tell an applied key from a
 # least could not have.
 seed; for f in "$work"/t/.container/*.sh; do
     case "$(basename "$f")" in
-        init-firewall.sh|check-config.sh|mutate-config.sh) continue ;;
+        init-firewall.sh|pin-jkb-hook.sh|check-config.sh|mutate-config.sh) continue ;;
     esac
-    # Every mention removed, so nothing looks like a caller any more.
+    # Every mention removed, so nothing looks like a caller any more — of either guarded script.
     python3 - "$f" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("init-firewall.sh", "some-other-script.sh"))
+open(p, 'w').write(s.replace("init-firewall.sh", "some-other-script.sh").replace("pin-jkb-hook.sh", "yet-another-script.sh"))
 PYX
 done
 run "no script reaches the firewall-argument guard" "the derivation below is checking nothing"
@@ -617,6 +617,14 @@ p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('/usr/local/bin/pin-jkb-hook.sh ""', '/usr/local/bin/pin-jkb-hook.sh', 1))
 PYX
 run "the hook-pinning sudoers grant stops pinning its argument" "pin-jkb-hook.sh no longer pins it to no arguments"
+
+# The caller half of that grant: `""` is an argument, and sudo refuses one here.
+seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('sudo -n /usr/local/bin/pin-jkb-hook.sh\n', 'sudo -n /usr/local/bin/pin-jkb-hook.sh ""\n', 1))
+PYX
+run "setup passes an argument to the hook-pinning script" "passes an argument to init-firewall.sh or pin-jkb-hook.sh"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys

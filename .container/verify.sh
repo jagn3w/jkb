@@ -1077,7 +1077,7 @@ done
 if [ -z "${JKB_SETUP_MARKER:-}" ]; then
     bad "lib.sh did not load, so whether the harness hooks' binary is pinned cannot be checked"
 elif [ -f "$JKB_SETUP_MARKER" ] && [ ! -x /usr/local/lib/jkb-hook/jkb ]; then
-    bad "setup finished but /usr/local/lib/jkb-hook/jkb is missing — the harness hooks have nothing to run (sudo -n /usr/local/bin/pin-jkb-hook.sh \"\")"
+    bad "setup finished but /usr/local/lib/jkb-hook/jkb is missing — the harness hooks have nothing to run (run: sudo -n /usr/local/bin/pin-jkb-hook.sh)"
 fi
 
 #     `sudo -n -l` failing and `sudo -n -l` listing nothing are different facts, and collapsing

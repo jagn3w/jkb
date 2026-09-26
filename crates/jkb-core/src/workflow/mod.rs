@@ -109,9 +109,10 @@ pub enum WorkflowEvent {
     Rework,
     /// It will not be done.
     Cancel,
-    /// Pick a landed or cancelled task back up — once the task itself is reopened
-    /// (`jkb task reopen`): the workflow follows its lifecycle, never leads it, or the next observe
-    /// would put it straight back.
+    /// Pick a landed or cancelled task back up — the operator's alone, and only once the task itself is
+    /// back to work (`jkb task set <uid> --status open`), or the next observe would put it straight
+    /// back. Never reconciled: a lifecycle reopened by anyone else, or by a synced checkbox, leaves the
+    /// workflow parked where the operator acts next.
     Reopen,
     /// The operator names the phase directly. [`Dest::Stated`], so excluded from liveness.
     Override,
@@ -125,8 +126,6 @@ pub enum WorkflowEvent {
     ObservedLanded,
     /// The task's lifecycle says it was cancelled.
     ObservedCancelled,
-    /// The task's lifecycle put a landed or cancelled task back to work.
-    ObservedReopened,
 }
 
 impl Event for WorkflowEvent {
@@ -146,7 +145,6 @@ impl Event for WorkflowEvent {
         Self::ReviewRepeated,
         Self::ObservedLanded,
         Self::ObservedCancelled,
-        Self::ObservedReopened,
     ];
 
     fn name(self) -> &'static str {
@@ -166,7 +164,6 @@ impl Event for WorkflowEvent {
             Self::ReviewRepeated => "review_repeated",
             Self::ObservedLanded => "observed_landed",
             Self::ObservedCancelled => "observed_cancelled",
-            Self::ObservedReopened => "observed_reopened",
         }
     }
 
@@ -176,8 +173,7 @@ impl Event for WorkflowEvent {
             | Self::ReviewFailed
             | Self::ReviewRepeated
             | Self::ObservedLanded
-            | Self::ObservedCancelled
-            | Self::ObservedReopened => EventKind::Reconciled,
+            | Self::ObservedCancelled => EventKind::Reconciled,
             _ => EventKind::Applied,
         }
     }
@@ -344,21 +340,22 @@ fn observed_cancelled(f: &WorkflowFacts) -> Verdict<WorkflowEvent> {
 }
 
 /// The lifecycle put the task back to work: no landing speaks for it and its status is not terminal.
-/// What a workflow `reopen` needs, and what `observed_reopened` reconciles on — one rule for both,
-/// so the two reopens cannot disagree about whether the task is live.
+/// What a workflow `reopen` needs. *Round 2:* this also drove an `observed_reopened` reconciliation,
+/// which let a coordinator reopen a landed task — `task set --status open`, then any observe — when
+/// reopening is the operator's.
 fn reopened(f: &WorkflowFacts) -> Verdict<WorkflowEvent> {
     all_of([
         require_no(f.landed, || {
             Denial::new(
-                "A landing still speaks for this work. Reopen the task itself first (`jkb task \
-                 reopen <uid>`): the workflow follows the task's lifecycle, or the next observe \
+                "A landing still speaks for this work. Reopen the task itself first (`jkb task set \
+                 <uid> --status open`): the workflow follows the task's lifecycle, or the next observe \
                  would put it straight back.",
             )
         }),
         require_no(Fact::from(f.task_status.is_terminal()), || {
             Denial::new(
-                "The task is still finished or cancelled. Reopen the task itself first (`jkb task \
-                 reopen <uid>`).",
+                "The task is still finished or cancelled. Reopen the task itself first (`jkb task set \
+                 <uid> --status open`).",
             )
         }),
     ])
@@ -554,18 +551,7 @@ macro_rules! graph {
             // Reopening a task already back at work is nothing to do — declared, because a guarded
             // row is never absorbed implicitly (`Machine::accepts`).
             row(Phase::Implement, WorkflowEvent::Reopen, Phase::Implement),
-            guarded(
-                Phase::Landed,
-                WorkflowEvent::ObservedReopened,
-                Phase::Implement,
-                reopened,
-            ),
-            guarded(
-                Phase::Cancelled,
-                WorkflowEvent::ObservedReopened,
-                Phase::Implement,
-                reopened,
-            ),
+
             override_from(Phase::Design),
             override_from(Phase::DesignReview),
             override_from(Phase::Implement),

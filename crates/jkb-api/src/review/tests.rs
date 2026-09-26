@@ -355,12 +355,6 @@ fn a_scoped_caller_s_review_credits_only_its_own_task() {
     let b = LocalBackend::new(db.clone());
     let mine = started(&b, "mine", "shared");
     let theirs = started(&b, "theirs", "shared");
-    file(
-        &b,
-        "reviews/s1",
-        &json!([{ "severity": "nit", "summary": "x" }]),
-    )
-    .unwrap();
     let token = match call(
         &b,
         json!({ "op": "role.grant", "role": "coordinator", "task": mine, "agent": "c" }),
@@ -371,7 +365,13 @@ fn a_scoped_caller_s_review_credits_only_its_own_task() {
         other => panic!("{other:?}"),
     };
     let scoped = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
-    let got = record(&scoped, "shared", "reviews/s1").unwrap();
+    file(
+        &scoped,
+        "repos/proj/codereviews/s1",
+        &json!([{ "severity": "nit", "summary": "x" }]),
+    )
+    .unwrap();
+    let got = record(&scoped, "shared", "repos/proj/codereviews/s1").unwrap();
     assert_eq!(
         got.recorded
             .iter()
@@ -409,19 +409,59 @@ fn a_non_operator_records_only_a_filing_and_the_gate_reads_the_recorded_round() 
     // The operator's `/review-log` path (a mount) still records any namespace.
     record(&b, "feat", "reviews/hand").unwrap();
 
-    let filed = file(
+    // Someone else's filing — the operator's here — is not this caller's to record.
+    file(
         &b,
-        "reviews/f",
+        "reviews/op",
+        &json!([{ "severity": "nit", "summary": "theirs" }]),
+    )
+    .unwrap();
+    let e = record(&scoped, "feat", "reviews/op").unwrap_err();
+    assert!(e.message.contains("this caller filed"), "{e:?}");
+    // It files only under its repository's codereviews.
+    let e = file(
+        &scoped,
+        "tasks/elsewhere",
+        &json!([{ "severity": "must-fix", "summary": "do this" }]),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+
+    let ns = "repos/proj/codereviews/f";
+    let filed = file(
+        &scoped,
+        ns,
         &json!([{ "severity": "must-fix", "summary": "bad", "file": "src/a.rs" }]),
     )
     .unwrap();
-    record(&scoped, "feat", "reviews/f").unwrap();
+    record(&scoped, "feat", ns).unwrap();
     call(
         &b,
         json!({ "op": "task.set", "uid": filed.uids[0], "priority": 3 }),
     )
     .unwrap();
-    let f = findings(&b, "reviews/f");
+    let f = findings(&b, ns);
     assert_eq!(f.open_count, 1, "still the must-fix it was recorded as");
     assert_eq!(f.rounds[0].must_fix, 1);
+    // Nothing added to a recorded round afterwards counts, and nothing may be filed inside it.
+    call(
+        &b,
+        json!({ "op": "task.add", "text": "late !p0", "home": format!("{ns}/must-fix"), "managed": true }),
+    )
+    .unwrap();
+    assert_eq!(
+        findings(&b, ns).open_count,
+        1,
+        "a late line is not the round's"
+    );
+    let e = file(
+        &b,
+        &format!("{ns}/more"),
+        &json!([{ "severity": "must-fix", "summary": "inside" }]),
+    )
+    .unwrap_err();
+    assert!(
+        e.message.contains("overlaps the recorded review round"),
+        "{e:?}"
+    );
 }

@@ -453,7 +453,13 @@ pub const MAX_SESSION_TICKETS: usize = 256;
 #[derive(Debug, Default)]
 pub struct Tickets {
     live: Mutex<Live>,
+    /// One lock per attested subagent, `(session, agent_id)`, held across a call's admission, its op
+    /// and the undo of a binding that op's failure owes ([`Tickets::agent_lock`]).
+    agents: Mutex<HashMap<(String, String), AgentLock>>,
 }
+
+/// One attested subagent's lock ([`Tickets::agent_lock`]).
+pub type AgentLock = Arc<Mutex<()>>;
 
 /// The tickets, and the order they expire in. Tickets are minted with a monotonic clock and all live
 /// for the same [`TICKET_BACKSTOP`], so mint order **is** expiry order: expiring is popping from the
@@ -504,6 +510,30 @@ impl Tickets {
     #[must_use]
     pub fn contains(&self, token: &str) -> bool {
         self.get(token).ok().flatten().is_some()
+    }
+
+    /// The lock of the attested subagent `token` names, if it names one. Held by a call for as long as
+    /// it may bind that subagent and undo the binding: a binding is then removed only by the call that
+    /// made it, with no other call of the same subagent in flight — undone unconditionally before, a
+    /// failed first op could delete the binding a concurrent, successful one had just relied on, and
+    /// the worker could bind a second task.
+    ///
+    /// # Errors
+    /// [`ErrorCode::Internal`] for a poisoned store.
+    pub fn agent_lock(&self, token: &str) -> Result<Option<AgentLock>, ApiError> {
+        let Some(t) = self.get(token)? else {
+            return Ok(None);
+        };
+        let Some(agent) = t.agent_id else {
+            return Ok(None);
+        };
+        let mut agents = self
+            .agents
+            .lock()
+            .map_err(|_| ApiError::with_code(ErrorCode::Internal, "agent locks poisoned"))?;
+        Ok(Some(Arc::clone(
+            agents.entry((t.session, agent)).or_default(),
+        )))
     }
 
     fn mint(&self, t: Ticket) -> Result<String, ApiError> {
@@ -559,7 +589,15 @@ impl Tickets {
                 };
             !hit
         });
-        Ok(before - live.by_token.len())
+        let released = before - live.by_token.len();
+        drop(live);
+        // A subagent that stopped, or a session that ended, needs no lock any more.
+        if tool_use_id.is_none() {
+            if let Ok(mut agents) = self.agents.lock() {
+                agents.retain(|(s, a), _| !(s == session && agent_id.is_none_or(|want| want == a)));
+            }
+        }
+        Ok(released)
     }
 }
 
@@ -763,9 +801,13 @@ fn reference_of<'r>(
             // An attested subagent records a review only once it is bound: a review is keyed by
             // branch, and `review::record` holds a scoped caller to its task — which an unbound one
             // does not have.
+            // Filing too: a filing's home is judged against the task the filer is held to.
             if principal.scope.is_none()
                 && principal.attested_agent().is_some()
-                && matches!(request, Request::TaskReviewRecord(_))
+                && matches!(
+                    request,
+                    Request::TaskReviewRecord(_) | Request::TaskReviewFile(_)
+                )
             {
                 return Err(forbidden(format!(
                     "`{op}` refused: {} has not bound to the task it reviews — run `jkb role bind \
@@ -851,10 +893,6 @@ pub fn authorize(
                      of its subtasks, or one of its findings",
                     principal.label
                 )));
-            }
-            if let Request::TaskPlace { ns, .. } = request {
-                check_destination(conn, scope, ns)
-                    .map_err(|e| forbidden(format!("`{op}` refused: {}", e.message)))?;
             }
             Ok(Admit::Run)
         }

@@ -732,11 +732,14 @@ pub const MAX_FINDING_TITLE_CHARS: usize = 200;
 
 /// `task.review_findings`: the findings under `namespaces` (every recorded review of a task).
 ///
-/// **Open must-fix** is the union of two sets: every finding a recorded round held as must-fix when
-/// it was recorded ([`jkb_core::reviews::must_fix_findings`]) that is not yet finished — whatever its
-/// priority or placement reads now, because both are task content the implementer under review can
-/// edit — and any finding now under the namespaces at priority 1 or above, so a finding added to a
-/// round afterwards still counts.
+/// **Open must-fix** is every finding a recorded round held as must-fix when it was recorded
+/// ([`jkb_core::reviews::must_fix_findings`]) that is not yet finished — whatever its priority or
+/// placement reads now, because both are task content the implementer under review can edit. Nothing
+/// live under a **recorded** round counts: a line synced into a mounted round's `tasks.md`, or a task
+/// placed beside the findings, is content too (review round 2), and a finding that matters after a
+/// round was recorded is another round. A namespace no review recorded has no snapshot, so it is read
+/// live (priority 1 or above, unfinished) — what a filing is before it is recorded; the land gate only
+/// ever asks about recorded ones.
 ///
 /// A **typed** scope, never a namespace interpolated into the DSL: a path with `,` in it split into two
 /// scopes that matched nothing, which is indistinguishable from "clean" unless the total is known too
@@ -772,6 +775,26 @@ pub fn review_findings(
     };
     let live = query.evaluate(conn)?;
     let snapshot = jkb_core::reviews::must_fix_findings(conn, namespaces)?;
+    let recorded: Vec<String> = jkb_core::reviews::rounds_in(conn, namespaces)?
+        .into_iter()
+        .map(|r| r.ns)
+        .collect();
+    let unrecorded: Vec<Scope> = namespaces
+        .iter()
+        .filter(|n| !recorded.contains(n))
+        .cloned()
+        .map(Scope::Subtree)
+        .collect();
+    let read_live = if unrecorded.is_empty() {
+        Vec::new()
+    } else {
+        Query {
+            kind: Some("task".to_owned()),
+            scope: Scope::Union(unrecorded),
+            ..Query::default()
+        }
+        .evaluate(conn)?
+    };
     let mut ids = live.clone();
     ids.extend(snapshot.iter().copied().filter(|id| !live.contains(id)));
     if ids.len() > MAX_EXAMINED_FINDINGS {
@@ -805,7 +828,8 @@ pub fn review_findings(
     for id in ids {
         let Some(m) = metas.get(&id) else { continue };
         let status = m.status.as_deref().unwrap_or("open");
-        let must_fix = snapshot.contains(&id) || m.priority.unwrap_or(i64::MAX) <= 1;
+        let must_fix = snapshot.contains(&id)
+            || (read_live.contains(&id) && m.priority.unwrap_or(i64::MAX) <= 1);
         if jkb_types::TaskStatus::is_terminal_str(Some(status)) || !must_fix {
             continue;
         }

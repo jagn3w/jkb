@@ -8,7 +8,8 @@
 # the managed hooks name absolutely, and nothing in the sandbox can replace it: a sandboxed command
 # runs with no_new_privs (measured: `NoNewPrivs: 1`, and `sudo -n` exits 1), so it cannot run this.
 #
-# Run as root through sudoers, with no arguments (`sudo -n pin-jkb-hook.sh ""`), by .container/setup.sh
+# Run as root through sudoers, with no arguments (`sudo -n /usr/local/bin/pin-jkb-hook.sh` — the
+# sudoers entry's `""` means none may be passed, and an empty string is one), by .container/setup.sh
 # after it builds jkb — and again by you after rebuilding jkb in the container.
 #
 # The residual, stated: this pins what `~/.cargo/bin/jkb` is when it runs. setup builds it from the
@@ -17,9 +18,21 @@
 set -euo pipefail
 src=/home/vscode/.cargo/bin/jkb
 dest_dir=/usr/local/lib/jkb-hook
-[ "$(id -u)" = 0 ] || { echo "pin-jkb-hook: must run as root (sudo -n $0 \"\")" >&2; exit 1; }
-[ -f "$src" ] && [ ! -L "$src" ] || { echo "pin-jkb-hook: $src is missing or a symlink" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "pin-jkb-hook: must run as root (sudo -n $0)" >&2; exit 1; }
+[ "$#" -eq 0 ] || { echo "pin-jkb-hook: takes no arguments; its source is fixed" >&2; exit 1; }
 install -d -o root -g root -m 0755 "$dest_dir"
-install -o root -g root -m 0755 "$src" "$dest_dir/jkb.new"
-mv -f "$dest_dir/jkb.new" "$dest_dir/jkb"
+# READ AS vscode, WRITTEN AS root. The source is in a directory the sandbox can write, so checking it
+# and then copying it as root is a race: swapped for a symlink in between, root would copy whatever it
+# named — a root-only file — to a world-readable path. Read with vscode's own permissions, the worst a
+# swap can do is pin a file vscode could already read. The destination is root's alone.
+tmp="$(mktemp "$dest_dir/.jkb.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+# Bounded: a FIFO planted at the source path would otherwise hold setup open for ever.
+timeout 30 runuser -u vscode -- cat -- "$src" > "$tmp" \
+    || { echo "pin-jkb-hook: could not read $src as vscode within 30s" >&2; exit 1; }
+[ -s "$tmp" ] || { echo "pin-jkb-hook: $src is empty" >&2; exit 1; }
+chown root:root "$tmp"
+chmod 0755 "$tmp"
+mv -f "$tmp" "$dest_dir/jkb"
+trap - EXIT
 "$dest_dir/jkb" --version

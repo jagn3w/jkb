@@ -58,9 +58,18 @@ pub(crate) fn scan(root: &Path) -> Vec<(PathBuf, String)> {
     candidates(root)
         .into_iter()
         .filter_map(|dir| {
-            crate::gitrepo::check_repo_config(&dir)
-                .err()
-                .map(|e| (dir, format!("{e:#}")))
+            // jkb's own refusal first; then what only YOUR git would reach — the submodules, which
+            // jkb's git never enters and so never refuses.
+            let why = if let Err(e) = crate::gitrepo::check_repo_config(&dir) {
+                format!("{e:#}")
+            } else {
+                let found = crate::gitrepo::module_findings(&dir);
+                if found.is_empty() {
+                    return None;
+                }
+                format!("its submodules: {}", found.join("; "))
+            };
+            Some((dir, why))
         })
         .collect()
 }

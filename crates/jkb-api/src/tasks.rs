@@ -721,8 +721,8 @@ pub fn undepend(
 /// `task.place`: place a task under `ns` as a reference mirror, or as its primary home.
 ///
 /// # Errors
-/// A malformed namespace, [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`] under `roots`, or a
-/// failed write.
+/// A malformed namespace, [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`] under `roots` or — for a
+/// caller held to the task `scope` — a namespace that task is not placed in, or a failed write.
 pub fn place(
     conn: &Connection,
     meta: &jkb_core::WriteMeta,
@@ -730,8 +730,14 @@ pub fn place(
     namespace: &str,
     home: bool,
     roots: Option<&FileRoots>,
+    scope: Option<ItemId>,
 ) -> Result<(), ApiError> {
     let id = writable(conn, reference, roots)?;
+    // Held here, on the scope the caller has once admitted — which for an attested subagent's first
+    // write is the task that write just bound it to, a scope `authorize` does not yet see.
+    if let Some(scope) = scope {
+        crate::rbac::check_destination(conn, scope, namespace)?;
+    }
     let ns_id = ns::ensure(conn, namespace)?;
     if home {
         task::set_primary_home(conn, meta, id, ns_id, 0)?;

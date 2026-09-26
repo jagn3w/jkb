@@ -684,6 +684,29 @@ const SHELL_SYNTAX: &[char] = &[
     '[', ']', '~',
 ];
 
+/// The words a command the shell will run as — quotes removed, as the shell removes them. `None` for an
+/// unbalanced quote. Sound only for a command with none of [`SHELL_SYNTAX`] in it: with no `$`, `` ` ``
+/// or `\\`, nothing inside either kind of quote is expanded or escaped.
+fn shell_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                word.get_or_insert_with(String::new);
+            }
+            (None, c) if c.is_whitespace() => words.extend(word.take()),
+            // Inside quotes or out, anything else is part of the word.
+            (_, c) => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    quote.is_none().then_some(words)
+}
+
 /// Classify a Bash command for [`attest`].
 fn attestation(command: &str) -> Attestation {
     if !runs_jkb(command) {
@@ -693,14 +716,20 @@ fn attestation(command: &str) -> Attestation {
     if command.contains(SHELL_SYNTAX) {
         return Attestation::Ask;
     }
-    let mut words = command.split_whitespace();
+    // Judged on the words the shell will pass, never the raw text: `task 'land'` is `task land` to
+    // the shell, and a raw comparison auto-approved it, `--gate` and all.
+    let Some(words) = shell_words(command) else {
+        return Attestation::Ask;
+    };
+    let mut words = words.into_iter();
     // `jkb` found on PATH, by name: a path to some other file called `jkb` is some other program.
-    if words.next() != Some("jkb") {
+    if words.next().as_deref() != Some("jkb") {
         return Attestation::Ask;
     }
-    let sub: Vec<&str> = words.filter(|w| !w.starts_with('-')).take(2).collect();
-    // `task land` runs the repository's gate — a shell command — where it is invoked.
-    if sub == ["task", "land"] {
+    // `task land` runs the repository's gate — a shell command — where it is invoked. Asked wherever
+    // `land` appears, rather than by locating the subcommand: a global option's value (`--db <path>`)
+    // sits where a parser that does not know every option would look for it.
+    if words.any(|w| w == "land") {
         return Attestation::Ask;
     }
     Attestation::Allow
@@ -850,6 +879,11 @@ mod tests {
             "FOO=1 jkb ls",
             "jkb task land task:x",
             "jkb --json task land task:x --gate true",
+            "jkb task 'land' task:x --gate 'sh /tmp/p.sh'",
+            "jkb task \"land\" task:x",
+            "jkb --db /home/vscode/.jkb/jkb.db task land task:x",
+            "jkb 'task' land x",
+            "jkb task add 'unbalanced",
             "jkb ls\nrm -rf /",
         ] {
             assert_eq!(attestation(ask), Attestation::Ask, "{ask}");

@@ -513,8 +513,9 @@ per-worktree config all fail, and the config is left unchanged. **A speed bump, 
 (corrected by review round 1): `.git/` is writable around the binds, so renaming `.git` itself away,
 or planting `.git/commondir` — which redirects git's config and hooks anywhere (measured on git
 2.51.1) — gets past them, and submodule configs are not bound. What holds is jkb's own audit before
-every git call, which also refuses a redirected git directory and judges submodule configs, and the
-reap service's scan of the same for your git (`docs/task-lifecycle.md`, D52). What it costs in here: `git config
+every git call, which also refuses a redirected git directory — and jkb's git never enters a
+submodule — and the reap service's scan, which also reports submodule configs, for your git
+(`docs/task-lifecycle.md`, D52). What it costs in here: `git config
 --local` and `git remote add` fail; `branch --set-upstream-to` and `push -u` print an error, exit
 0 and record no upstream — set those on the host. Status, commit, branches, fetch and `git worktree
 add`/`remove` (so `jkb task work`) are unaffected. A repository cloned after the container starts is
@@ -538,8 +539,8 @@ could add would run unsandboxed).
 **The hooks run a pinned, root-owned `jkb`** — `/usr/local/lib/jkb-hook/jkb`, never `jkb` from
 PATH. They run outside the sandbox with the credential readable, and `~/.cargo/bin` is writable from
 inside it (measured: a sandboxed `touch ~/.cargo/bin/x` succeeds), so a PATH lookup ran whatever a
-tool call last installed there. `setup.sh` pins its build with `sudo -n pin-jkb-hook.sh ""` (a
-root script, sudoers-pinned to no arguments), which a sandboxed command cannot run (measured:
+tool call last installed there. `setup.sh` pins its build with `sudo -n /usr/local/bin/pin-jkb-hook.sh`
+(a root script, sudoers-pinned to no arguments), which a sandboxed command cannot run (measured:
 `NoNewPrivs: 1`, `sudo -n` exits 1). After rebuilding jkb yourself, run it again. `check-config.sh`
 refuses a managed hook naming anything else, and `verify.sh` that the pinned binary is missing or
 writable. The residual: it pins whatever `~/.cargo/bin/jkb` is when it runs.

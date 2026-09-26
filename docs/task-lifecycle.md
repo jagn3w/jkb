@@ -796,10 +796,13 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   mid-flight — at its **first move**, whatever it runs then, including the default: pinning only
   on `workflow set` let a redefined `default` change a task already in `landable` (review round 1).
   An unreadable stored `default` is refused, never replaced by the preset. The log is append-only;
-  permission is checked **in the callee** (`store::fire`). A workflow `reopen` **follows** the
-  task's lifecycle rather than leading it (`jkb task reopen` first, then `observed_reopened`
-  reconciles), and is the operator's: a workflow reopened alone was put straight back by the next
-  observe. Deleting a task revokes its grants and keeps its workflow history (V022 has no cascade
+  permission is checked **in the callee** (`store::fire`). A workflow `reopen` is the
+  operator's, and **follows** the task's lifecycle rather than leading it: it needs the task back
+  to work first (`jkb task set <uid> --status open`), or the next observe would put it straight
+  back. Nothing reconciles a reopen — a lifecycle reopened by a coordinator or a synced checkbox
+  leaves the workflow parked where the operator acts next. *Superseded (round 2):* an
+  `observed_reopened` reconciliation let any observe follow a lifecycle reopen, so a coordinator
+  could reopen a landed task. Deleting a task revokes its grants and keeps its workflow history (V022 has no cascade
   from `items`, which is AUTOINCREMENT), so `item rm` + `undo` gives back a task still pinned.
 - **`jkb-core/src/reviews.rs`** (V023) — the land gate's review facts, **out of tags**.
 - **`jkb-api/src/rbac.rs`** — `Request::permission` (exhaustive), `OP_GRANTS`, principals,
@@ -831,11 +834,18 @@ names — and rounds are ordered by recording. *Superseded:* a round was first r
 the highest item id among its findings, and review round 1 showed why that fails: a finding's
 priority, placement and `area=` are ordinary task content, so the implementer under review could
 lower its own last round's must-fix, or file a line into an older clean round so it sorted newest.
-The gate's open-must-fix count is the snapshot's must-fixes not yet finished **plus** anything now
-in the namespaces at `p1` or above. A round a **non-operator** records must be a namespace
-`task.review_file` filed (`review_filings`), and holds exactly what it filed: naming `tasks` as a
-round would otherwise have put every task in the recording task's scope. The operator's
-`/review-log`, whose findings arrive through a mount, still records any namespace.
+The gate's open-must-fix count is the snapshot's must-fixes not yet finished — and nothing live
+under a recorded round: *round 2* found the live half (anything now at `p1` under the namespace)
+reachable by a line synced into a mounted round's `tasks.md` and by a task placed beside the
+findings. A finding that matters after a round is recorded is another round. A round a
+**non-operator** records must be a namespace **it** filed with `task.review_file`
+(`review_filings.filed_by`), and holds exactly what it filed: naming `tasks` as a round would put
+every task in the recording task's scope, and recording another worker's filing would pull that
+round's findings into its own. The operator's `/review-log`, whose findings arrive through a mount,
+still records any namespace. A filing is refused into, above or below any recorded round; a
+principal held to one task files only under `repos/<repo>/codereviews/` of its task's repository
+(the nearest `repo=` up its parents) — findings are ordinary open tasks on the shared frontier —
+and an attested subagent binds before it files.
 
 **Review facts are not tags (hole H3).** `reviewed=`, `review=` and `review-waived=` decided the
 gate, and a tag is content any writer may set — the sync engine included, applying a `tasks.md`
@@ -858,10 +868,12 @@ chooses: a command its ticket or role token, else the container credential if it
 (a person at a container terminal can; the model's sandboxed tools cannot); a hook the container
 credential; `jkb mcp` only an operator-configured role token — never the container's ceiling on
 behalf of every agent it serves. The daemon caches grant hashes so a wrong token costs at most
-one read a second — claimed under the lock, on the reader connection — empties the cache when it
-grants or revokes, and re-resolves every call from the database so a revocation is never served
-stale; a call that then fails `Unauthorized` evicts its hash and closes the connection, so a grant
-revoked behind the daemon's back cannot hold slots open. The container credential is marked in its
+one read a second — claimed under the lock, on the reader connection, and released if the read
+fails — lets a grant it mints refresh at once, and re-resolves every call from the database so a
+revocation is never served stale; a call that then fails `Unauthorized` evicts its hash and closes
+the connection, so a grant revoked behind the daemon's back cannot hold slots open. *Round 2:*
+emptying the whole cache on every grant or revocation made every live token miss at once, and the
+misses during the refresh were refused — the container credential's attestation calls among them. The container credential is marked in its
 own column, set only by rotation — a grant the operator merely labelled `container` mints no
 tickets. A session holds at most 256 live tickets, the daemon 4096, expired in mint order.
 
@@ -904,21 +916,35 @@ Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed 
    (measured: `rev-parse --git-common-dir` then answers the planted one). An empty directory there
    is no defence either — git dies on it (measured). Submodule configs (`.git/modules/*/config`) are
    not bound at all.
-2. Every jkb git call audits the repository **fresh, before every call**, and runs hooks-off. It
-   judges every key of the repository's own config — local, worktree, included, and each
-   submodule's — against an **allowlist** of repository-shape keys (`git config --list
+2. Every jkb git call audits the repository **fresh, before every call**, runs hooks-off, and
+   **never enters a submodule**: `-c diff.ignoreSubmodules=dirty` and friends, and
+   `--ignore-submodules=dirty` on every `status` and `diff` — on the command line because a tracked
+   `.gitmodules` can set `submodule.<name>.ignore=none`, which outranks the `-c` (measured on git
+   2.51.1: a superproject `status` ran a filter planted in `.git/modules/sub/config`, and with the
+   option it did not, still reporting a moved submodule commit). The cost: a submodule's uncommitted
+   edits no longer make a checkout read dirty — a graft carries only the submodule's commit anyway.
+   It judges every key of the repository's own config — local, worktree and included — against an
+   **allowlist** of repository-shape keys (`git config --list
    --show-origin --show-scope` executes nothing; `-c core.fsmonitor=false -c core.hooksPath=/dev/null`
    does *not* stop a planted filter, so the audit is what holds). It refuses a git directory that
    takes its config and hooks from anywhere but its repository: a main repository's git directory is
    its own common directory, a linked worktree's is `<common>/worktrees/<name>`, and a jkb session's
-   common directory is its repository's `.git`. The allowlist names keys, not sections:
-   `core.worktree` points checkout at any directory (`$HOME` included, measured) and
+   common directory is its repository's `.git` — or, for a repository nested in the session, one
+   of that repository's own submodules. The allowlist names keys, not sections: `core.worktree`
+   points checkout at any directory (`$HOME` included, measured) and
    `status.showUntrackedFiles=no` hides what a landing left, so both are refused — except a
-   submodule's own `core.worktree` pointing back into the superproject, which git writes. *Also
-   corrected:* the audit was once per directory per process, so the reap service, one long process,
-   never re-read a config it had passed.
-3. The reap service runs the same check on every repo and session worktree each pass and posts a
-   sticky notification — the only layer that covers **your** git, run by hand.
+   submodule git directory's own `core.worktree` landing inside its repository, which git writes.
+   *Also corrected:* the audit was once per directory per process, so the reap service, one long
+   process, never re-read a config it had passed. *Superseded (round 2):* round 1 walked every file
+   named `config` under `.git/modules` in the blocking audit — which read loose refs as configs,
+   missed per-worktree `modules/` and redirected submodule `.git` files, and was fooled by symlinks.
+   jkb's git no longer reads a submodule at all, so what a submodule's git directory holds is the
+   reap scan's to report (below).
+3. The reap service runs the same check on every repo and session worktree each pass, plus what
+   only your git reaches — each submodule git directory's own config (real git directories only,
+   top-level `config` only, symlinks reported, `core.worktree` judged through symlinks) and each
+   submodule checkout's `.git` link — and posts a sticky notification. The only layer that covers
+   **your** git, run by hand.
 
 And the land gate — the candidate's own code — runs in the container through `docker exec` (exit
 status and output measured intact), settled before the graft, for a repository under `~/repos`,
@@ -937,8 +963,9 @@ the merge queue as unscoped (round 1). A scoped caller adds tasks only `--under`
 tasks (`task.add`'s home and mirrors, `task.place`) only where its task itself is placed — never
 into a review round. `review::record` credits only in-scope tasks for a scoped caller. An attested
 subagent binds to its task on its first task-targeted write, or explicitly with `jkb role bind
-<uid>` — a binding its first op made is undone if that op then fails — and a reviewer must be bound
-before it records a review. `--no-review` asks who the client is before anything moves, whatever
+<uid>` — a binding its first op made is undone if that op then fails, and one subagent's calls are
+serialized from admission to that undo, so it never undoes a binding a concurrent call of its own
+relied on — and a reviewer must be bound before it records or files a review. `--no-review` asks who the client is before anything moves, whatever
 credential it presents.
 
 **Swarm landings follow the task's strategy.** `scripts/merge-queue.sh` records a landing with

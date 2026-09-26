@@ -348,7 +348,12 @@ fn a_cancelled_task_settles_its_workflow_and_revokes_its_workers() {
 }
 
 /// Record `ns` (already holding findings) against `id` as `source` allows.
-fn record(db: &Db, id: ItemId, ns: &str, source: crate::reviews::RoundSource) -> crate::Result<()> {
+fn record(
+    db: &Db,
+    id: ItemId,
+    ns: &str,
+    source: crate::reviews::RoundSource<'static>,
+) -> crate::Result<()> {
     let ns = ns.to_owned();
     db.write_txn("test", move |c, m| {
         crate::reviews::record(c, m, id, &ns, "abc", "test", source)
@@ -398,7 +403,7 @@ fn only_a_filing_is_a_round_to_a_non_operator_and_scope_follows_the_snapshot() {
             create(c, m, &spec)
         })
         .unwrap();
-    let e = record(&db, id, "tasks", crate::reviews::RoundSource::Filed).unwrap_err();
+    let e = record(&db, id, "tasks", crate::reviews::RoundSource::Filed("w")).unwrap_err();
     assert!(e.to_string().contains("not a namespace"), "{e}");
     assert!(!db.read(move |c| roles::in_scope(c, id, other)).unwrap());
     // A filing: exactly what was filed is the round, and so the scope.
@@ -408,11 +413,26 @@ fn only_a_filing_is_a_round_to_a_non_operator_and_scope_follows_the_snapshot() {
             spec.home = "reviews/f/must-fix".into();
             spec.priority = Some(1);
             let f = create(c, m, &spec)?;
-            crate::reviews::record_filing(c, "reviews/f", &[f])?;
+            crate::reviews::record_filing(c, "reviews/f", &[f], "w")?;
             Ok(f)
         })
         .unwrap();
-    record(&db, id, "reviews/f", crate::reviews::RoundSource::Filed).unwrap();
+    // Someone else's filing is not this caller's to record.
+    let e = record(
+        &db,
+        id,
+        "reviews/f",
+        crate::reviews::RoundSource::Filed("other"),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("this caller filed"), "{e}");
+    record(
+        &db,
+        id,
+        "reviews/f",
+        crate::reviews::RoundSource::Filed("w"),
+    )
+    .unwrap();
     assert!(db.read(move |c| roles::in_scope(c, id, f)).unwrap());
     // Something placed under the round's namespace afterwards is not one of its findings.
     let late = db
@@ -473,7 +493,7 @@ fn an_unreadable_default_is_refused_not_replaced_by_the_preset() {
 }
 
 #[test]
-fn reopen_follows_the_task_s_lifecycle() {
+fn reopen_follows_the_task_s_lifecycle_and_is_the_operator_s() {
     let db = Db::open_in_memory().unwrap();
     let id = a_task(&db);
     db.write_txn("test", move |c, m| {
@@ -490,9 +510,17 @@ fn reopen_follows_the_task_s_lifecycle() {
     // Reopening the workflow alone would be undone by the next observe.
     let refused = do_fire(&db, id, WorkflowEvent::Reopen, Role::Operator, None);
     assert!(
-        matches!(&refused, Moved::Refused(why) if why.contains("jkb task reopen")),
+        matches!(&refused, Moved::Refused(why) if why.contains("--status open")),
         "{refused:?}"
     );
+    // The lifecycle is reopened — by anyone, a synced checkbox included — and the workflow stays
+    // parked: observing does not follow it, and only the operator's `reopen` does.
+    db.write_txn("test", move |c, m| set_status(c, m, id, TaskStatus::Open))
+        .unwrap();
+    assert!(matches!(
+        do_observe(&db, id),
+        Moved::AlreadyThere(Phase::Cancelled)
+    ));
     assert!(
         matches!(
             do_fire(&db, id, WorkflowEvent::Reopen, Role::Coordinator, None),
@@ -500,20 +528,12 @@ fn reopen_follows_the_task_s_lifecycle() {
         ),
         "the coordinator does not reopen"
     );
-    // The lifecycle reopens; observing follows it.
-    db.write_txn("test", move |c, m| set_status(c, m, id, TaskStatus::Open))
-        .unwrap();
     assert!(matches!(
-        do_observe(&db, id),
+        do_fire(&db, id, WorkflowEvent::Reopen, Role::Operator, None),
         Moved::To {
-            event: WorkflowEvent::ObservedReopened,
             to: Phase::Implement,
             ..
         }
-    ));
-    assert!(matches!(
-        do_observe(&db, id),
-        Moved::AlreadyThere(Phase::Implement)
     ));
     assert!(matches!(
         do_fire(&db, id, WorkflowEvent::Reopen, Role::Operator, None),

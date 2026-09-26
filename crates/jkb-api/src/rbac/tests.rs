@@ -419,6 +419,12 @@ fn a_scoped_caller_adds_only_under_its_task_and_records_only_its_own_review() {
                          "findings": "reviews/x" });
     let e = refused(&rev, record);
     assert!(e.message.contains("jkb role bind"), "{e:?}");
+    let e = refused(
+        &rev,
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+                "ns": "repos/r/codereviews/x", "findings": [] }),
+    );
+    assert!(e.message.contains("jkb role bind"), "a filing too: {e:?}");
     ok(&rev, json!({ "op": "role.bind", "uid": a }));
     match ok(&rev, json!({ "op": "role.whoami" })) {
         Response::WhoAmI { whoami } => assert_eq!(whoami.task.as_deref(), Some(a.as_str())),
@@ -536,4 +542,72 @@ fn a_session_holds_a_bounded_number_of_live_tickets() {
         json!({ "op": "attest.release", "session": "greedy", "tool_use_id": "t0" }),
     );
     mint("greedy", usize::MAX).unwrap();
+}
+
+/// An attested subagent's FIRST write binds it, and is held to the scope that binding makes: placing
+/// its task into another task's review round is refused even then.
+#[test]
+fn a_first_write_that_binds_is_held_to_the_scope_it_binds() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "implementer", "role": "implementer" }),
+    );
+    let ticket = match ok(
+        &kb.as_token(&container),
+        json!({ "op": "attest.mint", "session": "s", "agent_id": "i1",
+                "agent_type": "implementer", "tool_use_id": "t" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let e = refused(
+        &kb.as_token(&ticket),
+        json!({ "op": "task.place", "uid": a, "ns": "repos/p/codereviews/other/must-fix" }),
+    );
+    assert!(e.message.contains("only where that task is"), "{e:?}");
+}
+
+/// Every call of one attested subagent takes the same lock — two of its tickets included — so a
+/// binding its failed call undoes cannot be one a concurrent call of it relied on. The main session
+/// takes none, and a stopped subagent's lock goes with it.
+#[test]
+fn one_subagent_s_calls_share_one_lock_until_it_stops() {
+    let kb = Kb::new();
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let hook = kb.as_token(&container);
+    let mint = |agent: Option<&str>, tool: &str| match ok(
+        &hook,
+        json!({ "op": "attest.mint", "session": "s", "agent_id": agent, "tool_use_id": tool }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let (t1, t2, main) = (
+        mint(Some("a1"), "x1"),
+        mint(Some("a1"), "x2"),
+        mint(None, "x3"),
+    );
+    let l1 = kb.tickets.agent_lock(&t1).unwrap().unwrap();
+    let l2 = kb.tickets.agent_lock(&t2).unwrap().unwrap();
+    assert!(
+        Arc::ptr_eq(&l1, &l2),
+        "one lock per subagent, whatever the ticket"
+    );
+    assert!(kb.tickets.agent_lock(&main).unwrap().is_none());
+    ok(
+        &hook,
+        json!({ "op": "attest.release", "session": "s", "agent_id": "a1" }),
+    );
+    let t3 = mint(Some("a1"), "x4");
+    let l3 = kb.tickets.agent_lock(&t3).unwrap().unwrap();
+    assert!(!Arc::ptr_eq(&l1, &l3), "released with the subagent");
 }

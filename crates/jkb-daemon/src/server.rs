@@ -212,8 +212,8 @@ struct State {
 /// recognized without a database read per request (D52.3). A hit is only admission: every call
 /// resolves its principal from the database again, so a revocation is never served stale — and a
 /// call refused `Unauthorized` evicts its hash and closes the connection, so a revoked holder cannot
-/// keep riding the cache past the read timeout and the op permits. A grant or revocation this daemon
-/// serves empties the set. A miss refreshes it at most once per [`GRANT_REFRESH`] — claimed under the
+/// keep riding the cache past the read timeout and the op permits. A grant this daemon serves lets the
+/// next miss refresh at once. A miss refreshes it at most once per [`GRANT_REFRESH`] — claimed under the
 /// lock, so a burst of misses costs **one** read, on the reader connection rather than ahead of the
 /// hooks' writes; the misses that arrive during it are answered as misses. A grant the host CLI wrote
 /// directly may wait out one interval.
@@ -525,8 +525,19 @@ async fn authenticate(state: &Arc<State>, given: &str) -> Result<Option<Caller>,
         // rather than starting a read of its own.
         cache.refreshed = Some(std::time::Instant::now());
     }
-    let (backend, _) = ready(state).await?;
-    let live = blocking_read(backend.reads(), jkb_core::roles::live_by_hash).await?;
+    let read = async {
+        let (backend, _) = ready(state).await?;
+        blocking_read(backend.reads(), jkb_core::roles::live_by_hash).await
+    };
+    let live = match read.await {
+        Ok(live) => live,
+        Err(e) => {
+            // Released, so the next miss tries again rather than every token waiting out the
+            // interval behind a read that never came back.
+            lock()?.refreshed = None;
+            return Err(e);
+        }
+    };
     let mut cache = lock()?;
     cache.hashes = live.into_iter().map(|(h, _)| h).collect();
     Ok(cache
@@ -972,9 +983,9 @@ async fn handle(
     ))
 }
 
-/// The reply to a served op, keeping the grant cache honest on the way: a grant or revocation this
-/// daemon served empties it, and a token admitted from it that then failed to resolve is evicted and
-/// its connection closed.
+/// The reply to a served op, keeping the grant cache honest on the way: a grant this daemon served
+/// lets the next miss refresh at once, and a token admitted from the cache that then failed to resolve
+/// is evicted and its connection closed.
 fn answer(
     state: &State,
     given: &str,
@@ -982,14 +993,12 @@ fn answer(
 ) -> hyper::Response<Full<Bytes>> {
     match served {
         Ok(response) => {
-            // A grant this daemon just minted must authenticate on the very next request, and
-            // one it just revoked (a rotation revokes too) must stop being admitted.
-            if matches!(
-                response,
-                Response::Granted { .. } | Response::Revoked { .. }
-            ) {
+            // A grant this daemon just minted must authenticate on the very next request: its miss
+            // may refresh at once. The set is kept — emptying it on every grant or revocation made
+            // every live token miss, and the misses during that refresh were refused. A revoked
+            // token needs nothing here: its next call fails to resolve and is evicted below.
+            if matches!(response, Response::Granted { .. }) {
                 if let Ok(mut cache) = state.grants.lock() {
-                    cache.hashes.clear();
                     cache.refreshed = None;
                 }
             }

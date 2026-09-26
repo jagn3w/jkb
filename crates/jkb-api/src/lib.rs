@@ -2564,6 +2564,16 @@ impl Backend for LocalBackend {
     }
 
     fn call(&self, request: Request) -> Result<Response, ApiError> {
+        // One call at a time per attested subagent, from admission to the undo below.
+        let agent_lock = match (&self.caller, &self.tickets) {
+            (rbac::Caller::Token(t), Some(tickets)) => tickets.agent_lock(t)?,
+            _ => None,
+        };
+        let _serial = agent_lock
+            .as_ref()
+            .map(|m| m.lock())
+            .transpose()
+            .map_err(|_| ApiError::with_code(ErrorCode::Internal, "agent lock poisoned"))?;
         let (principal, bound) = self.admit(&request)?;
         let out = self.dispatch(request, &principal);
         // A binding this call made is kept only if the op it was made for ran: a first op refused
@@ -2997,8 +3007,9 @@ impl LocalBackend {
             }
             Request::TaskPlace { uid, ns, home } => {
                 let roots = self.file_roots.clone();
+                let scope = principal.scope;
                 task_write(db, actor, uid, move |c, m, uid| {
-                    tasks::place(c, m, uid, &ns, home, roots.as_ref())
+                    tasks::place(c, m, uid, &ns, home, roots.as_ref(), scope)
                 })?;
                 Response::Applied {}
             }
@@ -3139,9 +3150,13 @@ impl LocalBackend {
                     })?,
                 }
             }
-            Request::TaskReviewFile(ask) => Response::ReviewFiled {
-                filed: db.write_txn_with(actor, move |c, m| review::file(c, m, &ask))?,
-            },
+            Request::TaskReviewFile(ask) => {
+                let (who, scope) = (principal.label.clone(), principal.scope);
+                Response::ReviewFiled {
+                    filed: db
+                        .write_txn_with(actor, move |c, m| review::file(c, m, &ask, &who, scope))?,
+                }
+            }
             Request::TaskReviewRecord(ask) => {
                 let roots = self.file_roots.clone();
                 Response::ReviewRecorded {
@@ -3151,12 +3166,13 @@ impl LocalBackend {
                         // Only the operator records a round its findings reached the KB for some
                         // other way than a filing (a mount): what a round holds becomes the scope
                         // of the task's workers.
-                        let source = if principal.is_operator() {
-                            jkb_core::reviews::RoundSource::AnyNamespace
-                        } else {
-                            jkb_core::reviews::RoundSource::Filed
-                        };
+                        let operator = principal.is_operator();
                         db.write_txn_with(actor, move |c, m| {
+                            let source = if operator {
+                                jkb_core::reviews::RoundSource::AnyNamespace
+                            } else {
+                                jkb_core::reviews::RoundSource::Filed(&who)
+                            };
                             review::record(c, m, &ask, roots.as_ref(), &who, scope, source)
                         })?
                     },

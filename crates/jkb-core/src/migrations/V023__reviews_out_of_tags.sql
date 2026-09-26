@@ -30,9 +30,12 @@ CREATE INDEX idx_reviews_item ON reviews (item_id, id);
 -- What `task.review_file` filed into each findings namespace. A round a non-operator records must be
 -- one of these, and holds exactly these items: a namespace a caller merely NAMED (`tasks`) would
 -- otherwise put every task under it into the recording task's scope (D52.4).
+-- `filed_by` is the principal that filed it: a non-operator records only its own filing, or it could
+-- record another task's round against its own and so bring that round's findings into its scope.
 CREATE TABLE review_filings (
-    ns       TEXT NOT NULL,
-    item_id  INTEGER NOT NULL,
+    ns        TEXT NOT NULL,
+    item_id   INTEGER NOT NULL,
+    filed_by  TEXT NOT NULL,
     PRIMARY KEY (ns, item_id)
 );
 

@@ -995,9 +995,9 @@ callers_ok=1
 callers=()
 for f in "$here"/*.sh; do
     case "$(basename "$f")" in
-        init-firewall.sh|check-config.sh|mutate-config.sh) continue ;;  # the script itself, and the two harnesses that quote it
+        init-firewall.sh|pin-jkb-hook.sh|check-config.sh|mutate-config.sh) continue ;;  # the scripts themselves, and the two harnesses that quote them
     esac
-    grep -qF 'init-firewall.sh' "$f" && callers+=("$f")
+    grep -qE 'init-firewall\.sh|pin-jkb-hook\.sh' "$f" && callers+=("$f")
 done
 [ "${#callers[@]}" -gt 0 ] || bad "no script here calls init-firewall.sh — the derivation below is checking nothing"
 for want in setup.sh run.sh entrypoint.sh; do
@@ -1017,8 +1017,10 @@ for caller in ${callers[@]+"${callers[@]}"}; do
     # comments are stripped first, because a comment can mention sudoers too. A caller running it
     # as root without sudo would slip past, and that is deliberate: nothing here is root, and the
     # rule this guard enforces is a property of the sudoers grant.
-    if dc_strip_comments "$caller" | grep -nE 'sudo[^#]*init-firewall\.sh[[:space:]]+[^;|&>#[:space:]]' >/dev/null; then
-        bad "$(basename "$caller") passes an argument to init-firewall.sh — sudoers permits none, and the allowlist is the root-owned snapshot"
+    # The same rule for every sudoers grant pinned to no arguments (`cmd ""`): pin-jkb-hook.sh was
+    # first called with `""`, which is an argument, so sudo would refuse it and setup would stop.
+    if dc_strip_comments "$caller" | grep -nE 'sudo[^#]*(init-firewall|pin-jkb-hook)\.sh[[:space:]]+[^;|&>#[:space:]]' >/dev/null; then
+        bad "$(basename "$caller") passes an argument to init-firewall.sh or pin-jkb-hook.sh — sudoers permits none to either, so sudo refuses the call"
         callers_ok=0
     fi
 done

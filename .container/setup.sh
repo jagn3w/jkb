@@ -74,7 +74,7 @@ jkb --version || true
 # The harness hooks run a root-owned copy of this build, not `jkb` from PATH: ~/.cargo/bin is
 # writable from the sandbox, and the hooks run outside it with the container credential (D52.9).
 say "pin the jkb the harness hooks run"
-sudo -n /usr/local/bin/pin-jkb-hook.sh ""
+sudo -n /usr/local/bin/pin-jkb-hook.sh
 
 # The .vsix files were staged into the image by fetch-extensions.sh, because a connect-time
 # download is refused by the firewall this script raised in its first act. Installing from disk
