@@ -411,18 +411,26 @@ fn find_docker() -> Option<PathBuf> {
 /// Where the gate for a landing in `dir` must run.
 ///
 /// **The gate builds and tests the candidate** — code written in the dev container that the operator
-/// has not yet accepted — so on the host it runs in the container, when the checkout is one the
-/// container shares (`~/repos`). A checkout outside it cannot have been written from the container,
+/// has not yet accepted — so on the host it runs in the container, when the repository is one the
+/// container shares (`~/repos`). A repository outside it cannot have been written from the container,
 /// and runs here; so does every gate inside the container itself. `on_host` is the operator's
 /// override, recorded by the caller.
 ///
+/// Decided on **canonical** paths, and on the repository as well as the checkout: git reports a
+/// checkout by its physical path, so with `~/repos` a symlink (which `run.sh` supports) a textual
+/// prefix test never matched and every gate ran here, silently. And a landing checkout outside
+/// `~/repos` of a repository inside it still lands code written in the container — which the
+/// container cannot see there, so that is refused rather than run here.
+///
 /// # Errors
-/// Refuses when the gate must run in the container and cannot: no `docker`, or the container is not
-/// running.
+/// Refuses when the gate must run in the container and cannot: no `docker`, the container is not
+/// running, or the landing checkout is not one it can see.
 pub fn gate_place(dir: &Path, on_host: bool) -> Result<GatePlace> {
     let name = std::env::var("JKB_CONTAINER_NAME").unwrap_or_else(|_| CONTAINER_NAME.to_owned());
+    let repo = crate::gitrepo::main_root(dir).ok().flatten();
     gate_place_with(
         dir,
+        repo.as_deref(),
         on_host,
         in_container(),
         std::env::var_os("HOME").map(PathBuf::from).as_deref(),
@@ -441,8 +449,10 @@ pub fn gate_place(dir: &Path, on_host: bool) -> Result<GatePlace> {
 
 /// [`gate_place`] with its environment handed in, so every branch is testable where there is no
 /// container to ask.
+#[allow(clippy::too_many_arguments)]
 fn gate_place_with(
     dir: &Path,
+    repo: Option<&Path>,
     on_host: bool,
     in_container: bool,
     home: Option<&Path>,
@@ -456,16 +466,24 @@ fn gate_place_with(
     let Some(home) = home else {
         return Ok(GatePlace::Here);
     };
-    let shared = home.join(jkb_daemon::CLIENT_FILE_ROOT);
-    let Ok(rel) = dir.strip_prefix(&shared) else {
-        return Ok(GatePlace::Here);
-    };
+    let shared = canonical(&home.join(jkb_daemon::CLIENT_FILE_ROOT));
     let refuse = |why: &str| {
         anyhow::anyhow!(
             "the gate runs the candidate's own code, which was written in the dev container, so it \
              runs there (design D52.12) — but {why}. Start it (.container/run.sh), or land with \
              --gate-on-host to run it here, recorded on the task."
         )
+    };
+    let dir = canonical(dir);
+    let Ok(rel) = dir.strip_prefix(&shared) else {
+        if repo.is_some_and(|r| canonical(r).starts_with(&shared)) {
+            return Err(refuse(&format!(
+                "this landing checkout ({}) is outside {}, where the container cannot see it",
+                dir.display(),
+                shared.display()
+            )));
+        }
+        return Ok(GatePlace::Here);
     };
     let docker = docker().ok_or_else(|| refuse("`docker` is not installed here"))?;
     if !running(&docker, name) {
@@ -578,7 +596,17 @@ mod tests {
         let docker = || Some(PathBuf::from("/usr/local/bin/docker"));
         let up = |_: &Path, _: &str| true;
         assert_eq!(
-            gate_place_with(shared, false, false, Some(home), docker, "jkb-dev", up).unwrap(),
+            gate_place_with(
+                shared,
+                None,
+                false,
+                false,
+                Some(home),
+                docker,
+                "jkb-dev",
+                up
+            )
+            .unwrap(),
             GatePlace::Container {
                 docker: "/usr/local/bin/docker".into(),
                 name: "jkb-dev".into(),
@@ -587,7 +615,17 @@ mod tests {
             "seen through the ~/repos bind"
         );
         let here = |dir, on_host, inside| {
-            gate_place_with(dir, on_host, inside, Some(home), docker, "jkb-dev", up).unwrap()
+            gate_place_with(
+                dir,
+                None,
+                on_host,
+                inside,
+                Some(home),
+                docker,
+                "jkb-dev",
+                up,
+            )
+            .unwrap()
         };
         assert_eq!(
             here(Path::new("/Users/op/other/r"), false, false),
@@ -602,6 +640,7 @@ mod tests {
         );
         let down = gate_place_with(
             shared,
+            None,
             false,
             false,
             Some(home),
@@ -615,10 +654,74 @@ mod tests {
             down.contains("`jkb-dev` is not running") && down.contains("--gate-on-host"),
             "{down}"
         );
-        let none = gate_place_with(shared, false, false, Some(home), || None, "jkb-dev", up)
-            .unwrap_err()
-            .to_string();
+        let none = gate_place_with(
+            shared,
+            None,
+            false,
+            false,
+            Some(home),
+            || None,
+            "jkb-dev",
+            up,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(none.contains("`docker` is not installed"), "{none}");
+    }
+
+    /// `~/repos` a symlink, as `run.sh` supports: git reports the physical path, and the gate still
+    /// runs in the container. A checkout of a shared repository that the container cannot see is
+    /// refused, never run here.
+    #[test]
+    fn a_gate_is_placed_by_canonical_paths_and_refused_where_the_container_cannot_see() {
+        use super::{gate_place_with, GatePlace};
+        use std::path::{Path, PathBuf};
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let real = t.path().join("Volumes/Code/repos");
+        std::fs::create_dir_all(real.join("jkb/.jkb/land")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, home.join("repos")).unwrap();
+        let docker = || Some(PathBuf::from("/usr/local/bin/docker"));
+        let up = |_: &Path, _: &str| true;
+        let physical = real.join("jkb/.jkb/land");
+        assert_eq!(
+            gate_place_with(
+                &physical,
+                None,
+                false,
+                false,
+                Some(&home),
+                docker,
+                "jkb-dev",
+                up
+            )
+            .unwrap(),
+            GatePlace::Container {
+                docker: "/usr/local/bin/docker".into(),
+                name: "jkb-dev".into(),
+                dir: "/home/vscode/repos/jkb/.jkb/land".into(),
+            }
+        );
+        let outside = t.path().join("elsewhere/land");
+        std::fs::create_dir_all(&outside).unwrap();
+        let e = gate_place_with(
+            &outside,
+            Some(&real.join("jkb")),
+            false,
+            false,
+            Some(&home),
+            docker,
+            "jkb-dev",
+            up,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("cannot see it") && e.contains("--gate-on-host"),
+            "{e}"
+        );
     }
 
     #[test]

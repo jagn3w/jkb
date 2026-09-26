@@ -549,10 +549,9 @@ fn hook() {
         return;
     }
     let url = crate::remote::daemon_url();
-    let backend = match crate::remote::client(&url, crate::remote::Purpose::Hook)
-        .and_then(|b| b.with_deadlines(CONNECT, TOTAL))
-    {
-        Ok(b) => b.with_down_marker(crate::remote::down_marker(&url)),
+    // Deadlines and the down marker come with every hook client (`remote::client`).
+    let backend = match crate::remote::client(&url, crate::remote::Purpose::Hook) {
+        Ok(b) => b,
         Err(e) => {
             append_log(&log, &[failure("client", &e)]);
             return;

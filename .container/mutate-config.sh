@@ -610,6 +610,28 @@ open(p, 'w').write(s.replace('takes no arguments', 'ignores extra arguments'))
 PYX
 run "the egress probe stops refusing arguments" "egress-status.sh no longer refuses arguments"
 
+# THE THIRD ROOT GRANT (D52.9), and what makes it matter: the managed hooks run the binary it pins.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('/usr/local/bin/pin-jkb-hook.sh ""', '/usr/local/bin/pin-jkb-hook.sh', 1))
+PYX
+run "the hook-pinning sudoers grant stops pinning its argument" "pin-jkb-hook.sh no longer pins it to no arguments"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"/usr/local/lib/jkb-hook/jkb workflow next --stop-hook"', '"jkb workflow next --stop-hook"', 1))
+PYX
+run "a managed hook runs jkb found on PATH" "does not run /usr/local/lib/jkb-hook/jkb"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"hooks": {', '"hooks_moved": {', 1))
+PYX
+run "the managed hooks cannot be read" "no hook commands could be read"
+
 # The two self-test lists (D51.9): drop one from each side in turn.
 seed; python3 - "$work/t/scripts/check.sh" <<'PYX'
 import sys
@@ -983,7 +1005,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=93
+PINNED_BAD_SITES=96
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

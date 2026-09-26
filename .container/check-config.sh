@@ -410,6 +410,24 @@ if grep -qE 'egress-status\.sh ""' "$here/Dockerfile" 2>/dev/null; then
 else
     bad "the sudoers entry for egress-status.sh no longer pins it to no arguments — a command naming no argument accepts every argument, and this one runs as root"
 fi
+# THE THIRD GRANT, THE SAME RULE (D52.9): pin-jkb-hook.sh installs the binary the harness hooks run
+# outside the sandbox, so it takes no argument — its source is fixed in the script.
+if grep -qE 'pin-jkb-hook\.sh ""' "$here/Dockerfile" 2>/dev/null; then
+    ok "sudoers grants pin-jkb-hook.sh with no arguments permitted"
+else
+    bad "the sudoers entry for pin-jkb-hook.sh no longer pins it to no arguments — it installs, as root, the binary the harness hooks run"
+fi
+# Every managed hook names the pinned binary absolutely. A bare `jkb` is found on PATH, and
+# ~/.cargo/bin is on PATH and writable from inside the sandbox — so the hooks, which run outside it
+# with the container credential readable, ran whatever a tool call last put there.
+hook_cmds="$(jq -r '.hooks[][].hooks[].command' "$here/managed-settings.json" 2>/dev/null)"
+if [ -z "$hook_cmds" ]; then
+    bad "no hook commands could be read from managed-settings.json — the check that they run the pinned binary examined nothing"
+elif grep -qv '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds"; then
+    bad "a managed hook does not run /usr/local/lib/jkb-hook/jkb — one found on PATH is replaceable from the sandbox: $(grep -m1 -v '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds")"
+else
+    ok "every managed hook runs the pinned, root-owned jkb"
+fi
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers
 # base ships /etc/sudoers.d/vscode = `NOPASSWD:ALL`, under which the agent can flush the firewall,
 # delete the allowlist snapshot or rewrite the root-owned script. verify.sh asks sudo itself at

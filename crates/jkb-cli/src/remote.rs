@@ -296,9 +296,18 @@ pub fn client(
         Purpose::Hook => container(),
         Purpose::Mcp => scoped_token(),
     };
-    Ok(match chosen {
+    let backend = match chosen {
         Some(t) => backend.with_token(t),
         None => backend,
+    };
+    // A hook holds up the tool call or the turn that fired it, so every hook client gets the hooks'
+    // deadlines and the shared down marker here — not at each hook, where the attestation hook once
+    // went without them and a busy daemon stalled every Bash call for its whole timeout.
+    Ok(match purpose {
+        Purpose::Hook => backend
+            .with_deadlines(crate::notify::CONNECT, crate::notify::TOTAL)?
+            .with_down_marker(down_marker(url)),
+        Purpose::Command | Purpose::Mcp => backend,
     })
 }
 

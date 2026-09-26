@@ -4546,8 +4546,12 @@ fn a_workflow_walks_from_the_cli_and_the_stop_hook_asks_only_when_the_session_dr
         assert!(out.status.success(), "{out:?}");
         serde_json::from_slice(&out.stdout).unwrap()
     };
-    let stop = |active: bool| -> String {
+    let stop_as = |active: bool, drive: Option<&str>| -> String {
         let mut cmd = assert_cmd::Command::from_std(jkb(&db));
+        match drive {
+            Some(d) => cmd.env("JKB_DRIVE", d),
+            None => cmd.env_remove("JKB_DRIVE"),
+        };
         let out = cmd
             .args(["workflow", "next", &uid, "--stop-hook"])
             .write_stdin(serde_json::json!({ "stop_hook_active": active }).to_string())
@@ -4556,7 +4560,13 @@ fn a_workflow_walks_from_the_cli_and_the_stop_hook_asks_only_when_the_session_dr
         assert!(out.status.success(), "{out:?}");
         String::from_utf8(out.stdout).unwrap()
     };
+    let stop = |active: bool| stop_as(active, Some("1"));
     let w = show();
+    assert_eq!(
+        stop_as(false, None),
+        "",
+        "a session that did not opt in is never held, whatever acts next"
+    );
     assert_eq!(w["phase"], "design");
     assert_eq!(w["source"], "default:design-reviewed");
     assert!(
@@ -4783,7 +4793,7 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
 
     hook(serde_json::json!({
         "hook_event_name": "PostToolUse", "session_id": "sess-1", "tool_use_id": "t1",
-        "tool_name": "Bash",
+        "tool_name": "Bash", "tool_input": { "command": "jkb role whoami" },
     }));
     let out = whoami(&main);
     assert!(!out.status.success(), "released at PostToolUse");

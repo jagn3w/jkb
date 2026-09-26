@@ -235,9 +235,11 @@ docker_args() { # docker_args <config> <repo-root> [all|posture]  -> one argumen
         # bound read-write, and git on the HOST runs whatever a repository's .git/config names
         # (core.fsmonitor, hooks, filters) — so a container that can write those files can run code
         # as the operator the next time they, or `jkb task land`, run git there. A read-only bind over
-        # each makes the write fail closed: git writes config by lock-and-rename, and a rename over a
+        # each stops the direct write: git writes config by lock-and-rename, and a rename over a
         # bind-mounted file fails (measured on Docker Desktop 29.7.2, 2026-09-25: EBUSY; the config
-        # was unchanged). Generated, not declared: container.json cannot list repositories. A
+        # was unchanged). A SPEED BUMP, NOT THE BOUNDARY (review round 1): .git/ is writable around
+        # these, so renaming .git itself or planting .git/commondir gets past them. jkb's audit before
+        # every git call, and the reap scan, are what hold (docs/task-lifecycle.md, D52). Generated, not declared: container.json cannot list repositories. A
         # repository cloned after the container starts is covered at its next start (the fingerprint
         # changes); until then jkb's own git refuses it if it is planted, and the reap service reports
         # it. What this costs inside: `git config --local`, `remote add`, and `--set-upstream-to` /

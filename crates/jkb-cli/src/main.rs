@@ -2590,7 +2590,10 @@ pub(crate) fn cmd_task_land(
     let facts = kb.facts_for_write(uid)?;
     // Waiving the review gate is the operator's alone (D52.4), and the waiver is written only after the
     // graft — so a caller that may not waive is refused here, before anything moves, rather than after.
-    if no_review && remote::scoped_token().is_some() {
+    // Asked of whoever this client authenticates as, whatever it presents: keyed on a ticket or role
+    // token in the environment, it missed the container credential a terminal in the container holds,
+    // which grafted, ran the gate, and was refused its waiver only then — landed, not marked landed.
+    if no_review {
         match kb.call(jkb_api::Request::RoleWhoami {})? {
             jkb_api::Response::WhoAmI { whoami }
                 if whoami.roles.iter().any(|r| r == "operator") => {}

@@ -96,7 +96,6 @@ pub(crate) fn config_key_allowed(key: &str) -> bool {
                         | "splitindex"
                         | "untrackedcache"
                         | "multipackindex"
-                        | "worktree"
                 )
         }
         "remote" => {
@@ -132,11 +131,44 @@ pub(crate) fn config_key_allowed(key: &str) -> bool {
                 )
         }
         "worktree" => !has_sub && name == "userelativepaths",
-        // Scalar preferences with no program in them.
-        "user" | "init" | "pull" | "push" | "fetch" | "gc" | "jkb" | "rerere" | "advice"
-        | "color" | "log" | "status" | "commit" | "tag" | "index" | "pack" | "maintenance" => {
-            !has_sub || section == "color"
+        // Scalar preferences with no program in them, key by key: a whole section admitted
+        // `status.showUntrackedFiles=no`, which silences the dirty check a landing asks before it
+        // writes a tree. `core.worktree` is gone for the same reason — it points checkout at any
+        // directory, `$HOME` included (measured on git 2.51.1); jkb's worktrees are `.git` files.
+        "user" => !has_sub && matches!(name, "name" | "email" | "signingkey" | "useconfigonly"),
+        "init" => !has_sub && name == "defaultbranch",
+        "pull" => !has_sub && matches!(name, "rebase" | "ff"),
+        "push" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "default" | "autosetupremote" | "followtags" | "recursesubmodules"
+                )
         }
+        "fetch" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "prune" | "prunetags" | "writecommitgraph" | "recursesubmodules" | "parallel"
+                )
+        }
+        "gc" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "auto" | "autodetach" | "autopacklimit" | "reflogexpire" | "writecommitgraph"
+                )
+        }
+        "rerere" => !has_sub && matches!(name, "enabled" | "autoupdate"),
+        "log" => !has_sub && matches!(name, "date" | "decorate" | "follow" | "showsignature"),
+        "commit" => !has_sub && matches!(name, "gpgsign" | "verbose" | "cleanup"),
+        "tag" => !has_sub && matches!(name, "gpgsign" | "sort"),
+        "index" => !has_sub && matches!(name, "version" | "threads" | "skiphash"),
+        "pack" => !has_sub && matches!(name, "threads" | "writebitmaps"),
+        "maintenance" => !has_sub && matches!(name, "auto" | "strategy"),
+        // Display only: no key in either names a program or changes what a command reports.
+        "advice" => !has_sub,
+        "color" => true,
         "merge" | "diff" => {
             !has_sub && matches!(name, "conflictstyle" | "ff" | "renames" | "algorithm")
         }
@@ -144,38 +176,30 @@ pub(crate) fn config_key_allowed(key: &str) -> bool {
     }
 }
 
-/// Directories whose repository config [`audit_repo_config`] has already passed, this process.
-static AUDITED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-
-/// Refuse to run git in `dir` when its repository's **own** config — local, worktree, or a file those
-/// include — sets a key outside [`config_key_allowed`] (design D52.11, hole H5). Such a key can make
-/// git run a program, and that file is writable from the dev container, so on the host it is a way
-/// for anything in the container to run code as the operator.
+/// Refuse to run git in `dir` when its repository could make git run a program there (design D52.11,
+/// hole H5): its **own** config — local, worktree, a file those include, or a submodule's — sets a key
+/// outside [`config_key_allowed`], or its git directory takes its config and hooks from somewhere that
+/// is not its repository ([`check_layout`]). Those files are writable from the dev container, so on
+/// the host they are a way for anything in the container to run code as the operator.
 ///
-/// Asked with `git config --list --show-origin --show-scope`, which reads config and executes nothing
-/// (measured on git 2.51.1 against a planted fsmonitor, hooks path, include, pager and filter). The
-/// operator's own scopes (`system`, `global`) and `command` (the environment's, e.g. the container's
-/// `safe.directory` grants) are theirs, not the repository's, and are not judged. Once per directory
-/// per process.
+/// Asked with `git config --list --show-origin --show-scope` and `git rev-parse`, which read config and
+/// execute nothing (measured on git 2.51.1 against a planted fsmonitor, hooks path, include, pager and
+/// filter). The operator's own scopes (`system`, `global`) and `command` (the environment's, e.g. the
+/// container's `safe.directory` grants) are theirs, not the repository's, and are not judged.
+///
+/// **Asked fresh before every git call.** It was once per directory per process, and the reap service
+/// is one long process: a config it passed on its first pass was never read again, so a filter planted
+/// afterwards ran on the next `git status` it made (measured on git 2.51.1). Two spawns per call is the
+/// price of the answer being about now.
 ///
 /// # Errors
-/// The refusal, naming the key, the file it is in, and how to remove it; or git not running at all.
+/// The refusal, naming the key or file and how to remove it; or git not running at all.
 pub(crate) fn audit_repo_config(dir: &Path) -> Result<()> {
-    if AUDITED
-        .lock()
-        .is_ok_and(|seen| seen.iter().any(|d| d == dir))
-    {
-        return Ok(());
-    }
-    check_repo_config(dir)?;
-    if let Ok(mut seen) = AUDITED.lock() {
-        seen.push(dir.to_path_buf());
-    }
-    Ok(())
+    check_repo_config(dir)
 }
 
-/// [`audit_repo_config`] without its per-process memory — for a long-running scan that must ask
-/// again every pass (`git_audit`).
+/// [`audit_repo_config`]'s check — also what the reap service's scan asks of every repository
+/// (`git_audit`), so the two cannot come to disagree.
 ///
 /// # Errors
 /// As [`audit_repo_config`].
@@ -203,15 +227,157 @@ pub(crate) fn check_repo_config(dir: &Path) -> Result<()> {
             continue;
         }
         let key = entry.split('\n').next().unwrap_or_default();
-        if !config_key_allowed(key) {
-            let file = origin.strip_prefix("file:").unwrap_or(origin);
-            anyhow::bail!(
-                "refusing to run git in {}: its repository config sets `{key}` ({file}, {scope} \
-                 scope), which is not on jkb's list of repository-shape keys and can make git run a \
-                 program. That file is writable from the dev container (design D52.11). If you did not \
-                 put it there, remove it on the host: git config --file {file} --unset-all {key}",
-                dir.display()
-            );
+        let file = origin.strip_prefix("file:").unwrap_or(origin);
+        refuse_key(dir, key, file, scope)?;
+    }
+    if let Some(common) = check_layout(dir)? {
+        check_module_configs(dir, &common)?;
+    }
+    Ok(())
+}
+
+fn refuse_key(dir: &Path, key: &str, file: &str, scope: &str) -> Result<()> {
+    if config_key_allowed(key) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to run git in {}: its repository config sets `{key}` ({file}, {scope} scope), \
+         which is not on jkb's list of repository-shape keys and can make git run a program. That \
+         file is writable from the dev container (design D52.11). If you did not put it there, \
+         remove it on the host: git config --file {file} --unset-all {key}",
+        dir.display()
+    )
+}
+
+/// Refuse a git directory that takes its config and hooks from somewhere other than its repository,
+/// returning the common directory it does use (`None` outside any repository).
+///
+/// A `commondir` file in a git directory redirects git's config, hooks and refs to whatever it names,
+/// and `.git/` is writable from the dev container around its read-only `config` and `hooks` binds
+/// (measured on git 2.51.1: a planted `.git/commondir` made `rev-parse --git-common-dir` answer the
+/// planted directory, whose config and hooks git then used). jkb's own git is judged on the config it
+/// actually reads either way; this is for **your** git in the same directory, which runs the hooks
+/// there — so jkb stops, and says so, rather than going on as if nothing were wrong.
+///
+/// A main repository's git directory is its own common directory. A linked worktree's is
+/// `<common>/worktrees/<name>`, and a jkb session's common directory is its repository's `.git`.
+fn check_layout(dir: &Path) -> Result<Option<PathBuf>> {
+    let out = git_in(
+        dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .output()
+    .with_context(|| format!("locating {}'s git directory", dir.display()))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        return Ok(None);
+    };
+    let real = |p: &str| fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+    let (git_dir, common) = (real(git_dir), real(common));
+    let redirected = |from: &Path, to: &Path| -> anyhow::Error {
+        anyhow::anyhow!(
+            "refusing to run git in {}: its git directory {} takes its config and hooks from {} — \
+             not its own repository. A `commondir` or `.git` file is writable from the dev container \
+             (design D52.11), and git you run there would use that directory's hooks. If you did not \
+             put it there, look at {}/commondir and {}/.git on the host.",
+            dir.display(),
+            from.display(),
+            to.display(),
+            from.display(),
+            dir.display()
+        )
+    };
+    if git_dir != common && git_dir.parent() != Some(common.join("worktrees").as_path()) {
+        return Err(redirected(&git_dir, &common));
+    }
+    if let Some(main) = session_main(&real(&dir.to_string_lossy())) {
+        let own = real(&main.join(".git").to_string_lossy());
+        if common != own {
+            return Err(redirected(&git_dir, &common));
+        }
+    }
+    Ok(Some(common))
+}
+
+/// The repository a jkb session worktree (`<main>/.jkb/work/<name>/…`) belongs to.
+fn session_main(dir: &Path) -> Option<PathBuf> {
+    let parts: Vec<_> = dir.components().collect();
+    let at = parts
+        .windows(2)
+        .position(|w| w[0].as_os_str() == ".jkb" && w[1].as_os_str() == "work")?;
+    Some(parts[..at].iter().collect())
+}
+
+/// Whether a submodule's `core.worktree` of `value`, relative to the git directory holding `config`,
+/// names a directory inside the superproject whose common directory is `common` — lexically, since
+/// the checkout it names may not exist yet.
+fn within(config: &Path, value: &str, common: &Path) -> bool {
+    let (Some(gitdir), Some(top)) = (config.parent(), common.parent()) else {
+        return false;
+    };
+    let mut at = PathBuf::new();
+    for c in gitdir.join(value).components() {
+        match c {
+            std::path::Component::ParentDir => {
+                if !at.pop() {
+                    return false;
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => at.push(other),
+        }
+    }
+    at.starts_with(top) && at != top && !at.starts_with(common)
+}
+
+/// The deepest submodule nesting [`check_module_configs`] walks.
+const MAX_MODULE_DEPTH: usize = 8;
+
+/// Judge every submodule's own config (`<common>/modules/**/config`): git reads it when it works in the
+/// submodule, including on a superproject's behalf, and it is neither bound read-only nor listed by the
+/// superproject's `config --list`.
+fn check_module_configs(dir: &Path, common: &Path) -> Result<()> {
+    let mut stack = vec![(common.join("modules"), 0usize)];
+    while let Some((at, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&at) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() && depth < MAX_MODULE_DEPTH {
+                stack.push((path, depth + 1));
+            } else if kind.is_file() && e.file_name() == "config" {
+                let file = path.to_string_lossy().into_owned();
+                let out = git_in(dir, &["config", "--file", &file, "--list", "-z"])
+                    .output()
+                    .with_context(|| format!("reading {file}"))?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "git could not read the submodule config {file}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                for entry in String::from_utf8_lossy(&out.stdout).split('\0') {
+                    let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+                    // git writes a submodule's own `core.worktree`, pointing back at its checkout
+                    // inside the superproject. Anywhere else, it points checkout at any directory.
+                    if key == "core.worktree" && within(&path, value, common) {
+                        continue;
+                    }
+                    if !key.is_empty() {
+                        refuse_key(dir, key, &file, "submodule")?;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -2652,6 +2818,10 @@ mod tests {
             "url.ext::sh.insteadof",
             "protocol.ext.allow",
             "core.remote.fsmonitor",
+            // Not programs, but they point a landing's checkout at `$HOME` and hide what it left.
+            "core.worktree",
+            "status.showuntrackedfiles",
+            "status.x",
         ] {
             assert!(!config_key_allowed(runs), "{runs} must be refused");
         }
@@ -2697,6 +2867,142 @@ mod tests {
             .to_string();
         assert!(e.contains("core.fsmonitor"), "{e}");
         assert!(!marker.exists(), "the planted program never ran");
+    }
+
+    /// The audit is asked fresh every call: a config planted after a directory passed is refused on
+    /// the next call, not waved through by a per-process memory of the first answer.
+    #[test]
+    fn a_config_planted_after_a_directory_passed_is_refused_on_the_next_call() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        super::audit_repo_config(&dir).expect("clean at first");
+        assert!(
+            fixture_git(&dir, &["config", "filter.x.clean", "touch /tmp/x"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let e = super::audit_repo_config(&dir).unwrap_err().to_string();
+        assert!(e.contains("filter.x.clean"), "{e}");
+    }
+
+    /// A `commondir` file redirects git's config and hooks (measured on git 2.51.1); jkb refuses the
+    /// directory and says where it points, whatever that directory's config holds.
+    #[test]
+    fn a_git_directory_redirected_by_commondir_is_refused() {
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for e in std::fs::read_dir(from).unwrap().flatten() {
+                let dest = to.join(e.file_name());
+                if e.file_type().unwrap().is_dir() {
+                    copy_tree(&e.path(), &dest);
+                } else {
+                    std::fs::copy(e.path(), dest).unwrap();
+                }
+            }
+        }
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let elsewhere = t.path().join("common");
+        std::fs::create_dir_all(elsewhere.join("hooks")).unwrap();
+        for part in ["config", "HEAD"] {
+            std::fs::copy(dir.join(".git").join(part), elsewhere.join(part)).unwrap();
+        }
+        for part in ["objects", "refs"] {
+            copy_tree(&dir.join(".git").join(part), &elsewhere.join(part));
+        }
+        std::fs::write(
+            dir.join(".git/commondir"),
+            format!("{}\n", elsewhere.display()),
+        )
+        .unwrap();
+        let e = super::audit_repo_config(&dir).unwrap_err().to_string();
+        assert!(
+            e.contains("takes its config and hooks from") && e.contains("common"),
+            "{e}"
+        );
+    }
+
+    /// A submodule's own config is judged too — and its git-written `core.worktree` pointing back into
+    /// the superproject is not held against it.
+    #[test]
+    fn a_submodule_s_own_config_is_judged() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        let module = dir.join(".git/modules/sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        std::fs::create_dir_all(&module).unwrap();
+        let cfg = module.join("config");
+        std::fs::write(
+            &cfg,
+            "[core]\n\trepositoryformatversion = 0\n\tworktree = ../../../sub\n",
+        )
+        .unwrap();
+        super::audit_repo_config(&dir).expect("git's own submodule layout passes");
+        std::fs::write(&cfg, "[core]\n\tworktree = ../../../../../..\n").unwrap();
+        let e = super::audit_repo_config(&dir).unwrap_err().to_string();
+        assert!(
+            e.contains("core.worktree") && e.contains("submodule"),
+            "{e}"
+        );
+        std::fs::write(&cfg, "[filter \"x\"]\n\tclean = touch /tmp/x\n").unwrap();
+        let e = super::audit_repo_config(&dir).unwrap_err().to_string();
+        assert!(e.contains("filter.x.clean"), "{e}");
+    }
+
+    /// A jkb session's `.git` file pointed at a git directory laid out as a worktree of some other,
+    /// planted repository: consistent to git, and still not its own repository's.
+    #[test]
+    fn a_session_whose_common_directory_is_not_its_repository_s_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let main = t.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        fixture(&main);
+        let session = main.join(".jkb/work/s");
+        assert!(fixture_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "s",
+                session.to_str().unwrap()
+            ]
+        )
+        .status()
+        .unwrap()
+        .success());
+        super::audit_repo_config(&session).expect("a real session passes");
+        let rogue = t.path().join("rogue");
+        std::fs::create_dir_all(&rogue).unwrap();
+        fixture(&rogue);
+        assert!(fixture_git(
+            &rogue,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "r",
+                t.path().join("rw").to_str().unwrap()
+            ]
+        )
+        .status()
+        .unwrap()
+        .success());
+        std::fs::write(
+            session.join(".git"),
+            format!("gitdir: {}\n", rogue.join(".git/worktrees/rw").display()),
+        )
+        .unwrap();
+        let e = super::audit_repo_config(&session).unwrap_err().to_string();
+        assert!(e.contains("takes its config and hooks from"), "{e}");
     }
 
     /// jkb's own git calls run no hooks and no fsmonitor, whatever the repository says.

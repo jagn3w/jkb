@@ -1,9 +1,9 @@
 //! The reap service's scan for repository config that could make the host run code (design D52.11,
 //! layer 3).
 //!
-//! Layer 1 (read-only binds over `.git/config` and `.git/hooks`, from `.container/run.sh`) covers the
-//! repositories present when the container starts; layer 2 ([`crate::gitrepo::audit_repo_config`])
-//! refuses to run jkb's own git anywhere a program is named. Neither covers **your** git — a terminal,
+//! Layer 1 (read-only binds over `.git/config` and `.git/hooks`, from `.container/run.sh`) is a speed
+//! bump — `.git/` is writable around it; layer 2 ([`crate::gitrepo::audit_repo_config`]) refuses to
+//! run jkb's own git anywhere a program is named or the git directory is redirected. Neither covers **your** git — a terminal,
 //! VS Code — in a repository cloned inside the container after it started, or in a session worktree,
 //! whose `.git` file can be rewritten to point anywhere. That cannot be prevented from here, so it is
 //! detected: every reap pass audits each repository under `~/repos` and its session worktrees, and a
@@ -90,8 +90,9 @@ pub(crate) fn notify(db: &Db, findings: &[(PathBuf, String)]) -> Result<()> {
         )
     } else {
         let body = format!(
-            "A repository's own git config names a program, so git you run there could execute it: {}. \
-             Remove the key on the host (the reap log names it and the file).",
+            "A repository's git setup could make git you run there execute a program (a key in its own \
+             config, or a git directory redirected elsewhere): {}. The reap log names the key or file; \
+             fix it on the host.",
             summary(findings)
         );
         (

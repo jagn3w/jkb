@@ -4953,3 +4953,66 @@ fn a_discovered_merged_pull_request_closes_its_task_in_one_run() {
     assert_eq!(v["closed"][0]["pr"], 45, "{v}");
     assert_eq!(f.status_of(&uid), "done");
 }
+
+/// `--no-review` asks who this client is **before** anything moves, whatever credential it presents:
+/// a terminal in the dev container holds the container credential (a coordinator), not a ticket, and
+/// keying the check on a ticket in the environment let it graft and run the gate before its waiver
+/// was refused — landed, and not marked landed.
+#[test]
+fn a_waiver_is_refused_before_anything_moves_to_a_container_terminal() {
+    use std::io::BufRead as _;
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let f = Fixture::new();
+    let uid = f.add_task("to land");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    let before = git(&f.repo, &["rev-parse", "main"]);
+    f.jkb()
+        .env("HOME", f.home.path())
+        .args(["role", "rotate-container", "--write"])
+        .assert()
+        .success();
+    let token = f.home.path().join("daemon/token");
+    let mut serve = jkb(Some(&f.db));
+    serve
+        .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+        .arg(&token)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = serve.spawn().unwrap();
+    let banner = std::io::BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap();
+    let _daemon = Kill(child);
+    let url = banner
+        .split_whitespace()
+        .find(|w| w.starts_with("http://"))
+        .unwrap()
+        .to_owned();
+    jkb(None)
+        .current_dir(&f.repo)
+        .env("HOME", f.home.path())
+        .env("JKB_REMOTE", &url)
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only the operator"));
+    assert_eq!(
+        git(&f.repo, &["rev-parse", "main"]),
+        before,
+        "nothing moved"
+    );
+}

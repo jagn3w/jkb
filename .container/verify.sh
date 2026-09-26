@@ -1061,7 +1061,8 @@ if [ -z "$root_installed" ]; then
     unwritable_ok=0
 fi
 for path in /usr/local /usr/local/bin /usr/local/share \
-            /usr/local/share/jkb-egress-allowlist.json /etc/sudoers.d $root_installed; do
+            /usr/local/share/jkb-egress-allowlist.json /etc/sudoers.d $root_installed \
+            /usr/local/lib /usr/local/lib/jkb-hook /usr/local/lib/jkb-hook/jkb; do
     # A path that does not exist yet (the snapshot, before the first raise) cannot be replaced
     # either, so absence is fine; what must never be true is that it exists AND is writable.
     if [ -e "$path" ] && [ -w "$path" ]; then
@@ -1070,6 +1071,14 @@ for path in /usr/local /usr/local/bin /usr/local/share \
     fi
 done
 [ "$unwritable_ok" -eq 1 ] && ok "the root-owned firewall and its allowlist cannot be replaced from here"
+# The binary the managed hooks run (D52.9) is there once setup has pinned it — absent, every hook
+# fails and every `jkb` a tool call makes goes unattested and refused.
+# JKB_SETUP_MARKER is lib.sh's, sourced above with `|| true`: unset, this would skip in silence.
+if [ -z "${JKB_SETUP_MARKER:-}" ]; then
+    bad "lib.sh did not load, so whether the harness hooks' binary is pinned cannot be checked"
+elif [ -f "$JKB_SETUP_MARKER" ] && [ ! -x /usr/local/lib/jkb-hook/jkb ]; then
+    bad "setup finished but /usr/local/lib/jkb-hook/jkb is missing — the harness hooks have nothing to run (sudo -n /usr/local/bin/pin-jkb-hook.sh \"\")"
+fi
 
 #     `sudo -n -l` failing and `sudo -n -l` listing nothing are different facts, and collapsing
 #     them reported the friendliest one: sudo missing, PAM broken or sudoers unparseable all

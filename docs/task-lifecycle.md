@@ -793,7 +793,14 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   bounded by a domain so none can hand an operator power to a worker) and **attributes**
   (`repeated_area`). Presets `design-reviewed` (default), `coordinated`, `autonomous`; operator
   definitions are versioned, and a task **pins a snapshot** so a redefinition never changes it
-  mid-flight. The log is append-only; permission is checked **in the callee** (`store::fire`).
+  mid-flight — at its **first move**, whatever it runs then, including the default: pinning only
+  on `workflow set` let a redefined `default` change a task already in `landable` (review round 1).
+  An unreadable stored `default` is refused, never replaced by the preset. The log is append-only;
+  permission is checked **in the callee** (`store::fire`). A workflow `reopen` **follows** the
+  task's lifecycle rather than leading it (`jkb task reopen` first, then `observed_reopened`
+  reconciles), and is the operator's: a workflow reopened alone was put straight back by the next
+  observe. Deleting a task revokes its grants and keeps its workflow history (V022 has no cascade
+  from `items`, which is AUTOINCREMENT), so `item rm` + `undo` gives back a task still pinned.
 - **`jkb-core/src/reviews.rs`** (V023) — the land gate's review facts, **out of tags**.
 - **`jkb-api/src/rbac.rs`** — `Request::permission` (exhaustive), `OP_GRANTS`, principals,
   the in-memory ticket store, `authorize` at the top of `LocalBackend::call` — the one dispatch
@@ -809,21 +816,38 @@ back to design (the fix changes how the operator understands the system — unde
 is back to the operator) or `submit_systemic` back to implementation (a difficult code pattern).
 `jkb workflow observe` takes the one reconciliation the facts call for, so after a round the task
 moves with no human prompt; `jkb workflow next --stop-hook` sends a Stop back, **once per stop**,
-while the next actor is one the session drives.
+while the next actor is one the session drives — **in a session that opted in** with `JKB_DRIVE`
+(`1`, or a task uid) where it was launched. The hook is managed, so it fires in every container
+session, and without the opt-in it told an interactive session in a task worktree to "continue"
+implementing on every turn.
 
 **The land gate gained its last-round clause.** The newest round must itself have found no
-must-fix: fixing a round's findings is not a review of the fix. A round is a review namespace,
-ordered by filing (the highest item id among its findings — no new table, and it covers every
-review recorded before this), and `must_fix` counts at **any** status. A daemon too old to report
-rounds refuses rather than skipping the clause.
+must-fix: fixing a round's findings is not a review of the fix, and `must_fix` counts at **any**
+status. A daemon too old to report rounds refuses rather than skipping the clause.
+
+**A round is what it was when it was recorded** (`review_rounds`, `review_round_findings`, V023).
+The first recording of a namespace snapshots its findings — which are must-fix, and the file each
+names — and rounds are ordered by recording. *Superseded:* a round was first read live, ordered by
+the highest item id among its findings, and review round 1 showed why that fails: a finding's
+priority, placement and `area=` are ordinary task content, so the implementer under review could
+lower its own last round's must-fix, or file a line into an older clean round so it sorted newest.
+The gate's open-must-fix count is the snapshot's must-fixes not yet finished **plus** anything now
+in the namespaces at `p1` or above. A round a **non-operator** records must be a namespace
+`task.review_file` filed (`review_filings`), and holds exactly what it filed: naming `tasks` as a
+round would otherwise have put every task in the recording task's scope. The operator's
+`/review-log`, whose findings arrive through a mount, still records any namespace.
 
 **Review facts are not tags (hole H3).** `reviewed=`, `review=` and `review-waived=` decided the
 gate, and a tag is content any writer may set — the sync engine included, applying a `tasks.md`
 line an agent in the dev container edited: `#review-waived=x` waived the gate. The answer is
 **not** a reserved facet: `tag.rs` records that apparatus being tried for `base` and six choke
-points failing to close it. The facts moved to an append-only `reviews` table (V023 migrated 11
-`reviewed=`, 35 `review=` and 28 `review-waived=` tags, measured on the live KB, and deleted them),
-and the gate reads only that, so a `reviewed=` tag is ordinary content nothing trusts.
+points failing to close it. The facts moved to an append-only `reviews` table (the live KB held 11
+`reviewed=`, 35 `review=` and 28 `review-waived=` tags, measured), and the gate reads only that, so
+a `reviewed=` tag is ordinary content nothing trusts. V023 migrates a `review=` **only beside a
+`reviewed=`**: `/review-log` tags a backlog finding `review=<ns>` as a trail, with no head, and
+migrating those made tasks the old gate called never-reviewed pass as reviewed. Those trails stay,
+as the ordinary tags they always were. No database had applied V022/V023 when round 1 edited them
+(the live KB was at version 21, and no other branch carries them), so they were edited in place.
 `task.facts`, `task.staging` and `task.show` carry it as a `review` field. Likewise **`landed`
 reads the landing transition, never `status = done`**, which a synced checkbox can write (H4).
 
@@ -834,8 +858,12 @@ chooses: a command its ticket or role token, else the container credential if it
 (a person at a container terminal can; the model's sandboxed tools cannot); a hook the container
 credential; `jkb mcp` only an operator-configured role token — never the container's ceiling on
 behalf of every agent it serves. The daemon caches grant hashes so a wrong token costs at most
-one read a second, clears the cache when it mints, and re-resolves every call from the database
-so a revocation is never served stale.
+one read a second — claimed under the lock, on the reader connection — empties the cache when it
+grants or revokes, and re-resolves every call from the database so a revocation is never served
+stale; a call that then fails `Unauthorized` evicts its hash and closes the connection, so a grant
+revoked behind the daemon's back cannot hold slots open. The container credential is marked in its
+own column, set only by rotation — a grant the operator merely labelled `container` mints no
+tickets. A session holds at most 256 live tickets, the daemon 4096, expired in mint order.
 
 **Harness attestation (D52.9) — the harness vouches, the agent holds no secret.** An in-process
 subagent cannot keep a secret from its parent (one process, one sandbox, one transcript), so
@@ -851,24 +879,67 @@ types and the generic ones map to nothing; and **a `PreToolUse` can be followed 
 (a permission refusal after the hook ran), so tickets are also released at `SubagentStop` and
 `SessionEnd`, with a 10-minute backstop.
 
+**What the hook approves.** A rewrite needs a permission decision. The hook returns `allow` only for
+one plain `jkb` invocation, found on PATH by name, that cannot run a shell command (no separators,
+pipes, redirects, substitutions or expansions, and not `task land`, which runs the gate) — what a
+`Bash(jkb:*)` rule would approve, with every request it makes held to the ticket's role. Anything
+else that runs `jkb` gets `ask`, so the prompt or the auto-mode classifier still judges it:
+returning `allow` for a whole compound command approved whatever rode along (`jkb ls && rm -rf …`).
+Only a ticketed call is released at `PostToolUse`, and every hook client carries the hooks'
+deadlines and down marker (`remote::client`). **The hooks run a pinned binary**,
+`/usr/local/lib/jkb-hook/jkb`, root-owned: they run outside the sandbox with the credential
+readable, and `~/.cargo/bin` is writable from inside it (measured). `pin-jkb-hook.sh` copies
+setup's build there through `sudo`, which a sandboxed command cannot use (measured:
+`NoNewPrivs: 1`, `sudo -n` exits 1). The residual: it pins whatever `~/.cargo/bin/jkb` is when it
+runs.
+
 **The host must not run container-written code (H5, H6).** Git on the host runs what a repository's
 own `.git/config` names, and the container writes that file. Three layers, measured on Docker
-Desktop 29.7.2 and git 2.51.1: `run.sh` binds each repo's `.git/config` and `.git/hooks` read-only
-(a rename over the bind fails with EBUSY — writes fail closed); every jkb git call audits the repo's
-own config against an **allowlist** of repository-shape keys before it runs (`git config --list
---show-origin --show-scope` executes nothing; `-c core.fsmonitor=false -c core.hooksPath=/dev/null`
-does *not* stop a planted filter, so the audit is what holds) and runs hooks-off; and the reap
-service audits every repo and session worktree each pass and posts a sticky notification. And the
-land gate — the candidate's own code — runs in the container through `docker exec` for a checkout
-under `~/repos` (exit status and output measured intact), settled before the graft;
+Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed bump.**
+
+1. `run.sh` binds each repo's `.git/config` and `.git/hooks` read-only (a rename over the bind fails
+   with EBUSY). *Corrected by review round 1:* this does not make writes fail closed. `.git/` itself
+   is writable around the binds, so the container can rename `.git` away and put a writable copy in
+   its place, or plant `.git/commondir`, which redirects git's config **and hooks** to any directory
+   (measured: `rev-parse --git-common-dir` then answers the planted one). An empty directory there
+   is no defence either — git dies on it (measured). Submodule configs (`.git/modules/*/config`) are
+   not bound at all.
+2. Every jkb git call audits the repository **fresh, before every call**, and runs hooks-off. It
+   judges every key of the repository's own config — local, worktree, included, and each
+   submodule's — against an **allowlist** of repository-shape keys (`git config --list
+   --show-origin --show-scope` executes nothing; `-c core.fsmonitor=false -c core.hooksPath=/dev/null`
+   does *not* stop a planted filter, so the audit is what holds). It refuses a git directory that
+   takes its config and hooks from anywhere but its repository: a main repository's git directory is
+   its own common directory, a linked worktree's is `<common>/worktrees/<name>`, and a jkb session's
+   common directory is its repository's `.git`. The allowlist names keys, not sections:
+   `core.worktree` points checkout at any directory (`$HOME` included, measured) and
+   `status.showUntrackedFiles=no` hides what a landing left, so both are refused — except a
+   submodule's own `core.worktree` pointing back into the superproject, which git writes. *Also
+   corrected:* the audit was once per directory per process, so the reap service, one long process,
+   never re-read a config it had passed.
+3. The reap service runs the same check on every repo and session worktree each pass and posts a
+   sticky notification — the only layer that covers **your** git, run by hand.
+
+And the land gate — the candidate's own code — runs in the container through `docker exec` (exit
+status and output measured intact), settled before the graft, for a repository under `~/repos`,
+decided on **canonical** paths: git reports a checkout by its physical path, so with `~/repos` a
+symlink the old textual prefix test never matched and every gate ran on the host. A landing checkout
+the container cannot see, of a repository it shares, is refused rather than run here.
 `--gate-on-host` is recorded.
 
 **Scope is enforced in the callee, not only at the target.** A principal held to one task writes
-only that task, its subtasks and its findings; an op naming no task cannot slip past that — a scoped
-caller adds tasks only `--under` its task, and `review::record` credits only in-scope tasks for a
-scoped caller (a branch names whatever tasks record it). An attested subagent binds to its task on
-its first task-targeted write, or explicitly with `jkb role bind <uid>`, and a reviewer must be
-bound before it records a review.
+only that task, its subtasks and its findings. `Request::target` is **exhaustive, with no
+wildcard**: each op writes one named task, or writes nothing a scope protects (its callee holds it —
+filing, recording, revoking, attesting), or writes **shared** state — a namespace, a lease, a
+worktree removal, an item outside the task tree — which a scoped principal is refused. *Superseded:*
+a `_ => None` arm admitted `removal.add` naming another task's worktree and `lease.take` displacing
+the merge queue as unscoped (round 1). A scoped caller adds tasks only `--under` its task, and places
+tasks (`task.add`'s home and mirrors, `task.place`) only where its task itself is placed — never
+into a review round. `review::record` credits only in-scope tasks for a scoped caller. An attested
+subagent binds to its task on its first task-targeted write, or explicitly with `jkb role bind
+<uid>` — a binding its first op made is undone if that op then fails — and a reviewer must be bound
+before it records a review. `--no-review` asks who the client is before anything moves, whatever
+credential it presents.
 
 **Swarm landings follow the task's strategy.** `scripts/merge-queue.sh` records a landing with
 `jkb task landed`, and under the default `design-reviewed` only the operator lands — so a batch
@@ -893,7 +964,7 @@ the swarm lands on its own runs under a strategy whose `lands` toggle includes t
 a hostile coordinator (a real reviewer filing a clean review on instruction) — mitigated by
 operator-owned agent definitions, rounds recording the attested reviewer, and landing staying the
 operator's under the default strategy. Git run *by hand* in a repository planted between reap
-passes. `/task-swarm`'s workflow agents hold no role until its script passes `agentType` (its
+passes. The hooks' binary as it was when last pinned. `/task-swarm`'s workflow agents hold no role until its script passes `agentType` (its
 `.claude/workflows` file was read-only to the session that built this); until then
 `jkb role map workflow-subagent coordinator` is the explicit, visible way to keep it working with
 worker isolation off.
