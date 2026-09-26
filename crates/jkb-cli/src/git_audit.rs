@@ -100,8 +100,8 @@ pub(crate) fn notify(db: &Db, findings: &[(PathBuf, String)]) -> Result<()> {
     } else {
         let body = format!(
             "A repository's git setup could make git you run there execute a program (a key in its own \
-             config, or a git directory redirected elsewhere): {}. The reap log names the key or file; \
-             fix it on the host.",
+             config, a hook in a submodule's git directory, or a git directory redirected elsewhere): \
+             {}. The reap log names the key or file; fix it on the host.",
             summary(findings)
         );
         (
@@ -110,7 +110,7 @@ pub(crate) fn notify(db: &Db, findings: &[(PathBuf, String)]) -> Result<()> {
                 "id": NOTIFY_ID,
                 "session": NOTIFY_ID,
                 "title": TITLE,
-                "subtitle": "jkb: planted git config",
+                "subtitle": "jkb: planted git setup",
                 "body": body.chars().take(jkb_core::notify::MAX_BODY_CHARS).collect::<String>(),
             }),
             Some(POST_TTL_MS),

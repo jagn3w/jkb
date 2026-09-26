@@ -455,7 +455,8 @@ const MAX_MODULE_DEPTH: usize = 8;
 /// What in `dir`'s **submodules** could make git run a program — for the reap scan to report, since
 /// jkb's own git never enters a submodule ([`git_cmd`]) but yours does: a submodule git directory's own
 /// config setting a key outside [`config_key_allowed`], or a `core.worktree` pointing outside the
-/// superproject; a symlinked submodule config, git directory, `modules/` or `.git`; a `.gitmodules`
+/// superproject; a `commondir` in one, or a hook in its own `hooks/` that is neither git's sample nor
+/// your template's; a symlinked submodule config, git directory, `modules/`, `hooks/` or `.git`; a `.gitmodules`
 /// path outside its own checkout; a submodule checkout whose `.git` file points somewhere other than
 /// a `modules/` this scan reads. Real git directories (those with a `HEAD`) under `<common>/modules`,
 /// each `<common>/worktrees/*/modules`, and each un-absorbed submodule's own `.git/modules` are read,
@@ -464,6 +465,11 @@ const MAX_MODULE_DEPTH: usize = 8;
 /// submodules are followed to [`MAX_MODULE_DEPTH`], and anything deeper is reported rather than
 /// passed over.
 pub(crate) fn module_findings(dir: &Path) -> Vec<String> {
+    findings_with(dir, template_hooks(dir))
+}
+
+/// [`module_findings`], with your template's `hooks/` given.
+fn findings_with(dir: &Path, template: Option<PathBuf>) -> Vec<String> {
     let Ok(Some((_, common))) = check_layout(dir) else {
         return Vec::new();
     };
@@ -476,6 +482,7 @@ pub(crate) fn module_findings(dir: &Path) -> Vec<String> {
         common,
         out: Vec::new(),
         judged: std::collections::HashSet::new(),
+        template,
     };
     let mut homes = vec![scan.common.join("modules")];
     if let Ok(entries) = fs::read_dir(scan.common.join("worktrees")) {
@@ -516,6 +523,27 @@ struct Scan<'a> {
     common: PathBuf,
     out: Vec<String>,
     judged: std::collections::HashSet<PathBuf>,
+    /// Your `init.templateDir`'s `hooks/` ([`template_hooks`]).
+    template: Option<PathBuf>,
+}
+
+/// The `hooks/` of the template git copies into every repository and submodule it creates — the
+/// operator's, from the environment or the global or system config, never the repository's own,
+/// which the container writes.
+fn template_hooks(dir: &Path) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("GIT_TEMPLATE_DIR") {
+        return Some(PathBuf::from(dir).join("hooks"));
+    }
+    ["--global", "--system"].iter().find_map(|scope| {
+        git_in(
+            dir,
+            &["config", scope, "--type=path", "--get", "init.templateDir"],
+        )
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("hooks"))
+    })
 }
 
 impl Scan<'_> {
@@ -526,7 +554,64 @@ impl Scan<'_> {
             return false;
         }
         judge_module(self.dir, gitdir, &self.top, &self.common, &mut self.out);
+        if !gitdir.join("commondir").exists() {
+            self.judge_hooks(gitdir);
+        }
         true
+    }
+
+    /// Report what could run from `gitdir`'s own `hooks/` for git you run there — measured on git
+    /// 2.51.1, a planted `pre-commit` ran on `git -C sub commit` (review round 7). Git writes only
+    /// `*.sample` files there, and copies your `init.templateDir`'s hooks in; anything else is
+    /// reported, and so is a `hooks/` that cannot be listed — git needs only to search it to run a
+    /// hook by name (round 8).
+    fn judge_hooks(&mut self, gitdir: &Path) {
+        let hooks = gitdir.join("hooks");
+        match fs::symlink_metadata(&hooks) {
+            Ok(m) if m.file_type().is_symlink() => {
+                self.out.push(format!("{} is a symlink", hooks.display()));
+                return;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                self.out
+                    .push(format!("{} cannot be read: {e}", hooks.display()));
+                return;
+            }
+        }
+        let entries = match fs::read_dir(&hooks) {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.out
+                    .push(format!("{} cannot be listed: {e}", hooks.display()));
+                return;
+            }
+        };
+        let template = self.template.clone();
+        for e in entries {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    self.out
+                        .push(format!("{} cannot be listed: {err}", hooks.display()));
+                    continue;
+                }
+            };
+            let name = e.file_name();
+            if name.to_string_lossy().ends_with(".sample") {
+                continue;
+            }
+            let yours = template.as_ref().is_some_and(|t| {
+                matches!(
+                    (fs::read(t.join(&name)), fs::read(e.path())),
+                    (Ok(a), Ok(b)) if a == b
+                )
+            });
+            if !yours {
+                self.out.push(format!("{} is a hook", e.path().display()));
+            }
+        }
     }
 
     /// Judge every git directory under the `modules/` directory `root`, at any nesting to
@@ -683,19 +768,6 @@ fn judge_module(dir: &Path, gitdir: &Path, top: &Path, common: &Path, out: &mut 
             to.trim()
         ));
         return;
-    }
-    // Hooks run from the submodule's own `hooks/` for git you run there — measured on git 2.51.1,
-    // a planted `pre-commit` ran on `git -C sub commit` — and git writes only `*.sample` files in
-    // it (review round 7).
-    let hooks = gitdir.join("hooks");
-    if fs::symlink_metadata(&hooks).is_ok_and(|m| m.file_type().is_symlink()) {
-        out.push(format!("{} is a symlink", hooks.display()));
-    } else if let Ok(entries) = fs::read_dir(&hooks) {
-        for e in entries.flatten() {
-            if !e.file_name().to_string_lossy().ends_with(".sample") {
-                out.push(format!("{} is a hook", e.path().display()));
-            }
-        }
     }
     let cfg = gitdir.join("config");
     match fs::symlink_metadata(&cfg) {
@@ -3523,6 +3595,29 @@ mod tests {
         std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\ntouch /tmp/h\n").unwrap();
         let found = super::module_findings(&dir).join("; ");
         assert!(found.contains("pre-commit is a hook"), "{found}");
+        // One git copied from your `init.templateDir` is yours, byte for byte; an edit is not.
+        let template = t.path().join("template/hooks");
+        std::fs::create_dir_all(&template).unwrap();
+        std::fs::write(template.join("pre-commit"), "#!/bin/sh\ntouch /tmp/h\n").unwrap();
+        let with = |dir: &Path| super::findings_with(dir, Some(template.clone())).join("; ");
+        assert!(!with(&dir).contains("is a hook"), "{}", with(&dir));
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\ntouch /tmp/other\n").unwrap();
+        assert!(
+            with(&dir).contains("pre-commit is a hook"),
+            "{}",
+            with(&dir)
+        );
+        #[cfg(unix)]
+        {
+            // A `hooks/` git can search but the scan cannot list still runs a hook by name.
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o311)).unwrap();
+            if std::fs::read_dir(&hooks).is_err() {
+                let found = super::module_findings(&dir).join("; ");
+                assert!(found.contains("hooks cannot be listed"), "{found}");
+            }
+            std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::fs::remove_dir_all(&hooks).unwrap();
         #[cfg(unix)]
         {

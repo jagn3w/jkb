@@ -617,6 +617,39 @@ fn a_round_holds_under_every_name_the_mirror_gives_it() {
         Some("tasks/x/codereviews/f")
     );
     assert_eq!(over("repos/x/codereviews/g"), None);
+    // Recorded again through another of its names, it is refused, not snapshotted as a new round.
+    let e = record(
+        &db,
+        id,
+        "repos/x/codereviews/f",
+        crate::reviews::RoundSource::AnyNamespace,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("already recorded as"), "{e}");
+    record(
+        &db,
+        id,
+        "tasks/x/codereviews/f",
+        crate::reviews::RoundSource::AnyNamespace,
+    )
+    .expect("its own name again is the same round");
+    // Every name gives the same set, a repository named `tasks` or `repos` included (round 8).
+    for ns in [
+        "reviews/f",
+        "repos/x/y",
+        "tasks/x/y",
+        "repos/tasks/a",
+        "tasks/tasks/a",
+        "tasks/a",
+        "repos/repos/x",
+        "tasks/repos",
+        "repos",
+    ] {
+        let forms = crate::task::mirror_forms(ns);
+        for other in &forms {
+            assert_eq!(crate::task::mirror_forms(other), forms, "{ns} vs {other}");
+        }
+    }
     // The same set of names from any one of them: a round at `reviews/f` holds `repos/reviews/f`
     // too, whose mirror it shares (round 7).
     for ns in ["reviews/f", "repos/reviews/f", "tasks/reviews/f"] {

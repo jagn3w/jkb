@@ -290,6 +290,14 @@ fn snapshot_round(
     if let Some(id) = existing {
         return Ok(id);
     }
+    // Another name for a recorded round — its `tasks/` mirror — or a namespace in or around one is
+    // not a new round: snapshotting it again would read today's priorities into a round newer than
+    // the one recorded, and turn the land gate's last-round verdict either way (review round 8).
+    if let Some(round) = round_overlapping(conn, ns)? {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "`{ns}` is, or lies in or around, the round already recorded as `{round}` — record              `{round}` itself; a finding that matters after a round is recorded is another round"
+        ))));
+    }
     let ids = if filed.is_empty() {
         Query {
             kind: Some("task".to_owned()),

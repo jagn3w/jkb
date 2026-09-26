@@ -28,6 +28,19 @@ use jkb_types::AgentId;
 use crate::ops_cli::{op_error, unexpected, Ops};
 use crate::{archive, branch_fate, gitrepo, owner, presence, repo, session, BranchFate};
 
+/// What recording a landing made of one task ([`Kb::landed`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// Recorded, and the task moved.
+    Recorded,
+    /// Recorded, but a guard held the task — open subtasks, say.
+    Held(String),
+    /// Nothing recorded: the task is already `done`, and this is not a landing to repeat.
+    Already,
+    /// Nothing recorded: this caller may not land it.
+    Refused(String),
+}
+
 /// The database, through whichever backend serves this command.
 #[derive(Clone, Copy)]
 pub(crate) struct Kb<'a> {
@@ -277,19 +290,31 @@ impl<'a> Kb<'a> {
 
     /// `task.landed`.
     ///
-    /// A task the caller may not land (a workflow parked at `landed`, a task outside its scope) comes
-    /// back as `Err(why)`, not as an error: the merge queue records a whole group branch task by
-    /// task, and one refused task must not leave every task after it unrecorded. Unlike a guard's
-    /// refusal, it recorded nothing.
-    pub(crate) fn landed(&self, uid: &str, landed: Landed) -> Result<Result<Landing, String>> {
+    /// What `task.landed` made of `uid`, for the merge queue recording a whole group branch task by
+    /// task. A task the caller may not land (a workflow parked at `landed`, a task outside its scope)
+    /// is a [`Verdict::Refused`], not an error, so one refused task does not leave every task after it
+    /// unrecorded (review round 4) — unless it is already `done`: one `task land --keep-worktree`
+    /// landed records the branch's tip from before the graft, so the same work asked about again is
+    /// [`Verdict::Already`], which is what the queue's advice for a branch already in its base
+    /// expects (round 8).
+    pub(crate) fn landed(&self, uid: &str, landed: Landed) -> Result<Verdict> {
         let request = Request::TaskLanded {
             uid: uid.to_owned(),
             landed,
         };
         match self.backend.call(request) {
-            Ok(Response::Landing { landing }) => Ok(Ok(landing)),
+            Ok(Response::Landing { landing }) => Ok(match landing.refusal {
+                None => Verdict::Recorded,
+                Some(why) => Verdict::Held(why),
+            }),
             Ok(other) => unexpected("task.landed", &other),
-            Err(e) if e.code == jkb_api::ErrorCode::Forbidden => Ok(Err(e.message)),
+            Err(e) if e.code == jkb_api::ErrorCode::Forbidden => {
+                if self.facts(uid)?.status == "done" {
+                    Ok(Verdict::Already)
+                } else {
+                    Ok(Verdict::Refused(e.message))
+                }
+            }
             Err(e) => Err(op_error(e, self.remote)),
         }
     }
@@ -1914,16 +1939,37 @@ mod tests {
             .landed(&parked, landed())
             .expect("a refusal, not an error");
         assert!(
-            held.as_ref().is_err_and(|r| r.contains("parked")),
+            matches!(&held, super::Verdict::Refused(r) if r.contains("parked")),
             "{held:?}"
         );
         let next = kb
             .landed(&open, landed())
             .expect("the next task is still asked");
         assert!(
-            !next.as_ref().is_err_and(|r| r.contains("parked")),
+            !matches!(&next, super::Verdict::Refused(r) if r.contains("parked")),
             "{next:?}"
         );
+        // Landed by `task land --keep-worktree`, whose recorded head is the tip before the graft:
+        // the same work asked about again is already landed, not refused (review round 8).
+        let done = add("done");
+        call(
+            &op,
+            serde_json::json!({ "op": "workflow.set", "uid": done, "strategy": "autonomous" }),
+        );
+        call(
+            &op,
+            serde_json::json!({ "op": "task.set", "uid": done, "status": "in_progress" }),
+        );
+        call(
+            &op,
+            serde_json::json!({ "op": "task.landed", "uid": done,
+                                "landed": { "branch": "b", "onto": "o", "head": "abcd" } }),
+        );
+        let again = Landed {
+            head: Some("ffff".into()),
+            ..landed()
+        };
+        assert_eq!(kb.landed(&done, again).unwrap(), super::Verdict::Already);
     }
 
     fn task(uid: &str, status: &str, onto: &str) -> BranchTask {

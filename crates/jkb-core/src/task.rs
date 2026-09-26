@@ -234,9 +234,12 @@ pub fn mirror_forms(ns: &str) -> Vec<String> {
     let mirror = tasks_mirror_ns(ns).unwrap_or_else(|| ns.to_owned());
     let mut forms = vec![ns.to_owned(), mirror.clone()];
     if let Some(rest) = mirror.strip_prefix(&format!("{DEFAULT_ROOT}/")) {
-        forms.push(format!("repos/{rest}"));
-        if !rest.starts_with("repos/") && rest != "repos" {
-            forms.push(rest.to_owned());
+        // Only a home that really mirrors here — a repository named `tasks` or `repos` has homes
+        // that do not (review round 8).
+        for home in [format!("repos/{rest}"), rest.to_owned()] {
+            if tasks_mirror_ns(&home).as_deref() == Some(mirror.as_str()) {
+                forms.push(home);
+            }
         }
     }
     forms.sort();

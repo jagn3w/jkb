@@ -818,7 +818,10 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   gets the lifecycle's no-op, not "held" (round 5) — but only a workflow parked at `landed`, and the branch, destination
   and head its live landing records: a cancelled task ticked `done`, or a landing somewhere else,
   recorded a landing it never had (round 6); a workflow the operator landed while it stayed parked at
-  `cancelled` has a live landing too, and new commits on the branch are new work (round 7). `jkb task landed` reports a refused task held and
+  `cancelled` has a live landing too, and new commits on the branch are new work (round 7). `jkb task landed` reports a task it may not
+  land again but that is already `done` as **already landed**, not refused: `task land
+  --keep-worktree` records the branch's tip from before the graft, so the queue's own advice for a
+  branch already in its base otherwise failed (round 8). `jkb task landed` reports a refused task held and
   records the branch's others (round 4: the refusal aborted the loop), and fails when this caller
   may land none of them rather than printing `recorded:` over nothing (round 5).) A task landed before D52 has no workflow rows, reads `design`,
   and is not held by this. *Superseded (round 2):* an
@@ -872,7 +875,10 @@ against the branch it drove satisfied the gate with no reviewer involved. A roun
 by `role grant reviewer` to itself. Reviewers come only from the operator — a grant, or the
 `agent_type → role` map an attested subagent resolves through. A round's namespace is any filed or
 recorded one, any `repos/<repo>/codereviews/<folder>` (a `/review-log` mount before it is recorded,
-round 4), and each through its `tasks/<repo>/…` mirror (round 5). Still not protected: a
+round 4), and each through its `tasks/<repo>/…` mirror (round 5). **A recorded round is recorded
+under one name**: recording another name for it, or a namespace in or around it, is refused rather
+than snapshotted as a newer round, which read today's priorities and turned the land gate's
+last-round verdict either way (round 8). Still not protected: a
 coordinator telling a reviewer it spawned to file a clean round, the "genuine worker told to lie"
 case below. A filing is refused into, above or below any recorded round; a
 principal held to one task files only under `repos/<repo>/codereviews/` of its task's repository
@@ -992,7 +998,14 @@ Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed 
    submodule's git directory is reported, not read past (round 6, measured on git 2.51.1: a filter
    planted in the directory it named ran on `git -C sub add`) — the same redirect `check_layout`
    refuses for a repository jkb runs git in. So is any hook in a submodule git directory's own
-   `hooks/` but git's `*.sample` files (round 7: a planted `pre-commit` ran on `git -C sub commit`).
+   `hooks/` but git's `*.sample` files (round 7: a planted `pre-commit` ran on `git -C sub commit`)
+   and those byte-identical to your `init.templateDir`'s, which git copied in — read from the
+   environment or the global or system config, never the repository's; a `hooks/` the scan cannot
+   list is reported too, since git needs only to search it to run a hook by name (round 8).
+   **Not covered: the repository's own `.git/hooks`.** The container sees it read-only through the
+   bind; a container that replaced `.git` wholesale could plant a hook there that neither layer
+   reports, because nothing can tell a planted hook from one you or `setup.sh` installed when the
+   container writes both the hook and anything it could be compared with (round 8).
 
 And the land gate — the candidate's own code — runs in the container through `docker exec` (exit
 status and output measured intact), settled before the graft, for a repository under `~/repos`,

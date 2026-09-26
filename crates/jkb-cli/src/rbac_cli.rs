@@ -238,7 +238,8 @@ pub fn role(b: &dyn Backend, cmd: RoleCmd, json_out: bool) -> Result<()> {
                                 .as_deref()
                                 .map(|r| format!("  REVOKED {r}"))
                                 .unwrap_or_default(),
-                            if g.grantable {
+                            // A revoked grant has nothing left to revoke.
+                            if g.grantable || g.revoked_at.is_some() {
                                 ""
                             } else {
                                 "  NOT GRANTABLE (its minter may no longer grant it; revoke it)"

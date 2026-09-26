@@ -2272,6 +2272,7 @@ pub(crate) fn cmd_task_landed(
     let mut recorded = Vec::new();
     let mut not_closed = Vec::new();
     let mut refused = 0;
+    let mut already = Vec::new();
     for uid in &uids {
         // `task.landed` states `landed_elsewhere` — the merge queue performed and gated the graft
         // itself (D38), which is why this is `observed_landed` and not `land`, whose guard asks
@@ -2287,11 +2288,10 @@ pub(crate) fn cmd_task_landed(
             },
         )?;
         match outcome {
-            Ok(landing) => match landing.refusal {
-                None => recorded.push(uid.clone()),
-                Some(why) => not_closed.push((uid.clone(), why)),
-            },
-            Err(why) => {
+            session_cli::Verdict::Recorded => recorded.push(uid.clone()),
+            session_cli::Verdict::Held(why) => not_closed.push((uid.clone(), why)),
+            session_cli::Verdict::Already => already.push(uid.clone()),
+            session_cli::Verdict::Refused(why) => {
                 refused += 1;
                 not_closed.push((uid.clone(), why));
             }
@@ -2304,16 +2304,23 @@ pub(crate) fn cmd_task_landed(
             serde_json::json!({
                 "repo": ctx.key, "branch": branch, "onto": onto, "head": head,
                 "landed": recorded,
+                "already": already,
                 "held": not_closed.iter().map(|(uid, why)| serde_json::json!({
                     "uid": uid, "reason": why,
                 })).collect::<Vec<_>>(),
             })
         );
     } else {
-        if refused < uids.len() {
+        if !recorded.is_empty() {
             println!("recorded: {branch} landed on {onto}");
         }
         for uid in &recorded {
+            println!("  {uid}");
+        }
+        if !already.is_empty() {
+            println!("already landed:");
+        }
+        for uid in &already {
             println!("  {uid}");
         }
         // Reported rather than swallowed: a task the queue could not close is one the queue's
