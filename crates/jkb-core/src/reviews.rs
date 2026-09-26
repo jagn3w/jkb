@@ -295,7 +295,8 @@ fn snapshot_round(
     // the one recorded, and turn the land gate's last-round verdict either way (review round 8).
     if let Some(round) = round_overlapping(conn, ns)? {
         return Err(Error::Types(TypeError::Validation(format!(
-            "`{ns}` is, or lies in or around, the round already recorded as `{round}` — record              `{round}` itself; a finding that matters after a round is recorded is another round"
+            "`{ns}` is, or lies in or around, the round already recorded as `{round}` — record \
+             `{round}` itself; a finding that matters after a round is recorded is another round"
         ))));
     }
     let ids = if filed.is_empty() {

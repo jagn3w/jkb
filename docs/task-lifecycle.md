@@ -821,7 +821,8 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   `cancelled` has a live landing too, and new commits on the branch are new work (round 7). `jkb task landed` reports a task it may not
   land again but that is already `done` as **already landed**, not refused: `task land
   --keep-worktree` records the branch's tip from before the graft, so the queue's own advice for a
-  branch already in its base otherwise failed (round 8). `jkb task landed` reports a refused task held and
+  branch already in its base otherwise failed (round 8) — only where its live landing records the
+  same branch onto the same destination, which `task.facts` now reports (round 9). `jkb task landed` reports a refused task held and
   records the branch's others (round 4: the refusal aborted the loop), and fails when this caller
   may land none of them rather than printing `recorded:` over nothing (round 5).) A task landed before D52 has no workflow rows, reads `design`,
   and is not held by this. *Superseded (round 2):* an
@@ -1000,7 +1001,9 @@ Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed 
    refuses for a repository jkb runs git in. So is any hook in a submodule git directory's own
    `hooks/` but git's `*.sample` files (round 7: a planted `pre-commit` ran on `git -C sub commit`)
    and those byte-identical to your `init.templateDir`'s, which git copied in — read from the
-   environment or the global or system config, never the repository's; a `hooks/` the scan cannot
+   environment or the global or system config (`[include]`s followed, as git follows them), never the
+   repository's, and not trusted when it lies beside the repositories, where the container could
+   write the same hook into both (round 9); a `hooks/` the scan cannot
    list is reported too, since git needs only to search it to run a hook by name (round 8).
    **Not covered: the repository's own `.git/hooks`.** The container sees it read-only through the
    bind; a container that replaced `.git` wholesale could plant a hook there that neither layer

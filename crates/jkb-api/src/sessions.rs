@@ -74,6 +74,11 @@ pub struct TaskState {
     /// Whether this client may write the task at all — `false` for one filed outside `jkb serve`'s
     /// file roots. A verb that does git work before its write asks this first.
     pub writable: bool,
+    /// The branch and destination of its live landing, if it has one — what tells `task landed` a
+    /// task it may not land again from one it already landed (review round 9). Absent from an older
+    /// daemon, which reads as no landing: nothing is then reported already landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<Box<(String, String)>>,
 }
 
 /// `task.facts`: what the session verbs read about a task, in one read.
@@ -109,6 +114,10 @@ pub fn facts(
         land_target: transition::land_target(conn, id)?,
         open_subtasks: !task::subtasks_all_terminal(conn, id)?,
         writable,
+        landed: transition::landing(conn, id)?
+            .live()
+            .and_then(|row| Some((row.labels.branch.clone()?, row.labels.onto.clone()?)))
+            .map(Box::new),
         start_refusal: if terminal {
             lifecycle::apply(&observed, TaskEvent::Start).refusal()
         } else {

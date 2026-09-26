@@ -465,7 +465,7 @@ const MAX_MODULE_DEPTH: usize = 8;
 /// submodules are followed to [`MAX_MODULE_DEPTH`], and anything deeper is reported rather than
 /// passed over.
 pub(crate) fn module_findings(dir: &Path) -> Vec<String> {
-    findings_with(dir, template_hooks(dir))
+    findings_with(dir, template_hooks(dir, None))
 }
 
 /// [`module_findings`], with your template's `hooks/` given.
@@ -482,8 +482,22 @@ fn findings_with(dir: &Path, template: Option<PathBuf>) -> Vec<String> {
         common,
         out: Vec::new(),
         judged: std::collections::HashSet::new(),
-        template,
+        template: None,
     };
+    // A template inside the tree that holds the repositories is the container's to write: a hook
+    // planted there and in a submodule byte for byte would pass as yours (review round 9).
+    if let Some(t) = template {
+        let resolved = fs::canonicalize(&t).unwrap_or_else(|_| t.clone());
+        match scan.top.parent() {
+            Some(repos) if resolved.starts_with(repos) => scan.out.push(format!(
+                "your init.templateDir ({}) lies in {}, beside the repositories the container \
+                 writes, so its hooks are not taken as yours",
+                t.display(),
+                repos.display()
+            )),
+            _ => scan.template = Some(t),
+        }
+    }
     let mut homes = vec![scan.common.join("modules")];
     if let Ok(entries) = fs::read_dir(scan.common.join("worktrees")) {
         for e in entries.flatten() {
@@ -530,19 +544,33 @@ struct Scan<'a> {
 /// The `hooks/` of the template git copies into every repository and submodule it creates — the
 /// operator's, from the environment or the global or system config, never the repository's own,
 /// which the container writes.
-fn template_hooks(dir: &Path) -> Option<PathBuf> {
+///
+/// Read `--includes`, as git does when it copies the template: a dotfiles `[include]` that sets it
+/// otherwise read as no template at all, and every hook it installs as planted (review round 9).
+/// `global` names the global config file in place of git's own choice.
+fn template_hooks(dir: &Path, global: Option<&Path>) -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("GIT_TEMPLATE_DIR") {
         return Some(PathBuf::from(dir).join("hooks"));
     }
     ["--global", "--system"].iter().find_map(|scope| {
-        git_in(
+        let mut cmd = git_in(
             dir,
-            &["config", scope, "--type=path", "--get", "init.templateDir"],
-        )
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("hooks"))
+            &[
+                "config",
+                scope,
+                "--includes",
+                "--type=path",
+                "--get",
+                "init.templateDir",
+            ],
+        );
+        if let Some(global) = global {
+            cmd.env("GIT_CONFIG_GLOBAL", global);
+        }
+        cmd.output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("hooks"))
     })
 }
 
@@ -3582,7 +3610,36 @@ mod tests {
         let found = super::module_findings(&dir).join("; ");
         assert!(found.contains("redirects its config and hooks"), "{found}");
         std::fs::remove_file(dir.join(".git/modules/sub/commondir")).unwrap();
-        // A hook planted in a submodule's own `hooks/`; git's samples are not hooks.
+        #[cfg(unix)]
+        {
+            // An un-absorbed git directory whose `modules/` is a symlink.
+            std::fs::remove_dir_all(dir.join("sub")).unwrap();
+            gitdir(&dir.join("sub/.git"), clean);
+            let elsewhere = t.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.join("sub/.git/modules")).unwrap();
+            let found = super::module_findings(&dir).join("; ");
+            assert!(found.contains(".git/modules is a symlink"), "{found}");
+        }
+    }
+
+    /// A hook in a submodule's own `hooks/` runs for git you run there (review rounds 7–9): reported,
+    /// unless it is git's sample or your template's byte for byte — a template that is not beside the
+    /// repositories — and a `hooks/` the scan cannot list is reported too.
+    #[test]
+    fn the_scan_reports_a_hook_planted_in_a_submodule() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let module = dir.join(".git/modules/sub");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            module.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
         let hooks = dir.join(".git/modules/sub/hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         std::fs::write(hooks.join("pre-commit.sample"), "#!/bin/sh\n").unwrap();
@@ -3596,7 +3653,9 @@ mod tests {
         let found = super::module_findings(&dir).join("; ");
         assert!(found.contains("pre-commit is a hook"), "{found}");
         // One git copied from your `init.templateDir` is yours, byte for byte; an edit is not.
-        let template = t.path().join("template/hooks");
+        // Your template lives outside the tree the repositories are in.
+        let home = tempfile::tempdir().unwrap();
+        let template = home.path().join("template/hooks");
         std::fs::create_dir_all(&template).unwrap();
         std::fs::write(template.join("pre-commit"), "#!/bin/sh\ntouch /tmp/h\n").unwrap();
         let with = |dir: &Path| super::findings_with(dir, Some(template.clone())).join("; ");
@@ -3606,6 +3665,15 @@ mod tests {
             with(&dir).contains("pre-commit is a hook"),
             "{}",
             with(&dir)
+        );
+        // Not a template beside the repositories, though: the container writes that too.
+        let beside = dir.parent().unwrap().join("dotfiles/template/hooks");
+        std::fs::create_dir_all(&beside).unwrap();
+        std::fs::copy(hooks.join("pre-commit"), beside.join("pre-commit")).unwrap();
+        let found = super::findings_with(&dir, Some(beside.clone())).join("; ");
+        assert!(
+            found.contains("pre-commit is a hook") && found.contains("beside the repositories"),
+            "{found}"
         );
         #[cfg(unix)]
         {
@@ -3618,18 +3686,29 @@ mod tests {
             }
             std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        std::fs::remove_dir_all(&hooks).unwrap();
-        #[cfg(unix)]
-        {
-            // An un-absorbed git directory whose `modules/` is a symlink.
-            std::fs::remove_dir_all(dir.join("sub")).unwrap();
-            gitdir(&dir.join("sub/.git"), clean);
-            let elsewhere = t.path().join("elsewhere");
-            std::fs::create_dir_all(&elsewhere).unwrap();
-            std::os::unix::fs::symlink(&elsewhere, dir.join("sub/.git/modules")).unwrap();
-            let found = super::module_findings(&dir).join("; ");
-            assert!(found.contains(".git/modules is a symlink"), "{found}");
-        }
+    }
+
+    /// Your template is read as git reads it when it copies one in, `[include]`s and all (review
+    /// round 9: a dotfiles include read as no template, and every hook it installed as planted).
+    #[test]
+    fn the_template_is_found_through_an_include() {
+        let t = tempfile::tempdir().unwrap();
+        let (global, included) = (t.path().join("gitconfig"), t.path().join("included"));
+        std::fs::write(
+            &global,
+            format!("[include]\n\tpath = {}\n", included.display()),
+        )
+        .unwrap();
+        let template = t.path().join("tpl");
+        std::fs::write(
+            &included,
+            format!("[init]\n\ttemplateDir = {}\n", template.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            super::template_hooks(t.path(), Some(&global)),
+            Some(template.join("hooks"))
+        );
     }
 
     /// A session's own `.gitmodules` is the one git reads there: a submodule its branch adds, which

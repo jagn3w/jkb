@@ -293,11 +293,12 @@ impl<'a> Kb<'a> {
     /// What `task.landed` made of `uid`, for the merge queue recording a whole group branch task by
     /// task. A task the caller may not land (a workflow parked at `landed`, a task outside its scope)
     /// is a [`Verdict::Refused`], not an error, so one refused task does not leave every task after it
-    /// unrecorded (review round 4) — unless it is already `done`: one `task land --keep-worktree`
-    /// landed records the branch's tip from before the graft, so the same work asked about again is
-    /// [`Verdict::Already`], which is what the queue's advice for a branch already in its base
-    /// expects (round 8).
+    /// unrecorded (review round 4) — unless its live landing already records this branch onto this
+    /// destination: one `task land --keep-worktree` landed records the branch's tip from before the
+    /// graft, so the same work asked about again is [`Verdict::Already`], which is what the queue's
+    /// advice for a branch already in its base expects (rounds 8–9).
     pub(crate) fn landed(&self, uid: &str, landed: Landed) -> Result<Verdict> {
+        let same = (landed.branch.clone(), landed.onto.clone());
         let request = Request::TaskLanded {
             uid: uid.to_owned(),
             landed,
@@ -309,7 +310,11 @@ impl<'a> Kb<'a> {
             }),
             Ok(other) => unexpected("task.landed", &other),
             Err(e) if e.code == jkb_api::ErrorCode::Forbidden => {
-                if self.facts(uid)?.status == "done" {
+                // Already landed only where its live landing already records: the same branch onto
+                // the same destination, a head moved by the graft aside (round 9). A new
+                // destination, a cancelled task ticked `done`, a caller who may not land — refused.
+                let facts = self.facts(uid)?;
+                if facts.status == "done" && facts.landed.as_deref() == Some(&same) {
                     Ok(Verdict::Already)
                 } else {
                     Ok(Verdict::Refused(e.message))
@@ -1970,6 +1975,19 @@ mod tests {
             ..landed()
         };
         assert_eq!(kb.landed(&done, again).unwrap(), super::Verdict::Already);
+        // Somewhere else is not the same landing, though `done` it is (round 9).
+        let elsewhere = Landed {
+            onto: "other".into(),
+            head: Some("ffff".into()),
+            ..landed()
+        };
+        assert!(
+            matches!(
+                kb.landed(&done, elsewhere).unwrap(),
+                super::Verdict::Refused(_)
+            ),
+            "a new destination is refused"
+        );
     }
 
     fn task(uid: &str, status: &str, onto: &str) -> BranchTask {

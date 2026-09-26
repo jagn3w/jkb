@@ -590,7 +590,8 @@ enum Regroup {
 
 /// What one call came to.
 enum Called {
-    Done(Response),
+    /// Boxed: `Response` is the largest thing any op answers, and this is only ever moved.
+    Done(Box<Response>),
     /// A transient refusal, reported if it began an outage: try again later.
     Waiting,
     /// One of the refusals the caller said it handles.
@@ -636,7 +637,7 @@ impl Stream<'_> {
                 if self.outage == Some(op) || !held_ack {
                     self.outage = None;
                 }
-                Called::Done(response)
+                Called::Done(Box::new(response))
             }
             Err(e) if transient(e.code, self.backend) => {
                 self.last_transient = e.code;
@@ -902,35 +903,37 @@ pub fn subscribe(
         );
         let mut handed_over = false;
         match polled {
-            Called::Done(Response::Messages { messages }) => {
-                let mut drained = messages.len() < o.batch;
-                for m in messages {
-                    if o.at_most_once {
-                        match s.call(ack(o, m.seq), &[]) {
-                            Called::Done(_) => {}
-                            // Not acked, so not emitted: the next poll fetches it again.
-                            Called::Waiting => {
-                                drained = false;
-                                break;
+            Called::Done(response) => match *response {
+                Response::Messages { messages } => {
+                    let mut drained = messages.len() < o.batch;
+                    for m in messages {
+                        if o.at_most_once {
+                            match s.call(ack(o, m.seq), &[]) {
+                                Called::Done(_) => {}
+                                // Not acked, so not emitted: the next poll fetches it again.
+                                Called::Waiting => {
+                                    drained = false;
+                                    break;
+                                }
+                                Called::Over(code) => return Ok(code),
+                                Called::Refused(e) => return Ok(s.fatal(&e)),
                             }
-                            Called::Over(code) => return Ok(code),
-                            Called::Refused(e) => return Ok(s.fatal(&e)),
+                        }
+                        if !s.emit(&message_event(&m)) {
+                            return Ok(0);
+                        }
+                        emitted = m.seq;
+                        handed_over = true;
+                    }
+                    if drained && (handed_over || !caught_up_announced) {
+                        caught_up_announced = true;
+                        if !s.emit(&json!({ "event": "caught_up", "seq": emitted })) {
+                            return Ok(0);
                         }
                     }
-                    if !s.emit(&message_event(&m)) {
-                        return Ok(0);
-                    }
-                    emitted = m.seq;
-                    handed_over = true;
                 }
-                if drained && (handed_over || !caught_up_announced) {
-                    caught_up_announced = true;
-                    if !s.emit(&json!({ "event": "caught_up", "seq": emitted })) {
-                        return Ok(0);
-                    }
-                }
-            }
-            Called::Done(other) => bail!("unexpected response to mq.poll: {other:?}"),
+                other => bail!("unexpected response to mq.poll: {other:?}"),
+            },
             Called::Waiting => {}
             Called::Over(code) => return Ok(code),
             Called::Refused(e) if e.code == ErrorCode::NoSuchGroup => match s.regroup(&e) {

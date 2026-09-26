@@ -626,6 +626,7 @@ fn a_round_holds_under_every_name_the_mirror_gives_it() {
     )
     .unwrap_err();
     assert!(e.to_string().contains("already recorded as"), "{e}");
+    assert!(!e.to_string().contains("  "), "a wrapped literal: {e}");
     record(
         &db,
         id,
