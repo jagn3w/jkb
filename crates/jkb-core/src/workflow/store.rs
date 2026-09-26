@@ -17,13 +17,11 @@ use serde_json::json;
 
 use super::strategy::{self, AreaScope, StrategySpec, DEFAULT_PRESET};
 use super::{Phase, WorkflowEvent, WorkflowFacts};
-use crate::query::{Query, Scope};
 use crate::roles::{self, Role};
 use crate::store::WriteMeta;
-use crate::{item, tag, transition, Error, Result};
+use crate::{item, transition, Error, Result};
 
-/// The facet a finding's area (the file it is in) is recorded under.
-pub const FACET_AREA: &str = "area";
+pub use crate::reviews::{rounds_in, Round, FACET_AREA};
 
 /// The name of the strategy definition that, when defined, replaces [`DEFAULT_PRESET`].
 pub const DEFAULT_DEFINITION: &str = "default";
@@ -36,83 +34,12 @@ fn invalid(msg: impl Into<String>) -> Error {
 // Review rounds
 // -------------------------------------------------------------------------------------------
 
-/// One review round, as read from its findings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Round {
-    /// Its findings namespace.
-    pub ns: String,
-    /// When it was filed, as an order: the highest item id among its findings. Findings are
-    /// created when the review is filed, so this orders rounds by filing with no clock.
-    pub filed: i64,
-    /// How many findings it filed as must-fix (priority 1 or above), **at any status**: fixing a
-    /// finding does not make the round that found it clean.
-    pub must_fix: usize,
-    /// The files its must-fix findings name.
-    pub areas: Vec<String>,
-}
-
 /// The review namespaces recorded against `task`, in recording order ([`crate::reviews`]).
 ///
 /// # Errors
 /// A database error.
 pub fn review_namespaces(conn: &Connection, task: ItemId) -> Result<Vec<String>> {
     Ok(crate::reviews::state(conn, task)?.namespaces)
-}
-
-/// The area a finding names: its `area=` facet, or — for a finding filed before that facet existed —
-/// the file in its title, which `review file` wrote as `summary — file[:line]`.
-fn area_of(meta: &item::ItemMeta, tags: &[(String, String)]) -> Option<String> {
-    if let Some((_, v)) = tags.iter().find(|(f, _)| f == FACET_AREA) {
-        return Some(v.clone());
-    }
-    let title = item::title_of(meta);
-    let (_, tail) = title.rsplit_once(" — ")?;
-    let file = match tail.rsplit_once(':') {
-        Some((f, line)) if line.chars().all(|c| c.is_ascii_digit()) && !line.is_empty() => f,
-        _ => tail,
-    };
-    (!file.is_empty() && !file.contains(' ')).then(|| file.to_owned())
-}
-
-/// The rounds under `namespaces`, oldest first. A namespace holding nothing is not a round.
-///
-/// # Errors
-/// A database error.
-pub fn rounds_in(conn: &Connection, namespaces: &[String]) -> Result<Vec<Round>> {
-    let mut out = Vec::new();
-    for ns in namespaces {
-        let ids = Query {
-            kind: Some("task".to_owned()),
-            scope: Scope::Subtree(ns.clone()),
-            ..Query::default()
-        }
-        .evaluate(conn)?;
-        let Some(filed) = ids.iter().map(|id| id.get()).max() else {
-            continue;
-        };
-        let metas = item::get_many(conn, &ids)?;
-        let tags = tag::applications_for(conn, &ids)?;
-        let mut must_fix = 0;
-        let mut areas = BTreeSet::new();
-        for id in &ids {
-            let Some(m) = metas.get(id) else { continue };
-            if m.priority.unwrap_or(i64::MAX) > 1 {
-                continue;
-            }
-            must_fix += 1;
-            if let Some(a) = area_of(m, tags.get(id).map_or(&[][..], Vec::as_slice)) {
-                areas.insert(a);
-            }
-        }
-        out.push(Round {
-            ns: ns.clone(),
-            filed,
-            must_fix,
-            areas: areas.into_iter().collect(),
-        });
-    }
-    out.sort_by_key(|r| r.filed);
-    Ok(out)
 }
 
 /// The rounds recorded against `task`, oldest first.
@@ -233,16 +160,25 @@ pub fn definitions(conn: &Connection) -> Result<Vec<(String, i64, String)>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// The strategy a task with nothing pinned runs: the `default` definition if the operator made one,
-/// else [`DEFAULT_PRESET`].
+/// The strategy a new task runs: the `default` definition if the operator made one, else
+/// [`DEFAULT_PRESET`].
 ///
 /// # Errors
-/// [`Error::Types`] for an unreadable stored definition.
+/// [`Error::Types`] for a stored `default` this binary cannot read — refused, never replaced by the
+/// preset, which would run the task under whatever the unreadable field was there to tighten — or a
+/// database error.
 pub fn default_strategy(conn: &Connection) -> Result<(String, StrategySpec)> {
-    match resolve_strategy(conn, DEFAULT_DEFINITION) {
-        Ok(found) => Ok(found),
-        Err(_) => resolve_strategy(conn, DEFAULT_PRESET),
-    }
+    let defined: bool = conn
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM workflow_strategies WHERE name = ?1)")?
+        .query_row([DEFAULT_DEFINITION], |r| r.get(0))?;
+    resolve_strategy(
+        conn,
+        if defined {
+            DEFAULT_DEFINITION
+        } else {
+            DEFAULT_PRESET
+        },
+    )
 }
 
 // -------------------------------------------------------------------------------------------
@@ -346,6 +282,14 @@ pub fn current(conn: &Connection, task: ItemId) -> Result<Current> {
         source,
         history,
     })
+}
+
+impl Current {
+    /// Whether a row of the task's history pinned its strategy.
+    #[must_use]
+    pub fn pinned(&self) -> bool {
+        self.history.iter().any(|r| r.spec.is_some())
+    }
 }
 
 /// Who is acting on a workflow: the roles held, and the principal to record.
@@ -496,19 +440,39 @@ fn check_reason(event: WorkflowEvent, reason: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle(
     conn: &Connection,
     meta: &WriteMeta,
     task: ItemId,
+    current: &Current,
     outcome: Outcome<Phase, WorkflowEvent, ()>,
     actor: &Actor,
     reason: Option<&str>,
     facts: &WorkflowFacts,
 ) -> Result<Moved> {
     Ok(match outcome {
+        // A declared self-loop is nothing to record.
+        Outcome::Moved { from, to, .. } if from == to => Moved::AlreadyThere(to),
         Outcome::Moved {
             from, event, to, ..
         } => {
+            // A task's first move pins the strategy it is running, so redefining `default` later
+            // changes only tasks that have not started — never one mid-flight (D52.5).
+            if !current.pinned() {
+                append(
+                    conn,
+                    meta,
+                    task,
+                    "pin_strategy",
+                    Some(from),
+                    from,
+                    actor,
+                    Some(&current.source),
+                    Some(&current.spec.to_json()?),
+                    None,
+                )?;
+            }
             append(
                 conn,
                 meta,
@@ -567,7 +531,7 @@ pub fn fire(
     let mut facts = observe_facts(conn, task, &current)?;
     facts.stated = stated;
     let outcome = current.spec.graph.machine().apply(&facts, event);
-    settle(conn, meta, task, outcome, actor, reason, &facts)
+    settle(conn, meta, task, &current, outcome, actor, reason, &facts)
 }
 
 /// Observe `task` and take the one reconciliation that applies — after a review round, this is what
@@ -588,7 +552,9 @@ pub fn observe(conn: &Connection, meta: &WriteMeta, task: ItemId, actor: &Actor)
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
-        Reconciliation::Fired(outcome) => settle(conn, meta, task, outcome, actor, None, &facts),
+        Reconciliation::Fired(outcome) => {
+            settle(conn, meta, task, &current, outcome, actor, None, &facts)
+        }
     }
 }
 

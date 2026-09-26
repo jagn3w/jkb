@@ -296,3 +296,20 @@ fn next_actor_names_a_role_for_every_live_phase() {
         assert!(!spec.next_actor(p).1.is_empty(), "{}", p.as_str());
     }
 }
+
+#[test]
+fn the_coordinator_s_base_permits_are_exactly_these() {
+    // Pinned whole, so a widening is a visible edit here rather than an unnoticed row: `reopen`
+    // (picking up what the operator landed or cancelled) and `override` stay the operator's.
+    assert_eq!(
+        BASE.permissions_of(Role::Coordinator),
+        vec![
+            WorkflowEvent::SubmitDesign,
+            WorkflowEvent::SubmitWork,
+            WorkflowEvent::SubmitSystemic,
+            WorkflowEvent::SystemicRedesign,
+            WorkflowEvent::Rework,
+            WorkflowEvent::Cancel,
+        ]
+    );
+}

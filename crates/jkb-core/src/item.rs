@@ -742,6 +742,9 @@ pub fn remove(conn: &Connection, meta: &WriteMeta, item: ItemId, force: bool) ->
     // above had to capture them.
     conn.prepare_cached("DELETE FROM items WHERE id = ?1")?
         .execute([item.get()])?;
+    // Grants scoped to it are revoked, never deleted (V022 keeps them: no cascade), and an undo
+    // does not revive them — a credential is re-armed only by minting a new one.
+    crate::roles::revoke_task(conn, meta, item)?;
     changelog::append(
         conn,
         meta,
@@ -866,6 +869,20 @@ pub fn primary_namespace(conn: &Connection, item: ItemId) -> Result<Option<Strin
         )?
         .query_row([item.get()], |r| r.get(0))
         .optional()?)
+}
+
+/// The path of every namespace an item is placed under, primary or mirror.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn namespaces_of(conn: &Connection, item: ItemId) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+              WHERE p.item_id = ?1 ORDER BY n.path",
+        )?
+        .query_map([item.get()], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// How many items of `kind` were **derived from** each of `parents`, as a

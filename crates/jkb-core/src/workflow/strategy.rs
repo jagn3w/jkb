@@ -255,7 +255,6 @@ pub static BASE: RoleTable<Role, WorkflowEvent> = RoleTable {
                 WorkflowEvent::SystemicRedesign,
                 WorkflowEvent::Rework,
                 WorkflowEvent::Cancel,
-                WorkflowEvent::Reopen,
             ],
         },
         Grant {

@@ -175,7 +175,7 @@ fn an_attested_agent_binds_to_its_first_task_and_cannot_hop() {
     let first = db
         .write_txn("test", move |c, m| bind_agent(c, m, "s1", "ag1", a))
         .unwrap();
-    assert_eq!(first, Bound::To(a));
+    assert_eq!(first, Bound::Now(a));
     let again = db
         .write_txn("test", move |c, m| bind_agent(c, m, "s1", "ag1", a))
         .unwrap();
@@ -187,7 +187,7 @@ fn an_attested_agent_binds_to_its_first_task_and_cannot_hop() {
     let other_session = db
         .write_txn("test", move |c, m| bind_agent(c, m, "s2", "ag1", b))
         .unwrap();
-    assert_eq!(other_session, Bound::To(b), "the binding is per session");
+    assert_eq!(other_session, Bound::Now(b), "the binding is per session");
     assert_eq!(db.read(|c| agent_binding(c, "s1", "ag1")).unwrap(), Some(a));
 }
 
@@ -205,7 +205,15 @@ fn scope_reaches_subtasks_and_the_task_s_own_findings_and_nothing_else() {
             let mut s = NewTask::new("task:s", "someone else's finding");
             s.home = "reviews/a-10/must-fix".into();
             let stray = create(c, m, &s)?;
-            crate::reviews::record(c, m, a, "reviews/a-1", "abc", "t")?;
+            crate::reviews::record(
+                c,
+                m,
+                a,
+                "reviews/a-1",
+                "abc",
+                "t",
+                crate::reviews::RoundSource::AnyNamespace,
+            )?;
             Ok((sub, finding, stray))
         })
         .unwrap();
@@ -233,4 +241,74 @@ fn a_grant_descends_from_whatever_minted_it() {
     assert!(db.read(move |c| descends_from(c, root, root)).unwrap());
     assert!(!db.read(move |c| descends_from(c, root, child)).unwrap());
     assert!(!db.read(move |c| descends_from(c, child, other)).unwrap());
+}
+
+#[test]
+fn a_grant_revoked_after_it_was_read_mints_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let (a, _) = tasks(&db);
+    let (coord, _) = db
+        .write_txn("test", |c, m| {
+            mint(c, m, Minter::Operator, Role::Coordinator, "c", None)
+        })
+        .unwrap();
+    // `coord` is the row as the request was admitted with; the revoke commits after.
+    let id = coord.id;
+    db.write_txn("test", move |c, m| revoke(c, m, id)).unwrap();
+    let stale = coord.clone();
+    let e = db
+        .write_txn("test", move |c, m| {
+            mint(c, m, Minter::Grant(&stale), Role::Reviewer, "r", Some(a))
+        })
+        .unwrap_err();
+    assert!(e.to_string().contains("revoked"), "{e}");
+    assert_eq!(db.read(|c| list(c, None, false)).unwrap(), vec![]);
+}
+
+#[test]
+fn only_rotation_makes_the_container_credential_whatever_a_grant_is_labelled() {
+    let db = Db::open_in_memory().unwrap();
+    let (a, _) = tasks(&db);
+    let (labelled, _) = db
+        .write_txn("test", move |c, m| {
+            mint(
+                c,
+                m,
+                Minter::Operator,
+                Role::Implementer,
+                CONTAINER_AGENT,
+                Some(a),
+            )
+        })
+        .unwrap();
+    assert!(!labelled.container, "the label decides nothing");
+    let (cred, _) = db.write_txn("test", rotate_container).unwrap();
+    assert!(cred.container);
+    db.write_txn("test", rotate_container).unwrap();
+    let live = db.read(|c| list(c, None, false)).unwrap();
+    assert!(
+        live.iter().any(|g| g.id == labelled.id),
+        "rotation retires only container credentials, not a grant that shares the label"
+    );
+    assert!(!live.iter().any(|g| g.id == cred.id));
+}
+
+#[test]
+fn deleting_a_task_revokes_its_grants_and_keeps_them_listed() {
+    let db = Db::open_in_memory().unwrap();
+    let (a, _) = tasks(&db);
+    let (g, token) = db
+        .write_txn("test", move |c, m| {
+            mint(c, m, Minter::Operator, Role::Implementer, "i", Some(a))
+        })
+        .unwrap();
+    db.write_txn("test", move |c, m| crate::item::remove(c, m, a, true))
+        .unwrap();
+    assert_eq!(db.read(move |c| resolve(c, &token)).unwrap(), None);
+    let all = db.read(|c| list(c, None, true)).unwrap();
+    let row = all
+        .iter()
+        .find(|r| r.id == g.id)
+        .expect("kept, not deleted");
+    assert!(row.revoked_at.is_some());
 }

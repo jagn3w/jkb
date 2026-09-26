@@ -7,6 +7,13 @@
 --     worker with no record of why. Revocation is its own, recursive, operation.
 --   * `workflow_transitions` and `workflow_strategies` are append-only records. A log makes no claim
 --     about the present, so there is nothing for an undo to put back.
+--
+-- No table here cascades from `items`. A deleted task's grants are REVOKED by `item::remove` (kept,
+-- so `role list --all` still shows who held what), and its workflow history and bindings stay. The
+-- item snapshot an undo restores does not carry these rows, so a cascade meant `item rm` + `undo`
+-- gave back a task with no pinned strategy -- running whatever `default` is now -- and no record of
+-- who held grants on it. `items` is AUTOINCREMENT (V010), so a kept row can never attach to a new
+-- item that reused the id.
 
 -- A credential: only its blake3 hash is kept. `parent_id` is the grant that minted it; revoking a
 -- grant revokes its subtree. `item_id` scopes it to one task (NULL: unscoped).
@@ -17,11 +24,15 @@ CREATE TABLE role_grants (
                     ('operator', 'coordinator', 'designer', 'implementer', 'reviewer',
                      'systemic_reviewer')),
     agent       TEXT NOT NULL CHECK (length(agent) > 0),
-    item_id     INTEGER REFERENCES items(id) ON DELETE CASCADE,
+    item_id     INTEGER,
     parent_id   INTEGER REFERENCES role_grants(id),
     granted_at  TEXT NOT NULL,
     txn_id      INTEGER,
-    revoked_at  TEXT
+    revoked_at  TEXT,
+    -- The dev container's own credential, the one grant that may mint harness tickets. Its own
+    -- column, set only by `rotate_container`: an `agent` label any operator-minted grant can carry
+    -- decided it before, so `role grant implementer --agent container` could mint tickets.
+    container   INTEGER NOT NULL DEFAULT 0 CHECK (container IN (0, 1))
 );
 CREATE INDEX idx_role_grants_item ON role_grants (item_id);
 CREATE INDEX idx_role_grants_parent ON role_grants (parent_id);
@@ -39,7 +50,7 @@ CREATE TABLE agent_role_map (
 CREATE TABLE agent_bindings (
     session     TEXT NOT NULL,
     agent_id    TEXT NOT NULL,
-    item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    item_id     INTEGER NOT NULL,
     bound_at    TEXT NOT NULL,
     PRIMARY KEY (session, agent_id)
 );
@@ -50,7 +61,7 @@ CREATE TABLE agent_bindings (
 CREATE TABLE workflow_transitions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     txn_id      TEXT NOT NULL,
-    item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    item_id     INTEGER NOT NULL,
     at          TEXT NOT NULL,
     event       TEXT NOT NULL,
     from_phase  TEXT,

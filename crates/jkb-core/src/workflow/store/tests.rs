@@ -59,7 +59,15 @@ fn file_round(db: &Db, id: ItemId, n: usize, findings: &[(i64, &str)]) {
                 tag::apply(c, m, f, FACET_AREA, area)?;
             }
         }
-        crate::reviews::record(c, m, id, &ns, "abc", "test")
+        crate::reviews::record(
+            c,
+            m,
+            id,
+            &ns,
+            "abc",
+            "test",
+            crate::reviews::RoundSource::AnyNamespace,
+        )
     })
     .unwrap();
 }
@@ -224,7 +232,15 @@ fn a_title_names_the_area_for_findings_filed_before_the_area_facet() {
         spec.home = "reviews/old/must-fix".into();
         spec.priority = Some(1);
         create(c, m, &spec)?;
-        crate::reviews::record(c, m, id, "reviews/old", "abc", "test")
+        crate::reviews::record(
+            c,
+            m,
+            id,
+            "reviews/old",
+            "abc",
+            "test",
+            crate::reviews::RoundSource::AnyNamespace,
+        )
     })
     .unwrap();
     let rs = db.read(move |c| rounds(c, id)).unwrap();
@@ -329,4 +345,188 @@ fn a_cancelled_task_settles_its_workflow_and_revokes_its_workers() {
         "grant {} no longer resolves",
         worker.id
     );
+}
+
+/// Record `ns` (already holding findings) against `id` as `source` allows.
+fn record(db: &Db, id: ItemId, ns: &str, source: crate::reviews::RoundSource) -> crate::Result<()> {
+    let ns = ns.to_owned();
+    db.write_txn("test", move |c, m| {
+        crate::reviews::record(c, m, id, &ns, "abc", "test", source)
+    })
+}
+
+#[test]
+fn a_round_is_what_it_was_when_recorded() {
+    let db = Db::open_in_memory().unwrap();
+    let id = a_task(&db);
+    file_round(&db, id, 1, &[(3, "a.rs")]);
+    file_round(&db, id, 2, &[(1, "b.rs")]);
+    // The implementer under review lowers round 2's must-fix, and files a line into round 1 so
+    // that it would sort newest by item id.
+    db.write_txn("test", |c, m| {
+        let f = crate::item::id_for_uid(c, "task:f2-0")?.unwrap();
+        crate::task::set_priority(c, m, f, Some(3))?;
+        let mut spec = NewTask::new("task:late", "late");
+        spec.home = "reviews/r1/must-fix".into();
+        spec.priority = Some(3);
+        create(c, m, &spec)?;
+        Ok(())
+    })
+    .unwrap();
+    let rs = db.read(move |c| rounds(c, id)).unwrap();
+    assert_eq!(
+        rs.iter().map(|r| r.ns.as_str()).collect::<Vec<_>>(),
+        vec!["reviews/r1", "reviews/r2"],
+        "recording order"
+    );
+    assert_eq!(rs[1].must_fix, 1, "the snapshot, not the lowered priority");
+    assert_eq!(rs[1].areas, vec!["b.rs".to_owned()]);
+    let must = db
+        .read(|c| crate::reviews::must_fix_findings(c, &["reviews/r2".to_owned()]))
+        .unwrap();
+    assert_eq!(must.len(), 1);
+}
+
+#[test]
+fn only_a_filing_is_a_round_to_a_non_operator_and_scope_follows_the_snapshot() {
+    let db = Db::open_in_memory().unwrap();
+    let id = a_task(&db);
+    let other = db
+        .write_txn("test", |c, m| {
+            let mut spec = NewTask::new("task:other", "O");
+            spec.home = "tasks/elsewhere".into();
+            create(c, m, &spec)
+        })
+        .unwrap();
+    let e = record(&db, id, "tasks", crate::reviews::RoundSource::Filed).unwrap_err();
+    assert!(e.to_string().contains("not a namespace"), "{e}");
+    assert!(!db.read(move |c| roles::in_scope(c, id, other)).unwrap());
+    // A filing: exactly what was filed is the round, and so the scope.
+    let f = db
+        .write_txn("test", |c, m| {
+            let mut spec = NewTask::new("task:filed", "finding");
+            spec.home = "reviews/f/must-fix".into();
+            spec.priority = Some(1);
+            let f = create(c, m, &spec)?;
+            crate::reviews::record_filing(c, "reviews/f", &[f])?;
+            Ok(f)
+        })
+        .unwrap();
+    record(&db, id, "reviews/f", crate::reviews::RoundSource::Filed).unwrap();
+    assert!(db.read(move |c| roles::in_scope(c, id, f)).unwrap());
+    // Something placed under the round's namespace afterwards is not one of its findings.
+    let late = db
+        .write_txn("test", |c, m| {
+            let mut spec = NewTask::new("task:late2", "late");
+            spec.home = "reviews/f/must-fix".into();
+            create(c, m, &spec)
+        })
+        .unwrap();
+    assert!(!db.read(move |c| roles::in_scope(c, id, late)).unwrap());
+}
+
+#[test]
+fn redefining_default_does_not_move_a_task_that_has_started() {
+    let db = Db::open_in_memory().unwrap();
+    let id = a_task(&db);
+    let fresh = db
+        .write_txn("test", |c, m| {
+            create(c, m, &NewTask::new("task:fresh", "F"))
+        })
+        .unwrap();
+    assert!(matches!(
+        do_fire(&db, id, WorkflowEvent::SubmitDesign, Role::Designer, None),
+        Moved::To { .. }
+    ));
+    db.write_txn("test", |c, m| {
+        define(c, m, "default", &preset("autonomous").unwrap())
+    })
+    .unwrap();
+    let cur = db.read(move |c| current(c, id)).unwrap();
+    assert_eq!(
+        cur.spec,
+        preset("design-reviewed").unwrap(),
+        "pinned at its first move"
+    );
+    assert_eq!(cur.source, "default:design-reviewed");
+    let cur = db.read(move |c| current(c, fresh)).unwrap();
+    assert_eq!(
+        cur.spec,
+        preset("autonomous").unwrap(),
+        "a task not started takes the new default"
+    );
+}
+
+#[test]
+fn an_unreadable_default_is_refused_not_replaced_by_the_preset() {
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("test", |c, _| {
+        c.execute(
+            "INSERT INTO workflow_strategies (name, version, spec, defined_at)
+             VALUES ('default', 1, '{\"graph\":\"direct\",\"from_the_future\":1}', 'now')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(db.read(super::default_strategy).is_err());
+}
+
+#[test]
+fn reopen_follows_the_task_s_lifecycle() {
+    let db = Db::open_in_memory().unwrap();
+    let id = a_task(&db);
+    db.write_txn("test", move |c, m| {
+        set_status(c, m, id, TaskStatus::Cancelled)
+    })
+    .unwrap();
+    assert!(matches!(
+        do_observe(&db, id),
+        Moved::To {
+            to: Phase::Cancelled,
+            ..
+        }
+    ));
+    // Reopening the workflow alone would be undone by the next observe.
+    let refused = do_fire(&db, id, WorkflowEvent::Reopen, Role::Operator, None);
+    assert!(
+        matches!(&refused, Moved::Refused(why) if why.contains("jkb task reopen")),
+        "{refused:?}"
+    );
+    assert!(
+        matches!(
+            do_fire(&db, id, WorkflowEvent::Reopen, Role::Coordinator, None),
+            Moved::Refused(_)
+        ),
+        "the coordinator does not reopen"
+    );
+    // The lifecycle reopens; observing follows it.
+    db.write_txn("test", move |c, m| set_status(c, m, id, TaskStatus::Open))
+        .unwrap();
+    assert!(matches!(
+        do_observe(&db, id),
+        Moved::To {
+            event: WorkflowEvent::ObservedReopened,
+            to: Phase::Implement,
+            ..
+        }
+    ));
+    assert!(matches!(
+        do_observe(&db, id),
+        Moved::AlreadyThere(Phase::Implement)
+    ));
+    assert!(matches!(
+        do_fire(&db, id, WorkflowEvent::Reopen, Role::Operator, None),
+        Moved::AlreadyThere(Phase::Implement)
+    ));
+}
+
+#[test]
+fn a_deleted_task_keeps_its_workflow_history() {
+    let db = Db::open_in_memory().unwrap();
+    let id = a_task(&db);
+    do_fire(&db, id, WorkflowEvent::SubmitDesign, Role::Designer, None);
+    db.write_txn("test", move |c, m| crate::item::remove(c, m, id, true))
+        .unwrap();
+    assert!(!db.read(move |c| super::history(c, id)).unwrap().is_empty());
 }

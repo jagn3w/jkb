@@ -150,7 +150,9 @@ pub static GRANTABLE: RoleTable<Role, Role> = RoleTable {
     ],
 };
 
-/// The `agent` label of the dev container's own credential (D52.3).
+/// The `agent` label of the dev container's own credential (D52.3). A label, for listings only: what
+/// makes a grant the container credential is [`GrantRow::container`], which only
+/// [`rotate_container`] sets — a label any operator-minted grant can carry decides nothing.
 pub const CONTAINER_AGENT: &str = "container";
 
 /// The longest agent label a grant records.
@@ -173,6 +175,9 @@ pub struct GrantRow {
     pub granted_at: String,
     /// When it was revoked, if it was.
     pub revoked_at: Option<String>,
+    /// Whether this is the dev container's own credential — the one grant that may mint harness
+    /// tickets (D52.9). Set only by [`rotate_container`].
+    pub container: bool,
 }
 
 fn validation(msg: impl Into<String>) -> Error {
@@ -213,7 +218,8 @@ fn check_agent(agent: &str) -> Result<()> {
     Ok(())
 }
 
-const GRANT_COLUMNS: &str = "id, role, agent, item_id, parent_id, granted_at, revoked_at";
+const GRANT_COLUMNS: &str =
+    "id, role, agent, item_id, parent_id, granted_at, revoked_at, container";
 
 /// A `role_grants` row as read, before its role is parsed.
 type RawGrant = (
@@ -224,6 +230,7 @@ type RawGrant = (
     Option<i64>,
     String,
     Option<String>,
+    bool,
 );
 
 fn grant_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawGrant> {
@@ -235,11 +242,12 @@ fn grant_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawGrant> {
         r.get(4)?,
         r.get(5)?,
         r.get(6)?,
+        r.get(7)?,
     ))
 }
 
 fn into_grant(
-    (id, role, agent, item, parent, granted_at, revoked_at): RawGrant,
+    (id, role, agent, item, parent, granted_at, revoked_at, container): RawGrant,
 ) -> Result<GrantRow> {
     Ok(GrantRow {
         id,
@@ -249,6 +257,7 @@ fn into_grant(
         parent,
         granted_at,
         revoked_at,
+        container,
     })
 }
 
@@ -282,7 +291,13 @@ pub fn mint(
     check_agent(agent)?;
     let parent = match minter {
         Minter::Operator => None,
-        Minter::Grant(g) => {
+        Minter::Grant(held) => {
+            // The minter as it is NOW, inside this write: `held` was resolved when the request was
+            // admitted, on the reader, and a revoke (a rotation, a task settling) may have committed
+            // since. Trusting that snapshot minted a live child under a revoked parent, and `resolve`
+            // reads only a row's own `revoked_at`, so the child outlived the rotation.
+            let g = get(conn, held.id)?
+                .ok_or_else(|| validation("the minting grant does not exist"))?;
             if g.revoked_at.is_some() {
                 return Err(validation("a revoked grant mints nothing"));
             }
@@ -307,11 +322,24 @@ pub fn mint(
             Some(g.id)
         }
     };
+    insert(conn, meta, role, agent, scope, parent, false)
+}
+
+fn insert(
+    conn: &Connection,
+    meta: &WriteMeta,
+    role: Role,
+    agent: &str,
+    scope: Option<ItemId>,
+    parent: Option<i64>,
+    container: bool,
+) -> Result<(GrantRow, String)> {
     let token = fresh_token()?;
     let id: i64 = conn
         .prepare_cached(
-            "INSERT INTO role_grants (token_hash, role, agent, item_id, parent_id, granted_at, txn_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?6)
+            "INSERT INTO role_grants
+                 (token_hash, role, agent, item_id, parent_id, granted_at, txn_id, container)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?6, ?7)
              RETURNING id",
         )?
         .query_row(
@@ -321,7 +349,8 @@ pub fn mint(
                 agent,
                 scope.map(ItemId::get),
                 parent,
-                meta.txn_id
+                meta.txn_id,
+                container
             ],
             |r| r.get(0),
         )?;
@@ -377,6 +406,7 @@ pub fn live_by_hash(conn: &Connection) -> Result<Vec<(String, GrantRow)>> {
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ),
         ))
     })?;
@@ -457,7 +487,7 @@ pub fn revoke_task(conn: &Connection, meta: &WriteMeta, task: ItemId) -> Result<
     Ok(n)
 }
 
-/// Replace the dev container's credential: revoke every live `container` grant (and what it
+/// Replace the dev container's credential: revoke every live container credential (and what it
 /// minted) and mint a fresh unscoped coordinator one. Returns the new grant and token. Host-only:
 /// the op layer refuses it to anyone but the operator.
 ///
@@ -465,21 +495,20 @@ pub fn revoke_task(conn: &Connection, meta: &WriteMeta, task: ItemId) -> Result<
 /// A database error.
 pub fn rotate_container(conn: &Connection, meta: &WriteMeta) -> Result<(GrantRow, String)> {
     let ids: Vec<i64> = conn
-        .prepare_cached(
-            "SELECT id FROM role_grants WHERE agent = ?1 AND parent_id IS NULL AND revoked_at IS NULL",
-        )?
-        .query_map([CONTAINER_AGENT], |r| r.get(0))?
+        .prepare_cached("SELECT id FROM role_grants WHERE container AND revoked_at IS NULL")?
+        .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for id in ids {
         revoke(conn, meta, id)?;
     }
-    mint(
+    insert(
         conn,
         meta,
-        Minter::Operator,
         Role::Coordinator,
         CONTAINER_AGENT,
         None,
+        None,
+        true,
     )
 }
 
@@ -542,7 +571,9 @@ pub fn agent_type_map(conn: &Connection) -> Result<Vec<(String, Role)>> {
 /// What [`bind_agent`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bound {
-    /// Bound now, or already bound to this task.
+    /// Bound by this call.
+    Now(ItemId),
+    /// Already bound to this task.
     To(ItemId),
     /// Already bound to a different task: the first bind wins (D52.9).
     Elsewhere(ItemId),
@@ -561,12 +592,16 @@ pub fn bind_agent(
     task: ItemId,
 ) -> Result<Bound> {
     check_agent(agent_id)?;
-    conn.prepare_cached(
-        "INSERT INTO agent_bindings (session, agent_id, item_id, bound_at)
-         VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-         ON CONFLICT(session, agent_id) DO NOTHING",
-    )?
-    .execute(params![session, agent_id, task.get()])?;
+    let inserted = conn
+        .prepare_cached(
+            "INSERT INTO agent_bindings (session, agent_id, item_id, bound_at)
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(session, agent_id) DO NOTHING",
+        )?
+        .execute(params![session, agent_id, task.get()])?;
+    if inserted == 1 {
+        return Ok(Bound::Now(task));
+    }
     let bound = agent_binding(conn, session, agent_id)?
         .ok_or_else(|| validation("the binding vanished as it was written"))?;
     Ok(if bound == task {
@@ -574,6 +609,26 @@ pub fn bind_agent(
     } else {
         Bound::Elsewhere(bound)
     })
+}
+
+/// Undo a binding [`bind_agent`] made to `task` — for an op refused after its admission bound the
+/// worker, so a failed first write does not decide the worker's task for good. Removes only that
+/// exact binding.
+///
+/// # Errors
+/// A database error.
+pub fn unbind_agent(
+    conn: &Connection,
+    _meta: &WriteMeta,
+    session: &str,
+    agent_id: &str,
+    task: ItemId,
+) -> Result<()> {
+    conn.prepare_cached(
+        "DELETE FROM agent_bindings WHERE session = ?1 AND agent_id = ?2 AND item_id = ?3",
+    )?
+    .execute(params![session, agent_id, task.get()])?;
+    Ok(())
 }
 
 /// The task an attested subagent is bound to, if it has bound one.
@@ -593,7 +648,7 @@ pub fn agent_binding(conn: &Connection, session: &str, agent_id: &str) -> Result
 const MAX_SCOPE_DEPTH: usize = 64;
 
 /// Whether `target` is inside `scope`'s reach: the task itself, one of its subtasks at any depth, or
-/// a finding filed in one of its recorded review rounds. What a principal scoped to a task may write.
+/// a finding of one of its recorded review rounds ([`crate::reviews::is_finding_of`]). What a principal scoped to a task may write.
 ///
 /// # Errors
 /// A database error.
@@ -606,24 +661,10 @@ pub fn in_scope(conn: &Connection, scope: ItemId, target: ItemId) -> Result<bool
             None => break,
         }
     }
-    let rounds = crate::reviews::state(conn, scope)?.namespaces;
-    if rounds.is_empty() {
-        return Ok(false);
-    }
-    let homes: Vec<String> = conn
-        .prepare_cached(
-            "SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-             WHERE p.item_id = ?1",
-        )?
-        .query_map([target.get()], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(homes.iter().any(|h| {
-        rounds.iter().any(|ns| {
-            h == ns
-                || h.strip_prefix(ns.as_str())
-                    .is_some_and(|t| t.starts_with('/'))
-        })
-    }))
+    // A finding of one of its recorded rounds — as the round was snapshotted when recorded, never
+    // whatever now sits under the namespace it named: a reviewer that recorded `tasks` as a round
+    // would otherwise have put every task under it in scope.
+    crate::reviews::is_finding_of(conn, scope, target)
 }
 
 /// Whether grant `id` is `ancestor` or was minted, directly or not, by it — what a grant holder may
