@@ -617,4 +617,24 @@ fn a_round_holds_under_every_name_the_mirror_gives_it() {
         Some("tasks/x/codereviews/f")
     );
     assert_eq!(over("repos/x/codereviews/g"), None);
+    // The same set of names from any one of them: a round at `reviews/f` holds `repos/reviews/f`
+    // too, whose mirror it shares (round 7).
+    for ns in ["reviews/f", "repos/reviews/f", "tasks/reviews/f"] {
+        let mut forms = crate::task::mirror_forms(ns);
+        forms.retain(|f| f != ns);
+        let mut all = crate::task::mirror_forms("reviews/f");
+        all.retain(|f| f != ns);
+        assert_eq!(forms, all, "{ns}");
+    }
+    assert_eq!(
+        inside("repos/reviews/f/nit").as_deref(),
+        Some("reviews/f"),
+        "a sibling home of the filed one"
+    );
+    // A pattern round answers the same from its home and its mirror.
+    assert_eq!(
+        inside("jkb/codereviews/f/nit"),
+        inside("tasks/jkb/codereviews/f/nit")
+    );
+    assert!(inside("jkb/codereviews/f/nit").is_some());
 }

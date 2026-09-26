@@ -730,6 +730,13 @@ fn a_parked_workflow_is_landed_again_only_after_the_operator_reopens_it() {
         Response::Landing { landing } => assert!(landing.refusal.is_none(), "{landing:?}"),
         other => panic!("{other:?}"),
     }
+    // Nor new commits on the same branch: that is new work.
+    let e = refused(
+        &c,
+        json!({ "op": "task.landed", "uid": a,
+                "landed": { "branch": "b", "onto": "o", "head": "ffff" } }),
+    );
+    assert!(e.message.contains("parked at `landed`"), "{e:?}");
     // Not a landing somewhere else, though: that records a landing it never had.
     let e = refused(
         &c,
@@ -896,4 +903,75 @@ fn a_cancelled_workflow_is_not_landed_by_ticking_it_done() {
                 "landed": { "branch": "b", "onto": "o", "head": "abcd" } }),
     );
     assert!(e.message.contains("parked at `cancelled`"), "{e:?}");
+}
+
+/// A live landing is not proof a workflow is parked at `landed`: one parked at `cancelled` that the
+/// operator then landed keeps its phase and gains a live landing, and a repeat of that landing is still
+/// the operator's to allow (review round 7). (A landing the guard held keeps the workflow from parking
+/// at `cancelled` at all: `observed_cancelled` needs no live landing.)
+#[test]
+fn a_live_landing_is_not_repeated_past_a_cancelled_workflow() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let (_, token) = grant(&kb.op, "coordinator", None, "coord");
+    let c = kb.as_token(&token);
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.set", "uid": a, "strategy": "autonomous" }),
+    );
+    ok(
+        &kb.op,
+        json!({ "op": "task.set", "uid": a, "status": "cancelled" }),
+    );
+    ok(&kb.op, json!({ "op": "workflow.observe", "uid": a }));
+    ok(
+        &kb.op,
+        json!({ "op": "task.set", "uid": a, "status": "in_progress" }),
+    );
+    let landed = json!({ "op": "task.landed", "uid": a,
+                         "landed": { "branch": "b", "onto": "o", "head": "abcd" } });
+    match ok(&kb.op, landed.clone()) {
+        Response::Landing { landing } => assert!(landing.moved, "{landing:?}"),
+        other => panic!("{other:?}"),
+    }
+    match ok(&kb.op, json!({ "op": "workflow.show", "uid": a })) {
+        Response::Workflow { workflow } => assert_eq!(workflow.phase, "cancelled"),
+        other => panic!("{other:?}"),
+    }
+    let e = refused(&c, landed);
+    assert!(e.message.contains("parked at `cancelled`"), "{e:?}");
+}
+
+/// A grant its minter may no longer grant is listed only with the revoked ones, and marked there: it
+/// never authenticates, and the operator should see which to revoke (review rounds 6–7).
+#[test]
+fn a_grant_no_longer_grantable_is_marked_in_the_full_listing() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let (_, coord) = grant(&kb.op, "coordinator", None, "coord");
+    let (id, _) = grant(&kb.as_token(&coord), "implementer", Some(&a), "w");
+    // As a build from before the table was tightened minted it.
+    kb.db
+        .write_txn("test", move |c, _| {
+            c.execute(
+                "UPDATE role_grants SET role = 'reviewer' WHERE id = ?1",
+                [id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let listed = |all: bool| match ok(&kb.op, json!({ "op": "role.list", "all": all })) {
+        Response::Grants { listing } => listing.grants,
+        other => panic!("{other:?}"),
+    };
+    assert!(!listed(false).iter().any(|g| g.id == id));
+    let stale = listed(true)
+        .into_iter()
+        .find(|g| g.id == id)
+        .expect("listed");
+    assert!(!stale.grantable, "{stale:?}");
+    assert!(listed(true)
+        .iter()
+        .filter(|g| g.id != id)
+        .all(|g| g.grantable));
 }

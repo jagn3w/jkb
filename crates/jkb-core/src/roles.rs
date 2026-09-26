@@ -394,8 +394,12 @@ pub fn resolve(conn: &Connection, token: &str) -> Result<Option<GrantRow>> {
     Ok(grantable_now(conn, &g)?.then_some(g))
 }
 
-/// Whether `g`'s minter — the operator, when it has no parent — may still grant its role.
-fn grantable_now(conn: &Connection, g: &GrantRow) -> Result<bool> {
+/// Whether `g`'s minter — the operator, when it has no parent — may still grant its role: whether
+/// [`resolve`] answers it at all.
+///
+/// # Errors
+/// A database error.
+pub fn grantable_now(conn: &Connection, g: &GrantRow) -> Result<bool> {
     use jkb_rbac::Grants as _;
     let Some(parent) = g.parent else {
         return Ok(true);

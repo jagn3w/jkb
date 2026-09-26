@@ -786,7 +786,7 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   grants a designer or an implementer, scoped inside its own scope — never a reviewer, since a token
   it mints is one it holds (review round 4) — and the table is checked when a grant **resolves**,
   not only when it is minted, so a grant minted before a tightening neither resolves nor lists as live
-  (rounds 5–6) — it stays unrevoked, and `role ls --all` still shows it);
+  (rounds 5–6) — it stays unrevoked, and `role ls --all` shows it marked `NOT GRANTABLE` (round 7));
   grants stored as **blake3 hashes** of 256-bit
   tokens, revoked recursively, **not changelogged** (`jkb undo` reviving a revoked grant would
   re-arm a credential); the operator's `agent_type → role` map; first-bind-wins agent bindings.
@@ -815,9 +815,10 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   inside the cancel, as round 4 first did, made it one-way for all but the operator when `jkb undo` or
   a `tasks.md` line that came back restored the status. Neither restores a parked landing; the
   operator's `reopen` does. The same landing again is not refused — the queue re-running a branch
-  gets the lifecycle's no-op, not "held" (round 5) — but only the branch and destination the live
-  landing records: a cancelled task ticked `done`, or a landing somewhere else, recorded a landing it
-  never had (round 6). `jkb task landed` reports a refused task held and
+  gets the lifecycle's no-op, not "held" (round 5) — but only a workflow parked at `landed`, and the branch, destination
+  and head its live landing records: a cancelled task ticked `done`, or a landing somewhere else,
+  recorded a landing it never had (round 6); a workflow the operator landed while it stayed parked at
+  `cancelled` has a live landing too, and new commits on the branch are new work (round 7). `jkb task landed` reports a refused task held and
   records the branch's others (round 4: the refusal aborted the loop), and fails when this caller
   may land none of them rather than printing `recorded:` over nothing (round 5).) A task landed before D52 has no workflow rows, reads `design`,
   and is not held by this. *Superseded (round 2):* an
@@ -990,7 +991,8 @@ Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed 
    (`modules/<a>/<b>` under `modules/<a>`) has that directory judged directly. A `commondir` in a
    submodule's git directory is reported, not read past (round 6, measured on git 2.51.1: a filter
    planted in the directory it named ran on `git -C sub add`) — the same redirect `check_layout`
-   refuses for a repository jkb runs git in.
+   refuses for a repository jkb runs git in. So is any hook in a submodule git directory's own
+   `hooks/` but git's `*.sample` files (round 7: a planted `pre-commit` ran on `git -C sub commit`).
 
 And the land gate — the candidate's own code — runs in the container through `docker exec` (exit
 status and output measured intact), settled before the graft, for a repository under `~/repos`,

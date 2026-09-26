@@ -225,22 +225,21 @@ fn tasks_mirror_ns(home: &str) -> Option<String> {
     Some(format!("{DEFAULT_ROOT}/{rest}"))
 }
 
-/// Every name `ns` goes by across the `tasks/` mirror: itself, the mirror [`tasks_mirror_ns`] gives a
-/// home, and — for a `tasks/<rest>` — each home that mirrors to it (`repos/<rest>`, and `<rest>` for a
-/// home outside `repos/`). What a rule about a namespace holds against, so a rule written for the home
-/// is not stepped around through the mirror, nor the other way (review round 6).
+/// Every name `ns` goes by across the `tasks/` mirror: itself, its `tasks/…` mirror
+/// ([`tasks_mirror_ns`]), and every home that mirrors there (`repos/<rest>`, and `<rest>` for a home
+/// outside `repos/`) — the same set from any one of them. What a rule about a namespace holds against,
+/// so a rule written for one name is not stepped around through another (review rounds 6–7).
 #[must_use]
 pub fn mirror_forms(ns: &str) -> Vec<String> {
-    let mut forms = vec![ns.to_owned()];
-    if let Some(mirror) = tasks_mirror_ns(ns) {
-        forms.push(mirror);
-    }
-    if let Some(rest) = ns.strip_prefix(&format!("{DEFAULT_ROOT}/")) {
+    let mirror = tasks_mirror_ns(ns).unwrap_or_else(|| ns.to_owned());
+    let mut forms = vec![ns.to_owned(), mirror.clone()];
+    if let Some(rest) = mirror.strip_prefix(&format!("{DEFAULT_ROOT}/")) {
         forms.push(format!("repos/{rest}"));
         if !rest.starts_with("repos/") && rest != "repos" {
             forms.push(rest.to_owned());
         }
     }
+    forms.sort();
     forms.dedup();
     forms
 }

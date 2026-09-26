@@ -927,7 +927,7 @@ pub fn authorize(
         // landed (round 5) — asked about the branch and destination its live landing already
         // records. Anything else — a cancelled task ticked
         // `done`, another destination — would record a landing it never had (round 6).
-        if current.phase.is_settled() && !repeats_landing(conn, target, request)? {
+        if current.phase.is_settled() && !repeats_landing(conn, target, current.phase, request)? {
             return Err(forbidden(format!(
                 "`{op}` refused: {reference}'s workflow is parked at `{}`, and only the operator \
                  picks it back up (`jkb task set {reference} --status open`, then `jkb workflow \
@@ -957,18 +957,32 @@ pub fn authorize(
     }
 }
 
-/// Whether `request` lands `task` exactly as its live landing already records — the same branch onto
-/// the same destination — which the lifecycle answers with a no-op. A landing stops being live when
-/// the task is put back to work, and a cancelled task has none, so ticking one `done` does not make
-/// this true.
-fn repeats_landing(conn: &Connection, task: ItemId, request: &Request) -> Result<bool, ApiError> {
+/// Whether `request` lands `task` exactly as its live landing already records — a workflow parked at
+/// `landed`, the same branch onto the same destination at the same head — which the lifecycle answers
+/// with a no-op. Parked at `landed`, because a live landing row is not proof of one: a landing the
+/// guard **held** (an open subtask) still records a row, and a task then cancelled and ticked `done`
+/// kept it live (review round 7). The same head, because new commits on the same branch are new work
+/// (round 7).
+fn repeats_landing(
+    conn: &Connection,
+    task: ItemId,
+    phase: jkb_core::workflow::Phase,
+    request: &Request,
+) -> Result<bool, ApiError> {
     let (Request::TaskLand { landed, .. } | Request::TaskLanded { landed, .. }) = request else {
         return Ok(false);
     };
+    if phase != jkb_core::workflow::Phase::Landed {
+        return Ok(false);
+    }
     let landing = jkb_core::transition::landing(conn, task)?;
     Ok(landing.live().is_some_and(|row| {
         row.labels.onto.as_deref() == Some(landed.onto.as_str())
             && row.labels.branch.as_deref() == Some(landed.branch.as_str())
+            && match (&row.labels.ref_commit, &landed.head) {
+                (Some(was), Some(now)) => was == now,
+                _ => true,
+            }
     }))
 }
 
@@ -993,6 +1007,14 @@ pub struct GrantInfo {
     pub granted_at: String,
     /// When revoked.
     pub revoked_at: Option<String>,
+    /// Whether its minter may still grant its role — `false` for one minted before the table was
+    /// tightened, which no longer authenticates although it was never revoked.
+    #[serde(default = "yes")]
+    pub grantable: bool,
+}
+
+const fn yes() -> bool {
+    true
 }
 
 fn info(conn: &Connection, g: GrantRow) -> Result<GrantInfo, ApiError> {
@@ -1000,7 +1022,9 @@ fn info(conn: &Connection, g: GrantRow) -> Result<GrantInfo, ApiError> {
         Some(id) => jkb_core::item::get(conn, id)?.map(|m| m.uid),
         None => None,
     };
+    let grantable = roles::grantable_now(conn, &g)?;
     Ok(GrantInfo {
+        grantable,
         id: g.id,
         role: g.role.as_str().to_owned(),
         agent: g.agent,

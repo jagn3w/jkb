@@ -202,15 +202,18 @@ pub fn review_namespace_containing(conn: &Connection, ns: &str) -> Result<Option
             return Ok(known);
         }
     }
-    let parts: Vec<&str> = ns.split('/').take(4).collect();
-    Ok(match parts.as_slice() {
-        ["repos" | "tasks", repo, "codereviews", folder]
-            if !repo.is_empty() && !folder.is_empty() =>
-        {
-            Some(parts.join("/"))
+    // By name, under any of its names, the same answer from each (round 7).
+    Ok(crate::task::mirror_forms(ns).iter().find_map(|form| {
+        let parts: Vec<&str> = form.split('/').take(4).collect();
+        match parts.as_slice() {
+            ["repos" | "tasks", repo, "codereviews", folder]
+                if !repo.is_empty() && !folder.is_empty() =>
+            {
+                Some(parts.join("/"))
+            }
+            _ => None,
         }
-        _ => None,
-    })
+    }))
 }
 
 /// The recorded round `ns` is, lies inside, or contains, if any. Filing there would put findings under

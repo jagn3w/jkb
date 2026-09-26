@@ -684,6 +684,19 @@ fn judge_module(dir: &Path, gitdir: &Path, top: &Path, common: &Path, out: &mut 
         ));
         return;
     }
+    // Hooks run from the submodule's own `hooks/` for git you run there — measured on git 2.51.1,
+    // a planted `pre-commit` ran on `git -C sub commit` — and git writes only `*.sample` files in
+    // it (review round 7).
+    let hooks = gitdir.join("hooks");
+    if fs::symlink_metadata(&hooks).is_ok_and(|m| m.file_type().is_symlink()) {
+        out.push(format!("{} is a symlink", hooks.display()));
+    } else if let Ok(entries) = fs::read_dir(&hooks) {
+        for e in entries.flatten() {
+            if !e.file_name().to_string_lossy().ends_with(".sample") {
+                out.push(format!("{} is a hook", e.path().display()));
+            }
+        }
+    }
     let cfg = gitdir.join("config");
     match fs::symlink_metadata(&cfg) {
         Ok(m) if m.file_type().is_symlink() => {
@@ -3497,6 +3510,20 @@ mod tests {
         let found = super::module_findings(&dir).join("; ");
         assert!(found.contains("redirects its config and hooks"), "{found}");
         std::fs::remove_file(dir.join(".git/modules/sub/commondir")).unwrap();
+        // A hook planted in a submodule's own `hooks/`; git's samples are not hooks.
+        let hooks = dir.join(".git/modules/sub/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-commit.sample"), "#!/bin/sh\n").unwrap();
+        assert!(
+            !super::module_findings(&dir)
+                .join("; ")
+                .contains("is a hook"),
+            "a sample is not a hook"
+        );
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\ntouch /tmp/h\n").unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("pre-commit is a hook"), "{found}");
+        std::fs::remove_dir_all(&hooks).unwrap();
         #[cfg(unix)]
         {
             // An un-absorbed git directory whose `modules/` is a symlink.

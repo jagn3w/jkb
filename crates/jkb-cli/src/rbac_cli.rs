@@ -226,7 +226,7 @@ pub fn role(b: &dyn Backend, cmd: RoleCmd, json_out: bool) -> Result<()> {
                 print(json_out, &json!(listing), || {
                     for g in &listing.grants {
                         println!(
-                            "{:>4}  {:<17} {:<24} {}{}{}",
+                            "{:>4}  {:<17} {:<24} {}{}{}{}",
                             g.id,
                             g.role,
                             g.agent,
@@ -237,7 +237,12 @@ pub fn role(b: &dyn Backend, cmd: RoleCmd, json_out: bool) -> Result<()> {
                             g.revoked_at
                                 .as_deref()
                                 .map(|r| format!("  REVOKED {r}"))
-                                .unwrap_or_default()
+                                .unwrap_or_default(),
+                            if g.grantable {
+                                ""
+                            } else {
+                                "  NOT GRANTABLE (its minter may no longer grant it; revoke it)"
+                            }
                         );
                     }
                     for (t, r) in &listing.agent_types {
