@@ -694,8 +694,8 @@ pub struct ReviewFindings {
     pub open_count: usize,
     /// The first [`MAX_LISTED_FINDINGS`] of them.
     pub open_must_fix: Vec<ReviewFinding>,
-    /// Each namespace that holds findings, as a review round, oldest filing first — what the land
-    /// gate's last-round clause and the workflow's repetition rule read (D52.6).
+    /// Each recorded round among the namespaces, oldest recording first, as it stood when recorded —
+    /// what the land gate's last-round clause and the workflow's repetition rule read (D52.6).
     #[serde(default)]
     pub rounds: Vec<ReviewRound>,
     /// Whether `rounds` was reported at all. An older daemon omits both, and a gate that read the
@@ -709,9 +709,9 @@ pub struct ReviewFindings {
 pub struct ReviewRound {
     /// Its findings namespace.
     pub ns: String,
-    /// Its filing order: the highest item id among its findings.
+    /// Its recording order.
     pub filed: i64,
-    /// How many must-fix findings it filed, at any status.
+    /// How many must-fix findings it held when recorded, at any status since.
     pub must_fix: usize,
     /// The files its must-fix findings name.
     pub areas: Vec<String>,
@@ -731,6 +731,12 @@ pub const MAX_EXAMINED_FINDINGS: usize = 10_000;
 pub const MAX_FINDING_TITLE_CHARS: usize = 200;
 
 /// `task.review_findings`: the findings under `namespaces` (every recorded review of a task).
+///
+/// **Open must-fix** is the union of two sets: every finding a recorded round held as must-fix when
+/// it was recorded ([`jkb_core::reviews::must_fix_findings`]) that is not yet finished — whatever its
+/// priority or placement reads now, because both are task content the implementer under review can
+/// edit — and any finding now under the namespaces at priority 1 or above, so a finding added to a
+/// round afterwards still counts.
 ///
 /// A **typed** scope, never a namespace interpolated into the DSL: a path with `,` in it split into two
 /// scopes that matched nothing, which is indistinguishable from "clean" unless the total is known too
@@ -764,14 +770,18 @@ pub fn review_findings(
         scope: Scope::Union(namespaces.iter().cloned().map(Scope::Subtree).collect()),
         ..Query::default()
     };
-    let ids = query.evaluate(conn)?;
+    let live = query.evaluate(conn)?;
+    let snapshot = jkb_core::reviews::must_fix_findings(conn, namespaces)?;
+    let mut ids = live.clone();
+    ids.extend(snapshot.iter().copied().filter(|id| !live.contains(id)));
     if ids.len() > MAX_EXAMINED_FINDINGS {
         return Err(ApiError::with_code(
             ErrorCode::Invalid,
             format!(
                 "the review namespaces {} hold {} tasks, and a review holds at most \
-                 {MAX_EXAMINED_FINDINGS} — a `review=` facet names something that is not a review; \
-                 remove it from the task (`jkb task tag rm <uid> review=<namespace>`)",
+                 {MAX_EXAMINED_FINDINGS} — a recorded round names something that is not a review. \
+                 A recorded round is append-only (a review happened), so nothing removes it: land \
+                 this task with `jkb task land <uid> --no-review`, which records the waiver on it",
                 namespaces.join(", "),
                 ids.len()
             ),
@@ -795,9 +805,8 @@ pub fn review_findings(
     for id in ids {
         let Some(m) = metas.get(&id) else { continue };
         let status = m.status.as_deref().unwrap_or("open");
-        if jkb_types::TaskStatus::is_terminal_str(Some(status))
-            || m.priority.unwrap_or(i64::MAX) > 1
-        {
+        let must_fix = snapshot.contains(&id) || m.priority.unwrap_or(i64::MAX) <= 1;
+        if jkb_types::TaskStatus::is_terminal_str(Some(status)) || !must_fix {
             continue;
         }
         out.open_count += 1;

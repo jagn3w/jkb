@@ -2447,9 +2447,9 @@ impl LocalBackend {
 
     /// Resolve this backend's caller and admit `request`, binding an attested subagent to its task on
     /// its first task-targeted write. The operator is admitted without a read.
-    fn admit(&self, request: &Request) -> Result<rbac::Principal, ApiError> {
+    fn admit(&self, request: &Request) -> Result<(rbac::Principal, Option<NewBinding>), ApiError> {
         if self.caller == rbac::Caller::Operator {
-            return Ok(rbac::Principal::operator());
+            return Ok((rbac::Principal::operator(), None));
         }
         let caller = self.caller.clone();
         let tickets = self.tickets.clone();
@@ -2465,25 +2465,34 @@ impl LocalBackend {
             task,
         } = admit
         {
+            let (s, a) = (session.clone(), agent_id.clone());
             let bound = self.db.write_txn(self.actor, move |c, m| {
-                jkb_core::roles::bind_agent(c, m, &session, &agent_id, task)
+                jkb_core::roles::bind_agent(c, m, &s, &a, task)
             })?;
-            if let jkb_core::roles::Bound::Elsewhere(_) = bound {
-                return Err(ApiError::with_code(
-                    ErrorCode::Forbidden,
-                    format!(
-                        "`{}` refused: {} is already working on another task, and a worker does not \
-                         hop",
-                        request.op(),
-                        principal.label
-                    ),
-                ));
-            }
+            let fresh = match bound {
+                jkb_core::roles::Bound::Elsewhere(_) => {
+                    return Err(ApiError::with_code(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "`{}` refused: {} is already working on another task, and a worker \
+                             does not hop",
+                            request.op(),
+                            principal.label
+                        ),
+                    ));
+                }
+                jkb_core::roles::Bound::Now(_) => Some(NewBinding {
+                    session,
+                    agent_id,
+                    task,
+                }),
+                jkb_core::roles::Bound::To(_) => None,
+            };
             let mut p = principal;
             p.scope = Some(task);
-            return Ok(p);
+            return Ok((p, fresh));
         }
-        Ok(principal)
+        Ok((principal, None))
     }
 
     /// The same backend, bounding every read's answer to about `bytes` of JSON, cut short and marked
@@ -2538,6 +2547,13 @@ impl LocalBackend {
     }
 }
 
+/// A binding [`LocalBackend::admit`] made for the call it admitted — undone if that call fails.
+struct NewBinding {
+    session: String,
+    agent_id: String,
+    task: jkb_types::ItemId,
+}
+
 impl Backend for LocalBackend {
     fn embeds(&self) -> bool {
         self.embedder.is_some()
@@ -2547,8 +2563,30 @@ impl Backend for LocalBackend {
         true
     }
 
-    #[allow(clippy::too_many_lines)] // a flat op dispatcher: one arm per op, as in the CLI's `run`
     fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let (principal, bound) = self.admit(&request)?;
+        let out = self.dispatch(request, &principal);
+        // A binding this call made is kept only if the op it was made for ran: a first op refused
+        // for any other reason (outside the file roots, malformed) must not leave the worker bound
+        // for good to a task it never worked on.
+        if out.is_err() {
+            if let Some(b) = bound {
+                self.db.write_txn(self.actor, move |c, m| {
+                    jkb_core::roles::unbind_agent(c, m, &b.session, &b.agent_id, b.task)
+                })?;
+            }
+        }
+        out
+    }
+}
+
+impl LocalBackend {
+    #[allow(clippy::too_many_lines)] // a flat op dispatcher: one arm per op, as in the CLI's `run`
+    fn dispatch(
+        &self,
+        request: Request,
+        principal: &rbac::Principal,
+    ) -> Result<Response, ApiError> {
         let now = mq::now_ms();
         // Chosen here, once, from the op's class — no arm picks a connection or a budget.
         let db = if request.is_agent_read() {
@@ -2556,7 +2594,6 @@ impl Backend for LocalBackend {
         } else {
             &self.db
         };
-        let principal = self.admit(&request)?;
         let mut budget = self.budget;
         let actor = self.actor;
         let created = |c: Created| Response::Created {
@@ -2894,8 +2931,9 @@ impl Backend for LocalBackend {
             Request::TaskAdd(ask) => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let roots = self.file_roots.clone();
+                let scope = principal.scope;
                 match db.write_txn_with(actor, move |c, m| {
-                    tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())
+                    tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref(), scope)
                 }) {
                     Ok(added) => Response::Added { added },
                     Err(tasks::AddFailure::NeedsGlobalBacklogAssent) => {
@@ -3110,8 +3148,16 @@ impl Backend for LocalBackend {
                     recording: {
                         let who = principal.label.clone();
                         let scope = principal.scope;
+                        // Only the operator records a round its findings reached the KB for some
+                        // other way than a filing (a mount): what a round holds becomes the scope
+                        // of the task's workers.
+                        let source = if principal.is_operator() {
+                            jkb_core::reviews::RoundSource::AnyNamespace
+                        } else {
+                            jkb_core::reviews::RoundSource::Filed
+                        };
                         db.write_txn_with(actor, move |c, m| {
-                            review::record(c, m, &ask, roots.as_ref(), &who, scope)
+                            review::record(c, m, &ask, roots.as_ref(), &who, scope, source)
                         })?
                     },
                 }
@@ -3173,7 +3219,7 @@ impl Backend for LocalBackend {
                 let (grant, token) = db.write_txn_with(actor, move |c, m| {
                     if let Some(t) = keep {
                         if let Some(g) = jkb_core::roles::resolve(c, &t)? {
-                            if g.agent == jkb_core::roles::CONTAINER_AGENT && g.parent.is_none() {
+                            if g.container {
                                 return Ok::<_, ApiError>((g, t));
                             }
                         }
@@ -3256,7 +3302,7 @@ impl Backend for LocalBackend {
                 Response::Ticket {
                     token: rbac::mint_ticket(
                         tickets,
-                        &principal,
+                        principal,
                         &session,
                         agent_id.as_deref(),
                         agent_type.as_deref(),

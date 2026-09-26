@@ -262,10 +262,13 @@ impl Request {
         }
     }
 
-    /// The one task (or item) this op writes, by reference, when it names one — what a scoped
-    /// principal is held to. Reads are not scoped: reading is not what a role protects.
+    /// What a principal held to one task is held to for this op (D52.4). **Exhaustive, with no
+    /// wildcard**, like [`Request::permission`]: a new op must say what it writes before it compiles.
+    /// A `_ => None` arm here once admitted every write op nobody had listed — `removal.add` naming
+    /// another task's worktree, `lease.take` displacing the merge queue — as unscoped.
     #[must_use]
-    pub fn target(&self) -> Option<&str> {
+    #[allow(clippy::too_many_lines)] // one arm per op, like `permission`
+    pub fn target(&self) -> Target<'_> {
         match self {
             Self::TaskSet { uid, .. }
             | Self::TaskEdit { uid, .. }
@@ -289,14 +292,126 @@ impl Request {
             | Self::WorkflowFire { uid, .. }
             | Self::WorkflowObserve { uid }
             | Self::WorkflowSet { uid, .. }
-            | Self::RoleBind { uid } => Some(uid),
-            Self::TaskStart(ask) => Some(&ask.uid),
-            Self::TaskTake(ask) => Some(&ask.uid),
-            Self::TaskAdd(ask) => ask.under.as_deref(),
-            Self::RoleGrant { task, .. } => task.as_deref(),
-            _ => None,
+            | Self::RoleBind { uid } => Target::Task(uid),
+            Self::TaskStart(ask) => Target::Task(&ask.uid),
+            Self::TaskTake(ask) => Target::Task(&ask.uid),
+            // A new top-level task is where a scope would otherwise stop.
+            Self::TaskAdd(ask) => ask.under.as_deref().map_or(Target::Shared, Target::Task),
+            Self::RoleGrant { task, .. } => task.as_deref().map_or(Target::Shared, Target::Task),
+            // What no one task owns: a namespace, an item outside the task tree, a repo's land lease,
+            // a worktree removal (its path and branch are its own fields, whatever uid it names), and
+            // every operator-only op.
+            Self::IngestText(_)
+            | Self::InvWrite(_)
+            | Self::LeaseTake { .. }
+            | Self::LeaseRelease { .. }
+            | Self::LeaseBreak { .. }
+            | Self::RemovalAdd { .. }
+            | Self::RemovalArchived { .. }
+            | Self::RemovalCancel { .. }
+            | Self::RemovalDrop { .. }
+            | Self::TaskReclaim { .. }
+            | Self::NsMv { .. }
+            | Self::MqCompact { .. }
+            | Self::RoleMap { .. }
+            | Self::RoleRotateContainer { .. }
+            | Self::WorkflowDefine { .. } => Target::Shared,
+            // Held by their own callee: a filing writes only a namespace nobody holds, and becomes
+            // a task's round only when recorded; recording holds a scoped caller to its task
+            // (`review::record`); revoking holds a grant to what it minted; attesting is the
+            // container credential's alone.
+            Self::TaskReviewFile(_)
+            | Self::TaskReviewRecord(_)
+            | Self::RoleRevoke { .. }
+            | Self::AttestMint { .. }
+            | Self::AttestRelease { .. }
+            // Reads, and the hooks' own records.
+            | Self::KbAmbient { .. }
+            | Self::KbQuery { .. }
+            | Self::KbLs { .. }
+            | Self::KbTree { .. }
+            | Self::KbCat { .. }
+            | Self::KbGrep { .. }
+            | Self::KbSearch { .. }
+            | Self::TaskReady { .. }
+            | Self::TaskShow { .. }
+            | Self::TaskSubtasks { .. }
+            | Self::TaskWhy { .. }
+            | Self::TaskFacts { .. }
+            | Self::TaskByBranch { .. }
+            | Self::RepoGate { .. }
+            | Self::TaskReviewFindings { .. }
+            | Self::TaskClaims { .. }
+            | Self::KbHealth {}
+            | Self::TaskStaging { .. }
+            | Self::ItemShow { .. }
+            | Self::KbRelated { .. }
+            | Self::KbBlobs { .. }
+            | Self::KbBlob { .. }
+            | Self::InvRead(_)
+            | Self::TaskPrFacts { .. }
+            | Self::TaskOpenInRepo { .. }
+            | Self::NsList { .. }
+            | Self::KbContext { .. }
+            | Self::ViewList {}
+            | Self::ViewRun { .. }
+            | Self::KbHistory { .. }
+            | Self::RemovalList { .. }
+            | Self::LeaseGet { .. }
+            | Self::RoleList { .. }
+            | Self::RoleWhoami {}
+            | Self::WorkflowShow { .. }
+            | Self::WorkflowStrategies {}
+            | Self::MqTopicCreate { .. }
+            | Self::MqSend { .. }
+            | Self::MqGroupCreate { .. }
+            | Self::MqPoll { .. }
+            | Self::MqAck { .. }
+            | Self::MqInspect {}
+            | Self::MqTail { .. }
+            | Self::NotifyEvent { .. }
+            | Self::NotifyOpenSessions {}
+            | Self::NotifyGone { .. }
+            | Self::SessionStarted { .. }
+            | Self::SessionEnded { .. }
+            | Self::SessionGone { .. }
+            | Self::SessionList { .. }
+            | Self::SessionState { .. } => Target::Free,
         }
     }
+}
+
+/// What an op writes, as far as a task scope is concerned ([`Request::target`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target<'a> {
+    /// Nothing a task scope protects, or something its own callee holds to the scope.
+    Free,
+    /// This one task, by reference.
+    Task(&'a str),
+    /// State no one task owns — refused to a principal held to one task.
+    Shared,
+}
+
+/// Whether a principal held to `scope` may put a task in namespace `ns`: only where `scope` itself is
+/// placed. A review round's namespace is never one — a scoped caller filing a line into its own
+/// older round, or a `!p0` into another task's, was the rest of what D52.4's scope left open.
+///
+/// # Errors
+/// [`ErrorCode::Forbidden`] naming the namespace, or a database error.
+pub fn check_destination(conn: &Connection, scope: ItemId, ns: &str) -> Result<(), ApiError> {
+    let ns = jkb_core::ns::normalize(ns)?;
+    let homes = jkb_core::item::namespaces_of(conn, scope)?;
+    if homes.contains(&ns) {
+        return Ok(());
+    }
+    Err(forbidden(format!(
+        "a caller held to one task places tasks only where that task is ({}), not in `{ns}`",
+        if homes.is_empty() {
+            "nowhere".to_owned()
+        } else {
+            homes.join(", ")
+        }
+    )))
 }
 
 // -------------------------------------------------------------------------------------------
@@ -326,14 +441,50 @@ pub struct Ticket {
     minted_at: Instant,
 }
 
+/// The most tickets live at once, daemon-wide. A ticket lives for one tool call, and a session holds
+/// one per call in flight, so this is far past real use — it bounds what a credential holder that
+/// mints and never releases can pile up (each ticket is otherwise kept until [`TICKET_BACKSTOP`]).
+pub const MAX_LIVE_TICKETS: usize = 4096;
+
+/// The most tickets one session holds live at once.
+pub const MAX_SESSION_TICKETS: usize = 256;
+
 /// The daemon's live tickets, by token.
 #[derive(Debug, Default)]
 pub struct Tickets {
-    live: Mutex<HashMap<String, Ticket>>,
+    live: Mutex<Live>,
+}
+
+/// The tickets, and the order they expire in. Tickets are minted with a monotonic clock and all live
+/// for the same [`TICKET_BACKSTOP`], so mint order **is** expiry order: expiring is popping from the
+/// front, never a scan of every ticket on every lookup.
+#[derive(Debug, Default)]
+struct Live {
+    by_token: HashMap<String, Ticket>,
+    expiry: std::collections::VecDeque<(Instant, String)>,
+}
+
+impl Live {
+    fn expire(&mut self) {
+        while let Some((at, _)) = self.expiry.front() {
+            if at.elapsed() < TICKET_BACKSTOP {
+                break;
+            }
+            if let Some((_, token)) = self.expiry.pop_front() {
+                self.by_token.remove(&token);
+            }
+        }
+        // A released ticket's queue entry outlives it; drop those once they are most of the queue,
+        // so the queue stays proportional to the live set.
+        if self.expiry.len() > 2 * self.by_token.len() + 64 {
+            let by_token = &self.by_token;
+            self.expiry.retain(|(_, t)| by_token.contains_key(t));
+        }
+    }
 }
 
 impl Tickets {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Ticket>>, ApiError> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Live>, ApiError> {
         self.live
             .lock()
             .map_err(|_| ApiError::with_code(ErrorCode::Internal, "ticket store poisoned"))
@@ -345,8 +496,8 @@ impl Tickets {
     /// [`ErrorCode::Internal`] for a poisoned store.
     pub fn get(&self, token: &str) -> Result<Option<Ticket>, ApiError> {
         let mut live = self.lock()?;
-        live.retain(|_, t| t.minted_at.elapsed() < TICKET_BACKSTOP);
-        Ok(live.get(token).cloned())
+        live.expire();
+        Ok(live.by_token.get(token).cloned())
     }
 
     /// Whether `token` names a live ticket — for a daemon deciding whether a request authenticates.
@@ -360,7 +511,29 @@ impl Tickets {
             "{TICKET_PREFIX}{}",
             roles::fresh_token().map_err(ApiError::from)?
         );
-        self.lock()?.insert(token.clone(), t);
+        let mut live = self.lock()?;
+        live.expire();
+        let busy = |why: String| ApiError::with_code(ErrorCode::Busy, why);
+        if live.by_token.len() >= MAX_LIVE_TICKETS {
+            return Err(busy(format!(
+                "{MAX_LIVE_TICKETS} attestation tickets are live — something mints them without \
+                 releasing them"
+            )));
+        }
+        let held = live
+            .by_token
+            .values()
+            .filter(|x| x.session == t.session)
+            .count();
+        if held >= MAX_SESSION_TICKETS {
+            return Err(busy(format!(
+                "session `{}` holds {MAX_SESSION_TICKETS} live attestation tickets — its tool calls \
+                 are not releasing them",
+                t.session
+            )));
+        }
+        live.expiry.push_back((t.minted_at, token.clone()));
+        live.by_token.insert(token.clone(), t);
         Ok(token)
     }
 
@@ -376,8 +549,8 @@ impl Tickets {
         tool_use_id: Option<&str>,
     ) -> Result<usize, ApiError> {
         let mut live = self.lock()?;
-        let before = live.len();
-        live.retain(|_, t| {
+        let before = live.by_token.len();
+        live.by_token.retain(|_, t| {
             let hit = t.session == session
                 && match (tool_use_id, agent_id) {
                     (Some(tool), _) => t.tool_use_id == tool,
@@ -386,7 +559,7 @@ impl Tickets {
                 };
             !hit
         });
-        Ok(before - live.len())
+        Ok(before - live.by_token.len())
     }
 }
 
@@ -561,6 +734,50 @@ fn deny(no: &Refusal, op: &str) -> ApiError {
     forbidden(format!("`{op}` refused: {no}"))
 }
 
+/// The task `request` is held to, or — for an op that names none — its admission, or its refusal
+/// for a principal held to one task.
+fn reference_of<'r>(
+    principal: &Principal,
+    request: &'r Request,
+    permission: OpPermission,
+) -> Result<Result<&'r str, Admit>, ApiError> {
+    let op = request.op();
+    let scoped = principal.scope.is_some() || principal.attested_agent().is_some();
+    Ok(match request.target() {
+        Target::Task(r) => Ok(r),
+        Target::Shared if scoped => {
+            let hint = if matches!(request, Request::TaskAdd(_)) {
+                ", and adds tasks only under it (`--under <uid>`)"
+            } else {
+                ": this writes state no one task owns"
+            };
+            return Err(forbidden(format!(
+                "`{op}` refused: {} is held to one task{hint}",
+                principal.label
+            )));
+        }
+        Target::Shared | Target::Free => {
+            if permission == OpPermission::Land {
+                return Err(forbidden(format!("`{op}` refused: it names no task")));
+            }
+            // An attested subagent records a review only once it is bound: a review is keyed by
+            // branch, and `review::record` holds a scoped caller to its task — which an unbound one
+            // does not have.
+            if principal.scope.is_none()
+                && principal.attested_agent().is_some()
+                && matches!(request, Request::TaskReviewRecord(_))
+            {
+                return Err(forbidden(format!(
+                    "`{op}` refused: {} has not bound to the task it reviews — run `jkb role bind \
+                     <uid>` first",
+                    principal.label
+                )));
+            }
+            Err(Admit::Run)
+        }
+    })
+}
+
 /// May `principal` run `request`? The operator may run anything. Everyone else is held to
 /// [`OP_GRANTS`], to its task scope for an op that writes one task, to the task's strategy for a
 /// landing, and — for attestation — to being the container credential itself.
@@ -593,7 +810,7 @@ pub fn authorize(
         OpPermission::Attest => {
             let container = matches!(
                 &principal.kind,
-                PrincipalKind::Grant(g) if g.agent == roles::CONTAINER_AGENT && g.parent.is_none()
+                PrincipalKind::Grant(g) if g.container
             );
             if !container {
                 return Err(forbidden(format!(
@@ -612,33 +829,9 @@ pub fn authorize(
             }
         }
     }
-    let Some(reference) = request.target() else {
-        if permission == OpPermission::Land {
-            return Err(forbidden(format!("`{op}` refused: it names no task")));
-        }
-        // A caller held to one task adds tasks only under it: a new top-level task names no target,
-        // so without this the scope would stop exactly where a new task starts.
-        // ...and records a review only once it is bound: a review is keyed by branch, and
-        // `review::record` holds a scoped caller to its task — which an unbound one does not have.
-        if principal.scope.is_none()
-            && principal.attested_agent().is_some()
-            && matches!(request, Request::TaskReviewRecord(_))
-        {
-            return Err(forbidden(format!(
-                "`{op}` refused: {} has not bound to the task it reviews — run `jkb role bind \
-                 <uid>` first",
-                principal.label
-            )));
-        }
-        let scoped = principal.scope.is_some() || principal.attested_agent().is_some();
-        if scoped && matches!(request, Request::TaskAdd(_)) {
-            return Err(forbidden(format!(
-                "`{op}` refused: {} is held to one task, and adds tasks only under it (`--under \
-                 <uid>`)",
-                principal.label
-            )));
-        }
-        return Ok(Admit::Run);
+    let reference = match reference_of(principal, request, permission)? {
+        Ok(r) => r,
+        Err(admit) => return Ok(admit),
     };
     let Some(target) = task::resolve_ref(conn, reference)? else {
         // Nothing to scope against; the op itself answers `not_found`.
@@ -658,6 +851,10 @@ pub fn authorize(
                      of its subtasks, or one of its findings",
                     principal.label
                 )));
+            }
+            if let Request::TaskPlace { ns, .. } = request {
+                check_destination(conn, scope, ns)
+                    .map_err(|e| forbidden(format!("`{op}` refused: {}", e.message)))?;
             }
             Ok(Admit::Run)
         }

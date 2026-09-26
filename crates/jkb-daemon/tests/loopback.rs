@@ -1168,3 +1168,46 @@ fn a_role_token_and_a_ticket_are_served_as_their_principal_over_http() {
         ErrorCode::Unauthorized
     );
 }
+
+/// A grant revoked behind the daemon's back — by the host CLI, straight into the database — is still
+/// in the daemon's cache. Its next request is refused, and the connection with it, so the holder
+/// cannot keep a slot open past the read timeout on a token that no longer names anything.
+#[test]
+fn a_grant_revoked_behind_the_cache_is_refused_and_its_connection_closed() {
+    let f = Fixture::new();
+    let op = f.client();
+    let Response::Granted { token, grant } = op
+        .call(
+            serde_json::from_value(
+                json!({ "op": "role.grant", "role": "coordinator", "agent": "c" }),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    let http = reqwest::blocking::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let ls = || {
+        http.post(format!("{}/v1/op", f.base))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body(json!({ "op": "kb.ls" }).to_string())
+            .send()
+            .unwrap()
+    };
+    assert_eq!(ls().status(), 200, "admitted, and now in the cache");
+    let id = grant.id;
+    f.db.write_txn("host-cli", move |c, m| jkb_core::roles::revoke(c, m, id))
+        .unwrap();
+    let r = ls();
+    assert_eq!(r.status(), 401);
+    assert_eq!(
+        r.headers().get("connection").map(|v| v.to_str().unwrap()),
+        Some("close"),
+        "refused like any unauthenticated request, not served on a kept-alive connection"
+    );
+}

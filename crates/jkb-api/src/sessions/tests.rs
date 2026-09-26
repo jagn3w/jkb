@@ -772,7 +772,11 @@ fn review_findings_are_bounded() {
     .unwrap();
     let e = ask(json!(["reviews/huge"])).unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
-    assert!(e.message.contains("review="), "{e:?}");
+    assert!(e.message.contains("--no-review"), "{e:?}");
+    assert!(
+        !e.message.contains("tag rm"),
+        "a tag no longer records a round, so removing one is no remedy: {e:?}"
+    );
 }
 
 /// `task.staging` answers only the repo's tasks that have somewhere to land, with what a row needs.

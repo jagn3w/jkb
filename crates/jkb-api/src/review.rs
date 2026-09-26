@@ -275,32 +275,7 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
         )));
     }
     let root = ns::normalize(&ask.ns)?;
-    if ask.findings.len() > MAX_FINDINGS {
-        return Err(invalid(format!(
-            "at most {MAX_FINDINGS} findings in one review ({} given)",
-            ask.findings.len()
-        )));
-    }
-    for f in &ask.findings {
-        if fold(&f.summary).is_empty() {
-            return Err(invalid("a finding with an empty summary"));
-        }
-        check_bytes("summary", &f.summary, MAX_SUMMARY_BYTES)?;
-        check_bytes("file", f.file.as_deref().unwrap_or(""), MAX_SUMMARY_BYTES)?;
-        check_bytes(
-            "scenario",
-            f.scenario.as_deref().unwrap_or(""),
-            MAX_DETAIL_BYTES,
-        )?;
-        check_bytes("fix", f.fix.as_deref().unwrap_or(""), MAX_DETAIL_BYTES)?;
-    }
-    let size = serde_json::to_vec(&ask.findings).map_or(usize::MAX, |v| v.len());
-    if size > MAX_FILING_BYTES {
-        return Err(invalid(format!(
-            "these findings take {size} bytes and one filing takes at most {MAX_FILING_BYTES}, \
-             even with their scenarios and fixes cut short; file fewer findings, or shorter summaries"
-        )));
-    }
+    check_findings(ask)?;
     let held = Query {
         scope: Scope::Subtree(root.clone()),
         ..Query::default()
@@ -343,6 +318,7 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
             .collect()
     };
     let mut uids = Vec::with_capacity(entries.len());
+    let mut ids = Vec::with_capacity(entries.len());
     for (i, (section, priority, body)) in entries.into_iter().enumerate() {
         let home = format!("{root}/{section}");
         if let Some(file) = mount::tasks_file_for(conn, &home)? {
@@ -364,12 +340,46 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
             task::set_status(conn, meta, id, TaskStatus::Done)?;
         }
         uids.push(uid);
+        ids.push(id);
     }
+    // What this filing holds, so recording it makes exactly these a task's round (and its scope).
+    jkb_core::reviews::record_filing(conn, &root, &ids)?;
     Ok(Filed {
         ns: root,
         uids,
         clean,
     })
+}
+
+/// Refuse findings too many, too large, or with an empty summary.
+fn check_findings(ask: &FileAsk) -> Result<(), ApiError> {
+    if ask.findings.len() > MAX_FINDINGS {
+        return Err(invalid(format!(
+            "at most {MAX_FINDINGS} findings in one review ({} given)",
+            ask.findings.len()
+        )));
+    }
+    for f in &ask.findings {
+        if fold(&f.summary).is_empty() {
+            return Err(invalid("a finding with an empty summary"));
+        }
+        check_bytes("summary", &f.summary, MAX_SUMMARY_BYTES)?;
+        check_bytes("file", f.file.as_deref().unwrap_or(""), MAX_SUMMARY_BYTES)?;
+        check_bytes(
+            "scenario",
+            f.scenario.as_deref().unwrap_or(""),
+            MAX_DETAIL_BYTES,
+        )?;
+        check_bytes("fix", f.fix.as_deref().unwrap_or(""), MAX_DETAIL_BYTES)?;
+    }
+    let size = serde_json::to_vec(&ask.findings).map_or(usize::MAX, |v| v.len());
+    if size > MAX_FILING_BYTES {
+        return Err(invalid(format!(
+            "these findings take {size} bytes and one filing takes at most {MAX_FILING_BYTES}, \
+             even with their scenarios and fixes cut short; file fewer findings, or shorter summaries"
+        )));
+    }
+    Ok(())
 }
 
 /// `task.review_record`'s request: a review of `branch` at `sha`, whose findings are under `findings`.
@@ -449,6 +459,7 @@ pub fn record(
     roots: Option<&FileRoots>,
     actor: &str,
     scope: Option<ItemId>,
+    source: jkb_core::reviews::RoundSource,
 ) -> Result<Recording, ApiError> {
     check_name("repo key", &ask.repo)?;
     check_name("branch", &ask.branch)?;
@@ -517,7 +528,7 @@ pub fn record(
             }
         }
         let before = line_problem(conn, &m.uid)?;
-        jkb_core::reviews::record(conn, meta, id, &findings, sha, actor)?;
+        jkb_core::reviews::record(conn, meta, id, &findings, sha, actor, source)?;
         let moved = item::get(conn, id)?.and_then(|m| m.status).as_deref() == Some("in_progress");
         if moved {
             task::set_status(conn, meta, id, TaskStatus::NeedsReview)?;

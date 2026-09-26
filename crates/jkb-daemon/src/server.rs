@@ -210,10 +210,13 @@ struct State {
 
 /// The live grants' token hashes, so a bearer that is neither the root token nor a ticket is
 /// recognized without a database read per request (D52.3). A hit is only admission: every call
-/// resolves its principal from the database again, so a revocation is never served stale. A miss
-/// refreshes the set at most once per [`GRANT_REFRESH`], so a flood of wrong tokens costs one read a
-/// second, not one each. A grant this daemon mints clears the interval, so it authenticates at once;
-/// one the host CLI wrote directly may wait out one interval.
+/// resolves its principal from the database again, so a revocation is never served stale — and a
+/// call refused `Unauthorized` evicts its hash and closes the connection, so a revoked holder cannot
+/// keep riding the cache past the read timeout and the op permits. A grant or revocation this daemon
+/// serves empties the set. A miss refreshes it at most once per [`GRANT_REFRESH`] — claimed under the
+/// lock, so a burst of misses costs **one** read, on the reader connection rather than ahead of the
+/// hooks' writes; the misses that arrive during it are answered as misses. A grant the host CLI wrote
+/// directly may wait out one interval.
 #[derive(Default)]
 struct GrantCache {
     hashes: HashSet<String>,
@@ -507,23 +510,25 @@ async fn authenticate(state: &Arc<State>, given: &str) -> Result<Option<Caller>,
             .lock()
             .map_err(|_| ApiError::with_code(ErrorCode::Internal, "grant cache poisoned"))
     };
-    let refresh_due = {
-        let cache = lock()?;
+    {
+        let mut cache = lock()?;
         if cache.hashes.contains(&hash) {
             return Ok(Some(Caller::Token(given.to_owned())));
         }
-        cache
+        if cache
             .refreshed
-            .is_none_or(|at| at.elapsed() >= GRANT_REFRESH)
-    };
-    if !refresh_due {
-        return Ok(None);
+            .is_some_and(|at| at.elapsed() < GRANT_REFRESH)
+        {
+            return Ok(None);
+        }
+        // Claimed before the read, so every miss arriving while it runs is answered as a miss
+        // rather than starting a read of its own.
+        cache.refreshed = Some(std::time::Instant::now());
     }
-    let (_, db) = ready(state).await?;
-    let live = blocking_read(&db, jkb_core::roles::live_by_hash).await?;
+    let (backend, _) = ready(state).await?;
+    let live = blocking_read(backend.reads(), jkb_core::roles::live_by_hash).await?;
     let mut cache = lock()?;
     cache.hashes = live.into_iter().map(|(h, _)| h).collect();
-    cache.refreshed = Some(std::time::Instant::now());
     Ok(cache
         .hashes
         .contains(&hash)
@@ -960,21 +965,46 @@ async fn handle(
     };
     let permit: Permit = Arc::new(permit);
     *held = Some(Arc::clone(&permit));
-    Ok(
-        match serve_op(&state, backend, db, request, wait, &permit).await {
-            Ok(response) => {
-                // A grant this daemon just minted must authenticate on the very next request, not
-                // after the cache's refresh interval.
-                if matches!(response, Response::Granted { .. }) {
-                    if let Ok(mut cache) = state.grants.lock() {
-                        cache.refreshed = None;
-                    }
+    Ok(answer(
+        &state,
+        &given,
+        serve_op(&state, backend, db, request, wait, &permit).await,
+    ))
+}
+
+/// The reply to a served op, keeping the grant cache honest on the way: a grant or revocation this
+/// daemon served empties it, and a token admitted from it that then failed to resolve is evicted and
+/// its connection closed.
+fn answer(
+    state: &State,
+    given: &str,
+    served: Result<Response, ApiError>,
+) -> hyper::Response<Full<Bytes>> {
+    match served {
+        Ok(response) => {
+            // A grant this daemon just minted must authenticate on the very next request, and
+            // one it just revoked (a rotation revokes too) must stop being admitted.
+            if matches!(
+                response,
+                Response::Granted { .. } | Response::Revoked { .. }
+            ) {
+                if let Ok(mut cache) = state.grants.lock() {
+                    cache.hashes.clear();
+                    cache.refreshed = None;
                 }
-                reply(StatusCode::OK, &json!(response))
             }
-            Err(e) => refuse(&e),
-        },
-    )
+            reply(StatusCode::OK, &json!(response))
+        }
+        // The token was admitted and then did not resolve: revoked since the cache last read,
+        // or a ticket released. Its hash goes, and so does the connection.
+        Err(e) if e.code == ErrorCode::Unauthorized => {
+            if let Ok(mut cache) = state.grants.lock() {
+                cache.hashes.remove(&jkb_core::roles::token_hash(given));
+            }
+            refuse_and_close(&e)
+        }
+        Err(e) => refuse(&e),
+    }
 }
 
 /// The permit a parsed request runs under, traded for its `op_permit` once its class is known, with

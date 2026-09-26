@@ -381,3 +381,47 @@ fn a_scoped_caller_s_review_credits_only_its_own_task() {
     );
     assert_eq!(got.unwritable, vec![theirs], "skipped, and said so");
 }
+
+/// A non-operator records only a namespace a filing made, and the gate counts the round as it was
+/// recorded: lowering a must-fix's priority afterwards does not clear it.
+#[test]
+fn a_non_operator_records_only_a_filing_and_the_gate_reads_the_recorded_round() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let mine = started(&b, "mine", "feat");
+    call(
+        &b,
+        json!({ "op": "task.add", "text": "by hand !p1", "home": "reviews/hand", "managed": true }),
+    )
+    .unwrap();
+    let token = match call(
+        &b,
+        json!({ "op": "role.grant", "role": "coordinator", "task": mine, "agent": "c" }),
+    )
+    .unwrap()
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let scoped = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
+    let e = record(&scoped, "feat", "reviews/hand").unwrap_err();
+    assert!(e.message.contains("not a namespace"), "{e:?}");
+    // The operator's `/review-log` path (a mount) still records any namespace.
+    record(&b, "feat", "reviews/hand").unwrap();
+
+    let filed = file(
+        &b,
+        "reviews/f",
+        &json!([{ "severity": "must-fix", "summary": "bad", "file": "src/a.rs" }]),
+    )
+    .unwrap();
+    record(&scoped, "feat", "reviews/f").unwrap();
+    call(
+        &b,
+        json!({ "op": "task.set", "uid": filed.uids[0], "priority": 3 }),
+    )
+    .unwrap();
+    let f = findings(&b, "reviews/f");
+    assert_eq!(f.open_count, 1, "still the must-fix it was recorded as");
+    assert_eq!(f.rounds[0].must_fix, 1);
+}

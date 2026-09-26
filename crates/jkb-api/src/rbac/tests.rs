@@ -217,7 +217,13 @@ fn each_role_fires_only_its_own_workflow_step() {
                 "the coordinator spawns, it does not implement"
             );
             assert!(workflow.may_fire.contains(&"submit_work".to_owned()));
-            assert!(workflow.history.len() == 2, "{:?}", workflow.history);
+            // The pin row the first move writes, then the two moves.
+            assert!(workflow.history.len() == 3, "{:?}", workflow.history);
+            assert!(
+                workflow.history[0].contains("pin_strategy"),
+                "{:?}",
+                workflow.history
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -420,4 +426,114 @@ fn a_scoped_caller_adds_only_under_its_task_and_records_only_its_own_review() {
     }
     let other = add(&kb.op, "task b");
     refused(&rev, json!({ "op": "role.bind", "uid": other }));
+}
+
+#[test]
+fn a_scoped_caller_writes_no_shared_state_and_places_only_beside_its_task() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let (_, coord) = grant(&kb.op, "coordinator", Some(&a), "c");
+    let c = kb.as_token(&coord);
+    for shared in [
+        json!({ "op": "lease.take", "name": "land:jkb", "holder": "x 1", "displace": "q 2" }),
+        json!({ "op": "removal.add", "removal": { "worktree": "/w/b", "repo_root": "/r",
+                "branch": "b", "uid": a, "recorded_at": 0, "accept_dirty": true,
+                "delete_branch": true } }),
+    ] {
+        let e = refused(&c, shared);
+        assert!(e.message.contains("no one task owns"), "{e:?}");
+    }
+    // Only where its own task is: never a review round's namespace, its own or another's.
+    let e = refused(
+        &c,
+        json!({ "op": "task.add", "text": "late !p3", "under": a,
+                "home": "repos/p/codereviews/r1/nit" }),
+    );
+    assert!(e.message.contains("only where that task is"), "{e:?}");
+    let e = refused(
+        &c,
+        json!({ "op": "task.add", "text": "x +repos/p/codereviews/r2", "under": a }),
+    );
+    assert!(e.message.contains("only where that task is"), "{e:?}");
+    ok(
+        &c,
+        json!({ "op": "task.add", "text": "a subtask", "under": a }),
+    );
+    let e = refused(
+        &c,
+        json!({ "op": "task.place", "uid": a, "ns": "repos/p/codereviews/r1/must-fix" }),
+    );
+    assert!(e.message.contains("only where that task is"), "{e:?}");
+}
+
+#[test]
+fn a_refused_first_op_leaves_the_worker_unbound_and_a_label_is_not_the_credential() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let b_task = add(&kb.op, "task b");
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "reviewer", "role": "reviewer" }),
+    );
+    let ticket = match ok(
+        &kb.as_token(&container),
+        json!({ "op": "attest.mint", "session": "s", "agent_id": "r1",
+                "agent_type": "reviewer", "tool_use_id": "t" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let rev = kb.as_token(&ticket);
+    // Admitted — so bound — then refused by the op itself.
+    let e = call(
+        &rev,
+        json!({ "op": "workflow.fire", "uid": a, "event": "no_such_event" }),
+    )
+    .unwrap_err();
+    assert_ne!(e.code, ErrorCode::Forbidden, "{e:?}");
+    match ok(&rev, json!({ "op": "role.whoami" })) {
+        Response::WhoAmI { whoami } => assert_eq!(whoami.task, None, "the binding was undone"),
+        other => panic!("{other:?}"),
+    }
+    ok(&rev, json!({ "op": "role.bind", "uid": b_task }));
+
+    // A grant the operator labelled `container` is not the container credential.
+    let (_, labelled) = grant(&kb.op, "implementer", Some(&a), "container");
+    let e = refused(
+        &kb.as_token(&labelled),
+        json!({ "op": "attest.mint", "session": "s", "tool_use_id": "t2" }),
+    );
+    assert!(e.message.contains("container's own credential"), "{e:?}");
+}
+
+#[test]
+fn a_session_holds_a_bounded_number_of_live_tickets() {
+    let kb = Kb::new();
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let hook = kb.as_token(&container);
+    let mint = |session: &str, i: usize| {
+        call(
+            &hook,
+            json!({ "op": "attest.mint", "session": session, "tool_use_id": format!("t{i}") }),
+        )
+    };
+    for i in 0..super::MAX_SESSION_TICKETS {
+        mint("greedy", i).unwrap();
+    }
+    let e = mint("greedy", usize::MAX).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Busy, "{e:?}");
+    mint("another", 0).expect("another session is not held to it");
+    // Releasing makes room again.
+    ok(
+        &hook,
+        json!({ "op": "attest.release", "session": "greedy", "tool_use_id": "t0" }),
+    );
+    mint("greedy", usize::MAX).unwrap();
 }

@@ -367,13 +367,16 @@ pub struct Added {
 ///
 /// # Errors
 /// A malformed line or ref, an `#onto=` tag, a home the rules cannot settle, `--sync` with no tasks
-/// mount, [`ErrorCode::Forbidden`] for a binding outside `roots`, or a failed write.
+/// mount, [`ErrorCode::Forbidden`] for a binding outside `roots` or — for a caller held to the task
+/// `scope` — a namespace that task is not placed in ([`crate::rbac::check_destination`]), or a failed
+/// write.
 pub fn add(
     conn: &Connection,
     meta: &jkb_core::WriteMeta,
     ask: &AddAsk,
     server_home: Option<&Path>,
     roots: Option<&FileRoots>,
+    scope: Option<ItemId>,
 ) -> Result<Added, AddFailure> {
     let invalid = |why: String| ApiError::with_code(ErrorCode::Invalid, why);
     check_len("a task line", &ask.text, MAX_CONTENT_BYTES)?;
@@ -456,6 +459,13 @@ pub fn add(
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
     if let Some(also) = &ask.also {
         spec.mirrors.push(jkb_core::ns::normalize(also)?);
+    }
+    // Judged on where it will actually go, after `--home`, `+ns`, `--also` and the parent's home
+    // have all had their say.
+    if let Some(scope) = scope {
+        for ns in std::iter::once(&spec.home).chain(&spec.mirrors) {
+            crate::rbac::check_destination(conn, scope, ns)?;
+        }
     }
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
 
