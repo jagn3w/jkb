@@ -450,7 +450,8 @@ pub fn generation(conn: &Connection) -> Result<(i64, i64)> {
         .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?)
 }
 
-/// Grants, newest first: only those scoped to `scope` when given, and revoked ones only when
+/// Grants, newest first: only those scoped to `scope` when given, and revoked ones — and ones their
+/// minter may no longer grant, which [`resolve`] no longer answers (review round 6) — only when
 /// `include_revoked`.
 ///
 /// # Errors
@@ -468,7 +469,10 @@ pub fn list(
     let rows = stmt.query_map(params![scope.map(ItemId::get), include_revoked], grant_row)?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(into_grant(row?)?);
+        let g = into_grant(row?)?;
+        if include_revoked || grantable_now(conn, &g)? {
+            out.push(g);
+        }
     }
     Ok(out)
 }

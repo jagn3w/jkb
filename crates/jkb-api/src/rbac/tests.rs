@@ -730,6 +730,13 @@ fn a_parked_workflow_is_landed_again_only_after_the_operator_reopens_it() {
         Response::Landing { landing } => assert!(landing.refusal.is_none(), "{landing:?}"),
         other => panic!("{other:?}"),
     }
+    // Not a landing somewhere else, though: that records a landing it never had.
+    let e = refused(
+        &c,
+        json!({ "op": "task.landed", "uid": a,
+                "landed": { "branch": "b", "onto": "elsewhere", "head": "abcd" } }),
+    );
+    assert!(e.message.contains("parked at `landed`"), "{e:?}");
     ok(
         &kb.op,
         json!({ "op": "task.set", "uid": a, "status": "open" }),
@@ -863,4 +870,30 @@ fn an_unrecorded_mounted_round_is_still_a_review_round() {
                 "home": "tasks/p/codereviews/m1/must-fix" }),
     );
     assert!(e.message.contains("never in a review round"), "{e:?}");
+}
+
+/// A task whose workflow is parked at `cancelled` is not landed by ticking it `done` first: only a
+/// repeat of a live landing gets past a parked workflow (review round 6).
+#[test]
+fn a_cancelled_workflow_is_not_landed_by_ticking_it_done() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let (_, token) = grant(&kb.op, "coordinator", None, "coord");
+    let c = kb.as_token(&token);
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.set", "uid": a, "strategy": "autonomous" }),
+    );
+    ok(
+        &kb.op,
+        json!({ "op": "task.set", "uid": a, "status": "cancelled" }),
+    );
+    ok(&kb.op, json!({ "op": "workflow.observe", "uid": a }));
+    ok(&c, json!({ "op": "task.set", "uid": a, "status": "done" }));
+    let e = refused(
+        &c,
+        json!({ "op": "task.landed", "uid": a,
+                "landed": { "branch": "b", "onto": "o", "head": "abcd" } }),
+    );
+    assert!(e.message.contains("parked at `cancelled`"), "{e:?}");
 }

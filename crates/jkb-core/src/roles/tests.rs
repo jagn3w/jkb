@@ -358,4 +358,8 @@ fn a_grant_its_minter_may_no_longer_grant_does_not_resolve() {
     let cached = db.read(live_by_hash).unwrap();
     assert!(!cached.iter().any(|(_, g)| g.id == stale.id), "{cached:?}");
     assert!(cached.iter().any(|(_, g)| g.id == fine.id), "{cached:?}");
+    // Nor is it listed as live, where the operator would see a grant that cannot work.
+    let listed = db.read(|c| list(c, None, false)).unwrap();
+    assert!(!listed.iter().any(|g| g.id == stale.id), "{listed:?}");
+    assert!(listed.iter().any(|g| g.id == fine.id), "{listed:?}");
 }

@@ -225,6 +225,26 @@ fn tasks_mirror_ns(home: &str) -> Option<String> {
     Some(format!("{DEFAULT_ROOT}/{rest}"))
 }
 
+/// Every name `ns` goes by across the `tasks/` mirror: itself, the mirror [`tasks_mirror_ns`] gives a
+/// home, and — for a `tasks/<rest>` — each home that mirrors to it (`repos/<rest>`, and `<rest>` for a
+/// home outside `repos/`). What a rule about a namespace holds against, so a rule written for the home
+/// is not stepped around through the mirror, nor the other way (review round 6).
+#[must_use]
+pub fn mirror_forms(ns: &str) -> Vec<String> {
+    let mut forms = vec![ns.to_owned()];
+    if let Some(mirror) = tasks_mirror_ns(ns) {
+        forms.push(mirror);
+    }
+    if let Some(rest) = ns.strip_prefix(&format!("{DEFAULT_ROOT}/")) {
+        forms.push(format!("repos/{rest}"));
+        if !rest.starts_with("repos/") && rest != "repos" {
+            forms.push(rest.to_owned());
+        }
+    }
+    forms.dedup();
+    forms
+}
+
 /// Ensure a task homed at `home` (its Primary namespace) has a `tasks/…` Reference mirror
 /// (a symbolic link) when `home` is outside `tasks/`, so `tasks/**` is the complete task
 /// index. Idempotent; returns whether a mirror was added.

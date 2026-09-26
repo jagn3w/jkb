@@ -670,6 +670,20 @@ impl Scan<'_> {
 }
 
 fn judge_module(dir: &Path, gitdir: &Path, top: &Path, common: &Path, out: &mut Vec<String>) {
+    // A `commondir` sends git to another directory's config and hooks — measured on git 2.51.1, a
+    // clean filter planted there ran on `git -C sub add` — so this directory's own `config` would
+    // be the wrong one to judge. [`check_layout`] refuses the same redirect for a repository jkb
+    // runs git in; a submodule's git directory never has one (review round 6).
+    let redirect = gitdir.join("commondir");
+    if fs::symlink_metadata(&redirect).is_ok() {
+        let to = fs::read_to_string(&redirect).unwrap_or_default();
+        out.push(format!(
+            "{} redirects its config and hooks to `{}`",
+            redirect.display(),
+            to.trim()
+        ));
+        return;
+    }
     let cfg = gitdir.join("config");
     match fs::symlink_metadata(&cfg) {
         Ok(m) if m.file_type().is_symlink() => {
@@ -3471,6 +3485,18 @@ mod tests {
         std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub/evil\n").unwrap();
         let found = super::module_findings(&dir).join("; ");
         assert!(found.contains("filter.e.clean"), "{found}");
+        // A `commondir` in a submodule's git directory takes its config from somewhere else.
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let evil = t.path().join("evil");
+        gitdir(&evil, "[filter \"c\"]\n\tclean = touch /tmp/c\n");
+        std::fs::write(
+            dir.join(".git/modules/sub/commondir"),
+            format!("{}\n", evil.display()),
+        )
+        .unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("redirects its config and hooks"), "{found}");
+        std::fs::remove_file(dir.join(".git/modules/sub/commondir")).unwrap();
         #[cfg(unix)]
         {
             // An un-absorbed git directory whose `modules/` is a symlink.

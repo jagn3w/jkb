@@ -181,21 +181,15 @@ pub fn record_filing(conn: &Connection, ns: &str, items: &[ItemId], filed_by: &s
 /// `repos/<repo>/codereviews/<folder>` — where `/review-log` mounts a round, which is neither until
 /// the operator records it, and which a recording then snapshots whole (review round 4: a line a
 /// worker put there first became another task's finding) — and each of these through its
-/// `tasks/<repo>/codereviews/<folder>` mirror (D26/D32), which a recording may name as well (round 5).
+/// `tasks/…` mirror (D26/D32, [`crate::task::mirror_forms`]), which a recording may name as well
+/// (rounds 5–6).
 /// A caller held to one task places nothing there, whatever its task's own placements: a worker bound
 /// to a finding lives in the round, and "beside its task" would otherwise be inside it.
 ///
 /// # Errors
 /// A database error.
 pub fn review_namespace_containing(conn: &Connection, ns: &str) -> Result<Option<String>> {
-    let mirrored = ns
-        .strip_prefix("tasks/")
-        .map(|rest| format!("repos/{rest}"))
-        .or_else(|| {
-            ns.strip_prefix("repos/")
-                .map(|rest| format!("tasks/{rest}"))
-        });
-    for candidate in std::iter::once(ns).chain(mirrored.as_deref()) {
+    for candidate in &crate::task::mirror_forms(ns) {
         let known = conn
             .prepare_cached(
                 "SELECT ns FROM (SELECT ns FROM review_rounds UNION SELECT ns FROM review_filings)
@@ -225,15 +219,23 @@ pub fn review_namespace_containing(conn: &Connection, ns: &str) -> Result<Option
 /// # Errors
 /// A database error.
 pub fn round_overlapping(conn: &Connection, ns: &str) -> Result<Option<String>> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT ns FROM review_rounds
-             WHERE ns = ?1 OR substr(?1, 1, length(ns) + 1) = ns || '/'
-                OR substr(ns, 1, length(?1) + 1) = ?1 || '/'
-             LIMIT 1",
-        )?
-        .query_row([ns], |r| r.get(0))
-        .optional()?)
+    // Under any of its names: a round recorded through its `tasks/` mirror still holds its home
+    // (review round 6).
+    for candidate in &crate::task::mirror_forms(ns) {
+        let found = conn
+            .prepare_cached(
+                "SELECT ns FROM review_rounds
+                 WHERE ns = ?1 OR substr(?1, 1, length(ns) + 1) = ns || '/'
+                    OR substr(ns, 1, length(?1) + 1) = ?1 || '/'
+                 LIMIT 1",
+            )?
+            .query_row([candidate], |r| r.get(0))
+            .optional()?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
 }
 
 /// The area a finding names: its `area=` facet, or — for a finding filed before that facet existed —

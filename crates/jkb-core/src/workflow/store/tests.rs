@@ -572,3 +572,49 @@ fn a_deleted_task_keeps_its_workflow_history() {
         .unwrap();
     assert!(!db.read(move |c| super::history(c, id)).unwrap().is_empty());
 }
+
+/// A round is one round under every name the `tasks/` mirror gives it: a filing outside `repos/` is
+/// still a review namespace through its mirror, and a round recorded through its mirror still holds
+/// its home against a later filing (review round 6).
+#[test]
+fn a_round_holds_under_every_name_the_mirror_gives_it() {
+    let db = Db::open_in_memory().unwrap();
+    let id = a_task(&db);
+    db.write_txn("test", move |c, m| {
+        let mut spec = NewTask::new("task:rf", "filed");
+        spec.home = "reviews/f/nit".into();
+        let f = create(c, m, &spec)?;
+        crate::reviews::record_filing(c, "reviews/f", &[f], "w")
+    })
+    .unwrap();
+    let inside = |ns: &'static str| {
+        db.read(move |c| crate::reviews::review_namespace_containing(c, ns))
+            .unwrap()
+    };
+    assert_eq!(inside("tasks/reviews/f/nit").as_deref(), Some("reviews/f"));
+    assert_eq!(inside("reviews/f/nit").as_deref(), Some("reviews/f"));
+    assert_eq!(inside("tasks/reviews/g"), None);
+    db.write_txn("test", |c, m| {
+        let mut spec = NewTask::new("task:rm", "mirrored");
+        spec.home = "tasks/x/codereviews/f/must-fix".into();
+        spec.priority = Some(1);
+        create(c, m, &spec).map(|_| ())
+    })
+    .unwrap();
+    record(
+        &db,
+        id,
+        "tasks/x/codereviews/f",
+        crate::reviews::RoundSource::AnyNamespace,
+    )
+    .unwrap();
+    let over = |ns: &'static str| {
+        db.read(move |c| crate::reviews::round_overlapping(c, ns))
+            .unwrap()
+    };
+    assert_eq!(
+        over("repos/x/codereviews/f/extra").as_deref(),
+        Some("tasks/x/codereviews/f")
+    );
+    assert_eq!(over("repos/x/codereviews/g"), None);
+}

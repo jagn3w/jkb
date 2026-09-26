@@ -40,7 +40,7 @@ pub enum RoleCmd {
         /// Only grants scoped to this task.
         #[arg(long)]
         task: Option<String>,
-        /// Include revoked grants.
+        /// Include revoked grants, and grants their minter may no longer grant.
         #[arg(long)]
         all: bool,
     },

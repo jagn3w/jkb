@@ -923,12 +923,11 @@ pub fn authorize(
         // A workflow parked at `landed`/`cancelled` is picked back up by the operator alone
         // (`reopen`), so nobody else lands the task again first — reopening its status and landing
         // it would re-land a finished task with its workflow never reopened (review round 3).
-        // A task still `done` is not landed again by this: the lifecycle answers a landing it already
-        // has with a no-op, which is what a merge queue re-running a branch must be told (round 5).
-        let done = jkb_core::item::get(conn, target)?
-            .and_then(|m| m.status)
-            .is_some_and(|s| s == jkb_types::TaskStatus::Done.as_str());
-        if current.phase.is_settled() && !done {
+        // Except the same landing again: a merge queue re-running a branch must be told the task
+        // landed (round 5) — asked about the branch and destination its live landing already
+        // records. Anything else — a cancelled task ticked
+        // `done`, another destination — would record a landing it never had (round 6).
+        if current.phase.is_settled() && !repeats_landing(conn, target, request)? {
             return Err(forbidden(format!(
                 "`{op}` refused: {reference}'s workflow is parked at `{}`, and only the operator \
                  picks it back up (`jkb task set {reference} --status open`, then `jkb workflow \
@@ -956,6 +955,21 @@ pub fn authorize(
         }),
         (None, None) => Ok(Admit::Run),
     }
+}
+
+/// Whether `request` lands `task` exactly as its live landing already records — the same branch onto
+/// the same destination — which the lifecycle answers with a no-op. A landing stops being live when
+/// the task is put back to work, and a cancelled task has none, so ticking one `done` does not make
+/// this true.
+fn repeats_landing(conn: &Connection, task: ItemId, request: &Request) -> Result<bool, ApiError> {
+    let (Request::TaskLand { landed, .. } | Request::TaskLanded { landed, .. }) = request else {
+        return Ok(false);
+    };
+    let landing = jkb_core::transition::landing(conn, task)?;
+    Ok(landing.live().is_some_and(|row| {
+        row.labels.onto.as_deref() == Some(landed.onto.as_str())
+            && row.labels.branch.as_deref() == Some(landed.branch.as_str())
+    }))
 }
 
 // -------------------------------------------------------------------------------------------

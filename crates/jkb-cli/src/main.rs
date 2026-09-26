@@ -2328,7 +2328,7 @@ pub(crate) fn cmd_task_landed(
     // guard's refusal still recorded the landing, so a branch of held parents is not this.
     anyhow::ensure!(
         refused < uids.len(),
-        "nothing on {branch} was recorded as landed on {onto}: this caller may land none of its tasks"
+        "nothing on {branch} was recorded as landed on {onto}: every one of its tasks was refused (the reasons are above)"
     );
     Ok(())
 }
