@@ -177,6 +177,23 @@ pub fn record_filing(conn: &Connection, ns: &str, items: &[ItemId], filed_by: &s
     Ok(())
 }
 
+/// The review namespace — filed or recorded — that `ns` is or lies inside, if any. A caller held to one
+/// task places nothing there, whatever its task's own placements: a worker bound to a finding lives
+/// in the round, and "beside its task" would otherwise be inside it.
+///
+/// # Errors
+/// A database error.
+pub fn review_namespace_containing(conn: &Connection, ns: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT ns FROM (SELECT ns FROM review_rounds UNION SELECT ns FROM review_filings)
+             WHERE ns = ?1 OR substr(?1, 1, length(ns) + 1) = ns || '/'
+             LIMIT 1",
+        )?
+        .query_row([ns], |r| r.get(0))
+        .optional()?)
+}
+
 /// The recorded round `ns` is, lies inside, or contains, if any. Filing there would put findings under
 /// a round another recording already fixed.
 ///
@@ -233,8 +250,9 @@ fn snapshot_round(
             return Err(Error::Types(TypeError::Validation(format!(
                 "`{ns}` is not a namespace this caller filed with `jkb task review file` — only the \
                  operator records a review someone else filed, or whose findings reached the KB \
-                 another way, because the round a task records decides which tasks its workers may \
-                 write"
+                 another way (a mounted `/review-log` folder), because the round a task records \
+                 decides which tasks its workers may write. Record it on the host: `jkb task review \
+                 record --branch <branch> --findings {ns}`"
             ))));
         }
     }

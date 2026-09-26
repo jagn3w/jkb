@@ -611,3 +611,151 @@ fn one_subagent_s_calls_share_one_lock_until_it_stops() {
     let l3 = kb.tickets.agent_lock(&t3).unwrap().unwrap();
     assert!(!Arc::ptr_eq(&l1, &l3), "released with the subagent");
 }
+
+/// A call of an attested subagent waits while another call of the same subagent holds its lock — the
+/// serialization the binding undo relies on, pinned by watching a call wait.
+#[test]
+fn a_subagent_s_call_waits_for_its_other_call() {
+    let kb = Kb::new();
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "reviewer", "role": "reviewer" }),
+    );
+    let ticket = match ok(
+        &kb.as_token(&container),
+        json!({ "op": "attest.mint", "session": "s", "agent_id": "a1",
+                "agent_type": "reviewer", "tool_use_id": "t" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let lock = kb.tickets.agent_lock(&ticket).unwrap().unwrap();
+    let held = lock.lock().unwrap();
+    let backend = kb.as_token(&ticket);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let r = call(&backend, json!({ "op": "kb.ls" }));
+        let _ = tx.send(r.is_ok());
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "the call ran while the subagent's other call held its lock"
+    );
+    drop(held);
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(true)
+    );
+    worker.join().unwrap();
+}
+
+/// The lock map does not outgrow the subagents holding live tickets.
+#[test]
+fn the_subagent_lock_map_is_bounded_by_live_subagents() {
+    let kb = Kb::new();
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let hook = kb.as_token(&container);
+    let n = 2 * super::MAX_SESSION_TICKETS + 20;
+    for i in 0..n {
+        let session = format!("s{i}");
+        let token = match ok(
+            &hook,
+            json!({ "op": "attest.mint", "session": session, "agent_id": "a", "tool_use_id": "t" }),
+        ) {
+            Response::Ticket { token } => token,
+            other => panic!("{other:?}"),
+        };
+        drop(kb.tickets.agent_lock(&token).unwrap());
+        // Its ticket released per tool call, as PostToolUse does, leaving the lock entry behind.
+        ok(
+            &hook,
+            json!({ "op": "attest.release", "session": session, "tool_use_id": "t" }),
+        );
+    }
+    assert!(
+        kb.tickets.agent_locks() <= 2 * super::MAX_SESSION_TICKETS + 1,
+        "{} locks for no live subagent",
+        kb.tickets.agent_locks()
+    );
+}
+
+/// A task whose workflow is parked at `landed` is not landed again by anyone but the operator, even
+/// under a strategy whose `lands` toggle names the coordinator and with the task reopened — and the
+/// workflow says the operator's `reopen` is next.
+#[test]
+fn a_parked_workflow_is_landed_again_only_after_the_operator_reopens_it() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    // Unscoped, as the container's own credential is: settling a task revokes grants scoped to it.
+    let (_, token) = grant(&kb.op, "coordinator", None, "coord");
+    let c = kb.as_token(&token);
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.set", "uid": a, "strategy": "autonomous" }),
+    );
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.fire", "uid": a, "event": "override", "to": "landed",
+                "reason": "landed before" }),
+    );
+    let landed = json!({ "op": "task.landed", "uid": a,
+                         "landed": { "branch": "b", "onto": "o", "head": "abcd" } });
+    let e = refused(&c, landed.clone());
+    assert!(e.message.contains("parked at `landed`"), "{e:?}");
+    match ok(&kb.op, json!({ "op": "workflow.show", "uid": a })) {
+        Response::Workflow { workflow } => {
+            assert_eq!(workflow.next_role, "operator");
+            assert!(
+                workflow.next_step.contains("reopen"),
+                "{}",
+                workflow.next_step
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // The operator reopens it; the coordinator's strategy then lets it land.
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.fire", "uid": a, "event": "reopen" }),
+    );
+    if let Err(e) = call(&c, landed) {
+        assert_ne!(e.code, ErrorCode::Forbidden, "{e:?}");
+    }
+}
+
+/// A caller held to a review finding lives inside the round, and still places nothing there: not a
+/// subtask beside its finding, not a mirror of it into the round.
+#[test]
+fn a_caller_held_to_a_finding_places_nothing_in_its_round() {
+    let kb = Kb::new();
+    let filed = match ok(
+        &kb.op,
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+                "ns": "repos/p/codereviews/r7",
+                "findings": [{ "severity": "must-fix", "summary": "bad" }] }),
+    ) {
+        Response::ReviewFiled { filed } => filed,
+        other => panic!("{other:?}"),
+    };
+    let finding = filed.uids[0].clone();
+    let (_, token) = grant(&kb.op, "implementer", Some(&finding), "impl");
+    let c = kb.as_token(&token);
+    let e = refused(
+        &c,
+        json!({ "op": "task.add", "text": "x !p0", "under": finding }),
+    );
+    assert!(e.message.contains("never in a review round"), "{e:?}");
+    let e = refused(
+        &c,
+        json!({ "op": "task.place", "uid": finding, "ns": "repos/p/codereviews/r7/nit" }),
+    );
+    assert!(e.message.contains("never in a review round"), "{e:?}");
+}

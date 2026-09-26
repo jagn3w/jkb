@@ -17,6 +17,8 @@
 //! one re-run command.
 
 use std::collections::HashMap;
+
+use jkb_fsm::State as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -110,7 +112,9 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
                 OpPermission::TaskWrite,
                 OpPermission::TaskStatus,
                 OpPermission::TaskClaim,
-                OpPermission::Review,
+                // Not `Review` (round 3): a coordinator drives the work, and one that could file an
+                // empty round and record it against the branch it drove satisfied the land gate
+                // with no reviewer involved. A round is a reviewer's, or the operator's.
                 OpPermission::Workflow,
                 OpPermission::Grant,
             ],
@@ -400,6 +404,12 @@ pub enum Target<'a> {
 /// [`ErrorCode::Forbidden`] naming the namespace, or a database error.
 pub fn check_destination(conn: &Connection, scope: ItemId, ns: &str) -> Result<(), ApiError> {
     let ns = jkb_core::ns::normalize(ns)?;
+    if let Some(round) = jkb_core::reviews::review_namespace_containing(conn, &ns)? {
+        return Err(forbidden(format!(
+            "a caller held to one task places tasks only where that task is, and never in a review \
+             round (`{ns}` is in `{round}`)"
+        )));
+    }
     let homes = jkb_core::item::namespaces_of(conn, scope)?;
     if homes.contains(&ns) {
         return Ok(());
@@ -531,9 +541,27 @@ impl Tickets {
             .agents
             .lock()
             .map_err(|_| ApiError::with_code(ErrorCode::Internal, "agent locks poisoned"))?;
+        // Bounded like the tickets beside it: once the map outgrows the subagents that hold a live
+        // ticket, drop the rest — a subagent whose tickets all expired unreleased holds nothing a
+        // lock could serialize. (Lock order: agents, then live; nothing takes them the other way.)
+        if agents.len() > 2 * MAX_SESSION_TICKETS {
+            let live = self.lock()?;
+            agents.retain(|(s, a), lock| {
+                Arc::strong_count(lock) > 1
+                    || live
+                        .by_token
+                        .values()
+                        .any(|t| &t.session == s && t.agent_id.as_deref() == Some(a))
+            });
+        }
         Ok(Some(Arc::clone(
             agents.entry((t.session, agent)).or_default(),
         )))
+    }
+
+    #[cfg(test)]
+    fn agent_locks(&self) -> usize {
+        self.agents.lock().map_or(0, |a| a.len())
     }
 
     fn mint(&self, t: Ticket) -> Result<String, ApiError> {
@@ -867,7 +895,15 @@ pub fn authorize(
             if let Decision::Deny(no) = RoleBased::new(&OP_GRANTS)
                 .decide(&principal.roles, Requirement::Permission(permission))
             {
-                return Err(deny(&no, op));
+                let mut e = deny(&no, op);
+                if permission == OpPermission::Review {
+                    e.message.push_str(
+                        ". A review round is filed and recorded by a reviewer — a \
+                         `reviewer`-typed subagent, recording its own filing — or by the operator \
+                         on the host (`jkb task review record --branch <b> --findings <ns>`)",
+                    );
+                }
+                return Err(e);
             }
         }
     }
@@ -880,9 +916,20 @@ pub fn authorize(
         return Ok(Admit::Run);
     };
     if permission == OpPermission::Land {
-        let spec = wf::current(conn, target)?.spec;
-        if let Decision::Deny(no) = spec.may_land(&principal.roles) {
+        let current = wf::current(conn, target)?;
+        if let Decision::Deny(no) = current.spec.may_land(&principal.roles) {
             return Err(deny(&no, op));
+        }
+        // A workflow parked at `landed`/`cancelled` is picked back up by the operator alone
+        // (`reopen`), so nobody else lands the task again first — reopening its status and landing
+        // it would re-land a finished task with its workflow never reopened (review round 3).
+        if current.phase.is_settled() {
+            return Err(forbidden(format!(
+                "`{op}` refused: {reference}'s workflow is parked at `{}`, and only the operator \
+                 picks it back up (`jkb task set {reference} --status open`, then `jkb workflow \
+                 fire {reference} reopen`). A merge queue landing it stalls on this one task.",
+                current.phase.as_str()
+            )));
         }
     }
     match (principal.scope, principal.attested_agent()) {
@@ -1123,7 +1170,19 @@ pub fn show(conn: &Connection, principal: &Principal, uid: &str) -> Result<Workf
     let id = task_id(conn, uid)?;
     let cur = wf::current(conn, id)?;
     let machine = cur.spec.graph.machine();
-    let (next, step) = cur.spec.next_actor(cur.phase);
+    let (mut next, mut step) = cur.spec.next_actor(cur.phase);
+    // Settled, with the task itself back to work: the operator's `reopen` is what is next, not
+    // "nothing".
+    if cur.phase.is_settled() {
+        let status = jkb_core::item::get(conn, id)?.and_then(|m| m.status);
+        if !jkb_types::TaskStatus::is_terminal_str(status.as_deref()) {
+            (next, step) = (
+                jkb_core::roles::Role::Operator,
+                "the task is back to work but its workflow is parked: `jkb workflow fire <uid> \
+                 reopen`",
+            );
+        }
+    }
     let may_fire = machine
         .accepted_from(cur.phase)
         .into_iter()

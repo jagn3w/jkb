@@ -357,7 +357,7 @@ fn a_scoped_caller_s_review_credits_only_its_own_task() {
     let theirs = started(&b, "theirs", "shared");
     let token = match call(
         &b,
-        json!({ "op": "role.grant", "role": "coordinator", "task": mine, "agent": "c" }),
+        json!({ "op": "role.grant", "role": "reviewer", "task": mine, "agent": "r" }),
     )
     .unwrap()
     {
@@ -396,13 +396,27 @@ fn a_non_operator_records_only_a_filing_and_the_gate_reads_the_recorded_round() 
     .unwrap();
     let token = match call(
         &b,
-        json!({ "op": "role.grant", "role": "coordinator", "task": mine, "agent": "c" }),
+        json!({ "op": "role.grant", "role": "reviewer", "task": mine, "agent": "r" }),
     )
     .unwrap()
     {
         Response::Granted { token, .. } => token,
         other => panic!("{other:?}"),
     };
+    // A coordinator drives the work; it neither files nor records the review of it.
+    let coord = match call(
+        &b,
+        json!({ "op": "role.grant", "role": "coordinator", "agent": "c" }),
+    )
+    .unwrap()
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let coordinator = LocalBackend::new(db.clone()).with_caller(crate::rbac::Caller::Token(coord));
+    let e = file(&coordinator, "repos/proj/codereviews/self", &json!([])).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+    assert!(e.message.contains("reviewer"), "{e:?}");
     let scoped = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
     let e = record(&scoped, "feat", "reviews/hand").unwrap_err();
     assert!(e.message.contains("not a namespace"), "{e:?}");

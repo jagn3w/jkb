@@ -446,7 +446,7 @@ pub fn add(
             let pid = task::resolve_ref(conn, reference)?
                 .ok_or_else(|| AddFailure::Refused(no_item(reference)))?;
             if !explicit {
-                if let Some(home) = item::primary_namespace(conn, pid)? {
+                if let Some(home) = home_beside(conn, pid, scope)? {
                     spec.home = home;
                     explicit = true;
                 }
@@ -490,6 +490,23 @@ pub fn add(
         home: spec.home,
         binding: synced,
     })
+}
+
+/// Where a subtask of `parent` lives by default: beside it — unless that is inside a review round and
+/// the caller is held to one task, which may not write there; its own task's home is then the nearest
+/// place it may.
+fn home_beside(
+    conn: &Connection,
+    parent: ItemId,
+    scope: Option<ItemId>,
+) -> Result<Option<String>, ApiError> {
+    let beside = item::primary_namespace(conn, parent)?;
+    if let (Some(scope), Some(home)) = (scope, beside.as_deref()) {
+        if jkb_core::reviews::review_namespace_containing(conn, home)?.is_some() {
+            return Ok(item::primary_namespace(conn, scope)?.or(beside));
+        }
+    }
+    Ok(beside)
 }
 
 /// `task.add`'s homing, for a task with no explicit placement: the ambient repo's backlog with

@@ -800,7 +800,11 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   operator's, and **follows** the task's lifecycle rather than leading it: it needs the task back
   to work first (`jkb task set <uid> --status open`), or the next observe would put it straight
   back. Nothing reconciles a reopen — a lifecycle reopened by a coordinator or a synced checkbox
-  leaves the workflow parked where the operator acts next. *Superseded (round 2):* an
+  leaves the workflow parked where the operator acts next — `workflow show` names the operator's
+  `reopen` — and nobody but the operator lands a task whose workflow is parked (round 3: reopening
+  the status and landing again re-landed it with its workflow never reopened; `task.landed` from the
+  merge queue stalls on such a task). A task landed before D52 has no workflow rows, reads `design`,
+  and is not held by this. *Superseded (round 2):* an
   `observed_reopened` reconciliation let any observe follow a lifecycle reopen, so a coordinator
   could reopen a landed task. Deleting a task revokes its grants and keeps its workflow history (V022 has no cascade
   from `items`, which is AUTOINCREMENT), so `item rm` + `undo` gives back a task still pinned.
@@ -842,7 +846,13 @@ findings. A finding that matters after a round is recorded is another round. A r
 (`review_filings.filed_by`), and holds exactly what it filed: naming `tasks` as a round would put
 every task in the recording task's scope, and recording another worker's filing would pull that
 round's findings into its own. The operator's `/review-log`, whose findings arrive through a mount,
-still records any namespace. A filing is refused into, above or below any recorded round; a
+still records any namespace — on the host: from the container, a mounted folder is recorded with
+`jkb task review record --branch <b> --findings <ns>` run there. **A coordinator neither files nor
+records a round** (round 3): it drives the work, and one that could file an empty round and record it
+against the branch it drove satisfied the gate with no reviewer involved. A round is a reviewer's — a
+`reviewer`-typed subagent recording its own filing — or the operator's. Still not protected: a
+coordinator telling a reviewer it spawned to file a clean round, the "genuine worker told to lie"
+case below. A filing is refused into, above or below any recorded round; a
 principal held to one task files only under `repos/<repo>/codereviews/` of its task's repository
 (the nearest `repo=` up its parents) — findings are ordinary open tasks on the shared frontier —
 and an attested subagent binds before it files.
@@ -921,8 +931,14 @@ Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed 
    `--ignore-submodules=dirty` on every `status` and `diff` — on the command line because a tracked
    `.gitmodules` can set `submodule.<name>.ignore=none`, which outranks the `-c` (measured on git
    2.51.1: a superproject `status` ran a filter planted in `.git/modules/sub/config`, and with the
-   option it did not, still reporting a moved submodule commit). The cost: a submodule's uncommitted
-   edits no longer make a checkout read dirty — a graft carries only the submodule's commit anyway.
+   option it did not, still reporting a moved submodule commit). `checkout` and `switch` run
+   `--quiet` too: their report of local changes enters every populated submodule, and a branch can
+   bring a submodule only the target tree's `.gitmodules` names (round 3, measured: the planted filter
+   ran on `checkout --detach` and `switch`, not with `--quiet`). And jkb's git runs **only** the
+   subcommands measured not to enter a submodule (`SAFE_SUBCOMMANDS`: `add -A`, `stash`,
+   `cherry-pick` and `diff-index` did), refused at runtime otherwise, so a new one arrives with its
+   own measurement. The cost: a submodule's uncommitted edits no longer make a checkout read dirty —
+   a graft carries only the submodule's commit anyway.
    It judges every key of the repository's own config — local, worktree and included — against an
    **allowlist** of repository-shape keys (`git config --list
    --show-origin --show-scope` executes nothing; `-c core.fsmonitor=false -c core.hooksPath=/dev/null`
@@ -960,8 +976,9 @@ filing, recording, revoking, attesting), or writes **shared** state — a namesp
 worktree removal, an item outside the task tree — which a scoped principal is refused. *Superseded:*
 a `_ => None` arm admitted `removal.add` naming another task's worktree and `lease.take` displacing
 the merge queue as unscoped (round 1). A scoped caller adds tasks only `--under` its task, and places
-tasks (`task.add`'s home and mirrors, `task.place`) only where its task itself is placed — never
-into a review round. `review::record` credits only in-scope tasks for a scoped caller. An attested
+tasks (`task.add`'s home and mirrors, `task.place`) only where its task itself is placed — and
+never at or under a filed or recorded review namespace, even when its task is a finding placed
+there (round 3); a subtask added under a finding falls back to the caller's own task's home. `review::record` credits only in-scope tasks for a scoped caller. An attested
 subagent binds to its task on its first task-targeted write, or explicitly with `jkb role bind
 <uid>` — a binding its first op made is undone if that op then fails, and one subagent's calls are
 serialized from admission to that undo, so it never undoes a binding a concurrent call of its own

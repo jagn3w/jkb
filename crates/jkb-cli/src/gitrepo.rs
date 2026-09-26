@@ -46,7 +46,9 @@ const DEFAULT_TRUNKS: &[&str] = &["main", "master", "trunk", "develop"];
 /// superproject records — nothing about a submodule's own work tree reaches jkb's answers.
 fn git_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut all: Vec<&str> = NEUTRALIZERS.to_vec();
-    if let Some((sub, rest)) = args.split_first() {
+    let (options, sub_and_rest) = args.split_at(subcommand_at(args));
+    all.extend_from_slice(options);
+    if let Some((sub, rest)) = sub_and_rest.split_first() {
         all.push(sub);
         // On the command line as well as in `-c`: a tracked `.gitmodules` can set
         // `submodule.<name>.ignore=none`, which outranks `diff.ignoreSubmodules` — measured on git
@@ -55,9 +57,62 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
         if matches!(*sub, "status" | "diff") {
             all.push("--ignore-submodules=dirty");
         }
+        // And `checkout`/`switch` report local changes after moving, which enters every populated
+        // submodule — `.gitmodules` `ignore=none` beats the `-c`, and a branch can bring a submodule
+        // whose name only the TARGET tree's `.gitmodules` knows (measured on git 2.51.1: the planted
+        // filter ran on `checkout --detach`, not on `checkout --quiet --detach`). `--quiet` skips that
+        // report; errors still print.
+        if matches!(*sub, "checkout" | "switch") {
+            all.push("--quiet");
+        }
         all.extend_from_slice(rest);
     }
     git_in(dir, &all)
+}
+
+/// The git subcommands jkb's own git may run: each measured, on git 2.51.1 against a submodule whose
+/// config holds a planted filter and whose `.gitmodules` says `ignore = none`, not to enter it under
+/// [`git_cmd`]'s settings. `add -A`, `stash`, `cherry-pick` and `diff-index` did enter it, so a
+/// subcommand is added here only with a measurement of its own — refused at runtime, in
+/// [`checked`], rather than left to every caller to remember.
+const SAFE_SUBCOMMANDS: &[&str] = &[
+    "rev-parse",
+    "symbolic-ref",
+    "config",
+    "worktree",
+    "for-each-ref",
+    "branch",
+    "status",
+    "diff",
+    "ls-files",
+    "rev-list",
+    "switch",
+    "checkout",
+    "merge",
+    "rebase",
+    "reset",
+];
+
+/// Where the subcommand is in `args`: past any leading `-c <key>=<value>` pairs, the one global
+/// option a caller passes.
+fn subcommand_at(args: &[&str]) -> usize {
+    let mut i = 0;
+    while args.get(i) == Some(&"-c") {
+        i += 2;
+    }
+    i.min(args.len())
+}
+
+/// Refuse a subcommand outside [`SAFE_SUBCOMMANDS`], then audit `dir` — what every jkb git call asks
+/// before it runs.
+fn checked(dir: &Path, args: &[&str]) -> Result<()> {
+    let sub = args.get(subcommand_at(args)).copied().unwrap_or_default();
+    anyhow::ensure!(
+        SAFE_SUBCOMMANDS.contains(&sub),
+        "jkb's git does not run `git {sub}`: it is not among the subcommands measured not to enter a \
+         submodule (design D52.11)"
+    );
+    audit_repo_config(dir)
 }
 
 /// The `-c` settings every jkb git call runs with ([`git_cmd`]).
@@ -435,7 +490,20 @@ pub(crate) fn module_findings(dir: &Path) -> Vec<String> {
             }
         }
     }
-    submodule_links(dir, &top, &common, &mut out);
+    // The checkout's own `.gitmodules` — a session's, not the main checkout's — is what git reads
+    // there.
+    let work_top = git_in(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )
+    .output()
+    .ok()
+    .filter(|o| o.status.success())
+    .map_or_else(
+        || top.clone(),
+        |o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()),
+    );
+    submodule_links(dir, &work_top, &common, &mut out);
     out
 }
 
@@ -494,8 +562,9 @@ fn inside(path: &Path, top: &Path, common: &Path) -> bool {
     resolved.starts_with(top) && resolved != top && !resolved.starts_with(common)
 }
 
-/// Each submodule checkout `.gitmodules` names whose `.git` file points outside the superproject's own
-/// `modules/` — where git you run in the superproject would follow it.
+/// Each submodule checkout `.gitmodules` names (under the checkout `top`) whose `.git` file points
+/// outside the superproject's own `modules/`, or whose `.git` is a git directory in its own right —
+/// judged like any other submodule git directory, since git you run in the superproject enters it.
 fn submodule_links(dir: &Path, top: &Path, common: &Path, out: &mut Vec<String>) {
     let gitmodules = top.join(".gitmodules");
     if !gitmodules.is_file() {
@@ -521,8 +590,13 @@ fn submodule_links(dir: &Path, top: &Path, common: &Path, out: &mut Vec<String>)
             continue;
         };
         let link = top.join(rel).join(".git");
+        if fs::symlink_metadata(&link).is_ok_and(|m| m.is_dir()) {
+            // Not absorbed: the submodule's git directory is here, in the checkout.
+            judge_module(dir, &link, top, common, out);
+            continue;
+        }
         let Ok(text) = fs::read_to_string(&link) else {
-            continue; // absent, or a directory: git's own layout before absorbing
+            continue;
         };
         let Some(target) = text.trim().strip_prefix("gitdir:") else {
             out.push(format!("{} is not a gitdir link", link.display()));
@@ -849,7 +923,7 @@ mod lex {
 /// Run `git` in `dir`, returning trimmed stdout. `Ok(None)` when git exits non-zero — the
 /// common "this ref does not exist" case, which is a fact rather than a failure.
 fn git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
-    audit_repo_config(dir)?;
+    checked(dir, args)?;
     let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
@@ -1005,7 +1079,7 @@ pub fn rev(dir: &Path, reference: &str) -> Result<Option<String>> {
 /// # Errors
 /// Returns an error if `git` cannot be executed at all.
 fn git_run(dir: &Path, args: &[&str]) -> Result<(bool, String)> {
-    audit_repo_config(dir)?;
+    checked(dir, args)?;
     let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
@@ -3120,6 +3194,26 @@ mod tests {
         let found = super::module_findings(&dir).join("; ");
         assert!(found.contains("filter.x.clean"), "{found}");
         super::audit_repo_config(&dir).expect("jkb's own git never reads it");
+        // A submodule whose `.git` is a git directory of its own, in the checkout, is judged too.
+        std::fs::write(&cfg, "[core]\n\trepositoryformatversion = 0\n").unwrap();
+        std::fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"inline\"]\n\tpath = inline\n",
+        )
+        .unwrap();
+        let inline = dir.join("inline/.git");
+        std::fs::create_dir_all(&inline).unwrap();
+        std::fs::write(inline.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            inline.join("config"),
+            "[filter \"z\"]\n\tclean = touch /tmp/z\n",
+        )
+        .unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("filter.z.clean"), "{found}");
+        std::fs::remove_dir_all(dir.join("inline")).unwrap();
+        std::fs::remove_file(dir.join(".gitmodules")).unwrap();
+        std::fs::write(&cfg, "[filter \"x\"]\n\tclean = touch /tmp/x\n").unwrap();
         std::fs::remove_file(&cfg).unwrap();
         #[cfg(unix)]
         {
@@ -3190,6 +3284,15 @@ mod tests {
             !marker.exists(),
             "`.gitmodules` put git back into the submodule"
         );
+        // A landing's checkout and switch report local changes — which enters the submodule — unless
+        // told not to.
+        run(&sup, &["branch", "other"]);
+        std::fs::write(sup.join("sub/f"), "dddd\n").unwrap();
+        let _ = super::git_run(&sup, &["checkout", "--detach", "other"]);
+        let _ = super::git_run(&sup, &["switch", "other"]);
+        assert!(!marker.exists(), "checkout or switch entered the submodule");
+        let e = super::git_run(&sup, &["stash"]).unwrap_err().to_string();
+        assert!(e.contains("does not run `git stash`"), "{e}");
     }
 
     /// A submodule checked out inside a session worktree has a git directory of its own, under the
