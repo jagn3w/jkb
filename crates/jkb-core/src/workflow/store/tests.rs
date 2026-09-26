@@ -330,14 +330,14 @@ fn a_cancelled_task_settles_its_workflow_and_revokes_its_workers() {
         })
         .unwrap();
     assert_eq!(facts.landed, Fact::No);
+    // Cancelling parked the workflow in the same transaction — no `observe` needed (review round 4).
+    assert_eq!(
+        db.read(move |c| current(c, id)).unwrap().phase,
+        Phase::Cancelled
+    );
     assert!(matches!(
         do_observe(&db, id),
-        Moved::To {
-            event: WorkflowEvent::ObservedCancelled,
-            to: Phase::Cancelled,
-            revoked: 1,
-            ..
-        }
+        Moved::AlreadyThere(Phase::Cancelled)
     ));
     assert_eq!(
         db.read(move |c| roles::resolve(c, &token)).unwrap(),
@@ -443,6 +443,22 @@ fn only_a_filing_is_a_round_to_a_non_operator_and_scope_follows_the_snapshot() {
         })
         .unwrap();
     assert!(!db.read(move |c| roles::in_scope(c, id, late)).unwrap());
+    // A subtask the worker split a finding into is its to finish, at any depth — though the round's
+    // namespace alone still puts nothing in reach.
+    let split = db
+        .write_txn("test", move |c, m| {
+            let mut spec = NewTask::new("task:split", "split");
+            spec.home = "tasks/elsewhere".into();
+            let s = create(c, m, &spec)?;
+            crate::task::add_subtask(c, m, f, s)?;
+            let mut spec = NewTask::new("task:split2", "deeper");
+            spec.home = "tasks/elsewhere".into();
+            let d = create(c, m, &spec)?;
+            crate::task::add_subtask(c, m, s, d)?;
+            Ok(d)
+        })
+        .unwrap();
+    assert!(db.read(move |c| roles::in_scope(c, id, split)).unwrap());
 }
 
 #[test]
@@ -500,13 +516,10 @@ fn reopen_follows_the_task_s_lifecycle_and_is_the_operator_s() {
         set_status(c, m, id, TaskStatus::Cancelled)
     })
     .unwrap();
-    assert!(matches!(
-        do_observe(&db, id),
-        Moved::To {
-            to: Phase::Cancelled,
-            ..
-        }
-    ));
+    assert_eq!(
+        db.read(move |c| current(c, id)).unwrap().phase,
+        Phase::Cancelled
+    );
     // Reopening the workflow alone would be undone by the next observe.
     let refused = do_fire(&db, id, WorkflowEvent::Reopen, Role::Operator, None);
     assert!(

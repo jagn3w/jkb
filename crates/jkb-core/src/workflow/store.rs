@@ -558,6 +558,40 @@ pub fn observe(conn: &Connection, meta: &WriteMeta, task: ItemId, actor: &Actor)
     }
 }
 
+/// Park `task`'s workflow where its lifecycle just ended it — `landed` on a live landing, `cancelled`
+/// on a cancellation — in the lifecycle's own transaction ([`transition::perform`] calls this).
+///
+/// Only these two, and never by [`observe`]'s reconciliation, which refuses when more than one
+/// observation applies — a landing with a fresh clean round would then park nothing. Review round 4:
+/// the workflow moved only on an explicit `workflow observe`, so a landed task sat at `landable`, and
+/// the refusal to re-land a parked workflow never fired on a real landing.
+///
+/// # Errors
+/// A database error, or an unreadable strategy.
+pub fn follow_end(conn: &Connection, meta: &WriteMeta, task: ItemId) -> Result<Moved> {
+    let current = current(conn, task)?;
+    if current.phase.is_settled() {
+        return Ok(Moved::AlreadyThere(current.phase));
+    }
+    let facts = observe_facts(conn, task, &current)?;
+    let lifecycle = Actor {
+        roles: Vec::new(),
+        principal: "lifecycle".to_owned(),
+    };
+    for event in [
+        WorkflowEvent::ObservedLanded,
+        WorkflowEvent::ObservedCancelled,
+    ] {
+        let outcome = current.spec.graph.machine().apply(&facts, event);
+        if matches!(outcome, Outcome::Moved { .. }) {
+            return settle(
+                conn, meta, task, &current, outcome, &lifecycle, None, &facts,
+            );
+        }
+    }
+    Ok(Moved::AlreadyThere(current.phase))
+}
+
 /// Pin `task` to the strategy `name` (operator only). Recorded as a row at the current phase, with
 /// the resolved spec, so redefining `name` later never changes this task.
 ///

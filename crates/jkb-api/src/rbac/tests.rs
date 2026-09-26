@@ -111,16 +111,24 @@ fn a_scoped_coordinator_writes_its_task_and_nothing_else() {
         "the refusal names who may: {e:?}"
     );
 
-    // It mints workers for its own task only, and never another coordinator.
-    let (_, rev) = grant(&c, "reviewer", Some(&a), "rev-1");
+    // It mints workers for its own task only, and never another coordinator — nor a reviewer, whose
+    // token it would hold, and so review its own work with.
+    grant(&c, "implementer", Some(&a), "impl-1");
     refused(
         &c,
-        json!({ "op": "role.grant", "role": "reviewer", "task": b_task, "agent": "x" }),
+        json!({ "op": "role.grant", "role": "implementer", "task": b_task, "agent": "x" }),
     );
     refused(
         &c,
         json!({ "op": "role.grant", "role": "coordinator", "task": a, "agent": "x" }),
     );
+    for role in ["reviewer", "systemic_reviewer"] {
+        refused(
+            &c,
+            json!({ "op": "role.grant", "role": role, "task": a, "agent": "x" }),
+        );
+    }
+    let (_, rev) = grant(&kb.op, "reviewer", Some(&a), "rev-1");
 
     // A reviewer reviews; it does not edit or set status.
     let r = kb.as_token(&rev);
@@ -703,11 +711,29 @@ fn a_parked_workflow_is_landed_again_only_after_the_operator_reopens_it() {
     );
     ok(
         &kb.op,
-        json!({ "op": "workflow.fire", "uid": a, "event": "override", "to": "landed",
-                "reason": "landed before" }),
+        json!({ "op": "workflow.fire", "uid": a, "event": "override", "to": "landable",
+                "reason": "reviewed" }),
+    );
+    // Really landed, then the task put back to work: its workflow stays parked at `landed`.
+    ok(
+        &kb.op,
+        json!({ "op": "task.set", "uid": a, "status": "in_progress" }),
     );
     let landed = json!({ "op": "task.landed", "uid": a,
                          "landed": { "branch": "b", "onto": "o", "head": "abcd" } });
+    match ok(&kb.op, landed.clone()) {
+        Response::Landing { landing } => assert!(landing.moved, "{landing:?}"),
+        other => panic!("{other:?}"),
+    }
+    ok(
+        &kb.op,
+        json!({ "op": "task.set", "uid": a, "status": "open" }),
+    );
+    // The coordinator picks the task back up and lands it again: refused, the workflow is parked.
+    ok(
+        &c,
+        json!({ "op": "task.set", "uid": a, "status": "in_progress" }),
+    );
     let e = refused(&c, landed.clone());
     assert!(e.message.contains("parked at `landed`"), "{e:?}");
     match ok(&kb.op, json!({ "op": "workflow.show", "uid": a })) {
@@ -793,4 +819,32 @@ fn a_subtask_under_a_round_homes_at_the_callers_own_task() {
         Response::Added { added } => assert_eq!(added.home, home),
         other => panic!("{other:?}"),
     }
+}
+
+/// A round `/review-log` mounted and nobody has recorded yet is neither filed nor recorded, and is
+/// still a review round: a worker held to one of its findings places nothing there, or the recording
+/// would later snapshot that line as the round's.
+#[test]
+fn an_unrecorded_mounted_round_is_still_a_review_round() {
+    let kb = Kb::new();
+    let finding = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "mounted finding !p1",
+                "home": "repos/p/codereviews/m1/must-fix" }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let (_, token) = grant(&kb.op, "implementer", Some(&finding), "impl");
+    let c = kb.as_token(&token);
+    let e = refused(
+        &c,
+        json!({ "op": "task.add", "text": "x !p0", "under": finding }),
+    );
+    assert!(e.message.contains("never in a review round"), "{e:?}");
+    let e = refused(
+        &c,
+        json!({ "op": "task.place", "uid": finding, "ns": "repos/p/codereviews/m1/nit" }),
+    );
+    assert!(e.message.contains("never in a review round"), "{e:?}");
 }

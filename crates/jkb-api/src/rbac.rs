@@ -927,7 +927,8 @@ pub fn authorize(
             return Err(forbidden(format!(
                 "`{op}` refused: {reference}'s workflow is parked at `{}`, and only the operator \
                  picks it back up (`jkb task set {reference} --status open`, then `jkb workflow \
-                 fire {reference} reopen`). A merge queue landing it stalls on this one task.",
+                 fire {reference} reopen`). A merge queue records the branch's other tasks and \
+                 reports this one held.",
                 current.phase.as_str()
             )));
         }

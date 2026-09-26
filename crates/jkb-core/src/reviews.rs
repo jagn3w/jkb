@@ -177,21 +177,33 @@ pub fn record_filing(conn: &Connection, ns: &str, items: &[ItemId], filed_by: &s
     Ok(())
 }
 
-/// The review namespace — filed or recorded — that `ns` is or lies inside, if any. A caller held to one
-/// task places nothing there, whatever its task's own placements: a worker bound to a finding lives
-/// in the round, and "beside its task" would otherwise be inside it.
+/// The review namespace that `ns` is or lies inside, if any: one filed or recorded, or any
+/// `repos/<repo>/codereviews/<folder>` — where `/review-log` mounts a round, which is neither until
+/// the operator records it, and which a recording then snapshots whole (review round 4: a line a
+/// worker put there first became another task's finding). A caller held to one task places nothing
+/// there, whatever its task's own placements: a worker bound to a finding lives in the round, and
+/// "beside its task" would otherwise be inside it.
 ///
 /// # Errors
 /// A database error.
 pub fn review_namespace_containing(conn: &Connection, ns: &str) -> Result<Option<String>> {
-    Ok(conn
+    let known = conn
         .prepare_cached(
             "SELECT ns FROM (SELECT ns FROM review_rounds UNION SELECT ns FROM review_filings)
              WHERE ns = ?1 OR substr(?1, 1, length(ns) + 1) = ns || '/'
              LIMIT 1",
         )?
         .query_row([ns], |r| r.get(0))
-        .optional()?)
+        .optional()?;
+    Ok(known.or_else(|| {
+        let parts: Vec<&str> = ns.split('/').take(4).collect();
+        match parts.as_slice() {
+            ["repos", repo, "codereviews", folder] if !repo.is_empty() && !folder.is_empty() => {
+                Some(parts.join("/"))
+            }
+            _ => None,
+        }
+    }))
 }
 
 /// The recorded round `ns` is, lies inside, or contains, if any. Filing there would put findings under

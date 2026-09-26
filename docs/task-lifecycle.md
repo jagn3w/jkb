@@ -783,7 +783,8 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   and a refusal names the roles that *would* be allowed. Nothing in it is about jkb.
 - **`jkb-core/src/roles.rs`** — the six roles (operator, coordinator, designer, implementer,
   reviewer, `systemic_reviewer`); who may grant whom (a `RoleTable<Role, Role>`: a coordinator
-  grants workers, scoped inside its own scope); grants stored as **blake3 hashes** of 256-bit
+  grants a designer or an implementer, scoped inside its own scope — never a reviewer, since a token
+  it mints is one it holds (review round 4)); grants stored as **blake3 hashes** of 256-bit
   tokens, revoked recursively, **not changelogged** (`jkb undo` reviving a revoked grant would
   re-arm a credential); the operator's `agent_type → role` map; first-bind-wins agent bindings.
 - **`jkb-core/src/workflow/`** — one phase set (design, `design_review`, implement, review,
@@ -802,8 +803,13 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   back. Nothing reconciles a reopen — a lifecycle reopened by a coordinator or a synced checkbox
   leaves the workflow parked where the operator acts next — `workflow show` names the operator's
   `reopen` — and nobody but the operator lands a task whose workflow is parked (round 3: reopening
-  the status and landing again re-landed it with its workflow never reopened; `task.landed` from the
-  merge queue stalls on such a task). A task landed before D52 has no workflow rows, reads `design`,
+  the status and landing again re-landed it with its workflow never reopened. The workflow **parks
+  in the lifecycle's own transaction** — a landing parks it at `landed`, a cancellation at
+  `cancelled` (`store::follow_end`, called from `transition::perform`): round 4 found it moved only
+  on an explicit `workflow observe`, so a really landed task sat at `landable` and this refusal never
+  fired. `jkb task landed` from the
+  merge queue reports such a task held and records the branch's others — round 4 found the refusal
+  aborting the loop, leaving every later task on a group branch unrecorded). A task landed before D52 has no workflow rows, reads `design`,
   and is not held by this. *Superseded (round 2):* an
   `observed_reopened` reconciliation let any observe follow a lifecycle reopen, so a coordinator
   could reopen a landed task. Deleting a task revokes its grants and keeps its workflow history (V022 has no cascade
@@ -850,7 +856,10 @@ still records any namespace — on the host: from the container, a mounted folde
 `jkb task review record --branch <b> --findings <ns>` run there. **A coordinator neither files nor
 records a round** (round 3): it drives the work, and one that could file an empty round and record it
 against the branch it drove satisfied the gate with no reviewer involved. A round is a reviewer's — a
-`reviewer`-typed subagent recording its own filing — or the operator's. Still not protected: a
+`reviewer`-typed subagent recording its own filing — or the operator's. Nor may a coordinator
+**mint** a reviewer (round 4): the token it minted is one it holds, so round 3's refusal was undone
+by `role grant reviewer` to itself. Reviewers come only from the operator — a grant, or the
+`agent_type → role` map an attested subagent resolves through. Still not protected: a
 coordinator telling a reviewer it spawned to file a clean round, the "genuine worker told to lie"
 case below. A filing is refused into, above or below any recorded round; a
 principal held to one task files only under `repos/<repo>/codereviews/` of its task's repository

@@ -108,7 +108,10 @@ impl Role {
 }
 
 /// Which role may grant which (design D52.2). The operator grants anything; a coordinator grants
-/// the four worker roles, and [`mint`] additionally holds it to its own scope.
+/// the workers that do the work — a designer, an implementer — and [`mint`] additionally holds it to
+/// its own scope. Never a reviewer (review round 4): a token it mints is a token it holds, so a
+/// reviewer grant from a coordinator was the coordinator reviewing its own work. A reviewer is the
+/// operator's to make, by a grant or by mapping an attested subagent type to the role.
 pub static GRANTABLE: RoleTable<Role, Role> = RoleTable {
     grants: &[
         Grant {
@@ -124,12 +127,7 @@ pub static GRANTABLE: RoleTable<Role, Role> = RoleTable {
         },
         Grant {
             role: Role::Coordinator,
-            permits: &[
-                Role::Designer,
-                Role::Implementer,
-                Role::Reviewer,
-                Role::SystemicReviewer,
-            ],
+            permits: &[Role::Designer, Role::Implementer],
         },
         Grant {
             role: Role::Designer,
@@ -275,7 +273,7 @@ pub enum Minter<'a> {
 ///
 /// A grant minted by another grant is refused unless [`GRANTABLE`] lets the minter's role grant
 /// `role`, and an unscoped minter's child may be scoped anywhere while a scoped minter's child must
-/// be scoped to the same task: a coordinator on one task cannot mint a reviewer for another.
+/// be scoped to the same task: a coordinator on one task cannot mint an implementer for another.
 ///
 /// # Errors
 /// [`Error::Types`] for a refused or malformed grant, or a database error.
@@ -647,8 +645,10 @@ pub fn agent_binding(conn: &Connection, session: &str, agent_id: &str) -> Result
 /// and a bound on a cycle a hand-edited database could hold.
 const MAX_SCOPE_DEPTH: usize = 64;
 
-/// Whether `target` is inside `scope`'s reach: the task itself, one of its subtasks at any depth, or
-/// a finding of one of its recorded review rounds ([`crate::reviews::is_finding_of`]). What a principal scoped to a task may write.
+/// Whether `target` is inside `scope`'s reach: the task itself, a finding of one of its recorded
+/// review rounds ([`crate::reviews::is_finding_of`]), or a subtask of either at any depth. What a
+/// principal scoped to a task may write — including the subtask it split a finding into (review
+/// round 4: it could add one and then not finish it).
 ///
 /// # Errors
 /// A database error.
@@ -657,14 +657,15 @@ pub fn in_scope(conn: &Connection, scope: ItemId, target: ItemId) -> Result<bool
     for _ in 0..MAX_SCOPE_DEPTH {
         match at {
             Some(id) if id == scope => return Ok(true),
+            // A finding as its round was snapshotted when recorded, never whatever now sits under
+            // the namespace it named: a reviewer that recorded `tasks` as a round would otherwise
+            // have put every task under it in scope.
+            Some(id) if crate::reviews::is_finding_of(conn, scope, id)? => return Ok(true),
             Some(id) => at = crate::containment::parent(conn, id)?,
             None => break,
         }
     }
-    // A finding of one of its recorded rounds — as the round was snapshotted when recorded, never
-    // whatever now sits under the namespace it named: a reviewer that recorded `tasks` as a round
-    // would otherwise have put every task under it in scope.
-    crate::reviews::is_finding_of(conn, scope, target)
+    Ok(false)
 }
 
 /// Whether grant `id` is `ancestor` or was minted, directly or not, by it — what a grant holder may

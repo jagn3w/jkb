@@ -22,7 +22,10 @@ fn tasks(db: &Db) -> (ItemId, ItemId) {
 #[test]
 fn the_grant_table_is_sound_and_only_the_operator_mints_a_coordinator() {
     assert_eq!(GRANTABLE.check(), vec![]);
-    assert!(GRANTABLE.permits(Role::Coordinator, Role::Reviewer));
+    assert!(GRANTABLE.permits(Role::Coordinator, Role::Implementer));
+    // A reviewer a coordinator minted would be the coordinator reviewing its own work.
+    assert!(!GRANTABLE.permits(Role::Coordinator, Role::Reviewer));
+    assert!(!GRANTABLE.permits(Role::Coordinator, Role::SystemicReviewer));
     assert!(!GRANTABLE.permits(Role::Coordinator, Role::Coordinator));
     assert!(!GRANTABLE.permits(Role::Reviewer, Role::Reviewer));
     assert_eq!(
@@ -67,14 +70,20 @@ fn a_coordinator_mints_workers_only_inside_its_own_scope() {
     let c1 = coord.clone();
     let (rev, _) = db
         .write_txn("test", move |c, m| {
-            mint(c, m, Minter::Grant(&c1), Role::Reviewer, "rev", Some(a))
+            mint(c, m, Minter::Grant(&c1), Role::Implementer, "rev", Some(a))
         })
         .unwrap();
     assert_eq!(rev.parent, Some(coord.id));
     for (role, scope, why) in [
-        (Role::Reviewer, Some(b), "that same task"),
-        (Role::Reviewer, None, "that same task"),
+        (Role::Implementer, Some(b), "that same task"),
+        (Role::Implementer, None, "that same task"),
         (Role::Coordinator, Some(a), "may not grant coordinator"),
+        (Role::Reviewer, Some(a), "may not grant reviewer"),
+        (
+            Role::SystemicReviewer,
+            Some(a),
+            "may not grant systemic_reviewer",
+        ),
         (Role::Operator, Some(a), "may not grant operator"),
     ] {
         let c2 = coord.clone();
@@ -88,7 +97,7 @@ fn a_coordinator_mints_workers_only_inside_its_own_scope() {
     }
     let e = db
         .write_txn("test", move |c, m| {
-            mint(c, m, Minter::Grant(&rev), Role::Reviewer, "x", Some(a))
+            mint(c, m, Minter::Grant(&rev), Role::Implementer, "x", Some(a))
         })
         .unwrap_err()
         .to_string();
@@ -132,7 +141,7 @@ fn rotating_the_container_credential_retires_the_old_one_and_its_workers() {
     assert_eq!(first.scope, None);
     let (_, worker) = db
         .write_txn("test", move |c, m| {
-            mint(c, m, Minter::Grant(&first), Role::Reviewer, "r", Some(a))
+            mint(c, m, Minter::Grant(&first), Role::Implementer, "r", Some(a))
         })
         .unwrap();
     let (_, t2) = db.write_txn("test", rotate_container).unwrap();
@@ -232,7 +241,7 @@ fn a_grant_descends_from_whatever_minted_it() {
     let (root, child, other) = db
         .write_txn("test", move |c, m| {
             let (root, _) = mint(c, m, Minter::Operator, Role::Coordinator, "c", Some(a))?;
-            let (child, _) = mint(c, m, Minter::Grant(&root), Role::Reviewer, "r", Some(a))?;
+            let (child, _) = mint(c, m, Minter::Grant(&root), Role::Implementer, "r", Some(a))?;
             let (other, _) = mint(c, m, Minter::Operator, Role::Coordinator, "d", Some(a))?;
             Ok((root.id, child.id, other.id))
         })
@@ -258,7 +267,7 @@ fn a_grant_revoked_after_it_was_read_mints_nothing() {
     let stale = coord.clone();
     let e = db
         .write_txn("test", move |c, m| {
-            mint(c, m, Minter::Grant(&stale), Role::Reviewer, "r", Some(a))
+            mint(c, m, Minter::Grant(&stale), Role::Implementer, "r", Some(a))
         })
         .unwrap_err();
     assert!(e.to_string().contains("revoked"), "{e}");

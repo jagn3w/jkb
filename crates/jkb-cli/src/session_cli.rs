@@ -276,14 +276,25 @@ impl<'a> Kb<'a> {
     }
 
     /// `task.landed`.
+    ///
+    /// A task the caller may not land (a workflow parked at `landed`, a task outside its scope) comes
+    /// back as a refusal that moved nothing, like a guard's: the merge queue records a whole group
+    /// branch task by task, and one refused task must not leave every task after it unrecorded.
     pub(crate) fn landed(&self, uid: &str, landed: Landed) -> Result<Landing> {
-        self.landing(
-            "task.landed",
-            Request::TaskLanded {
-                uid: uid.to_owned(),
-                landed,
-            },
-        )
+        let request = Request::TaskLanded {
+            uid: uid.to_owned(),
+            landed,
+        };
+        match self.backend.call(request) {
+            Ok(Response::Landing { landing }) => Ok(landing),
+            Ok(other) => unexpected("task.landed", &other),
+            Err(e) if e.code == jkb_api::ErrorCode::Forbidden => Ok(Landing {
+                moved: false,
+                refusal: Some(e.message),
+                status: String::new(),
+            }),
+            Err(e) => Err(op_error(e, self.remote)),
+        }
     }
 
     /// `task.review_findings`.
@@ -1857,9 +1868,72 @@ impl Drop for LandLease<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_is_spent, open_worktree, task_on, Kb};
+    use super::{batch_is_spent, open_worktree, task_on, Kb, Landed};
     use jkb_api::sessions::BranchTask;
     use std::collections::BTreeMap;
+
+    /// One refused task on a branch the merge queue records answers as a refusal of that task, not an
+    /// error: the caller records the branch's other tasks and reports the refused one held.
+    #[test]
+    fn a_task_the_caller_may_not_land_is_held_and_its_siblings_still_land() {
+        use jkb_api::{Backend as _, LocalBackend, Request, Response};
+        let db = jkb_core::Db::open_in_memory().unwrap();
+        let op = LocalBackend::new(db.clone());
+        let call = |b: &LocalBackend, r: serde_json::Value| {
+            b.call(serde_json::from_value::<Request>(r).unwrap())
+                .unwrap()
+        };
+        let add =
+            |text: &str| match call(&op, serde_json::json!({ "op": "task.add", "text": text })) {
+                Response::Added { added } => added.uid,
+                other => panic!("{other:?}"),
+            };
+        let (parked, open) = (add("parked"), add("open"));
+        for uid in [&parked, &open] {
+            call(
+                &op,
+                serde_json::json!({ "op": "workflow.set", "uid": uid, "strategy": "autonomous" }),
+            );
+        }
+        call(
+            &op,
+            serde_json::json!({ "op": "workflow.fire", "uid": parked, "event": "override",
+                                "to": "landed", "reason": "landed before" }),
+        );
+        let Response::Granted { token, .. } = call(
+            &op,
+            serde_json::json!({ "op": "role.grant", "role": "coordinator", "agent": "coord" }),
+        ) else {
+            panic!("granted")
+        };
+        let coord = LocalBackend::new(db).with_caller(jkb_api::rbac::Caller::Token(token));
+        let kb = Kb::new(&coord);
+        let landed = || Landed {
+            branch: "b".into(),
+            onto: "o".into(),
+            head: None,
+        };
+        let held = kb
+            .landed(&parked, landed())
+            .expect("a refusal, not an error");
+        assert!(!held.moved);
+        assert!(
+            held.refusal
+                .as_deref()
+                .is_some_and(|r| r.contains("parked")),
+            "{held:?}"
+        );
+        let next = kb
+            .landed(&open, landed())
+            .expect("the next task is still asked");
+        assert!(
+            !next
+                .refusal
+                .as_deref()
+                .is_some_and(|r| r.contains("parked")),
+            "{next:?}"
+        );
+    }
 
     fn task(uid: &str, status: &str, onto: &str) -> BranchTask {
         BranchTask {
