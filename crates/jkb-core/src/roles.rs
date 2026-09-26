@@ -375,17 +375,36 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<GrantRow>> {
 ///
 /// # Errors
 /// A database error.
+///
+/// So does a grant its minter's role may not grant **now** ([`GRANTABLE`]): the table is checked at
+/// mint, and a tightening — round 4 took reviewer from what a coordinator grants — would otherwise
+/// leave every grant minted before it working (review round 5).
 pub fn resolve(conn: &Connection, token: &str) -> Result<Option<GrantRow>> {
-    conn.prepare_cached(&format!(
-        "SELECT {GRANT_COLUMNS} FROM role_grants WHERE token_hash = ?1 AND revoked_at IS NULL"
-    ))?
-    .query_row([token_hash(token)], grant_row)
-    .optional()?
-    .map(into_grant)
-    .transpose()
+    let Some(g) = conn
+        .prepare_cached(&format!(
+            "SELECT {GRANT_COLUMNS} FROM role_grants WHERE token_hash = ?1 AND revoked_at IS NULL"
+        ))?
+        .query_row([token_hash(token)], grant_row)
+        .optional()?
+        .map(into_grant)
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    Ok(grantable_now(conn, &g)?.then_some(g))
 }
 
-/// Every live grant with its token hash, for a daemon's in-memory resolution cache.
+/// Whether `g`'s minter — the operator, when it has no parent — may still grant its role.
+fn grantable_now(conn: &Connection, g: &GrantRow) -> Result<bool> {
+    use jkb_rbac::Grants as _;
+    let Some(parent) = g.parent else {
+        return Ok(true);
+    };
+    Ok(get(conn, parent)?.is_some_and(|p| GRANTABLE.permits(p.role, g.role)))
+}
+
+/// Every live grant with its token hash, for a daemon's in-memory resolution cache — each one
+/// [`resolve`] would answer.
 ///
 /// # Errors
 /// A database error.
@@ -411,7 +430,11 @@ pub fn live_by_hash(conn: &Connection) -> Result<Vec<(String, GrantRow)>> {
     let mut out = Vec::new();
     for row in rows {
         let (hash, g) = row?;
-        out.push((hash, into_grant(g)?));
+        let g = into_grant(g)?;
+        // As [`resolve`]: a grant its minter may no longer grant is not live.
+        if grantable_now(conn, &g)? {
+            out.push((hash, g));
+        }
     }
     Ok(out)
 }

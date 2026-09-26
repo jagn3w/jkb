@@ -923,7 +923,12 @@ pub fn authorize(
         // A workflow parked at `landed`/`cancelled` is picked back up by the operator alone
         // (`reopen`), so nobody else lands the task again first — reopening its status and landing
         // it would re-land a finished task with its workflow never reopened (review round 3).
-        if current.phase.is_settled() {
+        // A task still `done` is not landed again by this: the lifecycle answers a landing it already
+        // has with a no-op, which is what a merge queue re-running a branch must be told (round 5).
+        let done = jkb_core::item::get(conn, target)?
+            .and_then(|m| m.status)
+            .is_some_and(|s| s == jkb_types::TaskStatus::Done.as_str());
+        if current.phase.is_settled() && !done {
             return Err(forbidden(format!(
                 "`{op}` refused: {reference}'s workflow is parked at `{}`, and only the operator \
                  picks it back up (`jkb task set {reference} --status open`, then `jkb workflow \

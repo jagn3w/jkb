@@ -27,7 +27,8 @@ fn status(b: &LocalBackend, uid: &str) -> String {
 /// established it, and a dry run writes nothing.
 #[test]
 fn a_task_closes_on_a_merge_its_client_established() {
-    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
     let uid = match call(
         &b,
         json!({ "op": "task.add", "text": "the work", "managed": true }),
@@ -97,8 +98,26 @@ fn a_task_closes_on_a_merge_its_client_established() {
     };
     assert!(e.is_some_and(|r| r.contains("history changed")));
     assert_eq!(status(&b, &uid), "in_progress");
+    let token = match call(
+        &b,
+        json!({ "op": "role.grant", "role": "implementer", "task": uid, "agent": "w" }),
+    )
+    .unwrap()
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
     assert_eq!(close("yes", false), None);
     assert_eq!(status(&b, &uid), "done");
+    // A pull request merging is a landing: the workflow parks, and the task's workers are done
+    // (review round 5 — a PR close has no destination, and parked nothing).
+    match call(&b, json!({ "op": "workflow.show", "uid": uid })).unwrap() {
+        Response::Workflow { workflow } => assert_eq!(workflow.phase, "landed"),
+        other => panic!("{other:?}"),
+    }
+    let worker = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
+    let e = call(&worker, json!({ "op": "role.whoami" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Unauthorized, "{e:?}");
     match call(&b, json!({ "op": "task.open_in_repo", "repo": "proj" })).unwrap() {
         Response::Uids { uids, .. } => assert!(uids.is_empty()),
         other => panic!("{other:?}"),

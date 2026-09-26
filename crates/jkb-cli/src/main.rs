@@ -2271,6 +2271,7 @@ pub(crate) fn cmd_task_landed(
 
     let mut recorded = Vec::new();
     let mut not_closed = Vec::new();
+    let mut refused = 0;
     for uid in &uids {
         // `task.landed` states `landed_elsewhere` — the merge queue performed and gated the graft
         // itself (D38), which is why this is `observed_landed` and not `land`, whose guard asks
@@ -2285,9 +2286,15 @@ pub(crate) fn cmd_task_landed(
                 head: head.clone(),
             },
         )?;
-        match outcome.refusal {
-            None => recorded.push(uid.clone()),
-            Some(why) => not_closed.push((uid.clone(), why)),
+        match outcome {
+            Ok(landing) => match landing.refusal {
+                None => recorded.push(uid.clone()),
+                Some(why) => not_closed.push((uid.clone(), why)),
+            },
+            Err(why) => {
+                refused += 1;
+                not_closed.push((uid.clone(), why));
+            }
         }
     }
 
@@ -2302,18 +2309,27 @@ pub(crate) fn cmd_task_landed(
                 })).collect::<Vec<_>>(),
             })
         );
-        return Ok(());
+    } else {
+        if refused < uids.len() {
+            println!("recorded: {branch} landed on {onto}");
+        }
+        for uid in &recorded {
+            println!("  {uid}");
+        }
+        // Reported rather than swallowed: a task the queue could not close is one the queue's
+        // caller will otherwise believe is done. The commonest reason is open subtasks, which is
+        // D34.4's rule holding — a merged branch is evidence, not proof that the work finished.
+        for (uid, why) in &not_closed {
+            eprintln!("  {uid} not closed — {why}");
+        }
     }
-    println!("recorded: {branch} landed on {onto}");
-    for uid in &recorded {
-        println!("  {uid}");
-    }
-    // Reported rather than swallowed: a task the queue could not close is one the queue's caller
-    // will otherwise believe is done. The commonest reason is open subtasks, which is D34.4's
-    // rule holding — a merged branch is evidence, not proof that the work finished.
-    for (uid, why) in &not_closed {
-        eprintln!("  {uid} not closed — {why}");
-    }
+    // Every task refused outright — a caller the strategy does not let land, say — recorded
+    // nothing at all, and is a failure to say so, not `recorded:` over nothing (review round 5). A
+    // guard's refusal still recorded the landing, so a branch of held parents is not this.
+    anyhow::ensure!(
+        refused < uids.len(),
+        "nothing on {branch} was recorded as landed on {onto}: this caller may land none of its tasks"
+    );
     Ok(())
 }
 

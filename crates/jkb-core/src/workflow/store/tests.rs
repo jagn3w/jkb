@@ -330,14 +330,20 @@ fn a_cancelled_task_settles_its_workflow_and_revokes_its_workers() {
         })
         .unwrap();
     assert_eq!(facts.landed, Fact::No);
-    // Cancelling parked the workflow in the same transaction — no `observe` needed (review round 4).
-    assert_eq!(
+    // A cancellation parks on `observe`, not inside the cancel: an undone cancel would otherwise
+    // leave the workers locked out (review round 5).
+    assert_ne!(
         db.read(move |c| current(c, id)).unwrap().phase,
         Phase::Cancelled
     );
     assert!(matches!(
         do_observe(&db, id),
-        Moved::AlreadyThere(Phase::Cancelled)
+        Moved::To {
+            event: WorkflowEvent::ObservedCancelled,
+            to: Phase::Cancelled,
+            revoked: 1,
+            ..
+        }
     ));
     assert_eq!(
         db.read(move |c| roles::resolve(c, &token)).unwrap(),
@@ -516,10 +522,13 @@ fn reopen_follows_the_task_s_lifecycle_and_is_the_operator_s() {
         set_status(c, m, id, TaskStatus::Cancelled)
     })
     .unwrap();
-    assert_eq!(
-        db.read(move |c| current(c, id)).unwrap().phase,
-        Phase::Cancelled
-    );
+    assert!(matches!(
+        do_observe(&db, id),
+        Moved::To {
+            to: Phase::Cancelled,
+            ..
+        }
+    ));
     // Reopening the workflow alone would be undone by the next observe.
     let refused = do_fire(&db, id, WorkflowEvent::Reopen, Role::Operator, None);
     assert!(

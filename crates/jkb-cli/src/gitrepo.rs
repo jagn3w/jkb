@@ -455,26 +455,41 @@ const MAX_MODULE_DEPTH: usize = 8;
 /// What in `dir`'s **submodules** could make git run a program — for the reap scan to report, since
 /// jkb's own git never enters a submodule ([`git_cmd`]) but yours does: a submodule git directory's own
 /// config setting a key outside [`config_key_allowed`], or a `core.worktree` pointing outside the
-/// superproject; a symlinked submodule config, git directory or `.git`; a submodule checkout whose
-/// `.git` file points somewhere other than a `modules/` this scan reads. Only real git directories
-/// (those with a `HEAD`) under `<common>/modules`, each `<common>/worktrees/*/modules`, and each
-/// un-absorbed submodule's own `.git/modules` are read, and only each one's top-level `config` — a
-/// loose ref that happens to be named `config` is not one. Submodules of submodules are followed to
-/// [`MAX_MODULE_DEPTH`], and anything deeper is reported rather than passed over.
+/// superproject; a symlinked submodule config, git directory, `modules/` or `.git`; a `.gitmodules`
+/// path outside its own checkout; a submodule checkout whose `.git` file points somewhere other than
+/// a `modules/` this scan reads. Real git directories (those with a `HEAD`) under `<common>/modules`,
+/// each `<common>/worktrees/*/modules`, and each un-absorbed submodule's own `.git/modules` are read,
+/// and so is whatever git directory a submodule's `.git` file names — each once, and only its
+/// top-level `config`: a loose ref that happens to be named `config` is not one. Submodules of
+/// submodules are followed to [`MAX_MODULE_DEPTH`], and anything deeper is reported rather than
+/// passed over.
 pub(crate) fn module_findings(dir: &Path) -> Vec<String> {
-    let mut out = Vec::new();
     let Ok(Some((_, common))) = check_layout(dir) else {
-        return out;
+        return Vec::new();
     };
     let Some(top) = common.parent().map(Path::to_path_buf) else {
-        return out;
+        return Vec::new();
     };
-    let mut roots = vec![common.join("modules")];
-    if let Ok(entries) = fs::read_dir(common.join("worktrees")) {
-        roots.extend(entries.flatten().map(|e| e.path().join("modules")));
+    let mut scan = Scan {
+        dir,
+        top,
+        common,
+        out: Vec::new(),
+        judged: std::collections::HashSet::new(),
+    };
+    let mut homes = vec![scan.common.join("modules")];
+    if let Ok(entries) = fs::read_dir(scan.common.join("worktrees")) {
+        for e in entries.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_symlink()) {
+                scan.out
+                    .push(format!("{} is a symlink", e.path().display()));
+            } else {
+                homes.push(e.path().join("modules"));
+            }
+        }
     }
-    for root in &roots {
-        walk_modules(dir, root, &top, &common, &mut out);
+    for home in &homes {
+        scan.walk(home);
     }
     // The checkout's own `.gitmodules` — a session's, not the main checkout's — is what git reads
     // there.
@@ -486,45 +501,171 @@ pub(crate) fn module_findings(dir: &Path) -> Vec<String> {
     .ok()
     .filter(|o| o.status.success())
     .map_or_else(
-        || top.clone(),
+        || scan.top.clone(),
         |o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()),
     );
-    submodule_links(dir, &work_top, &top, &common, roots, &mut out);
-    out
+    scan.links(&work_top, homes);
+    scan.out
 }
 
-/// Judge every git directory under the `modules/` directory `root`, at any nesting to
-/// [`MAX_MODULE_DEPTH`]. A symlink there is reported and never followed.
-fn walk_modules(dir: &Path, root: &Path, top: &Path, common: &Path, out: &mut Vec<String>) {
-    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    while let Some((at, depth)) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&at) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let path = e.path();
-            let Ok(kind) = e.file_type() else {
+/// One reap scan of a repository's submodules: what it found, and the git directories it has
+/// already judged — each once, however many ways it is reached.
+struct Scan<'a> {
+    dir: &'a Path,
+    top: PathBuf,
+    common: PathBuf,
+    out: Vec<String>,
+    judged: std::collections::HashSet<PathBuf>,
+}
+
+impl Scan<'_> {
+    /// Judge `gitdir` unless it already was; whether it was new.
+    fn judge(&mut self, gitdir: &Path) -> bool {
+        let key = fs::canonicalize(gitdir).unwrap_or_else(|_| gitdir.to_path_buf());
+        if !self.judged.insert(key) {
+            return false;
+        }
+        judge_module(self.dir, gitdir, &self.top, &self.common, &mut self.out);
+        true
+    }
+
+    /// Judge every git directory under the `modules/` directory `root`, at any nesting to
+    /// [`MAX_MODULE_DEPTH`]. A symlink there, `root` included, is reported and never followed.
+    fn walk(&mut self, root: &Path) {
+        if fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink()) {
+            self.out.push(format!("{} is a symlink", root.display()));
+            return;
+        }
+        let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+        while let Some((at, depth)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&at) else {
                 continue;
             };
-            if kind.is_symlink() {
-                out.push(format!("{} is a symlink", path.display()));
-                continue;
-            }
-            if !kind.is_dir() {
-                continue;
-            }
-            if depth >= MAX_MODULE_DEPTH {
-                out.push(format!("{} is nested too deep to scan", path.display()));
-                continue;
-            }
-            if path.join("HEAD").is_file() {
-                judge_module(dir, &path, top, common, out);
-                stack.push((path.join("modules"), depth + 1));
-            } else {
-                // A submodule name may hold `/`: its git directory is deeper.
-                stack.push((path, depth + 1));
+            for e in entries.flatten() {
+                let path = e.path();
+                let Ok(kind) = e.file_type() else {
+                    continue;
+                };
+                if kind.is_symlink() {
+                    self.out.push(format!("{} is a symlink", path.display()));
+                    continue;
+                }
+                if !kind.is_dir() {
+                    continue;
+                }
+                if depth >= MAX_MODULE_DEPTH {
+                    self.out
+                        .push(format!("{} is nested too deep to scan", path.display()));
+                    continue;
+                }
+                if path.join("HEAD").is_file() {
+                    self.judge(&path);
+                    stack.push((path.join("modules"), depth + 1));
+                } else {
+                    // A submodule name may hold `/`: its git directory is deeper.
+                    stack.push((path, depth + 1));
+                }
             }
         }
+    }
+
+    /// Each submodule checkout `.gitmodules` names under the checkout `work_top`, and theirs in turn,
+    /// each checkout once. A path outside its checkout is reported and not followed — a hostile
+    /// `path = .` would otherwise read the same file again at every level. A `.git` that is a
+    /// symlink, cannot be read, or is a file pointing outside every `modules/` in `homes` is
+    /// reported; one that is a git directory in its own right (not absorbed) is judged, and so is
+    /// every git directory under its own `modules/`; one a `.git` file names is judged too, if the
+    /// walk did not reach it — git you run in the superproject enters them all.
+    fn links(&mut self, work_top: &Path, homes: Vec<PathBuf>) {
+        let start = fs::canonicalize(work_top).unwrap_or_else(|_| work_top.to_path_buf());
+        let mut seen = std::collections::HashSet::from([start.clone()]);
+        // A checkout to read `.gitmodules` in, the `modules/` directories its submodules' git
+        // directories may be in, and how deep it is.
+        let mut stack = vec![(start, homes, 0)];
+        while let Some((checkout, homes, depth)) = stack.pop() {
+            for rel in submodule_paths(self.dir, &checkout) {
+                let Ok(sub) = fs::canonicalize(checkout.join(&rel)) else {
+                    // Not checked out.
+                    continue;
+                };
+                if !sub.starts_with(&checkout) || sub == checkout {
+                    self.out.push(format!(
+                        "{} names `{rel}`, outside its own checkout",
+                        checkout.join(".gitmodules").display()
+                    ));
+                    continue;
+                }
+                if !seen.insert(sub.clone()) {
+                    continue;
+                }
+                let mut homes = homes.clone();
+                if !self.follow(&sub, &mut homes) {
+                    continue;
+                }
+                if depth + 1 >= MAX_MODULE_DEPTH {
+                    self.out
+                        .push(format!("{} is nested too deep to scan", sub.display()));
+                    continue;
+                }
+                stack.push((sub, homes, depth + 1));
+            }
+        }
+    }
+
+    /// Judge the submodule checked out at `sub` through its `.git`, adding its own `modules/` to
+    /// `homes` when its git directory is here; whether to read its `.gitmodules` in turn.
+    fn follow(&mut self, sub: &Path, homes: &mut Vec<PathBuf>) -> bool {
+        let link = sub.join(".git");
+        let meta = match fs::symlink_metadata(&link) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                self.out
+                    .push(format!("{} cannot be read: {e}", link.display()));
+                return false;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            self.out.push(format!("{} is a symlink", link.display()));
+            return false;
+        }
+        if meta.is_dir() {
+            // Not absorbed: the submodule's git directory is here, in the checkout.
+            self.judge(&link);
+            let modules = link.join("modules");
+            self.walk(&modules);
+            homes.push(fs::canonicalize(&modules).unwrap_or(modules));
+            return true;
+        }
+        let text = match fs::read_to_string(&link) {
+            Ok(text) => text,
+            Err(e) => {
+                self.out
+                    .push(format!("{} cannot be read: {e}", link.display()));
+                return false;
+            }
+        };
+        let Some(target) = text.trim().strip_prefix("gitdir:") else {
+            self.out
+                .push(format!("{} is not a gitdir link", link.display()));
+            return false;
+        };
+        let target = sub.join(target.trim());
+        let resolved = fs::canonicalize(&target).unwrap_or(target);
+        if !homes.iter().any(|h| resolved.starts_with(h)) {
+            self.out.push(format!(
+                "{} points at {}, outside this repository's own modules",
+                link.display(),
+                resolved.display()
+            ));
+            return false;
+        }
+        // Inside a home, but maybe not where the walk looks (`modules/<a>/<b>` under a git directory
+        // `modules/<a>`): judged here if the walk did not reach it.
+        if self.judge(&resolved) {
+            self.walk(&resolved.join("modules"));
+        }
+        true
     }
 }
 
@@ -581,76 +722,6 @@ fn inside(path: &Path, top: &Path, common: &Path) -> bool {
         at
     });
     resolved.starts_with(top) && resolved != top && !resolved.starts_with(common)
-}
-
-/// Each submodule checkout `.gitmodules` names under the checkout `work_top`, and theirs in turn: one
-/// whose `.git` is a symlink, cannot be read, or is a file pointing outside every `modules/` this scan
-/// reads is reported; one whose `.git` is a git directory in its own right (not absorbed) is judged
-/// like any other, and so is every git directory under its own `modules/` — git you run in the
-/// superproject enters them all.
-fn submodule_links(
-    dir: &Path,
-    work_top: &Path,
-    top: &Path,
-    common: &Path,
-    homes: Vec<PathBuf>,
-    out: &mut Vec<String>,
-) {
-    // A checkout to read `.gitmodules` in, the `modules/` directories its submodules' git directories
-    // may be in, and how deep it is.
-    let mut stack = vec![(work_top.to_path_buf(), homes, 0)];
-    while let Some((checkout, homes, depth)) = stack.pop() {
-        for rel in submodule_paths(dir, &checkout) {
-            let sub = checkout.join(rel);
-            let link = sub.join(".git");
-            let meta = match fs::symlink_metadata(&link) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    out.push(format!("{} cannot be read: {e}", link.display()));
-                    continue;
-                }
-            };
-            let mut homes = homes.clone();
-            if meta.file_type().is_symlink() {
-                out.push(format!("{} is a symlink", link.display()));
-                continue;
-            } else if meta.is_dir() {
-                // Not absorbed: the submodule's git directory is here, in the checkout.
-                judge_module(dir, &link, top, common, out);
-                let modules = link.join("modules");
-                walk_modules(dir, &modules, top, common, out);
-                homes.push(fs::canonicalize(&modules).unwrap_or(modules));
-            } else {
-                let text = match fs::read_to_string(&link) {
-                    Ok(text) => text,
-                    Err(e) => {
-                        out.push(format!("{} cannot be read: {e}", link.display()));
-                        continue;
-                    }
-                };
-                let Some(target) = text.trim().strip_prefix("gitdir:") else {
-                    out.push(format!("{} is not a gitdir link", link.display()));
-                    continue;
-                };
-                let target = sub.join(target.trim());
-                let resolved = fs::canonicalize(&target).unwrap_or(target);
-                if !homes.iter().any(|h| resolved.starts_with(h)) {
-                    out.push(format!(
-                        "{} points at {}, outside this repository's own modules",
-                        link.display(),
-                        resolved.display()
-                    ));
-                    continue;
-                }
-            }
-            if depth + 1 >= MAX_MODULE_DEPTH {
-                out.push(format!("{} is nested too deep to scan", sub.display()));
-                continue;
-            }
-            stack.push((sub, homes, depth + 1));
-        }
-    }
 }
 
 /// The paths `checkout`'s `.gitmodules` names, relative to it.
@@ -3346,6 +3417,70 @@ mod tests {
             std::os::unix::fs::symlink(&elsewhere, dir.join(".git/modules/other")).unwrap();
             let found = super::module_findings(&dir).join("; ");
             assert!(found.contains("modules/other is a symlink"), "{found}");
+        }
+    }
+
+    /// A `.gitmodules` the container wrote is hostile input: a path at or above its own checkout is
+    /// reported and not followed (`path = .` twenty times over would otherwise grow as 20^depth), a
+    /// `.git` file naming a git directory the walk never reaches is judged anyway, and a symlinked
+    /// `modules/` is reported rather than read through (review round 5).
+    #[test]
+    fn the_scan_holds_against_a_hostile_gitmodules() {
+        use std::fmt::Write as _;
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let gitdir = |at: &Path, config: &str| {
+            std::fs::create_dir_all(at).unwrap();
+            std::fs::write(at.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(at.join("config"), config).unwrap();
+        };
+        let clean = "[core]\n\trepositoryformatversion = 0\n";
+        // An un-absorbed submodule whose `.gitmodules` names itself twenty times, and the root.
+        gitdir(&dir.join("x/.git"), clean);
+        std::fs::write(dir.join(".gitmodules"), "[submodule \"x\"]\n\tpath = x\n").unwrap();
+        let mut gm = String::new();
+        for i in 0..20 {
+            let _ = write!(gm, "[submodule \"s{i}\"]\n\tpath = .\n");
+        }
+        gm.push_str("[submodule \"up\"]\n\tpath = ..\n");
+        std::fs::write(dir.join("x/.gitmodules"), gm).unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(
+            found.contains("names `.`, outside its own checkout"),
+            "{found}"
+        );
+        assert!(
+            found.contains("names `..`, outside its own checkout"),
+            "{found}"
+        );
+        std::fs::remove_dir_all(dir.join("x")).unwrap();
+        // A `.git` file naming a git directory inside a judged one, where the walk does not look.
+        gitdir(&dir.join(".git/modules/sub"), clean);
+        gitdir(
+            &dir.join(".git/modules/sub/evil"),
+            "[filter \"e\"]\n\tclean = touch /tmp/e\n",
+        );
+        std::fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub/evil\n").unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("filter.e.clean"), "{found}");
+        #[cfg(unix)]
+        {
+            // An un-absorbed git directory whose `modules/` is a symlink.
+            std::fs::remove_dir_all(dir.join("sub")).unwrap();
+            gitdir(&dir.join("sub/.git"), clean);
+            let elsewhere = t.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.join("sub/.git/modules")).unwrap();
+            let found = super::module_findings(&dir).join("; ");
+            assert!(found.contains(".git/modules is a symlink"), "{found}");
         }
     }
 

@@ -98,10 +98,10 @@ pub fn perform(
     {
         apply_effects(conn, meta, task, effects)?;
         record(conn, meta, task, event, Some(*from), *to, facts, labels)?;
-        // The workflow ends where the lifecycle does, in this transaction: a workflow left behind
-        // at `landable` never parked, and a landed task was landed again (review round 4).
-        if to.is_terminal() {
-            crate::workflow::store::follow_end(conn, meta, task)?;
+        // A landing parks the workflow in this transaction: one left behind at `landable` never
+        // parked, and a landed task was landed again (review round 4).
+        if *to == TaskStatus::Done && matches!(event, TaskEvent::Land | TaskEvent::ObservedLanded) {
+            crate::workflow::store::follow_landing(conn, meta, task)?;
         }
     }
     Ok(outcome)

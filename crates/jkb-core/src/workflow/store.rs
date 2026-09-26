@@ -558,38 +558,42 @@ pub fn observe(conn: &Connection, meta: &WriteMeta, task: ItemId, actor: &Actor)
     }
 }
 
-/// Park `task`'s workflow where its lifecycle just ended it — `landed` on a live landing, `cancelled`
-/// on a cancellation — in the lifecycle's own transaction ([`transition::perform`] calls this).
+/// Park `task`'s workflow at `landed` — the lifecycle just landed it, in this transaction
+/// ([`transition::perform`] calls this). `landed` is the lifecycle's own verdict on the event it
+/// recorded, not [`transition::landing`], which counts only a landing with a destination: a task
+/// closed by its pull request merging has none, and never parked (review round 5).
 ///
-/// Only these two, and never by [`observe`]'s reconciliation, which refuses when more than one
-/// observation applies — a landing with a fresh clean round would then park nothing. Review round 4:
-/// the workflow moved only on an explicit `workflow observe`, so a landed task sat at `landable`, and
-/// the refusal to re-land a parked workflow never fired on a real landing.
+/// A landing only. Review round 4 found the workflow moved on an explicit `workflow observe` alone,
+/// so a landed task sat at `landable` and the refusal to land a parked workflow again never fired.
+/// A cancellation still parks on `observe`: parking — and revoking the task's workers — inside the
+/// cancel made it one-way for everyone but the operator, when `jkb undo` or a `tasks.md` line that
+/// came back restored the status (round 5). Neither restores a parked landing either: the operator's
+/// `reopen` does.
+///
+/// Never by [`observe`]'s reconciliation, which refuses when more than one observation applies — a
+/// landing with a fresh clean round would then park nothing.
 ///
 /// # Errors
 /// A database error, or an unreadable strategy.
-pub fn follow_end(conn: &Connection, meta: &WriteMeta, task: ItemId) -> Result<Moved> {
+pub fn follow_landing(conn: &Connection, meta: &WriteMeta, task: ItemId) -> Result<Moved> {
     let current = current(conn, task)?;
     if current.phase.is_settled() {
         return Ok(Moved::AlreadyThere(current.phase));
     }
-    let facts = observe_facts(conn, task, &current)?;
+    let mut facts = observe_facts(conn, task, &current)?;
+    facts.landed = Fact::Yes;
     let lifecycle = Actor {
         roles: Vec::new(),
         principal: "lifecycle".to_owned(),
     };
-    for event in [
-        WorkflowEvent::ObservedLanded,
-        WorkflowEvent::ObservedCancelled,
-    ] {
-        let outcome = current.spec.graph.machine().apply(&facts, event);
-        if matches!(outcome, Outcome::Moved { .. }) {
-            return settle(
-                conn, meta, task, &current, outcome, &lifecycle, None, &facts,
-            );
-        }
-    }
-    Ok(Moved::AlreadyThere(current.phase))
+    let outcome = current
+        .spec
+        .graph
+        .machine()
+        .apply(&facts, WorkflowEvent::ObservedLanded);
+    settle(
+        conn, meta, task, &current, outcome, &lifecycle, None, &facts,
+    )
 }
 
 /// Pin `task` to the strategy `name` (operator only). Recorded as a row at the current phase, with

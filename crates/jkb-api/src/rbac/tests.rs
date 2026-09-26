@@ -725,6 +725,11 @@ fn a_parked_workflow_is_landed_again_only_after_the_operator_reopens_it() {
         Response::Landing { landing } => assert!(landing.moved, "{landing:?}"),
         other => panic!("{other:?}"),
     }
+    // The queue re-running the branch is told the task landed, not that it is held.
+    match ok(&c, landed.clone()) {
+        Response::Landing { landing } => assert!(landing.refusal.is_none(), "{landing:?}"),
+        other => panic!("{other:?}"),
+    }
     ok(
         &kb.op,
         json!({ "op": "task.set", "uid": a, "status": "open" }),
@@ -845,6 +850,17 @@ fn an_unrecorded_mounted_round_is_still_a_review_round() {
     let e = refused(
         &c,
         json!({ "op": "task.place", "uid": finding, "ns": "repos/p/codereviews/m1/nit" }),
+    );
+    assert!(e.message.contains("never in a review round"), "{e:?}");
+    // Nor through the round's `tasks/` mirror, even where the finding is placed there too.
+    ok(
+        &kb.op,
+        json!({ "op": "task.place", "uid": finding, "ns": "tasks/p/codereviews/m1/must-fix" }),
+    );
+    let e = refused(
+        &c,
+        json!({ "op": "task.add", "text": "y !p0", "under": finding,
+                "home": "tasks/p/codereviews/m1/must-fix" }),
     );
     assert!(e.message.contains("never in a review round"), "{e:?}");
 }

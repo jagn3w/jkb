@@ -180,30 +180,43 @@ pub fn record_filing(conn: &Connection, ns: &str, items: &[ItemId], filed_by: &s
 /// The review namespace that `ns` is or lies inside, if any: one filed or recorded, or any
 /// `repos/<repo>/codereviews/<folder>` — where `/review-log` mounts a round, which is neither until
 /// the operator records it, and which a recording then snapshots whole (review round 4: a line a
-/// worker put there first became another task's finding). A caller held to one task places nothing
-/// there, whatever its task's own placements: a worker bound to a finding lives in the round, and
-/// "beside its task" would otherwise be inside it.
+/// worker put there first became another task's finding) — and each of these through its
+/// `tasks/<repo>/codereviews/<folder>` mirror (D26/D32), which a recording may name as well (round 5).
+/// A caller held to one task places nothing there, whatever its task's own placements: a worker bound
+/// to a finding lives in the round, and "beside its task" would otherwise be inside it.
 ///
 /// # Errors
 /// A database error.
 pub fn review_namespace_containing(conn: &Connection, ns: &str) -> Result<Option<String>> {
-    let known = conn
-        .prepare_cached(
-            "SELECT ns FROM (SELECT ns FROM review_rounds UNION SELECT ns FROM review_filings)
-             WHERE ns = ?1 OR substr(?1, 1, length(ns) + 1) = ns || '/'
-             LIMIT 1",
-        )?
-        .query_row([ns], |r| r.get(0))
-        .optional()?;
-    Ok(known.or_else(|| {
-        let parts: Vec<&str> = ns.split('/').take(4).collect();
-        match parts.as_slice() {
-            ["repos", repo, "codereviews", folder] if !repo.is_empty() && !folder.is_empty() => {
-                Some(parts.join("/"))
-            }
-            _ => None,
+    let mirrored = ns
+        .strip_prefix("tasks/")
+        .map(|rest| format!("repos/{rest}"))
+        .or_else(|| {
+            ns.strip_prefix("repos/")
+                .map(|rest| format!("tasks/{rest}"))
+        });
+    for candidate in std::iter::once(ns).chain(mirrored.as_deref()) {
+        let known = conn
+            .prepare_cached(
+                "SELECT ns FROM (SELECT ns FROM review_rounds UNION SELECT ns FROM review_filings)
+                 WHERE ns = ?1 OR substr(?1, 1, length(ns) + 1) = ns || '/'
+                 LIMIT 1",
+            )?
+            .query_row([candidate], |r| r.get(0))
+            .optional()?;
+        if known.is_some() {
+            return Ok(known);
         }
-    }))
+    }
+    let parts: Vec<&str> = ns.split('/').take(4).collect();
+    Ok(match parts.as_slice() {
+        ["repos" | "tasks", repo, "codereviews", folder]
+            if !repo.is_empty() && !folder.is_empty() =>
+        {
+            Some(parts.join("/"))
+        }
+        _ => None,
+    })
 }
 
 /// The recorded round `ns` is, lies inside, or contains, if any. Filing there would put findings under

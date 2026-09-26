@@ -321,3 +321,41 @@ fn deleting_a_task_revokes_its_grants_and_keeps_them_listed() {
         .expect("kept, not deleted");
     assert!(row.revoked_at.is_some());
 }
+
+/// A grant minted before the table was tightened — a coordinator's reviewer, from before review
+/// round 4 — no longer resolves, in a daemon's cache or out of it; one the table still allows does.
+#[test]
+fn a_grant_its_minter_may_no_longer_grant_does_not_resolve() {
+    let db = Db::open_in_memory().unwrap();
+    let (a, _) = tasks(&db);
+    let (coord, _) = db
+        .write_txn("test", move |c, m| {
+            mint(c, m, Minter::Operator, Role::Coordinator, "coord", None)
+        })
+        .unwrap();
+    let parent = coord.id;
+    let ((stale, stale_token), (fine, fine_token)) = db
+        .write_txn("test", move |c, m| {
+            // As the mint of an older build wrote it, past today's check.
+            let stale = super::insert(c, m, Role::Reviewer, "rev", Some(a), Some(parent), false)?;
+            let fine = mint(
+                c,
+                m,
+                Minter::Grant(&coord),
+                Role::Implementer,
+                "impl",
+                Some(a),
+            )?;
+            Ok((stale, fine))
+        })
+        .unwrap();
+    let (t1, t2) = (stale_token.clone(), fine_token.clone());
+    assert_eq!(db.read(move |c| resolve(c, &t1)).unwrap(), None);
+    assert_eq!(
+        db.read(move |c| resolve(c, &t2)).unwrap(),
+        Some(fine.clone())
+    );
+    let cached = db.read(live_by_hash).unwrap();
+    assert!(!cached.iter().any(|(_, g)| g.id == stale.id), "{cached:?}");
+    assert!(cached.iter().any(|(_, g)| g.id == fine.id), "{cached:?}");
+}

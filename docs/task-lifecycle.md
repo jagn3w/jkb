@@ -784,7 +784,9 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
 - **`jkb-core/src/roles.rs`** — the six roles (operator, coordinator, designer, implementer,
   reviewer, `systemic_reviewer`); who may grant whom (a `RoleTable<Role, Role>`: a coordinator
   grants a designer or an implementer, scoped inside its own scope — never a reviewer, since a token
-  it mints is one it holds (review round 4)); grants stored as **blake3 hashes** of 256-bit
+  it mints is one it holds (review round 4) — and the table is checked when a grant **resolves**,
+  not only when it is minted, so a tightening retires the grants minted before it (round 5));
+  grants stored as **blake3 hashes** of 256-bit
   tokens, revoked recursively, **not changelogged** (`jkb undo` reviving a revoked grant would
   re-arm a credential); the operator's `agent_type → role` map; first-bind-wins agent bindings.
 - **`jkb-core/src/workflow/`** — one phase set (design, `design_review`, implement, review,
@@ -803,13 +805,18 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   back. Nothing reconciles a reopen — a lifecycle reopened by a coordinator or a synced checkbox
   leaves the workflow parked where the operator acts next — `workflow show` names the operator's
   `reopen` — and nobody but the operator lands a task whose workflow is parked (round 3: reopening
-  the status and landing again re-landed it with its workflow never reopened. The workflow **parks
-  in the lifecycle's own transaction** — a landing parks it at `landed`, a cancellation at
-  `cancelled` (`store::follow_end`, called from `transition::perform`): round 4 found it moved only
-  on an explicit `workflow observe`, so a really landed task sat at `landable` and this refusal never
-  fired. `jkb task landed` from the
-  merge queue reports such a task held and records the branch's others — round 4 found the refusal
-  aborting the loop, leaving every later task on a group branch unrecorded). A task landed before D52 has no workflow rows, reads `design`,
+  the status and landing again re-landed it with its workflow never reopened. A **landing parks
+  the workflow at `landed` in the lifecycle's own transaction** (`store::follow_landing`, called from
+  `transition::perform` on `land`/`observed_landed`, a pull request merging included): round 4 found
+  it moved only on an explicit `workflow observe`, so a really landed task sat at `landable` and this
+  refusal never fired; round 5 found a PR close — a landing with no destination — still never
+  parked. A **cancellation still parks on `observe`**: parking it (and revoking the task's workers)
+  inside the cancel, as round 4 first did, made it one-way for all but the operator when `jkb undo` or
+  a `tasks.md` line that came back restored the status. Neither restores a parked landing; the
+  operator's `reopen` does. A task still `done` is not refused — the queue re-running a branch gets
+  the lifecycle's no-op, not "held" (round 5). `jkb task landed` reports a refused task held and
+  records the branch's others (round 4: the refusal aborted the loop), and fails when this caller
+  may land none of them rather than printing `recorded:` over nothing (round 5).) A task landed before D52 has no workflow rows, reads `design`,
   and is not held by this. *Superseded (round 2):* an
   `observed_reopened` reconciliation let any observe follow a lifecycle reopen, so a coordinator
   could reopen a landed task. Deleting a task revokes its grants and keeps its workflow history (V022 has no cascade
@@ -859,7 +866,9 @@ against the branch it drove satisfied the gate with no reviewer involved. A roun
 `reviewer`-typed subagent recording its own filing — or the operator's. Nor may a coordinator
 **mint** a reviewer (round 4): the token it minted is one it holds, so round 3's refusal was undone
 by `role grant reviewer` to itself. Reviewers come only from the operator — a grant, or the
-`agent_type → role` map an attested subagent resolves through. Still not protected: a
+`agent_type → role` map an attested subagent resolves through. A round's namespace is any filed or
+recorded one, any `repos/<repo>/codereviews/<folder>` (a `/review-log` mount before it is recorded,
+round 4), and each through its `tasks/<repo>/…` mirror (round 5). Still not protected: a
 coordinator telling a reviewer it spawned to file a clean round, the "genuine worker told to lie"
 case below. A filing is refused into, above or below any recorded round; a
 principal held to one task files only under `repos/<repo>/codereviews/` of its task's repository
@@ -969,7 +978,13 @@ Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed 
    only your git reaches — each submodule git directory's own config (real git directories only,
    top-level `config` only, symlinks reported, `core.worktree` judged through symlinks) and each
    submodule checkout's `.git` link — and posts a sticky notification. The only layer that covers
-   **your** git, run by hand.
+   **your** git, run by hand. It follows what your git follows (round 4, measured on git 2.51.1): a
+   symlinked `.git` is reported, each submodule's own `.gitmodules` is read in turn to
+   `MAX_MODULE_DEPTH` (deeper is reported), and an un-absorbed git directory's own `modules/` is
+   walked. The `.gitmodules` it follows is hostile input (round 5): a path at or above its own
+   checkout is reported, not followed — `path = .` twenty times grew the scan as 20^depth — each
+   checkout is read once, and a `.git` file naming a git directory the walk does not reach
+   (`modules/<a>/<b>` under `modules/<a>`) has that directory judged directly.
 
 And the land gate — the candidate's own code — runs in the container through `docker exec` (exit
 status and output measured intact), settled before the graft, for a repository under `~/repos`,

@@ -278,21 +278,18 @@ impl<'a> Kb<'a> {
     /// `task.landed`.
     ///
     /// A task the caller may not land (a workflow parked at `landed`, a task outside its scope) comes
-    /// back as a refusal that moved nothing, like a guard's: the merge queue records a whole group
-    /// branch task by task, and one refused task must not leave every task after it unrecorded.
-    pub(crate) fn landed(&self, uid: &str, landed: Landed) -> Result<Landing> {
+    /// back as `Err(why)`, not as an error: the merge queue records a whole group branch task by
+    /// task, and one refused task must not leave every task after it unrecorded. Unlike a guard's
+    /// refusal, it recorded nothing.
+    pub(crate) fn landed(&self, uid: &str, landed: Landed) -> Result<Result<Landing, String>> {
         let request = Request::TaskLanded {
             uid: uid.to_owned(),
             landed,
         };
         match self.backend.call(request) {
-            Ok(Response::Landing { landing }) => Ok(landing),
+            Ok(Response::Landing { landing }) => Ok(Ok(landing)),
             Ok(other) => unexpected("task.landed", &other),
-            Err(e) if e.code == jkb_api::ErrorCode::Forbidden => Ok(Landing {
-                moved: false,
-                refusal: Some(e.message),
-                status: String::new(),
-            }),
+            Err(e) if e.code == jkb_api::ErrorCode::Forbidden => Ok(Err(e.message)),
             Err(e) => Err(op_error(e, self.remote)),
         }
     }
@@ -1916,21 +1913,15 @@ mod tests {
         let held = kb
             .landed(&parked, landed())
             .expect("a refusal, not an error");
-        assert!(!held.moved);
         assert!(
-            held.refusal
-                .as_deref()
-                .is_some_and(|r| r.contains("parked")),
+            held.as_ref().is_err_and(|r| r.contains("parked")),
             "{held:?}"
         );
         let next = kb
             .landed(&open, landed())
             .expect("the next task is still asked");
         assert!(
-            !next
-                .refusal
-                .as_deref()
-                .is_some_and(|r| r.contains("parked")),
+            !next.as_ref().is_err_and(|r| r.contains("parked")),
             "{next:?}"
         );
     }
