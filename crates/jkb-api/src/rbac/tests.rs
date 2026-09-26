@@ -759,3 +759,38 @@ fn a_caller_held_to_a_finding_places_nothing_in_its_round() {
     );
     assert!(e.message.contains("never in a review round"), "{e:?}");
 }
+
+/// A subtask of something inside a review round, asked for by a caller held to a task outside it,
+/// lives at the caller's own task's home — the nearest place it may write — rather than being refused.
+#[test]
+fn a_subtask_under_a_round_homes_at_the_callers_own_task() {
+    let kb = Kb::new();
+    ok(
+        &kb.op,
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+                "ns": "repos/p/codereviews/r8",
+                "findings": [{ "severity": "nit", "summary": "meh" }] }),
+    );
+    let (task, home) = match ok(&kb.op, json!({ "op": "task.add", "text": "own task" })) {
+        Response::Added { added } => (added.uid, added.home),
+        other => panic!("{other:?}"),
+    };
+    assert!(!home.contains("codereviews"), "{home}");
+    let inside = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "inside", "under": task,
+                "home": "repos/p/codereviews/r8/nit" }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let (_, token) = grant(&kb.op, "implementer", Some(&task), "impl");
+    let c = kb.as_token(&token);
+    match ok(
+        &c,
+        json!({ "op": "task.add", "text": "follow-up", "under": inside }),
+    ) {
+        Response::Added { added } => assert_eq!(added.home, home),
+        other => panic!("{other:?}"),
+    }
+}
