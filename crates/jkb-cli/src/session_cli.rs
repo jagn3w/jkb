@@ -2048,6 +2048,20 @@ mod tests {
             kb.landed(&merged, landed()).unwrap(),
             super::Verdict::Already
         );
+        // Put back to work and ticked done again, it never landed: refused (review round 11).
+        for s in ["open", "done"] {
+            call(
+                &op,
+                serde_json::json!({ "op": "task.set", "uid": merged, "status": s }),
+            );
+        }
+        assert!(
+            matches!(
+                kb.landed(&merged, landed()).unwrap(),
+                super::Verdict::Refused(_)
+            ),
+            "a reopened merge is not a landing"
+        );
     }
 
     fn task(uid: &str, status: &str, onto: &str) -> BranchTask {

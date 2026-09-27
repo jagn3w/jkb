@@ -823,7 +823,8 @@ to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-r
   --keep-worktree` records the branch's tip from before the graft, so the queue's own advice for a
   branch already in its base otherwise failed (round 8) — only where its live landing records the
   same branch onto the same destination, which `task.facts` now reports (round 9), or a pull request
-  that merged it, which records no destination (round 10). On such a task the answer is true
+  that merged it, which records no destination (round 10) — the newer of the two, and neither once
+  the task was put back to work (`transition::current_landing`, round 11). On such a task the answer is true
   whoever asks; on any other, a caller's own refusal stays a refusal. `jkb task landed` reports a refused task held and
   records the branch's others (round 4: the refusal aborted the loop), and fails when this caller
   may land none of them rather than printing `recorded:` over nothing (round 5).) A task landed before D52 has no workflow rows, reads `design`,
@@ -1008,7 +1009,9 @@ Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed 
    resolves beside the repositories is the container's to write, so it does not vouch for a
    submodule hook (rounds 9–10 — first the whole template was judged, which a single hook
    symlinked into `~/repos` stepped around, and the standing finding it raised against every
-   repository hid any real one behind an unchanged summary); a `hooks/` the scan cannot
+   repository hid any real one behind an unchanged summary). Such a hook's finding says it matches
+   your template and where that template really lies, so the fix reads as moving the template, not
+   deleting your hook (round 11); a `hooks/` the scan cannot
    list is reported too, since git needs only to search it to run a hook by name (round 8).
    **Not covered: the repository's own `.git/hooks`.** The container sees it read-only through the
    bind; a container that replaced `.git` wholesale could plant a hook there that neither layer

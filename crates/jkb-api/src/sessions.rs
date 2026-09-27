@@ -132,17 +132,15 @@ pub fn facts(
         land_target: transition::land_target(conn, id)?,
         open_subtasks: !task::subtasks_all_terminal(conn, id)?,
         writable,
-        landed: match transition::landing(conn, id)?.live().and_then(|row| {
-            Some(LiveLanding::Grafted {
-                branch: row.labels.branch.clone()?,
-                onto: row.labels.onto.clone()?,
-            })
-        }) {
-            Some(grafted) => Some(Box::new(grafted)),
-            None => {
-                transition::merged_by_pr(conn, id)?.map(|pr| Box::new(LiveLanding::Merged { pr }))
-            }
-        },
+        landed: transition::current_landing(conn, id)?
+            .and_then(
+                |row| match (row.labels.branch, row.labels.onto, row.labels.pr_number) {
+                    (Some(branch), Some(onto), _) => Some(LiveLanding::Grafted { branch, onto }),
+                    (_, None, Some(pr)) => Some(LiveLanding::Merged { pr }),
+                    _ => None,
+                },
+            )
+            .map(Box::new),
         start_refusal: if terminal {
             lifecycle::apply(&observed, TaskEvent::Start).refusal()
         } else {

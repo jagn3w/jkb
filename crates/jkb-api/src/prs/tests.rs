@@ -179,3 +179,85 @@ fn a_close_is_held_when_the_history_moved() {
         None
     );
 }
+
+fn landed(b: &LocalBackend, uid: &str) -> Option<crate::sessions::LiveLanding> {
+    match call(b, json!({ "op": "task.facts", "uid": uid })).unwrap() {
+        Response::TaskState { state } => state.landed.map(|l| *l),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The landing that speaks now is the newest one still standing: a PR merge after a held graft is
+/// what closed the task, and nothing speaks once the task is put back to work — ticking it done
+/// again is not a landing (review round 11).
+#[test]
+fn the_landing_that_speaks_is_the_newest_one_still_standing() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let add = |text: &str, under: Option<&str>| match call(
+        &b,
+        json!({ "op": "task.add", "text": text, "managed": true, "under": under }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let uid = add("the work", None);
+    let child = add("a subtask", Some(&uid));
+    call(
+        &b,
+        json!({ "op": "task.start", "uid": uid, "take": { "owner": "box:1" },
+                "place": { "branch": "feat", "repo": "proj" } }),
+    )
+    .unwrap();
+    // Grafted while a subtask is open: held, but the row is live.
+    match call(
+        &b,
+        json!({ "op": "task.landed", "uid": uid,
+                "landed": { "branch": "feat", "onto": "staging" } }),
+    )
+    .unwrap()
+    {
+        Response::Landing { landing } => assert!(landing.refusal.is_some(), "{landing:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        landed(&b, &uid),
+        Some(crate::sessions::LiveLanding::Grafted {
+            branch: "feat".into(),
+            onto: "staging".into()
+        })
+    );
+    call(
+        &b,
+        json!({ "op": "task.set", "uid": child, "status": "done" }),
+    )
+    .unwrap();
+    call(
+        &b,
+        json!({ "op": "task.pr_record", "uid": uid, "number": 31 }),
+    )
+    .unwrap();
+    let live = facts(&b, &uid).live_landing;
+    match call(
+        &b,
+        json!({ "op": "task.close_merged", "uid": uid, "merged": "yes", "pr": 31,
+                "observed": { "live_landing": live, "pr": 31 } }),
+    )
+    .unwrap()
+    {
+        Response::Closed { refusal } => assert_eq!(refusal, None),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(status(&b, &uid), "done");
+    assert_eq!(
+        landed(&b, &uid),
+        Some(crate::sessions::LiveLanding::Merged { pr: 31 }),
+        "the merge that closed it, not the held graft before it"
+    );
+    // Put back to work, then ticked done: neither landing speaks.
+    for s in ["open", "done"] {
+        call(&b, json!({ "op": "task.set", "uid": uid, "status": s })).unwrap();
+    }
+    assert_eq!(landed(&b, &uid), None);
+}

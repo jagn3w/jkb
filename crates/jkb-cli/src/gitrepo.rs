@@ -515,6 +515,16 @@ fn findings_with(dir: &Path, template: Option<PathBuf>) -> Vec<String> {
     scan.out
 }
 
+/// How a submodule hook stands against your template's hook of the same name.
+enum TemplateMatch {
+    /// The same bytes, from a template outside the repositories: yours.
+    Yours,
+    /// No template hook, or different bytes.
+    Not,
+    /// The same bytes, from a template hook that really lies in `repos`, which the container writes.
+    Beside { real: PathBuf, repos: PathBuf },
+}
+
 /// One reap scan of a repository's submodules: what it found, and the git directories it has
 /// already judged — each once, however many ways it is reached.
 struct Scan<'a> {
@@ -579,18 +589,20 @@ impl Scan<'_> {
     /// write, so the same bytes planted there and in a submodule would pass as yours (review rounds
     /// 9–10: first the whole template was judged, which a hook symlinked into the repositories
     /// stepped around, and a standing finding against every repository hid a real one).
-    fn is_your_template_hook(&self, yours: &Path, hook: &Path) -> bool {
+    fn template_match(&self, yours: &Path, hook: &Path) -> TemplateMatch {
         let Ok(real) = fs::canonicalize(yours) else {
-            return false;
+            return TemplateMatch::Not;
         };
-        if self
-            .top
-            .parent()
-            .is_some_and(|repos| real.starts_with(repos))
-        {
-            return false;
+        if !matches!((fs::read(&real), fs::read(hook)), (Ok(a), Ok(b)) if a == b) {
+            return TemplateMatch::Not;
         }
-        matches!((fs::read(&real), fs::read(hook)), (Ok(a), Ok(b)) if a == b)
+        match self.top.parent() {
+            Some(repos) if real.starts_with(repos) => TemplateMatch::Beside {
+                real,
+                repos: repos.to_path_buf(),
+            },
+            _ => TemplateMatch::Yours,
+        }
     }
 
     /// Report what could run from `gitdir`'s own `hooks/` for git you run there — measured on git
@@ -635,11 +647,21 @@ impl Scan<'_> {
             if name.to_string_lossy().ends_with(".sample") {
                 continue;
             }
-            let yours = template
-                .as_ref()
-                .is_some_and(|t| self.is_your_template_hook(&t.join(&name), &e.path()));
-            if !yours {
-                self.out.push(format!("{} is a hook", e.path().display()));
+            let judged = template.as_ref().map_or(TemplateMatch::Not, |t| {
+                self.template_match(&t.join(&name), &e.path())
+            });
+            match judged {
+                TemplateMatch::Yours => {}
+                TemplateMatch::Not => self.out.push(format!("{} is a hook", e.path().display())),
+                // Say why, or it reads as planted and the fix looks like deleting your own hook
+                // (review round 11).
+                TemplateMatch::Beside { real, repos } => self.out.push(format!(
+                    "{} is a hook — it matches your template's, but {} lies in {}, which the \
+                     container writes, so it cannot vouch for it; move your template out",
+                    e.path().display(),
+                    real.display(),
+                    repos.display()
+                )),
             }
         }
     }
@@ -3688,10 +3710,11 @@ mod tests {
             std::fs::remove_file(template.join("pre-commit")).unwrap();
             std::os::unix::fs::symlink(beside.join("pre-commit"), template.join("pre-commit"))
                 .unwrap();
+            let found = with(&dir);
+            assert!(found.contains("pre-commit is a hook"), "{found}");
             assert!(
-                with(&dir).contains("pre-commit is a hook"),
-                "{}",
-                with(&dir)
+                found.contains("move your template out"),
+                "and says why: {found}"
             );
         }
         #[cfg(unix)]
