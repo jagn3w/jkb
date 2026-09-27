@@ -221,6 +221,13 @@ The findings now exist, so point the branch's tasks at them (design D38.4). This
 jkb task review record --branch "$branch" --findings "$ns"
 ```
 
+**Who may record.** Only the operator or a `reviewer` records a round (D52, review rounds 3–4): a
+coordinator drives the work, so it neither files nor records one, nor mints itself a reviewer. The
+dev container's session authenticates as a coordinator, so from the container step 4's mount and
+this step are refused. There, either file the findings with `jkb task review file --findings "$ns"
+--from <result.json>` from a `reviewer`-typed subagent, which then records its own filing, or run
+steps 4–5 on the host.
+
 Pass `--branch` explicitly, using step 1's value. It defaults to the branch checked out where
 it runs, which is right in a session and ambiguous anywhere else: run from the main copy that
 default is the *staging* branch. `record` does now match a staging branch, via each branch's
