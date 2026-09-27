@@ -3551,8 +3551,11 @@ fn task_reap_compacts_the_message_queue() {
     assert!(stderr.contains("newer jkb"), "{stderr}");
 
     // And under --watch, where compaction runs FIRST each pass, its failure does not end the service.
+    // HOME is the tempdir: each pass also scans `~/repos` (D52.11 layer 3), and the developer's
+    // own repositories are not this test's to read.
     let mut watch = jkb(&newer)
         .args(["task", "reap", "--watch", "--interval-secs", "60"])
+        .env("HOME", tmp.path())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
