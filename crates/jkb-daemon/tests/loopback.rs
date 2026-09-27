@@ -361,6 +361,43 @@ fn raw_http_is_held_to_the_same_rules() {
     assert_eq!(r.status(), 400);
 }
 
+/// An oversized body is read to its end — to a bound — before the 413 is answered. Answering first
+/// closed a socket with the upload unread, and the reset that sends can make the client's kernel drop
+/// the 413 unread: `raw_http_is_held_to_the_same_rules` failed that way on macOS under load.
+#[test]
+fn an_oversized_body_is_drained_before_the_refusal() {
+    use std::io::{Read as _, Write as _};
+    let f = Fixture::new();
+    let token = std::fs::read_to_string(&f.token).unwrap();
+    let addr = f.base.trim_start_matches("http://").to_owned();
+    let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+    let len = 2 * jkb_daemon::MAX_BODY_BYTES;
+    write!(
+        sock,
+        "POST /v1/op HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\ncontent-length: {len}\r\n\r\n",
+        token.trim()
+    )
+    .unwrap();
+    let most = len * 3 / 4;
+    sock.write_all(&vec![b'x'; most]).unwrap();
+    // Past the limit, but the body is not all here: no answer yet.
+    sock.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut early = [0u8; 1];
+    let premature = sock.read(&mut early);
+    assert!(
+        premature.is_err(),
+        "the refusal went out with the upload unread: {premature:?}"
+    );
+    sock.write_all(&vec![b'x'; len - most]).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut head = [0u8; 12];
+    sock.read_exact(&mut head).unwrap();
+    assert_eq!(&head, b"HTTP/1.1 413", "{}", String::from_utf8_lossy(&head));
+}
+
 #[test]
 fn a_database_migrated_past_this_build_is_refused() {
     let f = Fixture::new();

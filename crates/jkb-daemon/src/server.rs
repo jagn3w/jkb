@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full, Limited};
+use http_body_util::{BodyExt as _, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -439,6 +439,44 @@ fn reply(status: StatusCode, body: &serde_json::Value) -> hyper::Response<Full<B
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::new())))
+}
+
+/// A request body as read: whole, or past the limit.
+enum Body {
+    Read(Bytes),
+    TooLarge,
+}
+
+/// How far past the limit an oversized body is still read, as a multiple of it, before the refusal
+/// goes out regardless.
+const DRAIN_FACTOR: usize = 8;
+
+/// Read `body`, up to `max` bytes. Past `max` the rest is read and **discarded** — to
+/// [`DRAIN_FACTOR`] times `max`, under the caller's read timeout — before the 413 is answered:
+/// answering first left the upload unread, the socket closed with data in it, and the reset that
+/// sends can make the client's kernel drop the 413 before the client reads it. The client then saw a
+/// transport error instead of the refusal (`raw_http_is_held_to_the_same_rules`, flaky on macOS
+/// under the land gate's load; not reproduced on Linux in 72 parallel runs).
+async fn read_body(mut body: Incoming, max: usize) -> Result<Body, hyper::Error> {
+    let mut read = Vec::new();
+    let mut seen = 0usize;
+    while let Some(frame) = body.frame().await {
+        let Ok(data) = frame?.into_data() else {
+            continue;
+        };
+        seen = seen.saturating_add(data.len());
+        if seen > max.saturating_mul(DRAIN_FACTOR) {
+            break;
+        }
+        if seen <= max {
+            read.extend_from_slice(&data);
+        }
+    }
+    Ok(if seen > max {
+        Body::TooLarge
+    } else {
+        Body::Read(Bytes::from(read))
+    })
 }
 
 /// A refusal before authentication: the answer, and the connection closed after it, so an
@@ -948,16 +986,21 @@ async fn handle(
     let asked_wait = Duration::from_millis(wait_ms(&req)).min(state.max_wait);
     let body = match tokio::time::timeout(
         state.read_timeout,
-        Limited::new(req.into_body(), state.max_body).collect(),
+        read_body(req.into_body(), state.max_body),
     )
     .await
     {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(e)) => {
+        Ok(Ok(Body::Read(bytes))) => bytes,
+        Ok(Ok(Body::TooLarge)) => {
             return Ok(refuse(&ApiError::with_code(
                 ErrorCode::TooLarge,
-                format!("request body refused: {e}"),
+                format!("request body refused: larger than {} bytes", state.max_body),
             )))
+        }
+        Ok(Err(e)) => {
+            return Ok(refuse_and_close(&ApiError::bad_request(format!(
+                "request body could not be read: {e}"
+            ))))
         }
         Err(_) => {
             return Ok(refuse(&ApiError::bad_request(format!(

@@ -542,7 +542,10 @@ launchd/systemd unit that `jkb service install` writes and `setup.sh` (re)starts
   that passes (a lock held past the busy timeout during a long write) needs no restart. Not every
   start-up failure is retried: an unwritable token directory still stops it, and a database file that
   does not exist yet is created, as every `jkb` command does;
-- holds a 1 MiB body limit, and separate concurrency budgets for operations, long-polls, the agent
+- holds a 1 MiB body limit — an oversized body is read to its end, up to eight times the limit, and
+  discarded before the 413 goes out: answering first closed the socket with the upload unread, and
+  the reset that sends let the client's kernel drop the 413 unread (flaky on macOS under the land
+  gate's load; `an_oversized_body_is_drained_before_the_refusal`) — and separate concurrency budgets for operations, long-polls, the agent
   read set and `ingest.text` (see their paragraphs above), answering `busy` when one is exhausted. A request past authentication holds its permit from before its body is
   read;
 - bounds the unauthenticated side too: at most 256 connections (one more is closed on accept — and
