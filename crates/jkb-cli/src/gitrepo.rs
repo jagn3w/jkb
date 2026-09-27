@@ -326,7 +326,8 @@ pub(crate) fn check_repo_config(dir: &Path) -> Result<()> {
 /// Whether a config entry `git config --list --show-scope` reports at `scope`, from `file`, is the
 /// repository's to answer for. `local` and `worktree` are — a file the repository's config includes is
 /// listed at the scope that included it. `system`, `global`, `command` and none are the operator's.
-/// `unknown` is judged only when its file lies in the repository (`repo`, its top level): Apple's git
+/// `unknown` is judged only when its file lies in the repository (`repo`, its top level; none when
+/// git finds no readable repository, and then it is not judged): Apple's git
 /// reads an extra, Xcode-owned layer — `/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig`,
 /// setting `credential.helper=osxkeychain` — and lists it as `unknown` (measured on git 2.50.1, Apple
 /// Git-155), which refused every repository on a Mac until this.
@@ -335,7 +336,8 @@ fn judged_scope(scope: &str, file: &str, repo: Option<&Path>) -> bool {
         "system" | "global" | "command" | "" => false,
         "unknown" => {
             let file = fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
-            repo.is_none_or(|repo| file.starts_with(repo))
+            // No repository — outside one, or one git cannot read — has no config of its own.
+            repo.is_some_and(|repo| file.starts_with(repo))
         }
         _ => true,
     }
@@ -3424,9 +3426,11 @@ mod tests {
             inside.to_str().unwrap(),
             Some(&repo)
         ));
+        // Outside a repository, or in one git cannot read, Apple's layer is still Apple's: a probe
+        // there must get git's own "cannot answer", not the audit's refusal (found on the host).
         assert!(
-            super::judged_scope("unknown", apple, None),
-            "no repository: judged"
+            !super::judged_scope("unknown", apple, None),
+            "no repository"
         );
         for scope in ["local", "worktree"] {
             assert!(super::judged_scope(scope, apple, Some(&repo)), "{scope}");
