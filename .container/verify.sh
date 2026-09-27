@@ -1097,15 +1097,17 @@ if [ "$sudo_rc" -ne 0 ] && [ -z "$sudo_entries" ]; then
 elif [ -z "$sudo_entries" ]; then
     bad "sudo -n -l succeeded but listed no grants — cannot establish what this user may run as root"
 else
-# THE ALLOWED SET IS NAMED, and it is exactly two: the firewall, which raises the rules, and the
-# status probe, which reads them (D51.1). The probe is a second grant and therefore a second thing
-# to justify — it is read-only, so a grant to run it is not a grant to change the boundary, and
-# both are pinned to no arguments. Anything else at all fails here, whatever added it.
-sudo_extra="$(grep -vE '/usr/local/bin/(init-firewall|egress-status)\.sh' <<<"$sudo_entries" || true)"
+# THE ALLOWED SET IS NAMED, and it is exactly three: the firewall, which raises the rules, the
+# status probe, which reads them (D51.1), and the hook pin, which copies ~/.cargo/bin/jkb to the
+# root-owned binary the managed hooks run (D52.9). Each is a grant to justify: the probe is
+# read-only; the pin takes no input but the binary it copies, which is the one the container's own
+# `jkb` already is. All three are pinned to no arguments. Anything else at all fails here, whatever
+# added it — this list missed the pin when D52 added it, and the first rebuilt container failed here.
+sudo_extra="$(grep -vE '/usr/local/bin/(init-firewall|egress-status|pin-jkb-hook)\.sh' <<<"$sudo_entries" || true)"
 if [ -z "$sudo_extra" ]; then
-    ok "the only commands permitted as root are the firewall and the egress probe ($(grep -c . <<<"$sudo_entries") grant(s))"
+    ok "the only commands permitted as root are the firewall, the egress probe and the hook pin ($(grep -c . <<<"$sudo_entries") grant(s))"
 else
-    bad "vscode may run more than the firewall and the egress probe as root: $(tr -s ' ' <<<"$sudo_extra" | tr '\n' ';')"
+    bad "vscode may run more than the firewall, the egress probe and the hook pin as root: $(tr -s ' ' <<<"$sudo_extra" | tr '\n' ';')"
 fi
 fi
 
