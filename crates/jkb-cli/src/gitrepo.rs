@@ -262,7 +262,8 @@ pub(crate) fn config_key_allowed(key: &str) -> bool {
 /// Asked with `git config --list --show-origin --show-scope` and `git rev-parse`, which read config and
 /// execute nothing (measured on git 2.51.1 against a planted fsmonitor, hooks path, include, pager and
 /// filter). The operator's own scopes (`system`, `global`) and `command` (the environment's, e.g. the
-/// container's `safe.directory` grants) are theirs, not the repository's, and are not judged.
+/// container's `safe.directory` grants) are theirs, not the repository's, and are not judged — nor is
+/// an `unknown` one outside the repository ([`judged_scope`]).
 ///
 /// **Asked fresh before every git call.** It was once per directory per process, and the reap service
 /// is one long process: a config it passed on its first pass was never read again, so a filter planted
@@ -295,13 +296,16 @@ pub(crate) fn check_repo_config(dir: &Path) -> Result<()> {
         dir.display(),
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    let git_dir = check_layout(dir)?.map(|(git_dir, _)| git_dir);
+    let layout = check_layout(dir)?;
+    let git_dir = layout.as_ref().map(|(git_dir, _)| git_dir.clone());
+    let repo = layout.and_then(|(_, common)| common.parent().map(Path::to_path_buf));
     let text = String::from_utf8_lossy(&out.stdout);
     let mut fields = text.split('\0');
     while let (Some(scope), Some(origin), Some(entry)) =
         (fields.next(), fields.next(), fields.next())
     {
-        if matches!(scope, "system" | "global" | "command" | "") {
+        let file = origin.strip_prefix("file:").unwrap_or(origin);
+        if !judged_scope(scope, file, repo.as_deref()) {
             continue;
         }
         let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
@@ -314,10 +318,27 @@ pub(crate) fn check_repo_config(dir: &Path) -> Result<()> {
         {
             continue;
         }
-        let file = origin.strip_prefix("file:").unwrap_or(origin);
         refuse_key(dir, key, file, scope)?;
     }
     Ok(())
+}
+
+/// Whether a config entry `git config --list --show-scope` reports at `scope`, from `file`, is the
+/// repository's to answer for. `local` and `worktree` are — a file the repository's config includes is
+/// listed at the scope that included it. `system`, `global`, `command` and none are the operator's.
+/// `unknown` is judged only when its file lies in the repository (`repo`, its top level): Apple's git
+/// reads an extra, Xcode-owned layer — `/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig`,
+/// setting `credential.helper=osxkeychain` — and lists it as `unknown` (measured on git 2.50.1, Apple
+/// Git-155), which refused every repository on a Mac until this.
+fn judged_scope(scope: &str, file: &str, repo: Option<&Path>) -> bool {
+    match scope {
+        "system" | "global" | "command" | "" => false,
+        "unknown" => {
+            let file = fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
+            repo.is_none_or(|repo| file.starts_with(repo))
+        }
+        _ => true,
+    }
 }
 
 fn refuse_key(dir: &Path, key: &str, file: &str, scope: &str) -> Result<()> {
@@ -3386,6 +3407,33 @@ mod tests {
             .to_string();
         assert!(e.contains("core.fsmonitor"), "{e}");
         assert!(!marker.exists(), "the planted program never ran");
+    }
+
+    /// Apple's git lists its Xcode-owned layer at `unknown` scope (measured on git 2.50.1, Apple
+    /// Git-155): not the repository's, so not judged — while an `unknown` file inside the repository,
+    /// and every `local` or `worktree` entry, still is.
+    #[test]
+    fn an_unknown_scope_is_judged_only_inside_the_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(t.path()).unwrap();
+        let apple = "/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig";
+        assert!(!super::judged_scope("unknown", apple, Some(&repo)));
+        let inside = repo.join(".git/elsewhere");
+        assert!(super::judged_scope(
+            "unknown",
+            inside.to_str().unwrap(),
+            Some(&repo)
+        ));
+        assert!(
+            super::judged_scope("unknown", apple, None),
+            "no repository: judged"
+        );
+        for scope in ["local", "worktree"] {
+            assert!(super::judged_scope(scope, apple, Some(&repo)), "{scope}");
+        }
+        for scope in ["system", "global", "command", ""] {
+            assert!(!super::judged_scope(scope, apple, Some(&repo)), "{scope}");
+        }
     }
 
     /// The audit is asked fresh every call: a config planted after a directory passed is refused on

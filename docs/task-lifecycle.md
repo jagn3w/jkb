@@ -982,7 +982,12 @@ Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed 
    points checkout at any directory (`$HOME` included, measured) and
    `status.showUntrackedFiles=no` hides what a landing left, so both are refused — except a
    submodule git directory's own `core.worktree` landing inside its repository, which git writes.
-   *Also corrected:* the audit was once per directory per process, so the reap service, one long
+   Only the repository's own scopes are judged — `local`, `worktree`, and an `unknown` one whose file
+   lies in the repository. Apple's git reads an extra, Xcode-owned layer
+   (`/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig`, `credential.helper=osxkeychain`)
+   and lists it as `unknown` (measured on git 2.50.1, Apple Git-155): judged as the repository's, it
+   refused every repository on a Mac, found by the land gate's tests on the host before anything
+   landed. *Also corrected:* the audit was once per directory per process, so the reap service, one long
    process, never re-read a config it had passed. *Superseded (round 2):* round 1 walked every file
    named `config` under `.git/modules` in the blocking audit — which read loose refs as configs,
    missed per-worktree `modules/` and redirected submodule `.git` files, and was fooled by symlinks.
