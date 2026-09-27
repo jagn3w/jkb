@@ -197,6 +197,25 @@ config_hash() { # config_hash <config> <repo-root>
 # pattern stopped matching, and the failure would be the harness's containers bind-mounting the
 # REAL ~/.jkb -- mutations writing to the live store. A mode cannot fail that way: the mount lines
 # are not emitted at all.
+repo_git_mounts() { # -> `--mount <spec>` pairs, one argument per line, for $HOST_REPOS's repositories
+    # Each repository's own .git/config and hooks, read-only (docker_args says why). Its own function
+    # so the self-test can count what it generates: the declared-mount check once compared the
+    # command line against container.json alone, and failed on any machine whose ~/repos held a
+    # repository (a Mac with four: 15 mounts against 7 declared).
+    local g rel
+    for g in "$HOST_REPOS"/*/.git; do
+        [ -d "$g" ] || continue
+        rel="${g#"$HOST_REPOS"/}"
+        case "$rel" in
+            *,*) printf 'warning: %s has a comma in its path, which a --mount cannot carry, so its git config stays writable from the container\n' "$g" >&2
+                 continue ;;
+        esac
+        [ -f "$g/config" ] && printf '%s\n' "--mount" "type=bind,source=$g/config,target=$CTR_REPOS/$rel/config,readonly"
+        [ -d "$g/hooks" ] && printf '%s\n' "--mount" "type=bind,source=$g/hooks,target=$CTR_REPOS/$rel/hooks,readonly"
+    done
+    return 0
+}
+
 docker_args() { # docker_args <config> <repo-root> [all|posture]  -> one argument per line
     local cfg="$1" root="$2" half="${3:-all}" line sub
     # REFUSED, not defaulted. `[ "$half" = posture ] || <emit>` read every unrecognised value as
@@ -244,17 +263,7 @@ docker_args() { # docker_args <config> <repo-root> [all|posture]  -> one argumen
         # changes); until then jkb's own git refuses it if it is planted, and the reap service reports
         # it. What this costs inside: `git config --local`, `remote add`, and `--set-upstream-to` /
         # `push -u` (which print an error and exit 0) — set those on the host.
-        local g rel
-        for g in "$HOST_REPOS"/*/.git; do
-            [ -d "$g" ] || continue
-            rel="${g#"$HOST_REPOS"/}"
-            case "$rel" in
-                *,*) printf 'warning: %s has a comma in its path, which a --mount cannot carry, so its git config stays writable from the container\n' "$g" >&2
-                     continue ;;
-            esac
-            [ -f "$g/config" ] && printf '%s\n' "--mount" "type=bind,source=$g/config,target=$CTR_REPOS/$rel/config,readonly"
-            [ -d "$g/hooks" ] && printf '%s\n' "--mount" "type=bind,source=$g/hooks,target=$CTR_REPOS/$rel/hooks,readonly"
-        done
+        repo_git_mounts
     fi
 
     # Through the shared reader, read through `$( )` — the inline jq this replaces was itself a
@@ -370,6 +379,19 @@ if [ "${1:-}" = --self-test ]; then
        "$(container_path "$HOST_REPOS_REAL/jkb")" "/c/repos/jkb"
     eq "...while something outside it is still refused" "$(rc_of container_path "$lnk/other")" "1"
 
+    echo "==> run.sh self-test: each repository's git config and hooks, bound read-only"
+    fx="$(mktemp -d)"
+    mkdir -p "$fx/a/.git/hooks" "$fx/b/.git" "$fx/notrepo"
+    : > "$fx/a/.git/config"; : > "$fx/b/.git/config"
+    HOST_REPOS="$fx" CTR_REPOS=/c/repos
+    mounts="$(repo_git_mounts)"
+    eq "a config and hooks for a, a config for b, nothing for a plain directory" \
+       "$(grep -cxF -- '--mount' <<<"$mounts" || true)" "3"
+    eq "...each read-only" "$(grep -c ',readonly$' <<<"$mounts" || true)" "3"
+    eq "...at the repository's container path" \
+       "$(grep -cxF -- "type=bind,source=$fx/a/.git/hooks,target=/c/repos/a/.git/hooks,readonly" <<<"$mounts" || true)" "1"
+    rm -rf "$fx"
+
     HOST_REPOS="$HOME/repos" CTR_REPOS=/home/vscode/repos
     HOST_REPOS_REAL="$(cd "$HOST_REPOS" 2>/dev/null && pwd -P || printf '%s' "$HOST_REPOS")"
 
@@ -401,8 +423,9 @@ if [ "${1:-}" = --self-test ]; then
     # would fail them rather than pass — but the mount count is the one that could quietly shrink,
     # and it is the security boundary, so it is compared against the file rather than to a number.
     declared="$(dc_mount_specs "$CONFIG" | grep -c . || true)"
-    eq "every declared mount reaches the command line" \
-       "$(grep -cxF -- '--mount' <<<"$args" || true)" "$declared"
+    generated="$(repo_git_mounts 2>/dev/null | grep -cxF -- '--mount' || true)"
+    eq "every declared mount, and each repository's generated git binds, reach the command line" \
+       "$(grep -cxF -- '--mount' <<<"$args" || true)" "$((declared + generated))"
     eq "...and there is at least one to reach it" "$([ "$declared" -gt 0 ] && echo yes || echo no)" "yes"
 
     # A DECLARATION THAT DECLARES NO FLAGS IS REFUSED, not started without them. `dc_run_args` used
