@@ -3212,6 +3212,7 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
 fn sweep_container_transcripts(json: bool, last_failure: &mut String) {
     match transcripts::sweep_dev_container(transcripts::DEV_CONTAINER_NAME) {
         transcripts::Sweep::Absent | transcripts::Sweep::Quiet => last_failure.clear(),
+
         transcripts::Sweep::Said(line) => {
             last_failure.clear();
             if json {
@@ -3223,7 +3224,11 @@ fn sweep_container_transcripts(json: bool, last_failure: &mut String) {
         // Said ONCE while it stays the same, as the compaction's and the reap's own failures are:
         // over budget is a standing condition rather than an event, and it would otherwise be 96
         // identical lines a day in a log whose whole discipline is that a line means something.
-        transcripts::Sweep::Failed(why) => {
+        //
+        // `Unreachable` is the same shape and shares the arm. It is also the one case where SILENCE
+        // would be the defect: "there may be a container over budget and I could not find out" is
+        // not the fact `Absent` reports, which is that there is no container here at all.
+        transcripts::Sweep::Unreachable(why) | transcripts::Sweep::Failed(why) => {
             if why != *last_failure {
                 eprintln!("transcripts: {why}");
                 last_failure.clone_from(&why);

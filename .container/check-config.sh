@@ -752,22 +752,23 @@ else
     ctr_rs="$(dc_strip_comments "$here/../crates/jkb-cli/src/transcripts.rs")"
     rs_ctr_name="$(grep -oE 'DEV_CONTAINER_NAME: &str = "[^"]+"' <<<"$ctr_rs" \
         | sed -n '1s/.*"\(.*\)"/\1/p')"
-    rs_sweep_path="$(grep -oE 'SWEEP_IN_IMAGE: &str = "[^"]+"' <<<"$ctr_rs" \
-        | sed -n '1s/.*"\(.*\)"/\1/p')"
     sh_ctr_name="$(grep -oE '^NAME="\$\{JKB_CONTAINER_NAME:-[^}]+\}"' <<<"$run_stripped" \
         | sed -n '1s/.*:-\(.*\)}"/\1/p')"
-    docker_dest="$(grep -oE '^COPY[^#]*sweep-transcripts\.sh[[:space:]]+[^[:space:]]+' \
-        "$here/Dockerfile" 2>/dev/null | sed -n '1s/.*[[:space:]]\([^[:space:]]*\)$/\1/p')"
     if [ -z "$rs_ctr_name" ] || [ -z "$sh_ctr_name" ]; then
         sweep_problems="$sweep_problems the container name cannot be read from both run.sh and transcripts.rs, so nothing holds the reaper to the container run.sh creates;"
     elif [ "$rs_ctr_name" != "$sh_ctr_name" ]; then
         sweep_problems="$sweep_problems the reaper pokes '$rs_ctr_name' while run.sh creates '$sh_ctr_name', so the only trigger between container starts reaches nothing and says nothing;"
     fi
-    if [ -z "$rs_sweep_path" ] || [ -z "$docker_dest" ]; then
-        sweep_problems="$sweep_problems the sweep's in-image path cannot be read from both the Dockerfile and transcripts.rs, so nothing holds the reaper to what the image carries;"
-    elif [ "$rs_sweep_path" != "$docker_dest" ]; then
-        sweep_problems="$sweep_problems the reaper runs '$rs_sweep_path' while the Dockerfile installs the sweep at '$docker_dest', so every tick fails on a path that is not there;"
-    fi
+    # THE SWEEP ITSELF IS EMBEDDED, not installed, and this is what holds that. The version this
+    # replaced baked a copy into the image and exec'd it by path -- which no ALREADY-RUNNING
+    # container has, since only a rebuilt image carries it and nothing forces a rebuild: the tick
+    # would have exited 127 on every live container, been reported once into reap.log and deduped
+    # for ever, with every gate green. `include_str!` leaves no second copy to drift, no rebuild to
+    # require and no path to agree about, so the guard that compared two paths is gone with them.
+    grep -qF -- 'include_str!("../../../.container/sweep-transcripts.sh")' <<<"$ctr_rs" \
+        || sweep_problems="$sweep_problems the reaper no longer embeds the sweep, so it runs something other than the script this repository tests;"
+    grep -qF -- '"exec", "-i", name, "bash", "-s"' <<<"$ctr_rs" \
+        || sweep_problems="$sweep_problems the reaper no longer feeds the sweep in on stdin, so it depends on a copy inside the container that an already-running one does not have;"
 fi
 
 # AND THE OPERATOR IS TOLD. run.sh discards the sweep's exit code with `|| true` -- correctly, since
@@ -846,6 +847,22 @@ else
         # container, so it belongs in mutate-verify.sh and is not covered here.
         # The quote is appended rather than written into the pattern, so these NEEDLES are not
         # counted by mutate-config.sh's scan for this file's own failure paths.
+        # THE REAPER'S CLASSIFIERS TOO. transcripts.rs decides "nothing happened" from the sweep's
+        # stdout, on phrases living in two files -- the same coupling this block already holds
+        # verify.sh to, and the same silent reclassification if one end is reworded.
+        # The declaration carries a `;` inside its own type (`[&str; 2]`), so the phrases are taken
+        # from the LINE rather than from a `;`-terminated span.
+        ctr_markers="$(grep -E '^const NOTHING_TO_DO' <<<"$ctr_rs" \
+            | grep -oE '"[^"]+"' | tr -d '"')"
+        if [ -z "$ctr_markers" ]; then
+            sweep_problems="$sweep_problems transcripts.rs declares no NOTHING_TO_DO phrases, so every tick reads as something happening;"
+        else
+            while IFS= read -r dc_marker; do
+                [ -n "$dc_marker" ] || continue
+                grep -qF -- "$dc_marker" <<<"$sweep_emit" \
+                    || sweep_problems="$sweep_problems transcripts.rs treats \"$dc_marker\" as the sweep having nothing to do, which the sweep never prints, so a quiet tick is logged as an event;"
+            done <<<"$ctr_markers"
+        fi
         dc_q='"'
         for dc_verdict in ok bad accept_bad; do
             grep -qE -- "(^|[[:space:]])$dc_verdict $dc_q" <<<"$verify_verdict" \

@@ -1673,3 +1673,27 @@ Relatedly, the over-budget FAIL arm had begun asserting an archiving pass it has
 `verify.sh` only ever runs `--dry-run`. It names the causes it cannot tell apart instead: the floor
 genuinely binding, a start sweep that could not write its archive (`could not create` in the
 scroll-back), and an archive refusing colliding destinations (`mv: not replacing`).
+
+**`docker exec` is the right mechanism; exec'ing a path was not.** Round 7 checked the live
+container and found `/usr/local/bin/` carrying only the four older scripts — so the first version of
+the second trigger, which baked the sweep into the image and ran it by absolute path, was **dead on
+every already-running container**: only a rebuilt image has that file, nothing forces a rebuild,
+`bash` would have exited 127, and the reaper would have reported that once into `reap.log` and
+deduped it for ever with every gate green.
+
+The fix removes the possibility rather than guarding it, which is this directory's own rule. The
+script is embedded in the `jkb` binary with `include_str!` (the crate already reaches out of itself
+this way for `.claude/commands/*.md`) and fed to `docker exec -i … bash -s` on **stdin**. There is
+then no copy in the image to drift, no rebuild to require, and no path for two files to agree about —
+the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was built from. It is written
+from a thread, because the script is 74KB against a 64KB pipe buffer and `bash -s` executes as it
+reads: a blocking write from the main thread deadlocks the moment the child pauses to run a `find`.
+
+Two things the same round caught about the tick itself. It had **no timeout**, and it runs *before*
+`reap_once` — so a Docker daemon that is half-up and never answers (the mode that hangs; one that is
+simply down errors fast) would stall the process this repository calls "the one that finishes every
+deferred landing on the machine", silently, for ever. One minute now, generous because a loaded
+daemon is slow before it is broken. And a daemon that will not answer is reported, where *absent* is
+not: "there is no container here" and "there may be one over budget and I could not find out" are
+different facts, and only the first is somebody working normally on a laptop or a cloud instance with
+no Docker at all.

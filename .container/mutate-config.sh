@@ -545,20 +545,29 @@ run "run.sh renames the container the reaper pokes" "so the only trigger between
 seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'SWEEP_IN_IMAGE: &str = "/usr/local/bin/sweep-transcripts.sh"'
+old = 'include_str!("../../../.container/sweep-transcripts.sh")'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'SWEEP_IN_IMAGE: &str = "/usr/local/sbin/sweep-transcripts.sh"', 1))
+open(p, 'w').write(s.replace(old, '"echo no-op"', 1))
 PYX
-run "the reaper runs a path the image does not carry" "so every tick fails on a path that is not there"
+run "the reaper stops embedding the sweep" "no longer embeds the sweep"
 
-seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = "COPY --chown=root:root sweep-transcripts.sh /usr/local/bin/sweep-transcripts.sh"
+old = '"exec", "-i", name, "bash", "-s"'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, "", 1))
+open(p, 'w').write(s.replace(old, '"exec", name, "bash", "/usr/local/bin/sweep-transcripts.sh"', 1))
 PYX
-run "the image stops carrying the sweep the reaper runs" "cannot be read from both the Dockerfile"
+run "the reaper goes back to a path inside the container" "no longer feeds the sweep in on stdin"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"nothing to archive"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"nothing needs archiving"', 1))
+PYX
+run "the reaper classifies a quiet tick on words the sweep does not print" "which the sweep never prints"
 
 seed; rm -f "$work/t/crates/jkb-cli/src/transcripts.rs"
 run "the reaper's container module is deleted" "nothing sweeps the container between starts"
@@ -1537,7 +1546,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=83
+PINNED_SWEEP_APPENDS=87
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"
