@@ -2748,7 +2748,21 @@ mod tests {
     /// claiming these fixtures "scrub by hand". One builder, so there is nothing to remember.
     fn fixture_git(at: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(at).args(args);
+        // NO BACKGROUND MAINTENANCE, set at the one place every fixture git command goes through
+        // so that no test has to remember it. git may DETACH a gc/repack that outlives the command
+        // that triggered it; it then packs and deletes loose objects while a test is still walking
+        // `.git/objects`, which is the shape of the intermittent `NotFound` in `copy_tree` below --
+        // seen on macOS in the full parallel suite, never under a filter, never in the container.
+        // Prevention rather than tolerance: with no detached process there is no window. The skip
+        // in `copy_tree` stays as a belt only while this cause is inferred rather than observed.
+        cmd.arg("-C").arg(at);
+        cmd.arg("-c")
+            .arg("gc.auto=0")
+            .arg("-c")
+            .arg("gc.autoDetach=false")
+            .arg("-c")
+            .arg("maintenance.auto=false");
+        cmd.args(args);
         // ONE call, and the selection is inside it. This used to be two — a
         // `scrub_repo_selection` for the three selectors and then the config isolation — and the
         // doc above pinned the first by saying its deletion was caught. It stopped being caught
@@ -3484,6 +3498,22 @@ mod tests {
                     copy_tree(&e.path(), &dest);
                 } else {
                     std::fs::copy(e.path(), &dest).unwrap_or_else(|err| {
+                        // A SOURCE THAT HAS VANISHED IS SKIPPED. This walks a LIVE git directory:
+                        // git writes transient files under .git/objects (pack temporaries, and
+                        // whatever its background maintenance leaves behind), so a path `read_dir`
+                        // listed a moment ago can be gone by the time `fs::copy` opens it. The
+                        // redirect this test asserts on does not depend on the object set being
+                        // complete, so skipping one is harmless -- whereas failing on it is a
+                        // flake, and it is the one that has been failing on macOS in the full
+                        // parallel suite while passing under a filter and in the container.
+                        //
+                        // NARROW ON PURPOSE: only NotFound, and only when the source really is
+                        // gone when asked again. A missing destination parent, a directory reached
+                        // as a non-dir, or any other error still panics below naming both paths --
+                        // so this cannot swallow the two bugs the message was added to tell apart.
+                        if err.kind() == std::io::ErrorKind::NotFound && !e.path().exists() {
+                            return 0;
+                        }
                         panic!(
                             "copy {} -> {}: {err} (dir={} file={} symlink={}, target exists={})",
                             e.path().display(),
