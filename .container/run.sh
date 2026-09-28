@@ -197,6 +197,25 @@ config_hash() { # config_hash <config> <repo-root>
 # pattern stopped matching, and the failure would be the harness's containers bind-mounting the
 # REAL ~/.jkb -- mutations writing to the live store. A mode cannot fail that way: the mount lines
 # are not emitted at all.
+repo_git_mounts() { # -> `--mount <spec>` pairs, one argument per line, for $HOST_REPOS's repositories
+    # Each repository's own .git/config and hooks, read-only (docker_args says why). Its own function
+    # so the self-test can count what it generates: the declared-mount check once compared the
+    # command line against container.json alone, and failed on any machine whose ~/repos held a
+    # repository (a Mac with four: 15 mounts against 7 declared).
+    local g rel
+    for g in "$HOST_REPOS"/*/.git; do
+        [ -d "$g" ] || continue
+        rel="${g#"$HOST_REPOS"/}"
+        case "$rel" in
+            *,*) printf 'warning: %s has a comma in its path, which a --mount cannot carry, so its git config stays writable from the container\n' "$g" >&2
+                 continue ;;
+        esac
+        [ -f "$g/config" ] && printf '%s\n' "--mount" "type=bind,source=$g/config,target=$CTR_REPOS/$rel/config,readonly"
+        [ -d "$g/hooks" ] && printf '%s\n' "--mount" "type=bind,source=$g/hooks,target=$CTR_REPOS/$rel/hooks,readonly"
+    done
+    return 0
+}
+
 docker_args() { # docker_args <config> <repo-root> [all|posture]  -> one argument per line
     local cfg="$1" root="$2" half="${3:-all}" line sub
     # REFUSED, not defaulted. `[ "$half" = posture ] || <emit>` read every unrecognised value as
@@ -230,6 +249,21 @@ docker_args() { # docker_args <config> <repo-root> [all|posture]  -> one argumen
             sub="$(dc_subst "$line" "$root")" || die "container.json's mounts could not be substituted"
             printf '%s\n' "--mount" "$sub"
         done <<<"$specs"
+
+        # EVERY REPOSITORY'S OWN GIT CONFIG AND HOOKS, READ-ONLY (design D52.11, hole H5). ~/repos is
+        # bound read-write, and git on the HOST runs whatever a repository's .git/config names
+        # (core.fsmonitor, hooks, filters) — so a container that can write those files can run code
+        # as the operator the next time they, or `jkb task land`, run git there. A read-only bind over
+        # each stops the direct write: git writes config by lock-and-rename, and a rename over a
+        # bind-mounted file fails (measured on Docker Desktop 29.7.2, 2026-09-25: EBUSY; the config
+        # was unchanged). A SPEED BUMP, NOT THE BOUNDARY (review round 1): .git/ is writable around
+        # these, so renaming .git itself or planting .git/commondir gets past them. jkb's audit before
+        # every git call, and the reap scan, are what hold (docs/task-lifecycle.md, D52). Generated, not declared: container.json cannot list repositories. A
+        # repository cloned after the container starts is covered at its next start (the fingerprint
+        # changes); until then jkb's own git refuses it if it is planted, and the reap service reports
+        # it. What this costs inside: `git config --local`, `remote add`, and `--set-upstream-to` /
+        # `push -u` (which print an error and exit 0) — set those on the host.
+        repo_git_mounts
     fi
 
     # Through the shared reader, read through `$( )` — the inline jq this replaces was itself a
@@ -345,6 +379,19 @@ if [ "${1:-}" = --self-test ]; then
        "$(container_path "$HOST_REPOS_REAL/jkb")" "/c/repos/jkb"
     eq "...while something outside it is still refused" "$(rc_of container_path "$lnk/other")" "1"
 
+    echo "==> run.sh self-test: each repository's git config and hooks, bound read-only"
+    fx="$(mktemp -d)"
+    mkdir -p "$fx/a/.git/hooks" "$fx/b/.git" "$fx/notrepo"
+    : > "$fx/a/.git/config"; : > "$fx/b/.git/config"
+    HOST_REPOS="$fx" CTR_REPOS=/c/repos
+    mounts="$(repo_git_mounts)"
+    eq "a config and hooks for a, a config for b, nothing for a plain directory" \
+       "$(grep -cxF -- '--mount' <<<"$mounts" || true)" "3"
+    eq "...each read-only" "$(grep -c ',readonly$' <<<"$mounts" || true)" "3"
+    eq "...at the repository's container path" \
+       "$(grep -cxF -- "type=bind,source=$fx/a/.git/hooks,target=/c/repos/a/.git/hooks,readonly" <<<"$mounts" || true)" "1"
+    rm -rf "$fx"
+
     HOST_REPOS="$HOME/repos" CTR_REPOS=/home/vscode/repos
     HOST_REPOS_REAL="$(cd "$HOST_REPOS" 2>/dev/null && pwd -P || printf '%s' "$HOST_REPOS")"
 
@@ -376,8 +423,9 @@ if [ "${1:-}" = --self-test ]; then
     # would fail them rather than pass — but the mount count is the one that could quietly shrink,
     # and it is the security boundary, so it is compared against the file rather than to a number.
     declared="$(dc_mount_specs "$CONFIG" | grep -c . || true)"
-    eq "every declared mount reaches the command line" \
-       "$(grep -cxF -- '--mount' <<<"$args" || true)" "$declared"
+    generated="$(repo_git_mounts 2>/dev/null | grep -cxF -- '--mount' || true)"
+    eq "every declared mount, and each repository's generated git binds, reach the command line" \
+       "$(grep -cxF -- '--mount' <<<"$args" || true)" "$((declared + generated))"
     eq "...and there is at least one to reach it" "$([ "$declared" -gt 0 ] && echo yes || echo no)" "yes"
 
     # A DECLARATION THAT DECLARES NO FLAGS IS REFUSED, not started without them. `dc_run_args` used
@@ -605,6 +653,14 @@ fi
 
 command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
 docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
+
+# The narrowed ~/.jkb binds and the credential's directory must exist on the host: a bind whose source
+# is missing is a hard error (D52.8). The credential itself is written by `jkb role rotate-container
+# --write` (setup.sh); without one, the container's jkb cannot reach the daemon at all.
+mkdir -p "$HOME/.jkb/claude-memory" "$HOME/.jkb/logs" "$HOME/.jkb-container"
+chmod 0700 "$HOME/.jkb-container"
+[ -s "$HOME/.jkb-container/credential" ] \
+    || echo "warning: no container credential at ~/.jkb-container/credential — run ./scripts/setup.sh on the host (jkb role rotate-container --write)" >&2
 
 if [ "$BUILD" -eq 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     # `name` and `build.dockerfile` are READ here. They were listed as consumed keys while nothing

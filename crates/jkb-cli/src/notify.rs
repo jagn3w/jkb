@@ -82,7 +82,7 @@ pub fn run(cmd: &NotifyCmd, json: bool) -> Result<()> {
 /// `jkb notify sessions`: the session registry, as the daemon holds it.
 fn sessions(all: bool, json: bool) -> Result<()> {
     let url = crate::remote::daemon_url();
-    let backend = jkb_daemon::client::RemoteBackend::new(&url, crate::remote::token_file(&url))
+    let backend = crate::remote::client(&url, crate::remote::Purpose::Hook)
         .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let mut sessions: Vec<jkb_api::ClaudeSession> = Vec::new();
     let mut after = None;
@@ -549,16 +549,14 @@ fn hook() {
         return;
     }
     let url = crate::remote::daemon_url();
-    let backend =
-        match jkb_daemon::client::RemoteBackend::new(&url, crate::remote::token_file(&url))
-            .and_then(|b| b.with_deadlines(CONNECT, TOTAL))
-        {
-            Ok(b) => b.with_down_marker(crate::remote::down_marker(&url)),
-            Err(e) => {
-                append_log(&log, &[failure("client", &e)]);
-                return;
-            }
-        };
+    // Deadlines and the down marker come with every hook client (`remote::client`).
+    let backend = match crate::remote::client(&url, crate::remote::Purpose::Hook) {
+        Ok(b) => b,
+        Err(e) => {
+            append_log(&log, &[failure("client", &e)]);
+            return;
+        }
+    };
     let instance = instance();
     let owner = owner_in(&instance, owner_id);
     let failures = handle(

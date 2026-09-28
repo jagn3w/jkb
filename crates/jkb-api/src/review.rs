@@ -10,7 +10,7 @@
 
 use std::fmt::Write as _;
 
-use jkb_core::location::{set_facet, valid_ref, FACET_BRANCH};
+use jkb_core::location::{valid_ref, FACET_BRANCH};
 use jkb_core::query::{Query, Scope};
 use jkb_core::{item, mount, ns, tag, task, transition, WriteMeta};
 use jkb_types::{ItemId, TaskStatus};
@@ -21,10 +21,10 @@ use crate::sessions::{check_name, review_findings};
 use crate::tasks::{check_line, line_problem, writable, FileRoots};
 use crate::{ApiError, ErrorCode};
 
-/// The branch HEAD a review ran against.
-pub const FACET_REVIEWED: &str = "reviewed";
-/// The review's findings namespace, so the findings are one `jkb ls` away.
-pub const FACET_REVIEW: &str = "review";
+/// The facet a filed finding names its file under, so repeated review areas can be told apart
+/// (design D52.6). Content on the *finding*, never on the reviewed task: the review's own record
+/// is in [`jkb_core::reviews`], not in tags.
+pub const FACET_AREA: &str = jkb_core::workflow::store::FACET_AREA;
 
 /// The most findings one `task.review_file` files. A review has tens; a reviewer that returned
 /// thousands is broken, and each finding is a task, a mirror and a changelog entry.
@@ -267,7 +267,13 @@ fn check_bytes(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
 /// # Errors
 /// [`ErrorCode::Invalid`] for a malformed or occupied namespace, a covered section, or an oversized
 /// finding; or a failed write.
-pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed, ApiError> {
+pub fn file(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ask: &FileAsk,
+    filed_by: &str,
+    scope: Option<ItemId>,
+) -> Result<Filed, ApiError> {
     if let Some(why) = ask.run.refusal() {
         return Err(invalid(format!(
             "this review did not run fully ({why}) — nothing was filed, because it would read as a \
@@ -275,6 +281,130 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
         )));
     }
     let root = ns::normalize(&ask.ns)?;
+    check_findings(ask)?;
+    // Never into, above or below a recorded round: its findings were fixed when it was recorded, and a
+    // must-fix filed beside them later would read as the round's (review round 2).
+    if let Some(round) = jkb_core::reviews::round_overlapping(conn, &root)? {
+        return Err(invalid(format!(
+            "`{root}` overlaps the recorded review round `{round}` — file a review into a namespace \
+             of its own"
+        )));
+    }
+    if let Some(scope) = scope {
+        check_filing_home(conn, scope, &root)?;
+    }
+    let held = Query {
+        scope: Scope::Subtree(root.clone()),
+        ..Query::default()
+    }
+    .evaluate(conn)?;
+    if !held.is_empty() {
+        return Err(invalid(format!(
+            "`{root}` already holds {} item(s): a review's findings are filed once, into a namespace \
+             of their own",
+            held.len()
+        )));
+    }
+
+    let clean = ask.findings.is_empty();
+    // The file each finding names, by position — its area, for telling repeated rounds apart.
+    let files: Vec<Option<String>> = ask
+        .findings
+        .iter()
+        .map(|f| {
+            f.file
+                .as_deref()
+                .map(fold)
+                // A path too long to be a tag is too long to be anyone's area; the finding is still
+                // filed, it just joins no repetition.
+                .filter(|f| !f.is_empty() && f.len() + FACET_AREA.len() <= tag::MAX_TAG_BYTES)
+        })
+        .collect();
+    let entries: Vec<(String, i64, String)> = if clean {
+        vec![("summary".to_owned(), 3, CLEAN_REVIEW.to_owned())]
+    } else {
+        ask.findings
+            .iter()
+            .map(|f| {
+                (
+                    f.severity.section().to_owned(),
+                    f.severity.priority(),
+                    f.body(),
+                )
+            })
+            .collect()
+    };
+    let mut uids = Vec::with_capacity(entries.len());
+    let mut ids = Vec::with_capacity(entries.len());
+    for (i, (section, priority, body)) in entries.into_iter().enumerate() {
+        let home = format!("{root}/{section}");
+        if let Some(file) = mount::tasks_file_for(conn, &home)? {
+            return Err(invalid(format!(
+                "`{home}` is written to {file} by a `tasks` mount; file the review into a namespace \
+                 no mount covers"
+            )));
+        }
+        let title = body.lines().next().unwrap_or_default().to_owned();
+        let uid = format!("{}-{i}", task::mint_uid(&title));
+        let mut spec = task::NewTask::new(uid.clone(), body);
+        spec.priority = Some(priority);
+        spec.home = home;
+        let id = task::create(conn, meta, &spec)?;
+        if let Some(file) = files.get(i).and_then(Option::as_deref) {
+            tag::apply(conn, meta, id, FACET_AREA, file)?;
+        }
+        if clean {
+            task::set_status(conn, meta, id, TaskStatus::Done)?;
+        }
+        uids.push(uid);
+        ids.push(id);
+    }
+    // What this filing holds, so recording it makes exactly these a task's round (and its scope).
+    jkb_core::reviews::record_filing(conn, &root, &ids, filed_by)?;
+    Ok(Filed {
+        ns: root,
+        uids,
+        clean,
+    })
+}
+
+/// A caller held to one task files only under its repository's `repos/<repo>/codereviews/`, found on
+/// the task or the nearest task above it that records a `repo=`. Findings are ordinary open tasks,
+/// mirrored into `tasks/` where a swarm picks work up, so a filing anywhere else is a new task on the
+/// shared frontier that `task.add --under` would have refused.
+fn check_filing_home(conn: &Connection, scope: ItemId, root: &str) -> Result<(), ApiError> {
+    let mut at = Some(scope);
+    let mut repo = None;
+    for _ in 0..64 {
+        let Some(id) = at else { break };
+        repo = tag::applications(conn, id)?
+            .into_iter()
+            .find(|(f, _)| f == jkb_core::location::FACET_REPO)
+            .map(|(_, v)| v);
+        if repo.is_some() {
+            break;
+        }
+        at = jkb_core::containment::parent(conn, id)?;
+    }
+    let Some(repo) = repo else {
+        return Err(ApiError::with_code(
+            ErrorCode::Forbidden,
+            "a caller held to one task files a review only under its repository's codereviews, and \
+             neither the task nor any task above it records a `repo=`",
+        ));
+    };
+    let home = format!("repos/{repo}/codereviews/");
+    if !root.starts_with(&home) {
+        return Err(ApiError::with_code(
+            ErrorCode::Forbidden,
+            format!("a caller held to one task files a review only under `{home}`, not `{root}`"),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse findings too many, too large, or with an empty summary.
+fn check_findings(ask: &FileAsk) -> Result<(), ApiError> {
     if ask.findings.len() > MAX_FINDINGS {
         return Err(invalid(format!(
             "at most {MAX_FINDINGS} findings in one review ({} given)",
@@ -301,59 +431,7 @@ pub fn file(conn: &Connection, meta: &WriteMeta, ask: &FileAsk) -> Result<Filed,
              even with their scenarios and fixes cut short; file fewer findings, or shorter summaries"
         )));
     }
-    let held = Query {
-        scope: Scope::Subtree(root.clone()),
-        ..Query::default()
-    }
-    .evaluate(conn)?;
-    if !held.is_empty() {
-        return Err(invalid(format!(
-            "`{root}` already holds {} item(s): a review's findings are filed once, into a namespace \
-             of their own",
-            held.len()
-        )));
-    }
-
-    let clean = ask.findings.is_empty();
-    let entries: Vec<(String, i64, String)> = if clean {
-        vec![("summary".to_owned(), 3, CLEAN_REVIEW.to_owned())]
-    } else {
-        ask.findings
-            .iter()
-            .map(|f| {
-                (
-                    f.severity.section().to_owned(),
-                    f.severity.priority(),
-                    f.body(),
-                )
-            })
-            .collect()
-    };
-    let mut uids = Vec::with_capacity(entries.len());
-    for (i, (section, priority, body)) in entries.into_iter().enumerate() {
-        let home = format!("{root}/{section}");
-        if let Some(file) = mount::tasks_file_for(conn, &home)? {
-            return Err(invalid(format!(
-                "`{home}` is written to {file} by a `tasks` mount; file the review into a namespace \
-                 no mount covers"
-            )));
-        }
-        let title = body.lines().next().unwrap_or_default().to_owned();
-        let uid = format!("{}-{i}", task::mint_uid(&title));
-        let mut spec = task::NewTask::new(uid.clone(), body);
-        spec.priority = Some(priority);
-        spec.home = home;
-        let id = task::create(conn, meta, &spec)?;
-        if clean {
-            task::set_status(conn, meta, id, TaskStatus::Done)?;
-        }
-        uids.push(uid);
-    }
-    Ok(Filed {
-        ns: root,
-        uids,
-        clean,
-    })
+    Ok(())
 }
 
 /// `task.review_record`'s request: a review of `branch` at `sha`, whose findings are under `findings`.
@@ -392,7 +470,8 @@ pub struct Recording {
     /// Skipped because a recorded branch value cannot be handed to git at all. Reported, not fatal:
     /// one malformed tag must not stop the whole branch being credited.
     pub unusable: Vec<String>,
-    /// Skipped because this client may not write them (filed outside `jkb serve`'s file roots).
+    /// Skipped because this client may not write them (filed outside `jkb serve`'s file roots, or outside
+    /// the one task a scoped caller is held to).
     #[serde(default)]
     pub unwritable: Vec<String>,
 }
@@ -417,9 +496,10 @@ const MAX_SHA_BYTES: usize = 64;
 /// (design D38.6). It all happens in the one transaction the op runs in, each task's status read inside
 /// it, so a task that landed meanwhile is not moved back, and an interrupted run tags nothing.
 ///
-/// `review=` is **added**, not set: a second run's findings do not retire the first run's still-open
-/// must-fix items (the gate unions every recorded namespace). `reviewed=` is set, since there is only
-/// one current HEAD.
+/// The round is **added** to the task's review record ([`jkb_core::reviews`]), never a tag: a second
+/// run's findings do not retire the first run's still-open must-fix items (the gate unions every
+/// recorded namespace), and the newest record's HEAD is the reviewed one. It is not a tag because a
+/// tag is content a synced file can write, and this decides the land gate (D52.7, hole H3).
 ///
 /// # Errors
 /// [`ErrorCode::Invalid`] for a malformed ask or an empty findings namespace, a tagged task whose
@@ -429,6 +509,9 @@ pub fn record(
     meta: &WriteMeta,
     ask: &RecordAsk,
     roots: Option<&FileRoots>,
+    actor: &str,
+    scope: Option<ItemId>,
+    source: jkb_core::reviews::RoundSource<'_>,
 ) -> Result<Recording, ApiError> {
     check_name("repo key", &ask.repo)?;
     check_name("branch", &ask.branch)?;
@@ -487,9 +570,17 @@ pub fn record(
             }
             Err(e) => return Err(e),
         }
+        // A caller held to one task (D52.4) records a review only for the work it is held to: a
+        // branch names whatever tasks record it, and a round recorded against another task's branch
+        // is a review that task did not get.
+        if let Some(s) = scope {
+            if !jkb_core::roles::in_scope(conn, s, id)? {
+                out.unwritable.push(m.uid.clone());
+                continue;
+            }
+        }
         let before = line_problem(conn, &m.uid)?;
-        set_facet(conn, meta, id, FACET_REVIEWED, sha)?;
-        tag::apply(conn, meta, id, FACET_REVIEW, &findings)?;
+        jkb_core::reviews::record(conn, meta, id, &findings, sha, actor, source)?;
         let moved = item::get(conn, id)?.and_then(|m| m.status).as_deref() == Some("in_progress");
         if moved {
             task::set_status(conn, meta, id, TaskStatus::NeedsReview)?;

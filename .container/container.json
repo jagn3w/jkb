@@ -96,13 +96,22 @@
     // open whichever checkout you want, including a `jkb task work` session inside one.
     "source=${localEnv:HOME}/repos,target=/home/vscode/repos,type=bind",
 
-    // The host's ~/.jkb: auto-memory (`claude-memory/`), worktree archives, logs, and the daemon's
-    // token. NOT the knowledge base: the container reaches that only through `jkb serve` on the host
-    // (JKB_REMOTE below), and has no database of its own. A SQLite database cannot be shared across
-    // this bind: measured (.container/sqlite-share-probe.py, 2026-09-13), an fcntl lock taken in here is
-    // invisible on macOS and a MAP_SHARED mapping is not shared, so WAL's write lock and wal-index
-    // both break, and two writers corrupted a scratch database within 38 commits.
-    "source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb,type=bind,consistency=cached",
+    // Of the host's ~/.jkb, ONLY what the container uses (design D52.8): auto-memory and the hooks'
+    // logs. NOT ~/.jkb itself, which holds the operator's database (and whole-database backups) and
+    // the daemon's root token — with the whole directory bound, anything in here could read the
+    // token that makes it the operator, or open the database directly and corrupt it: measured
+    // (.container/sqlite-share-probe.py, 2026-09-13), an fcntl lock taken in here is invisible on
+    // macOS and a MAP_SHARED mapping is not shared. The container reaches the knowledge base only
+    // through `jkb serve` on the host (JKB_REMOTE below).
+    "source=${localEnv:HOME}/.jkb/claude-memory,target=/home/vscode/.jkb/claude-memory,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.jkb/logs,target=/home/vscode/.jkb/logs,type=bind,consistency=cached",
+
+    // The container's credential, READ-ONLY (D52.3): a coordinator grant, the ceiling of anything in
+    // here, written on the host by `jkb role rotate-container --write`. Outside ~/.jkb on purpose, so
+    // it is not a read-only bind nested in a writable one. The model's tools are denied it by the
+    // managed settings (managed-settings.json); the harness's hooks, which run outside the sandbox,
+    // read it to mint each tool call's ticket.
+    "source=${localEnv:HOME}/.jkb-container,target=/home/vscode/.jkb-container,type=bind,readonly",
 
     // NO credential mount, deliberately. `~/.claude/.credentials.json` is Linux/WSL-only — on
     // macOS the credentials live in the Keychain and the file does not exist, and a bind mount
@@ -136,7 +145,8 @@
     // and even a read is unsafe. check-config.sh holds this address to egress-lib.sh's DAEMON_HOST
     // and DAEMON_PORT, the one opening init-firewall.sh makes. host:port with no scheme, like
     // jkb serve's own --addr: this file's comment stripper (lib.sh dc_strip) cannot tell a URL's //
-    // from a comment. The token is read from ~/.jkb/daemon/<port>/token, through the bind.
+    // from a comment. It authenticates with the container credential (~/.jkb-container, D52.3); the
+    // daemon's root token is on the host only.
     "JKB_REMOTE": "host.docker.internal:7117",
     // See the target/ volume above: keeps cargo's output off the bind mount.
     "CARGO_TARGET_DIR": "/home/vscode/.cargo/target",

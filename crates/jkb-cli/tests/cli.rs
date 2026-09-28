@@ -3551,8 +3551,11 @@ fn task_reap_compacts_the_message_queue() {
     assert!(stderr.contains("newer jkb"), "{stderr}");
 
     // And under --watch, where compaction runs FIRST each pass, its failure does not end the service.
+    // HOME is the tempdir: each pass also scans `~/repos` (D52.11 layer 3), and the developer's
+    // own repositories are not this test's to read.
     let mut watch = jkb(&newer)
         .args(["task", "reap", "--watch", "--interval-secs", "60"])
+        .env("HOME", tmp.path())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -4528,4 +4531,277 @@ fn the_mcp_server_serves_its_tools_through_the_daemon() {
     assert_eq!(v["content"], "from the container !p1", "{v}");
     assert_eq!(v["priority"], 2, "{v}");
     drop(serve);
+}
+
+/// A task's workflow from the command line (design D52.5, D52.10): the default strategy waits on the
+/// operator's design approval, each step is a verb, and the Stop hook keeps a session going while the
+/// next step is one it drives — once per stop — and lets it stop when the operator acts next.
+#[test]
+fn a_workflow_walks_from_the_cli_and_the_stop_hook_asks_only_when_the_session_drives() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("jkb.db");
+    let uid = add_task(&db, "workflow walk");
+    let show = || -> serde_json::Value {
+        let out = jkb(&db)
+            .args(["--json", "workflow", "show", &uid])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let stop_as = |active: bool, drive: Option<&str>| -> String {
+        let mut cmd = assert_cmd::Command::from_std(jkb(&db));
+        match drive {
+            Some(d) => cmd.env("JKB_DRIVE", d),
+            None => cmd.env_remove("JKB_DRIVE"),
+        };
+        let out = cmd
+            .args(["workflow", "next", &uid, "--stop-hook"])
+            .write_stdin(serde_json::json!({ "stop_hook_active": active }).to_string())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let stop = |active: bool| stop_as(active, Some("1"));
+    let w = show();
+    assert_eq!(
+        stop_as(false, None),
+        "",
+        "a session that did not opt in is never held, whatever acts next"
+    );
+    assert_eq!(w["phase"], "design");
+    assert_eq!(w["source"], "default:design-reviewed");
+    assert!(
+        stop(false).contains("\"decision\":\"block\""),
+        "a designer acts next"
+    );
+    assert_eq!(
+        stop(true),
+        "",
+        "once per stop: a stop already sent back is let through"
+    );
+
+    jkb(&db)
+        .args(["workflow", "fire", &uid, "submit_design"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("now design_review"));
+    assert_eq!(
+        stop(false),
+        "",
+        "the operator approves designs: the session may stop"
+    );
+    jkb(&db)
+        .args(["workflow", "fire", &uid, "approve_design"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["workflow", "fire", &uid, "submit_systemic"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs a written reason"));
+    jkb(&db)
+        .args(["workflow", "fire", &uid, "submit_work"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["workflow", "observe", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing to do: still review"));
+    let block = stop(false);
+    assert!(block.contains("reviewer"), "{block}");
+
+    jkb(&db)
+        .args(["workflow", "dot", "reviewed-design"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("digraph"));
+    jkb(&db)
+        .args(["workflow", "strategies"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("* design-reviewed"))
+        .stdout(predicate::str::contains("autonomous"));
+    jkb(&db)
+        .args(["role", "matrix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "| permission | operator | coordinator",
+        ));
+}
+
+/// A role token through `jkb serve` (D52.3): `JKB_AGENT_TOKEN` is the bearer, the daemon serves the
+/// principal it names, and what the role does not allow is refused — with the roles that may.
+#[test]
+fn a_role_token_is_served_as_its_role_through_the_daemon() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("jkb.db");
+    let token = dir.path().join("daemon/token");
+    let uid = add_task(&db, "reviewed work");
+    let out = jkb(&db)
+        .args([
+            "role", "grant", "reviewer", "--task", &uid, "--agent", "rev-1", "--export",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let line = String::from_utf8(out.stdout).unwrap();
+    let grant = line
+        .trim()
+        .strip_prefix("export JKB_AGENT_TOKEN=")
+        .unwrap_or_else(|| panic!("{line}"))
+        .to_owned();
+    let (_serve, url) = Daemon::start(&db, &token);
+    let as_reviewer = || {
+        let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+        cmd.env("HOME", dir.path())
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env("JKB_AGENT_TOKEN", &grant)
+            .env_remove("JKB_DB");
+        cmd
+    };
+    as_reviewer()
+        .args(["role", "whoami"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("grant:"))
+        .stdout(predicate::str::contains("reviewer"));
+    as_reviewer()
+        .args(["--global", "task", "edit", &uid, "--append", "sneaky"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refused"));
+    as_reviewer()
+        .args(["workflow", "fire", &uid, "submit_design"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("designer"));
+    // The operator sees the grant, and revoking it locks the token out.
+    jkb(&db)
+        .args(["role", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rev-1"));
+}
+
+/// The attestation hook end to end (D52.9): with the container credential under `$HOME`, a
+/// `PreToolUse` for a Bash command that runs `jkb` comes back rewritten to carry a ticket; the ticket
+/// authenticates as the harness said — the main session as the container's coordinator, a subagent as
+/// its mapped type's role — and `PostToolUse` ends it. A command that does not run `jkb` is left alone.
+#[test]
+#[allow(clippy::too_many_lines)] // one end-to-end scenario, read top to bottom
+fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("jkb.db");
+    let token = dir.path().join("daemon/token");
+    let (_serve, url) = Daemon::start(&db, &token);
+    // The operator, on the host: the container credential and the agent-type map.
+    let operator = |args: &[&str]| {
+        let mut cmd = assert_cmd::Command::from_std(jkb(&db));
+        cmd.env("HOME", dir.path()).args(args).assert().success();
+    };
+    operator(&["role", "rotate-container", "--write"]);
+    // setup.sh re-runs keep a live credential rather than revoking every worker minted from it.
+    let mut again = assert_cmd::Command::from_std(jkb(&db));
+    again
+        .env("HOME", dir.path())
+        .args(["role", "rotate-container", "--write", "--keep-live"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is live; kept"));
+    operator(&["role", "map", "reviewer", "reviewer"]);
+    let credential = dir.path().join(".jkb-container/credential");
+    assert!(
+        credential.exists(),
+        "written where the container's bind reads it"
+    );
+
+    let hook = |payload: serde_json::Value| -> String {
+        let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+        let out = cmd
+            .env("HOME", dir.path())
+            .env("JKB_REMOTE", &url)
+            .env_remove("JKB_DB")
+            .args(["attest", "hook"])
+            .write_stdin(payload.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the hook never fails a tool call: {out:?}"
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let ticket_of = |out: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(out).unwrap_or_else(|_| panic!("{out}"));
+        let cmd = v["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(cmd.ends_with("; jkb role whoami"), "{cmd}");
+        cmd.split_once("JKB_ATTEST=")
+            .unwrap()
+            .1
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let whoami = |ticket: &str| {
+        let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+        cmd.env("HOME", dir.path())
+            .env("JKB_REMOTE", &url)
+            .env("JKB_ATTEST", ticket)
+            .env_remove("JKB_DB")
+            .args(["role", "whoami"])
+            .output()
+            .unwrap()
+    };
+    let pre = |tool: &str, agent: Option<(&str, &str)>, command: &str| {
+        let mut p = serde_json::json!({
+            "hook_event_name": "PreToolUse", "session_id": "sess-1", "tool_name": "Bash",
+            "tool_use_id": tool, "tool_input": { "command": command, "description": "d" },
+        });
+        if let Some((id, ty)) = agent {
+            p["agent_id"] = serde_json::json!(id);
+            p["agent_type"] = serde_json::json!(ty);
+        }
+        hook(p)
+    };
+
+    assert_eq!(
+        pre("t0", None, "ls -la"),
+        "",
+        "not a jkb command: untouched"
+    );
+    let main = ticket_of(&pre("t1", None, "jkb role whoami"));
+    let out = whoami(&main);
+    assert!(out.status.success(), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("session:sess-1") && said.contains("coordinator"),
+        "{said}"
+    );
+
+    let sub = ticket_of(&pre("t2", Some(("ag-7", "reviewer")), "jkb role whoami"));
+    let said = String::from_utf8_lossy(&whoami(&sub).stdout).into_owned();
+    assert!(
+        said.contains("reviewer@ag-7") && said.contains("reviewer"),
+        "{said}"
+    );
+
+    hook(serde_json::json!({
+        "hook_event_name": "PostToolUse", "session_id": "sess-1", "tool_use_id": "t1",
+        "tool_name": "Bash", "tool_input": { "command": "jkb role whoami" },
+    }));
+    let out = whoami(&main);
+    assert!(!out.status.success(), "released at PostToolUse");
+    hook(serde_json::json!({
+        "hook_event_name": "SubagentStop", "session_id": "sess-1", "agent_id": "ag-7",
+    }));
+    assert!(!whoami(&sub).status.success(), "released at SubagentStop");
 }

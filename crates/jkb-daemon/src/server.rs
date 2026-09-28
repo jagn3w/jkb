@@ -28,12 +28,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full, Limited};
+use http_body_util::{BodyExt as _, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use jkb_api::rbac::Caller;
 use jkb_api::{ApiError, Backend as _, ErrorCode, LocalBackend, Request, Response};
 use jkb_core::Db;
 use serde_json::json;
@@ -200,7 +201,30 @@ struct State {
     max_wait: Duration,
     poll_floor: Duration,
     read_timeout: Duration,
+    /// The harness tickets this daemon minted (D52.9) — in memory, shared by every request's backend,
+    /// and kept across a database re-open.
+    tickets: jkb_api::rbac::SharedTickets,
+    /// Which bearer tokens name a live grant, for authenticating before the body is read.
+    grants: Mutex<GrantCache>,
 }
+
+/// The live grants' token hashes, so a bearer that is neither the root token nor a ticket is
+/// recognized without a database read per request (D52.3). A hit is only admission: every call
+/// resolves its principal from the database again, so a revocation is never served stale — and a
+/// call refused `Unauthorized` evicts its hash and closes the connection, so a revoked holder cannot
+/// keep riding the cache past the read timeout and the op permits. A grant this daemon serves lets the
+/// next miss refresh at once. A miss refreshes it at most once per [`GRANT_REFRESH`] — claimed under the
+/// lock, so a burst of misses costs **one** read, on the reader connection rather than ahead of the
+/// hooks' writes; the misses that arrive during it are answered as misses. A grant the host CLI wrote
+/// directly may wait out one interval.
+#[derive(Default)]
+struct GrantCache {
+    hashes: HashSet<String>,
+    refreshed: Option<std::time::Instant>,
+}
+
+/// How often a miss may re-read the grants.
+const GRANT_REFRESH: Duration = Duration::from_secs(1);
 
 /// Bind, write a fresh token, and serve on a background thread.
 ///
@@ -359,6 +383,8 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         max_wait: cfg.max_wait,
         poll_floor: cfg.poll_floor,
         read_timeout: cfg.read_timeout,
+        tickets: Arc::default(),
+        grants: Mutex::default(),
     });
     let connections = Arc::new(Semaphore::new(connection_budget(cfg.max_connections)));
     let read_timeout = cfg.read_timeout;
@@ -415,6 +441,44 @@ fn reply(status: StatusCode, body: &serde_json::Value) -> hyper::Response<Full<B
         .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::new())))
 }
 
+/// A request body as read: whole, or past the limit.
+enum Body {
+    Read(Bytes),
+    TooLarge,
+}
+
+/// How far past the limit an oversized body is still read, as a multiple of it, before the refusal
+/// goes out regardless.
+const DRAIN_FACTOR: usize = 8;
+
+/// Read `body`, up to `max` bytes. Past `max` the rest is read and **discarded** — to
+/// [`DRAIN_FACTOR`] times `max`, under the caller's read timeout — before the 413 is answered:
+/// answering first left the upload unread, the socket closed with data in it, and the reset that
+/// sends can make the client's kernel drop the 413 before the client reads it. The client then saw a
+/// transport error instead of the refusal (`raw_http_is_held_to_the_same_rules`, flaky on macOS
+/// under the land gate's load; not reproduced on Linux in 72 parallel runs).
+async fn read_body(mut body: Incoming, max: usize) -> Result<Body, hyper::Error> {
+    let mut read = Vec::new();
+    let mut seen = 0usize;
+    while let Some(frame) = body.frame().await {
+        let Ok(data) = frame?.into_data() else {
+            continue;
+        };
+        seen = seen.saturating_add(data.len());
+        if seen > max.saturating_mul(DRAIN_FACTOR) {
+            break;
+        }
+        if seen <= max {
+            read.extend_from_slice(&data);
+        }
+    }
+    Ok(if seen > max {
+        Body::TooLarge
+    } else {
+        Body::Read(Bytes::from(read))
+    })
+}
+
 /// A refusal before authentication: the answer, and the connection closed after it, so an
 /// unauthenticated client cannot hold a slot by sending refused requests down a kept-alive connection.
 fn refuse_and_close(e: &ApiError) -> hyper::Response<Full<Bytes>> {
@@ -455,12 +519,69 @@ pub const fn status_for(code: ErrorCode) -> StatusCode {
     }
 }
 
-fn authorized(state: &State, req: &hyper::Request<Incoming>) -> bool {
+/// The bearer token a request presents, trimmed.
+fn bearer(req: &hyper::Request<Incoming>) -> Option<String> {
     req.headers()
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|given| token::matches(&state.token, given.trim()))
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// Who `given` authenticates as: the operator for the root token (compared in constant time), a
+/// token-holding caller for a live ticket or grant, or nobody.
+async fn authenticate(state: &Arc<State>, given: &str) -> Result<Option<Caller>, ApiError> {
+    if token::matches(&state.token, given) {
+        return Ok(Some(Caller::Operator));
+    }
+    if given.starts_with(jkb_api::rbac::TICKET_PREFIX) {
+        return Ok(state
+            .tickets
+            .contains(given)
+            .then(|| Caller::Token(given.to_owned())));
+    }
+    let hash = jkb_core::roles::token_hash(given);
+    let lock = || {
+        state
+            .grants
+            .lock()
+            .map_err(|_| ApiError::with_code(ErrorCode::Internal, "grant cache poisoned"))
+    };
+    {
+        let mut cache = lock()?;
+        if cache.hashes.contains(&hash) {
+            return Ok(Some(Caller::Token(given.to_owned())));
+        }
+        if cache
+            .refreshed
+            .is_some_and(|at| at.elapsed() < GRANT_REFRESH)
+        {
+            return Ok(None);
+        }
+        // Claimed before the read, so every miss arriving while it runs is answered as a miss
+        // rather than starting a read of its own.
+        cache.refreshed = Some(std::time::Instant::now());
+    }
+    let read = async {
+        let (backend, _) = ready(state).await?;
+        blocking_read(backend.reads(), jkb_core::roles::live_by_hash).await
+    };
+    let live = match read.await {
+        Ok(live) => live,
+        Err(e) => {
+            // Released, so the next miss tries again rather than every token waiting out the
+            // interval behind a read that never came back.
+            lock()?.refreshed = None;
+            return Err(e);
+        }
+    };
+    let mut cache = lock()?;
+    cache.hashes = live.into_iter().map(|(h, _)| h).collect();
+    Ok(cache
+        .hashes
+        .contains(&hash)
+        .then(|| Caller::Token(given.to_owned())))
 }
 
 fn wait_ms(req: &hyper::Request<Incoming>) -> u64 {
@@ -815,17 +936,30 @@ async fn handle(
             route.0, route.1
         ))));
     }
-    if !authorized(&state, &req) {
-        return Ok(refuse_and_close(&ApiError::with_code(
+    let wrong = || {
+        refuse_and_close(&ApiError::with_code(
             ErrorCode::Unauthorized,
-            "missing or wrong bearer token (it is rotated each time jkb serve starts)",
-        )));
-    }
+            "missing or wrong bearer token (it is rotated each time jkb serve starts; a role token \
+             may have been revoked, a ticket released)",
+        ))
+    };
+    let Some(given) = bearer(&req) else {
+        return Ok(wrong());
+    };
+    let caller = match authenticate(&state, &given).await {
+        Ok(Some(caller)) => caller,
+        Ok(None) => return Ok(wrong()),
+        Err(e) => return Ok(refuse_and_close(&e)),
+    };
     authed.store(true, Ordering::SeqCst);
     let (backend, db) = match ready(&state).await {
         Ok(serving) => serving,
         Err(refusal) => return Ok(refuse(&refusal)),
     };
+    // This request's backend: the caller it authenticated as, and the daemon's one ticket store.
+    let backend = backend
+        .with_tickets(Arc::clone(&state.tickets))
+        .with_caller(caller);
     let (backend, db) = (&backend, &db);
     // Every request past authentication holds an op permit from here — through the schema read, the
     // body and the parse — so authenticated clients cannot pile up unbounded work before the budget
@@ -852,16 +986,21 @@ async fn handle(
     let asked_wait = Duration::from_millis(wait_ms(&req)).min(state.max_wait);
     let body = match tokio::time::timeout(
         state.read_timeout,
-        Limited::new(req.into_body(), state.max_body).collect(),
+        read_body(req.into_body(), state.max_body),
     )
     .await
     {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(e)) => {
+        Ok(Ok(Body::Read(bytes))) => bytes,
+        Ok(Ok(Body::TooLarge)) => {
             return Ok(refuse(&ApiError::with_code(
                 ErrorCode::TooLarge,
-                format!("request body refused: {e}"),
+                format!("request body refused: larger than {} bytes", state.max_body),
             )))
+        }
+        Ok(Err(e)) => {
+            return Ok(refuse_and_close(&ApiError::bad_request(format!(
+                "request body could not be read: {e}"
+            ))))
         }
         Err(_) => {
             return Ok(refuse(&ApiError::bad_request(format!(
@@ -880,12 +1019,44 @@ async fn handle(
     };
     let permit: Permit = Arc::new(permit);
     *held = Some(Arc::clone(&permit));
-    Ok(
-        match serve_op(&state, backend, db, request, wait, &permit).await {
-            Ok(response) => reply(StatusCode::OK, &json!(response)),
-            Err(e) => refuse(&e),
-        },
-    )
+    Ok(answer(
+        &state,
+        &given,
+        serve_op(&state, backend, db, request, wait, &permit).await,
+    ))
+}
+
+/// The reply to a served op, keeping the grant cache honest on the way: a grant this daemon served
+/// lets the next miss refresh at once, and a token admitted from the cache that then failed to resolve
+/// is evicted and its connection closed.
+fn answer(
+    state: &State,
+    given: &str,
+    served: Result<Response, ApiError>,
+) -> hyper::Response<Full<Bytes>> {
+    match served {
+        Ok(response) => {
+            // A grant this daemon just minted must authenticate on the very next request: its miss
+            // may refresh at once. The set is kept — emptying it on every grant or revocation made
+            // every live token miss, and the misses during that refresh were refused. A revoked
+            // token needs nothing here: its next call fails to resolve and is evicted below.
+            if matches!(response, Response::Granted { .. }) {
+                if let Ok(mut cache) = state.grants.lock() {
+                    cache.refreshed = None;
+                }
+            }
+            reply(StatusCode::OK, &json!(response))
+        }
+        // The token was admitted and then did not resolve: revoked since the cache last read,
+        // or a ticket released. Its hash goes, and so does the connection.
+        Err(e) if e.code == ErrorCode::Unauthorized => {
+            if let Ok(mut cache) = state.grants.lock() {
+                cache.hashes.remove(&jkb_core::roles::token_hash(given));
+            }
+            refuse_and_close(&e)
+        }
+        Err(e) => refuse(&e),
+    }
 }
 
 /// The permit a parsed request runs under, traded for its `op_permit` once its class is known, with

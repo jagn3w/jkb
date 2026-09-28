@@ -1078,3 +1078,13 @@ conventions every session is expected to know.
   and that is asserted from the constants the compiler saw, one-directional because wider is the
   safe side. It exists because removing the redundant call removed the only coupling, which
   nothing noticed for a round.
+
+## jkb's own git runs hooks-off, after auditing the repository's config (D52.11)
+
+Recorded in `docs/task-lifecycle.md` (D52); noted here because it is the same seam this doc's
+scrub lives in. Every git call `gitrepo.rs` makes goes through one spawn (`git_in`) and now passes
+`-c core.hooksPath=/dev/null -c core.fsmonitor=false`, and before the first call in a directory
+`audit_repo_config` refuses a repository whose **own** config (local, worktree, included files)
+sets a key outside an allowlist of repository-shape keys — the dev container can write those files,
+and the host's git runs what they name. The `post-merge` hook this installer places is unaffected:
+it is your `git pull`'s hook, not jkb's, and it runs landed code.

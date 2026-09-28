@@ -287,3 +287,140 @@ mod high_water_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod reviews_migration_tests {
+    use super::embedded;
+    use refinery::Target;
+    use rusqlite::Connection;
+
+    /// V023 moves the land gate's review facts out of tags (design D52.7). Migrated in two steps, like
+    /// the V011 test beside it, so the tags exist in the shapes a real store holds before V023 runs:
+    /// several rounds with one head, a head with no round, a waiver, and an unrelated tag to leave.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one migration scenario, seeded and read back top to bottom
+    fn v023_moves_review_facets_into_reviews_and_leaves_other_tags() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(22))
+            .run(&mut conn)
+            .unwrap();
+        for (id, uid, priority) in [
+            (1, "task:a", None),
+            (2, "task:b", None),
+            (3, "task:c", None),
+            (4, "task:backlog", Some(2)),
+            (5, "task:f-old", Some(1)),
+            (6, "task:f-new", Some(3)),
+        ] {
+            conn.execute(
+                "INSERT INTO items (id, uid, kind, priority) VALUES (?1, ?2, 'task', ?3)",
+                rusqlite::params![id, uid, priority],
+            )
+            .unwrap();
+        }
+        // Each round's findings: the older round's is a must-fix.
+        for (ns_id, path, item) in [
+            (101, "codereviews/20260820-1/must-fix", 5),
+            (102, "codereviews/20260821-2/nit", 6),
+        ] {
+            conn.execute(
+                "INSERT INTO namespaces (id, path, kind) VALUES (?1, ?2, 'logical')",
+                rusqlite::params![ns_id, path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO placements (item_id, namespace_id, role) VALUES (?1, ?2, 'home')",
+                rusqlite::params![item, ns_id],
+            )
+            .unwrap();
+        }
+        for (item, facet, value) in [
+            (1, "review", "codereviews/20260821-2"),
+            (1, "review", "codereviews/20260820-1"),
+            (1, "reviewed", "51c459a"),
+            (1, "repo", "jkb"),
+            (2, "reviewed", "abc"),
+            (3, "review-waived", "def"),
+            // A backlog finding's trail back to the review that found it: no `reviewed=` beside
+            // it, so it records no review — and it stays, as the ordinary tag it always was.
+            (4, "review", "codereviews/20260821-2"),
+        ] {
+            conn.execute(
+                "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, ?2, ?3)",
+                rusqlite::params![item, facet, value],
+            )
+            .unwrap();
+        }
+        embedded::migrations::runner().run(&mut conn).unwrap();
+
+        let rows: Vec<(i64, String, Option<String>, String)> = conn
+            .prepare("SELECT item_id, kind, ns, sha FROM reviews ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let s = |v: &str| v.to_owned();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    s("recorded"),
+                    Some(s("codereviews/20260820-1")),
+                    s("51c459a")
+                ),
+                (
+                    1,
+                    s("recorded"),
+                    Some(s("codereviews/20260821-2")),
+                    s("51c459a")
+                ),
+                (2, s("recorded"), None, s("abc")),
+                (3, s("waived"), None, s("def")),
+            ],
+            "rounds in name (date) order, a bare head kept, the waiver kept"
+        );
+        let left: Vec<String> = conn
+            .prepare("SELECT facet FROM tag_applications ORDER BY facet")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            left,
+            vec!["repo".to_owned(), "review".to_owned()],
+            "only the migrated review facets go; the backlog trail stays"
+        );
+        let trail: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM tag_applications WHERE item_id = 4 AND facet = 'review'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trail, 1);
+
+        let rounds: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT r.ns, coalesce(sum(f.must_fix), 0) FROM review_rounds r
+                 LEFT JOIN review_round_findings f ON f.round_id = r.id
+                 GROUP BY r.id ORDER BY r.id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rounds,
+            vec![
+                (s("codereviews/20260820-1"), 1),
+                (s("codereviews/20260821-2"), 0)
+            ],
+            "every migrated round snapshotted, in filing order, with its must-fix count"
+        );
+    }
+}

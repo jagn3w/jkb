@@ -362,12 +362,164 @@ pub fn resolve_gate(
     }
 }
 
-/// Build the gate invocation for `dir`.
+/// Where a landing's gate runs (design D52.12, hole H6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatePlace {
+    /// In this process's own environment.
+    Here,
+    /// In the dev container, through `docker exec`.
+    Container {
+        /// The `docker` binary.
+        docker: PathBuf,
+        /// The container.
+        name: String,
+        /// The landing checkout, as the container sees it.
+        dir: PathBuf,
+    },
+}
+
+/// The container `jkb-dev`'s `run.sh` starts, overridable the same way (`JKB_CONTAINER_NAME`).
+pub const CONTAINER_NAME: &str = "jkb-dev";
+
+/// Where the dev container sees the host's `~/repos` — the bind `container.json` declares.
+pub const CONTAINER_REPOS: &str = "/home/vscode/repos";
+
+/// Whether this process is inside the dev container: remote mode, or Docker's marker file.
+fn in_container() -> bool {
+    crate::remote::target().is_some() || Path::new("/.dockerenv").exists()
+}
+
+/// `docker`, from `PATH` or where Docker Desktop and Homebrew install it — launchd's default `PATH`
+/// holds none of those (measured, 2026-09-25), and a land started from VS Code or a service must not
+/// be refused for that.
+fn find_docker() -> Option<PathBuf> {
+    let on_path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join("docker"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let known = [
+        home.map(|h| h.join(".docker/bin/docker")),
+        Some(PathBuf::from("/usr/local/bin/docker")),
+        Some(PathBuf::from("/opt/homebrew/bin/docker")),
+    ];
+    on_path
+        .chain(known.into_iter().flatten())
+        .find(|p| p.is_file())
+}
+
+/// Where the gate for a landing in `dir` must run.
+///
+/// **The gate builds and tests the candidate** — code written in the dev container that the operator
+/// has not yet accepted — so on the host it runs in the container, when the repository is one the
+/// container shares (`~/repos`). A repository outside it cannot have been written from the container,
+/// and runs here; so does every gate inside the container itself. `on_host` is the operator's
+/// override, recorded by the caller.
+///
+/// Decided on **canonical** paths, and on the repository as well as the checkout: git reports a
+/// checkout by its physical path, so with `~/repos` a symlink (which `run.sh` supports) a textual
+/// prefix test never matched and every gate ran here, silently. And a landing checkout outside
+/// `~/repos` of a repository inside it still lands code written in the container — which the
+/// container cannot see there, so that is refused rather than run here.
+///
+/// # Errors
+/// Refuses when the gate must run in the container and cannot: no `docker`, the container is not
+/// running, or the landing checkout is not one it can see.
+pub fn gate_place(dir: &Path, on_host: bool) -> Result<GatePlace> {
+    let name = std::env::var("JKB_CONTAINER_NAME").unwrap_or_else(|_| CONTAINER_NAME.to_owned());
+    let repo = crate::gitrepo::main_root(dir).ok().flatten();
+    gate_place_with(
+        dir,
+        repo.as_deref(),
+        on_host,
+        in_container(),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        find_docker,
+        &name,
+        |docker, name| {
+            std::process::Command::new(docker)
+                .args(["inspect", "-f", "{{.State.Running}}", name])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+        },
+    )
+}
+
+/// [`gate_place`] with its environment handed in, so every branch is testable where there is no
+/// container to ask.
+#[allow(clippy::too_many_arguments)]
+fn gate_place_with(
+    dir: &Path,
+    repo: Option<&Path>,
+    on_host: bool,
+    in_container: bool,
+    home: Option<&Path>,
+    docker: impl FnOnce() -> Option<PathBuf>,
+    name: &str,
+    running: impl FnOnce(&Path, &str) -> bool,
+) -> Result<GatePlace> {
+    if on_host || in_container {
+        return Ok(GatePlace::Here);
+    }
+    let Some(home) = home else {
+        return Ok(GatePlace::Here);
+    };
+    let shared = canonical(&home.join(jkb_daemon::CLIENT_FILE_ROOT));
+    let refuse = |why: &str| {
+        anyhow::anyhow!(
+            "the gate runs the candidate's own code, which was written in the dev container, so it \
+             runs there (design D52.12) — but {why}. Start it (.container/run.sh), or land with \
+             --gate-on-host to run it here, recorded on the task."
+        )
+    };
+    let dir = canonical(dir);
+    let Ok(rel) = dir.strip_prefix(&shared) else {
+        if repo.is_some_and(|r| canonical(r).starts_with(&shared)) {
+            return Err(refuse(&format!(
+                "this landing checkout ({}) is outside {}, where the container cannot see it",
+                dir.display(),
+                shared.display()
+            )));
+        }
+        return Ok(GatePlace::Here);
+    };
+    let docker = docker().ok_or_else(|| refuse("`docker` is not installed here"))?;
+    if !running(&docker, name) {
+        return Err(refuse(&format!("the container `{name}` is not running")));
+    }
+    Ok(GatePlace::Container {
+        docker,
+        name: name.to_owned(),
+        dir: Path::new(CONTAINER_REPOS).join(rel),
+    })
+}
+
+/// Build the gate invocation for `dir`, where `place` says it runs.
 ///
 /// Separate from [`run_gate`] so the scrubbing below is pinned at THIS call site.
-fn gate_cmd(dir: &Path, cmd: &str) -> std::process::Command {
-    let mut command = std::process::Command::new("sh");
-    command.arg("-c").arg(cmd).current_dir(dir);
+fn gate_cmd(dir: &Path, cmd: &str, place: &GatePlace) -> std::process::Command {
+    let mut command = match place {
+        GatePlace::Here => {
+            let mut c = std::process::Command::new("sh");
+            c.arg("-c").arg(cmd).current_dir(dir);
+            c
+        }
+        GatePlace::Container {
+            docker,
+            name,
+            dir: inside,
+        } => {
+            let mut c = std::process::Command::new(docker);
+            c.arg("exec")
+                .arg("-w")
+                .arg(inside)
+                .arg(name)
+                .args(["sh", "-c", cmd]);
+            c
+        }
+    };
     // The gate must judge the directory it was handed. An inherited `GIT_DIR` outranks the cwd
     // for every git call the gate makes, so a leaked one has it verifying a different checkout
     // and reporting that as this session's verdict.
@@ -375,14 +527,19 @@ fn gate_cmd(dir: &Path, cmd: &str) -> std::process::Command {
     command
 }
 
-/// Run `cmd` in `dir` through the user's shell. Returns whether it passed, and its combined
-/// output when `capture` — which `--json` needs, since a build streaming to stdout would
-/// otherwise be interleaved into the JSON document.
+/// Run `cmd` in `dir` through the user's shell, where `place` says. Returns whether it passed, and
+/// its combined output when `capture` — which `--json` needs, since a build streaming to stdout
+/// would otherwise be interleaved into the JSON document.
 ///
 /// # Errors
 /// Returns an error if the shell cannot be executed at all.
-pub fn run_gate(dir: &Path, cmd: &str, capture: bool) -> Result<(bool, Option<String>)> {
-    let mut command = gate_cmd(dir, cmd);
+pub fn run_gate(
+    dir: &Path,
+    cmd: &str,
+    place: &GatePlace,
+    capture: bool,
+) -> Result<(bool, Option<String>)> {
+    let mut command = gate_cmd(dir, cmd, place);
     if capture {
         let out = command
             .output()
@@ -407,11 +564,165 @@ mod tests {
     fn the_gate_spawn_does_not_inherit_a_repository_selection() {
         crate::gitrepo::assert_scrubbed(
             "gate",
-            &super::gate_cmd(std::path::Path::new("/somewhere"), "true"),
+            &super::gate_cmd(
+                std::path::Path::new("/somewhere"),
+                "true",
+                &super::GatePlace::Here,
+            ),
+            &[],
+        );
+        crate::gitrepo::assert_scrubbed(
+            "gate",
+            &super::gate_cmd(
+                std::path::Path::new("/somewhere"),
+                "true",
+                &super::GatePlace::Container {
+                    docker: "docker".into(),
+                    name: "jkb-dev".into(),
+                    dir: "/home/vscode/repos/x".into(),
+                },
+            ),
             &[],
         );
     }
     use super::{branch_for, mint_name, name_from_branch};
+
+    #[test]
+    fn a_gate_runs_in_the_container_for_a_checkout_it_shares_and_refuses_without_one() {
+        use super::{gate_place_with, GatePlace};
+        use std::path::{Path, PathBuf};
+        let home = Path::new("/Users/op");
+        let shared = Path::new("/Users/op/repos/jkb/.jkb/land");
+        let docker = || Some(PathBuf::from("/usr/local/bin/docker"));
+        let up = |_: &Path, _: &str| true;
+        assert_eq!(
+            gate_place_with(
+                shared,
+                None,
+                false,
+                false,
+                Some(home),
+                docker,
+                "jkb-dev",
+                up
+            )
+            .unwrap(),
+            GatePlace::Container {
+                docker: "/usr/local/bin/docker".into(),
+                name: "jkb-dev".into(),
+                dir: "/home/vscode/repos/jkb/.jkb/land".into(),
+            },
+            "seen through the ~/repos bind"
+        );
+        let here = |dir, on_host, inside| {
+            gate_place_with(
+                dir,
+                None,
+                on_host,
+                inside,
+                Some(home),
+                docker,
+                "jkb-dev",
+                up,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            here(Path::new("/Users/op/other/r"), false, false),
+            GatePlace::Here,
+            "not shared"
+        );
+        assert_eq!(here(shared, true, false), GatePlace::Here, "--gate-on-host");
+        assert_eq!(
+            here(shared, false, true),
+            GatePlace::Here,
+            "already inside the container"
+        );
+        let down = gate_place_with(
+            shared,
+            None,
+            false,
+            false,
+            Some(home),
+            docker,
+            "jkb-dev",
+            |_, _| false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            down.contains("`jkb-dev` is not running") && down.contains("--gate-on-host"),
+            "{down}"
+        );
+        let none = gate_place_with(
+            shared,
+            None,
+            false,
+            false,
+            Some(home),
+            || None,
+            "jkb-dev",
+            up,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(none.contains("`docker` is not installed"), "{none}");
+    }
+
+    /// `~/repos` a symlink, as `run.sh` supports: git reports the physical path, and the gate still
+    /// runs in the container. A checkout of a shared repository that the container cannot see is
+    /// refused, never run here.
+    #[test]
+    fn a_gate_is_placed_by_canonical_paths_and_refused_where_the_container_cannot_see() {
+        use super::{gate_place_with, GatePlace};
+        use std::path::{Path, PathBuf};
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let real = t.path().join("Volumes/Code/repos");
+        std::fs::create_dir_all(real.join("jkb/.jkb/land")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, home.join("repos")).unwrap();
+        let docker = || Some(PathBuf::from("/usr/local/bin/docker"));
+        let up = |_: &Path, _: &str| true;
+        let physical = real.join("jkb/.jkb/land");
+        assert_eq!(
+            gate_place_with(
+                &physical,
+                None,
+                false,
+                false,
+                Some(&home),
+                docker,
+                "jkb-dev",
+                up
+            )
+            .unwrap(),
+            GatePlace::Container {
+                docker: "/usr/local/bin/docker".into(),
+                name: "jkb-dev".into(),
+                dir: "/home/vscode/repos/jkb/.jkb/land".into(),
+            }
+        );
+        let outside = t.path().join("elsewhere/land");
+        std::fs::create_dir_all(&outside).unwrap();
+        let e = gate_place_with(
+            &outside,
+            Some(&real.join("jkb")),
+            false,
+            false,
+            Some(&home),
+            docker,
+            "jkb-dev",
+            up,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("cannot see it") && e.contains("--gate-on-host"),
+            "{e}"
+        );
+    }
 
     #[test]
     fn a_session_name_is_the_task_made_readable() {

@@ -35,6 +35,8 @@ pub mod nstype;
 pub mod placement;
 pub mod query;
 pub mod removal;
+pub mod reviews;
+pub mod roles;
 pub mod sql;
 pub mod sync_state;
 pub mod tag;
@@ -42,6 +44,7 @@ pub mod task;
 pub mod transition;
 pub mod undo;
 pub mod view;
+pub mod workflow;
 
 pub use error::{Error, Result};
 pub use migrate::{

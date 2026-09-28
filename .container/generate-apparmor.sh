@@ -66,10 +66,32 @@ tpl = m.group(1)
 # start the container, which is the safe direction and is why this is not made conditional here.
 # DaemonProfile is dockerd's own label from /proc/self/attr/current, defaulting to "unconfined";
 # it appears only as a signal peer, so a daemon running confined would need this regenerated.
+# UPSTREAM QUOTES THESE ITSELF NOW, and that is why a raw value is wrong rather than merely
+# unquoted. The template used to carry the quotes literally (`profile "{{.Name}}"`,
+# `peer="{{.DaemonProfile}}"`); it now carries none, and profileData exposes Name, PeerName and
+# DaemonProfile as METHODS that quote. Handing a raw value to the new template yields an unquoted
+# profile name and unquoted peers -- a profile that still loads. These mirror quoteProfileName and
+# quotePeerName; the escape set is upstream's, taken from the AppArmor parser's own lexer.
+NAME = "jkb-dev"
+DAEMON_PROFILE = "unconfined"
+
+def quote_profile_name(s):          # moby: quoteProfileName
+    return '"' + s.replace('"', '\\"') + '"' if s else ""
+
+def quote_peer_name(s):             # moby: quotePeerName
+    if not s:
+        return ""
+    return '"' + "".join(("\\" + c if c in '\\"*?[]{}^,' else c) for c in s) + '"'
+
 DATA = {
     "Abi": "abi/3.0",
-    "Name": "jkb-dev",
-    "DaemonProfile": "unconfined",
+    "Name": quote_profile_name(NAME),
+    "PeerName": quote_peer_name(NAME),
+    # The unconfined SELECTOR is deliberately NOT quoted, and upstream returns it verbatim for
+    # exactly that reason: `peer="unconfined"` names a profile literally called unconfined instead
+    # of selecting the unconfined one. Our vendored profile carried the quoted form until this.
+    "DaemonProfile": DAEMON_PROFILE if DAEMON_PROFILE == "unconfined"
+                     else quote_peer_name(DAEMON_PROFILE),
     "Imports": ["#include <tunables/global>"],
     "InnerImports": ["#include <abstractions/base>"],
 }
@@ -189,7 +211,7 @@ if "{{" in profile or "}}" in profile:
 for required in (f"abi <{DATA['Abi']}>,",
                  DATA["Imports"][0],
                  "  " + DATA["InnerImports"][0],
-                 f'profile "{DATA["Name"]}" flags=(attach_disconnected,mediate_deleted) {{'):
+                 f'profile {DATA["Name"]} flags=(attach_disconnected,mediate_deleted) {{'):
     if required not in profile.splitlines():
         sys.exit(f"the rendered profile is missing an action-produced line: {required!r} — the "
                  f"renderer dropped a branch, and `missing` cannot see it because it skips every "
@@ -198,7 +220,7 @@ missing = [ln for ln in tpl.splitlines()
            if "{{" not in ln and ln.strip() and ln != DENY_MOUNT and ln not in profile.splitlines()]
 if missing:
     sys.exit("the renderer dropped upstream lines:\n  " + "\n  ".join(missing))
-if f'profile "{DATA["Name"]}"' not in profile:
+if f'profile {DATA["Name"]}' not in profile:
     sys.exit("rendered profile does not declare the expected profile name")
 if not profile.rstrip().endswith("}"):
     sys.exit("rendered profile does not end with a closing brace")
@@ -276,12 +298,13 @@ GOOD = """{{if .Abi}}abi <{{.Abi}}>,
 {{$value}}
 {{- end}}
 
-profile "{{.Name}}" flags=(attach_disconnected,mediate_deleted) {
+profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
 {{- range $value := .InnerImports}}
   {{$value}}
 {{- end}}
   umount,
-  signal (receive) peer="{{.DaemonProfile}}",
+  signal (receive) peer={{.DaemonProfile}},
+  signal (send,receive) peer={{.PeerName}},
   deny @{PROC}/sysrq-trigger rwklx,
 
   deny mount,

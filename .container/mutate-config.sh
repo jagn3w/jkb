@@ -187,8 +187,14 @@ open(p, 'w').write(s)
 PY
 run "the generator's syscall list stops parsing" "no longer yields"
 
-seed; jq_dc 'del(.mounts[] | select(test("/home/vscode/.jkb")))'
-run "the knowledge-base mount is dropped" "declared mount set is missing"
+seed; jq_dc 'del(.mounts[] | select(test("/home/vscode/.jkb/")))'
+run "the narrowed ~/.jkb mounts are dropped" "declared mount set is missing"
+
+seed; jq_dc '.mounts += ["source=${localEnv:HOME}/.jkb,target=/home/vscode/.jkb-whole,type=bind"]'
+run "the whole host ~/.jkb is bound again (D52.8)" "the whole ~/.jkb: the operator's database and root token"
+
+seed; jq_dc '.mounts |= map(sub(",readonly$"; ""))'
+run "the container credential is bound writable" "the container credential mount is not read-only"
 
 # EVERY KEY IN container.json IS APPLIED BY SOMETHING. This replaced four mutations about
 # workspaceFolder and initializeCommand, which were Dev Containers' rules and are gone with it —
@@ -213,13 +219,13 @@ run "run.sh stops naming the keys it applies" "cannot tell an applied key from a
 # least could not have.
 seed; for f in "$work"/t/.container/*.sh; do
     case "$(basename "$f")" in
-        init-firewall.sh|check-config.sh|mutate-config.sh) continue ;;
+        init-firewall.sh|pin-jkb-hook.sh|check-config.sh|mutate-config.sh) continue ;;
     esac
-    # Every mention removed, so nothing looks like a caller any more.
+    # Every mention removed, so nothing looks like a caller any more — of either guarded script.
     python3 - "$f" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("init-firewall.sh", "some-other-script.sh"))
+open(p, 'w').write(s.replace("init-firewall.sh", "some-other-script.sh").replace("pin-jkb-hook.sh", "yet-another-script.sh"))
 PYX
 done
 run "no script reaches the firewall-argument guard" "the derivation below is checking nothing"
@@ -604,6 +610,36 @@ open(p, 'w').write(s.replace('takes no arguments', 'ignores extra arguments'))
 PYX
 run "the egress probe stops refusing arguments" "egress-status.sh no longer refuses arguments"
 
+# THE THIRD ROOT GRANT (D52.9), and what makes it matter: the managed hooks run the binary it pins.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('/usr/local/bin/pin-jkb-hook.sh ""', '/usr/local/bin/pin-jkb-hook.sh', 1))
+PYX
+run "the hook-pinning sudoers grant stops pinning its argument" "pin-jkb-hook.sh no longer pins it to no arguments"
+
+# The caller half of that grant: `""` is an argument, and sudo refuses one here.
+seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('sudo -n /usr/local/bin/pin-jkb-hook.sh\n', 'sudo -n /usr/local/bin/pin-jkb-hook.sh ""\n', 1))
+PYX
+run "setup passes an argument to the hook-pinning script" "passes an argument to init-firewall.sh or pin-jkb-hook.sh"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"/usr/local/lib/jkb-hook/jkb workflow next --stop-hook"', '"jkb workflow next --stop-hook"', 1))
+PYX
+run "a managed hook runs jkb found on PATH" "does not run /usr/local/lib/jkb-hook/jkb"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"hooks": {', '"hooks_moved": {', 1))
+PYX
+run "the managed hooks cannot be read" "no hook commands could be read"
+
 # The two self-test lists (D51.9): drop one from each side in turn.
 seed; python3 - "$work/t/scripts/check.sh" <<'PYX'
 import sys
@@ -632,11 +668,17 @@ PYX
 run "both lists drop the same self-test" "self-test that no gate runs"
 
 # The second sudoers grant is read-only by argument, so the allowed SET is what verify.sh pins.
+# ANCHORED ON THE LABEL, because the EXPECTATION is the thing under test and is meant to move. This
+# named the expectation in full and went NO-OP the moment D52's hook pin grew verify.sh's list and
+# mutate-verify.sh shortened its expect to the stable prefix -- the guard against stale expectations,
+# itself stale, failing the gate while pointing at a file that was fine.
 seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
-import sys
+import re, sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('"may run more than the firewall and the egress probe as root"',
-                             '"may run more than the firewall as root"', 1))
+out = re.sub(r'(run "blanket passwordless root is restored" ")[^"]*(")',
+             r'\g<1>a sudoers sentence verify.sh never prints\g<2>', s, count=1)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
 PYX
 run "a harness expectation drifts from verify.sh" "expects text verify.sh never prints"
 
@@ -977,7 +1019,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=92
+PINNED_BAD_SITES=96
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

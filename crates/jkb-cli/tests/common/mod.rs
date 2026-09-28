@@ -185,7 +185,13 @@ pub fn assert_isolated(what: &str, cmd: &Command) {
 /// own database, or refuse the command outright — and a fixture's `notify hook` must not post to a real
 /// daemon. A `jkb` fixture drops these; a bare `git` one has no reason to.
 #[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
-pub const REMOTE_MUST_DROP: &[&str] = &["JKB_REMOTE", "JKB_REMOTE_TOKEN_FILE"];
+pub const REMOTE_MUST_DROP: &[&str] = &[
+    "JKB_REMOTE",
+    "JKB_REMOTE_TOKEN_FILE",
+    // A role token or harness ticket sends the command to a daemon as that principal (D52.3).
+    "JKB_AGENT_TOKEN",
+    "JKB_ATTEST",
+];
 
 /// Drop [`REMOTE_MUST_DROP`] from a command that runs the `jkb` binary.
 #[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
@@ -199,7 +205,16 @@ pub fn isolate_remote_env(cmd: &mut Command) {
 /// spelled out here as the oracle rather than read from [`REMOTE_MUST_DROP`].
 #[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
 pub fn assert_jkb_isolated(what: &str, cmd: &Command) {
-    assert_isolated_dropping(what, cmd, &["JKB_REMOTE", "JKB_REMOTE_TOKEN_FILE"]);
+    assert_isolated_dropping(
+        what,
+        cmd,
+        &[
+            "JKB_REMOTE",
+            "JKB_REMOTE_TOKEN_FILE",
+            "JKB_AGENT_TOKEN",
+            "JKB_ATTEST",
+        ],
+    );
 }
 
 fn assert_isolated_dropping(what: &str, cmd: &Command, also: &[&str]) {

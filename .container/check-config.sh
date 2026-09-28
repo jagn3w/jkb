@@ -239,7 +239,7 @@ fi
 # An empty or truncated result would make verify.sh's boundary assertion meaningless.
 mount_targets="$(dc_mount_targets "$here/container.json")"
 missing_mounts=()
-for m in /home/vscode/repos /home/vscode/.jkb; do
+for m in /home/vscode/repos /home/vscode/.jkb/claude-memory /home/vscode/.jkb/logs /home/vscode/.jkb-container; do
     grep -qx "$m" <<<"$mount_targets" || missing_mounts+=("$m")
 done
 if [ ${#missing_mounts[@]} -eq 0 ]; then
@@ -297,7 +297,11 @@ done <<<"$mount_targets"
 while IFS= read -r src; do
     [ -n "$src" ] || continue
     case "$src" in
-        '${localEnv:HOME}/repos'|'${localEnv:HOME}/.jkb') ;;
+        '${localEnv:HOME}/repos'|'${localEnv:HOME}/.jkb/claude-memory'|'${localEnv:HOME}/.jkb/logs'|'${localEnv:HOME}/.jkb-container') ;;
+        # The whole of ~/.jkb carries the operator's database, its backups and the daemon's root
+        # token: anything in the container could read the token that makes it the operator (D52.8).
+        '${localEnv:HOME}/.jkb'|'${localEnv:HOME}/.jkb/') forbidden+=("host source $src (the whole ~/.jkb: the operator's database and root token, D52.8)") ;;
+        '${localEnv:HOME}/.jkb/'*) forbidden+=("host source $src (only claude-memory and logs of ~/.jkb are reviewed, D52.8)") ;;
         *) forbidden+=("host source $src (not on the reviewed bind allowlist)") ;;
     esac
 done <<<"$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*$//p')"
@@ -306,9 +310,16 @@ done <<<"$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*
 # made "every declared mount is acceptable" pass with the host's ~/.ssh bound in — a guard that
 # fails OPEN. Excluding volumes instead means an unrecognised type is reviewed, not waved through.
 bind_sources="$(dc_mount_sources "$here/container.json" | sed -n '/|volume$/!s/|[^|]*$//p' | grep -c .)"
-if [ "$bind_sources" -lt 2 ]; then
-    bad "only $bind_sources host bind source(s) parsed — the workspace and ~/.jkb are both binds, so the review below saw less than the config declares"
+if [ "$bind_sources" -lt 4 ]; then
+    bad "only $bind_sources host bind source(s) parsed — the workspace, ~/.jkb's claude-memory and logs, and the container credential are all binds, so the review below saw less than the config declares"
 fi
+# THE CREDENTIAL IS READ-ONLY (D52.3). A writable bind would let anything in the container replace the
+# credential the host's hooks and clients read — with a token it minted for itself, say.
+cred_spec="$(dc_mount_specs "$here/container.json" | grep -F 'target=/home/vscode/.jkb-container' || true)"
+case ",$cred_spec," in
+    *,readonly,*|*,ro,*) ok "the container credential is bound read-only" ;;
+    *) bad "the container credential mount is not read-only: ${cred_spec:-(missing)}" ;;
+esac
 if [ ${#forbidden[@]} -eq 0 ]; then
     ok "every declared mount is acceptable (no posture directory, no docker socket, binds from the reviewed set)"
 else
@@ -398,6 +409,24 @@ if grep -qE 'egress-status\.sh ""' "$here/Dockerfile" 2>/dev/null; then
     ok "sudoers grants egress-status.sh with no arguments permitted"
 else
     bad "the sudoers entry for egress-status.sh no longer pins it to no arguments — a command naming no argument accepts every argument, and this one runs as root"
+fi
+# THE THIRD GRANT, THE SAME RULE (D52.9): pin-jkb-hook.sh installs the binary the harness hooks run
+# outside the sandbox, so it takes no argument — its source is fixed in the script.
+if grep -qE 'pin-jkb-hook\.sh ""' "$here/Dockerfile" 2>/dev/null; then
+    ok "sudoers grants pin-jkb-hook.sh with no arguments permitted"
+else
+    bad "the sudoers entry for pin-jkb-hook.sh no longer pins it to no arguments — it installs, as root, the binary the harness hooks run"
+fi
+# Every managed hook names the pinned binary absolutely. A bare `jkb` is found on PATH, and
+# ~/.cargo/bin is on PATH and writable from inside the sandbox — so the hooks, which run outside it
+# with the container credential readable, ran whatever a tool call last put there.
+hook_cmds="$(jq -r '.hooks[][].hooks[].command' "$here/managed-settings.json" 2>/dev/null)"
+if [ -z "$hook_cmds" ]; then
+    bad "no hook commands could be read from managed-settings.json — the check that they run the pinned binary examined nothing"
+elif grep -qv '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds"; then
+    bad "a managed hook does not run /usr/local/lib/jkb-hook/jkb — one found on PATH is replaceable from the sandbox: $(grep -m1 -v '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds")"
+else
+    ok "every managed hook runs the pinned, root-owned jkb"
 fi
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers
 # base ships /etc/sudoers.d/vscode = `NOPASSWD:ALL`, under which the agent can flush the firewall,
@@ -966,9 +995,9 @@ callers_ok=1
 callers=()
 for f in "$here"/*.sh; do
     case "$(basename "$f")" in
-        init-firewall.sh|check-config.sh|mutate-config.sh) continue ;;  # the script itself, and the two harnesses that quote it
+        init-firewall.sh|pin-jkb-hook.sh|check-config.sh|mutate-config.sh) continue ;;  # the scripts themselves, and the two harnesses that quote them
     esac
-    grep -qF 'init-firewall.sh' "$f" && callers+=("$f")
+    grep -qE 'init-firewall\.sh|pin-jkb-hook\.sh' "$f" && callers+=("$f")
 done
 [ "${#callers[@]}" -gt 0 ] || bad "no script here calls init-firewall.sh — the derivation below is checking nothing"
 for want in setup.sh run.sh entrypoint.sh; do
@@ -988,8 +1017,10 @@ for caller in ${callers[@]+"${callers[@]}"}; do
     # comments are stripped first, because a comment can mention sudoers too. A caller running it
     # as root without sudo would slip past, and that is deliberate: nothing here is root, and the
     # rule this guard enforces is a property of the sudoers grant.
-    if dc_strip_comments "$caller" | grep -nE 'sudo[^#]*init-firewall\.sh[[:space:]]+[^;|&>#[:space:]]' >/dev/null; then
-        bad "$(basename "$caller") passes an argument to init-firewall.sh — sudoers permits none, and the allowlist is the root-owned snapshot"
+    # The same rule for every sudoers grant pinned to no arguments (`cmd ""`): pin-jkb-hook.sh was
+    # first called with `""`, which is an argument, so sudo would refuse it and setup would stop.
+    if dc_strip_comments "$caller" | grep -nE 'sudo[^#]*(init-firewall|pin-jkb-hook)\.sh[[:space:]]+[^;|&>#[:space:]]' >/dev/null; then
+        bad "$(basename "$caller") passes an argument to init-firewall.sh or pin-jkb-hook.sh — sudoers permits none to either, so sudo refuses the call"
         callers_ok=0
     fi
 done

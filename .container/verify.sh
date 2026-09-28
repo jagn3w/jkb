@@ -1134,6 +1134,24 @@ for t in ${DECLARED_EXTRA[@]+"${DECLARED_EXTRA[@]}"}; do
         bad "--declare $t is not inside any host BIND $DC declares — only a mount nested in a declared bind may be named here (a named volume reaches no host filesystem, so nothing under one is reviewable this way)"
     fi
 done
+# THE GENERATED READ-ONLY GIT BINDS (design D52.11). run.sh binds every repository's .git/config and
+# .git/hooks read-only over the ~/repos bind; container.json cannot list repositories, so they are
+# declared here, by shape — and ONLY read-only: a writable bind at the same path is exactly what H5
+# is, so it stays undeclared and fails the boundary check below.
+git_ro_binds=0; git_rw_binds=()
+while IFS=' ' read -r _ _ _ _ mp opts _; do
+    case "$mp" in
+        /home/vscode/repos/*/.git/config|/home/vscode/repos/*/.git/hooks) ;;
+        *) continue ;;
+    esac
+    case ",$opts," in
+        *,ro,*) EXPECTED="$(printf '%s\n%s\n' "$EXPECTED" "$mp" | sort -u)"; git_ro_binds=$((git_ro_binds+1)) ;;
+        *) git_rw_binds+=("$mp") ;;
+    esac
+done <<<"$mountinfo"
+if [ ${#git_rw_binds[@]} -gt 0 ]; then
+    bad "a repository's git config or hooks is bound WRITABLE: ${git_rw_binds[*]} — the host's git runs what those name (D52.11)"
+fi
 if [ "$mounts_readable" != yes ]; then
     bad "could not read /proc/self/mountinfo — the mount boundary was not checked, which is not the same as finding it clean"
 elif [ -z "$EXPECTED" ]; then
@@ -1191,7 +1209,8 @@ if [ -z "$root_installed" ]; then
     unwritable_ok=0
 fi
 for path in /usr/local /usr/local/bin /usr/local/share \
-            /usr/local/share/jkb-egress-allowlist.json /etc/sudoers.d $root_installed; do
+            /usr/local/share/jkb-egress-allowlist.json /etc/sudoers.d $root_installed \
+            /usr/local/lib /usr/local/lib/jkb-hook /usr/local/lib/jkb-hook/jkb; do
     # A path that does not exist yet (the snapshot, before the first raise) cannot be replaced
     # either, so absence is fine; what must never be true is that it exists AND is writable.
     if [ -e "$path" ] && [ -w "$path" ]; then
@@ -1200,6 +1219,14 @@ for path in /usr/local /usr/local/bin /usr/local/share \
     fi
 done
 [ "$unwritable_ok" -eq 1 ] && ok "the root-owned firewall and its allowlist cannot be replaced from here"
+# The binary the managed hooks run (D52.9) is there once setup has pinned it — absent, every hook
+# fails and every `jkb` a tool call makes goes unattested and refused.
+# JKB_SETUP_MARKER is lib.sh's, sourced above with `|| true`: unset, this would skip in silence.
+if [ -z "${JKB_SETUP_MARKER:-}" ]; then
+    bad "lib.sh did not load, so whether the harness hooks' binary is pinned cannot be checked"
+elif [ -f "$JKB_SETUP_MARKER" ] && [ ! -x /usr/local/lib/jkb-hook/jkb ]; then
+    bad "setup finished but /usr/local/lib/jkb-hook/jkb is missing — the harness hooks have nothing to run (run: sudo -n /usr/local/bin/pin-jkb-hook.sh)"
+fi
 
 #     `sudo -n -l` failing and `sudo -n -l` listing nothing are different facts, and collapsing
 #     them reported the friendliest one: sudo missing, PAM broken or sudoers unparseable all
@@ -1218,15 +1245,17 @@ if [ "$sudo_rc" -ne 0 ] && [ -z "$sudo_entries" ]; then
 elif [ -z "$sudo_entries" ]; then
     bad "sudo -n -l succeeded but listed no grants — cannot establish what this user may run as root"
 else
-# THE ALLOWED SET IS NAMED, and it is exactly two: the firewall, which raises the rules, and the
-# status probe, which reads them (D51.1). The probe is a second grant and therefore a second thing
-# to justify — it is read-only, so a grant to run it is not a grant to change the boundary, and
-# both are pinned to no arguments. Anything else at all fails here, whatever added it.
-sudo_extra="$(grep -vE '/usr/local/bin/(init-firewall|egress-status)\.sh' <<<"$sudo_entries" || true)"
+# THE ALLOWED SET IS NAMED, and it is exactly three: the firewall, which raises the rules, the
+# status probe, which reads them (D51.1), and the hook pin, which copies ~/.cargo/bin/jkb to the
+# root-owned binary the managed hooks run (D52.9). Each is a grant to justify: the probe is
+# read-only; the pin takes no input but the binary it copies, which is the one the container's own
+# `jkb` already is. All three are pinned to no arguments. Anything else at all fails here, whatever
+# added it — this list missed the pin when D52 added it, and the first rebuilt container failed here.
+sudo_extra="$(grep -vE '/usr/local/bin/(init-firewall|egress-status|pin-jkb-hook)\.sh' <<<"$sudo_entries" || true)"
 if [ -z "$sudo_extra" ]; then
-    ok "the only commands permitted as root are the firewall and the egress probe ($(grep -c . <<<"$sudo_entries") grant(s))"
+    ok "the only commands permitted as root are the firewall, the egress probe and the hook pin ($(grep -c . <<<"$sudo_entries") grant(s))"
 else
-    bad "vscode may run more than the firewall and the egress probe as root: $(tr -s ' ' <<<"$sudo_extra" | tr '\n' ';')"
+    bad "vscode may run more than the firewall, the egress probe and the hook pin as root: $(tr -s ' ' <<<"$sudo_extra" | tr '\n' ';')"
 fi
 fi
 
@@ -1464,11 +1493,29 @@ assert "$mem_repo is inside a declared mount point" "$ws_mounted"
 # happily reports `linked` for, and every write lost on the next rebuild. The boundary check above
 # cannot cover it either: `comm -23 actual EXPECTED` reports mounts that are EXTRA, never a
 # declared one that is missing.
-kb_mounted=no
+mem_mounted=no; logs_mounted=no
 while IFS= read -r m; do
-    [ "$m" = /home/vscode/.jkb ] && { kb_mounted=yes; break; }
+    [ "$m" = /home/vscode/.jkb/claude-memory ] && mem_mounted=yes
+    [ "$m" = /home/vscode/.jkb/logs ] && logs_mounted=yes
 done <<<"$actual"
-assert "knowledge base is mounted" "$kb_mounted"
+assert "auto-memory and the hook logs are mounted from the host" \
+    "$([ "$mem_mounted$logs_mounted" = yesyes ] && echo yes || echo no)"
+# ...and NOTHING ELSE of the host's ~/.jkb (D52.8): not its database, not its backups, not the
+# daemon's root token. Asked of the filesystem, so a whole-~/.jkb bind that slipped back in fails
+# here whatever the mount table is made to say.
+kb_hidden=yes; kb_seen=()
+for f in /home/vscode/.jkb/jkb.db /home/vscode/.jkb/jkb.db-wal /home/vscode/.jkb/daemon /home/vscode/.jkb/backups; do
+    [ -e "$f" ] && { kb_hidden=no; kb_seen+=("$f"); }
+done
+assert "the operator's database and root token are not in the container${kb_seen[*]:+ (found: ${kb_seen[*]})}" "$kb_hidden"
+# THE CONTAINER CREDENTIAL IS BOUND READ-ONLY (D52.3). Its content is the host's to write.
+cred_ro=no
+while IFS=' ' read -r _ _ _ _ mp opts _; do
+    [ "$mp" = /home/vscode/.jkb-container ] || continue
+    case ",$opts," in *,ro,*) cred_ro=yes ;; esac
+done <<<"$mountinfo"
+assert "the container credential is bound read-only" "$cred_ro"
+note "$git_ro_binds repository git config/hooks path(s) are bound read-only (D52.11)"
 
 # REMOTE MODE, NOT A DATABASE OF ITS OWN (tasks S6.5). The container reaches the knowledge base only
 # through jkb serve on the host. It had its own once — JKB_DB on the jkb-kb-local volume, which
@@ -1496,7 +1543,9 @@ assert "JKB_DB is not set (the container has no database of its own)" \
 #     bind is same-kernel ext4, where opening is correct and refusing would be the bug.
 # The `file:` refusal is required everywhere, because Rust refuses URIs on every filesystem.
 kb_lib="$(cd "$(dirname "$0")/.." && pwd)/scripts/lib.sh"
-kb_probe_dir="/home/vscode/.jkb/.verify-refusal-probe-$$"
+# On the logs bind: a HOST bind, which is what the shared-filesystem refusal is about. ~/.jkb itself is
+# no longer one (D52.8).
+kb_probe_dir="/home/vscode/.jkb/logs/.verify-refusal-probe-$$"
 if ! command -v jkb >/dev/null 2>&1; then
     note "no jkb installed here, so the installed-binary refusal checks did not run (setup.sh installs it)"
 else
@@ -1507,7 +1556,7 @@ else
     fi
     assert "the installed jkb refuses a file: URI database (rebuild it if not: setup.sh)" "$kb_uri_refused"
 
-    kb_magic="$(stat -f -c %t /home/vscode/.jkb 2>/dev/null || true)"
+    kb_magic="$(stat -f -c %t /home/vscode/.jkb/logs 2>/dev/null || true)"
     kb_kind="$(bash -c '. "$1" && shared_fs_kind "$2"' _ "$kb_lib" "$kb_magic" 2>/dev/null || true)"
     if [ -n "$kb_kind" ]; then
         kb_refused=no
@@ -1518,7 +1567,7 @@ else
         fi
         assert "the installed jkb refuses a database on the $kb_kind host bind (rebuild it if not: setup.sh)" "$kb_refused"
     else
-        note "the ~/.jkb bind is not a shared filesystem here (magic ${kb_magic:-unreadable}), so there is nothing for jkb to refuse on it"
+        note "the ~/.jkb/logs bind is not a shared filesystem here (magic ${kb_magic:-unreadable}), so there is nothing for jkb to refuse on it"
     fi
     # ...and the installed jkb is in remote mode: it refuses to name a database at all. Asked without
     # the daemon, which this check must not need (mutate-verify.sh's containers have none).
@@ -1650,8 +1699,9 @@ esac
 # whole path a client takes, not just the port. `--noproxy '*'`: this runs outside the nested
 # sandbox, and a proxy variable in the environment would test the proxy instead of the rule.
 # The header goes through a file descriptor so the token is never in this process's argv.
-# Keyed by the daemon's port (`~/.jkb/daemon/<port>/token`), which is how a client finds it.
-daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb/daemon/${daemon_at##*:}/token}"
+# The container's own credential (D52.8), on its read-only bind — no longer the host daemon's token
+# under ~/.jkb, which the container does not see.
+daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb-container/credential}"
 # NO TOKEN IS A FAILURE since the cutover (tasks S6.5): every jkb command in here goes to the daemon,
 # so a container that cannot authenticate to it has no knowledge base at all. The one exception is
 # a harness that builds a correct container with no host daemon behind it — mutate-verify.sh's
@@ -1663,7 +1713,7 @@ daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb/daemon/${daemon_at##*:}/token}
 if [ ! -e "$daemon_token" ] && [ "${JKB_VERIFY_NO_DAEMON:-0}" = 1 ]; then
     note "there is no daemon token at $daemon_token and JKB_VERIFY_NO_DAEMON=1 says no host daemon is expected, so jkb serve was not asked"
 elif [ ! -e "$daemon_token" ]; then
-    bad "there is no daemon token at $daemon_token, so no jkb command in this container can reach the knowledge base — run ./scripts/setup.sh on the host to install com.jkb.serve"
+    bad "there is no container credential at $daemon_token, so no jkb command in this container can reach the knowledge base — run ./scripts/setup.sh on the host (it installs com.jkb.serve and writes the credential)"
 elif [ ! -r "$daemon_token" ]; then
     bad "the daemon token at $daemon_token exists but this user cannot read it, so remote mode could not authenticate to jkb serve on the host ($(stat -c '%U:%G %a' "$daemon_token" 2>/dev/null || echo 'owner unreadable'))"
 else
@@ -1672,7 +1722,7 @@ else
         "http://$daemon_at/v1/hello" 2>/dev/null)" || daemon_hello=""
     case "$daemon_hello" in
         *'"protocol"'*)
-            ok "jkb serve on the host answers this container, authenticated by the token on the ~/.jkb bind"
+            ok "jkb serve on the host answers this container, authenticated by the container credential"
             # ...and the INSTALLED jkb gets there too. curl proves the path, not the binary: one built
             # before `JKB_REMOTE` accepted bare host:port reads the address as a URL scheme and fails
             # every command, while the `--db` refusal above passes on it. A read no database is needed

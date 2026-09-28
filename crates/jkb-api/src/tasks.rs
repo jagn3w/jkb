@@ -367,13 +367,16 @@ pub struct Added {
 ///
 /// # Errors
 /// A malformed line or ref, an `#onto=` tag, a home the rules cannot settle, `--sync` with no tasks
-/// mount, [`ErrorCode::Forbidden`] for a binding outside `roots`, or a failed write.
+/// mount, [`ErrorCode::Forbidden`] for a binding outside `roots` or — for a caller held to the task
+/// `scope` — a namespace that task is not placed in ([`crate::rbac::check_destination`]), or a failed
+/// write.
 pub fn add(
     conn: &Connection,
     meta: &jkb_core::WriteMeta,
     ask: &AddAsk,
     server_home: Option<&Path>,
     roots: Option<&FileRoots>,
+    scope: Option<ItemId>,
 ) -> Result<Added, AddFailure> {
     let invalid = |why: String| ApiError::with_code(ErrorCode::Invalid, why);
     check_len("a task line", &ask.text, MAX_CONTENT_BYTES)?;
@@ -443,7 +446,7 @@ pub fn add(
             let pid = task::resolve_ref(conn, reference)?
                 .ok_or_else(|| AddFailure::Refused(no_item(reference)))?;
             if !explicit {
-                if let Some(home) = item::primary_namespace(conn, pid)? {
+                if let Some(home) = home_beside(conn, pid, scope)? {
                     spec.home = home;
                     explicit = true;
                 }
@@ -456,6 +459,13 @@ pub fn add(
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
     if let Some(also) = &ask.also {
         spec.mirrors.push(jkb_core::ns::normalize(also)?);
+    }
+    // Judged on where it will actually go, after `--home`, `+ns`, `--also` and the parent's home
+    // have all had their say.
+    if let Some(scope) = scope {
+        for ns in std::iter::once(&spec.home).chain(&spec.mirrors) {
+            crate::rbac::check_destination(conn, scope, ns)?;
+        }
     }
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
 
@@ -480,6 +490,23 @@ pub fn add(
         home: spec.home,
         binding: synced,
     })
+}
+
+/// Where a subtask of `parent` lives by default: beside it — unless that is inside a review round and
+/// the caller is held to one task, which may not write there; its own task's home is then the nearest
+/// place it may.
+fn home_beside(
+    conn: &Connection,
+    parent: ItemId,
+    scope: Option<ItemId>,
+) -> Result<Option<String>, ApiError> {
+    let beside = item::primary_namespace(conn, parent)?;
+    if let (Some(scope), Some(home)) = (scope, beside.as_deref()) {
+        if jkb_core::reviews::review_namespace_containing(conn, home)?.is_some() {
+            return Ok(item::primary_namespace(conn, scope)?.or(beside));
+        }
+    }
+    Ok(beside)
 }
 
 /// `task.add`'s homing, for a task with no explicit placement: the ambient repo's backlog with
@@ -711,8 +738,8 @@ pub fn undepend(
 /// `task.place`: place a task under `ns` as a reference mirror, or as its primary home.
 ///
 /// # Errors
-/// A malformed namespace, [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`] under `roots`, or a
-/// failed write.
+/// A malformed namespace, [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`] under `roots` or — for a
+/// caller held to the task `scope` — a namespace that task is not placed in, or a failed write.
 pub fn place(
     conn: &Connection,
     meta: &jkb_core::WriteMeta,
@@ -720,8 +747,14 @@ pub fn place(
     namespace: &str,
     home: bool,
     roots: Option<&FileRoots>,
+    scope: Option<ItemId>,
 ) -> Result<(), ApiError> {
     let id = writable(conn, reference, roots)?;
+    // Held here, on the scope the caller has once admitted — which for an attested subagent's first
+    // write is the task that write just bound it to, a scope `authorize` does not yet see.
+    if let Some(scope) = scope {
+        crate::rbac::check_destination(conn, scope, namespace)?;
+    }
     let ns_id = ns::ensure(conn, namespace)?;
     if home {
         task::set_primary_home(conn, meta, id, ns_id, 0)?;

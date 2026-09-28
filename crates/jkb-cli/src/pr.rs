@@ -287,6 +287,9 @@ fn gh_cmd(dir: &Path, args: &[&str]) -> Command {
 /// authentication, and adding an HTTP client plus a token story to `jkb-cli` for one query is a
 /// dependency and a secret this tool does not otherwise need.
 fn gh(dir: &Path, args: &[&str]) -> Result<String, String> {
+    // `gh` resolves the repository through git, which reads the same repository config a planted
+    // program could be named in (D52.11).
+    crate::gitrepo::audit_repo_config(dir).map_err(|e| format!("{e:#}"))?;
     let out = gh_cmd(dir, args).output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "`gh` is not installed, so a pull request cannot be checked from here — \

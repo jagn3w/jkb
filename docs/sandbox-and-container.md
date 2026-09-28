@@ -1063,3 +1063,13 @@ the guarantees while the steps survived, and each defect is one guarantee that t
   never arrived while `install-extensions.sh` said "rebuild the container" — advice just followed.
   The staleness check's own argument (`docker start` reuses what the container was built with)
   applies to the image and was applied only to the arguments.
+
+## Roles in the container: the credential, the narrowed mounts, and attestation (D52)
+
+Recorded where the code lives — `docs/task-lifecycle.md` (D52) for roles, grants and harness
+attestation, and `.container/README.md` for the mounts and managed settings. The boundary facts
+this doc cares about, in one place: the container no longer holds the daemon's root token or the
+knowledge base (only `~/.jkb/{claude-memory,logs}` and a read-only coordinator credential are
+bound); every repository's `.git/config` and `.git/hooks` are bound read-only, because the host's
+git runs what they name; and the attestation hook runs **outside** the sandbox by design — it is
+the harness vouching for which agent made a tool call, and it is the only reader of the credential.

@@ -26,6 +26,13 @@ pub struct StagingTask {
     pub status: String,
     /// Every facet value it carries, by facet.
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Its review record — what the land gate reads (D52.7). Absent from an older daemon: fails
+    /// closed, as never reviewed.
+    #[serde(
+        default,
+        skip_serializing_if = "jkb_core::reviews::ReviewState::is_empty"
+    )]
+    pub review: jkb_core::reviews::ReviewState,
     /// Where its work lands, from its transition history.
     pub land_target: String,
     /// Whether any subtask is unfinished.
@@ -71,6 +78,7 @@ pub fn staging(
     let ids: Vec<_> = targeted.iter().map(|(id, _, _)| *id).collect();
     let metas = item::get_many(conn, &ids)?;
     let mut tags = tag::applications_for(conn, &ids)?;
+    let mut reviews = jkb_core::reviews::state_for(conn, &ids)?;
     let mut out = Vec::new();
     for (id, land_target, status) in targeted {
         let Some(meta) = metas.get(&id) else { continue };
@@ -83,6 +91,7 @@ pub fn staging(
             title: item::title_of(meta),
             status,
             tags: grouped,
+            review: reviews.remove(&id).unwrap_or_default(),
             land_target,
             open_subtasks: !task::subtasks_all_terminal(conn, id)?,
         };

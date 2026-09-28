@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
+use super::rbac_cli::RoleCmd;
 use super::{Cli, Command, CommandsCmd, NsCmd, TaskCmd};
 
 /// How a command behaves with `JKB_REMOTE` set.
@@ -34,15 +35,23 @@ const NOT_YET: &str = "not ported to the daemon yet; run it on the host";
 
 /// Whether `command` may run in remote mode. Exhaustive on purpose — see the module doc.
 #[must_use]
+#[allow(clippy::too_many_lines)] // a flat table: one arm per command, no wildcard, by design
 pub const fn support(command: &Command) -> Support {
     match command {
-        Command::Notify { .. } | Command::Guide | Command::Commands { .. } => Support::NoDatabase,
+        Command::Notify { .. }
+        | Command::Guide
+        | Command::Commands { .. }
+        | Command::Attest { .. } => Support::NoDatabase,
         Command::Serve { .. } => {
             Support::Refused("the daemon runs on the host, next to the database")
         }
         Command::Mount { .. }
         | Command::Sync { .. }
         | Command::Service { .. }
+        // Writes the credential to this host's own filesystem.
+        | Command::Role {
+            cmd: RoleCmd::RotateContainer { .. },
+        }
         // It embeds with the host's model (tasks F5).
         | Command::Index { .. }
         // A repair and a copy of the database change the host (design-s6-4.md I); the report does not.
@@ -64,6 +73,9 @@ pub const fn support(command: &Command) -> Support {
         // The queue, and the agent read set (tasks S6.1). `ops_cli::handles` names the same reads for
         // dispatch; `the_ported_reads_are_the_ones_ops_cli_handles` holds the two together.
         Command::Mq { .. }
+        // Roles and workflows are ops; the daemon enforces who may run which.
+        | Command::Role { .. }
+        | Command::Workflow { .. }
         | Command::Query { .. }
         | Command::Search { .. }
         | Command::Find { .. }
@@ -219,6 +231,86 @@ pub fn token_file(url: &str) -> PathBuf {
         .unwrap_or_else(|| super::service::serve_token_path(port_of(url)))
 }
 
+/// The variable the attestation hook sets on a tool call's command: that call's ticket (D52.9).
+pub const ATTEST_VAR: &str = "JKB_ATTEST";
+
+/// The variable a role grant's holder sets: its token (`jkb role grant`).
+pub const AGENT_TOKEN_VAR: &str = "JKB_AGENT_TOKEN";
+
+/// The dev container's credential, where it is on this machine.
+#[must_use]
+pub fn container_credential() -> PathBuf {
+    home().join(jkb_daemon::CONTAINER_CREDENTIAL)
+}
+
+/// The scoped token this process was given, if any: a harness ticket before a role token.
+#[must_use]
+pub fn scoped_token() -> Option<String> {
+    [ATTEST_VAR, AGENT_TOKEN_VAR]
+        .iter()
+        .find_map(|v| std::env::var(v).ok())
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+}
+
+/// Who a client is, which decides the credential it presents (D52.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// A `jkb` command — run by a person or by a model's tool call. Its ticket or role token if it was
+    /// given one; else the container credential if it can read it (a person at a container terminal
+    /// can; the model's sandboxed tools cannot); else the daemon's token file.
+    Command,
+    /// A hook the Claude Code harness runs, outside the sandbox: the container credential if there is
+    /// one, else the token file. Never an inherited ticket: a hook is the harness, not a tool call.
+    Hook,
+    /// `jkb mcp`: one long-lived process serving every agent of a session, so it must not hold the
+    /// container's ceiling on their behalf. Only a role token the operator configured, else the token
+    /// file — which exists only on the host.
+    Mcp,
+}
+
+/// The one place a client of `jkb serve` is built, and so the one place that chooses what it
+/// authenticates as — the rule every call site would otherwise have to remember.
+///
+/// # Errors
+/// An [`jkb_api::ApiError`] if the HTTP client cannot be built.
+pub fn client(
+    url: &str,
+    purpose: Purpose,
+) -> Result<jkb_daemon::client::RemoteBackend, jkb_api::ApiError> {
+    let backend = jkb_daemon::client::RemoteBackend::new(url, token_file(url))?;
+    // A token file named outright is a deliberate choice, and outranks the credential found by
+    // default.
+    let named_file = std::env::var_os("JKB_REMOTE_TOKEN_FILE").is_some_and(|v| !v.is_empty());
+    let container = || {
+        if named_file {
+            return None;
+        }
+        std::fs::read_to_string(container_credential())
+            .ok()
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+    };
+    let chosen = match purpose {
+        Purpose::Command => scoped_token().or_else(container),
+        Purpose::Hook => container(),
+        Purpose::Mcp => scoped_token(),
+    };
+    let backend = match chosen {
+        Some(t) => backend.with_token(t),
+        None => backend,
+    };
+    // A hook holds up the tool call or the turn that fired it, so every hook client gets the hooks'
+    // deadlines and the shared down marker here — not at each hook, where the attestation hook once
+    // went without them and a busy daemon stalled every Bash call for its whole timeout.
+    Ok(match purpose {
+        Purpose::Hook => backend
+            .with_deadlines(crate::notify::CONNECT, crate::notify::TOTAL)?
+            .with_down_marker(down_marker(url)),
+        Purpose::Command | Purpose::Mcp => backend,
+    })
+}
+
 /// The port a client of `url` connects to (`http://host:port[/…]`) — and so the port its token and
 /// down marker are keyed by. A URL naming none gets its **scheme's** default, 80 or 443, because that
 /// is where the HTTP client connects: defaulting to serve's port sent the real daemon's token to
@@ -306,10 +398,19 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                 CommandsCmd::Uninstall => super::commands::uninstall(),
                 CommandsCmd::List => super::commands::list(),
             },
+            Command::Attest { cmd } => {
+                super::rbac_cli::attest(&cmd);
+                Ok(())
+            }
             _ => bail!("internal: a NoDatabase command with no remote dispatch"),
         },
         Support::Ported => {
-            let backend = match jkb_daemon::client::RemoteBackend::new(remote, token_file(remote)) {
+            let purpose = if matches!(cli.command, Command::Mcp) {
+                Purpose::Mcp
+            } else {
+                Purpose::Command
+            };
+            let backend = match client(remote, purpose) {
                 Ok(backend) => backend.with_down_marker(down_marker(remote)),
                 Err(e) => {
                     let err = super::mq_cli::refused(e.code, e.message);
@@ -322,6 +423,8 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
             };
             match cli.command {
                 Command::Mq { cmd } => super::mq_cli::run(&backend, cmd, cli.json),
+                Command::Role { cmd } => super::rbac_cli::role(&backend, cmd, cli.json),
+                Command::Workflow { cmd } => super::rbac_cli::workflow(&backend, cmd, cli.json),
                 Command::Mcp => jkb_mcp::run_stdio(jkb_mcp::Tools {
                     backend: std::sync::Arc::new(backend),
                 }),

@@ -361,6 +361,43 @@ fn raw_http_is_held_to_the_same_rules() {
     assert_eq!(r.status(), 400);
 }
 
+/// An oversized body is read to its end — to a bound — before the 413 is answered. Answering first
+/// closed a socket with the upload unread, and the reset that sends can make the client's kernel drop
+/// the 413 unread: `raw_http_is_held_to_the_same_rules` failed that way on macOS under load.
+#[test]
+fn an_oversized_body_is_drained_before_the_refusal() {
+    use std::io::{Read as _, Write as _};
+    let f = Fixture::new();
+    let token = std::fs::read_to_string(&f.token).unwrap();
+    let addr = f.base.trim_start_matches("http://").to_owned();
+    let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+    let len = 2 * jkb_daemon::MAX_BODY_BYTES;
+    write!(
+        sock,
+        "POST /v1/op HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\ncontent-length: {len}\r\n\r\n",
+        token.trim()
+    )
+    .unwrap();
+    let most = len * 3 / 4;
+    sock.write_all(&vec![b'x'; most]).unwrap();
+    // Past the limit, but the body is not all here: no answer yet.
+    sock.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut early = [0u8; 1];
+    let premature = sock.read(&mut early);
+    assert!(
+        premature.is_err(),
+        "the refusal went out with the upload unread: {premature:?}"
+    );
+    sock.write_all(&vec![b'x'; len - most]).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut head = [0u8; 12];
+    sock.read_exact(&mut head).unwrap();
+    assert_eq!(&head, b"HTTP/1.1 413", "{}", String::from_utf8_lossy(&head));
+}
+
 #[test]
 fn a_database_migrated_past_this_build_is_refused() {
     let f = Fixture::new();
@@ -1085,4 +1122,129 @@ fn an_unread_answer_holds_its_permit_until_the_write_deadline() {
         }
     }
     drop(stalled);
+}
+
+/// Roles over the wire (design D52.3): a role token and a harness ticket reach the daemon as the
+/// bearer, are served as the principal they name and held to its role, and a token that names
+/// nothing is refused before the body is read. The root token stays the operator.
+#[test]
+fn a_role_token_and_a_ticket_are_served_as_their_principal_over_http() {
+    let f = Fixture::new();
+    let op = f.client();
+    let call = |b: &RemoteBackend, r: serde_json::Value| {
+        b.call(serde_json::from_value(r).expect("request parses"))
+    };
+    let Response::Added { added } =
+        call(&op, json!({ "op": "task.add", "text": "the work" })).unwrap()
+    else {
+        panic!("added")
+    };
+    let uid = added.uid;
+    let Response::Granted { token, .. } = call(
+        &op,
+        json!({ "op": "role.grant", "role": "reviewer", "task": uid, "agent": "rev" }),
+    )
+    .unwrap() else {
+        panic!("granted")
+    };
+    let reviewer = f.client().with_token(token.clone());
+    let Response::WhoAmI { whoami } = call(&reviewer, json!({ "op": "role.whoami" })).unwrap()
+    else {
+        panic!("whoami")
+    };
+    assert_eq!(whoami.roles, vec!["reviewer"]);
+    let e = call(
+        &reviewer,
+        json!({ "op": "task.edit", "uid": uid, "text": "x", "append": true }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+
+    // A token naming nothing is unauthorized — and not retried, having nothing fresher to try.
+    let nobody = f.client().with_token("0".repeat(64));
+    assert_eq!(
+        call(&nobody, json!({ "op": "kb.ls" })).unwrap_err().code,
+        ErrorCode::Unauthorized
+    );
+
+    // The container credential mints a ticket; the ticket authenticates; released, it does not.
+    let Response::Granted {
+        token: container, ..
+    } = call(&op, json!({ "op": "role.rotate_container" })).unwrap()
+    else {
+        panic!("rotated")
+    };
+    let hook = f.client().with_token(container);
+    let Response::Ticket { token: ticket } = call(
+        &hook,
+        json!({ "op": "attest.mint", "session": "s", "tool_use_id": "t1" }),
+    )
+    .unwrap() else {
+        panic!("ticket")
+    };
+    let main = f.client().with_token(ticket.clone());
+    call(&main, json!({ "op": "kb.ls" })).expect("a live ticket authenticates");
+    call(
+        &hook,
+        json!({ "op": "attest.release", "session": "s", "tool_use_id": "t1" }),
+    )
+    .unwrap();
+    assert_eq!(
+        call(&main, json!({ "op": "kb.ls" })).unwrap_err().code,
+        ErrorCode::Unauthorized
+    );
+
+    // A revoked grant is refused on its very next request, cache or no cache.
+    let Response::Grants { listing } = call(&op, json!({ "op": "role.list" })).unwrap() else {
+        panic!("listed")
+    };
+    let rev_id = listing.grants.iter().find(|g| g.agent == "rev").unwrap().id;
+    call(&op, json!({ "op": "role.revoke", "id": rev_id })).unwrap();
+    assert_eq!(
+        call(&reviewer, json!({ "op": "kb.ls" })).unwrap_err().code,
+        ErrorCode::Unauthorized
+    );
+}
+
+/// A grant revoked behind the daemon's back — by the host CLI, straight into the database — is still
+/// in the daemon's cache. Its next request is refused, and the connection with it, so the holder
+/// cannot keep a slot open past the read timeout on a token that no longer names anything.
+#[test]
+fn a_grant_revoked_behind_the_cache_is_refused_and_its_connection_closed() {
+    let f = Fixture::new();
+    let op = f.client();
+    let Response::Granted { token, grant } = op
+        .call(
+            serde_json::from_value(
+                json!({ "op": "role.grant", "role": "coordinator", "agent": "c" }),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    let http = reqwest::blocking::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let ls = || {
+        http.post(format!("{}/v1/op", f.base))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body(json!({ "op": "kb.ls" }).to_string())
+            .send()
+            .unwrap()
+    };
+    assert_eq!(ls().status(), 200, "admitted, and now in the cache");
+    let id = grant.id;
+    f.db.write_txn("host-cli", move |c, m| jkb_core::roles::revoke(c, m, id))
+        .unwrap();
+    let r = ls();
+    assert_eq!(r.status(), 401);
+    assert_eq!(
+        r.headers().get("connection").map(|v| v.to_str().unwrap()),
+        Some("close"),
+        "refused like any unauthenticated request, not served on a kept-alive connection"
+    );
 }

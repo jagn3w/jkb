@@ -98,6 +98,11 @@ pub fn perform(
     {
         apply_effects(conn, meta, task, effects)?;
         record(conn, meta, task, event, Some(*from), *to, facts, labels)?;
+        // A landing parks the workflow in this transaction: one left behind at `landable` never
+        // parked, and a landed task was landed again (review round 4).
+        if *to == TaskStatus::Done && matches!(event, TaskEvent::Land | TaskEvent::ObservedLanded) {
+            crate::workflow::store::follow_landing(conn, meta, task)?;
+        }
     }
     Ok(outcome)
 }
@@ -397,6 +402,37 @@ pub fn record_undo(
 /// Returns a database error if the history cannot be read.
 pub fn resumed(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
     Ok(resumption(&history(conn, task)?).cloned())
+}
+
+/// The landing that speaks for `task`'s work now: the newer of its live graft — a `land` or
+/// `observed_landed` with a destination, as [`landing`] counts one — and the `observed_landed` that
+/// closed it when its pull request merged (`task close-merged`: a `pr_number`, no destination), so
+/// long as nothing has put it back to work since. One reader of "which landing speaks now", not
+/// two: a held graft row, still live, hid a later PR merge when they were read apart (review
+/// round 11).
+///
+/// # Errors
+/// Returns a database error if the history cannot be read.
+pub fn current_landing(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
+    use jkb_fsm::Event as _;
+    let rows = history(conn, task)?;
+    let grafts = [TaskEvent::Land.name(), TaskEvent::ObservedLanded.name()];
+    let graft = rows
+        .iter()
+        .rev()
+        .find(|r| grafts.contains(&r.event.as_str()) && r.labels.onto.is_some());
+    let merged = rows.iter().rev().find(|r| {
+        r.event == TaskEvent::ObservedLanded.name()
+            && r.to_status == TaskStatus::Done.as_str()
+            && r.labels.pr_number.is_some()
+    });
+    let back = resumption(&rows).map(|r| r.id);
+    Ok([graft, merged]
+        .into_iter()
+        .flatten()
+        .filter(|r| back.is_none_or(|b| r.id > b))
+        .max_by_key(|r| r.id)
+        .cloned())
 }
 
 /// [`resumed`] over rows already in hand, so a caller needing both reads the history once.

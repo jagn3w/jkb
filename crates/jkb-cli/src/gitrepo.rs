@@ -32,11 +32,897 @@ const DEFAULT_TRUNKS: &[&str] = &["main", "master", "trunk", "develop"];
 /// configuration and are deliberately left alone: this project's own dev container uses them
 /// to carry `safe.directory` grants, and stripping those makes git refuse the checkout
 /// outright.
+///
+/// **No hooks and no fsmonitor, ever** (design D52.11). A repository's own `.git/config` and
+/// `.git/hooks` are writable from the dev container, and git runs whatever they name; jkb's plumbing
+/// needs neither, and its only graft already ran hooks-off for its own reasons. What `-c` cannot
+/// neutralize — a planted filter, textconv or pager — [`audit_repo_config`] refuses before every
+/// call.
+///
+/// **And never into a submodule.** Recursing runs git inside the submodule under the submodule's own
+/// config, which the audit does not judge (measured on git 2.51.1: a superproject `git status` ran a
+/// clean filter planted in `.git/modules/sub/config`; with `diff.ignoreSubmodules=dirty` it did not,
+/// and still reported a moved submodule commit). So jkb's git reads a submodule only as a commit its
+/// superproject records — nothing about a submodule's own work tree reaches jkb's answers.
 fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut all: Vec<&str> = NEUTRALIZERS.to_vec();
+    let (options, sub_and_rest) = args.split_at(subcommand_at(args));
+    all.extend_from_slice(options);
+    if let Some((sub, rest)) = sub_and_rest.split_first() {
+        all.push(sub);
+        // On the command line as well as in `-c`: a tracked `.gitmodules` can set
+        // `submodule.<name>.ignore=none`, which outranks `diff.ignoreSubmodules` — measured on git
+        // 2.51.1, it put `status` back into the submodule, and the planted filter ran. The option is
+        // the one thing a file in the repository cannot override.
+        if matches!(*sub, "status" | "diff") {
+            all.push("--ignore-submodules=dirty");
+        }
+        // And `checkout`/`switch` report local changes after moving, which enters every populated
+        // submodule — `.gitmodules` `ignore=none` beats the `-c`, and a branch can bring a submodule
+        // whose name only the TARGET tree's `.gitmodules` knows (measured on git 2.51.1: the planted
+        // filter ran on `checkout --detach`, not on `checkout --quiet --detach`). `--quiet` skips that
+        // report; errors still print.
+        if matches!(*sub, "checkout" | "switch") {
+            all.push("--quiet");
+        }
+        all.extend_from_slice(rest);
+    }
+    git_in(dir, &all)
+}
+
+/// The git subcommands jkb's own git may run: each measured, on git 2.51.1 against a submodule whose
+/// config holds a planted filter and whose `.gitmodules` says `ignore = none`, not to enter it under
+/// [`git_cmd`]'s settings. `add -A`, `stash`, `cherry-pick` and `diff-index` did enter it, so a
+/// subcommand is added here only with a measurement of its own — refused at runtime, in
+/// [`checked`], rather than left to every caller to remember.
+const SAFE_SUBCOMMANDS: &[&str] = &[
+    "rev-parse",
+    "symbolic-ref",
+    "config",
+    "worktree",
+    "for-each-ref",
+    "branch",
+    "status",
+    "diff",
+    "ls-files",
+    "rev-list",
+    "switch",
+    "checkout",
+    "merge",
+    "rebase",
+    "reset",
+];
+
+/// Where the subcommand is in `args`: past any leading `-c <key>=<value>` pairs, the one global
+/// option a caller passes.
+fn subcommand_at(args: &[&str]) -> usize {
+    let mut i = 0;
+    while args.get(i) == Some(&"-c") {
+        i += 2;
+    }
+    i.min(args.len())
+}
+
+/// Refuse a subcommand outside [`SAFE_SUBCOMMANDS`], then audit `dir` — what every jkb git call asks
+/// before it runs.
+fn checked(dir: &Path, args: &[&str]) -> Result<()> {
+    let sub = args.get(subcommand_at(args)).copied().unwrap_or_default();
+    anyhow::ensure!(
+        SAFE_SUBCOMMANDS.contains(&sub),
+        "jkb's git does not run `git {sub}`: it is not among the subcommands measured not to enter a \
+         submodule (design D52.11)"
+    );
+    audit_repo_config(dir)
+}
+
+/// The `-c` settings every jkb git call runs with ([`git_cmd`]).
+const NEUTRALIZERS: &[&str] = &[
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "diff.ignoreSubmodules=dirty",
+    "-c",
+    "submodule.recurse=false",
+    "-c",
+    "fetch.recurseSubmodules=false",
+    "-c",
+    "push.recurseSubmodules=no",
+];
+
+/// The **one** production `git` spawn in this module: `git -C <dir> <args>`, repository selection
+/// scrubbed. [`git_cmd`] adds the neutralizers to it; [`audit_repo_config`] reads config through it.
+fn git_in(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
     scrub_repo_selection(&mut cmd);
     cmd
+}
+
+/// Whether `key` (as git lists it: section and name lower-cased, a subsection verbatim) may appear in
+/// a repository's own config — the **repository-shape** keys: where it fetches, what its branches
+/// track, how it is laid out, who commits. An allowlist, not a denylist, because git keeps growing
+/// keys that run programs (`core.fsmonitor`, `core.sshCommand`, `core.pager`, `*.textconv`, `filter.*`,
+/// `merge.*.driver`, `credential.*`, `gpg.program`, `alias.*`, `pager.*`, `submodule.*.update`,
+/// `include.*`) and a denylist fails open on the next one.
+pub(crate) fn config_key_allowed(key: &str) -> bool {
+    let (section, rest) = key.split_once('.').unwrap_or((key, ""));
+    let name = rest.rsplit('.').next().unwrap_or(rest);
+    let has_sub = rest.contains('.');
+    match section {
+        "core" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "repositoryformatversion"
+                        | "filemode"
+                        | "bare"
+                        | "logallrefupdates"
+                        | "ignorecase"
+                        | "precomposeunicode"
+                        | "symlinks"
+                        | "autocrlf"
+                        | "eol"
+                        | "safecrlf"
+                        | "abbrev"
+                        | "quotepath"
+                        | "sparsecheckout"
+                        | "sparsecheckoutcone"
+                        | "commitgraph"
+                        | "splitindex"
+                        | "untrackedcache"
+                        | "multipackindex"
+                )
+        }
+        "remote" => {
+            has_sub
+                && matches!(
+                    name,
+                    "url"
+                        | "fetch"
+                        | "pushurl"
+                        | "push"
+                        | "tagopt"
+                        | "prune"
+                        | "mirror"
+                        | "promisor"
+                        | "partialclonefilter"
+                )
+        }
+        "branch" => {
+            has_sub
+                && matches!(
+                    name,
+                    "remote" | "merge" | "rebase" | "pushremote" | "description"
+                        // VS Code's Git extension records a branch's merge base here.
+                        | "vscode-merge-base"
+                )
+        }
+        "submodule" => has_sub && matches!(name, "url" | "active" | "branch"),
+        "extensions" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "objectformat" | "refstorage" | "relativeworktrees" | "preciousobjects"
+                )
+        }
+        "worktree" => !has_sub && name == "userelativepaths",
+        // Scalar preferences with no program in them, key by key: a whole section admitted
+        // `status.showUntrackedFiles=no`, which silences the dirty check a landing asks before it
+        // writes a tree. `core.worktree` is gone for the same reason — it points checkout at any
+        // directory, `$HOME` included (measured on git 2.51.1); jkb's worktrees are `.git` files.
+        "user" => !has_sub && matches!(name, "name" | "email" | "signingkey" | "useconfigonly"),
+        "init" => !has_sub && name == "defaultbranch",
+        "pull" => !has_sub && matches!(name, "rebase" | "ff"),
+        "push" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "default" | "autosetupremote" | "followtags" | "recursesubmodules"
+                )
+        }
+        "fetch" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "prune" | "prunetags" | "writecommitgraph" | "recursesubmodules" | "parallel"
+                )
+        }
+        "gc" => {
+            !has_sub
+                && matches!(
+                    name,
+                    "auto" | "autodetach" | "autopacklimit" | "reflogexpire" | "writecommitgraph"
+                )
+        }
+        "rerere" => !has_sub && matches!(name, "enabled" | "autoupdate"),
+        "log" => !has_sub && matches!(name, "date" | "decorate" | "follow" | "showsignature"),
+        "commit" => !has_sub && matches!(name, "gpgsign" | "verbose" | "cleanup"),
+        "tag" => !has_sub && matches!(name, "gpgsign" | "sort"),
+        "index" => !has_sub && matches!(name, "version" | "threads" | "skiphash"),
+        "pack" => !has_sub && matches!(name, "threads" | "writebitmaps"),
+        "maintenance" => !has_sub && matches!(name, "auto" | "strategy"),
+        // Display only: no key in either names a program or changes what a command reports.
+        "advice" => !has_sub,
+        "color" => true,
+        "merge" | "diff" => {
+            !has_sub && matches!(name, "conflictstyle" | "ff" | "renames" | "algorithm")
+        }
+        _ => false,
+    }
+}
+
+/// Refuse to run git in `dir` when its repository could make git run a program there (design D52.11,
+/// hole H5): its **own** config — local, worktree, a file those include, or a submodule's — sets a key
+/// outside [`config_key_allowed`], or its git directory takes its config and hooks from somewhere that
+/// is not its repository ([`check_layout`]). Those files are writable from the dev container, so on
+/// the host they are a way for anything in the container to run code as the operator.
+///
+/// Asked with `git config --list --show-origin --show-scope` and `git rev-parse`, which read config and
+/// execute nothing (measured on git 2.51.1 against a planted fsmonitor, hooks path, include, pager and
+/// filter). The operator's own scopes (`system`, `global`) and `command` (the environment's, e.g. the
+/// container's `safe.directory` grants) are theirs, not the repository's, and are not judged — nor is
+/// an `unknown` one outside the repository ([`judged_scope`]).
+///
+/// **Asked fresh before every git call.** It was once per directory per process, and the reap service
+/// is one long process: a config it passed on its first pass was never read again, so a filter planted
+/// afterwards ran on the next `git status` it made (measured on git 2.51.1). Two spawns per call is the
+/// price of the answer being about now.
+///
+/// # Errors
+/// The refusal, naming the key or file and how to remove it; or git not running at all.
+pub(crate) fn audit_repo_config(dir: &Path) -> Result<()> {
+    check_repo_config(dir)
+}
+
+/// [`audit_repo_config`]'s check — also what the reap service's scan asks of every repository
+/// (`git_audit`), so the two cannot come to disagree.
+///
+/// # Errors
+/// As [`audit_repo_config`].
+pub(crate) fn check_repo_config(dir: &Path) -> Result<()> {
+    let out = git_in(
+        dir,
+        &["config", "--list", "--show-origin", "--show-scope", "-z"],
+    )
+    .output()
+    .with_context(|| format!("reading {}'s git config", dir.display()))?;
+    // Outside any repository `config --list` still lists the operator's own scopes and succeeds; a
+    // failure is a config git cannot parse, which is no more trustworthy than a planted one.
+    anyhow::ensure!(
+        out.status.success(),
+        "git could not read the config for {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let layout = check_layout(dir)?;
+    let git_dir = layout.as_ref().map(|(git_dir, _)| git_dir.clone());
+    let repo = layout.and_then(|(_, common)| common.parent().map(Path::to_path_buf));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut fields = text.split('\0');
+    while let (Some(scope), Some(origin), Some(entry)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        let file = origin.strip_prefix("file:").unwrap_or(origin);
+        if !judged_scope(scope, file, repo.as_deref()) {
+            continue;
+        }
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        // git writes a submodule's own `core.worktree`, pointing back at its checkout; jkb run inside
+        // a submodule reads it as local config. Anywhere else it points checkout at any directory.
+        if key == "core.worktree"
+            && git_dir
+                .as_deref()
+                .is_some_and(|g| submodule_worktree(g, value))
+        {
+            continue;
+        }
+        refuse_key(dir, key, file, scope)?;
+    }
+    Ok(())
+}
+
+/// Whether a config entry `git config --list --show-scope` reports at `scope`, from `file`, is the
+/// repository's to answer for. `local` and `worktree` are — a file the repository's config includes is
+/// listed at the scope that included it. `system`, `global`, `command` and none are the operator's.
+/// `unknown` is judged only when its file lies in the repository (`repo`, its top level; none when
+/// git finds no readable repository, and then it is not judged): Apple's git
+/// reads an extra, Xcode-owned layer — `/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig`,
+/// setting `credential.helper=osxkeychain` — and lists it as `unknown` (measured on git 2.50.1, Apple
+/// Git-155), which refused every repository on a Mac until this.
+fn judged_scope(scope: &str, file: &str, repo: Option<&Path>) -> bool {
+    match scope {
+        "system" | "global" | "command" | "" => false,
+        "unknown" => {
+            let file = fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
+            // No repository — outside one, or one git cannot read — has no config of its own.
+            repo.is_some_and(|repo| file.starts_with(repo))
+        }
+        _ => true,
+    }
+}
+
+fn refuse_key(dir: &Path, key: &str, file: &str, scope: &str) -> Result<()> {
+    if config_key_allowed(key) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to run git in {}: its repository config sets `{key}` ({file}, {scope} scope), \
+         which is not on jkb's list of repository-shape keys and can make git run a program. That \
+         file is writable from the dev container (design D52.11). If you did not put it there, \
+         remove it on the host: git config --file {file} --unset-all {key}",
+        dir.display()
+    )
+}
+
+/// Refuse a git directory that takes its config and hooks from somewhere other than its repository,
+/// returning it and the common directory it does use (`None` outside any repository).
+///
+/// A `commondir` file in a git directory redirects git's config, hooks and refs to whatever it names,
+/// and `.git/` is writable from the dev container around its read-only `config` and `hooks` binds
+/// (measured on git 2.51.1: a planted `.git/commondir` made `rev-parse --git-common-dir` answer the
+/// planted directory, whose config and hooks git then used). jkb's own git is judged on the config it
+/// actually reads either way; this is for **your** git in the same directory, which runs the hooks
+/// there — so jkb stops, and says so, rather than going on as if nothing were wrong.
+///
+/// A main repository's git directory is its own common directory. A linked worktree's is
+/// `<common>/worktrees/<name>`, and a jkb session's common directory is its repository's `.git` —
+/// asked of the session worktree itself, not of a submodule checked out inside it, whose git
+/// directory is its own.
+fn check_layout(dir: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+    let out = git_in(
+        dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .output()
+    .with_context(|| format!("locating {}'s git directory", dir.display()))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        return Ok(None);
+    };
+    let real = |p: &str| fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+    let (git_dir, common) = (real(git_dir), real(common));
+    let redirected = |from: &Path, to: &Path| -> anyhow::Error {
+        anyhow::anyhow!(
+            "refusing to run git in {}: its git directory {} takes its config and hooks from {} — \
+             not its own repository. A `commondir` or `.git` file is writable from the dev container \
+             (design D52.11), and git you run there would use that directory's hooks. If you did not \
+             put it there, look at {}/commondir and {}/.git on the host.",
+            dir.display(),
+            from.display(),
+            to.display(),
+            from.display(),
+            dir.display()
+        )
+    };
+    if git_dir != common && git_dir.parent() != Some(common.join("worktrees").as_path()) {
+        return Err(redirected(&git_dir, &common));
+    }
+    if let Some((main, root)) = session_of(&real(&dir.to_string_lossy())) {
+        // A repository nested inside the session (a submodule) answers its own top level; the
+        // session's own rule is for the session. Anything that cannot say is held to it.
+        let top = git_in(
+            dir,
+            &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        )
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| real(String::from_utf8_lossy(&o.stdout).trim()));
+        let nested = top.is_some_and(|t| t != root && t.starts_with(&root));
+        let own = real(&main.join(".git").to_string_lossy());
+        // Nested, it must be one of the repository's own submodules: git keeps a linked worktree's
+        // under `<main>/.git/worktrees/<name>/modules`, a checkout's under `<main>/.git/modules`.
+        let submodule = common.starts_with(own.join("modules"))
+            || (common.starts_with(own.join("worktrees"))
+                && common.components().any(|c| c.as_os_str() == "modules"));
+        if if nested { !submodule } else { common != own } {
+            return Err(redirected(&git_dir, &common));
+        }
+    }
+    Ok(Some((git_dir, common)))
+}
+
+/// Whether `git_dir` is a submodule's git directory — under a repository's `.git/modules/`, or
+/// `.git/worktrees/<name>/modules/` — whose `core.worktree` of `value` lands inside that repository's
+/// tree and outside its `.git`.
+fn submodule_worktree(git_dir: &Path, value: &str) -> bool {
+    let Some(dot_git) = git_dir
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == ".git"))
+    else {
+        return false;
+    };
+    let Ok(rel) = git_dir.strip_prefix(dot_git) else {
+        return false;
+    };
+    let parts: Vec<_> = rel
+        .components()
+        .map(std::path::Component::as_os_str)
+        .collect();
+    let in_modules = parts.first().is_some_and(|p| *p == "modules")
+        || (parts.first().is_some_and(|p| *p == "worktrees")
+            && parts.get(2).is_some_and(|p| *p == "modules"));
+    let Some(top) = dot_git.parent() else {
+        return false;
+    };
+    in_modules && inside(&git_dir.join(value), top, dot_git)
+}
+
+/// The repository a jkb session worktree (`<main>/.jkb/work/<name>/…`) belongs to, and the session
+/// worktree's own root.
+fn session_of(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let parts: Vec<_> = dir.components().collect();
+    let at = parts
+        .windows(2)
+        .position(|w| w[0].as_os_str() == ".jkb" && w[1].as_os_str() == "work")?;
+    let name = parts.get(at + 2)?;
+    let main: PathBuf = parts[..at].iter().collect();
+    let root = main.join(".jkb").join("work").join(name);
+    Some((main, root))
+}
+
+/// The deepest submodule nesting [`module_findings`] walks.
+const MAX_MODULE_DEPTH: usize = 8;
+
+/// What in `dir`'s **submodules** could make git run a program — for the reap scan to report, since
+/// jkb's own git never enters a submodule ([`git_cmd`]) but yours does: a submodule git directory's own
+/// config setting a key outside [`config_key_allowed`], or a `core.worktree` pointing outside the
+/// superproject; a `commondir` in one, or a hook in its own `hooks/` that is neither git's sample nor
+/// your template's; a symlinked submodule config, git directory, `modules/`, `hooks/` or `.git`; a `.gitmodules`
+/// path outside its own checkout; a submodule checkout whose `.git` file points somewhere other than
+/// a `modules/` this scan reads. Real git directories (those with a `HEAD`) under `<common>/modules`,
+/// each `<common>/worktrees/*/modules`, and each un-absorbed submodule's own `.git/modules` are read,
+/// and so is whatever git directory a submodule's `.git` file names — each once, and only its
+/// top-level `config`: a loose ref that happens to be named `config` is not one. Submodules of
+/// submodules are followed to [`MAX_MODULE_DEPTH`], and anything deeper is reported rather than
+/// passed over.
+pub(crate) fn module_findings(dir: &Path) -> Vec<String> {
+    findings_with(dir, template_hooks(dir, None))
+}
+
+/// [`module_findings`], with your template's `hooks/` given.
+fn findings_with(dir: &Path, template: Option<PathBuf>) -> Vec<String> {
+    let Ok(Some((_, common))) = check_layout(dir) else {
+        return Vec::new();
+    };
+    let Some(top) = common.parent().map(Path::to_path_buf) else {
+        return Vec::new();
+    };
+    let mut scan = Scan {
+        dir,
+        top,
+        common,
+        out: Vec::new(),
+        judged: std::collections::HashSet::new(),
+        template,
+    };
+    let mut homes = vec![scan.common.join("modules")];
+    if let Ok(entries) = fs::read_dir(scan.common.join("worktrees")) {
+        for e in entries.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_symlink()) {
+                scan.out
+                    .push(format!("{} is a symlink", e.path().display()));
+            } else {
+                homes.push(e.path().join("modules"));
+            }
+        }
+    }
+    for home in &homes {
+        scan.walk(home);
+    }
+    // The checkout's own `.gitmodules` — a session's, not the main checkout's — is what git reads
+    // there.
+    let work_top = git_in(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )
+    .output()
+    .ok()
+    .filter(|o| o.status.success())
+    .map_or_else(
+        || scan.top.clone(),
+        |o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()),
+    );
+    scan.links(&work_top, homes);
+    scan.out
+}
+
+/// How a submodule hook stands against your template's hook of the same name.
+enum TemplateMatch {
+    /// The same bytes, from a template outside the repositories: yours.
+    Yours,
+    /// No template hook, or different bytes.
+    Not,
+    /// The same bytes, from a template hook that really lies in `repos`, which the container writes.
+    Beside { real: PathBuf, repos: PathBuf },
+}
+
+/// One reap scan of a repository's submodules: what it found, and the git directories it has
+/// already judged — each once, however many ways it is reached.
+struct Scan<'a> {
+    dir: &'a Path,
+    top: PathBuf,
+    common: PathBuf,
+    out: Vec<String>,
+    judged: std::collections::HashSet<PathBuf>,
+    /// Your `init.templateDir`'s `hooks/` ([`template_hooks`]).
+    template: Option<PathBuf>,
+}
+
+/// The `hooks/` of the template git copies into every repository and submodule it creates — the
+/// operator's, from the environment or the global or system config, never the repository's own,
+/// which the container writes.
+///
+/// Read `--includes`, as git does when it copies the template: a dotfiles `[include]` that sets it
+/// otherwise read as no template at all, and every hook it installs as planted (review round 9).
+/// `global` names the global config file in place of git's own choice.
+fn template_hooks(dir: &Path, global: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("GIT_TEMPLATE_DIR") {
+        return Some(PathBuf::from(dir).join("hooks"));
+    }
+    ["--global", "--system"].iter().find_map(|scope| {
+        let mut cmd = git_in(
+            dir,
+            &[
+                "config",
+                scope,
+                "--includes",
+                "--type=path",
+                "--get",
+                "init.templateDir",
+            ],
+        );
+        if let Some(global) = global {
+            cmd.env("GIT_CONFIG_GLOBAL", global);
+        }
+        cmd.output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("hooks"))
+    })
+}
+
+impl Scan<'_> {
+    /// Judge `gitdir` unless it already was; whether it was new.
+    fn judge(&mut self, gitdir: &Path) -> bool {
+        let key = fs::canonicalize(gitdir).unwrap_or_else(|_| gitdir.to_path_buf());
+        if !self.judged.insert(key) {
+            return false;
+        }
+        judge_module(self.dir, gitdir, &self.top, &self.common, &mut self.out);
+        if !gitdir.join("commondir").exists() {
+            self.judge_hooks(gitdir);
+        }
+        true
+    }
+
+    /// Whether `hook` is byte for byte the template hook `yours` — judged by where `yours` really is,
+    /// through every symlink: one inside the tree that holds the repositories is the container's to
+    /// write, so the same bytes planted there and in a submodule would pass as yours (review rounds
+    /// 9–10: first the whole template was judged, which a hook symlinked into the repositories
+    /// stepped around, and a standing finding against every repository hid a real one).
+    fn template_match(&self, yours: &Path, hook: &Path) -> TemplateMatch {
+        let Ok(real) = fs::canonicalize(yours) else {
+            return TemplateMatch::Not;
+        };
+        if !matches!((fs::read(&real), fs::read(hook)), (Ok(a), Ok(b)) if a == b) {
+            return TemplateMatch::Not;
+        }
+        match self.top.parent() {
+            Some(repos) if real.starts_with(repos) => TemplateMatch::Beside {
+                real,
+                repos: repos.to_path_buf(),
+            },
+            _ => TemplateMatch::Yours,
+        }
+    }
+
+    /// Report what could run from `gitdir`'s own `hooks/` for git you run there — measured on git
+    /// 2.51.1, a planted `pre-commit` ran on `git -C sub commit` (review round 7). Git writes only
+    /// `*.sample` files there, and copies your `init.templateDir`'s hooks in; anything else is
+    /// reported, and so is a `hooks/` that cannot be listed — git needs only to search it to run a
+    /// hook by name (round 8).
+    fn judge_hooks(&mut self, gitdir: &Path) {
+        let hooks = gitdir.join("hooks");
+        match fs::symlink_metadata(&hooks) {
+            Ok(m) if m.file_type().is_symlink() => {
+                self.out.push(format!("{} is a symlink", hooks.display()));
+                return;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                self.out
+                    .push(format!("{} cannot be read: {e}", hooks.display()));
+                return;
+            }
+        }
+        let entries = match fs::read_dir(&hooks) {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.out
+                    .push(format!("{} cannot be listed: {e}", hooks.display()));
+                return;
+            }
+        };
+        let template = self.template.clone();
+        for e in entries {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    self.out
+                        .push(format!("{} cannot be listed: {err}", hooks.display()));
+                    continue;
+                }
+            };
+            let name = e.file_name();
+            if name.to_string_lossy().ends_with(".sample") {
+                continue;
+            }
+            let judged = template.as_ref().map_or(TemplateMatch::Not, |t| {
+                self.template_match(&t.join(&name), &e.path())
+            });
+            match judged {
+                TemplateMatch::Yours => {}
+                TemplateMatch::Not => self.out.push(format!("{} is a hook", e.path().display())),
+                // Say why, or it reads as planted and the fix looks like deleting your own hook
+                // (review round 11).
+                TemplateMatch::Beside { real, repos } => self.out.push(format!(
+                    "{} is a hook — it matches your template's, but {} lies in {}, which the \
+                     container writes, so it cannot vouch for it; move your template out",
+                    e.path().display(),
+                    real.display(),
+                    repos.display()
+                )),
+            }
+        }
+    }
+
+    /// Judge every git directory under the `modules/` directory `root`, at any nesting to
+    /// [`MAX_MODULE_DEPTH`]. A symlink there, `root` included, is reported and never followed.
+    fn walk(&mut self, root: &Path) {
+        if fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink()) {
+            self.out.push(format!("{} is a symlink", root.display()));
+            return;
+        }
+        let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+        while let Some((at, depth)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&at) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                let Ok(kind) = e.file_type() else {
+                    continue;
+                };
+                if kind.is_symlink() {
+                    self.out.push(format!("{} is a symlink", path.display()));
+                    continue;
+                }
+                if !kind.is_dir() {
+                    continue;
+                }
+                if depth >= MAX_MODULE_DEPTH {
+                    self.out
+                        .push(format!("{} is nested too deep to scan", path.display()));
+                    continue;
+                }
+                if path.join("HEAD").is_file() {
+                    self.judge(&path);
+                    stack.push((path.join("modules"), depth + 1));
+                } else {
+                    // A submodule name may hold `/`: its git directory is deeper.
+                    stack.push((path, depth + 1));
+                }
+            }
+        }
+    }
+
+    /// Each submodule checkout `.gitmodules` names under the checkout `work_top`, and theirs in turn,
+    /// each checkout once. A path outside its checkout is reported and not followed — a hostile
+    /// `path = .` would otherwise read the same file again at every level. A `.git` that is a
+    /// symlink, cannot be read, or is a file pointing outside every `modules/` in `homes` is
+    /// reported; one that is a git directory in its own right (not absorbed) is judged, and so is
+    /// every git directory under its own `modules/`; one a `.git` file names is judged too, if the
+    /// walk did not reach it — git you run in the superproject enters them all.
+    fn links(&mut self, work_top: &Path, homes: Vec<PathBuf>) {
+        let start = fs::canonicalize(work_top).unwrap_or_else(|_| work_top.to_path_buf());
+        let mut seen = std::collections::HashSet::from([start.clone()]);
+        // A checkout to read `.gitmodules` in, the `modules/` directories its submodules' git
+        // directories may be in, and how deep it is.
+        let mut stack = vec![(start, homes, 0)];
+        while let Some((checkout, homes, depth)) = stack.pop() {
+            for rel in submodule_paths(self.dir, &checkout) {
+                let Ok(sub) = fs::canonicalize(checkout.join(&rel)) else {
+                    // Not checked out.
+                    continue;
+                };
+                if !sub.starts_with(&checkout) || sub == checkout {
+                    self.out.push(format!(
+                        "{} names `{rel}`, outside its own checkout",
+                        checkout.join(".gitmodules").display()
+                    ));
+                    continue;
+                }
+                if !seen.insert(sub.clone()) {
+                    continue;
+                }
+                let mut homes = homes.clone();
+                if !self.follow(&sub, &mut homes) {
+                    continue;
+                }
+                if depth + 1 >= MAX_MODULE_DEPTH {
+                    self.out
+                        .push(format!("{} is nested too deep to scan", sub.display()));
+                    continue;
+                }
+                stack.push((sub, homes, depth + 1));
+            }
+        }
+    }
+
+    /// Judge the submodule checked out at `sub` through its `.git`, adding its own `modules/` to
+    /// `homes` when its git directory is here; whether to read its `.gitmodules` in turn.
+    fn follow(&mut self, sub: &Path, homes: &mut Vec<PathBuf>) -> bool {
+        let link = sub.join(".git");
+        let meta = match fs::symlink_metadata(&link) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                self.out
+                    .push(format!("{} cannot be read: {e}", link.display()));
+                return false;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            self.out.push(format!("{} is a symlink", link.display()));
+            return false;
+        }
+        if meta.is_dir() {
+            // Not absorbed: the submodule's git directory is here, in the checkout.
+            self.judge(&link);
+            let modules = link.join("modules");
+            self.walk(&modules);
+            homes.push(fs::canonicalize(&modules).unwrap_or(modules));
+            return true;
+        }
+        let text = match fs::read_to_string(&link) {
+            Ok(text) => text,
+            Err(e) => {
+                self.out
+                    .push(format!("{} cannot be read: {e}", link.display()));
+                return false;
+            }
+        };
+        let Some(target) = text.trim().strip_prefix("gitdir:") else {
+            self.out
+                .push(format!("{} is not a gitdir link", link.display()));
+            return false;
+        };
+        let target = sub.join(target.trim());
+        let resolved = fs::canonicalize(&target).unwrap_or(target);
+        if !homes.iter().any(|h| resolved.starts_with(h)) {
+            self.out.push(format!(
+                "{} points at {}, outside this repository's own modules",
+                link.display(),
+                resolved.display()
+            ));
+            return false;
+        }
+        // Inside a home, but maybe not where the walk looks (`modules/<a>/<b>` under a git directory
+        // `modules/<a>`): judged here if the walk did not reach it.
+        if self.judge(&resolved) {
+            self.walk(&resolved.join("modules"));
+        }
+        true
+    }
+}
+
+fn judge_module(dir: &Path, gitdir: &Path, top: &Path, common: &Path, out: &mut Vec<String>) {
+    // A `commondir` sends git to another directory's config and hooks — measured on git 2.51.1, a
+    // clean filter planted there ran on `git -C sub add` — so this directory's own `config` would
+    // be the wrong one to judge. [`check_layout`] refuses the same redirect for a repository jkb
+    // runs git in; a submodule's git directory never has one (review round 6).
+    let redirect = gitdir.join("commondir");
+    if fs::symlink_metadata(&redirect).is_ok() {
+        let to = fs::read_to_string(&redirect).unwrap_or_default();
+        out.push(format!(
+            "{} redirects its config and hooks to `{}`",
+            redirect.display(),
+            to.trim()
+        ));
+        return;
+    }
+    let cfg = gitdir.join("config");
+    match fs::symlink_metadata(&cfg) {
+        Ok(m) if m.file_type().is_symlink() => {
+            out.push(format!("{} is a symlink", cfg.display()));
+            return;
+        }
+        Ok(_) => {}
+        Err(_) => return,
+    }
+    let file = cfg.to_string_lossy().into_owned();
+    let Ok(o) = git_in(dir, &["config", "--file", &file, "--list", "-z"]).output() else {
+        return;
+    };
+    if !o.status.success() {
+        out.push(format!("git cannot read the submodule config {file}"));
+        return;
+    }
+    for entry in String::from_utf8_lossy(&o.stdout).split('\0') {
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        if key.is_empty() {
+            continue;
+        }
+        if key == "core.worktree" {
+            if !inside(&gitdir.join(value), top, common) {
+                out.push(format!(
+                    "{file} points core.worktree outside the superproject"
+                ));
+            }
+        } else if !config_key_allowed(key) {
+            out.push(format!("{file} sets `{key}`"));
+        }
+    }
+}
+
+/// Whether `path` is inside the superproject's tree `top` and not inside its git directory — through
+/// symlinks where the path exists (a symlink at a submodule's path is the container's to plant), and
+/// lexically where it does not yet.
+fn inside(path: &Path, top: &Path, common: &Path) -> bool {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| {
+        let mut at = PathBuf::new();
+        for c in path.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    at.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => at.push(other),
+            }
+        }
+        at
+    });
+    resolved.starts_with(top) && resolved != top && !resolved.starts_with(common)
+}
+
+/// The paths `checkout`'s `.gitmodules` names, relative to it.
+fn submodule_paths(dir: &Path, checkout: &Path) -> Vec<String> {
+    let gitmodules = checkout.join(".gitmodules");
+    if !gitmodules.is_file() {
+        return Vec::new();
+    }
+    let file = gitmodules.to_string_lossy().into_owned();
+    let Ok(o) = git_in(
+        dir,
+        &[
+            "config",
+            "--file",
+            &file,
+            "-z",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+    )
+    .output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&o.stdout)
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\n').map(|(_, rel)| rel.to_owned()))
+        .collect()
 }
 
 /// Remove the environment variables that select a repository, so the working directory decides
@@ -343,6 +1229,7 @@ mod lex {
 /// Run `git` in `dir`, returning trimmed stdout. `Ok(None)` when git exits non-zero — the
 /// common "this ref does not exist" case, which is a fact rather than a failure.
 fn git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
+    checked(dir, args)?;
     let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
@@ -498,6 +1385,7 @@ pub fn rev(dir: &Path, reference: &str) -> Result<Option<String>> {
 /// # Errors
 /// Returns an error if `git` cannot be executed at all.
 fn git_run(dir: &Path, args: &[&str]) -> Result<(bool, String)> {
+    checked(dir, args)?;
     let out = git_cmd(dir, args)
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
@@ -1407,11 +2295,12 @@ mod tests {
 
     /// `(file, fn)` — each of these is separately asserted to scrub, by the test named.
     const SCRUBBERS: &[(&str, &str)] = &[
-        ("src/gitrepo.rs", "git_cmd"), // every_git_call_drops_the_callers_repository_selection
+        ("src/gitrepo.rs", "git_in"), // every_git_call_drops_the_callers_repository_selection
         ("src/gitrepo.rs", "fixture_git"), // the_test_fixtures_do_not_reach_another_repository
-        ("src/pr.rs", "gh_cmd"),       // the_gh_spawn_does_not_inherit_a_repository_selection
+        ("src/pr.rs", "gh_cmd"),      // the_gh_spawn_does_not_inherit_a_repository_selection
         ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
         ("src/archive.rs", "fixture_git"), // the_archive_fixture_does_not_reach_another_repository
+        ("src/git_audit.rs", "fixture_git"), // the_audit_fixture_does_not_reach_another_repository
         // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
         // the spawn is, since that is what the scan can see.
         ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config
@@ -1430,6 +2319,12 @@ mod tests {
             "src/archive.rs",
             "the_old_store_s_files_are_never_opened",
             "spawns `mkfifo` on a temp path; it is never asked about a repository",
+        ),
+        (
+            "src/session.rs",
+            "gate_place",
+            "asks `docker inspect` whether the dev container is running; it is never asked about a \
+             repository (the gate itself runs through `gate_cmd`)",
         ),
     ];
 
@@ -1760,7 +2655,7 @@ mod tests {
         let self_src = std::fs::read_to_string(root.join("src/gitrepo.rs")).expect("read self");
 
         // The retired per-module check's distinctive premise: this file holds exactly ONE
-        // production git spawn, in `git_cmd`. It is what makes an empty `stray` above mean
+        // production git spawn, in `git_in`. It is what makes an empty `stray` above mean
         // "nothing bypasses" rather than "the slice was wrong" for the file that matters most.
         let self_prod = match self_src.find("\n#[cfg(test)]\nmod tests {") {
             Some(cut) => &self_src[..cut],
@@ -1772,7 +2667,7 @@ mod tests {
                 .map(|f| super::code_only(self_prod).matches(f).count())
                 .sum::<usize>(),
             1,
-            "expected exactly one production git spawn in gitrepo.rs (in `git_cmd`); the scan is \
+            "expected exactly one production git spawn in gitrepo.rs (in `git_in`); the scan is \
              looking at the wrong slice or the spawn has been respelled"
         );
         assert!(
@@ -1831,6 +2726,12 @@ mod tests {
             &git_cmd(Path::new("/somewhere"), &["rev-parse", "--show-toplevel"]),
             &[],
         );
+        // The config audit reads through the same spawn.
+        super::assert_scrubbed(
+            "git",
+            &super::git_in(Path::new("/somewhere"), &["config", "--list"]),
+            &[],
+        );
     }
 
     /// The ONE builder for every git spawn in this test module.
@@ -1847,7 +2748,21 @@ mod tests {
     /// claiming these fixtures "scrub by hand". One builder, so there is nothing to remember.
     fn fixture_git(at: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(at).args(args);
+        // NO BACKGROUND MAINTENANCE, set at the one place every fixture git command goes through
+        // so that no test has to remember it. git may DETACH a gc/repack that outlives the command
+        // that triggered it; it then packs and deletes loose objects while a test is still walking
+        // `.git/objects`, which is the shape of the intermittent `NotFound` in `copy_tree` below --
+        // seen on macOS in the full parallel suite, never under a filter, never in the container.
+        // Prevention rather than tolerance: with no detached process there is no window. The skip
+        // in `copy_tree` stays as a belt only while this cause is inferred rather than observed.
+        cmd.arg("-C").arg(at);
+        cmd.arg("-c")
+            .arg("gc.auto=0")
+            .arg("-c")
+            .arg("gc.autoDetach=false")
+            .arg("-c")
+            .arg("maintenance.auto=false");
+        cmd.args(args);
         // ONE call, and the selection is inside it. This used to be two — a
         // `scrub_repo_selection` for the three selectors and then the config isolation — and the
         // doc above pinned the first by saying its deletion was caught. It stopped being caught
@@ -2404,6 +3319,797 @@ mod tests {
             super::has_branch(root, "squash").expect("has_branch"),
             Fact::Unknown,
             "git could not answer, which is not the same as the branch being gone"
+        );
+    }
+
+    #[test]
+    fn the_config_allowlist_takes_repository_shape_and_nothing_that_runs_a_program() {
+        use super::config_key_allowed;
+        // Every local key found across the operator's nine real repos (measured 2026-09-25).
+        for ok in [
+            "core.repositoryformatversion",
+            "core.filemode",
+            "core.bare",
+            "core.logallrefupdates",
+            "core.ignorecase",
+            "core.precomposeunicode",
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "branch.main.remote",
+            "branch.main.merge",
+            "branch.task/x.vscode-merge-base",
+            "extensions.relativeworktrees",
+            "worktree.userelativepaths",
+            "user.email",
+            "pull.rebase",
+        ] {
+            assert!(config_key_allowed(ok), "{ok}");
+        }
+        for runs in [
+            "core.fsmonitor",
+            "core.hookspath",
+            "core.sshcommand",
+            "core.pager",
+            "core.editor",
+            "core.askpass",
+            "core.gitproxy",
+            "sequence.editor",
+            "include.path",
+            "includeif.gitdir:/x.path",
+            "filter.x.clean",
+            "filter.lfs.process",
+            "diff.external",
+            "diff.x.textconv",
+            "diff.x.command",
+            "merge.x.driver",
+            "credential.helper",
+            "credential.https://h.helper",
+            "gpg.program",
+            "gpg.ssh.program",
+            "alias.st",
+            "pager.log",
+            "submodule.x.update",
+            "remote.origin.uploadpack",
+            "remote.origin.receivepack",
+            "url.ext::sh.insteadof",
+            "protocol.ext.allow",
+            "core.remote.fsmonitor",
+            // Not programs, but they point a landing's checkout at `$HOME` and hide what it left.
+            "core.worktree",
+            "status.showuntrackedfiles",
+            "status.x",
+        ] {
+            assert!(!config_key_allowed(runs), "{runs} must be refused");
+        }
+    }
+
+    /// A planted `core.fsmonitor` is what a plain `git status` on the host would run (measured). jkb's
+    /// git refuses the repository instead, naming the key and its file, and the program never runs.
+    #[test]
+    fn a_repository_whose_own_config_names_a_program_is_refused_before_git_runs() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let marker = t.path().join("ran");
+        let evil = t.path().join("evil.sh");
+        std::fs::write(&evil, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            super::root(&dir).unwrap().is_some(),
+            "a clean repository runs"
+        );
+        let planted = t.path().join("r2");
+        std::fs::create_dir_all(&planted).unwrap();
+        fixture(&planted);
+        let set = fixture_git(
+            &planted,
+            &["config", "core.fsmonitor", evil.to_str().unwrap()],
+        )
+        .status()
+        .unwrap();
+        assert!(set.success());
+        let e = super::root(&planted).unwrap_err().to_string();
+        assert!(
+            e.contains("core.fsmonitor") && e.contains(".git/config"),
+            "{e}"
+        );
+        let e = super::git_run(&planted, &["status"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("core.fsmonitor"), "{e}");
+        assert!(!marker.exists(), "the planted program never ran");
+    }
+
+    /// Apple's git lists its Xcode-owned layer at `unknown` scope (measured on git 2.50.1, Apple
+    /// Git-155): not the repository's, so not judged — while an `unknown` file inside the repository,
+    /// and every `local` or `worktree` entry, still is.
+    #[test]
+    fn an_unknown_scope_is_judged_only_inside_the_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(t.path()).unwrap();
+        let apple = "/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig";
+        assert!(!super::judged_scope("unknown", apple, Some(&repo)));
+        let inside = repo.join(".git/elsewhere");
+        assert!(super::judged_scope(
+            "unknown",
+            inside.to_str().unwrap(),
+            Some(&repo)
+        ));
+        // Outside a repository, or in one git cannot read, Apple's layer is still Apple's: a probe
+        // there must get git's own "cannot answer", not the audit's refusal (found on the host).
+        assert!(
+            !super::judged_scope("unknown", apple, None),
+            "no repository"
+        );
+        for scope in ["local", "worktree"] {
+            assert!(super::judged_scope(scope, apple, Some(&repo)), "{scope}");
+        }
+        for scope in ["system", "global", "command", ""] {
+            assert!(!super::judged_scope(scope, apple, Some(&repo)), "{scope}");
+        }
+    }
+
+    /// The audit is asked fresh every call: a config planted after a directory passed is refused on
+    /// the next call, not waved through by a per-process memory of the first answer.
+    #[test]
+    fn a_config_planted_after_a_directory_passed_is_refused_on_the_next_call() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        super::audit_repo_config(&dir).expect("clean at first");
+        assert!(
+            fixture_git(&dir, &["config", "filter.x.clean", "touch /tmp/x"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let e = super::audit_repo_config(&dir).unwrap_err().to_string();
+        assert!(e.contains("filter.x.clean"), "{e}");
+    }
+
+    /// A `commondir` file redirects git's config and hooks (measured on git 2.51.1); jkb refuses the
+    /// directory and says where it points, whatever that directory's config holds.
+    #[test]
+    fn a_git_directory_redirected_by_commondir_is_refused() {
+        // EVERY FAILURE HERE NAMES ITS SUBJECT. A bare `unwrap` on the copy reported only
+        // `NotFound`, which is the one thing that cannot be true of a path `read_dir` has just
+        // listed -- unless it is a dangling symlink, or a directory reached as a non-dir, or the
+        // destination's parent is missing. Those are three different bugs with one message, and
+        // telling them apart cost several rounds across two machines because the panic named
+        // neither path. The entry type is in there because `read_dir` does not follow symlinks
+        // while `fs::copy` does, which is exactly how the three cases diverge.
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to)
+                .unwrap_or_else(|e| panic!("create_dir_all {}: {e}", to.display()));
+            let entries = std::fs::read_dir(from)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", from.display()));
+            for e in entries.flatten() {
+                let dest = to.join(e.file_name());
+                let ty = e
+                    .file_type()
+                    .unwrap_or_else(|err| panic!("file_type {}: {err}", e.path().display()));
+                if ty.is_dir() {
+                    copy_tree(&e.path(), &dest);
+                } else {
+                    std::fs::copy(e.path(), &dest).unwrap_or_else(|err| {
+                        // A SOURCE THAT HAS VANISHED IS SKIPPED. This walks a LIVE git directory:
+                        // git writes transient files under .git/objects (pack temporaries, and
+                        // whatever its background maintenance leaves behind), so a path `read_dir`
+                        // listed a moment ago can be gone by the time `fs::copy` opens it. The
+                        // redirect this test asserts on does not depend on the object set being
+                        // complete, so skipping one is harmless -- whereas failing on it is a
+                        // flake, and it is the one that has been failing on macOS in the full
+                        // parallel suite while passing under a filter and in the container.
+                        //
+                        // NARROW ON PURPOSE: only NotFound, and only when the source really is
+                        // gone when asked again. A missing destination parent, a directory reached
+                        // as a non-dir, or any other error still panics below naming both paths --
+                        // so this cannot swallow the two bugs the message was added to tell apart.
+                        if err.kind() == std::io::ErrorKind::NotFound && !e.path().exists() {
+                            return 0;
+                        }
+                        panic!(
+                            "copy {} -> {}: {err} (dir={} file={} symlink={}, target exists={})",
+                            e.path().display(),
+                            dest.display(),
+                            ty.is_dir(),
+                            ty.is_file(),
+                            ty.is_symlink(),
+                            e.path().exists(),
+                        )
+                    });
+                }
+            }
+        }
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let elsewhere = t.path().join("common");
+        std::fs::create_dir_all(elsewhere.join("hooks")).unwrap();
+        for part in ["config", "HEAD"] {
+            std::fs::copy(dir.join(".git").join(part), elsewhere.join(part)).unwrap();
+        }
+        for part in ["objects", "refs"] {
+            copy_tree(&dir.join(".git").join(part), &elsewhere.join(part));
+        }
+        std::fs::write(
+            dir.join(".git/commondir"),
+            format!("{}\n", elsewhere.display()),
+        )
+        .unwrap();
+        let e = super::audit_repo_config(&dir).unwrap_err().to_string();
+        assert!(
+            e.contains("takes its config and hooks from") && e.contains("common"),
+            "{e}"
+        );
+    }
+
+    /// A submodule's own config is jkb's to report, not to refuse: jkb's git never enters a submodule,
+    /// but yours does. Only real submodule git directories are read — a loose ref that happens to be
+    /// named `config` is not a config — and git's own `core.worktree` back into the superproject passes.
+    #[test]
+    fn submodule_configs_are_reported_by_the_scan_and_never_block_jkb() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        let module = dir.join(".git/modules/sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        std::fs::create_dir_all(module.join("refs/remotes/origin/feature")).unwrap();
+        std::fs::write(module.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            module.join("refs/remotes/origin/feature/config"),
+            "0123456789012345678901234567890123456789\n",
+        )
+        .unwrap();
+        let cfg = module.join("config");
+        std::fs::write(
+            &cfg,
+            "[core]\n\trepositoryformatversion = 0\n\tworktree = ../../../sub\n",
+        )
+        .unwrap();
+        assert_eq!(super::module_findings(&dir), Vec::<String>::new());
+        std::fs::write(&cfg, "[core]\n\tworktree = ../../../../../..\n").unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("core.worktree outside"), "{found}");
+        std::fs::write(&cfg, "[filter \"x\"]\n\tclean = touch /tmp/x\n").unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("filter.x.clean"), "{found}");
+        super::audit_repo_config(&dir).expect("jkb's own git never reads it");
+        // A submodule whose `.git` is a git directory of its own, in the checkout, is judged too.
+        std::fs::write(&cfg, "[core]\n\trepositoryformatversion = 0\n").unwrap();
+        std::fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"inline\"]\n\tpath = inline\n",
+        )
+        .unwrap();
+        let inline = dir.join("inline/.git");
+        std::fs::create_dir_all(&inline).unwrap();
+        std::fs::write(inline.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            inline.join("config"),
+            "[filter \"z\"]\n\tclean = touch /tmp/z\n",
+        )
+        .unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("filter.z.clean"), "{found}");
+        std::fs::remove_dir_all(dir.join("inline")).unwrap();
+        std::fs::remove_file(dir.join(".gitmodules")).unwrap();
+        std::fs::write(&cfg, "[filter \"x\"]\n\tclean = touch /tmp/x\n").unwrap();
+        std::fs::remove_file(&cfg).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(t.path().join("elsewhere"), &cfg).unwrap();
+            let found = super::module_findings(&dir).join("; ");
+            assert!(found.contains("is a symlink"), "{found}");
+        }
+    }
+
+    /// Git you run in the superproject enters submodules of submodules and follows a symlinked `.git`
+    /// (measured on git 2.51.1, review round 4), so the scan follows each `.gitmodules` down, reads an
+    /// un-absorbed git directory's own `modules/`, and reports a symlink wherever git would follow one.
+    #[test]
+    fn the_scan_follows_nested_submodules_and_reports_symlinked_git_directories() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let gitdir = |at: &Path, config: &str| {
+            std::fs::create_dir_all(at).unwrap();
+            std::fs::write(at.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(at.join("config"), config).unwrap();
+        };
+        let clean = "[core]\n\trepositoryformatversion = 0\n";
+        // `sub` is absorbed; its nested `n` keeps its git directory inline, in the checkout.
+        gitdir(&dir.join(".git/modules/sub"), clean);
+        std::fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        assert_eq!(super::module_findings(&dir), Vec::<String>::new());
+        std::fs::write(
+            dir.join("sub/.gitmodules"),
+            "[submodule \"n\"]\n\tpath = n\n",
+        )
+        .unwrap();
+        gitdir(
+            &dir.join("sub/n/.git"),
+            "[filter \"q\"]\n\tclean = touch /tmp/q\n",
+        );
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("filter.q.clean"), "{found}");
+        // An un-absorbed git directory's own `modules/` holds its submodules' git directories.
+        std::fs::write(dir.join("sub/n/.git/config"), clean).unwrap();
+        gitdir(
+            &dir.join("sub/n/.git/modules/deep"),
+            "[filter \"w\"]\n\tclean = touch /tmp/w\n",
+        );
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("filter.w.clean"), "{found}");
+        std::fs::remove_dir_all(dir.join("sub/n")).unwrap();
+        std::fs::remove_file(dir.join("sub/.gitmodules")).unwrap();
+        assert_eq!(super::module_findings(&dir), Vec::<String>::new());
+        #[cfg(unix)]
+        {
+            // A symlinked `.git` — git follows it to whatever config is there.
+            let elsewhere = t.path().join("elsewhere");
+            gitdir(&elsewhere, "[filter \"y\"]\n\tclean = touch /tmp/y\n");
+            std::fs::remove_file(dir.join("sub/.git")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.join("sub/.git")).unwrap();
+            let found = super::module_findings(&dir).join("; ");
+            assert!(found.contains("sub/.git is a symlink"), "{found}");
+            std::fs::remove_file(dir.join("sub/.git")).unwrap();
+            std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+            // And a symlink among the absorbed git directories.
+            std::os::unix::fs::symlink(&elsewhere, dir.join(".git/modules/other")).unwrap();
+            let found = super::module_findings(&dir).join("; ");
+            assert!(found.contains("modules/other is a symlink"), "{found}");
+        }
+    }
+
+    /// A `.gitmodules` the container wrote is hostile input: a path at or above its own checkout is
+    /// reported and not followed (`path = .` twenty times over would otherwise grow as 20^depth), a
+    /// `.git` file naming a git directory the walk never reaches is judged anyway, and a symlinked
+    /// `modules/` is reported rather than read through (review round 5).
+    #[test]
+    fn the_scan_holds_against_a_hostile_gitmodules() {
+        use std::fmt::Write as _;
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let gitdir = |at: &Path, config: &str| {
+            std::fs::create_dir_all(at).unwrap();
+            std::fs::write(at.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(at.join("config"), config).unwrap();
+        };
+        let clean = "[core]\n\trepositoryformatversion = 0\n";
+        // An un-absorbed submodule whose `.gitmodules` names itself twenty times, and the root.
+        gitdir(&dir.join("x/.git"), clean);
+        std::fs::write(dir.join(".gitmodules"), "[submodule \"x\"]\n\tpath = x\n").unwrap();
+        let mut gm = String::new();
+        for i in 0..20 {
+            let _ = write!(gm, "[submodule \"s{i}\"]\n\tpath = .\n");
+        }
+        gm.push_str("[submodule \"up\"]\n\tpath = ..\n");
+        std::fs::write(dir.join("x/.gitmodules"), gm).unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(
+            found.contains("names `.`, outside its own checkout"),
+            "{found}"
+        );
+        assert!(
+            found.contains("names `..`, outside its own checkout"),
+            "{found}"
+        );
+        std::fs::remove_dir_all(dir.join("x")).unwrap();
+        // A `.git` file naming a git directory inside a judged one, where the walk does not look.
+        gitdir(&dir.join(".git/modules/sub"), clean);
+        gitdir(
+            &dir.join(".git/modules/sub/evil"),
+            "[filter \"e\"]\n\tclean = touch /tmp/e\n",
+        );
+        std::fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub/evil\n").unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("filter.e.clean"), "{found}");
+        // A `commondir` in a submodule's git directory takes its config from somewhere else.
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let evil = t.path().join("evil");
+        gitdir(&evil, "[filter \"c\"]\n\tclean = touch /tmp/c\n");
+        std::fs::write(
+            dir.join(".git/modules/sub/commondir"),
+            format!("{}\n", evil.display()),
+        )
+        .unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("redirects its config and hooks"), "{found}");
+        std::fs::remove_file(dir.join(".git/modules/sub/commondir")).unwrap();
+        #[cfg(unix)]
+        {
+            // An un-absorbed git directory whose `modules/` is a symlink.
+            std::fs::remove_dir_all(dir.join("sub")).unwrap();
+            gitdir(&dir.join("sub/.git"), clean);
+            let elsewhere = t.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.join("sub/.git/modules")).unwrap();
+            let found = super::module_findings(&dir).join("; ");
+            assert!(found.contains(".git/modules is a symlink"), "{found}");
+        }
+    }
+
+    /// A hook in a submodule's own `hooks/` runs for git you run there (review rounds 7–9): reported,
+    /// unless it is git's sample or your template's byte for byte — a template that is not beside the
+    /// repositories — and a `hooks/` the scan cannot list is reported too.
+    #[test]
+    fn the_scan_reports_a_hook_planted_in_a_submodule() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let module = dir.join(".git/modules/sub");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            module.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        let hooks = dir.join(".git/modules/sub/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-commit.sample"), "#!/bin/sh\n").unwrap();
+        assert!(
+            !super::module_findings(&dir)
+                .join("; ")
+                .contains("is a hook"),
+            "a sample is not a hook"
+        );
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\ntouch /tmp/h\n").unwrap();
+        let found = super::module_findings(&dir).join("; ");
+        assert!(found.contains("pre-commit is a hook"), "{found}");
+        // One git copied from your `init.templateDir` is yours, byte for byte; an edit is not.
+        // Your template lives outside the tree the repositories are in.
+        let home = tempfile::tempdir().unwrap();
+        let template = home.path().join("template/hooks");
+        std::fs::create_dir_all(&template).unwrap();
+        std::fs::write(template.join("pre-commit"), "#!/bin/sh\ntouch /tmp/h\n").unwrap();
+        let with = |dir: &Path| super::findings_with(dir, Some(template.clone())).join("; ");
+        assert!(!with(&dir).contains("is a hook"), "{}", with(&dir));
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\ntouch /tmp/other\n").unwrap();
+        assert!(
+            with(&dir).contains("pre-commit is a hook"),
+            "{}",
+            with(&dir)
+        );
+        // Not a template beside the repositories, though: the container writes that too.
+        let beside = dir.parent().unwrap().join("dotfiles/template/hooks");
+        std::fs::create_dir_all(&beside).unwrap();
+        std::fs::copy(hooks.join("pre-commit"), beside.join("pre-commit")).unwrap();
+        let found = super::findings_with(&dir, Some(beside.clone())).join("; ");
+        assert!(found.contains("pre-commit is a hook"), "{found}");
+        let clean = t.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        fixture(&clean);
+        assert_eq!(
+            super::findings_with(&clean, Some(beside.clone())),
+            Vec::<String>::new(),
+            "no standing finding against a repository with no hook"
+        );
+        #[cfg(unix)]
+        {
+            // Nor one hook of your real template symlinked into the repositories' tree.
+            std::fs::remove_file(template.join("pre-commit")).unwrap();
+            std::os::unix::fs::symlink(beside.join("pre-commit"), template.join("pre-commit"))
+                .unwrap();
+            let found = with(&dir);
+            assert!(found.contains("pre-commit is a hook"), "{found}");
+            assert!(
+                found.contains("move your template out"),
+                "and says why: {found}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            // A `hooks/` git can search but the scan cannot list still runs a hook by name.
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o311)).unwrap();
+            if std::fs::read_dir(&hooks).is_err() {
+                let found = super::module_findings(&dir).join("; ");
+                assert!(found.contains("hooks cannot be listed"), "{found}");
+            }
+            std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Your template is read as git reads it when it copies one in, `[include]`s and all (review
+    /// round 9: a dotfiles include read as no template, and every hook it installed as planted).
+    #[test]
+    fn the_template_is_found_through_an_include() {
+        let t = tempfile::tempdir().unwrap();
+        let (global, included) = (t.path().join("gitconfig"), t.path().join("included"));
+        std::fs::write(
+            &global,
+            format!("[include]\n\tpath = {}\n", included.display()),
+        )
+        .unwrap();
+        let template = t.path().join("tpl");
+        std::fs::write(
+            &included,
+            format!("[init]\n\ttemplateDir = {}\n", template.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            super::template_hooks(t.path(), Some(&global)),
+            Some(template.join("hooks"))
+        );
+    }
+
+    /// A session's own `.gitmodules` is the one git reads there: a submodule its branch adds, which
+    /// the main checkout has never heard of, is scanned from the session.
+    #[test]
+    fn the_scan_reads_a_session_s_own_gitmodules() {
+        let t = tempfile::tempdir().unwrap();
+        let main = t.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        fixture(&main);
+        let session = main.join(".jkb/work/s");
+        assert!(fixture_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "s",
+                session.to_str().unwrap()
+            ]
+        )
+        .status()
+        .unwrap()
+        .success());
+        std::fs::write(
+            session.join(".gitmodules"),
+            "[submodule \"only\"]\n\tpath = only\n",
+        )
+        .unwrap();
+        let inline = session.join("only/.git");
+        std::fs::create_dir_all(&inline).unwrap();
+        std::fs::write(inline.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            inline.join("config"),
+            "[filter \"s\"]\n\tclean = touch /tmp/s\n",
+        )
+        .unwrap();
+        assert!(!main.join(".gitmodules").exists());
+        let found = super::module_findings(&session).join("; ");
+        assert!(found.contains("filter.s.clean"), "{found}");
+    }
+
+    /// Measured on git 2.51.1: a superproject `git status` runs a clean filter planted in a
+    /// submodule's own config. jkb's git does not enter the submodule, so it runs nothing — and still
+    /// sees the submodule's commit move.
+    #[test]
+    fn jkb_s_git_does_not_run_a_submodule_s_config() {
+        let t = tempfile::tempdir().unwrap();
+        let (child, sup) = (t.path().join("child"), t.path().join("sup"));
+        let marker = t.path().join("ran");
+        for d in [&child, &sup] {
+            std::fs::create_dir_all(d).unwrap();
+            fixture(d);
+        }
+        std::fs::write(child.join("f"), "aaaa\n").unwrap();
+        std::fs::write(child.join(".gitattributes"), "* filter=y\n").unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            assert!(
+                fixture_git(dir, args).status().unwrap().success(),
+                "{args:?}"
+            );
+        };
+        run(&child, &["add", "-A"]);
+        run(&child, &["commit", "-qm", "c"]);
+        run(
+            &sup,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                child.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        run(&sup, &["commit", "-qm", "s"]);
+        let cfg = sup.join(".git/modules/sub/config");
+        let mut text = std::fs::read_to_string(&cfg).unwrap();
+        {
+            use std::fmt::Write as _;
+            let _ = write!(
+                text,
+                "[filter \"y\"]\n\tclean = touch {}; cat\n",
+                marker.display()
+            );
+        }
+        std::fs::write(&cfg, text).unwrap();
+        // Same size, new mtime: git must hash it, through the filter, to know.
+        std::fs::write(sup.join("sub/f"), "bbbb\n").unwrap();
+        let _ = super::git_run(&sup, &["status", "--porcelain"]);
+        assert!(!marker.exists(), "the submodule's filter ran");
+        // A tracked `.gitmodules` asking git to look inside anyway does not outrank the command line.
+        let mut gm = std::fs::read_to_string(sup.join(".gitmodules")).unwrap();
+        gm.push_str("\tignore = none\n");
+        std::fs::write(sup.join(".gitmodules"), gm).unwrap();
+        std::fs::write(sup.join("sub/f"), "cccc\n").unwrap();
+        let _ = super::git_run(&sup, &["status", "--porcelain"]);
+        let _ = super::git_run(&sup, &["diff", "--name-only"]);
+        assert!(
+            !marker.exists(),
+            "`.gitmodules` put git back into the submodule"
+        );
+        // A landing's checkout and switch report local changes — which enters the submodule — unless
+        // told not to.
+        run(&sup, &["branch", "other"]);
+        std::fs::write(sup.join("sub/f"), "dddd\n").unwrap();
+        let _ = super::git_run(&sup, &["checkout", "--detach", "other"]);
+        let _ = super::git_run(&sup, &["switch", "other"]);
+        assert!(!marker.exists(), "checkout or switch entered the submodule");
+        let e = super::git_run(&sup, &["stash"]).unwrap_err().to_string();
+        assert!(e.contains("does not run `git stash`"), "{e}");
+    }
+
+    /// A submodule checked out inside a session worktree has a git directory of its own, under the
+    /// repository's `.git/worktrees/<s>/modules`, and passes; a stray repository nested there does not.
+    #[test]
+    fn a_submodule_in_a_session_passes_and_a_stray_nested_repository_does_not() {
+        let t = tempfile::tempdir().unwrap();
+        let (child, main) = (t.path().join("child"), t.path().join("main"));
+        for d in [&child, &main] {
+            std::fs::create_dir_all(d).unwrap();
+            fixture(d);
+        }
+        let run = |dir: &Path, args: &[&str]| {
+            assert!(
+                fixture_git(dir, args).status().unwrap().success(),
+                "{args:?}"
+            );
+        };
+        run(
+            &main,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                child.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        run(&main, &["commit", "-qm", "s"]);
+        let session = main.join(".jkb/work/s");
+        run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "s",
+                session.to_str().unwrap(),
+            ],
+        );
+        run(
+            &session,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "-q",
+                "--init",
+            ],
+        );
+        super::audit_repo_config(&session.join("sub")).expect("its own submodule");
+        super::audit_repo_config(&session).expect("and the session itself");
+        assert_eq!(super::module_findings(&session), Vec::<String>::new());
+        assert_eq!(super::module_findings(&main), Vec::<String>::new());
+        run(
+            &child,
+            &["config", "core.worktree", t.path().to_str().unwrap()],
+        );
+        let e = super::audit_repo_config(&child).unwrap_err().to_string();
+        assert!(
+            e.contains("core.worktree"),
+            "outside a submodule it is refused: {e}"
+        );
+        let stray = session.join("vendor/lib");
+        std::fs::create_dir_all(&stray).unwrap();
+        fixture(&stray);
+        let e = super::audit_repo_config(&stray).unwrap_err().to_string();
+        assert!(e.contains("takes its config and hooks from"), "{e}");
+    }
+
+    /// A jkb session's `.git` file pointed at a git directory laid out as a worktree of some other,
+    /// planted repository: consistent to git, and still not its own repository's.
+    #[test]
+    fn a_session_whose_common_directory_is_not_its_repository_s_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let main = t.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        fixture(&main);
+        let session = main.join(".jkb/work/s");
+        assert!(fixture_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "s",
+                session.to_str().unwrap()
+            ]
+        )
+        .status()
+        .unwrap()
+        .success());
+        super::audit_repo_config(&session).expect("a real session passes");
+        let rogue = t.path().join("rogue");
+        std::fs::create_dir_all(&rogue).unwrap();
+        fixture(&rogue);
+        assert!(fixture_git(
+            &rogue,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "r",
+                t.path().join("rw").to_str().unwrap()
+            ]
+        )
+        .status()
+        .unwrap()
+        .success());
+        std::fs::write(
+            session.join(".git"),
+            format!("gitdir: {}\n", rogue.join(".git/worktrees/rw").display()),
+        )
+        .unwrap();
+        let e = super::audit_repo_config(&session).unwrap_err().to_string();
+        assert!(e.contains("takes its config and hooks from"), "{e}");
+    }
+
+    /// jkb's own git calls run no hooks and no fsmonitor, whatever the repository says.
+    #[test]
+    fn jkb_git_runs_hooks_off() {
+        let cmd = git_cmd(Path::new("/somewhere"), &["status"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "core.hooksPath=/dev/null"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "core.fsmonitor=false"),
+            "{args:?}"
         );
     }
 }

@@ -52,6 +52,13 @@ pub struct TaskState {
     pub status: String,
     /// Every facet value it carries, by facet — a multi-map, as the tags are.
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Its review record — what the land gate reads (D52.7). Not a tag: tags are content a synced
+    /// file can write. Absent from an older daemon, which reads as never reviewed: fail closed.
+    #[serde(
+        default,
+        skip_serializing_if = "jkb_core::reviews::ReviewState::is_empty"
+    )]
+    pub review: jkb_core::reviews::ReviewState,
     /// Who holds its claim, if anyone.
     pub claim: Option<String>,
     /// Where its work lands, from its transition history.
@@ -67,6 +74,29 @@ pub struct TaskState {
     /// Whether this client may write the task at all — `false` for one filed outside `jkb serve`'s
     /// file roots. A verb that does git work before its write asks this first.
     pub writable: bool,
+    /// Its live landing, if it has one — what tells `task landed` a task it may not land again from
+    /// one it already landed (review rounds 9–10). Absent from an older daemon, which reads as no
+    /// landing: nothing is then reported already landed. Boxed: `TaskState` rides in `Response`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<Box<LiveLanding>>,
+}
+
+/// Where a task's work landed, as far as its history says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveLanding {
+    /// Grafted: this branch onto this destination.
+    Grafted {
+        /// The branch.
+        branch: String,
+        /// Where it landed.
+        onto: String,
+    },
+    /// Merged as this pull request (`task close-merged`), which records no destination.
+    Merged {
+        /// The pull request.
+        pr: i64,
+    },
 }
 
 /// `task.facts`: what the session verbs read about a task, in one read.
@@ -97,10 +127,20 @@ pub fn facts(
         terminal,
         status,
         tags,
+        review: jkb_core::reviews::state(conn, id)?,
         claim: claim::holder(conn, id)?,
         land_target: transition::land_target(conn, id)?,
         open_subtasks: !task::subtasks_all_terminal(conn, id)?,
         writable,
+        landed: transition::current_landing(conn, id)?
+            .and_then(
+                |row| match (row.labels.branch, row.labels.onto, row.labels.pr_number) {
+                    (Some(branch), Some(onto), _) => Some(LiveLanding::Grafted { branch, onto }),
+                    (_, None, Some(pr)) => Some(LiveLanding::Merged { pr }),
+                    _ => None,
+                },
+            )
+            .map(Box::new),
         start_refusal: if terminal {
             lifecycle::apply(&observed, TaskEvent::Start).refusal()
         } else {
@@ -686,6 +726,27 @@ pub struct ReviewFindings {
     pub open_count: usize,
     /// The first [`MAX_LISTED_FINDINGS`] of them.
     pub open_must_fix: Vec<ReviewFinding>,
+    /// Each recorded round among the namespaces, oldest recording first, as it stood when recorded —
+    /// what the land gate's last-round clause and the workflow's repetition rule read (D52.6).
+    #[serde(default)]
+    pub rounds: Vec<ReviewRound>,
+    /// Whether `rounds` was reported at all. An older daemon omits both, and a gate that read the
+    /// empty list as "no round found a must-fix" would fail open.
+    #[serde(default)]
+    pub rounds_reported: bool,
+}
+
+/// One review round ([`jkb_core::workflow::store::Round`]) as `task.review_findings` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRound {
+    /// Its findings namespace.
+    pub ns: String,
+    /// Its recording order.
+    pub filed: i64,
+    /// How many must-fix findings it held when recorded, at any status since.
+    pub must_fix: usize,
+    /// The files its must-fix findings name.
+    pub areas: Vec<String>,
 }
 
 /// The most namespaces one `task.review_findings` names.
@@ -702,6 +763,15 @@ pub const MAX_EXAMINED_FINDINGS: usize = 10_000;
 pub const MAX_FINDING_TITLE_CHARS: usize = 200;
 
 /// `task.review_findings`: the findings under `namespaces` (every recorded review of a task).
+///
+/// **Open must-fix** is every finding a recorded round held as must-fix when it was recorded
+/// ([`jkb_core::reviews::must_fix_findings`]) that is not yet finished — whatever its priority or
+/// placement reads now, because both are task content the implementer under review can edit. Nothing
+/// live under a **recorded** round counts: a line synced into a mounted round's `tasks.md`, or a task
+/// placed beside the findings, is content too (review round 2), and a finding that matters after a
+/// round was recorded is another round. A namespace no review recorded has no snapshot, so it is read
+/// live (priority 1 or above, unfinished) — what a filing is before it is recorded; the land gate only
+/// ever asks about recorded ones.
 ///
 /// A **typed** scope, never a namespace interpolated into the DSL: a path with `,` in it split into two
 /// scopes that matched nothing, which is indistinguishable from "clean" unless the total is known too
@@ -725,21 +795,48 @@ pub fn review_findings(
         check_name("review namespace", n)?;
     }
     if namespaces.is_empty() {
-        return Ok(ReviewFindings::default());
+        return Ok(ReviewFindings {
+            rounds_reported: true,
+            ..ReviewFindings::default()
+        });
     }
     let query = Query {
         kind: Some("task".to_owned()),
         scope: Scope::Union(namespaces.iter().cloned().map(Scope::Subtree).collect()),
         ..Query::default()
     };
-    let ids = query.evaluate(conn)?;
+    let live = query.evaluate(conn)?;
+    let snapshot = jkb_core::reviews::must_fix_findings(conn, namespaces)?;
+    let recorded: Vec<String> = jkb_core::reviews::rounds_in(conn, namespaces)?
+        .into_iter()
+        .map(|r| r.ns)
+        .collect();
+    let unrecorded: Vec<Scope> = namespaces
+        .iter()
+        .filter(|n| !recorded.contains(n))
+        .cloned()
+        .map(Scope::Subtree)
+        .collect();
+    let read_live = if unrecorded.is_empty() {
+        Vec::new()
+    } else {
+        Query {
+            kind: Some("task".to_owned()),
+            scope: Scope::Union(unrecorded),
+            ..Query::default()
+        }
+        .evaluate(conn)?
+    };
+    let mut ids = live.clone();
+    ids.extend(snapshot.iter().copied().filter(|id| !live.contains(id)));
     if ids.len() > MAX_EXAMINED_FINDINGS {
         return Err(ApiError::with_code(
             ErrorCode::Invalid,
             format!(
                 "the review namespaces {} hold {} tasks, and a review holds at most \
-                 {MAX_EXAMINED_FINDINGS} — a `review=` facet names something that is not a review; \
-                 remove it from the task (`jkb task tag rm <uid> review=<namespace>`)",
+                 {MAX_EXAMINED_FINDINGS} — a recorded round names something that is not a review. \
+                 A recorded round is append-only (a review happened), so nothing removes it: land \
+                 this task with `jkb task land <uid> --no-review`, which records the waiver on it",
                 namespaces.join(", "),
                 ids.len()
             ),
@@ -748,14 +845,24 @@ pub fn review_findings(
     let metas = item::get_many(conn, &ids)?;
     let mut out = ReviewFindings {
         total: ids.len(),
+        rounds: jkb_core::workflow::store::rounds_in(conn, namespaces)?
+            .into_iter()
+            .map(|r| ReviewRound {
+                ns: r.ns,
+                filed: r.filed,
+                must_fix: r.must_fix,
+                areas: r.areas,
+            })
+            .collect(),
+        rounds_reported: true,
         ..ReviewFindings::default()
     };
     for id in ids {
         let Some(m) = metas.get(&id) else { continue };
         let status = m.status.as_deref().unwrap_or("open");
-        if jkb_types::TaskStatus::is_terminal_str(Some(status))
-            || m.priority.unwrap_or(i64::MAX) > 1
-        {
+        let must_fix = snapshot.contains(&id)
+            || (read_live.contains(&id) && m.priority.unwrap_or(i64::MAX) <= 1);
+        if jkb_types::TaskStatus::is_terminal_str(Some(status)) || !must_fix {
             continue;
         }
         out.open_count += 1;

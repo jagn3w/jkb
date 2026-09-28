@@ -37,6 +37,7 @@ pub mod items;
 pub mod kb;
 pub mod namespaces;
 pub mod prs;
+pub mod rbac;
 pub mod removals;
 pub mod review;
 pub mod sessions;
@@ -597,6 +598,150 @@ pub enum Request {
     /// Record a review against a branch ([`review::record`]).
     #[serde(rename = "task.review_record")]
     TaskReviewRecord(review::RecordAsk),
+    /// Record that a landing waived the review gate (`jkb task land --no-review`) — in the task's
+    /// review record, never a tag ([`jkb_core::reviews::waive`]).
+    #[serde(rename = "task.review_waive")]
+    TaskReviewWaive {
+        /// The task.
+        uid: String,
+        /// The head the waived landing grafted.
+        sha: String,
+    },
+    /// Record that a landing ran its gate on the host rather than in the dev container
+    /// (`jkb task land --gate-on-host`; [`jkb_core::reviews::gate_on_host`]). Operator only.
+    #[serde(rename = "task.ran_on_host")]
+    TaskRanOnHost {
+        /// The task.
+        uid: String,
+        /// The head whose gate ran on the host.
+        sha: String,
+    },
+    /// Mint a role grant ([`rbac::grant`]); its token is answered once, and only its hash kept.
+    #[serde(rename = "role.grant")]
+    RoleGrant {
+        /// The role.
+        role: String,
+        /// The task it is scoped to.
+        #[serde(default)]
+        task: Option<String>,
+        /// Who it is handed to.
+        agent: String,
+    },
+    /// Revoke a grant and everything it minted ([`rbac::revoke`]).
+    #[serde(rename = "role.revoke")]
+    RoleRevoke {
+        /// The grant.
+        id: i64,
+    },
+    /// The grants and the agent-type map ([`rbac::list`]).
+    #[serde(rename = "role.list")]
+    RoleList {
+        /// Only those scoped to this task.
+        #[serde(default)]
+        task: Option<String>,
+        /// Revoked ones too.
+        #[serde(default)]
+        all: bool,
+    },
+    /// Who the caller is ([`rbac::whoami`]).
+    #[serde(rename = "role.whoami")]
+    RoleWhoami {},
+    /// Bind an attested subagent to the task it works on — first bind wins, and it cannot hop
+    /// ([`rbac::authorize`] does the binding; the op itself does nothing more).
+    #[serde(rename = "role.bind")]
+    RoleBind {
+        /// The task.
+        uid: String,
+    },
+    /// Map a Claude Code agent type to a role, or clear it (operator; [`rbac::map`]).
+    #[serde(rename = "role.map")]
+    RoleMap {
+        /// The agent definition's `name`.
+        agent_type: String,
+        /// The role; none clears the mapping.
+        #[serde(default)]
+        role: Option<String>,
+    },
+    /// Replace the dev container's credential (operator; [`jkb_core::roles::rotate_container`]).
+    #[serde(rename = "role.rotate_container")]
+    RoleRotateContainer {
+        /// The credential written now: kept, and answered back, when it still names the live
+        /// container grant — so a re-run of setup does not revoke every worker minted from it.
+        #[serde(default)]
+        keep: Option<String>,
+    },
+    /// A task's workflow: phase, strategy, who acts next ([`rbac::show`]).
+    #[serde(rename = "workflow.show")]
+    WorkflowShow {
+        /// The task.
+        uid: String,
+    },
+    /// Fire a workflow event ([`rbac::fire`]).
+    #[serde(rename = "workflow.fire")]
+    WorkflowFire {
+        /// The task.
+        uid: String,
+        /// The event.
+        event: String,
+        /// Why — required by the events that decide who sees the work next.
+        #[serde(default)]
+        reason: Option<String>,
+        /// The phase an `override` names.
+        #[serde(default)]
+        to: Option<String>,
+    },
+    /// Take the one reconciliation that applies ([`rbac::observe`]).
+    #[serde(rename = "workflow.observe")]
+    WorkflowObserve {
+        /// The task.
+        uid: String,
+    },
+    /// Pin a task to a strategy (operator; [`jkb_core::workflow::store::set_strategy`]).
+    #[serde(rename = "workflow.set")]
+    WorkflowSet {
+        /// The task.
+        uid: String,
+        /// A preset or definition name.
+        strategy: String,
+    },
+    /// Define or redefine a strategy (operator; [`rbac::define`]).
+    #[serde(rename = "workflow.define")]
+    WorkflowDefine {
+        /// Its name.
+        name: String,
+        /// Its spec, as JSON.
+        spec: Value,
+    },
+    /// The presets and definitions ([`rbac::strategies`]).
+    #[serde(rename = "workflow.strategies")]
+    WorkflowStrategies {},
+    /// Mint a harness attestation ticket for one tool call (the container credential only;
+    /// [`rbac::mint_ticket`]).
+    #[serde(rename = "attest.mint")]
+    AttestMint {
+        /// The Claude Code session.
+        session: String,
+        /// The subagent, when one made the call.
+        #[serde(default)]
+        agent_id: Option<String>,
+        /// Its type.
+        #[serde(default)]
+        agent_type: Option<String>,
+        /// The tool call.
+        tool_use_id: String,
+    },
+    /// Release tickets: one tool call's, one subagent's, or a whole session's ([`rbac::Tickets::release`]).
+    #[serde(rename = "attest.release")]
+    AttestRelease {
+        /// The session.
+        session: String,
+        /// Only this subagent's.
+        #[serde(default)]
+        agent_id: Option<String>,
+        /// Only this tool call's.
+        #[serde(default)]
+        tool_use_id: Option<String>,
+    },
     /// A page of the held task claims ([`claims::claims`]).
     #[serde(rename = "task.claims")]
     TaskClaims {
@@ -1124,6 +1269,23 @@ impl Request {
         "task.review_findings",
         "task.review_file",
         "task.review_record",
+        "task.review_waive",
+        "task.ran_on_host",
+        "role.grant",
+        "role.revoke",
+        "role.list",
+        "role.whoami",
+        "role.bind",
+        "role.map",
+        "role.rotate_container",
+        "workflow.show",
+        "workflow.fire",
+        "workflow.observe",
+        "workflow.set",
+        "workflow.define",
+        "workflow.strategies",
+        "attest.mint",
+        "attest.release",
         "task.claims",
         "task.reclaim",
         "kb.health",
@@ -1213,6 +1375,23 @@ impl Request {
             Self::TaskReviewFindings { .. } => "task.review_findings",
             Self::TaskReviewFile(_) => "task.review_file",
             Self::TaskReviewRecord(_) => "task.review_record",
+            Self::TaskReviewWaive { .. } => "task.review_waive",
+            Self::TaskRanOnHost { .. } => "task.ran_on_host",
+            Self::RoleGrant { .. } => "role.grant",
+            Self::RoleRevoke { .. } => "role.revoke",
+            Self::RoleList { .. } => "role.list",
+            Self::RoleWhoami {} => "role.whoami",
+            Self::RoleBind { .. } => "role.bind",
+            Self::RoleMap { .. } => "role.map",
+            Self::RoleRotateContainer { .. } => "role.rotate_container",
+            Self::WorkflowShow { .. } => "workflow.show",
+            Self::WorkflowFire { .. } => "workflow.fire",
+            Self::WorkflowObserve { .. } => "workflow.observe",
+            Self::WorkflowSet { .. } => "workflow.set",
+            Self::WorkflowDefine { .. } => "workflow.define",
+            Self::WorkflowStrategies {} => "workflow.strategies",
+            Self::AttestMint { .. } => "attest.mint",
+            Self::AttestRelease { .. } => "attest.release",
             Self::TaskClaims { .. } => "task.claims",
             Self::TaskReclaim { .. } => "task.reclaim",
             Self::KbHealth {} => "kb.health",
@@ -1280,7 +1459,11 @@ impl Request {
             | Self::KbContext { .. }
             | Self::ViewList {}
             | Self::ViewRun { .. }
-            | Self::RepoGate { .. } => true,
+            | Self::RepoGate { .. }
+            | Self::RoleList { .. }
+            | Self::RoleWhoami {}
+            | Self::WorkflowShow { .. }
+            | Self::WorkflowStrategies {} => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -1327,6 +1510,21 @@ impl Request {
             | Self::TaskLanded { .. }
             | Self::TaskReviewFile(_)
             | Self::TaskReviewRecord(_)
+            | Self::TaskReviewWaive { .. }
+            | Self::TaskRanOnHost { .. }
+            | Self::RoleGrant { .. }
+            | Self::RoleRevoke { .. }
+            // Its admission writes the binding, so it is served on the writer.
+            | Self::RoleBind { .. }
+            | Self::RoleMap { .. }
+            | Self::RoleRotateContainer { .. }
+            | Self::WorkflowFire { .. }
+            | Self::WorkflowObserve { .. }
+            | Self::WorkflowSet { .. }
+            | Self::WorkflowDefine { .. }
+            // In memory: no database at all, so the writer is as good as anywhere.
+            | Self::AttestMint { .. }
+            | Self::AttestRelease { .. }
             | Self::TaskReclaim { .. }
             // FTS5's integrity check is an `INSERT`, which the `query_only` reader refuses.
             | Self::KbHealth {}
@@ -1765,6 +1963,60 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
+    /// A `role.grant` or `role.rotate_container`: the grant, and its token — answered this once.
+    Granted {
+        /// The grant.
+        grant: rbac::GrantInfo,
+        /// Its token.
+        token: String,
+    },
+    /// A `role.revoke`.
+    Revoked {
+        /// How many grants it revoked (the grant and what it minted).
+        count: usize,
+    },
+    /// A `role.list`.
+    Grants {
+        /// The listing.
+        listing: rbac::GrantListing,
+    },
+    /// A `role.whoami`.
+    WhoAmI {
+        /// The caller.
+        whoami: rbac::WhoAmI,
+    },
+    /// A `workflow.show`.
+    Workflow {
+        /// The task's workflow.
+        workflow: Box<rbac::WorkflowView>,
+    },
+    /// A `workflow.fire` or `workflow.observe`.
+    WorkflowMoved {
+        /// What happened.
+        outcome: rbac::WorkflowMove,
+    },
+    /// A `workflow.strategies`.
+    Strategies {
+        /// Presets, then definitions.
+        strategies: Vec<rbac::StrategyInfo>,
+        /// What a task with nothing pinned runs.
+        default: String,
+    },
+    /// A `workflow.define`.
+    Defined {
+        /// The new version.
+        version: i64,
+    },
+    /// An `attest.mint`.
+    Ticket {
+        /// The ticket.
+        token: String,
+    },
+    /// An `attest.release`.
+    TicketsReleased {
+        /// How many.
+        count: usize,
+    },
 }
 
 impl Response {
@@ -1838,6 +2090,16 @@ impl Response {
             | Self::Blob { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
+            | Self::Granted { .. }
+            | Self::Revoked { .. }
+            | Self::Grants { .. }
+            | Self::WhoAmI { .. }
+            | Self::Workflow { .. }
+            | Self::WorkflowMoved { .. }
+            | Self::Strategies { .. }
+            | Self::Defined { .. }
+            | Self::Ticket { .. }
+            | Self::TicketsReleased { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -1915,6 +2177,16 @@ impl Response {
             | Self::Blob { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
+            | Self::Granted { .. }
+            | Self::Revoked { .. }
+            | Self::Grants { .. }
+            | Self::WhoAmI { .. }
+            | Self::Workflow { .. }
+            | Self::WorkflowMoved { .. }
+            | Self::Strategies { .. }
+            | Self::Defined { .. }
+            | Self::Ticket { .. }
+            | Self::TicketsReleased { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -2127,6 +2399,11 @@ pub struct LocalBackend {
     /// Who the changelog records as making this backend's writes.
     actor: &'static str,
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
+    /// Who is asking (D52.3): the operator unless [`LocalBackend::with_caller`] named a token, which is
+    /// resolved and authorized on every call ([`rbac`]).
+    caller: rbac::Caller,
+    /// The harness tickets this process minted — a daemon's, shared by every per-request backend.
+    tickets: Option<rbac::SharedTickets>,
 }
 
 impl LocalBackend {
@@ -2141,7 +2418,81 @@ impl LocalBackend {
             file_roots: None,
             actor: "api",
             embedder: None,
+            caller: rbac::Caller::Operator,
+            tickets: None,
         }
+    }
+
+    /// The same backend, serving `caller` rather than the operator: every call resolves its token to
+    /// a principal and is refused what that principal's role, scope and task strategy do not allow.
+    #[must_use]
+    pub fn with_caller(mut self, caller: rbac::Caller) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    /// The same backend, minting and resolving harness tickets in `tickets` — one store per daemon,
+    /// shared by every request's backend.
+    #[must_use]
+    pub fn with_tickets(mut self, tickets: rbac::SharedTickets) -> Self {
+        self.tickets = Some(tickets);
+        self
+    }
+
+    /// The ticket store, if this backend has one.
+    #[must_use]
+    pub fn tickets(&self) -> Option<&rbac::SharedTickets> {
+        self.tickets.as_ref()
+    }
+
+    /// Resolve this backend's caller and admit `request`, binding an attested subagent to its task on
+    /// its first task-targeted write. The operator is admitted without a read.
+    fn admit(&self, request: &Request) -> Result<(rbac::Principal, Option<NewBinding>), ApiError> {
+        if self.caller == rbac::Caller::Operator {
+            return Ok((rbac::Principal::operator(), None));
+        }
+        let caller = self.caller.clone();
+        let tickets = self.tickets.clone();
+        let req = request.clone();
+        let (principal, admit) = self.reads.read_with(move |c| {
+            let p = rbac::resolve(c, &caller, tickets.as_deref())?;
+            let admit = rbac::authorize(c, &p, &req)?;
+            Ok::<_, ApiError>((p, admit))
+        })?;
+        if let rbac::Admit::BindThenRun {
+            session,
+            agent_id,
+            task,
+        } = admit
+        {
+            let (s, a) = (session.clone(), agent_id.clone());
+            let bound = self.db.write_txn(self.actor, move |c, m| {
+                jkb_core::roles::bind_agent(c, m, &s, &a, task)
+            })?;
+            let fresh = match bound {
+                jkb_core::roles::Bound::Elsewhere(_) => {
+                    return Err(ApiError::with_code(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "`{}` refused: {} is already working on another task, and a worker \
+                             does not hop",
+                            request.op(),
+                            principal.label
+                        ),
+                    ));
+                }
+                jkb_core::roles::Bound::Now(_) => Some(NewBinding {
+                    session,
+                    agent_id,
+                    task,
+                }),
+                jkb_core::roles::Bound::To(_) => None,
+            };
+            let mut p = principal;
+            p.scope = Some(task);
+            return Ok((p, fresh));
+        }
+        Ok((principal, None))
     }
 
     /// The same backend, bounding every read's answer to about `bytes` of JSON, cut short and marked
@@ -2196,6 +2547,13 @@ impl LocalBackend {
     }
 }
 
+/// A binding [`LocalBackend::admit`] made for the call it admitted — undone if that call fails.
+struct NewBinding {
+    session: String,
+    agent_id: String,
+    task: jkb_types::ItemId,
+}
+
 impl Backend for LocalBackend {
     fn embeds(&self) -> bool {
         self.embedder.is_some()
@@ -2205,8 +2563,40 @@ impl Backend for LocalBackend {
         true
     }
 
-    #[allow(clippy::too_many_lines)] // a flat op dispatcher: one arm per op, as in the CLI's `run`
     fn call(&self, request: Request) -> Result<Response, ApiError> {
+        // One call at a time per attested subagent, from admission to the undo below.
+        let agent_lock = match (&self.caller, &self.tickets) {
+            (rbac::Caller::Token(t), Some(tickets)) => tickets.agent_lock(t)?,
+            _ => None,
+        };
+        let _serial = agent_lock
+            .as_ref()
+            .map(|m| m.lock())
+            .transpose()
+            .map_err(|_| ApiError::with_code(ErrorCode::Internal, "agent lock poisoned"))?;
+        let (principal, bound) = self.admit(&request)?;
+        let out = self.dispatch(request, &principal);
+        // A binding this call made is kept only if the op it was made for ran: a first op refused
+        // for any other reason (outside the file roots, malformed) must not leave the worker bound
+        // for good to a task it never worked on.
+        if out.is_err() {
+            if let Some(b) = bound {
+                self.db.write_txn(self.actor, move |c, m| {
+                    jkb_core::roles::unbind_agent(c, m, &b.session, &b.agent_id, b.task)
+                })?;
+            }
+        }
+        out
+    }
+}
+
+impl LocalBackend {
+    #[allow(clippy::too_many_lines)] // a flat op dispatcher: one arm per op, as in the CLI's `run`
+    fn dispatch(
+        &self,
+        request: Request,
+        principal: &rbac::Principal,
+    ) -> Result<Response, ApiError> {
         let now = mq::now_ms();
         // Chosen here, once, from the op's class — no arm picks a connection or a budget.
         let db = if request.is_agent_read() {
@@ -2551,8 +2941,9 @@ impl Backend for LocalBackend {
             Request::TaskAdd(ask) => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let roots = self.file_roots.clone();
+                let scope = principal.scope;
                 match db.write_txn_with(actor, move |c, m| {
-                    tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref())
+                    tasks::add(c, m, &ask, server_home.as_deref(), roots.as_ref(), scope)
                 }) {
                     Ok(added) => Response::Added { added },
                     Err(tasks::AddFailure::NeedsGlobalBacklogAssent) => {
@@ -2616,8 +3007,9 @@ impl Backend for LocalBackend {
             }
             Request::TaskPlace { uid, ns, home } => {
                 let roots = self.file_roots.clone();
+                let scope = principal.scope;
                 task_write(db, actor, uid, move |c, m, uid| {
-                    tasks::place(c, m, uid, &ns, home, roots.as_ref())
+                    tasks::place(c, m, uid, &ns, home, roots.as_ref(), scope)
                 })?;
                 Response::Applied {}
             }
@@ -2758,17 +3150,192 @@ impl Backend for LocalBackend {
                     })?,
                 }
             }
-            Request::TaskReviewFile(ask) => Response::ReviewFiled {
-                filed: db.write_txn_with(actor, move |c, m| review::file(c, m, &ask))?,
-            },
+            Request::TaskReviewFile(ask) => {
+                let (who, scope) = (principal.label.clone(), principal.scope);
+                Response::ReviewFiled {
+                    filed: db
+                        .write_txn_with(actor, move |c, m| review::file(c, m, &ask, &who, scope))?,
+                }
+            }
             Request::TaskReviewRecord(ask) => {
                 let roots = self.file_roots.clone();
                 Response::ReviewRecorded {
-                    recording: db.write_txn_with(actor, move |c, m| {
-                        review::record(c, m, &ask, roots.as_ref())
+                    recording: {
+                        let who = principal.label.clone();
+                        let scope = principal.scope;
+                        // Only the operator records a round its findings reached the KB for some
+                        // other way than a filing (a mount): what a round holds becomes the scope
+                        // of the task's workers.
+                        let operator = principal.is_operator();
+                        db.write_txn_with(actor, move |c, m| {
+                            let source = if operator {
+                                jkb_core::reviews::RoundSource::AnyNamespace
+                            } else {
+                                jkb_core::reviews::RoundSource::Filed(&who)
+                            };
+                            review::record(c, m, &ask, roots.as_ref(), &who, scope, source)
+                        })?
+                    },
+                }
+            }
+            Request::TaskReviewWaive { uid, sha } => {
+                let roots = self.file_roots.clone();
+                let who = principal.label.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    let id = tasks::writable(c, &uid, roots.as_ref())?;
+                    jkb_core::reviews::waive(c, m, id, &sha, &who).map_err(ApiError::from)
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskRanOnHost { uid, sha } => {
+                let roots = self.file_roots.clone();
+                let who = principal.label.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    let id = tasks::writable(c, &uid, roots.as_ref())?;
+                    jkb_core::reviews::gate_on_host(c, m, id, &sha, &who).map_err(ApiError::from)
+                })?;
+                Response::Applied {}
+            }
+            Request::RoleGrant { role, task, agent } => {
+                let p = principal.clone();
+                let (grant, token) = db.write_txn_with(actor, move |c, m| {
+                    rbac::grant(c, m, &p, &role, task.as_deref(), &agent)
+                })?;
+                Response::Granted { grant, token }
+            }
+            Request::RoleRevoke { id } => {
+                let p = principal.clone();
+                Response::Revoked {
+                    count: db.write_txn_with(actor, move |c, m| rbac::revoke(c, m, &p, id))?,
+                }
+            }
+            Request::RoleList { task, all } => Response::Grants {
+                listing: db.read_with(move |c| rbac::list(c, task.as_deref(), all))?,
+            },
+            Request::RoleWhoami {} => {
+                let p = principal.clone();
+                Response::WhoAmI {
+                    whoami: db.read_with(move |c| rbac::whoami(c, &p))?,
+                }
+            }
+            Request::RoleBind { uid } => {
+                // The binding was made by `admit`; what is left is to say the task is one this client
+                // may write at all.
+                let roots = self.file_roots.clone();
+                db.read_with(move |c| tasks::writable(c, &uid, roots.as_ref()).map(|_| ()))?;
+                Response::Applied {}
+            }
+            Request::RoleMap { agent_type, role } => {
+                db.write_txn_with(actor, move |c, m| {
+                    rbac::map(c, m, &agent_type, role.as_deref())
+                })?;
+                Response::Applied {}
+            }
+            Request::RoleRotateContainer { keep } => {
+                let (grant, token) = db.write_txn_with(actor, move |c, m| {
+                    if let Some(t) = keep {
+                        if let Some(g) = jkb_core::roles::resolve(c, &t)? {
+                            if g.container {
+                                return Ok::<_, ApiError>((g, t));
+                            }
+                        }
+                    }
+                    let (row, token) = jkb_core::roles::rotate_container(c, m)?;
+                    Ok((row, token))
+                })?;
+                let grant = db.read_with(move |c| {
+                    rbac::list(c, None, false)
+                        .map(|l| l.grants.into_iter().find(|g| g.id == grant.id))
+                })?;
+                let grant = grant.ok_or_else(|| {
+                    ApiError::with_code(ErrorCode::Internal, "the new credential vanished")
+                })?;
+                Response::Granted { grant, token }
+            }
+            Request::WorkflowShow { uid } => {
+                let p = principal.clone();
+                Response::Workflow {
+                    workflow: Box::new(db.read_with(move |c| rbac::show(c, &p, &uid))?),
+                }
+            }
+            Request::WorkflowFire {
+                uid,
+                event,
+                reason,
+                to,
+            } => {
+                let p = principal.clone();
+                let roots = self.file_roots.clone();
+                Response::WorkflowMoved {
+                    outcome: db.write_txn_with(actor, move |c, m| {
+                        tasks::writable(c, &uid, roots.as_ref())?;
+                        rbac::fire(c, m, &p, &uid, &event, reason.as_deref(), to.as_deref())
                     })?,
                 }
             }
+            Request::WorkflowObserve { uid } => {
+                let p = principal.clone();
+                let roots = self.file_roots.clone();
+                Response::WorkflowMoved {
+                    outcome: db.write_txn_with(actor, move |c, m| {
+                        tasks::writable(c, &uid, roots.as_ref())?;
+                        rbac::observe(c, m, &p, &uid)
+                    })?,
+                }
+            }
+            Request::WorkflowSet { uid, strategy } => {
+                let a = principal.actor();
+                let roots = self.file_roots.clone();
+                db.write_txn_with(actor, move |c, m| {
+                    let id = tasks::writable(c, &uid, roots.as_ref())?;
+                    jkb_core::workflow::store::set_strategy(c, m, id, &strategy, &a)
+                        .map_err(ApiError::from)
+                })?;
+                Response::Applied {}
+            }
+            Request::WorkflowDefine { name, spec } => Response::Defined {
+                version: db.write_txn_with(actor, move |c, m| rbac::define(c, m, &name, &spec))?,
+            },
+            Request::WorkflowStrategies {} => {
+                let (strategies, default) = db.read_with(rbac::strategies)?;
+                Response::Strategies {
+                    strategies,
+                    default,
+                }
+            }
+            Request::AttestMint {
+                session,
+                agent_id,
+                tool_use_id,
+                agent_type,
+            } => {
+                let tickets = self.tickets.as_ref().ok_or_else(|| {
+                    ApiError::with_code(
+                        ErrorCode::Unsupported,
+                        "attestation tickets are minted by jkb serve, not an in-process backend",
+                    )
+                })?;
+                Response::Ticket {
+                    token: rbac::mint_ticket(
+                        tickets,
+                        principal,
+                        &session,
+                        agent_id.as_deref(),
+                        agent_type.as_deref(),
+                        &tool_use_id,
+                    )?,
+                }
+            }
+            Request::AttestRelease {
+                session,
+                agent_id,
+                tool_use_id,
+            } => Response::TicketsReleased {
+                count: match &self.tickets {
+                    Some(t) => t.release(&session, agent_id.as_deref(), tool_use_id.as_deref())?,
+                    None => 0,
+                },
+            },
             Request::TaskClaims { after } => {
                 let (claims, next) = db.read_with(move |c| claims::claims(c, after))?;
                 Response::Claims { claims, next }

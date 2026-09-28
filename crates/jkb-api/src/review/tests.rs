@@ -5,6 +5,13 @@ use serde_json::json;
 use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 use jkb_core::Db;
 
+fn facts(b: &LocalBackend, uid: &str) -> crate::sessions::TaskState {
+    match call(b, json!({ "op": "task.facts", "uid": uid })).unwrap() {
+        Response::TaskState { state } => state,
+        other => panic!("{other:?}"),
+    }
+}
+
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
     b.call(serde_json::from_value(r).expect("request parses"))
 }
@@ -216,11 +223,28 @@ fn a_review_is_recorded_only_against_findings_that_exist() {
     );
     let shown = show(&b, &uid);
     assert_eq!(shown["item"]["status"], "needs_review");
+    let review = facts(&b, &uid).review;
+    assert_eq!(review.reviewed.as_deref(), Some("abc123"));
+    assert_eq!(review.namespaces, vec!["reviews/r1".to_owned()]);
     let tags = shown["item"]["tags"].to_string();
     assert!(
-        tags.contains("abc123") && tags.contains("reviews/r1"),
-        "{tags}"
+        !tags.contains("abc123") && !tags.contains("reviews/r1"),
+        "the review record is not a tag (D52.7): {tags}"
     );
+
+    // A tag spelled like the old record is ordinary content: it waives nothing, reviews nothing.
+    call(
+        &b,
+        json!({ "op": "task.tag", "uid": uid, "facet_value": "review-waived=forged", "mode": "add" }),
+    )
+    .unwrap();
+    assert_eq!(facts(&b, &uid).review.waived, None);
+    call(
+        &b,
+        json!({ "op": "task.review_waive", "uid": uid, "sha": "def456" }),
+    )
+    .unwrap();
+    assert_eq!(facts(&b, &uid).review.waived.as_deref(), Some("def456"));
 
     // A task landing on the reviewed branch whose work has not been grafted there is reported, and
     // a branch nobody records tags nothing.
@@ -321,4 +345,137 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
     let mut small = findings[..1].to_vec();
     small[0].scenario = Some("s".to_owned());
     assert!(!super::fit(&mut small));
+}
+
+/// A caller held to one task records a review for that task only, even when another task records the
+/// same branch (D52.4): a round recorded against someone else's work is a review it did not get.
+#[test]
+fn a_scoped_caller_s_review_credits_only_its_own_task() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let mine = started(&b, "mine", "shared");
+    let theirs = started(&b, "theirs", "shared");
+    let token = match call(
+        &b,
+        json!({ "op": "role.grant", "role": "reviewer", "task": mine, "agent": "r" }),
+    )
+    .unwrap()
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let scoped = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
+    file(
+        &scoped,
+        "repos/proj/codereviews/s1",
+        &json!([{ "severity": "nit", "summary": "x" }]),
+    )
+    .unwrap();
+    let got = record(&scoped, "shared", "repos/proj/codereviews/s1").unwrap();
+    assert_eq!(
+        got.recorded
+            .iter()
+            .map(|r| r.uid.as_str())
+            .collect::<Vec<_>>(),
+        vec![mine.as_str()]
+    );
+    assert_eq!(got.unwritable, vec![theirs], "skipped, and said so");
+}
+
+/// A non-operator records only a namespace a filing made, and the gate counts the round as it was
+/// recorded: lowering a must-fix's priority afterwards does not clear it.
+#[test]
+fn a_non_operator_records_only_a_filing_and_the_gate_reads_the_recorded_round() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let mine = started(&b, "mine", "feat");
+    call(
+        &b,
+        json!({ "op": "task.add", "text": "by hand !p1", "home": "reviews/hand", "managed": true }),
+    )
+    .unwrap();
+    let token = match call(
+        &b,
+        json!({ "op": "role.grant", "role": "reviewer", "task": mine, "agent": "r" }),
+    )
+    .unwrap()
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    // A coordinator drives the work; it neither files nor records the review of it.
+    let coord = match call(
+        &b,
+        json!({ "op": "role.grant", "role": "coordinator", "agent": "c" }),
+    )
+    .unwrap()
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let coordinator = LocalBackend::new(db.clone()).with_caller(crate::rbac::Caller::Token(coord));
+    let e = file(&coordinator, "repos/proj/codereviews/self", &json!([])).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+    assert!(e.message.contains("reviewer"), "{e:?}");
+    let scoped = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
+    let e = record(&scoped, "feat", "reviews/hand").unwrap_err();
+    assert!(e.message.contains("not a namespace"), "{e:?}");
+    // The operator's `/review-log` path (a mount) still records any namespace.
+    record(&b, "feat", "reviews/hand").unwrap();
+
+    // Someone else's filing — the operator's here — is not this caller's to record.
+    file(
+        &b,
+        "reviews/op",
+        &json!([{ "severity": "nit", "summary": "theirs" }]),
+    )
+    .unwrap();
+    let e = record(&scoped, "feat", "reviews/op").unwrap_err();
+    assert!(e.message.contains("this caller filed"), "{e:?}");
+    // It files only under its repository's codereviews.
+    let e = file(
+        &scoped,
+        "tasks/elsewhere",
+        &json!([{ "severity": "must-fix", "summary": "do this" }]),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+
+    let ns = "repos/proj/codereviews/f";
+    let filed = file(
+        &scoped,
+        ns,
+        &json!([{ "severity": "must-fix", "summary": "bad", "file": "src/a.rs" }]),
+    )
+    .unwrap();
+    record(&scoped, "feat", ns).unwrap();
+    call(
+        &b,
+        json!({ "op": "task.set", "uid": filed.uids[0], "priority": 3 }),
+    )
+    .unwrap();
+    let f = findings(&b, ns);
+    assert_eq!(f.open_count, 1, "still the must-fix it was recorded as");
+    assert_eq!(f.rounds[0].must_fix, 1);
+    // Nothing added to a recorded round afterwards counts, and nothing may be filed inside it.
+    call(
+        &b,
+        json!({ "op": "task.add", "text": "late !p0", "home": format!("{ns}/must-fix"), "managed": true }),
+    )
+    .unwrap();
+    assert_eq!(
+        findings(&b, ns).open_count,
+        1,
+        "a late line is not the round's"
+    );
+    let e = file(
+        &b,
+        &format!("{ns}/more"),
+        &json!([{ "severity": "must-fix", "summary": "inside" }]),
+    )
+    .unwrap_err();
+    assert!(
+        e.message.contains("overlaps the recorded review round"),
+        "{e:?}"
+    );
 }

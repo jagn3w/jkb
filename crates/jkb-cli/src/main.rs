@@ -10,6 +10,7 @@ mod archive;
 mod atomic;
 mod commands;
 mod doctor;
+mod git_audit;
 mod gitrepo;
 mod inv_cli;
 mod item_cli;
@@ -21,6 +22,7 @@ mod owner;
 mod pr;
 mod pr_cli;
 mod presence;
+mod rbac_cli;
 mod remote;
 mod repo;
 mod review;
@@ -209,6 +211,21 @@ enum Command {
     },
     /// Run the MCP server over stdio (read + audited write tools).
     Mcp,
+    /// Roles and grants: who may do what, and the tokens that say so (design D52).
+    Role {
+        #[command(subcommand)]
+        cmd: rbac_cli::RoleCmd,
+    },
+    /// A task's workflow: its phase, who acts next, and the steps each role may take (design D52).
+    Workflow {
+        #[command(subcommand)]
+        cmd: rbac_cli::WorkflowCmd,
+    },
+    /// Harness attestation: the Claude Code hook that tells jkb serve which agent made a tool call.
+    Attest {
+        #[command(subcommand)]
+        cmd: rbac_cli::AttestCmd,
+    },
     /// The message queue: topics, sends, NDJSON subscriptions (design r3.2 Q6).
     Mq {
         #[command(subcommand)]
@@ -878,10 +895,15 @@ enum TaskCmd {
         /// bypass is visible rather than invisible.
         #[arg(long)]
         no_review: bool,
+        /// Run the gate here on the host rather than in the dev container, where it runs by default
+        /// for a checkout the container shares — it is the candidate's own, container-written code
+        /// (design D52.12). Recorded on the task.
+        #[arg(long, conflicts_with = "no_gate")]
+        gate_on_host: bool,
         /// Drop this repo's land lease, whoever holds it, and land nothing — for a holder that is
         /// gone for good but cannot be proven so (another machine, a session never seen to end).
         /// Host only.
-        #[arg(long, conflicts_with_all = ["gate", "no_gate", "keep_worktree", "no_review"])]
+        #[arg(long, conflicts_with_all = ["gate", "no_gate", "keep_worktree", "no_review", "gate_on_host"])]
         break_lock: bool,
     },
     /// File a code review's findings, and record that it ran so `task land` can require one.
@@ -1192,6 +1214,12 @@ fn run(cli: Cli) -> Result<()> {
     if let Command::Notify { cmd } = &cli.command {
         return notify::run(cmd, cli.json);
     }
+    // The attestation hook, likewise: the harness runs it on every tool call, and it talks only to
+    // `jkb serve`, with the container's credential.
+    if let Command::Attest { cmd } = &cli.command {
+        rbac_cli::attest(cmd);
+        return Ok(());
+    }
 
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
     // kernel that is the host's `jkb.db`, which a process on each side of the bind corrupts — so
@@ -1199,6 +1227,12 @@ fn run(cli: Cli) -> Result<()> {
     // run git, written a file or opened anything.
     if let Some(remote) = remote::target() {
         return remote::run(cli, &remote);
+    }
+    // A caller given a ticket or a role token is served as that principal (D52.3), and only `jkb serve`
+    // holds the tickets and checks every op — so it goes there, through the same table of what may run
+    // remotely, rather than opening the database as the operator.
+    if remote::scoped_token().is_some() {
+        return remote::run(cli, &remote::daemon_url());
     }
 
     // Keep the bundled Claude Code commands/workflows fresh in the user's config dir
@@ -1363,6 +1397,13 @@ fn run(cli: Cli) -> Result<()> {
         Command::Mq { cmd } => {
             mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
         }
+        Command::Role { cmd } => {
+            rbac_cli::role(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
+        }
+        Command::Workflow { cmd } => {
+            rbac_cli::workflow(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
+        }
+        Command::Attest { .. } => unreachable!("dispatched before the database is opened"),
         Command::Serve { .. } | Command::Service { .. } => {
             unreachable!("dispatched before the database is opened")
         }
@@ -1483,7 +1524,10 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               one land at a time, so a red gate means YOUR branch broke it.
                               REFUSES a task with no recorded review, or whose review left a
                               must-fix finding open — anything at priority <= 1, so !p0 blocks
-                              as well as !p1. --no-review records a waiver.
+                              as well as !p1 — or whose NEWEST round found any must-fix (fixing
+                              them is not a review of the fix: run another round). --no-review
+                              (operator only) records a waiver. The gate runs in the dev
+                              container for a checkout under ~/repos; --gate-on-host is recorded.
   jkb task abandon <uid>      drop the session and reopen the task (the branch is kept).
   jkb task reap               finish landings that could not move their own worktree, delete
                               archives past 30 days, and compact the message queue. A session may not unlink its own
@@ -1493,6 +1537,20 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
   jkb task sessions           what is in flight here, with uncommitted work and commits ahead.
   jkb task gate ["<cmd>"]     show or set the command that verifies a landing in this repo.
       If you are inside a session, land is the human's call — commit, and say you are done.
+
+WORKFLOW AND ROLES (who does what next, and who may — design D52)
+  jkb workflow next [<uid>]   the phase, the role that acts next, and the one thing to do.
+                              Omit <uid> for the task this branch is for.
+  jkb workflow show <uid>     the strategy, what you may fire, the permission matrix, history.
+  jkb workflow fire <uid> <event> [--reason …]
+                              submit_design, approve_design, submit_work, submit_systemic,
+                              systemic_redesign (both need --reason), rework, cancel, reopen.
+  jkb workflow observe <uid>  after a review round: take the step the round calls for —
+                              landable, back to implement, or on to a systemic review.
+  jkb role grant <role> --task <uid> --export
+                              a token for a worker you spawn (coordinator: worker roles only).
+  jkb role whoami             who this caller is. Spawn workers with an explicit agent type
+                              (subagent_type / agentType): a generic one holds no role.
 
 STAGING BRANCHES (where a batch lands before trunk — the swarm's integration branch)
   jkb staging ls [--all]      every staging branch and the tasks landing on it: each task's state
@@ -2213,6 +2271,8 @@ pub(crate) fn cmd_task_landed(
 
     let mut recorded = Vec::new();
     let mut not_closed = Vec::new();
+    let mut refused = 0;
+    let mut already = Vec::new();
     for uid in &uids {
         // `task.landed` states `landed_elsewhere` — the merge queue performed and gated the graft
         // itself (D38), which is why this is `observed_landed` and not `land`, whose guard asks
@@ -2227,9 +2287,14 @@ pub(crate) fn cmd_task_landed(
                 head: head.clone(),
             },
         )?;
-        match outcome.refusal {
-            None => recorded.push(uid.clone()),
-            Some(why) => not_closed.push((uid.clone(), why)),
+        match outcome {
+            session_cli::Verdict::Recorded => recorded.push(uid.clone()),
+            session_cli::Verdict::Held(why) => not_closed.push((uid.clone(), why)),
+            session_cli::Verdict::Already => already.push(uid.clone()),
+            session_cli::Verdict::Refused(why) => {
+                refused += 1;
+                not_closed.push((uid.clone(), why));
+            }
         }
     }
 
@@ -2239,23 +2304,39 @@ pub(crate) fn cmd_task_landed(
             serde_json::json!({
                 "repo": ctx.key, "branch": branch, "onto": onto, "head": head,
                 "landed": recorded,
+                "already": already,
                 "held": not_closed.iter().map(|(uid, why)| serde_json::json!({
                     "uid": uid, "reason": why,
                 })).collect::<Vec<_>>(),
             })
         );
-        return Ok(());
+    } else {
+        if !recorded.is_empty() {
+            println!("recorded: {branch} landed on {onto}");
+        }
+        for uid in &recorded {
+            println!("  {uid}");
+        }
+        if !already.is_empty() {
+            println!("already landed:");
+        }
+        for uid in &already {
+            println!("  {uid}");
+        }
+        // Reported rather than swallowed: a task the queue could not close is one the queue's
+        // caller will otherwise believe is done. The commonest reason is open subtasks, which is
+        // D34.4's rule holding — a merged branch is evidence, not proof that the work finished.
+        for (uid, why) in &not_closed {
+            eprintln!("  {uid} not closed — {why}");
+        }
     }
-    println!("recorded: {branch} landed on {onto}");
-    for uid in &recorded {
-        println!("  {uid}");
-    }
-    // Reported rather than swallowed: a task the queue could not close is one the queue's caller
-    // will otherwise believe is done. The commonest reason is open subtasks, which is D34.4's
-    // rule holding — a merged branch is evidence, not proof that the work finished.
-    for (uid, why) in &not_closed {
-        eprintln!("  {uid} not closed — {why}");
-    }
+    // Every task refused outright — a caller the strategy does not let land, say — recorded
+    // nothing at all, and is a failure to say so, not `recorded:` over nothing (review round 5). A
+    // guard's refusal still recorded the landing, so a branch of held parents is not this.
+    anyhow::ensure!(
+        refused < uids.len(),
+        "nothing on {branch} was recorded as landed on {onto}: every one of its tasks was refused (the reasons are above)"
+    );
     Ok(())
 }
 
@@ -2277,6 +2358,7 @@ fn cmd_task_session(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result
                 no_gate: false,
                 keep_worktree: false,
                 no_review: false,
+                gate_on_host: false,
                 break_lock: true,
             },
             json,
@@ -2304,6 +2386,7 @@ pub(crate) struct LandFlags {
     pub(crate) no_gate: bool,
     pub(crate) keep_worktree: bool,
     pub(crate) no_review: bool,
+    pub(crate) gate_on_host: bool,
     pub(crate) break_lock: bool,
 }
 
@@ -2516,6 +2599,7 @@ pub(crate) fn cmd_task_land(
         no_gate,
         keep_worktree,
         no_review,
+        gate_on_host,
         break_lock,
     } = flags;
     let gate_flag = gate_flag.as_deref();
@@ -2527,7 +2611,21 @@ pub(crate) fn cmd_task_land(
     // Asked before anything moves: a task this client may not write would otherwise be grafted and
     // its session disposed of, and only then refused its record — landed, in progress, sessionless.
     let facts = kb.facts_for_write(uid)?;
-    let tags = facts.tags.clone();
+    // Waiving the review gate is the operator's alone (D52.4), and the waiver is written only after the
+    // graft — so a caller that may not waive is refused here, before anything moves, rather than after.
+    // Asked of whoever this client authenticates as, whatever it presents: keyed on a ticket or role
+    // token in the environment, it missed the container credential a terminal in the container holds,
+    // which grafted, ran the gate, and was refused its waiver only then — landed, not marked landed.
+    if no_review {
+        match kb.call(jkb_api::Request::RoleWhoami {})? {
+            jkb_api::Response::WhoAmI { whoami }
+                if whoami.roles.iter().any(|r| r == "operator") => {}
+            _ => anyhow::bail!(
+                "--no-review waives the review gate, which only the operator may do; run another \
+                 review round instead"
+            ),
+        }
+    }
 
     // The lock is taken **before** anything is checked, not just before the graft.
     //
@@ -2560,9 +2658,10 @@ pub(crate) fn cmd_task_land(
     // only *owed* here; it is written after the landing actually happens, so a land that then
     // fails on the graft or the gate build leaves no waiver for something that never occurred.
     let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
-    let waiver_owed = review::enforce(kb, uid, &tags, no_review, json)?;
+    let waiver_owed = review::enforce(kb, uid, &facts.review, no_review, json)?;
 
     let land_dir = land_dir_for(&ctx, &onto)?;
+    let gate_place = gate_place_for(kb, uid, &head, &land_dir, no_gate, gate_on_host)?;
 
     let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
     // TWO FAILURES, TWO REMEDIES. They were one arm, and the message it printed was written for
@@ -2596,7 +2695,10 @@ pub(crate) fn cmd_task_land(
         );
     }
     if let Some(cmd) = &gate {
-        let (passed, output) = session::run_gate(&land_dir, cmd, json)?;
+        if let (session::GatePlace::Container { name, .. }, false) = (&gate_place, json) {
+            println!("gate: running in the dev container `{name}`");
+        }
+        let (passed, output) = session::run_gate(&land_dir, cmd, &gate_place, json)?;
         if !passed {
             gitrepo::reset_hard(&land_dir, &pre)?;
             let tail = output
@@ -2678,6 +2780,28 @@ struct Landed<'a> {
 }
 
 /// Mark the task done, free the claim, and dispose of the session (design D36.4).
+/// Where a landing's gate runs, settled BEFORE the graft so a refusal — no container to run the
+/// candidate's code in — has moved nothing (D52.12). Running it on the host instead is the operator's
+/// call, recorded on the task first: the op is operator-only, so a caller that may not make it is
+/// refused here too.
+fn gate_place_for(
+    kb: &session_cli::Kb<'_>,
+    uid: &str,
+    head: &str,
+    land_dir: &Path,
+    no_gate: bool,
+    gate_on_host: bool,
+) -> Result<session::GatePlace> {
+    if no_gate {
+        return Ok(session::GatePlace::Here);
+    }
+    let place = session::gate_place(land_dir, gate_on_host)?;
+    if gate_on_host {
+        kb.ran_on_host(uid, head)?;
+    }
+    Ok(place)
+}
+
 fn settle_landing(
     kb: &session_cli::Kb<'_>,
     stores: &archive::Stores<'_>,
@@ -2695,7 +2819,7 @@ fn settle_landing(
     // is also recorded for a task somebody finished during the gate: the waived landing is what
     // it describes, not the status.
     if let Some(sha) = landed.waiver {
-        kb.set_facet(task_uid, review::FACET_REVIEW_WAIVED, sha)?;
+        kb.review_waive(task_uid, sha)?;
     }
 
     // Is the session still there at all? `git status` in a directory that no longer exists
@@ -2978,7 +3102,14 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     let mut last_observed = String::new();
     let mut last_compaction_failure = String::new();
     let mut last_sweep_failure = String::new();
+    let mut last_git_audit = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        // Repository config that could make this host run code (D52.11, layer 3): said, and
+        // notified, when the set of findings changes — posted when one appears, withdrawn when
+        // the last is gone.
+        if !dry_run {
+            git_audit_pass(db_path, &mut last_git_audit, json);
+        }
         // The queue's compaction rides the same timer (design r3.2 Q3). Work done is always
         // printed — two passes that each reaped one message are two events, not a repeat. Only a
         // FAILURE is silenced while unchanged, for the same reason as the sweep's silence below.
@@ -3027,6 +3158,31 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One pass of the git-config scan over `~/repos` ([`git_audit`]). Never fails the service.
+fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let findings = git_audit::scan(&home.join(jkb_daemon::CLIENT_FILE_ROOT));
+    let now = git_audit::summary(&findings);
+    if now == *last {
+        return;
+    }
+    for (dir, why) in &findings {
+        let line = format!("git-audit: {}: {why}", dir.display());
+        if json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    let sent = open_db(db_path).and_then(|db| git_audit::notify(&db, &findings));
+    match sent {
+        Ok(()) => *last = now,
+        Err(e) => eprintln!("git-audit: could not post its notification: {e:#}"),
+    }
 }
 
 /// One sweep, with the database opened for it and closed after.

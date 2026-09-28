@@ -796,6 +796,14 @@ impl Fixture {
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         v["uid"].as_str().unwrap().to_owned()
     }
+
+    /// A concern (`!p2`) under `ns`: a round holding one has findings and no must-fix.
+    fn add_concern(&self, ns: &str, text: &str) {
+        self.jkb()
+            .args(["--global", "task", "add", text, "!p2", &format!("+{ns}")])
+            .assert()
+            .success();
+    }
 }
 
 /// `staging ls` groups live sessions under the branch they land on, and derives each task's
@@ -963,9 +971,26 @@ fn landing_requires_a_review_with_no_open_must_fix_findings() {
     assert_eq!(t["open_must_fix"], 1);
     assert_eq!(t["state"].as_str().unwrap(), "review");
 
-    // 3. Dismissing the finding lets it land. Concerns and nits never blocked.
+    // 3. Dismissing the finding is not enough (D52.6): the newest round found a must-fix, and
+    //    fixing it is not a review of the fix.
     f.jkb()
         .args(["--global", "task", "set", &finding, "--status", "cancelled"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "newest review round (reviews/gate)",
+        ));
+    assert_eq!(git(&f.repo, &["rev-parse", &onto]), before);
+
+    // 4. A fresh round with nothing must-fix lets it land. Concerns and nits never blocked.
+    f.add_concern("reviews/gate-2", "a concern, not a must-fix");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/gate-2"])
         .assert()
         .success();
     f.jkb()
@@ -1089,8 +1114,8 @@ fn a_review_with_no_findings_is_refused_not_read_as_clean() {
         .failure()
         .stderr(predicate::str::contains("no findings found"));
 
-    // And a task that somehow carries such a facet pair still cannot land: the gate checks
-    // that findings exist, not merely that a namespace was named.
+    // And tags spelled like the old review record are ordinary content (D52.7): a synced file or
+    // an agent that writes them has recorded no review, so the gate still refuses.
     f.jkb()
         .args(["--global", "task", "tag", "set", &uid, "reviewed=deadbeef"])
         .assert()
@@ -1110,7 +1135,7 @@ fn a_review_with_no_findings_is_refused_not_read_as_clean() {
         .args(["task", "land", &uid, "--no-gate"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("holds no findings at all"));
+        .stderr(predicate::str::contains("no recorded review"));
     assert_eq!(f.status_of(&uid), "in_progress");
 }
 
@@ -4182,11 +4207,7 @@ fn a_container_session_lands_through_the_daemon() {
     )
     .unwrap();
     assert!(
-        shown["tags"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["facet"] == "review-waived"),
+        shown["review"]["waived"].is_string(),
         "the waiver was recorded through the daemon: {shown}"
     );
     let stored: serde_json::Value = serde_json::from_slice(
@@ -4931,4 +4952,67 @@ fn a_discovered_merged_pull_request_closes_its_task_in_one_run() {
     assert_eq!(v["closed"][0]["uid"], uid.as_str(), "{v}");
     assert_eq!(v["closed"][0]["pr"], 45, "{v}");
     assert_eq!(f.status_of(&uid), "done");
+}
+
+/// `--no-review` asks who this client is **before** anything moves, whatever credential it presents:
+/// a terminal in the dev container holds the container credential (a coordinator), not a ticket, and
+/// keying the check on a ticket in the environment let it graft and run the gate before its waiver
+/// was refused — landed, and not marked landed.
+#[test]
+fn a_waiver_is_refused_before_anything_moves_to_a_container_terminal() {
+    use std::io::BufRead as _;
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let f = Fixture::new();
+    let uid = f.add_task("to land");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    let before = git(&f.repo, &["rev-parse", "main"]);
+    f.jkb()
+        .env("HOME", f.home.path())
+        .args(["role", "rotate-container", "--write"])
+        .assert()
+        .success();
+    let token = f.home.path().join("daemon/token");
+    let mut serve = jkb(Some(&f.db));
+    serve
+        .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+        .arg(&token)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = serve.spawn().unwrap();
+    let banner = std::io::BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap();
+    let _daemon = Kill(child);
+    let url = banner
+        .split_whitespace()
+        .find(|w| w.starts_with("http://"))
+        .unwrap()
+        .to_owned();
+    jkb(None)
+        .current_dir(&f.repo)
+        .env("HOME", f.home.path())
+        .env("JKB_REMOTE", &url)
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only the operator"));
+    assert_eq!(
+        git(&f.repo, &["rev-parse", "main"]),
+        before,
+        "nothing moved"
+    );
 }

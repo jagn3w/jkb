@@ -486,6 +486,72 @@ The one path constraint left is about the checkout that *provides* the container
 you may open: `run.sh` has to hand the container a path to its own `setup.sh`, so that checkout has
 to be under `~/repos`. It says so and stops.
 
+### Only what the container uses of `~/.jkb`, the credential read-only, and every repo's git config read-only (D52)
+
+The whole of `~/.jkb` used to be bound in. It holds the operator's database, five whole-database
+copies, and the daemon's **root token** — the credential that makes a caller the operator — so
+anything in here could read it, or open the database directly (the no-raw-sqlite hook is advisory
+and fails open). Measured from inside, 2026-09-25: `jkb.db`, its `-wal`/`-shm`, `backups/` and
+`daemon/` were all visible. Now (design D52.8, `docs/task-lifecycle.md` D52):
+
+| host | container | mode | for |
+|---|---|---|---|
+| `~/.jkb/claude-memory` | same | rw | auto-memory |
+| `~/.jkb/logs` | same | rw | the hooks' logs |
+| `~/.jkb-container/` | same | **ro** | the container credential — a coordinator grant, this container's ceiling |
+
+`~/.jkb` itself is an image directory, so the database and the root token do not exist in here.
+The container authenticates to `jkb serve` with its credential, written on the host by `setup.sh`
+(`jkb role rotate-container --write --keep-live`, which keeps a live one rather than revoking every
+worker minted from it). It is outside `~/.jkb` so it is not a read-only bind nested in a writable one.
+
+**Every repository's `.git/config` and `.git/hooks` are bound read-only** by `run.sh`, generated
+because this file cannot list repositories. Git on the HOST runs what those name (`core.fsmonitor`,
+hooks, filters), so a container able to write them could run code as the operator (hole H5).
+Measured on Docker Desktop 29.7.2: overwriting, renaming over (EBUSY), planting a hook and enabling
+per-worktree config all fail, and the config is left unchanged. **A speed bump, not the boundary**
+(corrected by review round 1): `.git/` is writable around the binds, so renaming `.git` itself away,
+or planting `.git/commondir` — which redirects git's config and hooks anywhere (measured on git
+2.51.1) — gets past them, and submodule configs are not bound. What holds is jkb's own audit before
+every git call, which also refuses a redirected git directory — and jkb's git never enters a
+submodule — and the reap service's scan, which also reports submodule configs, for your git
+(`docs/task-lifecycle.md`, D52). What it costs in here: `git config
+--local` and `git remote add` fail; `branch --set-upstream-to` and `push -u` print an error, exit
+0 and record no upstream — set those on the host. Status, commit, branches, fetch and `git worktree
+add`/`remove` (so `jkb task work`) are unaffected. A repository cloned after the container starts is
+covered at its next start; until then jkb's own git refuses a planted one, and the host's reap
+service posts a notification.
+
+`verify.sh` asserts the database and token are absent, the credential is read-only, and every
+generated git bind is read-only (a writable one fails the boundary check). `check-config.sh`
+refuses the whole `~/.jkb` as a bind source and a writable credential mount; `mutate-config.sh`
+and `mutate-verify.sh` carry a mutation for each.
+
+**The harness's own rules are managed settings baked into the image**
+(`/etc/claude-code/managed-settings.json`, from `managed-settings.json` here, root-owned): the
+attestation hook (`jkb attest hook`, which tells `jkb serve` which agent made each `jkb` call),
+the workflow Stop hook (which holds only a session launched with `JKB_DRIVE`), and deny rules keeping the model's in-process tools — which the Bash
+sandbox does not confine — away from the credential, from session transcripts (a live tool call's
+ticket is written there; `*.jsonl` only, so auto-memory stays readable, and workflow journals do
+not), and from the files that configure the harness (a hook, agent definition or MCP server it
+could add would run unsandboxed).
+
+**The hooks run a pinned, root-owned `jkb`** — `/usr/local/lib/jkb-hook/jkb`, never `jkb` from
+PATH. They run outside the sandbox with the credential readable, and `~/.cargo/bin` is writable from
+inside it (measured: a sandboxed `touch ~/.cargo/bin/x` succeeds), so a PATH lookup ran whatever a
+tool call last installed there. `setup.sh` pins its build with `sudo -n /usr/local/bin/pin-jkb-hook.sh`
+(a root script, sudoers-pinned to no arguments), which a sandboxed command cannot run (measured:
+`NoNewPrivs: 1`, `sudo -n` exits 1). After rebuilding jkb yourself, run it again. `check-config.sh`
+refuses a managed hook naming anything else, and `verify.sh` that the pinned binary is missing or
+writable. The residual: it pins whatever `~/.cargo/bin/jkb` is when it runs.
+
+**Not yet measured, because it needs this image running:** that managed hooks run beside the
+project's and user's (they are not exclusive unless `allowManagedHooksOnly`, which is not set
+because it would disable this repo's own hooks); that the managed deny rules merge with the
+posture's; that returning `permissionDecision: "allow"` with `updatedInput` from the attestation
+hook does not override a deny rule (it returns `allow` only for one plain `jkb` invocation, and
+`ask` for any other command running `jkb`); and hook latency against the real daemon. `verify.sh` does not yet check these.
+
 ### A nested bind must be named
 
 `verify.sh` compares exact mount points, with no prefix logic — filtering by prefix is what once

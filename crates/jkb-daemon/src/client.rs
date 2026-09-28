@@ -18,6 +18,9 @@ pub struct RemoteBackend {
     base: String,
     token_file: PathBuf,
     token: Mutex<Option<String>>,
+    /// A token given outright — a role grant or a harness ticket (D52.3) — sent in place of the
+    /// token file's, and never re-read: it does not rotate with the daemon.
+    fixed: Option<String>,
     client: reqwest::blocking::Client,
     poll_wait: Duration,
     /// How long a request may take beyond any long-poll wait.
@@ -43,6 +46,7 @@ impl RemoteBackend {
             base: base.trim_end_matches('/').to_owned(),
             token_file,
             token: Mutex::new(None),
+            fixed: None,
             client: http_client(Duration::from_secs(1))?,
             poll_wait: Duration::from_secs(2),
             op_timeout: Duration::from_secs(30),
@@ -77,7 +81,18 @@ impl RemoteBackend {
         self
     }
 
+    /// Authenticate with `token` instead of the token file's: a role grant, the dev container's
+    /// credential, or a harness ticket. The daemon serves the caller it names, held to its role.
+    #[must_use]
+    pub fn with_token(mut self, token: String) -> Self {
+        self.fixed = Some(token);
+        self
+    }
+
     fn token(&self, fresh: bool) -> Result<String, ApiError> {
+        if let Some(t) = &self.fixed {
+            return Ok(t.clone());
+        }
         let mut cached = self
             .token
             .lock()
@@ -259,7 +274,8 @@ impl Backend for RemoteBackend {
         // when jkb serve itself said `unauthorized` (not any 401), so a wrong token is never retried
         // in a loop.
         match self.attempt(&request, &self.token(false)?) {
-            Err(e) if e.code == ErrorCode::Unauthorized => {
+            // A fixed token does not rotate, so there is nothing fresher to retry with.
+            Err(e) if e.code == ErrorCode::Unauthorized && self.fixed.is_none() => {
                 self.attempt(&request, &self.token(true)?)
             }
             other => other,
