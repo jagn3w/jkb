@@ -262,6 +262,85 @@ open(p, 'w').write(s.replace("verify.sh", "nothing.sh"))
 PYX
 run "run.sh stops verifying at all" "nothing verifies the container"
 
+# THE TRANSCRIPT SWEEP, one mutation per way its enumeration goes wrong, plus the two ways the
+# wiring does. Every one of them is silent at run time — the sweep reports success while archiving
+# the wrong set or the empty set — so this is the only place any of them is ever observed failing.
+#
+# ANCHORED ON CODE THE FILE HAS TO KEEP: the `find` line inside `transcript_records`, the function
+# name check-config.sh extracts by, and run.sh's invocation statement. Never on a message: a
+# mutation anchored on wording silently becomes a NO-OP the day the wording is improved, and then
+# reports MISSED about a guard that is perfectly fine. `assert` on each, so that if one of these
+# anchors DOES move, this says so instead of certifying the unmutated tree.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'find -L "$abs"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'find "$abs"', 1))
+PYX
+run "the sweep stops following a symlinked root" "does not pass -L"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'find -L "$abs" -type d'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'find -L "$abs" -maxdepth 2 -type d', 1))
+PYX
+run "the sweep bounds its depth, missing the nested agent transcripts" "it caps the depth"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "-type f -name '*.jsonl' -exec"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "-type f -exec", 1))
+PYX
+run "the sweep stops filtering on *.jsonl, so auto-memory is in the plan" "does not filter on *.jsonl"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '-type d -name memory -prune -o '
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the sweep walks out through the memory symlink into ~/.jkb" "does not prune memory/"
+
+# ...AND THE EXTRACTION ITSELF, pinned against reading nothing. check-config.sh pulls the function
+# body out by name, and a rename would leave its four greps matching an empty string — which is
+# four `ok`s about a file nobody read, the exact shape this harness exists to refuse.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'transcript_records() {'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'enumerate_them() {', 1))
+PYX
+run "the enumeration is renamed, so the guard reads nothing" "no transcript_records"
+
+# THE WIRING, both halves. Removing it is a container that fills up again; moving it after the
+# verify is the reap's own bug back — one failing assertion about something else and the sweep
+# never runs, which is how the deleted postStartCommand came to be unconditional.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "run.sh stops sweeping transcripts" "run.sh does not invoke it"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+sweep = 'in_container -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true\n'
+verify = 'in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?\n'
+assert sweep in s and verify in s, "mutation target absent"
+open(p, 'w').write(s.replace(sweep, '', 1).replace(verify, verify + sweep, 1))
+PYX
+run "the sweep moves after the verify, where a failing assertion disables it" "AFTER verify.sh"
+
 # THE ENTRYPOINT LINE. One line in the Dockerfile is the whole of "the firewall is raised on every
 # start"; deleting it leaves both config harnesses green because run.sh raises it too, and breaks
 # only `docker start`, Docker Desktop and a daemon restart — where nothing else looks.
@@ -1019,7 +1098,7 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 echo
 echo "==> coverage"
 bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=96
+PINNED_BAD_SITES=97
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

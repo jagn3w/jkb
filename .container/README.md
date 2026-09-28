@@ -271,7 +271,10 @@ not completed in this container, and `verify.sh` alone if it has. That is decide
 interrupted first run used to leave setup unreachable for the container's whole life. It also
 sweeps deferred worktree archives — the container's job, because a session cannot archive its own
 checkout and the host's reaper cannot see `/home/vscode/...` paths — and it does that *before*
-verifying, so a failing assertion about something else cannot disable it.
+verifying, so a failing assertion about something else cannot disable it. Beside it, and for the
+same ordering reason, it sweeps session transcripts by byte budget: without that, the sandbox's
+deny list outgrows a single argv and **every** Bash call in **every** session fails at spawn. See
+*Transcripts are swept by byte budget, not by age* at the end of this file for the measurement.
 
 ```sh
 ./.container/run.sh --build     # rebuild the image (needed after a Dockerfile or extension change)
@@ -1276,3 +1279,80 @@ repo's build output, so `jkb doctor` and `jkb task reap` print what the archives
 deliberately not pruned — `git clean -X` deletes exactly the regenerable files and also deletes a
 gitignored `.env`, and unrequested deletion is what this whole mechanism exists to avoid. Shorten
 `--retain-days` if size matters more than the safety net.
+
+## Transcripts are swept by byte budget, not by age
+
+Every Bash tool call in every container session failed at spawn with `E2BIG`. Not degraded —
+total, from the first call, in a container that had worked the week before, with nothing in the
+message naming the cause.
+
+**What was measured, 2026-09-28, in `jkb-dev`:**
+
+| | |
+|---|---|
+| transcript `.jsonl` files under `~/.claude/projects` | 1,182 |
+| their path text | 224 KB (~194 bytes per path) |
+| deny-list entries the sandbox profile built from them | ~2,396 |
+| path text in the profile | 448 KB |
+| what the harness reported | `command line 498.8KB across 3 args` |
+| `MAX_ARG_STRLEN` (Linux, 32 pages) | 131,072 bytes |
+
+Claude Code's Bash sandbox enumerates every transcript **individually** into its read-`denyOnly`
+list and passes that profile to the shell as a **single argv string**, which the kernel caps at
+one page-times-32. Two things multiplied it. Transcripts **nest** — `<slug>/<uuid>.jsonl` is depth
+2, `<slug>/<uuid>/subagents/agent-*.jsonl` is depth 4, and
+`<slug>/<uuid>/subagents/workflows/wf_*/agent-*.jsonl` is depth 6 — and the deep ones are the
+bulk, one per task-swarm implementer, per reviewer and per Workflow agent. And
+`~/.claude/projects` is a **symlink** to `~/.claude-state/projects`, so every file is listed under
+both spellings: the 224 KB is doubled before the fixed security paths are added.
+
+`.claude-state` is a Docker volume, so none of this resets on a rebuild. The count only goes up.
+
+**Why the budget is bytes.** The failing quantity is bytes of argv, so that is what
+`.container/sweep-transcripts.sh` counts: the path text of the `.jsonl` files under the root,
+doubled for the two spellings, archived oldest-first until the projection is under 64 KB — half
+the ceiling, leaving the other half for the ~30 fixed security paths, the write-side lists and the
+JSON quoting around every entry.
+
+The two obvious alternatives are both things that already failed here:
+
+- **Time-based** is what Claude Code itself does, and `cleanupPeriodDays` never binds — the byte
+  budget is exhausted well inside any 30-day window. A container with retention configured is
+  exactly the container that arrived at 1,182 files.
+- **Count-based** is closer, but it drifts in the direction that breaks: the path text per file
+  grows as agents nest deeper, so a count chosen against today's tree silently stops fitting
+  without anything changing but the shape of the work.
+
+**What it costs.** Archived transcripts move to `~/.claude-state/transcript-archive`, a sibling of
+`projects/` in the same volume. It survives rebuilds, the move is a rename on one filesystem
+rather than a copy, and being outside `projects/` is the only reason the sweep reduces anything.
+Nothing is deleted. But Claude Code no longer lists an archived session, so `--resume` will not
+offer it and `/resume` will not find it — recovering one is copying a file back, if you know it is
+there. At ~194 bytes a path the budget keeps roughly the newest 169 files, and the newest 32 are
+kept unconditionally whatever the arithmetic says, because the live session is writing one of them
+right now.
+
+`run.sh` runs it on every start, **before** `verify.sh` and for the same reason the deferred
+worktree reap runs there (*Using it*, above): one failing assertion about something else must not
+disable it. It is never fatal — what it could not archive it says, and a deny list slightly too
+long is the state we were already in.
+
+**Four properties of one `find` carry the whole thing**, and each is held by both
+`sweep-transcripts.sh --self-test` and a `check-config.sh` assertion, because every way of getting
+it wrong is silent in both directions — a sweep that archives the wrong set reports success
+exactly like one that archives the right set:
+
+- **`-L`**, because the root is reachable through a symlink and `find` does not follow a symlinked
+  *starting point* without it. Drop it and the sweep enumerates nothing and says so cheerfully.
+- **No depth cap**, because the nested agent transcripts are the population that matters. Cap it
+  and the container still dies at spawn with a sweep in the log saying it worked.
+- **`-name '*.jsonl'`**, because `<slug>/memory/` holds auto-memory as `.md` files and
+  `workflows/wf_*.json` are run records. The name is the guard; depth never was.
+- **`memory/` pruned**, because under `-L` that per-repo symlink into the bind-mounted
+  `~/.jkb/claude-memory` is followed like a real directory and the walk leaves the volume — into
+  files the *host* owns.
+
+And every project slug begins with `-` (the absolute path with non-alphanumerics replaced, so the
+leading `/` becomes one): `-home-vscode-repos-jkb`. A bare `dirname "$rel"` reads that as the `-h`
+option and dies, and it is every path in the tree rather than an edge case, so the relative
+directory comes from `${rel%/*}` and every external command here is given `--`.

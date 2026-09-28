@@ -497,6 +497,56 @@ else
     bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
 fi
 
+# THE TRANSCRIPT SWEEP, and the four properties of its enumeration that no runtime check can see.
+#
+# WHY IT IS GUARDED STATICALLY. The sweep runs on every container start and moves files out of
+# ~/.claude/projects. Every way of getting it wrong is SILENT in both directions: widen the name
+# filter and it archives the auto-memory the host also owns, through a symlink into the bind mount;
+# cap the depth and it sweeps the cheap half of the population (depth 2) while the agent
+# transcripts that are the bulk (depth 4 and 6) accumulate exactly as before, so the container
+# still dies at spawn with a sweep in the log saying it worked. Neither state raises anything at
+# run time. The self-test catches all four — this is the half that catches them being edited out
+# of the file the self-test does not run against.
+#
+# ONE ASSERTION, composed message. The four are one property — "the enumeration still enumerates
+# the right set" — and splitting them would be four failure paths where one names the subject.
+# ANCHORED ON THE FUNCTION NAME, like the verify guard above is anchored on the invocation: the
+# body is extracted by name, so a mutation that edits the real `find` is seen and the self-test's
+# own `find` calls are not, and an extraction that reads nothing is a failure rather than four
+# vacuous passes.
+sweep_problems=""
+run_stripped="$(dc_strip_comments "$here/run.sh")"
+sweep_at="$(grep -nE '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/sweep-transcripts\.sh' <<<"$run_stripped" | head -1 | cut -d: -f1)"
+verify_at="$(grep -nE '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/verify\.sh' <<<"$run_stripped" | head -1 | cut -d: -f1)"
+if [ -z "$sweep_at" ]; then
+    sweep_problems="$sweep_problems run.sh does not invoke it (a statement, not a mention of the name);"
+elif [ -n "$verify_at" ] && [ "$sweep_at" -gt "$verify_at" ]; then
+    sweep_problems="$sweep_problems run.sh runs it AFTER verify.sh (line $sweep_at vs $verify_at), so one failing assertion about something else disables it;"
+fi
+if [ ! -f "$here/sweep-transcripts.sh" ]; then
+    sweep_problems="$sweep_problems sweep-transcripts.sh is not there at all;"
+else
+    sweep_enum="$(dc_strip_comments "$here/sweep-transcripts.sh" \
+        | awk '/^transcript_records\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }')"
+    if [ -z "$sweep_enum" ]; then
+        sweep_problems="$sweep_problems it has no transcript_records() to read, so the four checks below establish nothing;"
+    else
+        grep -qF -- 'find -L ' <<<"$sweep_enum" \
+            || sweep_problems="$sweep_problems it does not pass -L, so a symlinked root (which is how the container spells it) enumerates nothing;"
+        grep -qF -- '-maxdepth' <<<"$sweep_enum" \
+            && sweep_problems="$sweep_problems it caps the depth, which misses the nested agent transcripts that are the bulk of the population;"
+        grep -qF -- "-name '*.jsonl'" <<<"$sweep_enum" \
+            || sweep_problems="$sweep_problems it does not filter on *.jsonl, so auto-memory and workflow run records are in the plan;"
+        grep -qF -- '-name memory -prune' <<<"$sweep_enum" \
+            || sweep_problems="$sweep_problems it does not prune memory/, so under -L the walk follows that symlink out into the bind-mounted ~/.jkb;"
+    fi
+fi
+if [ -z "$sweep_problems" ]; then
+    ok "run.sh sweeps transcripts before verifying, and the sweep enumerates only transcripts, at every depth"
+else
+    bad "the transcript sweep does not hold:$sweep_problems — see .container/sweep-transcripts.sh"
+fi
+
 # ...AND THE IDIOM THAT MADE THAT GUARD LIE is refused for the whole repository, in
 # `scripts/tests/dev-scripts.test.sh`, not here. The scan that stood in this place covered
 # `"$here"/*.sh` and matched only the `dc_strip_comments | grep -q` spelling, so it could not

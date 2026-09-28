@@ -1045,6 +1045,14 @@ dc_mirror_host_hooks "$NAME" "$CONFIG"
 # ran it unconditionally and this is that shape back.
 in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 
+# THE TRANSCRIPT SWEEP, BEFORE THE VERIFY, for the reason the reap above is: a failing assertion
+# about something else must not disable it. It is the same shape of job — a thing that only this
+# script is placed to do on every start — and it is the more urgent of the two, because the state
+# it prevents is a container in which NO Bash tool call works at all (E2BIG at spawn, measured
+# 2026-09-28; sweep-transcripts.sh carries the numbers). Never fatal: what it could not archive it
+# says, and a deny list slightly too long is the state we were already in.
+in_container -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
+
 # ONE VERIFIER, AFTER BOTH ARMS. It used to be the last line of setup.sh on the fresh path and a
 # separate call here on the restart path — so the review's "a fatal verify suppresses everything
 # after it" was fixed in one arm and left in the other, which is what fixing at a site rather than
