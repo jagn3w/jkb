@@ -1500,3 +1500,48 @@ disappear between two statements of one function — a live session, `cleanupPer
 a second `run.sh` all produce it in the field, and none of them can be staged. The static pin in
 `check-config.sh` and its mutation are the whole of the coverage, which is worth writing down rather
 than leaving a reader to infer that the fixture covers it.
+
+**Round 4, and the two findings that were not about the guards.** The sweep's only trigger is a
+container start. The origin story at the top of this section is exactly that path — a container that
+had worked the week before reached 1,182 transcripts *without being recreated* — and the documented
+workflow is `run.sh` once, then attach and keep working, where a second window (`code <path>` from an
+attached terminal) never re-enters `run.sh`. The budget keeps roughly 169 files, and every swarm
+implementer, reviewer and Workflow agent writes a transcript. Measured in this container on
+2026-09-28, after the sweep had shipped: **80,092 deny bytes projected against a 65,536 budget**, in a
+tree no sweep had reached since the start. A start-only trigger bounds the deny list at a rate that
+has nothing to do with the rate transcripts are created, and that gap is not closed by anything in
+this file.
+
+What *is* closed is the reporting. `run.sh` discards the sweep's exit code with `|| true` — correctly,
+since a deny list slightly too long must not abort a start — so the warning scrolled past several
+steps before the verify anyone actually reads, and `verify.sh` said nothing about transcripts at all.
+It now runs the sweep's own `--dry-run` (moves nothing; returns non-zero exactly when the residual
+would still be over budget) and reports the answer where the operator is looking. The unreclaimable
+floor is `accept_bad`, not `bad`: past roughly 199 run journals no sweep can bring the tree under, and
+that is a condition to act on rather than a broken boundary — which is what this container's two exit
+codes exist to distinguish.
+
+Two more assertions that passed for the wrong reason, both introduced by the round that was fixing
+that very class:
+
+- **Three of the four containment rows returned 1 for an unrelated reason.** They sweep `$root` while
+  the budget around them was measured through `$work/projects-link`; the spellings differ by a byte
+  per path, so the residual check returned 1 whatever containment decided, and `rc_of` sees only the
+  code. Measured: deleting the entire containment block turned exactly **one** of the four red — the
+  executable half of the guard against the `.archive/.archive/` nesting had come to rest on a single
+  row balanced on an exact budget equality that any fixture edit breaks in silence. They assert the
+  refusal's own words now, not the exit code.
+- **`transcript_resolve` collapsed a `..` only when its left-hand component already existed.** On the
+  *first* sweep — the only state the question is ever asked in, since the sweep is what creates the
+  archive — the whole of `…/transcript-archive/../projects/.archive` is the unresolvable tail, the
+  prefix test saw a path still containing `..`, and the archive was accepted inside the root (deny
+  bytes 96 → 114 on the probe). Every later sweep then refused for ever, because `mkdir` had made the
+  `..` collapsible. The self-test row written for this route passed for the same reason: it ran after
+  a real sweep had already created the archive. The tail is collapsed lexically now, which is sound
+  *here and only here* — a tail component that existed as a directory would have stopped the walk-up,
+  so there is no symlink left in it for `..` to mean something else about.
+
+And a rule worth stating plainly, because this section has now recorded it four times at four sites:
+**a guard on a comparison must pin both operands.** `phys_root` was pinned and `phys_archive` was not;
+the seam refusal named one of three seams; the containment rows asserted a code that two different
+things produce. Each shipped with a comment claiming the whole property.

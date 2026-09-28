@@ -428,6 +428,41 @@ open(p, 'w').write(s.replace(old, 'JKB_DENY_BUDGET_BYTES=99999999 bash .containe
 PYX
 run "run.sh wires the self-test budget seam into the container" "sets JKB_DENY_BUDGET_BYTES"
 
+# ...AND EVERY OTHER SEAM, because the guard that shipped named one of three. A root that does not
+# exist is the cheapest way to switch the sweep off and leave a clean log.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\nUSER vscode\n"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "\nENV JKB_TRANSCRIPT_ROOT=/nonexistent\nUSER vscode\n", 1))
+PYX
+run "the Dockerfile pins the transcript root to a tree that is not there" "sets JKB_TRANSCRIPT_ROOT"
+
+# ...and the list itself going away, which is what makes the loop above establish anything.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '\nSEAMS="'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '\nSEAM_NAMES="', 1))
+PYX
+run "the seam list is renamed, so the guard reads nothing" "no SEAMS= line to read"
+
+# THE OPERATOR-FACING HALF. run.sh discards the sweep's exit code on purpose, so verify.sh -- the
+# thing anyone actually reads after a start -- is the only durable place the budget is reported.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'bash "$sweep_sh" --dry-run'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'true --not-a-dry-run', 1))
+PYX
+run "verify.sh stops reporting the transcript deny list" "does not ask whether the deny list still fits"
+
+seed; rm -f "$work/t/.container/verify.sh"
+run "verify.sh is deleted outright" "verify.sh is not there to report the deny list"
+
 # THE VERIFY LINE THE ORDERING IS MEASURED AGAINST. Reading nothing there used to make the ordering
 # test SKIP rather than fail -- the one extraction in this block that was not pinned against an
 # empty read, which is the failure mode this whole file exists to refuse.
@@ -1308,8 +1343,12 @@ fi
 # left the count unmoved, left `bad_sites` unmoved (all branches emit through one `bad "`), and
 # shipped with no mutation: exactly the gap this pin exists to close. Two appends on one line
 # bypassed it the same way. `grep -o` counts occurrences, so any spelling of a new branch moves it.
-sweep_appends="$(grep -o 'sweep_problems' "$repo/.container/check-config.sh" | grep -c .)"
-PINNED_SWEEP_APPENDS=47
+# COUNTED OVER CODE, NOT COMMENTS. The sweep guard's own prose names PINNED_SWEEP_APPENDS,
+# transcript_projection_fell, HELD_NAME and phys_archive by identifier, so a round that DOCUMENTS a
+# branch would otherwise move this count and print "Add a mutation for it" about a sentence.
+sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
+    | grep -o 'sweep_problems' | grep -c .)"
+PINNED_SWEEP_APPENDS=53
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

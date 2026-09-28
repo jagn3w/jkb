@@ -33,6 +33,20 @@ command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0
 # the harm the pin below is written against.
 dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 
+# THE LINE NUMBER OF A `bash .container/<script>` STATEMENT in run.sh, as opposed to the same name
+# appearing in a comment, a string or an array. DEFINED HERE, beside the other shared extractor,
+# because the regex had been written out three times and the copy that single-sourced two of them
+# was placed BELOW the third -- so the change that claimed to remove the duplication left it. The
+# harm is prospective and specific: run.sh's reap line already uses `bash -lc '…'`, and the day
+# verify.sh is invoked that way whoever widens the regex widens it at the site that went red and
+# leaves the other, at which point this file prints `ok run.sh invokes verify.sh` beside a FAIL
+# saying there is no verify.sh statement -- and the cheapest repair for the second is to delete the
+# ordering branch that keeps the sweep from being disabled by an unrelated assertion.
+dc_stmt_line() { # dc_stmt_line <stripped run.sh> <script basename regex> -> line number, or nothing
+    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/$2" \
+        <<<"$1" | sed -n '1s/^\([0-9]*\):.*/\1/p'
+}
+
 # NEVER PIPE A FILE-READER INTO `grep -q`, AND THIS IS NOT STYLE. `grep -q` exits at its FIRST
 # match by design, so a producer still writing gets EPIPE -- and under `set -o pipefail` (line 9)
 # that turns a SUCCESSFUL match into a FAILED pipeline. It is a race between how fast the producer
@@ -491,7 +505,12 @@ fi
 #
 # So: require a statement-level exec of it — the shape the firewall-argument guard below already
 # uses — and let mutate-config.sh delete only that line.
-if stripped_matches "$here/run.sh" '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/verify\.sh'; then
+# THROUGH dc_stmt_line, which is now the ONLY spelling of "a `bash .container/<x>` statement in
+# run.sh" in this file. It answers this question and both of the sweep's below, so widening it for
+# one -- the day verify.sh is invoked as `bash -lc '…'`, the way the reap line already is -- widens
+# it for all three, instead of leaving this site green while the sweep's ordering branch goes red
+# and invites its own deletion as the cheaper repair.
+if [ -n "$(dc_stmt_line "$(dc_strip_comments "$here/run.sh")" 'verify\.sh')" ]; then
     ok "run.sh invokes verify.sh (a statement, not a mention of the name)"
 else
     bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
@@ -519,13 +538,6 @@ fi
 # vacuous passes.
 sweep_problems=""
 run_stripped="$(dc_strip_comments "$here/run.sh")"
-# ONE EXTRACTOR FOR BOTH, because the regex that finds a `bash .container/<x>` STATEMENT (as
-# opposed to the name appearing in a comment, a string or an array) was written out a third time
-# here, and a rule every call site has to remember is the defect this repository keeps rediscovering.
-dc_stmt_line() { # dc_stmt_line <stripped run.sh> <script basename> -> line number, or nothing
-    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/$2" \
-        <<<"$1" | sed -n '1s/^\([0-9]*\):.*/\1/p'
-}
 sweep_at="$(dc_stmt_line "$run_stripped" 'sweep-transcripts\.sh')"
 verify_at="$(dc_stmt_line "$run_stripped" 'verify\.sh')"
 if [ -z "$sweep_at" ]; then
@@ -648,22 +660,55 @@ else
         # cause. A static pin is the only watcher available, so it is the one that is here.
         grep -qF -- '[ -e "$f" ] || continue' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems it counts a transcript that vanished between the plan and the move as a failure, which a live session produces routinely;"
-        # THE BUDGET SEAM IS FOR THE SELF-TEST, NOT FOR THE CONTAINER. JKB_DENY_BUDGET_BYTES exists
-        # so --self-test can run the file as a PROGRAM against a tree it can build in a temp dir.
-        # Wired into any shipped container file it would silently disable the sweep -- set it high
-        # and every start reports "nothing to archive" for ever, which is indistinguishable from a
-        # healthy tree and is the precise state this whole script was written to end.
-        for dc_f in run.sh Dockerfile container.json entrypoint.sh; do
-            [ -f "$here/$dc_f" ] || continue
-            grep -qF -- 'JKB_DENY_BUDGET_BYTES' "$here/$dc_f" \
-                && sweep_problems="$sweep_problems $dc_f sets JKB_DENY_BUDGET_BYTES, which is a self-test seam: in the container it silently disables the sweep while every start still reports success;"
-        done
+        # THE SEAMS ARE FOR THE SELF-TEST, NOT FOR THE CONTAINER. Each exists so --self-test can run
+        # the file as a PROGRAM against a tree it can build in a temp dir, and each can switch the
+        # sweep off from a shipped file: a root that does not exist ("does not exist — nothing to
+        # sweep", rc 0), an archive somewhere harmless, or a budget nothing reaches. Every one of
+        # them then produces a start that reports success for ever while the deny list grows to the
+        # E2BIG this script exists to end.
+        #
+        # READ FROM THE FILE THAT DEFINES THEM, not spelled here. The version that shipped named ONE
+        # of the three, so the other two were refused by nothing while this guard's comment claimed
+        # the property -- and the seam list was by then written in three places with three different
+        # contents. An extraction that reads nothing is a failure, as everywhere else in this file.
+        # STRIPPED OF COMMENTS BEFORE MATCHING, because a comment cannot set a variable: this file's
+        # own habit is to name the identifier under discussion, so a line like "# nothing here sets
+        # JKB_DENY_BUDGET_BYTES" above run.sh's invocation would otherwise redden the gate with a
+        # false accusation whose natural repair is to delete the explanation.
+        sweep_seams="$(grep -oE '^SEAMS="[^"]*"' <<<"$sweep_body" | sed -n '1s/^SEAMS="\(.*\)"/\1/p')"
+        if [ -z "$sweep_seams" ]; then
+            sweep_problems="$sweep_problems it has no SEAMS= line to read, so the check that no shipped file wires a self-test seam into the container establishes nothing;"
+        else
+            for dc_f in run.sh Dockerfile container.json entrypoint.sh; do
+                [ -f "$here/$dc_f" ] || continue
+                dc_f_body="$(dc_strip_comments "$here/$dc_f")"
+                for dc_seam in $sweep_seams; do
+                    grep -qF -- "$dc_seam" <<<"$dc_f_body" \
+                        && sweep_problems="$sweep_problems $dc_f sets $dc_seam, which is a self-test seam: in the container it silently disables the sweep while every start still reports success;"
+                done
+            done
+        fi
         grep -qE -- 'CLAUDE_BASE=.*CLAUDE_CONFIG_DIR' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems it does not honour CLAUDE_CONFIG_DIR, which commands.rs, auto-mode.sh and swarm-status.sh all do, so a second config dir sweeps an absent tree and reports success;"
     fi
 fi
+# AND THE OPERATOR IS TOLD. run.sh discards the sweep's exit code with `|| true` -- correctly, since
+# a deny list slightly too long must not abort a start -- so the one state in which NO Bash tool call
+# works was reported only by a line that scrolled past several steps before the verify the operator
+# actually reads. verify.sh now asks, by running the sweep's own `--dry-run` (which moves nothing and
+# returns non-zero exactly when the residual would still be over budget) rather than re-deriving the
+# budget a second time.
+if [ ! -f "$here/verify.sh" ]; then
+    sweep_problems="$sweep_problems verify.sh is not there to report the deny list at all;"
+else
+    verify_body="$(dc_strip_comments "$here/verify.sh")"
+    { grep -qE -- 'sweep_sh=.*sweep-transcripts\.sh' <<<"$verify_body" \
+      && grep -qF -- 'bash "$sweep_sh" --dry-run' <<<"$verify_body"; } \
+        || sweep_problems="$sweep_problems verify.sh does not ask whether the deny list still fits in one argv, so the container's health report reads green in the one state where no Bash call works at all;"
+fi
+
 if [ -z "$sweep_problems" ]; then
-    ok "run.sh sweeps transcripts before verifying, and the sweep enumerates only transcripts, at every depth"
+    ok "run.sh sweeps transcripts before verifying, the sweep enumerates only transcripts at every depth, and verify.sh reports the budget"
 else
     bad "the transcript sweep does not hold:$sweep_problems — see .container/sweep-transcripts.sh"
 fi

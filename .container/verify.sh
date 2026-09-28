@@ -1822,6 +1822,41 @@ echo
 # volume; what changes is that a caller can tell the two apart.
 #   1  a real failure
 #   3  the only failures are conditions this container was configured to accept
+# THE DENY LIST STILL FITS IN ONE ARGV. This is the container's health report, and it said nothing
+# about the one state in which NO Bash tool call works: Claude Code's sandbox profile enumerates
+# every session transcript into a single argv, Linux caps one argument at MAX_ARG_STRLEN, and a
+# container over that limit fails every Bash call at spawn with E2BIG and nothing in the message
+# naming transcripts. run.sh sweeps before getting here -- and discards the result with `|| true`,
+# deliberately, because a deny list slightly too long must not abort a start. So the sweep's warning
+# scrolls past several steps earlier and the operator reads a green verify. The question belongs
+# where the operator is looking.
+#
+# ASKED BY RUNNING THE SWEEP'S OWN DRY RUN, never by re-deriving the arithmetic here: `--dry-run`
+# moves nothing, and since round 3 it returns non-zero exactly when the residual would still be
+# over budget. One definition of the budget, one of the projection, and this file asks rather than
+# answers.
+#
+# `accept_bad`, NOT `bad`, for the unreclaimable floor. The workflow harness's run journals are
+# never archived and .claude-state is a volume, so past roughly 199 of them no sweep can bring the
+# tree under budget -- that is a condition to report and act on, not a broken boundary, and this
+# file's two exit codes exist to tell those apart.
+# `dirname "$0"`, the same idiom the egress-lib source at the top of this file uses: the sweep is
+# this script's sibling, and asking for it through a repo root this file does not otherwise compute
+# is one more thing to get wrong.
+sweep_sh="$(dirname "$0")/sweep-transcripts.sh"
+if [ -f "$sweep_sh" ]; then
+    sweep_dry="$(bash "$sweep_sh" --dry-run 2>&1)"; sweep_dry_rc=$?
+    if [ "$sweep_dry_rc" -eq 0 ]; then
+        ok "the transcript deny list fits in one argv ($(printf '%s' "$sweep_dry" | tr '\n' ' '))"
+    elif case "$sweep_dry" in *"cannot bring this tree under it"*) true ;; *) false ;; esac; then
+        accept_bad "the transcript deny list cannot be brought under budget by archiving: $(printf '%s' "$sweep_dry" | tr '\n' ' ') — the run journals it may not touch already exceed the budget; see .container/README.md"
+    else
+        bad "the transcript deny list is over budget: $(printf '%s' "$sweep_dry" | tr '\n' ' ') — every Bash tool call in this container may fail at spawn with E2BIG; run .container/sweep-transcripts.sh"
+    fi
+else
+    bad "there is no sweep-transcripts.sh beside this script, so nothing bounds the Bash sandbox deny list"
+fi
+
 if [ "$fail" -ne 0 ]; then
     printf '\033[31m%d failed\033[0m, %d passed\n' "$fail" "$pass"
     if [ "$accepted_failure" -ne 0 ] && [ "$fail" -eq "$accepted_failure" ]; then

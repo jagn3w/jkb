@@ -53,6 +53,17 @@ CLAUDE_BASE="${CLAUDE_CONFIG_DIR:-${HOME:-/home/vscode}/.claude}"
 TRANSCRIPT_ROOT="${JKB_TRANSCRIPT_ROOT:-$CLAUDE_BASE/projects}"
 TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-state/transcript-archive}"
 
+# THE SEAMS, NAMED ONCE AND IN ONE PLACE. All three exist for --self-test, which cannot drive this
+# file as a program without them, and every one of them can switch the sweep off: a root that does
+# not exist, an archive somewhere harmless, or a budget nothing ever reaches all produce a start
+# that reports success for ever while the deny list grows. check-config.sh refuses every name on
+# this line in run.sh, the Dockerfile, container.json and entrypoint.sh, and reads the list from
+# HERE rather than spelling it -- the guard that shipped covered one of the three, which is the
+# same half-a-guard shape this file has now recorded four times.
+# CLAUDE_CONFIG_DIR is deliberately NOT here: it is a legitimate thing for a shipped file to set,
+# and the whole point of honouring it is that the sweep follows it.
+SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES"
+
 # MAX_ARG_STRLEN on Linux: 32 pages. Recorded for the reader; the budget below is derived from it.
 ARGV_MAX_BYTES=131072
 # Half of it. The other half is headroom for what this sweep does NOT count: the ~30 fixed
@@ -148,10 +159,16 @@ transcript_projection_fell() { # transcript_projection_fell <moved> <before> <af
 # Which files to archive, OLDEST FIRST, to bring the projection under budget — and no more than
 # that. Stops at the first record that brings it under, so an ordinary start archives a handful.
 #
-# SORTED BY MTIME AND THEN BY PATH. The second key is not decoration: a task swarm writes a dozen
-# agent transcripts in the same second, and without it the set chosen at a tie depends on the
-# order find happened to walk the tree, which makes this function untestable and its behaviour
-# unrepeatable on two containers with identical contents.
+# SORTED BY MTIME AND THEN BY PATH. A task swarm writes a dozen agent transcripts in the same
+# second, and a tie broken by the order `find` happened to walk the tree makes this function
+# untestable and its behaviour different on two containers with identical contents.
+#
+# WHAT THE SECOND KEY ACTUALLY BUYS, stated honestly because the row below cannot show it: POSIX,
+# GNU and BSD `sort` all fall back to comparing the WHOLE LINE when every key ties, and a tied
+# record's mtime field is byte-identical, so path order arrives either way -- removing `-k2,2`
+# leaves the self-test green, measured. The key earns its place by surviving `-s`, which disables
+# that last resort and would hand the choice back to walk order, and by saying out loud which
+# ordering this function promises. The row below asserts the PROMISE, not the flag.
 #
 # THE HELD NAME IS SPARED HERE, AND `tot` IS WHY. Every record's bytes go into the projection,
 # including the ones no plan may ever contain, because the kernel counts a path the sweep cannot
@@ -237,7 +254,7 @@ transcript_records() { # transcript_records <root> -> "<mtime><TAB><path>" per t
 # resolved and the missing tail put back on. This also collapses any `..` in the caller's spelling,
 # which is the second way into the containment the refusal below exists to refuse.
 transcript_resolve() { # transcript_resolve <path> -> physical path
-    local p="$1" tail="" base
+    local p="$1" tail="" base out seg
     case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
     while [ ! -d "$p" ]; do
         tail="/${p##*/}$tail"
@@ -246,7 +263,27 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
     done
     base="$(cd "$p" && pwd -P)" || return 1
     [ "$base" != "/" ] || base=""
-    printf '%s%s\n' "$base" "$tail"
+    # AND THE TAIL IS COLLAPSED LEXICALLY, because `pwd -P` never saw it. Putting the tail back
+    # verbatim left any `..` in it intact, and on the FIRST sweep -- when nothing of the archive
+    # exists yet, which is the only state that matters, since the sweep is what creates it -- the
+    # whole of `…/transcript-archive/../projects/.archive` is tail. The prefix test then compared a
+    # path still containing `..` and did not match, so the archive was accepted INSIDE the
+    # enumerated root (deny bytes 96 -> 114 on the probe), and every later sweep refused for ever
+    # because mkdir had since made the `..` collapsible. Lexical is sound here and only here: a tail
+    # component that existed as a directory would have stopped the loop above, so there is no
+    # symlink left in it for `..` to mean something else about.
+    out="$base"
+    while [ -n "$tail" ]; do
+        tail="${tail#/}"
+        seg="${tail%%/*}"
+        case "$tail" in */*) tail="/${tail#*/}" ;; *) tail="" ;; esac
+        case "$seg" in
+            ''|.) ;;
+            ..)   out="${out%/*}" ;;
+            *)    out="$out/$seg" ;;
+        esac
+    done
+    printf '%s\n' "${out:-/}"
 }
 
 # EVERY PROJECT SLUG BEGINS WITH `-`. Claude Code names a project directory after the absolute
@@ -404,19 +441,21 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
 # ---------------------------------------------------------------------------------------------
 
 if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
-    # THE SEAMS MUST NOT BE SET IN THE ENVIRONMENT THAT RUNS THIS. Every one of them is read at load
-    # time, above, so a developer with JKB_DENY_BUDGET_BYTES exported would get a red gate for a
-    # correct script (the constants rows read their value, not the shipped one) -- or, with the
-    # wrong value, a green one for rows that are no longer measuring what they say. A suite that
-    # silently reads the environment it is run in establishes nothing, and this is the same reason
-    # the program rows below pass `env -u`. Refused loudly rather than worked around.
-    for seam in JKB_DENY_BUDGET_BYTES JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE CLAUDE_CONFIG_DIR; do
-        [ -z "${!seam:-}" ] || {
-            printf 'sweep-transcripts --self-test: %s is set in this environment; unset it and re-run\n' \
-                "$seam" >&2
-            exit 2
-        }
-    done
+    # ONE SEAM IS REFUSED HERE, and only one: JKB_DENY_BUDGET_BYTES, whose value the constants rows
+    # below actually read. Exported, it gives a red gate for a correct script, or -- worse -- a
+    # green one for rows that have quietly stopped measuring the shipped number.
+    #
+    # THE OTHERS ARE NOT REFUSED, AND THAT IS THE POINT. The first version of this refused all three
+    # plus CLAUDE_CONFIG_DIR, which made `./scripts/check.sh` exit red on a correct checkout for any
+    # developer using the second-config-dir posture line 48 of this file cites approvingly -- and
+    # `check.sh` stops at the first failing gate, so every step after this one silently stopped
+    # running. A machine-dependent gate step degrades to a named skip in this repository; it never
+    # reddens. The rest cannot affect a row anyway: the function rows pass explicit paths, and the
+    # program rows below neutralise every seam with `env -u`.
+    [ -z "${JKB_DENY_BUDGET_BYTES:-}" ] || {
+        printf 'sweep-transcripts --self-test: JKB_DENY_BUDGET_BYTES is set in this environment; unset it and re-run\n' >&2
+        exit 2
+    }
     fails=0
     eq() { # eq <label> <got> <want>
         if [ "$2" = "$3" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
@@ -497,7 +536,9 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     KEEP_NEWEST=99
     eq "a floor above the population archives nothing at all" \
        "$(printf '%s\n' "$five" | transcript_plan)" ""
-    # Ties are ordinary: a swarm writes a dozen agent transcripts in the same second.
+    # Ties are ordinary: a swarm writes a dozen agent transcripts in the same second. This asserts
+    # the promise -- scrambled input, path order out -- and not the presence of `-k2,2`, which
+    # sort's last-resort whole-line comparison makes redundant for exactly this input shape.
     DENY_BUDGET_BYTES=0 KEEP_NEWEST=0
     tied="7${TAB}/bbbb/bbbb
 7${TAB}/aaaa/aaaa
@@ -542,6 +583,12 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # ...and the things that are NOT transcripts and must never move. The run journal is the OLDEST
     # file in the tree by a margin, so it is first in any plan its name does not spare.
     mk "$slug/2222/subagents/workflows/wf_x/journal.jsonl"         200001010000
+    # A NON-TRANSCRIPT OUTSIDE memory/, which the fixture did not have. Every other non-.jsonl file
+    # here lives in the auto-memory store, reached through the `memory` symlink and so already
+    # behind the -prune -- so both rows that looked like coverage of the `-name '*.jsonl'` filter
+    # were satisfied by the prune alone, and widening the filter to `-name '*'` left the whole
+    # suite green. This file is what makes the name half of the walk discriminate.
+    mk "$slug/2222/subagents/notes.md"                             202601010000
     # AUTO-MEMORY IS A SYMLINK OUT OF THE TREE, exactly as the container has it: each slug's
     # `memory` points at ~/.jkb/claude-memory/<repo>, which is a bind mount of the HOST's
     # knowledge base. Under -L the walk follows it like a real directory and leaves the volume
@@ -695,16 +742,49 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # container spells it -- the same containment was accepted, and the .archive/.archive/ nesting
     # the refusal exists to stop reproduced at 530 -> 602 -> 674 deny bytes. The last row is the
     # `..` route into the same state.
+    # ASSERTED ON THE REFUSAL, NOT ON THE EXIT CODE. `rc_of` was the whole of these rows, and by
+    # round 4 three of the four returned 1 for an unrelated reason: they sweep `$root` while the
+    # budget around them is measured through `$work/projects-link`, the two spellings differ by a
+    # byte per path, and the new residual check returns 1 on its own. Measured: deleting the entire
+    # containment `case` block turned exactly ONE of the four red. So the executable half of the
+    # guard against the nesting defect had come to rest on a single row balanced on an exact budget
+    # equality that any fixture edit breaks in silence -- an assertion passing for the wrong reason,
+    # which is the defect this file has now recorded at four different sites.
+    refused() { # refused <root> <archive> -> yes when the containment refusal is what spoke
+        local out
+        # Captured and then matched, never `| grep -q`: grep exits at its first match, the producer
+        # gets EPIPE, and `set -o pipefail` two hundred lines up turns a SUCCESSFUL match into a
+        # failed pipeline. This repository has a shell test for that idiom.
+        out="$(sweep_transcripts "$1" "$2" 2>&1 >/dev/null)"
+        case "$out" in *"is inside"*) echo yes ;; *) echo no ;; esac
+    }
     eq "an archive inside the root is refused" \
-       "$(rc_of sweep_transcripts "$root" "$root/.archive")" "1"
+       "$(refused "$root" "$root/.archive")" "yes"
     eq "...with the root spelled through a symlink, as the container spells it" \
-       "$(rc_of sweep_transcripts "$work/projects-link" "$root/.archive")" "1"
+       "$(refused "$work/projects-link" "$root/.archive")" "yes"
     eq "...with the archive spelled through that symlink instead" \
-       "$(rc_of sweep_transcripts "$root" "$work/projects-link/.archive")" "1"
-    eq "...and by way of a .. that climbs back in" \
-       "$(rc_of sweep_transcripts "$root" "$arch/../projects/.archive")" "1"
+       "$(refused "$root" "$work/projects-link/.archive")" "yes"
+    eq "...and it is a refusal, not a success" \
+       "$(rc_of sweep_transcripts "$root" "$root/.archive")" "1"
     eq "...and nothing was created for any of them" \
        "$([ -e "$root/.archive" ] && echo yes || echo no)" "no"
+
+    # THE `..` ROUTE, ON A TREE WHOSE ARCHIVE DOES NOT EXIST YET, which is the only state the
+    # question is ever asked in: the sweep is what creates the archive, so the first run of any
+    # container has nothing there. The row that stood here ran after a real sweep had already made
+    # `$arch`, so the `..` was collapsible by `pwd -P` and the refusal fired for a reason no first
+    # run has -- it passed while the first-run path accepted the archive INSIDE the root and wrote
+    # the nesting (96 -> 114 deny bytes on the probe).
+    dd_root="$work/dd/state/projects"
+    mk "$dd_root/-slug/a.jsonl" 202601010000
+    eq "a .. that climbs back in is refused before the archive exists" \
+       "$(refused "$dd_root" "$work/dd/state/transcript-archive/../projects/.archive")" "yes"
+    eq "...and nothing was written inside the root" \
+       "$([ -e "$dd_root/.archive" ] && echo yes || echo no)" "no"
+    # ...and the sibling it resolves to WITHOUT the .. is still accepted, so the row above is a
+    # refusal and not a resolver that refuses everything it cannot parse.
+    eq "...while the plain sibling it was climbing out of is accepted" \
+       "$(refused "$dd_root" "$work/dd/state/transcript-archive")" "no"
     # A SIBLING ARCHIVE IS STILL ACCEPTED, so the four rows above are a refusal and not a function
     # that refuses everything -- which would pass all four and archive nothing for ever.
     eq "a sibling archive, which is what ships, is accepted" \
@@ -821,7 +901,7 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
         while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
         [ "$#" -eq 0 ] || shift
         env -u CLAUDE_CONFIG_DIR -u JKB_TRANSCRIPT_ROOT -u JKB_TRANSCRIPT_ARCHIVE \
-            ${envs[@]+"${envs[@]}"} bash "$self" "$@"
+            -u JKB_DENY_BUDGET_BYTES ${envs[@]+"${envs[@]}"} bash "$self" "$@"
     }
     phome="$work/phome"; mkdir -p "$phome/.claude/projects"   # exists, empty
     palt="$work/palt"                                          # $palt/projects absent
