@@ -1091,11 +1091,22 @@ if [ "$OPEN" -eq 1 ] && [ "$verify_rc" -ne 0 ]; then
     # followable step.
     printf '\n\033[31mnot opening a window:\033[0m verify.sh reported problems (exit %s).\n' "$verify_rc" >&2
     if [ "$verify_rc" -eq 3 ]; then
-        printf 'Every failure it reported is a condition this container was configured to accept —\n' >&2
-        printf 'JKB_EGRESS_ACCEPT_UNFILTERED=1, which lets it start with unfiltered egress. That is\n' >&2
-        printf 'a container to attach to and diagnose, not one to run an agent in unattended, so no\n' >&2
-        printf 'window is opened while it holds. Either unset it in container.json and recreate, or\n' >&2
-        printf 'attach by hand with the Command Palette route above.\n' >&2
+        # WHAT VERIFY REPORTED, NOT WHAT EXIT 3 USED TO MEAN. This named the unfiltered-egress
+        # override as the only thing exit 3 can be, and then told the operator to unset a variable
+        # and recreate the container. Exit 3 gained a second producer the day verify.sh started
+        # reporting the transcript deny list: past the point where the run journals and the kept
+        # newest transcripts exceed the budget on their own, no sweep helps, which is a condition to
+        # act on rather than a broken boundary -- and recreating the container changes nothing,
+        # because those journals live in a volume. Two conditions with opposite remedies cannot
+        # share one hard-coded sentence, so the remedy is read off verify's own output, which each
+        # accepted arm already carries.
+        printf 'Every failure it reported is a condition this container was configured to accept.\n' >&2
+        printf 'That is a container to attach to and diagnose, not one to run an agent in unattended,\n' >&2
+        printf 'so no window is opened while it holds. The FAIL line(s) above say which condition and\n' >&2
+        printf 'what to do about it — the unfiltered-egress override (JKB_EGRESS_ACCEPT_UNFILTERED=1,\n' >&2
+        printf 'unset it in container.json and recreate) and a transcript deny list past what any\n' >&2
+        printf 'sweep can reclaim are both reported here and want different things. Or attach by hand\n' >&2
+        printf 'with the Command Palette route above.\n' >&2
     else
         printf 'Fix them, or attach by hand with the Command Palette route above if you know why.\n' >&2
     fi

@@ -1487,12 +1487,27 @@ archived copy is the only one there is.
 `JKB_DENY_BUDGET_BYTES` is a **self-test seam**, and it is the only way `--self-test` can drive this
 file *as a program* against a tree it can build in a temp directory — without it every program-level
 row has to point at an empty root, where `sweep_transcripts` returns at `no transcripts` before it
-ever reads its third argument, so `--dry-run` through the CLI was exercised by nothing. Two things
-keep a seam from becoming a lever: `check-config.sh` refuses it appearing in `run.sh`, the
-`Dockerfile`, `container.json` or `entrypoint.sh` (wired into the container it would silently disable
-the sweep while every start still reported success — the state this script exists to end, wearing a
-clean log), and `--self-test` **refuses to run** when any seam is set in its own environment, since a
-suite that reads the environment it was started in establishes nothing about the shipped values.
+ever reads its third argument, so `--dry-run` through the CLI was exercised by nothing. Two things keep a seam from becoming a lever, and the second is narrower than it first shipped:
+
+- `check-config.sh` refuses **any** seam appearing in any shipped file under `.container/` — the list
+  of names read out of the script's own `SEAMS=` line and checked against every `${JKB_…:-}` it
+  actually reads, the file list derived from the directory rather than retyped. Wired into the
+  container, a seam silently disables the sweep while every start still reports success: the state
+  this script exists to end, wearing a clean log. The first version named one of three seams and
+  scanned four files by hand — missing `verify.sh`, which the same change had just made a *caller*
+  and which runs **inside** the container, where a seam actually takes effect. (In `run.sh` it would
+  not: `in_container` is plain `docker exec` with no `-e`, so a `VAR=… in_container …` prefix sets
+  the variable for the docker CLI and never reaches the container.)
+- `--self-test` refuses to run when **`JKB_DENY_BUDGET_BYTES`** is set in its own environment — that
+  one, and deliberately not the others. Its value is what the constants rows read, so exported it
+  gives a red gate for a correct script or a green one for rows that have stopped measuring the
+  shipped number. The version that refused all three plus `CLAUDE_CONFIG_DIR` was backed out on a
+  measurement: `./scripts/check.sh` went red on a *correct checkout* for anyone using the
+  second-config-dir posture this very script cites approvingly, and `check.sh` stops at the first
+  failing gate, so every step after it silently stopped running. A machine-dependent gate step
+  degrades to a named skip in this repository; it never reddens. The other two cannot affect a row
+  anyway — the function rows pass explicit paths and the program rows neutralise every seam with
+  `env -u`. Do not re-add them.
 
 One property has no executable test anywhere and says so in place: a transcript that vanishes
 between the plan and the move must not be counted as a failure. Reaching that state needs a file to
@@ -1541,7 +1556,44 @@ that very class:
   *here and only here* — a tail component that existed as a directory would have stopped the walk-up,
   so there is no symlink left in it for `..` to mean something else about.
 
-And a rule worth stating plainly, because this section has now recorded it four times at four sites:
-**a guard on a comparison must pin both operands.** `phys_root` was pinned and `phys_archive` was not;
-the seam refusal named one of three seams; the containment rows asserted a code that two different
-things produce. Each shipped with a comment claiming the whole property.
+And a rule worth stating plainly, because this section keeps recording it: **a guard must pin the
+whole of what its message claims.** `phys_root` was pinned and `phys_archive` was not; the seam
+refusal named one of three seams and scanned four of the files that matter; the containment rows
+asserted an exit code that two different things produce; the `verify.sh` guard required the sweep to
+be *called* and not that any verdict came of it. Each shipped with a comment claiming the whole
+property, and each was found by deleting the code underneath and watching the assertion stay green.
+
+**Round 5 found the assertion added in round 4 reporting the state it was added to catch.**
+`verify.sh` asks the sweep `--dry-run` and reads its exit code — and that code was a verdict on
+`before - planned`, a tree that does not exist, because a dry run moves nothing. So whenever the real
+sweep at container start had failed — the archive unusable, `mkdir` denied, ENOSPC on the state
+volume, a containment refusal — `run.sh` discarded that failure by design, the dry run found a plan
+that *would* have fitted, and `verify.sh` printed `ok  the transcript deny list fits in one argv` over
+a tree in which not one file had moved and every Bash call still died at spawn. Reproduced: 60
+transcripts, 7,200 deny bytes, budget 3,960, a regular file where the archive's parent must go — real
+sweep `could not create … — nothing archived`, rc 1; dry run rc **0**. Both exit codes now answer one
+question, *is the deny list as it stands on disk right now too long for one argv*, and `before -
+planned` stays in the summary as information rather than as the verdict.
+
+Three consequences of that block, all of the same family — a report is only as good as what it can
+tell apart:
+
+- **The unhelpable state was diagnosed too late.** `accept_bad` (exit 3, "a condition to act on")
+  was selected by a message that tested the run journals *alone*. But the residual after a full plan
+  is those journals **plus the newest `KEEP_NEWEST`**, which crosses 65,536 at roughly 161 journals
+  while a journals-only test only speaks past about 199 — and a container reaches the first on its
+  way to the second. In that window the tree was equally beyond any sweep's help and was reported as
+  a broken boundary: exit 1, `run.sh` refuses to open a window, and the only remedy sentence shown
+  was the one that does not apply. `transcript_irreducible` now measures what no sweep can remove —
+  held plus floor — so the verdict arrives when the state does.
+- **Every non-zero exit was called "over budget".** The sweep returns non-zero for things that are
+  not about the budget: a containment refusal (the only line is the refusal), a resolver failure (rc
+  1 and *no output at all*), a syntax error (rc 2, bash's own message). Each printed "the transcript
+  deny list is over budget — «unrelated text or nothing»" followed by a sentence asserting an
+  archiving pass that never happened. The arms classify on the sweep's own wording now, and anything
+  else is reported as *the sweep could not answer*, which is a different thing to act on.
+- **Exit 3 gained a second producer and `run.sh`'s narration did not notice.** It named the
+  unfiltered-egress override as the only thing exit 3 can mean and told the operator to unset a
+  variable that is not set and recreate a container whose journals live in a volume. Two conditions
+  with opposite remedies cannot share one hard-coded sentence, so the message now points at the FAIL
+  lines, which each carry their own.

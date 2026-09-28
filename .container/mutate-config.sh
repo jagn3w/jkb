@@ -463,6 +463,38 @@ run "verify.sh stops reporting the transcript deny list" "does not ask whether t
 seed; rm -f "$work/t/.container/verify.sh"
 run "verify.sh is deleted outright" "verify.sh is not there to report the deny list"
 
+# ...AND THE VERDICT ARMS, which the call-site check above cannot see. The realistic drift is not
+# deletion but a refactor that keeps the call and demotes the verdict to a note -- the same green.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'accept_bad "the transcript deny list cannot be brought under budget'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'echo "  note the transcript deny list cannot be brought under budget', 1))
+PYX
+run "verify.sh demotes the accepted deny-list verdict to a note" "reaches no \`accept_bad\` verdict"
+
+# THE SEAM DECLARATION DRIFTING FROM THE CODE, which is the shape that put one of three seams
+# behind the refusal in the first place.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE"', 1))
+PYX
+run "a seam the script reads is dropped from SEAMS" "so a seam is wired into no refusal"
+
+# ...and verify.sh, the caller that runs INSIDE the container, where a seam actually takes effect.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'sweep_dry="$(bash "$sweep_sh" --dry-run 2>&1)"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'sweep_dry="$(JKB_DENY_BUDGET_BYTES=99999999 bash "$sweep_sh" --dry-run 2>&1)"', 1))
+PYX
+run "verify.sh wires the budget seam into its own call" "verify.sh sets JKB_DENY_BUDGET_BYTES"
+
 # THE VERIFY LINE THE ORDERING IS MEASURED AGAINST. Reading nothing there used to make the ordering
 # test SKIP rather than fail -- the one extraction in this block that was not pinned against an
 # empty read, which is the failure mode this whole file exists to refuse.
@@ -1320,7 +1352,10 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 # cannot be fooled either, and it forces the decision at the moment an assertion is added.
 echo
 echo "==> coverage"
-bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
+# COUNTED OVER CODE, NOT COMMENTS, for the same reason PINNED_SWEEP_APPENDS is: check-config.sh's
+# prose quotes the idioms it is talking about, so a comment explaining this very scan moved the
+# count by one and demanded "a mutation for the new one" about a sentence.
+bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" | grep -c 'bad "')"
 PINNED_BAD_SITES=97
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
@@ -1348,7 +1383,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=53
+PINNED_SWEEP_APPENDS=61
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

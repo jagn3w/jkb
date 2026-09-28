@@ -1836,12 +1836,25 @@ if [ -f "$sweep_sh" ]; then
     # the verdict is the last of them; flattening all of it into one `ok`/`FAIL` produced a line
     # nobody finishes reading, which for an operator-facing report is the same as saying nothing.
     sweep_tail="$(tail -n 1 <<<"$sweep_dry")"
+    # CLASSIFIED ON WHAT THE SWEEP SAID, not on the fact that it said something. Every arm below
+    # used to hang off `rc != 0` meaning "over budget", and the sweep returns non-zero for things
+    # that are not about the budget at all: an archive that resolves inside the root (rc 1, and the
+    # only line is the containment refusal), a `transcript_resolve` failure (rc 1, no output at all,
+    # so `sweep_tail` is empty), a syntax error or an unreadable file (rc 2, bash's own message).
+    # Each of those printed "the transcript deny list is over budget — <unrelated text or nothing>"
+    # followed by a sentence asserting an archiving pass that never happened.
     if [ "$sweep_dry_rc" -eq 0 ]; then
         ok "the transcript deny list fits in one argv — $sweep_tail"
+    elif case "$sweep_dry" in *"E2BIG"*) false ;; *) true ;; esac; then
+        bad "the transcript sweep could not answer whether the deny list fits in one argv (exit $sweep_dry_rc) — ${sweep_tail:-it printed nothing}
+       This is not a budget verdict: the sweep did not get far enough to give one. Run
+       .container/sweep-transcripts.sh --dry-run by hand and read what it says."
     elif case "$sweep_dry" in *"cannot bring this tree under it"*) true ;; *) false ;; esac; then
         accept_bad "the transcript deny list cannot be brought under budget by archiving at all — $sweep_tail
-       The workflow run journals the sweep may not touch already exceed the budget on their own.
-       Remove finished runs' journal.jsonl by hand, or raise DENY_BUDGET_BYTES; .container/README.md has the numbers."
+       What the sweep may never remove — the workflow run journals, plus the newest transcripts it
+       keeps for the live session — is already over the budget on its own, so no number of sweeps
+       changes this. Remove finished runs' journal.jsonl by hand, or widen the budget;
+       .container/README.md has the numbers."
     else
         bad "the transcript deny list is over budget — $sweep_tail
        Every Bash tool call in this container may fail at spawn with E2BIG, with nothing in the

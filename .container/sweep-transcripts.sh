@@ -62,6 +62,9 @@ TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-stat
 # same half-a-guard shape this file has now recorded four times.
 # CLAUDE_CONFIG_DIR is deliberately NOT here: it is a legitimate thing for a shipped file to set,
 # and the whole point of honouring it is that the sweep follows it.
+# HAND-WRITTEN, AND CHECKED AGAINST REALITY BY check-config.sh, which derives the same set from
+# every `${JKB_…:-}` this file actually reads and requires the two to agree. A declaration nothing
+# compares to the code is a fourth seam waiting to be refused by nothing.
 SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES"
 
 # MAX_ARG_STRLEN on Linux: 32 pages. Recorded for the reader; the budget below is derived from it.
@@ -200,6 +203,24 @@ transcript_unreclaimable() { # transcript_unreclaimable < records -> the held-ba
         '{ base = $2; sub(/^.*\//, "", base); if (base == held) print }'
 }
 
+# THE SMALLEST DENY LIST ANY SWEEP COULD LEAVE: everything it may never archive, PLUS the newest
+# KEEP_NEWEST it will never archive. If that is over budget, no number of sweeps helps.
+#
+# THE FLOOR IS HALF OF IT, and asking only about the held set left a window where the tree was
+# equally beyond help and did not say so. This file's own numbers give it: the residual after a full
+# plan is held plus the newest KEEP_NEWEST, which passes 65,536 at roughly 161 run journals, while a
+# held-only test only speaks past about 199. A container reaches the first on its way to the second,
+# so the unhelpable state that gets REPORTED as unhelpable was the second one it arrives at.
+# Sorted newest-first so the first `keep` reclaimable records are the ones the floor protects.
+transcript_irreducible() { # transcript_irreducible < records -> bytes no sweep can remove
+    LC_ALL=C sort -t"$TAB" -k1,1nr -k2,2r \
+    | LC_ALL=C awk -F"$TAB" -v keep="$KEEP_NEWEST" -v mult="$DENY_SPELLINGS" -v held="$HELD_NAME" '
+        { base = $2; sub(/^.*\//, "", base)
+          if (base == held)  { tot += length($2); next }
+          if (kept < keep)   { tot += length($2); kept++ } }
+        END { printf "%d\n", mult * tot }'
+}
+
 # Every .jsonl under a root, as records.
 #
 # THINGS ABOUT THIS ONE `find`, each of which cost a real failure:
@@ -295,7 +316,7 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
 # a path here is given `--`.
 sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
     local root="$1" archive="$2" dry="${3:-}"
-    local abs phys_root phys_archive records plan planned held_bytes err
+    local abs phys_root phys_archive records plan planned irreducible err
     local f rel dir before after moved=0 failed=0
 
     abs="$(cd "$root" 2>/dev/null && pwd)" || {
@@ -329,14 +350,15 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
         return 0
     fi
     before="$(printf '%s\n' "$records" | transcript_projection)"
-    # SAID OUT LOUD, because it is the one state the sweep cannot fix. The harness's run journals
-    # are never archived, so once their path text alone exceeds the budget no plan brings the tree
-    # under it -- and every line the sweep prints below still reads as success while every Bash
-    # call goes on dying at spawn. The count only ever grows: .claude-state is a volume.
-    held_bytes="$(printf '%s\n' "$records" | transcript_unreclaimable | transcript_projection)"
-    if [ "$held_bytes" -gt "$DENY_BUDGET_BYTES" ]; then
-        printf 'transcript sweep: %s deny bytes are in %s files the sweep never archives, over the whole %s byte budget — archiving every transcript cannot bring this tree under it\n' \
-            "$held_bytes" "$HELD_NAME" "$DENY_BUDGET_BYTES" >&2
+    # SAID OUT LOUD, because it is the one state the sweep cannot fix, and verify.sh reads this
+    # sentence to tell "this needs a decision" from "this boundary is broken". The run journals are
+    # never archived and the newest KEEP_NEWEST are never archived; .claude-state is a volume, so
+    # the first of those only grows. Once their sum is over budget every line below still reads as
+    # success while every Bash call goes on dying at spawn.
+    irreducible="$(printf '%s\n' "$records" | transcript_irreducible)"
+    if [ "$irreducible" -gt "$DENY_BUDGET_BYTES" ]; then
+        printf 'transcript sweep: %s deny bytes are in files no sweep can remove (%s, plus the newest %s kept for the live session), over the whole %s byte budget — archiving every transcript cannot bring this tree under it\n' \
+            "$irreducible" "$HELD_NAME" "$KEEP_NEWEST" "$DENY_BUDGET_BYTES" >&2
     fi
     plan="$(printf '%s\n' "$records" | transcript_plan)"
     if [ -z "$plan" ]; then
@@ -428,8 +450,19 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
     fi
     # THE RESIDUAL, LAST, because the two above name a cause and this one names the state the whole
     # script exists to prevent: a deny list still too long for one argv.
+    #
+    # A DRY RUN IS JUDGED ON THE TREE AS IT IS, NOT ON THE ONE ITS PLAN IMAGINES. This tested
+    # `before - planned` -- a hypothetical -- so it exited 0 whenever the PLAN would have fit,
+    # regardless of whether anything had ever been archived. verify.sh reads that code, and the
+    # failure case is exactly the one it was added for: with the archive unusable (ENOSPC, a regular
+    # file where the directory must go, a refused containment) the real sweep at container start
+    # moves nothing and returns 1, run.sh discards that by design, and verify then printed
+    # `ok  the transcript deny list fits in one argv` over a tree where not one file had moved and
+    # every Bash call still died at spawn. Both codes now answer one question -- is the deny list,
+    # as it stands on disk right now, too long for one argv -- and `before - planned` stays in the
+    # summary above as information.
     if [ "$dry" = "--dry-run" ]; then
-        transcript_over_budget "$((before - planned))" "would remain" || return 1
+        transcript_over_budget "$before" "are in this tree now, and a dry run moves nothing" || return 1
     else
         transcript_over_budget "$after" "remain after this sweep" || return 1
     fi
@@ -666,7 +699,12 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     DENY_BUDGET_BYTES=0 KEEP_NEWEST=2
     over_out="$(sweep_transcripts "$work/projects-link" "$arch" --dry-run 2>&1)"; over_rc=$?
     eq "a plan that cannot reach the budget returns non-zero" "$over_rc" "1"
-    eq "...and says how much would remain" "$(grep -c 'would remain, over the' <<<"$over_out")" "1"
+    # THE TREE AS IT IS, not the tree the plan imagines. A dry run moves nothing, so a verdict about
+    # `before - planned` is a verdict about a state that does not exist -- and verify.sh reads this
+    # exit code, so with the archive unusable it printed `ok the transcript deny list fits in one
+    # argv` over a tree where nothing had moved.
+    eq "...and says how much is in the tree now, not what a plan would leave" \
+       "$(grep -c 'are in this tree now, and a dry run moves nothing' <<<"$over_out")" "1"
     eq "...and its summary no longer claims the residual is \"under\" the budget" \
        "$(grep -c -- '-> under' <<<"$over_out")" "0"
     # THE EMPTY PLAN, which is the branch that read as success for two rounds: with the floor above
@@ -876,6 +914,35 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...counted and reported" "$(grep -c 'could not be archived' <<<"$blk_out")" "1"
     eq "...and the transcript is still in the tree" \
        "$([ -f "$blk_root/-slug/x.jsonl" ] && echo yes || echo no)" "yes"
+    DENY_BUDGET_BYTES="$DEFAULT_BUDGET" KEEP_NEWEST="$DEFAULT_KEEP"
+
+    # THE CONTRACT verify.sh RESTS ON, watched in the state it exists for: the archive unusable, the
+    # tree over budget, a plan that WOULD have fitted. A regular file where the archive's parent
+    # directory must go, so `mkdir -p` fails for every planned file and not one moves -- ENOSPC and
+    # a read-only volume are the same shape. Before the dry run was judged on the tree as it is, it
+    # exited 0 here (`7200 -> 3960 deny bytes, budget 3960`) and verify.sh printed
+    # `ok  the transcript deny list fits in one argv` over a container where every Bash call dies.
+    blocked_root="$work/blocked/projects"
+    i=0
+    while [ "$i" -lt "$((DEFAULT_KEEP + 28))" ]; do
+        mk "$blocked_root/-slug/t$(printf '%03d' "$i").jsonl" 202601010000
+        i=$((i + 1))
+    done
+    : > "$work/blocked/not-a-dir"
+    blocked_proj="$(transcript_records "$blocked_root" | transcript_projection)"
+    DENY_BUDGET_BYTES=$((blocked_proj * 55 / 100)) KEEP_NEWEST="$DEFAULT_KEEP"
+    blocked_real="$(sweep_transcripts "$blocked_root" "$work/blocked/not-a-dir/arch" 2>&1)"; blocked_rc=$?
+    eq "a sweep whose archive cannot be created archives nothing and says so" "$blocked_rc" "1"
+    eq "...leaving every transcript where it was" \
+       "$(find "$blocked_root" -type f -name '*.jsonl' | grep -c . )" "$((DEFAULT_KEEP + 28))"
+    eq "...and nothing claims to have archived" \
+       "$(grep -c 'could not create' <<<"$blocked_real")" "1"
+    # AND THE DRY RUN, which is the code verify.sh actually reads.
+    blocked_dry="$(sweep_transcripts "$blocked_root" "$work/blocked/not-a-dir/arch" --dry-run 2>&1)"
+    blocked_dry_rc=$?
+    eq "a dry run over the same tree refuses to call it healthy" "$blocked_dry_rc" "1"
+    eq "...naming the projection that is really there, not the one its plan imagines" \
+       "$(grep -c "$blocked_proj deny bytes are in this tree now" <<<"$blocked_dry")" "1"
     DENY_BUDGET_BYTES="$DEFAULT_BUDGET" KEEP_NEWEST="$DEFAULT_KEEP"
 
     echo "==> sweep-transcripts self-test: the script as a program"

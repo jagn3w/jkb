@@ -676,12 +676,36 @@ else
         # JKB_DENY_BUDGET_BYTES" above run.sh's invocation would otherwise redden the gate with a
         # false accusation whose natural repair is to delete the explanation.
         sweep_seams="$(grep -oE '^SEAMS="[^"]*"' <<<"$sweep_body" | sed -n '1s/^SEAMS="\(.*\)"/\1/p')"
+        # AND IT MUST EQUAL WHAT THE SCRIPT ACTUALLY READS. SEAMS is hand-written; the overrides are
+        # `${JKB_…:-}` expansions. They agree today, by hand. A fourth one -- `KEEP_NEWEST=
+        # "${JKB_KEEP_NEWEST:-32}"` is the obvious next -- added without touching SEAMS would be
+        # refused in no shipped file, move no pin and make no mutation MISSED, while this guard went
+        # on reporting the whole property. Derived and compared, the way HELD_NAME already is
+        # against swarm-status.sh.
+        sweep_reads="$(grep -oE '\$\{JKB_[A-Z_]+:-' <<<"$sweep_body" \
+            | sed -E 's/^\$\{([A-Z_]+):-$/\1/' | LC_ALL=C sort -u | tr '\n' ' ')"
+        sweep_declared="$(printf '%s\n' $sweep_seams | LC_ALL=C sort -u | tr '\n' ' ')"
+        if [ -z "$sweep_reads" ]; then
+            sweep_problems="$sweep_problems it reads no \${JKB_…:-} override at all, so the SEAMS declaration can no longer be checked against the code;"
+        elif [ "$sweep_reads" != "$sweep_declared" ]; then
+            sweep_problems="$sweep_problems SEAMS declares [$sweep_declared] while the script reads [$sweep_reads], so a seam is wired into no refusal while this guard reports the whole property;"
+        fi
         if [ -z "$sweep_seams" ]; then
             sweep_problems="$sweep_problems it has no SEAMS= line to read, so the check that no shipped file wires a self-test seam into the container establishes nothing;"
         else
-            for dc_f in run.sh Dockerfile container.json entrypoint.sh; do
-                [ -f "$here/$dc_f" ] || continue
-                dc_f_body="$(dc_strip_comments "$here/$dc_f")"
+            # EVERY SHIPPED FILE, DERIVED, not a list retyped once a round. The list named four and
+            # missed verify.sh -- which the same change had just made a CALLER of the sweep, and
+            # which runs INSIDE the container, where a seam takes effect immediately (in run.sh it
+            # would not: `in_container` is plain `docker exec` with no `-e`, so a `VAR=… in_container`
+            # prefix sets it for the docker CLI and never reaches the container). So the one file
+            # where the harm was real was the one not scanned. The two harnesses are excluded
+            # because guarding a name means writing it, and sweep-transcripts.sh because declaring
+            # a seam means naming it.
+            for dc_f_path in "$here"/*.sh "$here"/Dockerfile "$here"/container.json; do
+                [ -f "$dc_f_path" ] || continue
+                dc_f="${dc_f_path##*/}"
+                case "$dc_f" in sweep-transcripts.sh|check-config.sh|mutate-config.sh) continue ;; esac
+                dc_f_body="$(dc_strip_comments "$dc_f_path")"
                 for dc_seam in $sweep_seams; do
                     grep -qF -- "$dc_seam" <<<"$dc_f_body" \
                         && sweep_problems="$sweep_problems $dc_f sets $dc_seam, which is a self-test seam: in the container it silently disables the sweep while every start still reports success;"
@@ -705,6 +729,28 @@ else
     { grep -qE -- 'sweep_sh=.*sweep-transcripts\.sh' <<<"$verify_body" \
       && grep -qF -- 'bash "$sweep_sh" --dry-run' <<<"$verify_body"; } \
         || sweep_problems="$sweep_problems verify.sh does not ask whether the deny list still fits in one argv, so the container's health report reads green in the one state where no Bash call works at all;"
+    # ...AND REACHES A VERDICT WITH IT. Asking only that the sweep is CALLED let every arm be
+    # deleted -- or, more realistically, demoted to a `note` by a refactor -- with this guard still
+    # printing ok about a verify.sh that now says nothing. `accept_bad` specifically, because exit 3
+    # against exit 1 is the fact run.sh reads to decide whether to open a window.
+    # Anchored on the CODE, not on the comment heading above it: `$verify_body` is comment-stripped,
+    # so a heading is not there to find. From the `sweep_sh=` assignment to the block's closing `fi`
+    # at column 0 -- the inner arms are indented, so they cannot end the extraction early.
+    verify_verdict="$(awk '/sweep_sh=/ { inf = 1 } inf { print } inf && /^fi$/ { exit }' \
+        <<<"$verify_body")"
+    if [ -z "$verify_verdict" ]; then
+        sweep_problems="$sweep_problems verify.sh has no deny-list block to read, so the check above establishes only that the name appears;"
+    else
+        # The quote is appended rather than written into the list, so these NEEDLES are not counted
+        # by mutate-config.sh's `grep -c 'bad "'` scan over this file -- that scan counts this
+        # file's own FAILURE PATHS, and a string being searched for is not one. Left inline, the
+        # loop moved PINNED_BAD_SITES by one and demanded a mutation for a pattern.
+        dc_q='"'
+        for dc_verdict in ok bad accept_bad; do
+            grep -qF -- "$dc_verdict $dc_q" <<<"$verify_verdict" \
+                || sweep_problems="$sweep_problems verify.sh's deny-list block reaches no \`$dc_verdict\` verdict, so it runs the sweep and reports nothing a caller can act on;"
+        done
+    fi
 fi
 
 if [ -z "$sweep_problems" ]; then
