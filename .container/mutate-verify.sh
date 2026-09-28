@@ -565,7 +565,9 @@ run "the container is given a database of its own at run time" "JKB_DB is not se
 run "remote mode is switched off at run time" "JKB_REMOTE names the host daemon" \
     "${HEALTHY[@]}" --env JKB_REMOTE=
 without 'JKB_VERIFY_NO_DAEMON'
-run "no daemon token, and a daemon is expected" "there is no daemon token" "${MUT[@]}"
+# "container credential": D52.8 replaced the daemon token on the ~/.jkb bind with a credential of the
+# container's own, and verify.sh's refusal says so.
+run "no daemon token, and a daemon is expected" "there is no container credential" "${MUT[@]}"
 
 # The nested-bind exception must not be usable as a general one. A `--declare` naming anything
 # OUTSIDE every declared target is the shape that would turn it into a hole — `/host` is the
@@ -657,13 +659,14 @@ run "the host daemon's name does not resolve at the raise" "did not resolve when
 # is a note there; planting a wrong one makes it ask, and nothing that answers — the Mac's real daemon
 # with a 401, or no daemon at all on a CI runner — may be reported as jkb serve answering. Same image
 # and flags as the control; the only difference is a file in the scratch knowledge-base bind.
-# At the path a client of the firewall's daemon port reads (`~/.jkb/daemon/<port>/token`).
-daemon_port="$(sed -n 's/^DAEMON_PORT=\([0-9][0-9]*\)$/\1/p' "$REPO/.container/egress-lib.sh" | head -1)"
-[ -n "$daemon_port" ] || { echo "could not read DAEMON_PORT from egress-lib.sh" >&2; exit 2; }
-mkdir -p "$scratch/jkb/daemon/$daemon_port" && printf 'not-the-token\n' > "$scratch/jkb/daemon/$daemon_port/token"
+# At the path verify.sh and the container's `jkb` read: the container credential on its read-only
+# bind (D52.8), `$scratch/jkb-container` here. It was planted at the old `~/.jkb/daemon/<port>/token`
+# after D52 moved the credential, where verify.sh never looked — so this run certified a container
+# it had not asked anything, and reported the guard as silent (found by the first post-D52 run).
+printf 'not-the-token\n' > "$scratch/jkb-container/credential"
 run "the daemon token on the bind does not authenticate" "does not answer at" \
     "${HEALTHY[@]}"
-rm -rf "$scratch/jkb/daemon"
+rm -f "$scratch/jkb-container/credential"
 
 # The base image ships /etc/sudoers.d/vscode with NOPASSWD:ALL, which makes the root-owned
 # firewall, its snapshot and the pinned sudoers argument all bypassable with one sudo. The
@@ -681,7 +684,9 @@ run "/usr/local itself is writable by the agent" "is writable by" \
     "${HEALTHY[@]}"
 
 mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/sudoers.d/vscode && chmod 0440 /etc/sudoers.d/vscode"
-run "blanket passwordless root is restored" "may run more than the firewall and the egress probe as root" \
+# The stable prefix of the refusal, not its whole list: the list grew a third grant with D52 (the
+# hook pin), and the full sentence this matched then described a set verify.sh no longer allows.
+run "blanket passwordless root is restored" "may run more than the firewall" \
     "${HEALTHY[@]}"
 
 # A PID 1 THAT NEVER wait()s. Replacing the image's reaper with an init that runs the command and

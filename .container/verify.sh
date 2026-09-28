@@ -1490,7 +1490,8 @@ esac
 # whole path a client takes, not just the port. `--noproxy '*'`: this runs outside the nested
 # sandbox, and a proxy variable in the environment would test the proxy instead of the rule.
 # The header goes through a file descriptor so the token is never in this process's argv.
-# Keyed by the daemon's port (`~/.jkb/daemon/<port>/token`), which is how a client finds it.
+# The container's own credential (D52.8), on its read-only bind — no longer the host daemon's token
+# under ~/.jkb, which the container does not see.
 daemon_token="${JKB_REMOTE_TOKEN_FILE:-$HOME/.jkb-container/credential}"
 # NO TOKEN IS A FAILURE since the cutover (tasks S6.5): every jkb command in here goes to the daemon,
 # so a container that cannot authenticate to it has no knowledge base at all. The one exception is
