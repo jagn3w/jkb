@@ -497,7 +497,7 @@ else
     bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
 fi
 
-# THE TRANSCRIPT SWEEP, and the four properties of its enumeration that no runtime check can see.
+# THE TRANSCRIPT SWEEP, and the properties of its enumeration that no runtime check can see.
 #
 # WHY IT IS GUARDED STATICALLY. The sweep runs on every container start and moves files out of
 # ~/.claude/projects. Every way of getting it wrong is SILENT in both directions: widen the name
@@ -505,11 +505,14 @@ fi
 # cap the depth and it sweeps the cheap half of the population (depth 2) while the agent
 # transcripts that are the bulk (depth 4 and 6) accumulate exactly as before, so the container
 # still dies at spawn with a sweep in the log saying it worked. Neither state raises anything at
-# run time. The self-test catches all four — this is the half that catches them being edited out
-# of the file the self-test does not run against.
+# run time. The self-test catches them — this is the half that catches them being edited out of
+# the file the self-test does not run against, and the half that compares a name against the
+# EXTERNAL harness that owns it, which no fixture of ours can do.
 #
-# ONE ASSERTION, composed message. The four are one property — "the enumeration still enumerates
-# the right set" — and splitting them would be four failure paths where one names the subject.
+# ONE ASSERTION, composed message. They are one property — "the enumeration still enumerates the
+# right set" — and splitting them would be a failure path each where one names the subject. No
+# numeral is written here: the count is `PINNED_SWEEP_APPENDS` in mutate-config.sh, derived from
+# this block, and a numeral in prose is a second copy of it that goes stale on the next condition.
 # ANCHORED ON THE FUNCTION NAME, like the verify guard above is anchored on the invocation: the
 # body is extracted by name, so a mutation that edits the real `find` is seen and the self-test's
 # own `find` calls are not, and an extraction that reads nothing is a failure rather than four
@@ -523,6 +526,18 @@ if [ -z "$sweep_at" ]; then
 elif [ -n "$verify_at" ] && [ "$sweep_at" -gt "$verify_at" ]; then
     sweep_problems="$sweep_problems run.sh runs it AFTER verify.sh (line $sweep_at vs $verify_at), so one failing assertion about something else disables it;"
 fi
+# `|| true` IS THE WHOLE OF "NEVER FATAL", and it was the one pinned property whose only watcher
+# was a mutation ANCHOR: both sweep mutations happened to carry the text inside their anchor
+# strings, so removing it from run.sh reported `NO-OP the mutation changed nothing`, pointing the
+# developer at the mutation rather than at the lost non-fatality -- whose natural repair (relax the
+# anchor) greens the gate. It vanishes altogether on a host with no jq or python3, where
+# mutate-config.sh exits early. run.sh is `set -euo pipefail`, and the sweep returns 1 on paths the
+# script itself documents (an unwritable archive, a file that raced away), so without this one
+# raced transcript aborts the start BEFORE verify.sh and before the attach instructions.
+if [ -n "$sweep_at" ] \
+   && ! grep -qE '\|\|[[:space:]]+true[[:space:]]*$' <<<"$(sed -n "${sweep_at}p" <<<"$run_stripped")"; then
+    sweep_problems="$sweep_problems run.sh does not append \`|| true\` to it, so under set -euo pipefail one file it could not archive aborts the start before verify.sh runs;"
+fi
 if [ ! -f "$here/sweep-transcripts.sh" ]; then
     sweep_problems="$sweep_problems sweep-transcripts.sh is not there at all;"
 else
@@ -530,7 +545,7 @@ else
     sweep_enum="$(awk '/^transcript_records\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
         <<<"$sweep_body")"
     if [ -z "$sweep_enum" ]; then
-        sweep_problems="$sweep_problems it has no transcript_records() to read, so the four checks below establish nothing;"
+        sweep_problems="$sweep_problems it has no transcript_records() to read, so the checks below establish nothing;"
     else
         grep -qF -- 'find -L ' <<<"$sweep_enum" \
             || sweep_problems="$sweep_problems it does not pass -L, so a symlinked root (which is how the container spells it) enumerates nothing;"
@@ -538,19 +553,53 @@ else
             && sweep_problems="$sweep_problems it caps the depth, which misses the nested agent transcripts that are the bulk of the population;"
         grep -qF -- "-name '*.jsonl'" <<<"$sweep_enum" \
             || sweep_problems="$sweep_problems it does not filter on *.jsonl, so auto-memory is in the plan;"
-        # THE HARNESS'S RUN JOURNAL IS A .jsonl, so the filter above matches it and only a name of
-        # its own holds it back. swarm-status.sh discovers every run by that name and then requires
-        # the file, so sweeping it broke the run view for every past run. The rule stated here used
-        # to name `wf_*.json` records, of which there are none anywhere.
-        grep -qF -- '! -name journal.jsonl' <<<"$sweep_enum" \
-            || sweep_problems="$sweep_problems it does not hold back journal.jsonl, which *.jsonl matches and swarm-status.sh finds runs by;"
+        # NOTHING IS HELD BACK IN THE WALK. This function feeds the PROJECTION as well as the
+        # plan, and the projection is the sizing of the argv that overflows -- a path the sweep
+        # cannot reclaim costs the kernel exactly what one it can costs. The round that introduced
+        # the journal exclusion put it here, and the sweep then acted on 65,250 bytes of a real
+        # 96,612 and printed "nothing to archive" while every Bash call went on dying at spawn.
+        # The name is spared in transcript_plan; the walk counts everything.
+        grep -qF -- '! -name' <<<"$sweep_enum" \
+            && sweep_problems="$sweep_problems it holds a name back in the WALK, which feeds the projection as well as the plan, so bytes it can never reclaim are invisible to the budget;"
         grep -qF -- '-name memory -prune' <<<"$sweep_enum" \
             || sweep_problems="$sweep_problems it does not prune memory/, so under -L the walk follows that symlink out into the bind-mounted ~/.jkb;"
+        # THE SPARED NAME IS DERIVED, NOT SPELLED. Its authority is an EXTERNAL harness -- Claude
+        # Code's workflow runner -- and this repo has already been wrong about the name once (it
+        # believed `wf_*.json`; there are zero such files anywhere). Pinning the literal here would
+        # have kept every gate green through a rename: swarm-status.sh would break visibly and get
+        # fixed, and the sweep would go on archiving the run state oldest-first with this guard,
+        # the fixture and the mutation all still agreeing about a name nothing writes. So the name
+        # comes out of swarm-status.sh's discovery predicate -- the one reader that defines it --
+        # and an extraction that reads nothing is a failure rather than a vacuous pass, the same
+        # arrangement this file uses for DEFAULT_ADDR and the extension id.
+        swarm_journal="$(grep -oE -- "-name [A-Za-z0-9_.-]+ -path '\*/subagents/workflows/wf_\*'" \
+            "$here/../scripts/swarm-status.sh" 2>/dev/null | sed -n '1s/^-name \([^ ]*\).*/\1/p')"
+        sweep_held="$(grep -oE '^HELD_NAME=[A-Za-z0-9_.-]+' <<<"$sweep_body" | sed -n '1s/^HELD_NAME=//p')"
+        if [ -z "$swarm_journal" ]; then
+            sweep_problems="$sweep_problems swarm-status.sh no longer discovers runs by \`-name <file> -path '*/subagents/workflows/wf_*'\`, so the name the sweep must spare cannot be read from the reader that defines it;"
+        elif [ "$sweep_held" != "$swarm_journal" ]; then
+            sweep_problems="$sweep_problems it spares HELD_NAME='$sweep_held' while swarm-status.sh finds runs by '$swarm_journal', so the sweep archives the harness's own run state oldest-first and every past run reads as \"no swarm run found\";"
+        fi
         # Checked as a REFUSAL rather than as a comparison of the two default constants, so the
         # JKB_TRANSCRIPT_ARCHIVE override cannot reach the state either.
-        grep -qF -- '"$abs"/*)' <<<"$sweep_body" \
+        grep -qF -- '"$phys_root"/*)' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems it does not refuse an archive inside the root, where each sweep re-enumerates what the last one moved;"
-        grep -qF -- 'CLAUDE_CONFIG_DIR' <<<"$sweep_body" \
+        # AND THE REFUSAL IS ON RESOLVED PATHS. It was a string-prefix test on the CALLER'S
+        # spelling while the walk is `-L`, so in the container -- where ~/.claude/projects is a
+        # symlink into the state volume -- an archive squarely inside the enumerated tree was not a
+        # prefix of the root as spelled and was accepted: the safety net was inoperative in the one
+        # deployment it was written for, and the .archive/.archive/ nesting reproduced at
+        # 530 -> 602 -> 674 deny bytes. `pwd -P` is what makes the two spellings comparable.
+        grep -qE -- 'phys_root=.*pwd -P' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it compares the caller's spellings rather than resolved paths, so under -L a symlinked root accepts an archive inside itself;"
+        # `CLAUDE_BASE=.*CLAUDE_CONFIG_DIR`, not a bare mention of the variable anywhere in the
+        # file: the mention form was satisfied by the self-test's own `env -u CLAUDE_CONFIG_DIR`,
+        # so the mutation that renames the variable IN THE ASSIGNMENT went from CAUGHT to MISSED
+        # the moment a row was added that names it for an unrelated reason. What is being asserted
+        # is that the config base is DERIVED from it. Whether that derivation is spelled correctly
+        # is the self-test's, which runs the script with CLAUDE_CONFIG_DIR set and reads the root
+        # back out of the message.
+        grep -qE -- 'CLAUDE_BASE=.*CLAUDE_CONFIG_DIR' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems it does not honour CLAUDE_CONFIG_DIR, which commands.rs, auto-mode.sh and swarm-status.sh all do, so a second config dir sweeps an absent tree and reports success;"
     fi
 fi

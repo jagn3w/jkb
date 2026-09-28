@@ -48,6 +48,11 @@ seed() {
     # ...and jkb-cli's remote.rs, which names the variable the notification hook reads.
     mkdir -p "$work/t/crates/jkb-cli/src"
     cp "$repo/crates/jkb-cli/src/remote.rs" "$work/t/crates/jkb-cli/src/"
+    # ...and swarm-status.sh, which OWNS the name the transcript sweep has to spare: check-config.sh
+    # reads it out of that file's discovery predicate rather than spelling it. Without this in the
+    # copy the extraction reads nothing, which is a failure by design -- so it would redden the
+    # unmutated tree and take the negative control with it.
+    cp "$repo/scripts/swarm-status.sh" "$work/t/scripts/"
     # The manifest is what lets mutated() see a DELETION or a MODE CHANGE. Taken here rather than
     # derived from a list, so it still covers a file added to seed() tomorrow.
     tree_manifest > "$work/manifest"
@@ -292,34 +297,73 @@ run "the sweep bounds its depth, missing the nested agent transcripts" "it caps 
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = "-name '*.jsonl' ! -name journal.jsonl"
+old = "-name '*.jsonl' -exec"
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, "! -name journal.jsonl", 1))
+open(p, 'w').write(s.replace(old, "-exec", 1))
 PYX
 run "the sweep stops filtering on *.jsonl, so auto-memory is in the plan" "does not filter on *.jsonl"
 
-# THE HARNESS'S OWN RUN JOURNAL. `*.jsonl` matches journal.jsonl, so this exclusion is the only
-# thing between the sweep and the state swarm-status.sh finds every run by -- and it shipped
-# without one, which is how the sweep came to archive 23 of them oldest-first.
+# THE HARNESS'S OWN RUN JOURNAL, and BOTH ways of getting it wrong, because the repair for the
+# first shipped the second. `*.jsonl` matches journal.jsonl, so a name of its own is the only thing
+# between the sweep and the state swarm-status.sh finds every run by -- and it shipped without one,
+# which is how the sweep came to archive 23 of them oldest-first. The fix then put that exclusion
+# in the WALK, which feeds the PROJECTION as well as the plan, so the sweep sized the argv at
+# 65,250 bytes of a real 96,612 and printed "nothing to archive" while every Bash call went on
+# dying at spawn. One mutation each, in the two directions.
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = " ! -name journal.jsonl"
+old = "-name '*.jsonl' -exec"
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, "", 1))
+open(p, 'w').write(s.replace(old, "-name '*.jsonl' ! -name journal.jsonl -exec", 1))
 PYX
-run "the sweep stops holding back the workflow run journal" "does not hold back journal.jsonl"
+run "the sweep holds the journal back in the walk, hiding its bytes from the budget" "holds a name back in the WALK"
+
+# ...AND THE NAME ITSELF, which an external harness owns. Renaming it here has to be caught by
+# DISAGREEMENT with swarm-status.sh and not by a literal this file also spells, because a literal
+# is green through the case that actually matters: the harness renaming its own run-state file.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\nHELD_NAME=journal.jsonl\n"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "\nHELD_NAME=run.jsonl\n", 1))
+PYX
+run "the sweep spares a name swarm-status.sh does not look for" "while swarm-status.sh finds runs by"
+
+# ...and that reader going away, which is the case a literal could never have seen: the guard must
+# refuse to establish anything rather than pass on a name it could not read.
+seed; python3 - "$work/t/scripts/swarm-status.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "-name journal.jsonl -path '*/subagents/workflows/wf_*'"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "-name journal.jsonl", 1))
+PYX
+run "swarm-status.sh stops discovering runs by that predicate" "cannot be read from the reader that defines it"
 
 # THE ARCHIVE MUST BE OUTSIDE THE ROOT. Anchored on the case pattern, which is the refusal itself,
 # not on its message.
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '        "$abs"/*)'
+old = '        "$phys_root"/*)'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, '        "$abs"/never-matches-anything)', 1))
+open(p, 'w').write(s.replace(old, '        "$phys_root"/never-matches-anything)', 1))
 PYX
 run "the sweep accepts an archive inside the root it enumerates" "does not refuse an archive inside the root"
+
+# ...AND THE REFUSAL COMPARING SPELLINGS RATHER THAN RESOLVED PATHS, which is how it shipped: a
+# string-prefix test against the caller's spelling, while the walk is `-L` and the container's root
+# IS a symlink. The refusal was present, pinned, mutated -- and inoperative in production.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'phys_root="$(cd "$root" && pwd -P)"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'phys_root="$(cd "$root" && pwd)"', 1))
+PYX
+run "the containment test goes back to comparing the caller's spellings" "rather than resolved paths"
 
 # ONE SPELLING OF THE CLAUDE CONFIG BASE, shared with commands.rs, auto-mode.sh and swarm-status.sh.
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
@@ -358,27 +402,56 @@ open(p, 'w').write(s.replace(old, 'enumerate_them() {', 1))
 PYX
 run "the enumeration is renamed, so the guard reads nothing" "no transcript_records"
 
-# THE WIRING, both halves. Removing it is a container that fills up again; moving it after the
+# THE WIRING, all three halves. Removing it is a container that fills up again; moving it after the
 # verify is the reap's own bug back — one failing assertion about something else and the sweep
-# never runs, which is how the deleted postStartCommand came to be unconditional.
+# never runs, which is how the deleted postStartCommand came to be unconditional; and dropping the
+# `|| true` makes one unarchivable file abort the start under run.sh's own `set -euo pipefail`.
+#
+# ANCHORED ON THE INVOCATION, NOT ON THE WHOLE LINE. These two used to carry `|| true` inside their
+# anchor strings, which made them the only watcher the non-fatality had: strip it from run.sh and
+# both reported `NO-OP the mutation changed nothing`, pointing at the mutation rather than at the
+# property, whose natural repair (relax the anchor) greens the gate. They now find the line by its
+# statement and take the whole line, so the third mutation below owns `|| true` alone.
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'in_container -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true\n'
-assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, '', 1))
+lines = s.split('\n')
+hit = [i for i, l in enumerate(lines) if 'bash .container/sweep-transcripts.sh' in l and not l.lstrip().startswith('#')]
+assert len(hit) == 1, "mutation target absent"
+del lines[hit[0]]
+open(p, 'w').write('\n'.join(lines))
 PYX
 run "run.sh stops sweeping transcripts" "run.sh does not invoke it"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-sweep = 'in_container -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true\n'
-verify = 'in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?\n'
-assert sweep in s and verify in s, "mutation target absent"
-open(p, 'w').write(s.replace(sweep, '', 1).replace(verify, verify + sweep, 1))
+lines = s.split('\n')
+def only(needle):
+    hit = [i for i, l in enumerate(lines) if needle in l and not l.lstrip().startswith('#')]
+    assert len(hit) == 1, "mutation target absent"
+    return hit[0]
+sweep, verify = only('bash .container/sweep-transcripts.sh'), only('bash .container/verify.sh')
+assert sweep < verify, "mutation target absent"
+line = lines.pop(sweep)
+lines.insert(verify, line)
+open(p, 'w').write('\n'.join(lines))
 PYX
 run "the sweep moves after the verify, where a failing assertion disables it" "AFTER verify.sh"
+
+# ...AND THE `|| true` ON ITS OWN, the entirety of "never fatal". Nothing watched it: the two
+# mutations above happened to contain it, so its removal made THEM misreport and left the lost
+# property unnamed. run.sh is `set -euo pipefail`, and the sweep returns 1 on paths the script
+# itself documents, so one transcript that raced away aborts the start before verify.sh runs and
+# before the attach instructions the comment beside it exists to protect.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'bash .container/sweep-transcripts.sh || true'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'bash .container/sweep-transcripts.sh', 1))
+PYX
+run "the sweep invocation stops being non-fatal" "does not append \`|| true\` to it"
 
 # THE ENTRYPOINT LINE. One line in the Dockerfile is the whole of "the firewall is raised on every
 # start"; deleting it leaves both config harnesses green because run.sh raises it too, and breaks
@@ -1150,17 +1223,24 @@ fi
 
 # THE COMPOSED ASSERTION'S OWN BRANCHES. The sweep guard appends to one variable and emits it through
 # a single `bad "`, so `bad_sites` moved by ONE when eight conditions arrived -- and one of the eight
-# shipped with no mutation, invisibly. Counting the appends forces the decision per branch, which is
+# shipped with no mutation, invisibly. Counting the branches forces the decision per branch, which is
 # the granularity the mutations are written at.
-sweep_appends="$(grep -c 'sweep_problems="\$sweep_problems' "$repo/.container/check-config.sh")"
-PINNED_SWEEP_APPENDS=11
+#
+# EVERY OCCURRENCE OF THE VARIABLE, not `grep -c` on one assignment spelling. That counted LINES
+# matching `sweep_problems="$sweep_problems`, so a condition written `sweep_problems+=" ...;"` --
+# semantically identical, and the idiom check-config.sh itself uses elsewhere for accumulation --
+# left the count unmoved, left `bad_sites` unmoved (all branches emit through one `bad "`), and
+# shipped with no mutation: exactly the gap this pin exists to close. Two appends on one line
+# bypassed it the same way. `grep -o` counts occurrences, so any spelling of a new branch moves it.
+sweep_appends="$(grep -o 'sweep_problems' "$repo/.container/check-config.sh" | grep -c .)"
+PINNED_SWEEP_APPENDS=33
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
-    printf '  the sweep guard has %s condition(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"
+    printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"
     echo "  They all emit through one \`bad \"\`, so the failure-path count above cannot see a new one."
     echo "  Add a mutation for it and update PINNED_SWEEP_APPENDS."
 else
-    printf '  %s conditions behind the sweep guard, each with a mutation, count pinned\n' "$sweep_appends"
+    printf '  %s mentions of sweep_problems behind the sweep guard, each branch with a mutation, count pinned\n' "$sweep_appends"
 fi
 
 echo

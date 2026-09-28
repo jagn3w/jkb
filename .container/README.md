@@ -1337,10 +1337,14 @@ worktree reap runs there (*Using it*, above): one failing assertion about someth
 disable it. It is never fatal — what it could not archive it says, and a deny list slightly too
 long is the state we were already in.
 
-**Four properties of one `find` carry the whole thing**, and each is held by both
+**These properties of one `find` carry the whole thing**, and each is held by both
 `sweep-transcripts.sh --self-test` and a `check-config.sh` assertion, because every way of getting
 it wrong is silent in both directions — a sweep that archives the wrong set reports success
-exactly like one that archives the right set:
+exactly like one that archives the right set. No numeral stands in front of the list, in any of the
+three files that carry it: the count lives in `PINNED_SWEEP_APPENDS`, which is derived from the
+guard block itself, and a number written in prose beside a list is a second copy that goes stale on
+the next condition — which is what happened here, "four" over five bullets, in a change whose whole
+guard strategy is pinning counts so an unwatched branch cannot be added:
 
 - **`-L`**, because the root is reachable through a symlink and `find` does not follow a symlinked
   *starting point* without it. Drop it and the sweep enumerates nothing and says so cheerfully.
@@ -1348,18 +1352,30 @@ exactly like one that archives the right set:
   and the container still dies at spawn with a sweep in the log saying it worked.
 - **`-name '*.jsonl'`**, because `<slug>/memory/` holds auto-memory as `.md` files. The name is
   the guard; depth never was.
-- **`! -name journal.jsonl`**, and the sentence that used to stand here was wrong in a way that
-  cost a real defect. It said the harness keeps `workflows/wf_*.json` run records; there are none —
+- **Nothing held back in the walk.** The enumeration feeds the *projection* as well as the plan,
+  and the projection is the sizing of the argv that overflows: the kernel charges the same bytes
+  for a path the sweep cannot reclaim as for one it can. The round that introduced the journal
+  exclusion put it in this `find`, and the sweep then acted on 65,250 bytes where the real path
+  text measured 96,612 — half again as much, all of it held-back journals — and printed
+  `nothing to archive` while every Bash call went on dying at spawn. Journals are never archived and `.claude-state` is a volume, so the
+  unreclaimable set only grows: at ~165 bytes each, about 198 of them exceed the whole budget on
+  their own, and the sweep now says that out loud rather than reporting success it cannot deliver.
+  The name is spared in `transcript_plan`; the walk counts everything.
+- **`HELD_NAME`, spared in the plan**, and the sentence that used to stand here was wrong in a way
+  that cost a real defect. It said the harness keeps `workflows/wf_*.json` run records; there are none —
   measured, zero anywhere under the root. What it writes is
   `<slug>/<uuid>/subagents/workflows/wf_*/journal.jsonl`, 23 of them in this container, which
   `*.jsonl` matches — and `swarm-status.sh` **discovers** every run by that exact name before
   requiring the file. So the sweep archived the harness's own run state oldest-first on every
   container start, and `swarm-status.sh <run>` answered `no swarm run found` for every past run.
   The `agent-*.jsonl` transcripts in those same directories are the bulk of what must be swept, so
-  `workflows` cannot be pruned the way `memory` is: exactly one name is held back. The self-test
+  `workflows` cannot be pruned the way `memory` is: exactly one name is spared. The self-test
   written to prevent this asserted the survival of a `wf_*.json` fixture — a shape no real tree
   has — so it could not fail. A guard whose fixture models something that does not exist is not a
-  guard, and this is the third place that same wrong rule was written down.
+  guard, and this is the third place that same wrong rule was written down. The name itself is no
+  longer spelled in `check-config.sh` either: it is **read out of `swarm-status.sh`'s discovery
+  predicate** and required to agree, because the authority is an external harness and a pinned
+  literal stays green through the one case that matters — that harness renaming its own file.
 - **`memory/` pruned**, because under `-L` that per-repo symlink into the bind-mounted
   `~/.jkb/claude-memory` is followed like a real directory and the walk leaves the volume — into
   files the *host* owns.
@@ -1368,3 +1384,64 @@ And every project slug begins with `-` (the absolute path with non-alphanumerics
 leading `/` becomes one): `-home-vscode-repos-jkb`. A bare `dirname "$rel"` reads that as the `-h`
 option and dies, and it is every path in the tree rather than an edge case, so the relative
 directory comes from `${rel%/*}` and every external command here is given `--`.
+
+The archive must be **outside** the root, or the sweep grows the deny list it exists to shrink: the
+next walk finds what this one moved, one directory deeper, for ever. That refusal was in place from
+the start and was **inoperative in the only deployment it was written for**. It compared the
+caller's *spellings* — a string prefix of the root as passed — while the walk is `-L` and
+`~/.claude/projects` is a symlink into the state volume, so
+`JKB_TRANSCRIPT_ARCHIVE=~/.claude-state/projects/.archive`, a path squarely inside the enumerated
+tree, was not a prefix of `/home/vscode/.claude/projects` and was accepted. Reproduced against the
+real script with nothing else touched: 530 → 602 → 674 deny bytes across two sweeps, files nesting
+under `.archive/.archive/` — the same signature this document already records as the measured
+defect. It now compares **resolved** paths (`pwd -P` on the root, and the archive's nearest
+existing ancestor resolved the same way, which also collapses a `..` that climbs back in), while
+the enumeration keeps the caller's unresolved spelling, because that is the spelling the deny list
+is built from. The self-test exercises the refusal through *every* spelling, not just the one the
+fixture happened to pass; the row that stood alone before was the row that passes either way.
+Behind it the sweep now carries a post-condition on the two numbers it was already printing —
+`before` and `after` sat side by side in the summary with nothing comparing them, which is how a
+run that *grew* the deny list exited 0 with every count reading as success.
+
+**What the self-test was really measuring.** Three rounds of review found the same shape here: an
+assertion that passes for the wrong reason.
+
+- The fixture's mtimes ascended in the same order as its `LC_ALL=C` paths, so *"archived the three
+  oldest and kept the two newest"* was satisfied by **path order alone**. Measured: replacing the
+  GNU `stat` format's `%Y` with a constant still printed `self-test passed`, that row included —
+  with a non-numeric key `sort -k1,1n` ties every record and falls back to the path key for the
+  identical set. So `%y` (a date string) or `%W` (0 on ext4) would have shipped green, and in the
+  container `KEEP_NEWEST` would have protected the 32 lexicographically-*last* paths rather than
+  the newest, archiving the live session's own transcript out from under it. The fixture now
+  arranges mtime order to **disagree** with path order, so the two choose different sets and only
+  the mtime one satisfies the rows; two further rows pin the record's first field as numeric and as
+  ordered.
+- None of the four budget constants was asserted anywhere — not here, not in `check-config.sh`, not
+  in `mutate-config.sh` — although the file's own header says `--self-test` exists to *state* them.
+  All four were mutated and every gate stayed green: `KEEP_NEWEST=0` (the harm `scripts/check.sh`
+  names by name), `KEEP_NEWEST=3200`, a 4× budget and a 10× argv cap. They are stated now, before
+  the first override, which is the only place the shipped values are readable.
+- The *"running it again"* rows were vacuous: `KEEP_NEWEST=2` was still in force over a population
+  of 2, so `n - keep` was zero and the plan was empty **by the floor** — they re-measured a floor
+  asserted three rows earlier, under the heading written to catch the nesting defect. The second
+  sweep now runs with the floor off and the budget set to exactly what the tree projects, so an
+  empty plan is the sweep deciding it is under budget; a third runs with a budget that binds, and
+  asserts it archives from the tree and not from its own archive.
+- Nothing ran the file as a **program**. The root resolution and the argument dispatch were
+  executed by no test, and `check-config.sh`'s `grep -qF CLAUDE_CONFIG_DIR` was satisfied by any
+  mention anywhere — so one brace out of place (`"${CLAUDE_CONFIG_DIR:-$HOME}/.claude"`) made the
+  sweep walk a tree that does not exist, print `does not exist`, exit 0, and leave every gate
+  green: precisely the *"a sweep that cannot find its subject must not look successful"* failure the
+  comment claims to have closed. There are now rows that invoke the script with `HOME`,
+  `CLAUDE_CONFIG_DIR` and `JKB_TRANSCRIPT_ROOT` pointed at fixtures and read the root back out of
+  its message, plus the `--dry-run`, unknown-argument and trailing-argument exits. That mention-form
+  guard has been tightened to `CLAUDE_BASE=.*CLAUDE_CONFIG_DIR`: the self-test's own
+  `env -u CLAUDE_CONFIG_DIR` was enough to satisfy the old one, which turned a CAUGHT mutation into
+  a MISSED one the moment an unrelated row named the variable.
+
+`|| true` on `run.sh`'s invocation is the entirety of the sweep's *never fatal* claim, and it was
+the one pinned property whose only watcher was a mutation **anchor**: both wiring mutations carried
+the text inside their anchor strings, so removing it from `run.sh` reported `NO-OP the mutation
+changed nothing` and pointed at the mutation rather than at the lost non-fatality — whose natural
+repair, relaxing the anchor, greens the gate. It has a condition and a mutation of its own now, and
+the two wiring mutations find their line by its statement instead.
