@@ -3198,12 +3198,30 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
     }
 }
 
-/// One sweep, with the database opened for it and closed after.
+/// A failure message's STANDING-CONDITION key: its digit runs masked.
 ///
-/// **Per sweep, not once for the service**, for the reason the queue's compaction is: the records are
-/// in the database now (tasks S6.4 stage 3), and a database this binary cannot open — one a newer jkb
-/// migrated, routine across branches here — must fail this pass, not the process. The service loop
-/// reports the failure and tries again next interval, where exiting put launchd into a restart loop.
+/// The reaper says a failure once while it stays the same, and compares whole sentences. The sweep's
+/// over-budget message embeds a byte count re-derived from the tree every run — and a tree is over
+/// budget *precisely while transcripts are being created*, which is the premise of this whole
+/// trigger. So the number moved every tick, no two sentences were equal, and the "said once"
+/// property never held in the one state it was written for: 96 near-identical lines a day.
+fn standing_key(why: &str) -> String {
+    let mut out = String::with_capacity(why.len());
+    let mut in_digits = false;
+    for c in why.chars() {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// One tick's worth of the dev container's transcripts, and what reaches the log.
 ///
 /// Extracted from the watch loop for length, but it earns a name anyway: the interesting thing here
@@ -3229,14 +3247,23 @@ fn sweep_container_transcripts(json: bool, last_failure: &mut String) {
         // would be the defect: "there may be a container over budget and I could not find out" is
         // not the fact `Absent` reports, which is that there is no container here at all.
         transcripts::Sweep::Unreachable(why) | transcripts::Sweep::Failed(why) => {
-            if why != *last_failure {
+            // Compared on the KEY and printed in full: the operator wants this run's numbers, the
+            // log wants one line per condition rather than one per tick.
+            let key = standing_key(&why);
+            if key != *last_failure {
                 eprintln!("transcripts: {why}");
-                last_failure.clone_from(&why);
+                *last_failure = key;
             }
         }
     }
 }
 
+/// One sweep, with the database opened for it and closed after.
+///
+/// **Per sweep, not once for the service**, for the reason the queue's compaction is: the records are
+/// in the database now (tasks S6.4 stage 3), and a database this binary cannot open — one a newer jkb
+/// migrated, routine across branches here — must fail this pass, not the process. The service loop
+/// reports the failure and tries again next interval, where exiting put launchd into a restart loop.
 fn reap_once(db_path: &Path, retain_days: u64, dry_run: bool) -> Result<archive::Report> {
     let db = open_db(db_path)?;
     let backend = jkb_api::LocalBackend::new(db).with_actor("reap");
@@ -4163,6 +4190,31 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The reaper says a standing condition ONCE. The sweep's over-budget sentence carries a byte
+    /// count re-derived every run, and a tree is over budget precisely while transcripts are being
+    /// created — so comparing whole sentences meant a new line every 15 minutes for ever, in the one
+    /// state the "said once" rule was written for.
+    #[test]
+    fn a_standing_condition_is_one_condition_however_its_numbers_move() {
+        let a = "transcript sweep: 80092 deny bytes remain after this sweep, over the 65536 byte budget";
+        let b = "transcript sweep: 80674 deny bytes remain after this sweep, over the 65536 byte budget";
+        assert_eq!(
+            super::standing_key(a),
+            super::standing_key(b),
+            "the same condition with different numbers is one condition"
+        );
+        let other = "transcript sweep: 80092 file(s) could not be archived";
+        assert_ne!(
+            super::standing_key(a),
+            super::standing_key(other),
+            "a different condition is still a different condition"
+        );
+        assert!(
+            super::standing_key(a).contains('#'),
+            "the digits are what is masked"
+        );
+    }
     /// `jkb serve`'s default token path is refused where the refusal says so, and an explicit one is
     /// the caller's decision. The refusal itself is `jkb_core`'s shared-filesystem rule, measured in
     /// the dev container against the `~/.jkb` bind (FUSE).

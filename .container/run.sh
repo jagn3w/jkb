@@ -1082,8 +1082,12 @@ if [ "$OPEN" -eq 1 ] && [ "$verify_rc" -ne 0 ]; then
     # into a container whose verifier just reported UNDECLARED mounts, permitted egress to a
     # non-allowlisted host, or a broken posture is not.
     #
-    # BOOTING IS NOT ENDORSING (D51.7). Exit 3 means every failure is a condition this container was
-    # CONFIGURED to accept — in practice, the unfiltered-egress override. That override exists so a
+    # BOOTING IS NOT ENDORSING (D51.7). Exit 3 means every failure is one this container TOLERATES
+    # rather than a broken boundary. It read "a condition this container was CONFIGURED to accept —
+    # in practice, the unfiltered-egress override", which was true while that override was the only
+    # producer and stopped being true when the transcript deny list joined it: nobody configures a
+    # container to accumulate run journals past what any sweep can reclaim. The branch below no
+    # longer names a cause for the same reason, and this comment is the one a reader reaches first. That override exists so a
     # container BOOTS and can be attached to and diagnosed; it does not make that container a place
     # to run an agent unattended, which is precisely what this flag would do. So it is still
     # refused, and the message says something that can be acted on: the previous wording told you

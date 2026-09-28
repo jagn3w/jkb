@@ -1614,12 +1614,12 @@ process with no checkout in hand has to run it. Root-owned, with a second gain t
 the host-triggered sweep runs a script the agent inside the container cannot rewrite. `run.sh` still
 runs the checkout's copy, which is what `--self-test` and `check-config.sh` read.
 
-Three names must agree for any of that to reach anything, and **each is silent when wrong**: a reaper
-poking a container name nothing creates, or running a path the image does not carry, reports nothing
-for ever — the same end state as having no second trigger at all, wearing a green log. So
-`check-config.sh` reads each from the file that owns it and requires them to match: `DEV_CONTAINER_NAME`
-against `run.sh`'s `${JKB_CONTAINER_NAME:-…}` default, and `SWEEP_IN_IMAGE` against the Dockerfile's
-`COPY` destination, with an extraction that reads nothing a failure rather than a vacuous pass.
+The container's **name** must agree across the two files that spell it, and it is **silent when
+wrong**: a reaper poking a name nothing creates reports nothing for ever — the same end state as
+having no second trigger at all, wearing a green log. So `check-config.sh` reads `DEV_CONTAINER_NAME`
+and `run.sh`'s `${JKB_CONTAINER_NAME:-…}` default from the files that own them and requires them to
+match, with an extraction that reads nothing a failure rather than a vacuous pass. (A second pair —
+the in-image path — used to be here too, and is gone with the image copy: see below.)
 
 The tick is **never fatal and usually silent**. No Docker, no such container, or a stopped one is the
 ordinary case for anyone not using the dev container and says nothing at all; a sweep with nothing to

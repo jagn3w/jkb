@@ -819,7 +819,19 @@ control_rc=$?
 # refuse the very state an operator declared, and every verdict would read as unattributable.
 control_ok=no
 [ "$control_rc" -eq 0 ] && grep -q "container checks passed" <<<"$control_out" && control_ok=yes
-[ "$control_rc" -eq 3 ] && grep -q "configured to accept" <<<"$control_out" && control_ok=yes
+# READ OUT OF verify.sh, never retyped. This carried the literal "configured to accept", which
+# verify.sh stopped printing the day exit 3 gained a second producer -- and a control that cannot
+# recognise a legitimate exit 3 aborts this whole harness with a diagnosis blaming the container,
+# so the one thing watching verify.sh's failure paths fire never runs. An extraction that reads
+# nothing is a failure here too, rather than a control that silently accepts anything.
+control_phrase="$(grep -oE "every failure above is [^\\']*" "$REPO/.container/verify.sh" \
+    | sed -n '1{s/\\\\n$//;p}')"
+if [ -z "$control_phrase" ]; then
+    printf '\033[31mverify.sh no longer prints an accepted-failure summary line, so this control\n'
+    printf 'cannot tell a legitimate exit 3 from a broken container\033[0m\n'
+    exit 1
+fi
+[ "$control_rc" -eq 3 ] && grep -qF "$control_phrase" <<<"$control_out" && control_ok=yes
 if [ "$control_ok" != yes ]; then
     printf '\033[31mthe unmutated container does not pass verify.sh (exit %s) — every MISSED above is\n' "$control_rc"
     printf 'unattributable, because a container that cannot run looks exactly like a guard that did not fire\033[0m\n'

@@ -530,7 +530,7 @@ open(p, 'w').write(s)
 PYX
 run "verify.sh stops classifying on any phrase" "classifies on no phrase at all"
 
-# THE THREE NAMES THAT MUST AGREE for the host reaper to reach this container at all. Each is silent
+# THE NAMES THAT MUST AGREE for the host reaper to reach this container at all. Each is silent
 # when wrong: a reaper poking a name nothing creates, or running a path the image does not carry,
 # reports nothing for ever -- the same end state as having no trigger between starts, with a green log.
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
@@ -541,6 +541,18 @@ assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, 'NAME="${JKB_CONTAINER_NAME:-jkb-devbox}"', 1))
 PYX
 run "run.sh renames the container the reaper pokes" "so the only trigger between container starts reaches nothing"
+
+# ...AND THE NAME BECOMING UNREADABLE, which is the third "extraction read nothing" branch in this
+# block and the one that shipped without a mutation. Behaviour-preserving: the quotes simply go, a
+# shape run.sh uses elsewhere.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'NAME="${JKB_CONTAINER_NAME:-jkb-dev}"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'NAME=${JKB_CONTAINER_NAME:-jkb-dev}', 1))
+PYX
+run "run.sh spells its container name in a shape the guard cannot read" "cannot be read from both run.sh and transcripts.rs"
 
 seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
 import sys
