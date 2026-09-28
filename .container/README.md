@@ -1445,3 +1445,41 @@ the text inside their anchor strings, so removing it from `run.sh` reported `NO-
 changed nothing` and pointed at the mutation rather than at the lost non-fatality — whose natural
 repair, relaxing the anchor, greens the gate. It has a condition and a mutation of its own now, and
 the two wiring mutations find their line by its statement instead.
+
+**Round 3 found the hole all of that guarding had been built around.** Nothing ever compared the
+projection to the budget. `before`, `after` and `DENY_BUDGET_BYTES` were printed side by side on one
+line with no pair of them ever tested — in a script whose entire subject is a budget. Both branches
+reported success over budget, reproduced 2026-09-28 against a copy with only the budget lowered:
+
+- **Empty plan.** 3 sessions + 3 run journals, 702 bytes projected against a budget of 500,
+  `KEEP_NEWEST=32`. The archivable population is inside the floor, so `n - keep` is negative and the
+  plan is empty *however far over the tree is*. Output: `702 deny bytes projected, budget 500 —
+  nothing to archive`, rc 0.
+- **Exhausted plan.** 43 sessions, budget 500: `archived 11 file(s) … (4086 -> 3076 deny bytes,
+  budget 500)`, rc 0, with the residual six times the budget sitting in the same `printf` as the
+  budget.
+
+On the real container the second is reachable on the journals' own growth: the residual after a full
+plan is `held_bytes` plus the newest `KEEP_NEWEST`, which passes 65,536 at roughly 161 journals,
+while the unreclaimable warning added the round before only fires past about 199. In that window the
+sweep prints success, `run.sh`'s `|| true` discards the code, and every Bash call still dies at
+spawn — the exact failure this whole file exists to prevent, with a clean log. `transcript_over_budget`
+now asks the question at all three exits, and the dry-run summary states the residual instead of
+asserting `-> under` an outcome nothing checked.
+
+Two smaller things the same round found, both of the *"half a guard"* shape this document keeps
+recording. The containment comparison has two operands and only `phys_root` was pinned — replacing
+`phys_archive="$(transcript_resolve "$archive")"` with `phys_archive="$archive"`, a plausible
+simplification, left every gate green and re-admitted the nesting. And the projection multiplies the
+*caller's* spelling of each path, which in the container is the shorter of the two: the real deny
+list is larger by 6 bytes a file, about 7KB at 1,182 files, roughly 11% of the budget, in the
+direction that overflows. The half-of-`MAX_ARG_STRLEN` margin absorbs it today; the constant now says
+so, because whoever tightens that margin has to close this gap first.
+
+`mv -n` is where the record has to be careful about platforms. On GNU coreutils 9.4 a collision
+prints `mv: not replacing '…'` and exits 1; BSD and macOS skip silently and exit 0. The self-test
+therefore asserts only what both agree on — the already-archived copy is unchanged and the source
+stays in the tree — and asserts nothing about the return code or the message. The collision is not
+hypothetical: a session whose `<slug>/<uuid>.jsonl` was archived and is then resumed by id recreates
+that relative path, the next sweep plans it oldest-first, and `~/.claude-state` is a volume, so the
+archived copy is the only one there is.

@@ -267,7 +267,7 @@ open(p, 'w').write(s.replace("verify.sh", "nothing.sh"))
 PYX
 run "run.sh stops verifying at all" "nothing verifies the container"
 
-# THE TRANSCRIPT SWEEP, one mutation per way its enumeration goes wrong, plus the two ways the
+# THE TRANSCRIPT SWEEP, one mutation per way its enumeration goes wrong, and one per way the
 # wiring does. Every one of them is silent at run time — the sweep reports success while archiving
 # the wrong set or the empty set — so this is the only place any of them is ever observed failing.
 #
@@ -365,6 +365,59 @@ open(p, 'w').write(s.replace(old, 'phys_root="$(cd "$root" && pwd)"', 1))
 PYX
 run "the containment test goes back to comparing the caller's spellings" "rather than resolved paths"
 
+# ...AND THE OTHER SIDE OF THAT COMPARISON, which the round that added the refusal left pinned by
+# nothing. A comparison has two operands; resolving one of them is half a guard.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'phys_archive="$(transcript_resolve "$archive")"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'phys_archive="$archive"', 1))
+PYX
+run "the archive side of the containment test stops being resolved" "does not resolve the ARCHIVE side"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'transcript_resolve() {'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'resolve_it() {', 1))
+PYX
+run "the resolver is renamed, so the guard reads nothing" "no transcript_resolve"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'base="$(cd "$p" && pwd -P)" || return 1'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'base="$(cd "$p" && pwd)" || return 1', 1))
+PYX
+run "the resolver stops reaching a physical path" "does not reach a physical path"
+
+# THE POST-CONDITION'S CALL SITE. Its arithmetic is watched by the self-test from literals; the
+# CALL is watched only here, because the state it guards is refused upstream and so cannot be
+# reached from the fixture.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '! transcript_projection_fell "$moved" "$before" "$after"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'false', 1))
+PYX
+run "the sweep stops asking whether the projection fell" "it never asks whether the projection actually fell"
+
+# THE VERIFY LINE THE ORDERING IS MEASURED AGAINST. Reading nothing there used to make the ordering
+# test SKIP rather than fail -- the one extraction in this block that was not pinned against an
+# empty read, which is the failure mode this whole file exists to refuse.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'bash .container/verify.sh'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'bash .container/verify-renamed.sh', 1))
+PYX
+run "run.sh has no verify statement to order the sweep against" "no verify.sh statement to order it against"
+
 # ONE SPELLING OF THE CLAUDE CONFIG BASE, shared with commands.rs, auto-mode.sh and swarm-status.sh.
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
@@ -376,8 +429,9 @@ PYX
 run "the sweep spells the config base its own way" "does not honour CLAUDE_CONFIG_DIR"
 
 # ...AND THE SCRIPT SIMPLY ABSENT, which is a FAIL path check-config.sh has always had and nothing
-# watched: the composed assertion emits eight conditions through ONE `bad "`, so PINNED_BAD_SITES
-# moved by one when the block arrived and could not notice that seven of the eight had a mutation.
+# watched: the composed assertion emits every condition through ONE `bad "`, so PINNED_BAD_SITES
+# moved by one when the whole block arrived and could not notice which branches had a mutation.
+# That is what PINNED_SWEEP_APPENDS is for, and why no count is written in prose here.
 seed; rm -f "$work/t/.container/sweep-transcripts.sh"
 run "the sweep script is deleted outright" "sweep-transcripts.sh is not there at all"
 
@@ -402,7 +456,7 @@ open(p, 'w').write(s.replace(old, 'enumerate_them() {', 1))
 PYX
 run "the enumeration is renamed, so the guard reads nothing" "no transcript_records"
 
-# THE WIRING, all three halves. Removing it is a container that fills up again; moving it after the
+# THE WIRING, every part of it. Removing it is a container that fills up again; moving it after the
 # verify is the reap's own bug back — one failing assertion about something else and the sweep
 # never runs, which is how the deleted postStartCommand came to be unconditional; and dropping the
 # `|| true` makes one unarchivable file abort the start under run.sh's own `set -euo pipefail`.
@@ -1222,8 +1276,8 @@ else
 fi
 
 # THE COMPOSED ASSERTION'S OWN BRANCHES. The sweep guard appends to one variable and emits it through
-# a single `bad "`, so `bad_sites` moved by ONE when eight conditions arrived -- and one of the eight
-# shipped with no mutation, invisibly. Counting the branches forces the decision per branch, which is
+# a single `bad "`, so `bad_sites` moves by ONE however many conditions arrive -- and one of the
+# first batch shipped with no mutation, invisibly. Counting the branches forces the decision per branch, which is
 # the granularity the mutations are written at.
 #
 # EVERY OCCURRENCE OF THE VARIABLE, not `grep -c` on one assignment spelling. That counted LINES
@@ -1233,7 +1287,7 @@ fi
 # shipped with no mutation: exactly the gap this pin exists to close. Two appends on one line
 # bypassed it the same way. `grep -o` counts occurrences, so any spelling of a new branch moves it.
 sweep_appends="$(grep -o 'sweep_problems' "$repo/.container/check-config.sh" | grep -c .)"
-PINNED_SWEEP_APPENDS=33
+PINNED_SWEEP_APPENDS=43
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

@@ -59,9 +59,19 @@ ARGV_MAX_BYTES=131072
 # security paths in the same deny list, the write-side allow/deny lists in the same argument, and
 # the JSON quoting around every entry. Half is not a measurement, it is a margin — and a margin is
 # what the previous arrangement (none) lacked.
-DENY_BUDGET_BYTES=$((ARGV_MAX_BYTES / 2))
+# JKB_DENY_BUDGET_BYTES is a TEST SEAM, alongside JKB_TRANSCRIPT_ROOT and JKB_TRANSCRIPT_ARCHIVE,
+# and the only way --self-test can drive this file as a PROGRAM against a tree small enough to
+# build in a temp directory -- without it, every program-level row has to point at an empty root,
+# where the sweep returns before it reads its own arguments. Nothing sets it in the container.
+DENY_BUDGET_BYTES="${JKB_DENY_BUDGET_BYTES:-$((ARGV_MAX_BYTES / 2))}"
 # Every transcript is listed TWICE, once per spelling of the root (see the measurement above).
 # If that symlink ever goes, this becomes 1 and the sweep simply keeps twice as many files.
+# IT LEANS LOW, DELIBERATELY BUT KNOWABLY. The two spellings are not the same length --
+# ~/.claude/projects/… and ~/.claude-state/projects/… differ by 6 bytes per path -- and what is
+# multiplied here is the CALLER'S spelling, which in the container is the shorter one. So the real
+# deny list is larger than this projection by 6 bytes a file: ~7KB at 1,182 files, about 11% of the
+# budget. The half-of-MAX_ARG_STRLEN margin is what absorbs it. Anyone tightening that margin has
+# to close this gap first, because the error is in the direction that overflows.
 DENY_SPELLINGS=2
 # KEPT UNCONDITIONALLY, whatever the budget says, because the live session is writing one of these
 # right now and archiving it out from under Claude Code is data loss with a plausible-looking
@@ -101,9 +111,38 @@ if stat -c '%Y' . >/dev/null 2>&1; then STAT_FMT=(-c "%Y${TAB}%n"); else STAT_FM
 # The bytes of deny-list path text these records would contribute.
 # LC_ALL=C so awk's length() counts BYTES: a repo path with any non-ASCII in it would otherwise be
 # measured shorter than the kernel measures it, in the direction that overflows.
-transcript_projection() { # transcript_projection < records -> bytes
+# THE LAST FIELD, so this takes records (`<mtime><TAB><path>`) and bare paths (a plan, piped
+# straight in) alike. One counter for both, because the alternative is writing the multiplication
+# out a second time for the plan's residual, and two copies of the arithmetic that decides whether
+# Bash can spawn is the defect this file keeps rediscovering in other forms.
+transcript_projection() { # transcript_projection < records|paths -> bytes
     LC_ALL=C awk -F"$TAB" -v mult="$DENY_SPELLINGS" \
-        '{ tot += length($2) } END { printf "%d\n", mult * tot }'
+        '{ tot += length($NF) } END { printf "%d\n", mult * tot }'
+}
+
+# IS THE TREE STILL OVER BUDGET? Nothing asked this until round 3, which is remarkable for a script
+# whose entire subject is a budget: `before`, `after` and DENY_BUDGET_BYTES were printed in one
+# line with nothing comparing any pair of them. Two reproductions, both rc 0 and both "success":
+# an EMPTY PLAN over budget (3 sessions + 3 journals, 702 projected against 500, KEEP_NEWEST=32 --
+# `n - keep` is negative, so the plan is empty however far over the tree is), and an EXHAUSTED PLAN
+# over budget (43 sessions, budget 500, `archived 11 file(s) (4086 -> 3076 deny bytes, budget
+# 500)`). On the real container the second is reachable on the journals' growth alone: the residual
+# after a full plan is held_bytes plus the newest KEEP_NEWEST, which passes 65,536 at ~161 journals
+# while the unreclaimable warning only fires past ~199. In that window every Bash call dies at spawn
+# and the sweep says it worked.
+transcript_over_budget() { # transcript_over_budget <projection> <what> -> rc 1 + message if over
+    [ "$1" -gt "$DENY_BUDGET_BYTES" ] || return 0
+    printf 'transcript sweep: %s deny bytes %s, over the %s byte budget — Bash may still fail at spawn with E2BIG\n' \
+        "$1" "$2" "$DENY_BUDGET_BYTES" >&2
+    return 1
+}
+
+# ...and did this sweep reduce anything at all? Pure, over the three numbers the summary already
+# prints, so --self-test can drive it from literals rather than only through a filesystem it cannot
+# easily put into the failing state. See the call site for what it is watching for.
+transcript_projection_fell() { # transcript_projection_fell <moved> <before> <after>
+    [ "$1" -gt 0 ] || return 0
+    [ "$3" -lt "$2" ]
 }
 
 # Which files to archive, OLDEST FIRST, to bring the projection under budget — and no more than
@@ -219,7 +258,7 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
 # a path here is given `--`.
 sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
     local root="$1" archive="$2" dry="${3:-}"
-    local abs phys_root phys_archive records plan held_bytes err
+    local abs phys_root phys_archive records plan planned held_bytes err
     local f rel dir before after moved=0 failed=0
 
     abs="$(cd "$root" 2>/dev/null && pwd)" || {
@@ -266,8 +305,15 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
     if [ -z "$plan" ]; then
         printf 'transcript sweep: %s deny bytes projected, budget %s — nothing to archive\n' \
             "$before" "$DENY_BUDGET_BYTES"
+        # "NOTHING TO ARCHIVE" IS NOT "NOTHING IS NEEDED", and for two rounds this branch said the
+        # first and meant to be read as the second. An empty plan only means the arithmetic chose
+        # no file -- including when `n - keep` is zero or negative, so a tree entirely inside the
+        # floor takes this branch at any distance over budget.
+        transcript_over_budget "$before" "are projected and none of them can be archived" || return 1
         return 0
     fi
+    # The residual a dry run WOULD leave. The plan is bare paths; transcript_projection takes them.
+    planned="$(printf '%s\n' "$plan" | transcript_projection)"
 
     # A DRY RUN WRITES NOTHING, the archive directory included. It created it before this was
     # split out, which is a dry run with a side effect — small, but the whole value of the flag is
@@ -308,8 +354,11 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
 
     after="$(transcript_records "$abs" | transcript_projection)"
     if [ "$dry" = "--dry-run" ]; then
-        printf 'transcript sweep: would archive %s file(s), %s -> under %s deny bytes\n' \
-            "$moved" "$before" "$DENY_BUDGET_BYTES"
+        # `%s -> %s`, not `-> under %s`: the old wording ASSERTED the outcome the rest of this
+        # function never checked, which is how a plan that cannot reach the budget read as one that
+        # does. The number is stated and then tested below.
+        printf 'transcript sweep: would archive %s file(s), %s -> %s deny bytes, budget %s\n' \
+            "$moved" "$before" "$((before - planned))" "$DENY_BUDGET_BYTES"
     else
         printf 'transcript sweep: archived %s file(s) to %s (%s -> %s deny bytes, budget %s)\n' \
             "$moved" "$archive" "$before" "$after" "$DENY_BUDGET_BYTES"
@@ -325,14 +374,24 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
     # than a refusal to continue -- run.sh discards the return value -- and why the wording says
     # what was observed rather than naming a cause with certainty. The nesting case is refused
     # outright above; this is the net that catches a route into it nobody has thought of yet.
-    if [ "$dry" != "--dry-run" ] && [ "$moved" -gt 0 ] && [ "$after" -ge "$before" ]; then
-        printf 'transcript sweep: archived %s file(s) and the projection did not fall (%s -> %s) — the archive is being re-enumerated under the root\n' \
+    if [ "$dry" != "--dry-run" ] && ! transcript_projection_fell "$moved" "$before" "$after"; then
+        # BOTH CAUSES NAMED, because the comment above admits the check cannot tell them apart and
+        # the message used to assert one of them as fact. An operator who reads "the archive is
+        # being re-enumerated" and finds a correctly-sited archive has been sent to the wrong place.
+        printf 'transcript sweep: archived %s file(s) and the projection did not fall (%s -> %s) — either the archive is being re-enumerated under the root, or transcripts are arriving faster than this sweep archives them\n' \
             "$moved" "$before" "$after" >&2
         return 1
     fi
     if [ "$failed" -gt 0 ]; then
         printf 'transcript sweep: %s file(s) could not be archived\n' "$failed" >&2
         return 1
+    fi
+    # THE RESIDUAL, LAST, because the two above name a cause and this one names the state the whole
+    # script exists to prevent: a deny list still too long for one argv.
+    if [ "$dry" = "--dry-run" ]; then
+        transcript_over_budget "$((before - planned))" "would remain" || return 1
+    else
+        transcript_over_budget "$after" "remain after this sweep" || return 1
     fi
     return 0
 }
@@ -391,6 +450,10 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "a path is counted once per spelling of the root" \
        "$(printf '%s\n' "$recs" | transcript_projection)" "40"
     eq "no records project no bytes" "$(printf '' | transcript_projection)" "0"
+    # THE SAME FUNCTION OVER A PLAN, which is bare paths with no mtime field. The sweep pipes its
+    # plan through this to work out the residual a dry run would leave, so the two must agree.
+    eq "bare paths are counted the same way records are" \
+       "$(printf '/aaaa/bbbb\n/cccc/dddd\n' | transcript_projection)" "40"
 
     echo "==> sweep-transcripts self-test: what the budget chooses"
     # Five 10-byte paths: 100 projected. A budget of 60 needs 40 bytes gone, which is two paths.
@@ -426,6 +489,17 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "files sharing an mtime are ordered by path, so the choice is repeatable" \
        "$(printf '%s\n' "$tied" | transcript_plan | tr '\n' ' ')" \
        "/aaaa/aaaa /bbbb/bbbb /cccc/cccc "
+
+    echo "==> sweep-transcripts self-test: did the sweep reduce anything"
+    # DRIVEN FROM LITERALS, because the state this exists to catch -- files moved and the deny list
+    # no smaller -- is refused outright upstream, so the fixture cannot easily be put into it.
+    # Reproduced by hand against the real script with ONLY the containment refusal neutered:
+    # `archived 2 file(s) and the projection did not fall (408 -> 444)`, rc 1, on the second sweep.
+    eq "moving nothing is not a failure"      "$(rc_of transcript_projection_fell 0 100 100)" "0"
+    eq "a projection that fell is fine"       "$(rc_of transcript_projection_fell 3 100 40)"  "0"
+    eq "a move that changed nothing is not"   "$(rc_of transcript_projection_fell 3 100 100)" "1"
+    eq "and one that GREW is the nesting signature" \
+       "$(rc_of transcript_projection_fell 2 408 444)" "1"
 
     echo "==> sweep-transcripts self-test: enumerating a real tree"
     work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
@@ -518,12 +592,40 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...and the shipped budget, which it is nowhere near, reports nothing of the kind" \
        "$(sweep_transcripts "$root" "$arch" --dry-run 2>&1 | grep -c 'cannot bring this tree under it')" "0"
 
-    echo "==> sweep-transcripts self-test: a dry run changes nothing"
+    echo "==> sweep-transcripts self-test: a sweep that cannot reach the budget says so"
+    # NOTHING COMPARED THE PROJECTION TO THE BUDGET until round 3 -- in a script whose whole subject
+    # is a budget, with `before`, `after` and DENY_BUDGET_BYTES printed side by side in one line.
+    # Both branches reported success over budget; both are watched here, through --dry-run so the
+    # fixture is not disturbed.
+    #
+    # THE EXHAUSTED PLAN: budget 0 is unreachable by construction, so the sweep plans everything the
+    # floor allows and must still say what remains instead of printing a clean summary.
     DENY_BUDGET_BYTES=0 KEEP_NEWEST=2
-    # 2>/dev/null: a budget of 0 is under the run journal's own bytes, so the unreclaimable
-    # warning fires on every row below. It is asserted on two rows of its own above; here it is
-    # noise in the gate's output, and a gate nobody can read is a gate nobody reads.
-    dry_out="$(sweep_transcripts "$work/projects-link" "$arch" --dry-run 2>/dev/null)"
+    over_out="$(sweep_transcripts "$work/projects-link" "$arch" --dry-run 2>&1)"; over_rc=$?
+    eq "a plan that cannot reach the budget returns non-zero" "$over_rc" "1"
+    eq "...and says how much would remain" "$(grep -c 'would remain, over the' <<<"$over_out")" "1"
+    eq "...and its summary no longer claims the residual is \"under\" the budget" \
+       "$(grep -c -- '-> under' <<<"$over_out")" "0"
+    # THE EMPTY PLAN, which is the branch that read as success for two rounds: with the floor above
+    # the whole population `n - keep` is negative and the plan is empty however far over the tree is.
+    DENY_BUDGET_BYTES=1 KEEP_NEWEST=99
+    empty_out="$(sweep_transcripts "$work/projects-link" "$arch" --dry-run 2>&1)"; empty_rc=$?
+    eq "an empty plan over budget returns non-zero too" "$empty_rc" "1"
+    eq "...so \"nothing to archive\" cannot stand as the whole answer" \
+       "$(grep -c 'none of them can be archived' <<<"$empty_out")" "1"
+
+    echo "==> sweep-transcripts self-test: a dry run changes nothing"
+    # A BUDGET THIS TREE CAN ACTUALLY REACH, derived from the fixture rather than guessed: what the
+    # two newest transcripts and the run journal project -- which is exactly what a correct sweep
+    # leaves. The 0 that stood here is unreachable by construction, so with the residual now
+    # checked every row below would have been asserting the failure path under a happy-path label.
+    # MEASURED THROUGH THE SPELLING THESE ROWS SWEEP. `$root` and `$work/projects-link` are
+    # different lengths, so a budget measured under one and applied under the other is a number
+    # about a different argv -- the whole subject of this file, in miniature.
+    survivors_p="$(transcript_records "$work/projects-link" \
+        | LC_ALL=C grep -E "/(1111\.jsonl|3333\.jsonl|$HELD_NAME)\$" | transcript_projection)"
+    DENY_BUDGET_BYTES="$survivors_p" KEEP_NEWEST=2
+    dry_out="$(sweep_transcripts "$work/projects-link" "$arch" --dry-run)"
     # `^  ` so the per-file lines are counted and the summary — which says "would archive N" too —
     # is not, which is how this row first read 4 for 3 files.
     eq "it names the three it would archive" "$(grep -c '^  would archive' <<<"$dry_out")" "3"
@@ -535,9 +637,9 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
        "$([ -e "$arch" ] && echo yes || echo no)" "no"
 
     echo "==> sweep-transcripts self-test: the sweep"
-    DENY_BUDGET_BYTES=0 KEEP_NEWEST=2
-    out="$(sweep_transcripts "$work/projects-link" "$arch" 2>/dev/null)"; rc=$?
-    eq "the sweep succeeds" "$rc" "0"
+    DENY_BUDGET_BYTES="$survivors_p" KEEP_NEWEST=2
+    out="$(sweep_transcripts "$work/projects-link" "$arch")"; rc=$?
+    eq "the sweep succeeds, having actually brought the tree under budget" "$rc" "0"
     eq "it archived the three oldest and kept the two newest" \
        "$(grep -c 'archived 3 file' <<<"$out")" "1"
     left="$(find "$root" -type f -name '*.jsonl' | sed "s#^$root/##" | LC_ALL=C sort | tr '\n' ' ')"
@@ -601,7 +703,7 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # that is already asserted above, and any regression in the re-run path -- re-enumerating the
     # archive, nesting, a plan recomputed against moved files -- reported ok under the heading
     # written to catch it. Inserting KEEP_NEWEST=0 here turned both of them red, which is the proof.
-    DENY_BUDGET_BYTES="$(transcript_records "$root" | transcript_projection)" KEEP_NEWEST=0
+    DENY_BUDGET_BYTES="$(transcript_records "$work/projects-link" | transcript_projection)" KEEP_NEWEST=0
     eq "a second sweep of a tree already under budget succeeds" \
        "$(rc_of sweep_transcripts "$work/projects-link" "$arch")" "0"
     eq "...and moves nothing, with no floor doing the work" \
@@ -611,8 +713,11 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # AND A RE-RUN THAT DOES MOVE SOMETHING, which is the path the nesting defect lived on: the
     # second sweep must archive from the TREE and never re-enumerate its own archive. One file, so
     # the count is exact rather than "at least".
-    DENY_BUDGET_BYTES=0 KEEP_NEWEST=1
-    out2="$(sweep_transcripts "$work/projects-link" "$arch" 2>/dev/null)"; rc2=$?
+    # Again a reachable budget, measured through the spelling swept: what the newest transcript and
+    # the run journal project, which is what one more archived file leaves.
+    DENY_BUDGET_BYTES="$(transcript_records "$work/projects-link" \
+        | LC_ALL=C grep -E "/(1111\.jsonl|$HELD_NAME)\$" | transcript_projection)" KEEP_NEWEST=1
+    out2="$(sweep_transcripts "$work/projects-link" "$arch")"; rc2=$?
     eq "a re-run that binds succeeds" "$rc2" "0"
     eq "...and archives from the tree, not from the archive the last one wrote" \
        "$(grep -c 'archived 1 file' <<<"$out2")" "1"
@@ -627,6 +732,55 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "an absent root succeeds" "$(rc_of sweep_transcripts "$work/nothing-here" "$arch")" "0"
     eq "...and creates no archive for it" \
        "$([ -d "$work/nothing-here" ] && echo yes || echo no)" "no"
+
+    # ...AND ON A REAL SWEEP, not only a dry run. They are two call sites, and the rows above watch
+    # one of them: deleting the non-dry-run check left the whole suite green. A tree of its own, so
+    # the fixture the sections above depend on is not disturbed.
+    res_root="$work/res/projects"; res_arch="$work/res/archive"
+    mk "$res_root/-slug/a.jsonl" 202601010000
+    mk "$res_root/-slug/b.jsonl" 202601020000
+    DENY_BUDGET_BYTES=1 KEEP_NEWEST=1
+    res_out="$(sweep_transcripts "$res_root" "$res_arch" 2>&1)"; res_rc=$?
+    eq "a real sweep still over budget when its plan runs out returns non-zero" "$res_rc" "1"
+    eq "...and says how much remains" "$(grep -c 'remain after this sweep' <<<"$res_out")" "1"
+    eq "...having archived the one file it could" \
+       "$([ -f "$res_arch/-slug/a.jsonl" ] && echo yes || echo no)" "yes"
+    DENY_BUDGET_BYTES="$DEFAULT_BUDGET" KEEP_NEWEST="$DEFAULT_KEEP"
+
+    echo "==> sweep-transcripts self-test: when a move cannot happen"
+    # `mv -n`, AND THE ONLY COPY. A session whose <slug>/<uuid>.jsonl was archived and is then
+    # resumed by id recreates that same relative path, which the next sweep plans oldest-first --
+    # and ~/.claude-state is a volume, so the archived copy is the only one there is. Without `-n`
+    # that copy is silently overwritten by a newer file of the same name.
+    #
+    # WHAT IS ASSERTED IS PORTABLE AND WHAT IS NOT IS NOT. Measured on GNU coreutils 9.4, `mv -n`
+    # onto an existing destination prints `mv: not replacing '…'` and exits 1; BSD/macOS `mv -n`
+    # skips silently and exits 0. So the return code and the message are NOT asserted here -- this
+    # file self-tests on macOS, and a row that is red on a Mac for a correct script is worse than no
+    # row. Both platforms agree on the two things that matter, which are the two things below.
+    coll_root="$work/coll/projects"; coll_arch="$work/coll/archive"
+    mk "$coll_root/-slug/dup.jsonl" 202601010000
+    printf 'the live file\n' > "$coll_root/-slug/dup.jsonl"
+    mkdir -p "$coll_arch/-slug"; printf 'already archived\n' > "$coll_arch/-slug/dup.jsonl"
+    DENY_BUDGET_BYTES=1 KEEP_NEWEST=0
+    sweep_transcripts "$coll_root" "$coll_arch" >/dev/null 2>&1
+    eq "an already-archived copy is never clobbered" \
+       "$(cat "$coll_arch/-slug/dup.jsonl")" "already archived"
+    eq "...and the source stays in the tree, where the next sweep will see it again" \
+       "$([ -f "$coll_root/-slug/dup.jsonl" ] && echo yes || echo no)" "yes"
+
+    # A DESTINATION THAT CANNOT BE MADE: a FILE where the archive's sub-directory has to go. Chosen
+    # over `chmod a-w` because root ignores a write bit and CI may run as root, so the chmod form is
+    # a row that quietly stops asserting on exactly the machine nobody watches.
+    blk_root="$work/blk/projects"; blk_arch="$work/blk/archive"
+    mk "$blk_root/-slug/x.jsonl" 202601010000
+    mkdir -p "$blk_arch"; : > "$blk_arch/-slug"
+    blk_out="$(sweep_transcripts "$blk_root" "$blk_arch" 2>&1)"; blk_rc=$?
+    eq "a destination that cannot be created is a failure, not a silent skip" "$blk_rc" "1"
+    eq "...counted and reported" "$(grep -c 'could not be archived' <<<"$blk_out")" "1"
+    eq "...and the transcript is still in the tree" \
+       "$([ -f "$blk_root/-slug/x.jsonl" ] && echo yes || echo no)" "yes"
+    DENY_BUDGET_BYTES="$DEFAULT_BUDGET" KEEP_NEWEST="$DEFAULT_KEEP"
 
     echo "==> sweep-transcripts self-test: the script as a program"
     # EVERYTHING ABOVE CALLS THE FUNCTIONS. Nothing above runs the FILE, so the root resolution at
@@ -672,6 +826,37 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # error rather than quietly running the suite with an argument nobody reads.
     eq "--self-test with a trailing argument is a usage error" \
        "$(rc_of prog HOME="$phome" -- --self-test extra)" "2"
+
+    # ...AND AGAINST A TREE THAT HAS SOMETHING IN IT, which is what makes `"${1:-}"` in the dispatch
+    # load-bearing. Every row above points at an EMPTY root, where sweep_transcripts returns at
+    # "no transcripts" before it ever reads its third argument -- so the flag they were added to
+    # cover was still exercised by nothing. Measured: dropping `"${1:-}"` from the dispatch left
+    # --self-test green and check-config.sh green at 70/70, while `sweep-transcripts.sh --dry-run`
+    # archived for real.
+    #
+    # KEEP_NEWEST + 2 files, derived rather than spelled, so the BUDGET is what chooses here and the
+    # row follows if the floor ever moves.
+    prog_root="$work/prog/projects"; prog_arch="$work/prog/archive"
+    i=0
+    while [ "$i" -lt "$((DEFAULT_KEEP + 2))" ]; do
+        mk "$prog_root/-slug/$(printf '%04d' "$i").jsonl" "20260101$(printf '%02d' $((i / 60)))$(printf '%02d' $((i % 60)))"
+        i=$((i + 1))
+    done
+    prog_tree="$(find "$prog_root" -type f | LC_ALL=C sort | tr '\n' ' ')"
+    dry_prog="$(prog HOME="$phome" JKB_TRANSCRIPT_ROOT="$prog_root" \
+        JKB_TRANSCRIPT_ARCHIVE="$prog_arch" JKB_DENY_BUDGET_BYTES=1 -- --dry-run 2>&1)"
+    eq "--dry-run through the CLI names the two the floor leaves over" \
+       "$(grep -c '^  would archive' <<<"$dry_prog")" "2"
+    eq "...and moves nothing" \
+       "$(find "$prog_root" -type f | LC_ALL=C sort | tr '\n' ' ')" "$prog_tree"
+    eq "...and creates no archive directory" \
+       "$([ -e "$prog_arch" ] && echo yes || echo no)" "no"
+    # The same invocation WITHOUT the flag must move them, or the rows above are about a budget that
+    # happened to choose nothing rather than about the flag.
+    prog HOME="$phome" JKB_TRANSCRIPT_ROOT="$prog_root" \
+        JKB_TRANSCRIPT_ARCHIVE="$prog_arch" JKB_DENY_BUDGET_BYTES=1 -- >/dev/null 2>&1
+    eq "...while the same run without it archives them" \
+       "$(find "$prog_arch" -type f | grep -c . )" "2"
 
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31msweep-transcripts self-test FAILED (%d)\033[0m\n' "$fails"; exit 1; }

@@ -515,15 +515,28 @@ fi
 # this block, and a numeral in prose is a second copy of it that goes stale on the next condition.
 # ANCHORED ON THE FUNCTION NAME, like the verify guard above is anchored on the invocation: the
 # body is extracted by name, so a mutation that edits the real `find` is seen and the self-test's
-# own `find` calls are not, and an extraction that reads nothing is a failure rather than four
+# own `find` calls are not, and an extraction that reads nothing is a failure rather than a run of
 # vacuous passes.
 sweep_problems=""
 run_stripped="$(dc_strip_comments "$here/run.sh")"
-sweep_at="$(grep -nE '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/sweep-transcripts\.sh' <<<"$run_stripped" | head -1 | cut -d: -f1)"
-verify_at="$(grep -nE '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/verify\.sh' <<<"$run_stripped" | head -1 | cut -d: -f1)"
+# ONE EXTRACTOR FOR BOTH, because the regex that finds a `bash .container/<x>` STATEMENT (as
+# opposed to the name appearing in a comment, a string or an array) was written out a third time
+# here, and a rule every call site has to remember is the defect this repository keeps rediscovering.
+dc_stmt_line() { # dc_stmt_line <stripped run.sh> <script basename> -> line number, or nothing
+    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/$2" \
+        <<<"$1" | sed -n '1s/^\([0-9]*\):.*/\1/p'
+}
+sweep_at="$(dc_stmt_line "$run_stripped" 'sweep-transcripts\.sh')"
+verify_at="$(dc_stmt_line "$run_stripped" 'verify\.sh')"
 if [ -z "$sweep_at" ]; then
     sweep_problems="$sweep_problems run.sh does not invoke it (a statement, not a mention of the name);"
-elif [ -n "$verify_at" ] && [ "$sweep_at" -gt "$verify_at" ]; then
+elif [ -z "$verify_at" ]; then
+    # PINNED AGAINST READING NOTHING, like every other extraction here. This one was the exception:
+    # an unmatched verify line made the ordering test below `[ -n "$verify_at" ] && …`, i.e. skipped,
+    # so the property that the sweep runs BEFORE the verify would have gone quiet rather than red --
+    # and that property is the whole reason the sweep is not disabled by an unrelated assertion.
+    sweep_problems="$sweep_problems run.sh has no verify.sh statement to order it against, so the sweep-before-verify property cannot be established;"
+elif [ "$sweep_at" -gt "$verify_at" ]; then
     sweep_problems="$sweep_problems run.sh runs it AFTER verify.sh (line $sweep_at vs $verify_at), so one failing assertion about something else disables it;"
 fi
 # `|| true` IS THE WHOLE OF "NEVER FATAL", and it was the one pinned property whose only watcher
@@ -572,8 +585,12 @@ else
         # comes out of swarm-status.sh's discovery predicate -- the one reader that defines it --
         # and an extraction that reads nothing is a failure rather than a vacuous pass, the same
         # arrangement this file uses for DEFAULT_ADDR and the extension id.
+        # THROUGH dc_strip_comments, like every other extraction in this file. Read raw, the
+        # authority for the name the sweep must spare could be a sentence ABOUT the predicate
+        # rather than the predicate -- and swarm-status.sh has prose around that very line.
         swarm_journal="$(grep -oE -- "-name [A-Za-z0-9_.-]+ -path '\*/subagents/workflows/wf_\*'" \
-            "$here/../scripts/swarm-status.sh" 2>/dev/null | sed -n '1s/^-name \([^ ]*\).*/\1/p')"
+            <<<"$(dc_strip_comments "$here/../scripts/swarm-status.sh" 2>/dev/null)" \
+            | sed -n '1s/^-name \([^ ]*\).*/\1/p')"
         sweep_held="$(grep -oE '^HELD_NAME=[A-Za-z0-9_.-]+' <<<"$sweep_body" | sed -n '1s/^HELD_NAME=//p')"
         if [ -z "$swarm_journal" ]; then
             sweep_problems="$sweep_problems swarm-status.sh no longer discovers runs by \`-name <file> -path '*/subagents/workflows/wf_*'\`, so the name the sweep must spare cannot be read from the reader that defines it;"
@@ -592,6 +609,23 @@ else
         # 530 -> 602 -> 674 deny bytes. `pwd -P` is what makes the two spellings comparable.
         grep -qE -- 'phys_root=.*pwd -P' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems it compares the caller's spellings rather than resolved paths, so under -L a symlinked root accepts an archive inside itself;"
+        # ...AND SO IS THE OTHER OPERAND, which the branch above does not establish. A comparison
+        # has two sides, and the round that fixed this pinned one of them: `phys_archive="$archive"`
+        # -- a plausible simplification, since the archive usually does not exist yet and plain
+        # `cd`+`pwd -P` cannot resolve a path that is not there -- left check-config.sh green and
+        # every mutation CAUGHT while re-admitting the nesting the branch above exists to refuse.
+        # Two branches because they are two edits with two repairs, and each carries its own
+        # mutation.
+        grep -qE -- 'phys_archive=.*transcript_resolve' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it does not resolve the ARCHIVE side of that comparison, so an archive that does not exist yet is compared as the caller spelled it;"
+        sweep_resolve="$(awk '/^transcript_resolve\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+            <<<"$sweep_body")"
+        if [ -z "$sweep_resolve" ]; then
+            sweep_problems="$sweep_problems it has no transcript_resolve() to read, so the branch above establishes nothing;"
+        else
+            grep -qF -- 'pwd -P' <<<"$sweep_resolve" \
+                || sweep_problems="$sweep_problems transcript_resolve() does not reach a physical path, so resolving the archive resolves nothing;"
+        fi
         # `CLAUDE_BASE=.*CLAUDE_CONFIG_DIR`, not a bare mention of the variable anywhere in the
         # file: the mention form was satisfied by the self-test's own `env -u CLAUDE_CONFIG_DIR`,
         # so the mutation that renames the variable IN THE ASSIGNMENT went from CAUGHT to MISSED
@@ -599,6 +633,13 @@ else
         # is that the config base is DERIVED from it. Whether that derivation is spelled correctly
         # is the self-test's, which runs the script with CLAUDE_CONFIG_DIR set and reads the root
         # back out of the message.
+        # THE POST-CONDITION'S CALL SITE. Its comparison is watched by the self-test, which drives
+        # transcript_projection_fell from literals -- but the self-test cannot see the call being
+        # deleted, because the state it guards (files moved, deny list no smaller) is refused
+        # upstream and so never arises in the fixture. A helper nothing calls is a helper that
+        # passes its own tests for ever.
+        grep -qF -- 'transcript_projection_fell "$moved"' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it never asks whether the projection actually fell, so a sweep that moved files and shrank nothing exits 0;"
         grep -qE -- 'CLAUDE_BASE=.*CLAUDE_CONFIG_DIR' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems it does not honour CLAUDE_CONFIG_DIR, which commands.rs, auto-mode.sh and swarm-status.sh all do, so a second config dir sweeps an absent tree and reports success;"
     fi
