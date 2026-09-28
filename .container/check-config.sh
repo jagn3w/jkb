@@ -716,6 +716,40 @@ else
             || sweep_problems="$sweep_problems it does not honour CLAUDE_CONFIG_DIR, which commands.rs, auto-mode.sh and swarm-status.sh all do, so a second config dir sweeps an absent tree and reports success;"
     fi
 fi
+# THE HOST REAPER POKES THIS CONTAINER, and three names have to agree for that to reach anything.
+# run.sh sweeps at container START and that is the only trigger it had, while transcripts are created
+# continuously -- the container that produced the E2BIG reached 1,182 of them without ever being
+# recreated. `jkb task reap --watch` on the host now sweeps it on every tick
+# (crates/jkb-cli/src/transcripts.rs), which it can only do through Docker: ~/.claude-state is a
+# named VOLUME with no host path, and the reaper knows a database, not a checkout.
+#
+# EVERY ONE OF THESE IS READ FROM THE FILE THAT OWNS IT. A reaper poking a container name nothing
+# creates, or running a path the image does not carry, is silent for ever -- which is the same
+# failure as having no second trigger at all, wearing a green log.
+if [ ! -f "$here/../crates/jkb-cli/src/transcripts.rs" ]; then
+    sweep_problems="$sweep_problems crates/jkb-cli/src/transcripts.rs is gone, so nothing sweeps the container between starts;"
+else
+    ctr_rs="$(dc_strip_comments "$here/../crates/jkb-cli/src/transcripts.rs")"
+    rs_ctr_name="$(grep -oE 'DEV_CONTAINER_NAME: &str = "[^"]+"' <<<"$ctr_rs" \
+        | sed -n '1s/.*"\(.*\)"/\1/p')"
+    rs_sweep_path="$(grep -oE 'SWEEP_IN_IMAGE: &str = "[^"]+"' <<<"$ctr_rs" \
+        | sed -n '1s/.*"\(.*\)"/\1/p')"
+    sh_ctr_name="$(grep -oE '^NAME="\$\{JKB_CONTAINER_NAME:-[^}]+\}"' <<<"$run_stripped" \
+        | sed -n '1s/.*:-\(.*\)}"/\1/p')"
+    docker_dest="$(grep -oE '^COPY[^#]*sweep-transcripts\.sh[[:space:]]+[^[:space:]]+' \
+        "$here/Dockerfile" 2>/dev/null | sed -n '1s/.*[[:space:]]\([^[:space:]]*\)$/\1/p')"
+    if [ -z "$rs_ctr_name" ] || [ -z "$sh_ctr_name" ]; then
+        sweep_problems="$sweep_problems the container name cannot be read from both run.sh and transcripts.rs, so nothing holds the reaper to the container run.sh creates;"
+    elif [ "$rs_ctr_name" != "$sh_ctr_name" ]; then
+        sweep_problems="$sweep_problems the reaper pokes '$rs_ctr_name' while run.sh creates '$sh_ctr_name', so the only trigger between container starts reaches nothing and says nothing;"
+    fi
+    if [ -z "$rs_sweep_path" ] || [ -z "$docker_dest" ]; then
+        sweep_problems="$sweep_problems the sweep's in-image path cannot be read from both the Dockerfile and transcripts.rs, so nothing holds the reaper to what the image carries;"
+    elif [ "$rs_sweep_path" != "$docker_dest" ]; then
+        sweep_problems="$sweep_problems the reaper runs '$rs_sweep_path' while the Dockerfile installs the sweep at '$docker_dest', so every tick fails on a path that is not there;"
+    fi
+fi
+
 # AND THE OPERATOR IS TOLD. run.sh discards the sweep's exit code with `|| true` -- correctly, since
 # a deny list slightly too long must not abort a start -- so the one state in which NO Bash tool call
 # works was reported only by a line that scrolled past several steps before the verify the operator

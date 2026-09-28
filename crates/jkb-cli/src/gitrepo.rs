@@ -2326,6 +2326,13 @@ mod tests {
             "asks `docker inspect` whether the dev container is running; it is never asked about a \
              repository (the gate itself runs through `gate_cmd`)",
         ),
+        (
+            "src/transcripts.rs",
+            "sweep_dev_container",
+            "spawns `docker`, which is addressed by CONTAINER NAME and never resolves a \
+             repository: the thing it acts on is a named volume inside that container, and \
+             the caller's cwd changes nothing about which container is poked",
+        ),
     ];
 
     /// The function a declaration line declares, or `UNPARSED` when the line declares one

@@ -48,6 +48,9 @@ seed() {
     # ...and jkb-cli's remote.rs, which names the variable the notification hook reads.
     mkdir -p "$work/t/crates/jkb-cli/src"
     cp "$repo/crates/jkb-cli/src/remote.rs" "$work/t/crates/jkb-cli/src/"
+    # ...and transcripts.rs, which owns the container name and the in-image path the host reaper
+    # pokes -- check-config.sh holds both to run.sh and the Dockerfile.
+    cp "$repo/crates/jkb-cli/src/transcripts.rs" "$work/t/crates/jkb-cli/src/"
     # ...and swarm-status.sh, which OWNS the name the transcript sweep has to spare: check-config.sh
     # reads it out of that file's discovery predicate rather than spelling it. Without this in the
     # copy the extraction reads nothing, which is a failure by design -- so it would redden the
@@ -526,6 +529,39 @@ for old, new in (('*"E2BIG"*) false ;; *) true ;;', '*) false ;;'),
 open(p, 'w').write(s)
 PYX
 run "verify.sh stops classifying on any phrase" "classifies on no phrase at all"
+
+# THE THREE NAMES THAT MUST AGREE for the host reaper to reach this container at all. Each is silent
+# when wrong: a reaper poking a name nothing creates, or running a path the image does not carry,
+# reports nothing for ever -- the same end state as having no trigger between starts, with a green log.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'NAME="${JKB_CONTAINER_NAME:-jkb-dev}"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'NAME="${JKB_CONTAINER_NAME:-jkb-devbox}"', 1))
+PYX
+run "run.sh renames the container the reaper pokes" "so the only trigger between container starts reaches nothing"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'SWEEP_IN_IMAGE: &str = "/usr/local/bin/sweep-transcripts.sh"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'SWEEP_IN_IMAGE: &str = "/usr/local/sbin/sweep-transcripts.sh"', 1))
+PYX
+run "the reaper runs a path the image does not carry" "so every tick fails on a path that is not there"
+
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "COPY --chown=root:root sweep-transcripts.sh /usr/local/bin/sweep-transcripts.sh"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "the image stops carrying the sweep the reaper runs" "cannot be read from both the Dockerfile"
+
+seed; rm -f "$work/t/crates/jkb-cli/src/transcripts.rs"
+run "the reaper's container module is deleted" "nothing sweeps the container between starts"
 
 # THE VERIFY LINE THE ORDERING IS MEASURED AGAINST. Reading nothing there used to make the ordering
 # test SKIP rather than fail -- the one extraction in this block that was not pinned against an
@@ -1415,7 +1451,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=65
+PINNED_SWEEP_APPENDS=75
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

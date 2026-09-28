@@ -1597,3 +1597,38 @@ tell apart:
   variable that is not set and recreate a container whose journals live in a volume. Two conditions
   with opposite remedies cannot share one hard-coded sentence, so the message now points at the FAIL
   lines, which each carry their own.
+
+**The second trigger (2026-09-28).** The gap recorded above — the sweep firing only at container
+start, while transcripts are created continuously — is closed by the **host's reaper**, not by a new
+scheduler. `jkb task reap --watch` is already the one long-lived process on the host sweeping on a
+timer for this project, and this is the same kind of job: something only an outside process is placed
+to do. It now pokes the container on each tick
+([`crates/jkb-cli/src/transcripts.rs`](../crates/jkb-cli/src/transcripts.rs)).
+
+It has to go through Docker, and that is forced rather than chosen: `~/.claude-state` is a **named
+volume** (`jkb-claude-state`), not a host bind, so there is no host path to walk — the work can only
+happen inside. The reaper also knows a *database path*, never a checkout, so it cannot run a working
+tree's copy of the script. It runs the one the **image** carries at `/usr/local/bin/`, installed the
+way `init-firewall.sh`, `entrypoint.sh` and the two egress scripts are, for the same reason: a
+process with no checkout in hand has to run it. Root-owned, with a second gain that is worth naming —
+the host-triggered sweep runs a script the agent inside the container cannot rewrite. `run.sh` still
+runs the checkout's copy, which is what `--self-test` and `check-config.sh` read.
+
+Three names must agree for any of that to reach anything, and **each is silent when wrong**: a reaper
+poking a container name nothing creates, or running a path the image does not carry, reports nothing
+for ever — the same end state as having no second trigger at all, wearing a green log. So
+`check-config.sh` reads each from the file that owns it and requires them to match: `DEV_CONTAINER_NAME`
+against `run.sh`'s `${JKB_CONTAINER_NAME:-…}` default, and `SWEEP_IN_IMAGE` against the Dockerfile's
+`COPY` destination, with an extraction that reads nothing a failure rather than a vacuous pass.
+
+The tick is **never fatal and usually silent**. No Docker, no such container, or a stopped one is the
+ordinary case for anyone not using the dev container and says nothing at all; a sweep with nothing to
+do says nothing, because this runs 96 times a day for ever and a log that reports a timer firing is a
+log nobody reads the rest of; and an over-budget tree is said **once** while it stays the same, the
+rule the reaper already applies to its own failures and the queue's compaction. Rejected: a loop
+inside the container and a timer unit beside this one, both of which are a second scheduler to reason
+about for one sweep.
+
+The `docker` spawn is declared in `gitrepo.rs`'s `NOT_REPO_AWARE`, and that guard is what caught it:
+`docker` is addressed by **container name**, never resolves a repository, and the caller's working
+directory changes nothing about which container is poked.

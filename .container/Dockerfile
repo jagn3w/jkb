@@ -116,9 +116,18 @@ COPY --chown=root:root entrypoint.sh /usr/local/bin/entrypoint.sh
 # in a lib directory: one install location, resolving the same way here and in the repo.
 COPY --chown=root:root egress-status.sh /usr/local/bin/egress-status.sh
 COPY --chown=root:root egress-lib.sh    /usr/local/bin/egress-lib.sh
+# THE TRANSCRIPT SWEEP, in the image because something OUTSIDE any checkout has to run it. The host
+# reaper (`jkb task reap --watch`, crates/jkb-cli/src/transcripts.rs) pokes this container on every
+# tick, because `run.sh` only sweeps at START while transcripts are created continuously, and a
+# container over the Bash sandbox's argv limit fails every tool call at spawn. The reaper knows a
+# database path, not a checkout, and `~/.claude-state` is a named VOLUME with no host path to walk —
+# so the copy it runs is this one. Root-owned by the argument above, with a second gain: the
+# host-triggered sweep runs a script the agent inside cannot rewrite. `run.sh` still runs the
+# checkout's copy, which is what the self-test and check-config.sh read.
+COPY --chown=root:root sweep-transcripts.sh /usr/local/bin/sweep-transcripts.sh
 RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/init-firewall.sh \
                     /usr/local/bin/entrypoint.sh /usr/local/bin/egress-status.sh \
-                    /usr/local/bin/egress-lib.sh \
+                    /usr/local/bin/egress-lib.sh /usr/local/bin/sweep-transcripts.sh \
     # Owned explicitly, not inherited. Everything here rests on `vscode` being unable to replace
     # the script sudo runs as root, or the allowlist snapshot beside it — and unlink/replace is
     # governed by the DIRECTORY, not the file mode. Debian-derived images have historically
@@ -127,7 +136,7 @@ RUN chown root:root /usr/local /usr/local/bin /usr/local/share /usr/local/bin/in
     # property nothing in this repo stated. verify.sh asserts the result at runtime.
     && chmod 0755 /usr/local /usr/local/bin /usr/local/share \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
-                  /usr/local/bin/egress-status.sh \
+                  /usr/local/bin/egress-status.sh /usr/local/bin/sweep-transcripts.sh \
     # IN THE IMAGE it is only ever sourced, so it needs no exec bit, and not having one is a small
     # statement that it is never a command anybody runs as root by name. (In the repo it does carry
     # one, because ./scripts/check.sh runs its --self-test directly.)

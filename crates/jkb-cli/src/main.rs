@@ -31,6 +31,7 @@ mod session;
 mod session_cli;
 mod staging;
 mod task_cli;
+mod transcripts;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -3103,6 +3104,7 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     let mut last_compaction_failure = String::new();
     let mut last_sweep_failure = String::new();
     let mut last_git_audit = String::new();
+    let mut last_transcript_failure = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         // Repository config that could make this host run code (D52.11, layer 3): said, and
         // notified, when the set of findings changes — posted when one appears, withdrawn when
@@ -3127,6 +3129,17 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
                 }
                 Compaction::Quiet => last_compaction_failure.clear(),
             }
+        }
+        // THE DEV CONTAINER'S TRANSCRIPTS, on the same tick and by the same argument as the queue's
+        // compaction above: this is the one long-lived process on the host already sweeping on a
+        // timer, and a container over the Bash sandbox's argv limit fails every tool call at spawn
+        // with nothing in the message naming transcripts. `.container/run.sh` sweeps at container
+        // START and that was the only trigger, while transcripts are created continuously — the
+        // container that produced the failure reached 1,182 of them without ever being recreated.
+        // Silent when there is no Docker, no such container or a stopped one, which is every host
+        // not using the dev container. Never fatal: it is somebody else's container.
+        if !dry_run {
+            sweep_container_transcripts(json, &mut last_transcript_failure);
         }
         match reap_once(db_path, retain_days, dry_run) {
             // Silence when there is nothing to say: this runs every quarter hour for ever, and a
@@ -3191,6 +3204,34 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
 /// in the database now (tasks S6.4 stage 3), and a database this binary cannot open — one a newer jkb
 /// migrated, routine across branches here — must fail this pass, not the process. The service loop
 /// reports the failure and tries again next interval, where exiting put launchd into a restart loop.
+/// One tick's worth of the dev container's transcripts, and what reaches the log.
+///
+/// Extracted from the watch loop for length, but it earns a name anyway: the interesting thing here
+/// is the reporting rule, which is the loop's own — say what CHANGED. A container that is not there,
+/// or had nothing to do, says nothing at all, because this runs every quarter hour for ever.
+fn sweep_container_transcripts(json: bool, last_failure: &mut String) {
+    match transcripts::sweep_dev_container(transcripts::DEV_CONTAINER_NAME) {
+        transcripts::Sweep::Absent | transcripts::Sweep::Quiet => last_failure.clear(),
+        transcripts::Sweep::Said(line) => {
+            last_failure.clear();
+            if json {
+                eprintln!("transcripts: {line}");
+            } else {
+                println!("transcripts: {line}");
+            }
+        }
+        // Said ONCE while it stays the same, as the compaction's and the reap's own failures are:
+        // over budget is a standing condition rather than an event, and it would otherwise be 96
+        // identical lines a day in a log whose whole discipline is that a line means something.
+        transcripts::Sweep::Failed(why) => {
+            if why != *last_failure {
+                eprintln!("transcripts: {why}");
+                last_failure.clone_from(&why);
+            }
+        }
+    }
+}
+
 fn reap_once(db_path: &Path, retain_days: u64, dry_run: bool) -> Result<archive::Report> {
     let db = open_db(db_path)?;
     let backend = jkb_api::LocalBackend::new(db).with_actor("reap");
