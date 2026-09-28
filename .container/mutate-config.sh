@@ -406,6 +406,28 @@ open(p, 'w').write(s.replace(old, 'false', 1))
 PYX
 run "the sweep stops asking whether the projection fell" "it never asks whether the projection actually fell"
 
+# THE VANISHED-SOURCE SKIP, whose only watcher this is: no executable test reaches a file that
+# disappears between the plan and the move, so the static pin and this mutation are the whole of it.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '        [ -e "$f" ] || continue\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "a transcript that raced away is counted as a failure again" "counts a transcript that vanished"
+
+# THE SELF-TEST SEAM WIRED INTO THE CONTAINER, which would disable the sweep while every start went
+# on reporting success -- the exact state the script exists to end, wearing a clean log.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'bash .container/sweep-transcripts.sh || true'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'JKB_DENY_BUDGET_BYTES=99999999 bash .container/sweep-transcripts.sh || true', 1))
+PYX
+run "run.sh wires the self-test budget seam into the container" "sets JKB_DENY_BUDGET_BYTES"
+
 # THE VERIFY LINE THE ORDERING IS MEASURED AGAINST. Reading nothing there used to make the ordering
 # test SKIP rather than fail -- the one extraction in this block that was not pinned against an
 # empty read, which is the failure mode this whole file exists to refuse.
@@ -1287,7 +1309,7 @@ fi
 # shipped with no mutation: exactly the gap this pin exists to close. Two appends on one line
 # bypassed it the same way. `grep -o` counts occurrences, so any spelling of a new branch moves it.
 sweep_appends="$(grep -o 'sweep_problems' "$repo/.container/check-config.sh" | grep -c .)"
-PINNED_SWEEP_APPENDS=43
+PINNED_SWEEP_APPENDS=47
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

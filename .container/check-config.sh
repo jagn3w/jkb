@@ -640,6 +640,24 @@ else
         # passes its own tests for ever.
         grep -qF -- 'transcript_projection_fell "$moved"' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems it never asks whether the projection actually fell, so a sweep that moved files and shrank nothing exits 0;"
+        # A FILE THAT VANISHED BETWEEN THE PLAN AND THE MOVE IS NOT A FAILURE. Pinned here and
+        # nowhere else, and said plainly: no executable test in this repository reaches that state,
+        # because it needs a file to disappear between two statements of one function. A live
+        # session, Claude Code's own cleanupPeriodDays retention or a second run.sh all produce it,
+        # and counting it made a healthy start print "N file(s) could not be archived" with no
+        # cause. A static pin is the only watcher available, so it is the one that is here.
+        grep -qF -- '[ -e "$f" ] || continue' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it counts a transcript that vanished between the plan and the move as a failure, which a live session produces routinely;"
+        # THE BUDGET SEAM IS FOR THE SELF-TEST, NOT FOR THE CONTAINER. JKB_DENY_BUDGET_BYTES exists
+        # so --self-test can run the file as a PROGRAM against a tree it can build in a temp dir.
+        # Wired into any shipped container file it would silently disable the sweep -- set it high
+        # and every start reports "nothing to archive" for ever, which is indistinguishable from a
+        # healthy tree and is the precise state this whole script was written to end.
+        for dc_f in run.sh Dockerfile container.json entrypoint.sh; do
+            [ -f "$here/$dc_f" ] || continue
+            grep -qF -- 'JKB_DENY_BUDGET_BYTES' "$here/$dc_f" \
+                && sweep_problems="$sweep_problems $dc_f sets JKB_DENY_BUDGET_BYTES, which is a self-test seam: in the container it silently disables the sweep while every start still reports success;"
+        done
         grep -qE -- 'CLAUDE_BASE=.*CLAUDE_CONFIG_DIR' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems it does not honour CLAUDE_CONFIG_DIR, which commands.rs, auto-mode.sh and swarm-status.sh all do, so a second config dir sweeps an absent tree and reports success;"
     fi

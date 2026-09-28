@@ -352,7 +352,9 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
         fi
     done <<<"$plan"
 
-    after="$(transcript_records "$abs" | transcript_projection)"
+    # `after` IS ONLY ASKED FOR ON A REAL SWEEP. It was computed unconditionally, which meant every
+    # `--dry-run` walked the whole tree a second time to produce a number the dry-run path never
+    # reads -- on the tree that prompted this file, 1,182 files and two `stat` batches.
     if [ "$dry" = "--dry-run" ]; then
         # `%s -> %s`, not `-> under %s`: the old wording ASSERTED the outcome the rest of this
         # function never checked, which is how a plan that cannot reach the budget read as one that
@@ -360,6 +362,7 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
         printf 'transcript sweep: would archive %s file(s), %s -> %s deny bytes, budget %s\n' \
             "$moved" "$before" "$((before - planned))" "$DENY_BUDGET_BYTES"
     else
+        after="$(transcript_records "$abs" | transcript_projection)"
         printf 'transcript sweep: archived %s file(s) to %s (%s -> %s deny bytes, budget %s)\n' \
             "$moved" "$archive" "$before" "$after" "$DENY_BUDGET_BYTES"
     fi
@@ -401,6 +404,19 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
 # ---------------------------------------------------------------------------------------------
 
 if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
+    # THE SEAMS MUST NOT BE SET IN THE ENVIRONMENT THAT RUNS THIS. Every one of them is read at load
+    # time, above, so a developer with JKB_DENY_BUDGET_BYTES exported would get a red gate for a
+    # correct script (the constants rows read their value, not the shipped one) -- or, with the
+    # wrong value, a green one for rows that are no longer measuring what they say. A suite that
+    # silently reads the environment it is run in establishes nothing, and this is the same reason
+    # the program rows below pass `env -u`. Refused loudly rather than worked around.
+    for seam in JKB_DENY_BUDGET_BYTES JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE CLAUDE_CONFIG_DIR; do
+        [ -z "${!seam:-}" ] || {
+            printf 'sweep-transcripts --self-test: %s is set in this environment; unset it and re-run\n' \
+                "$seam" >&2
+            exit 2
+        }
+    done
     fails=0
     eq() { # eq <label> <got> <want>
         if [ "$2" = "$3" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"

@@ -1483,3 +1483,20 @@ stays in the tree — and asserts nothing about the return code or the message. 
 hypothetical: a session whose `<slug>/<uuid>.jsonl` was archived and is then resumed by id recreates
 that relative path, the next sweep plans it oldest-first, and `~/.claude-state` is a volume, so the
 archived copy is the only one there is.
+
+`JKB_DENY_BUDGET_BYTES` is a **self-test seam**, and it is the only way `--self-test` can drive this
+file *as a program* against a tree it can build in a temp directory — without it every program-level
+row has to point at an empty root, where `sweep_transcripts` returns at `no transcripts` before it
+ever reads its third argument, so `--dry-run` through the CLI was exercised by nothing. Two things
+keep a seam from becoming a lever: `check-config.sh` refuses it appearing in `run.sh`, the
+`Dockerfile`, `container.json` or `entrypoint.sh` (wired into the container it would silently disable
+the sweep while every start still reported success — the state this script exists to end, wearing a
+clean log), and `--self-test` **refuses to run** when any seam is set in its own environment, since a
+suite that reads the environment it was started in establishes nothing about the shipped values.
+
+One property has no executable test anywhere and says so in place: a transcript that vanishes
+between the plan and the move must not be counted as a failure. Reaching that state needs a file to
+disappear between two statements of one function — a live session, `cleanupPeriodDays` retention, or
+a second `run.sh` all produce it in the field, and none of them can be staged. The static pin in
+`check-config.sh` and its mutation are the whole of the coverage, which is worth writing down rather
+than leaving a reader to infer that the fixture covers it.
