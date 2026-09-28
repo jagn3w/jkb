@@ -668,11 +668,17 @@ PYX
 run "both lists drop the same self-test" "self-test that no gate runs"
 
 # The second sudoers grant is read-only by argument, so the allowed SET is what verify.sh pins.
+# ANCHORED ON THE LABEL, because the EXPECTATION is the thing under test and is meant to move. This
+# named the expectation in full and went NO-OP the moment D52's hook pin grew verify.sh's list and
+# mutate-verify.sh shortened its expect to the stable prefix -- the guard against stale expectations,
+# itself stale, failing the gate while pointing at a file that was fine.
 seed; python3 - "$work/t/.container/mutate-verify.sh" <<'PYX'
-import sys
+import re, sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('"may run more than the firewall and the egress probe as root"',
-                             '"may run more than the firewall as root"', 1))
+out = re.sub(r'(run "blanket passwordless root is restored" ")[^"]*(")',
+             r'\g<1>a sudoers sentence verify.sh never prints\g<2>', s, count=1)
+assert out != s, "mutation target absent"
+open(p, 'w').write(out)
 PYX
 run "a harness expectation drifts from verify.sh" "expects text verify.sh never prints"
 
