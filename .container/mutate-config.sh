@@ -563,6 +563,86 @@ run "the image stops carrying the sweep the reaper runs" "cannot be read from bo
 seed; rm -f "$work/t/crates/jkb-cli/src/transcripts.rs"
 run "the reaper's container module is deleted" "nothing sweeps the container between starts"
 
+# THE PLAIN `bad` ARMS, which the accept_bad mutation above leaves standing because `accept_bad "`
+# contains `bad "` -- the substring the guard is now anchored against. All three, because a STATIC
+# guard cannot tell "this block reaches a bad verdict" from "this block reaches a bad verdict FOR
+# THE BUDGET": demoting two of the three leaves the third, and the grep is satisfied. What that
+# costs is written down in check-config.sh beside the loop, and the behavioural half -- that an
+# over-budget tree really produces exit 1 and an unreclaimable one exit 3 -- belongs in
+# mutate-verify.sh, which needs a container.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+n = 0
+for old in ('bad "the transcript sweep could not answer',
+            'bad "the transcript deny list is over budget',
+            'bad "there is no sweep-transcripts.sh beside this script'):
+    assert old in s, "mutation target absent"
+    s = s.replace(old, 'echo "  note: ' + old[5:], 1); n += 1
+assert n == 3, "mutation target absent"
+open(p, 'w').write(s)
+PYX
+run "verify.sh demotes its plain deny-list verdicts to notes" "reaches no \`bad\` verdict"
+
+# THE EMITTING HALF'S BOUNDARY, which is an extraction bounded by a literal and so fails by reading
+# EVERYTHING rather than nothing. Behaviour-preserving: the two tests simply swap.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'if [ "$#" -eq 1 ] && [ "${1:-}" = "--self-test" ]; then', 1))
+PYX
+run "the self-test dispatch is reworded, widening the emitting half to the whole file" "is no longer where the emitting half"
+
+# THE TWO "EXTRACTION READ NOTHING" BRANCHES that shipped with no mutation, which is what the
+# coverage line used to claim could not happen.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert '${JKB_' in s, "mutation target absent"
+open(p, 'w').write(s.replace('${JKB_', '${XKB_'))
+PYX
+run "the sweep stops reading any JKB_ override, so SEAMS cannot be checked" "it reads no \${JKB_"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert 'sweep_sh=' in s, "mutation target absent"
+open(p, 'w').write(s.replace('sweep_sh', 'sweeper_path'))
+PYX
+run "verify.sh renames the handle its deny-list block is read by" "has no deny-list block to read"
+
+# BOTH HALVES OF "NO SWEEP CAN FIX THIS". verify.sh decides exit 3 against exit 1 on that sentence,
+# and the floor half is the one that shipped unwatched: with it gone, the window the README says this
+# closed reports an unhelpable tree as a broken boundary and run.sh refuses to open a window.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (kept < keep)   { tot += length($2); kept++ } }'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '          }', 1))
+PYX
+run "the floor stops counting toward what no sweep can remove" "does not count the newest KEEP_NEWEST"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (base == held)  { tot += length($2); next }'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '          if (base == held)  { next }', 1))
+PYX
+run "the held-back files stop counting toward what no sweep can remove" "does not count the held-back files toward what no sweep can remove"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'transcript_irreducible() {'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'irreducible_bytes() {', 1))
+PYX
+run "the irreducible measure is renamed, so the guard reads nothing" "no transcript_irreducible"
+
 # THE VERIFY LINE THE ORDERING IS MEASURED AGAINST. Reading nothing there used to make the ordering
 # test SKIP rather than fail -- the one extraction in this block that was not pinned against an
 # empty read, which is the failure mode this whole file exists to refuse.
@@ -1423,8 +1503,14 @@ echo "==> coverage"
 # COUNTED OVER CODE, NOT COMMENTS, for the same reason PINNED_SWEEP_APPENDS is: check-config.sh's
 # prose quotes the idioms it is talking about, so a comment explaining this very scan moved the
 # count by one and demanded "a mutation for the new one" about a sentence.
-bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" | grep -c 'bad "')"
-PINNED_BAD_SITES=97
+# OCCURRENCES, NOT LINES, for the reason written out beside PINNED_SWEEP_APPENDS below -- which was
+# rewritten for exactly this and left its neighbour counting lines in the same commit. Two failure
+# paths on one line (`grep -q A || bad "…"; grep -q B || bad "…"`, and this file already spells
+# compound `|| { bad "…"; gen_ok=0; }` forms) moved the pin by one, so one of the two shipped with no
+# mutation while the harness printed a coverage number over it.
+bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
+    | grep -o 'bad "' | grep -c .)"
+PINNED_BAD_SITES=93
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
@@ -1451,14 +1537,19 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=75
+PINNED_SWEEP_APPENDS=83
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"
     echo "  They all emit through one \`bad \"\`, so the failure-path count above cannot see a new one."
     echo "  Add a mutation for it and update PINNED_SWEEP_APPENDS."
 else
-    printf '  %s mentions of sweep_problems behind the sweep guard, each branch with a mutation, count pinned\n' "$sweep_appends"
+    # WHAT THE COUNT ESTABLISHES, AND NOT MORE. This said "each branch with a mutation", which the
+    # count cannot see -- it forces a new branch to be DECIDED about, not written for. Two branches
+    # had none when that line was printed, both of them "the extraction read nothing" guards this
+    # file says must be watched failing. Claiming more than was established, printed by the harness
+    # that exists to catch exactly that.
+    printf '  %s mentions of sweep_problems behind the sweep guard, count pinned so a new branch must be decided about\n' "$sweep_appends"
 fi
 
 echo

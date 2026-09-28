@@ -1632,3 +1632,44 @@ about for one sweep.
 The `docker` spawn is declared in `gitrepo.rs`'s `NOT_REPO_AWARE`, and that guard is what caught it:
 `docker` is addressed by **container name**, never resolves a repository, and the caller's working
 directory changes nothing about which container is poked.
+
+**Round 6, and a guard whose three checks were really two.** The verdict-coverage loop added the
+round before — requiring `verify.sh`'s deny-list block to reach `ok`, `bad` *and* `accept_bad` —
+matched `bad "` as an unanchored substring, and `accept_bad "` **contains** `bad "`. So the
+`accept_bad` arm alone satisfied the `bad` iteration: both plain arms could be demoted to notes, the
+gate still printed 70/70, and the one mutation here (which demotes `accept_bad`) was still caught by
+the survivors. Anchored now — and what it still *cannot* see is written beside it, because a static
+read cannot do better: it establishes that the block reaches each **kind** of verdict, never that the
+*budget* arms are the ones reaching them. The behavioural half — an over-budget tree really exiting
+1, an unreclaimable one really exiting 3, which is what `run.sh` reads to decide whether to open a
+window — needs a container, so it belongs in `mutate-verify.sh` and **is not covered yet**.
+
+Two more of the same family, both in guards this series added:
+
+- **The floor half of `transcript_irreducible` was watched by nothing.** Both rows exercising the
+  "beyond any sweep's help" message held `KEEP_NEWEST=0`, so deleting the floor term left
+  `--self-test`, `check-config.sh` and `mutate-config.sh` all green while `verify.sh` silently
+  reclassified over-budget trees from `accept_bad` to `bad` — in exactly the 161-to-199-journal
+  window this document claims the term closed. There is now a row whose budget sits *between* what
+  the journals project alone and what they project plus the floor, so only counting both reaches it;
+  and the static pin asks that each half is **recognised and counted**, after a mutant whose held arm
+  was `{ next }` passed the version that asked only that the arm existed.
+- **`bad_sites` counted lines while its neighbour counted occurrences**, rewritten in the same commit
+  for exactly the reason lines undercount. Two failure paths on one line moved the pin by one, so one
+  of them shipped unmutated under a printed coverage number. And that harness's success line claimed
+  "each branch with a mutation", which a count cannot establish and which was false for two branches
+  — both of them the *extraction read nothing* guards this file says must be watched failing. It now
+  says only what the count establishes.
+
+**Exit 3 stopped being about a choice.** Both files said every failure reported was "a condition this
+container was configured to accept" — true while the unfiltered-egress override was the only
+producer, and false the moment the transcript deny list joined it. Nobody *configures* a container to
+accumulate 199 run journals; it is emergent, and it is the one exit-3 producer with a concrete
+remedy. Telling an operator they chose a state they did not choose, about the only thing they can
+act on, is worse than saying nothing. It now reads "one this container tolerates rather than a broken
+boundary", and the enumeration of producers lives in the FAIL lines rather than in a second copy.
+
+Relatedly, the over-budget FAIL arm had begun asserting an archiving pass it has no evidence of —
+`verify.sh` only ever runs `--dry-run`. It names the causes it cannot tell apart instead: the floor
+genuinely binding, a start sweep that could not write its archive (`could not create` in the
+scroll-back), and an archive refusing colliding destinations (`mv: not replacing`).

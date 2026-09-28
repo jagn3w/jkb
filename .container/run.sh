@@ -1100,13 +1100,12 @@ if [ "$OPEN" -eq 1 ] && [ "$verify_rc" -ne 0 ]; then
         # because those journals live in a volume. Two conditions with opposite remedies cannot
         # share one hard-coded sentence, so the remedy is read off verify's own output, which each
         # accepted arm already carries.
-        printf 'Every failure it reported is a condition this container was configured to accept.\n' >&2
-        printf 'That is a container to attach to and diagnose, not one to run an agent in unattended,\n' >&2
-        printf 'so no window is opened while it holds. The FAIL line(s) above say which condition and\n' >&2
-        printf 'what to do about it — the unfiltered-egress override (JKB_EGRESS_ACCEPT_UNFILTERED=1,\n' >&2
-        printf 'unset it in container.json and recreate) and a transcript deny list past what any\n' >&2
-        printf 'sweep can reclaim are both reported here and want different things. Or attach by hand\n' >&2
-        printf 'with the Command Palette route above.\n' >&2
+        printf 'Every failure it reported is one this container tolerates rather than a broken\n' >&2
+        printf 'boundary. That is a container to attach to and diagnose, not one to run an agent in\n' >&2
+        printf 'unattended, so no window is opened while it holds. The FAIL line(s) above say which\n' >&2
+        printf 'condition it is and what to do about it — they want different things, and the list\n' >&2
+        printf 'of them is not repeated here, because a second copy of it goes stale. Or attach by\n' >&2
+        printf 'hand with the Command Palette route above.\n' >&2
     else
         printf 'Fix them, or attach by hand with the Command Palette route above if you know why.\n' >&2
     fi

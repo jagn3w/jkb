@@ -17,7 +17,12 @@ set -uo pipefail
 pass=0; fail=0; accepted_failure=0
 ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
-# A failure that is a CONSEQUENCE of a condition this container was configured to accept. Reported
+# A failure this container TOLERATES rather than one that means its boundary is broken. It was
+# "a condition this container was configured to accept", which was true while the unfiltered-egress
+# override was the only producer and became false the moment the transcript deny list joined it:
+# nobody CONFIGURES a container to accumulate 199 workflow run journals, and telling an operator
+# they chose a state they did not choose about the one exit-3 producer with a concrete remedy is
+# worse than saying nothing. Reported
 # at full volume like any other -- what it changes is the exit code, so a caller can tell "this
 # container is misconfigured" from "this container is in a state its operator chose".
 #
@@ -1858,7 +1863,12 @@ if [ -f "$sweep_sh" ]; then
     else
         bad "the transcript deny list is over budget — $sweep_tail
        Every Bash tool call in this container may fail at spawn with E2BIG, with nothing in the
-       message naming transcripts. The sweep has already archived all its floor allows this start."
+       message naming transcripts. This is a --dry-run, so it says what IS there and not what the
+       start sweep managed: the causes it cannot tell apart are the floor genuinely binding, a start
+       sweep that could not write its archive (look for \`could not create\` in the scroll-back), and
+       an archive refusing colliding destinations (\`mv: not replacing\`). Check
+       ~/.claude-state/transcript-archive is writable and holds no entry with the same relative path
+       as a live session's transcript."
     fi
 else
     bad "there is no sweep-transcripts.sh beside this script, so nothing bounds the Bash sandbox deny list"
@@ -1877,11 +1887,11 @@ echo
 # condition the design REQUIRES to keep failing. The failure is still reported every run, at full
 # volume; what changes is that a caller can tell the two apart.
 #   1  a real failure
-#   3  the only failures are conditions this container was configured to accept
+#   3  the only failures are ones this container tolerates rather than a broken boundary
 if [ "$fail" -ne 0 ]; then
     printf '\033[31m%d failed\033[0m, %d passed\n' "$fail" "$pass"
     if [ "$accepted_failure" -ne 0 ] && [ "$fail" -eq "$accepted_failure" ]; then
-        printf 'every failure above is a condition this container was configured to accept.\n'
+        printf 'every failure above is one this container tolerates rather than a broken boundary.\n' 
         exit 3
     fi
     exit 1

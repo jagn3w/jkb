@@ -688,6 +688,26 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...and the shipped budget, which it is nowhere near, reports nothing of the kind" \
        "$(sweep_transcripts "$root" "$arch" --dry-run 2>&1 | grep -c 'cannot bring this tree under it')" "0"
 
+    # THE FLOOR IS HALF OF "NO SWEEP CAN FIX THIS", and the rows above cover only the other half:
+    # both hold KEEP_NEWEST at 0, so deleting the floor term from transcript_irreducible left every
+    # gate green while verify.sh silently reclassified over-budget trees from accept_bad (exit 3, a
+    # condition to act on, with a remedy) to bad (exit 1, a broken boundary, and run.sh refuses to
+    # open a window). This is the 161-to-199-journal window the README says this closed.
+    #
+    # The budget sits BETWEEN the two, so only counting both reaches it: above what the run journal
+    # projects alone, below what it projects plus the newest KEEP_NEWEST.
+    floor_only_p="$(transcript_records "$root" | transcript_unreclaimable | transcript_projection)"
+    KEEP_NEWEST=2
+    both_p="$(transcript_records "$root" | transcript_irreducible)"
+    eq "the floor adds bytes the held set alone does not account for" \
+       "$([ "$both_p" -gt "$floor_only_p" ] && echo yes || echo no)" "yes"
+    DENY_BUDGET_BYTES=$(( (floor_only_p + both_p) / 2 ))
+    eq "a tree the floor alone puts beyond any sweep's help says so" \
+       "$(sweep_transcripts "$root" "$arch" --dry-run 2>&1 | grep -c 'cannot bring this tree under it')" "1"
+    eq "...and the same tree with no floor is merely over budget, not beyond help" \
+       "$(KEEP_NEWEST=0; sweep_transcripts "$root" "$arch" --dry-run 2>&1 | grep -c 'cannot bring this tree under it')" "0"
+    DENY_BUDGET_BYTES="$DEFAULT_BUDGET" KEEP_NEWEST="$DEFAULT_KEEP"
+
     echo "==> sweep-transcripts self-test: a sweep that cannot reach the budget says so"
     # NOTHING COMPARED THE PROJECTION TO THE BUDGET until round 3 -- in a script whose whole subject
     # is a budget, with `before`, `after` and DENY_BUDGET_BYTES printed side by side in one line.
@@ -922,19 +942,31 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # a read-only volume are the same shape. Before the dry run was judged on the tree as it is, it
     # exited 0 here (`7200 -> 3960 deny bytes, budget 3960`) and verify.sh printed
     # `ok  the transcript deny list fits in one argv` over a container where every Bash call dies.
+    # THE MARGIN IS DERIVED, NOT WRITTEN TWICE. The surplus over the floor and the fraction of the
+    # projection the budget keeps are one relationship: the budget must be reachable by archiving
+    # SOME of the surplus and not all of it, or `before - planned` lands on the budget and the old
+    # verdict passes for a different reason. Written as two literals (`+ 28`, `* 55 / 100`) the
+    # margin was one file, and raising KEEP_NEWEST to 48 left both of these rows green under the
+    # reverted behaviour. SURPLUS files are candidates; the budget keeps KEEP_FRACTION of the whole,
+    # so the plan needs roughly (1 - KEEP_FRACTION) of the projection gone and there must be more
+    # candidates than that demands.
     blocked_root="$work/blocked/projects"
+    blocked_surplus=$((DEFAULT_KEEP * 3))
     i=0
-    while [ "$i" -lt "$((DEFAULT_KEEP + 28))" ]; do
+    while [ "$i" -lt "$((DEFAULT_KEEP + blocked_surplus))" ]; do
         mk "$blocked_root/-slug/t$(printf '%03d' "$i").jsonl" 202601010000
         i=$((i + 1))
     done
     : > "$work/blocked/not-a-dir"
     blocked_proj="$(transcript_records "$blocked_root" | transcript_projection)"
-    DENY_BUDGET_BYTES=$((blocked_proj * 55 / 100)) KEEP_NEWEST="$DEFAULT_KEEP"
+    # 80%: the plan must remove about a fifth of the projection, which is well inside the surplus
+    # (three times the floor) and nowhere near exhausting it -- so `before - planned` sits under the
+    # budget while `before` sits over it, which is the whole difference the rows below measure.
+    DENY_BUDGET_BYTES=$((blocked_proj * 80 / 100)) KEEP_NEWEST="$DEFAULT_KEEP"
     blocked_real="$(sweep_transcripts "$blocked_root" "$work/blocked/not-a-dir/arch" 2>&1)"; blocked_rc=$?
     eq "a sweep whose archive cannot be created archives nothing and says so" "$blocked_rc" "1"
     eq "...leaving every transcript where it was" \
-       "$(find "$blocked_root" -type f -name '*.jsonl' | grep -c . )" "$((DEFAULT_KEEP + 28))"
+       "$(find "$blocked_root" -type f -name '*.jsonl' | grep -c . )" "$((DEFAULT_KEEP + blocked_surplus))"
     eq "...and nothing claims to have archived" \
        "$(grep -c 'could not create' <<<"$blocked_real")" "1"
     # AND THE DRY RUN, which is the code verify.sh actually reads.

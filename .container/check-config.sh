@@ -645,6 +645,26 @@ else
         # is that the config base is DERIVED from it. Whether that derivation is spelled correctly
         # is the self-test's, which runs the script with CLAUDE_CONFIG_DIR set and reads the root
         # back out of the message.
+        # WHAT NO SWEEP CAN REMOVE IS BOTH HALVES. verify.sh decides exit 3 ("a condition to act on",
+        # with a remedy) against exit 1 ("a broken boundary", and run.sh refuses to open a window) on
+        # this one sentence, and the first version of it asked about the held set alone. The residual
+        # after a full plan is held PLUS the newest KEEP_NEWEST, which crosses the budget at roughly
+        # 161 run journals where a held-only test only speaks past about 199 -- and a container
+        # reaches the first on its way to the second. The self-test stages a budget between the two;
+        # this is the half that catches the term being edited out of the file it does not run against.
+        sweep_irr="$(awk '/^transcript_irreducible\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+            <<<"$sweep_body")"
+        if [ -z "$sweep_irr" ]; then
+            sweep_problems="$sweep_problems it has no transcript_irreducible() to read, so nothing establishes what the sweep calls beyond its own help;"
+        else
+            # RECOGNISED **AND** COUNTED, on one line each. Asking only that the arm exists passed a
+            # mutant whose held arm was `{ next }` -- it still recognised the set and contributed
+            # nothing, which is the whole defect in miniature.
+            grep -qE -- 'base == held.*tot \+= length' <<<"$sweep_irr" \
+                || sweep_problems="$sweep_problems transcript_irreducible() does not count the held-back files toward what no sweep can remove, so a tree the run journals alone put beyond help is reported as a broken boundary;"
+            grep -qE -- 'kept < keep.*tot \+= length' <<<"$sweep_irr" \
+                || sweep_problems="$sweep_problems transcript_irreducible() does not count the newest KEEP_NEWEST the floor protects, so the window where the floor is what puts a tree beyond help is reported as a broken boundary;"
+        fi
         # THE POST-CONDITION'S CALL SITE. Its comparison is watched by the self-test, which drives
         # transcript_projection_fell from literals -- but the self-test cannot see the call being
         # deleted, because the state it guards (files moved, deny list no smaller) is refused
@@ -795,16 +815,40 @@ else
             # satisfy the check: rewording the real printf then left this guard green, because the
             # phrase was still in the file -- inside the suite that greps for it. Measured; the
             # mutation reported MISSED until this line existed.
+            # PINNED AGAINST READING EVERYTHING, which is the failure mode an extraction bounded by
+            # a literal has -- the mirror of the empty-read every other extraction here is pinned
+            # against. Swap the two tests on that dispatch line (`[ "$#" -eq 1 ] && [ "${1:-}" = …`,
+            # identical behaviour) and the address stops matching, `q` never fires, and this silently
+            # becomes the whole file again: the state in which the self-test's own `grep -c '<phrase>'`
+            # rows satisfy the marker check and rewording the real printf passes.
             sweep_emit="$(sed -n '/^if \[ "\${1:-}" = "--self-test" \]/q;p' <<<"$sweep_body")"
+            if [ "$(grep -c . <<<"$sweep_emit")" -ge "$(grep -c . <<<"$sweep_body")" ]; then
+                sweep_problems="$sweep_problems the --self-test dispatch line is no longer where the emitting half of sweep-transcripts.sh ends, so the check below reads the self-test's own grep patterns as things the sweep prints;"
+                sweep_emit=""
+            fi
             while IFS= read -r dc_marker; do
                 [ -n "$dc_marker" ] || continue
                 grep -qF -- "$dc_marker" <<<"$sweep_emit" \
                     || sweep_problems="$sweep_problems verify.sh classifies on \"$dc_marker\", which sweep-transcripts.sh never prints, so that verdict is unreachable and its cases fall to another;"
             done <<<"$verify_markers"
         fi
+        # ANCHORED, because `accept_bad "` CONTAINS `bad "`. Unanchored, the accept_bad arm alone
+        # satisfied the `bad` iteration, so both plain `bad` arms could be demoted to notes -- the
+        # exact drift this loop was written against -- with the gate still printing 70/70 and the
+        # single mutation here (which demotes accept_bad) still caught by the survivors. A guard
+        # whose three checks were really two, in the round that added it to make three.
+        #
+        # WHAT THIS STILL CANNOT SEE, said plainly: it establishes that the block reaches each KIND
+        # of verdict, never that the BUDGET arms are the ones reaching them. Demote two of the three
+        # plain `bad` calls and the third satisfies the grep. A static read cannot do better; the
+        # behavioural half -- an over-budget tree really exiting 1 and an unreclaimable one really
+        # exiting 3, which is what run.sh reads to decide whether to open a window -- needs a
+        # container, so it belongs in mutate-verify.sh and is not covered here.
+        # The quote is appended rather than written into the pattern, so these NEEDLES are not
+        # counted by mutate-config.sh's scan for this file's own failure paths.
         dc_q='"'
         for dc_verdict in ok bad accept_bad; do
-            grep -qF -- "$dc_verdict $dc_q" <<<"$verify_verdict" \
+            grep -qE -- "(^|[[:space:]])$dc_verdict $dc_q" <<<"$verify_verdict" \
                 || sweep_problems="$sweep_problems verify.sh's deny-list block reaches no \`$dc_verdict\` verdict, so it runs the sweep and reports nothing a caller can act on;"
         done
     fi
