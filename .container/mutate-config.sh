@@ -495,6 +495,38 @@ open(p, 'w').write(s.replace(old, 'sweep_dry="$(JKB_DENY_BUDGET_BYTES=99999999 b
 PYX
 run "verify.sh wires the budget seam into its own call" "verify.sh sets JKB_DENY_BUDGET_BYTES"
 
+# THE PHRASES THE TWO FILES SHARE. verify.sh tells "over budget" from "beyond any sweep's help" from
+# "could not answer" by matching the sweep's own wording; reword one end and the container is
+# silently reclassified for ever, with no gate noticing.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'archiving every transcript cannot bring this tree under it'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'no amount of archiving helps here', 1))
+PYX
+run "the sweep rewords the phrase verify.sh classifies on" "which sweep-transcripts.sh never prints"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '*"E2BIG"*'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '*"E2BIG-renamed"*', 1))
+PYX
+run "verify.sh classifies on a phrase the sweep does not print" "which sweep-transcripts.sh never prints"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+for old, new in (('*"E2BIG"*) false ;; *) true ;;', '*) false ;;'),
+                 ('*"cannot bring this tree under it"*) true ;; *) false ;;', '*) true ;;')):
+    assert old in s, "mutation target absent"
+    s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+PYX
+run "verify.sh stops classifying on any phrase" "classifies on no phrase at all"
+
 # THE VERIFY LINE THE ORDERING IS MEASURED AGAINST. Reading nothing there used to make the ordering
 # test SKIP rather than fail -- the one extraction in this block that was not pinned against an
 # empty read, which is the failure mode this whole file exists to refuse.
@@ -1383,7 +1415,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=61
+PINNED_SWEEP_APPENDS=65
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

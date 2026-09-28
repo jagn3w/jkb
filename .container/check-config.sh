@@ -745,6 +745,29 @@ else
         # by mutate-config.sh's `grep -c 'bad "'` scan over this file -- that scan counts this
         # file's own FAILURE PATHS, and a string being searched for is not one. Left inline, the
         # loop moved PINNED_BAD_SITES by one and demanded a mutation for a pattern.
+        # AND THE PHRASES IT CLASSIFIES ON MUST BE PHRASES THE SWEEP SAYS. verify.sh decides between
+        # "over budget", "beyond any sweep's help" and "could not answer" by matching the sweep's own
+        # wording -- two literals, living in two files, with nothing comparing them. Reword one and
+        # verify silently reclassifies every future container: an over-budget tree becomes "the sweep
+        # could not answer", or an unhelpable one becomes a broken boundary that refuses to open a
+        # window. Derived rather than spelled here: every `*"…"*` pattern in that block must be text
+        # the sweep actually emits.
+        verify_markers="$(grep -oE '\*"[^"]+"\*' <<<"$verify_verdict" | sed -E 's/^\*"(.*)"\*$/\1/')"
+        if [ -z "$verify_markers" ]; then
+            sweep_problems="$sweep_problems verify.sh's deny-list block classifies on no phrase at all, so every outcome of the sweep reaches the same verdict;"
+        else
+            # MATCHED AGAINST WHAT THE SWEEP CAN PRINT, which is everything ABOVE its --self-test
+            # block. Matched against the whole file, the self-test's own `grep -c '<phrase>'` rows
+            # satisfy the check: rewording the real printf then left this guard green, because the
+            # phrase was still in the file -- inside the suite that greps for it. Measured; the
+            # mutation reported MISSED until this line existed.
+            sweep_emit="$(sed -n '/^if \[ "\${1:-}" = "--self-test" \]/q;p' <<<"$sweep_body")"
+            while IFS= read -r dc_marker; do
+                [ -n "$dc_marker" ] || continue
+                grep -qF -- "$dc_marker" <<<"$sweep_emit" \
+                    || sweep_problems="$sweep_problems verify.sh classifies on \"$dc_marker\", which sweep-transcripts.sh never prints, so that verdict is unreachable and its cases fall to another;"
+            done <<<"$verify_markers"
+        fi
         dc_q='"'
         for dc_verdict in ok bad accept_bad; do
             grep -qF -- "$dc_verdict $dc_q" <<<"$verify_verdict" \
