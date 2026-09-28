@@ -3463,14 +3463,37 @@ mod tests {
     /// directory and says where it points, whatever that directory's config holds.
     #[test]
     fn a_git_directory_redirected_by_commondir_is_refused() {
+        // EVERY FAILURE HERE NAMES ITS SUBJECT. A bare `unwrap` on the copy reported only
+        // `NotFound`, which is the one thing that cannot be true of a path `read_dir` has just
+        // listed -- unless it is a dangling symlink, or a directory reached as a non-dir, or the
+        // destination's parent is missing. Those are three different bugs with one message, and
+        // telling them apart cost several rounds across two machines because the panic named
+        // neither path. The entry type is in there because `read_dir` does not follow symlinks
+        // while `fs::copy` does, which is exactly how the three cases diverge.
         fn copy_tree(from: &Path, to: &Path) {
-            std::fs::create_dir_all(to).unwrap();
-            for e in std::fs::read_dir(from).unwrap().flatten() {
+            std::fs::create_dir_all(to)
+                .unwrap_or_else(|e| panic!("create_dir_all {}: {e}", to.display()));
+            let entries = std::fs::read_dir(from)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", from.display()));
+            for e in entries.flatten() {
                 let dest = to.join(e.file_name());
-                if e.file_type().unwrap().is_dir() {
+                let ty = e
+                    .file_type()
+                    .unwrap_or_else(|err| panic!("file_type {}: {err}", e.path().display()));
+                if ty.is_dir() {
                     copy_tree(&e.path(), &dest);
                 } else {
-                    std::fs::copy(e.path(), dest).unwrap();
+                    std::fs::copy(e.path(), &dest).unwrap_or_else(|err| {
+                        panic!(
+                            "copy {} -> {}: {err} (dir={} file={} symlink={}, target exists={})",
+                            e.path().display(),
+                            dest.display(),
+                            ty.is_dir(),
+                            ty.is_file(),
+                            ty.is_symlink(),
+                            e.path().exists(),
+                        )
+                    });
                 }
             }
         }
