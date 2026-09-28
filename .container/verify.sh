@@ -1808,20 +1808,6 @@ else
     fi
 fi
 
-echo
-echo "  note: that the sandbox actually ENGAGES for a tool call is not asserted here — it needs a"
-echo "  live session. Inside one, run:  ./scripts/auto-mode.sh sandboxed   (control + canary, no"
-echo "  cost; do NOT use printenv CLAUDE_CODE_SANDBOXED, which was unset on a host whose sandbox"
-echo "  was provably enforcing), or"
-echo "  ./scripts/auto-mode.sh probe   for the full write/egress/credential probe."
-echo
-# TWO KINDS OF FAILURE, TWO EXIT CODES (D51.5). One code meant both "the boundary is broken" and
-# "this container is in a state you deliberately configured", and run.sh gated --open on it — so a
-# host using the documented escape could never open a window, and the message told it to fix a
-# condition the design REQUIRES to keep failing. The failure is still reported every run, at full
-# volume; what changes is that a caller can tell the two apart.
-#   1  a real failure
-#   3  the only failures are conditions this container was configured to accept
 # THE DENY LIST STILL FITS IN ONE ARGV. This is the container's health report, and it said nothing
 # about the one state in which NO Bash tool call works: Claude Code's sandbox profile enumerates
 # every session transcript into a single argv, Linux caps one argument at MAX_ARG_STRLEN, and a
@@ -1846,17 +1832,39 @@ echo
 sweep_sh="$(dirname "$0")/sweep-transcripts.sh"
 if [ -f "$sweep_sh" ]; then
     sweep_dry="$(bash "$sweep_sh" --dry-run 2>&1)"; sweep_dry_rc=$?
+    # THE LAST LINE, not the whole of it. The sweep says several things on the way to its verdict and
+    # the verdict is the last of them; flattening all of it into one `ok`/`FAIL` produced a line
+    # nobody finishes reading, which for an operator-facing report is the same as saying nothing.
+    sweep_tail="$(tail -n 1 <<<"$sweep_dry")"
     if [ "$sweep_dry_rc" -eq 0 ]; then
-        ok "the transcript deny list fits in one argv ($(printf '%s' "$sweep_dry" | tr '\n' ' '))"
+        ok "the transcript deny list fits in one argv — $sweep_tail"
     elif case "$sweep_dry" in *"cannot bring this tree under it"*) true ;; *) false ;; esac; then
-        accept_bad "the transcript deny list cannot be brought under budget by archiving: $(printf '%s' "$sweep_dry" | tr '\n' ' ') — the run journals it may not touch already exceed the budget; see .container/README.md"
+        accept_bad "the transcript deny list cannot be brought under budget by archiving at all — $sweep_tail
+       The workflow run journals the sweep may not touch already exceed the budget on their own.
+       Remove finished runs' journal.jsonl by hand, or raise DENY_BUDGET_BYTES; .container/README.md has the numbers."
     else
-        bad "the transcript deny list is over budget: $(printf '%s' "$sweep_dry" | tr '\n' ' ') — every Bash tool call in this container may fail at spawn with E2BIG; run .container/sweep-transcripts.sh"
+        bad "the transcript deny list is over budget — $sweep_tail
+       Every Bash tool call in this container may fail at spawn with E2BIG, with nothing in the
+       message naming transcripts. The sweep has already archived all its floor allows this start."
     fi
 else
     bad "there is no sweep-transcripts.sh beside this script, so nothing bounds the Bash sandbox deny list"
 fi
 
+echo
+echo "  note: that the sandbox actually ENGAGES for a tool call is not asserted here — it needs a"
+echo "  live session. Inside one, run:  ./scripts/auto-mode.sh sandboxed   (control + canary, no"
+echo "  cost; do NOT use printenv CLAUDE_CODE_SANDBOXED, which was unset on a host whose sandbox"
+echo "  was provably enforcing), or"
+echo "  ./scripts/auto-mode.sh probe   for the full write/egress/credential probe."
+echo
+# TWO KINDS OF FAILURE, TWO EXIT CODES (D51.5). One code meant both "the boundary is broken" and
+# "this container is in a state you deliberately configured", and run.sh gated --open on it — so a
+# host using the documented escape could never open a window, and the message told it to fix a
+# condition the design REQUIRES to keep failing. The failure is still reported every run, at full
+# volume; what changes is that a caller can tell the two apart.
+#   1  a real failure
+#   3  the only failures are conditions this container was configured to accept
 if [ "$fail" -ne 0 ]; then
     printf '\033[31m%d failed\033[0m, %d passed\n' "$fail" "$pass"
     if [ "$accepted_failure" -ne 0 ] && [ "$fail" -eq "$accepted_failure" ]; then
