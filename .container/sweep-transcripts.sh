@@ -43,7 +43,14 @@ set -uo pipefail
 # the same volume, which buys three things at once: it survives a rebuild (same volume), the move
 # is a rename rather than a copy (same filesystem), and it is outside the tree Claude Code walks,
 # which is the only reason the sweep reduces anything.
-TRANSCRIPT_ROOT="${JKB_TRANSCRIPT_ROOT:-${HOME:-/home/vscode}/.claude/projects}"
+# CLAUDE_CONFIG_DIR is honoured here because commands.rs, auto-mode.sh and swarm-status.sh all
+# honour it, and one site spelling the config base differently is the whole bug. It is unset in
+# the container today so this changes nothing now -- but a second config dir (the staging-login
+# pattern auto-mode-test.sh already uses) would have pointed the sweep at an absent tree, where
+# it prints "no transcripts", exits 0, and the real tree keeps growing while every Bash call goes
+# on dying at spawn. A sweep that cannot find its subject must not look successful.
+CLAUDE_BASE="${CLAUDE_CONFIG_DIR:-${HOME:-/home/vscode}/.claude}"
+TRANSCRIPT_ROOT="${JKB_TRANSCRIPT_ROOT:-$CLAUDE_BASE/projects}"
 TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-state/transcript-archive}"
 
 # MAX_ARG_STRLEN on Linux: 32 pages. Recorded for the reader; the budget below is derived from it.
@@ -121,9 +128,19 @@ transcript_plan() { # transcript_plan < records -> paths to archive, oldest firs
 #                 <slug>/<uuid>/subagents/workflows/wf_*/agent-*.jsonl (depth 6), and they are the
 #                 BULK of the population — one per swarm implementer, reviewer and workflow agent.
 #                 A depth cap here would sweep the cheap half and leave the expensive half.
-#   -name filter  <slug>/memory/ holds auto-memory as .md files and workflows/ holds wf_*.json run
-#                 records. Neither is a transcript and neither may be moved, at any depth. The
-#                 NAME is what guards them; depth never was.
+#   -name filter  <slug>/memory/ holds auto-memory as .md files. Not transcripts, not ours to
+#                 move, at any depth. The NAME is what guards them; depth never was.
+#   journal.jsonl HELD BACK BY NAME, and the rule this bullet used to state was WRONG. It said the
+#                 harness keeps `wf_*.json` run records; there are none -- measured, zero anywhere
+#                 under the real root. What it actually writes is
+#                 <slug>/<uuid>/subagents/workflows/wf_*/journal.jsonl (23 of them in this
+#                 container), `*.jsonl` matches it, and swarm-status.sh DISCOVERS runs by that exact
+#                 name (-name journal.jsonl -path '*/subagents/workflows/wf_*') and then requires
+#                 the file. So the sweep archived the harness's own state oldest-first on every
+#                 container start, and `swarm-status.sh <run>` printed "no swarm run found" for
+#                 every past run. The agent transcripts in those SAME directories (agent-*.jsonl)
+#                 are the bulk of the population and must still be swept, so `workflows` cannot be
+#                 pruned the way `memory` is -- exactly one name is held back.
 #   memory pruned belt to that brace: under -L, the per-repo `memory` symlink into the bind-mounted
 #                 ~/.jkb/claude-memory is followed like a real directory, so the walk leaves the
 #                 volume entirely. Pruned by name, which is portable (-prune/-o are POSIX, GNU's
@@ -138,7 +155,8 @@ transcript_records() { # transcript_records <root> -> "<mtime><TAB><path>" per t
     # caller's spelling, which is what makes -L above the thing doing the work.
     abs="$(cd "$1" 2>/dev/null && pwd)" || return 0
     [ -n "$abs" ] || return 0
-    find -L "$abs" -type d -name memory -prune -o -type f -name '*.jsonl' -exec stat "${STAT_FMT[@]}" {} + 2>/dev/null
+    find -L "$abs" -type d -name memory -prune \
+         -o -type f -name '*.jsonl' ! -name journal.jsonl -exec stat "${STAT_FMT[@]}" {} + 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -160,6 +178,16 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
         printf 'transcript sweep: %s does not exist — nothing to sweep\n' "$root"
         return 0
     }
+    # AN ARCHIVE INSIDE THE ROOT GROWS THE DENY LIST IT EXISTS TO SHRINK: the next walk finds
+    # what this one moved, one directory deeper, for ever. The shipped constants are siblings, so
+    # this is reachable only through JKB_TRANSCRIPT_ARCHIVE or a future edit -- which is precisely
+    # why it is refused here rather than left to a check on the defaults.
+    case "$archive/" in
+        "$abs"/*)
+            printf 'transcript sweep: archive %s is inside %s — each sweep would re-enumerate what the last one moved\n' \
+                "$archive" "$abs" >&2
+            return 1 ;;
+    esac
     records="$(transcript_records "$abs")"
     if [ -z "$records" ]; then
         printf 'transcript sweep: no transcripts under %s\n' "$root"
@@ -287,7 +315,7 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     mk "$slug/2222/subagents/agent-a.jsonl"                        202601030000
     mk "$slug/2222/subagents/workflows/wf_x/agent-b.jsonl"         202601040000
     # ...and the things that are NOT transcripts and must never move.
-    mk "$slug/2222/subagents/workflows/wf_x.json"                  202601010000
+    mk "$slug/2222/subagents/workflows/wf_x/journal.jsonl"         202601010000
     # AUTO-MEMORY IS A SYMLINK OUT OF THE TREE, exactly as the container has it: each slug's
     # `memory` points at ~/.jkb/claude-memory/<repo>, which is a bind mount of the HOST's
     # knowledge base. Under -L the walk follows it like a real directory and leaves the volume
@@ -318,8 +346,9 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # is not, which is how this row first read 4 for 3 files.
     eq "it names the three it would archive" "$(grep -c '^  would archive' <<<"$dry_out")" "3"
     eq "...and its summary agrees" "$(grep -c 'would archive 3 file' <<<"$dry_out")" "1"
+    # Six, not five: the run journal is a .jsonl in the tree that is never in the plan.
     eq "...and moved none of them" \
-       "$(find "$root" -type f -name '*.jsonl' | grep -c . )" "5"
+       "$(find "$root" -type f -name '*.jsonl' | grep -c . )" "6"
     eq "...and did not even create the archive directory" \
        "$([ -e "$arch" ] && echo yes || echo no)" "no"
 
@@ -330,8 +359,10 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "it archived the three oldest and kept the two newest" \
        "$(grep -c 'archived 3 file' <<<"$out")" "1"
     left="$(find "$root" -type f -name '*.jsonl' | sed "s#^$root/##" | LC_ALL=C sort | tr '\n' ' ')"
-    eq "the newest two are still where Claude Code looks for them" "$left" \
-       "-home-vscode-repos-jkb/2222/subagents/workflows/wf_x/agent-b.jsonl -tmp-d52harness-work/3333.jsonl "
+    # The two newest transcripts AND the run journal, which is the oldest file in the fixture and
+    # would be first in the plan if the name were not held back. Its presence here is the assertion.
+    eq "the newest two, and the run journal, are still where they were" "$left" \
+       "-home-vscode-repos-jkb/2222/subagents/workflows/wf_x/agent-b.jsonl -home-vscode-repos-jkb/2222/subagents/workflows/wf_x/journal.jsonl -tmp-d52harness-work/3333.jsonl "
     # THE DASH-LEADING SLUG SURVIVES THE MOVE. If `${rel%/*}` had been `dirname "$rel"` this
     # directory would not exist and the files would be in the archive root, or nowhere.
     eq "the archive keeps the dash-leading slug as a directory" \
@@ -343,17 +374,28 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "the whole auto-memory store is untouched, .jsonl decoy included" \
        "$(find "$store" -type f | LC_ALL=C sort | sed "s#^$store/##" | tr '\n' ' ')" \
        "MEMORY.md bash-e2big.md not-a-transcript.jsonl "
-    eq "workflow run records are untouched" \
-       "$([ -f "$slug/2222/subagents/workflows/wf_x.json" ] && echo yes || echo no)" "yes"
+    # THE HARNESS'S OWN RUN STATE, and the row that used to stand here asserted the survival of
+    # `workflows/wf_x.json` -- a shape that exists nowhere, so it could not fail while the real
+    # journals were being archived. It is the OLDEST file in the fixture, so it is first in line.
+    eq "the workflow harness's run journal is untouched" \
+       "$([ -f "$slug/2222/subagents/workflows/wf_x/journal.jsonl" ] && echo yes || echo no)" "yes"
+    eq "...and no run journal reached the archive" \
+       "$(find "$arch" -type f -name journal.jsonl | grep -c . )" "0"
     eq "nothing that is not a transcript reached the archive" \
        "$(find "$arch" -type f ! -name '*.jsonl' | grep -c . )" "0"
+
+    # THE ARCHIVE MUST BE OUTSIDE THE ROOT, watched failing rather than assumed from the defaults.
+    eq "an archive inside the root is refused" \
+       "$(rc_of sweep_transcripts "$root" "$root/.archive")" "1"
+    eq "...and nothing was created for it" \
+       "$([ -e "$root/.archive" ] && echo yes || echo no)" "no"
 
     echo "==> sweep-transcripts self-test: running it again, and running it on nothing"
     archived_before="$(find "$arch" -type f | grep -c . )"
     eq "a second sweep of the same tree succeeds" \
        "$(rc_of sweep_transcripts "$work/projects-link" "$arch")" "0"
     eq "...and moves nothing that the first sweep left" \
-       "$(find "$root" -type f -name '*.jsonl' | grep -c . )" "2"
+       "$(find "$root" -type f -name '*.jsonl' | grep -c . )" "3"
     eq "...and adds nothing to the archive" \
        "$(find "$arch" -type f | grep -c . )" "$archived_before"
     DENY_BUDGET_BYTES=$((ARGV_MAX_BYTES / 2)) KEEP_NEWEST=32

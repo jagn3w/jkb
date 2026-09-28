@@ -292,18 +292,57 @@ run "the sweep bounds its depth, missing the nested agent transcripts" "it caps 
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = "-type f -name '*.jsonl' -exec"
+old = "-name '*.jsonl' ! -name journal.jsonl"
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, "-type f -exec", 1))
+open(p, 'w').write(s.replace(old, "! -name journal.jsonl", 1))
 PYX
 run "the sweep stops filtering on *.jsonl, so auto-memory is in the plan" "does not filter on *.jsonl"
+
+# THE HARNESS'S OWN RUN JOURNAL. `*.jsonl` matches journal.jsonl, so this exclusion is the only
+# thing between the sweep and the state swarm-status.sh finds every run by -- and it shipped
+# without one, which is how the sweep came to archive 23 of them oldest-first.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = " ! -name journal.jsonl"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "the sweep stops holding back the workflow run journal" "does not hold back journal.jsonl"
+
+# THE ARCHIVE MUST BE OUTSIDE THE ROOT. Anchored on the case pattern, which is the refusal itself,
+# not on its message.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '        "$abs"/*)'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '        "$abs"/never-matches-anything)', 1))
+PYX
+run "the sweep accepts an archive inside the root it enumerates" "does not refuse an archive inside the root"
+
+# ONE SPELLING OF THE CLAUDE CONFIG BASE, shared with commands.rs, auto-mode.sh and swarm-status.sh.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '${CLAUDE_CONFIG_DIR:-'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '${JKB_NOT_THE_CONFIG_DIR:-', 1))
+PYX
+run "the sweep spells the config base its own way" "does not honour CLAUDE_CONFIG_DIR"
+
+# ...AND THE SCRIPT SIMPLY ABSENT, which is a FAIL path check-config.sh has always had and nothing
+# watched: the composed assertion emits eight conditions through ONE `bad "`, so PINNED_BAD_SITES
+# moved by one when the block arrived and could not notice that seven of the eight had a mutation.
+seed; rm -f "$work/t/.container/sweep-transcripts.sh"
+run "the sweep script is deleted outright" "sweep-transcripts.sh is not there at all"
 
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '-type d -name memory -prune -o '
+old = '-name memory -prune'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, '', 1))
+open(p, 'w').write(s.replace(old, '-name memory-never-matches -prune', 1))
 PYX
 run "the sweep walks out through the memory symlink into ~/.jkb" "does not prune memory/"
 
@@ -1107,6 +1146,21 @@ if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
 else
     printf '  %s failure paths in check-config.sh, %s mutations, count pinned\n' \
         "$bad_sites" "${#EXPECTS[@]}"
+fi
+
+# THE COMPOSED ASSERTION'S OWN BRANCHES. The sweep guard appends to one variable and emits it through
+# a single `bad "`, so `bad_sites` moved by ONE when eight conditions arrived -- and one of the eight
+# shipped with no mutation, invisibly. Counting the appends forces the decision per branch, which is
+# the granularity the mutations are written at.
+sweep_appends="$(grep -c 'sweep_problems="\$sweep_problems' "$repo/.container/check-config.sh")"
+PINNED_SWEEP_APPENDS=11
+if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
+    fails=$((fails+1))
+    printf '  the sweep guard has %s condition(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"
+    echo "  They all emit through one \`bad \"\`, so the failure-path count above cannot see a new one."
+    echo "  Add a mutation for it and update PINNED_SWEEP_APPENDS."
+else
+    printf '  %s conditions behind the sweep guard, each with a mutation, count pinned\n' "$sweep_appends"
 fi
 
 echo

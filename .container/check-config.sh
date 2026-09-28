@@ -526,8 +526,9 @@ fi
 if [ ! -f "$here/sweep-transcripts.sh" ]; then
     sweep_problems="$sweep_problems sweep-transcripts.sh is not there at all;"
 else
-    sweep_enum="$(dc_strip_comments "$here/sweep-transcripts.sh" \
-        | awk '/^transcript_records\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }')"
+    sweep_body="$(dc_strip_comments "$here/sweep-transcripts.sh")"
+    sweep_enum="$(awk '/^transcript_records\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+        <<<"$sweep_body")"
     if [ -z "$sweep_enum" ]; then
         sweep_problems="$sweep_problems it has no transcript_records() to read, so the four checks below establish nothing;"
     else
@@ -536,9 +537,21 @@ else
         grep -qF -- '-maxdepth' <<<"$sweep_enum" \
             && sweep_problems="$sweep_problems it caps the depth, which misses the nested agent transcripts that are the bulk of the population;"
         grep -qF -- "-name '*.jsonl'" <<<"$sweep_enum" \
-            || sweep_problems="$sweep_problems it does not filter on *.jsonl, so auto-memory and workflow run records are in the plan;"
+            || sweep_problems="$sweep_problems it does not filter on *.jsonl, so auto-memory is in the plan;"
+        # THE HARNESS'S RUN JOURNAL IS A .jsonl, so the filter above matches it and only a name of
+        # its own holds it back. swarm-status.sh discovers every run by that name and then requires
+        # the file, so sweeping it broke the run view for every past run. The rule stated here used
+        # to name `wf_*.json` records, of which there are none anywhere.
+        grep -qF -- '! -name journal.jsonl' <<<"$sweep_enum" \
+            || sweep_problems="$sweep_problems it does not hold back journal.jsonl, which *.jsonl matches and swarm-status.sh finds runs by;"
         grep -qF -- '-name memory -prune' <<<"$sweep_enum" \
             || sweep_problems="$sweep_problems it does not prune memory/, so under -L the walk follows that symlink out into the bind-mounted ~/.jkb;"
+        # Checked as a REFUSAL rather than as a comparison of the two default constants, so the
+        # JKB_TRANSCRIPT_ARCHIVE override cannot reach the state either.
+        grep -qF -- '"$abs"/*)' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it does not refuse an archive inside the root, where each sweep re-enumerates what the last one moved;"
+        grep -qF -- 'CLAUDE_CONFIG_DIR' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it does not honour CLAUDE_CONFIG_DIR, which commands.rs, auto-mode.sh and swarm-status.sh all do, so a second config dir sweeps an absent tree and reports success;"
     fi
 fi
 if [ -z "$sweep_problems" ]; then

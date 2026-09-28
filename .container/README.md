@@ -1346,8 +1346,20 @@ exactly like one that archives the right set:
   *starting point* without it. Drop it and the sweep enumerates nothing and says so cheerfully.
 - **No depth cap**, because the nested agent transcripts are the population that matters. Cap it
   and the container still dies at spawn with a sweep in the log saying it worked.
-- **`-name '*.jsonl'`**, because `<slug>/memory/` holds auto-memory as `.md` files and
-  `workflows/wf_*.json` are run records. The name is the guard; depth never was.
+- **`-name '*.jsonl'`**, because `<slug>/memory/` holds auto-memory as `.md` files. The name is
+  the guard; depth never was.
+- **`! -name journal.jsonl`**, and the sentence that used to stand here was wrong in a way that
+  cost a real defect. It said the harness keeps `workflows/wf_*.json` run records; there are none —
+  measured, zero anywhere under the root. What it writes is
+  `<slug>/<uuid>/subagents/workflows/wf_*/journal.jsonl`, 23 of them in this container, which
+  `*.jsonl` matches — and `swarm-status.sh` **discovers** every run by that exact name before
+  requiring the file. So the sweep archived the harness's own run state oldest-first on every
+  container start, and `swarm-status.sh <run>` answered `no swarm run found` for every past run.
+  The `agent-*.jsonl` transcripts in those same directories are the bulk of what must be swept, so
+  `workflows` cannot be pruned the way `memory` is: exactly one name is held back. The self-test
+  written to prevent this asserted the survival of a `wf_*.json` fixture — a shape no real tree
+  has — so it could not fail. A guard whose fixture models something that does not exist is not a
+  guard, and this is the third place that same wrong rule was written down.
 - **`memory/` pruned**, because under `-L` that per-repo symlink into the bind-mounted
   `~/.jkb/claude-memory` is followed like a real directory and the walk leaves the volume — into
   files the *host* owns.
