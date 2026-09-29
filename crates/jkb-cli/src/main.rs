@@ -3203,7 +3203,6 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
     }
 }
 
-
 /// The session ids this machine currently believes are live.
 ///
 /// **Read per tick, never cached.** A session that started since the last sweep is exactly the one
