@@ -3198,6 +3198,24 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
     }
 }
 
+/// How recently a session must have been SEEN to count as live.
+///
+/// **Absence of an end record is not life, and treating it as life caused the failure this whole
+/// feature prevents.** A container session ends without its `SessionEnd` hook whenever the container
+/// is stopped — every rebuild, and the documented E2BIG recovery, which is `run.sh` recreating it.
+/// Those rows can never be closed afterwards: the liveness probe needs the same instance, and a
+/// recreated container is a different one, so every orphan stays `ended_at IS NULL` until the
+/// 90-day prune. The reaper then handed those dead ids to the sweep, which protects the whole
+/// subtree under each (`<slug>/<id>/subagents/**` — the bulk of the population). Three or four
+/// orphaned swarm sessions exceed the entire budget on their own: the sweep reclaims nothing,
+/// reports a floor that "lapses" when this share does not, and every Bash call goes on dying at
+/// spawn. Reached by the recovery step the record tells the operator to run.
+///
+/// Six refresh windows, derived from the registry's own cadence rather than picked: a row is
+/// refreshed at most once an hour, so six hours of silence is not evidence of life. Over-keeping is
+/// only the safe direction while it LAPSES.
+const LIVE_SEEN_WITHIN_MS: i64 = jkb_core::claude_session::SEEN_REFRESH_MS * 6;
+
 /// The session ids this machine currently believes are live.
 ///
 /// **Read per tick, never cached.** A session that started since the last sweep is exactly the one
@@ -3210,16 +3228,29 @@ fn live_sessions(db_path: &Path) -> Vec<String> {
     let Ok(db) = open_db(db_path) else {
         return Vec::new();
     };
+    let now = jkb_core::mq::now_ms();
     db.read(|conn| jkb_core::claude_session::list(conn, false, None))
-        .map(|page| {
-            let mut ids: Vec<String> = page.rows.into_iter().map(|r| r.session).collect();
-            // One id per session however many processes hold it, and a stable order so two ticks
-            // that see the same sessions send the same string.
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        })
+        .map(|page| live_ids(page.rows, now))
         .unwrap_or_default()
+}
+
+/// Which of the registry's open rows are evidence of a session that is actually running.
+///
+/// Pure, and separated for that reason: the rule it applies is the one whose first version caused
+/// the failure the sweep exists to prevent, and a rule that important should be drivable from
+/// literals rather than reachable only through a database.
+fn live_ids(rows: Vec<jkb_core::claude_session::HolderRow>, now: i64) -> Vec<String> {
+    let cutoff = now.saturating_sub(LIVE_SEEN_WITHIN_MS);
+    let mut ids: Vec<String> = rows
+        .into_iter()
+        .filter(|r| r.seen_at >= cutoff)
+        .map(|r| r.session)
+        .collect();
+    // One id per session however many processes hold it, and a stable order so two ticks that see
+    // the same sessions send the same string.
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// A failure message's STANDING-CONDITION key: its digit runs masked.
@@ -4232,6 +4263,55 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A ROW WITH NO END RECORD IS NOT A LIVE SESSION. A container session ends without its
+    /// `SessionEnd` hook whenever the container is stopped — every rebuild, and the documented
+    /// E2BIG recovery — and those rows can never be closed afterwards, so they sat open for the
+    /// 90-day prune. The sweep protects the whole subtree under each id, and three or four orphaned
+    /// swarm sessions exceed the entire budget: the sweep then reclaimed nothing and every Bash call
+    /// went on dying at spawn, reached by the recovery step the record tells the operator to run.
+    #[test]
+    fn a_session_nobody_has_seen_for_hours_stops_holding_its_transcripts() {
+        use jkb_core::claude_session::HolderRow;
+        let row = |session: &str, seen_at: i64| HolderRow {
+            session: session.to_owned(),
+            pid: String::new(),
+            instance: String::new(),
+            cwd: String::new(),
+            started_at: None,
+            start_source: None,
+            seen_at,
+            ended_at: None,
+            end_reason: None,
+        };
+        let now = 1_000_000_000_000;
+        let hour = jkb_core::claude_session::SEEN_REFRESH_MS;
+        let got = super::live_ids(
+            vec![
+                row("fresh", now - 60_000),
+                row("an-hour-idle", now - hour),
+                // Orphaned by a container recreate: open for ever, and the shape that caused it.
+                row("orphaned-weeks-ago", now - hour * 24 * 14),
+                // One session, two processes holding it: one id out.
+                row("fresh", now - 120_000),
+            ],
+            now,
+        );
+        assert_eq!(got, vec!["an-hour-idle", "fresh"], "sorted and deduped");
+        assert!(
+            !got.iter().any(|id| id == "orphaned-weeks-ago"),
+            "an unclosable row must stop protecting, or the sweep can never reclaim"
+        );
+        // ...and the boundary is the cutoff itself, not something either side of it.
+        let edge = super::live_ids(
+            vec![
+                row("just-inside", now - super::LIVE_SEEN_WITHIN_MS),
+                row("just-outside", now - super::LIVE_SEEN_WITHIN_MS - 1),
+            ],
+            now,
+        );
+        assert_eq!(edge, vec!["just-inside"]);
+    }
 
     /// THE REPORTING RULE, driven for every outcome. Nothing executed it before: the seam stopped
     /// one level lower, at `sweep_with`, so the loop's own discipline — say what CHANGED — was

@@ -822,6 +822,32 @@ fi
 if [ -n "$sweep_at" ]; then
     grep -qF -- '-e "JKB_KEEP_SESSIONS=' <<<"$(sed -n "${sweep_at}p" <<<"$run_stripped")" \
         || sweep_problems="$sweep_problems run.sh sweeps without passing the live-session list, so on a container that was already running a live transcript can be archived out from under its session;"
+    # ...AND THE LIST IS ACTUALLY DERIVED. The flag alone pins nothing that matters: delete the six
+    # lines that fill `sweep_keep` and `-e "JKB_KEEP_SESSIONS=$sweep_keep"` still passes an empty
+    # string for ever, with this guard reporting the protection it no longer has. Reproduced: the
+    # composed assertion stayed `ok` and check-config's output was byte-identical to the unmutated
+    # tree's.
+    grep -qF -- 'jkb notify sessions --json' <<<"$run_stripped" \
+        || sweep_problems="$sweep_problems run.sh never asks jkb which sessions are live, so the list it passes is empty on every start and the protection exists in name only;"
+    # ...AND IT READS THE FIELD THE API ACTUALLY EMITS. `jq -r '.[].session'` is a second, uncompared
+    # spelling of `ClaudeSession::session`; a serde rename there makes jq emit nothing for every row,
+    # the list is permanently empty, and every guard above still passes. Held to the Rust the way
+    # HELD_NAME is held to swarm-status.sh.
+    rs_session_field="$(grep -oE '^\s*pub session: String,' \
+        "$here/../crates/jkb-api/src/lib.rs" 2>/dev/null | head -1 | sed -E 's/.*pub ([a-z_]+):.*/\1/')"
+    rs_session_rename="$(grep -B 1 -E '^\s*pub session: String,' \
+        "$here/../crates/jkb-api/src/lib.rs" 2>/dev/null | grep -oE 'rename = "[^"]+"' | head -1 \
+        | sed -E 's/rename = "(.*)"/\1/')"
+    dc_session_key="${rs_session_rename:-$rs_session_field}"
+    if [ -z "$dc_session_key" ]; then
+        sweep_problems="$sweep_problems the session id's field cannot be read from jkb-api, so nothing holds run.sh's jq filter to what the API emits;"
+    else
+        # THE CLOSING QUOTE IS PART OF THE NEEDLE. Without it `.[].session` matches `.[].session_id`
+        # as a substring and the mutation that renames the field goes MISSED — the same shape as
+        # `accept_bad` satisfying a search for `bad`, which this file has already been bitten by.
+        grep -qF -- ".[].$dc_session_key'" <<<"$run_stripped" \
+            || sweep_problems="$sweep_problems run.sh reads a session field the API does not emit (it emits '$dc_session_key'), so the live-session list is empty on every start;"
+    fi
 fi
 
 # AND THE OPERATOR IS TOLD. run.sh discards the sweep's exit code with `|| true` -- correctly, since

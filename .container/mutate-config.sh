@@ -51,6 +51,9 @@ seed() {
     # ...and transcripts.rs, which owns the container name and the in-image path the host reaper
     # pokes -- check-config.sh holds both to run.sh and the Dockerfile.
     cp "$repo/crates/jkb-cli/src/transcripts.rs" "$work/t/crates/jkb-cli/src/"
+    # ...and jkb-api, which owns the JSON field name run.sh's jq filter reads.
+    mkdir -p "$work/t/crates/jkb-api/src"
+    cp "$repo/crates/jkb-api/src/lib.rs" "$work/t/crates/jkb-api/src/"
     # ...and swarm-status.sh, which OWNS the name the transcript sweep has to spare: check-config.sh
     # reads it out of that file's discovery predicate rather than spelling it. Without this in the
     # copy the extraction reads nothing, which is a failure by design -- so it would redden the
@@ -681,6 +684,38 @@ open(p, 'w').write(s.replace(old, '', 1))
 PYX
 run "run.sh sweeps without telling the container which sessions are live" "sweeps without passing the live-session list"
 
+# ...AND THE DERIVATION BEHIND THE FLAG. Deleting the block that fills it leaves `-e
+# "JKB_KEEP_SESSIONS=$sweep_keep"` passing an empty string for ever, with the guard above reporting
+# a protection that no longer exists -- a one-line reversion to the unprotected state.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'jkb notify sessions --json'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'true --no-sessions', 1))
+PYX
+run "run.sh stops asking jkb which sessions are live" "never asks jkb which sessions are live"
+
+# ...AND THE FIELD IT READS. `jq -r '.[].session'` is a second spelling of ClaudeSession::session; a
+# serde rename makes jq emit nothing for every row and the list is empty on every start.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ".[].session"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, ".[].session_id", 1))
+PYX
+run "run.sh reads a session field the API does not emit" "reads a session field the API does not emit"
+
+seed; python3 - "$work/t/crates/jkb-api/src/lib.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    pub session: String,"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '    #[serde(rename = "session_id")]\n    pub session: String,', 1))
+PYX
+run "the API renames the session field out from under run.sh" "reads a session field the API does not emit"
+
 # THE REAPER'S QUIET-TICK PHRASES going unread, the last extraction-read-nothing branch with no
 # mutation of its own.
 seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
@@ -747,6 +782,8 @@ PYX
 run "verify.sh renames the handle its deny-list block is read by" "has no deny-list block to read"
 
 # BOTH HALVES OF "NO SWEEP CAN FIX THIS". verify.sh decides exit 3 against exit 1 on that sentence,
+# which is the difference between a remedy that applies and three that do not (both codes refuse a
+# window; run.sh tests `-ne 0`),
 # and the floor half is the one that shipped unwatched: with it gone, the window the README says this
 # closed reports an unhelpable tree as a broken boundary and run.sh refuses to open a window.
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
@@ -1670,7 +1707,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=103
+PINNED_SWEEP_APPENDS=109
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

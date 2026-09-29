@@ -1581,7 +1581,9 @@ planned` stays in the summary as information rather than as the verdict.
 Three consequences of that block, all of the same family — a report is only as good as what it can
 tell apart:
 
-- **The unhelpable state was diagnosed too late.** `accept_bad` (exit 3, "a condition to act on")
+- **The unhelpable state was diagnosed too late.** `accept_bad` (exit 3, "a condition to act on";
+  both codes refuse a window — `run.sh` tests `-ne 0` — and what exit 3 changes is which refusal
+  the operator is given)
   was selected by a message that tested the run journals *alone*. But the residual after a full plan
   is those journals **plus the newest `KEEP_NEWEST`**, which crosses 65,536 at roughly 161 journals
   while a journals-only test only speaks past about 199 — and a container reaches the first on its
@@ -1848,11 +1850,65 @@ Three more worth keeping:
   today. The pin lives in `common/` now and `assert_jkb_isolated` asserts it, which is what makes a
   third fixture unable to arrive without it. Verified by deleting it from one fixture and watching
   that fixture's own isolation test go red.
-- **The five-way budget classifier was executed by nothing.** It decides exit 1 against exit 3 —
-  whether `run.sh` opens a window — and a one-token flip in any arm changed that with every gate
-  green. It is a pure `sweep_verdict()` now, driven from nine literal rows in `verify.sh --self-test`
+- **The five-way budget classifier was executed by nothing.** It decides exit 1 against exit 3,
+  and a one-token flip in any arm changed that with every gate green. What that code actually
+  buys was overstated here and in three other places as "whether `run.sh` opens a window": it does
+  not — `run.sh` refuses on ANY non-zero verify (`run.sh:1045`). Exit 3 changes which refusal the
+  operator reads, which for the transcript floor is the difference between one remedy that applies
+  and three that do not. Corrected in place rather than quietly, because the overstatement was the
+  stated justification for the classifier's guards. It is a pure `sweep_verdict()` now, driven from nine literal rows in `verify.sh --self-test`
   (which the gate already runs and which needs no container); three arm mutations confirm the rows
   discriminate. Defining it *above* the self-test block was not incidental: the block exits before
   anything below it is read, and bash resolves a function at call time, so a use above its
   definition is an empty result rather than an error — the mistake `check-config.sh` records making
   three times with one helper, and which I made once here before moving it.
+
+**Round 11 — and the protection added to prevent data loss could cause the E2BIG instead.**
+
+`live_sessions` asked the registry for rows with `ended_at IS NULL` and called them live. But a
+container session ends **without its `SessionEnd` hook** whenever the container is stopped — every
+rebuild, and the documented E2BIG recovery, which is `run.sh` recreating the container. Those rows
+can never be closed afterwards: the liveness probe needs the same instance, and a recreated container
+is a different one, so an orphan stays open until the 90-day prune. For those 90 days the reaper
+handed the dead ids to the sweep, which protects the whole subtree under each — and
+`<slug>/<id>/subagents/**` is, in the walk's own words, the bulk of the population. Three or four
+orphaned swarm sessions exceed the entire 65,536-byte budget on their own: the sweep reclaims
+nothing, reports a floor it says "lapses" when this share never does, and every Bash call goes on
+dying at spawn. **Reached by the recovery step this document tells the operator to run.**
+
+The keep list is a liveness claim now, not an absence-of-an-end-record: a row must have been *seen*
+within six of the registry's own refresh windows (`SEEN_REFRESH_MS * 6`, derived rather than picked —
+a row refreshes at most hourly, so six hours of silence is not evidence of life). Over-keeping is
+only the safe direction *while it lapses*. The decision is a pure `live_ids(rows, now)` so the rule
+whose first version caused this is drivable from literals, including at the cutoff itself.
+
+**And `verify.sh` measured a different tree from the one the sweep had just acted on.** It runs the
+sweep's `--dry-run` to report the budget, and `run.sh` passed it no keep list — so a container held
+down by live sessions came out `over` (exit 1) instead of `beyond` (exit 3), with a FAIL naming the
+floor, an unwritable archive and colliding destinations, none of which applied, while the real cause
+— a live session holding its whole subagent subtree, precisely what the keep list exists for — was
+not among them. Reproduced at 120 subagent transcripts under one live session plus 40 archivable,
+budget 30,000: `beyond` with the list, `over` without it. The verify exec carries the same `-e` now.
+
+**A claim this record repeated four times was simply false.** "exit 1 refuses a window, exit 3 does
+not" — `run.sh` refuses on **any** non-zero verify (`run.sh:1045`). Exit 3 changes *which refusal*
+the operator reads, which for the transcript floor is the difference between one remedy that applies
+and three that do not. That is still worth a classifier and its guards; it is not what was written
+down, and the overstatement was the stated justification for them.
+
+Two guards were pinning a spelling against nothing:
+
+- The fixture's no-real-container pin named `JKB_CONTAINER_NAME` as a literal compared to nothing in
+  `transcripts.rs`. Rename `CONTAINER_NAME_VAR` and `dev_container_name()`'s test follows the
+  constant, `assert_jkb_isolated` compares the stale literal it set itself against the stale literal
+  it expects, and `check-config.sh` compares only the default *value* — every guard green while
+  `cargo test` goes back to archiving the developer's live transcripts. The fixture module is
+  compiled into the bin's test build, so the two spellings are now one assertion.
+- The live-session guard pinned only that `-e "JKB_KEEP_SESSIONS=` appears on the sweep line. Delete
+  the six lines that *fill* it and the flag passes an empty string for ever, with the guard
+  reporting a protection that no longer exists — reproduced, and check-config's output was
+  byte-identical to the unmutated tree's. The derivation is pinned now, and so is the JSON field
+  `jq` reads, held to `ClaudeSession`'s serde name the way `HELD_NAME` is held to `swarm-status.sh`.
+  Writing that guard reproduced this branch's most-repeated bug in miniature: `.[].session` matched
+  `.[].session_id` as a substring, so the rename mutation went MISSED until the closing quote joined
+  the needle — the same shape as `accept_bad` satisfying a search for `bad`.

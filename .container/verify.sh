@@ -380,7 +380,8 @@ REC
 # and the rows would have passed nothing while printing five failures about a correct file.
 # check-config.sh records making this exact mistake three times with one helper.
 # WHICH VERDICT A SWEEP RUN DESERVES — a pure function of its exit code and its output, because
-# this decision drives what `run.sh` does (exit 1 refuses a window, exit 3 does not) and nothing
+# this decision drives what `run.sh` SAYS (exit 3 changes the refusal's wording and its advice;
+# it does NOT open a window — run.sh refuses on any non-zero, run.sh:1045) and nothing
 # executed it. Five arms, each a one-token flip away from the wrong container behaviour, and the
 # static guards can only see that the arms exist. Defined before its caller and driven by
 # `--self-test`, which needs no container.
@@ -424,7 +425,9 @@ if [ "$SELF_TEST" = yes ]; then
     done
 
     echo "==> verify.sh self-test: the transcript-budget verdict"
-    # THE DECISION run.sh READS. exit 1 refuses a window and exit 3 does not, so a one-token flip in
+    # THE DECISION run.sh READS. Both codes refuse a window — run.sh:1045 tests `-ne 0` — and what
+    # exit 3 changes is WHICH REFUSAL the operator is given, which for the transcript floor is the
+    # difference between a remedy that applies and three that do not. A one-token flip in
     # any arm changes what the container does — and until this existed the whole five-way chain was
     # executed by nothing, with the static guards able to see only that the arms were present.
     # Literal inputs, so no container and no Docker are needed.

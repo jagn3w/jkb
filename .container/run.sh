@@ -1083,7 +1083,15 @@ in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .con
 # way to fix it. The exit code is still verify's, at the very end.
 say "verify"
 verify_rc=0
-in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
+# ...AND IT GETS THE SAME KEEP LIST THE SWEEP GOT. verify.sh measures the deny list by running
+# the sweep's own `--dry-run`, and without the ids it measured a DIFFERENT tree from the one the
+# real sweep had just acted on: a container held down by live sessions came out `over budget`
+# (exit 1) instead of `beyond any sweep` (exit 3), and the FAIL named the floor, an unwritable
+# archive and colliding destinations — none of which applied, while the actual cause, a live
+# session holding its whole subagent subtree, was not among them. Reproduced against the real
+# scripts: 120 subagent transcripts under one live session, 40 archivable, budget 30000 —
+# `beyond` with the list, `over` without it.
+in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
 
 say "attached VS Code windows"
 cat <<EOF
