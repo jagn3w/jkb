@@ -43,22 +43,13 @@ fn jkb_bare() -> Command {
     // transcripts on every tick, and the test below spawns that loop as a REAL child with the
     // developer's own environment — so without this the first pass ran `docker exec … jkb-dev`
     // against the container the developer is working in and archived their live transcripts out of
-    // `~/.claude-state`, with `watch.kill()` able to orphan the exec mid-archive. A name nothing
-    // can create makes `docker inspect` fail, which the sweep reads as "no such container".
-    cmd.env(
-        jkb_transcripts_container_var(),
-        "jkb-test-no-such-container",
-    );
+    // `~/.claude-state`, with `watch.kill()` able to orphan the exec mid-archive. Pointed at a name
+    // nothing can create, the probe lists no such container and the sweep answers `Absent`.
+    //
+    // In `common`, not here: it was spelled in this fixture alone while `sessions.rs` built its own
+    // `jkb` without it, and `assert_jkb_isolated` — the oracle both already run — did not look.
+    common::isolate_container_env(&mut cmd);
     cmd
-}
-
-/// The variable `transcripts.rs` takes the dev container's name from.
-///
-/// Spelled here as its own literal rather than read from the crate: a fixture that imports the
-/// constant production reads cannot fail when production renames it, and what this fixture is
-/// protecting is the developer's own transcripts.
-fn jkb_transcripts_container_var() -> &'static str {
-    "JKB_CONTAINER_NAME"
 }
 
 fn db_path(dir: &TempDir) -> std::path::PathBuf {
@@ -2982,31 +2973,6 @@ fn sync_keeps_two_tasks_files_in_one_directory_apart() {
 /// The fixture above must not hand the developer's repository selection to the `jkb` it spawns,
 /// and thence to every `git` that `jkb` spawns. Named at THIS call site, not at
 /// `isolate_git_env`: a test of the helper alone stayed green with the call deleted.
-#[test]
-fn the_cli_fixture_cannot_reach_a_real_dev_container() {
-    // `task reap --watch` sweeps the dev container's transcripts on every tick, and
-    // `compaction_failure_does_not_end_the_watch` spawns that loop as a REAL child carrying this
-    // fixture's environment. Without an override the first pass ran `docker exec … jkb-dev` against
-    // the container the developer is working in and archived their live transcripts — a test suite
-    // that destroys real data, and one whose damage is invisible until somebody wants `/resume`.
-    //
-    // Asserted on the BUILT command, so deleting the env from `jkb_bare` reddens here rather than
-    // in somebody's `~/.claude-state`. The variable and the sentinel are written as literals: a
-    // test that reads what production reads cannot fail when production is wrong.
-    let tmp = TempDir::new().unwrap();
-    let cmd = jkb(&tmp.path().join("x.db"));
-    let got = cmd
-        .get_envs()
-        .find(|(k, _)| k.to_string_lossy() == "JKB_CONTAINER_NAME")
-        .and_then(|(_, v)| v)
-        .map(|v| v.to_string_lossy().into_owned());
-    assert_eq!(
-        got.as_deref(),
-        Some("jkb-test-no-such-container"),
-        "the cli fixture must point the transcript sweep at a container nothing can create"
-    );
-}
-
 #[test]
 fn the_cli_fixture_does_not_inherit_a_repository() {
     let tmp = TempDir::new().unwrap();

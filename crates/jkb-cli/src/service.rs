@@ -332,7 +332,13 @@ fn launchd_reap_plist(exe: &Path, db: &Path) -> String {
          the second trigger is dead on exactly the machine this project is developed on, and the
          only symptom is a container that fills up — which is the failure it exists to prevent.
          /opt/homebrew/bin for Apple silicon, /usr/local/bin for Intel and for Docker Desktop's own
-         symlink. -->
+         symlink.
+
+         THE SYSTEMD UNIT DELIBERATELY HAS NO EQUIVALENT, and the asymmetry is the point: there
+         `Environment=PATH=` REPLACES the inherited value, whose compiled default already carries
+         /usr/local/bin:/usr/bin:/bin — so it could not help and could subtract, taking `git` with
+         it on a host that had imported a richer PATH. Here the value is a superset of launchd's
+         own minimal default, so it can only add. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -364,7 +370,6 @@ fn systemd_reap_unit(exe: &Path, db: &Path) -> String {
          [Service]\n\
          Type=simple\n\
          ExecStart={exe} --db {db} task reap --watch\n\
-         Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -512,11 +517,15 @@ mod tests {
         let unit = systemd_reap_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
         assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
-        // THE TICK SHELLS OUT to `docker`, and a systemd user unit inherits a minimal PATH. The
-        // launchd side has the same need for the same reason; see its plist.
+        // NO `Environment=PATH=` HERE, deliberately, and the launchd side is not the same case.
+        // systemd's `Environment=` REPLACES the inherited value rather than extending it, and its
+        // compiled default already carries /usr/local/bin:/usr/bin:/bin — so the line could never
+        // make `docker` reachable where it was not, and on a host that had imported a richer PATH
+        // (rootless Docker in ~/bin, a Nix profile) it SUBTRACTED: `docker` still missing, and
+        // `git` — which every worktree archive shells out to — missing as well.
         assert!(
-            unit.contains("Environment=PATH="),
-            "the reaper must be able to find docker: {unit}"
+            !unit.contains("Environment=PATH="),
+            "a replaced PATH can only subtract here: {unit}"
         );
     }
 

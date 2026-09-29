@@ -1805,3 +1805,54 @@ output when the daemon **answered**, so silence is earned rather than assumed, a
 templates carry a PATH. And the "no sweep can remove" message named two of its three terms, omitting
 the one that usually dominates and is the only one that *lapses* — half an hour after a swarm the
 operator was told to delete run journals worth a few hundred bytes when the answer was to wait.
+
+**Round 10 — the first to review only fixes, and it found a must-fix anyway.** I had said the
+previous round's size tracked how much *new code* a round saw. That was wrong, and the way it was
+wrong matters: the must-fix here was a **consequence of round 9's own fix**.
+
+Round 9 stopped `run.sh` sweeping when the container was already running, because that path passes
+no live-session list and its only safety was the premise *nothing is open at container start*. True
+as far as it went — and it traded a rare loss for a common one. A container up for days, or started
+from Docker Desktop, was then swept by **nothing** on that path: the window stayed refused, and
+re-running `run.sh` — the documented recovery for the very E2BIG this exists to prevent — stopped
+recovering. Two messages also became false where they printed. `verify.sh` told the operator to look
+for `could not create` in the scroll-back of a sweep that never ran, and the skip line asserted that
+the reaper's tick owned the container, which `run.sh` never checked and which is false whenever
+`setup.sh --no-service` was used or the unit is stopped.
+
+The fix is to stop skipping and start passing: `run.sh` now reads the same registry the reaper does,
+through the daemon that already holds it, and hands the ids over with `docker exec -e`. `in_container`
+is a plain `docker exec`, so `-e` reaches it where a shell prefix would set the variable for the
+Docker CLI and never enter the container. An empty list is the safe direction and the one the reaper
+also takes when it cannot read: the recency window and the floor still stand.
+
+That also settles what `JKB_KEEP_SESSIONS` **is**. It had been filed with the four switch-it-off test
+seams and refused in any shipped file — with a message saying it silently disables the sweep, which
+is false for this one variable and would have refused the thing `run.sh` is supposed to do. `SEAMS`
+now names the four that must never appear in a shipped file; `INPUTS` names every `JKB_` the script
+reads. The agreement check and the self-test's neutralisation cover `INPUTS`; only `SEAMS` earns the
+blanket refusal.
+
+Three more worth keeping:
+
+- **A `PATH` that could only subtract.** The systemd reap unit got `Environment=PATH=` alongside the
+  launchd one, and the two are not the same case: systemd *replaces* the inherited value, and its
+  compiled default already carries `/usr/local/bin:/usr/bin:/bin`. So it could never make `docker`
+  reachable where it was not — and on a host that had imported a richer `PATH` (rootless Docker in
+  `~/bin`, a Nix profile) it removed `git`, which every worktree archive shells out to. Dropped from
+  systemd, kept on launchd where the new value is a superset of launchd's own minimal default and
+  can only add.
+- **The container pin was on one of two fixtures.** `sessions.rs` builds its own `jkb` and did not
+  get it, and the oracle both fixtures already run did not look — so the guard test read green over
+  half the surface. It is harmless only because `sessions.rs` happens to call `task reap` one-shot
+  today. The pin lives in `common/` now and `assert_jkb_isolated` asserts it, which is what makes a
+  third fixture unable to arrive without it. Verified by deleting it from one fixture and watching
+  that fixture's own isolation test go red.
+- **The five-way budget classifier was executed by nothing.** It decides exit 1 against exit 3 —
+  whether `run.sh` opens a window — and a one-token flip in any arm changed that with every gate
+  green. It is a pure `sweep_verdict()` now, driven from nine literal rows in `verify.sh --self-test`
+  (which the gate already runs and which needs no container); three arm mutations confirm the rows
+  discriminate. Defining it *above* the self-test block was not incidental: the block exits before
+  anything below it is read, and bash resolves a function at call time, so a use above its
+  definition is an empty result rather than an error — the mistake `check-config.sh` records making
+  three times with one helper, and which I made once here before moving it.

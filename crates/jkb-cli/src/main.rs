@@ -3196,12 +3196,8 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
         Ok(()) => *last = now,
         Err(e) => eprintln!("git-audit: could not post its notification: {e:#}"),
     }
+}
 
-/// One tick's worth of the dev container's transcripts, and what reaches the log.
-///
-/// Extracted from the watch loop for length, but it earns a name anyway: the interesting thing here
-/// is the reporting rule, which is the loop's own — say what CHANGED. A container that is not there,
-/// or had nothing to do, says nothing at all, because this runs every quarter hour for ever.
 /// The session ids this machine currently believes are live.
 ///
 /// **Read per tick, never cached.** A session that started since the last sweep is exactly the one

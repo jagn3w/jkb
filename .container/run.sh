@@ -1052,21 +1052,28 @@ in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 # 2026-09-28; sweep-transcripts.sh carries the numbers). Never fatal: what it could not archive it
 # says, and a deny list slightly too long is the state we were already in.
 #
-# ...AND ONLY WHEN NOTHING IS OPEN IN IT, which is the premise the sweep's own floor rests on. This
-# ran on the ALREADY-RUNNING path too — `run.sh` against a live container prints "is already
-# running" and falls through here — and it passes no `JKB_KEEP_SESSIONS`, so the live-session
-# protection the reaper's tick carries does not exist on this path. An agent blocked on a
-# permission prompt for seventy minutes, or a session left attached overnight, is outside the
-# recency window; after a swarm the newest-32 floor is spent on subagent files; and `run.sh` in the
-# morning to open a window would archive `<slug>/<uuid>.jsonl` out from under a live session and
-# sever `/resume`. The reaper sweeps a running container every tick WITH the registry's ids, so the
-# start trigger is needed only when the container was not running — and then "nothing is open" is
-# true by construction rather than by assumption.
-if [ "$state" = running ]; then
-    say "skip transcript sweep: $NAME was already running, so the reaper's tick owns it (it passes the live-session list; this path cannot)"
-else
-    in_container -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
+# ...AND IT CARRIES THE LIVE-SESSION LIST, which is what lets it run on every path. It did not, and
+# the repair for that was to skip the sweep when the container was ALREADY running — on the ground
+# that "nothing is open at container start" is only true when the container just started. That
+# traded a rare loss for a common one: a container up for days, or started from Docker Desktop, was
+# then swept by nothing on this path, the window stayed refused, and the documented recovery for the
+# very E2BIG this exists to prevent — re-running run.sh — no longer recovered. Worse, the skip
+# asserted that the reaper's tick owned the container, which this script never checked and which is
+# false whenever `setup.sh --no-service` was used or the unit is stopped.
+#
+# So the list comes from the same registry the reaper reads, through the daemon that already holds
+# it. Empty is the safe direction and the one the reaper also takes when it cannot read: the recency
+# window and the floor still stand. `-e` reaches `in_container` because that is a plain `docker
+# exec`; a shell prefix would set the variable for the docker CLI and never enter the container.
+sweep_keep=""
+if command -v jkb >/dev/null 2>&1; then
+    sweep_sessions="$(jkb notify sessions --json 2>/dev/null || true)"
+    if [ -n "$sweep_sessions" ]; then
+        sweep_keep="$(printf '%s' "$sweep_sessions" | jq -r '.[].session' 2>/dev/null \
+            | LC_ALL=C sort -u | tr '\n' ' ' || true)"
+    fi
 fi
+in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
 
 # ONE VERIFIER, AFTER BOTH ARMS. It used to be the last line of setup.sh on the fresh path and a
 # separate call here on the restart path — so the review's "a fatal verify suppresses everything

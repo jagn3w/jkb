@@ -375,6 +375,33 @@ REC
 # hypothetical — the `^/dev` / `/devtools` class above is the same file's own history.
 # mutate-verify.sh would catch it, but mutate-verify.sh needs a Docker host and is not in the
 # gate. This is, and it costs nothing.
+# DEFINED ABOVE THE SELF-TEST, which exits before anything below it is read. Bash resolves a
+# function at call time, so a use above its definition is not an error but an EMPTY result --
+# and the rows would have passed nothing while printing five failures about a correct file.
+# check-config.sh records making this exact mistake three times with one helper.
+# WHICH VERDICT A SWEEP RUN DESERVES — a pure function of its exit code and its output, because
+# this decision drives what `run.sh` does (exit 1 refuses a window, exit 3 does not) and nothing
+# executed it. Five arms, each a one-token flip away from the wrong container behaviour, and the
+# static guards can only see that the arms exist. Defined before its caller and driven by
+# `--self-test`, which needs no container.
+sweep_verdict() { # sweep_verdict <rc> <output> -> unmeasured|healthy|beyond|over|unanswerable
+    case "$2" in
+        # A root that is not there was never measured; one that is there and EMPTY was — zero bytes,
+        # and that is every freshly created container.
+        *"does not exist"*) printf 'unmeasured\n'; return ;;
+    esac
+    [ "$1" -eq 0 ] && { printf 'healthy\n'; return; }
+    case "$2" in
+        # Beyond any sweep is a condition to act on, not a broken boundary: exit 3, not exit 1.
+        *"cannot bring this tree under it"*) printf 'beyond\n'; return ;;
+        # The sweep names E2BIG only when it is giving a BUDGET verdict. Anything else non-zero is
+        # the sweep failing to answer at all — a containment refusal, a resolver failure with no
+        # output, a syntax error — and reporting that as "over budget" asserts a pass that never ran.
+        *"E2BIG"*) printf 'over\n'; return ;;
+    esac
+    printf 'unanswerable\n'
+}
+
 if [ "$SELF_TEST" = yes ]; then
     st_fail=0
     st() { # st <mount point> <owned|checked>
@@ -395,6 +422,42 @@ if [ "$SELF_TEST" = yes ]; then
              /home/vscode/repos /home/vscode/.jkb /host; do
         st "$p" checked
     done
+
+    echo "==> verify.sh self-test: the transcript-budget verdict"
+    # THE DECISION run.sh READS. exit 1 refuses a window and exit 3 does not, so a one-token flip in
+    # any arm changes what the container does — and until this existed the whole five-way chain was
+    # executed by nothing, with the static guards able to see only that the arms were present.
+    # Literal inputs, so no container and no Docker are needed.
+    sv() { # sv <label> <rc> <output> <want>
+        got="$(sweep_verdict "$2" "$3")"
+        if [ "$got" = "$4" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
+        else printf '  \033[31mFAIL\033[0m %s\n         got:  %s\n         want: %s\n' "$1" "$got" "$4"; st_fail=$((st_fail+1)); fi
+    }
+    sv "a tree under budget is healthy" 0 \
+       "transcript sweep: 4100 deny bytes projected, budget 65536 — nothing to archive" healthy
+    # An EMPTY root has been measured — zero bytes — and that is every fresh container. Failing it
+    # reddens the happy path, and a gate that cries there is one people learn to skip.
+    sv "an empty but existing tree is healthy, not unmeasured" 0 \
+       "transcript sweep: no transcripts under /home/vscode/.claude/projects" healthy
+    sv "a root that is not there was never measured" 0 \
+       "transcript sweep: /x does not exist — nothing to sweep" unmeasured
+    # ...and that beats the exit code, because the sweep exits 0 when it found nothing to look at.
+    sv "...whatever the exit code says" 1 \
+       "transcript sweep: /x does not exist — nothing to sweep" unmeasured
+    sv "over budget is a budget verdict" 1 \
+       "transcript sweep: 80092 deny bytes remain after this sweep, over the 65536 byte budget — Bash may still fail at spawn with E2BIG" over
+    # BEYOND ANY SWEEP is exit 3, not exit 1: a condition to act on rather than a broken boundary.
+    # It must win over the over-budget arm, since the sweep prints both lines in that state.
+    sv "beyond any sweep outranks merely over budget" 1 \
+       "transcript sweep: 90000 deny bytes are in files no sweep can remove right now — archiving every transcript cannot bring this tree under it
+transcript sweep: 90000 deny bytes are projected and none of them can be archived, over the 65536 byte budget — Bash may still fail at spawn with E2BIG" beyond
+    # Everything else non-zero is the sweep not answering at all. Reported as "over budget" it
+    # asserted an archiving pass that never happened.
+    sv "a containment refusal is not a budget verdict" 1 \
+       "transcript sweep: archive /x is inside /y — each sweep would re-enumerate what the last one moved" unanswerable
+    sv "a sweep that printed nothing is not a budget verdict" 1 "" unanswerable
+    sv "a broken script is not a budget verdict" 2 \
+       "/usr/bin/bash: line 9: syntax error near unexpected token" unanswerable
 
     # Assertion 7's judgement, whose FAIL arm no container harness can reach (see
     # missing_extensions). `st` compares strings, so these read as the mount cases do.
@@ -1848,10 +1911,10 @@ if [ -f "$sweep_sh" ]; then
     # so `sweep_tail` is empty), a syntax error or an unreadable file (rc 2, bash's own message).
     # Each of those printed "the transcript deny list is over budget — <unrelated text or nothing>"
     # followed by a sentence asserting an archiving pass that never happened.
-    if [ "$sweep_dry_rc" -eq 0 ] \
-       && case "$sweep_dry" in *"does not exist"*) false ;; *) true ;; esac; then
+    sweep_v="$(sweep_verdict "$sweep_dry_rc" "$sweep_dry")"
+    if [ "$sweep_v" = healthy ]; then
         ok "the transcript deny list fits in one argv — $sweep_tail"
-    elif [ "$sweep_dry_rc" -eq 0 ]; then
+    elif [ "$sweep_v" = unmeasured ]; then
         # A SWEEP THAT FOUND NO TREE IS NOT A MEASURED PASS. It exits 0 for "nothing to sweep", and
         # the arm above printed `ok the transcript deny list fits in one argv` over a budget nobody
         # measured — the exact rule the sweep's own header states and that broke: a sweep that
@@ -1867,11 +1930,11 @@ if [ -f "$sweep_sh" ]; then
         bad "the transcript deny list was never measured — $sweep_tail
        The sweep found no tree to look at, so nothing here says whether Bash can spawn. Check that
        ~/.claude/projects exists and points into the state volume."
-    elif case "$sweep_dry" in *"E2BIG"*) false ;; *) true ;; esac; then
+    elif [ "$sweep_v" = unanswerable ]; then
         bad "the transcript sweep could not answer whether the deny list fits in one argv (exit $sweep_dry_rc) — ${sweep_tail:-it printed nothing}
        This is not a budget verdict: the sweep did not get far enough to give one. Run
        .container/sweep-transcripts.sh --dry-run by hand and read what it says."
-    elif case "$sweep_dry" in *"cannot bring this tree under it"*) true ;; *) false ;; esac; then
+    elif [ "$sweep_v" = beyond ]; then
         # THE SWEEP'S OWN SENTENCE, not a second copy of it. This kept its own enumeration of what
         # cannot be reclaimed, and went stale the moment a third term was added: it told the
         # operator to delete run journals when the real answer, half an hour after a swarm, is to

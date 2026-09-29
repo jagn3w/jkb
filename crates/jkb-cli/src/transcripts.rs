@@ -152,11 +152,16 @@ pub fn sweep_with(name: &str, live: &[String], run: Runner<'_>) -> Sweep {
     // exits 0 with EMPTY output when the daemon answered and there is no such container, so
     // silence is earned rather than assumed, and it lists only running containers, which is the
     // question anyway.
+    // THE FILTER ONLY NARROWS; the decision is the exact match below. `--filter name=` is a
+    // REGEX on the daemon's side, so an anchored `^…$` is the one part of this that could fail
+    // CLOSED — silently listing nothing, which reads as "no such container" — if a future Docker
+    // treats the anchors differently or a name ever carries a metacharacter. Unanchored it can
+    // only over-list, and over-listing is what the exact match is for.
     let probe = run(
         &[
             "ps",
             "--filter",
-            &format!("name=^{name}$"),
+            &format!("name={name}"),
             "--format",
             "{{.Names}}",
         ],
@@ -197,7 +202,13 @@ pub fn sweep_with(name: &str, live: &[String], run: Runner<'_>) -> Sweep {
         &["exec", "-i", "-e", &keep, name, "bash", "-s"],
         Some(SWEEP_SCRIPT),
     ) else {
-        return Sweep::Absent;
+        // NOT `Absent`. The probe just answered, so Docker is there and the container is running —
+        // a spawn that fails now is the client vanishing between two calls, not a host without
+        // containers, and `Absent` would lose the tick in silence. The round that stopped the
+        // probe arm absorbing this left the exec arm doing it.
+        return Sweep::Unreachable(format!(
+            "docker answered about {name} and then could not be run"
+        ));
     };
     if err == TIMED_OUT {
         return Sweep::Unreachable(format!("the sweep in {name} did not finish"));
@@ -446,7 +457,7 @@ mod tests {
         let calls = seen.borrow();
         assert_eq!(
             calls[0].0,
-            vec!["ps", "--filter", "name=^jkb-dev$", "--format", "{{.Names}}"]
+            vec!["ps", "--filter", "name=jkb-dev", "--format", "{{.Names}}"]
         );
         assert!(!calls[0].1, "the probe is asked nothing on stdin");
         assert_eq!(

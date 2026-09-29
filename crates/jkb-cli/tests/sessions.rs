@@ -107,6 +107,9 @@ fn jkb(db: Option<&Path>) -> Command {
     // probed for liveness on the host that issued it, so an unpinned name makes every
     // claim fixture `Unknown` and nothing is ever reclaimed.
     cmd.env("HOSTNAME", "host");
+    // This file spawns `jkb` too, and `task reap` here is one-shot only by accident of what
+    // it happens to call today. See `common::isolate_container_env`.
+    common::isolate_container_env(&mut cmd);
     cmd
 }
 

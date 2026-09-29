@@ -482,13 +482,13 @@ run "verify.sh demotes the accepted deny-list verdict to a note" "reaches no \`a
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'SEAMS="'
+old = 'INPUTS="$SEAMS '
 assert s.count(old) == 1, "mutation target absent"
 i = s.index(old) + len(old)
 j = s.index('"', i)
-open(p, 'w').write(s[:i] + s[i:j].split(' ', 1)[1] + s[j:])
+open(p, 'w').write(s[:i] + s[j:])
 PYX
-run "a seam the script reads is dropped from SEAMS" "so a seam is wired into no refusal"
+run "an input the script reads is dropped from INPUTS" "so an input is covered by neither"
 
 # ...and verify.sh, the caller that runs INSIDE the container, where a seam actually takes effect.
 seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
@@ -524,15 +524,27 @@ run "verify.sh classifies on a phrase the sweep does not print" "which sweep-tra
 seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-for old, new in (('*"does not exist"*) false ;; *) true ;;', '*) true ;;'),
-                 ('*"E2BIG"*) false ;; *) true ;;', '*) false ;;'),
-                 ('*"cannot bring this tree under it"*) true ;; *) false ;;', '*) true ;;'),
+for old, new in (('*"does not exist"*) printf', '*) printf'),
+                 ('*"cannot bring this tree under it"*) printf', '*) printf'),
+                 ('*"E2BIG"*) printf', '*) printf'),
                  ("grep -F 'no sweep can remove'", "head -0")):
     assert old in s, "mutation target absent"
     s = s.replace(old, new, 1)
 open(p, 'w').write(s)
 PYX
 run "verify.sh stops classifying on any phrase" "classifies on no phrase at all"
+
+# ...AND THE FUNCTION THAT DECIDES, renamed so the extraction reads nothing. The classifiers moved
+# into it when the chain was made pure, and the guard went on reading the reporting block -- where
+# there were then none left, so it established nothing and two mutations went MISSED.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'sweep_verdict() {'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'decide_sweep() {', 1))
+PYX
+run "the sweep verdict function is renamed, so the guard reads nothing" "no sweep_verdict() to read"
 
 # THE NAMES THAT MUST AGREE for the host reaper to reach this container at all. Each is silent
 # when wrong: a reaper poking a name nothing creates, or running a path the image does not carry,
@@ -663,11 +675,11 @@ run "the plan stops asking what a live session holds" "transcript_plan() does no
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'if [ "$state" = running ]; then\n    say "skip transcript sweep'
+old = '-e "JKB_KEEP_SESSIONS=$sweep_keep" '
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'if false; then\n    say "skip transcript sweep', 1))
+open(p, 'w').write(s.replace(old, '', 1))
 PYX
-run "run.sh sweeps a container that was already running" "without first asking whether the container was ALREADY running"
+run "run.sh sweeps without telling the container which sessions are live" "sweeps without passing the live-session list"
 
 # THE REAPER'S QUIET-TICK PHRASES going unread, the last extraction-read-nothing branch with no
 # mutation of its own.
@@ -1658,7 +1670,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=101
+PINNED_SWEEP_APPENDS=103
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

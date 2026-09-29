@@ -721,13 +721,18 @@ else
         # refused in no shipped file, move no pin and make no mutation MISSED, while this guard went
         # on reporting the whole property. Derived and compared, the way HELD_NAME already is
         # against swarm-status.sh.
+        # EVERY INPUT, not only the refusable seams. JKB_KEEP_SESSIONS is production input that
+        # both triggers pass, so it belongs to the agreement check and not to the blanket refusal.
+        sweep_inputs="$(grep -oE '^INPUTS="[^"]*"' <<<"$sweep_body" \
+            | sed -n '1s/^INPUTS="\(.*\)"/\1/p')"
+        sweep_inputs="${sweep_inputs//\$SEAMS/$sweep_seams}"
         sweep_reads="$(grep -oE '\$\{JKB_[A-Z_]+:-' <<<"$sweep_body" \
             | sed -E 's/^\$\{([A-Z_]+):-$/\1/' | LC_ALL=C sort -u | tr '\n' ' ')"
-        sweep_declared="$(printf '%s\n' $sweep_seams | LC_ALL=C sort -u | tr '\n' ' ')"
+        sweep_declared="$(printf '%s\n' $sweep_inputs | LC_ALL=C sort -u | tr '\n' ' ')"
         if [ -z "$sweep_reads" ]; then
             sweep_problems="$sweep_problems it reads no \${JKB_…:-} override at all, so the SEAMS declaration can no longer be checked against the code;"
         elif [ "$sweep_reads" != "$sweep_declared" ]; then
-            sweep_problems="$sweep_problems SEAMS declares [$sweep_declared] while the script reads [$sweep_reads], so a seam is wired into no refusal while this guard reports the whole property;"
+            sweep_problems="$sweep_problems INPUTS declares [$sweep_declared] while the script reads [$sweep_reads], so an input is covered by neither the shipped-file refusal nor the self-test neutralisation while this guard reports the whole property;"
         fi
         if [ -z "$sweep_seams" ]; then
             sweep_problems="$sweep_problems it has no SEAMS= line to read, so the check that no shipped file wires a self-test seam into the container establishes nothing;"
@@ -806,20 +811,17 @@ else
         || sweep_problems="$sweep_problems the reaper no longer feeds the sweep in on stdin, so it depends on a copy inside the container that an already-running one does not have;"
 fi
 
-# ...AND IT DOES NOT RUN WHEN SOMETHING MAY BE OPEN. The start trigger carries no live-session list
-# — `in_container` is plain `docker exec` with no `-e`, and the host script has no id list to pass —
-# so its safety rests entirely on "nothing is open at container start". That premise is false on the
-# already-running path, where `run.sh` prints "is already running" and falls straight through: an
-# agent blocked on a prompt past the recency window, with the floor spent on subagent files, loses
-# its transcript and its `/resume`. The reaper sweeps a running container every tick WITH the ids,
-# so this trigger is only needed when the container was not running.
+# ...AND IT CARRIES THE LIVE-SESSION LIST. Without it this trigger's only safety is "nothing is open
+# at container start", which is false whenever `run.sh` is pointed at a container that is ALREADY
+# running — up for days, or started from Docker Desktop. Skipping the sweep there was the first
+# repair and it was worse: the container was then swept by nothing on that path, the window stayed
+# refused, and re-running `run.sh` — the documented recovery for the very E2BIG this exists to
+# prevent — stopped recovering. So the list is passed instead, from the same registry the reaper
+# reads. `-e` and not a shell prefix: `in_container` is a plain `docker exec`, so a `VAR=… ` prefix
+# sets the variable for the docker CLI and never enters the container.
 if [ -n "$sweep_at" ]; then
-    # The few lines above it, not just the one: the sweep sits in the `else` of that test, so its
-    # immediate predecessor is `else` and the question is asked a little further back.
-    sweep_guard_from=$(( sweep_at > 6 ? sweep_at - 6 : 1 ))
-    sweep_guard_line="$(sed -n "${sweep_guard_from},${sweep_at}p" <<<"$run_stripped")"
-    grep -qE '\[ "\$state" (!)?= running \]' <<<"$sweep_guard_line" \
-        || sweep_problems="$sweep_problems run.sh sweeps without first asking whether the container was ALREADY running, and that path passes no live-session list, so a live transcript can be archived out from under a session;"
+    grep -qF -- '-e "JKB_KEEP_SESSIONS=' <<<"$(sed -n "${sweep_at}p" <<<"$run_stripped")" \
+        || sweep_problems="$sweep_problems run.sh sweeps without passing the live-session list, so on a container that was already running a live transcript can be archived out from under its session;"
 fi
 
 # AND THE OPERATOR IS TOLD. run.sh discards the sweep's exit code with `|| true` -- correctly, since
@@ -862,8 +864,18 @@ else
         # line out of the sweep's output to quote back to the operator. The second arrived when the
         # accepted arm stopped keeping its own copy of the causes, and it is the same coupling — a
         # sentence living in two files with nothing comparing them.
+        # FROM THE VERDICT FUNCTION AND THE REPORTING BLOCK BOTH. The classifying `case` arms moved
+        # into `sweep_verdict()` when that chain was made pure and testable, and this extraction
+        # went on reading only the reporting block — where there were then no `*"…"*` patterns
+        # left, so the check established nothing and two mutations went MISSED. Extracted by
+        # FUNCTION NAME, like the sweep's own, so it follows the code rather than a line range.
+        verify_decide="$(awk '/^sweep_verdict\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+            <<<"$verify_body")"
+        if [ -z "$verify_decide" ]; then
+            sweep_problems="$sweep_problems verify.sh has no sweep_verdict() to read, so nothing establishes which outcome of the sweep reaches which verdict;"
+        fi
         verify_markers="$(
-            { grep -oE '\*"[^"]+"\*' <<<"$verify_verdict" | sed -E 's/^\*"(.*)"\*$/\1/'
+            { grep -oE '\*"[^"]+"\*' <<<"$verify_decide$verify_verdict" | sed -E 's/^\*"(.*)"\*$/\1/'
               grep -oE "grep -F '[^']+'" <<<"$verify_verdict" | sed -E "s/^grep -F '(.*)'\$/\1/"
             } )"
         if [ -z "$verify_markers" ]; then

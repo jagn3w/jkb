@@ -67,7 +67,15 @@ TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-stat
 # HAND-WRITTEN, AND CHECKED AGAINST REALITY BY check-config.sh, which derives the same set from
 # every `${JKB_…:-}` this file actually reads and requires the two to agree. A declaration nothing
 # compares to the code is a fourth seam waiting to be refused by nothing.
-SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_KEEP_SESSIONS JKB_NOW_SECS"
+SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_NOW_SECS"
+# ...AND EVERY JKB_ INPUT, which is a longer list than the seams. JKB_KEEP_SESSIONS is NOT a
+# seam: it is the sweep's live production input, the sessions a caller knows to be running, and
+# both triggers pass it. Refusing it in shipped files -- the blanket rule the four above earn --
+# would refuse the thing run.sh is supposed to do, with a message saying it silently disables the
+# sweep, which is false for this one variable. It still needs the rest: check-config compares
+# this list against what the script actually reads, and --self-test neutralises all of it so a
+# developer's exported value cannot reach a row.
+INPUTS="$SEAMS JKB_KEEP_SESSIONS"
 
 # MAX_ARG_STRLEN on Linux: 32 pages. Recorded for the reader; the budget below is derived from it.
 ARGV_MAX_BYTES=131072
@@ -1150,10 +1158,11 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # macOS) treats an empty array under `set -u` as unbound.
     prog() {
         local envs=() unset_args=(-u CLAUDE_CONFIG_DIR) seam
-        # DERIVED FROM $SEAMS, not retyped. The list named three of four, so an exported
-        # JKB_KEEP_SESSIONS reached every row below -- and nothing but this comment would have
-        # stopped the next seam repeating it.
-        for seam in $SEAMS; do unset_args+=(-u "$seam"); done
+        # DERIVED FROM $INPUTS -- every JKB_ the script reads, not only the refusable ones --
+        # and not retyped. The list named three of four, so an exported JKB_KEEP_SESSIONS
+        # reached every row below, and nothing but this comment would have stopped the next
+        # one repeating it.
+        for seam in $INPUTS; do unset_args+=(-u "$seam"); done
         while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
         [ "$#" -eq 0 ] || shift
         env "${unset_args[@]}" ${envs[@]+"${envs[@]}"} bash "$self" "$@"
