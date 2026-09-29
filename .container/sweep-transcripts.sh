@@ -53,8 +53,10 @@ CLAUDE_BASE="${CLAUDE_CONFIG_DIR:-${HOME:-/home/vscode}/.claude}"
 TRANSCRIPT_ROOT="${JKB_TRANSCRIPT_ROOT:-$CLAUDE_BASE/projects}"
 TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-state/transcript-archive}"
 
-# THE SEAMS, NAMED ONCE AND IN ONE PLACE. All three exist for --self-test, which cannot drive this
-# file as a program without them, and every one of them can switch the sweep off: a root that does
+# THE SEAMS, NAMED ONCE AND IN ONE PLACE: every JKB_ input this file reads. Most exist for
+# --self-test, which cannot drive this file as a program without them; JKB_KEEP_SESSIONS is the
+# host reaper's, and belongs here for the same reason — every one of them can switch the sweep off
+# (a keep-list naming everything protects everything): a root that does
 # not exist, an archive somewhere harmless, or a budget nothing ever reaches all produce a start
 # that reports success for ever while the deny list grows. check-config.sh refuses every name on
 # this line in run.sh, the Dockerfile, container.json and entrypoint.sh, and reads the list from
@@ -65,7 +67,7 @@ TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-stat
 # HAND-WRITTEN, AND CHECKED AGAINST REALITY BY check-config.sh, which derives the same set from
 # every `${JKB_…:-}` this file actually reads and requires the two to agree. A declaration nothing
 # compares to the code is a fourth seam waiting to be refused by nothing.
-SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES"
+SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_KEEP_SESSIONS"
 
 # MAX_ARG_STRLEN on Linux: 32 pages. Recorded for the reader; the budget below is derived from it.
 ARGV_MAX_BYTES=131072
@@ -95,6 +97,27 @@ DENY_SPELLINGS=2
 # the right answer — a container that cannot resume its own session is worse than one whose deny
 # list is a little long.
 KEEP_NEWEST=32
+# ...AND TWO GUARDS THAT ARE ABOUT LIVENESS, NOT RETENTION, added when the sweep gained a SECOND
+# trigger. KEEP_NEWEST's whole argument was "the live session is writing one of them right now", and
+# it was written for a sweep that ran at container START, when nothing is open. On the host reaper's
+# timer it runs mid-flight, and during a swarm more than 32 transcripts are touched inside one
+# window -- so the newest-32 floor stops being a statement about live sessions and a running
+# session's transcript can be archived out from under it, at which point `/resume` cannot find it.
+#
+# THE REGISTRY IS THE PRECISE ANSWER and the window is the belt to its brace. jkb knows which
+# Claude sessions are live (every hook in the container posts to the host daemon), and a transcript
+# is named for its session, so the reaper passes those ids in and they are never planned. The
+# window then covers what the registry cannot see: a session that predates the registry, one whose
+# hooks are not reporting, a container not in remote mode. Neither is time-based RETENTION, which
+# this file rejects above and still rejects -- what bounds the sweep is bytes. These say only that a
+# file written moments ago is probably open, which is a different claim from "old files may go".
+KEEP_MODIFIED_WITHIN_SECS=3600
+# Space-separated session ids that must not be archived whatever the arithmetic says. Empty unless
+# a caller knows better; the reaper fills it from the registry, `run.sh` leaves it alone.
+KEEP_SESSIONS="${JKB_KEEP_SESSIONS:-}"
+# Overridable so --self-test can place the fixture's mtimes relative to a fixed present; the
+# freshness window is meaningless against a clock the suite does not control.
+NOW_SECS="${NOW_SECS:-$(date +%s)}"
 # THE ONE NAME THE SWEEP HOLDS BACK, and the rule it replaced was WRONG. That rule said the
 # workflow harness keeps `wf_*.json` run records; there are none -- measured, zero anywhere under
 # the real root. What it actually writes is <slug>/<uuid>/subagents/workflows/wf_*/journal.jsonl
@@ -180,10 +203,17 @@ transcript_projection_fell() { # transcript_projection_fell <moved> <before> <af
 transcript_plan() { # transcript_plan < records -> paths to archive, oldest first
     LC_ALL=C sort -t"$TAB" -k1,1n -k2,2 \
     | LC_ALL=C awk -F"$TAB" -v budget="$DENY_BUDGET_BYTES" -v keep="$KEEP_NEWEST" \
-                   -v mult="$DENY_SPELLINGS" -v held="$HELD_NAME" '
+                   -v mult="$DENY_SPELLINGS" -v held="$HELD_NAME" \
+                   -v live=" $KEEP_SESSIONS " -v now="$NOW_SECS" -v fresh="$KEEP_MODIFIED_WITHIN_SECS" '
         { tot += length($2)
           base = $2; sub(/^.*\//, "", base)
           if (base == held) next
+          # A LIVE SESSION IS NEVER PLANNED, by name or by recency. Skipped like the held name and
+          # before the floor, because a file that may not be archived was never a candidate: letting
+          # it consume a `keep` slot would reserve protection for something already protected.
+          if (now > 0 && fresh > 0 && $1 > now - fresh) next
+          id = base; sub(/\.jsonl$/, "", id)
+          if (index(live, " " id " ") > 0) next
           n++; path[n] = $2 }
         END {
             proj = mult * tot
@@ -522,6 +552,8 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "the deny budget is half of it, the other half headroom" "$DENY_BUDGET_BYTES" "65536"
     eq "every path is listed once per spelling of the root" "$DENY_SPELLINGS" "2"
     eq "the floor that keeps the live session's own transcript is 32" "$KEEP_NEWEST" "32"
+    eq "a file written within the hour is treated as open" "$KEEP_MODIFIED_WITHIN_SECS" "3600"
+    eq "and nothing is held live unless a caller says so" "$KEEP_SESSIONS" ""
     # SET, but its VALUE is deliberately not pinned here. Its authority is swarm-status.sh's
     # discovery predicate, and check-config.sh reads it out of that file and requires agreement -- a
     # literal in this row as well would be a second copy of the same rule, which would have to be
@@ -529,6 +561,7 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "a name is held back at all" "$([ -n "$HELD_NAME" ] && echo yes || echo no)" "yes"
     # Captured so the restore further down reads these and does not re-spell them as a second copy.
     DEFAULT_BUDGET="$DENY_BUDGET_BYTES"; DEFAULT_KEEP="$KEEP_NEWEST"
+    DEFAULT_FRESH="$KEEP_MODIFIED_WITHIN_SECS"
 
     echo "==> sweep-transcripts self-test: the byte projection"
     # Two spellings of every path, so the projection is twice the path text. 10 + 10 = 20 bytes of
@@ -590,6 +623,56 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "a move that changed nothing is not"   "$(rc_of transcript_projection_fell 3 100 100)" "1"
     eq "and one that GREW is the nesting signature" \
        "$(rc_of transcript_projection_fell 2 408 444)" "1"
+
+    echo "==> sweep-transcripts self-test: a live session is never planned"
+    # THE FLOOR IS NOT A STATEMENT ABOUT LIVE SESSIONS once the sweep runs on a timer. These two rows
+    # are what makes it one again. `KEEP_NEWEST=0` throughout, so nothing here is the floor doing the
+    # work: the only thing standing between these files and the plan is that they are live.
+    live_recs="100${TAB}/p/-s/aaaaaaaa.jsonl
+200${TAB}/p/-s/bbbbbbbb.jsonl
+300${TAB}/p/-s/cccccccc.jsonl"
+    DENY_BUDGET_BYTES=0 KEEP_NEWEST=0 NOW_SECS=0 KEEP_SESSIONS=""
+    eq "with nothing live and no clock, every file is a candidate" \
+       "$(printf '%s\n' "$live_recs" | transcript_plan | tr '\n' ' ')" \
+       "/p/-s/aaaaaaaa.jsonl /p/-s/bbbbbbbb.jsonl /p/-s/cccccccc.jsonl "
+    # BY NAME, from the registry: a transcript is named for its session, and the reaper passes the
+    # ids of every session jkb knows to be live. This is the precise half.
+    KEEP_SESSIONS="bbbbbbbb"
+    eq "a session the registry calls live is not planned, whatever the budget wants" \
+       "$(printf '%s\n' "$live_recs" | transcript_plan | tr '\n' ' ')" \
+       "/p/-s/aaaaaaaa.jsonl /p/-s/cccccccc.jsonl "
+    KEEP_SESSIONS="aaaaaaaa cccccccc"
+    eq "...and more than one of them" \
+       "$(printf '%s\n' "$live_recs" | transcript_plan | tr '\n' ' ')" "/p/-s/bbbbbbbb.jsonl "
+    # A PREFIX IS NOT A MATCH. The list is searched with its separators, so a session whose id is a
+    # substring of a live one is still archivable -- ids are uuids and this is cheap to get wrong.
+    KEEP_SESSIONS="bbbb"
+    eq "an id that merely contains a live one is still planned" \
+       "$(printf '%s\n' "$live_recs" | transcript_plan | tr '\n' ' ')" \
+       "/p/-s/aaaaaaaa.jsonl /p/-s/bbbbbbbb.jsonl /p/-s/cccccccc.jsonl "
+    # BY RECENCY, which covers what the registry cannot see: a session predating it, one whose hooks
+    # are not reporting, a container not in remote mode. `now` is fixed here because a window
+    # measured against a clock the suite does not control asserts nothing.
+    # now 1000 less a 850s window is a cutoff of 150, so the 200 and 300 files are inside it.
+    KEEP_SESSIONS="" NOW_SECS=1000 KEEP_MODIFIED_WITHIN_SECS=850
+    eq "a file written inside the window is not planned" \
+       "$(printf '%s\n' "$live_recs" | transcript_plan | tr '\n' ' ')" "/p/-s/aaaaaaaa.jsonl "
+    KEEP_MODIFIED_WITHIN_SECS=1
+    eq "...and once it is outside, it is a candidate again" \
+       "$(printf '%s\n' "$live_recs" | transcript_plan | tr '\n' ' ')" \
+       "/p/-s/aaaaaaaa.jsonl /p/-s/bbbbbbbb.jsonl /p/-s/cccccccc.jsonl "
+    # AND NEITHER SKIP CONSUMES A FLOOR SLOT. A file that may not be archived was never a candidate,
+    # so letting it hold a `keep` place would reserve protection for something already protected.
+    KEEP_SESSIONS="aaaaaaaa" KEEP_MODIFIED_WITHIN_SECS=0 KEEP_NEWEST=1
+    eq "the floor still protects a real candidate, not a slot spent on a live one" \
+       "$(printf '%s\n' "$live_recs" | transcript_plan | tr '\n' ' ')" "/p/-s/bbbbbbbb.jsonl "
+    # ...and their bytes are still PROJECTED: the argv counts what the sweep may not touch.
+    KEEP_SESSIONS="aaaaaaaa bbbbbbbb cccccccc" KEEP_NEWEST=0
+    eq "a tree that is entirely live still projects its bytes" \
+       "$(printf '%s\n' "$live_recs" | transcript_projection)" "120"
+    eq "...and plans nothing" "$(printf '%s\n' "$live_recs" | transcript_plan)" ""
+    DENY_BUDGET_BYTES="$DEFAULT_BUDGET" KEEP_NEWEST="$DEFAULT_KEEP"
+    KEEP_SESSIONS="" NOW_SECS=0 KEEP_MODIFIED_WITHIN_SECS="$DEFAULT_FRESH"
 
     echo "==> sweep-transcripts self-test: enumerating a real tree"
     work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT

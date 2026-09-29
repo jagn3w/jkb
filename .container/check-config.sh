@@ -665,6 +665,10 @@ else
             grep -qE -- 'kept < keep.*tot \+= length' <<<"$sweep_irr" \
                 || sweep_problems="$sweep_problems transcript_irreducible() does not count the newest KEEP_NEWEST the floor protects, so the window where the floor is what puts a tree beyond help is reported as a broken boundary;"
         fi
+        grep -qF -- 'index(live, " " id " ")' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems the sweep does not skip the sessions it is told are live, so the reaper's keep-list is data nothing acts on;"
+        grep -qF -- '$1 > now - fresh' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems the sweep does not spare recently-written transcripts, so a live session the registry cannot see is archived out from under it;"
         # THE POST-CONDITION'S CALL SITE. Its comparison is watched by the self-test, which drives
         # transcript_projection_fell from literals -- but the self-test cannot see the call being
         # deleted, because the state it guards (files moved, deny list no smaller) is refused
@@ -754,6 +758,22 @@ else
         | sed -n '1s/.*"\(.*\)"/\1/p')"
     sh_ctr_name="$(grep -oE '^NAME="\$\{JKB_CONTAINER_NAME:-[^}]+\}"' <<<"$run_stripped" \
         | sed -n '1s/.*:-\(.*\)}"/\1/p')"
+    # A LIVE SESSION IS NEVER PLANNED, and the two halves of that live in two languages. The
+    # floor's argument -- "the live session is writing one of them right now" -- was written for
+    # a sweep that ran at container START, when nothing is open; on the reaper's timer it runs
+    # mid-flight, and during a swarm more than KEEP_NEWEST transcripts are touched inside one
+    # window. So the reaper passes the ids the registry calls live and the sweep skips them,
+    # with a recency window behind it for sessions the registry cannot see. A variable name
+    # spelled differently at the two ends protects nothing while both files read correct.
+    rs_keep_var="$(grep -oE 'KEEP_SESSIONS_VAR: &str = "[^"]+"' <<<"$ctr_rs" \
+        | sed -n '1s/.*"\(.*\)"/\1/p')"
+    sh_keep_var="$(grep -oE '^KEEP_SESSIONS="\$\{[A-Z_]+:-' <<<"$sweep_body" \
+        | sed -n '1s/^KEEP_SESSIONS="\${\([A-Z_]*\):-/\1/p')"
+    if [ -z "$rs_keep_var" ] || [ -z "$sh_keep_var" ]; then
+        sweep_problems="$sweep_problems the never-archive list's variable cannot be read from both transcripts.rs and sweep-transcripts.sh, so nothing holds the reaper's keep-list to the one the sweep reads;"
+    elif [ "$rs_keep_var" != "$sh_keep_var" ]; then
+        sweep_problems="$sweep_problems the reaper sets '$rs_keep_var' while the sweep reads '$sh_keep_var', so a live session's transcript can be archived out from under it;"
+    fi
     if [ -z "$rs_ctr_name" ] || [ -z "$sh_ctr_name" ]; then
         sweep_problems="$sweep_problems the container name cannot be read from both run.sh and transcripts.rs, so nothing holds the reaper to the container run.sh creates;"
     elif [ "$rs_ctr_name" != "$sh_ctr_name" ]; then
@@ -767,7 +787,7 @@ else
     # require and no path to agree about, so the guard that compared two paths is gone with them.
     grep -qF -- 'include_str!("../../../.container/sweep-transcripts.sh")' <<<"$ctr_rs" \
         || sweep_problems="$sweep_problems the reaper no longer embeds the sweep, so it runs something other than the script this repository tests;"
-    grep -qF -- '"exec", "-i", name, "bash", "-s"' <<<"$ctr_rs" \
+    grep -qF -- '"exec", "-i", "-e", &keep, name, "bash", "-s"' <<<"$ctr_rs" \
         || sweep_problems="$sweep_problems the reaper no longer feeds the sweep in on stdin, so it depends on a copy inside the container that an already-running one does not have;"
 fi
 

@@ -1697,3 +1697,34 @@ daemon is slow before it is broken. And a daemon that will not answer is reporte
 not: "there is no container here" and "there may be one over budget and I could not find out" are
 different facts, and only the first is somebody working normally on a laptop or a cloud instance with
 no Docker at all.
+
+**A live session's transcript, once the sweep runs on a timer.** `KEEP_NEWEST`'s entire argument was
+*"the live session is writing one of them right now"* — and it was written for a sweep that ran at
+container **start**, when nothing is open. On the host reaper's timer it runs mid-flight, and during
+a swarm more than 32 transcripts are touched inside one window: at that point the newest-32 floor
+stops being a statement about live sessions at all, a running session's transcript can be archived
+out from under it, and `/resume` cannot find it again.
+
+Two guards, and they answer different halves:
+
+- **The registry is the precise one.** `jkb` already knows which Claude sessions are live — every
+  hook in the container posts to the host daemon, so container sessions are registered on the host —
+  and a transcript is named for its session. The reaper reads that list *per tick* (never cached: a
+  session started since the last sweep is the one most at risk, being also the most recently
+  written) and hands the ids to the sweep in `JKB_KEEP_SESSIONS`, which never plans one. A database
+  the binary cannot open yields an **empty** list, which is the safe direction — empty falls back to
+  the other two protections rather than to none.
+- **Recency is the belt to that brace**, for what the registry cannot see: a session predating it,
+  one whose hooks are not reporting, a container not in remote mode. One hour, and it is deliberately
+  generous because over-protecting is *visible* — the sweep already says when it cannot reach the
+  budget — while under-protecting is a lost transcript.
+
+Neither is the time-based **retention** this document rejects further up, and the distinction is the
+whole point: what bounds the sweep is still bytes. These say only that a file written moments ago is
+probably open, which is a different claim from "old files may go".
+
+Both skips happen **before** the floor and, like the held name, their bytes are still *projected* —
+a file the sweep may not archive was never a candidate, so letting one consume a `KEEP_NEWEST` slot
+would reserve protection for something already protected, while the argv still has to count it.
+`check-config.sh` holds `KEEP_SESSIONS_VAR` and the shell's `${JKB_KEEP_SESSIONS:-}` to each other:
+a variable spelled differently at the two ends protects nothing while both files read correct.

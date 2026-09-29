@@ -3139,7 +3139,7 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         // Silent when there is no Docker, no such container or a stopped one, which is every host
         // not using the dev container. Never fatal: it is somebody else's container.
         if !dry_run {
-            sweep_container_transcripts(json, &mut last_transcript_failure);
+            sweep_container_transcripts(db_path, json, &mut last_transcript_failure);
         }
         match reap_once(db_path, retain_days, dry_run) {
             // Silence when there is nothing to say: this runs every quarter hour for ever, and a
@@ -3196,6 +3196,34 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
         Ok(()) => *last = now,
         Err(e) => eprintln!("git-audit: could not post its notification: {e:#}"),
     }
+
+/// One tick's worth of the dev container's transcripts, and what reaches the log.
+///
+/// Extracted from the watch loop for length, but it earns a name anyway: the interesting thing here
+/// is the reporting rule, which is the loop's own — say what CHANGED. A container that is not there,
+/// or had nothing to do, says nothing at all, because this runs every quarter hour for ever.
+/// The session ids this machine currently believes are live.
+///
+/// **Read per tick, never cached.** A session that started since the last sweep is exactly the one
+/// most at risk, since it is also the most recently written. A database this binary cannot open —
+/// one a newer `jkb` migrated, routine across branches here — yields an EMPTY list, and that is the
+/// direction worth being careful about: empty means the sweep falls back to its recency window and
+/// its floor, which protect less precisely but do protect. It is one page: `LIST_CAP` is 1000 live
+/// sessions, and a machine with more of those has a different problem.
+fn live_sessions(db_path: &Path) -> Vec<String> {
+    let Ok(db) = open_db(db_path) else {
+        return Vec::new();
+    };
+    db.read(|conn| jkb_core::claude_session::list(conn, false, None))
+        .map(|page| {
+            let mut ids: Vec<String> = page.rows.into_iter().map(|r| r.session).collect();
+            // One id per session however many processes hold it, and a stable order so two ticks
+            // that see the same sessions send the same string.
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        })
+        .unwrap_or_default()
 }
 
 /// A failure message's STANDING-CONDITION key: its digit runs masked.
@@ -3227,8 +3255,9 @@ fn standing_key(why: &str) -> String {
 /// Extracted from the watch loop for length, but it earns a name anyway: the interesting thing here
 /// is the reporting rule, which is the loop's own — say what CHANGED. A container that is not there,
 /// or had nothing to do, says nothing at all, because this runs every quarter hour for ever.
-fn sweep_container_transcripts(json: bool, last_failure: &mut String) {
-    match transcripts::sweep_dev_container(transcripts::DEV_CONTAINER_NAME) {
+fn sweep_container_transcripts(db_path: &Path, json: bool, last_failure: &mut String) {
+    match transcripts::sweep_dev_container(transcripts::DEV_CONTAINER_NAME, &live_sessions(db_path))
+    {
         transcripts::Sweep::Absent | transcripts::Sweep::Quiet => last_failure.clear(),
 
         transcripts::Sweep::Said(line) => {

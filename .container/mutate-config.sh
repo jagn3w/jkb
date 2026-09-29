@@ -482,9 +482,11 @@ run "verify.sh demotes the accepted deny-list verdict to a note" "reaches no \`a
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES"'
-assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE"', 1))
+old = 'SEAMS="'
+assert s.count(old) == 1, "mutation target absent"
+i = s.index(old) + len(old)
+j = s.index('"', i)
+open(p, 'w').write(s[:i] + s[i:j].split(' ', 1)[1] + s[j:])
 PYX
 run "a seam the script reads is dropped from SEAMS" "so a seam is wired into no refusal"
 
@@ -566,7 +568,7 @@ run "the reaper stops embedding the sweep" "no longer embeds the sweep"
 seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '"exec", "-i", name, "bash", "-s"'
+old = '"exec", "-i", "-e", &keep, name, "bash", "-s"'
 assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, '"exec", name, "bash", "/usr/local/bin/sweep-transcripts.sh"', 1))
 PYX
@@ -580,6 +582,45 @@ assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, '"nothing needs archiving"', 1))
 PYX
 run "the reaper classifies a quiet tick on words the sweep does not print" "which the sweep never prints"
+
+# A LIVE SESSION'S TRANSCRIPT, which the newest-32 floor stopped protecting the day the sweep gained
+# a timer. Four ways to lose it, each silent: the two ends naming the variable differently, the
+# sweep ignoring the list, the sweep ignoring recency, and the list going unread altogether.
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'KEEP_SESSIONS_VAR: &str = "JKB_KEEP_SESSIONS"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'KEEP_SESSIONS_VAR: &str = "JKB_LIVE_SESSIONS"', 1))
+PYX
+run "the reaper names the keep-list something the sweep does not read" "so a live session's transcript can be archived"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (index(live, " " id " ") > 0) next\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the sweep stops skipping the sessions it is told are live" "keep-list is data nothing acts on"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (now > 0 && fresh > 0 && $1 > now - fresh) next\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the sweep stops sparing recently-written transcripts" "does not spare recently-written transcripts"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'KEEP_SESSIONS="${JKB_KEEP_SESSIONS:-}"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'KEEP_SESSIONS=""', 1))
+PYX
+run "the sweep stops reading the keep-list at all" "cannot be read from both transcripts.rs and sweep-transcripts.sh"
 
 seed; rm -f "$work/t/crates/jkb-cli/src/transcripts.rs"
 run "the reaper's container module is deleted" "nothing sweeps the container between starts"
@@ -1558,7 +1599,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=87
+PINNED_SWEEP_APPENDS=95
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

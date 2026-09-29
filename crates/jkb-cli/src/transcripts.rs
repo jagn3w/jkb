@@ -89,6 +89,13 @@ pub type Runner<'a> = &'a dyn Fn(&[&str], Option<&str>) -> Option<(bool, String,
 /// The stderr a [`Runner`] reports when its command ran out of time.
 pub const TIMED_OUT: &str = "\u{0}jkb:timed-out";
 
+/// The environment variable the sweep reads its never-archive list from.
+///
+/// Spelled once here and once in `.container/sweep-transcripts.sh`; `check-config.sh` requires the
+/// two to agree, because a keep-list the sweep does not read is a keep-list that protects nothing
+/// while every gate reports the property.
+pub const KEEP_SESSIONS_VAR: &str = "JKB_KEEP_SESSIONS";
+
 /// What the sweep prints when it ran and there was nothing to do.
 ///
 /// These are the sweep's words, and `check-config.sh` requires each to be text the sweep actually
@@ -111,7 +118,7 @@ fn last_line(s: &str) -> String {
 ///
 /// Separated from [`sweep_dev_container`] so the decisions here are testable without Docker: what
 /// counts as absent, what counts as unreachable, what counts as quiet, and what reaches the log.
-pub fn sweep_with(name: &str, run: Runner<'_>) -> Sweep {
+pub fn sweep_with(name: &str, live: &[String], run: Runner<'_>) -> Sweep {
     // ASKED BEFORE POKED, so "there is no such container" is a fact rather than an error message
     // parsed out of a failed exec. `docker exec` against a missing container and against a broken
     // one both exit non-zero with prose, and telling those apart by their wording is a guess that
@@ -129,8 +136,20 @@ pub fn sweep_with(name: &str, run: Runner<'_>) -> Sweep {
     if running.trim() != "true" {
         return Sweep::Absent;
     }
-    // `-i` and `bash -s`: the script arrives on stdin, so nothing has to exist inside the container.
-    let Some((ok, out, err)) = run(&["exec", "-i", name, "bash", "-s"], Some(SWEEP_SCRIPT)) else {
+    // THE SESSIONS THIS MACHINE KNOWS ARE LIVE, so the sweep never plans one. `KEEP_NEWEST`'s whole
+    // argument was "the live session is writing one of them right now", and it was written for a
+    // sweep that ran at container START, when nothing is open. On this timer it runs mid-flight, and
+    // during a swarm more than 32 transcripts are touched inside one window — at which point the
+    // newest-32 floor stops being a statement about live sessions and a running one can be archived
+    // out from under itself. A transcript is named for its session, so the ids are the answer.
+    //
+    // Passed as ONE environment variable rather than arguments: `docker exec -e` leaves the script's
+    // own argument dispatch alone, and an id list is data, not a flag.
+    let keep = format!("{KEEP_SESSIONS_VAR}={}", live.join(" "));
+    let Some((ok, out, err)) = run(
+        &["exec", "-i", "-e", &keep, name, "bash", "-s"],
+        Some(SWEEP_SCRIPT),
+    ) else {
         return Sweep::Absent;
     };
     if err == TIMED_OUT {
@@ -159,10 +178,10 @@ pub fn sweep_with(name: &str, run: Runner<'_>) -> Sweep {
     }
 }
 
-/// Sweep the dev container's transcripts, if there is one.
+/// Sweep the dev container's transcripts, if there is one, never touching a live session's.
 #[must_use]
-pub fn sweep_dev_container(name: &str) -> Sweep {
-    sweep_with(name, &|args, stdin| {
+pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
+    sweep_with(name, live, &|args, stdin| {
         // Spawned rather than `output()`ed, so the wait has a deadline.
         let mut child = Command::new("docker")
             .args(args)
@@ -216,7 +235,10 @@ pub fn sweep_dev_container(name: &str) -> Sweep {
 
 #[cfg(test)]
 mod tests {
-    use super::{sweep_with, Sweep, DEV_CONTAINER_NAME, NOTHING_TO_DO, SWEEP_SCRIPT, TIMED_OUT};
+    use super::{
+        sweep_with, Sweep, DEV_CONTAINER_NAME, KEEP_SESSIONS_VAR, NOTHING_TO_DO, SWEEP_SCRIPT,
+        TIMED_OUT,
+    };
     use std::cell::RefCell;
 
     type Reply = Option<(bool, &'static str, &'static str)>;
@@ -246,7 +268,7 @@ mod tests {
     fn no_docker_at_all_is_absent_and_pokes_nothing_further() {
         let seen = Seen::default();
         assert_eq!(
-            sweep_with("jkb-dev", &runner(vec![None], &seen)),
+            sweep_with("jkb-dev", &[], &runner(vec![None], &seen)),
             Sweep::Absent
         );
         assert_eq!(seen.borrow().len(), 1, "it must not try to exec after that");
@@ -256,7 +278,7 @@ mod tests {
     fn a_container_that_is_not_running_is_absent() {
         let seen = Seen::default();
         let r = runner(vec![Some((true, "false\n", ""))], &seen);
-        assert_eq!(sweep_with("jkb-dev", &r), Sweep::Absent);
+        assert_eq!(sweep_with("jkb-dev", &[], &r), Sweep::Absent);
         assert_eq!(seen.borrow().len(), 1);
     }
 
@@ -267,14 +289,14 @@ mod tests {
             vec![Some((false, "", "Error: No such object: jkb-dev\n"))],
             &seen,
         );
-        assert_eq!(sweep_with("jkb-dev", &r), Sweep::Absent);
+        assert_eq!(sweep_with("jkb-dev", &[], &r), Sweep::Absent);
     }
 
     #[test]
     fn a_wedged_daemon_is_said_rather_than_swallowed() {
         let seen = Seen::default();
         let r = runner(vec![Some((false, "", TIMED_OUT))], &seen);
-        match sweep_with("jkb-dev", &r) {
+        match sweep_with("jkb-dev", &[], &r) {
             Sweep::Unreachable(why) => assert!(why.contains("did not answer"), "{why}"),
             other => panic!("wanted Unreachable, got {other:?}"),
         }
@@ -292,7 +314,7 @@ mod tests {
             vec![Some((true, "true\n", "")), Some((false, "", TIMED_OUT))],
             &seen,
         );
-        match sweep_with("jkb-dev", &r) {
+        match sweep_with("jkb-dev", &[], &r) {
             Sweep::Unreachable(why) => assert!(why.contains("did not finish"), "{why}"),
             other => panic!("wanted Unreachable, got {other:?}"),
         }
@@ -320,15 +342,57 @@ mod tests {
             ],
             &seen,
         );
-        assert_eq!(sweep_with("jkb-dev", &r), Sweep::Quiet);
+        assert_eq!(sweep_with("jkb-dev", &[], &r), Sweep::Quiet);
         let calls = seen.borrow();
         assert_eq!(
             calls[0].0,
             vec!["inspect", "-f", "{{.State.Running}}", "jkb-dev"]
         );
         assert!(!calls[0].1, "inspect is asked nothing on stdin");
-        assert_eq!(calls[1].0, vec!["exec", "-i", "jkb-dev", "bash", "-s"]);
+        assert_eq!(
+            calls[1].0,
+            vec![
+                "exec",
+                "-i",
+                "-e",
+                "JKB_KEEP_SESSIONS=",
+                "jkb-dev",
+                "bash",
+                "-s"
+            ]
+        );
         assert!(calls[1].1, "the sweep must arrive on stdin");
+    }
+
+    /// The ids of every session this machine knows to be live are handed to the sweep, which never
+    /// plans one — the protection `KEEP_NEWEST` stopped providing when the sweep gained a timer.
+    #[test]
+    fn live_sessions_are_named_to_the_sweep_so_it_cannot_plan_them() {
+        let seen = Seen::default();
+        let live = ["aaaa-1111".to_owned(), "bbbb-2222".to_owned()];
+        let r = runner(
+            vec![
+                Some((true, "true\n", "")),
+                Some((true, "transcript sweep: 10 deny bytes projected, budget 65536 — nothing to archive\n", "")),
+            ],
+            &seen,
+        );
+        assert_eq!(sweep_with("jkb-dev", &live, &r), Sweep::Quiet);
+        let calls = seen.borrow();
+        assert_eq!(
+            calls[1].0,
+            vec![
+                "exec",
+                "-i",
+                "-e",
+                "JKB_KEEP_SESSIONS=aaaa-1111 bbbb-2222",
+                "jkb-dev",
+                "bash",
+                "-s"
+            ],
+            "space-separated, in one variable, as the sweep splits them"
+        );
+        assert_eq!(KEEP_SESSIONS_VAR, "JKB_KEEP_SESSIONS");
     }
 
     #[test]
@@ -354,7 +418,7 @@ mod tests {
             ],
             &seen,
         );
-        match sweep_with("jkb-dev", &r) {
+        match sweep_with("jkb-dev", &[], &r) {
             Sweep::Said(line) => assert!(line.contains("archived 7 file(s)"), "{line}"),
             other => panic!("wanted Said, got {other:?}"),
         }
@@ -376,7 +440,7 @@ mod tests {
             ],
             &seen,
         );
-        match sweep_with("jkb-dev", &r) {
+        match sweep_with("jkb-dev", &[], &r) {
             Sweep::Failed(why) => assert!(why.contains("E2BIG"), "{why}"),
             other => panic!("wanted Failed, got {other:?}"),
         }
@@ -396,7 +460,7 @@ mod tests {
             ],
             &seen,
         );
-        match sweep_with("jkb-dev", &r) {
+        match sweep_with("jkb-dev", &[], &r) {
             Sweep::Failed(why) => assert!(why.contains("could not create"), "{why}"),
             other => panic!("wanted Failed, got {other:?}"),
         }
@@ -412,7 +476,7 @@ mod tests {
             vec![Some((true, "true\n", "")), Some((false, "", ""))],
             &seen,
         );
-        match sweep_with("jkb-dev", &r) {
+        match sweep_with("jkb-dev", &[], &r) {
             Sweep::Failed(why) => assert!(!why.is_empty(), "an empty failure is never reported"),
             other => panic!("wanted Failed, got {other:?}"),
         }
