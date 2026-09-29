@@ -326,6 +326,18 @@ fn launchd_reap_plist(exe: &Path, db: &Path) -> String {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- A PATH, because this job SHELLS OUT. Each tick asks Docker to sweep the dev container's
+         transcripts (crates/jkb-cli/src/transcripts.rs), and launchd gives an agent a minimal
+         default PATH that does not include where Docker Desktop installs its client. Without this
+         the second trigger is dead on exactly the machine this project is developed on, and the
+         only symptom is a container that fills up — which is the failure it exists to prevent.
+         /opt/homebrew/bin for Apple silicon, /usr/local/bin for Intel and for Docker Desktop's own
+         symlink. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <!-- The sweep archives a worktree and, a month later, deletes that archive. Both are things
          somebody may want to look up afterwards, and launchd sends a job's stdio to /dev/null
          unless told otherwise. -->
@@ -352,6 +364,7 @@ fn systemd_reap_unit(exe: &Path, db: &Path) -> String {
          [Service]\n\
          Type=simple\n\
          ExecStart={exe} --db {db} task reap --watch\n\
+         Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -465,6 +478,13 @@ mod tests {
         assert_ne!(REAP_LABEL, LABEL, "two jobs cannot share one launchd label");
         assert!(plist.contains("<string>task</string>"));
         assert!(plist.contains("<string>reap</string>"));
+        // Its tick shells out to `docker`, and launchd hands an agent a minimal PATH that omits
+        // where Docker Desktop installs its client — so the second transcript trigger would be
+        // dead on the machine this project is developed on, with no symptom but a full container.
+        assert!(
+            plist.contains("<key>EnvironmentVariables</key>") && plist.contains("/usr/local/bin"),
+            "the reaper must be able to find docker: {plist}"
+        );
         assert!(plist.contains("<key>KeepAlive</key>"));
         // Its own log: an archive made and an archive deleted are both worth looking up later,
         // and without these launchd sends the whole record to /dev/null.
@@ -492,6 +512,12 @@ mod tests {
         let unit = systemd_reap_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
         assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
+        // THE TICK SHELLS OUT to `docker`, and a systemd user unit inherits a minimal PATH. The
+        // launchd side has the same need for the same reason; see its plist.
+        assert!(
+            unit.contains("Environment=PATH="),
+            "the reaper must be able to find docker: {unit}"
+        );
     }
 
     /// Pins the CALLER, not the seam. `atomic::write` has its own test, and it stays green

@@ -524,7 +524,8 @@ run "verify.sh classifies on a phrase the sweep does not print" "which sweep-tra
 seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-for old, new in (('*"E2BIG"*) false ;; *) true ;;', '*) false ;;'),
+for old, new in (('*"does not exist"*|*"no transcripts"*) false ;; *) true ;;', '*) true ;;'),
+                 ('*"E2BIG"*) false ;; *) true ;;', '*) false ;;'),
                  ('*"cannot bring this tree under it"*) true ;; *) false ;;', '*) true ;;')):
     assert old in s, "mutation target absent"
     s = s.replace(old, new, 1)
@@ -644,6 +645,40 @@ open(p, 'w').write(s.replace(old, '', 1))
 PYX
 run "the irreducible measure stops asking what a live session holds" "transcript_irreducible() does not ask whether a file is protected"
 
+# ...AND THE PLAN'S HALF OF IT, which the loop above covers for one function and this covers for the
+# other. Only the irreducible arm had a mutation, so the guard that keeps a live transcript out of
+# the PLAN -- the one that actually prevents the move -- had never been watched failing.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (protected($2, $1)) next\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the plan stops asking what a live session holds" "transcript_plan() does not ask whether a file is protected"
+
+# THE START TRIGGER FIRING WHEN SOMETHING IS OPEN. It carries no live-session list, so its whole
+# safety is that nothing is running when it fires.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'if [ "$state" = running ]; then\n    say "skip transcript sweep'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'if false; then\n    say "skip transcript sweep', 1))
+PYX
+run "run.sh sweeps a container that was already running" "without first asking whether the container was ALREADY running"
+
+# THE REAPER'S QUIET-TICK PHRASES going unread, the last extraction-read-nothing branch with no
+# mutation of its own.
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'const NOTHING_TO_DO'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'const QUIET_PHRASES', 1))
+PYX
+run "the reaper renames the phrases it calls a quiet tick by" "declares no NOTHING_TO_DO phrases"
+
 seed; rm -f "$work/t/crates/jkb-cli/src/transcripts.rs"
 run "the reaper's container module is deleted" "nothing sweeps the container between starts"
 
@@ -660,10 +695,11 @@ p = sys.argv[1]; s = open(p).read()
 n = 0
 for old in ('bad "the transcript sweep could not answer',
             'bad "the transcript deny list is over budget',
+            'bad "the transcript deny list was never measured',
             'bad "there is no sweep-transcripts.sh beside this script'):
     assert old in s, "mutation target absent"
     s = s.replace(old, 'echo "  note: ' + old[5:], 1); n += 1
-assert n == 3, "mutation target absent"
+assert n == 4, "mutation target absent"
 open(p, 'w').write(s)
 PYX
 run "verify.sh demotes its plain deny-list verdicts to notes" "reaches no \`bad\` verdict"
@@ -1621,7 +1657,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=99
+PINNED_SWEEP_APPENDS=101
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

@@ -427,8 +427,13 @@ sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
     # success while every Bash call goes on dying at spawn.
     irreducible="$(printf '%s\n' "$records" | transcript_irreducible)"
     if [ "$irreducible" -gt "$DENY_BUDGET_BYTES" ]; then
-        printf 'transcript sweep: %s deny bytes are in files no sweep can remove (%s, plus the newest %s kept for the live session), over the whole %s byte budget — archiving every transcript cannot bring this tree under it\n' \
-            "$irreducible" "$HELD_NAME" "$KEEP_NEWEST" "$DENY_BUDGET_BYTES" >&2
+        # ALL THREE TERMS, and the third is usually the largest. This named the held journals and
+        # the floor only — so half an hour after a swarm, when the recency window covers nearly the
+        # whole tree, the operator was told to delete journals worth a few hundred bytes and never
+        # told that the answer is to wait. The one term that LAPSES is the one worth saying.
+        printf 'transcript sweep: %s deny bytes are in files no sweep can remove right now (%s files, the newest %s kept for the live session, and anything written in the last %ss or held by a live session — that last part lapses), over the whole %s byte budget — archiving every transcript cannot bring this tree under it\n' \
+            "$irreducible" "$HELD_NAME" "$KEEP_NEWEST" "$KEEP_MODIFIED_WITHIN_SECS" \
+            "$DENY_BUDGET_BYTES" >&2
     fi
     plan="$(printf '%s\n' "$records" | transcript_plan)"
     if [ -z "$plan" ]; then
@@ -1165,6 +1170,14 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "JKB_TRANSCRIPT_ROOT overrides both" \
        "$(prog HOME="$phome" CLAUDE_CONFIG_DIR="$palt" JKB_TRANSCRIPT_ROOT="$proot" -- 2>&1)" \
        "transcript sweep: no transcripts under $proot"
+    # THE NEUTRALISATION ITSELF, watched. `prog` derives its `env -u` list from $SEAMS after that
+    # list named three of four — and nothing saw the derivation: replacing the loop with `:` left
+    # the whole suite green, while a developer with any seam exported got program rows asserting
+    # exact messages against the wrong tree, and check.sh stopping at this gate. Exported here on
+    # purpose, for one command.
+    eq "an exported seam does not reach a program row" \
+       "$(JKB_TRANSCRIPT_ROOT="$work/nowhere-at-all" prog HOME="$phome" -- 2>&1)" \
+       "transcript sweep: no transcripts under $phome/.claude/projects"
     eq "--dry-run is accepted"  "$(rc_of prog HOME="$phome" -- --dry-run)" "0"
     eq "a bare run is accepted" "$(rc_of prog HOME="$phome" --)" "0"
     eq "an unknown argument is a usage error" "$(rc_of prog HOME="$phome" -- --wat)" "2"

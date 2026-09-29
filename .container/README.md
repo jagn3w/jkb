@@ -1311,8 +1311,10 @@ both spellings: the 224 KB is doubled before the fixed security paths are added.
 **Why the budget is bytes.** The failing quantity is bytes of argv, so that is what
 `.container/sweep-transcripts.sh` counts: the path text of the `.jsonl` files under the root,
 doubled for the two spellings, archived oldest-first until the projection is under 64 KB — half
-the ceiling, leaving the other half for the ~30 fixed security paths, the write-side lists and the
-JSON quoting around every entry.
+the ceiling, leaving the other half for the security paths, the write-side lists and the
+JSON quoting around every entry. **That half is not static** — it was described here as "~30 fixed"
+paths, and the Round 8 note below records 89 measured, six of them per-task git worktrees, which
+grow with exactly this workload and which no sweep can reclaim.
 
 The two obvious alternatives are both things that already failed here:
 
@@ -1530,8 +1532,9 @@ this file.
 What *is* closed is the reporting. `run.sh` discards the sweep's exit code with `|| true` — correctly,
 since a deny list slightly too long must not abort a start — so the warning scrolled past several
 steps before the verify anyone actually reads, and `verify.sh` said nothing about transcripts at all.
-It now runs the sweep's own `--dry-run` (moves nothing; returns non-zero exactly when the residual
-would still be over budget) and reports the answer where the operator is looking. The unreclaimable
+It now runs the sweep's own `--dry-run` (moves nothing; returns non-zero when the tree *as it
+stands* is over budget — not when the plan would fail to reach it, which would be a verdict about a
+tree that does not exist) and reports the answer where the operator is looking. The unreclaimable
 floor is `accept_bad`, not `bad`: past roughly 199 run journals no sweep can bring the tree under, and
 that is a condition to act on rather than a broken boundary — which is what this container's two exit
 codes exist to distinguish.
@@ -1608,11 +1611,16 @@ to do. It now pokes the container on each tick
 It has to go through Docker, and that is forced rather than chosen: `~/.claude-state` is a **named
 volume** (`jkb-claude-state`), not a host bind, so there is no host path to walk — the work can only
 happen inside. The reaper also knows a *database path*, never a checkout, so it cannot run a working
-tree's copy of the script. It runs the one the **image** carries at `/usr/local/bin/`, installed the
-way `init-firewall.sh`, `entrypoint.sh` and the two egress scripts are, for the same reason: a
-process with no checkout in hand has to run it. Root-owned, with a second gain that is worth naming —
-the host-triggered sweep runs a script the agent inside the container cannot rewrite. `run.sh` still
-runs the checkout's copy, which is what `--self-test` and `check-config.sh` read.
+tree's copy of the script. It feeds the sweep to `docker exec -i … bash -s` on **stdin**, from a copy
+`include_str!`'d into the `jkb` binary at compile time.
+
+> **Superseded, and worth keeping.** This first installed the script *into the image* at
+> `/usr/local/bin/`, the way `init-firewall.sh` and the egress scripts are, and exec'd it by path.
+> What reversed it was a measurement: `ls /usr/local/bin/` in the **running** container showed only
+> the four older scripts. Only a rebuilt image carries a new file, nothing forces a rebuild, so
+> `bash` would have exited 127 — the trigger dead on every live container, reported once into
+> `reap.log` and deduped for ever, with every gate green. Embedding removes the second copy instead
+> of guarding it: no drift, no rebuild, no path for two files to agree about.
 
 The container's **name** must agree across the two files that spell it, and it is **silent when
 wrong**: a reaper poking a name nothing creates reports nothing for ever — the same end state as
@@ -1763,3 +1771,37 @@ grows with exactly the workload this sweep was written for, and no sweep can rec
 A few hundred bytes against 65,536 today, but it runs in the direction that overflows and it
 compounds with the spelling lean recorded above: both have to be closed before anyone tightens this
 margin.
+
+**Round 9 — fourteen findings and two must-fix, after I had told the user the curve had broken.**
+It had not, and the reason is worth recording: both must-fixes were in the *newest* work, and the
+first was the worst defect this branch produced.
+
+**The test suite archived the developer's own transcripts.** `crates/jkb-cli/tests/cli.rs` spawns a
+real `task reap --watch` child with the developer's own environment, to prove a compaction failure
+does not end the service. That loop now sweeps the dev container on its first tick — so on any host
+with `jkb-dev` running, which is the normal state while working on this repo, `cargo test`
+`docker exec`'d the sweep into the live container and moved real transcripts out of
+`~/.claude-state`, with `watch.kill()` at 1500ms able to orphan the exec mid-archive. The reaper now
+resolves its target through `JKB_CONTAINER_NAME` exactly as `run.sh` does, the fixture points it at
+a name nothing can create, and `the_cli_fixture_cannot_reach_a_real_dev_container` asserts that on
+the built command — so deleting it reddens a test rather than somebody's `/resume`. The same seam
+closes a real gap: an operator who sets `JKB_CONTAINER_NAME` had a trigger silently dead for ever.
+
+**And the start trigger fired on the already-running path.** `run.sh` against a live container prints
+"is already running" and fell straight through to the sweep, which passes no `JKB_KEEP_SESSIONS` —
+so every protection rounds 7–9 added covered the reaper's tick and not this one. An agent blocked on
+a permission prompt past the recency window, with the floor spent on subagent files, would lose its
+transcript to somebody opening a window in the morning. The premise the start trigger rests on is
+*nothing is open at container start*; it now only fires when that is true by construction, and the
+reaper's tick — which does carry the ids — owns the running case.
+
+Three more worth keeping. `verify.sh`'s rc-0 arm printed `ok the transcript deny list fits in one
+argv` when the sweep exited 0 because it **found no tree at all**, which is the sweep's own stated
+rule broken in the reporting layer: a sweep that cannot find its subject must not look successful.
+`Sweep::Absent` — reported by saying nothing — absorbed *"docker could not be run or reached"* as
+well as *"no such container"*, so a launchd agent whose PATH omits Docker Desktop gives a trigger
+dead for ever and silent about it; the probe is `docker ps --filter` now, which exits 0 with empty
+output when the daemon **answered**, so silence is earned rather than assumed, and both unit
+templates carry a PATH. And the "no sweep can remove" message named two of its three terms, omitting
+the one that usually dominates and is the only one that *lapses* — half an hour after a swarm the
+operator was told to delete run journals worth a few hundred bytes when the answer was to wait.

@@ -38,6 +38,26 @@ use std::time::{Duration, Instant};
 /// nothing creates would be silent for ever, which is the failure this whole module exists to end.
 pub const DEV_CONTAINER_NAME: &str = "jkb-dev";
 
+/// The environment variable `run.sh` takes the container's name from.
+pub const CONTAINER_NAME_VAR: &str = "JKB_CONTAINER_NAME";
+
+/// The container this host should sweep: what `run.sh` would have named, the same way it names it.
+///
+/// **Honoured for two reasons, and the second is why it is not just tidiness.** An operator who
+/// sets `JKB_CONTAINER_NAME` creates a container this reaper would otherwise never find — a trigger
+/// silently dead for ever, which is the exact failure the name guard exists to prevent. And it is
+/// the seam that keeps a TEST SUITE from reaching a real container: `cargo test` spawns
+/// `task reap --watch` as a real child with the developer's own environment, so without an override
+/// the first tick `docker exec`s the sweep into the running `jkb-dev` and archives the developer's
+/// live transcripts. A name nothing can create is the fixture's answer.
+#[must_use]
+pub fn dev_container_name() -> String {
+    std::env::var(CONTAINER_NAME_VAR)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEV_CONTAINER_NAME.to_owned())
+}
+
 /// The sweep itself, embedded at compile time.
 ///
 /// `include_str!` rather than a file the container carries, for the reason in the module docs: a
@@ -124,16 +144,43 @@ pub fn sweep_with(name: &str, live: &[String], run: Runner<'_>) -> Sweep {
     // one both exit non-zero with prose, and telling those apart by their wording is a guess that
     // goes stale with the next Docker release.
     //
-    // `None` (no docker on this host) and a failed inspect (no such container) are one answer:
-    // there is nothing here to sweep. A TIMEOUT is not one of them.
-    let inspect = run(&["inspect", "-f", "{{.State.Running}}", name], None);
-    if matches!(&inspect, Some((_, _, err)) if err == TIMED_OUT) {
-        return Sweep::Unreachable(format!("docker inspect {name} did not answer"));
-    }
-    let Some((true, running, _)) = inspect else {
+    // `docker ps --filter` RATHER THAN `docker inspect`, because the two questions have to be told
+    // apart and only this one separates them by EXIT CODE. `inspect` on a missing container exits
+    // non-zero — the same as a daemon that cannot be reached, a socket the user may not open, or a
+    // `DOCKER_HOST` pointing nowhere — so every one of those became `Absent`, which is reported by
+    // saying nothing. A trigger dead for ever, never saying it could not find out. `ps --filter`
+    // exits 0 with EMPTY output when the daemon answered and there is no such container, so
+    // silence is earned rather than assumed, and it lists only running containers, which is the
+    // question anyway.
+    let probe = run(
+        &[
+            "ps",
+            "--filter",
+            &format!("name=^{name}$"),
+            "--format",
+            "{{.Names}}",
+        ],
+        None,
+    );
+    let Some((ok, names, err)) = probe else {
+        // The BINARY is not there. A laptop or a cloud instance that never runs containers is
+        // somebody working normally, and it is the one case that stays silent.
         return Sweep::Absent;
     };
-    if running.trim() != "true" {
+    if err == TIMED_OUT {
+        return Sweep::Unreachable(format!("docker did not answer when asked about {name}"));
+    }
+    if !ok {
+        // Docker is installed and would not answer: a daemon that is down, a socket this user may
+        // not open, a context or DOCKER_HOST pointing somewhere unreachable. Any of those leaves
+        // the container unswept, and none of them is a reason to be quiet about it.
+        return Sweep::Unreachable(format!(
+            "docker is installed but could not be asked about {name}: {}",
+            last_line(&err)
+        ));
+    }
+    if !names.lines().any(|l| l.trim() == name) {
+        // The daemon answered and there is no such container running. Earned silence.
         return Sweep::Absent;
     }
     // THE SESSIONS THIS MACHINE KNOWS ARE LIVE, so the sweep never plans one. `KEEP_NEWEST`'s whole
@@ -303,22 +350,46 @@ mod tests {
         assert_eq!(seen.borrow().len(), 1, "it must not try to exec after that");
     }
 
+    /// The daemon ANSWERED and listed nothing: there is no such container running. Silence here is
+    /// earned, which is the whole difference from the case below.
     #[test]
     fn a_container_that_is_not_running_is_absent() {
         let seen = Seen::default();
-        let r = runner(vec![Some((true, "false\n", ""))], &seen);
+        let r = runner(vec![Some((true, "", ""))], &seen);
         assert_eq!(sweep_with("jkb-dev", &[], &r), Sweep::Absent);
         assert_eq!(seen.borrow().len(), 1);
     }
 
+    /// A name that merely CONTAINS ours is not ours. `--filter name=` is a substring match on the
+    /// daemon's side; the anchors are passed, and this is the belt to them.
     #[test]
-    fn a_missing_container_is_absent_rather_than_a_failure() {
+    fn a_container_whose_name_merely_contains_ours_is_not_ours() {
+        let seen = Seen::default();
+        let r = runner(vec![Some((true, "jkb-dev-scratch\n", ""))], &seen);
+        assert_eq!(sweep_with("jkb-dev", &[], &r), Sweep::Absent);
+        assert_eq!(seen.borrow().len(), 1, "and nothing is exec'd into it");
+    }
+
+    /// Installed, and would not answer. Every one of these used to be `Absent` — reported by
+    /// saying nothing — so the trigger could be dead for ever on a host that has the container:
+    /// a launchd agent whose PATH omits Docker Desktop, a socket this user may not open, a
+    /// `DOCKER_HOST` pointing nowhere.
+    #[test]
+    fn a_docker_that_will_not_answer_is_said_not_swallowed() {
         let seen = Seen::default();
         let r = runner(
-            vec![Some((false, "", "Error: No such object: jkb-dev\n"))],
+            vec![Some((
+                false,
+                "",
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n",
+            ))],
             &seen,
         );
-        assert_eq!(sweep_with("jkb-dev", &[], &r), Sweep::Absent);
+        match sweep_with("jkb-dev", &[], &r) {
+            Sweep::Unreachable(why) => assert!(why.contains("could not be asked"), "{why}"),
+            other => panic!("wanted Unreachable, got {other:?}"),
+        }
+        assert_eq!(seen.borrow().len(), 1, "it must not exec through that");
     }
 
     #[test]
@@ -340,7 +411,7 @@ mod tests {
     fn a_sweep_that_never_finishes_is_said_too() {
         let seen = Seen::default();
         let r = runner(
-            vec![Some((true, "true\n", "")), Some((false, "", TIMED_OUT))],
+            vec![Some((true, "jkb-dev\n", "")), Some((false, "", TIMED_OUT))],
             &seen,
         );
         match sweep_with("jkb-dev", &[], &r) {
@@ -362,7 +433,7 @@ mod tests {
         let seen = Seen::default();
         let r = runner(
             vec![
-                Some((true, "true\n", "")),
+                Some((true, "jkb-dev\n", "")),
                 Some((
                     true,
                     "transcript sweep: 10 deny bytes projected, budget 65536 — nothing to archive\n",
@@ -375,9 +446,9 @@ mod tests {
         let calls = seen.borrow();
         assert_eq!(
             calls[0].0,
-            vec!["inspect", "-f", "{{.State.Running}}", "jkb-dev"]
+            vec!["ps", "--filter", "name=^jkb-dev$", "--format", "{{.Names}}"]
         );
-        assert!(!calls[0].1, "inspect is asked nothing on stdin");
+        assert!(!calls[0].1, "the probe is asked nothing on stdin");
         assert_eq!(
             calls[1].0,
             vec![
@@ -401,7 +472,7 @@ mod tests {
         let live = ["aaaa-1111".to_owned(), "bbbb-2222".to_owned()];
         let r = runner(
             vec![
-                Some((true, "true\n", "")),
+                Some((true, "jkb-dev\n", "")),
                 Some((true, "transcript sweep: 10 deny bytes projected, budget 65536 — nothing to archive\n", "")),
             ],
             &seen,
@@ -424,6 +495,27 @@ mod tests {
         assert_eq!(KEEP_SESSIONS_VAR, "JKB_KEEP_SESSIONS");
     }
 
+    /// The name is `run.sh`'s, honoured the way `run.sh` honours it — and the override is what
+    /// stops `cargo test` reaching a real container, since the suite spawns `task reap --watch` as
+    /// a real child with the developer's own environment.
+    #[test]
+    fn the_container_name_follows_run_sh_and_can_be_overridden() {
+        // Serialised against nothing else: this is the only test that touches the variable, and it
+        // restores what it found rather than assuming there was nothing.
+        let before = std::env::var(super::CONTAINER_NAME_VAR).ok();
+        std::env::remove_var(super::CONTAINER_NAME_VAR);
+        assert_eq!(super::dev_container_name(), "jkb-dev");
+        std::env::set_var(super::CONTAINER_NAME_VAR, "jkb-somewhere-else");
+        assert_eq!(super::dev_container_name(), "jkb-somewhere-else");
+        // Empty is not a name. Set-but-blank would otherwise point every exec at "".
+        std::env::set_var(super::CONTAINER_NAME_VAR, "   ");
+        assert_eq!(super::dev_container_name(), "jkb-dev");
+        match before {
+            Some(v) => std::env::set_var(super::CONTAINER_NAME_VAR, v),
+            None => std::env::remove_var(super::CONTAINER_NAME_VAR),
+        }
+    }
+
     #[test]
     fn the_embedded_script_is_the_sweep_and_carries_its_own_dispatch() {
         assert!(
@@ -442,7 +534,7 @@ mod tests {
         let seen = Seen::default();
         let r = runner(
             vec![
-                Some((true, "true\n", "")),
+                Some((true, "jkb-dev\n", "")),
                 Some((true, "transcript sweep: archived 7 file(s) to /x (70000 -> 62000 deny bytes, budget 65536)\n", "")),
             ],
             &seen,
@@ -460,7 +552,7 @@ mod tests {
         let seen = Seen::default();
         let r = runner(
             vec![
-                Some((true, "true\n", "")),
+                Some((true, "jkb-dev\n", "")),
                 Some((
                     false,
                     "transcript sweep: archived 0 file(s)\n",
@@ -480,7 +572,7 @@ mod tests {
         let seen = Seen::default();
         let r = runner(
             vec![
-                Some((true, "true\n", "")),
+                Some((true, "jkb-dev\n", "")),
                 Some((
                     false,
                     "transcript sweep: could not create /x — nothing archived\n",
@@ -502,7 +594,7 @@ mod tests {
     fn a_failure_that_printed_nothing_still_reaches_the_log() {
         let seen = Seen::default();
         let r = runner(
-            vec![Some((true, "true\n", "")), Some((false, "", ""))],
+            vec![Some((true, "jkb-dev\n", "")), Some((false, "", ""))],
             &seen,
         );
         match sweep_with("jkb-dev", &[], &r) {

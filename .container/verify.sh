@@ -1823,8 +1823,8 @@ fi
 # where the operator is looking.
 #
 # ASKED BY RUNNING THE SWEEP'S OWN DRY RUN, never by re-deriving the arithmetic here: `--dry-run`
-# moves nothing, and since round 3 it returns non-zero exactly when the residual would still be
-# over budget. One definition of the budget, one of the projection, and this file asks rather than
+# moves nothing, and since round 3 it returns non-zero when the tree AS IT STANDS is over budget
+# — not when the plan would fail to reach it, which is a verdict about a tree that does not exist. One definition of the budget, one of the projection, and this file asks rather than
 # answers.
 #
 # `accept_bad`, NOT `bad`, for the unreclaimable floor. The workflow harness's run journals are
@@ -1848,17 +1848,32 @@ if [ -f "$sweep_sh" ]; then
     # so `sweep_tail` is empty), a syntax error or an unreadable file (rc 2, bash's own message).
     # Each of those printed "the transcript deny list is over budget — <unrelated text or nothing>"
     # followed by a sentence asserting an archiving pass that never happened.
-    if [ "$sweep_dry_rc" -eq 0 ]; then
+    if [ "$sweep_dry_rc" -eq 0 ] \
+       && case "$sweep_dry" in *"does not exist"*|*"no transcripts"*) false ;; *) true ;; esac; then
         ok "the transcript deny list fits in one argv — $sweep_tail"
+    elif [ "$sweep_dry_rc" -eq 0 ]; then
+        # A SWEEP THAT FOUND NO TREE IS NOT A MEASURED PASS. It exits 0 for "nothing to sweep", and
+        # this arm printed `ok the transcript deny list fits in one argv` over a budget nobody
+        # measured — the exact rule the sweep's own header states and this broke: a sweep that
+        # cannot find its subject must not look successful. Reachable whenever
+        # `$CLAUDE_BASE/projects` is missing: a second config dir, or a `dc_link_state` that failed
+        # and which run.sh deliberately tolerates and defers to this file.
+        bad "the transcript deny list was never measured — $sweep_tail
+       The sweep found no tree to look at, so nothing here says whether Bash can spawn. Check that
+       ~/.claude/projects exists and points into the state volume."
     elif case "$sweep_dry" in *"E2BIG"*) false ;; *) true ;; esac; then
         bad "the transcript sweep could not answer whether the deny list fits in one argv (exit $sweep_dry_rc) — ${sweep_tail:-it printed nothing}
        This is not a budget verdict: the sweep did not get far enough to give one. Run
        .container/sweep-transcripts.sh --dry-run by hand and read what it says."
     elif case "$sweep_dry" in *"cannot bring this tree under it"*) true ;; *) false ;; esac; then
-        accept_bad "the transcript deny list cannot be brought under budget by archiving at all — $sweep_tail
-       What the sweep may never remove — the workflow run journals, plus the newest transcripts it
-       keeps for the live session — is already over the budget on its own, so no number of sweeps
-       changes this. Remove finished runs' journal.jsonl by hand, or widen the budget;
+        # THE SWEEP'S OWN SENTENCE, not a second copy of it. This kept its own enumeration of what
+        # cannot be reclaimed, and went stale the moment a third term was added: it told the
+        # operator to delete run journals when the real answer, half an hour after a swarm, is to
+        # wait for the recency window to lapse.
+        accept_bad "the transcript deny list cannot be brought under budget by archiving at all
+       $(printf '%s' "$sweep_dry" | grep -F 'no sweep can remove' | head -1)
+       Nothing this sweep can do changes that. If the reason given above lapses, waiting is the
+       remedy; otherwise remove finished runs' journal.jsonl by hand or widen the budget —
        .container/README.md has the numbers."
     else
         bad "the transcript deny list is over budget — $sweep_tail

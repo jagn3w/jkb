@@ -806,11 +806,27 @@ else
         || sweep_problems="$sweep_problems the reaper no longer feeds the sweep in on stdin, so it depends on a copy inside the container that an already-running one does not have;"
 fi
 
+# ...AND IT DOES NOT RUN WHEN SOMETHING MAY BE OPEN. The start trigger carries no live-session list
+# — `in_container` is plain `docker exec` with no `-e`, and the host script has no id list to pass —
+# so its safety rests entirely on "nothing is open at container start". That premise is false on the
+# already-running path, where `run.sh` prints "is already running" and falls straight through: an
+# agent blocked on a prompt past the recency window, with the floor spent on subagent files, loses
+# its transcript and its `/resume`. The reaper sweeps a running container every tick WITH the ids,
+# so this trigger is only needed when the container was not running.
+if [ -n "$sweep_at" ]; then
+    # The few lines above it, not just the one: the sweep sits in the `else` of that test, so its
+    # immediate predecessor is `else` and the question is asked a little further back.
+    sweep_guard_from=$(( sweep_at > 6 ? sweep_at - 6 : 1 ))
+    sweep_guard_line="$(sed -n "${sweep_guard_from},${sweep_at}p" <<<"$run_stripped")"
+    grep -qE '\[ "\$state" (!)?= running \]' <<<"$sweep_guard_line" \
+        || sweep_problems="$sweep_problems run.sh sweeps without first asking whether the container was ALREADY running, and that path passes no live-session list, so a live transcript can be archived out from under a session;"
+fi
+
 # AND THE OPERATOR IS TOLD. run.sh discards the sweep's exit code with `|| true` -- correctly, since
 # a deny list slightly too long must not abort a start -- so the one state in which NO Bash tool call
 # works was reported only by a line that scrolled past several steps before the verify the operator
 # actually reads. verify.sh now asks, by running the sweep's own `--dry-run` (which moves nothing and
-# returns non-zero exactly when the residual would still be over budget) rather than re-deriving the
+# returns non-zero when the tree as it stands is over budget) rather than re-deriving the
 # budget a second time.
 if [ ! -f "$here/verify.sh" ]; then
     sweep_problems="$sweep_problems verify.sh is not there to report the deny list at all;"

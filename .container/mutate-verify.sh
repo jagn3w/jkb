@@ -824,7 +824,12 @@ control_ok=no
 # recognise a legitimate exit 3 aborts this whole harness with a diagnosis blaming the container,
 # so the one thing watching verify.sh's failure paths fire never runs. An extraction that reads
 # nothing is a failure here too, rather than a control that silently accepts anything.
-control_phrase="$(grep -oE "every failure above is [^\\']*" "$REPO/.container/verify.sh" \
+# ANCHORED ON THE printf, not on the bare sentence. This directory quotes the string under
+# discussion in the comment above it -- verify.sh and run.sh both already do that for this very
+# sentence -- so an unanchored first match would take a comment as the control phrase and abort
+# the harness with a diagnosis blaming the container.
+control_phrase="$(grep -oE "printf 'every failure above is [^\\']*" "$REPO/.container/verify.sh" \
+    | sed -n "1s/^printf '//p" \
     | sed -n '1{s/\\\\n$//;p}')"
 if [ -z "$control_phrase" ]; then
     printf '\033[31mverify.sh no longer prints an accepted-failure summary line, so this control\n'

@@ -3256,8 +3256,25 @@ fn standing_key(why: &str) -> String {
 /// is the reporting rule, which is the loop's own — say what CHANGED. A container that is not there,
 /// or had nothing to do, says nothing at all, because this runs every quarter hour for ever.
 fn sweep_container_transcripts(db_path: &Path, json: bool, last_failure: &mut String) {
-    match transcripts::sweep_dev_container(transcripts::DEV_CONTAINER_NAME, &live_sessions(db_path))
-    {
+    report_container_sweep(
+        transcripts::sweep_dev_container(
+            &transcripts::dev_container_name(),
+            &live_sessions(db_path),
+        ),
+        json,
+        last_failure,
+    );
+}
+
+/// What one outcome does to the log and to the dedup state.
+///
+/// **Taken as a value, so all five variants can be driven.** The testability seam stopped one level
+/// below this, at `sweep_with`, leaving the rule its own doc calls "the interesting thing here"
+/// executed by nothing: that the quiet outcomes CLEAR the remembered failure, and that the dedup
+/// compares the standing key while printing the full message. The second is the one that can go
+/// wrong in silence — compare the key, store the raw sentence, and the log is noisy again.
+fn report_container_sweep(outcome: transcripts::Sweep, json: bool, last_failure: &mut String) {
+    match outcome {
         transcripts::Sweep::Absent | transcripts::Sweep::Quiet => last_failure.clear(),
 
         transcripts::Sweep::Said(line) => {
@@ -4219,6 +4236,56 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE REPORTING RULE, driven for every outcome. Nothing executed it before: the seam stopped
+    /// one level lower, at `sweep_with`, so the loop's own discipline — say what CHANGED — was
+    /// asserted by no test at all.
+    #[test]
+    fn the_tick_remembers_a_condition_and_forgets_it_when_it_clears() {
+        use crate::transcripts::Sweep;
+        let mut last = String::new();
+
+        // A standing failure is remembered by its key, not its sentence: the byte count moves every
+        // tick, and comparing whole sentences meant a new line every quarter hour for ever.
+        super::report_container_sweep(
+            Sweep::Failed("80092 bytes over budget".to_owned()),
+            false,
+            &mut last,
+        );
+        let first = last.clone();
+        assert!(!first.is_empty(), "a failure must be remembered");
+        super::report_container_sweep(
+            Sweep::Failed("80674 bytes over budget".to_owned()),
+            false,
+            &mut last,
+        );
+        assert_eq!(
+            last, first,
+            "the same condition with new numbers is one condition"
+        );
+
+        // ...and a tick that is fine CLEARS it, or the condition can never be reported again.
+        super::report_container_sweep(Sweep::Quiet, false, &mut last);
+        assert!(last.is_empty(), "a quiet tick forgets the failure");
+        super::report_container_sweep(Sweep::Absent, false, &mut last);
+        assert!(last.is_empty());
+        super::report_container_sweep(Sweep::Said("archived 7".to_owned()), false, &mut last);
+        assert!(
+            last.is_empty(),
+            "a tick that did something is not a failure"
+        );
+
+        // An unreachable daemon is a standing condition too, and shares the arm.
+        super::report_container_sweep(
+            Sweep::Unreachable("docker did not answer".to_owned()),
+            false,
+            &mut last,
+        );
+        assert!(
+            !last.is_empty(),
+            "an unreachable daemon must be remembered, not swallowed"
+        );
+    }
 
     /// The reaper says a standing condition ONCE. The sweep's over-budget sentence carries a byte
     /// count re-derived every run, and a tree is over budget precisely while transcripts are being

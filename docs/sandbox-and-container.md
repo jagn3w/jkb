@@ -896,9 +896,19 @@ whose diagnosis and reason-record stand. Review round 3 (`low`, 3 reviewers, 17 
   the daemon also uses.
 - **Booting is not endorsing.** `--open` launches a VS Code window, which *is* starting a session, so
   it opens only on a clean verify. The override buys a container you can attach to **by hand** and
-  diagnose. `verify.sh` gained a distinct exit code for "every failure is a condition this container
-  was configured to accept", so the failure is still reported at full volume every run while a caller
-  can tell it from a broken boundary — and the message stops advising you to fix a condition the
+  diagnose. `verify.sh` gained a distinct exit code for "every failure is one this container
+  **tolerates** rather than a broken boundary", so the failure is still reported at full volume every
+  run while a caller can tell the two apart.
+
+  > **Superseded wording, and the measurement that changed it.** This read "a condition this
+  > container was *configured* to accept", which was true while the unfiltered-egress override was
+  > exit 3's only producer. It stopped being true when `verify.sh` began reporting the Bash-sandbox
+  > transcript budget: nobody *configures* a container to accumulate workflow run journals past what
+  > any sweep can reclaim, and that is the one exit-3 producer with a concrete remedy. The old
+  > sentence sent an operator to unset a variable that was not set and recreate a container whose
+  > journals live in a volume. Two producers, opposite remedies, so `run.sh` no longer names a cause
+  > at all and points at the FAIL lines instead. The budget half of this is recorded in
+  > [.container/README.md](../.container/README.md), not restated here — and the message stops advising you to fix a condition the
   design requires to keep failing.
 - **Serialise in the callee.** Two raises run concurrently on every fresh create (the entrypoint's
   and `run.sh`'s re-raise) over one ipset, one chain and one record; the interleavings install a

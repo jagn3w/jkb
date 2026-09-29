@@ -1051,7 +1051,22 @@ in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 # it prevents is a container in which NO Bash tool call works at all (E2BIG at spawn, measured
 # 2026-09-28; sweep-transcripts.sh carries the numbers). Never fatal: what it could not archive it
 # says, and a deny list slightly too long is the state we were already in.
-in_container -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
+#
+# ...AND ONLY WHEN NOTHING IS OPEN IN IT, which is the premise the sweep's own floor rests on. This
+# ran on the ALREADY-RUNNING path too — `run.sh` against a live container prints "is already
+# running" and falls through here — and it passes no `JKB_KEEP_SESSIONS`, so the live-session
+# protection the reaper's tick carries does not exist on this path. An agent blocked on a
+# permission prompt for seventy minutes, or a session left attached overnight, is outside the
+# recency window; after a swarm the newest-32 floor is spent on subagent files; and `run.sh` in the
+# morning to open a window would archive `<slug>/<uuid>.jsonl` out from under a live session and
+# sever `/resume`. The reaper sweeps a running container every tick WITH the registry's ids, so the
+# start trigger is needed only when the container was not running — and then "nothing is open" is
+# true by construction rather than by assumption.
+if [ "$state" = running ]; then
+    say "skip transcript sweep: $NAME was already running, so the reaper's tick owns it (it passes the live-session list; this path cannot)"
+else
+    in_container -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
+fi
 
 # ONE VERIFIER, AFTER BOTH ARMS. It used to be the last line of setup.sh on the fresh path and a
 # separate call here on the restart path — so the review's "a fatal verify suppresses everything
