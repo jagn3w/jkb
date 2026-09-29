@@ -381,7 +381,7 @@ REC
 # check-config.sh records making this exact mistake three times with one helper.
 # WHICH VERDICT A SWEEP RUN DESERVES — a pure function of its exit code and its output, because
 # this decision drives what `run.sh` SAYS (exit 3 changes the refusal's wording and its advice;
-# it does NOT open a window — run.sh refuses on any non-zero, run.sh:1045) and nothing
+# it does NOT open a window — run.sh's `verify_rc -ne 0` gate refuses on any non-zero) and nothing
 # executed it. Five arms, each a one-token flip away from the wrong container behaviour, and the
 # static guards can only see that the arms exist. Defined before its caller and driven by
 # `--self-test`, which needs no container.
@@ -425,7 +425,7 @@ if [ "$SELF_TEST" = yes ]; then
     done
 
     echo "==> verify.sh self-test: the transcript-budget verdict"
-    # THE DECISION run.sh READS. Both codes refuse a window — run.sh:1045 tests `-ne 0` — and what
+    # THE DECISION run.sh READS. Both codes refuse a window — its gate tests `verify_rc -ne 0` — and what
     # exit 3 changes is WHICH REFUSAL the operator is given, which for the transcript floor is the
     # difference between a remedy that applies and three that do not. A one-token flip in
     # any arm changes what the container does — and until this existed the whole five-way chain was
@@ -1902,6 +1902,33 @@ fi
 # is one more thing to get wrong.
 sweep_sh="$(dirname "$0")/sweep-transcripts.sh"
 if [ -f "$sweep_sh" ]; then
+    # THE KEEP LIST IS AN INPUT TO THIS MEASUREMENT, not a detail of the caller. `--dry-run` asks the
+    # real sweep what it WOULD do, and what it would do depends on which sessions it must not touch:
+    # protected files cannot be archived, so a missing keep list makes the tree look more reclaimable
+    # than it is. The verdict flips with it -- `beyond` (live sessions hold this down, waiting is the
+    # remedy) becomes `over` (archive harder) -- and `over`'s text then rules out the floor BY NAME
+    # while the floor is the actual cause. run.sh exports it; a hand-run inside the container, which
+    # is the route run.sh's own failure text recommends, had nothing to export it.
+    #
+    # SET-BUT-EMPTY IS AN ANSWER. run.sh passes an empty list on purpose for a container that was not
+    # running -- nothing inside it can be live -- so `set` and `unset` cannot be collapsed, and the
+    # test is `${VAR+set}` rather than `-n "$VAR"`.
+    #
+    # ASKED THE SAME WAY run.sh ASKS. `--live-ids` applies one rule in one place
+    # (crates/jkb-cli/src/transcripts.rs); deriving the list here by any other route would be a third
+    # answer to "which sessions are live" with nothing keeping the three in step.
+    sweep_keep_note=""
+    if [ -n "${JKB_KEEP_SESSIONS+set}" ]; then
+        : # supplied by our caller, and authoritative even when empty
+    elif sweep_live="$(jkb notify sessions --live-ids 2>/dev/null)"; then
+        JKB_KEEP_SESSIONS="$(printf '%s' "$sweep_live" | tr '\n' ' ')"
+        export JKB_KEEP_SESSIONS
+    else
+        sweep_keep_note="
+       NOTE: no keep list. Nobody passed \$JKB_KEEP_SESSIONS and jkb could not be asked which
+       sessions are live, so this measurement archives files the real sweep protects and reads
+       MORE reclaimable than the container is. A binding floor can reach this arm in that state."
+    fi
     sweep_dry="$(bash "$sweep_sh" --dry-run 2>&1)"; sweep_dry_rc=$?
     # THE LAST LINE, not the whole of it. The sweep says several things on the way to its verdict and
     # the verdict is the last of them; flattening all of it into one `ok`/`FAIL` produced a line
@@ -1948,11 +1975,11 @@ if [ -f "$sweep_sh" ]; then
        remedy; otherwise remove finished runs' journal.jsonl by hand or widen the budget —
        .container/README.md has the numbers."
     else
-        bad "the transcript deny list is over budget — $sweep_tail
+        bad "the transcript deny list is over budget — $sweep_tail$sweep_keep_note
        Every Bash tool call in this container may fail at spawn with E2BIG, with nothing in the
        message naming transcripts. This is a --dry-run, so it says what IS there and not what the
-       start sweep managed. A binding floor is NOT among the causes — that produces the arm above,
-       not this one — so what is left is a start sweep that could not write its archive (look for
+       start sweep managed. With a keep list, a binding floor is NOT among the causes — that
+       produces the arm above, not this one — so what is left is a start sweep that could not write its archive (look for
        \`could not create\` in the scroll-back), an archive refusing colliding destinations
        (\`mv: not replacing\`), and transcripts arriving since the sweep ran. Check
        ~/.claude-state/transcript-archive is writable and holds no entry with the same relative path

@@ -1017,40 +1017,22 @@ case "$setup_probe" in
              exit 1 ;;
 esac
 
-if [ "$setup_done" -eq 0 ]; then
-    [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
-    say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
-    in_container -w "$ctr_repo" "$NAME" bash .container/setup.sh
-fi
-
-# THE LOGIN, CARRIED ON EVERY START. A container that was stopped outside this script (Docker
-# Desktop, `docker stop`) may hold a token written since its last start; this is the first chance
-# to move it into the state volume, and it happens before verify.sh looks at the links. Not fatal:
-# verify.sh below reports whatever state it leaves.
-say "login state"
-in_container -w "$ctr_repo" "$NAME" bash -c '. .container/lib.sh && dc_persist_login' \
-    || say "the login could not be moved into the state volume — verify.sh below reports what state it is in"
-
-# THE HOST'S GIT HOOKS, COPIED IN ON EVERY START (lib.sh's dc_mirror_host_hooks says why a copy and
-# not a mount). Every start, so an edit to a hook on the host arrives at the next one. Run here, on
-# the host, because the host's hooks directory is exactly what the container cannot see. Never
-# fatal: verify.sh below reports a hooks directory git cannot find.
-say "git hooks"
-dc_mirror_host_hooks "$NAME" "$CONFIG"
-
-# THE REAP RUNS BEFORE THE VERIFY, and independently of it. It was after, and verify.sh exits 1 on
-# any failing assertion under `set -e` — so one assertion about something else disabled the only
-# reaper that can finish container-side archive records, whose /home/vscode/... paths the host's
-# `com.jkb.reap` cannot see, while multi-gigabyte archives accumulate. The deleted postStartCommand
-# ran it unconditionally and this is that shape back.
-in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
-
-# THE TRANSCRIPT SWEEP, BEFORE THE VERIFY, for the reason the reap above is: a failing assertion
-# about something else must not disable it. It is the same shape of job — a thing that only this
-# script is placed to do on every start — and it is the more urgent of the two, because the state
-# it prevents is a container in which NO Bash tool call works at all (E2BIG at spawn, measured
-# 2026-09-28; sweep-transcripts.sh carries the numbers). Never fatal: what it could not archive it
-# says, and a deny list slightly too long is the state we were already in.
+# THE TRANSCRIPT SWEEP, BEFORE EVERYTHING THAT CAN FAIL. Same reason the reap below runs before
+# the verify — a failure about something else must not disable it — but carried further, because
+# the sweep is the more urgent job: the state it prevents is a container in which NO Bash tool
+# call works at all (E2BIG at spawn, measured 2026-09-28; sweep-transcripts.sh carries the
+# numbers). Never fatal: what it could not archive it says, and a deny list slightly too long is
+# the state we were already in.
+#
+# ABOVE FIRST-RUN SETUP, which is the whole point of the position. `setup.sh` is called
+# UNGUARDED under `set -e`, so a setup that fails takes the rest of this script with it — and
+# the documented E2BIG recovery is `run.sh --rm && run.sh`, which DESTROYS the container and
+# therefore always re-runs setup, while the transcripts it has to reclaim live in the state
+# volume and survive the `--rm`. So the one path that exists to recover from a wedged container
+# was also the one path where an unrelated setup failure meant the sweep never ran at all. It
+# needs nothing setup provides: a running container and `$ctr_repo`, both settled far above, and
+# a plain `bash` script that reads no `jkb` inside the container (the live list is asked on the
+# HOST, below). The reap cannot move up here with it — that one does need the container's jkb.
 #
 # ...AND IT CARRIES THE LIVE-SESSION LIST, which is what lets it run on every path. It did not, and
 # the repair for that was to skip the sweep when the container was ALREADY running — on the ground
@@ -1102,6 +1084,34 @@ else
     say "transcript sweep: $NAME was not running, so nothing in it is live"
 fi
 in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
+
+if [ "$setup_done" -eq 0 ]; then
+    [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
+    say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
+    in_container -w "$ctr_repo" "$NAME" bash .container/setup.sh
+fi
+
+# THE LOGIN, CARRIED ON EVERY START. A container that was stopped outside this script (Docker
+# Desktop, `docker stop`) may hold a token written since its last start; this is the first chance
+# to move it into the state volume, and it happens before verify.sh looks at the links. Not fatal:
+# verify.sh below reports whatever state it leaves.
+say "login state"
+in_container -w "$ctr_repo" "$NAME" bash -c '. .container/lib.sh && dc_persist_login' \
+    || say "the login could not be moved into the state volume — verify.sh below reports what state it is in"
+
+# THE HOST'S GIT HOOKS, COPIED IN ON EVERY START (lib.sh's dc_mirror_host_hooks says why a copy and
+# not a mount). Every start, so an edit to a hook on the host arrives at the next one. Run here, on
+# the host, because the host's hooks directory is exactly what the container cannot see. Never
+# fatal: verify.sh below reports a hooks directory git cannot find.
+say "git hooks"
+dc_mirror_host_hooks "$NAME" "$CONFIG"
+
+# THE REAP RUNS BEFORE THE VERIFY, and independently of it. It was after, and verify.sh exits 1 on
+# any failing assertion under `set -e` — so one assertion about something else disabled the only
+# reaper that can finish container-side archive records, whose /home/vscode/... paths the host's
+# `com.jkb.reap` cannot see, while multi-gigabyte archives accumulate. The deleted postStartCommand
+# ran it unconditionally and this is that shape back.
+in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 
 # ONE VERIFIER, AFTER BOTH ARMS. It used to be the last line of setup.sh on the fresh path and a
 # separate call here on the restart path — so the review's "a fatal verify suppresses everything

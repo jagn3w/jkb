@@ -2959,10 +2959,6 @@ fn report_landing(
     kept_status: Option<&(String, String)>,
     json: bool,
 ) {
-    // Reported from what actually happened, never from what was intended. Two claims here were
-    // simply false: `"{uid} is done"` after a status this transaction deliberately left as
-    // `cancelled`, and "removed session and its branch" in the arm that only ran
-    // `git worktree prune` because somebody else had already removed the directory.
     let status = kept_status.map_or("done", |(s, _)| s.as_str());
     if json {
         println!(
@@ -3040,12 +3036,7 @@ fn report_landing(
     }
 }
 
-/// `task reap` — archive worktrees a landing could not move, then delete archives past the
-/// retention window (design D49).
-///
-/// Takes the database **path** rather than a handle, and opens it per pass (`reap_once`), so a
-/// database this binary cannot open fails a pass rather than the service. The records need no repo
-/// context, so one service sweeps every repo on the machine.
+/// What one `task reap` invocation was asked for.
 #[derive(Clone, Copy)]
 struct ReapFlags {
     retain_days: u64,
@@ -3055,6 +3046,12 @@ struct ReapFlags {
     interval_secs: u64,
 }
 
+/// `task reap` — archive worktrees a landing could not move, then delete archives past the
+/// retention window (design D49).
+///
+/// Takes the database **path** rather than a handle, and opens it per pass (`reap_once`), so a
+/// database this binary cannot open fails a pass rather than the service. The records need no repo
+/// context, so one service sweeps every repo on the machine.
 fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     let ReapFlags {
         retain_days,
@@ -3209,8 +3206,11 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
 /// most at risk, since it is also the most recently written. A database this binary cannot open —
 /// one a newer `jkb` migrated, routine across branches here — yields an EMPTY list, and that is the
 /// direction worth being careful about: empty means the sweep falls back to its recency window and
-/// its floor, which protect less precisely but do protect. It is one page: `LIST_CAP` is 1000 live
-/// sessions, and a machine with more of those has a different problem.
+/// its floor, which protect less precisely but do protect.
+///
+/// **Paged to exhaustion** — see the body. "One page is enough, `LIST_CAP` is 1000" was this
+/// function's own reasoning until the listing's `seen_at ASC` order was read: past the cap one page
+/// does not truncate the keep list, it inverts it.
 fn live_sessions(db_path: &Path) -> Vec<String> {
     let Ok(db) = open_db(db_path) else {
         return Vec::new();

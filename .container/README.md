@@ -1785,8 +1785,8 @@ with `jkb-dev` running, which is the normal state while working on this repo, `c
 `docker exec`'d the sweep into the live container and moved real transcripts out of
 `~/.claude-state`, with `watch.kill()` at 1500ms able to orphan the exec mid-archive. The reaper now
 resolves its target through `JKB_CONTAINER_NAME` exactly as `run.sh` does, the fixture points it at
-a name nothing can create, and `the_cli_fixture_cannot_reach_a_real_dev_container` asserts that on
-the built command — so deleting it reddens a test rather than somebody's `/resume`. The same seam
+a name nothing can create, and `the_cli_fixture_does_not_inherit_a_repository` asserts that on
+the built command through `assert_jkb_isolated` — so deleting it reddens a test rather than somebody's `/resume`. The same seam
 closes a real gap: an operator who sets `JKB_CONTAINER_NAME` had a trigger silently dead for ever.
 
 **And the start trigger fired on the already-running path.** `run.sh` against a live container prints
@@ -1853,7 +1853,7 @@ Three more worth keeping:
 - **The five-way budget classifier was executed by nothing.** It decides exit 1 against exit 3,
   and a one-token flip in any arm changed that with every gate green. What that code actually
   buys was overstated here and in three other places as "whether `run.sh` opens a window": it does
-  not — `run.sh` refuses on ANY non-zero verify (`run.sh:1045`). Exit 3 changes which refusal the
+  not — `run.sh` refuses on ANY non-zero verify (run.sh's `verify_rc -ne 0` gate). Exit 3 changes which refusal the
   operator reads, which for the transcript floor is the difference between one remedy that applies
   and three that do not. Corrected in place rather than quietly, because the overstatement was the
   stated justification for the classifier's guards. It is a pure `sweep_verdict()` now, driven from nine literal rows in `verify.sh --self-test`
@@ -1891,7 +1891,7 @@ not among them. Reproduced at 120 subagent transcripts under one live session pl
 budget 30,000: `beyond` with the list, `over` without it. The verify exec carries the same `-e` now.
 
 **A claim this record repeated four times was simply false.** "exit 1 refuses a window, exit 3 does
-not" — `run.sh` refuses on **any** non-zero verify (`run.sh:1045`). Exit 3 changes *which refusal*
+not" — `run.sh` refuses on **any** non-zero verify (run.sh's `verify_rc -ne 0` gate). Exit 3 changes *which refusal*
 the operator reads, which for the transcript floor is the difference between one remedy that applies
 and three that do not. That is still worth a classifier and its guards; it is not what was written
 down, and the overstatement was the stated justification for them.

@@ -265,9 +265,13 @@ transcript_plan() { # transcript_plan < records -> paths to archive, oldest firs
         }'
 }
 
-# The records no plan may ever contain, so the sweep can say out loud when they alone exceed the
-# budget -- the one state it cannot fix, in which archiving every transcript still leaves the argv
-# over MAX_ARG_STRLEN and every Bash call still dies at spawn.
+# The records no plan may ever contain: the held name, and nothing else.
+#
+# THE SELF-TEST'S HELPER, not the sweep's. `sweep_transcripts` asks `transcript_irreducible` for the
+# state it reports; this exists so the rows below can weigh the held set ALONE against held-plus-
+# floor and prove the two differ -- which is the whole content of the 161-to-199-journal window, and
+# is not visible from either number by itself. Naming it as the thing that "lets the sweep say that
+# state out loud" sent a reader to the wrong function for the reporting path.
 transcript_unreclaimable() { # transcript_unreclaimable < records -> the held-back records
     LC_ALL=C awk -F"$TAB" -v held="$HELD_NAME" \
         '{ base = $2; sub(/^.*\//, "", base); if (base == held) print }'
@@ -326,7 +330,7 @@ transcript_irreducible() { # transcript_irreducible < records -> bytes no sweep 
 #                 archived and .claude-state is a volume, so the unreclaimable set only grows: at
 #                 ~165 bytes each, ~198 of them exceed the whole budget on their own. The walk
 #                 counts everything; transcript_plan is where the name is spared, and
-#                 transcript_unreclaimable is what lets the sweep say that state out loud.
+#                 transcript_irreducible is what lets the sweep say that state out loud.
 #   memory pruned belt to that brace: under -L, the per-repo `memory` symlink into the bind-mounted
 #                 ~/.jkb/claude-memory is followed like a real directory, so the walk leaves the
 #                 volume entirely. Pruned by name, which is portable (-prune/-o are POSIX, GNU's

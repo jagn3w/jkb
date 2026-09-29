@@ -108,14 +108,24 @@ pub enum Sweep {
     Failed(String),
 }
 
-/// One command run: `(success, stdout, stderr)`, or `None` when the program could not be launched.
+/// One command run: `(success, stdout, stderr)`, or `None` when the program is not installed.
 ///
-/// A run that hit [`DOCKER_TIMEOUT`] answers with [`TIMED_OUT`] as its stderr, which is a sentinel
-/// rather than a message so no caller has to match Docker's wording for it.
+/// `None` means exactly one thing — **no `docker` binary on this host** — because it is the only
+/// answer a caller is allowed to keep quiet about. A run that hit [`DOCKER_TIMEOUT`] answers with
+/// [`TIMED_OUT`] as its stderr, and one that had a `docker` to launch and still could not launch it
+/// answers with [`LAUNCH_FAILED`]; both are sentinels rather than messages so no caller has to match
+/// Docker's wording for them.
 pub type Runner<'a> = &'a dyn Fn(&[&str], Option<&str>) -> Option<(bool, String, String)>;
 
 /// The stderr a [`Runner`] reports when its command ran out of time.
 pub const TIMED_OUT: &str = "\u{0}jkb:timed-out";
+
+/// The stderr prefix a [`Runner`] reports when `docker` exists but could not be launched.
+///
+/// A PREFIX, not an exact sentinel like [`TIMED_OUT`], because the OS error is the whole diagnostic
+/// value here — a permission denied on the binary, an exec format error, a full process table —
+/// and the reason is appended to it.
+pub const LAUNCH_FAILED: &str = "\u{0}jkb:launch-failed ";
 
 /// The environment variable the sweep reads its never-archive list from.
 ///
@@ -224,9 +234,17 @@ pub fn sweep_with(name: &str, live: &[String], run: Runner<'_>) -> Sweep {
     );
     let Some((ok, names, err)) = probe else {
         // The BINARY is not there. A laptop or a cloud instance that never runs containers is
-        // somebody working normally, and it is the one case that stays silent.
+        // somebody working normally, and it is the one case that stays silent — and it is the ONLY
+        // one, which is why `None` is narrowed to `ErrorKind::NotFound` at the spawn rather than
+        // meaning "could not launch". Every other spawn failure — `docker` present but not
+        // executable by this user, an exec format error, a process table with no room left — is a
+        // host that MEANT to have containers, and answering `Absent` retired the trigger on it
+        // permanently without ever saying so.
         return Sweep::Absent;
     };
+    if let Some(why) = err.strip_prefix(LAUNCH_FAILED) {
+        return Sweep::Unreachable(format!("docker is installed but could not be run: {why}"));
+    }
     if err == TIMED_OUT {
         return Sweep::Unreachable(format!("docker did not answer when asked about {name}"));
     }
@@ -296,7 +314,7 @@ pub fn sweep_with(name: &str, live: &[String], run: Runner<'_>) -> Sweep {
 pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
     sweep_with(name, live, &|args, stdin| {
         // Spawned rather than `output()`ed, so the wait has a deadline.
-        let mut child = Command::new("docker")
+        let spawned = Command::new("docker")
             .args(args)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -305,8 +323,14 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .ok()?;
+            .spawn();
+        // ONLY a missing binary is `None`. See `Runner`: `None` is the one answer callers report by
+        // staying silent, so every other spawn error has to arrive as a message instead.
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => return Some((false, String::new(), format!("{LAUNCH_FAILED}{e}"))),
+        };
         // EVERY PIPE GETS A THREAD, and all three for the same reason: a pipe nobody is moving
         // blocks whoever is on the other end of it.
         //
@@ -355,6 +379,17 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) if Instant::now() >= deadline => {
+                    // This kills the local `docker exec` CLIENT. The sweep itself is a `bash` inside
+                    // the container and keeps running: `exec` does not signal the remote process
+                    // when its client dies. That is deliberate — a half-finished archive is worse
+                    // than a slow one, and the sweep is written to be interrupted safely at a file
+                    // boundary, not mid-`mv`. What it costs is that a container slow enough to time
+                    // out once will usually do it again, and each tick leaves another `bash`
+                    // running; they do not serialise, and the message they produce dedups to one
+                    // constant key, so the stacking is silent. The reason that is tolerable and not
+                    // a leak: `DOCKER_TIMEOUT` is a minute against a sweep measured in seconds, so
+                    // reaching it at all means the container is wedged, which is the state the
+                    // `Unreachable` below exists to report.
                     let _ = child.kill();
                     let _ = child.wait();
                     return Some((false, String::new(), TIMED_OUT.to_owned()));
@@ -378,20 +413,23 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
 #[cfg(test)]
 mod tests {
     use super::{
-        sweep_with, Sweep, DEV_CONTAINER_NAME, KEEP_SESSIONS_VAR, NOTHING_TO_DO, SWEEP_SCRIPT,
-        TIMED_OUT,
+        sweep_with, Sweep, DEV_CONTAINER_NAME, KEEP_SESSIONS_VAR, LAUNCH_FAILED, NOTHING_TO_DO,
+        SWEEP_SCRIPT, TIMED_OUT,
     };
     use std::cell::RefCell;
 
-    type Reply = Option<(bool, &'static str, &'static str)>;
+    // Borrowed rather than `'static`: one reply is built at runtime (the launch-failure sentinel
+    // plus the OS reason), and spelling that sentinel as a literal here would be a second copy of
+    // a constant whose whole job is to be compared against.
+    type Reply<'a> = Option<(bool, &'a str, &'a str)>;
     type Seen = RefCell<Vec<(Vec<String>, bool)>>;
 
     /// A runner that answers a fixed script of replies and records what it was asked, and whether
     /// anything was handed to the command on stdin.
-    fn runner(
-        replies: Vec<Reply>,
-        seen: &Seen,
-    ) -> impl Fn(&[&str], Option<&str>) -> Option<(bool, String, String)> + '_ {
+    fn runner<'a>(
+        replies: Vec<Reply<'a>>,
+        seen: &'a Seen,
+    ) -> impl Fn(&[&str], Option<&str>) -> Option<(bool, String, String)> + 'a {
         let replies = RefCell::new(replies.into_iter());
         move |args: &[&str], stdin: Option<&str>| {
             seen.borrow_mut().push((
@@ -494,6 +532,33 @@ mod tests {
         );
         match sweep_with("jkb-dev", &[], &r) {
             Sweep::Unreachable(why) => assert!(why.contains("could not be asked"), "{why}"),
+            other => panic!("wanted Unreachable, got {other:?}"),
+        }
+        assert_eq!(seen.borrow().len(), 1, "it must not exec through that");
+    }
+
+    /// Present, and could not be launched. Distinct from a host with no `docker` at all, which is
+    /// the ONE silent answer — and the distinction is the whole point: a `docker` the service user
+    /// may not execute, or an exec that fails for want of a process slot, is a host that meant to
+    /// have containers. Absorbed into `Absent` it retired the trigger for ever without a word, on
+    /// the very configuration the record names (a launchd agent with its own PATH and user).
+    #[test]
+    fn a_docker_that_cannot_be_launched_is_said_not_swallowed() {
+        let seen = Seen::default();
+        let stderr = format!("{LAUNCH_FAILED}permission denied (os error 13)");
+        let r = runner(vec![Some((false, "", &stderr))], &seen);
+        match sweep_with("jkb-dev", &[], &r) {
+            Sweep::Unreachable(why) => {
+                assert!(why.contains("could not be run"), "{why}");
+                assert!(
+                    why.contains("permission denied"),
+                    "the OS reason survives: {why}"
+                );
+                assert!(
+                    !why.contains('\u{0}'),
+                    "the sentinel itself never reaches a human: {why}"
+                );
+            }
             other => panic!("wanted Unreachable, got {other:?}"),
         }
         assert_eq!(seen.borrow().len(), 1, "it must not exec through that");
