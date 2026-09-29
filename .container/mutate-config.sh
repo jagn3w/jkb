@@ -718,6 +718,30 @@ open(p, 'w').write(s.replace(old, 'const QUIET_PHRASES', 1))
 PYX
 run "the reaper renames the phrases it calls a quiet tick by" "declares no NOTHING_TO_DO phrases"
 
+# A QUIET EXIT WITH NO MARKER. The reaper prints `Said` unconditionally, so a success path the sweep
+# adds without a phrase in NOTHING_TO_DO is one identical line every quarter of an hour for ever.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+# Anchored on sweep_transcripts's own last statement: a bare `    return 0` also appears inside the
+# AWK_PROTECTED string, which is not the shell function the guard counts.
+old = '        transcript_over_budget "$after" "remain after this sweep" || return 1'
+assert s.count(old) == 1, "mutation target absent"
+open(p, 'w').write(s.replace(old, old + '\n        [ -n "$abs" ] && return 0', 1))
+PYX
+run "the sweep gains a success exit with no phrase behind it" "success exits, pinned at 4"
+
+# ...AND THE VERIFY EXEC'S OWN KEEP LIST, which was round 11's must-fix and which nothing pinned:
+# deleting only that occurrence left every gate green.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/verify.sh'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh', 1))
+PYX
+run "verify.sh measures a different tree from the one the sweep acted on" "verify.sh is measured without the live-session list"
+
 seed; rm -f "$work/t/crates/jkb-cli/src/transcripts.rs"
 run "the reaper's container module is deleted" "nothing sweeps the container between starts"
 
@@ -1698,7 +1722,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=107
+PINNED_SWEEP_APPENDS=111
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

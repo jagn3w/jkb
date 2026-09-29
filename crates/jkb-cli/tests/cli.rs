@@ -3178,10 +3178,37 @@ fn the_hook_feeds_the_session_registry_that_notify_sessions_lists() {
         "{human}"
     );
 
+    // THE VERB .container/run.sh ACTUALLY CALLS, which nothing invoked. It is a literal in run.sh
+    // and a separate literal in the clap derive, compared only by a grep over run.sh — so renaming
+    // the flag, or breaking it, left every gate green while the next container start took the
+    // "could not ask jkb which sessions are live" branch and swept a live container with an empty
+    // keep list. A benign-looking message over a dead protection.
+    let live_ids = || -> String {
+        let out = client()
+            .args(["notify", "sessions", "--live-ids"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    assert_eq!(
+        live_ids(),
+        "s-1\n",
+        "a live session prints its id on its own line"
+    );
+
     hook(serde_json::json!({
         "hook_event_name": "SessionEnd", "session_id": "s-1", "reason": "prompt_input_exit",
     }));
     assert_eq!(listed(false), serde_json::json!([]));
+    // ...and an ended one holds nothing, which is what lets the sweep reclaim it.
+    assert_eq!(
+        live_ids(),
+        "",
+        "an ended session must not hold its transcripts"
+    );
     let all = listed(true);
     assert_eq!(all[0]["end_reason"], "prompt_input_exit", "{all}");
     let log = std::fs::read_to_string(dir.path().join(".jkb/logs/notify-hook.log"))

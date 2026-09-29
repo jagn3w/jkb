@@ -1074,18 +1074,32 @@ in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 # and prints one id per line, so there is nothing here to keep in step and no JSON field to agree
 # about. `sweep_ok` records whether the registry could be READ, which is not the same fact as its
 # being empty — a sweep that ran unprotected must not look like one with nothing to protect.
+#
+# ASKED ONLY WHEN SOMETHING COULD BE RUNNING IN IT. A container this script just CREATED, or just
+# started from stopped, has no sessions inside it — so the correct keep list there is empty, and
+# asking the registry actively harms: nothing closes a session's row when its container is stopped
+# or removed (no SessionEnd hook fires), so every session from the destroyed container still looks
+# recently seen. Passing those made `run.sh --rm && run.sh` — the documented E2BIG recovery — hold
+# three or four dead sessions' whole subagent subtrees, which the README measures as exceeding the
+# entire budget: the recovery reclaimed nothing for up to six hours, where before this trigger
+# carried any list at all it recovered in one pass.
 sweep_keep=""
-sweep_ok=no
-if command -v jkb >/dev/null 2>&1; then
-    if sweep_ids="$(jkb notify sessions --live-ids 2>/dev/null)"; then
-        sweep_ok=yes
-        sweep_keep="$(printf '%s' "$sweep_ids" | tr '\n' ' ')"
+sweep_ok=yes
+if [ "$state" = running ]; then
+    sweep_ok=no
+    if command -v jkb >/dev/null 2>&1; then
+        if sweep_ids="$(jkb notify sessions --live-ids 2>/dev/null)"; then
+            sweep_ok=yes
+            sweep_keep="$(printf '%s' "$sweep_ids" | tr '\n' ' ')"
+        fi
     fi
 fi
 if [ "$sweep_ok" = no ]; then
     say "transcript sweep: could not ask jkb which sessions are live — sweeping with the recency window and the floor only"
-else
+elif [ "$state" = running ]; then
     say "transcript sweep: holding $(printf '%s' "$sweep_keep" | wc -w | tr -d ' ') live session(s)"
+else
+    say "transcript sweep: $NAME was not running, so nothing in it is live"
 fi
 in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
 

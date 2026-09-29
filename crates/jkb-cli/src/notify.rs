@@ -145,14 +145,23 @@ fn keep_latest(rows: Vec<jkb_api::ClaudeSession>) -> Vec<jkb_api::ClaudeSession>
 
 /// One process's hold on a session, on one line: id, state, process and where it runs.
 fn session_line(s: &jkb_api::ClaudeSession) -> String {
-    let state = match (&s.end_reason, &s.start_source) {
+    // STALENESS IS PART OF THE STATE. A row with no end record prints as "live" here, and
+    // `--live-ids` on this same command excludes it once nothing has been seen of it for
+    // `LIVE_SEEN_WITHIN_MS` — so an operator checking why a transcript was archived read a listing
+    // that flatly contradicted the keep list, with nothing in the output to tell the two apart.
+    // Nothing closes a container session's row, so "live" here is routinely months old.
+    let unseen_ms = jkb_core::mq::now_ms().saturating_sub(s.seen_at);
+    let how = match (&s.end_reason, &s.start_source) {
         (Some(reason), _) => format!("ended ({reason})"),
+        (None, _) if unseen_ms >= crate::transcripts::LIVE_SEEN_WITHIN_MS => {
+            format!("open, unseen {}h", unseen_ms / 3_600_000)
+        }
         (None, Some(source)) => format!("live ({source})"),
         (None, None) => "live (seen)".to_owned(),
     };
     let pid = if s.pid.is_empty() { "?" } else { &s.pid };
     format!(
-        "{}  {state}  pid {pid} on {}  {}",
+        "{}  {how}  pid {pid} on {}  {}",
         s.session, s.instance, s.cwd
     )
 }

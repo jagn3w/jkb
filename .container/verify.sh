@@ -1951,9 +1951,10 @@ if [ -f "$sweep_sh" ]; then
         bad "the transcript deny list is over budget — $sweep_tail
        Every Bash tool call in this container may fail at spawn with E2BIG, with nothing in the
        message naming transcripts. This is a --dry-run, so it says what IS there and not what the
-       start sweep managed: the causes it cannot tell apart are the floor genuinely binding, a start
-       sweep that could not write its archive (look for \`could not create\` in the scroll-back), and
-       an archive refusing colliding destinations (\`mv: not replacing\`). Check
+       start sweep managed. A binding floor is NOT among the causes — that produces the arm above,
+       not this one — so what is left is a start sweep that could not write its archive (look for
+       \`could not create\` in the scroll-back), an archive refusing colliding destinations
+       (\`mv: not replacing\`), and transcripts arriving since the sweep ran. Check
        ~/.claude-state/transcript-archive is writable and holds no entry with the same relative path
        as a live session's transcript."
     fi

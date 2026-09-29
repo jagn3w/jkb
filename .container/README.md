@@ -1908,7 +1908,13 @@ Two guards were pinning a spelling against nothing:
   the six lines that *fill* it and the flag passes an empty string for ever, with the guard
   reporting a protection that no longer exists — reproduced, and check-config's output was
   byte-identical to the unmutated tree's. The derivation is pinned now, and so is the JSON field
-  `jq` reads, held to `ClaudeSession`'s serde name the way `HELD_NAME` is held to `swarm-status.sh`.
+  `jq` read, held to `ClaudeSession`'s serde name the way `HELD_NAME` is held to `swarm-status.sh`.
+  **That guard lasted one commit** and went with the `jq` it was written for — the next change
+  replaced the whole derivation with `jkb notify sessions --live-ids`, so there is no JSON field to
+  agree about any more and what is pinned is that `run.sh` asks `jkb` at all. The diagnosis is worth
+  keeping even though the guard is gone, because it is this branch's most repeated defect in
+  miniature: `.[].session` matched `.[].session_id` as a substring, so the rename mutation went
+  MISSED until the closing quote joined the needle.
   Writing that guard reproduced this branch's most-repeated bug in miniature: `.[].session` matched
   `.[].session_id` as a substring, so the rename mutation went MISSED until the closing quote joined
   the needle — the same shape as `accept_bad` satisfying a search for `bad`.
@@ -1944,3 +1950,45 @@ Finally, `--json` got the shape its neighbour already had. The tick printed pros
 `--json` while the queue compaction beside it printed a document to stdout, so a machine consumer of
 the reaper recorded a compaction and never a sweep, never an over-budget container, and never a
 daemon it could not reach.
+
+**Round 12 — the keep list was inverted, not merely truncated.** `live_sessions` took one page of
+`claude_session::list` and dropped `next`. That listing is ordered **`seen_at` ascending** — least
+recently seen first, which is what a liveness sweep wants to probe — so the first page is the
+*oldest* rows, which is exactly the set the new recency filter discards, while the session running
+right now has the largest `seen_at` and sits on the last page. Past `LIST_CAP` the keep list
+therefore did not shrink; it emptied, and the tick swept a live container with no protection at all
+and printed nothing, because `Quiet` is silent. Two other readers of this API already page, and one
+carries a comment about this identical defect being found here before. It pages to exhaustion now.
+
+The two fixes of round 11 combined to produce that: the recency filter is what turns "oldest first"
+from a harmless ordering into an inversion. Neither was wrong alone.
+
+**And the recovery path was made worse before it was made better.** Nothing closes a session's row
+when its container is stopped or removed — no `SessionEnd` hook fires — so after `run.sh --rm`, every
+session from the destroyed container still looks recently seen. `run.sh` passed those ids to the next
+start, and each holds its whole `<slug>/<id>/subagents/**` subtree: three or four of them exceed the
+entire budget, so the documented E2BIG recovery reclaimed nothing for up to six hours, where before
+this trigger carried any list at all it recovered in one pass. The fix is not a heuristic — a
+container this script just created, or just started from stopped, has **no sessions inside it**, so
+the correct keep list there is empty and the registry is asked only when `$state` is `running`.
+
+Three more of the same family — a rule applied to some of its instances:
+
+- `NOTHING_TO_DO` listed two of the sweep's three quiet exits, omitting `does not exist — nothing to
+  sweep`. `Said` is printed unconditionally (only failures are deduped), so a container whose
+  transcript root is absent logged one identical line every quarter of an hour for ever — the noise
+  the standing-key dedup exists to prevent, on the one path it did not cover. The count of the
+  sweep's success exits is pinned now, so a fourth is a red gate rather than a new log line.
+- Neither installed unit carried `JKB_CONTAINER_NAME`. A launchd agent gets only what
+  `EnvironmentVariables` lists and a `systemd --user` unit gets the user manager's environment, so
+  the operator override `dev_container_name`'s doc promises worked for `run.sh` and for the test
+  fixture and **never for the reaper** — which resolved `jkb-dev` for ever and reported the miss by
+  saying nothing. Captured at install time now, like the database path beside it.
+- The `--live-ids` verb was a literal in `run.sh` and a separate literal in the clap derive, compared
+  only by a grep over `run.sh`, and invoked by no test at all. Breaking it left every gate green while
+  the next start took the "could not ask jkb" branch and swept a live container with an empty list —
+  a benign-looking message over a dead protection. The existing daemon fixture exercises it now.
+
+And `jkb notify sessions` printed "live" for rows `--live-ids` on the same command excludes, with
+nothing in the output to tell them apart — so the listing an operator checks after a transcript is
+archived contradicted the keep list. It shows `open, unseen Nh` past the threshold.

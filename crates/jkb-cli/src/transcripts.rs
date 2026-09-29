@@ -130,7 +130,16 @@ pub const KEEP_SESSIONS_VAR: &str = "JKB_KEEP_SESSIONS";
 /// emits — the same guard it applies to `verify.sh`'s classifiers, and for the same reason: a
 /// phrase living in two files with nothing comparing them silently reclassifies every future run
 /// the day one end is reworded.
-const NOTHING_TO_DO: [&str; 2] = ["nothing to archive", "no transcripts"];
+const NOTHING_TO_DO: [&str; 3] = [
+    "nothing to archive",
+    "no transcripts",
+    // The sweep exits 0 for a root that is not there too, and this one was missing: a container
+    // whose transcript root is absent logged one identical line every quarter hour for ever,
+    // because `Said` is printed unconditionally and only `Failed`/`Unreachable` are deduped.
+    // check-config.sh derives the sweep's own quiet exits and requires each to be declared here,
+    // so a fourth one is a red gate rather than a new log line.
+    "does not exist",
+];
 
 /// How recently a session must have been SEEN to count as live.
 ///
@@ -457,8 +466,9 @@ mod tests {
         assert_eq!(seen.borrow().len(), 1);
     }
 
-    /// A name that merely CONTAINS ours is not ours. `--filter name=` is a substring match on the
-    /// daemon's side; the anchors are passed, and this is the belt to them.
+    /// A name that merely CONTAINS ours is not ours. `--filter name=` is a regex on the daemon's
+    /// side and is passed UNANCHORED on purpose — anchors are the one place the probe could fail
+    /// closed and silently — so it can only over-list, and this exact match is the whole decision.
     #[test]
     fn a_container_whose_name_merely_contains_ours_is_not_ours() {
         let seen = Seen::default();
@@ -703,6 +713,9 @@ mod tests {
     /// actually prints, which is the half that catches the sweep's end being reworded.
     #[test]
     fn nothing_to_do_is_recognised_by_the_sweeps_own_wording() {
-        assert_eq!(NOTHING_TO_DO, ["nothing to archive", "no transcripts"]);
+        assert_eq!(
+            NOTHING_TO_DO,
+            ["nothing to archive", "no transcripts", "does not exist"]
+        );
     }
 }

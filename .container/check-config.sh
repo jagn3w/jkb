@@ -838,6 +838,15 @@ if [ -n "$sweep_at" ]; then
     # agree about and nothing here to keep in step.
     grep -qF -- 'jkb notify sessions --live-ids' <<<"$run_stripped" \
         || sweep_problems="$sweep_problems run.sh never asks jkb which sessions are live, so the list it passes is empty on every start and the protection exists in name only;"
+    # ...AND verify.sh MEASURES THE SAME TREE. It reports the budget by running the sweep's own
+    # --dry-run, so without the ids it measures a DIFFERENT tree from the one the sweep just acted
+    # on: a container held down by live sessions comes out `over` (exit 1) rather than `beyond`
+    # (exit 3), with a FAIL naming causes that do not apply. That was a must-fix, and nothing pinned
+    # it — deleting only that occurrence left every gate green.
+    if [ -n "$verify_at" ]; then
+        grep -qF -- '-e "JKB_KEEP_SESSIONS=' <<<"$(sed -n "${verify_at}p" <<<"$run_stripped")" \
+            || sweep_problems="$sweep_problems verify.sh is measured without the live-session list, so it judges a different tree from the one the sweep acted on and names causes that cannot apply;"
+    fi
     # ...AND THE TWO EMPTY STATES ARE TOLD APART. "no live sessions" and "could not ask the daemon"
     # both produce an empty list, and a sweep that ran UNPROTECTED must not look in the scroll-back
     # like one that had nothing to protect.
@@ -941,10 +950,20 @@ else
         # THE REAPER'S CLASSIFIERS TOO. transcripts.rs decides "nothing happened" from the sweep's
         # stdout, on phrases living in two files -- the same coupling this block already holds
         # verify.sh to, and the same silent reclassification if one end is reworded.
-        # The declaration carries a `;` inside its own type (`[&str; 2]`), so the phrases are taken
-        # from the LINE rather than from a `;`-terminated span.
-        ctr_markers="$(grep -E '^const NOTHING_TO_DO' <<<"$ctr_rs" \
-            | grep -oE '"[^"]+"' | tr -d '"')"
+        # FROM THE WHOLE DECLARATION, which spans lines once it has a comment in it — it did not
+        # when this was written, and the day a third phrase arrived the extraction read a line with
+        # no quoted strings on it and reported that the reaper declares none.
+        ctr_markers="$(awk '/^const NOTHING_TO_DO/ { inf = 1 } inf { print } inf && /\];/ { exit }' \
+            <<<"$ctr_rs" | grep -oE '"[^"]+"' | tr -d '"')"
+        # ...AND THE OTHER DIRECTION. The phrases above are the reaper's list of what counts as a
+        # quiet tick; the sweep is where quiet exits are ADDED. A fourth one with no marker is one
+        # identical log line every quarter of an hour for ever, which is the noise the dedup exists
+        # to prevent, on the one path it does not cover. Counting them forces the decision.
+        sweep_quiet="$(awk '/^sweep_transcripts\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+            <<<"$sweep_body" | grep -c 'return 0')"
+        if [ "$sweep_quiet" -ne 4 ]; then
+            sweep_problems="$sweep_problems sweep_transcripts() has $sweep_quiet success exits, pinned at 4 — a new one needs a phrase in transcripts.rs NOTHING_TO_DO or the reaper logs it every tick for ever;"
+        fi
         if [ -z "$ctr_markers" ]; then
             sweep_problems="$sweep_problems transcripts.rs declares no NOTHING_TO_DO phrases, so every tick reads as something happening;"
         else

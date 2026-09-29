@@ -3217,11 +3217,32 @@ fn live_sessions(db_path: &Path) -> Vec<String> {
         return Vec::new();
     };
     let now = jkb_core::mq::now_ms();
-    db.read(|conn| jkb_core::claude_session::list(conn, false, None))
-        .map(|page| {
-            transcripts::live_ids(page.rows.into_iter().map(|r| (r.session, r.seen_at)), now)
-        })
-        .unwrap_or_default()
+    // PAGED TO EXHAUSTION, and the ordering is why this is not a detail. The live listing is
+    // `seen_at ASC` — least recently seen first, which is what a liveness sweep wants to probe — so
+    // the FIRST page is the oldest rows, exactly the ones `live_ids` discards, while the session
+    // running right now has the largest `seen_at` and sits on the last page. Taking one page and
+    // dropping `next` therefore did not merely truncate the keep list: past `LIST_CAP` it INVERTED
+    // it, returning empty and sweeping a live container with no protection at all, silently
+    // (`Quiet` prints nothing). Both other readers of this API already page, and one of them carries
+    // a comment about this identical defect having been found here before.
+    let mut rows: Vec<(String, i64)> = Vec::new();
+    let mut after = None;
+    loop {
+        // A read that fails mid-listing yields what it has: fewer protected sessions is the same
+        // direction as no registry at all, which the recency window and the floor still cover.
+        let cursor = after.take();
+        let Ok(page) =
+            db.read(move |conn| jkb_core::claude_session::list(conn, false, cursor.as_ref()))
+        else {
+            break;
+        };
+        rows.extend(page.rows.into_iter().map(|r| (r.session, r.seen_at)));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    transcripts::live_ids(rows, now)
 }
 
 /// One line about the container's transcripts, in whichever shape the caller reads.
