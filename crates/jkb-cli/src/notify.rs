@@ -74,13 +74,20 @@ pub fn run(cmd: &NotifyCmd, json: bool) -> Result<()> {
         }
         NotifyCmd::Topic => println!("{}", jkb_core::notify::TOPIC),
         NotifyCmd::Hook => hook(),
-        NotifyCmd::Sessions { all } => sessions(*all, json)?,
+        NotifyCmd::Sessions { all, live_ids } => sessions(*all, *live_ids, json)?,
     }
     Ok(())
 }
 
 /// `jkb notify sessions`: the session registry, as the daemon holds it.
-fn sessions(all: bool, json: bool) -> Result<()> {
+/// List the registry's sessions, or just the ids the transcript sweep must hold.
+///
+/// **`live_ids` exists so the sweep's keep list has one implementation.** `.container/run.sh` used to
+/// take this command's `--json` and pull `.[].session` out with `jq` — a second answer to "which
+/// sessions count", in another language, which went on handing out ids from rows that had been open
+/// for months after the reaper's own answer learned not to. The rule is
+/// [`crate::transcripts::live_ids`] and both callers apply it.
+fn sessions(all: bool, live_ids: bool, json: bool) -> Result<()> {
     let url = crate::remote::daemon_url();
     let backend = crate::remote::client(&url, crate::remote::Purpose::Hook)
         .map_err(|e| anyhow::anyhow!("{}", e.message))?;
@@ -103,6 +110,15 @@ fn sessions(all: bool, json: bool) -> Result<()> {
         }
     }
     let sessions = keep_latest(sessions);
+    if live_ids {
+        for id in crate::transcripts::live_ids(
+            sessions.into_iter().map(|s| (s.session, s.seen_at)),
+            jkb_core::mq::now_ms(),
+        ) {
+            println!("{id}");
+        }
+        return Ok(());
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
         return Ok(());

@@ -1065,13 +1065,27 @@ in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 # it. Empty is the safe direction and the one the reaper also takes when it cannot read: the recency
 # window and the floor still stand. `-e` reaches `in_container` because that is a plain `docker
 # exec`; a shell prefix would set the variable for the docker CLI and never enter the container.
+#
+# ASKED FOR THE IDS, NOT FOR THE ROWS. This read `--json` and pulled `.[].session` out with `jq` — a
+# second answer to "which sessions count", in another language, with nothing comparing the two. They
+# diverged immediately: when the reaper learned that an unclosable row is not a live session, this
+# path went on handing out ids from rows that had been open for months, which is the state that makes
+# the sweep reclaim nothing. `--live-ids` applies the one rule (crates/jkb-cli/src/transcripts.rs)
+# and prints one id per line, so there is nothing here to keep in step and no JSON field to agree
+# about. `sweep_ok` records whether the registry could be READ, which is not the same fact as its
+# being empty — a sweep that ran unprotected must not look like one with nothing to protect.
 sweep_keep=""
+sweep_ok=no
 if command -v jkb >/dev/null 2>&1; then
-    sweep_sessions="$(jkb notify sessions --json 2>/dev/null || true)"
-    if [ -n "$sweep_sessions" ]; then
-        sweep_keep="$(printf '%s' "$sweep_sessions" | jq -r '.[].session' 2>/dev/null \
-            | LC_ALL=C sort -u | tr '\n' ' ' || true)"
+    if sweep_ids="$(jkb notify sessions --live-ids 2>/dev/null)"; then
+        sweep_ok=yes
+        sweep_keep="$(printf '%s' "$sweep_ids" | tr '\n' ' ')"
     fi
+fi
+if [ "$sweep_ok" = no ]; then
+    say "transcript sweep: could not ask jkb which sessions are live — sweeping with the recency window and the floor only"
+else
+    say "transcript sweep: holding $(printf '%s' "$sweep_keep" | wc -w | tr -d ' ') live session(s)"
 fi
 in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
 

@@ -52,8 +52,16 @@ pub const CONTAINER_NAME_VAR: &str = "JKB_CONTAINER_NAME";
 /// live transcripts. A name nothing can create is the fixture's answer.
 #[must_use]
 pub fn dev_container_name() -> String {
-    std::env::var(CONTAINER_NAME_VAR)
-        .ok()
+    chosen_container_name(std::env::var(CONTAINER_NAME_VAR).ok())
+}
+
+/// The name an override does or does not supply — the decision, without the environment.
+///
+/// Separated because a test that reached for `set_var` would be setting a process-wide variable in a
+/// binary whose other tests concurrently fork `git`, which is the one rule this crate wrote down for
+/// itself (`gitrepo.rs`). The environment read is one line above and has nothing to decide.
+fn chosen_container_name(from_env: Option<String>) -> String {
+    from_env
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| DEV_CONTAINER_NAME.to_owned())
 }
@@ -123,6 +131,44 @@ pub const KEEP_SESSIONS_VAR: &str = "JKB_KEEP_SESSIONS";
 /// phrase living in two files with nothing comparing them silently reclassifies every future run
 /// the day one end is reworded.
 const NOTHING_TO_DO: [&str; 2] = ["nothing to archive", "no transcripts"];
+
+/// How recently a session must have been SEEN to count as live.
+///
+/// **Absence of an end record is not life, and treating it as life caused the failure this whole
+/// feature prevents.** A container session ends without its `SessionEnd` hook whenever the container
+/// is stopped — every rebuild, and the documented E2BIG recovery, which is `run.sh` recreating it.
+/// Those rows can never be closed afterwards: the liveness probe needs the same instance, and a
+/// recreated container is a different one, so every orphan stays open until the 90-day prune. Handed
+/// to the sweep, each shields the whole subtree under it (`<slug>/<id>/subagents/**` — the bulk of
+/// the population), and three or four orphaned swarm sessions exceed the entire budget on their own:
+/// the sweep reclaims nothing and every Bash call goes on dying at spawn.
+///
+/// Six refresh windows, derived from the registry's own cadence rather than picked: a row is
+/// refreshed at most once an hour, so six hours of silence is not evidence of life. Over-keeping is
+/// only the safe direction while it LAPSES.
+pub const LIVE_SEEN_WITHIN_MS: i64 = jkb_core::claude_session::SEEN_REFRESH_MS * 6;
+
+/// The session ids a sweep must not plan, from `(session, seen_at)` pairs.
+///
+/// **One rule, two callers, because there are two triggers.** The reaper reads the registry from the
+/// database; `run.sh` asks the daemon for it on the host. Those are different access paths and will
+/// stay different — but "which sessions count" is one question, and the round that first answered it
+/// answered it in only one of the two places: the staleness fix above landed on the reaper while
+/// `run.sh` went on passing ids from rows that had been open for months. A rule every call site must
+/// separately remember is the defect this repository keeps rediscovering.
+pub fn live_ids<I: IntoIterator<Item = (String, i64)>>(rows: I, now: i64) -> Vec<String> {
+    let cutoff = now.saturating_sub(LIVE_SEEN_WITHIN_MS);
+    let mut ids: Vec<String> = rows
+        .into_iter()
+        .filter(|(_, seen_at)| *seen_at >= cutoff)
+        .map(|(session, _)| session)
+        .collect();
+    // One id per session however many processes hold it, and a stable order so two runs that see the
+    // same sessions produce the same string.
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
 
 /// The verdict of a multi-line report is its last non-empty line; it says several things on the way
 /// to one. The sweep's own `--self-test` and `.container/verify.sh` read it the same way.
@@ -351,6 +397,46 @@ mod tests {
         }
     }
 
+    /// A ROW WITH NO END RECORD IS NOT A LIVE SESSION. A container session ends without its
+    /// `SessionEnd` hook whenever the container is stopped — every rebuild, and the documented
+    /// E2BIG recovery — and those rows can never be closed afterwards, so they sat open for the
+    /// 90-day prune. The sweep protects the whole subtree under each id, and three or four orphaned
+    /// swarm sessions exceed the entire budget: the sweep then reclaimed nothing and every Bash call
+    /// went on dying at spawn, reached by the recovery step the record tells the operator to run.
+    #[test]
+    fn a_session_nobody_has_seen_for_hours_stops_holding_its_transcripts() {
+        // `(session, seen_at)` pairs, which is all the rule is about — the two callers map
+        // their own row types to this, and neither type belongs in the rule.
+        let row = |session: &str, seen_at: i64| (session.to_owned(), seen_at);
+        let now = 1_000_000_000_000;
+        let hour = jkb_core::claude_session::SEEN_REFRESH_MS;
+        let got = super::live_ids(
+            vec![
+                row("fresh", now - 60_000),
+                row("an-hour-idle", now - hour),
+                // Orphaned by a container recreate: open for ever, and the shape that caused it.
+                row("orphaned-weeks-ago", now - hour * 24 * 14),
+                // One session, two processes holding it: one id out.
+                row("fresh", now - 120_000),
+            ],
+            now,
+        );
+        assert_eq!(got, vec!["an-hour-idle", "fresh"], "sorted and deduped");
+        assert!(
+            !got.iter().any(|id| id == "orphaned-weeks-ago"),
+            "an unclosable row must stop protecting, or the sweep can never reclaim"
+        );
+        // ...and the boundary is the cutoff itself, not something either side of it.
+        let edge = super::live_ids(
+            vec![
+                row("just-inside", now - super::LIVE_SEEN_WITHIN_MS),
+                row("just-outside", now - super::LIVE_SEEN_WITHIN_MS - 1),
+            ],
+            now,
+        );
+        assert_eq!(edge, vec!["just-inside"]);
+    }
+
     #[test]
     fn no_docker_at_all_is_absent_and_pokes_nothing_further() {
         let seen = Seen::default();
@@ -509,22 +595,20 @@ mod tests {
     /// The name is `run.sh`'s, honoured the way `run.sh` honours it — and the override is what
     /// stops `cargo test` reaching a real container, since the suite spawns `task reap --watch` as
     /// a real child with the developer's own environment.
+    ///
+    /// Driven by VALUES, not by `set_var`: this binary's other tests fork `git` concurrently, and a
+    /// process-wide variable set mid-run is the hazard this crate wrote a rule about for itself.
     #[test]
     fn the_container_name_follows_run_sh_and_can_be_overridden() {
-        // Serialised against nothing else: this is the only test that touches the variable, and it
-        // restores what it found rather than assuming there was nothing.
-        let before = std::env::var(super::CONTAINER_NAME_VAR).ok();
-        std::env::remove_var(super::CONTAINER_NAME_VAR);
-        assert_eq!(super::dev_container_name(), "jkb-dev");
-        std::env::set_var(super::CONTAINER_NAME_VAR, "jkb-somewhere-else");
-        assert_eq!(super::dev_container_name(), "jkb-somewhere-else");
+        let chosen = super::chosen_container_name;
+        assert_eq!(chosen(None), "jkb-dev");
+        assert_eq!(
+            chosen(Some("jkb-somewhere-else".to_owned())),
+            "jkb-somewhere-else"
+        );
         // Empty is not a name. Set-but-blank would otherwise point every exec at "".
-        std::env::set_var(super::CONTAINER_NAME_VAR, "   ");
-        assert_eq!(super::dev_container_name(), "jkb-dev");
-        match before {
-            Some(v) => std::env::set_var(super::CONTAINER_NAME_VAR, v),
-            None => std::env::remove_var(super::CONTAINER_NAME_VAR),
-        }
+        assert_eq!(chosen(Some(String::new())), "jkb-dev");
+        assert_eq!(chosen(Some("   ".to_owned())), "jkb-dev");
     }
 
     #[test]

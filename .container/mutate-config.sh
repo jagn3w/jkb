@@ -690,31 +690,22 @@ run "run.sh sweeps without telling the container which sessions are live" "sweep
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'jkb notify sessions --json'
+old = 'jkb notify sessions --live-ids'
 assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, 'true --no-sessions', 1))
 PYX
 run "run.sh stops asking jkb which sessions are live" "never asks jkb which sessions are live"
 
-# ...AND THE FIELD IT READS. `jq -r '.[].session'` is a second spelling of ClaudeSession::session; a
-# serde rename makes jq emit nothing for every row and the list is empty on every start.
+# ...AND THE TWO EMPTY STATES. A sweep that ran with no protection must not read, in the scroll-back,
+# like one that had nothing to protect.
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = ".[].session"
+old = 'could not ask jkb which sessions are live'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, ".[].session_id", 1))
+open(p, 'w').write(s.replace(old, 'no live sessions', 1))
 PYX
-run "run.sh reads a session field the API does not emit" "reads a session field the API does not emit"
-
-seed; python3 - "$work/t/crates/jkb-api/src/lib.rs" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = "    pub session: String,"
-assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, '    #[serde(rename = "session_id")]\n    pub session: String,', 1))
-PYX
-run "the API renames the session field out from under run.sh" "reads a session field the API does not emit"
+run "run.sh stops saying when it could not read the registry" "does not say when it could not read the registry"
 
 # THE REAPER'S QUIET-TICK PHRASES going unread, the last extraction-read-nothing branch with no
 # mutation of its own.
@@ -1707,7 +1698,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=109
+PINNED_SWEEP_APPENDS=107
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

@@ -12,7 +12,8 @@
 #
 #   1182 transcript .jsonl files, 224KB of path text (~194 bytes per path)
 #   ~/.claude/projects is a SYMLINK to ~/.claude-state/projects, so every file is listed under
-#   BOTH spellings: ~2396 deny entries (2 x 1182, plus ~30 fixed security paths), 448KB of path
+#   BOTH spellings: ~2396 deny entries (2 x 1182, plus the fixed-path half — ~30 at the time,
+#   measured at 89 a year later and growing with registered worktrees; see DENY_SPELLINGS), 448KB of path
 #   text, reported by the harness as `command line 498.8KB across 3 args`
 #
 # Every Bash tool call in every container session then failed at spawn with E2BIG. Not degraded:

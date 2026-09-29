@@ -1912,3 +1912,35 @@ Two guards were pinning a spelling against nothing:
   Writing that guard reproduced this branch's most-repeated bug in miniature: `.[].session` matched
   `.[].session_id` as a substring, so the rename mutation went MISSED until the closing quote joined
   the needle — the same shape as `accept_bad` satisfying a search for `bad`.
+
+**The keep list had two implementations, and they diverged within one round.** The reaper read the
+registry from the database; `run.sh` asked the daemon for `--json` and pulled `.[].session` out with
+`jq`. Two answers to one question — *which sessions count* — in two languages, with nothing comparing
+them. So when the reaper learned that an unclosable row is not a live session, `run.sh` went on
+handing out ids from rows that had been open for months, which is precisely the state that makes the
+sweep reclaim nothing. The fix above was made once and needed making twice, and that is the whole
+argument against this shape.
+
+`jkb notify sessions --live-ids` applies [`transcripts::live_ids`] and prints one id per line. Both
+triggers call it; the rule lives once. It also deletes two couplings that existed only because the
+rule was duplicated — `run.sh` no longer needs `jq`, and `check-config.sh` no longer has to hold a
+JSON field name to `ClaudeSession`'s serde spelling. Access paths still differ (the reaper reads the
+database, the host asks the daemon) and that is fine: what must not differ is the rule.
+
+And the two empty lists are now distinguishable. *No live sessions* and *could not ask the daemon*
+both produced an empty `sweep_keep`, so a sweep that ran with **no protection at all** looked in the
+scroll-back exactly like one that had nothing to protect. `run.sh` says which happened, and
+`check-config.sh` pins that it does.
+
+Three smaller ones from the same round: the budget-seam refusal scanned `mutate-verify.sh` — the one
+file this record designates for closing the known behavioural gap, which means staging a budget in it
+— and refused it with a message that is false about that file; the header's `~30 fixed security
+paths` was the figure the budget comment seventy lines below already re-measures at 89, left where a
+reader meets it first; and `dev_container_name`'s test called `set_var` in a binary whose other tests
+fork `git` concurrently, which is the one rule this crate wrote down for itself. The decision is a
+pure `chosen_container_name(Option<String>)` now, driven by values.
+
+Finally, `--json` got the shape its neighbour already had. The tick printed prose to stderr under
+`--json` while the queue compaction beside it printed a document to stdout, so a machine consumer of
+the reaper recorded a compaction and never a sweep, never an over-budget container, and never a
+daemon it could not reach.

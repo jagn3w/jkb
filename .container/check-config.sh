@@ -748,7 +748,10 @@ else
             for dc_f_path in "$here"/*.sh "$here"/Dockerfile "$here"/container.json; do
                 [ -f "$dc_f_path" ] || continue
                 dc_f="${dc_f_path##*/}"
-                case "$dc_f" in sweep-transcripts.sh|check-config.sh|mutate-config.sh) continue ;; esac
+                # mutate-verify.sh joins the two harnesses: the record designates it for closing
+                # the behavioural half of the verify gap, which means staging a budget in it, and
+                # refusing that with "it silently disables the sweep" is false about that file.
+                case "$dc_f" in sweep-transcripts.sh|check-config.sh|mutate-config.sh|mutate-verify.sh) continue ;; esac
                 dc_f_body="$(dc_strip_comments "$dc_f_path")"
                 for dc_seam in $sweep_seams; do
                     grep -qF -- "$dc_seam" <<<"$dc_f_body" \
@@ -822,32 +825,24 @@ fi
 if [ -n "$sweep_at" ]; then
     grep -qF -- '-e "JKB_KEEP_SESSIONS=' <<<"$(sed -n "${sweep_at}p" <<<"$run_stripped")" \
         || sweep_problems="$sweep_problems run.sh sweeps without passing the live-session list, so on a container that was already running a live transcript can be archived out from under its session;"
-    # ...AND THE LIST IS ACTUALLY DERIVED. The flag alone pins nothing that matters: delete the six
+    # ...AND THE LIST IS ACTUALLY DERIVED. The flag alone pins nothing that matters: delete the
     # lines that fill `sweep_keep` and `-e "JKB_KEEP_SESSIONS=$sweep_keep"` still passes an empty
     # string for ever, with this guard reporting the protection it no longer has. Reproduced: the
     # composed assertion stayed `ok` and check-config's output was byte-identical to the unmutated
     # tree's.
-    grep -qF -- 'jkb notify sessions --json' <<<"$run_stripped" \
+    #
+    # PINNED ON THE VERB, not on a JSON field. This used to read `--json` and pull `.[].session` out
+    # with `jq`, so the guard had to hold that field name to `ClaudeSession`'s serde name — a
+    # coupling that existed only because the rule was implemented twice. `--live-ids` applies the one
+    # rule in crates/jkb-cli/src/transcripts.rs and prints one id per line, so there is no field to
+    # agree about and nothing here to keep in step.
+    grep -qF -- 'jkb notify sessions --live-ids' <<<"$run_stripped" \
         || sweep_problems="$sweep_problems run.sh never asks jkb which sessions are live, so the list it passes is empty on every start and the protection exists in name only;"
-    # ...AND IT READS THE FIELD THE API ACTUALLY EMITS. `jq -r '.[].session'` is a second, uncompared
-    # spelling of `ClaudeSession::session`; a serde rename there makes jq emit nothing for every row,
-    # the list is permanently empty, and every guard above still passes. Held to the Rust the way
-    # HELD_NAME is held to swarm-status.sh.
-    rs_session_field="$(grep -oE '^\s*pub session: String,' \
-        "$here/../crates/jkb-api/src/lib.rs" 2>/dev/null | head -1 | sed -E 's/.*pub ([a-z_]+):.*/\1/')"
-    rs_session_rename="$(grep -B 1 -E '^\s*pub session: String,' \
-        "$here/../crates/jkb-api/src/lib.rs" 2>/dev/null | grep -oE 'rename = "[^"]+"' | head -1 \
-        | sed -E 's/rename = "(.*)"/\1/')"
-    dc_session_key="${rs_session_rename:-$rs_session_field}"
-    if [ -z "$dc_session_key" ]; then
-        sweep_problems="$sweep_problems the session id's field cannot be read from jkb-api, so nothing holds run.sh's jq filter to what the API emits;"
-    else
-        # THE CLOSING QUOTE IS PART OF THE NEEDLE. Without it `.[].session` matches `.[].session_id`
-        # as a substring and the mutation that renames the field goes MISSED — the same shape as
-        # `accept_bad` satisfying a search for `bad`, which this file has already been bitten by.
-        grep -qF -- ".[].$dc_session_key'" <<<"$run_stripped" \
-            || sweep_problems="$sweep_problems run.sh reads a session field the API does not emit (it emits '$dc_session_key'), so the live-session list is empty on every start;"
-    fi
+    # ...AND THE TWO EMPTY STATES ARE TOLD APART. "no live sessions" and "could not ask the daemon"
+    # both produce an empty list, and a sweep that ran UNPROTECTED must not look in the scroll-back
+    # like one that had nothing to protect.
+    grep -qF -- 'could not ask jkb which sessions are live' <<<"$run_stripped" \
+        || sweep_problems="$sweep_problems run.sh does not say when it could not read the registry, so a sweep that ran with no live-session protection is indistinguishable from one with nothing to protect;"
 fi
 
 # AND THE OPERATOR IS TOLD. run.sh discards the sweep's exit code with `|| true` -- correctly, since
