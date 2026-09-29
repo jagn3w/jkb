@@ -679,9 +679,17 @@ else
         # ...AND BOTH READERS ASK THE SAME QUESTION. transcript_plan must not plan a protected file
         # and transcript_irreducible must count one; the day they disagree is the day a sweep
         # archives a live transcript while reporting itself unable to reclaim anything.
+        # SUBSTITUTED, NOT PIPED, and every other check in this file is a here-string for the same
+        # reason: `producer | grep -q` is a defect this repository has shipped before. `grep -q`
+        # exits at its FIRST match, the producer dies on the unwritten tail, and under `pipefail`
+        # the pipeline reports the status of the producer -- so a check that FOUND what it wanted
+        # fails. Latent by size rather than wrong-by-construction: these function bodies fit the
+        # 64KB pipe buffer today, so awk finishes before grep leaves and this passed every run,
+        # which is exactly what makes it worth removing rather than watching.
         for dc_fn in transcript_plan transcript_irreducible; do
-            awk -v f="$dc_fn" '$0 ~ "^" f "\\(\\)" { inf = 1 } inf { print } inf && /^\}/ { exit }' \
-                <<<"$sweep_body" | grep -qF -- 'protected($2, $1)' \
+            dc_body="$(awk -v f="$dc_fn" '$0 ~ "^" f "\\(\\)" { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+                <<<"$sweep_body")"
+            grep -qF -- 'protected($2, $1)' <<<"$dc_body" \
                 || sweep_problems="$sweep_problems $dc_fn() does not ask whether a file is protected, so the plan and the irreducible measure no longer agree about what a live session holds;"
         done
         # THE POST-CONDITION'S CALL SITE. Its comparison is watched by the self-test, which drives
