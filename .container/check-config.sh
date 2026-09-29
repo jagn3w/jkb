@@ -665,10 +665,25 @@ else
             grep -qE -- 'kept < keep.*tot \+= length' <<<"$sweep_irr" \
                 || sweep_problems="$sweep_problems transcript_irreducible() does not count the newest KEEP_NEWEST the floor protects, so the window where the floor is what puts a tree beyond help is reported as a broken boundary;"
         fi
-        grep -qF -- 'index(live, " " id " ")' <<<"$sweep_body" \
+        # MATCHED ON THE SESSION DIRECTORY, not the leaf name. A session writes <slug>/<uuid>.jsonl
+        # and everything under <slug>/<uuid>/subagents/…, and those nested agent transcripts are
+        # the BULK of the population: matching only the basename protected the first and left the
+        # majority to the recency window alone. The registry has no row for a Task-tool subagent,
+        # so nothing else can cover them.
+        grep -qF -- 'index(path, "/" id "/")' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems the sweep does not spare what a live session writes BENEATH its own directory, which is the bulk of the population and has no registry row of its own;"
+        grep -qF -- 'index(path, "/" id ".jsonl")' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems the sweep does not skip the sessions it is told are live, so the reaper's keep-list is data nothing acts on;"
-        grep -qF -- '$1 > now - fresh' <<<"$sweep_body" \
+        grep -qF -- 'mtime > now - fresh' <<<"$sweep_body" \
             || sweep_problems="$sweep_problems the sweep does not spare recently-written transcripts, so a live session the registry cannot see is archived out from under it;"
+        # ...AND BOTH READERS ASK THE SAME QUESTION. transcript_plan must not plan a protected file
+        # and transcript_irreducible must count one; the day they disagree is the day a sweep
+        # archives a live transcript while reporting itself unable to reclaim anything.
+        for dc_fn in transcript_plan transcript_irreducible; do
+            awk -v f="$dc_fn" '$0 ~ "^" f "\\(\\)" { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+                <<<"$sweep_body" | grep -qF -- 'protected($2, $1)' \
+                || sweep_problems="$sweep_problems $dc_fn() does not ask whether a file is protected, so the plan and the irreducible measure no longer agree about what a live session holds;"
+        done
         # THE POST-CONDITION'S CALL SITE. Its comparison is watched by the self-test, which drives
         # transcript_projection_fell from literals -- but the self-test cannot see the call being
         # deleted, because the state it guards (files moved, deny list no smaller) is refused

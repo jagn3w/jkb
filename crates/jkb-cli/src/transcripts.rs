@@ -194,10 +194,21 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
             .stderr(Stdio::piped())
             .spawn()
             .ok()?;
-        // WRITTEN FROM A THREAD, because the script is larger than a pipe buffer (74KB against
-        // 64KB) and `bash -s` executes as it reads: a blocking write from here would deadlock the
-        // moment the child stopped reading to run a `find`. The handle is moved in, so the pipe is
-        // closed when the thread ends and `bash` sees EOF.
+        // EVERY PIPE GETS A THREAD, and all three for the same reason: a pipe nobody is moving
+        // blocks whoever is on the other end of it.
+        //
+        // The WRITER, because the script is larger than a pipe buffer (74KB against 64KB) and
+        // `bash -s` executes as it reads, so a blocking write from here deadlocks the moment the
+        // child pauses to run a `find`. The handle is moved in, so the pipe closes when the thread
+        // ends and `bash` sees EOF.
+        //
+        // The READERS, because the child can outrun a 64KB buffer too, and the case where it does
+        // is the one that matters: an archive that has gone read-only or full makes `mkdir -p`
+        // fail for every planned file, ~100 bytes of stderr each, ~100KB across a thousand. Left
+        // unread until `wait_with_output` after the loop, the child blocked on write, `try_wait`
+        // never returned `Some`, and at sixty seconds this reported `Unreachable` — telling the
+        // operator the daemon would not answer when the daemon was fine and the disk was full,
+        // and burning the whole timeout before `reap_once` on every tick.
         let writer = stdin.map(|s| {
             let mut pipe = child.stdin.take();
             let body = s.to_owned();
@@ -207,6 +218,24 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
                 }
                 drop(pipe);
             })
+        });
+        // Spelled twice rather than shared: the two handles are different types, and a generic
+        // helper for six lines reads worse than the six lines.
+        let out_pipe = child.stdout.take();
+        let out_t = std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut p) = out_pipe {
+                let _ = std::io::Read::read_to_string(&mut p, &mut buf);
+            }
+            buf
+        });
+        let err_pipe = child.stderr.take();
+        let err_t = std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut p) = err_pipe {
+                let _ = std::io::Read::read_to_string(&mut p, &mut buf);
+            }
+            buf
         });
         let deadline = Instant::now() + DOCKER_TIMEOUT;
         loop {
@@ -224,12 +253,12 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
         if let Some(w) = writer {
             let _ = w.join();
         }
-        let out = child.wait_with_output().ok()?;
-        Some((
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        ))
+        // Joined AFTER the child is gone or killed, so both pipes have reached EOF and neither
+        // join can outlive the deadline the loop above enforces.
+        let status = child.wait().ok()?;
+        let stdout = out_t.join().unwrap_or_default();
+        let stderr = err_t.join().unwrap_or_default();
+        Some((status.success(), stdout, stderr))
     })
 }
 

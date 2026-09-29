@@ -1728,3 +1728,38 @@ a file the sweep may not archive was never a candidate, so letting one consume a
 would reserve protection for something already protected, while the argv still has to count it.
 `check-config.sh` holds `KEEP_SESSIONS_VAR` and the shell's `${JKB_KEEP_SESSIONS:-}` to each other:
 a variable spelled differently at the two ends protects nothing while both files read correct.
+
+**Round 8 — six findings, none must-fix, and the first round in single digits.** Three of them were
+about the liveness guards added the round before, and two of those were the same shape.
+
+The registry half protected a session's **own** `<slug>/<uuid>.jsonl` and nothing else, because it
+matched the transcript's leaf name against a session id. But a Task-tool subagent opens no session,
+so the registry never holds a row for `<slug>/<uuid>/subagents/agent-X.jsonl` — and those nested
+transcripts are, as the walk's own comment says, *the bulk of the population*. They were left to the
+recency window alone, which a subagent sitting an hour on one tool call or a pending permission
+prompt walks straight out of. The match is on the **session directory** now: `/<uuid>.jsonl` or
+`/<uuid>/`, so everything a live session wrote is covered by the row it does have.
+
+`transcript_irreducible` did not know about either skip, so a container recreated after a heavy
+swarm — the standard recovery from an E2BIG — had every transcript inside the recency window, no
+plan could reach the budget, and the measure reported a number under it. `verify.sh` then fell past
+`accept_bad` into plain `bad`: exit 1 instead of 3, `run.sh` refusing to open a window, and a FAIL
+naming three causes none of which applied. Both functions ask **one predicate** now, held as a
+single awk text rather than a rule each remembers — the day they disagree is the day a sweep
+archives a live transcript while reporting itself unable to reclaim anything.
+
+And the reaper drained neither output pipe until after its wait loop. An archive gone read-only in
+an over-budget container makes `mkdir -p` fail for every planned file — ~100 bytes of stderr each,
+~100KB across a thousand, against a 64KB buffer. The child blocks on write, `try_wait` never returns,
+and at sixty seconds the tick reported `Unreachable`: *the daemon would not answer*, when the daemon
+was fine and the disk was full, burning the whole timeout before `reap_once` every time. All three
+pipes have a thread now, joined after the child is gone.
+
+Two smaller ones worth keeping. `prog`'s `env -u` list named three of the four seams, so it is
+derived from `$SEAMS` now and the next seam cannot repeat it. And the headroom comment called the
+uncounted half "the ~30 fixed security paths" — measured in a session that day: **89 deny paths, six
+of them registered git worktrees**. D36 gives every task its own worktree, so the uncounted half
+grows with exactly the workload this sweep was written for, and no sweep can reclaim a worktree path.
+A few hundred bytes against 65,536 today, but it runs in the direction that overflows and it
+compounds with the spelling lean recorded above: both have to be closed before anyone tightens this
+margin.

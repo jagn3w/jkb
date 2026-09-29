@@ -598,7 +598,7 @@ run "the reaper names the keep-list something the sweep does not read" "so a liv
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '          if (index(live, " " id " ") > 0) next\n'
+old = '        if (index(path, "/" id ".jsonl") > 0) return 1\n'
 assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, '', 1))
 PYX
@@ -607,7 +607,7 @@ run "the sweep stops skipping the sessions it is told are live" "keep-list is da
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '          if (now > 0 && fresh > 0 && $1 > now - fresh) next\n'
+old = '    if (now > 0 && fresh > 0 && mtime > now - fresh) return 1\n'
 assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, '', 1))
 PYX
@@ -621,6 +621,28 @@ assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, 'KEEP_SESSIONS=""', 1))
 PYX
 run "the sweep stops reading the keep-list at all" "cannot be read from both transcripts.rs and sweep-transcripts.sh"
+
+# ...AND WHAT A LIVE SESSION WRITES BENEATH ITSELF, which is the bulk of the population and has no
+# registry row of its own: a Task-tool subagent opens no session.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '        if (index(path, "/" id "/") > 0) return 1\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "a live session stops protecting its own subagents' transcripts" "BENEATH its own directory"
+
+# ...and the two readers of that predicate drifting apart, which is a live transcript archived by a
+# sweep that reported itself unable to reclaim anything.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (protected($2, $1)) { tot += length($2); next }\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the irreducible measure stops asking what a live session holds" "transcript_irreducible() does not ask whether a file is protected"
 
 seed; rm -f "$work/t/crates/jkb-cli/src/transcripts.rs"
 run "the reaper's container module is deleted" "nothing sweeps the container between starts"
@@ -681,7 +703,7 @@ run "verify.sh renames the handle its deny-list block is read by" "has no deny-l
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '          if (kept < keep)   { tot += length($2); kept++ } }'
+old = '          if (kept < keep)       { tot += length($2); kept++ } }'
 assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, '          }', 1))
 PYX
@@ -690,7 +712,7 @@ run "the floor stops counting toward what no sweep can remove" "does not count t
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '          if (base == held)  { tot += length($2); next }'
+old = '          if (base == held)        { tot += length($2); next }'
 assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, '          if (base == held)  { next }', 1))
 PYX
@@ -1599,7 +1621,7 @@ fi
 # branch would otherwise move this count and print "Add a mutation for it" about a sentence.
 sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'sweep_problems' | grep -c .)"
-PINNED_SWEEP_APPENDS=95
+PINNED_SWEEP_APPENDS=99
 if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"

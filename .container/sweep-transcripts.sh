@@ -67,14 +67,21 @@ TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-stat
 # HAND-WRITTEN, AND CHECKED AGAINST REALITY BY check-config.sh, which derives the same set from
 # every `${JKB_…:-}` this file actually reads and requires the two to agree. A declaration nothing
 # compares to the code is a fourth seam waiting to be refused by nothing.
-SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_KEEP_SESSIONS"
+SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_KEEP_SESSIONS JKB_NOW_SECS"
 
 # MAX_ARG_STRLEN on Linux: 32 pages. Recorded for the reader; the budget below is derived from it.
 ARGV_MAX_BYTES=131072
-# Half of it. The other half is headroom for what this sweep does NOT count: the ~30 fixed
-# security paths in the same deny list, the write-side allow/deny lists in the same argument, and
-# the JSON quoting around every entry. Half is not a measurement, it is a margin — and a margin is
-# what the previous arrangement (none) lacked.
+# Half of it. The other half is headroom for what this sweep does NOT count: the security paths in
+# the same deny list, the write-side allow/deny lists in the same argument, and the JSON quoting
+# around every entry. Half is not a measurement, it is a margin — and a margin is what the previous
+# arrangement (none) lacked.
+#
+# THAT SET IS NOT FIXED, and this comment used to call it "the ~30 fixed security paths". Measured
+# in a session on 2026-09-28: 89 deny paths, SIX of them registered git worktrees — and D36 gives
+# every task its own worktree, so the uncounted half grows with exactly the workload this sweep was
+# written for. No sweep can reclaim a worktree path. A few hundred bytes against 65,536 today, but
+# the error runs in the direction that overflows, and it compounds with the spelling lean below:
+# both have to be closed before anyone tightens this margin.
 # JKB_DENY_BUDGET_BYTES is a TEST SEAM, alongside JKB_TRANSCRIPT_ROOT and JKB_TRANSCRIPT_ARCHIVE,
 # and the only way --self-test can drive this file as a PROGRAM against a tree small enough to
 # build in a temp directory -- without it, every program-level row has to point at an empty root,
@@ -117,7 +124,7 @@ KEEP_MODIFIED_WITHIN_SECS=3600
 KEEP_SESSIONS="${JKB_KEEP_SESSIONS:-}"
 # Overridable so --self-test can place the fixture's mtimes relative to a fixed present; the
 # freshness window is meaningless against a clock the suite does not control.
-NOW_SECS="${NOW_SECS:-$(date +%s)}"
+NOW_SECS="${JKB_NOW_SECS:-$(date +%s)}"
 # THE ONE NAME THE SWEEP HOLDS BACK, and the rule it replaced was WRONG. That rule said the
 # workflow harness keeps `wf_*.json` run records; there are none -- measured, zero anywhere under
 # the real root. What it actually writes is <slug>/<uuid>/subagents/workflows/wf_*/journal.jsonl
@@ -200,20 +207,44 @@ transcript_projection_fell() { # transcript_projection_fell <moved> <before> <af
 # including the ones no plan may ever contain, because the kernel counts a path the sweep cannot
 # reclaim exactly like one it can. `keep` is a floor on the ARCHIVABLE population: a held file was
 # never a candidate, so counting it toward the floor would reserve a slot no plan could have used.
+# IS THIS FILE ONE A LIVE SESSION MAY BE WRITING? Asked by transcript_plan, which must not plan
+# one, and by transcript_irreducible, which must count one -- and the day those two disagree is the
+# day a sweep archives a live transcript while reporting itself unable to reclaim anything. So it is
+# one text, handed to both awks, rather than a rule each of them remembers.
+AWK_PROTECTED='
+function protected(path, mtime,   i, id) {
+    if (now > 0 && fresh > 0 && mtime > now - fresh) return 1
+    for (i = 1; i <= nlive; i++) {
+        id = LIVE[i]
+        if (id == "") continue
+        # BY SESSION DIRECTORY, NOT BY LEAF NAME. A session writes <slug>/<uuid>.jsonl AND
+        # everything under <slug>/<uuid>/subagents/... -- and those nested agent transcripts are
+        # the BULK of the population, as this file says of the walk. Matching only the basename
+        # protected the first and left the majority to the recency window alone, which a subagent
+        # sitting an hour on one tool call or a permission prompt walks straight out of. The
+        # registry has no row for a Task-tool subagent, so no id of its own ever appears -- but the
+        # session it belongs to has one, and every file it writes is under that session directory.
+        if (index(path, "/" id ".jsonl") > 0) return 1
+        if (index(path, "/" id "/") > 0) return 1
+    }
+    return 0
+}
+BEGIN { nlive = split(live, LIVE, " ") }
+'
+
 transcript_plan() { # transcript_plan < records -> paths to archive, oldest first
     LC_ALL=C sort -t"$TAB" -k1,1n -k2,2 \
     | LC_ALL=C awk -F"$TAB" -v budget="$DENY_BUDGET_BYTES" -v keep="$KEEP_NEWEST" \
                    -v mult="$DENY_SPELLINGS" -v held="$HELD_NAME" \
-                   -v live=" $KEEP_SESSIONS " -v now="$NOW_SECS" -v fresh="$KEEP_MODIFIED_WITHIN_SECS" '
+                   -v live="$KEEP_SESSIONS" -v now="$NOW_SECS" -v fresh="$KEEP_MODIFIED_WITHIN_SECS" \
+        "$AWK_PROTECTED"'
         { tot += length($2)
           base = $2; sub(/^.*\//, "", base)
           if (base == held) next
-          # A LIVE SESSION IS NEVER PLANNED, by name or by recency. Skipped like the held name and
-          # before the floor, because a file that may not be archived was never a candidate: letting
-          # it consume a `keep` slot would reserve protection for something already protected.
-          if (now > 0 && fresh > 0 && $1 > now - fresh) next
-          id = base; sub(/\.jsonl$/, "", id)
-          if (index(live, " " id " ") > 0) next
+          # A LIVE SESSION IS NEVER PLANNED. Skipped like the held name and before the floor,
+          # because a file that may not be archived was never a candidate: letting it consume a
+          # `keep` slot would reserve protection for something already protected.
+          if (protected($2, $1)) next
           n++; path[n] = $2 }
         END {
             proj = mult * tot
@@ -244,10 +275,19 @@ transcript_unreclaimable() { # transcript_unreclaimable < records -> the held-ba
 # Sorted newest-first so the first `keep` reclaimable records are the ones the floor protects.
 transcript_irreducible() { # transcript_irreducible < records -> bytes no sweep can remove
     LC_ALL=C sort -t"$TAB" -k1,1nr -k2,2r \
-    | LC_ALL=C awk -F"$TAB" -v keep="$KEEP_NEWEST" -v mult="$DENY_SPELLINGS" -v held="$HELD_NAME" '
+    | LC_ALL=C awk -F"$TAB" -v keep="$KEEP_NEWEST" -v mult="$DENY_SPELLINGS" -v held="$HELD_NAME" \
+                   -v live="$KEEP_SESSIONS" -v now="$NOW_SECS" -v fresh="$KEEP_MODIFIED_WITHIN_SECS" \
+        "$AWK_PROTECTED"'
         { base = $2; sub(/^.*\//, "", base)
-          if (base == held)  { tot += length($2); next }
-          if (kept < keep)   { tot += length($2); kept++ } }
+          if (base == held)        { tot += length($2); next }
+          # ...AND WHAT A LIVE SESSION HOLDS, which this did not count. A container recreated after
+          # a heavy swarm -- the standard recovery from an E2BIG -- has every transcript inside the
+          # recency window, so no plan reaches the budget while this reported a number under it:
+          # verify.sh then fell past `accept_bad` into plain `bad`, exit 1 instead of 3, run.sh
+          # refused to open a window, and the causes it printed were all wrong. Protection here is
+          # about NOW: the share of it the recency window contributes lapses, and the message says so.
+          if (protected($2, $1)) { tot += length($2); next }
+          if (kept < keep)       { tot += length($2); kept++ } }
         END { printf "%d\n", mult * tot }'
 }
 
@@ -553,6 +593,10 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "every path is listed once per spelling of the root" "$DENY_SPELLINGS" "2"
     eq "the floor that keeps the live session's own transcript is 32" "$KEEP_NEWEST" "32"
     eq "a file written within the hour is treated as open" "$KEEP_MODIFIED_WITHIN_SECS" "3600"
+    # Set here rather than asserted from the environment: unlike the others this is a caller's
+    # input, so its shipped value is "whatever JKB_KEEP_SESSIONS said", and what the rows below
+    # need is a known starting point.
+    KEEP_SESSIONS=""
     eq "and nothing is held live unless a caller says so" "$KEEP_SESSIONS" ""
     # SET, but its VALUE is deliberately not pinned here. Its authority is swarm-status.sh's
     # discovery predicate, and check-config.sh reads it out of that file and requires agreement -- a
@@ -644,6 +688,27 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     KEEP_SESSIONS="aaaaaaaa cccccccc"
     eq "...and more than one of them" \
        "$(printf '%s\n' "$live_recs" | transcript_plan | tr '\n' ' ')" "/p/-s/bbbbbbbb.jsonl "
+    # ...AND EVERYTHING THAT SESSION WROTE BENEATH ITSELF, which is the half that was missing. A
+    # Task-tool subagent opens no session, so the registry has no row of its own for
+    # <slug>/<uuid>/subagents/agent-X.jsonl -- and those nested transcripts are the BULK of the
+    # population. Matched on the leaf name alone they were left to the recency window, which a
+    # subagent sitting an hour on one tool call or a permission prompt walks straight out of.
+    nested_recs="100${TAB}/p/-s/uuuu.jsonl
+100${TAB}/p/-s/uuuu/subagents/agent-a.jsonl
+100${TAB}/p/-s/uuuu/subagents/workflows/wf_1/agent-b.jsonl
+100${TAB}/p/-s/vvvv/subagents/agent-c.jsonl"
+    DENY_BUDGET_BYTES=0 KEEP_NEWEST=0 NOW_SECS=0 KEEP_SESSIONS="uuuu"
+    eq "a live session protects its nested agent transcripts, not just its own file" \
+       "$(printf '%s\n' "$nested_recs" | transcript_plan | tr '\n' ' ')" \
+       "/p/-s/vvvv/subagents/agent-c.jsonl "
+    # ...and what it protects is counted as beyond any sweep, or verify.sh reports a tree no plan
+    # can shrink as a broken boundary and prints causes that do not apply.
+    eq "what a live session holds counts toward what no sweep can remove" \
+       "$([ "$(printf '%s\n' "$nested_recs" | transcript_irreducible)" -gt 0 ] && echo yes || echo no)" "yes"
+    KEEP_SESSIONS=""
+    eq "...and with nothing live, none of it is" \
+       "$(printf '%s\n' "$nested_recs" | transcript_irreducible)" "0"
+
     # A PREFIX IS NOT A MATCH. The list is searched with its separators, so a session whose id is a
     # substring of a live one is still archivable -- ids are uuids and this is cheap to get wrong.
     KEEP_SESSIONS="bbbb"
@@ -1079,11 +1144,14 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # `${envs[@]+...}` because bash 3.2 (which is what a Mac ships, and this file self-tests on
     # macOS) treats an empty array under `set -u` as unbound.
     prog() {
-        local envs=()
+        local envs=() unset_args=(-u CLAUDE_CONFIG_DIR) seam
+        # DERIVED FROM $SEAMS, not retyped. The list named three of four, so an exported
+        # JKB_KEEP_SESSIONS reached every row below -- and nothing but this comment would have
+        # stopped the next seam repeating it.
+        for seam in $SEAMS; do unset_args+=(-u "$seam"); done
         while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
         [ "$#" -eq 0 ] || shift
-        env -u CLAUDE_CONFIG_DIR -u JKB_TRANSCRIPT_ROOT -u JKB_TRANSCRIPT_ARCHIVE \
-            -u JKB_DENY_BUDGET_BYTES ${envs[@]+"${envs[@]}"} bash "$self" "$@"
+        env "${unset_args[@]}" ${envs[@]+"${envs[@]}"} bash "$self" "$@"
     }
     phome="$work/phome"; mkdir -p "$phome/.claude/projects"   # exists, empty
     palt="$work/palt"                                          # $palt/projects absent
