@@ -524,9 +524,10 @@ run "verify.sh classifies on a phrase the sweep does not print" "which sweep-tra
 seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-for old, new in (('*"does not exist"*|*"no transcripts"*) false ;; *) true ;;', '*) true ;;'),
+for old, new in (('*"does not exist"*) false ;; *) true ;;', '*) true ;;'),
                  ('*"E2BIG"*) false ;; *) true ;;', '*) false ;;'),
-                 ('*"cannot bring this tree under it"*) true ;; *) false ;;', '*) true ;;')):
+                 ('*"cannot bring this tree under it"*) true ;; *) false ;;', '*) true ;;'),
+                 ("grep -F 'no sweep can remove'", "head -0")):
     assert old in s, "mutation target absent"
     s = s.replace(old, new, 1)
 open(p, 'w').write(s)

@@ -1849,15 +1849,21 @@ if [ -f "$sweep_sh" ]; then
     # Each of those printed "the transcript deny list is over budget — <unrelated text or nothing>"
     # followed by a sentence asserting an archiving pass that never happened.
     if [ "$sweep_dry_rc" -eq 0 ] \
-       && case "$sweep_dry" in *"does not exist"*|*"no transcripts"*) false ;; *) true ;; esac; then
+       && case "$sweep_dry" in *"does not exist"*) false ;; *) true ;; esac; then
         ok "the transcript deny list fits in one argv — $sweep_tail"
     elif [ "$sweep_dry_rc" -eq 0 ]; then
         # A SWEEP THAT FOUND NO TREE IS NOT A MEASURED PASS. It exits 0 for "nothing to sweep", and
-        # this arm printed `ok the transcript deny list fits in one argv` over a budget nobody
-        # measured — the exact rule the sweep's own header states and this broke: a sweep that
+        # the arm above printed `ok the transcript deny list fits in one argv` over a budget nobody
+        # measured — the exact rule the sweep's own header states and that broke: a sweep that
         # cannot find its subject must not look successful. Reachable whenever
         # `$CLAUDE_BASE/projects` is missing: a second config dir, or a `dc_link_state` that failed
         # and which run.sh deliberately tolerates and defers to this file.
+        #
+        # "DOES NOT EXIST" ONLY, and not "no transcripts". A root that exists and is EMPTY has been
+        # measured: the deny list is zero bytes and Bash can spawn — which is every freshly created
+        # container. Failing that too, as the first version of this arm did, reddens the verify on
+        # a healthy new container, and a gate that cries on the happy path is a gate people learn
+        # to skip. The difference is whether there was a subject, not whether it had anything in it.
         bad "the transcript deny list was never measured — $sweep_tail
        The sweep found no tree to look at, so nothing here says whether Bash can spawn. Check that
        ~/.claude/projects exists and points into the state volume."

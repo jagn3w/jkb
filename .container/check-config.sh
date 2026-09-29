@@ -858,7 +858,14 @@ else
         # could not answer", or an unhelpable one becomes a broken boundary that refuses to open a
         # window. Derived rather than spelled here: every `*"…"*` pattern in that block must be text
         # the sweep actually emits.
-        verify_markers="$(grep -oE '\*"[^"]+"\*' <<<"$verify_verdict" | sed -E 's/^\*"(.*)"\*$/\1/')"
+        # BOTH WAYS IT BORROWS A PHRASE: a `*"…"*` case pattern, and a `grep -F '…'` that pulls a
+        # line out of the sweep's output to quote back to the operator. The second arrived when the
+        # accepted arm stopped keeping its own copy of the causes, and it is the same coupling — a
+        # sentence living in two files with nothing comparing them.
+        verify_markers="$(
+            { grep -oE '\*"[^"]+"\*' <<<"$verify_verdict" | sed -E 's/^\*"(.*)"\*$/\1/'
+              grep -oE "grep -F '[^']+'" <<<"$verify_verdict" | sed -E "s/^grep -F '(.*)'\$/\1/"
+            } )"
         if [ -z "$verify_markers" ]; then
             sweep_problems="$sweep_problems verify.sh's deny-list block classifies on no phrase at all, so every outcome of the sweep reaches the same verdict;"
         else
