@@ -405,10 +405,9 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
 # WHETHER THIS FILE HAS A JOB. Everything above budgets a deny list that names every transcript by
 # path, because that is what `Read(~/.claude/projects/**/*.jsonl)` compiled to: one bubblewrap
 # argument per file, and past ~200 of them every Bash call died at spawn. That rule is gone. The
-# transcript deny is .container/deny-transcripts.sh now, a hook that costs no argv, and what is
-# left in managed-settings.json is `Read(~/.claude/projects)` -- one entry, whatever is under it.
-# Measured after the change: the live sandbox profile lists the tree as two paths where it had
-# listed ~412.
+# transcript deny is .container/deny-transcripts.sh now, a hook that costs no argv, and
+# managed-settings.json names no path under the tree at all. Measured after the change: the live
+# sandbox profile stopped listing ~412 transcript paths.
 #
 # So a budget computed from file count describes a list that no longer exists, and it did harm the
 # moment it outlived its premise: it reported "69776 deny bytes ... Bash may still fail at spawn
@@ -1280,14 +1279,20 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     echo "==> sweep-transcripts self-test: whether the posture gives this file a job at all"
     pdir="$work/posture"; mkdir -p "$pdir"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)","Read(~/.claude-state/projects/**/*.jsonl)"]}}' >"$pdir/globs.json"
-    printf '%s\n' '{"permissions":{"deny":["Read(~/.jkb-container/**)","Read(~/.claude/projects)","Read(~/.claude-state/projects)"]}}' >"$pdir/hook.json"
+    # hook.json is the posture that SHIPS: no rule names the tree at all.
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.jkb-container/**)","Read(~/.jkb-container)"]}}' >"$pdir/hook.json"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**)"]}}' >"$pdir/subtree.json"
+    # A bare directory is ONE argv entry, so for this function's question -- is the argv O(files)?
+    # -- it is "no". It is still refused, for swallowing auto-memory; that is check-config.sh's and
+    # verify.sh's memory arm, a different property with its own guard.
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects)","Read(~/.claude-state/projects)"]}}' >"$pdir/baredir.json"
     printf '%s\n' '{"hooks":{}}' >"$pdir/nodeny.json"
     printf '%s\n' 'not json {' >"$pdir/broken.json"
     pe() { if posture_enumerates_transcripts "$1"; then echo yes; else echo no; fi; }
     eq "the old per-file globs enumerate transcripts"          "$(pe "$pdir/globs.json")"   yes
-    eq "the hook posture's exact-path rules do not"            "$(pe "$pdir/hook.json")"    no
+    eq "the posture that ships names no transcript"            "$(pe "$pdir/hook.json")"    no
     eq "a subtree wildcard collapses, so it does not either"   "$(pe "$pdir/subtree.json")" no
+    eq "a bare directory is one argv entry, so neither does it" "$(pe "$pdir/baredir.json")" no
     eq "a posture with no deny rules names nothing"            "$(pe "$pdir/nodeny.json")"  no
     # CANNOT TELL MEANS YES -- the direction that keeps sweeping. Getting these backwards is the
     # expensive way round: a sweep that stood down on an unreadable posture would leave a tree

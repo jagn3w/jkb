@@ -1313,7 +1313,7 @@ over each, so the argv grows by one path per file on disk.
 | both spellings (`.claude` and `.claude-state` are one tree) | 67,638 bytes |
 | `MAX_ARG_STRLEN` (Linux, 32 pages, not tunable) | 131,072 bytes |
 | **share of the ceiling spent by two rules** | **52%** |
-| after: two exact-path rules + a hook | ~60 bytes |
+| after: a hook, and no rule naming the tree | 0 bytes for the tree |
 
 Past the ceiling *every* Bash tool call fails at spawn with `E2BIG` — not the one that overflowed,
 all of them, including `:` — with nothing in the message naming transcripts.
@@ -1353,15 +1353,34 @@ tools and its absence is silent:
 
 **Bash is covered separately and always was.** The sandbox's blanket `denyRead` of `~` hides this
 tree from Bash regardless; naming a path in a deny rule is in fact what *exposed* it, which is why
-`~/.claude/todos` was invisible while `~/.claude/projects` was not. `managed-settings.json` keeps
-one exact-path rule per spelling as the belt to that brace — one argv entry each, and neither
-matches a memory path.
+`~/.claude/todos` was invisible while `~/.claude/projects` was not.
 
-**Not yet measured:** the argv figure after this change is predicted from the collapse rule, not
-observed, because bubblewrap's command line is built outside the sandbox and a session cannot see
-its own (we are PID 2 in its namespace). Confirm it on the next `run.sh --build`: the container
-should start, `verify.sh` should report the hook row green, and the sweep's `--dry-run` projection
-should fall to near zero.
+**There is no permissions rule for the tree, and a second trap is why.** The first cut kept
+`Read(~/.claude/projects)` and its `.claude-state` spelling beside the hook, as a belt to its
+brace, on the theory that a rule naming a directory names only the directory. The smoke test in the
+rebuilt container disproved it on the first try: a `Read` of a transcript was refused *by the
+hook*, quoting its reason text — and a `Read` of `<slug>/memory/MEMORY.md`, which the hook had
+allowed, was refused anyway, with `File is in a directory that is denied by your permission
+settings`. **Claude Code applies a directory rule to its whole subtree.** Any permissions rule broad
+enough to cover the transcripts therefore covers memory, which is the same property that made this
+a hook in the first place. So there is no belt to add.
+
+The guards had the same wrong belief. `memory_shadow` and the `check-config.sh` memory arm matched
+the bare pattern only (bash `case` semantics), so both read the belt rules as clear. They now match
+`$pat` **and** `$pat/*`, and turned red on exactly those two rules before they were removed.
+
+**Measured in the rebuilt container, 2026-09-30.** A session cannot see bubblewrap's own command
+line (it is PID 2 in the sandbox's namespace), but it can see the deny list Claude Code hands it:
+before the change that list carried the transcripts one by one and ended `"... and 439 more"`;
+after, it carried no transcript at all — only the two bare-directory rules this section goes on to
+remove, one entry each. In the same container, a `Read` of a transcript was refused by the hook with
+its reason text, which is the only evidence that Claude Code honours this hook's `deny` for the
+file tools — the self-test proves the script decides correctly, not that the harness obeys it.
+
+**The sweep's projection did not fall, and that is not a contradiction.** It never read the deny
+list; it modelled it from the file count, so it went on reporting ~69,000 bytes of a list that no
+longer existed, and verify.sh read that as over budget. The sweep now asks the installed posture
+whether it still names transcripts by path before it budgets anything — see the next section.
 
 ## Transcripts are swept by byte budget, not by age
 

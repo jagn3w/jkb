@@ -1360,6 +1360,16 @@ json.dump(d, open(p, "w"), indent=2)
 PYX
 run "the collapsing shape swallows auto-memory" "covers ~/.claude/projects/<slug>/memory"
 
+# THE BARE-DIRECTORY BELT, which is the shape that actually shipped and broke memory in a real
+# container -- and which the memory arm passed until it matched `$pat/*` as well as `$pat`.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a bare directory rule covers auto-memory's subtree" "covers ~/.claude/projects/<slug>/memory"
+
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()

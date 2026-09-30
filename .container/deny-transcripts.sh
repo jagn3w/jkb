@@ -31,9 +31,16 @@
 #
 # WHAT STILL COVERS BASH. The sandbox's blanket `denyRead` of `~` already hides this tree from
 # Bash -- observable in one listing, where `~/.claude/todos` is invisible while `~/.claude/projects`
-# was not, because naming a path in a deny rule is what EXPOSES it. managed-settings.json keeps one
-# exact-path rule per spelling as the belt to that brace; each is a single argv entry, and neither
-# matches a memory path, so verify.sh's memory_shadow stays clear.
+# was not, because naming a path in a deny rule is what EXPOSES it.
+#
+# THIS HOOK IS THE ONLY FILE-TOOL RULE FOR THE TREE, AND THAT IS DELIBERATE. The first cut kept
+# `Read(~/.claude/projects)` and its .claude-state spelling beside it "as the belt to this brace",
+# on the theory that naming a directory names only the directory. Measured in the rebuilt container
+# (2026-09-30), Claude Code applies a directory rule to its whole subtree: this hook ALLOWED
+# <slug>/memory/MEMORY.md and the permission rule behind it denied it anyway ("File is in a
+# directory that is denied by your permission settings"). Any permissions rule broad enough to
+# cover the transcripts covers memory too -- that is the property that made this a hook in the
+# first place -- so there is no belt to add.
 #
 # FAILS CLOSED, unlike .claude/hooks/block-raw-sqlite.sh, and deliberately. That hook steers an
 # agent away from a better tool, so an error there must not wedge Bash. This one is a

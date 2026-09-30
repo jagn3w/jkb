@@ -403,12 +403,20 @@ REC
 #
 # Bash's `case` lets `*` cross `/`, so `**` and `*` behave the same here. That is the conservative
 # direction: this can over-report a shadow, never miss one.
+#
+# A RULE COVERS ITS SUBTREE, which is Claude Code's semantics and not bash's -- hence `$pat/*` beside
+# `$pat`. This matched the bare pattern only, so `Read(~/.claude/projects)` -- an exact-path rule
+# added as "the belt to the hook's brace" on the theory that naming a directory names only the
+# directory -- read as clear. Measured in the rebuilt container on 2026-09-30, it is not: a Read of
+# <slug>/memory/MEMORY.md came back "File is in a directory that is denied by your permission
+# settings" while the hook in front of it had ALLOWED the same path. The guard shared the exact
+# wrong belief it existed to catch, which is the one way a guard cannot fail.
 memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> clear|shadowed:<pattern>
     local mem="$1" pat
     while IFS= read -r pat; do
         [ -n "$pat" ] || continue
         case "$mem" in
-            $pat) printf 'shadowed:%s\n' "$pat"; return ;;
+            $pat|$pat/*) printf 'shadowed:%s\n' "$pat"; return ;;
         esac
     done <<<"$2"
     printf 'clear\n'
@@ -472,6 +480,14 @@ if [ "$SELF_TEST" = yes ]; then
     ms "...and it is caught whichever spelling of the tree is used" \
        "/home/vscode/.claude-state/projects/-home-vscode-repos-jkb/memory/MEMORY.md" \
        '/home/vscode/.claude-state/projects/**' shadowed
+    # THE SHAPE THAT ACTUALLY SHIPPED AND BROKE: a bare directory, no wildcard at all. Claude Code
+    # applies it to the whole subtree -- measured, not inferred: in the rebuilt container this
+    # rule denied a Read of <slug>/memory/MEMORY.md that the hook had allowed. This row read
+    # `clear` until the matcher learned `$pat/*`.
+    ms "a bare directory rule covers its subtree, memory included" \
+       "$MEMP" '/home/vscode/.claude/projects' shadowed
+    ms "...but a bare rule on a SIBLING directory does not" \
+       "$MEMP" '/home/vscode/.claude/projects-archive' clear
     ms "a rule about another tree leaves memory alone" \
        "$MEMP" '/home/vscode/repos/**/*.env' clear
     # The scan must read EVERY rule, not just the first: a shadowing rule added below a harmless

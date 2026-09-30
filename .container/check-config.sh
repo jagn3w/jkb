@@ -488,12 +488,16 @@ else
     # 1. Nothing may cover auto-memory. Two spellings of the tree, one synthetic slug: no rule
     #    names a slug, so a probe path answers for every repo at once and keeps a second copy of
     #    the linker's slugify out of this file.
+    #    A RULE COVERS ITS SUBTREE -- Claude Code's semantics, not bash's -- so `$dc_pat/*` is
+    #    matched beside the bare pattern. Without it this passed `Read(~/.claude/projects)`, which a
+    #    Read in the rebuilt container showed denies <slug>/memory/MEMORY.md outright ("File is in
+    #    a directory that is denied by your permission settings", 2026-09-30).
     dc_mem_hit=""
     for dc_root in /home/vscode/.claude/projects /home/vscode/.claude-state/projects; do
         while IFS= read -r dc_pat; do
             [ -n "$dc_pat" ] || continue
             case "$dc_root/-probe-repo/memory/MEMORY.md" in
-                $dc_pat) dc_mem_hit="$dc_mem_hit $dc_pat" ;;
+                $dc_pat|$dc_pat/*) dc_mem_hit="$dc_mem_hit $dc_pat" ;;
             esac
         done <<<"$dc_deny"
     done
@@ -526,8 +530,9 @@ else
 fi
 
 # AND THE HOOK THAT REPLACED THEM MUST ACTUALLY BE WIRED. With the globs gone, deny-transcripts.sh
-# is the ONLY thing stopping a file tool reading another session's transcript -- the exact-path
-# rules above cover Bash, not Read/Edit/Write. Deleting the hook entry, or the COPY that installs
+# is the ONLY thing stopping a file tool reading another session's transcript -- there is no
+# permissions rule for the tree at all, because any rule broad enough to cover the transcripts
+# covers auto-memory too (the memory arm above refuses it). Deleting the hook entry, or the COPY that installs
 # it, leaves every gate here green and the confidentiality boundary simply absent. Three things
 # have to hold together, so all three are asked: it is referenced, it is installed, and it is
 # installed root-owned (a hook the sandbox can rewrite is a hook the agent controls).
