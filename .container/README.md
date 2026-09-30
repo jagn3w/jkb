@@ -341,7 +341,7 @@ container with no VS Code in it; the skip is printed, and the judgement itself
 is watched even though no container harness can reach it.
 
 **The pin binds the download, not the installed version.** Measured on a container *restart*: VS
-Code auto-updated `anthropic.claude-code` from the pinned 2.1.250 to 2.1.251 and fetched it
+Code auto-updated `anthropic.claude-code` from the then-pinned 2.1.250 to 2.1.251 and fetched it
 successfully, apparently through `code-server --use-host-proxy`, which tunnels via the host and so
 does not meet the container's firewall at all. That path is not reliable — the same flag was
 present in the create that failed — so it changes nothing about staging the `.vsix` at build time.

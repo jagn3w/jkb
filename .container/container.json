@@ -178,7 +178,7 @@
   // on a restart here (2.1.250 -> 2.1.251), which is why verify.sh compares ids and not versions.
   "customizations": {
     "vscode": {
-      "extensions": ["rust-lang.rust-analyzer@0.3.3025", "anthropic.claude-code@2.1.250"]
+      "extensions": ["rust-lang.rust-analyzer@0.3.3025", "anthropic.claude-code@2.1.285"]
     }
   }
 }
