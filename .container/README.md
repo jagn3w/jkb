@@ -1280,27 +1280,19 @@ deliberately not pruned — `git clean -X` deletes exactly the regenerable files
 gitignored `.env`, and unrequested deletion is what this whole mechanism exists to avoid. Shorten
 `--retain-days` if size matters more than the safety net.
 
-## The deny list is O(1) now, because the rule shape was the bug
+## Why the deny list cannot be made O(1): memory and transcripts share a tree
 
-The sweep below is a byte budget for a deny list that grew with the file count. It should never
-have grown with the file count. Two rules in `managed-settings.json` did that, and changing their
-shape removed the whole failure mode rather than bounding it.
+The sweep below budgets a deny list that grows with the file count. The obvious question is why it
+grows at all, and the answer is a shape — but the fix that shape suggests is **not available**, and
+that is worth recording because it looks available right up until it is tried.
 
-```
--  "Read(~/.claude/projects/**/*.jsonl)",        one argv path PER MATCHING FILE
--  "Read(~/.claude-state/projects/**/*.jsonl)",
-+  "Read(~/.claude/projects/**)",                one argv path, whatever the tree holds
-+  "Read(~/.claude-state/projects/**)",
-```
-
-**Why the shape decides it.** Claude Code compiles `permissions.deny` into the bubblewrap argv for
-the Bash sandbox. A rule ending in a directory wildcard *collapses*: "everything under here" needs
-no enumeration, so `Read(~/.ssh/**)` becomes the single path `~/.ssh`. Eight rules in the live
-profile do exactly that — `~/.ssh`, `~/.aws`, `~/Documents`, `~/.pki`, `~/.config/gcloud`,
-`~/.jkb-container` and more. A rule ending in a **file pattern** cannot collapse: the sandbox must
-name every match and bind `/dev/null` over each, so the argv grows by one path per file on disk.
-The two transcript rules were the only file-pattern rules in the profile, and they were the entire
-problem.
+**The shape.** Claude Code compiles `permissions.deny` into the bubblewrap argv for the Bash
+sandbox. A rule ending in a directory wildcard *collapses*: `Read(~/.ssh/**)` becomes the single
+path `~/.ssh`, and eight rules in the live profile do exactly that — `~/.aws`, `~/Documents`,
+`~/.pki`, `~/.config/gcloud`, `~/.jkb-container` among them. A rule ending in a **file pattern**
+cannot: the sandbox names every match and binds `/dev/null` over each, so the argv grows by one
+path per file on disk. The two transcript rules are the only file-pattern rules in the profile,
+and they are the entire cost.
 
 **Measured 2026-09-30, in `jkb-dev`, after a sweep had already run:**
 
@@ -1308,37 +1300,44 @@ problem.
 |---|---|
 | `.jsonl` files under `~/.claude/projects` | 206 |
 | path text, one spelling | 33,819 bytes |
-| both spellings (`.claude` and `.claude-state` are the same tree) | 67,638 bytes |
+| both spellings (`.claude` and `.claude-state` are one tree) | 67,638 bytes |
 | `MAX_ARG_STRLEN` | 131,072 bytes |
 | **share of the ceiling spent by two rules** | **52%** |
-| the same two rules, after | ~50 bytes |
+| the same two rules written as `projects/**` | ~50 bytes |
 
-**And the 67,638 bytes bought nothing.** `~` is already in the sandbox's blanket `denyRead` with
-`.claude/projects` in no allow list, so Bash could not read those files either way. The rules exist
-to bound the *file tools* — Bash and Read/Edit/Write are bounded by different mechanisms, as
-`scripts/link-claude-memory.sh` records — and the subtree form bounds them just as well. The
-enumeration was pure cost. It is visible in one listing: `~/.claude/todos` is invisible to Bash
-under the blanket deny, while `~/.claude/projects` was not. The per-file binds were what exposed
-the tree they were added to hide.
+**And that last row is the trap.** It was written, committed, and reverted. `Read(~/.claude/projects/**)`
+takes the argv to nothing — and it also covers `~/.claude/projects/<slug>/memory`, which is where
+Claude Code keeps auto-memory. That location is not ours: `scripts/link-claude-memory.sh` exists to
+put the link there, and verify.sh **fails** when it is missing. So the collapsing shape and the
+memory requirement are the same path, and only one of them can win.
 
-**Retention is not an alternative, and this is the measurement that says so.** Every one of those
-206 files was under three days old — the age histogram has zero entries past 3d. `cleanupPeriodDays`
-at any value deletes nothing here. This is not accumulation, it is **production rate**: ~70 subagent
-transcripts a day, 201 of the 206 files and 98% of the bytes, because every review round and every
-workflow leaves one per agent. That is also why a comment would not have held. The next
-file-pattern deny rule reintroduces the failure within days and looks entirely reasonable in review,
-so the rule lives in `check-config.sh` where it is checked, with three mutations pinning it: the
-exact regression, a plausible new rule (`Read(~/repos/**/*.env)`), and the unreadable-config arm.
+The failure it would have caused has no symptom. Denied memory does not error — `MEMORY.md` stops
+arriving in context, which reads like an agent that forgot rather than a broken container. It was
+caught by adding `memory_shadow` to verify.sh and running its rows against the change that had just
+been made.
 
-**What this does not change.** The sweep stays, demoted from the defence to the backstop: it still
-bounds disk in `.claude-state`, and it is the recovery if a future rule or a Claude Code change
-reintroduces enumeration. Everything below remains true about how it works — read it as insurance,
-not as the thing standing between this container and E2BIG.
+**So the transcript rules must end in a file pattern, and the argv cost is a consequence of Claude
+Code's layout rather than of anything this repo chose.** Two guards hold the line instead:
+
+- `check-config.sh` refuses any deny rule that covers the auto-memory path, and any *other* rule
+  ending in a file pattern — the two transcript rules are named as the one exception, so a third
+  O(files) term cannot arrive unnoticed. Five mutations pin it.
+- `verify.sh`'s `memory_shadow` asks the same question at runtime against the posture actually
+  installed in `/etc/claude-code`, which is what catches a rule that only ever exists in the image.
+
+**Retention is not an alternative either**, measured rather than assumed: every one of those 206
+files was under three days old, so `cleanupPeriodDays` at any value deletes nothing. This is
+production rate, not accumulation — ~70 subagent transcripts a day, 201 of the 206 files and 98% of
+the bytes, one per agent per review round and workflow.
+
+**What would actually fix it**, unmeasured and therefore not done: a rule naming only the subagent
+subtree (`projects/**/subagents/**`) leaves `memory` alone and could collapse per uuid directory —
+roughly 10 entries instead of 201. Whether Claude Code collapses a pattern with a literal segment
+after a wildcard is not something this container can answer from inside a running session; it needs
+the rule changed, the image rebuilt, a fresh session, and the resulting deny list measured. Until
+someone does that, the sweep below is the answer and not a workaround.
 
 ## Transcripts are swept by byte budget, not by age
-
-*Backstop, since the section above removed the cause. Still the recovery path, and still what
-bounds disk.*
 
 Every Bash tool call in every container session failed at spawn with `E2BIG`. Not degraded —
 total, from the first call, in a container that had worked the week before, with nothing in the

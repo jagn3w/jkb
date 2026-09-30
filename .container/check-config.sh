@@ -442,57 +442,77 @@ elif grep -qv '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds"; then
 else
     ok "every managed hook runs the pinned, root-owned jkb"
 fi
-# NO DENY RULE MAY END IN A FILE PATTERN, and this is a RESOURCE bound, not a taste one.
+# THE TWO THINGS A DENY RULE OVER THE TRANSCRIPT TREE CAN BREAK, and they pull in OPPOSITE
+# directions. This is one check because treating either alone produces the other's failure.
 #
-# Claude Code compiles these `permissions.deny` rules into the bubblewrap argv for the Bash
-# sandbox. A rule ending in a directory wildcard COLLAPSES to one argv entry -- `Read(~/.ssh/**)`
-# becomes the single path `~/.ssh` -- because "everything under here" needs no enumeration. A rule
-# ending in a FILE pattern cannot collapse: the sandbox has to name every matching file, and it
-# binds /dev/null over each one, so the argv grows by one path PER FILE ON DISK.
+#   ARGV. Claude Code compiles `permissions.deny` into the bubblewrap argv for the Bash sandbox.
+#   A rule ending in a directory wildcard COLLAPSES -- `Read(~/.ssh/**)` becomes the single path
+#   `~/.ssh`, as it does for ~/.aws, ~/Documents, ~/.pki and ~/.jkb-container. A rule ending in a
+#   FILE pattern cannot: the sandbox names every match and binds /dev/null over each, so the argv
+#   grows by one path per file on disk. Measured 2026-09-30, after a sweep had already run: the
+#   two transcript rules expanded to 206 paths, 33,819 bytes per spelling, 67,638 across both,
+#   against a MAX_ARG_STRLEN of 131,072 Linux does not let you raise -- 52% of the ceiling. Past
+#   it EVERY Bash call in the container dies at spawn with E2BIG, including `:`, with nothing in
+#   the message naming transcripts.
 #
-# MEASURED, on 2026-09-30, on the container this repo ships. `Read(~/.claude/projects/**/*.jsonl)`
-# plus its `.claude-state` spelling expanded to 206 literal paths: 33,819 bytes of path text per
-# spelling, 67,638 across both, against a MAX_ARG_STRLEN of 131,072 that Linux does not let you
-# raise. 52% of the ceiling, spent on two rules. Past it EVERY Bash tool call in the container
-# fails at spawn with E2BIG -- not the one that overflowed, all of them, including `:` -- and
-# nothing in the error names transcripts. Two sessions lost hours to it.
+#   MEMORY. Claude Code keeps auto-memory at ~/.claude/projects/<slug>/memory/. That location is
+#   not ours to choose, `scripts/link-claude-memory.sh` exists to put the link there, and
+#   verify.sh FAILS when it is missing. A subtree rule over `projects/**` covers it -- and denied
+#   memory does not error, it goes QUIET: MEMORY.md stops arriving in context, which reads like an
+#   agent that forgot rather than a broken container.
 #
-# AND THE COST BOUGHT NOTHING. `~` is already in the sandbox's blanket `denyRead` with
-# `.claude/projects` in no allow list, so Bash could not read those files regardless; the
-# per-file rules are redundant for Bash and exist only to bound the Read/Edit/Write tools, which
-# a collapsing rule bounds just as well. Observable in the same directory: `~/.claude/todos` is
-# invisible to Bash under the blanket deny, while `~/.claude/projects` was VISIBLE -- the per-file
-# binds are what exposed the tree they were added to hide.
-#
-# WHY A GUARD AND NOT A COMMENT. Retention cannot save this: every one of those 206 files was
-# under three days old, so `cleanupPeriodDays` at any value deletes nothing. The population is
-# production rate, not accumulation -- roughly 70 subagent transcripts a day, ~98% of the bytes --
-# so the NEXT file-pattern deny rule reintroduces the whole failure within days of being written,
-# and it will look entirely reasonable in review. The rule has to live where it is checked.
-deny_globs="$(jq -r '.permissions.deny[]?' "$here/managed-settings.json" 2>/dev/null)"
-if [ -z "$deny_globs" ]; then
-    bad "no permissions.deny rules could be read from managed-settings.json — the check that none of them expands per-file examined nothing"
+# SO THE COLLAPSING SHAPE IS UNAVAILABLE HERE, and that is a finding, not an oversight. It was
+# tried: the rules were changed to `projects/**`, which takes the argv to ~50 bytes, and
+# verify.sh's `memory_shadow` rows caught that the same edit swallows auto-memory on both
+# spellings. The transcript rules therefore MUST end in a file pattern, they are named below as
+# the one exception, and their cost is what .container/sweep-transcripts.sh budgets. Anything
+# else ending in a file pattern is a new O(files) term and is refused.
+dc_deny_raw="$(jq -r '.permissions.deny[]?' "$here/managed-settings.json" 2>/dev/null)"
+if [ -z "$dc_deny_raw" ]; then
+    bad "no permissions.deny rules could be read from managed-settings.json — the checks that none of them blows the argv or swallows auto-memory examined nothing"
 else
-    # The path inside Tool(...), then its last segment. A `*` there is a file pattern; a bare `**`
-    # is the whole-subtree form that collapses. `sed` rather than a pipe into a quiet grep: this
-    # file has shipped that bug once (see the substitution note in the sweep block).
-    deny_paths="$(sed -E 's/^[A-Za-z]+\((.*)\)$/\1/' <<<"$deny_globs")"
-    expanding=""
+    # TILDES NORMALISED ON BOTH SIDES, and this is not cosmetic: bash performs tilde expansion on
+    # an UNQUOTED `case` pattern but not on the quoted word being matched, so a literal `~` on one
+    # side and an expanded `/home/vscode` on the other never match and the memory check silently
+    # passes everything. It did, until the mutation rows below were run against it. `/home/vscode`
+    # rather than `$HOME` because this file also runs on CI, where $HOME is the runner's and the
+    # rules being read describe the container's.
+    dc_deny="$(sed -E 's/^[A-Za-z]+\((.*)\)$/\1/' <<<"$dc_deny_raw" | sed 's|^~|/home/vscode|')"
+    # 1. Nothing may cover auto-memory. Two spellings of the tree, one synthetic slug: no rule
+    #    names a slug, so a probe path answers for every repo at once and keeps a second copy of
+    #    the linker's slugify out of this file.
+    dc_mem_hit=""
+    for dc_root in /home/vscode/.claude/projects /home/vscode/.claude-state/projects; do
+        while IFS= read -r dc_pat; do
+            [ -n "$dc_pat" ] || continue
+            case "$dc_root/-probe-repo/memory/MEMORY.md" in
+                $dc_pat) dc_mem_hit="$dc_mem_hit $dc_pat" ;;
+            esac
+        done <<<"$dc_deny"
+    done
+    # 2. Nothing may expand per-file EXCEPT the two transcript rules, which have to.
+    dc_allowed_file_globs='/home/vscode/.claude/projects/**/*.jsonl /home/vscode/.claude-state/projects/**/*.jsonl'
+    dc_expanding=""
     while IFS= read -r dc_rule; do
         [ -n "$dc_rule" ] || continue
+        case " $dc_allowed_file_globs " in *" $dc_rule "*) continue ;; esac
         dc_last="${dc_rule##*/}"
         case "$dc_last" in
-            '**') continue ;;                       # whole subtree — collapses to one argv entry
-            *'*'*) expanding="$expanding $dc_rule" ;;
+            '**') continue ;;
+            *'*'*) dc_expanding="$dc_expanding $dc_rule" ;;
         esac
-    done <<<"$deny_paths"
-    if [ -n "$expanding" ]; then
-        bad "a managed deny rule ends in a file pattern, so the Bash sandbox must name every matching file and the argv grows with the file count — at 131072 bytes every Bash call in the container dies at spawn with E2BIG:$expanding
-       Use the whole-subtree form (\`dir/**\`), which collapses to a single argv entry. If the
-       intent really is to spare siblings of the matched files, say so here and measure the
-       expansion — .container/README.md carries the numbers."
+    done <<<"$dc_deny"
+    if [ -n "$dc_mem_hit" ]; then
+        bad "a managed deny rule covers ~/.claude/projects/<slug>/memory, so MEMORY.md stops reaching context with no error anywhere:$dc_mem_hit
+       Auto-memory's location is Claude Code's, not ours, and verify.sh FAILS when it is not
+       linked there — so a subtree rule over the transcript tree cannot also be the argv fix."
+    elif [ -n "$dc_expanding" ]; then
+        bad "a managed deny rule ends in a file pattern and is not one of the two transcript rules, so the Bash sandbox must name every matching file and the argv grows with the file count until every Bash call dies at spawn:$dc_expanding
+       Use the whole-subtree form (\`dir/**\`), which collapses to a single argv entry. If it must
+       spare siblings the way the transcript rules spare memory, add it to
+       dc_allowed_file_globs with the measurement — .container/README.md carries the numbers."
     else
-        ok "no managed deny rule expands per-file into the Bash sandbox argv"
+        ok "no managed deny rule swallows auto-memory, and only the two budgeted transcript rules expand per-file"
     fi
 fi
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers

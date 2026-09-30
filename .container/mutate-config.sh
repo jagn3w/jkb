@@ -1307,16 +1307,31 @@ open(p, 'w').write(s.replace('"hooks": {', '"hooks_moved": {', 1))
 PYX
 run "the managed hooks cannot be read" "no hook commands could be read"
 
-# THE ARGV BOUND (2026-09-30). Both arms: the exact rule that caused the E2BIG, and a plausible
-# new one nobody would blink at in review. A file-pattern deny is named per-matching-file in the
-# bubblewrap argv, so it grows with the file count until every Bash call in the container dies at
-# spawn -- and retention cannot save it, because the population is production rate, not age.
+# THE TWO THINGS A TRANSCRIPT-TREE DENY RULE CAN BREAK (2026-09-30), pulling opposite ways. The
+# memory arm is pinned FIRST because it is the one that was got wrong: the collapsing `projects/**`
+# shape fixes the argv and silently swallows auto-memory, and it was committed before verify.sh's
+# memory_shadow rows caught it.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('"Read(~/.claude/projects/**)"', '"Read(~/.claude/projects/**/*.jsonl)"', 1))
+open(p, 'w').write(s.replace('"Read(~/.claude/projects/**/*.jsonl)"', '"Read(~/.claude/projects/**)"', 1))
 PYX
-run "the per-file transcript deny comes back" "ends in a file pattern"
+run "the collapsing shape swallows auto-memory" "covers ~/.claude/projects/<slug>/memory"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"Read(~/.claude-state/projects/**/*.jsonl)"', '"Read(~/.claude-state/projects/**)"', 1))
+PYX
+run "...in the .claude-state spelling too" "covers ~/.claude/projects/<slug>/memory"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects/*/memory/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a rule naming memory outright" "covers ~/.claude/projects/<slug>/memory"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys
@@ -1721,7 +1736,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=99
+PINNED_BAD_SITES=100
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
