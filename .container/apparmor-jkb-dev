@@ -2,7 +2,7 @@
 #
 # GENERATED FILE -- DO NOT EDIT. Run .container/generate-apparmor.sh to refresh it.
 # Source: https://raw.githubusercontent.com/moby/profiles/main/apparmor/template.go
-# upstream-sha256: ebd53318b00903965756736b334652d8de1846214bf46cc1ba1677b64a68e662
+# upstream-sha256: 7da15d81aa5c507f5002b844fdc49a969904681447a2cc29222bd6cbe797163b
 #
 # This is Docker's own `docker-default` with ONE CHANGE, at the single site marked PATCHED below:
 # the mount family is opened up. `deny mount,` becomes `mount,`, and `pivot_root,` is added --
@@ -51,6 +51,19 @@ profile "jkb-dev" flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
 
   network,
+  # Disallow obsolete socket families removed from the Linux kernel.
+  # AF_DECnet has no AppArmor family name, so it cannot be denied here.
+  deny network ax25,
+  deny network ipx,
+  deny network appletalk,
+  deny network netrom,
+  deny network rose,
+  deny network econet,
+  deny network atmsvc,
+  deny network irda,
+  deny network wanpipe,
+  deny network isdn,
+  deny network caif,
   # Disallow AF_ALG (Linux kernel crypto API); see https://copy.fail/
   deny network alg,
   # Disallow AF_VSOCK to prevent host/guest communication.

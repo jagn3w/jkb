@@ -444,8 +444,307 @@
    "args": [
     {
      "index": 0,
-     "value": 38,
+     "value": 3,
      "op": "SCMP_CMP_LT"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 7,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 8,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 9,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 10,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 13,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 14,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 15,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 16,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 17,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 18,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 21,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 22,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 24,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 26,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 27,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 28,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 29,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 30,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 31,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 32,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 33,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 35,
+     "op": "SCMP_CMP_EQ"
+    }
+   ]
+  },
+  {
+   "names": [
+    "socket"
+   ],
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "value": 36,
+     "op": "SCMP_CMP_EQ"
     }
    ]
   },
@@ -871,5 +1170,5 @@
    "action": "SCMP_ACT_ALLOW"
   }
  ],
- "comment": "Docker default seccomp profile + unconditional allow for the namespace/mount syscalls bubblewrap needs, so Claude Code's sandbox can run nested inside this container. GENERATED FILE -- DO NOT EDIT; run .container/generate-seccomp.sh. Source: https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json upstream-sha256: 785b2429264afba4d594320337cb17f144f3c7d51585f9805eef72e28f4f9334"
+ "comment": "Docker default seccomp profile + unconditional allow for the namespace/mount syscalls bubblewrap needs, so Claude Code's sandbox can run nested inside this container. GENERATED FILE -- DO NOT EDIT; run .container/generate-seccomp.sh. Source: https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json upstream-sha256: 6416b47770785a41ac59073cdc77d9fe98517df2799dc83ef207e622de3053f6"
 }
