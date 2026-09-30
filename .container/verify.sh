@@ -385,6 +385,35 @@ REC
 # executed it. Five arms, each a one-token flip away from the wrong container behaviour, and the
 # static guards can only see that the arms exist. Defined before its caller and driven by
 # `--self-test`, which needs no container.
+# WHETHER A DENY RULE SWALLOWS AUTO-MEMORY -- a pure function, because the two halves it compares
+# are decided in different files by people solving different problems, and nothing else looks at
+# both. `link-claude-memory.sh` MUST put the link at ~/.claude/projects/<slug>/memory: that is
+# where Claude Code reads memory from, it is not negotiable, and the block further down this file
+# treats "not linked" as FATAL. `managed-settings.json` denies paths under that same tree to keep
+# one session from reading another's transcripts. A deny rule written to cover transcripts can
+# therefore cover memory as well, and NOTHING SAYS SO: memory does not error when it is denied, it
+# goes quiet -- MEMORY.md simply stops arriving in context, which reads like an agent that forgot
+# rather than like a broken container.
+#
+# THE SHAPES ARE ONE CHARACTER APART, which is the whole reason this is checked and not reasoned
+# about. `projects/**/*.jsonl` cannot match `<slug>/memory/MEMORY.md` -- it must end in .jsonl.
+# `projects/**` matches it. The second form is the one that keeps the sandbox argv O(1) (see
+# check-config.sh and the README section on the deny list), so the pressure to write it is real
+# and will recur.
+#
+# Bash's `case` lets `*` cross `/`, so `**` and `*` behave the same here. That is the conservative
+# direction: this can over-report a shadow, never miss one.
+memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> clear|shadowed:<pattern>
+    local mem="$1" pat
+    while IFS= read -r pat; do
+        [ -n "$pat" ] || continue
+        case "$mem" in
+            $pat) printf 'shadowed:%s\n' "$pat"; return ;;
+        esac
+    done <<<"$2"
+    printf 'clear\n'
+}
+
 sweep_verdict() { # sweep_verdict <rc> <output> -> unmeasured|healthy|beyond|over|unanswerable
     case "$2" in
         # A root that is not there was never measured; one that is there and EMPTY was — zero bytes,
@@ -423,6 +452,35 @@ if [ "$SELF_TEST" = yes ]; then
              /home/vscode/repos /home/vscode/.jkb /host; do
         st "$p" checked
     done
+
+    echo "==> verify.sh self-test: does a deny rule swallow auto-memory"
+    # Literal inputs on both sides, so this needs no container and no Claude Code. The point of
+    # the rows is the PAIR: the same memory path against the two rule shapes, one of which is the
+    # shape the argv budget pushes everyone towards.
+    MEMP=/home/vscode/.claude/projects/-home-vscode-repos-jkb/memory/MEMORY.md
+    ms() { # ms <label> <memory path> <deny paths> <want prefix>
+        got="$(memory_shadow "$2" "$3")"
+        case "$got" in
+            "$4"*) printf '  \033[32mok\033[0m   %s\n' "$1" ;;
+            *) printf '  \033[31mFAIL\033[0m %s\n         got:  %s\n         want: %s...\n' "$1" "$got" "$4"; st_fail=$((st_fail+1)) ;;
+        esac
+    }
+    ms "the .jsonl rule cannot reach memory — it must end in .jsonl" \
+       "$MEMP" '/home/vscode/.claude/projects/**/*.jsonl' clear
+    ms "the subtree rule DOES reach memory, which is the trap" \
+       "$MEMP" '/home/vscode/.claude/projects/**' shadowed
+    ms "...and it is caught whichever spelling of the tree is used" \
+       "/home/vscode/.claude-state/projects/-home-vscode-repos-jkb/memory/MEMORY.md" \
+       '/home/vscode/.claude-state/projects/**' shadowed
+    ms "a rule about another tree leaves memory alone" \
+       "$MEMP" '/home/vscode/repos/**/*.env' clear
+    # The scan must read EVERY rule, not just the first: a shadowing rule added below a harmless
+    # one is the realistic way this arrives.
+    ms "a shadowing rule is found when it is not the first" "$MEMP" \
+       '/home/vscode/.ssh
+/home/vscode/repos/**/*.env
+/home/vscode/.claude/projects/**' shadowed
+    ms "no rules at all is clear, not an error" "$MEMP" "" clear
 
     echo "==> verify.sh self-test: the transcript-budget verdict"
     # THE DECISION run.sh READS. Both codes refuse a window — its gate tests `verify_rc -ne 0` — and what
@@ -1508,6 +1566,57 @@ case "$mem_state" in
     *)
         bad "scripts/link-claude-memory.sh --status answered '$mem_state', which this check does not recognise" ;;
 esac
+
+# ...AND NOTHING IN THE POSTURE MAY SWALLOW THE PLACE THE BLOCK ABOVE INSISTS ON. The two are
+# decided in different files: the block above FAILS unless memory is linked at
+# ~/.claude/projects/<slug>/memory, and managed-settings.json denies paths under that same tree so
+# one session cannot read another's transcripts. A rule written for the second reason can cover
+# the first, and the failure has no symptom -- denied memory does not error, MEMORY.md just stops
+# arriving, which reads as an agent that forgot. Checked here rather than reasoned about, because
+# the two rule shapes are one character apart and the argv budget actively pushes towards the
+# dangerous one (see the README's deny-list section).
+#
+# READ FROM THE POSTURE IN FORCE, not from the repo's copy: this runs inside the container, so
+# /etc/claude-code is what Claude Code actually loaded. A repo file that disagrees with it is a
+# different failure, and check-config.sh owns that one.
+mem_managed=/etc/claude-code/managed-settings.json
+if [ ! -f "$mem_managed" ]; then
+    bad "there are no managed settings at $mem_managed, so nothing here establishes that the posture leaves auto-memory readable"
+else
+    mem_deny="$(jq -r '.permissions.deny[]? | sub("^[A-Za-z]+\\("; "") | sub("\\)$"; "")' "$mem_managed" 2>/dev/null \
+                | sed "s|^~|$HOME|")"
+    # A SYNTHETIC SLUG, deliberately. The question is whether the TREE is covered, and no rule
+    # names a slug; a probe path is therefore faithful for every repo at once and saves this file
+    # from carrying a second copy of the linker's slugify -- two spellings of one rule being the
+    # defect this record keeps rediscovering. A rule that did name one slug is caught by the live
+    # scan below instead.
+    mem_shadowed=""
+    for mem_root in "$HOME/.claude/projects" "$HOME/.claude-state/projects"; do
+        mem_probe="$mem_root/-probe-repo/memory/MEMORY.md"
+        mem_v="$(memory_shadow "$mem_probe" "$mem_deny")"
+        case "$mem_v" in shadowed:*) mem_shadowed="$mem_shadowed ${mem_v#shadowed:}" ;; esac
+    done
+    # And every link that actually exists, which is what catches a slug-specific rule.
+    for mem_link in "$HOME"/.claude/projects/*/memory "$HOME"/.claude-state/projects/*/memory; do
+        [ -e "$mem_link" ] || [ -L "$mem_link" ] || continue
+        mem_v="$(memory_shadow "$mem_link/MEMORY.md" "$mem_deny")"
+        case "$mem_v" in shadowed:*) mem_shadowed="$mem_shadowed ${mem_v#shadowed:}" ;; esac
+    done
+    if [ -z "$mem_deny" ]; then
+        bad "no permissions.deny rules could be read from $mem_managed — the check that none of them swallows auto-memory examined nothing"
+    elif [ -n "$mem_shadowed" ]; then
+        # FATAL. The container runs, every other check passes, and memory silently stops working
+        # -- which is the exact failure profile this file exists to convert into a sentence.
+        bad "a managed deny rule covers the auto-memory location, so MEMORY.md will stop reaching context with no error anywhere:$(printf '%s' "$mem_shadowed" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+       Auto-memory has to live at ~/.claude/projects/<slug>/memory — Claude Code decides that, and
+       the check above FAILS when it is not there — so a deny rule over that tree cannot also be
+       the argv fix. Narrow it to the transcripts (they are <slug>/<uuid>.jsonl and
+       <slug>/<uuid>/subagents/**, memory is the only other child) and re-measure the argv with
+       .container/sweep-transcripts.sh --dry-run."
+    else
+        ok "no managed deny rule covers the auto-memory location"
+    fi
+fi
 
 # 3e. Git runs the hooks the host runs. VS Code copies the host's ~/.gitconfig in on attach, so a
 #     global core.hooksPath names a host directory; run.sh mirrors it (lib.sh's
