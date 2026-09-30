@@ -933,12 +933,39 @@ types and the generic ones map to nothing; and **a `PreToolUse` can be followed 
 (a permission refusal after the hook ran), so tickets are also released at `SubagentStop` and
 `SessionEnd`, with a 10-minute backstop.
 
-**What the hook approves.** A rewrite needs a permission decision. The hook returns `allow` only for
-one plain `jkb` invocation — the command word literally `jkb`, with no path component — that cannot
-run a shell command, and is not `task land`, which runs the gate. That is what a `Bash(jkb:*)` rule
-would approve, with every request it makes held to the ticket's role. Anything else that runs `jkb`
-gets `ask`, so the prompt or the auto-mode classifier still judges it: returning `allow` for a whole
-compound command approved whatever rode along (`jkb ls && rm -rf …`).
+**What the hook approves, and what it declines to answer.** The hook returns `allow` only for one
+plain `jkb` invocation — the command word literally `jkb`, with no path component — that cannot run
+a shell command, and is not `task land`, which runs the gate. That is what a `Bash(jkb:*)` rule
+would approve, with every request it makes held to the ticket's role. For anything else that runs
+`jkb` it returns **no `permissionDecision` at all**, and the session's own rules and prompt judge
+the call exactly as they did before this hook existed.
+
+**Superseded: `ask` for anything that is not one plain invocation.** That was the whole of the
+over-prompting, and it was a design error rather than a tuning problem. A `PreToolUse` `ask`
+*overrides* an allow rule, so adding attestation quietly took a decision that belonged to the
+user's settings and made it more conservatively than they had: every `cd repo && jkb …` and
+`jkb … | jq` began prompting for a mechanism whose whole purpose is to be invisible. Returning
+`allow` there is not the alternative — it would approve whatever rode along with the `jkb`
+(`jkb ls && rm -rf …`). Declining to answer is, and it costs nothing on the security axis, because
+a ticket is an **authorization** fact the daemon holds every request to, not a permission grant.
+Authorization and human oversight are separate concerns, and the hook only ever needed the first.
+
+The rewrite still goes out for every ticketed class, because that is how the ticket reaches `jkb`
+and it is a genuine per-tool-call secret: **each Bash tool call runs in its own PID namespace**
+(measured — from a second call, the first call's processes are invisible to `ps` and its
+`/proc/*/environ` unreadable). So the ticket cannot instead be left in a file for `jkb` to find: any
+Bash call could read that file, and an in-process subagent would be able to steal one minted for a
+different `agent_type` — which is exactly what the harness vouching exists to prevent, since
+ancestry cannot tell a subagent from its parent.
+
+**Not yet measured, and it gates this change:** whether the harness applies `updatedInput` when no
+`permissionDecision` accompanies it. The hook-output schema marks the field optional, but that was
+read out of the installed bundle, not observed. If it turns out `updatedInput` is dropped without a
+decision, every deferred `jkb` call loses its ticket and the daemon refuses it `Unauthorized` — a
+loud, immediate failure rather than a silent weakening, and `JKB_ATTEST_DECISION=ask` restores the
+old behaviour on both classes without a rebuild (the hook binary is pinned and root-owned, so a
+rollback that needs one is not a rollback). Verify with one deferred call, e.g. `cd /tmp && jkb role
+whoami`, on a session running a rebuilt and re-pinned hook.
 
 **Superseded: "no separators, pipes, redirects, substitutions or expansions", refused even inside
 quotes.** That rule was reversed by a measurement — it put a permission prompt on jkb's own
