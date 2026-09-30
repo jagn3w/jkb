@@ -564,8 +564,17 @@ writable. The residual: it pins whatever `~/.cargo/bin/jkb` is when it runs.
 project's and user's (they are not exclusive unless `allowManagedHooksOnly`, which is not set
 because it would disable this repo's own hooks); that the managed deny rules merge with the
 posture's; that returning `permissionDecision: "allow"` with `updatedInput` from the attestation
-hook does not override a deny rule (it returns `allow` only for one plain `jkb` invocation, and
-`ask` for any other command running `jkb`); and hook latency against the real daemon. `verify.sh` does not yet check these.
+hook does not override a deny rule; and hook latency against the real daemon. `verify.sh` does not
+yet check these.
+
+What the hook emits is recorded once, in D52.9 of [docs/task-lifecycle.md](../docs/task-lifecycle.md),
+and is no longer restated here — this paragraph used to say it returns "`ask` for any other command
+running `jkb`", which stopped being true and left two governing records disagreeing about a security
+hook. Two of that section's open questions bear on this container specifically: whether `updatedInput`
+is applied when the hook returns **no** `permissionDecision` (the emission it now uses for most
+commands), and which text the permission rules are matched against — the original command or the
+rewritten one carrying `export JKB_ATTEST=…`. Both need this image running, and `verify.sh` checks
+neither.
 
 ### A nested bind must be named
 

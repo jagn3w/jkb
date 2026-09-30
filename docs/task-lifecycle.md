@@ -938,8 +938,9 @@ plain `jkb` invocation — the command word literally `jkb`, with no path compon
 a shell command, and is not `task land`, which runs the gate. That is what a `Bash(jkb:*)` rule
 would approve, with every request it makes held to the ticket's role. It returns `ask` for one
 thing only: a command that may be `task land`. For everything else that runs `jkb` it returns **no
-`permissionDecision` at all**, and the session's own rules and prompt judge the call exactly as they
-did before this hook existed.
+`permissionDecision` at all**, and the session's own rules and prompt judge the call — on the
+rewritten command, which is not quite the same thing as before the hook existed (see the two open
+questions below).
 
 **Why `land` alone keeps the prompt.** `land` runs the repository's gate through `sh -c` with a
 command the *caller* supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling.
@@ -971,14 +972,33 @@ Bash call could read that file, and an in-process subagent would be able to stea
 different `agent_type` — which is exactly what the harness vouching exists to prevent, since
 ancestry cannot tell a subagent from its parent.
 
-**Not yet measured, and it gates this change:** whether the harness applies `updatedInput` when no
-`permissionDecision` accompanies it. The hook-output schema marks the field optional, but that was
-read out of the installed bundle, not observed. If it turns out `updatedInput` is dropped without a
-decision, every deferred `jkb` call loses its ticket and the daemon refuses it `Unauthorized` — a
-loud, immediate failure rather than a silent weakening, and `JKB_ATTEST_DECISION=ask` restores the
-old behaviour on both classes without a rebuild (the hook binary is pinned and root-owned, so a
-rollback that needs one is not a rollback). Verify with one deferred call, e.g. `cd /tmp && jkb role
-whoami`, on a session running a rebuilt and re-pinned hook.
+**Two things not yet measured, and they gate this change.** Both need a session running a rebuilt,
+re-pinned hook; neither was observed, and one of them decides whether the change delivers anything
+at all.
+
+*Is `updatedInput` applied with no `permissionDecision`?* The hook-output schema marks the field
+optional, but that was read out of the installed bundle, not observed. If `updatedInput` is dropped
+without a decision, every deferred `jkb` call loses its ticket and the daemon refuses it
+`Unauthorized` — a loud, immediate failure rather than a silent weakening. Check it with one
+deferred call: `cd /tmp && jkb role whoami`.
+
+*Which text are the permission rules matched against?* Not measured, and asserting otherwise was
+the error this paragraph replaces. For a deferred call the rules see `updatedInput`, whose command
+is `export JKB_ATTEST=…; cd repo && jkb workflow next` — not the text the rules were written
+against. Claude Code judges a command list part by part, so a session with `Bash(cd:*)` and
+`Bash(jkb:*)` gains an `export JKB_ATTEST=…` part that matches no rule and may prompt anyway, in
+which case the intended benefit does not exist. The other branch is worse: if the rules match the
+*original* text, then an existing `Bash(jkb:*)` rule silently covers a `land --gate '<shell>'`
+smuggled behind an assignment prefix. Measure it with no rebuild — put `Bash(export:*)` in
+`permissions.deny` and run one deferred `jkb` call. A refusal proves the rules see the rewritten
+list, and tells you at the same time whether the over-prompting is actually gone.
+
+**Rollback**, for either answer: `JKB_ATTEST_DECISION=ask` forces the old prompt on both classes
+with no rebuild — the hook binary is pinned and root-owned, so a rollback that needs one is not a
+rollback. It is read from the hook process's environment, and the hook is spawned by the harness,
+so on the host it goes in the environment Claude Code is started with; **inside the dev container
+the only place is `containerEnv` in `.container/container.json`, which is fixed at create, so it
+needs a recreate.** Worth knowing before the moment it is needed.
 
 **Superseded: "no separators, pipes, redirects, substitutions or expansions", refused even inside
 quotes.** That rule was reversed by a measurement — it put a permission prompt on jkb's own

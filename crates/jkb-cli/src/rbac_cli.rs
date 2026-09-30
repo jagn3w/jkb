@@ -840,8 +840,15 @@ fn attestation(command: &str) -> Attestation {
     // (`--gate`), so it is arbitrary execution wearing a `jkb` spelling. Asked wherever `land`
     // appears in a `jkb` command, rather than by locating the subcommand: a global option's value
     // (`--db <path>`) sits where a parser that does not know every option would look for it.
+    // Located wherever the jkb word sits, not at index 0. An assignment prefix or a wrapper
+    // (`FOO=1 jkb …`, `env jkb …`, `timeout 300 jkb …`, `sudo jkb …`) leaves it at index 1, and
+    // `runs_jkb` counts every one of those as a jkb call — so a test that insisted on index 0
+    // disagreed with the ticketing about exactly the class this guard exists for.
     let lands = |words: &Vec<String>| {
-        words.first().is_some_and(|w| is_jkb(w)) && words[1..].iter().any(|w| w == "land")
+        words
+            .iter()
+            .position(|w| is_jkb(w))
+            .is_some_and(|at| words[at + 1..].iter().any(|w| w == "land"))
     };
     if commands.iter().any(lands) {
         return Attestation::Ask;
@@ -1068,6 +1075,12 @@ mod tests {
             "jkb task 'la'nd task:x",
             // In a list, the `land` may be in any of the commands.
             "jkb task add 'ok' && jkb task land task:x",
+            // The command word need not be the FIRST word: an assignment prefix or a wrapper
+            // leaves `jkb` at index 1, and `runs_jkb` counts it as a jkb call either way.
+            "FOO=1 jkb task land task:x --gate 'sh /tmp/p.sh'",
+            "env jkb task land task:x",
+            "timeout 300 jkb task land task:x",
+            "sudo jkb task land task:x",
             // Nothing modelled, so `land` cannot be ruled out. The tilde one is why this must be
             // `Ask` and not `Defer`: under `HOME=land` it passes bash `task land … --gate …`.
             "jkb --json task ~ task:x --gate 'sh /tmp/p.sh'",
