@@ -183,6 +183,13 @@ RUN mkdir -p "$(dirname "$JKB_NS_MARKER")" && chown vscode:vscode "$(dirname "$J
 # harness itself — a hook, an agent definition or an MCP server it could add would run unsandboxed.
 COPY --chown=root:root managed-settings.json /etc/claude-code/managed-settings.json
 RUN chmod 0644 /etc/claude-code/managed-settings.json
+# The transcript deny, which is a HOOK rather than a permissions rule for a resource reason the
+# script's own header measures: a `Read(...*.jsonl)` glob is named per-matching-file in the Bash
+# sandbox's bubblewrap argv, and at ~200 files that is half of MAX_ARG_STRLEN and every Bash call
+# in the container dies at spawn. Root-owned and 0755 for the same reason pin-jkb-hook.sh is: it
+# is the thing that confines the agent, so the agent must not be able to rewrite it.
+COPY --chown=root:root deny-transcripts.sh /usr/local/bin/deny-transcripts.sh
+RUN chmod 0755 /usr/local/bin/deny-transcripts.sh
 # The binary the managed hooks run, root-owned, where nothing in the sandbox can replace it (D52.9):
 # pin-jkb-hook.sh copies setup's build there, run through sudo — which a sandboxed tool call cannot.
 COPY --chown=root:root pin-jkb-hook.sh /usr/local/bin/pin-jkb-hook.sh

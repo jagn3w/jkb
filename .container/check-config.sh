@@ -437,8 +437,15 @@ fi
 hook_cmds="$(jq -r '.hooks[][].hooks[].command' "$here/managed-settings.json" 2>/dev/null)"
 if [ -z "$hook_cmds" ]; then
     bad "no hook commands could be read from managed-settings.json — the check that they run the pinned binary examined nothing"
-elif grep -qv '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds"; then
-    bad "a managed hook does not run /usr/local/lib/jkb-hook/jkb — one found on PATH is replaceable from the sandbox: $(grep -m1 -v '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds")"
+elif grep -qvE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.sh$)' <<<"$hook_cmds"; then
+    # TWO PINNED PATHS, NOT A RELAXED PATTERN. The rule is "absolute, root-owned, and not writable
+    # from inside the sandbox", and both satisfy it: the Dockerfile installs each --chown=root:root
+    # and the sandbox's allowOnly write list reaches neither. deny-transcripts.sh joined the list
+    # when the transcript deny moved out of permissions.deny and into a hook, because a
+    # `Read(...*.jsonl)` glob is named per-matching-file in the bubblewrap argv and blew it. A
+    # THIRD entry here should be suspicious: each one is a program that runs outside the sandbox
+    # with the container credential readable.
+    bad "a managed hook runs neither pinned root-owned program — one found on PATH is replaceable from the sandbox: $(grep -m1 -vE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.sh$)' <<<"$hook_cmds")"
 else
     ok "every managed hook runs the pinned, root-owned jkb"
 fi
@@ -490,12 +497,13 @@ else
             esac
         done <<<"$dc_deny"
     done
-    # 2. Nothing may expand per-file EXCEPT the two transcript rules, which have to.
-    dc_allowed_file_globs='/home/vscode/.claude/projects/**/*.jsonl /home/vscode/.claude-state/projects/**/*.jsonl'
+    # 2. NOTHING may expand per-file. There is no exception left: the transcript rules were the
+    #    only ones that needed a file pattern, and they became deny-transcripts.sh precisely so
+    #    this ban could be absolute. Re-introducing an exception list is how the 67,638 bytes come
+    #    back one reasonable-looking rule at a time.
     dc_expanding=""
     while IFS= read -r dc_rule; do
         [ -n "$dc_rule" ] || continue
-        case " $dc_allowed_file_globs " in *" $dc_rule "*) continue ;; esac
         dc_last="${dc_rule##*/}"
         case "$dc_last" in
             '**') continue ;;
@@ -507,12 +515,42 @@ else
        Auto-memory's location is Claude Code's, not ours, and verify.sh FAILS when it is not
        linked there — so a subtree rule over the transcript tree cannot also be the argv fix."
     elif [ -n "$dc_expanding" ]; then
-        bad "a managed deny rule ends in a file pattern and is not one of the two transcript rules, so the Bash sandbox must name every matching file and the argv grows with the file count until every Bash call dies at spawn:$dc_expanding
-       Use the whole-subtree form (\`dir/**\`), which collapses to a single argv entry. If it must
-       spare siblings the way the transcript rules spare memory, add it to
-       dc_allowed_file_globs with the measurement — .container/README.md carries the numbers."
+        bad "a managed deny rule ends in a file pattern, so the Bash sandbox must name every matching file and the argv grows with the file count until every Bash call in the container dies at spawn:$dc_expanding
+       Use the whole-subtree form (\`dir/**\`), which collapses to a single argv entry. If it has
+       to spare a sibling the way the transcript deny spares auto-memory, a glob cannot express
+       that at all — make it a PreToolUse hook, as .container/deny-transcripts.sh is, and it costs
+       no argv. .container/README.md carries the measurements."
     else
-        ok "no managed deny rule swallows auto-memory, and only the two budgeted transcript rules expand per-file"
+        ok "no managed deny rule swallows auto-memory, and none expands per-file into the Bash sandbox argv"
+    fi
+fi
+
+# AND THE HOOK THAT REPLACED THEM MUST ACTUALLY BE WIRED. With the globs gone, deny-transcripts.sh
+# is the ONLY thing stopping a file tool reading another session's transcript -- the exact-path
+# rules above cover Bash, not Read/Edit/Write. Deleting the hook entry, or the COPY that installs
+# it, leaves every gate here green and the confidentiality boundary simply absent. Three things
+# have to hold together, so all three are asked: it is referenced, it is installed, and it is
+# installed root-owned (a hook the sandbox can rewrite is a hook the agent controls).
+dc_hook=/usr/local/bin/deny-transcripts.sh
+if ! jq -e --arg h "$dc_hook" '[.hooks.PreToolUse[]?.hooks[]?.command] | index($h)' \
+        "$here/managed-settings.json" >/dev/null 2>&1; then
+    bad "managed-settings.json no longer runs $dc_hook as a PreToolUse hook — with the transcript globs gone, nothing else keeps a file tool out of another session's transcript"
+elif ! grep -qF -- "COPY --chown=root:root deny-transcripts.sh $dc_hook" "$here/Dockerfile"; then
+    bad "the Dockerfile does not install deny-transcripts.sh root-owned at $dc_hook — the hook managed-settings.json names is either missing or writable by the agent it confines"
+elif [ ! -f "$here/deny-transcripts.sh" ]; then
+    bad "there is no .container/deny-transcripts.sh to install, so the transcript deny does not exist"
+else
+    # The matcher has to name the tools that can READ a file. A hook wired only to Read leaves
+    # Grep and Glob able to enumerate and search the tree.
+    dc_match="$(jq -r --arg h "$dc_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$here/managed-settings.json" 2>/dev/null)"
+    dc_missing=""
+    for dc_tool in Read Edit Write Grep Glob; do
+        case "$dc_match" in *"$dc_tool"*) ;; *) dc_missing="$dc_missing $dc_tool" ;; esac
+    done
+    if [ -n "$dc_missing" ]; then
+        bad "the transcript hook's matcher does not cover:$dc_missing — a tool left out can read or enumerate the tree the hook exists to close"
+    else
+        ok "the transcript deny is a wired, root-owned hook covering every file-reading tool"
     fi
 fi
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers

@@ -1280,62 +1280,76 @@ deliberately not pruned — `git clean -X` deletes exactly the regenerable files
 gitignored `.env`, and unrequested deletion is what this whole mechanism exists to avoid. Shorten
 `--retain-days` if size matters more than the safety net.
 
-## Why the deny list cannot be made O(1): memory and transcripts share a tree
+## The transcript deny is a hook, so the sandbox argv is O(1)
 
-The sweep below budgets a deny list that grows with the file count. The obvious question is why it
-grows at all, and the answer is a shape — but the fix that shape suggests is **not available**, and
-that is worth recording because it looks available right up until it is tried.
+Two `permissions.deny` globs used to cost more than half the argv budget every Bash call in this
+container gets. They are now one PreToolUse hook, `.container/deny-transcripts.sh`, and the sweep
+below went from the defence to disk hygiene.
 
-**The shape.** Claude Code compiles `permissions.deny` into the bubblewrap argv for the Bash
-sandbox. A rule ending in a directory wildcard *collapses*: `Read(~/.ssh/**)` becomes the single
-path `~/.ssh`, and eight rules in the live profile do exactly that — `~/.aws`, `~/Documents`,
-`~/.pki`, `~/.config/gcloud`, `~/.jkb-container` among them. A rule ending in a **file pattern**
-cannot: the sandbox names every match and binds `/dev/null` over each, so the argv grows by one
-path per file on disk. The two transcript rules are the only file-pattern rules in the profile,
-and they are the entire cost.
+**Why a glob was the wrong instrument.** Claude Code compiles `permissions.deny` into the
+bubblewrap argv for the Bash sandbox. A rule ending in a directory wildcard *collapses* to one
+entry — `Read(~/.ssh/**)` becomes `~/.ssh`, and eight rules in the live profile do exactly that.
+A rule ending in a **file pattern** cannot: the sandbox names every match and binds `/dev/null`
+over each, so the argv grows by one path per file on disk.
 
-**Measured 2026-09-30, in `jkb-dev`, after a sweep had already run:**
+**Measured 2026-09-30 in `jkb-dev`, after a sweep had already run:**
 
 | | |
 |---|---|
 | `.jsonl` files under `~/.claude/projects` | 206 |
 | path text, one spelling | 33,819 bytes |
 | both spellings (`.claude` and `.claude-state` are one tree) | 67,638 bytes |
-| `MAX_ARG_STRLEN` | 131,072 bytes |
+| `MAX_ARG_STRLEN` (Linux, 32 pages, not tunable) | 131,072 bytes |
 | **share of the ceiling spent by two rules** | **52%** |
-| the same two rules written as `projects/**` | ~50 bytes |
+| after: two exact-path rules + a hook | ~60 bytes |
 
-**And that last row is the trap.** It was written, committed, and reverted. `Read(~/.claude/projects/**)`
-takes the argv to nothing — and it also covers `~/.claude/projects/<slug>/memory`, which is where
-Claude Code keeps auto-memory. That location is not ours: `scripts/link-claude-memory.sh` exists to
-put the link there, and verify.sh **fails** when it is missing. So the collapsing shape and the
-memory requirement are the same path, and only one of them can win.
+Past the ceiling *every* Bash tool call fails at spawn with `E2BIG` — not the one that overflowed,
+all of them, including `:` — with nothing in the message naming transcripts.
 
-The failure it would have caused has no symptom. Denied memory does not error — `MEMORY.md` stops
-arriving in context, which reads like an agent that forgot rather than a broken container. It was
-caught by adding `memory_shadow` to verify.sh and running its rows against the change that had just
-been made.
+**The obvious fix is a trap, and it was committed before it was caught.**
+`Read(~/.claude/projects/**)` collapses beautifully and also covers
+`~/.claude/projects/<slug>/memory`, which is where Claude Code keeps auto-memory. That location is
+not ours to choose: `scripts/link-claude-memory.sh` exists to put the link there and verify.sh
+**fails** when it is missing. Denied memory does not error — `MEMORY.md` stops arriving in context,
+which reads like an agent that forgot rather than a broken container. `memory` and `<uuid>.jsonl`
+are siblings, so **no glob separates them**; that is a property of Claude Code's layout, not
+something this repo can rule its way out of.
 
-**So the transcript rules must end in a file pattern, and the argv cost is a consequence of Claude
-Code's layout rather than of anything this repo chose.** Two guards hold the line instead:
+**A hook can, and costs no argv, because it is code rather than a path list.** The trade is one
+process per file-tool call in exchange for O(files) of argv. `deny-transcripts.sh` normalises the
+path lexically first — `<slug>/memory/../e1d7.jsonl` is a transcript wearing memory's prefix, and
+a string compare allows it — then denies anything under either spelling of the tree except a
+`memory/` segment. Fifteen self-test rows, run by `./scripts/check.sh` and CI.
 
-- `check-config.sh` refuses any deny rule that covers the auto-memory path, and any *other* rule
-  ending in a file pattern — the two transcript rules are named as the one exception, so a third
-  O(files) term cannot arrive unnoticed. Five mutations pin it.
-- `verify.sh`'s `memory_shadow` asks the same question at runtime against the posture actually
-  installed in `/etc/claude-code`, which is what catches a rule that only ever exists in the image.
+**It fails closed**, unlike `.claude/hooks/block-raw-sqlite.sh`, which fails open. That one steers
+an agent toward a better tool, so an error must not wedge Bash. This one is a confidentiality
+boundary: if `jq` cannot parse the call, the raw text is checked for the roots and the answer is
+no. A call naming no path at all is still allowed — otherwise every Bash command in the container
+would be blocked.
 
-**Retention is not an alternative either**, measured rather than assumed: every one of those 206
-files was under three days old, so `cleanupPeriodDays` at any value deletes nothing. This is
-production rate, not accumulation — ~70 subagent transcripts a day, 201 of the 206 files and 98% of
-the bytes, one per agent per review round and workflow.
+**What holds it in place**, because the hook is now the only thing denying transcripts to the file
+tools and its absence is silent:
 
-**What would actually fix it**, unmeasured and therefore not done: a rule naming only the subagent
-subtree (`projects/**/subagents/**`) leaves `memory` alone and could collapse per uuid directory —
-roughly 10 entries instead of 201. Whether Claude Code collapses a pattern with a literal segment
-after a wildcard is not something this container can answer from inside a running session; it needs
-the rule changed, the image rebuilt, a fresh session, and the resulting deny list measured. Until
-someone does that, the sweep below is the answer and not a workaround.
+- `check-config.sh` (static): no deny rule may cover the memory path; **none** may end in a file
+  pattern — the exception list is gone, since nothing needs one now; and the hook must be
+  referenced, installed by the Dockerfile, installed `--chown=root:root`, and matched against
+  every file-reading tool (`Read|Edit|Write|NotebookEdit|Grep|Glob` — a hook wired to `Read` alone
+  leaves `Grep` able to search the tree). Six mutations pin these.
+- `verify.sh` (runtime): the installed hook exists, is root-owned and not writable by `vscode`,
+  passes its own self-test in the container, and — asked of the installed copy, not a fixture —
+  denies a transcript path while allowing a memory path.
+
+**Bash is covered separately and always was.** The sandbox's blanket `denyRead` of `~` hides this
+tree from Bash regardless; naming a path in a deny rule is in fact what *exposed* it, which is why
+`~/.claude/todos` was invisible while `~/.claude/projects` was not. `managed-settings.json` keeps
+one exact-path rule per spelling as the belt to that brace — one argv entry each, and neither
+matches a memory path.
+
+**Not yet measured:** the argv figure after this change is predicted from the collapse rule, not
+observed, because bubblewrap's command line is built outside the sandbox and a session cannot see
+its own (we are PID 2 in its namespace). Confirm it on the next `run.sh --build`: the container
+should start, `verify.sh` should report the hook row green, and the sweep's `--dry-run` projection
+should fall to near zero.
 
 ## Transcripts are swept by byte budget, not by age
 
