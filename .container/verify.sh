@@ -1618,6 +1618,34 @@ else
     fi
 fi
 
+# ...AND THE HOOK THAT NOW CARRIES THE TRANSCRIPT DENY IS PRESENT AND ROOT-OWNED. check-config.sh
+# asks whether the repo WIRES it; this asks whether the running container HAS it, which is a
+# different question and the one that matters after a rebuild from a stale image or a hand-edited
+# /etc/claude-code. With the per-file globs gone (they cost 52% of MAX_ARG_STRLEN in argv), this
+# script is the only thing keeping a file tool out of another session's transcript, and its
+# absence is silent: every tool call simply succeeds.
+mem_hook=/usr/local/bin/deny-transcripts.sh
+if [ ! -x "$mem_hook" ]; then
+    bad "$mem_hook is missing or not executable, so nothing stops a file tool reading another session's transcript — rebuild the image"
+elif [ "$(stat -c '%U' "$mem_hook" 2>/dev/null)" != root ] || [ -w "$mem_hook" ]; then
+    bad "$mem_hook is not root-owned-and-read-only to this user — the hook that confines the agent is writable by it"
+elif ! "$mem_hook" --self-test >/dev/null 2>&1; then
+    bad "$mem_hook fails its own self-test in this container — the transcript deny is wired but not working"
+else
+    # ASKED OF THE INSTALLED COPY, not of a fixture: the answer that matters is what the hook in
+    # THIS image does, and its two load-bearing cases are opposite verdicts on sibling paths.
+    mem_t="$(printf '{"tool_input":{"file_path":"%s/.claude/projects/-probe/x.jsonl"}}' "$HOME" | "$mem_hook" 2>/dev/null)"
+    mem_m="$(printf '{"tool_input":{"file_path":"%s/.claude/projects/-probe/memory/MEMORY.md"}}' "$HOME" | "$mem_hook" 2>/dev/null)"
+    case "$mem_t" in
+        *'"deny"'*)
+            case "$mem_m" in
+                *'"deny"'*) bad "the installed transcript hook also denies auto-memory — MEMORY.md will stop reaching context with no error anywhere" ;;
+                *) ok "the transcript hook is installed root-owned, denies a transcript and allows auto-memory" ;;
+            esac ;;
+        *) bad "the installed transcript hook does NOT deny a transcript path — it is present but not holding the boundary" ;;
+    esac
+fi
+
 # 3e. Git runs the hooks the host runs. VS Code copies the host's ~/.gitconfig in on attach, so a
 #     global core.hooksPath names a host directory; run.sh mirrors it (lib.sh's
 #     dc_mirror_host_hooks). If the mirror is missing, git runs NO hooks and says nothing, which is

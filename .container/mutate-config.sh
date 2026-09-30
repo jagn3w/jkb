@@ -1298,7 +1298,7 @@ import sys
 p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('"/usr/local/lib/jkb-hook/jkb workflow next --stop-hook"', '"jkb workflow next --stop-hook"', 1))
 PYX
-run "a managed hook runs jkb found on PATH" "does not run /usr/local/lib/jkb-hook/jkb"
+run "a managed hook runs jkb found on PATH" "runs neither pinned root-owned program"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
@@ -1307,39 +1307,58 @@ open(p, 'w').write(s.replace('"hooks": {', '"hooks_moved": {', 1))
 PYX
 run "the managed hooks cannot be read" "no hook commands could be read"
 
-# THE TWO THINGS A TRANSCRIPT-TREE DENY RULE CAN BREAK (2026-09-30), pulling opposite ways. The
-# memory arm is pinned FIRST because it is the one that was got wrong: the collapsing `projects/**`
-# shape fixes the argv and silently swallows auto-memory, and it was committed before verify.sh's
-# memory_shadow rows caught it.
+# THE TRANSCRIPT DENY (2026-09-30), which is a HOOK because a glob cannot be both cheap and
+# correct here. A `Read(...*.jsonl)` glob is named per-matching-file in the bubblewrap argv (206
+# files = 52% of MAX_ARG_STRLEN, and past it every Bash call dies at spawn); the collapsing
+# `projects/**` form is cheap and swallows auto-memory, which fails SILENTLY. Both dead ends are
+# pinned below alongside the wiring of the hook that replaced them, because with the globs gone
+# the hook is the only thing left holding the boundary.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["hooks"]["PreToolUse"] = [h for h in d["hooks"]["PreToolUse"] if "deny-transcripts.sh" not in json.dumps(h)]
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the transcript hook is unwired" "no longer runs /usr/local/bin/deny-transcripts.sh"
+
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('"Read(~/.claude/projects/**/*.jsonl)"', '"Read(~/.claude/projects/**)"', 1))
+open(p, 'w').write(s.replace("COPY --chown=root:root deny-transcripts.sh /usr/local/bin/deny-transcripts.sh\n", "", 1))
+PYX
+run "the transcript hook is not installed" "does not install deny-transcripts.sh root-owned"
+
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("COPY --chown=root:root deny-transcripts.sh", "COPY deny-transcripts.sh", 1))
+PYX
+run "the transcript hook is installed agent-writable" "does not install deny-transcripts.sh root-owned"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+for h in d["hooks"]["PreToolUse"]:
+    if "deny-transcripts.sh" in json.dumps(h): h["matcher"] = "Read"
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the hook misses the tools that can also read" "matcher does not cover"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects/**/*.jsonl)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a per-file deny glob comes back" "ends in a file pattern"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects/**)")
+json.dump(d, open(p, "w"), indent=2)
 PYX
 run "the collapsing shape swallows auto-memory" "covers ~/.claude/projects/<slug>/memory"
-
-seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('"Read(~/.claude-state/projects/**/*.jsonl)"', '"Read(~/.claude-state/projects/**)"', 1))
-PYX
-run "...in the .claude-state spelling too" "covers ~/.claude/projects/<slug>/memory"
-
-seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
-import json, sys
-p = sys.argv[1]; d = json.load(open(p))
-d["permissions"]["deny"].append("Read(~/.claude/projects/*/memory/**)")
-json.dump(d, open(p, "w"), indent=2)
-PYX
-run "a rule naming memory outright" "covers ~/.claude/projects/<slug>/memory"
-
-seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
-import json, sys
-p = sys.argv[1]; d = json.load(open(p))
-d["permissions"]["deny"].append("Read(~/repos/**/*.env)")
-json.dump(d, open(p, "w"), indent=2)
-PYX
-run "a new file-pattern deny rule is added" "ends in a file pattern"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
@@ -1736,7 +1755,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=100
+PINNED_BAD_SITES=104
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
