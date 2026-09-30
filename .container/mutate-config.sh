@@ -1307,6 +1307,32 @@ open(p, 'w').write(s.replace('"hooks": {', '"hooks_moved": {', 1))
 PYX
 run "the managed hooks cannot be read" "no hook commands could be read"
 
+# THE ARGV BOUND (2026-09-30). Both arms: the exact rule that caused the E2BIG, and a plausible
+# new one nobody would blink at in review. A file-pattern deny is named per-matching-file in the
+# bubblewrap argv, so it grows with the file count until every Bash call in the container dies at
+# spawn -- and retention cannot save it, because the population is production rate, not age.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"Read(~/.claude/projects/**)"', '"Read(~/.claude/projects/**/*.jsonl)"', 1))
+PYX
+run "the per-file transcript deny comes back" "ends in a file pattern"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/repos/**/*.env)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a new file-pattern deny rule is added" "ends in a file pattern"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"permissions": {', '"permissions_moved": {', 1))
+PYX
+run "the deny rules cannot be read" "examined nothing"
+
 # The two self-test lists (D51.9): drop one from each side in turn.
 seed; python3 - "$work/t/scripts/check.sh" <<'PYX'
 import sys
@@ -1695,7 +1721,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=97
+PINNED_BAD_SITES=99
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

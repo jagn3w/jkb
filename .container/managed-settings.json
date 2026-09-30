@@ -3,8 +3,8 @@
     "deny": [
       "Read(~/.jkb-container/**)",
       "Read(~/.jkb-container)",
-      "Read(~/.claude/projects/**/*.jsonl)",
-      "Read(~/.claude-state/projects/**/*.jsonl)",
+      "Read(~/.claude/projects/**)",
+      "Read(~/.claude-state/projects/**)",
       "Edit(~/repos/**/.claude/settings.json)",
       "Edit(~/repos/**/.claude/settings.local.json)",
       "Edit(~/repos/**/.claude/hooks/**)",

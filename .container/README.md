@@ -1292,7 +1292,65 @@ deliberately not pruned — `git clean -X` deletes exactly the regenerable files
 gitignored `.env`, and unrequested deletion is what this whole mechanism exists to avoid. Shorten
 `--retain-days` if size matters more than the safety net.
 
+## The deny list is O(1) now, because the rule shape was the bug
+
+The sweep below is a byte budget for a deny list that grew with the file count. It should never
+have grown with the file count. Two rules in `managed-settings.json` did that, and changing their
+shape removed the whole failure mode rather than bounding it.
+
+```
+-  "Read(~/.claude/projects/**/*.jsonl)",        one argv path PER MATCHING FILE
+-  "Read(~/.claude-state/projects/**/*.jsonl)",
++  "Read(~/.claude/projects/**)",                one argv path, whatever the tree holds
++  "Read(~/.claude-state/projects/**)",
+```
+
+**Why the shape decides it.** Claude Code compiles `permissions.deny` into the bubblewrap argv for
+the Bash sandbox. A rule ending in a directory wildcard *collapses*: "everything under here" needs
+no enumeration, so `Read(~/.ssh/**)` becomes the single path `~/.ssh`. Eight rules in the live
+profile do exactly that — `~/.ssh`, `~/.aws`, `~/Documents`, `~/.pki`, `~/.config/gcloud`,
+`~/.jkb-container` and more. A rule ending in a **file pattern** cannot collapse: the sandbox must
+name every match and bind `/dev/null` over each, so the argv grows by one path per file on disk.
+The two transcript rules were the only file-pattern rules in the profile, and they were the entire
+problem.
+
+**Measured 2026-09-30, in `jkb-dev`, after a sweep had already run:**
+
+| | |
+|---|---|
+| `.jsonl` files under `~/.claude/projects` | 206 |
+| path text, one spelling | 33,819 bytes |
+| both spellings (`.claude` and `.claude-state` are the same tree) | 67,638 bytes |
+| `MAX_ARG_STRLEN` | 131,072 bytes |
+| **share of the ceiling spent by two rules** | **52%** |
+| the same two rules, after | ~50 bytes |
+
+**And the 67,638 bytes bought nothing.** `~` is already in the sandbox's blanket `denyRead` with
+`.claude/projects` in no allow list, so Bash could not read those files either way. The rules exist
+to bound the *file tools* — Bash and Read/Edit/Write are bounded by different mechanisms, as
+`scripts/link-claude-memory.sh` records — and the subtree form bounds them just as well. The
+enumeration was pure cost. It is visible in one listing: `~/.claude/todos` is invisible to Bash
+under the blanket deny, while `~/.claude/projects` was not. The per-file binds were what exposed
+the tree they were added to hide.
+
+**Retention is not an alternative, and this is the measurement that says so.** Every one of those
+206 files was under three days old — the age histogram has zero entries past 3d. `cleanupPeriodDays`
+at any value deletes nothing here. This is not accumulation, it is **production rate**: ~70 subagent
+transcripts a day, 201 of the 206 files and 98% of the bytes, because every review round and every
+workflow leaves one per agent. That is also why a comment would not have held. The next
+file-pattern deny rule reintroduces the failure within days and looks entirely reasonable in review,
+so the rule lives in `check-config.sh` where it is checked, with three mutations pinning it: the
+exact regression, a plausible new rule (`Read(~/repos/**/*.env)`), and the unreadable-config arm.
+
+**What this does not change.** The sweep stays, demoted from the defence to the backstop: it still
+bounds disk in `.claude-state`, and it is the recovery if a future rule or a Claude Code change
+reintroduces enumeration. Everything below remains true about how it works — read it as insurance,
+not as the thing standing between this container and E2BIG.
+
 ## Transcripts are swept by byte budget, not by age
+
+*Backstop, since the section above removed the cause. Still the recovery path, and still what
+bounds disk.*
 
 Every Bash tool call in every container session failed at spawn with `E2BIG`. Not degraded —
 total, from the first call, in a container that had worked the week before, with nothing in the
