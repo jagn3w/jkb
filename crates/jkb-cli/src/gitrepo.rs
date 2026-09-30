@@ -2352,6 +2352,13 @@ mod tests {
              repository: the thing it acts on is a named volume inside that container, and \
              the caller's cwd changes nothing about which container is poked",
         ),
+        (
+            "src/rbac_cli.rs",
+            "bash_argv",
+            "spawns `bash` to word-split literal command strings, with `jkb` shadowed by a shell \
+             function; it calls `env_clear` and sets an empty `PATH`, so it inherits no `GIT_*` \
+             variable to be scrubbed of and can reach no binary in the first place",
+        ),
     ];
 
     /// The function a declaration line declares, or `UNPARSED` when the line declares one

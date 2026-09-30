@@ -682,21 +682,78 @@ enum Attestation {
     Ask,
 }
 
-/// Characters that make a command more than one plain invocation: separators, pipes, redirects,
-/// substitutions, expansions, grouping, escapes, comments and line breaks. Refused even inside quotes,
-/// because telling a quoted one from a live one is a shell parser's job, not this hook's.
+/// The three characters this hook cannot reason about wherever they appear: `$` and `` ` `` are
+/// substituted inside double quotes, and `\\` escapes the quoting itself. With none of them present,
+/// [`shell_words`] reads quotes exactly as the shell does, which is what lets every other
+/// metacharacter be judged by whether it is quoted. Refused outright, quoted or not, by
+/// [`shell_words`] itself so that no caller can proceed on words it could not model.
+const UNQUOTABLE: &[char] = &['$', '`', '\\'];
+
+/// Characters that make a command more than one plain invocation when the shell sees them bare:
+/// separators, pipes, redirects, grouping, comments, globs and line breaks. Inside either kind of
+/// quote the shell passes them through as text, so a quoted one is an argument and not syntax --
+/// which is what `jkb query 'status!=done'` and `jkb task add 'Fix it !p1 #area=hook'` are made of.
+/// Refusing those cost a permission prompt on the most ordinary `jkb` calls there are, because
+/// jkb's own quick-add syntax (`!p<n> #<facet>=<value>`) is spelled in these characters.
+///
+/// `\r` is the one member bash does NOT read as syntax -- it is ordinary word text to it
+/// (measured: `a\rb` is passed as the single word `a\rb`). It is kept as a deliberate extra,
+/// because a carriage return in a command is a line ending that got through something, and asking
+/// is the cheap side of that.
+///
+/// Two judgement calls. `!` is history expansion, which is off in the non-interactive shell a tool
+/// call runs in, and is literal inside single quotes even where it is on. `~` is absent because it
+/// has no quoted spelling that still expands (`"~"` is passed through as a literal `~`), so listing
+/// it would refuse `--db ~/.jkb/jkb.db` with no way to write it; [`shell_words`] restricts the
+/// tilde words it will model instead -- it keeps only one that also carries a `/`.
+///
+/// An earlier version of this comment claimed a tilde "yields exactly one word and always a path,
+/// so it can neither split a command nor forge the word `jkb` or `land`". The first half holds --
+/// tilde expansion is not word-split even when the expansion contains a space (measured:
+/// `HOME='/x y'` makes `~/z` the single word `/x y/z`). The second half is false: `~` expands to
+/// `$HOME`, `~+` to `$PWD` and `~-` to `$OLDPWD`, which are ordinary variables, and `HOME=land`
+/// makes a bare `~` expand to exactly `land` -- which would have carried `task land` and its
+/// `--gate` past this hook with no prompt.
 const SHELL_SYNTAX: &[char] = &[
-    ';', '&', '|', '<', '>', '$', '`', '(', ')', '{', '}', '\\', '\n', '\r', '#', '!', '*', '?',
-    '[', ']', '~',
+    ';', '&', '|', '<', '>', '(', ')', '{', '}', '\n', '\r', '#', '!', '*', '?', '[', ']',
 ];
 
-/// The words a command the shell will run as — quotes removed, as the shell removes them. `None` for an
-/// unbalanced quote. Sound only for a command with none of [`SHELL_SYNTAX`] in it: with no `$`, `` ` ``
-/// or `\\`, nothing inside either kind of quote is expanded or escaped.
+/// A character bash's **lexer** breaks a command line on: a blank (space or tab) or a newline.
+///
+/// Not [`char::is_whitespace`], which is Unicode-wide: a non-breaking space is ordinary word text
+/// to bash. Reading `jkb\u{a0}task show x` as four words made it one plain invocation here while
+/// bash looked for a command named `jkb\u{a0}task`.
+///
+/// And not `IFS`, which an earlier version of this comment named. `IFS` splits the RESULT of an
+/// expansion, not the command line, so the caller cannot change this set (measured on GNU bash:
+/// under `IFS=x`, `p axb c` still passes `axb` and `c`; under `IFS=` it still passes `a` and `b`).
+/// The distinction matters because the wrong reason points at an unsafe correction -- a reader who
+/// believed this held only "at IFS's default value" and made it consult `$IFS` would, under
+/// `IFS=x`, split words bash keeps whole and revive exactly the defect above.
+fn is_blank(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n')
+}
+
+/// The words a command the shell will run as — quotes removed, as the shell removes them — or
+/// `None` for any command this cannot model faithfully: an [`UNQUOTABLE`] character anywhere, a
+/// bare [`SHELL_SYNTAX`] character, an unbalanced quote, or a word whose value the shell decides
+/// (a bare leading `~`, unless the word also carries a `/`).
+///
+/// The soundness precondition is enforced here rather than stated for the caller to honour. It was
+/// prose before ("sound only for a command with none of [`UNQUOTABLE`] in it"), which made it a
+/// rule every call site had to remember, and the one thing this must never do is return words that
+/// are not what the shell will pass.
 fn shell_words(command: &str) -> Option<Vec<String>> {
+    // `$` and a backtick substitute inside double quotes and a backslash escapes the quoting
+    // itself, so with any of them present the quote tracking below is not a model of anything.
+    if command.contains(UNQUOTABLE) {
+        return None;
+    }
     let mut words = Vec::new();
     let mut word: Option<String> = None;
     let mut quote: Option<char> = None;
+    // The word being read opens with a bare `~`, so the shell, not this reader, decides its value.
+    let mut expands = false;
     for c in command.chars() {
         match (quote, c) {
             (Some(q), c) if c == q => quote = None,
@@ -704,13 +761,40 @@ fn shell_words(command: &str) -> Option<Vec<String>> {
                 quote = Some(c);
                 word.get_or_insert_with(String::new);
             }
-            (None, c) if c.is_whitespace() => words.extend(word.take()),
-            // Inside quotes or out, anything else is part of the word.
-            (_, c) => word.get_or_insert_with(String::new).push(c),
+            // Bare, so the shell's and not an argument's. Ordered before the whitespace arm: a line
+            // break is both, and it is a command separator first.
+            (None, c) if SHELL_SYNTAX.contains(&c) => return None,
+            (None, c) if is_blank(c) => {
+                if let Some(w) = word.take() {
+                    words.push(modelled(w, expands)?);
+                }
+                expands = false;
+            }
+            // Inside quotes or out, anything else is part of the word. An unquoted `~` is the one
+            // character whose VALUE the shell chooses rather than passes through -- ANYWHERE in the
+            // word, not only at its start: bash also expands one after an assignment's `=` and after
+            // a `:` in the value (measured: under `HOME=land`, `a=~` is passed as `a=land`).
+            (_, c) => {
+                if quote.is_none() && c == '~' {
+                    expands = true;
+                }
+                word.get_or_insert_with(String::new).push(c);
+            }
         }
     }
-    words.extend(word);
+    if let Some(w) = word {
+        words.push(modelled(w, expands)?);
+    }
     quote.is_none().then_some(words)
+}
+
+/// One finished word, or `None` when the shell will choose its value and this cannot say what it
+/// will be. A word with an unquoted `~` in it but carrying a `/` is safe to keep unexpanded:
+/// whatever the tilde expands to, the `/` survives, so the word can never come out equal to a bare
+/// word like `jkb` or `land` -- which is the only thing the words are ever compared against. A bare
+/// `~`, `~+`, `~-` or `a=~` can be anything at all.
+fn modelled(word: String, expands: bool) -> Option<String> {
+    (!expands || word.contains('/')).then_some(word)
 }
 
 /// Classify a Bash command for [`attest`].
@@ -718,12 +802,10 @@ fn attestation(command: &str) -> Attestation {
     if !runs_jkb(command) {
         return Attestation::Skip;
     }
-    let command = command.trim();
-    if command.contains(SHELL_SYNTAX) {
-        return Attestation::Ask;
-    }
+    let command = command.trim_matches(is_blank);
     // Judged on the words the shell will pass, never the raw text: `task 'land'` is `task land` to
-    // the shell, and a raw comparison auto-approved it, `--gate` and all.
+    // the shell, and a raw comparison auto-approved it, `--gate` and all. Anything `shell_words`
+    // cannot model faithfully comes back `None` and is asked, so this is the only gate.
     let Some(words) = shell_words(command) else {
         return Attestation::Ask;
     };
@@ -849,7 +931,10 @@ pub fn attest(cmd: &AttestCmd) {
 
 #[cfg(test)]
 mod tests {
-    use super::{attestation, driven, runs_jkb, Attestation, Drive};
+    use super::{
+        attestation, driven, is_blank, runs_jkb, shell_words, Attestation, Drive, SHELL_SYNTAX,
+        UNQUOTABLE,
+    };
 
     #[test]
     fn the_stop_hook_holds_only_a_session_that_opted_in() {
@@ -864,14 +949,37 @@ mod tests {
         assert_eq!(driven(Some("task:y"), None), Drive::Task("task:y".into()));
     }
 
+    /// Every command the classifier approves. `attestation` is asserted against them below, and
+    /// `every_approved_command_is_the_jkb_on_path_and_nothing_else` runs each one through a real
+    /// bash to check the words it approved are the words bash actually passes.
+    const ALLOWED: &[&str] = &[
+        "jkb task show x",
+        "jkb --json workflow next",
+        "  jkb role whoami  ",
+        "jkb task add 'a subtask' --under task:x",
+        // A quoted metacharacter is an argument, not syntax. jkb's own quick-add syntax is
+        // spelled in these characters, so refusing them put a prompt on the most ordinary
+        // `jkb` calls there are -- which is what this arm exists to approve.
+        "jkb query 'status!=done'",
+        "jkb task add 'Fix the sweep !p1 @2026-10-01 +tasks/inbox #area=container'",
+        "jkb search 'what changed?'",
+        "jkb task edit x --text \"a # hash, a ! bang and a [bracket]\"",
+        "jkb grep '*.rs' repos/jkb",
+        // Tilde expansion yields one word and always a path, and has no quoted spelling that
+        // still expands, so it is judged bare.
+        "jkb --db ~/.jkb/jkb.db task show x",
+        // A line break is a separator bare and text quoted, like every other character here;
+        // the bare spelling is in the asked list below.
+        "jkb task add 'line one\nline two'",
+        // Split on IFS, so a non-breaking space is ordinary word text, quoted or not --
+        // which is exactly what bash passes. Only a word SEPARATOR has to match.
+        "jkb task add 'a\u{a0}b'",
+        "jkb task show\u{3000}x",
+    ];
+
     #[test]
     fn only_one_plain_jkb_invocation_is_approved_and_the_rest_is_asked() {
-        for allow in [
-            "jkb task show x",
-            "jkb --json workflow next",
-            "  jkb role whoami  ",
-            "jkb task add 'a subtask' --under task:x",
-        ] {
+        for allow in ALLOWED {
             assert_eq!(attestation(allow), Attestation::Allow, "{allow}");
         }
         for ask in [
@@ -891,12 +999,204 @@ mod tests {
             "jkb 'task' land x",
             "jkb task add 'unbalanced",
             "jkb ls\nrm -rf /",
+            // Bare, so the shell's: quoting is what makes a metacharacter data, and nothing else.
+            "jkb ls *",
+            "jkb task show {a,b}",
+            "jkb task show x # land",
+            "jkb task show 'x' > out",
+            "jkb task add 'ok' && jkb task land task:x",
+            // `$`, a backtick and a backslash are refused wherever they are, quoted or not: they
+            // are what the word reader cannot model, and it is only sound without them.
+            "jkb task add 'x' `whoami`",
+            "jkb task add \"x\" \\; rm -rf /",
+            "jkb task add '$(whoami)'",
+            // A quote boundary does not end a word, so it cannot hide a subcommand either.
+            "jkb task 'la'nd task:x",
+            // Bash splits on IFS alone, so these are one word to it and must be here too: the
+            // first is a command named `jkb\u{a0}task`, not `jkb`.
+            "jkb\u{a0}task show x",
+            "\u{a0}jkb task show x",
+            // Measured: this ran an arbitrary program with only a writable cwd. A command word
+            // containing `/` is never searched on PATH, so `jkb\u{a0}./x` is the relative path
+            // `jkb\u{a0}.` / `x` -- no PATH entry needed, and no character from either list used.
+            "jkb\u{a0}./x --gate 'sh /tmp/p.sh'",
+            "jkb\u{a0}evil",
+            // A bare tilde is whatever `$HOME`, `$PWD` or `$OLDPWD` holds. Measured: under
+            // `HOME=land` the first of these passes bash the word `land`, so it ran the gate.
+            "jkb --json task ~ task:x --gate 'sh /tmp/p.sh'",
+            "jkb task show ~",
+            "jkb task show ~+",
+            "jkb task show ~-",
         ] {
             assert_eq!(attestation(ask), Attestation::Ask, "{ask}");
         }
         for skip in ["ls", "cargo build -p jkb-cli", "echo jkb-core"] {
             assert_eq!(attestation(skip), Attestation::Skip, "{skip}");
         }
+    }
+
+    /// The words bash passes for a command, and how many times it ran `jkb`. `jkb` is installed as
+    /// a shell FUNCTION: bash resolves a command word function -> builtin -> `PATH`, so the function
+    /// fires only when the word is exactly `jkb`, and nothing is executed. It therefore proves the
+    /// command word is literally `jkb` with no path component -- NOT that the binary came from
+    /// `PATH`, which a `jkb` function or alias in the invoking shell would defeat anyway.
+    fn bash_argv(cmd: &str, env: &[(&str, &str)], cwd: &std::path::Path) -> (usize, Vec<String>) {
+        use std::process::Command;
+        let script = format!(
+            "jkb() {{ printf '\u{2}'; for a in \"$@\"; do printf '%s\u{1}' \"$a\"; done; }}\n{cmd}"
+        );
+        let mut c = Command::new("/bin/bash");
+        c.arg("-c").arg(&script).current_dir(cwd);
+        // Nothing is inherited, so "nothing is executed" is a property of this function rather than
+        // of whatever `ALLOWED` happens to hold. `bash -c` sources `$BASH_ENV`, which would let the
+        // developer's shell configure the oracle for a security classifier; an inherited `PATH`
+        // would let a row that is one bad edit away from approving too much actually run something;
+        // and an inherited `GIT_DIR`/`GIT_WORK_TREE` is the measured damage the crate's spawn guard
+        // exists to prevent. With an empty `PATH` a mis-approved row reaches no binary at all.
+        c.env_clear();
+        c.env("PATH", "");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().expect("bash is required to run this test");
+        let stdout = String::from_utf8(out.stdout).expect("bash emitted non-utf8");
+        let calls = stdout.matches('\u{2}').count();
+        let mut args: Vec<String> = stdout
+            .replace('\u{2}', "")
+            .split('\u{1}')
+            .map(str::to_owned)
+            .collect();
+        args.pop(); // the empty tail after the final separator
+        (calls, args)
+    }
+
+    /// The table above asserts what the classifier decides; this asserts the decision was about the
+    /// command bash actually runs. Every approved command goes through a real bash and must come
+    /// back as exactly one `jkb` call, passing exactly the words the model said, with no argument
+    /// equal to `land`.
+    ///
+    /// It exists because a table row could not have caught either defect it was added for. The word
+    /// reader split on `char::is_whitespace` while bash splits on `IFS` alone, so `jkb\u{a0}./x`
+    /// was approved as the two words `jkb ./x` while bash executed the single relative path
+    /// `jkb\u{a0}./x`. And a bare `~` was approved as the literal word `~` while bash expanded it
+    /// to `$HOME` -- so the run under a hostile `HOME`/`OLDPWD` below is the half a word comparison
+    /// against the ambient environment cannot see. Measured against GNU bash in the dev container.
+    #[test]
+    fn every_approved_command_runs_one_jkb_and_passes_the_modelled_words() {
+        // A real `land` directory, so the hostile `OLDPWD` below survives bash's own validation.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cwd = dir.path();
+        std::fs::create_dir(cwd.join("land")).expect("a `land` directory to point OLDPWD at");
+        for cmd in ALLOWED {
+            let (calls, args) = bash_argv(cmd, &[], cwd);
+            assert_eq!(
+                calls, 1,
+                "bash did not run exactly one `jkb`: {cmd:?} -> {args:?}"
+            );
+            let model = shell_words(cmd.trim_matches(is_blank)).expect("approved, so modelled");
+            let model = &model[1..];
+
+            // Compared per word, not per command: a tilde word is the one thing left to expand, and
+            // keying the exemption on the whole command would stop comparing every OTHER word in it.
+            // The length is always compared -- tilde expansion is not word-split (measured:
+            // `HOME='/x y'` makes `~/z` one word), so a word appearing or vanishing is a defect.
+            assert_eq!(args.len(), model.len(), "word count for {cmd:?}: {args:?}");
+            for (got, want) in args.iter().zip(model) {
+                assert!(
+                    got == want || want.starts_with('~'),
+                    "word mismatch for {cmd:?}: {args:?} vs {model:?}"
+                );
+            }
+            assert!(
+                !args.iter().any(|a| a == "land"),
+                "bash passed the word `land` from an approved command: {cmd:?} -> {args:?}"
+            );
+
+            // The expansions a tilde reads are ordinary variables, so approving a tilde word means
+            // approving whatever they hold. Nothing here may become a bare subcommand.
+            //
+            // `OLDPWD` is set to a directory that EXISTS: bash discards an inherited `OLDPWD`
+            // naming a missing one (measured -- it was silently empty here, so `~-` stayed literal
+            // and this half of the check proved nothing). The call count is asserted too, so an
+            // empty `hostile` cannot pass `.any()` trivially.
+            let (calls, hostile) = bash_argv(
+                cmd,
+                &[("HOME", "land"), ("OLDPWD", "land"), ("PWD", "land")],
+                cwd,
+            );
+            assert_eq!(calls, 1, "the hostile run did not reach `jkb`: {cmd:?}");
+            assert!(
+                !hostile.iter().any(|a| a == "land"),
+                "a hostile HOME made an approved command pass `land`: {cmd:?} -> {hostile:?}"
+            );
+        }
+    }
+
+    /// Every character in either list is the SOLE reason its command is asked. The template is
+    /// approved as it stands, so the character is the only thing that changes the verdict, and a
+    /// character leaving a list fails here by construction.
+    ///
+    /// This exists because the tables could not enforce it: `;`, `|`, `<`, `(`, `)`, bare `!`, `?`,
+    /// `[`, `]` and `\r` had no fixture that turned on them -- `curl … | sh; echo jkb` is asked
+    /// because its first word is `curl`, and `jkb task show x # land` because it contains `land` --
+    /// so deleting one of them from `SHELL_SYNTAX` failed no test. That is how `~` was removed from
+    /// the list with the whole suite green, taking a real hole with it.
+    #[test]
+    fn every_listed_character_is_the_only_reason_its_command_is_asked() {
+        // Spelled out here rather than read from the constants. A loop over `SHELL_SYNTAX` cannot
+        // notice a character LEAVING `SHELL_SYNTAX` -- it just stops testing it -- which is the
+        // very way `~` was dropped from the list with the whole suite green. Measured: with the
+        // loop reading the constant, deleting `;` from it failed no test.
+        const BARE_ONLY: &[char] = &[
+            ';', '&', '|', '<', '>', '(', ')', '{', '}', '\n', '\r', '#', '!', '*', '?', '[', ']',
+        ];
+        const NEVER: &[char] = &['$', '`', '\\'];
+        assert_eq!(
+            attestation("jkb task show ab"),
+            Attestation::Allow,
+            "template"
+        );
+        assert_eq!(
+            SHELL_SYNTAX, BARE_ONLY,
+            "SHELL_SYNTAX changed: change this list too, deliberately"
+        );
+        assert_eq!(
+            UNQUOTABLE, NEVER,
+            "UNQUOTABLE changed: change this list too, deliberately"
+        );
+        for &c in BARE_ONLY {
+            assert_eq!(
+                attestation(&format!("jkb task show a{c}b")),
+                Attestation::Ask,
+                "bare {c:?} must be refused"
+            );
+            assert_eq!(
+                attestation(&format!("jkb task show 'a{c}b'")),
+                Attestation::Allow,
+                "quoted {c:?} is argument text"
+            );
+        }
+        for &c in NEVER {
+            assert_eq!(
+                attestation(&format!("jkb task show a{c}b")),
+                Attestation::Ask,
+                "bare {c:?} must be refused"
+            );
+            assert_eq!(
+                attestation(&format!("jkb task show 'a{c}b'")),
+                Attestation::Ask,
+                "quoted {c:?} must be refused too"
+            );
+        }
+        // `~` is in neither list, so it is pinned here rather than by the loops above.
+        for bare in ["jkb task show ~", "jkb task show ~+", "jkb task show ~-"] {
+            assert_eq!(attestation(bare), Attestation::Ask, "{bare}");
+        }
+        assert_eq!(
+            attestation("jkb --db ~/.jkb/jkb.db task show x"),
+            Attestation::Allow,
+            "a tilde word carrying a `/` keeps it however it expands"
+        );
     }
 
     #[test]

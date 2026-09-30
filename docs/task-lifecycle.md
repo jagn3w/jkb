@@ -934,11 +934,41 @@ types and the generic ones map to nothing; and **a `PreToolUse` can be followed 
 `SessionEnd`, with a 10-minute backstop.
 
 **What the hook approves.** A rewrite needs a permission decision. The hook returns `allow` only for
-one plain `jkb` invocation, found on PATH by name, that cannot run a shell command (no separators,
-pipes, redirects, substitutions or expansions, and not `task land`, which runs the gate) — what a
-`Bash(jkb:*)` rule would approve, with every request it makes held to the ticket's role. Anything
-else that runs `jkb` gets `ask`, so the prompt or the auto-mode classifier still judges it:
-returning `allow` for a whole compound command approved whatever rode along (`jkb ls && rm -rf …`).
+one plain `jkb` invocation — the command word literally `jkb`, with no path component — that cannot
+run a shell command, and is not `task land`, which runs the gate. That is what a `Bash(jkb:*)` rule
+would approve, with every request it makes held to the ticket's role. Anything else that runs `jkb`
+gets `ask`, so the prompt or the auto-mode classifier still judges it: returning `allow` for a whole
+compound command approved whatever rode along (`jkb ls && rm -rf …`).
+
+**Superseded: "no separators, pipes, redirects, substitutions or expansions", refused even inside
+quotes.** That rule was reversed by a measurement — it put a permission prompt on jkb's own
+quick-add syntax. `!p<n>`, `#<facet>=<value>` and `?` are spelled in the very characters it refused,
+so `jkb query 'status!=done'` and `jkb task add 'Fix it !p1 #area=hook'` were asked, and because a
+`PreToolUse` `ask` overrides an allow rule, anyone with `Bash(jkb:*)` newly saw a prompt on the most
+ordinary calls there are. The rule now turns on whether the shell would read a character as syntax:
+
+- `$`, a backtick and a backslash are refused **anywhere**, quoted or not. They are what the word
+  reader cannot model — the first two substitute inside double quotes, the third escapes the quoting
+  itself — so with any of them present its output is not a model of anything.
+- Every other metacharacter (`; & | < > ( ) { } # ! * ? [ ]` and a line break) is refused only when
+  it appears **bare**. Inside either kind of quote the shell passes it through as text.
+- A `~` is in neither list, because it has no quoted spelling that still expands. A word holding an
+  unquoted `~` anywhere is accepted only when it also carries a `/`, so that whatever the tilde
+  expands to, the `/` survives. "Anywhere" is load-bearing: bash expands a tilde after an
+  assignment's `=` and after a `:` in the value too, so `a=~` becomes `a=$HOME`.
+
+Two measurements paid for that last clause, and both are the reason the property is stated as the
+command word rather than as PATH. **A word separator is a blank, not Unicode whitespace** — bash's
+lexer breaks a command line on space, tab and newline, and the caller's `IFS` does not change that
+(`IFS` splits the result of an expansion; measured on GNU bash, `IFS=x` still passes `axb` whole).
+While the reader split on `char::is_whitespace`, `jkb<NBSP>./x` read as the two words `jkb ./x` and
+was approved, while bash ran the single relative path `jkb<NBSP>./x` — a command word containing `/`
+is never searched on `PATH`, so a writable working directory was enough to run an arbitrary program.
+And **a bare tilde is an ordinary variable**: `~` is `$HOME`, `~+` is `$PWD`, `~-` is `$OLDPWD`, so
+under `HOME=land` a bare `~` expands to exactly `land`, which would have carried `task land` and its
+`--gate` past the hook. Note the residual: the hook checks the command *word*, so a `jkb` shell
+function or alias in the invoking shell still shadows the binary, and neither the hook nor its
+tests can see that.
 Only a ticketed call is released at `PostToolUse`, and every hook client carries the hooks'
 deadlines and down marker (`remote::client`). **The hooks run a pinned binary**,
 `/usr/local/lib/jkb-hook/jkb`, root-owned: they run outside the sandbox with the credential
