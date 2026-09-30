@@ -972,26 +972,28 @@ Bash call could read that file, and an in-process subagent would be able to stea
 different `agent_type` — which is exactly what the harness vouching exists to prevent, since
 ancestry cannot tell a subagent from its parent.
 
-**Two things not yet measured, and they gate this change.** Both need a session running a rebuilt,
-re-pinned hook; neither was observed, and one of them decides whether the change delivers anything
-at all.
+**Measured on Claude Code 2.1.283, with the hook rebuilt from this change and re-pinned.** Two
+questions gated it, and until they were measured this paragraph said so rather than asserting
+either answer.
 
-*Is `updatedInput` applied with no `permissionDecision`?* The hook-output schema marks the field
-optional, but that was read out of the installed bundle, not observed. If `updatedInput` is dropped
-without a decision, every deferred `jkb` call loses its ticket and the daemon refuses it
-`Unauthorized` — a loud, immediate failure rather than a silent weakening. Check it with one
-deferred call: `cd /tmp && jkb role whoami`.
+*`updatedInput` is applied with no `permissionDecision`.* `cd /tmp && ~/.cargo/bin/jkb role
+whoami` — a two-command list, so the deferred class, for which the hook now emits no decision —
+arrived with `JKB_ATTEST` set, and the daemon answered `coordinator` rather than `Unauthorized`.
+The schema had marked the field optional, but that was read out of the installed bundle; this is
+the observation. Had it gone the other way, every deferred call would have lost its ticket.
 
-*Which text are the permission rules matched against?* Not measured, and asserting otherwise was
-the error this paragraph replaces. For a deferred call the rules see `updatedInput`, whose command
-is `export JKB_ATTEST=…; cd repo && jkb workflow next` — not the text the rules were written
-against. Claude Code judges a command list part by part, so a session with `Bash(cd:*)` and
-`Bash(jkb:*)` gains an `export JKB_ATTEST=…` part that matches no rule and may prompt anyway, in
-which case the intended benefit does not exist. The other branch is worse: if the rules match the
-*original* text, then an existing `Bash(jkb:*)` rule silently covers a `land --gate '<shell>'`
-smuggled behind an assignment prefix. Measure it with no rebuild — put `Bash(export:*)` in
-`permissions.deny` and run one deferred `jkb` call. A refusal proves the rules see the rewritten
-list, and tells you at the same time whether the over-prompting is actually gone.
+*The over-prompting is gone for the shape that caused it.* In an interactive session, `cd /tmp &&
+jkb role whoami` ran with **no** permission prompt, where the old hook forced one. The open risk
+here had been that the rules match the rewritten command (`export JKB_ATTEST=…; cd … && jkb …`), in
+which case the `export` part would match no rule and prompt anyway. The deny-rule probe
+(`Bash(export:*)` in `permissions.deny`, then one deferred call) produced an approval prompt rather
+than a refusal, so the rules see the original text. That is also why the prefix spellings matter:
+a `Bash(jkb:*)` rule is matched against the text the model wrote, which is why `land` is located
+wherever the `jkb` word sits rather than only at index 0.
+
+A trap met while measuring, worth keeping: a probe that itself contains `$` — `echo
+${JKB_ATTEST:+present}` — is asked by design, because a command this cannot model cannot be
+cleared of `land`. It looked like the fix failing and was the guard working.
 
 **Rollback**, for either answer: `JKB_ATTEST_DECISION=ask` forces the old prompt on both classes
 with no rebuild — the hook binary is pinned and root-owned, so a rollback that needs one is not a

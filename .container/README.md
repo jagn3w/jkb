@@ -570,11 +570,10 @@ yet check these.
 What the hook emits is recorded once, in D52.9 of [docs/task-lifecycle.md](../docs/task-lifecycle.md),
 and is no longer restated here — this paragraph used to say it returns "`ask` for any other command
 running `jkb`", which stopped being true and left two governing records disagreeing about a security
-hook. Two of that section's open questions bear on this container specifically: whether `updatedInput`
-is applied when the hook returns **no** `permissionDecision` (the emission it now uses for most
-commands), and which text the permission rules are matched against — the original command or the
-rewritten one carrying `export JKB_ATTEST=…`. Both need this image running, and `verify.sh` checks
-neither.
+hook. Two questions that bear on this container specifically were measured there (Claude Code
+2.1.283, hook re-pinned): `updatedInput` *is* applied when the hook returns no `permissionDecision`,
+and the permission rules are matched against the original command, not the rewritten one carrying
+`export JKB_ATTEST=…`. `verify.sh` checks neither, so a harness upgrade could change both silently.
 
 ### A nested bind must be named
 
