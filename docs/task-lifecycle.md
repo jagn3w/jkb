@@ -936,9 +936,22 @@ types and the generic ones map to nothing; and **a `PreToolUse` can be followed 
 **What the hook approves, and what it declines to answer.** The hook returns `allow` only for one
 plain `jkb` invocation — the command word literally `jkb`, with no path component — that cannot run
 a shell command, and is not `task land`, which runs the gate. That is what a `Bash(jkb:*)` rule
-would approve, with every request it makes held to the ticket's role. For anything else that runs
-`jkb` it returns **no `permissionDecision` at all**, and the session's own rules and prompt judge
-the call exactly as they did before this hook existed.
+would approve, with every request it makes held to the ticket's role. It returns `ask` for one
+thing only: a command that may be `task land`. For everything else that runs `jkb` it returns **no
+`permissionDecision` at all**, and the session's own rules and prompt judge the call exactly as they
+did before this hook existed.
+
+**Why `land` alone keeps the prompt.** `land` runs the repository's gate through `sh -c` with a
+command the *caller* supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling.
+Deferring it would let that ride in under a `Bash(jkb:*)` allow rule — a rule whose author said
+"jkb commands are fine", not "any shell command spelled as a jkb command is fine". That is the one
+case where the hook's `ask` was the only thing in the way; `may_land` in the daemon decides *who*
+may land, not *what* their gate runs. Two consequences follow. A command whose words cannot be
+modelled at all is asked rather than deferred, because `land` cannot be ruled out in it — and the
+sharpest instance is a bare tilde: `jkb --json task ~ task:x --gate '…'` mentions no `land`, yet
+under `HOME=land` bash passes `task land … --gate …`. And a command *list* is judged command by
+command, so `cd repo && jkb workflow next` is understood as two commands, neither a `land`, and
+needs no prompt, while `jkb task add 'ok' && jkb task land x` is asked on its second command.
 
 **Superseded: `ask` for anything that is not one plain invocation.** That was the whole of the
 over-prompting, and it was a design error rather than a tuning problem. A `PreToolUse` `ask`
