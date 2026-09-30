@@ -81,4 +81,23 @@ if [ -f "$repo/ui/vscode/package.json" ]; then
     "$repo/scripts/install-extension.sh" --build-in "$HOME/.jkb-ui-build"
 fi
 
+# The server's Machine settings, merged — not replaced — with vscode-machine-settings.json. Here
+# rather than in setup.sh for the reason this whole script exists: the file belongs to the server,
+# and the server arrives on ATTACH. Why these settings: dc_machine_settings_path in lib.sh.
+say "vs code machine settings"
+settings="$(dc_machine_settings_path)"
+if ! merged="$(dc_merge_machine_settings "$settings" "$here/vscode-machine-settings.json")"; then
+    # Refused, not overwritten: VS Code accepts comments in that file and jq does not, so a file
+    # we cannot parse is most likely one a person edited, and rewriting it would lose their edits.
+    echo "  $settings is not plain JSON (comments?) — left untouched." >&2
+    echo "  Merge $here/vscode-machine-settings.json into it by hand (Preferences: Open Remote Settings)." >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$settings")"
+# Same directory, so the rename is atomic and the server's watcher never reads half a file.
+tmp="$(mktemp "$settings.XXXXXX")"
+printf '%s\n' "$merged" > "$tmp"
+mv "$tmp" "$settings"
+echo "  merged $(jq -r 'keys | join(", ")' "$here/vscode-machine-settings.json") into $settings"
+
 say "done — reload the window ('Developer: Reload Window') to activate them"

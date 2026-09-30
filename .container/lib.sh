@@ -236,6 +236,53 @@ dc_local_extension() { # dc_local_extension <repo-root>
     printf '%s.%s\n' "$publisher" "$name"
 }
 
+# The VS Code server's MACHINE settings: the scope that applies to every folder opened in this
+# container and to nothing on the host. It is where vscode-machine-settings.json lands, because
+# `customizations.vscode.settings` in container.json would be read by nothing — attaching ignores
+# `customizations` (see the extension list's comment there).
+#
+# WHY THOSE SETTINGS EXIST, measured 2026-10-01: the host's "Virtual Machine Service for Docker"
+# sat at 100% of a core while `docker stats` showed jkb-dev at ~4%. The culprit was a 25-minute-old
+# `rg --files --hidden --no-ignore --follow -g **/package.json ...` spawned by the VS Code server
+# (an extension's `workspaceContains` probe); its one open directory was
+# ~/repos/jkb/target/debug/deps, the HOST's build output, reachable only through the bind mount.
+# Killing it dropped the host CPU at once. The cost is invisible to `docker stats` because a bind
+# mount is VirtioFS, whose host half runs inside the VM service process, not in the container.
+# The search's `-g !` list was exactly VS Code's default `files.exclude`, and the workspace's
+# `search.exclude` (which does list `**/target`) was absent from it — so `files.exclude` is the
+# knob that reaches it, and `--no-ignore` is why .gitignore did not.
+dc_machine_settings_path() { # dc_machine_settings_path [home]
+    printf '%s/.vscode-server/data/Machine/settings.json\n' "${1:-$HOME}"
+}
+
+# The current settings with <want> merged in, on stdout. <have> may be absent or empty (an
+# unconfigured server has no file); anything else must be a plain-JSON object, and if it is not —
+# VS Code allows comments there — this returns 1 rather than guess, because the caller writes the
+# result over the file and a guess would destroy settings somebody wrote by hand. Objects merge
+# recursively (jq `*`), so a user's own `files.exclude` entries survive beside ours; a key we set
+# wins over theirs.
+dc_merge_machine_settings() { # dc_merge_machine_settings <have-file> <want-file>
+    local have='{}'
+    if [ -s "$1" ]; then
+        have="$(jq -e 'if type == "object" then . else error("not an object") end' "$1" 2>/dev/null)" || return 1
+    fi
+    jq -e 'type == "object"' "$2" >/dev/null 2>&1 || return 1
+    jq -n --argjson have "$have" --slurpfile want "$2" '$have * $want[0]'
+}
+
+# The top-level keys of <want> that <have> does not already satisfy, one per line; nothing when
+# every one is in force. "Satisfied" is exactly "merging <want> in would not change it", so this
+# cannot disagree with dc_merge_machine_settings about what applying would do. Returns 1 when
+# <have> cannot be read as a JSON object, so an unreadable file is not reported as "all missing".
+dc_machine_settings_missing() { # dc_machine_settings_missing <have-file> <want-file>
+    local have='{}'
+    if [ -s "$1" ]; then
+        have="$(jq -e 'if type == "object" then . else error("not an object") end' "$1" 2>/dev/null)" || return 1
+    fi
+    jq -r --argjson h "$have" \
+       'to_entries[] | select(({(.key): $h[.key]} * {(.key): .value}) != {(.key): $h[.key]}) | .key' "$2"
+}
+
 # Link Claude Code's state out of ~/.claude into the .claude-state volume, so sessions, memory and
 # the login survive a rebuild without anything of the host's being mounted in.
 #

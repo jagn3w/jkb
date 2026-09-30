@@ -653,6 +653,44 @@ transcript sweep: 90000 deny bytes are projected and none of them can be archive
     st2 "a record from before this start"          "$(rv set /x /x)" "none||||-"
     rm -rf "$rt"
 
+    # Assertion 8's judgement and install-extensions.sh's merge, which share lib.sh's definitions.
+    # Like assertion 7, its FAIL arm needs a VS Code server no harness has, so it is reached here.
+    echo "==> verify.sh self-test: machine settings (merge and missing)"
+    mt="$(mktemp -d)"; shipped="$(dirname "$0")/vscode-machine-settings.json"
+    printf '{"files.exclude":{"**/target":true},"search.followSymlinks":false}\n' > "$mt/want"
+    mm() { dc_merge_machine_settings "$@" | jq -cS .; }
+    ms() { dc_machine_settings_missing "$@" | tr '\n' ' '; }
+    # The shipped file is what every other case stands in for, so an empty or broken one must not
+    # leave them passing: `{}` would make assertion 8 print `ok` having checked nothing.
+    st2 "the shipped settings are a non-empty object" \
+        "$(jq -e 'type == "object" and length > 0' "$shipped" 2>/dev/null)" true
+    st2 "no file yet: the merge is exactly what we want" \
+        "$(mm "$mt/none" "$mt/want")" "$(jq -cS . "$mt/want")"
+    st2 "no file yet: every key is missing" "$(ms "$mt/none" "$mt/want")" "files.exclude search.followSymlinks "
+    : > "$mt/empty"
+    st2 "an empty file reads as no settings" "$(ms "$mt/empty" "$mt/want")" "files.exclude search.followSymlinks "
+    printf '{"files.exclude":{"**/dist":true},"editor.tabSize":2}\n' > "$mt/user"
+    st2 "a user's own exclude and unrelated keys survive the merge" \
+        "$(mm "$mt/user" "$mt/want")" \
+        '{"editor.tabSize":2,"files.exclude":{"**/dist":true,"**/target":true},"search.followSymlinks":false}'
+    mm "$mt/user" "$mt/want" > "$mt/merged"
+    st2 "after the merge nothing is missing" "$(ms "$mt/merged" "$mt/want")" ""
+    mm "$mt/user" "$shipped" > "$mt/merged-shipped"
+    st2 "after merging the SHIPPED file nothing is missing" "$(ms "$mt/merged-shipped" "$shipped")" ""
+    printf '{"files.exclude":{"**/target":false,"**/dist":true},"search.followSymlinks":false}\n' > "$mt/off"
+    st2 "an exclude turned back off is missing, not satisfied" "$(ms "$mt/off" "$mt/want")" "files.exclude "
+    printf '{"search.followSymlinks":true,"files.exclude":{"**/target":true}}\n' > "$mt/follow"
+    st2 "a scalar with the other value is missing" "$(ms "$mt/follow" "$mt/want")" "search.followSymlinks "
+    printf '{\n  // mine\n  "editor.tabSize": 2\n}\n' > "$mt/jsonc"
+    st2 "a file with comments is refused by the merge, not rewritten" \
+        "$(dc_merge_machine_settings "$mt/jsonc" "$mt/want" >/dev/null 2>&1; echo $?)" 1
+    st2 "...and is unreadable to the check, not 'everything missing'" \
+        "$(dc_machine_settings_missing "$mt/jsonc" "$mt/want" >/dev/null 2>&1; echo $?)" 1
+    printf '[1]\n' > "$mt/array"
+    st2 "a non-object file is refused" \
+        "$(dc_merge_machine_settings "$mt/array" "$mt/want" >/dev/null 2>&1; echo $?)" 1
+    rm -rf "$mt"
+
     echo
     [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
     printf '\033[32mverify.sh self-test passed\033[0m\n'
@@ -1876,6 +1914,27 @@ else
         bad "declared extensions are not installed:$missing — $present other(s) are, so this is not the
        never-installed state. Run ./.container/install-extensions.sh from an attached terminal; if it
        reports one was not staged into the image, rebuild: ./.container/run.sh --rm && ./.container/run.sh --build"
+    fi
+fi
+
+# 8. The server's Machine settings carry vscode-machine-settings.json — above all `files.exclude`
+#    for `target/`, without which an extension's `workspaceContains` probe walks the host's build
+#    output over VirtioFS and holds the host VM at 100% of a core while `docker stats` reads ~4%
+#    (measured; see dc_machine_settings_path in lib.sh). Same skip and same never-installed note as
+#    assertion 7, for the same reason: both are written by install-extensions.sh, after attach.
+if [ -n "$code_server" ]; then
+    machine_settings="$(dc_machine_settings_path)"
+    if ! unset_keys="$(dc_machine_settings_missing "$machine_settings" "$here_dc/vscode-machine-settings.json")"; then
+        bad "$machine_settings is not plain JSON, so whether it carries vscode-machine-settings.json cannot be read.
+       Merge that file into it by hand (Preferences: Open Remote Settings), removing comments."
+    elif [ -z "$unset_keys" ]; then
+        ok "VS Code machine settings carry vscode-machine-settings.json"
+    elif [ ! -s "$machine_settings" ]; then
+        echo "  note this VS Code server has no machine settings yet — attaching does not write them."
+        echo "       Run  ./.container/install-extensions.sh  from a terminal in the attached window."
+    else
+        bad "VS Code machine settings are missing or override: $(printf '%s' "$unset_keys" | tr '\n' ' ')— run
+       ./.container/install-extensions.sh from an attached terminal, then Developer: Reload Window"
     fi
 fi
 
