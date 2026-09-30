@@ -1017,6 +1017,74 @@ case "$setup_probe" in
              exit 1 ;;
 esac
 
+# THE TRANSCRIPT SWEEP, BEFORE EVERYTHING THAT CAN FAIL. Same reason the reap below runs before
+# the verify — a failure about something else must not disable it — but carried further, because
+# the sweep is the more urgent job: the state it prevents is a container in which NO Bash tool
+# call works at all (E2BIG at spawn, measured 2026-09-28; sweep-transcripts.sh carries the
+# numbers). Never fatal: what it could not archive it says, and a deny list slightly too long is
+# the state we were already in.
+#
+# ABOVE FIRST-RUN SETUP, which is the whole point of the position. `setup.sh` is called
+# UNGUARDED under `set -e`, so a setup that fails takes the rest of this script with it — and
+# the documented E2BIG recovery is `run.sh --rm && run.sh`, which DESTROYS the container and
+# therefore always re-runs setup, while the transcripts it has to reclaim live in the state
+# volume and survive the `--rm`. So the one path that exists to recover from a wedged container
+# was also the one path where an unrelated setup failure meant the sweep never ran at all. It
+# needs nothing setup provides: a running container and `$ctr_repo`, both settled far above, and
+# a plain `bash` script that reads no `jkb` inside the container (the live list is asked on the
+# HOST, below). The reap cannot move up here with it — that one does need the container's jkb.
+#
+# ...AND IT CARRIES THE LIVE-SESSION LIST, which is what lets it run on every path. It did not, and
+# the repair for that was to skip the sweep when the container was ALREADY running — on the ground
+# that "nothing is open at container start" is only true when the container just started. That
+# traded a rare loss for a common one: a container up for days, or started from Docker Desktop, was
+# then swept by nothing on this path, the window stayed refused, and the documented recovery for the
+# very E2BIG this exists to prevent — re-running run.sh — no longer recovered. Worse, the skip
+# asserted that the reaper's tick owned the container, which this script never checked and which is
+# false whenever `setup.sh --no-service` was used or the unit is stopped.
+#
+# So the list comes from the same registry the reaper reads, through the daemon that already holds
+# it. Empty is the safe direction and the one the reaper also takes when it cannot read: the recency
+# window and the floor still stand. `-e` reaches `in_container` because that is a plain `docker
+# exec`; a shell prefix would set the variable for the docker CLI and never enter the container.
+#
+# ASKED FOR THE IDS, NOT FOR THE ROWS. This read `--json` and pulled `.[].session` out with `jq` — a
+# second answer to "which sessions count", in another language, with nothing comparing the two. They
+# diverged immediately: when the reaper learned that an unclosable row is not a live session, this
+# path went on handing out ids from rows that had been open for months, which is the state that makes
+# the sweep reclaim nothing. `--live-ids` applies the one rule (crates/jkb-cli/src/transcripts.rs)
+# and prints one id per line, so there is nothing here to keep in step and no JSON field to agree
+# about. `sweep_ok` records whether the registry could be READ, which is not the same fact as its
+# being empty — a sweep that ran unprotected must not look like one with nothing to protect.
+#
+# ASKED ONLY WHEN SOMETHING COULD BE RUNNING IN IT. A container this script just CREATED, or just
+# started from stopped, has no sessions inside it — so the correct keep list there is empty, and
+# asking the registry actively harms: nothing closes a session's row when its container is stopped
+# or removed (no SessionEnd hook fires), so every session from the destroyed container still looks
+# recently seen. Passing those made `run.sh --rm && run.sh` — the documented E2BIG recovery — hold
+# three or four dead sessions' whole subagent subtrees, which the README measures as exceeding the
+# entire budget: the recovery reclaimed nothing for up to six hours, where before this trigger
+# carried any list at all it recovered in one pass.
+sweep_keep=""
+sweep_ok=yes
+if [ "$state" = running ]; then
+    sweep_ok=no
+    if command -v jkb >/dev/null 2>&1; then
+        if sweep_ids="$(jkb notify sessions --live-ids 2>/dev/null)"; then
+            sweep_ok=yes
+            sweep_keep="$(printf '%s' "$sweep_ids" | tr '\n' ' ')"
+        fi
+    fi
+fi
+if [ "$sweep_ok" = no ]; then
+    say "transcript sweep: could not ask jkb which sessions are live — sweeping with the recency window and the floor only"
+elif [ "$state" = running ]; then
+    say "transcript sweep: holding $(printf '%s' "$sweep_keep" | wc -w | tr -d ' ') live session(s)"
+else
+    say "transcript sweep: $NAME was not running, so nothing in it is live"
+fi
+in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
+
 if [ "$setup_done" -eq 0 ]; then
     [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
     say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
@@ -1053,7 +1121,15 @@ in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
 # way to fix it. The exit code is still verify's, at the very end.
 say "verify"
 verify_rc=0
-in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
+# ...AND IT GETS THE SAME KEEP LIST THE SWEEP GOT. verify.sh measures the deny list by running
+# the sweep's own `--dry-run`, and without the ids it measured a DIFFERENT tree from the one the
+# real sweep had just acted on: a container held down by live sessions came out `over budget`
+# (exit 1) instead of `beyond any sweep` (exit 3), and the FAIL named the floor, an unwritable
+# archive and colliding destinations — none of which applied, while the actual cause, a live
+# session holding its whole subagent subtree, was not among them. Reproduced against the real
+# scripts: 120 subagent transcripts under one live session, 40 archivable, budget 30000 —
+# `beyond` with the list, `over` without it.
+in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
 
 say "attached VS Code windows"
 cat <<EOF
@@ -1074,8 +1150,12 @@ if [ "$OPEN" -eq 1 ] && [ "$verify_rc" -ne 0 ]; then
     # into a container whose verifier just reported UNDECLARED mounts, permitted egress to a
     # non-allowlisted host, or a broken posture is not.
     #
-    # BOOTING IS NOT ENDORSING (D51.7). Exit 3 means every failure is a condition this container was
-    # CONFIGURED to accept — in practice, the unfiltered-egress override. That override exists so a
+    # BOOTING IS NOT ENDORSING (D51.7). Exit 3 means every failure is one this container TOLERATES
+    # rather than a broken boundary. It read "a condition this container was CONFIGURED to accept —
+    # in practice, the unfiltered-egress override", which was true while that override was the only
+    # producer and stopped being true when the transcript deny list joined it: nobody configures a
+    # container to accumulate run journals past what any sweep can reclaim. The branch below no
+    # longer names a cause for the same reason, and this comment is the one a reader reaches first. That override exists so a
     # container BOOTS and can be attached to and diagnosed; it does not make that container a place
     # to run an agent unattended, which is precisely what this flag would do. So it is still
     # refused, and the message says something that can be acted on: the previous wording told you
@@ -1083,11 +1163,21 @@ if [ "$OPEN" -eq 1 ] && [ "$verify_rc" -ne 0 ]; then
     # followable step.
     printf '\n\033[31mnot opening a window:\033[0m verify.sh reported problems (exit %s).\n' "$verify_rc" >&2
     if [ "$verify_rc" -eq 3 ]; then
-        printf 'Every failure it reported is a condition this container was configured to accept —\n' >&2
-        printf 'JKB_EGRESS_ACCEPT_UNFILTERED=1, which lets it start with unfiltered egress. That is\n' >&2
-        printf 'a container to attach to and diagnose, not one to run an agent in unattended, so no\n' >&2
-        printf 'window is opened while it holds. Either unset it in container.json and recreate, or\n' >&2
-        printf 'attach by hand with the Command Palette route above.\n' >&2
+        # WHAT VERIFY REPORTED, NOT WHAT EXIT 3 USED TO MEAN. This named the unfiltered-egress
+        # override as the only thing exit 3 can be, and then told the operator to unset a variable
+        # and recreate the container. Exit 3 gained a second producer the day verify.sh started
+        # reporting the transcript deny list: past the point where the run journals and the kept
+        # newest transcripts exceed the budget on their own, no sweep helps, which is a condition to
+        # act on rather than a broken boundary -- and recreating the container changes nothing,
+        # because those journals live in a volume. Two conditions with opposite remedies cannot
+        # share one hard-coded sentence, so the remedy is read off verify's own output, which each
+        # accepted arm already carries.
+        printf 'Every failure it reported is one this container tolerates rather than a broken\n' >&2
+        printf 'boundary. That is a container to attach to and diagnose, not one to run an agent in\n' >&2
+        printf 'unattended, so no window is opened while it holds. The FAIL line(s) above say which\n' >&2
+        printf 'condition it is and what to do about it — they want different things, and the list\n' >&2
+        printf 'of them is not repeated here, because a second copy of it goes stale. Or attach by\n' >&2
+        printf 'hand with the Command Palette route above.\n' >&2
     else
         printf 'Fix them, or attach by hand with the Command Palette route above if you know why.\n' >&2
     fi

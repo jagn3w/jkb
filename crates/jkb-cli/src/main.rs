@@ -31,6 +31,7 @@ mod session;
 mod session_cli;
 mod staging;
 mod task_cli;
+mod transcripts;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,11 @@ enum NotifyCmd {
         /// Include ended rows, most recently seen first.
         #[arg(long)]
         all: bool,
+        /// Print only the ids of sessions recent enough to be treated as running, one per line —
+        /// exactly what the transcript sweep must not archive. `.container/run.sh` reads this so
+        /// the rule lives once: the reaper applies the same function to rows it reads itself.
+        #[arg(long, conflicts_with = "all")]
+        live_ids: bool,
     },
 }
 
@@ -2953,10 +2959,6 @@ fn report_landing(
     kept_status: Option<&(String, String)>,
     json: bool,
 ) {
-    // Reported from what actually happened, never from what was intended. Two claims here were
-    // simply false: `"{uid} is done"` after a status this transaction deliberately left as
-    // `cancelled`, and "removed session and its branch" in the arm that only ran
-    // `git worktree prune` because somebody else had already removed the directory.
     let status = kept_status.map_or("done", |(s, _)| s.as_str());
     if json {
         println!(
@@ -3034,12 +3036,7 @@ fn report_landing(
     }
 }
 
-/// `task reap` — archive worktrees a landing could not move, then delete archives past the
-/// retention window (design D49).
-///
-/// Takes the database **path** rather than a handle, and opens it per pass (`reap_once`), so a
-/// database this binary cannot open fails a pass rather than the service. The records need no repo
-/// context, so one service sweeps every repo on the machine.
+/// What one `task reap` invocation was asked for.
 #[derive(Clone, Copy)]
 struct ReapFlags {
     retain_days: u64,
@@ -3049,6 +3046,12 @@ struct ReapFlags {
     interval_secs: u64,
 }
 
+/// `task reap` — archive worktrees a landing could not move, then delete archives past the
+/// retention window (design D49).
+///
+/// Takes the database **path** rather than a handle, and opens it per pass (`reap_once`), so a
+/// database this binary cannot open fails a pass rather than the service. The records need no repo
+/// context, so one service sweeps every repo on the machine.
 fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     let ReapFlags {
         retain_days,
@@ -3103,6 +3106,7 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
     let mut last_compaction_failure = String::new();
     let mut last_sweep_failure = String::new();
     let mut last_git_audit = String::new();
+    let mut last_transcript_failure = String::new();
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         // Repository config that could make this host run code (D52.11, layer 3): said, and
         // notified, when the set of findings changes — posted when one appears, withdrawn when
@@ -3127,6 +3131,17 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
                 }
                 Compaction::Quiet => last_compaction_failure.clear(),
             }
+        }
+        // THE DEV CONTAINER'S TRANSCRIPTS, on the same tick and by the same argument as the queue's
+        // compaction above: this is the one long-lived process on the host already sweeping on a
+        // timer, and a container over the Bash sandbox's argv limit fails every tool call at spawn
+        // with nothing in the message naming transcripts. `.container/run.sh` sweeps at container
+        // START and that was the only trigger, while transcripts are created continuously — the
+        // container that produced the failure reached 1,182 of them without ever being recreated.
+        // Silent when there is no Docker, no such container or a stopped one, which is every host
+        // not using the dev container. Never fatal: it is somebody else's container.
+        if !dry_run {
+            sweep_container_transcripts(db_path, json, &mut last_transcript_failure);
         }
         match reap_once(db_path, retain_days, dry_run) {
             // Silence when there is nothing to say: this runs every quarter hour for ever, and a
@@ -3182,6 +3197,143 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
     match sent {
         Ok(()) => *last = now,
         Err(e) => eprintln!("git-audit: could not post its notification: {e:#}"),
+    }
+}
+
+/// The session ids this machine currently believes are live.
+///
+/// **Read per tick, never cached.** A session that started since the last sweep is exactly the one
+/// most at risk, since it is also the most recently written. A database this binary cannot open —
+/// one a newer `jkb` migrated, routine across branches here — yields an EMPTY list, and that is the
+/// direction worth being careful about: empty means the sweep falls back to its recency window and
+/// its floor, which protect less precisely but do protect.
+///
+/// **Paged to exhaustion** — see the body. "One page is enough, `LIST_CAP` is 1000" was this
+/// function's own reasoning until the listing's `seen_at ASC` order was read: past the cap one page
+/// does not truncate the keep list, it inverts it.
+fn live_sessions(db_path: &Path) -> Vec<String> {
+    let Ok(db) = open_db(db_path) else {
+        return Vec::new();
+    };
+    let now = jkb_core::mq::now_ms();
+    // PAGED TO EXHAUSTION, and the ordering is why this is not a detail. The live listing is
+    // `seen_at ASC` — least recently seen first, which is what a liveness sweep wants to probe — so
+    // the FIRST page is the oldest rows, exactly the ones `live_ids` discards, while the session
+    // running right now has the largest `seen_at` and sits on the last page. Taking one page and
+    // dropping `next` therefore did not merely truncate the keep list: past `LIST_CAP` it INVERTED
+    // it, returning empty and sweeping a live container with no protection at all, silently
+    // (`Quiet` prints nothing). Both other readers of this API already page, and one of them carries
+    // a comment about this identical defect having been found here before.
+    let mut rows: Vec<(String, i64)> = Vec::new();
+    let mut after = None;
+    loop {
+        // A read that fails mid-listing yields what it has: fewer protected sessions is the same
+        // direction as no registry at all, which the recency window and the floor still cover.
+        let cursor = after.take();
+        let Ok(page) =
+            db.read(move |conn| jkb_core::claude_session::list(conn, false, cursor.as_ref()))
+        else {
+            break;
+        };
+        rows.extend(page.rows.into_iter().map(|r| (r.session, r.seen_at)));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    transcripts::live_ids(rows, now)
+}
+
+/// One line about the container's transcripts, in whichever shape the caller reads.
+///
+/// **`--json` means a document on stdout, as the compaction beside it already emits.** This printed
+/// prose to stderr under `--json` — so a machine consumer of the tick recorded a queue compaction
+/// and never a sweep, never an over-budget container, and never a daemon it could not reach. The
+/// human shape keeps stderr for the bad news, which is where a supervisor log wants it.
+fn say_transcripts(json: bool, line: &str, bad: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "transcripts": { "ok": !bad, "message": line } })
+        );
+    } else if bad {
+        eprintln!("transcripts: {line}");
+    } else {
+        println!("transcripts: {line}");
+    }
+}
+
+/// A failure message's STANDING-CONDITION key: its digit runs masked.
+///
+/// The reaper says a failure once while it stays the same, and compares whole sentences. The sweep's
+/// over-budget message embeds a byte count re-derived from the tree every run — and a tree is over
+/// budget *precisely while transcripts are being created*, which is the premise of this whole
+/// trigger. So the number moved every tick, no two sentences were equal, and the "said once"
+/// property never held in the one state it was written for: 96 near-identical lines a day.
+fn standing_key(why: &str) -> String {
+    let mut out = String::with_capacity(why.len());
+    let mut in_digits = false;
+    for c in why.chars() {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// One tick's worth of the dev container's transcripts, and what reaches the log.
+///
+/// Extracted from the watch loop for length, but it earns a name anyway: the interesting thing here
+/// is the reporting rule, which is the loop's own — say what CHANGED. A container that is not there,
+/// or had nothing to do, says nothing at all, because this runs every quarter hour for ever.
+fn sweep_container_transcripts(db_path: &Path, json: bool, last_failure: &mut String) {
+    report_container_sweep(
+        transcripts::sweep_dev_container(
+            &transcripts::dev_container_name(),
+            &live_sessions(db_path),
+        ),
+        json,
+        last_failure,
+    );
+}
+
+/// What one outcome does to the log and to the dedup state.
+///
+/// **Taken as a value, so all five variants can be driven.** The testability seam stopped one level
+/// below this, at `sweep_with`, leaving the rule its own doc calls "the interesting thing here"
+/// executed by nothing: that the quiet outcomes CLEAR the remembered failure, and that the dedup
+/// compares the standing key while printing the full message. The second is the one that can go
+/// wrong in silence — compare the key, store the raw sentence, and the log is noisy again.
+fn report_container_sweep(outcome: transcripts::Sweep, json: bool, last_failure: &mut String) {
+    match outcome {
+        transcripts::Sweep::Absent | transcripts::Sweep::Quiet => last_failure.clear(),
+
+        transcripts::Sweep::Said(line) => {
+            last_failure.clear();
+            say_transcripts(json, &line, false);
+        }
+        // Said ONCE while it stays the same, as the compaction's and the reap's own failures are:
+        // over budget is a standing condition rather than an event, and it would otherwise be 96
+        // identical lines a day in a log whose whole discipline is that a line means something.
+        //
+        // `Unreachable` is the same shape and shares the arm. It is also the one case where SILENCE
+        // would be the defect: "there may be a container over budget and I could not find out" is
+        // not the fact `Absent` reports, which is that there is no container here at all.
+        transcripts::Sweep::Unreachable(why) | transcripts::Sweep::Failed(why) => {
+            // Compared on the KEY and printed in full: the operator wants this run's numbers, the
+            // log wants one line per condition rather than one per tick.
+            let key = standing_key(&why);
+            if key != *last_failure {
+                say_transcripts(json, &why, true);
+                *last_failure = key;
+            }
+        }
     }
 }
 
@@ -4117,6 +4269,81 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE REPORTING RULE, driven for every outcome. Nothing executed it before: the seam stopped
+    /// one level lower, at `sweep_with`, so the loop's own discipline — say what CHANGED — was
+    /// asserted by no test at all.
+    #[test]
+    fn the_tick_remembers_a_condition_and_forgets_it_when_it_clears() {
+        use crate::transcripts::Sweep;
+        let mut last = String::new();
+
+        // A standing failure is remembered by its key, not its sentence: the byte count moves every
+        // tick, and comparing whole sentences meant a new line every quarter hour for ever.
+        super::report_container_sweep(
+            Sweep::Failed("80092 bytes over budget".to_owned()),
+            false,
+            &mut last,
+        );
+        let first = last.clone();
+        assert!(!first.is_empty(), "a failure must be remembered");
+        super::report_container_sweep(
+            Sweep::Failed("80674 bytes over budget".to_owned()),
+            false,
+            &mut last,
+        );
+        assert_eq!(
+            last, first,
+            "the same condition with new numbers is one condition"
+        );
+
+        // ...and a tick that is fine CLEARS it, or the condition can never be reported again.
+        super::report_container_sweep(Sweep::Quiet, false, &mut last);
+        assert!(last.is_empty(), "a quiet tick forgets the failure");
+        super::report_container_sweep(Sweep::Absent, false, &mut last);
+        assert!(last.is_empty());
+        super::report_container_sweep(Sweep::Said("archived 7".to_owned()), false, &mut last);
+        assert!(
+            last.is_empty(),
+            "a tick that did something is not a failure"
+        );
+
+        // An unreachable daemon is a standing condition too, and shares the arm.
+        super::report_container_sweep(
+            Sweep::Unreachable("docker did not answer".to_owned()),
+            false,
+            &mut last,
+        );
+        assert!(
+            !last.is_empty(),
+            "an unreachable daemon must be remembered, not swallowed"
+        );
+    }
+
+    /// The reaper says a standing condition ONCE. The sweep's over-budget sentence carries a byte
+    /// count re-derived every run, and a tree is over budget precisely while transcripts are being
+    /// created — so comparing whole sentences meant a new line every 15 minutes for ever, in the one
+    /// state the "said once" rule was written for.
+    #[test]
+    fn a_standing_condition_is_one_condition_however_its_numbers_move() {
+        let a = "transcript sweep: 80092 deny bytes remain after this sweep, over the 65536 byte budget";
+        let b = "transcript sweep: 80674 deny bytes remain after this sweep, over the 65536 byte budget";
+        assert_eq!(
+            super::standing_key(a),
+            super::standing_key(b),
+            "the same condition with different numbers is one condition"
+        );
+        let other = "transcript sweep: 80092 file(s) could not be archived";
+        assert_ne!(
+            super::standing_key(a),
+            super::standing_key(other),
+            "a different condition is still a different condition"
+        );
+        assert!(
+            super::standing_key(a).contains('#'),
+            "the digits are what is masked"
+        );
+    }
     /// `jkb serve`'s default token path is refused where the refusal says so, and an explicit one is
     /// the caller's decision. The refusal itself is `jkb_core`'s shared-filesystem rule, measured in
     /// the dev container against the `~/.jkb` bind (FUSE).

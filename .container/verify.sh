@@ -17,7 +17,12 @@ set -uo pipefail
 pass=0; fail=0; accepted_failure=0
 ok()  { pass=$((pass+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
-# A failure that is a CONSEQUENCE of a condition this container was configured to accept. Reported
+# A failure this container TOLERATES rather than one that means its boundary is broken. It was
+# "a condition this container was configured to accept", which was true while the unfiltered-egress
+# override was the only producer and became false the moment the transcript deny list joined it:
+# nobody CONFIGURES a container to accumulate 199 workflow run journals, and telling an operator
+# they chose a state they did not choose about the one exit-3 producer with a concrete remedy is
+# worse than saying nothing. Reported
 # at full volume like any other -- what it changes is the exit code, so a caller can tell "this
 # container is misconfigured" from "this container is in a state its operator chose".
 #
@@ -370,6 +375,34 @@ REC
 # hypothetical — the `^/dev` / `/devtools` class above is the same file's own history.
 # mutate-verify.sh would catch it, but mutate-verify.sh needs a Docker host and is not in the
 # gate. This is, and it costs nothing.
+# DEFINED ABOVE THE SELF-TEST, which exits before anything below it is read. Bash resolves a
+# function at call time, so a use above its definition is not an error but an EMPTY result --
+# and the rows would have passed nothing while printing five failures about a correct file.
+# check-config.sh records making this exact mistake three times with one helper.
+# WHICH VERDICT A SWEEP RUN DESERVES — a pure function of its exit code and its output, because
+# this decision drives what `run.sh` SAYS (exit 3 changes the refusal's wording and its advice;
+# it does NOT open a window — run.sh's `verify_rc -ne 0` gate refuses on any non-zero) and nothing
+# executed it. Five arms, each a one-token flip away from the wrong container behaviour, and the
+# static guards can only see that the arms exist. Defined before its caller and driven by
+# `--self-test`, which needs no container.
+sweep_verdict() { # sweep_verdict <rc> <output> -> unmeasured|healthy|beyond|over|unanswerable
+    case "$2" in
+        # A root that is not there was never measured; one that is there and EMPTY was — zero bytes,
+        # and that is every freshly created container.
+        *"does not exist"*) printf 'unmeasured\n'; return ;;
+    esac
+    [ "$1" -eq 0 ] && { printf 'healthy\n'; return; }
+    case "$2" in
+        # Beyond any sweep is a condition to act on, not a broken boundary: exit 3, not exit 1.
+        *"cannot bring this tree under it"*) printf 'beyond\n'; return ;;
+        # The sweep names E2BIG only when it is giving a BUDGET verdict. Anything else non-zero is
+        # the sweep failing to answer at all — a containment refusal, a resolver failure with no
+        # output, a syntax error — and reporting that as "over budget" asserts a pass that never ran.
+        *"E2BIG"*) printf 'over\n'; return ;;
+    esac
+    printf 'unanswerable\n'
+}
+
 if [ "$SELF_TEST" = yes ]; then
     st_fail=0
     st() { # st <mount point> <owned|checked>
@@ -390,6 +423,44 @@ if [ "$SELF_TEST" = yes ]; then
              /home/vscode/repos /home/vscode/.jkb /host; do
         st "$p" checked
     done
+
+    echo "==> verify.sh self-test: the transcript-budget verdict"
+    # THE DECISION run.sh READS. Both codes refuse a window — its gate tests `verify_rc -ne 0` — and what
+    # exit 3 changes is WHICH REFUSAL the operator is given, which for the transcript floor is the
+    # difference between a remedy that applies and three that do not. A one-token flip in
+    # any arm changes what the container does — and until this existed the whole five-way chain was
+    # executed by nothing, with the static guards able to see only that the arms were present.
+    # Literal inputs, so no container and no Docker are needed.
+    sv() { # sv <label> <rc> <output> <want>
+        got="$(sweep_verdict "$2" "$3")"
+        if [ "$got" = "$4" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
+        else printf '  \033[31mFAIL\033[0m %s\n         got:  %s\n         want: %s\n' "$1" "$got" "$4"; st_fail=$((st_fail+1)); fi
+    }
+    sv "a tree under budget is healthy" 0 \
+       "transcript sweep: 4100 deny bytes projected, budget 65536 — nothing to archive" healthy
+    # An EMPTY root has been measured — zero bytes — and that is every fresh container. Failing it
+    # reddens the happy path, and a gate that cries there is one people learn to skip.
+    sv "an empty but existing tree is healthy, not unmeasured" 0 \
+       "transcript sweep: no transcripts under /home/vscode/.claude/projects" healthy
+    sv "a root that is not there was never measured" 0 \
+       "transcript sweep: /x does not exist — nothing to sweep" unmeasured
+    # ...and that beats the exit code, because the sweep exits 0 when it found nothing to look at.
+    sv "...whatever the exit code says" 1 \
+       "transcript sweep: /x does not exist — nothing to sweep" unmeasured
+    sv "over budget is a budget verdict" 1 \
+       "transcript sweep: 80092 deny bytes remain after this sweep, over the 65536 byte budget — Bash may still fail at spawn with E2BIG" over
+    # BEYOND ANY SWEEP is exit 3, not exit 1: a condition to act on rather than a broken boundary.
+    # It must win over the over-budget arm, since the sweep prints both lines in that state.
+    sv "beyond any sweep outranks merely over budget" 1 \
+       "transcript sweep: 90000 deny bytes are in files no sweep can remove right now — archiving every transcript cannot bring this tree under it
+transcript sweep: 90000 deny bytes are projected and none of them can be archived, over the 65536 byte budget — Bash may still fail at spawn with E2BIG" beyond
+    # Everything else non-zero is the sweep not answering at all. Reported as "over budget" it
+    # asserted an archiving pass that never happened.
+    sv "a containment refusal is not a budget verdict" 1 \
+       "transcript sweep: archive /x is inside /y — each sweep would re-enumerate what the last one moved" unanswerable
+    sv "a sweep that printed nothing is not a budget verdict" 1 "" unanswerable
+    sv "a broken script is not a budget verdict" 2 \
+       "/usr/bin/bash: line 9: syntax error near unexpected token" unanswerable
 
     # Assertion 7's judgement, whose FAIL arm no container harness can reach (see
     # missing_extensions). `st` compares strings, so these read as the mount cases do.
@@ -1808,6 +1879,116 @@ else
     fi
 fi
 
+# THE DENY LIST STILL FITS IN ONE ARGV. This is the container's health report, and it said nothing
+# about the one state in which NO Bash tool call works: Claude Code's sandbox profile enumerates
+# every session transcript into a single argv, Linux caps one argument at MAX_ARG_STRLEN, and a
+# container over that limit fails every Bash call at spawn with E2BIG and nothing in the message
+# naming transcripts. run.sh sweeps before getting here -- and discards the result with `|| true`,
+# deliberately, because a deny list slightly too long must not abort a start. So the sweep's warning
+# scrolls past several steps earlier and the operator reads a green verify. The question belongs
+# where the operator is looking.
+#
+# ASKED BY RUNNING THE SWEEP'S OWN DRY RUN, never by re-deriving the arithmetic here: `--dry-run`
+# moves nothing, and since round 3 it returns non-zero when the tree AS IT STANDS is over budget
+# — not when the plan would fail to reach it, which is a verdict about a tree that does not exist. One definition of the budget, one of the projection, and this file asks rather than
+# answers.
+#
+# `accept_bad`, NOT `bad`, for the unreclaimable floor. The workflow harness's run journals are
+# never archived and .claude-state is a volume, so past roughly 199 of them no sweep can bring the
+# tree under budget -- that is a condition to report and act on, not a broken boundary, and this
+# file's two exit codes exist to tell those apart.
+# `dirname "$0"`, the same idiom the egress-lib source at the top of this file uses: the sweep is
+# this script's sibling, and asking for it through a repo root this file does not otherwise compute
+# is one more thing to get wrong.
+sweep_sh="$(dirname "$0")/sweep-transcripts.sh"
+if [ -f "$sweep_sh" ]; then
+    # THE KEEP LIST IS AN INPUT TO THIS MEASUREMENT, not a detail of the caller. `--dry-run` asks the
+    # real sweep what it WOULD do, and what it would do depends on which sessions it must not touch:
+    # protected files cannot be archived, so a missing keep list makes the tree look more reclaimable
+    # than it is. The verdict flips with it -- `beyond` (live sessions hold this down, waiting is the
+    # remedy) becomes `over` (archive harder) -- and `over`'s text then rules out the floor BY NAME
+    # while the floor is the actual cause. run.sh exports it; a hand-run inside the container, which
+    # is the route run.sh's own failure text recommends, had nothing to export it.
+    #
+    # SET-BUT-EMPTY IS AN ANSWER. run.sh passes an empty list on purpose for a container that was not
+    # running -- nothing inside it can be live -- so `set` and `unset` cannot be collapsed, and the
+    # test is `${VAR+set}` rather than `-n "$VAR"`.
+    #
+    # ASKED THE SAME WAY run.sh ASKS. `--live-ids` applies one rule in one place
+    # (crates/jkb-cli/src/transcripts.rs); deriving the list here by any other route would be a third
+    # answer to "which sessions are live" with nothing keeping the three in step.
+    sweep_keep_note=""
+    if [ -n "${JKB_KEEP_SESSIONS+set}" ]; then
+        : # supplied by our caller, and authoritative even when empty
+    elif sweep_live="$(jkb notify sessions --live-ids 2>/dev/null)"; then
+        JKB_KEEP_SESSIONS="$(printf '%s' "$sweep_live" | tr '\n' ' ')"
+        export JKB_KEEP_SESSIONS
+    else
+        sweep_keep_note="
+       NOTE: no keep list. Nobody passed \$JKB_KEEP_SESSIONS and jkb could not be asked which
+       sessions are live, so this measurement archives files the real sweep protects and reads
+       MORE reclaimable than the container is. A binding floor can reach this arm in that state."
+    fi
+    sweep_dry="$(bash "$sweep_sh" --dry-run 2>&1)"; sweep_dry_rc=$?
+    # THE LAST LINE, not the whole of it. The sweep says several things on the way to its verdict and
+    # the verdict is the last of them; flattening all of it into one `ok`/`FAIL` produced a line
+    # nobody finishes reading, which for an operator-facing report is the same as saying nothing.
+    sweep_tail="$(tail -n 1 <<<"$sweep_dry")"
+    # CLASSIFIED ON WHAT THE SWEEP SAID, not on the fact that it said something. Every arm below
+    # used to hang off `rc != 0` meaning "over budget", and the sweep returns non-zero for things
+    # that are not about the budget at all: an archive that resolves inside the root (rc 1, and the
+    # only line is the containment refusal), a `transcript_resolve` failure (rc 1, no output at all,
+    # so `sweep_tail` is empty), a syntax error or an unreadable file (rc 2, bash's own message).
+    # Each of those printed "the transcript deny list is over budget — <unrelated text or nothing>"
+    # followed by a sentence asserting an archiving pass that never happened.
+    sweep_v="$(sweep_verdict "$sweep_dry_rc" "$sweep_dry")"
+    if [ "$sweep_v" = healthy ]; then
+        ok "the transcript deny list fits in one argv — $sweep_tail"
+    elif [ "$sweep_v" = unmeasured ]; then
+        # A SWEEP THAT FOUND NO TREE IS NOT A MEASURED PASS. It exits 0 for "nothing to sweep", and
+        # the arm above printed `ok the transcript deny list fits in one argv` over a budget nobody
+        # measured — the exact rule the sweep's own header states and that broke: a sweep that
+        # cannot find its subject must not look successful. Reachable whenever
+        # `$CLAUDE_BASE/projects` is missing: a second config dir, or a `dc_link_state` that failed
+        # and which run.sh deliberately tolerates and defers to this file.
+        #
+        # "DOES NOT EXIST" ONLY, and not "no transcripts". A root that exists and is EMPTY has been
+        # measured: the deny list is zero bytes and Bash can spawn — which is every freshly created
+        # container. Failing that too, as the first version of this arm did, reddens the verify on
+        # a healthy new container, and a gate that cries on the happy path is a gate people learn
+        # to skip. The difference is whether there was a subject, not whether it had anything in it.
+        bad "the transcript deny list was never measured — $sweep_tail
+       The sweep found no tree to look at, so nothing here says whether Bash can spawn. Check that
+       ~/.claude/projects exists and points into the state volume."
+    elif [ "$sweep_v" = unanswerable ]; then
+        bad "the transcript sweep could not answer whether the deny list fits in one argv (exit $sweep_dry_rc) — ${sweep_tail:-it printed nothing}
+       This is not a budget verdict: the sweep did not get far enough to give one. Run
+       .container/sweep-transcripts.sh --dry-run by hand and read what it says."
+    elif [ "$sweep_v" = beyond ]; then
+        # THE SWEEP'S OWN SENTENCE, not a second copy of it. This kept its own enumeration of what
+        # cannot be reclaimed, and went stale the moment a third term was added: it told the
+        # operator to delete run journals when the real answer, half an hour after a swarm, is to
+        # wait for the recency window to lapse.
+        accept_bad "the transcript deny list cannot be brought under budget by archiving at all
+       $(printf '%s' "$sweep_dry" | grep -F 'no sweep can remove' | head -1)
+       Nothing this sweep can do changes that. If the reason given above lapses, waiting is the
+       remedy; otherwise remove finished runs' journal.jsonl by hand or widen the budget —
+       .container/README.md has the numbers."
+    else
+        bad "the transcript deny list is over budget — $sweep_tail$sweep_keep_note
+       Every Bash tool call in this container may fail at spawn with E2BIG, with nothing in the
+       message naming transcripts. This is a --dry-run, so it says what IS there and not what the
+       start sweep managed. With a keep list, a binding floor is NOT among the causes — that
+       produces the arm above, not this one — so what is left is a start sweep that could not write its archive (look for
+       \`could not create\` in the scroll-back), an archive refusing colliding destinations
+       (\`mv: not replacing\`), and transcripts arriving since the sweep ran. Check
+       ~/.claude-state/transcript-archive is writable and holds no entry with the same relative path
+       as a live session's transcript."
+    fi
+else
+    bad "there is no sweep-transcripts.sh beside this script, so nothing bounds the Bash sandbox deny list"
+fi
+
 echo
 echo "  note: that the sandbox actually ENGAGES for a tool call is not asserted here — it needs a"
 echo "  live session. Inside one, run:  ./scripts/auto-mode.sh sandboxed   (control + canary, no"
@@ -1821,11 +2002,11 @@ echo
 # condition the design REQUIRES to keep failing. The failure is still reported every run, at full
 # volume; what changes is that a caller can tell the two apart.
 #   1  a real failure
-#   3  the only failures are conditions this container was configured to accept
+#   3  the only failures are ones this container tolerates rather than a broken boundary
 if [ "$fail" -ne 0 ]; then
     printf '\033[31m%d failed\033[0m, %d passed\n' "$fail" "$pass"
     if [ "$accepted_failure" -ne 0 ] && [ "$fail" -eq "$accepted_failure" ]; then
-        printf 'every failure above is a condition this container was configured to accept.\n'
+        printf 'every failure above is one this container tolerates rather than a broken boundary.\n' 
         exit 3
     fi
     exit 1

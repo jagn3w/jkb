@@ -39,6 +39,16 @@ fn jkb_bare() -> Command {
     // and nothing is ever reclaimed. Pinned rather than read, so the tests do not depend on
     // whatever the developer's machine is called.
     cmd.env("HOSTNAME", "host");
+    // NO TEST MAY REACH A REAL CONTAINER. `task reap --watch` sweeps the dev container's
+    // transcripts on every tick, and the test below spawns that loop as a REAL child with the
+    // developer's own environment — so without this the first pass ran `docker exec … jkb-dev`
+    // against the container the developer is working in and archived their live transcripts out of
+    // `~/.claude-state`, with `watch.kill()` able to orphan the exec mid-archive. Pointed at a name
+    // nothing can create, the probe lists no such container and the sweep answers `Absent`.
+    //
+    // In `common`, not here: it was spelled in this fixture alone while `sessions.rs` built its own
+    // `jkb` without it, and `assert_jkb_isolated` — the oracle both already run — did not look.
+    common::isolate_container_env(&mut cmd);
     cmd
 }
 
@@ -3168,10 +3178,37 @@ fn the_hook_feeds_the_session_registry_that_notify_sessions_lists() {
         "{human}"
     );
 
+    // THE VERB .container/run.sh ACTUALLY CALLS, which nothing invoked. It is a literal in run.sh
+    // and a separate literal in the clap derive, compared only by a grep over run.sh — so renaming
+    // the flag, or breaking it, left every gate green while the next container start took the
+    // "could not ask jkb which sessions are live" branch and swept a live container with an empty
+    // keep list. A benign-looking message over a dead protection.
+    let live_ids = || -> String {
+        let out = client()
+            .args(["notify", "sessions", "--live-ids"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    assert_eq!(
+        live_ids(),
+        "s-1\n",
+        "a live session prints its id on its own line"
+    );
+
     hook(serde_json::json!({
         "hook_event_name": "SessionEnd", "session_id": "s-1", "reason": "prompt_input_exit",
     }));
     assert_eq!(listed(false), serde_json::json!([]));
+    // ...and an ended one holds nothing, which is what lets the sweep reclaim it.
+    assert_eq!(
+        live_ids(),
+        "",
+        "an ended session must not hold its transcripts"
+    );
     let all = listed(true);
     assert_eq!(all[0]["end_reason"], "prompt_input_exit", "{all}");
     let log = std::fs::read_to_string(dir.path().join(".jkb/logs/notify-hook.log"))

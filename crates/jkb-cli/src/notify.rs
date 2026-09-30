@@ -74,13 +74,20 @@ pub fn run(cmd: &NotifyCmd, json: bool) -> Result<()> {
         }
         NotifyCmd::Topic => println!("{}", jkb_core::notify::TOPIC),
         NotifyCmd::Hook => hook(),
-        NotifyCmd::Sessions { all } => sessions(*all, json)?,
+        NotifyCmd::Sessions { all, live_ids } => sessions(*all, *live_ids, json)?,
     }
     Ok(())
 }
 
 /// `jkb notify sessions`: the session registry, as the daemon holds it.
-fn sessions(all: bool, json: bool) -> Result<()> {
+/// List the registry's sessions, or just the ids the transcript sweep must hold.
+///
+/// **`live_ids` exists so the sweep's keep list has one implementation.** `.container/run.sh` used to
+/// take this command's `--json` and pull `.[].session` out with `jq` — a second answer to "which
+/// sessions count", in another language, which went on handing out ids from rows that had been open
+/// for months after the reaper's own answer learned not to. The rule is
+/// [`crate::transcripts::live_ids`] and both callers apply it.
+fn sessions(all: bool, live_ids: bool, json: bool) -> Result<()> {
     let url = crate::remote::daemon_url();
     let backend = crate::remote::client(&url, crate::remote::Purpose::Hook)
         .map_err(|e| anyhow::anyhow!("{}", e.message))?;
@@ -103,6 +110,15 @@ fn sessions(all: bool, json: bool) -> Result<()> {
         }
     }
     let sessions = keep_latest(sessions);
+    if live_ids {
+        for id in crate::transcripts::live_ids(
+            sessions.into_iter().map(|s| (s.session, s.seen_at)),
+            jkb_core::mq::now_ms(),
+        ) {
+            println!("{id}");
+        }
+        return Ok(());
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
         return Ok(());
@@ -129,14 +145,23 @@ fn keep_latest(rows: Vec<jkb_api::ClaudeSession>) -> Vec<jkb_api::ClaudeSession>
 
 /// One process's hold on a session, on one line: id, state, process and where it runs.
 fn session_line(s: &jkb_api::ClaudeSession) -> String {
-    let state = match (&s.end_reason, &s.start_source) {
+    // STALENESS IS PART OF THE STATE. A row with no end record prints as "live" here, and
+    // `--live-ids` on this same command excludes it once nothing has been seen of it for
+    // `LIVE_SEEN_WITHIN_MS` — so an operator checking why a transcript was archived read a listing
+    // that flatly contradicted the keep list, with nothing in the output to tell the two apart.
+    // Nothing closes a container session's row, so "live" here is routinely months old.
+    let unseen_ms = jkb_core::mq::now_ms().saturating_sub(s.seen_at);
+    let how = match (&s.end_reason, &s.start_source) {
         (Some(reason), _) => format!("ended ({reason})"),
+        (None, _) if unseen_ms >= crate::transcripts::LIVE_SEEN_WITHIN_MS => {
+            format!("open, unseen {}h", unseen_ms / 3_600_000)
+        }
         (None, Some(source)) => format!("live ({source})"),
         (None, None) => "live (seen)".to_owned(),
     };
     let pid = if s.pid.is_empty() { "?" } else { &s.pid };
     format!(
-        "{}  {state}  pid {pid} on {}  {}",
+        "{}  {how}  pid {pid} on {}  {}",
         s.session, s.instance, s.cwd
     )
 }

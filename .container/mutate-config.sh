@@ -48,6 +48,17 @@ seed() {
     # ...and jkb-cli's remote.rs, which names the variable the notification hook reads.
     mkdir -p "$work/t/crates/jkb-cli/src"
     cp "$repo/crates/jkb-cli/src/remote.rs" "$work/t/crates/jkb-cli/src/"
+    # ...and transcripts.rs, which owns the container name and the in-image path the host reaper
+    # pokes -- check-config.sh holds both to run.sh and the Dockerfile.
+    cp "$repo/crates/jkb-cli/src/transcripts.rs" "$work/t/crates/jkb-cli/src/"
+    # ...and jkb-api, which owns the JSON field name run.sh's jq filter reads.
+    mkdir -p "$work/t/crates/jkb-api/src"
+    cp "$repo/crates/jkb-api/src/lib.rs" "$work/t/crates/jkb-api/src/"
+    # ...and swarm-status.sh, which OWNS the name the transcript sweep has to spare: check-config.sh
+    # reads it out of that file's discovery predicate rather than spelling it. Without this in the
+    # copy the extraction reads nothing, which is a failure by design -- so it would redden the
+    # unmutated tree and take the negative control with it.
+    cp "$repo/scripts/swarm-status.sh" "$work/t/scripts/"
     # The manifest is what lets mutated() see a DELETION or a MODE CHANGE. Taken here rather than
     # derived from a list, so it still covers a file added to seed() tomorrow.
     tree_manifest > "$work/manifest"
@@ -261,6 +272,662 @@ p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace("verify.sh", "nothing.sh"))
 PYX
 run "run.sh stops verifying at all" "nothing verifies the container"
+
+# THE TRANSCRIPT SWEEP, one mutation per way its enumeration goes wrong, and one per way the
+# wiring does. Every one of them is silent at run time — the sweep reports success while archiving
+# the wrong set or the empty set — so this is the only place any of them is ever observed failing.
+#
+# ANCHORED ON CODE THE FILE HAS TO KEEP: the `find` line inside `transcript_records`, the function
+# name check-config.sh extracts by, and run.sh's invocation statement. Never on a message: a
+# mutation anchored on wording silently becomes a NO-OP the day the wording is improved, and then
+# reports MISSED about a guard that is perfectly fine. `assert` on each, so that if one of these
+# anchors DOES move, this says so instead of certifying the unmutated tree.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'find -L "$abs"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'find "$abs"', 1))
+PYX
+run "the sweep stops following a symlinked root" "does not pass -L"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'find -L "$abs" -type d'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'find -L "$abs" -maxdepth 2 -type d', 1))
+PYX
+run "the sweep bounds its depth, missing the nested agent transcripts" "it caps the depth"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "-name '*.jsonl' -exec"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "-exec", 1))
+PYX
+run "the sweep stops filtering on *.jsonl, so auto-memory is in the plan" "does not filter on *.jsonl"
+
+# THE HARNESS'S OWN RUN JOURNAL, and BOTH ways of getting it wrong, because the repair for the
+# first shipped the second. `*.jsonl` matches journal.jsonl, so a name of its own is the only thing
+# between the sweep and the state swarm-status.sh finds every run by -- and it shipped without one,
+# which is how the sweep came to archive 23 of them oldest-first. The fix then put that exclusion
+# in the WALK, which feeds the PROJECTION as well as the plan, so the sweep sized the argv at
+# 65,250 bytes of a real 96,612 and printed "nothing to archive" while every Bash call went on
+# dying at spawn. One mutation each, in the two directions.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "-name '*.jsonl' -exec"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "-name '*.jsonl' ! -name journal.jsonl -exec", 1))
+PYX
+run "the sweep holds the journal back in the walk, hiding its bytes from the budget" "holds a name back in the WALK"
+
+# ...AND THE NAME ITSELF, which an external harness owns. Renaming it here has to be caught by
+# DISAGREEMENT with swarm-status.sh and not by a literal this file also spells, because a literal
+# is green through the case that actually matters: the harness renaming its own run-state file.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\nHELD_NAME=journal.jsonl\n"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "\nHELD_NAME=run.jsonl\n", 1))
+PYX
+run "the sweep spares a name swarm-status.sh does not look for" "while swarm-status.sh finds runs by"
+
+# ...and that reader going away, which is the case a literal could never have seen: the guard must
+# refuse to establish anything rather than pass on a name it could not read.
+seed; python3 - "$work/t/scripts/swarm-status.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "-name journal.jsonl -path '*/subagents/workflows/wf_*'"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "-name journal.jsonl", 1))
+PYX
+run "swarm-status.sh stops discovering runs by that predicate" "cannot be read from the reader that defines it"
+
+# THE ARCHIVE MUST BE OUTSIDE THE ROOT. Anchored on the case pattern, which is the refusal itself,
+# not on its message.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '        "$phys_root"/*)'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '        "$phys_root"/never-matches-anything)', 1))
+PYX
+run "the sweep accepts an archive inside the root it enumerates" "does not refuse an archive inside the root"
+
+# ...AND THE REFUSAL COMPARING SPELLINGS RATHER THAN RESOLVED PATHS, which is how it shipped: a
+# string-prefix test against the caller's spelling, while the walk is `-L` and the container's root
+# IS a symlink. The refusal was present, pinned, mutated -- and inoperative in production.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'phys_root="$(cd "$root" && pwd -P)"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'phys_root="$(cd "$root" && pwd)"', 1))
+PYX
+run "the containment test goes back to comparing the caller's spellings" "rather than resolved paths"
+
+# ...AND THE OTHER SIDE OF THAT COMPARISON, which the round that added the refusal left pinned by
+# nothing. A comparison has two operands; resolving one of them is half a guard.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'phys_archive="$(transcript_resolve "$archive")"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'phys_archive="$archive"', 1))
+PYX
+run "the archive side of the containment test stops being resolved" "does not resolve the ARCHIVE side"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'transcript_resolve() {'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'resolve_it() {', 1))
+PYX
+run "the resolver is renamed, so the guard reads nothing" "no transcript_resolve"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'base="$(cd "$p" && pwd -P)" || return 1'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'base="$(cd "$p" && pwd)" || return 1', 1))
+PYX
+run "the resolver stops reaching a physical path" "does not reach a physical path"
+
+# THE POST-CONDITION'S CALL SITE. Its arithmetic is watched by the self-test from literals; the
+# CALL is watched only here, because the state it guards is refused upstream and so cannot be
+# reached from the fixture.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '! transcript_projection_fell "$moved" "$before" "$after"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'false', 1))
+PYX
+run "the sweep stops asking whether the projection fell" "it never asks whether the projection actually fell"
+
+# THE VANISHED-SOURCE SKIP, whose only watcher this is: no executable test reaches a file that
+# disappears between the plan and the move, so the static pin and this mutation are the whole of it.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '        [ -e "$f" ] || continue\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "a transcript that raced away is counted as a failure again" "counts a transcript that vanished"
+
+# THE SELF-TEST SEAM WIRED INTO THE CONTAINER, which would disable the sweep while every start went
+# on reporting success -- the exact state the script exists to end, wearing a clean log.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'bash .container/sweep-transcripts.sh || true'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'JKB_DENY_BUDGET_BYTES=99999999 bash .container/sweep-transcripts.sh || true', 1))
+PYX
+run "run.sh wires the self-test budget seam into the container" "sets JKB_DENY_BUDGET_BYTES"
+
+# ...AND EVERY OTHER SEAM, because the guard that shipped named one of three. A root that does not
+# exist is the cheapest way to switch the sweep off and leave a clean log.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\nUSER vscode\n"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "\nENV JKB_TRANSCRIPT_ROOT=/nonexistent\nUSER vscode\n", 1))
+PYX
+run "the Dockerfile pins the transcript root to a tree that is not there" "sets JKB_TRANSCRIPT_ROOT"
+
+# ...and the list itself going away, which is what makes the loop above establish anything.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '\nSEAMS="'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '\nSEAM_NAMES="', 1))
+PYX
+run "the seam list is renamed, so the guard reads nothing" "no SEAMS= line to read"
+
+# THE OPERATOR-FACING HALF. run.sh discards the sweep's exit code on purpose, so verify.sh -- the
+# thing anyone actually reads after a start -- is the only durable place the budget is reported.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'bash "$sweep_sh" --dry-run'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'true --not-a-dry-run', 1))
+PYX
+run "verify.sh stops reporting the transcript deny list" "does not ask whether the deny list still fits"
+
+seed; rm -f "$work/t/.container/verify.sh"
+run "verify.sh is deleted outright" "verify.sh is not there to report the deny list"
+
+# ...AND THE VERDICT ARMS, which the call-site check above cannot see. The realistic drift is not
+# deletion but a refactor that keeps the call and demotes the verdict to a note -- the same green.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'accept_bad "the transcript deny list cannot be brought under budget'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'echo "  note the transcript deny list cannot be brought under budget', 1))
+PYX
+run "verify.sh demotes the accepted deny-list verdict to a note" "reaches no \`accept_bad\` verdict"
+
+# THE SEAM DECLARATION DRIFTING FROM THE CODE, which is the shape that put one of three seams
+# behind the refusal in the first place.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'INPUTS="$SEAMS '
+assert s.count(old) == 1, "mutation target absent"
+i = s.index(old) + len(old)
+j = s.index('"', i)
+open(p, 'w').write(s[:i] + s[j:])
+PYX
+run "an input the script reads is dropped from INPUTS" "so an input is covered by neither"
+
+# ...and verify.sh, the caller that runs INSIDE the container, where a seam actually takes effect.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'sweep_dry="$(bash "$sweep_sh" --dry-run 2>&1)"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'sweep_dry="$(JKB_DENY_BUDGET_BYTES=99999999 bash "$sweep_sh" --dry-run 2>&1)"', 1))
+PYX
+run "verify.sh wires the budget seam into its own call" "verify.sh sets JKB_DENY_BUDGET_BYTES"
+
+# THE PHRASES THE TWO FILES SHARE. verify.sh tells "over budget" from "beyond any sweep's help" from
+# "could not answer" by matching the sweep's own wording; reword one end and the container is
+# silently reclassified for ever, with no gate noticing.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'archiving every transcript cannot bring this tree under it'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'no amount of archiving helps here', 1))
+PYX
+run "the sweep rewords the phrase verify.sh classifies on" "which sweep-transcripts.sh never prints"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '*"E2BIG"*'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '*"E2BIG-renamed"*', 1))
+PYX
+run "verify.sh classifies on a phrase the sweep does not print" "which sweep-transcripts.sh never prints"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+for old, new in (('*"does not exist"*) printf', '*) printf'),
+                 ('*"cannot bring this tree under it"*) printf', '*) printf'),
+                 ('*"E2BIG"*) printf', '*) printf'),
+                 ("grep -F 'no sweep can remove'", "head -0")):
+    assert old in s, "mutation target absent"
+    s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+PYX
+run "verify.sh stops classifying on any phrase" "classifies on no phrase at all"
+
+# ...AND THE FUNCTION THAT DECIDES, renamed so the extraction reads nothing. The classifiers moved
+# into it when the chain was made pure, and the guard went on reading the reporting block -- where
+# there were then none left, so it established nothing and two mutations went MISSED.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'sweep_verdict() {'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'decide_sweep() {', 1))
+PYX
+run "the sweep verdict function is renamed, so the guard reads nothing" "no sweep_verdict() to read"
+
+# THE NAMES THAT MUST AGREE for the host reaper to reach this container at all. Each is silent
+# when wrong: a reaper poking a name nothing creates, or running a path the image does not carry,
+# reports nothing for ever -- the same end state as having no trigger between starts, with a green log.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'NAME="${JKB_CONTAINER_NAME:-jkb-dev}"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'NAME="${JKB_CONTAINER_NAME:-jkb-devbox}"', 1))
+PYX
+run "run.sh renames the container the reaper pokes" "so the only trigger between container starts reaches nothing"
+
+# ...AND THE NAME BECOMING UNREADABLE, which is the third "extraction read nothing" branch in this
+# block and the one that shipped without a mutation. Behaviour-preserving: the quotes simply go, a
+# shape run.sh uses elsewhere.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'NAME="${JKB_CONTAINER_NAME:-jkb-dev}"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'NAME=${JKB_CONTAINER_NAME:-jkb-dev}', 1))
+PYX
+run "run.sh spells its container name in a shape the guard cannot read" "cannot be read from both run.sh and transcripts.rs"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'include_str!("../../../.container/sweep-transcripts.sh")'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"echo no-op"', 1))
+PYX
+run "the reaper stops embedding the sweep" "no longer embeds the sweep"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"exec", "-i", "-e", &keep, name, "bash", "-s"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"exec", name, "bash", "/usr/local/bin/sweep-transcripts.sh"', 1))
+PYX
+run "the reaper goes back to a path inside the container" "no longer feeds the sweep in on stdin"
+
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"nothing to archive"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"nothing needs archiving"', 1))
+PYX
+run "the reaper classifies a quiet tick on words the sweep does not print" "which the sweep never prints"
+
+# A LIVE SESSION'S TRANSCRIPT, which the newest-32 floor stopped protecting the day the sweep gained
+# a timer. Four ways to lose it, each silent: the two ends naming the variable differently, the
+# sweep ignoring the list, the sweep ignoring recency, and the list going unread altogether.
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'KEEP_SESSIONS_VAR: &str = "JKB_KEEP_SESSIONS"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'KEEP_SESSIONS_VAR: &str = "JKB_LIVE_SESSIONS"', 1))
+PYX
+run "the reaper names the keep-list something the sweep does not read" "so a live session's transcript can be archived"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '        if (index(path, "/" id ".jsonl") > 0) return 1\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the sweep stops skipping the sessions it is told are live" "keep-list is data nothing acts on"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '    if (now > 0 && fresh > 0 && mtime > now - fresh) return 1\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the sweep stops sparing recently-written transcripts" "does not spare recently-written transcripts"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'KEEP_SESSIONS="${JKB_KEEP_SESSIONS:-}"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'KEEP_SESSIONS=""', 1))
+PYX
+run "the sweep stops reading the keep-list at all" "cannot be read from both transcripts.rs and sweep-transcripts.sh"
+
+# ...AND WHAT A LIVE SESSION WRITES BENEATH ITSELF, which is the bulk of the population and has no
+# registry row of its own: a Task-tool subagent opens no session.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '        if (index(path, "/" id "/") > 0) return 1\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "a live session stops protecting its own subagents' transcripts" "BENEATH its own directory"
+
+# ...and the two readers of that predicate drifting apart, which is a live transcript archived by a
+# sweep that reported itself unable to reclaim anything.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (protected($2, $1)) { tot += length($2); next }\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the irreducible measure stops asking what a live session holds" "transcript_irreducible() does not ask whether a file is protected"
+
+# ...AND THE PLAN'S HALF OF IT, which the loop above covers for one function and this covers for the
+# other. Only the irreducible arm had a mutation, so the guard that keeps a live transcript out of
+# the PLAN -- the one that actually prevents the move -- had never been watched failing.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (protected($2, $1)) next\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "the plan stops asking what a live session holds" "transcript_plan() does not ask whether a file is protected"
+
+# THE START TRIGGER FIRING WHEN SOMETHING IS OPEN. It carries no live-session list, so its whole
+# safety is that nothing is running when it fires.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '-e "JKB_KEEP_SESSIONS=$sweep_keep" '
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '', 1))
+PYX
+run "run.sh sweeps without telling the container which sessions are live" "sweeps without passing the live-session list"
+
+# ...AND THE DERIVATION BEHIND THE FLAG. Deleting the block that fills it leaves `-e
+# "JKB_KEEP_SESSIONS=$sweep_keep"` passing an empty string for ever, with the guard above reporting
+# a protection that no longer exists -- a one-line reversion to the unprotected state.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'jkb notify sessions --live-ids'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'true --no-sessions', 1))
+PYX
+run "run.sh stops asking jkb which sessions are live" "never asks jkb which sessions are live"
+
+# ...AND THE TWO EMPTY STATES. A sweep that ran with no protection must not read, in the scroll-back,
+# like one that had nothing to protect.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'could not ask jkb which sessions are live'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'no live sessions', 1))
+PYX
+run "run.sh stops saying when it could not read the registry" "does not say when it could not read the registry"
+
+# THE REAPER'S QUIET-TICK PHRASES going unread, the last extraction-read-nothing branch with no
+# mutation of its own.
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'const NOTHING_TO_DO'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'const QUIET_PHRASES', 1))
+PYX
+run "the reaper renames the phrases it calls a quiet tick by" "declares no NOTHING_TO_DO phrases"
+
+# A QUIET EXIT WITH NO MARKER. The reaper prints `Said` unconditionally, so a success path the sweep
+# adds without a phrase in NOTHING_TO_DO is one identical line every quarter of an hour for ever.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+# Anchored on sweep_transcripts's own last statement: a bare `    return 0` also appears inside the
+# AWK_PROTECTED string, which is not the shell function the guard counts.
+old = '        transcript_over_budget "$after" "remain after this sweep" || return 1'
+assert s.count(old) == 1, "mutation target absent"
+open(p, 'w').write(s.replace(old, old + '\n        [ -n "$abs" ] && return 0', 1))
+PYX
+run "the sweep gains a success exit with no phrase behind it" "success exits, pinned at 4"
+
+# ...AND THE VERIFY EXEC'S OWN KEEP LIST, which was round 11's must-fix and which nothing pinned:
+# deleting only that occurrence left every gate green.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/verify.sh'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh', 1))
+PYX
+run "verify.sh measures a different tree from the one the sweep acted on" "verify.sh is measured without the live-session list"
+
+seed; rm -f "$work/t/crates/jkb-cli/src/transcripts.rs"
+run "the reaper's container module is deleted" "nothing sweeps the container between starts"
+
+# THE PLAIN `bad` ARMS, which the accept_bad mutation above leaves standing because `accept_bad "`
+# contains `bad "` -- the substring the guard is now anchored against. All three, because a STATIC
+# guard cannot tell "this block reaches a bad verdict" from "this block reaches a bad verdict FOR
+# THE BUDGET": demoting two of the three leaves the third, and the grep is satisfied. What that
+# costs is written down in check-config.sh beside the loop, and the behavioural half -- that an
+# over-budget tree really produces exit 1 and an unreclaimable one exit 3 -- belongs in
+# mutate-verify.sh, which needs a container.
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+n = 0
+for old in ('bad "the transcript sweep could not answer',
+            'bad "the transcript deny list is over budget',
+            'bad "the transcript deny list was never measured',
+            'bad "there is no sweep-transcripts.sh beside this script'):
+    assert old in s, "mutation target absent"
+    s = s.replace(old, 'echo "  note: ' + old[5:], 1); n += 1
+assert n == 4, "mutation target absent"
+open(p, 'w').write(s)
+PYX
+run "verify.sh demotes its plain deny-list verdicts to notes" "reaches no \`bad\` verdict"
+
+# THE EMITTING HALF'S BOUNDARY, which is an extraction bounded by a literal and so fails by reading
+# EVERYTHING rather than nothing. Behaviour-preserving: the two tests simply swap.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'if [ "$#" -eq 1 ] && [ "${1:-}" = "--self-test" ]; then', 1))
+PYX
+run "the self-test dispatch is reworded, widening the emitting half to the whole file" "is no longer where the emitting half"
+
+# THE TWO "EXTRACTION READ NOTHING" BRANCHES that shipped with no mutation, which is what the
+# coverage line used to claim could not happen.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert '${JKB_' in s, "mutation target absent"
+open(p, 'w').write(s.replace('${JKB_', '${XKB_'))
+PYX
+run "the sweep stops reading any JKB_ override, so SEAMS cannot be checked" "it reads no \${JKB_"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert 'sweep_sh=' in s, "mutation target absent"
+open(p, 'w').write(s.replace('sweep_sh', 'sweeper_path'))
+PYX
+run "verify.sh renames the handle its deny-list block is read by" "has no deny-list block to read"
+
+# BOTH HALVES OF "NO SWEEP CAN FIX THIS". verify.sh decides exit 3 against exit 1 on that sentence,
+# which is the difference between a remedy that applies and three that do not (both codes refuse a
+# window; run.sh tests `-ne 0`),
+# and the floor half is the one that shipped unwatched: with it gone, the window the README says this
+# closed reports an unhelpable tree as a broken boundary and run.sh refuses to open a window.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (kept < keep)       { tot += length($2); kept++ } }'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '          }', 1))
+PYX
+run "the floor stops counting toward what no sweep can remove" "does not count the newest KEEP_NEWEST"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '          if (base == held)        { tot += length($2); next }'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '          if (base == held)  { next }', 1))
+PYX
+run "the held-back files stop counting toward what no sweep can remove" "does not count the held-back files toward what no sweep can remove"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'transcript_irreducible() {'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'irreducible_bytes() {', 1))
+PYX
+run "the irreducible measure is renamed, so the guard reads nothing" "no transcript_irreducible"
+
+# THE VERIFY LINE THE ORDERING IS MEASURED AGAINST. Reading nothing there used to make the ordering
+# test SKIP rather than fail -- the one extraction in this block that was not pinned against an
+# empty read, which is the failure mode this whole file exists to refuse.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'bash .container/verify.sh'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'bash .container/verify-renamed.sh', 1))
+PYX
+run "run.sh has no verify statement to order the sweep against" "no verify.sh statement to order it against"
+
+# ONE SPELLING OF THE CLAUDE CONFIG BASE, shared with commands.rs, auto-mode.sh and swarm-status.sh.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '${CLAUDE_CONFIG_DIR:-'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '${JKB_NOT_THE_CONFIG_DIR:-', 1))
+PYX
+run "the sweep spells the config base its own way" "does not honour CLAUDE_CONFIG_DIR"
+
+# ...AND THE SCRIPT SIMPLY ABSENT, which is a FAIL path check-config.sh has always had and nothing
+# watched: the composed assertion emits every condition through ONE `bad "`, so PINNED_BAD_SITES
+# moved by one when the whole block arrived and could not notice which branches had a mutation.
+# That is what PINNED_SWEEP_APPENDS is for, and why no count is written in prose here.
+seed; rm -f "$work/t/.container/sweep-transcripts.sh"
+run "the sweep script is deleted outright" "sweep-transcripts.sh is not there at all"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '-name memory -prune'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '-name memory-never-matches -prune', 1))
+PYX
+run "the sweep walks out through the memory symlink into ~/.jkb" "does not prune memory/"
+
+# ...AND THE EXTRACTION ITSELF, pinned against reading nothing. check-config.sh pulls the function
+# body out by name, and a rename would leave its four greps matching an empty string — which is
+# four `ok`s about a file nobody read, the exact shape this harness exists to refuse.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'transcript_records() {'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'enumerate_them() {', 1))
+PYX
+run "the enumeration is renamed, so the guard reads nothing" "no transcript_records"
+
+# THE WIRING, every part of it. Removing it is a container that fills up again; moving it after the
+# verify is the reap's own bug back — one failing assertion about something else and the sweep
+# never runs, which is how the deleted postStartCommand came to be unconditional; and dropping the
+# `|| true` makes one unarchivable file abort the start under run.sh's own `set -euo pipefail`.
+#
+# ANCHORED ON THE INVOCATION, NOT ON THE WHOLE LINE. These two used to carry `|| true` inside their
+# anchor strings, which made them the only watcher the non-fatality had: strip it from run.sh and
+# both reported `NO-OP the mutation changed nothing`, pointing at the mutation rather than at the
+# property, whose natural repair (relax the anchor) greens the gate. They now find the line by its
+# statement and take the whole line, so the third mutation below owns `|| true` alone.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+lines = s.split('\n')
+hit = [i for i, l in enumerate(lines) if 'bash .container/sweep-transcripts.sh' in l and not l.lstrip().startswith('#')]
+assert len(hit) == 1, "mutation target absent"
+del lines[hit[0]]
+open(p, 'w').write('\n'.join(lines))
+PYX
+run "run.sh stops sweeping transcripts" "run.sh does not invoke it"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+lines = s.split('\n')
+def only(needle):
+    hit = [i for i, l in enumerate(lines) if needle in l and not l.lstrip().startswith('#')]
+    assert len(hit) == 1, "mutation target absent"
+    return hit[0]
+sweep, verify = only('bash .container/sweep-transcripts.sh'), only('bash .container/verify.sh')
+assert sweep < verify, "mutation target absent"
+line = lines.pop(sweep)
+lines.insert(verify, line)
+open(p, 'w').write('\n'.join(lines))
+PYX
+run "the sweep moves after the verify, where a failing assertion disables it" "AFTER verify.sh"
+
+# ...AND THE `|| true` ON ITS OWN, the entirety of "never fatal". Nothing watched it: the two
+# mutations above happened to contain it, so its removal made THEM misreport and left the lost
+# property unnamed. run.sh is `set -euo pipefail`, and the sweep returns 1 on paths the script
+# itself documents, so one transcript that raced away aborts the start before verify.sh runs and
+# before the attach instructions the comment beside it exists to protect.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'bash .container/sweep-transcripts.sh || true'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'bash .container/sweep-transcripts.sh', 1))
+PYX
+run "the sweep invocation stops being non-fatal" "does not append \`|| true\` to it"
 
 # THE ENTRYPOINT LINE. One line in the Dockerfile is the whole of "the firewall is raised on every
 # start"; deleting it leaves both config harnesses green because run.sh raises it too, and breaks
@@ -1018,8 +1685,17 @@ run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 # cannot be fooled either, and it forces the decision at the moment an assertion is added.
 echo
 echo "==> coverage"
-bad_sites="$(grep -c 'bad "' "$repo/.container/check-config.sh")"
-PINNED_BAD_SITES=96
+# COUNTED OVER CODE, NOT COMMENTS, for the same reason PINNED_SWEEP_APPENDS is: check-config.sh's
+# prose quotes the idioms it is talking about, so a comment explaining this very scan moved the
+# count by one and demanded "a mutation for the new one" about a sentence.
+# OCCURRENCES, NOT LINES, for the reason written out beside PINNED_SWEEP_APPENDS below -- which was
+# rewritten for exactly this and left its neighbour counting lines in the same commit. Two failure
+# paths on one line (`grep -q A || bad "…"; grep -q B || bad "…"`, and this file already spells
+# compound `|| { bad "…"; gen_ok=0; }` forms) moved the pin by one, so one of the two shipped with no
+# mutation while the harness printed a coverage number over it.
+bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
+    | grep -o 'bad "' | grep -c .)"
+PINNED_BAD_SITES=97
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
@@ -1028,6 +1704,37 @@ if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
 else
     printf '  %s failure paths in check-config.sh, %s mutations, count pinned\n' \
         "$bad_sites" "${#EXPECTS[@]}"
+fi
+
+# THE COMPOSED ASSERTION'S OWN BRANCHES. The sweep guard appends to one variable and emits it through
+# a single `bad "`, so `bad_sites` moves by ONE however many conditions arrive -- and one of the
+# first batch shipped with no mutation, invisibly. Counting the branches forces the decision per branch, which is
+# the granularity the mutations are written at.
+#
+# EVERY OCCURRENCE OF THE VARIABLE, not `grep -c` on one assignment spelling. That counted LINES
+# matching `sweep_problems="$sweep_problems`, so a condition written `sweep_problems+=" ...;"` --
+# semantically identical, and the idiom check-config.sh itself uses elsewhere for accumulation --
+# left the count unmoved, left `bad_sites` unmoved (all branches emit through one `bad "`), and
+# shipped with no mutation: exactly the gap this pin exists to close. Two appends on one line
+# bypassed it the same way. `grep -o` counts occurrences, so any spelling of a new branch moves it.
+# COUNTED OVER CODE, NOT COMMENTS. The sweep guard's own prose names PINNED_SWEEP_APPENDS,
+# transcript_projection_fell, HELD_NAME and phys_archive by identifier, so a round that DOCUMENTS a
+# branch would otherwise move this count and print "Add a mutation for it" about a sentence.
+sweep_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
+    | grep -o 'sweep_problems' | grep -c .)"
+PINNED_SWEEP_APPENDS=111
+if [ "$sweep_appends" -ne "$PINNED_SWEEP_APPENDS" ]; then
+    fails=$((fails+1))
+    printf '  the sweep guard mentions sweep_problems %s time(s), pinned at %s.\n' "$sweep_appends" "$PINNED_SWEEP_APPENDS"
+    echo "  They all emit through one \`bad \"\`, so the failure-path count above cannot see a new one."
+    echo "  Add a mutation for it and update PINNED_SWEEP_APPENDS."
+else
+    # WHAT THE COUNT ESTABLISHES, AND NOT MORE. This said "each branch with a mutation", which the
+    # count cannot see -- it forces a new branch to be DECIDED about, not written for. Two branches
+    # had none when that line was printed, both of them "the extraction read nothing" guards this
+    # file says must be watched failing. Claiming more than was established, printed by the harness
+    # that exists to catch exactly that.
+    printf '  %s mentions of sweep_problems behind the sweep guard, count pinned so a new branch must be decided about\n' "$sweep_appends"
 fi
 
 echo

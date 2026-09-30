@@ -193,7 +193,7 @@ fn units_for_platform(db: &Path) -> Result<Vec<Unit>> {
                 REAP_LABEL,
                 home.join("Library/LaunchAgents")
                     .join(format!("{REAP_LABEL}.plist")),
-                launchd_reap_plist(&exe, &db),
+                launchd_reap_plist(&exe, &db, container_override().as_deref()),
             ),
             (
                 SERVE_LABEL,
@@ -213,7 +213,7 @@ fn units_for_platform(db: &Path) -> Result<Vec<Unit>> {
                 REAP_LABEL,
                 home.join(".config/systemd/user")
                     .join(format!("{REAP_LABEL}.service")),
-                systemd_reap_unit(&exe, &db),
+                systemd_reap_unit(&exe, &db, container_override().as_deref()),
             ),
             (
                 SERVE_LABEL,
@@ -301,7 +301,29 @@ fn systemd_unit(exe: &Path, db: &Path) -> String {
 /// `--watch` rather than launchd's own `StartInterval`, so the two platforms run the same code
 /// path: one long-lived process sweeping on a timer, restarted if it dies. A `StartInterval` job
 /// here and a systemd timer there would be two schedulers to reason about for one sweep.
-fn launchd_reap_plist(exe: &Path, db: &Path) -> String {
+/// The dev container's name to bake into the reaper's unit, when the operator has chosen one.
+///
+/// **A service does not inherit your shell.** `transcripts::dev_container_name()` honours
+/// `JKB_CONTAINER_NAME` so an operator who renames the container is still swept — but a launchd
+/// agent gets only what its `EnvironmentVariables` lists, and a `systemd --user` unit gets the user
+/// manager's environment, not a login shell's. So the override worked for `run.sh` and for the test
+/// fixture and never for the reaper, which went on resolving `jkb-dev`, finding nothing, and
+/// reporting that by saying nothing — the silently-dead trigger the name guard exists to prevent.
+/// Captured at install time, like the database path beside it; `setup.sh` reinstalls on every pull.
+fn container_override() -> Option<String> {
+    std::env::var(crate::transcripts::CONTAINER_NAME_VAR)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn launchd_reap_plist(exe: &Path, db: &Path, container: Option<&str>) -> String {
+    let container_env = container.map_or_else(String::new, |c| {
+        format!(
+            "\n        <key>{}</key>\n        <string>{}</string>",
+            crate::transcripts::CONTAINER_NAME_VAR,
+            xml_escape(c)
+        )
+    });
     let exe = xml_escape(&exe.to_string_lossy());
     let log_dir = db.parent().unwrap_or_else(|| Path::new("/tmp"));
     let log = xml_escape(&log_dir.join("reap.log").to_string_lossy());
@@ -326,6 +348,24 @@ fn launchd_reap_plist(exe: &Path, db: &Path) -> String {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- A PATH, because this job SHELLS OUT. Each tick asks Docker to sweep the dev container's
+         transcripts (crates/jkb-cli/src/transcripts.rs), and launchd gives an agent a minimal
+         default PATH that does not include where Docker Desktop installs its client. Without this
+         the second trigger is dead on exactly the machine this project is developed on, and the
+         only symptom is a container that fills up — which is the failure it exists to prevent.
+         /opt/homebrew/bin for Apple silicon, /usr/local/bin for Intel and for Docker Desktop's own
+         symlink.
+
+         THE SYSTEMD UNIT DELIBERATELY HAS NO EQUIVALENT, and the asymmetry is the point: there
+         `Environment=PATH=` REPLACES the inherited value, whose compiled default already carries
+         /usr/local/bin:/usr/bin:/bin — so it could not help and could subtract, taking `git` with
+         it on a host that had imported a richer PATH. Here the value is a superset of launchd's
+         own minimal default, so it can only add. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>{container_env}
+    </dict>
     <!-- The sweep archives a worktree and, a month later, deletes that archive. Both are things
          somebody may want to look up afterwards, and launchd sends a job's stdio to /dev/null
          unless told otherwise. -->
@@ -341,7 +381,16 @@ fn launchd_reap_plist(exe: &Path, db: &Path) -> String {
 
 /// A systemd **user** unit running the worktree reaper. See [`launchd_reap_plist`] for why this
 /// is a long-lived `--watch` process rather than a timer.
-fn systemd_reap_unit(exe: &Path, db: &Path) -> String {
+fn systemd_reap_unit(exe: &Path, db: &Path, container: Option<&str>) -> String {
+    // No blanket `Environment=PATH=` here — see the plist for why the two platforms differ — but a
+    // container name the operator chose has to reach the unit somehow, and systemd's Environment=
+    // adds a variable rather than replacing an inherited one.
+    let container_env = container.map_or_else(String::new, |c| {
+        format!(
+            "Environment={}={c}\n         ",
+            crate::transcripts::CONTAINER_NAME_VAR
+        )
+    });
     let exe = exe.to_string_lossy();
     let db = db.to_string_lossy();
     format!(
@@ -352,7 +401,7 @@ fn systemd_reap_unit(exe: &Path, db: &Path) -> String {
          [Service]\n\
          Type=simple\n\
          ExecStart={exe} --db {db} task reap --watch\n\
-         Restart=on-failure\n\
+         {container_env}Restart=on-failure\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n"
@@ -460,11 +509,31 @@ mod tests {
         let plist = launchd_reap_plist(
             Path::new("/usr/local/bin/jkb"),
             Path::new("/home/u/.jkb/jkb.db"),
+            None,
+        );
+        // ...AND WITH AN OPERATOR-CHOSEN NAME, the case dev_container_name's doc claims works and
+        // which did not: a launchd agent gets only what EnvironmentVariables lists, so the reaper
+        // resolved the compiled default for ever and reported the miss by printing nothing.
+        let named = launchd_reap_plist(
+            Path::new("/usr/local/bin/jkb"),
+            Path::new("/home/u/.jkb/jkb.db"),
+            Some("jkb-alt"),
+        );
+        assert!(
+            named.contains("<key>JKB_CONTAINER_NAME</key>") && named.contains("jkb-alt"),
+            "the reaper must sweep the container the operator actually named: {named}"
         );
         assert!(plist.contains(&format!("<string>{REAP_LABEL}</string>")));
         assert_ne!(REAP_LABEL, LABEL, "two jobs cannot share one launchd label");
         assert!(plist.contains("<string>task</string>"));
         assert!(plist.contains("<string>reap</string>"));
+        // Its tick shells out to `docker`, and launchd hands an agent a minimal PATH that omits
+        // where Docker Desktop installs its client — so the second transcript trigger would be
+        // dead on the machine this project is developed on, with no symptom but a full container.
+        assert!(
+            plist.contains("<key>EnvironmentVariables</key>") && plist.contains("/usr/local/bin"),
+            "the reaper must be able to find docker: {plist}"
+        );
         assert!(plist.contains("<key>KeepAlive</key>"));
         // Its own log: an archive made and an archive deleted are both worth looking up later,
         // and without these launchd sends the whole record to /dev/null.
@@ -489,9 +558,32 @@ mod tests {
 
     #[test]
     fn systemd_reap_unit_runs_the_reaper() {
-        let unit = systemd_reap_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
+        let unit = systemd_reap_unit(
+            Path::new("/usr/bin/jkb"),
+            Path::new("/home/u/.jkb/jkb.db"),
+            None,
+        );
+        let named = systemd_reap_unit(
+            Path::new("/usr/bin/jkb"),
+            Path::new("/home/u/.jkb/jkb.db"),
+            Some("jkb-alt"),
+        );
+        assert!(
+            named.contains("Environment=JKB_CONTAINER_NAME=jkb-alt"),
+            "the reaper must sweep the container the operator actually named: {named}"
+        );
         assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
+        // NO `Environment=PATH=` HERE, deliberately, and the launchd side is not the same case.
+        // systemd's `Environment=` REPLACES the inherited value rather than extending it, and its
+        // compiled default already carries /usr/local/bin:/usr/bin:/bin — so the line could never
+        // make `docker` reachable where it was not, and on a host that had imported a richer PATH
+        // (rootless Docker in ~/bin, a Nix profile) it SUBTRACTED: `docker` still missing, and
+        // `git` — which every worktree archive shells out to — missing as well.
+        assert!(
+            !unit.contains("Environment=PATH="),
+            "a replaced PATH can only subtract here: {unit}"
+        );
     }
 
     /// Pins the CALLER, not the seam. `atomic::write` has its own test, and it stays green

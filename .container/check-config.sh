@@ -33,6 +33,20 @@ command -v jq >/dev/null 2>&1 || { echo "   (skipped: jq not installed)"; exit 0
 # the harm the pin below is written against.
 dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 
+# THE LINE NUMBER OF A `bash .container/<script>` STATEMENT in run.sh, as opposed to the same name
+# appearing in a comment, a string or an array. DEFINED HERE, beside the other shared extractor,
+# because the regex had been written out three times and the copy that single-sourced two of them
+# was placed BELOW the third -- so the change that claimed to remove the duplication left it. The
+# harm is prospective and specific: run.sh's reap line already uses `bash -lc '…'`, and the day
+# verify.sh is invoked that way whoever widens the regex widens it at the site that went red and
+# leaves the other, at which point this file prints `ok run.sh invokes verify.sh` beside a FAIL
+# saying there is no verify.sh statement -- and the cheapest repair for the second is to delete the
+# ordering branch that keeps the sweep from being disabled by an unrelated assertion.
+dc_stmt_line() { # dc_stmt_line <stripped run.sh> <script basename regex> -> line number, or nothing
+    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/$2" \
+        <<<"$1" | sed -n '1s/^\([0-9]*\):.*/\1/p'
+}
+
 # NEVER PIPE A FILE-READER INTO `grep -q`, AND THIS IS NOT STYLE. `grep -q` exits at its FIRST
 # match by design, so a producer still writing gets EPIPE -- and under `set -o pipefail` (line 9)
 # that turns a SUCCESSFUL match into a FAILED pipeline. It is a race between how fast the producer
@@ -491,10 +505,494 @@ fi
 #
 # So: require a statement-level exec of it — the shape the firewall-argument guard below already
 # uses — and let mutate-config.sh delete only that line.
-if stripped_matches "$here/run.sh" '^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/verify\.sh'; then
+# THROUGH dc_stmt_line, which is now the ONLY spelling of "a `bash .container/<x>` statement in
+# run.sh" in this file. It answers this question and both of the sweep's below, so widening it for
+# one -- the day verify.sh is invoked as `bash -lc '…'`, the way the reap line already is -- widens
+# it for all three, instead of leaving this site green while the sweep's ordering branch goes red
+# and invites its own deletion as the cheaper repair.
+if [ -n "$(dc_stmt_line "$(dc_strip_comments "$here/run.sh")" 'verify\.sh')" ]; then
     ok "run.sh invokes verify.sh (a statement, not a mention of the name)"
 else
     bad "run.sh no longer runs verify.sh — nothing verifies the container, and the guard above says it does"
+fi
+
+# THE TRANSCRIPT SWEEP, and the properties of its enumeration that no runtime check can see.
+#
+# WHY IT IS GUARDED STATICALLY. The sweep runs on every container start and moves files out of
+# ~/.claude/projects. Every way of getting it wrong is SILENT in both directions: widen the name
+# filter and it archives the auto-memory the host also owns, through a symlink into the bind mount;
+# cap the depth and it sweeps the cheap half of the population (depth 2) while the agent
+# transcripts that are the bulk (depth 4 and 6) accumulate exactly as before, so the container
+# still dies at spawn with a sweep in the log saying it worked. Neither state raises anything at
+# run time. The self-test catches them — this is the half that catches them being edited out of
+# the file the self-test does not run against, and the half that compares a name against the
+# EXTERNAL harness that owns it, which no fixture of ours can do.
+#
+# ONE ASSERTION, composed message. They are one property — "the enumeration still enumerates the
+# right set" — and splitting them would be a failure path each where one names the subject. No
+# numeral is written here: the count is `PINNED_SWEEP_APPENDS` in mutate-config.sh, derived from
+# this block, and a numeral in prose is a second copy of it that goes stale on the next condition.
+# ANCHORED ON THE FUNCTION NAME, like the verify guard above is anchored on the invocation: the
+# body is extracted by name, so a mutation that edits the real `find` is seen and the self-test's
+# own `find` calls are not, and an extraction that reads nothing is a failure rather than a run of
+# vacuous passes.
+sweep_problems=""
+run_stripped="$(dc_strip_comments "$here/run.sh")"
+sweep_at="$(dc_stmt_line "$run_stripped" 'sweep-transcripts\.sh')"
+verify_at="$(dc_stmt_line "$run_stripped" 'verify\.sh')"
+if [ -z "$sweep_at" ]; then
+    sweep_problems="$sweep_problems run.sh does not invoke it (a statement, not a mention of the name);"
+elif [ -z "$verify_at" ]; then
+    # PINNED AGAINST READING NOTHING, like every other extraction here. This one was the exception:
+    # an unmatched verify line made the ordering test below `[ -n "$verify_at" ] && …`, i.e. skipped,
+    # so the property that the sweep runs BEFORE the verify would have gone quiet rather than red --
+    # and that property is the whole reason the sweep is not disabled by an unrelated assertion.
+    sweep_problems="$sweep_problems run.sh has no verify.sh statement to order it against, so the sweep-before-verify property cannot be established;"
+elif [ "$sweep_at" -gt "$verify_at" ]; then
+    sweep_problems="$sweep_problems run.sh runs it AFTER verify.sh (line $sweep_at vs $verify_at), so one failing assertion about something else disables it;"
+fi
+# `|| true` IS THE WHOLE OF "NEVER FATAL", and it was the one pinned property whose only watcher
+# was a mutation ANCHOR: both sweep mutations happened to carry the text inside their anchor
+# strings, so removing it from run.sh reported `NO-OP the mutation changed nothing`, pointing the
+# developer at the mutation rather than at the lost non-fatality -- whose natural repair (relax the
+# anchor) greens the gate. It vanishes altogether on a host with no jq or python3, where
+# mutate-config.sh exits early. run.sh is `set -euo pipefail`, and the sweep returns 1 on paths the
+# script itself documents (an unwritable archive, a file that raced away), so without this one
+# raced transcript aborts the start BEFORE verify.sh and before the attach instructions.
+if [ -n "$sweep_at" ] \
+   && ! grep -qE '\|\|[[:space:]]+true[[:space:]]*$' <<<"$(sed -n "${sweep_at}p" <<<"$run_stripped")"; then
+    sweep_problems="$sweep_problems run.sh does not append \`|| true\` to it, so under set -euo pipefail one file it could not archive aborts the start before verify.sh runs;"
+fi
+if [ ! -f "$here/sweep-transcripts.sh" ]; then
+    sweep_problems="$sweep_problems sweep-transcripts.sh is not there at all;"
+else
+    sweep_body="$(dc_strip_comments "$here/sweep-transcripts.sh")"
+    sweep_enum="$(awk '/^transcript_records\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+        <<<"$sweep_body")"
+    if [ -z "$sweep_enum" ]; then
+        sweep_problems="$sweep_problems it has no transcript_records() to read, so the checks below establish nothing;"
+    else
+        grep -qF -- 'find -L ' <<<"$sweep_enum" \
+            || sweep_problems="$sweep_problems it does not pass -L, so a symlinked root (which is how the container spells it) enumerates nothing;"
+        grep -qF -- '-maxdepth' <<<"$sweep_enum" \
+            && sweep_problems="$sweep_problems it caps the depth, which misses the nested agent transcripts that are the bulk of the population;"
+        grep -qF -- "-name '*.jsonl'" <<<"$sweep_enum" \
+            || sweep_problems="$sweep_problems it does not filter on *.jsonl, so auto-memory is in the plan;"
+        # NOTHING IS HELD BACK IN THE WALK. This function feeds the PROJECTION as well as the
+        # plan, and the projection is the sizing of the argv that overflows -- a path the sweep
+        # cannot reclaim costs the kernel exactly what one it can costs. The round that introduced
+        # the journal exclusion put it here, and the sweep then acted on 65,250 bytes of a real
+        # 96,612 and printed "nothing to archive" while every Bash call went on dying at spawn.
+        # The name is spared in transcript_plan; the walk counts everything.
+        grep -qF -- '! -name' <<<"$sweep_enum" \
+            && sweep_problems="$sweep_problems it holds a name back in the WALK, which feeds the projection as well as the plan, so bytes it can never reclaim are invisible to the budget;"
+        grep -qF -- '-name memory -prune' <<<"$sweep_enum" \
+            || sweep_problems="$sweep_problems it does not prune memory/, so under -L the walk follows that symlink out into the bind-mounted ~/.jkb;"
+        # THE SPARED NAME IS DERIVED, NOT SPELLED. Its authority is an EXTERNAL harness -- Claude
+        # Code's workflow runner -- and this repo has already been wrong about the name once (it
+        # believed `wf_*.json`; there are zero such files anywhere). Pinning the literal here would
+        # have kept every gate green through a rename: swarm-status.sh would break visibly and get
+        # fixed, and the sweep would go on archiving the run state oldest-first with this guard,
+        # the fixture and the mutation all still agreeing about a name nothing writes. So the name
+        # comes out of swarm-status.sh's discovery predicate -- the one reader that defines it --
+        # and an extraction that reads nothing is a failure rather than a vacuous pass, the same
+        # arrangement this file uses for DEFAULT_ADDR and the extension id.
+        # THROUGH dc_strip_comments, like every other extraction in this file. Read raw, the
+        # authority for the name the sweep must spare could be a sentence ABOUT the predicate
+        # rather than the predicate -- and swarm-status.sh has prose around that very line.
+        swarm_journal="$(grep -oE -- "-name [A-Za-z0-9_.-]+ -path '\*/subagents/workflows/wf_\*'" \
+            <<<"$(dc_strip_comments "$here/../scripts/swarm-status.sh" 2>/dev/null)" \
+            | sed -n '1s/^-name \([^ ]*\).*/\1/p')"
+        sweep_held="$(grep -oE '^HELD_NAME=[A-Za-z0-9_.-]+' <<<"$sweep_body" | sed -n '1s/^HELD_NAME=//p')"
+        if [ -z "$swarm_journal" ]; then
+            sweep_problems="$sweep_problems swarm-status.sh no longer discovers runs by \`-name <file> -path '*/subagents/workflows/wf_*'\`, so the name the sweep must spare cannot be read from the reader that defines it;"
+        elif [ "$sweep_held" != "$swarm_journal" ]; then
+            sweep_problems="$sweep_problems it spares HELD_NAME='$sweep_held' while swarm-status.sh finds runs by '$swarm_journal', so the sweep archives the harness's own run state oldest-first and every past run reads as \"no swarm run found\";"
+        fi
+        # Checked as a REFUSAL rather than as a comparison of the two default constants, so the
+        # JKB_TRANSCRIPT_ARCHIVE override cannot reach the state either.
+        grep -qF -- '"$phys_root"/*)' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it does not refuse an archive inside the root, where each sweep re-enumerates what the last one moved;"
+        # AND THE REFUSAL IS ON RESOLVED PATHS. It was a string-prefix test on the CALLER'S
+        # spelling while the walk is `-L`, so in the container -- where ~/.claude/projects is a
+        # symlink into the state volume -- an archive squarely inside the enumerated tree was not a
+        # prefix of the root as spelled and was accepted: the safety net was inoperative in the one
+        # deployment it was written for, and the .archive/.archive/ nesting reproduced at
+        # 530 -> 602 -> 674 deny bytes. `pwd -P` is what makes the two spellings comparable.
+        grep -qE -- 'phys_root=.*pwd -P' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it compares the caller's spellings rather than resolved paths, so under -L a symlinked root accepts an archive inside itself;"
+        # ...AND SO IS THE OTHER OPERAND, which the branch above does not establish. A comparison
+        # has two sides, and the round that fixed this pinned one of them: `phys_archive="$archive"`
+        # -- a plausible simplification, since the archive usually does not exist yet and plain
+        # `cd`+`pwd -P` cannot resolve a path that is not there -- left check-config.sh green and
+        # every mutation CAUGHT while re-admitting the nesting the branch above exists to refuse.
+        # Two branches because they are two edits with two repairs, and each carries its own
+        # mutation.
+        grep -qE -- 'phys_archive=.*transcript_resolve' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it does not resolve the ARCHIVE side of that comparison, so an archive that does not exist yet is compared as the caller spelled it;"
+        sweep_resolve="$(awk '/^transcript_resolve\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+            <<<"$sweep_body")"
+        if [ -z "$sweep_resolve" ]; then
+            sweep_problems="$sweep_problems it has no transcript_resolve() to read, so the branch above establishes nothing;"
+        else
+            grep -qF -- 'pwd -P' <<<"$sweep_resolve" \
+                || sweep_problems="$sweep_problems transcript_resolve() does not reach a physical path, so resolving the archive resolves nothing;"
+        fi
+        # `CLAUDE_BASE=.*CLAUDE_CONFIG_DIR`, not a bare mention of the variable anywhere in the
+        # file: the mention form was satisfied by the self-test's own `env -u CLAUDE_CONFIG_DIR`,
+        # so the mutation that renames the variable IN THE ASSIGNMENT went from CAUGHT to MISSED
+        # the moment a row was added that names it for an unrelated reason. What is being asserted
+        # is that the config base is DERIVED from it. Whether that derivation is spelled correctly
+        # is the self-test's, which runs the script with CLAUDE_CONFIG_DIR set and reads the root
+        # back out of the message.
+        # WHAT NO SWEEP CAN REMOVE IS BOTH HALVES. verify.sh decides exit 3 ("a condition to act on",
+        # with a remedy) against exit 1 ("a broken boundary", and run.sh refuses to open a window) on
+        # this one sentence, and the first version of it asked about the held set alone. The residual
+        # after a full plan is held PLUS the newest KEEP_NEWEST, which crosses the budget at roughly
+        # 161 run journals where a held-only test only speaks past about 199 -- and a container
+        # reaches the first on its way to the second. The self-test stages a budget between the two;
+        # this is the half that catches the term being edited out of the file it does not run against.
+        sweep_irr="$(awk '/^transcript_irreducible\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+            <<<"$sweep_body")"
+        if [ -z "$sweep_irr" ]; then
+            sweep_problems="$sweep_problems it has no transcript_irreducible() to read, so nothing establishes what the sweep calls beyond its own help;"
+        else
+            # RECOGNISED **AND** COUNTED, on one line each. Asking only that the arm exists passed a
+            # mutant whose held arm was `{ next }` -- it still recognised the set and contributed
+            # nothing, which is the whole defect in miniature.
+            grep -qE -- 'base == held.*tot \+= length' <<<"$sweep_irr" \
+                || sweep_problems="$sweep_problems transcript_irreducible() does not count the held-back files toward what no sweep can remove, so a tree the run journals alone put beyond help is reported as a broken boundary;"
+            grep -qE -- 'kept < keep.*tot \+= length' <<<"$sweep_irr" \
+                || sweep_problems="$sweep_problems transcript_irreducible() does not count the newest KEEP_NEWEST the floor protects, so the window where the floor is what puts a tree beyond help is reported as a broken boundary;"
+        fi
+        # MATCHED ON THE SESSION DIRECTORY, not the leaf name. A session writes <slug>/<uuid>.jsonl
+        # and everything under <slug>/<uuid>/subagents/…, and those nested agent transcripts are
+        # the BULK of the population: matching only the basename protected the first and left the
+        # majority to the recency window alone. The registry has no row for a Task-tool subagent,
+        # so nothing else can cover them.
+        grep -qF -- 'index(path, "/" id "/")' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems the sweep does not spare what a live session writes BENEATH its own directory, which is the bulk of the population and has no registry row of its own;"
+        grep -qF -- 'index(path, "/" id ".jsonl")' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems the sweep does not skip the sessions it is told are live, so the reaper's keep-list is data nothing acts on;"
+        grep -qF -- 'mtime > now - fresh' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems the sweep does not spare recently-written transcripts, so a live session the registry cannot see is archived out from under it;"
+        # ...AND BOTH READERS ASK THE SAME QUESTION. transcript_plan must not plan a protected file
+        # and transcript_irreducible must count one; the day they disagree is the day a sweep
+        # archives a live transcript while reporting itself unable to reclaim anything.
+        # SUBSTITUTED, NOT PIPED, and every other check in this file is a here-string for the same
+        # reason: `producer | grep -q` is a defect this repository has shipped before. `grep -q`
+        # exits at its FIRST match, the producer dies on the unwritten tail, and under `pipefail`
+        # the pipeline reports the status of the producer -- so a check that FOUND what it wanted
+        # fails. Latent by size rather than wrong-by-construction: these function bodies fit the
+        # 64KB pipe buffer today, so awk finishes before grep leaves and this passed every run,
+        # which is exactly what makes it worth removing rather than watching.
+        for dc_fn in transcript_plan transcript_irreducible; do
+            dc_body="$(awk -v f="$dc_fn" '$0 ~ "^" f "\\(\\)" { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+                <<<"$sweep_body")"
+            grep -qF -- 'protected($2, $1)' <<<"$dc_body" \
+                || sweep_problems="$sweep_problems $dc_fn() does not ask whether a file is protected, so the plan and the irreducible measure no longer agree about what a live session holds;"
+        done
+        # THE POST-CONDITION'S CALL SITE. Its comparison is watched by the self-test, which drives
+        # transcript_projection_fell from literals -- but the self-test cannot see the call being
+        # deleted, because the state it guards (files moved, deny list no smaller) is refused
+        # upstream and so never arises in the fixture. A helper nothing calls is a helper that
+        # passes its own tests for ever.
+        grep -qF -- 'transcript_projection_fell "$moved"' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it never asks whether the projection actually fell, so a sweep that moved files and shrank nothing exits 0;"
+        # A FILE THAT VANISHED BETWEEN THE PLAN AND THE MOVE IS NOT A FAILURE. Pinned here and
+        # nowhere else, and said plainly: no executable test in this repository reaches that state,
+        # because it needs a file to disappear between two statements of one function. A live
+        # session, Claude Code's own cleanupPeriodDays retention or a second run.sh all produce it,
+        # and counting it made a healthy start print "N file(s) could not be archived" with no
+        # cause. A static pin is the only watcher available, so it is the one that is here.
+        grep -qF -- '[ -e "$f" ] || continue' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it counts a transcript that vanished between the plan and the move as a failure, which a live session produces routinely;"
+        # THE SEAMS ARE FOR THE SELF-TEST, NOT FOR THE CONTAINER. Each exists so --self-test can run
+        # the file as a PROGRAM against a tree it can build in a temp dir, and each can switch the
+        # sweep off from a shipped file: a root that does not exist ("does not exist — nothing to
+        # sweep", rc 0), an archive somewhere harmless, or a budget nothing reaches. Every one of
+        # them then produces a start that reports success for ever while the deny list grows to the
+        # E2BIG this script exists to end.
+        #
+        # READ FROM THE FILE THAT DEFINES THEM, not spelled here. The version that shipped named ONE
+        # of the three, so the other two were refused by nothing while this guard's comment claimed
+        # the property -- and the seam list was by then written in three places with three different
+        # contents. An extraction that reads nothing is a failure, as everywhere else in this file.
+        # STRIPPED OF COMMENTS BEFORE MATCHING, because a comment cannot set a variable: this file's
+        # own habit is to name the identifier under discussion, so a line like "# nothing here sets
+        # JKB_DENY_BUDGET_BYTES" above run.sh's invocation would otherwise redden the gate with a
+        # false accusation whose natural repair is to delete the explanation.
+        sweep_seams="$(grep -oE '^SEAMS="[^"]*"' <<<"$sweep_body" | sed -n '1s/^SEAMS="\(.*\)"/\1/p')"
+        # AND IT MUST EQUAL WHAT THE SCRIPT ACTUALLY READS. SEAMS is hand-written; the overrides are
+        # `${JKB_…:-}` expansions. They agree today, by hand. A fourth one -- `KEEP_NEWEST=
+        # "${JKB_KEEP_NEWEST:-32}"` is the obvious next -- added without touching SEAMS would be
+        # refused in no shipped file, move no pin and make no mutation MISSED, while this guard went
+        # on reporting the whole property. Derived and compared, the way HELD_NAME already is
+        # against swarm-status.sh.
+        # EVERY INPUT, not only the refusable seams. JKB_KEEP_SESSIONS is production input that
+        # both triggers pass, so it belongs to the agreement check and not to the blanket refusal.
+        sweep_inputs="$(grep -oE '^INPUTS="[^"]*"' <<<"$sweep_body" \
+            | sed -n '1s/^INPUTS="\(.*\)"/\1/p')"
+        sweep_inputs="${sweep_inputs//\$SEAMS/$sweep_seams}"
+        sweep_reads="$(grep -oE '\$\{JKB_[A-Z_]+:-' <<<"$sweep_body" \
+            | sed -E 's/^\$\{([A-Z_]+):-$/\1/' | LC_ALL=C sort -u | tr '\n' ' ')"
+        sweep_declared="$(printf '%s\n' $sweep_inputs | LC_ALL=C sort -u | tr '\n' ' ')"
+        if [ -z "$sweep_reads" ]; then
+            sweep_problems="$sweep_problems it reads no \${JKB_…:-} override at all, so the SEAMS declaration can no longer be checked against the code;"
+        elif [ "$sweep_reads" != "$sweep_declared" ]; then
+            sweep_problems="$sweep_problems INPUTS declares [$sweep_declared] while the script reads [$sweep_reads], so an input is covered by neither the shipped-file refusal nor the self-test neutralisation while this guard reports the whole property;"
+        fi
+        if [ -z "$sweep_seams" ]; then
+            sweep_problems="$sweep_problems it has no SEAMS= line to read, so the check that no shipped file wires a self-test seam into the container establishes nothing;"
+        else
+            # EVERY SHIPPED FILE, DERIVED, not a list retyped once a round. The list named four and
+            # missed verify.sh -- which the same change had just made a CALLER of the sweep, and
+            # which runs INSIDE the container, where a seam takes effect immediately (in run.sh it
+            # would not: `in_container` is plain `docker exec` with no `-e`, so a `VAR=… in_container`
+            # prefix sets it for the docker CLI and never reaches the container). So the one file
+            # where the harm was real was the one not scanned. The two harnesses are excluded
+            # because guarding a name means writing it, and sweep-transcripts.sh because declaring
+            # a seam means naming it.
+            for dc_f_path in "$here"/*.sh "$here"/Dockerfile "$here"/container.json; do
+                [ -f "$dc_f_path" ] || continue
+                dc_f="${dc_f_path##*/}"
+                # mutate-verify.sh joins the two harnesses: the record designates it for closing
+                # the behavioural half of the verify gap, which means staging a budget in it, and
+                # refusing that with "it silently disables the sweep" is false about that file.
+                case "$dc_f" in sweep-transcripts.sh|check-config.sh|mutate-config.sh|mutate-verify.sh) continue ;; esac
+                dc_f_body="$(dc_strip_comments "$dc_f_path")"
+                for dc_seam in $sweep_seams; do
+                    grep -qF -- "$dc_seam" <<<"$dc_f_body" \
+                        && sweep_problems="$sweep_problems $dc_f sets $dc_seam, which is a self-test seam: in the container it silently disables the sweep while every start still reports success;"
+                done
+            done
+        fi
+        grep -qE -- 'CLAUDE_BASE=.*CLAUDE_CONFIG_DIR' <<<"$sweep_body" \
+            || sweep_problems="$sweep_problems it does not honour CLAUDE_CONFIG_DIR, which commands.rs, auto-mode.sh and swarm-status.sh all do, so a second config dir sweeps an absent tree and reports success;"
+    fi
+fi
+# THE HOST REAPER POKES THIS CONTAINER, and three names have to agree for that to reach anything.
+# run.sh sweeps at container START and that is the only trigger it had, while transcripts are created
+# continuously -- the container that produced the E2BIG reached 1,182 of them without ever being
+# recreated. `jkb task reap --watch` on the host now sweeps it on every tick
+# (crates/jkb-cli/src/transcripts.rs), which it can only do through Docker: ~/.claude-state is a
+# named VOLUME with no host path, and the reaper knows a database, not a checkout.
+#
+# EVERY ONE OF THESE IS READ FROM THE FILE THAT OWNS IT. A reaper poking a container name nothing
+# creates, or running a path the image does not carry, is silent for ever -- which is the same
+# failure as having no second trigger at all, wearing a green log.
+if [ ! -f "$here/../crates/jkb-cli/src/transcripts.rs" ]; then
+    sweep_problems="$sweep_problems crates/jkb-cli/src/transcripts.rs is gone, so nothing sweeps the container between starts;"
+else
+    ctr_rs="$(dc_strip_comments "$here/../crates/jkb-cli/src/transcripts.rs")"
+    rs_ctr_name="$(grep -oE 'DEV_CONTAINER_NAME: &str = "[^"]+"' <<<"$ctr_rs" \
+        | sed -n '1s/.*"\(.*\)"/\1/p')"
+    sh_ctr_name="$(grep -oE '^NAME="\$\{JKB_CONTAINER_NAME:-[^}]+\}"' <<<"$run_stripped" \
+        | sed -n '1s/.*:-\(.*\)}"/\1/p')"
+    # A LIVE SESSION IS NEVER PLANNED, and the two halves of that live in two languages. The
+    # floor's argument -- "the live session is writing one of them right now" -- was written for
+    # a sweep that ran at container START, when nothing is open; on the reaper's timer it runs
+    # mid-flight, and during a swarm more than KEEP_NEWEST transcripts are touched inside one
+    # window. So the reaper passes the ids the registry calls live and the sweep skips them,
+    # with a recency window behind it for sessions the registry cannot see. A variable name
+    # spelled differently at the two ends protects nothing while both files read correct.
+    rs_keep_var="$(grep -oE 'KEEP_SESSIONS_VAR: &str = "[^"]+"' <<<"$ctr_rs" \
+        | sed -n '1s/.*"\(.*\)"/\1/p')"
+    sh_keep_var="$(grep -oE '^KEEP_SESSIONS="\$\{[A-Z_]+:-' <<<"$sweep_body" \
+        | sed -n '1s/^KEEP_SESSIONS="\${\([A-Z_]*\):-/\1/p')"
+    if [ -z "$rs_keep_var" ] || [ -z "$sh_keep_var" ]; then
+        sweep_problems="$sweep_problems the never-archive list's variable cannot be read from both transcripts.rs and sweep-transcripts.sh, so nothing holds the reaper's keep-list to the one the sweep reads;"
+    elif [ "$rs_keep_var" != "$sh_keep_var" ]; then
+        sweep_problems="$sweep_problems the reaper sets '$rs_keep_var' while the sweep reads '$sh_keep_var', so a live session's transcript can be archived out from under it;"
+    fi
+    if [ -z "$rs_ctr_name" ] || [ -z "$sh_ctr_name" ]; then
+        sweep_problems="$sweep_problems the container name cannot be read from both run.sh and transcripts.rs, so nothing holds the reaper to the container run.sh creates;"
+    elif [ "$rs_ctr_name" != "$sh_ctr_name" ]; then
+        sweep_problems="$sweep_problems the reaper pokes '$rs_ctr_name' while run.sh creates '$sh_ctr_name', so the only trigger between container starts reaches nothing and says nothing;"
+    fi
+    # THE SWEEP ITSELF IS EMBEDDED, not installed, and this is what holds that. The version this
+    # replaced baked a copy into the image and exec'd it by path -- which no ALREADY-RUNNING
+    # container has, since only a rebuilt image carries it and nothing forces a rebuild: the tick
+    # would have exited 127 on every live container, been reported once into reap.log and deduped
+    # for ever, with every gate green. `include_str!` leaves no second copy to drift, no rebuild to
+    # require and no path to agree about, so the guard that compared two paths is gone with them.
+    grep -qF -- 'include_str!("../../../.container/sweep-transcripts.sh")' <<<"$ctr_rs" \
+        || sweep_problems="$sweep_problems the reaper no longer embeds the sweep, so it runs something other than the script this repository tests;"
+    grep -qF -- '"exec", "-i", "-e", &keep, name, "bash", "-s"' <<<"$ctr_rs" \
+        || sweep_problems="$sweep_problems the reaper no longer feeds the sweep in on stdin, so it depends on a copy inside the container that an already-running one does not have;"
+fi
+
+# ...AND IT CARRIES THE LIVE-SESSION LIST. Without it this trigger's only safety is "nothing is open
+# at container start", which is false whenever `run.sh` is pointed at a container that is ALREADY
+# running — up for days, or started from Docker Desktop. Skipping the sweep there was the first
+# repair and it was worse: the container was then swept by nothing on that path, the window stayed
+# refused, and re-running `run.sh` — the documented recovery for the very E2BIG this exists to
+# prevent — stopped recovering. So the list is passed instead, from the same registry the reaper
+# reads. `-e` and not a shell prefix: `in_container` is a plain `docker exec`, so a `VAR=… ` prefix
+# sets the variable for the docker CLI and never enters the container.
+if [ -n "$sweep_at" ]; then
+    grep -qF -- '-e "JKB_KEEP_SESSIONS=' <<<"$(sed -n "${sweep_at}p" <<<"$run_stripped")" \
+        || sweep_problems="$sweep_problems run.sh sweeps without passing the live-session list, so on a container that was already running a live transcript can be archived out from under its session;"
+    # ...AND THE LIST IS ACTUALLY DERIVED. The flag alone pins nothing that matters: delete the
+    # lines that fill `sweep_keep` and `-e "JKB_KEEP_SESSIONS=$sweep_keep"` still passes an empty
+    # string for ever, with this guard reporting the protection it no longer has. Reproduced: the
+    # composed assertion stayed `ok` and check-config's output was byte-identical to the unmutated
+    # tree's.
+    #
+    # PINNED ON THE VERB, not on a JSON field. This used to read `--json` and pull `.[].session` out
+    # with `jq`, so the guard had to hold that field name to `ClaudeSession`'s serde name — a
+    # coupling that existed only because the rule was implemented twice. `--live-ids` applies the one
+    # rule in crates/jkb-cli/src/transcripts.rs and prints one id per line, so there is no field to
+    # agree about and nothing here to keep in step.
+    grep -qF -- 'jkb notify sessions --live-ids' <<<"$run_stripped" \
+        || sweep_problems="$sweep_problems run.sh never asks jkb which sessions are live, so the list it passes is empty on every start and the protection exists in name only;"
+    # ...AND verify.sh MEASURES THE SAME TREE. It reports the budget by running the sweep's own
+    # --dry-run, so without the ids it measures a DIFFERENT tree from the one the sweep just acted
+    # on: a container held down by live sessions comes out `over` (exit 1) rather than `beyond`
+    # (exit 3), with a FAIL naming causes that do not apply. That was a must-fix, and nothing pinned
+    # it — deleting only that occurrence left every gate green.
+    if [ -n "$verify_at" ]; then
+        grep -qF -- '-e "JKB_KEEP_SESSIONS=' <<<"$(sed -n "${verify_at}p" <<<"$run_stripped")" \
+            || sweep_problems="$sweep_problems verify.sh is measured without the live-session list, so it judges a different tree from the one the sweep acted on and names causes that cannot apply;"
+    fi
+    # ...AND THE TWO EMPTY STATES ARE TOLD APART. "no live sessions" and "could not ask the daemon"
+    # both produce an empty list, and a sweep that ran UNPROTECTED must not look in the scroll-back
+    # like one that had nothing to protect.
+    grep -qF -- 'could not ask jkb which sessions are live' <<<"$run_stripped" \
+        || sweep_problems="$sweep_problems run.sh does not say when it could not read the registry, so a sweep that ran with no live-session protection is indistinguishable from one with nothing to protect;"
+fi
+
+# AND THE OPERATOR IS TOLD. run.sh discards the sweep's exit code with `|| true` -- correctly, since
+# a deny list slightly too long must not abort a start -- so the one state in which NO Bash tool call
+# works was reported only by a line that scrolled past several steps before the verify the operator
+# actually reads. verify.sh now asks, by running the sweep's own `--dry-run` (which moves nothing and
+# returns non-zero when the tree as it stands is over budget) rather than re-deriving the
+# budget a second time.
+if [ ! -f "$here/verify.sh" ]; then
+    sweep_problems="$sweep_problems verify.sh is not there to report the deny list at all;"
+else
+    verify_body="$(dc_strip_comments "$here/verify.sh")"
+    { grep -qE -- 'sweep_sh=.*sweep-transcripts\.sh' <<<"$verify_body" \
+      && grep -qF -- 'bash "$sweep_sh" --dry-run' <<<"$verify_body"; } \
+        || sweep_problems="$sweep_problems verify.sh does not ask whether the deny list still fits in one argv, so the container's health report reads green in the one state where no Bash call works at all;"
+    # ...AND REACHES A VERDICT WITH IT. Asking only that the sweep is CALLED let every arm be
+    # deleted -- or, more realistically, demoted to a `note` by a refactor -- with this guard still
+    # printing ok about a verify.sh that now says nothing. `accept_bad` specifically, because exit 3
+    # against exit 1 is the fact run.sh reads to decide whether to open a window.
+    # Anchored on the CODE, not on the comment heading above it: `$verify_body` is comment-stripped,
+    # so a heading is not there to find. From the `sweep_sh=` assignment to the block's closing `fi`
+    # at column 0 -- the inner arms are indented, so they cannot end the extraction early.
+    verify_verdict="$(awk '/sweep_sh=/ { inf = 1 } inf { print } inf && /^fi$/ { exit }' \
+        <<<"$verify_body")"
+    if [ -z "$verify_verdict" ]; then
+        sweep_problems="$sweep_problems verify.sh has no deny-list block to read, so the check above establishes only that the name appears;"
+    else
+        # The quote is appended rather than written into the list, so these NEEDLES are not counted
+        # by mutate-config.sh's `grep -c 'bad "'` scan over this file -- that scan counts this
+        # file's own FAILURE PATHS, and a string being searched for is not one. Left inline, the
+        # loop moved PINNED_BAD_SITES by one and demanded a mutation for a pattern.
+        # AND THE PHRASES IT CLASSIFIES ON MUST BE PHRASES THE SWEEP SAYS. verify.sh decides between
+        # "over budget", "beyond any sweep's help" and "could not answer" by matching the sweep's own
+        # wording -- two literals, living in two files, with nothing comparing them. Reword one and
+        # verify silently reclassifies every future container: an over-budget tree becomes "the sweep
+        # could not answer", or an unhelpable one becomes a broken boundary that refuses to open a
+        # window. Derived rather than spelled here: every `*"…"*` pattern in that block must be text
+        # the sweep actually emits.
+        # BOTH WAYS IT BORROWS A PHRASE: a `*"…"*` case pattern, and a `grep -F '…'` that pulls a
+        # line out of the sweep's output to quote back to the operator. The second arrived when the
+        # accepted arm stopped keeping its own copy of the causes, and it is the same coupling — a
+        # sentence living in two files with nothing comparing them.
+        # FROM THE VERDICT FUNCTION AND THE REPORTING BLOCK BOTH. The classifying `case` arms moved
+        # into `sweep_verdict()` when that chain was made pure and testable, and this extraction
+        # went on reading only the reporting block — where there were then no `*"…"*` patterns
+        # left, so the check established nothing and two mutations went MISSED. Extracted by
+        # FUNCTION NAME, like the sweep's own, so it follows the code rather than a line range.
+        verify_decide="$(awk '/^sweep_verdict\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+            <<<"$verify_body")"
+        if [ -z "$verify_decide" ]; then
+            sweep_problems="$sweep_problems verify.sh has no sweep_verdict() to read, so nothing establishes which outcome of the sweep reaches which verdict;"
+        fi
+        verify_markers="$(
+            { grep -oE '\*"[^"]+"\*' <<<"$verify_decide$verify_verdict" | sed -E 's/^\*"(.*)"\*$/\1/'
+              grep -oE "grep -F '[^']+'" <<<"$verify_verdict" | sed -E "s/^grep -F '(.*)'\$/\1/"
+            } )"
+        if [ -z "$verify_markers" ]; then
+            sweep_problems="$sweep_problems verify.sh's deny-list block classifies on no phrase at all, so every outcome of the sweep reaches the same verdict;"
+        else
+            # MATCHED AGAINST WHAT THE SWEEP CAN PRINT, which is everything ABOVE its --self-test
+            # block. Matched against the whole file, the self-test's own `grep -c '<phrase>'` rows
+            # satisfy the check: rewording the real printf then left this guard green, because the
+            # phrase was still in the file -- inside the suite that greps for it. Measured; the
+            # mutation reported MISSED until this line existed.
+            # PINNED AGAINST READING EVERYTHING, which is the failure mode an extraction bounded by
+            # a literal has -- the mirror of the empty-read every other extraction here is pinned
+            # against. Swap the two tests on that dispatch line (`[ "$#" -eq 1 ] && [ "${1:-}" = …`,
+            # identical behaviour) and the address stops matching, `q` never fires, and this silently
+            # becomes the whole file again: the state in which the self-test's own `grep -c '<phrase>'`
+            # rows satisfy the marker check and rewording the real printf passes.
+            sweep_emit="$(sed -n '/^if \[ "\${1:-}" = "--self-test" \]/q;p' <<<"$sweep_body")"
+            if [ "$(grep -c . <<<"$sweep_emit")" -ge "$(grep -c . <<<"$sweep_body")" ]; then
+                sweep_problems="$sweep_problems the --self-test dispatch line is no longer where the emitting half of sweep-transcripts.sh ends, so the check below reads the self-test's own grep patterns as things the sweep prints;"
+                sweep_emit=""
+            fi
+            while IFS= read -r dc_marker; do
+                [ -n "$dc_marker" ] || continue
+                grep -qF -- "$dc_marker" <<<"$sweep_emit" \
+                    || sweep_problems="$sweep_problems verify.sh classifies on \"$dc_marker\", which sweep-transcripts.sh never prints, so that verdict is unreachable and its cases fall to another;"
+            done <<<"$verify_markers"
+        fi
+        # ANCHORED, because `accept_bad "` CONTAINS `bad "`. Unanchored, the accept_bad arm alone
+        # satisfied the `bad` iteration, so both plain `bad` arms could be demoted to notes -- the
+        # exact drift this loop was written against -- with the gate still printing 70/70 and the
+        # single mutation here (which demotes accept_bad) still caught by the survivors. A guard
+        # whose three checks were really two, in the round that added it to make three.
+        #
+        # WHAT THIS STILL CANNOT SEE, said plainly: it establishes that the block reaches each KIND
+        # of verdict, never that the BUDGET arms are the ones reaching them. Demote two of the three
+        # plain `bad` calls and the third satisfies the grep. A static read cannot do better; the
+        # behavioural half -- an over-budget tree really exiting 1 and an unreclaimable one really
+        # exiting 3, which is what run.sh reads to decide whether to open a window -- needs a
+        # container, so it belongs in mutate-verify.sh and is not covered here.
+        # The quote is appended rather than written into the pattern, so these NEEDLES are not
+        # counted by mutate-config.sh's scan for this file's own failure paths.
+        # THE REAPER'S CLASSIFIERS TOO. transcripts.rs decides "nothing happened" from the sweep's
+        # stdout, on phrases living in two files -- the same coupling this block already holds
+        # verify.sh to, and the same silent reclassification if one end is reworded.
+        # FROM THE WHOLE DECLARATION, which spans lines once it has a comment in it — it did not
+        # when this was written, and the day a third phrase arrived the extraction read a line with
+        # no quoted strings on it and reported that the reaper declares none.
+        ctr_markers="$(awk '/^const NOTHING_TO_DO/ { inf = 1 } inf { print } inf && /\];/ { exit }' \
+            <<<"$ctr_rs" | grep -oE '"[^"]+"' | tr -d '"')"
+        # ...AND THE OTHER DIRECTION. The phrases above are the reaper's list of what counts as a
+        # quiet tick; the sweep is where quiet exits are ADDED. A fourth one with no marker is one
+        # identical log line every quarter of an hour for ever, which is the noise the dedup exists
+        # to prevent, on the one path it does not cover. Counting them forces the decision.
+        sweep_quiet="$(awk '/^sweep_transcripts\(\)/ { inf = 1 } inf { print } inf && /^\}/ { exit }' \
+            <<<"$sweep_body" | grep -c 'return 0')"
+        if [ "$sweep_quiet" -ne 4 ]; then
+            sweep_problems="$sweep_problems sweep_transcripts() has $sweep_quiet success exits, pinned at 4 — a new one needs a phrase in transcripts.rs NOTHING_TO_DO or the reaper logs it every tick for ever;"
+        fi
+        if [ -z "$ctr_markers" ]; then
+            sweep_problems="$sweep_problems transcripts.rs declares no NOTHING_TO_DO phrases, so every tick reads as something happening;"
+        else
+            while IFS= read -r dc_marker; do
+                [ -n "$dc_marker" ] || continue
+                grep -qF -- "$dc_marker" <<<"$sweep_emit" \
+                    || sweep_problems="$sweep_problems transcripts.rs treats \"$dc_marker\" as the sweep having nothing to do, which the sweep never prints, so a quiet tick is logged as an event;"
+            done <<<"$ctr_markers"
+        fi
+        dc_q='"'
+        for dc_verdict in ok bad accept_bad; do
+            grep -qE -- "(^|[[:space:]])$dc_verdict $dc_q" <<<"$verify_verdict" \
+                || sweep_problems="$sweep_problems verify.sh's deny-list block reaches no \`$dc_verdict\` verdict, so it runs the sweep and reports nothing a caller can act on;"
+        done
+    fi
+fi
+
+if [ -z "$sweep_problems" ]; then
+    ok "run.sh sweeps transcripts before verifying, the sweep enumerates only transcripts at every depth, and verify.sh reports the budget"
+else
+    bad "the transcript sweep does not hold:$sweep_problems — see .container/sweep-transcripts.sh"
 fi
 
 # ...AND THE IDIOM THAT MADE THAT GUARD LIE is refused for the whole repository, in

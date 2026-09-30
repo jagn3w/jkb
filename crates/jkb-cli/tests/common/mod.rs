@@ -201,8 +201,31 @@ pub fn isolate_remote_env(cmd: &mut Command) {
     }
 }
 
-/// [`assert_isolated`] for a fixture that runs `jkb`: the git isolation plus remote mode's variables,
-/// spelled out here as the oracle rather than read from [`REMOTE_MUST_DROP`].
+/// The dev container a `jkb` under test may NEVER reach.
+///
+/// `task reap --watch` sweeps the dev container's transcripts on every tick, and this crate spawns
+/// that loop as a real child with the developer's own environment — so without this, `cargo test`
+/// `docker exec`'d into the running `jkb-dev` and archived real transcripts out of
+/// `~/.claude-state`. A name nothing can create makes the probe list no such container, which the
+/// sweep classifies as "nothing here to sweep".
+///
+/// **Here rather than in each fixture.** It was added to one of this crate's two `jkb` builders and
+/// the shared oracle did not check it, so half the surface was unguarded while the guard test read
+/// green — the rule-every-call-site-must-remember shape. Both builders call this; so does
+/// [`assert_jkb_isolated`], which asserts it.
+#[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
+pub const NO_REAL_CONTAINER: (&str, &str) = ("JKB_CONTAINER_NAME", "jkb-test-no-such-container");
+
+/// Point a `jkb` under test at a container that cannot exist. Call from every fixture that builds
+/// one; [`assert_jkb_isolated`] is what makes forgetting visible.
+#[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
+pub fn isolate_container_env(cmd: &mut Command) {
+    cmd.env(NO_REAL_CONTAINER.0, NO_REAL_CONTAINER.1);
+}
+
+/// [`assert_isolated`] for a fixture that runs `jkb`: the git isolation, remote mode's variables
+/// (spelled out here as the oracle rather than read from [`REMOTE_MUST_DROP`]), and that it cannot
+/// reach a real dev container.
 #[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
 pub fn assert_jkb_isolated(what: &str, cmd: &Command) {
     assert_isolated_dropping(
@@ -214,6 +237,19 @@ pub fn assert_jkb_isolated(what: &str, cmd: &Command) {
             "JKB_AGENT_TOKEN",
             "JKB_ATTEST",
         ],
+    );
+    // ...AND THAT IT CANNOT REACH A REAL CONTAINER. Asserted in the oracle both fixtures already
+    // run, so a third fixture cannot arrive without it.
+    let got = cmd
+        .get_envs()
+        .find(|(k, _)| k.to_string_lossy() == NO_REAL_CONTAINER.0)
+        .and_then(|(_, v)| v)
+        .map(|v| v.to_string_lossy().into_owned());
+    assert_eq!(
+        got.as_deref(),
+        Some(NO_REAL_CONTAINER.1),
+        "{what} must point the transcript sweep at a container nothing can create, \
+         or `cargo test` archives the developer's own transcripts"
     );
 }
 

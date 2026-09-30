@@ -993,6 +993,25 @@ pub(crate) const REPO_SELECTION_VARS: &[&str] = &[
 #[path = "../tests/common/mod.rs"]
 pub(crate) mod fixture_env;
 
+/// The fixture's no-real-container pin names the SAME variable production reads.
+///
+/// Both sides were literals compared to nothing: rename [`crate::transcripts::CONTAINER_NAME_VAR`]
+/// and `dev_container_name()`'s own test follows the constant, `assert_jkb_isolated` compares the
+/// stale literal it set itself against the stale literal it expects, and `check-config.sh` compares
+/// only the default VALUE — so every guard stays green while `cargo test` goes back to
+/// `docker exec`-ing the sweep into the container the developer is working in. This file is where
+/// the two spellings meet, because the fixture module is compiled into this build.
+#[cfg(test)]
+#[test]
+fn the_fixture_pins_the_variable_production_actually_reads() {
+    assert_eq!(
+        fixture_env::NO_REAL_CONTAINER.0,
+        crate::transcripts::CONTAINER_NAME_VAR,
+        "the fixture must name the variable the reaper resolves its target from, \
+         or `cargo test` archives the developer's own transcripts"
+    );
+}
+
 /// The oracle for [`scrub_repo_selection`], written down rather than computed.
 ///
 /// A LITERAL on purpose, and never [`REPO_SELECTION_VARS`]. Production iterates that list, so an
@@ -2325,6 +2344,13 @@ mod tests {
             "gate_place",
             "asks `docker inspect` whether the dev container is running; it is never asked about a \
              repository (the gate itself runs through `gate_cmd`)",
+        ),
+        (
+            "src/transcripts.rs",
+            "sweep_dev_container",
+            "spawns `docker`, which is addressed by CONTAINER NAME and never resolves a \
+             repository: the thing it acts on is a named volume inside that container, and \
+             the caller's cwd changes nothing about which container is poked",
         ),
     ];
 

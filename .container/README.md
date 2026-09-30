@@ -271,7 +271,10 @@ not completed in this container, and `verify.sh` alone if it has. That is decide
 interrupted first run used to leave setup unreachable for the container's whole life. It also
 sweeps deferred worktree archives — the container's job, because a session cannot archive its own
 checkout and the host's reaper cannot see `/home/vscode/...` paths — and it does that *before*
-verifying, so a failing assertion about something else cannot disable it.
+verifying, so a failing assertion about something else cannot disable it. Beside it, and for the
+same ordering reason, it sweeps session transcripts by byte budget: without that, the sandbox's
+deny list outgrows a single argv and **every** Bash call in **every** session fails at spawn. See
+*Transcripts are swept by byte budget, not by age* at the end of this file for the measurement.
 
 ```sh
 ./.container/run.sh --build     # rebuild the image (needed after a Dockerfile or extension change)
@@ -1276,3 +1279,716 @@ repo's build output, so `jkb doctor` and `jkb task reap` print what the archives
 deliberately not pruned — `git clean -X` deletes exactly the regenerable files and also deletes a
 gitignored `.env`, and unrequested deletion is what this whole mechanism exists to avoid. Shorten
 `--retain-days` if size matters more than the safety net.
+
+## Transcripts are swept by byte budget, not by age
+
+Every Bash tool call in every container session failed at spawn with `E2BIG`. Not degraded —
+total, from the first call, in a container that had worked the week before, with nothing in the
+message naming the cause.
+
+**What was measured, 2026-09-28, in `jkb-dev`:**
+
+| | |
+|---|---|
+| transcript `.jsonl` files under `~/.claude/projects` | 1,182 |
+| their path text | 224 KB (~194 bytes per path) |
+| deny-list entries the sandbox profile built from them | ~2,396 |
+| path text in the profile | 448 KB |
+| what the harness reported | `command line 498.8KB across 3 args` |
+| `MAX_ARG_STRLEN` (Linux, 32 pages) | 131,072 bytes |
+
+Claude Code's Bash sandbox enumerates every transcript **individually** into its read-`denyOnly`
+list and passes that profile to the shell as a **single argv string**, which the kernel caps at
+one page-times-32. Two things multiplied it. Transcripts **nest** — `<slug>/<uuid>.jsonl` is depth
+2, `<slug>/<uuid>/subagents/agent-*.jsonl` is depth 4, and
+`<slug>/<uuid>/subagents/workflows/wf_*/agent-*.jsonl` is depth 6 — and the deep ones are the
+bulk, one per task-swarm implementer, per reviewer and per Workflow agent. And
+`~/.claude/projects` is a **symlink** to `~/.claude-state/projects`, so every file is listed under
+both spellings: the 224 KB is doubled before the fixed security paths are added.
+
+`.claude-state` is a Docker volume, so none of this resets on a rebuild. The count only goes up.
+
+**Why the budget is bytes.** The failing quantity is bytes of argv, so that is what
+`.container/sweep-transcripts.sh` counts: the path text of the `.jsonl` files under the root,
+doubled for the two spellings, archived oldest-first until the projection is under 64 KB — half
+the ceiling, leaving the other half for the security paths, the write-side lists and the
+JSON quoting around every entry. **That half is not static** — it was described here as "~30 fixed"
+paths, and the Round 8 note below records 89 measured, six of them per-task git worktrees, which
+grow with exactly this workload and which no sweep can reclaim.
+
+The two obvious alternatives are both things that already failed here:
+
+- **Time-based** is what Claude Code itself does, and `cleanupPeriodDays` never binds — the byte
+  budget is exhausted well inside any 30-day window. A container with retention configured is
+  exactly the container that arrived at 1,182 files.
+- **Count-based** is closer, but it drifts in the direction that breaks: the path text per file
+  grows as agents nest deeper, so a count chosen against today's tree silently stops fitting
+  without anything changing but the shape of the work.
+
+**What it costs.** Archived transcripts move to `~/.claude-state/transcript-archive`, a sibling of
+`projects/` in the same volume. It survives rebuilds, the move is a rename on one filesystem
+rather than a copy, and being outside `projects/` is the only reason the sweep reduces anything.
+Nothing is deleted. But Claude Code no longer lists an archived session, so `--resume` will not
+offer it and `/resume` will not find it — recovering one is copying a file back, if you know it is
+there. At ~194 bytes a path the budget keeps roughly the newest 169 files, and the newest 32 are
+kept unconditionally whatever the arithmetic says, because the live session is writing one of them
+right now.
+
+`run.sh` runs it on every start, **before** `verify.sh` and for the same reason the deferred
+worktree reap runs there (*Using it*, above): one failing assertion about something else must not
+disable it. It is never fatal — what it could not archive it says, and a deny list slightly too
+long is the state we were already in.
+
+**These properties of one `find` carry the whole thing**, and each is held by both
+`sweep-transcripts.sh --self-test` and a `check-config.sh` assertion, because every way of getting
+it wrong is silent in both directions — a sweep that archives the wrong set reports success
+exactly like one that archives the right set. No numeral stands in front of the list, in any of the
+three files that carry it: the count lives in `PINNED_SWEEP_APPENDS`, which is derived from the
+guard block itself, and a number written in prose beside a list is a second copy that goes stale on
+the next condition — which is what happened here, "four" over five bullets, in a change whose whole
+guard strategy is pinning counts so an unwatched branch cannot be added:
+
+- **`-L`**, because the root is reachable through a symlink and `find` does not follow a symlinked
+  *starting point* without it. Drop it and the sweep enumerates nothing and says so cheerfully.
+- **No depth cap**, because the nested agent transcripts are the population that matters. Cap it
+  and the container still dies at spawn with a sweep in the log saying it worked.
+- **`-name '*.jsonl'`**, because `<slug>/memory/` holds auto-memory as `.md` files. The name is
+  the guard; depth never was.
+- **Nothing held back in the walk.** The enumeration feeds the *projection* as well as the plan,
+  and the projection is the sizing of the argv that overflows: the kernel charges the same bytes
+  for a path the sweep cannot reclaim as for one it can. The round that introduced the journal
+  exclusion put it in this `find`, and the sweep then acted on 65,250 bytes where the real path
+  text measured 96,612 — half again as much, all of it held-back journals — and printed
+  `nothing to archive` while every Bash call went on dying at spawn. Journals are never archived and `.claude-state` is a volume, so the
+  unreclaimable set only grows: at ~165 bytes each, about 198 of them exceed the whole budget on
+  their own, and the sweep now says that out loud rather than reporting success it cannot deliver.
+  The name is spared in `transcript_plan`; the walk counts everything.
+- **`HELD_NAME`, spared in the plan**, and the sentence that used to stand here was wrong in a way
+  that cost a real defect. It said the harness keeps `workflows/wf_*.json` run records; there are none —
+  measured, zero anywhere under the root. What it writes is
+  `<slug>/<uuid>/subagents/workflows/wf_*/journal.jsonl`, 23 of them in this container, which
+  `*.jsonl` matches — and `swarm-status.sh` **discovers** every run by that exact name before
+  requiring the file. So the sweep archived the harness's own run state oldest-first on every
+  container start, and `swarm-status.sh <run>` answered `no swarm run found` for every past run.
+  The `agent-*.jsonl` transcripts in those same directories are the bulk of what must be swept, so
+  `workflows` cannot be pruned the way `memory` is: exactly one name is spared. The self-test
+  written to prevent this asserted the survival of a `wf_*.json` fixture — a shape no real tree
+  has — so it could not fail. A guard whose fixture models something that does not exist is not a
+  guard, and this is the third place that same wrong rule was written down. The name itself is no
+  longer spelled in `check-config.sh` either: it is **read out of `swarm-status.sh`'s discovery
+  predicate** and required to agree, because the authority is an external harness and a pinned
+  literal stays green through the one case that matters — that harness renaming its own file.
+- **`memory/` pruned**, because under `-L` that per-repo symlink into the bind-mounted
+  `~/.jkb/claude-memory` is followed like a real directory and the walk leaves the volume — into
+  files the *host* owns.
+
+And every project slug begins with `-` (the absolute path with non-alphanumerics replaced, so the
+leading `/` becomes one): `-home-vscode-repos-jkb`. A bare `dirname "$rel"` reads that as the `-h`
+option and dies, and it is every path in the tree rather than an edge case, so the relative
+directory comes from `${rel%/*}` and every external command here is given `--`.
+
+The archive must be **outside** the root, or the sweep grows the deny list it exists to shrink: the
+next walk finds what this one moved, one directory deeper, for ever. That refusal was in place from
+the start and was **inoperative in the only deployment it was written for**. It compared the
+caller's *spellings* — a string prefix of the root as passed — while the walk is `-L` and
+`~/.claude/projects` is a symlink into the state volume, so
+`JKB_TRANSCRIPT_ARCHIVE=~/.claude-state/projects/.archive`, a path squarely inside the enumerated
+tree, was not a prefix of `/home/vscode/.claude/projects` and was accepted. Reproduced against the
+real script with nothing else touched: 530 → 602 → 674 deny bytes across two sweeps, files nesting
+under `.archive/.archive/` — the same signature this document already records as the measured
+defect. It now compares **resolved** paths (`pwd -P` on the root, and the archive's nearest
+existing ancestor resolved the same way, which also collapses a `..` that climbs back in), while
+the enumeration keeps the caller's unresolved spelling, because that is the spelling the deny list
+is built from. The self-test exercises the refusal through *every* spelling, not just the one the
+fixture happened to pass; the row that stood alone before was the row that passes either way.
+Behind it the sweep now carries a post-condition on the two numbers it was already printing —
+`before` and `after` sat side by side in the summary with nothing comparing them, which is how a
+run that *grew* the deny list exited 0 with every count reading as success.
+
+**What the self-test was really measuring.** Three rounds of review found the same shape here: an
+assertion that passes for the wrong reason.
+
+- The fixture's mtimes ascended in the same order as its `LC_ALL=C` paths, so *"archived the three
+  oldest and kept the two newest"* was satisfied by **path order alone**. Measured: replacing the
+  GNU `stat` format's `%Y` with a constant still printed `self-test passed`, that row included —
+  with a non-numeric key `sort -k1,1n` ties every record and falls back to the path key for the
+  identical set. So `%y` (a date string) or `%W` (0 on ext4) would have shipped green, and in the
+  container `KEEP_NEWEST` would have protected the 32 lexicographically-*last* paths rather than
+  the newest, archiving the live session's own transcript out from under it. The fixture now
+  arranges mtime order to **disagree** with path order, so the two choose different sets and only
+  the mtime one satisfies the rows; two further rows pin the record's first field as numeric and as
+  ordered.
+- None of the four budget constants was asserted anywhere — not here, not in `check-config.sh`, not
+  in `mutate-config.sh` — although the file's own header says `--self-test` exists to *state* them.
+  All four were mutated and every gate stayed green: `KEEP_NEWEST=0` (the harm `scripts/check.sh`
+  names by name), `KEEP_NEWEST=3200`, a 4× budget and a 10× argv cap. They are stated now, before
+  the first override, which is the only place the shipped values are readable.
+- The *"running it again"* rows were vacuous: `KEEP_NEWEST=2` was still in force over a population
+  of 2, so `n - keep` was zero and the plan was empty **by the floor** — they re-measured a floor
+  asserted three rows earlier, under the heading written to catch the nesting defect. The second
+  sweep now runs with the floor off and the budget set to exactly what the tree projects, so an
+  empty plan is the sweep deciding it is under budget; a third runs with a budget that binds, and
+  asserts it archives from the tree and not from its own archive.
+- Nothing ran the file as a **program**. The root resolution and the argument dispatch were
+  executed by no test, and `check-config.sh`'s `grep -qF CLAUDE_CONFIG_DIR` was satisfied by any
+  mention anywhere — so one brace out of place (`"${CLAUDE_CONFIG_DIR:-$HOME}/.claude"`) made the
+  sweep walk a tree that does not exist, print `does not exist`, exit 0, and leave every gate
+  green: precisely the *"a sweep that cannot find its subject must not look successful"* failure the
+  comment claims to have closed. There are now rows that invoke the script with `HOME`,
+  `CLAUDE_CONFIG_DIR` and `JKB_TRANSCRIPT_ROOT` pointed at fixtures and read the root back out of
+  its message, plus the `--dry-run`, unknown-argument and trailing-argument exits. That mention-form
+  guard has been tightened to `CLAUDE_BASE=.*CLAUDE_CONFIG_DIR`: the self-test's own
+  `env -u CLAUDE_CONFIG_DIR` was enough to satisfy the old one, which turned a CAUGHT mutation into
+  a MISSED one the moment an unrelated row named the variable.
+
+`|| true` on `run.sh`'s invocation is the entirety of the sweep's *never fatal* claim, and it was
+the one pinned property whose only watcher was a mutation **anchor**: both wiring mutations carried
+the text inside their anchor strings, so removing it from `run.sh` reported `NO-OP the mutation
+changed nothing` and pointed at the mutation rather than at the lost non-fatality — whose natural
+repair, relaxing the anchor, greens the gate. It has a condition and a mutation of its own now, and
+the two wiring mutations find their line by its statement instead.
+
+**Round 3 found the hole all of that guarding had been built around.** Nothing ever compared the
+projection to the budget. `before`, `after` and `DENY_BUDGET_BYTES` were printed side by side on one
+line with no pair of them ever tested — in a script whose entire subject is a budget. Both branches
+reported success over budget, reproduced 2026-09-28 against a copy with only the budget lowered:
+
+- **Empty plan.** 3 sessions + 3 run journals, 702 bytes projected against a budget of 500,
+  `KEEP_NEWEST=32`. The archivable population is inside the floor, so `n - keep` is negative and the
+  plan is empty *however far over the tree is*. Output: `702 deny bytes projected, budget 500 —
+  nothing to archive`, rc 0.
+- **Exhausted plan.** 43 sessions, budget 500: `archived 11 file(s) … (4086 -> 3076 deny bytes,
+  budget 500)`, rc 0, with the residual six times the budget sitting in the same `printf` as the
+  budget.
+
+On the real container the second is reachable on the journals' own growth: the residual after a full
+plan is `held_bytes` plus the newest `KEEP_NEWEST`, which passes 65,536 at roughly 161 journals,
+while the unreclaimable warning added the round before only fires past about 199. In that window the
+sweep prints success, `run.sh`'s `|| true` discards the code, and every Bash call still dies at
+spawn — the exact failure this whole file exists to prevent, with a clean log. `transcript_over_budget`
+now asks the question at all three exits, and the dry-run summary states the residual instead of
+asserting `-> under` an outcome nothing checked.
+
+Two smaller things the same round found, both of the *"half a guard"* shape this document keeps
+recording. The containment comparison has two operands and only `phys_root` was pinned — replacing
+`phys_archive="$(transcript_resolve "$archive")"` with `phys_archive="$archive"`, a plausible
+simplification, left every gate green and re-admitted the nesting. And the projection multiplies the
+*caller's* spelling of each path, which in the container is the shorter of the two: the real deny
+list is larger by 6 bytes a file, about 7KB at 1,182 files, roughly 11% of the budget, in the
+direction that overflows. The half-of-`MAX_ARG_STRLEN` margin absorbs it today; the constant now says
+so, because whoever tightens that margin has to close this gap first.
+
+`mv -n` is where the record has to be careful about platforms. On GNU coreutils 9.4 a collision
+prints `mv: not replacing '…'` and exits 1; BSD and macOS skip silently and exit 0. The self-test
+therefore asserts only what both agree on — the already-archived copy is unchanged and the source
+stays in the tree — and asserts nothing about the return code or the message. The collision is not
+hypothetical: a session whose `<slug>/<uuid>.jsonl` was archived and is then resumed by id recreates
+that relative path, the next sweep plans it oldest-first, and `~/.claude-state` is a volume, so the
+archived copy is the only one there is.
+
+`JKB_DENY_BUDGET_BYTES` is a **self-test seam**, and it is the only way `--self-test` can drive this
+file *as a program* against a tree it can build in a temp directory — without it every program-level
+row has to point at an empty root, where `sweep_transcripts` returns at `no transcripts` before it
+ever reads its third argument, so `--dry-run` through the CLI was exercised by nothing. Two things keep a seam from becoming a lever, and the second is narrower than it first shipped:
+
+- `check-config.sh` refuses **any** seam appearing in any shipped file under `.container/` — the list
+  of names read out of the script's own `SEAMS=` line and checked against every `${JKB_…:-}` it
+  actually reads, the file list derived from the directory rather than retyped. Wired into the
+  container, a seam silently disables the sweep while every start still reports success: the state
+  this script exists to end, wearing a clean log. The first version named one of three seams and
+  scanned four files by hand — missing `verify.sh`, which the same change had just made a *caller*
+  and which runs **inside** the container, where a seam actually takes effect. (In `run.sh` it would
+  not: `in_container` is plain `docker exec` with no `-e`, so a `VAR=… in_container …` prefix sets
+  the variable for the docker CLI and never reaches the container.)
+- `--self-test` refuses to run when **`JKB_DENY_BUDGET_BYTES`** is set in its own environment — that
+  one, and deliberately not the others. Its value is what the constants rows read, so exported it
+  gives a red gate for a correct script or a green one for rows that have stopped measuring the
+  shipped number. The version that refused all three plus `CLAUDE_CONFIG_DIR` was backed out on a
+  measurement: `./scripts/check.sh` went red on a *correct checkout* for anyone using the
+  second-config-dir posture this very script cites approvingly, and `check.sh` stops at the first
+  failing gate, so every step after it silently stopped running. A machine-dependent gate step
+  degrades to a named skip in this repository; it never reddens. The other two cannot affect a row
+  anyway — the function rows pass explicit paths and the program rows neutralise every seam with
+  `env -u`. Do not re-add them.
+
+One property has no executable test anywhere and says so in place: a transcript that vanishes
+between the plan and the move must not be counted as a failure. Reaching that state needs a file to
+disappear between two statements of one function — a live session, `cleanupPeriodDays` retention, or
+a second `run.sh` all produce it in the field, and none of them can be staged. The static pin in
+`check-config.sh` and its mutation are the whole of the coverage, which is worth writing down rather
+than leaving a reader to infer that the fixture covers it.
+
+**Round 4, and the two findings that were not about the guards.** The sweep's only trigger is a
+container start. The origin story at the top of this section is exactly that path — a container that
+had worked the week before reached 1,182 transcripts *without being recreated* — and the documented
+workflow is `run.sh` once, then attach and keep working, where a second window (`code <path>` from an
+attached terminal) never re-enters `run.sh`. The budget keeps roughly 169 files, and every swarm
+implementer, reviewer and Workflow agent writes a transcript. Measured in this container on
+2026-09-28, after the sweep had shipped: **80,092 deny bytes projected against a 65,536 budget**, in a
+tree no sweep had reached since the start. A start-only trigger bounds the deny list at a rate that
+has nothing to do with the rate transcripts are created, and that gap is not closed by anything in
+this file.
+
+What *is* closed is the reporting. `run.sh` discards the sweep's exit code with `|| true` — correctly,
+since a deny list slightly too long must not abort a start — so the warning scrolled past several
+steps before the verify anyone actually reads, and `verify.sh` said nothing about transcripts at all.
+It now runs the sweep's own `--dry-run` (moves nothing; returns non-zero when the tree *as it
+stands* is over budget — not when the plan would fail to reach it, which would be a verdict about a
+tree that does not exist) and reports the answer where the operator is looking. The unreclaimable
+floor is `accept_bad`, not `bad`: past roughly 199 run journals no sweep can bring the tree under, and
+that is a condition to act on rather than a broken boundary — which is what this container's two exit
+codes exist to distinguish.
+
+Two more assertions that passed for the wrong reason, both introduced by the round that was fixing
+that very class:
+
+- **Three of the four containment rows returned 1 for an unrelated reason.** They sweep `$root` while
+  the budget around them was measured through `$work/projects-link`; the spellings differ by a byte
+  per path, so the residual check returned 1 whatever containment decided, and `rc_of` sees only the
+  code. Measured: deleting the entire containment block turned exactly **one** of the four red — the
+  executable half of the guard against the `.archive/.archive/` nesting had come to rest on a single
+  row balanced on an exact budget equality that any fixture edit breaks in silence. They assert the
+  refusal's own words now, not the exit code.
+- **`transcript_resolve` collapsed a `..` only when its left-hand component already existed.** On the
+  *first* sweep — the only state the question is ever asked in, since the sweep is what creates the
+  archive — the whole of `…/transcript-archive/../projects/.archive` is the unresolvable tail, the
+  prefix test saw a path still containing `..`, and the archive was accepted inside the root (deny
+  bytes 96 → 114 on the probe). Every later sweep then refused for ever, because `mkdir` had made the
+  `..` collapsible. The self-test row written for this route passed for the same reason: it ran after
+  a real sweep had already created the archive. The tail is collapsed lexically now, which is sound
+  *here and only here* — a tail component that existed as a directory would have stopped the walk-up,
+  so there is no symlink left in it for `..` to mean something else about.
+
+And a rule worth stating plainly, because this section keeps recording it: **a guard must pin the
+whole of what its message claims.** `phys_root` was pinned and `phys_archive` was not; the seam
+refusal named one of three seams and scanned four of the files that matter; the containment rows
+asserted an exit code that two different things produce; the `verify.sh` guard required the sweep to
+be *called* and not that any verdict came of it. Each shipped with a comment claiming the whole
+property, and each was found by deleting the code underneath and watching the assertion stay green.
+
+**Round 5 found the assertion added in round 4 reporting the state it was added to catch.**
+`verify.sh` asks the sweep `--dry-run` and reads its exit code — and that code was a verdict on
+`before - planned`, a tree that does not exist, because a dry run moves nothing. So whenever the real
+sweep at container start had failed — the archive unusable, `mkdir` denied, ENOSPC on the state
+volume, a containment refusal — `run.sh` discarded that failure by design, the dry run found a plan
+that *would* have fitted, and `verify.sh` printed `ok  the transcript deny list fits in one argv` over
+a tree in which not one file had moved and every Bash call still died at spawn. Reproduced: 60
+transcripts, 7,200 deny bytes, budget 3,960, a regular file where the archive's parent must go — real
+sweep `could not create … — nothing archived`, rc 1; dry run rc **0**. Both exit codes now answer one
+question, *is the deny list as it stands on disk right now too long for one argv*, and `before -
+planned` stays in the summary as information rather than as the verdict.
+
+Three consequences of that block, all of the same family — a report is only as good as what it can
+tell apart:
+
+- **The unhelpable state was diagnosed too late.** `accept_bad` (exit 3, "a condition to act on";
+  both codes refuse a window — `run.sh` tests `-ne 0` — and what exit 3 changes is which refusal
+  the operator is given)
+  was selected by a message that tested the run journals *alone*. But the residual after a full plan
+  is those journals **plus the newest `KEEP_NEWEST`**, which crosses 65,536 at roughly 161 journals
+  while a journals-only test only speaks past about 199 — and a container reaches the first on its
+  way to the second. In that window the tree was equally beyond any sweep's help and was reported as
+  a broken boundary: exit 1, `run.sh` refuses to open a window, and the only remedy sentence shown
+  was the one that does not apply. `transcript_irreducible` now measures what no sweep can remove —
+  held plus floor — so the verdict arrives when the state does.
+- **Every non-zero exit was called "over budget".** The sweep returns non-zero for things that are
+  not about the budget: a containment refusal (the only line is the refusal), a resolver failure (rc
+  1 and *no output at all*), a syntax error (rc 2, bash's own message). Each printed "the transcript
+  deny list is over budget — «unrelated text or nothing»" followed by a sentence asserting an
+  archiving pass that never happened. The arms classify on the sweep's own wording now, and anything
+  else is reported as *the sweep could not answer*, which is a different thing to act on.
+- **Exit 3 gained a second producer and `run.sh`'s narration did not notice.** It named the
+  unfiltered-egress override as the only thing exit 3 can mean and told the operator to unset a
+  variable that is not set and recreate a container whose journals live in a volume. Two conditions
+  with opposite remedies cannot share one hard-coded sentence, so the message now points at the FAIL
+  lines, which each carry their own.
+
+**The second trigger (2026-09-28).** The gap recorded above — the sweep firing only at container
+start, while transcripts are created continuously — is closed by the **host's reaper**, not by a new
+scheduler. `jkb task reap --watch` is already the one long-lived process on the host sweeping on a
+timer for this project, and this is the same kind of job: something only an outside process is placed
+to do. It now pokes the container on each tick
+([`crates/jkb-cli/src/transcripts.rs`](../crates/jkb-cli/src/transcripts.rs)).
+
+It has to go through Docker, and that is forced rather than chosen: `~/.claude-state` is a **named
+volume** (`jkb-claude-state`), not a host bind, so there is no host path to walk — the work can only
+happen inside. The reaper also knows a *database path*, never a checkout, so it cannot run a working
+tree's copy of the script. It feeds the sweep to `docker exec -i … bash -s` on **stdin**, from a copy
+`include_str!`'d into the `jkb` binary at compile time.
+
+> **Superseded, and worth keeping.** This first installed the script *into the image* at
+> `/usr/local/bin/`, the way `init-firewall.sh` and the egress scripts are, and exec'd it by path.
+> What reversed it was a measurement: `ls /usr/local/bin/` in the **running** container showed only
+> the four older scripts. Only a rebuilt image carries a new file, nothing forces a rebuild, so
+> `bash` would have exited 127 — the trigger dead on every live container, reported once into
+> `reap.log` and deduped for ever, with every gate green. Embedding removes the second copy instead
+> of guarding it: no drift, no rebuild, no path for two files to agree about.
+
+The container's **name** must agree across the two files that spell it, and it is **silent when
+wrong**: a reaper poking a name nothing creates reports nothing for ever — the same end state as
+having no second trigger at all, wearing a green log. So `check-config.sh` reads `DEV_CONTAINER_NAME`
+and `run.sh`'s `${JKB_CONTAINER_NAME:-…}` default from the files that own them and requires them to
+match, with an extraction that reads nothing a failure rather than a vacuous pass. (A second pair —
+the in-image path — used to be here too, and is gone with the image copy: see below.)
+
+The tick is **never fatal and usually silent**. No Docker, no such container, or a stopped one is the
+ordinary case for anyone not using the dev container and says nothing at all; a sweep with nothing to
+do says nothing, because this runs 96 times a day for ever and a log that reports a timer firing is a
+log nobody reads the rest of; and an over-budget tree is said **once** while it stays the same, the
+rule the reaper already applies to its own failures and the queue's compaction. Rejected: a loop
+inside the container and a timer unit beside this one, both of which are a second scheduler to reason
+about for one sweep.
+
+The `docker` spawn is declared in `gitrepo.rs`'s `NOT_REPO_AWARE`, and that guard is what caught it:
+`docker` is addressed by **container name**, never resolves a repository, and the caller's working
+directory changes nothing about which container is poked.
+
+**Round 6, and a guard whose three checks were really two.** The verdict-coverage loop added the
+round before — requiring `verify.sh`'s deny-list block to reach `ok`, `bad` *and* `accept_bad` —
+matched `bad "` as an unanchored substring, and `accept_bad "` **contains** `bad "`. So the
+`accept_bad` arm alone satisfied the `bad` iteration: both plain arms could be demoted to notes, the
+gate still printed 70/70, and the one mutation here (which demotes `accept_bad`) was still caught by
+the survivors. Anchored now — and what it still *cannot* see is written beside it, because a static
+read cannot do better: it establishes that the block reaches each **kind** of verdict, never that the
+*budget* arms are the ones reaching them. The behavioural half — an over-budget tree really exiting
+1, an unreclaimable one really exiting 3, which is what `run.sh` reads to decide whether to open a
+window — needs a container, so it belongs in `mutate-verify.sh` and **is not covered yet**.
+
+Two more of the same family, both in guards this series added:
+
+- **The floor half of `transcript_irreducible` was watched by nothing.** Both rows exercising the
+  "beyond any sweep's help" message held `KEEP_NEWEST=0`, so deleting the floor term left
+  `--self-test`, `check-config.sh` and `mutate-config.sh` all green while `verify.sh` silently
+  reclassified over-budget trees from `accept_bad` to `bad` — in exactly the 161-to-199-journal
+  window this document claims the term closed. There is now a row whose budget sits *between* what
+  the journals project alone and what they project plus the floor, so only counting both reaches it;
+  and the static pin asks that each half is **recognised and counted**, after a mutant whose held arm
+  was `{ next }` passed the version that asked only that the arm existed.
+- **`bad_sites` counted lines while its neighbour counted occurrences**, rewritten in the same commit
+  for exactly the reason lines undercount. Two failure paths on one line moved the pin by one, so one
+  of them shipped unmutated under a printed coverage number. And that harness's success line claimed
+  "each branch with a mutation", which a count cannot establish and which was false for two branches
+  — both of them the *extraction read nothing* guards this file says must be watched failing. It now
+  says only what the count establishes.
+
+**Exit 3 stopped being about a choice.** Both files said every failure reported was "a condition this
+container was configured to accept" — true while the unfiltered-egress override was the only
+producer, and false the moment the transcript deny list joined it. Nobody *configures* a container to
+accumulate 199 run journals; it is emergent, and it is the one exit-3 producer with a concrete
+remedy. Telling an operator they chose a state they did not choose, about the only thing they can
+act on, is worse than saying nothing. It now reads "one this container tolerates rather than a broken
+boundary", and the enumeration of producers lives in the FAIL lines rather than in a second copy.
+
+Relatedly, the over-budget FAIL arm had begun asserting an archiving pass it has no evidence of —
+`verify.sh` only ever runs `--dry-run`. It names the causes it cannot tell apart instead: the floor
+genuinely binding, a start sweep that could not write its archive (`could not create` in the
+scroll-back), and an archive refusing colliding destinations (`mv: not replacing`).
+
+**`docker exec` is the right mechanism; exec'ing a path was not.** Round 7 checked the live
+container and found `/usr/local/bin/` carrying only the four older scripts — so the first version of
+the second trigger, which baked the sweep into the image and ran it by absolute path, was **dead on
+every already-running container**: only a rebuilt image has that file, nothing forces a rebuild,
+`bash` would have exited 127, and the reaper would have reported that once into `reap.log` and
+deduped it for ever with every gate green.
+
+The fix removes the possibility rather than guarding it, which is this directory's own rule. The
+script is embedded in the `jkb` binary with `include_str!` (the crate already reaches out of itself
+this way for `.claude/commands/*.md`) and fed to `docker exec -i … bash -s` on **stdin**. There is
+then no copy in the image to drift, no rebuild to require, and no path for two files to agree about —
+the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was built from. It is written
+from a thread, because the script is 74KB against a 64KB pipe buffer and `bash -s` executes as it
+reads: a blocking write from the main thread deadlocks the moment the child pauses to run a `find`.
+
+Two things the same round caught about the tick itself. It had **no timeout**, and it runs *before*
+`reap_once` — so a Docker daemon that is half-up and never answers (the mode that hangs; one that is
+simply down errors fast) would stall the process this repository calls "the one that finishes every
+deferred landing on the machine", silently, for ever. One minute now, generous because a loaded
+daemon is slow before it is broken. And a daemon that will not answer is reported, where *absent* is
+not: "there is no container here" and "there may be one over budget and I could not find out" are
+different facts, and only the first is somebody working normally on a laptop or a cloud instance with
+no Docker at all.
+
+**A live session's transcript, once the sweep runs on a timer.** `KEEP_NEWEST`'s entire argument was
+*"the live session is writing one of them right now"* — and it was written for a sweep that ran at
+container **start**, when nothing is open. On the host reaper's timer it runs mid-flight, and during
+a swarm more than 32 transcripts are touched inside one window: at that point the newest-32 floor
+stops being a statement about live sessions at all, a running session's transcript can be archived
+out from under it, and `/resume` cannot find it again.
+
+Two guards, and they answer different halves:
+
+- **The registry is the precise one.** `jkb` already knows which Claude sessions are live — every
+  hook in the container posts to the host daemon, so container sessions are registered on the host —
+  and a transcript is named for its session. The reaper reads that list *per tick* (never cached: a
+  session started since the last sweep is the one most at risk, being also the most recently
+  written) and hands the ids to the sweep in `JKB_KEEP_SESSIONS`, which never plans one. A database
+  the binary cannot open yields an **empty** list, which is the safe direction — empty falls back to
+  the other two protections rather than to none.
+- **Recency is the belt to that brace**, for what the registry cannot see: a session predating it,
+  one whose hooks are not reporting, a container not in remote mode. One hour, and it is deliberately
+  generous because over-protecting is *visible* — the sweep already says when it cannot reach the
+  budget — while under-protecting is a lost transcript.
+
+Neither is the time-based **retention** this document rejects further up, and the distinction is the
+whole point: what bounds the sweep is still bytes. These say only that a file written moments ago is
+probably open, which is a different claim from "old files may go".
+
+Both skips happen **before** the floor and, like the held name, their bytes are still *projected* —
+a file the sweep may not archive was never a candidate, so letting one consume a `KEEP_NEWEST` slot
+would reserve protection for something already protected, while the argv still has to count it.
+`check-config.sh` holds `KEEP_SESSIONS_VAR` and the shell's `${JKB_KEEP_SESSIONS:-}` to each other:
+a variable spelled differently at the two ends protects nothing while both files read correct.
+
+**Round 8 — six findings, none must-fix, and the first round in single digits.** Three of them were
+about the liveness guards added the round before, and two of those were the same shape.
+
+The registry half protected a session's **own** `<slug>/<uuid>.jsonl` and nothing else, because it
+matched the transcript's leaf name against a session id. But a Task-tool subagent opens no session,
+so the registry never holds a row for `<slug>/<uuid>/subagents/agent-X.jsonl` — and those nested
+transcripts are, as the walk's own comment says, *the bulk of the population*. They were left to the
+recency window alone, which a subagent sitting an hour on one tool call or a pending permission
+prompt walks straight out of. The match is on the **session directory** now: `/<uuid>.jsonl` or
+`/<uuid>/`, so everything a live session wrote is covered by the row it does have.
+
+`transcript_irreducible` did not know about either skip, so a container recreated after a heavy
+swarm — the standard recovery from an E2BIG — had every transcript inside the recency window, no
+plan could reach the budget, and the measure reported a number under it. `verify.sh` then fell past
+`accept_bad` into plain `bad`: exit 1 instead of 3, `run.sh` refusing to open a window, and a FAIL
+naming three causes none of which applied. Both functions ask **one predicate** now, held as a
+single awk text rather than a rule each remembers — the day they disagree is the day a sweep
+archives a live transcript while reporting itself unable to reclaim anything.
+
+And the reaper drained neither output pipe until after its wait loop. An archive gone read-only in
+an over-budget container makes `mkdir -p` fail for every planned file — ~100 bytes of stderr each,
+~100KB across a thousand, against a 64KB buffer. The child blocks on write, `try_wait` never returns,
+and at sixty seconds the tick reported `Unreachable`: *the daemon would not answer*, when the daemon
+was fine and the disk was full, burning the whole timeout before `reap_once` every time. All three
+pipes have a thread now, joined after the child is gone.
+
+Two smaller ones worth keeping. `prog`'s `env -u` list named three of the four seams, so it is
+derived from `$SEAMS` now and the next seam cannot repeat it. And the headroom comment called the
+uncounted half "the ~30 fixed security paths" — measured in a session that day: **89 deny paths, six
+of them registered git worktrees**. D36 gives every task its own worktree, so the uncounted half
+grows with exactly the workload this sweep was written for, and no sweep can reclaim a worktree path.
+A few hundred bytes against 65,536 today, but it runs in the direction that overflows and it
+compounds with the spelling lean recorded above: both have to be closed before anyone tightens this
+margin.
+
+**Round 9 — fourteen findings and two must-fix, after I had told the user the curve had broken.**
+It had not, and the reason is worth recording: both must-fixes were in the *newest* work, and the
+first was the worst defect this branch produced.
+
+**The test suite archived the developer's own transcripts.** `crates/jkb-cli/tests/cli.rs` spawns a
+real `task reap --watch` child with the developer's own environment, to prove a compaction failure
+does not end the service. That loop now sweeps the dev container on its first tick — so on any host
+with `jkb-dev` running, which is the normal state while working on this repo, `cargo test`
+`docker exec`'d the sweep into the live container and moved real transcripts out of
+`~/.claude-state`, with `watch.kill()` at 1500ms able to orphan the exec mid-archive. The reaper now
+resolves its target through `JKB_CONTAINER_NAME` exactly as `run.sh` does, the fixture points it at
+a name nothing can create, and `the_cli_fixture_does_not_inherit_a_repository` asserts that on
+the built command through `assert_jkb_isolated` — so deleting it reddens a test rather than somebody's `/resume`. The same seam
+closes a real gap: an operator who sets `JKB_CONTAINER_NAME` had a trigger silently dead for ever.
+
+**And the start trigger fired on the already-running path.** `run.sh` against a live container prints
+"is already running" and fell straight through to the sweep, which passes no `JKB_KEEP_SESSIONS` —
+so every protection rounds 7–9 added covered the reaper's tick and not this one. An agent blocked on
+a permission prompt past the recency window, with the floor spent on subagent files, would lose its
+transcript to somebody opening a window in the morning. The premise the start trigger rests on is
+*nothing is open at container start*; it now only fires when that is true by construction, and the
+reaper's tick — which does carry the ids — owns the running case.
+
+Three more worth keeping. `verify.sh`'s rc-0 arm printed `ok the transcript deny list fits in one
+argv` when the sweep exited 0 because it **found no tree at all**, which is the sweep's own stated
+rule broken in the reporting layer: a sweep that cannot find its subject must not look successful.
+`Sweep::Absent` — reported by saying nothing — absorbed *"docker could not be run or reached"* as
+well as *"no such container"*, so a launchd agent whose PATH omits Docker Desktop gives a trigger
+dead for ever and silent about it; the probe is `docker ps --filter` now, which exits 0 with empty
+output when the daemon **answered**, so silence is earned rather than assumed, and both unit
+templates carry a PATH. And the "no sweep can remove" message named two of its three terms, omitting
+the one that usually dominates and is the only one that *lapses* — half an hour after a swarm the
+operator was told to delete run journals worth a few hundred bytes when the answer was to wait.
+
+**Round 10 — the first to review only fixes, and it found a must-fix anyway.** I had said the
+previous round's size tracked how much *new code* a round saw. That was wrong, and the way it was
+wrong matters: the must-fix here was a **consequence of round 9's own fix**.
+
+Round 9 stopped `run.sh` sweeping when the container was already running, because that path passes
+no live-session list and its only safety was the premise *nothing is open at container start*. True
+as far as it went — and it traded a rare loss for a common one. A container up for days, or started
+from Docker Desktop, was then swept by **nothing** on that path: the window stayed refused, and
+re-running `run.sh` — the documented recovery for the very E2BIG this exists to prevent — stopped
+recovering. Two messages also became false where they printed. `verify.sh` told the operator to look
+for `could not create` in the scroll-back of a sweep that never ran, and the skip line asserted that
+the reaper's tick owned the container, which `run.sh` never checked and which is false whenever
+`setup.sh --no-service` was used or the unit is stopped.
+
+The fix is to stop skipping and start passing: `run.sh` now reads the same registry the reaper does,
+through the daemon that already holds it, and hands the ids over with `docker exec -e`. `in_container`
+is a plain `docker exec`, so `-e` reaches it where a shell prefix would set the variable for the
+Docker CLI and never enter the container. An empty list is the safe direction and the one the reaper
+also takes when it cannot read: the recency window and the floor still stand.
+
+That also settles what `JKB_KEEP_SESSIONS` **is**. It had been filed with the four switch-it-off test
+seams and refused in any shipped file — with a message saying it silently disables the sweep, which
+is false for this one variable and would have refused the thing `run.sh` is supposed to do. `SEAMS`
+now names the four that must never appear in a shipped file; `INPUTS` names every `JKB_` the script
+reads. The agreement check and the self-test's neutralisation cover `INPUTS`; only `SEAMS` earns the
+blanket refusal.
+
+Three more worth keeping:
+
+- **A `PATH` that could only subtract.** The systemd reap unit got `Environment=PATH=` alongside the
+  launchd one, and the two are not the same case: systemd *replaces* the inherited value, and its
+  compiled default already carries `/usr/local/bin:/usr/bin:/bin`. So it could never make `docker`
+  reachable where it was not — and on a host that had imported a richer `PATH` (rootless Docker in
+  `~/bin`, a Nix profile) it removed `git`, which every worktree archive shells out to. Dropped from
+  systemd, kept on launchd where the new value is a superset of launchd's own minimal default and
+  can only add.
+- **The container pin was on one of two fixtures.** `sessions.rs` builds its own `jkb` and did not
+  get it, and the oracle both fixtures already run did not look — so the guard test read green over
+  half the surface. It is harmless only because `sessions.rs` happens to call `task reap` one-shot
+  today. The pin lives in `common/` now and `assert_jkb_isolated` asserts it, which is what makes a
+  third fixture unable to arrive without it. Verified by deleting it from one fixture and watching
+  that fixture's own isolation test go red.
+- **The five-way budget classifier was executed by nothing.** It decides exit 1 against exit 3,
+  and a one-token flip in any arm changed that with every gate green. What that code actually
+  buys was overstated here and in three other places as "whether `run.sh` opens a window": it does
+  not — `run.sh` refuses on ANY non-zero verify (run.sh's `verify_rc -ne 0` gate). Exit 3 changes which refusal the
+  operator reads, which for the transcript floor is the difference between one remedy that applies
+  and three that do not. Corrected in place rather than quietly, because the overstatement was the
+  stated justification for the classifier's guards. It is a pure `sweep_verdict()` now, driven from nine literal rows in `verify.sh --self-test`
+  (which the gate already runs and which needs no container); three arm mutations confirm the rows
+  discriminate. Defining it *above* the self-test block was not incidental: the block exits before
+  anything below it is read, and bash resolves a function at call time, so a use above its
+  definition is an empty result rather than an error — the mistake `check-config.sh` records making
+  three times with one helper, and which I made once here before moving it.
+
+**Round 11 — and the protection added to prevent data loss could cause the E2BIG instead.**
+
+`live_sessions` asked the registry for rows with `ended_at IS NULL` and called them live. But a
+container session ends **without its `SessionEnd` hook** whenever the container is stopped — every
+rebuild, and the documented E2BIG recovery, which is `run.sh` recreating the container. Those rows
+can never be closed afterwards: the liveness probe needs the same instance, and a recreated container
+is a different one, so an orphan stays open until the 90-day prune. For those 90 days the reaper
+handed the dead ids to the sweep, which protects the whole subtree under each — and
+`<slug>/<id>/subagents/**` is, in the walk's own words, the bulk of the population. Three or four
+orphaned swarm sessions exceed the entire 65,536-byte budget on their own: the sweep reclaims
+nothing, reports a floor it says "lapses" when this share never does, and every Bash call goes on
+dying at spawn. **Reached by the recovery step this document tells the operator to run.**
+
+The keep list is a liveness claim now, not an absence-of-an-end-record: a row must have been *seen*
+within six of the registry's own refresh windows (`SEEN_REFRESH_MS * 6`, derived rather than picked —
+a row refreshes at most hourly, so six hours of silence is not evidence of life). Over-keeping is
+only the safe direction *while it lapses*. The decision is a pure `live_ids(rows, now)` so the rule
+whose first version caused this is drivable from literals, including at the cutoff itself.
+
+**And `verify.sh` measured a different tree from the one the sweep had just acted on.** It runs the
+sweep's `--dry-run` to report the budget, and `run.sh` passed it no keep list — so a container held
+down by live sessions came out `over` (exit 1) instead of `beyond` (exit 3), with a FAIL naming the
+floor, an unwritable archive and colliding destinations, none of which applied, while the real cause
+— a live session holding its whole subagent subtree, precisely what the keep list exists for — was
+not among them. Reproduced at 120 subagent transcripts under one live session plus 40 archivable,
+budget 30,000: `beyond` with the list, `over` without it. The verify exec carries the same `-e` now.
+
+**A claim this record repeated four times was simply false.** "exit 1 refuses a window, exit 3 does
+not" — `run.sh` refuses on **any** non-zero verify (run.sh's `verify_rc -ne 0` gate). Exit 3 changes *which refusal*
+the operator reads, which for the transcript floor is the difference between one remedy that applies
+and three that do not. That is still worth a classifier and its guards; it is not what was written
+down, and the overstatement was the stated justification for them.
+
+Two guards were pinning a spelling against nothing:
+
+- The fixture's no-real-container pin named `JKB_CONTAINER_NAME` as a literal compared to nothing in
+  `transcripts.rs`. Rename `CONTAINER_NAME_VAR` and `dev_container_name()`'s test follows the
+  constant, `assert_jkb_isolated` compares the stale literal it set itself against the stale literal
+  it expects, and `check-config.sh` compares only the default *value* — every guard green while
+  `cargo test` goes back to archiving the developer's live transcripts. The fixture module is
+  compiled into the bin's test build, so the two spellings are now one assertion.
+- The live-session guard pinned only that `-e "JKB_KEEP_SESSIONS=` appears on the sweep line. Delete
+  the six lines that *fill* it and the flag passes an empty string for ever, with the guard
+  reporting a protection that no longer exists — reproduced, and check-config's output was
+  byte-identical to the unmutated tree's. The derivation is pinned now, and so is the JSON field
+  `jq` read, held to `ClaudeSession`'s serde name the way `HELD_NAME` is held to `swarm-status.sh`.
+  **That guard lasted one commit** and went with the `jq` it was written for — the next change
+  replaced the whole derivation with `jkb notify sessions --live-ids`, so there is no JSON field to
+  agree about any more and what is pinned is that `run.sh` asks `jkb` at all. The diagnosis is worth
+  keeping even though the guard is gone, because it is this branch's most repeated defect in
+  miniature: `.[].session` matched `.[].session_id` as a substring, so the rename mutation went
+  MISSED until the closing quote joined the needle.
+  Writing that guard reproduced this branch's most-repeated bug in miniature: `.[].session` matched
+  `.[].session_id` as a substring, so the rename mutation went MISSED until the closing quote joined
+  the needle — the same shape as `accept_bad` satisfying a search for `bad`.
+
+**The keep list had two implementations, and they diverged within one round.** The reaper read the
+registry from the database; `run.sh` asked the daemon for `--json` and pulled `.[].session` out with
+`jq`. Two answers to one question — *which sessions count* — in two languages, with nothing comparing
+them. So when the reaper learned that an unclosable row is not a live session, `run.sh` went on
+handing out ids from rows that had been open for months, which is precisely the state that makes the
+sweep reclaim nothing. The fix above was made once and needed making twice, and that is the whole
+argument against this shape.
+
+`jkb notify sessions --live-ids` applies [`transcripts::live_ids`] and prints one id per line. Both
+triggers call it; the rule lives once. It also deletes two couplings that existed only because the
+rule was duplicated — `run.sh` no longer needs `jq`, and `check-config.sh` no longer has to hold a
+JSON field name to `ClaudeSession`'s serde spelling. Access paths still differ (the reaper reads the
+database, the host asks the daemon) and that is fine: what must not differ is the rule.
+
+And the two empty lists are now distinguishable. *No live sessions* and *could not ask the daemon*
+both produced an empty `sweep_keep`, so a sweep that ran with **no protection at all** looked in the
+scroll-back exactly like one that had nothing to protect. `run.sh` says which happened, and
+`check-config.sh` pins that it does.
+
+Three smaller ones from the same round: the budget-seam refusal scanned `mutate-verify.sh` — the one
+file this record designates for closing the known behavioural gap, which means staging a budget in it
+— and refused it with a message that is false about that file; the header's `~30 fixed security
+paths` was the figure the budget comment seventy lines below already re-measures at 89, left where a
+reader meets it first; and `dev_container_name`'s test called `set_var` in a binary whose other tests
+fork `git` concurrently, which is the one rule this crate wrote down for itself. The decision is a
+pure `chosen_container_name(Option<String>)` now, driven by values.
+
+Finally, `--json` got the shape its neighbour already had. The tick printed prose to stderr under
+`--json` while the queue compaction beside it printed a document to stdout, so a machine consumer of
+the reaper recorded a compaction and never a sweep, never an over-budget container, and never a
+daemon it could not reach.
+
+**Round 12 — the keep list was inverted, not merely truncated.** `live_sessions` took one page of
+`claude_session::list` and dropped `next`. That listing is ordered **`seen_at` ascending** — least
+recently seen first, which is what a liveness sweep wants to probe — so the first page is the
+*oldest* rows, which is exactly the set the new recency filter discards, while the session running
+right now has the largest `seen_at` and sits on the last page. Past `LIST_CAP` the keep list
+therefore did not shrink; it emptied, and the tick swept a live container with no protection at all
+and printed nothing, because `Quiet` is silent. Two other readers of this API already page, and one
+carries a comment about this identical defect being found here before. It pages to exhaustion now.
+
+The two fixes of round 11 combined to produce that: the recency filter is what turns "oldest first"
+from a harmless ordering into an inversion. Neither was wrong alone.
+
+**And the recovery path was made worse before it was made better.** Nothing closes a session's row
+when its container is stopped or removed — no `SessionEnd` hook fires — so after `run.sh --rm`, every
+session from the destroyed container still looks recently seen. `run.sh` passed those ids to the next
+start, and each holds its whole `<slug>/<id>/subagents/**` subtree: three or four of them exceed the
+entire budget, so the documented E2BIG recovery reclaimed nothing for up to six hours, where before
+this trigger carried any list at all it recovered in one pass. The fix is not a heuristic — a
+container this script just created, or just started from stopped, has **no sessions inside it**, so
+the correct keep list there is empty and the registry is asked only when `$state` is `running`.
+
+Three more of the same family — a rule applied to some of its instances:
+
+- `NOTHING_TO_DO` listed two of the sweep's three quiet exits, omitting `does not exist — nothing to
+  sweep`. `Said` is printed unconditionally (only failures are deduped), so a container whose
+  transcript root is absent logged one identical line every quarter of an hour for ever — the noise
+  the standing-key dedup exists to prevent, on the one path it did not cover. The count of the
+  sweep's success exits is pinned now, so a fourth is a red gate rather than a new log line.
+- Neither installed unit carried `JKB_CONTAINER_NAME`. A launchd agent gets only what
+  `EnvironmentVariables` lists and a `systemd --user` unit gets the user manager's environment, so
+  the operator override `dev_container_name`'s doc promises worked for `run.sh` and for the test
+  fixture and **never for the reaper** — which resolved `jkb-dev` for ever and reported the miss by
+  saying nothing. Captured at install time now, like the database path beside it.
+- The `--live-ids` verb was a literal in `run.sh` and a separate literal in the clap derive, compared
+  only by a grep over `run.sh`, and invoked by no test at all. Breaking it left every gate green while
+  the next start took the "could not ask jkb" branch and swept a live container with an empty list —
+  a benign-looking message over a dead protection. The existing daemon fixture exercises it now.
+
+And `jkb notify sessions` printed "live" for rows `--live-ids` on the same command excludes, with
+nothing in the output to tell them apart — so the listing an operator checks after a transcript is
+archived contradicted the keep list. It shows `open, unseen Nh` past the threshold.
