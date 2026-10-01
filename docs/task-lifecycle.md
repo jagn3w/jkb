@@ -940,10 +940,13 @@ would approve, with every request it makes held to the ticket's role. It returns
 thing only: a command that may be `task land`. For everything else that runs `jkb` it returns **no
 `permissionDecision` at all**, and the session's own rules and prompt judge the call against the
 command as the model wrote it, not the rewritten one carrying `export JKB_ATTEST=…` — measured, see
-below — exactly as they did before this hook existed. A redirect, a comment or a bare `!` (`jkb …
-2>&1`) rules out `allow`, since it is more than the invocation an allow rule for `jkb` approved,
-but cannot put a `land` in jkb's argv, so it is deferred rather than asked; only grouping, brace
-expansion and globs, which can create a word or run a command, still force the prompt.
+below — exactly as they did before this hook existed. A command the classifier cannot model is asked,
+because `land` cannot be ruled out of it — and that includes a redirect or a comment, so `jkb …
+2>&1` prompts. Deferring redirects was tried and reverted in the same series: review round 6
+measured a redirect operator spelled with `&` or `|` (`jkb task 2>&1 land x`) split as a command
+separator, and a quote inside a comment or a here-doc body opening a quote that bash never saw,
+each deferring a `land` bash runs. Doing it safely needs redirects, here-docs and comments lexed as
+bash lexes them.
 
 **Why `land` alone keeps the prompt.** `land` runs the repository's gate through `sh -c` with a
 command the *caller* supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling.
