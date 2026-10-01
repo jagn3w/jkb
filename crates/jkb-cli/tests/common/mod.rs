@@ -293,3 +293,51 @@ fn assert_isolated_dropping(what: &str, cmd: &Command, also: &[&str]) {
         );
     }
 }
+
+/// A `jkb serve` child, killed when dropped — so a failed assertion does not leave a daemon running
+/// past the test.
+///
+/// Here rather than in `cli.rs` because `sessions.rs` needs one too: a caller the RBAC refuses can
+/// only be served through `jkb serve` (a direct `--db` invocation is the operator), and the landing
+/// fixtures live in `sessions.rs`. Each file keeps its own `start`, built from its own isolated `jkb`
+/// command; the process lifecycle is the part worth having once.
+#[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
+pub struct Daemon(pub std::process::Child);
+
+#[allow(dead_code)] // compiled into three crates (see the module doc); not every one uses this
+impl Daemon {
+    /// Start `jkb serve` from `cmd` (already carrying its arguments); the daemon and its address.
+    pub fn spawn(mut cmd: Command) -> (Self, String) {
+        use std::io::BufRead as _;
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let daemon = Self(child);
+        let banner = std::io::BufReader::new(stdout)
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        let url = banner
+            .split_whitespace()
+            .find(|w| w.starts_with("http://"))
+            .unwrap_or_else(|| panic!("no address in {banner}"))
+            .to_owned();
+        (daemon, url)
+    }
+
+    /// Kill it and reap it.
+    pub fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}

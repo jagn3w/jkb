@@ -18,7 +18,7 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 mod common;
-use common::isolate_git_env;
+use common::{isolate_git_env, Daemon};
 
 /// A scratch repo plus a database kept *outside* it — a db file inside the repo would show
 /// up as an untracked change and make every land refuse a dirty tree.
@@ -925,6 +925,96 @@ fn recording_a_review_tags_the_task_and_moves_it_to_needs_review() {
         .assert()
         .success()
         .stdout(predicate::str::contains("no task records branch=main"));
+}
+
+impl Daemon {
+    /// Start `jkb serve` over `db` on an ephemeral port; the daemon and its `http://` address.
+    fn start(db: &Path, token: &Path) -> (Self, String) {
+        let mut cmd = jkb(Some(db));
+        cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+            .arg(token);
+        Self::spawn(cmd)
+    }
+}
+
+/// A caller the strategy does not let land is refused BEFORE anything moves (D52.4).
+///
+/// The Land permission used to be asked first by `task.land` — the record, the last step — so a
+/// caller who may not land got its branch grafted onto the target and its gate run, and was
+/// refused only the record: landed in git, not in jkb. The task here is otherwise landable (a
+/// clean review round, no gate), which is what makes the test bite: without it the review gate
+/// refuses first, before the graft, under the old code as well, and the test would pass for the
+/// wrong reason. The operator landing the same task afterwards is the proof that it was.
+#[test]
+fn a_caller_who_may_not_land_is_refused_before_the_target_moves() {
+    let f = Fixture::new();
+    let uid = f.add_task("work a coordinator may not land");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    f.add_concern("reviews/clean", "a concern, not a must-fix");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/clean"])
+        .assert()
+        .success();
+
+    // A coordinator: unscoped, so it may take the repo's land lease, and under the default
+    // `design-reviewed` strategy not one who lands — the operator alone does. A task-scoped grant
+    // is the wrong caller for this test: it is refused the lease (`lease.take` writes state no one
+    // task owns) before the graft under the old code too, so it would pass for the wrong reason.
+    let out = f
+        .jkb()
+        .args(["role", "grant", "coordinator"])
+        .args(["--agent", "coord-1", "--export"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let line = String::from_utf8(out.stdout).unwrap();
+    let grant = line
+        .trim()
+        .strip_prefix("export JKB_AGENT_TOKEN=")
+        .unwrap_or_else(|| panic!("{line}"))
+        .to_owned();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Daemon::start(&f.db, &token);
+
+    let before = git(&f.repo, &["rev-parse", &onto]);
+    let status = f.status_of(&uid);
+    let mut as_coordinator = jkb(None);
+    as_coordinator
+        .current_dir(&f.repo)
+        .env("HOME", f.home.path())
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env("JKB_AGENT_TOKEN", &grant)
+        .env_remove("JKB_DB")
+        .args(["task", "land", &uid, "--no-gate"]);
+    let out = as_coordinator.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The target first: it is the harm. Before `task.land_check` this command was refused too, but
+    // by `task.land`, after the graft had already moved the target.
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &onto]),
+        before,
+        "a caller refused the landing must not have moved the target — {stderr}"
+    );
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("`task.land_check` refused"), "{stderr}");
+    assert_eq!(f.status_of(&uid), status, "nor recorded anything");
+
+    // The same task, landed by the operator: the refusal above was the role, nothing else.
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate"])
+        .assert()
+        .success();
+    assert_ne!(git(&f.repo, &["rev-parse", &onto]), before);
 }
 
 /// The land gate: unreviewed refuses, an open must-fix refuses, cancelling it lets the

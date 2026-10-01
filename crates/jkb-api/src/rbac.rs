@@ -245,9 +245,10 @@ impl Request {
             | Self::RemovalCancel { .. }
             | Self::RemovalDrop { .. } => OpPermission::TaskClaim,
             Self::TaskReviewFile(_) | Self::TaskReviewRecord(_) => OpPermission::Review,
-            Self::TaskLand { .. } | Self::TaskLanded { .. } | Self::TaskCloseMerged { .. } => {
-                OpPermission::Land
-            }
+            Self::TaskLand { .. }
+            | Self::TaskLandCheck { .. }
+            | Self::TaskLanded { .. }
+            | Self::TaskCloseMerged { .. } => OpPermission::Land,
             Self::WorkflowFire { .. } | Self::WorkflowObserve { .. } => OpPermission::Workflow,
             Self::RoleGrant { .. } | Self::RoleRevoke { .. } => OpPermission::Grant,
             Self::AttestMint { .. } | Self::AttestRelease { .. } => OpPermission::Attest,
@@ -287,6 +288,7 @@ impl Request {
             | Self::TaskLocate { uid, .. }
             | Self::TaskAbandon { uid, .. }
             | Self::TaskLand { uid, .. }
+            | Self::TaskLandCheck { uid, .. }
             | Self::TaskLanded { uid, .. }
             | Self::TaskReviewWaive { uid, .. }
             | Self::TaskRanOnHost { uid, .. }
@@ -969,7 +971,10 @@ fn repeats_landing(
     phase: jkb_core::workflow::Phase,
     request: &Request,
 ) -> Result<bool, ApiError> {
-    let (Request::TaskLand { landed, .. } | Request::TaskLanded { landed, .. }) = request else {
+    let (Request::TaskLand { landed, .. }
+    | Request::TaskLandCheck { landed, .. }
+    | Request::TaskLanded { landed, .. }) = request
+    else {
         return Ok(false);
     };
     if phase != jkb_core::workflow::Phase::Landed {

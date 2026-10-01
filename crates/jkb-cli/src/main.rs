@@ -2663,7 +2663,7 @@ pub(crate) fn cmd_task_land(
     // branch first. Concerns and nits do not block — only must-fix findings do. A waiver is
     // only *owed* here; it is written after the landing actually happens, so a land that then
     // fails on the graft or the gate build leaves no waiver for something that never occurred.
-    let head = gitrepo::rev(&ctx.root, &branch)?.unwrap_or_else(|| "unknown".to_owned());
+    let head = refuse_unless_may_land(kb, &ctx.root, &facts.uid, &branch, &onto)?;
     let waiver_owed = review::enforce(kb, uid, &facts.review, no_review, json)?;
 
     let land_dir = land_dir_for(&ctx, &onto)?;
@@ -2742,6 +2742,34 @@ pub(crate) fn cmd_task_land(
         },
         json,
     )
+}
+
+/// Whether this caller may land `uid` from `branch` onto `onto` at all — asked with the payload the
+/// record will carry, and answered by the daemon's own `task.land` authorization, BEFORE the graft
+/// moves `onto` and before the gate runs a caller-supplied command. Until this, the Land permission
+/// was first asked by the record itself, after both: a caller the strategy does not let land got
+/// its branch grafted, its gate run and its session archived, and was refused only the record —
+/// landed in git, not in jkb.
+///
+/// Returns the branch's head — read here, so the head this asks about is the head that lands, and
+/// `"unknown"` when the branch has none, which is what the waiver string carries.
+fn refuse_unless_may_land(
+    kb: &session_cli::Kb<'_>,
+    root: &Path,
+    uid: &str,
+    branch: &str,
+    onto: &str,
+) -> Result<String> {
+    let head = gitrepo::rev(root, branch)?;
+    kb.land_check(
+        uid,
+        &jkb_api::sessions::Landed {
+            branch: branch.to_owned(),
+            onto: onto.to_owned(),
+            head: head.clone(),
+        },
+    )?;
+    Ok(head.unwrap_or_else(|| "unknown".to_owned()))
 }
 
 /// `task land --break-lock`: drop this repo's land lease, whoever holds it.

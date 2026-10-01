@@ -578,6 +578,21 @@ pub enum Request {
         /// Where it landed.
         landed: sessions::Landed,
     },
+    /// Whether `task.land` with exactly this payload would be admitted — asked by `jkb task land`
+    /// before it grafts or runs the gate, and answered by the same [`rbac::authorize`] as the record
+    /// itself, so there is one rule rather than a copy of it. Records nothing.
+    ///
+    /// It exists because the Land permission used to be asked only by `task.land`, at the very end:
+    /// a caller who may not land got its branch grafted onto the target and its gate run, and was
+    /// refused only the record — landed in git, not in jkb.
+    #[serde(rename = "task.land_check")]
+    TaskLandCheck {
+        /// The task.
+        uid: String,
+        /// Where it would land — carried so a merge queue re-landing the same branch is admitted
+        /// here exactly as `task.land` admits it.
+        landed: sessions::Landed,
+    },
     /// A landing the merge queue performed, for one task ([`sessions::landed`]).
     #[serde(rename = "task.landed")]
     TaskLanded {
@@ -1265,6 +1280,7 @@ impl Request {
         "lease.release",
         "lease.break",
         "task.land",
+        "task.land_check",
         "task.landed",
         "task.review_findings",
         "task.review_file",
@@ -1313,6 +1329,7 @@ impl Request {
     /// named here; `every_op_names_its_own_wire_tag_and_is_advertised` checks [`Request::OPS`]
     /// against the tags serde accepts and each op's name against the tag it serializes with.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one arm per op, like `permission`
     pub const fn op(&self) -> &'static str {
         match self {
             Self::MqTopicCreate { .. } => "mq.topic_create",
@@ -1371,6 +1388,7 @@ impl Request {
             Self::LeaseRelease { .. } => "lease.release",
             Self::LeaseBreak { .. } => "lease.break",
             Self::TaskLand { .. } => "task.land",
+            Self::TaskLandCheck { .. } => "task.land_check",
             Self::TaskLanded { .. } => "task.landed",
             Self::TaskReviewFindings { .. } => "task.review_findings",
             Self::TaskReviewFile(_) => "task.review_file",
@@ -1429,6 +1447,7 @@ impl Request {
     /// Exhaustive, so a new op must say. A write classed here fails against the daemon's `query_only`
     /// reader rather than writing somewhere unguarded (`every_op_is_served_on_the_connection_its_class_names`).
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one arm per op, like `permission`
     pub const fn is_agent_read(&self) -> bool {
         match self {
             Self::KbAmbient { .. }
@@ -1507,6 +1526,8 @@ impl Request {
             | Self::LeaseRelease { .. }
             | Self::LeaseBreak { .. }
             | Self::TaskLand { .. }
+            // Records nothing itself, but its admission can bind an attested subagent to the task.
+            | Self::TaskLandCheck { .. }
             | Self::TaskLanded { .. }
             | Self::TaskReviewFile(_)
             | Self::TaskReviewRecord(_)
@@ -1963,6 +1984,9 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
+    /// A `task.land_check` the caller passed: `task.land` with that payload would be admitted.
+    /// A refusal is an error, like every other refused op.
+    LandAdmitted {},
     /// A `role.grant` or `role.rotate_container`: the grant, and its token — answered this once.
     Granted {
         /// The grant.
@@ -2090,6 +2114,7 @@ impl Response {
             | Self::Blob { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
+            | Self::LandAdmitted {}
             | Self::Granted { .. }
             | Self::Revoked { .. }
             | Self::Grants { .. }
@@ -2177,6 +2202,7 @@ impl Response {
             | Self::Blob { .. }
             | Self::Lease { .. }
             | Self::LeaseBroken { .. }
+            | Self::LandAdmitted {}
             | Self::Granted { .. }
             | Self::Revoked { .. }
             | Self::Grants { .. }
@@ -3141,6 +3167,13 @@ impl LocalBackend {
                         sessions::land(c, m, uid, &landed, roots.as_ref())
                     })?,
                 }
+            }
+            // Admission asked who may land; this asks what `task.land` itself would refuse before
+            // recording — the same function, so the answer cannot drift from the record's.
+            Request::TaskLandCheck { uid, landed } => {
+                let roots = self.file_roots.clone();
+                db.read_with(move |c| sessions::land_check(c, &uid, &landed, roots.as_ref()))?;
+                Response::LandAdmitted {}
             }
             Request::TaskLanded { uid, landed } => {
                 let roots = self.file_roots.clone();
