@@ -5,6 +5,13 @@
 #   .container/sweep-transcripts.sh --dry-run    print what it would archive; move nothing
 #   .container/sweep-transcripts.sh --self-test  exercise the derivation; no container, no Docker
 #
+# SUPERSEDED AS THE DEFENCE (2026-09-30), KEPT AS THE BACKSTOP. What follows describes the posture
+# this file was written against, in which the sandbox enumerated every transcript. That stopped
+# being true when the transcript deny moved into a hook (.container/deny-transcripts.sh) and out of
+# permissions.deny: no rule names a transcript now, and on such a posture this script stands down
+# and says so -- see posture_enumerates_transcripts, which asks every settings layer. It still
+# sweeps the day an enumerating rule comes back, anywhere. .container/README.md has the record.
+#
 # THE FAILURE, MEASURED IN THIS CONTAINER ON 2026-09-28. Claude Code's Bash sandbox profile
 # enumerates every session transcript INDIVIDUALLY into its read-`denyOnly` list, and hands that
 # profile to the shell as a single argv string. Linux caps one argument at MAX_ARG_STRLEN = 32
@@ -395,13 +402,6 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
     printf '%s\n' "${out:-/}"
 }
 
-# EVERY PROJECT SLUG BEGINS WITH `-`. Claude Code names a project directory after the absolute
-# path with non-alphanumerics replaced, so a leading `/` becomes a leading `-`:
-# `-home-vscode-repos-jkb`. A bare `dirname "$rel"` reads that as the `-h` option and dies, and
-# this is every path in the tree rather than an edge case. So: the root is resolved to an absolute
-# path first (which makes every enumerated path start with `/`), the relative directory comes from
-# `${rel%/*}` parameter expansion rather than from dirname, and every external command that takes
-# a path here is given `--`.
 # WHETHER THIS FILE HAS A JOB. Everything above budgets a deny list that names every transcript by
 # path, because that is what `Read(~/.claude/projects/**/*.jsonl)` compiled to: one bubblewrap
 # argument per file, and past ~200 of them every Bash call died at spawn. That rule is gone. The
@@ -418,24 +418,110 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
 #
 # CANNOT TELL MEANS YES. A posture that is missing, unreadable or not JSON answers "enumerates",
 # which keeps the old behaviour: sweeping when it was not needed costs an archived transcript,
-# not sweeping when it was costs every Bash call in the container. The rule it looks for is the
-# one check-config.sh refuses outright -- a deny under a projects tree ending in a file pattern --
-# so on a correctly built image this answers "no", and would answer "yes" again the day someone
-# brought such a rule back.
-posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
-    local rules rule last
-    [ -r "$1" ] || return 0
-    rules="$(jq -r '.permissions.deny[]?' "$1" 2>/dev/null)" || return 0
-    while IFS= read -r rule; do
-        [ -n "$rule" ] || continue
-        rule="${rule#*(}"; rule="${rule%)}"
-        case "$rule" in *projects/*) ;; *) continue ;; esac
-        last="${rule##*/}"
-        case "$last" in '**') ;; *'*'*) return 0 ;; esac
-    done <<<"$rules"
+# not sweeping when it was costs every Bash call in the container. The rule it looks for -- one
+# enumerated per match that also covers a transcript -- is a shape check-config.sh refuses in the
+# managed file, so on a correctly built image this answers "no", and would answer "yes" again the
+# day someone brought such a rule back, in ANY settings layer, not only the managed one.
+# ---- THE DENY-RULE READER, DEFINED ONCE, HERE ---------------------------------------------------
+# check-config.sh (static) and verify.sh (runtime) load these functions FROM THIS FILE by name rather
+# than carrying copies. They live here because this is the one script that cannot source anything:
+# the host reaper pipes it into the container over `bash -s`, so it must be self-contained. Before
+# this, three files each parsed deny rules their own way and each copy was wrong differently --
+# one missed Claude Code's absolute `//path` spelling, one only looked at rules containing
+# `projects/`, one passed a mid-path `**` -- and the subtree fix had to land twice. One reader is
+# the fix for all of them. RENAMING ONE BREAKS BOTH LOADERS LOUDLY (command not found), never quietly.
+
+# A rule's path as Claude Code reads it: `//x` is absolute, `~/x` is the home, a single leading `/`
+# is relative to the SETTINGS FILE's directory, anything else relative to the session's cwd (which
+# no static reader can know, so it comes back as written and matches nothing absolute).
+posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> -> path pattern
+    local r="$1"
+    r="${r#*(}"; r="${r%)}"
+    case "$r" in
+        //*)   printf '%s\n' "/${r#//}" ;;
+        "~")   printf '%s\n' "$2" ;;
+        "~/"*) printf '%s\n' "$2/${r#\~/}" ;;
+        /*)    printf '%s\n' "$3$r" ;;
+        *)     printf '%s\n' "$r" ;;
+    esac
+}
+
+# Whether a rule covers a path, with Claude Code's SUBTREE semantics: a rule naming a directory
+# covers everything under it -- measured, a bare `Read(~/.claude/projects)` denied a Read of
+# <slug>/memory/MEMORY.md. `$1` is deliberately unquoted: it is the rule's glob.
+posture_rule_covers() { # posture_rule_covers <path pattern> <path> -> rc 0 covered
+    case "$2" in $1|$1/*) return 0 ;; esac
     return 1
 }
 
+# Whether Claude Code must NAME EVERY MATCH of a rule in the bubblewrap argv. Only two shapes
+# collapse to one entry: no wildcard at all, and a single trailing `/**` on a wildcard-free prefix
+# (`Read(~/.ssh/**)` -> `~/.ssh`). Anything else -- a file pattern at the end, or a `**` mid-path
+# with a literal tail like `~/repos/**/.env` -- is enumerated, one argv entry per match on disk.
+# The first cut looked only at the last segment and so passed the mid-path shape.
+posture_rule_expands() { # posture_rule_expands <path pattern> -> rc 0 expands per match
+    local pre
+    case "$1" in *[\*\?\[]*) ;; *) return 1 ;; esac
+    case "$1" in
+        */\*\*) pre="${1%/\*\*}"
+                case "$pre" in *[\*\?\[]*) return 0 ;; esac
+                return 1 ;;
+    esac
+    return 0
+}
+
+# Every settings file whose permissions.deny reaches the sandbox profile Claude Code builds:
+# managed, its drop-ins, the user's, and every repo's project settings (a session can start in any
+# of them, worktrees included). OVER-APPROXIMATES on purpose -- one enumerating rule anywhere is
+# enough to matter. Files that do not exist are normal and skipped.
+posture_layer_files() { # posture_layer_files <managed-settings.json> -> one path per line
+    local f h="${HOME:-/nonexistent}"
+    printf '%s\n' "$1"
+    for f in "$(dirname "$1")"/managed-settings.d/*.json \
+             "$h/.claude/settings.json" "$h/.claude/settings.local.json" \
+             "$h"/repos/*/.claude/settings.json "$h"/repos/*/.claude/settings.local.json \
+             "$h"/repos/*/.claude/worktrees/*/.claude/settings.json "$h"/repos/*/.claude/worktrees/*/.claude/settings.local.json \
+             "$h"/repos/*/.jkb/work/*/.claude/settings.json "$h"/repos/*/.jkb/work/*/.claude/settings.local.json; do
+        [ -f "$f" ] && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+# THE SWEEP'S QUESTION, asked precisely: does any layer carry a rule that is enumerated per match
+# AND covers a transcript? Both halves. The first cut asked "does a rule under projects/ end in a
+# file pattern", which missed `Read(~/.claude/**/*.jsonl)` (it does not say projects/) and would
+# have stood the sweep down while the argv grew; asking only "does anything expand" would instead
+# be fooled by the seven `Edit(~/repos/**/...)` rules, which expand but name no transcript.
+posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
+    local f rules rule pat probe layers home="${HOME:-/home/vscode}"
+    [ -r "$1" ] || return 0
+    # A COMMAND substitution, not `< <(...)`: a process substitution discards the producer's exit
+    # status, and a layer list that failed half-way would read as a short, clean one. Failing to list
+    # the layers is CANNOT TELL, which means yes. (check-config.sh's procsub guard caught this.)
+    layers="$(posture_layer_files "$1")" || return 0
+    while IFS= read -r f; do
+        rules="$(jq -r '.permissions.deny[]?' "$f" 2>/dev/null)" || return 0
+        while IFS= read -r rule; do
+            [ -n "$rule" ] || continue
+            pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")")"
+            posture_rule_expands "$pat" || continue
+            for probe in "$home/.claude/projects/-probe/x.jsonl" \
+                         "$home/.claude/projects/-probe/u/subagents/a.jsonl" \
+                         "$home/.claude-state/projects/-probe/x.jsonl"; do
+                posture_rule_covers "$pat" "$probe" && return 0
+            done
+        done <<<"$rules"
+    done <<<"$layers"
+    return 1
+}
+
+# EVERY PROJECT SLUG BEGINS WITH `-`. Claude Code names a project directory after the absolute
+# path with non-alphanumerics replaced, so a leading `/` becomes a leading `-`:
+# `-home-vscode-repos-jkb`. A bare `dirname "$rel"` reads that as the `-h` option and dies, and
+# this is every path in the tree rather than an edge case. So: the root is resolved to an absolute
+# path first (which makes every enumerated path start with `/`), the relative directory comes from
+# `${rel%/*}` parameter expansion rather than from dirname, and every external command that takes
+# a path here is given `--`.
 sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
     local root="$1" archive="$2" dry="${3:-}"
     local abs phys_root phys_archive records plan planned irreducible err
@@ -1288,11 +1374,54 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects)","Read(~/.claude-state/projects)"]}}' >"$pdir/baredir.json"
     printf '%s\n' '{"hooks":{}}' >"$pdir/nodeny.json"
     printf '%s\n' 'not json {' >"$pdir/broken.json"
-    pe() { if posture_enumerates_transcripts "$1"; then echo yes; else echo no; fi; }
+    # HERMETIC HOME. posture_layer_files reads $HOME's settings and every repo's, so a row run
+    # against the developer's own HOME would be decided by their machine. `pe` runs in an empty
+    # one unless a row hands it another.
+    mkdir -p "$work/nohome"
+    pe() { if HOME="${2:-$work/nohome}" posture_enumerates_transcripts "$1"; then echo yes; else echo no; fi; }
     eq "the old per-file globs enumerate transcripts"          "$(pe "$pdir/globs.json")"   yes
     eq "the posture that ships names no transcript"            "$(pe "$pdir/hook.json")"    no
     eq "a subtree wildcard collapses, so it does not either"   "$(pe "$pdir/subtree.json")" no
     eq "a bare directory is one argv entry, so neither does it" "$(pe "$pdir/baredir.json")" no
+    # A per-file glob that does not SAY projects/ still covers transcripts. The first predicate only
+    # looked at rules containing `projects/`, and stood the sweep down on this one.
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/*.jsonl)"]}}' >"$pdir/broad.json"
+    eq "a broad per-file glob over ~/.claude enumerates transcripts" "$(pe "$pdir/broad.json")" yes
+    # ...while a rule that expands but names no transcript does not -- the shipped ~/repos/** shape.
+    printf '%s\n' '{"permissions":{"deny":["Edit(~/repos/**/.claude/settings.json)"]}}' >"$pdir/repos.json"
+    eq "an expanding rule that covers no transcript does not" "$(pe "$pdir/repos.json")" no
+    # Claude Code's absolute spelling: `//` is the filesystem root, a single `/` is relative to the
+    # settings file. Both readers must agree with Claude Code, not with bash.
+    printf '%s\n' "{\"permissions\":{\"deny\":[\"Read(/$work/nohome/.claude/projects/**/*.jsonl)\"]}}" >"$pdir/abs.json"
+    eq "the //absolute spelling of a per-file glob enumerates" "$(pe "$pdir/abs.json")" yes
+    # OTHER LAYERS. The managed file is clean in both rows; the rule lives elsewhere.
+    lhome="$work/layerhome"; mkdir -p "$lhome/.claude" "$lhome/repos/r/.claude"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]}}' >"$lhome/.claude/settings.json"
+    eq "a per-file glob in USER settings enumerates though managed is clean" "$(pe "$pdir/hook.json" "$lhome")" yes
+    rm "$lhome/.claude/settings.json"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude-state/projects/**/*.jsonl)"]}}' >"$lhome/repos/r/.claude/settings.local.json"
+    eq "...and in a repo's project settings" "$(pe "$pdir/hook.json" "$lhome")" yes
+    mkdir -p "$pdir/managed-settings.d"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]}}' >"$pdir/managed-settings.d/50-x.json"
+    eq "...and in a managed drop-in" "$(pe "$pdir/hook.json")" yes
+    rm -r "$pdir/managed-settings.d"
+    printf '%s\n' 'not json {' >"$lhome/repos/r/.claude/settings.local.json"
+    eq "an unreadable layer is CANNOT TELL, which means yes" "$(pe "$pdir/hook.json" "$lhome")" yes
+
+    echo "==> sweep-transcripts self-test: the shared deny-rule reader"
+    rp() { posture_rule_path "$1" /h /etc/claude-code; }
+    eq "~/x is the home"                         "$(rp 'Read(~/.claude/projects)')"   /h/.claude/projects
+    eq "//x is absolute"                         "$(rp 'Read(//h/.claude/projects)')" /h/.claude/projects
+    eq "a single /x is relative to the settings file" "$(rp 'Read(/x)')"              /etc/claude-code/x
+    ex() { if posture_rule_expands "$1"; then echo yes; else echo no; fi; }
+    eq "no wildcard collapses"                   "$(ex /h/.claude/projects)"          no
+    eq "a trailing /** on a literal prefix collapses" "$(ex /h/.ssh/**)"              no
+    eq "a trailing file pattern expands"         "$(ex '/h/p/**/*.jsonl')"            yes
+    eq "a mid-path ** with a literal tail expands" "$(ex '/h/repos/**/.env')"         yes
+    eq "a trailing /** after a wildcard expands" "$(ex '/h/*/x/**')"                  yes
+    cv() { if posture_rule_covers "$1" "$2"; then echo yes; else echo no; fi; }
+    eq "a bare directory covers its subtree"     "$(cv /h/p /h/p/s/memory/M.md)"      yes
+    eq "...but not a sibling that shares a prefix" "$(cv /h/p /h/pq/x)"               no
     eq "a posture with no deny rules names nothing"            "$(pe "$pdir/nodeny.json")"  no
     # CANNOT TELL MEANS YES -- the direction that keeps sweeping. Getting these backwards is the
     # expensive way round: a sweep that stood down on an unreadable posture would leave a tree

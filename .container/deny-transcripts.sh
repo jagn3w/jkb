@@ -44,50 +44,117 @@
 #
 # FAILS CLOSED, unlike .claude/hooks/block-raw-sqlite.sh, and deliberately. That hook steers an
 # agent away from a better tool, so an error there must not wedge Bash. This one is a
-# confidentiality boundary: if it cannot tell what is being read, the answer is no. The blast
-# radius of failing closed is only this tree -- every path outside it is allowed without the hook
-# having to decide anything.
+# confidentiality boundary, so EVERY way of not reaching a verdict is a refusal: a payload jq
+# cannot parse, a missing jq, an unset variable, any crash. An EXIT trap turns anything that ends
+# the script without an explicit allow into exit 2, which Claude Code treats as blocking. The first
+# cut only closed the jq-parse case and said "fails closed" about all of it; with HOME unset,
+# `set -u` aborted at rc=1, which Claude Code reads as a NON-blocking error and lets the call
+# through.
+#
+# THE ONE OPEN EDGE, stated rather than hidden: a hook KILLED for exceeding its timeout is
+# non-blocking in Claude Code, and nothing inside the script can change that. It answers in ~7ms
+# (measured, 50 runs) against the 10s budget managed-settings.json gives it.
+#
+# PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
+# `~` is the user's home, and a relative path is relative to the SESSION'S cwd (the payload's
+# `.cwd`), not to wherever the harness happened to start this script. Both were missed at first,
+# and the `~` one was confirmed live (2026-10-01): a Read of `~/.claude/projects/<slug>/x.jsonl`
+# went straight past this hook, which had resolved it under its own $PWD, and was stopped only by a
+# permissions rule that a later commit removed.
+#
+# AND AN ANCESTOR OF THE TREE IS DENIED, not only paths inside it. Grep and Glob walk whatever they
+# are rooted at, so `Grep path=~/.claude-state` -- or `path=$HOME`, or no path at all from a home
+# cwd -- read transcripts while naming no transcript. The per-file `.jsonl` deny rules this hook
+# replaced had also been doing that job, as an ignore glob ripgrep honoured, so removing them
+# silently dropped it: the second time in this change that a rule turned out to have a job nobody
+# had written down. A Glob whose PATTERN carries the location (`/home/.../projects/**`,
+# `../../.claude/projects/**`) has its literal prefix checked the same way.
 set -uo pipefail
-
-# The two spellings of one tree: ~/.claude/projects is a symlink into the state volume, so the
-# same transcript is reachable by either name and a rule that knows only one knows neither.
-ROOTS_DEFAULT="$HOME/.claude/projects $HOME/.claude-state/projects"
 
 # Lexical, not `realpath`: the file may not exist yet (a Write), and a resolver that fails on a
 # missing path would answer "cannot tell" for exactly the calls that create one. `..` is collapsed
 # here because `<slug>/memory/../e1d7.jsonl` is a transcript wearing memory's prefix, and a check
 # that compared the raw string would allow it.
-normalise() { # normalise <path> -> lexically resolved absolute path
-    local p="$1" out=() seg
-    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
-    local IFS=/
-    for seg in $p; do
+# SPLIT WITH `read -a`, NEVER WITH AN UNQUOTED EXPANSION. `for seg in $p` with IFS=/ also does
+# pathname expansion, so a `*` segment became the names of files in whatever directory this ran in:
+# `/h/.claude/projects/*` normalised to `/h/.claude/projects/AGENTS.md/CLAUDE.md/...`. A hook that
+# rewrites the path it is judging into an unrelated one can be steered past itself. Caught by the
+# glob_base rows, which tripped on the same loop. `-d ''` so a newline in a path is a byte of it.
+split_path() { # split_path <path> -> sets the array `parts`
+    parts=()
+    IFS=/ read -r -d '' -a parts < <(printf '%s' "$1") || true
+}
+
+normalise() { # normalise <absolute path> -> lexically resolved absolute path
+    local out=() seg parts
+    split_path "$1"
+    for seg in ${parts[@]+"${parts[@]}"}; do
         case "$seg" in
             ''|.) ;;
             ..) [ "${#out[@]}" -gt 0 ] && unset 'out[${#out[@]}-1]' ;;
             *) out+=("$seg") ;;
         esac
     done
-    printf '/%s' "${out[@]+${out[@]}}" | sed 's|^/$|/|'
-    [ "${#out[@]}" -eq 0 ] && printf '/'
-    printf '\n'
+    if [ "${#out[@]}" -eq 0 ]; then printf '/\n'; else printf '/%s' "${out[@]}"; printf '\n'; fi
+}
+
+# `~` and `~/x` are the home; `~name/x` is over-approximated as the home too, because the safe
+# error here is refusing a path that was harmless, never allowing one that was not.
+resolve() { # resolve <path> <home> <cwd> -> normalised absolute path
+    local p="$1"
+    case "$p" in
+        "~")      p="$2" ;;
+        "~/"*)    p="$2/${p#\~/}" ;;
+        "~"*/*)   p="$2/${p#*/}" ;;
+        /*)       ;;
+        *)        p="$3/$p" ;;
+    esac
+    normalise "$p"
+}
+
+# The literal leading part of a glob pattern: every segment before the first that holds a glob
+# character. `**/*.jsonl` -> "" (the search root alone decides), `/a/b/*/c` -> /a/b.
+glob_base() { # glob_base <pattern> -> literal prefix, possibly empty
+    local pat="$1" out="" seg first=1 parts
+    case "$pat" in /*) out="/" ;; esac
+    split_path "$pat"
+    for seg in ${parts[@]+"${parts[@]}"}; do
+        [ -n "$seg" ] || continue
+        case "$seg" in *[\*\?\[\{]*) break ;; esac
+        if [ "$first" -eq 1 ] && [ "$out" != "/" ]; then out="$seg"; else out="${out%/}/$seg"; fi
+        first=0
+    done
+    printf '%s\n' "$out"
 }
 
 # THE DECISION, pure so --self-test can drive it with literals and no Claude Code.
-verdict() { # verdict <path> <roots> -> allow|deny
-    local p roots="$2" root
-    p="$(normalise "$1")"
+#
+# PREFIX TESTS ARE STRING SURGERY, NOT `case` PATTERNS. The ancestor test was first written
+# `case "$root/" in "${p%/}"/*)`, and for p=/ -- where the quoted part is EMPTY -- it did not match
+# `/h/.claude/projects/` on bash 5.2.21, while the literal pattern `/*` did. Reproduced in a fresh
+# shell; the dot after a slash is part of it. Whatever bash's matcher is doing there, a
+# confidentiality check must not depend on it, so "starts with" is `${x#"$prefix"} != $x`, which
+# compares bytes and nothing else.
+verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
+    local p roots="$2" root rel rest anc
+    p="$(resolve "$1" "$3" "$4")"
     for root in $roots; do
-        case "$p/" in
-            "$root"/*)
-                # Auto-memory is the one child of a slug that is not a transcript, and it must stay
-                # readable. Matched as a SEGMENT: `<slug>/memory/...` is memory, `<slug>/memoryX/`
-                # is not, and `<slug>/x/memory` is not a store Claude Code would ever read.
-                case "$p/" in
-                    "$root"/*/memory/*) printf 'allow\n'; return ;;
-                esac
-                printf 'deny\n'; return ;;
-        esac
+        # INSIDE the tree: the root itself, or anything under root/.
+        if [ "$p" = "$root" ] || [ "${p#"$root"/}" != "$p" ]; then
+            # Auto-memory is the one child of a slug that is not a transcript. EXACTLY one slug
+            # deep: `<slug>/memory/...`. A `case` `*` crosses `/`, so the first cut's
+            # `"$root"/*/memory/*` matched a directory called memory at ANY depth --
+            # `<slug>/<uuid>/subagents/memory/a.jsonl` was readable and writable.
+            rel="${p#"$root"}"; rel="${rel#/}"
+            case "$rel" in
+                */*) rest="${rel#*/}"
+                     case "$rest" in memory|memory/*) printf 'allow\n'; return ;; esac ;;
+            esac
+            printf 'deny\n'; return
+        fi
+        # An ANCESTOR of the tree: anything rooted here walks into it. For p=/ this is "/".
+        anc="${p%/}/"
+        if [ "${root#"$anc"}" != "$root" ]; then printf 'deny\n'; return; fi
     done
     printf 'allow\n'
 }
@@ -95,12 +162,12 @@ verdict() { # verdict <path> <roots> -> allow|deny
 if [ "${1:-}" = --self-test ]; then
     fails=0
     R="/h/.claude/projects /h/.claude-state/projects"
-    t() { # t <label> <path> <want>
-        local got; got="$(verdict "$2" "$R")"
+    t() { # t <label> <path> <want> [cwd]
+        local got; got="$(verdict "$2" "$R" /h "${4:-/h/repos/jkb}")"
         if [ "$got" = "$3" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
         else printf '  \033[31mFAIL\033[0m %s\n         got %s, wanted %s\n' "$1" "$got" "$3"; fails=$((fails+1)); fi
     }
-    echo "==> deny-transcripts self-test"
+    echo "==> deny-transcripts self-test: the decision"
     t "a session transcript is denied"            /h/.claude/projects/-slug/e1d7.jsonl            deny
     t "a subagent transcript is denied"           /h/.claude/projects/-slug/e1d7/subagents/a.jsonl deny
     t "a workflow agent transcript is denied"     /h/.claude/projects/-slug/e1d7/subagents/workflows/wf_1/a.jsonl deny
@@ -108,59 +175,155 @@ if [ "${1:-}" = --self-test ]; then
     # The whole reason this is a hook and not a glob.
     t "auto-memory is ALLOWED"                    /h/.claude/projects/-slug/memory/MEMORY.md      allow
     t "a memory note is allowed"                  /h/.claude/projects/-slug/memory/foo.md         allow
+    t "the memory directory itself is allowed"    /h/.claude/projects/-slug/memory                allow
     t "...in the state-volume spelling too"       /h/.claude-state/projects/-slug/memory/MEMORY.md allow
-    # Traversal: a transcript wearing memory's prefix. Allowing this is the whole point of
-    # normalising, and a string compare gets it wrong.
+    # Memory is exactly one slug deep.
+    t "a memory directory two levels down is NOT memory" \
+      /h/.claude/projects/-slug/e1d7/subagents/memory/a.jsonl deny
+    t "...nor one level down under a uuid"        /h/.claude/projects/-slug/e1d7/memory/x.jsonl   deny
+    t "memoryX is not memory"                     /h/.claude/projects/-slug/memoryX/f.md          deny
+    # Traversal: a transcript wearing memory's prefix.
     t "a transcript reached through memory/.. is denied" \
       /h/.claude/projects/-slug/memory/../e1d7.jsonl deny
+    t "a memory/../../other/memory chain lands where it lands" \
+      /h/.claude/projects/-slug/a/memory/../../b/memory/x.jsonl deny
     t "a transcript reached through // is denied" /h/.claude/projects//-slug//e1d7.jsonl          deny
-    t "a relative-looking .. inside the tree is denied" \
-      /h/.claude/projects/-slug/e1d7/../e1d7.jsonl  deny
+    # A glob character in a path is a byte of the path, never expanded against this process's cwd.
+    t "a * in a path is not expanded against the cwd" "/h/.claude/projects/*"                     deny
+    t "...nor a * that would match files here"    "/h/.claude/projects/-slug/memory/../*"         deny
+    # Resolved the way the TOOL resolves it.
+    t "a ~ path is the home, not this process's cwd"  "~/.claude/projects/-slug/e1d7.jsonl"       deny
+    t "~ memory is still allowed"                 "~/.claude/projects/-slug/memory/MEMORY.md"     allow
+    t "a ~name path is over-approximated to the home" "~vscode/.claude/projects/-slug/e.jsonl"   deny
+    t "a relative path resolves against the SESSION cwd" \
+      ".claude/projects/-slug/e1d7.jsonl" deny /h
+    t "...so from a repo cwd it is a repo path"   ".claude/projects/-slug/e1d7.jsonl"             allow /h/repos/jkb
+    t "a relative climb out of the repo into the tree is denied" \
+      "../../.claude-state/projects/-s/e.jsonl" deny /h/repos/jkb
+    # Ancestors: a search rooted here walks into the tree.
+    t "the state volume root is an ancestor, denied" /h/.claude-state                             deny
+    t "~/.claude is an ancestor, denied"          /h/.claude                                      deny
+    t "the home is an ancestor, denied"           /h                                              deny
+    t "/ is an ancestor, denied"                  /                                               deny
+    t "~ alone is the home, denied"               "~"                                             deny
     # Near-misses that must NOT be swallowed.
-    t "memoryX is not memory"                     /h/.claude/projects/-slug/memoryX/f.md          deny
     t "a repo file is allowed"                    /h/repos/jkb/src/main.rs                        allow
+    t "the repos directory is not an ancestor"    /h/repos                                        allow
     t "the memory STORE outside the tree is allowed" /h/.jkb/claude-memory/jkb/MEMORY.md          allow
-    t "a sibling directory is allowed"            /h/.claude/settings.json                        allow
+    t "a sibling file is allowed"                 /h/.claude/settings.json                        allow
     t "a path merely containing the root name is allowed" /h/x/.claude/projects-backup/a.jsonl    allow
+    t "a sibling whose name starts like the root is not an ancestor" /h/.claude-statement         allow
+
+    echo "==> deny-transcripts self-test: the literal prefix of a Glob pattern"
+    g() { local got; got="$(glob_base "$2")"
+          if [ "$got" = "$3" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
+          else printf '  \033[31mFAIL\033[0m %s\n         got [%s], wanted [%s]\n' "$1" "$got" "$3"; fails=$((fails+1)); fi; }
+    g "a wholly relative glob has no prefix"      '**/*.jsonl'                         ''
+    g "an absolute glob keeps its literal part"   '/h/.claude/projects/**/*.jsonl'     '/h/.claude/projects'
+    g "a relative climb is kept to be resolved"   '../../.claude/projects/*/x'         '../../.claude/projects'
+    g "a ~ glob keeps the ~"                      '~/.claude-state/projects/*'         '~/.claude-state/projects'
+    g "a bracket is a glob character"             '/h/a/[bc]/d'                        '/h/a'
+
+    # THROUGH THE PROGRAM: the fail-closed contract is about how the script EXITS, which no call to
+    # `verdict` can show. Run as Claude Code runs it: JSON on stdin, decision on stdout or rc 2.
+    echo "==> deny-transcripts self-test: hook mode, as Claude Code runs it"
+    self="$0"
+    h() { # h <label> <want deny|allow> <stdin> [env...]
+        local label="$1" want="$2" in="$3" out rc=0; shift 3
+        out="$(printf '%s' "$in" | env "$@" "$BASH" "$self" 2>/dev/null)" || rc=$?
+        local got=allow
+        case "$out" in *'"permissionDecision":"deny"'*) got=deny ;; esac
+        [ "$rc" -eq 2 ] && got=deny
+        [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && got="rc=$rc (non-blocking: the call would go through)"
+        if [ "$got" = "$want" ]; then printf '  \033[32mok\033[0m   %s\n' "$label"
+        else printf '  \033[31mFAIL\033[0m %s\n         got %s, wanted %s\n' "$label" "$got" "$want"; fails=$((fails+1)); fi
+    }
+    h "a Read of a transcript is denied" deny \
+      '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    h "a Read of memory is allowed" allow \
+      '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/memory/MEMORY.md"}}' HOME=/h
+    h "a Read with a ~ path is denied" deny \
+      '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"~/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    h "a Grep rooted at the state volume is denied" deny \
+      '{"tool_name":"Grep","cwd":"/h/repos/jkb","tool_input":{"path":"/h/.claude-state","pattern":"x"}}' HOME=/h
+    h "a Grep with NO path from a home cwd is denied" deny \
+      '{"tool_name":"Grep","cwd":"/h","tool_input":{"pattern":"x"}}' HOME=/h
+    h "...and from a repo cwd is allowed" allow \
+      '{"tool_name":"Grep","cwd":"/h/repos/jkb","tool_input":{"pattern":"x"}}' HOME=/h
+    h "a Glob whose pattern names the tree is denied" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"/h/.claude/projects/**/*.jsonl"}}' HOME=/h
+    h "a Glob climbing into the tree from its path is denied" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"path":"/h/repos/jkb","pattern":"../../.claude-state/projects/*"}}' HOME=/h
+    h "an ordinary Glob in a repo is allowed" allow \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"**/*.rs"}}' HOME=/h
+    h "a call naming no path at all, to a non-search tool, is allowed" allow \
+      '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{}}' HOME=/h
+    # FAIL CLOSED: every way of not reaching a verdict is a refusal.
+    h "an unparseable payload is denied" deny 'not json {' HOME=/h
+    h "an empty payload is denied" deny '' HOME=/h
+    # With HOME unset the hook falls back to the ACCOUNT's home, so the probe is a transcript there.
+    acct="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    h "HOME unset falls back to the account home and still denies -- never rc 1" deny \
+      '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$acct"'/.claude/projects/-s/e.jsonl"}}' -u HOME
+    h "no jq on PATH is a refusal, not a pass" deny \
+      '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/repos/jkb/x"}}' HOME=/h PATH=/nonexistent
     if [ "$fails" -eq 0 ]; then printf '\033[32mdeny-transcripts self-test passed\033[0m\n'; exit 0; fi
     printf '\033[31mdeny-transcripts self-test: %s failed\033[0m\n' "$fails"; exit 1
 fi
 
 # ---------------------------------------------------------------------------- hook mode
-input="$(cat 2>/dev/null)"
-# Both spellings of the field: Read/Edit/Write carry `file_path`, Grep/Glob carry `path`. Asking
-# for both costs one jq and means a tool added later with either name is covered rather than
-# silently exempt.
+# The trap is set BEFORE anything that can fail, so nothing below can end this script without a
+# decision: `decided` is set only by allow/deny, and any other exit -- set -u, a crash, a helper
+# missing -- becomes exit 2, which blocks.
+decided=""
+on_exit() {
+    local rc=$?
+    [ -n "$decided" ] && exit "$rc"
+    printf 'deny-transcripts.sh could not reach a decision (exit %s), so it refuses: this hook guards other sessions'"'"' transcripts and an unclassified call is treated as one.\n' "$rc" >&2
+    exit 2
+}
+trap on_exit EXIT
+
+allow() { decided=allow; exit 0; }
 deny() {
+    decided=deny
     printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":%s}}\n' \
-        '"Session transcripts are not readable. They are other agents'"'"' working context, they are not a source of truth for this repository, and reading them is how one session inherits another'"'"'s mistakes. Auto-memory under <slug>/memory/ IS readable, and ~/.jkb/claude-memory holds the shared store. If you need what another session concluded, read the decision record it left in docs/ or the commit message."'
+        '"Session transcripts are not readable, and neither is any directory containing them -- a search rooted there walks into them. They are other agents'"'"' working context, not a source of truth for this repository, and reading them is how one session inherits another'"'"'s mistakes. Auto-memory under <slug>/memory/ IS readable, and ~/.jkb/claude-memory holds the shared store. If you need what another session concluded, read the decision record it left in docs/ or the commit message."'
     exit 0
 }
 
-jq_rc=0
-paths="$(printf '%s' "$input" \
-    | jq -r '[.tool_input.file_path?, .tool_input.path?, .tool_input.notebook_path?]
-             | map(select(. != null and . != "")) | .[]' 2>/dev/null)" || jq_rc=$?
+# HOME from the account database when the environment lost it: the roots are derived from it, and
+# a hook that cannot name the tree it guards cannot classify anything. Still empty -> refuse.
+home="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
+[ -n "$home" ] || exit 3
+roots="$home/.claude/projects $home/.claude-state/projects"
 
-# THE FAIL-CLOSED ARM, and without it the claim in the header is false. If jq could not parse the
-# call, `paths` is empty and the loop below allows -- so a malformed payload that NAMES a
-# transcript would be the one input that gets through. There is no path to classify in that state,
-# so the raw text is asked instead: it is a cruder question, but it is asked only when the precise
-# one could not be, and the cost of a false deny here is one refused tool call with a reason.
-if [ "$jq_rc" -ne 0 ] || ! command -v jq >/dev/null 2>&1; then
-    for dc_root in $ROOTS_DEFAULT; do
-        case "$input" in *"$dc_root"*) deny ;; esac
-    done
-fi
+input="$(cat 2>/dev/null)"
+command -v jq >/dev/null 2>&1 || exit 3
+# One parse, @sh-quoted so `eval` assigns rather than executes. Every location a file tool can be
+# pointed at: Read/Edit/Write carry file_path, Grep/Glob carry path, NotebookEdit notebook_path,
+# and Glob's pattern can carry the location by itself.
+assign="$(printf '%s' "$input" | jq -er '@sh "tool=\(.tool_name // "") cwd=\(.cwd // "") fp=\(.tool_input.file_path // "") pth=\(.tool_input.path // "") nb=\(.tool_input.notebook_path // "") pat=\(.tool_input.pattern // "")"' 2>/dev/null)" || exit 3
+eval "$assign"
+[ -n "$cwd" ] || cwd="$PWD"
 
+check() { # check <path>: deny on deny, return on allow, refuse on anything else
+    local v; v="$(verdict "$1" "$roots" "$home" "$cwd")"
+    case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac
+}
 
-# NO PATH IS NOT A FAILURE. Most tool calls carry none, and a hook that denied those would block
-# every Bash command in the container. The fail-closed rule applies to a path it cannot classify,
-# not to a call that names no path.
-[ -n "$paths" ] || exit 0
-
-while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    [ "$(verdict "$p" "$ROOTS_DEFAULT")" = deny ] && deny
-done <<<"$paths"
-exit 0
+for p in "$fp" "$nb"; do [ -n "$p" ] && check "$p"; done
+case "$tool" in
+    Grep|Glob)
+        # A search with no path searches the session's cwd.
+        base="${pth:-$cwd}"
+        check "$base"
+        if [ "$tool" = Glob ] && [ -n "$pat" ]; then
+            gb="$(glob_base "$pat")"
+            if [ -n "$gb" ]; then
+                case "$gb" in /*|"~"*) check "$gb" ;; *) check "$(resolve "$base" "$home" "$cwd")/$gb" ;; esac
+            fi
+        fi ;;
+    *) [ -n "$pth" ] && check "$pth" ;;
+esac
+allow

@@ -411,13 +411,16 @@ REC
 # <slug>/memory/MEMORY.md came back "File is in a directory that is denied by your permission
 # settings" while the hook in front of it had ALLOWED the same path. The guard shared the exact
 # wrong belief it existed to catch, which is the one way a guard cannot fail.
+# THE ONE DENY-RULE READER, loaded from sweep-transcripts.sh by name (it is this file's sibling,
+# which the transcript-budget check below already relies on). This used to match with its own `case`
+# and parse rules with its own jq+sed, which missed Claude Code's `//path` spelling exactly as
+# check-config.sh's copy did -- the same defect in two places, needing two fixes. One definition now.
+eval "$(sed -n '/^posture_rule_path() {/,/^}/p; /^posture_rule_covers() {/,/^}/p; /^posture_layer_files() {/,/^}/p' "$(dirname "$0")/sweep-transcripts.sh")"
 memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> clear|shadowed:<pattern>
     local mem="$1" pat
     while IFS= read -r pat; do
         [ -n "$pat" ] || continue
-        case "$mem" in
-            $pat|$pat/*) printf 'shadowed:%s\n' "$pat"; return ;;
-        esac
+        posture_rule_covers "$pat" "$mem" && { printf 'shadowed:%s\n' "$pat"; return; }
     done <<<"$2"
     printf 'clear\n'
 }
@@ -488,6 +491,10 @@ if [ "$SELF_TEST" = yes ]; then
        "$MEMP" '/home/vscode/.claude/projects' shadowed
     ms "...but a bare rule on a SIBLING directory does not" \
        "$MEMP" '/home/vscode/.claude/projects-archive' clear
+    # Claude Code's ABSOLUTE spelling is `//path`; the pattern is what the shared reader makes of the
+    # RULE. Both old copies rewrote `~` and nothing else, so this exact rule read as clear.
+    ms "a //absolute bare-directory rule covers memory too" \
+       "$MEMP" "$(posture_rule_path 'Read(//home/vscode/.claude/projects)' /home/vscode /etc/claude-code)" shadowed
     ms "a rule about another tree leaves memory alone" \
        "$MEMP" '/home/vscode/repos/**/*.env' clear
     # The scan must read EVERY rule, not just the first: a shadowing rule added below a harmless
@@ -1599,8 +1606,17 @@ mem_managed=/etc/claude-code/managed-settings.json
 if [ ! -f "$mem_managed" ]; then
     bad "there are no managed settings at $mem_managed, so nothing here establishes that the posture leaves auto-memory readable"
 else
-    mem_deny="$(jq -r '.permissions.deny[]? | sub("^[A-Za-z]+\\("; "") | sub("\\)$"; "")' "$mem_managed" 2>/dev/null \
-                | sed "s|^~|$HOME|")"
+    # EVERY LAYER, read the way Claude Code reads it: managed, its drop-ins, the user's settings and
+    # every repo's. A memory-swallowing rule in a project's settings.local.json breaks memory exactly
+    # as one in the image would, and this used to read the managed file alone.
+    mem_deny=""; mem_unread=""
+    while IFS= read -r mem_f; do
+        mem_rules="$(jq -r '.permissions.deny[]?' "$mem_f" 2>/dev/null)" || { mem_unread="$mem_unread $mem_f"; continue; }
+        while IFS= read -r mem_r; do
+            [ -n "$mem_r" ] && mem_deny="$mem_deny$(posture_rule_path "$mem_r" "$HOME" "$(dirname "$mem_f")")
+"
+        done <<<"$mem_rules"
+    done <<<"$(posture_layer_files "$mem_managed")"
     # A SYNTHETIC SLUG, deliberately. The question is whether the TREE is covered, and no rule
     # names a slug; a probe path is therefore faithful for every repo at once and saves this file
     # from carrying a second copy of the linker's slugify -- two spellings of one rule being the
@@ -1618,8 +1634,10 @@ else
         mem_v="$(memory_shadow "$mem_link/MEMORY.md" "$mem_deny")"
         case "$mem_v" in shadowed:*) mem_shadowed="$mem_shadowed ${mem_v#shadowed:}" ;; esac
     done
-    if [ -z "$mem_deny" ]; then
-        bad "no permissions.deny rules could be read from $mem_managed — the check that none of them swallows auto-memory examined nothing"
+    if [ -n "$mem_unread" ]; then
+        bad "a settings layer could not be parsed, so whether it swallows auto-memory is unknown:$mem_unread"
+    elif [ -z "$mem_deny" ]; then
+        bad "no permissions.deny rules could be read from any settings layer — the check that none of them swallows auto-memory examined nothing"
     elif [ -n "$mem_shadowed" ]; then
         # FATAL. The container runs, every other check passes, and memory silently stops working
         # -- which is the exact failure profile this file exists to convert into a sentence.
@@ -1648,18 +1666,33 @@ elif [ "$(stat -c '%U' "$mem_hook" 2>/dev/null)" != root ] || [ -w "$mem_hook" ]
 elif ! "$mem_hook" --self-test >/dev/null 2>&1; then
     bad "$mem_hook fails its own self-test in this container — the transcript deny is wired but not working"
 else
-    # ASKED OF THE INSTALLED COPY, not of a fixture: the answer that matters is what the hook in
-    # THIS image does, and its two load-bearing cases are opposite verdicts on sibling paths.
-    mem_t="$(printf '{"tool_input":{"file_path":"%s/.claude/projects/-probe/x.jsonl"}}' "$HOME" | "$mem_hook" 2>/dev/null)"
-    mem_m="$(printf '{"tool_input":{"file_path":"%s/.claude/projects/-probe/memory/MEMORY.md"}}' "$HOME" | "$mem_hook" 2>/dev/null)"
-    case "$mem_t" in
-        *'"deny"'*)
-            case "$mem_m" in
-                *'"deny"'*) bad "the installed transcript hook also denies auto-memory — MEMORY.md will stop reaching context with no error anywhere" ;;
-                *) ok "the transcript hook is installed root-owned, denies a transcript and allows auto-memory" ;;
-            esac ;;
-        *) bad "the installed transcript hook does NOT deny a transcript path — it is present but not holding the boundary" ;;
-    esac
+    # ASKED OF THE INSTALLED COPY, not of a fixture, and under EVERY spelling of the tree. This
+    # probed ~/.claude/projects alone, so a hook that had lost its ~/.claude-state/projects root
+    # still passed here while that whole spelling was readable. The spellings are THIS file's own
+    # list -- what the hook is required to cover -- not the hook's, so a hook that drops one cannot
+    # agree with itself. Verdict by exit too: rc 2 is the hook refusing, and anything else non-zero
+    # would let the call through.
+    mem_probe_hook() { # mem_probe_hook <path> -> deny|allow|broken
+        local out rc=0
+        out="$(printf '{"tool_name":"Read","cwd":"%s","tool_input":{"file_path":"%s"}}' "$HOME" "$1" | "$mem_hook" 2>/dev/null)" || rc=$?
+        case "$rc:$out" in
+            0:*'"permissionDecision":"deny"'*|2:*) echo deny ;;
+            0:*) echo allow ;;
+            *) echo broken ;;
+        esac
+    }
+    mem_hook_wrong=""
+    for mem_root in "$HOME/.claude/projects" "$HOME/.claude-state/projects"; do
+        [ "$(mem_probe_hook "$mem_root/-probe/x.jsonl")" = deny ] \
+            || mem_hook_wrong="$mem_hook_wrong a transcript under $mem_root is NOT denied;"
+        [ "$(mem_probe_hook "$mem_root/-probe/memory/MEMORY.md")" = allow ] \
+            || mem_hook_wrong="$mem_hook_wrong auto-memory under $mem_root is NOT allowed;"
+    done
+    if [ -n "$mem_hook_wrong" ]; then
+        bad "the installed transcript hook is present but wrong:$mem_hook_wrong"
+    else
+        ok "the transcript hook is installed root-owned, and under both spellings denies a transcript and allows auto-memory"
+    fi
 fi
 
 # 3e. Git runs the hooks the host runs. VS Code copies the host's ~/.gitconfig in on attach, so a

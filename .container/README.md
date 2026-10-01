@@ -1328,28 +1328,67 @@ are siblings, so **no glob separates them**; that is a property of Claude Code's
 something this repo can rule its way out of.
 
 **A hook can, and costs no argv, because it is code rather than a path list.** The trade is one
-process per file-tool call in exchange for O(files) of argv. `deny-transcripts.sh` normalises the
-path lexically first — `<slug>/memory/../e1d7.jsonl` is a transcript wearing memory's prefix, and
-a string compare allows it — then denies anything under either spelling of the tree except a
-`memory/` segment. Fifteen self-test rows, run by `./scripts/check.sh` and CI.
+process per file-tool call (~7ms, measured over 30 runs) in exchange for O(files) of argv. What
+`deny-transcripts.sh` decides, and each clause is there because the first cut got it wrong:
 
-**It fails closed**, unlike `.claude/hooks/block-raw-sqlite.sh`, which fails open. That one steers
-an agent toward a better tool, so an error must not wedge Bash. This one is a confidentiality
-boundary: if `jq` cannot parse the call, the raw text is checked for the roots and the answer is
-no. A call naming no path at all is still allowed — otherwise every Bash command in the container
-would be blocked.
+- **Paths are resolved the way the tool resolves them.** A leading `~` is the home, and a relative
+  path is relative to the *session's* cwd (the payload's `.cwd`), not the hook's own. Confirmed
+  live on 2026-10-01: a `Read` of `~/.claude/projects/<slug>/x.jsonl` went straight past the first
+  cut, which had resolved it under its own `$PWD`, and was stopped only by a permissions rule that
+  a later commit removed. The two commits were unsafe apart.
+- **An ancestor of the tree is denied**, not only paths inside it. `Grep path=~/.claude-state`, or
+  `path=$HOME`, or a search with no path from a home cwd, reads transcripts while naming none. The
+  per-file `.jsonl` rules this hook replaced had been doing that job as an ignore glob ripgrep
+  honoured, so removing them silently dropped it. A `Glob` whose pattern carries the location
+  (`/home/…/projects/**`, `../../.claude/projects/*`) has its literal prefix checked the same way.
+- **Memory is exactly one slug deep**: `<slug>/memory/…`. A `case` `*` crosses `/`, so the first
+  cut exempted a directory called `memory` at any depth.
+- **Paths are split with `read -a`, never an unquoted expansion.** `for seg in $p` also does
+  pathname expansion, so a `*` segment became the names of files in the hook's cwd. A hook that
+  rewrites the path it is judging into an unrelated one can be steered past itself.
+- **Prefix tests are string surgery, not `case` patterns.** `case "$root/" in "${p%/}"/*)` with
+  `p=/` did not match `/h/.claude/projects/` on bash 5.2.21, so `/` read as "not an ancestor".
 
-**What holds it in place**, because the hook is now the only thing denying transcripts to the file
+52 self-test rows, run by `./scripts/check.sh` and CI. They include program-level rows that run the
+hook exactly as Claude Code does, JSON on stdin and a verdict on stdout or exit 2, because the
+fail-closed contract is about how the script *exits*, which no call to a function can show.
+
+**It fails closed**, unlike `.claude/hooks/block-raw-sqlite.sh`, which fails open on purpose (that
+one steers an agent to a better tool, so an error must not wedge Bash). This one is a
+confidentiality boundary, so every way of not reaching a verdict is a refusal: an unparseable
+payload, a missing `jq`, an unset variable, any crash. An EXIT trap turns anything that ends the
+script without an explicit allow into exit 2, which Claude Code treats as blocking. The first cut
+only closed the jq-parse case: with `HOME` unset, `set -u` aborted at rc 1, which Claude Code reads
+as non-blocking, and the call went through. **One edge stays open, and it is the harness's:** a
+hook killed for exceeding its timeout is non-blocking, and nothing inside the script changes that.
+It answers in ~7ms against a 10s budget.
+
+**What holds it in place**, because the hook is the only thing denying transcripts to the file
 tools and its absence is silent:
 
-- `check-config.sh` (static): no deny rule may cover the memory path; **none** may end in a file
-  pattern — the exception list is gone, since nothing needs one now; and the hook must be
-  referenced, installed by the Dockerfile, installed `--chown=root:root`, and matched against
-  every file-reading tool (`Read|Edit|Write|NotebookEdit|Grep|Glob` — a hook wired to `Read` alone
-  leaves `Grep` able to search the tree). Six mutations pin these.
+- **One deny-rule reader**, defined in `sweep-transcripts.sh` (the one script that cannot source
+  anything; the reaper pipes it in over `bash -s`) and loaded by name into `check-config.sh` and
+  `verify.sh`. Three files used to parse rules three ways, and each was wrong differently: one
+  missed Claude Code's absolute `//path` spelling, one only looked at rules containing `projects/`,
+  one passed a mid-path `**`. A rename now makes both loaders fail loudly.
+- `check-config.sh` (static): no rule may cover the memory path, with Claude Code's subtree
+  semantics; nothing may be enumerated per match (a file pattern at the end, or a `**` mid-path)
+  except the seven named `~/repos/**` rules below; and the hook must be referenced, installed by the
+  Dockerfile `--chown=root:root`, and matched against every file-reading tool **as whole tokens**,
+  since `Edit` is a substring of `NotebookEdit` and a substring test passed a matcher without it.
 - `verify.sh` (runtime): the installed hook exists, is root-owned and not writable by `vscode`,
-  passes its own self-test in the container, and — asked of the installed copy, not a fixture —
-  denies a transcript path while allowing a memory path.
+  passes its own self-test in the container, and, asked of the installed copy under **both**
+  spellings of the tree, denies a transcript and allows auto-memory. It probed one spelling at
+  first, so a hook that lost its `~/.claude-state` root still passed. The memory check reads
+  **every** settings layer (managed, drop-ins, user, every repo's project settings), not only the
+  managed file.
+
+**The seven `~/repos/**` rules are a known O(worktrees) term, named rather than tolerated.** They
+keep agents from editing a repo's harness configuration, and each `**` sits mid-path, so the
+sandbox enumerates one entry per match on disk. Measured on 2026-10-01: 64 paths, 4,246 bytes, from
+13 checkouts and worktrees, about 330 bytes each. Small against 131,072, but every task worktree
+adds a set, so it is listed in `check-config.sh` by exact text and a new rule of that shape fails
+until somebody adds it there on purpose.
 
 **Bash is covered separately and always was.** The sandbox's blanket `denyRead` of `~` hides this
 tree from Bash regardless; naming a path in a deny rule is in fact what *exposed* it, which is why
@@ -1379,8 +1418,12 @@ file tools — the self-test proves the script decides correctly, not that the h
 
 **The sweep's projection did not fall, and that is not a contradiction.** It never read the deny
 list; it modelled it from the file count, so it went on reporting ~69,000 bytes of a list that no
-longer existed, and verify.sh read that as over budget. The sweep now asks the installed posture
-whether it still names transcripts by path before it budgets anything — see the next section.
+longer existed, and verify.sh read that as over budget. The sweep now asks, before it budgets
+anything, whether any settings layer — managed, drop-ins, user, or any repo's project settings —
+carries a rule that is enumerated per match *and* covers a transcript. Both halves: the first
+version asked only about rules under `projects/`, which missed `Read(~/.claude/**/*.jsonl)`, and
+"does anything expand" alone would be fooled by the `~/repos/**` rules, which expand but name no
+transcript. See the next section.
 
 ## Transcripts are swept by byte budget, not by age
 

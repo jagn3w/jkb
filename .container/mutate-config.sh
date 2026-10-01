@@ -1350,7 +1350,7 @@ p = sys.argv[1]; d = json.load(open(p))
 d["permissions"]["deny"].append("Read(~/.claude/projects/**/*.jsonl)")
 json.dump(d, open(p, "w"), indent=2)
 PYX
-run "a per-file deny glob comes back" "ends in a file pattern"
+run "a per-file deny glob comes back" "is enumerated per match"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys
@@ -1369,6 +1369,45 @@ d["permissions"]["deny"].append("Read(~/.claude/projects)")
 json.dump(d, open(p, "w"), indent=2)
 PYX
 run "a bare directory rule covers auto-memory's subtree" "covers ~/.claude/projects/<slug>/memory"
+
+# THE REVIEW ROUND'S ROWS (2026-10-01): each one a guard the first cut had and could not fire.
+# `Edit` is a substring of `NotebookEdit`, so a substring matcher check passed a matcher without Edit.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"Read|Edit|Write|NotebookEdit|Grep|Glob"', '"Read|Write|NotebookEdit|Grep|Glob"', 1))
+PYX
+run "the hook matcher drops only Edit" "matcher does not cover: Edit"
+
+# Claude Code's absolute spelling of the bare-directory rule that drops MEMORY.md.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(//home/vscode/.claude/projects)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a //absolute bare-directory rule covers auto-memory" "covers ~/.claude/projects/<slug>/memory"
+
+# A mid-path ** with a literal tail is enumerated per match; only the seven named rules may be.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/repos/**/.env)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a new mid-path ** rule outside the named seven" "is enumerated per match"
+
+# The hook file itself gone from the tree the Dockerfile copies.
+seed; rm -f "$work/t/.container/deny-transcripts.sh"
+run "the transcript hook file is missing" "there is no .container/deny-transcripts.sh"
+
+# The shared reader renamed in the sweep: both loaders must fail loudly, not pass on nothing.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("posture_rule_covers() {", "posture_rule_covers_renamed() {", 1))
+PYX
+run "the shared deny-rule reader cannot be loaded" "could not be loaded from sweep-transcripts.sh"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
@@ -1765,7 +1804,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=104
+PINNED_BAD_SITES=105
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

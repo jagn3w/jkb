@@ -447,7 +447,7 @@ elif grep -qvE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.
     # with the container credential readable.
     bad "a managed hook runs neither pinned root-owned program — one found on PATH is replaceable from the sandbox: $(grep -m1 -vE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.sh$)' <<<"$hook_cmds")"
 else
-    ok "every managed hook runs the pinned, root-owned jkb"
+    ok "every managed hook runs one of the two pinned, root-owned programs (jkb, deny-transcripts.sh)"
 fi
 # THE TWO THINGS A DENY RULE OVER THE TRANSCRIPT TREE CAN BREAK, and they pull in OPPOSITE
 # directions. This is one check because treating either alone produces the other's failure.
@@ -474,58 +474,61 @@ fi
 # spellings. The transcript rules therefore MUST end in a file pattern, they are named below as
 # the one exception, and their cost is what .container/sweep-transcripts.sh budgets. Anything
 # else ending in a file pattern is a new O(files) term and is refused.
+# THE ONE DENY-RULE READER, loaded from sweep-transcripts.sh by name -- not a copy. This block used
+# to parse rules itself (sed, `~` only) while verify.sh parsed them with jq and the sweep a third
+# way, and each was wrong differently: this one missed Claude Code's absolute `//path` spelling, so
+# `Read(//home/vscode/.claude/projects)` -- the exact bare-directory rule that silently drops
+# MEMORY.md -- passed as clear. A rename in the sweep makes these calls "command not found" and the
+# checks below fail loudly, which is the direction a shared definition must fail in.
+eval "$(sed -n '/^posture_rule_path() {/,/^}/p; /^posture_rule_covers() {/,/^}/p; /^posture_rule_expands() {/,/^}/p' "$here/sweep-transcripts.sh")"
 dc_deny_raw="$(jq -r '.permissions.deny[]?' "$here/managed-settings.json" 2>/dev/null)"
-if [ -z "$dc_deny_raw" ]; then
+if ! declare -F posture_rule_path posture_rule_covers posture_rule_expands >/dev/null; then
+    bad "the deny-rule reader could not be loaded from sweep-transcripts.sh, so nothing below can say whether a rule blows the argv or swallows auto-memory"
+elif [ -z "$dc_deny_raw" ]; then
     bad "no permissions.deny rules could be read from managed-settings.json — the checks that none of them blows the argv or swallows auto-memory examined nothing"
 else
-    # TILDES NORMALISED ON BOTH SIDES, and this is not cosmetic: bash performs tilde expansion on
-    # an UNQUOTED `case` pattern but not on the quoted word being matched, so a literal `~` on one
-    # side and an expanded `/home/vscode` on the other never match and the memory check silently
-    # passes everything. It did, until the mutation rows below were run against it. `/home/vscode`
-    # rather than `$HOME` because this file also runs on CI, where $HOME is the runner's and the
-    # rules being read describe the container's.
-    dc_deny="$(sed -E 's/^[A-Za-z]+\((.*)\)$/\1/' <<<"$dc_deny_raw" | sed 's|^~|/home/vscode|')"
-    # 1. Nothing may cover auto-memory. Two spellings of the tree, one synthetic slug: no rule
-    #    names a slug, so a probe path answers for every repo at once and keeps a second copy of
-    #    the linker's slugify out of this file.
-    #    A RULE COVERS ITS SUBTREE -- Claude Code's semantics, not bash's -- so `$dc_pat/*` is
-    #    matched beside the bare pattern. Without it this passed `Read(~/.claude/projects)`, which a
-    #    Read in the rebuilt container showed denies <slug>/memory/MEMORY.md outright ("File is in
-    #    a directory that is denied by your permission settings", 2026-09-30).
-    dc_mem_hit=""
-    for dc_root in /home/vscode/.claude/projects /home/vscode/.claude-state/projects; do
-        while IFS= read -r dc_pat; do
-            [ -n "$dc_pat" ] || continue
-            case "$dc_root/-probe-repo/memory/MEMORY.md" in
-                $dc_pat|$dc_pat/*) dc_mem_hit="$dc_mem_hit $dc_pat" ;;
-            esac
-        done <<<"$dc_deny"
-    done
-    # 2. NOTHING may expand per-file. There is no exception left: the transcript rules were the
-    #    only ones that needed a file pattern, and they became deny-transcripts.sh precisely so
-    #    this ban could be absolute. Re-introducing an exception list is how the 67,638 bytes come
-    #    back one reasonable-looking rule at a time.
-    dc_expanding=""
+    # Rules are read as the INSTALLED file reads them: home is the container's, and a single
+    # leading `/` is relative to /etc/claude-code, where the image puts this file -- not $HOME,
+    # which on CI is the runner's.
+    # THE KNOWN EXPANDERS, named rather than tolerated by shape. These seven predate this guard and
+    # keep agents from editing a repo's harness configuration; each `**` sits MID-PATH, so the
+    # sandbox enumerates one argv entry per match on disk -- and every task worktree adds a set.
+    # That is an O(worktrees) term, bounded by how many worktrees exist, measured in
+    # .container/README.md. A new rule of this shape fails until it is added here, deliberately.
+    dc_known_expanders='Edit(~/repos/**/.claude/settings.json)
+Edit(~/repos/**/.claude/settings.local.json)
+Edit(~/repos/**/.claude/hooks/**)
+Edit(~/repos/**/.claude/agents/**)
+Edit(~/repos/**/.claude/skills/**)
+Edit(~/repos/**/.claude/workflows/**)
+Edit(~/repos/**/.mcp.json)'
+    dc_mem_hit=""; dc_expanding=""
     while IFS= read -r dc_rule; do
         [ -n "$dc_rule" ] || continue
-        dc_last="${dc_rule##*/}"
-        case "$dc_last" in
-            '**') continue ;;
-            *'*'*) dc_expanding="$dc_expanding $dc_rule" ;;
-        esac
-    done <<<"$dc_deny"
+        dc_pat="$(posture_rule_path "$dc_rule" /home/vscode /etc/claude-code)"
+        # 1. Nothing may cover auto-memory, with Claude Code's subtree semantics. Two spellings of
+        #    the tree, one synthetic slug: no rule names a slug, so a probe answers for every repo.
+        for dc_probe in /home/vscode/.claude/projects/-probe-repo/memory/MEMORY.md \
+                        /home/vscode/.claude-state/projects/-probe-repo/memory/MEMORY.md; do
+            posture_rule_covers "$dc_pat" "$dc_probe" && { dc_mem_hit="$dc_mem_hit $dc_rule"; break; }
+        done
+        # 2. Nothing may be enumerated per match unless it is a named, measured exception.
+        if posture_rule_expands "$dc_pat" && ! grep -qxF -- "$dc_rule" <<<"$dc_known_expanders"; then
+            dc_expanding="$dc_expanding $dc_rule"
+        fi
+    done <<<"$dc_deny_raw"
     if [ -n "$dc_mem_hit" ]; then
         bad "a managed deny rule covers ~/.claude/projects/<slug>/memory, so MEMORY.md stops reaching context with no error anywhere:$dc_mem_hit
        Auto-memory's location is Claude Code's, not ours, and verify.sh FAILS when it is not
        linked there — so a subtree rule over the transcript tree cannot also be the argv fix."
     elif [ -n "$dc_expanding" ]; then
-        bad "a managed deny rule ends in a file pattern, so the Bash sandbox must name every matching file and the argv grows with the file count until every Bash call in the container dies at spawn:$dc_expanding
-       Use the whole-subtree form (\`dir/**\`), which collapses to a single argv entry. If it has
-       to spare a sibling the way the transcript deny spares auto-memory, a glob cannot express
-       that at all — make it a PreToolUse hook, as .container/deny-transcripts.sh is, and it costs
-       no argv. .container/README.md carries the measurements."
+        bad "a managed deny rule is enumerated per match — a file pattern at the end, or a ** mid-path — so the Bash sandbox must name every matching path and the argv grows with the tree until every Bash call in the container dies at spawn:$dc_expanding
+       Only two shapes collapse to one argv entry: no wildcard, or a single trailing \`/**\` on a
+       literal prefix. If it has to spare a sibling the way the transcript deny spares auto-memory,
+       a glob cannot express that — make it a PreToolUse hook, as .container/deny-transcripts.sh
+       is. .container/README.md carries the measurements."
     else
-        ok "no managed deny rule swallows auto-memory, and none expands per-file into the Bash sandbox argv"
+        ok "no managed deny rule swallows auto-memory, and none is enumerated per match beyond the seven named ~/repos/** rules"
     fi
 fi
 
@@ -549,8 +552,12 @@ else
     # Grep and Glob able to enumerate and search the tree.
     dc_match="$(jq -r --arg h "$dc_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$here/managed-settings.json" 2>/dev/null)"
     dc_missing=""
-    for dc_tool in Read Edit Write Grep Glob; do
-        case "$dc_match" in *"$dc_tool"*) ;; *) dc_missing="$dc_missing $dc_tool" ;; esac
+    # WHOLE TOKENS, not substrings. This was `case "$dc_match" in *Edit*)`, and `Edit` is a substring
+    # of `NotebookEdit` -- so a matcher that dropped Edit still passed, and Edit calls on another
+    # session's transcript reached no hook. NotebookEdit is required in its own right too.
+    dc_tokens=" $(tr '|' ' ' <<<"$dc_match") "
+    for dc_tool in Read Edit Write NotebookEdit Grep Glob; do
+        case "$dc_tokens" in *" $dc_tool "*) ;; *) dc_missing="$dc_missing $dc_tool" ;; esac
     done
     if [ -n "$dc_missing" ]; then
         bad "the transcript hook's matcher does not cover:$dc_missing — a tool left out can read or enumerate the tree the hook exists to close"
