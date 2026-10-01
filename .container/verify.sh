@@ -247,6 +247,55 @@ ns_verdict() { # ns_verdict <recorded-pid> <recorded-mnt> <observed-pid> <observ
     printf 'ours'
 }
 
+# WHETHER A DENY RULE SWALLOWS AUTO-MEMORY -- a pure function, because the two halves it compares
+# are decided in different files by people solving different problems, and nothing else looks at
+# both. `link-claude-memory.sh` MUST put the link at ~/.claude/projects/<slug>/memory: that is
+# where Claude Code reads memory from, it is not negotiable, and the block further down this file
+# treats "not linked" as FATAL. The pressure on that same tree comes from the other side: keeping
+# one session out of another's transcripts, which is deny-transcripts.sh's job now and was a deny
+# rule's before it. Any rule someone writes to cover transcripts covers memory as well, and
+# NOTHING SAYS SO: memory does not error when it is denied, it
+# goes quiet -- MEMORY.md simply stops arriving in context, which reads like an agent that forgot
+# rather than like a broken container.
+#
+# THE SHAPES ARE ONE CHARACTER APART, which is the whole reason this is checked and not reasoned
+# about. `projects/**/*.jsonl` cannot match `<slug>/memory/MEMORY.md` -- it must end in .jsonl.
+# `projects/**` matches it. The second form is the one that keeps the sandbox argv O(1) (see
+# check-config.sh and the README section on the deny list), so the pressure to write it is real
+# and will recur.
+#
+# Bash's `case` lets `*` cross `/`, so `**` and `*` behave the same here, which over-reports rather
+# than misses. What it does NOT model is spelling, and it once missed for exactly that reason: the
+# claim here used to be "never miss one", and `Read(~/.claude/projects/)` (trailing slash) missed
+# until the shared reader learned to canonicalise. Spellings it knows: `~/`, `//`, a single leading
+# `/` (relative to the settings file), trailing and repeated slashes. A cwd-relative rule cannot be
+# resolved statically and matches nothing absolute.
+#
+# A RULE COVERS ITS SUBTREE, which is Claude Code's semantics and not bash's -- hence `$pat/*` beside
+# `$pat`. This matched the bare pattern only, so `Read(~/.claude/projects)` -- an exact-path rule
+# added as "the belt to the hook's brace" on the theory that naming a directory names only the
+# directory -- read as clear. Measured in the rebuilt container on 2026-09-30, it is not: a Read of
+# <slug>/memory/MEMORY.md came back "File is in a directory that is denied by your permission
+# settings" while the hook in front of it had ALLOWED the same path. The guard shared the exact
+# wrong belief it existed to catch, which is the one way a guard cannot fail.
+# THE ONE DENY-RULE READER, loaded from sweep-transcripts.sh by name (it is this file's sibling,
+# which the transcript-budget check below already relies on). This used to match with its own `case`
+# and parse rules with its own jq+sed, which missed Claude Code's `//path` spelling exactly as
+# check-config.sh's copy did -- the same defect in two places, needing two fixes. One definition now.
+# EVERY posture_* FUNCTION, by one pattern -- not a hand-kept list of names. The list form missed
+# posture_canon when posture_rule_path began calling it: posture_rule_path then printed nothing, an
+# empty pattern "covered" everything, and every rule read as swallowing auto-memory. Loud that time;
+# the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
+eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$(dirname "$0")/sweep-transcripts.sh")"
+memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> clear|shadowed:<pattern>
+    local mem="$1" pat
+    while IFS= read -r pat; do
+        [ -n "$pat" ] || continue
+        posture_rule_covers "$pat" "$mem" && { printf 'shadowed:%s\n' "$pat"; return; }
+    done <<<"$2"
+    printf 'clear\n'
+}
+
 reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
     [ -n "$1" ] || { printf 'pid1-unreadable'; return; }
     # A container at its --pids-limit fails exactly here -- which is the SYMPTOM of a PID 1 that
@@ -385,55 +434,6 @@ REC
 # executed it. Five arms, each a one-token flip away from the wrong container behaviour, and the
 # static guards can only see that the arms exist. Defined before its caller and driven by
 # `--self-test`, which needs no container.
-# WHETHER A DENY RULE SWALLOWS AUTO-MEMORY -- a pure function, because the two halves it compares
-# are decided in different files by people solving different problems, and nothing else looks at
-# both. `link-claude-memory.sh` MUST put the link at ~/.claude/projects/<slug>/memory: that is
-# where Claude Code reads memory from, it is not negotiable, and the block further down this file
-# treats "not linked" as FATAL. The pressure on that same tree comes from the other side: keeping
-# one session out of another's transcripts, which is deny-transcripts.sh's job now and was a deny
-# rule's before it. Any rule someone writes to cover transcripts covers memory as well, and
-# NOTHING SAYS SO: memory does not error when it is denied, it
-# goes quiet -- MEMORY.md simply stops arriving in context, which reads like an agent that forgot
-# rather than like a broken container.
-#
-# THE SHAPES ARE ONE CHARACTER APART, which is the whole reason this is checked and not reasoned
-# about. `projects/**/*.jsonl` cannot match `<slug>/memory/MEMORY.md` -- it must end in .jsonl.
-# `projects/**` matches it. The second form is the one that keeps the sandbox argv O(1) (see
-# check-config.sh and the README section on the deny list), so the pressure to write it is real
-# and will recur.
-#
-# Bash's `case` lets `*` cross `/`, so `**` and `*` behave the same here, which over-reports rather
-# than misses. What it does NOT model is spelling, and it once missed for exactly that reason: the
-# claim here used to be "never miss one", and `Read(~/.claude/projects/)` (trailing slash) missed
-# until the shared reader learned to canonicalise. Spellings it knows: `~/`, `//`, a single leading
-# `/` (relative to the settings file), trailing and repeated slashes. A cwd-relative rule cannot be
-# resolved statically and matches nothing absolute.
-#
-# A RULE COVERS ITS SUBTREE, which is Claude Code's semantics and not bash's -- hence `$pat/*` beside
-# `$pat`. This matched the bare pattern only, so `Read(~/.claude/projects)` -- an exact-path rule
-# added as "the belt to the hook's brace" on the theory that naming a directory names only the
-# directory -- read as clear. Measured in the rebuilt container on 2026-09-30, it is not: a Read of
-# <slug>/memory/MEMORY.md came back "File is in a directory that is denied by your permission
-# settings" while the hook in front of it had ALLOWED the same path. The guard shared the exact
-# wrong belief it existed to catch, which is the one way a guard cannot fail.
-# THE ONE DENY-RULE READER, loaded from sweep-transcripts.sh by name (it is this file's sibling,
-# which the transcript-budget check below already relies on). This used to match with its own `case`
-# and parse rules with its own jq+sed, which missed Claude Code's `//path` spelling exactly as
-# check-config.sh's copy did -- the same defect in two places, needing two fixes. One definition now.
-# EVERY posture_* FUNCTION, by one pattern -- not a hand-kept list of names. The list form missed
-# posture_canon when posture_rule_path began calling it: posture_rule_path then printed nothing, an
-# empty pattern "covered" everything, and every rule read as swallowing auto-memory. Loud that time;
-# the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
-eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$(dirname "$0")/sweep-transcripts.sh")"
-memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> clear|shadowed:<pattern>
-    local mem="$1" pat
-    while IFS= read -r pat; do
-        [ -n "$pat" ] || continue
-        posture_rule_covers "$pat" "$mem" && { printf 'shadowed:%s\n' "$pat"; return; }
-    done <<<"$2"
-    printf 'clear\n'
-}
-
 sweep_verdict() { # sweep_verdict <rc> <output> -> unmeasured|healthy|beyond|over|unanswerable
     case "$2" in
         # A root that is not there was never measured; one that is there and EMPTY was — zero bytes,
@@ -1615,7 +1615,7 @@ mem_managed=/etc/claude-code/managed-settings.json
 # THE SHARED READER MUST HAVE LOADED. If a function it uses were missing, posture_rule_covers would
 # be "command not found", memory_shadow would answer `clear`, and this whole block would pass on
 # nothing -- the quiet direction. check-config.sh guards its own load the same way.
-if ! declare -F posture_canon posture_rule_is_path posture_rule_path posture_rule_covers posture_layer_files posture_hook_matcher >/dev/null; then
+if ! declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_layer_files posture_hook_matcher >/dev/null; then
     bad "the deny-rule reader could not be loaded from sweep-transcripts.sh beside this script, so whether any settings layer swallows auto-memory, or whether the hook is wired, is unchecked"
 elif [ ! -f "$mem_managed" ]; then
     bad "there are no managed settings at $mem_managed, so nothing here establishes that the posture leaves auto-memory readable"
@@ -1625,7 +1625,7 @@ else
     # as one in the image would, and this used to read the managed file alone.
     mem_deny=""; mem_unread=""; mem_skipped=""; mem_where=""
     while IFS= read -r mem_f; do
-        mem_rules="$(jq -r '.permissions.deny[]?' "$mem_f" 2>/dev/null)" || {
+        mem_rules="$(posture_deny_rules "$mem_f" . perm 2>/dev/null)" || {
             # The MANAGED file unreadable is fatal: it is the posture, and nothing else holds the line.
             # Any other layer that will not parse is one Claude Code skips as well, so a rule in it is
             # not in force -- and refusing the whole container over a trailing comma in an unrelated

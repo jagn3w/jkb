@@ -1498,7 +1498,7 @@ run "an absolute allowRead entry over ~/.claude" "reaches the transcript tree"
 seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('\nroots=""\n', '\nroots_moved=""\n', 1))
+open(p, 'w').write(s.replace('\nroot_list=()\n', '\nroot_list_moved=()\n', 1))
 PYX
 run "the hook's roots can no longer be found" "transcript roots could not be found"
 
@@ -1519,6 +1519,15 @@ d.setdefault("sandbox", {}).setdefault("filesystem", {}).setdefault("denyWrite",
 json.dump(d, open(p, "w"), indent=2)
 PYX
 run "a per-file glob in sandbox.filesystem.denyWrite" "is enumerated per match"
+
+# REVIEW ROUND 6. An allow entry spelled as a glob is its literal base: `~/.claude/**` opens the tree.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowRead"].append("~/.claude/**")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a sandbox allowRead glob over ~/.claude" "reaches the transcript tree"
 
 # MCP tools run unsandboxed and take paths; a matcher without them leaves every one unguarded.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'

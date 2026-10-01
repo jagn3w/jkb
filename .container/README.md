@@ -545,11 +545,13 @@ and `mutate-verify.sh` carry a mutation for each.
 **The harness's own rules are managed settings baked into the image**
 (`/etc/claude-code/managed-settings.json`, from `managed-settings.json` here, root-owned): the
 attestation hook (`jkb attest hook`, which tells `jkb serve` which agent made each `jkb` call),
-the workflow Stop hook (which holds only a session launched with `JKB_DRIVE`), and deny rules keeping the model's in-process tools — which the Bash
-sandbox does not confine — away from the credential, from session transcripts (a live tool call's
-ticket is written there; `*.jsonl` only, so auto-memory stays readable, and workflow journals do
-not), and from the files that configure the harness (a hook, agent definition or MCP server it
-could add would run unsandboxed).
+the workflow Stop hook (which holds only a session launched with `JKB_DRIVE`), the transcript
+hook `deny-transcripts.sh`, which keeps every tool out of other sessions' transcripts (a live tool
+call's ticket is written there) while leaving auto-memory readable, and deny rules keeping the
+model's in-process tools — which the Bash sandbox does not confine — away from the credential and
+from the files that configure the harness (a hook, agent definition or MCP server it could add
+would run unsandboxed). Why the transcript guard is a hook and not a `*.jsonl` deny rule is in "The
+transcript deny is a hook" below.
 
 **The hooks run a pinned, root-owned `jkb`** — `/usr/local/lib/jkb-hook/jkb`, never `jkb` from
 PATH. They run outside the sandbox with the credential readable, and `~/.cargo/bin` is writable from
@@ -1329,7 +1331,7 @@ are siblings, so **no glob separates them**; that is a property of Claude Code's
 something this repo can rule its way out of.
 
 **A hook can, and costs no argv, because it is code rather than a path list.** The trade is one
-process per file-tool call (the timing is recorded once, in the script's header) in exchange for
+process per tool call, since the matcher is `.*` (the timing is recorded once, in the script's header), in exchange for
 O(files) of argv. What
 `deny-transcripts.sh` decides, and each clause is there because the first cut got it wrong:
 
@@ -1361,7 +1363,7 @@ O(files) of argv. What
   round 3 found built-ins it left out. Artifact reads a local file and uploads it. Bash is let
   through inside the hook (the kernel sandbox confines it, and it is what a person repairs a broken
   container with). Any tool whose fields the hook does not know has every string that *could be a
-  path* judged: one holding a `/`, or starting `~` or `.`, with no newline. A flat cap on all strings
+  path* judged: one holding a `/`, or starting `~` or `.`. Multi-line strings count, because a server that normalises lexically collapses them. A flat cap on all strings
   refused a long `TodoWrite`. An MCP server resolves relative paths against its own cwd, so for
   `mcp__*` tools a relative string is judged against the session cwd, `CLAUDE_PROJECT_DIR` and the
   home. `CLAUDE_CONFIG_DIR`, when set, adds its `projects` tree to the roots.

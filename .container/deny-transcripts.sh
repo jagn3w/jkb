@@ -1,33 +1,19 @@
 #!/bin/bash -p
-# PreToolUse hook: deny the file tools any session's transcript, while leaving auto-memory alone.
+# PreToolUse hook: keep every tool out of any session's transcript, while leaving auto-memory alone.
 #
 #   .container/deny-transcripts.sh            # hook mode: tool-call JSON on stdin
 #   .container/deny-transcripts.sh --self-test
 #
-# WHY A HOOK AND NOT A DENY RULE. This replaces two `permissions.deny` globs, and the reason is a
-# resource bound rather than a preference. Claude Code compiles `permissions.deny` into the
-# bubblewrap argv for the Bash sandbox. A rule ending in a directory wildcard COLLAPSES to a single
-# argv entry -- `Read(~/.ssh/**)` becomes `~/.ssh` -- but a rule ending in a FILE pattern cannot:
-# the sandbox names every match and binds /dev/null over each, so the argv grows by one path per
-# file on disk. Measured 2026-09-30 in jkb-dev, after a sweep had already run:
-#
-#     Read(~/.claude/projects/**/*.jsonl)  + its .claude-state spelling
-#       206 .jsonl files -> 33,819 bytes of path text per spelling, 67,638 across both,
-#       against a MAX_ARG_STRLEN of 131,072 that Linux does not let you raise.  52% of the
-#       ceiling, spent by two rules. Past it EVERY Bash tool call in the container fails at
-#       spawn with E2BIG -- not the one that overflowed, all of them, including `:` -- with
-#       nothing in the message naming transcripts.
-#
-# AND THE COLLAPSING SHAPE IS UNAVAILABLE, which is the whole reason this file exists. It was
-# tried and reverted: `Read(~/.claude/projects/**)` takes the argv to ~50 bytes and also covers
-# `~/.claude/projects/<slug>/memory`, which is where Claude Code keeps auto-memory. That location
-# is not ours to choose -- scripts/link-claude-memory.sh exists to put the link there and verify.sh
-# FAILS when it is missing -- and denied memory does not error, it goes QUIET: MEMORY.md stops
-# arriving in context, which reads like an agent that forgot rather than a broken container.
+# THE RECORD IS .container/README.md, "The transcript deny is a hook": why this is a hook and not a
+# deny rule (a per-file `Read(...*.jsonl)` glob was half of MAX_ARG_STRLEN in the Bash sandbox's
+# argv, measured; the collapsing `projects/**` swallows auto-memory), and what each review round
+# found. The notes below are the ones someone changing THIS FILE needs beside the code: the
+# invariants, and why each guard is shaped the way it is. The design is not restated here, so the
+# two cannot disagree -- they did once, about multi-line strings.
 #
 # A glob cannot separate `<slug>/memory/` from `<slug>/<uuid>.jsonl`; they are siblings. A hook
-# can, and costs nothing in argv because it is code rather than a path list. That is the whole
-# trade: O(files) of argv becomes O(1) of argv plus one process per file-tool call.
+# can, and costs nothing in argv because it is code rather than a path list: one process per TOOL
+# CALL (the matcher is `.*`) in exchange for O(files) of argv.
 #
 # WHAT STILL COVERS BASH. The sandbox's blanket `denyRead` of `~` already hides this tree from
 # Bash -- observable in one listing, where `~/.claude/todos` is invisible while `~/.claude/projects`
@@ -52,8 +38,11 @@
 # through.
 #
 # THE ONE OPEN EDGE, stated rather than hidden: a hook KILLED for exceeding its timeout is
-# non-blocking in Claude Code, and nothing inside the script can change that. It answers in ~7ms
-# (measured, 50 runs) against the 10s budget managed-settings.json gives it.
+# non-blocking in Claude Code, and nothing inside the script can change that. Per call, measured
+# 2026-10-01 in jkb-dev as 50 sequential invocations under `date +%s%N`: 13ms for a Bash call (let
+# through right after the parse) and 50ms for a judged Read, against the 10s budget
+# managed-settings.json gives it. It was ~7ms before five review rounds added guards; the number is
+# re-measured rather than carried, because this hook now runs on EVERY tool call.
 #
 # PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
 # `~` is the user's home, and a relative path is relative to the SESSION'S cwd (the payload's
@@ -159,14 +148,17 @@ normalise() { # normalise <absolute path> -> lexically resolved absolute path
 }
 
 # `~` and `~/x` are the home; `~name/x` is over-approximated as the home too, because the safe
-# error here is refusing a path that was harmless, never allowing one that was not.
+# error here is refusing a path that was harmless, never allowing one that was not. A SLASHLESS
+# `~word` is a home only when it is shaped like a user name (`~vscode`, as expanduser reads it):
+# anything else -- `~"how does sync work"`, jkb's own vector-search syntax, or `~2h of work` -- is
+# text, and resolving it to the home refused ordinary calls as transcript reads (review round 6).
 resolve() { # resolve <path> <home> <cwd> -> normalised absolute path
     local p="$1"
     case "$p" in
         "~")      p="$2" ;;
         "~/"*)    p="$2/${p#\~/}" ;;
         "~"*/*)   p="$2/${p#*/}" ;;
-        "~"?*)    p="$2" ;;
+        "~"[A-Za-z0-9._-]*) case "${p#\~}" in *[!A-Za-z0-9._-]*) p="$3/$p" ;; *) p="$2" ;; esac ;;
         /*)       ;;
         *)        p="$3/$p" ;;
     esac
@@ -180,7 +172,7 @@ join_raw() { # join_raw <path> <home> <cwd> -> absolute, un-normalised
         "~")    printf '%s\n' "$2" ;;
         "~/"*)  printf '%s\n' "$2/${1#\~/}" ;;
         "~"*/*) printf '%s\n' "$2/${1#*/}" ;;
-        "~"?*)  printf '%s\n' "$2" ;;
+        "~"[A-Za-z0-9._-]*) case "${1#\~}" in *[!A-Za-z0-9._-]*) printf '%s\n' "$3/$1" ;; *) printf '%s\n' "$2" ;; esac ;;
         /*)     printf '%s\n' "$1" ;;
         *)      printf '%s\n' "$3/$1" ;;
     esac
@@ -493,6 +485,27 @@ if [ "${1:-}" = --self-test ]; then
     h "a 5KB prose string with slashes in an MCP call is allowed" allow "$prose" HOME=/h
     chain="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("/" + ([range(1500) | "a b/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
     h "...while a 10KB chain with spaces that collapses into the tree is denied" deny "$chain" HOME=/h
+    # REVIEW ROUND 6. Text that starts with `~` is not a home; a file:// URI is its path.
+    h "jkb's own vector-search syntax is not a path" allow \
+      '{"tool_name":"mcp__jkb__search","cwd":"/h/repos/jkb","tool_input":{"query":"~\"how does sync work\" kind:task"}}' HOME=/h
+    h "a ~2h estimate is not a path" allow \
+      '{"tool_name":"TaskCreate","cwd":"/h/repos/jkb","tool_input":{"description":"~2h of work"}}' HOME=/h
+    h "a file:// URI to a transcript is denied" deny \
+      '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"file:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    h "a percent-escaped file URI is refused, not decoded" deny \
+      '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"file:///h/%2eclaude/projects/-s/e.jsonl"}}' HOME=/h
+    h "a Glob climbing after a wildcard is denied" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"*/../../../.claude/projects/*/*.jsonl"}}' HOME=/h
+    h "a Glob hiding an absolute path in braces is denied" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{/h/.claude/projects/**/*.jsonl,**/*.rs}"}}' HOME=/h
+    # A REDIRECTED HOME adds roots, never removes them: the account's real tree stays guarded.
+    acct2="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    if [ -n "$acct2" ] && [ "$acct2" != /h ]; then
+        h "with HOME redirected, the account home's real tree is still denied" deny \
+          '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$acct2"'/.claude-state/projects/-s/e.jsonl"}}' HOME=/h
+    fi
+    h "an ordinary brace pattern is allowed" allow \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"**/*.{rs,toml}"}}' HOME=/h
     # A bare ~name is a home, as a server applying expanduser would read it.
     # A MULTI-LINE string a lexically-normalising server would collapse into the tree.
     h "a multi-line string that collapses into the tree is denied" deny \
@@ -562,7 +575,9 @@ deny() {
 # paths refused ordinary calls once every tool reached this hook: 40 todos from a home cwd, an empty
 # activeForm read as "the home, an ancestor of the tree", a 4.6KB Agent prompt over the byte budget
 # (review round 4, all reproduced). A subagent's own tool calls reach this hook in their own right.
-input="$(cat 2>/dev/null)"
+# Read with the builtin, not `cat`: every tool call pays for this hook now, so a fork saved here is
+# saved on every Bash call.
+IFS= read -r -d '' input || true
 command -v jq >/dev/null 2>&1 || exit 3
 tool="$(printf '%s' "$input" | jqh -er '.tool_name | strings' 2>/dev/null)" || exit 3
 case "$tool" in
@@ -571,7 +586,11 @@ esac
 
 # HOME from the account database when the environment lost it: the roots are derived from it, and
 # a hook that cannot name the tree it guards cannot classify anything. Still empty -> refuse.
-home="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
+# THE ENVIRONMENT CAN ADD A ROOT, NEVER REMOVE ONE. The roots come from the union of $HOME and the
+# account's home in the password database: a settings layer can set `env.HOME`, and roots taken from
+# $HOME alone then guarded /tmp/x/.claude while the real tree sat unguarded (review round 6).
+acct_home="$(getent passwd "$UID" 2>/dev/null | cut -d: -f6)"
+home="${HOME:-$acct_home}"
 [ -n "$home" ] || exit 3
 # NORMALISED, so a HOME of `/home/vscode/` or `/home//vscode` still names the tree: built raw, the
 # roots became `/home/vscode//.claude/projects`, which no normalised path ever starts with, and
@@ -583,16 +602,16 @@ home="$(normalise "$home")"
 # gave roots no `realpath -m` output ever starts with, so direct reads went through. Review round 3.
 # Not shared with the sweep by loading it: this file is installed alone, root-owned, at
 # /usr/local/bin, with no sibling to load from. check-config.sh holds the two to the same set.
-roots=""
+# ONE realpath for every root, not one per root: this runs on every tool call.
+root_list=()
 for r in "$home/.claude/projects" "$home/.claude-state/projects" \
+         ${acct_home:+"$acct_home/.claude/projects" "$acct_home/.claude-state/projects"} \
          ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/projects"}; do
-    r="$(normalise "$r")"
-    roots="$roots$r
-"
-    rp="$(realpath -m -- "$r" 2>/dev/null)" || exit 3
-    [ "$rp" != "$r" ] && roots="$roots$rp
-"
+    root_list+=("$(normalise "$r")")
 done
+root_phys="$(realpath -m -- "${root_list[@]}" 2>/dev/null)" || exit 3
+roots="$(printf '%s\n' "${root_list[@]}" "$root_phys" | awk 'NF && !seen[$0]++')
+"
 
 # One parse, @sh-quoted so `eval` assigns rather than executes. Every location a file tool can be
 # pointed at: Read/Edit/Write carry file_path, Grep/Glob carry path, NotebookEdit notebook_path,
@@ -608,7 +627,19 @@ eval "$assign"
 [ -n "$cwd" ] || cwd="$PWD"
 
 check() { # check <path> [base]: deny on deny, return on allow, refuse on anything else
-    local base="${2:-$cwd}" v abs raw phys
+    local base="${2:-$cwd}" v abs raw phys p="$1"
+    # A file:// URI IS ITS PATH. Joined onto the cwd as a relative string, `file:///h/.claude/...`
+    # judged as /cwd/file:/h/... and an MCP server handed a transcript as a URI was allowed (review
+    # round 6). Percent-escapes are refused rather than decoded: a decoder here is a second parser
+    # of the same string, and the agent can always send the plain path.
+    case "$p" in
+        file://localhost/*) p="/${p#file://localhost/}" ;;
+        file:///*)          p="/${p#file:///}" ;;
+        file:/*)            p="/${p#file:/}" ;;
+        file:*)             exit 3 ;;
+    esac
+    case "$p" in file:*|*%*) [ "$p" = "$1" ] || exit 3 ;; esac
+    set -- "$p" "${2:-}"
     # A BYTE BUDGET, before any walk: PATH_MAX is 4096, so no path the kernel can open is longer,
     # and anything longer is either garbage or a `a/..`-chain built to be slow. Refused up front so
     # no input can push this into its timeout.
@@ -640,6 +671,13 @@ case "$tool" in
         base="${pth:-$cwd}"
         check "$base"
         if [ "$tool" = Glob ] && [ -n "$pat" ]; then
+            # ONLY THE LITERAL PREFIX IS JUDGED, so the rest must not steer the walk: a `..` after a
+            # wildcard (`*/../../../.claude/projects/*`) or an absolute alternative in braces
+            # (`{/h/.claude/projects/**,**/*.rs}`) went unjudged (review round 6). Both are refused;
+            # ordinary patterns -- `**/*.{rs,toml}`, `{src,tests}/**` -- hold neither.
+            case "/$pat/" in */../*) [ "$(glob_base "$pat")" != "$pat" ] && deny ;; esac
+            case "$pat" in *"{"*"}"*) bc="${pat#*\{}"; bc="${bc%%\}*}"
+                                      case "$bc" in */*|*..*|*"~"*) deny ;; esac ;; esac
             gb="$(glob_base "$pat")"
             if [ -n "$gb" ]; then
                 # Joined onto the UN-normalised base, so check()'s realpath meets any link in the
@@ -654,7 +692,7 @@ case "$tool" in
         [ -n "$pth" ] && check "$pth" ;;
     *)
         # A tool whose fields are not known here: every string it was given that COULD BE A PATH is
-        # judged -- one holding a `/`, or starting `~` or `.`, and holding no newline. Not every
+        # judged -- one holding a `/`, or starting `~` or `.` (multi-line strings included, see below). Not every
         # string: with every tool now routed here, a flat cap on all strings refused a TodoWrite or
         # an AskUserQuestion with a long list. The exception is a cwd that is itself in or above the
         # tree, where a bare word like `projects` is a path into it; then every string counts.

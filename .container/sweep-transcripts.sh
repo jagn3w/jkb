@@ -518,6 +518,12 @@ posture_rule_base() { # posture_rule_base <path pattern> -> literal prefix
 # covers everything under it -- measured, a bare `Read(~/.claude/projects)` denied a Read of
 # <slug>/memory/MEMORY.md. `$1` is deliberately unquoted: it is the rule's glob.
 posture_rule_covers() { # posture_rule_covers <path pattern> <path> -> rc 0 covered
+    # A RELATIVE PATTERN NEVER COVERS AN ABSOLUTE PATH here. Claude Code resolves it against a
+    # project, and no project contains ~/.claude -- but as an unquoted `case` pattern `**/*.md`
+    # matched /home/vscode/.claude/projects/-p/memory/MEMORY.md, because `*` crosses `/`, and one
+    # repo's `Edit(**/*.md)` made verify.sh refuse the whole container (review round 6). Decided in
+    # the callee, so no caller can forget it.
+    case "$1" in /*) ;; *) case "$2" in /*) return 1 ;; esac ;; esac
     case "$2" in $1|$1/*) return 0 ;; esac
     return 1
 }
@@ -561,33 +567,46 @@ posture_layer_files() { # posture_layer_files <managed-settings.json> -> one pat
 # have stood the sweep down while the argv grew; asking only "does anything expand" would instead
 # be fooled by the seven `Edit(~/repos/**/...)` rules, which expand but name no transcript.
 posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
-    local f rules rule pat base root layers home="${HOME:-/home/vscode}" proots
+    local f rules rule pat base root layers kind proot home="${HOME:-/home/vscode}" proots
     [ -r "$1" ] || return 0
     # The transcript tree as the sweep itself finds it -- CLAUDE_CONFIG_DIR honoured exactly as
-    # TRANSCRIPT_ROOT honours it -- plus the state volume's spelling.
-    proots="$(posture_canon "${CLAUDE_CONFIG_DIR:-$home/.claude}/projects") $(posture_canon "$home/.claude-state/projects")"
+    # TRANSCRIPT_ROOT honours it -- plus the state volume's spelling. AN ARRAY: a config dir under
+    # "Application Support" split into fragments that no glob overlapped (review round 6).
+    proots=("$(posture_canon "${CLAUDE_CONFIG_DIR:-$home/.claude}/projects")" "$(posture_canon "$home/.claude-state/projects")")
     layers="$(posture_layer_files "$1")" || return 0
     while IFS= read -r f; do
-        # BOTH LISTS THAT REACH THE ARGV: permissions.deny, and sandbox.filesystem.denyRead, whose
-        # entries are bare paths. The second was ignored, so a transcript glob there stood the sweep
-        # down while the argv grew (review round 3, measured). Bare entries are wrapped as Read rules
-        # so the one reader handles both.
-        rules="$(posture_deny_rules "$f" 2>/dev/null)" || return 0
+        # LAYER-AWARE, because "cannot tell" means different things in different layers (review
+        # round 6). The MANAGED file unreadable is cannot-tell, so yes. Any other layer that is not
+        # valid JSON contributes no rules at all -- the same reading verify.sh's memory check takes --
+        # so it is skipped rather than turned into a permanent "yes" by one stray comma in an
+        # unrelated repo. A PROJECT layer's relative rule is relative to that project, which never
+        # contains ~/.claude, so it is resolved there; a relative rule in a user or drop-in layer
+        # could meet a session started anywhere, and stays cannot-tell.
+        case "$f" in
+            "$1") kind=managed ;;
+            */managed-settings.d/*) kind=dropin ;;
+            "${CLAUDE_CONFIG_DIR:-$home/.claude}"/*) kind=user ;;
+            *) kind=project; proot="$(dirname "$(dirname "$f")")" ;;
+        esac
+        if ! rules="$(posture_deny_rules "$f" 2>/dev/null)"; then
+            [ "$kind" = managed ] && return 0
+            continue
+        fi
         while IFS= read -r rule; do
             [ -n "$rule" ] || continue
             posture_rule_is_path "$rule" || continue
             pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")")"
             posture_rule_expands "$pat" || continue
-            # A cwd-relative rule could cover the tree from a session started in $HOME: CANNOT
-            # TELL, which means yes.
-            case "$pat" in /*) ;; *) return 0 ;; esac
-            # OVERLAP, not three probes. The first version tested three synthetic paths, so
-            # `.../projects/-home-vscode-repos-jkb/**/*.jsonl` and a UUID-shaped `*-*-*-*-*.jsonl`
-            # both read "no" while enumerating the real tree. Any expanding rule whose literal
-            # prefix contains, or lies inside, the transcript tree is counted. That over-counts a
-            # glob that could only match memory notes, which is the cheap direction to be wrong in.
+            case "$pat" in
+                /*) ;;
+                *) [ "$kind" = project ] || return 0
+                   pat="$(posture_canon "$proot/${pat#./}")" ;;
+            esac
+            # OVERLAP, not three probes: any expanding rule whose literal prefix contains, or lies
+            # inside, the transcript tree is counted. That over-counts a glob that could only match
+            # memory notes, which is the cheap direction to be wrong in.
             base="$(posture_rule_base "$pat")"
-            for root in $proots; do
+            for root in "${proots[@]}"; do
                 [ "$base" = "$root" ] && return 0
                 [ "${root#"${base%/}"/}" != "$root" ] && return 0
                 [ "${base#"$root"/}" != "$base" ] && return 0
@@ -1492,7 +1511,12 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...and in a managed drop-in" "$(pe "$pdir/hook.json")" yes
     rm -r "$pdir/managed-settings.d"
     printf '%s\n' 'not json {' >"$lhome/repos/r/.claude/settings.local.json"
-    eq "an unreadable layer is CANNOT TELL, which means yes" "$(pe "$pdir/hook.json" "$lhome")" yes
+    # A non-managed layer that is not valid JSON contributes no rules -- the reading verify.sh takes.
+    eq "an unparseable PROJECT layer contributes no rules" "$(pe "$pdir/hook.json" "$lhome")" no
+    printf '%s\n' 'not json {' >"$pdir/badmanaged.json"
+    eq "...but an unparseable MANAGED file is cannot-tell, so yes" "$(pe "$pdir/badmanaged.json")" yes
+    printf '%s\n' '{"permissions":{"deny":["Read(./.env.*)"]}}' >"$lhome/repos/r/.claude/settings.local.json"
+    eq "a project's relative rule is resolved in that project, and enumerates nothing here" "$(pe "$pdir/hook.json" "$lhome")" no
     # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/-home-vscode-repos-jkb/**/*.jsonl)"]}}' >"$pdir/slug.json"
     eq "a slug-specific per-file glob enumerates"   "$(pe "$pdir/slug.json")" yes
@@ -1542,6 +1566,7 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     cv() { if posture_rule_covers "$1" "$2"; then echo yes; else echo no; fi; }
     eq "a bare directory covers its subtree"     "$(cv /h/p /h/p/s/memory/M.md)"      yes
     eq "...but not a sibling that shares a prefix" "$(cv /h/p /h/pq/x)"               no
+    eq "a relative pattern never covers an absolute path" "$(cv '**/*.md' /h/.claude/projects/-p/memory/MEMORY.md)" no
     eq "a posture with no deny rules names nothing"            "$(pe "$pdir/nodeny.json")"  no
     # CANNOT TELL MEANS YES -- the direction that keeps sweeping. Getting these backwards is the
     # expensive way round: a sweep that stood down on an unreadable posture would leave a tree

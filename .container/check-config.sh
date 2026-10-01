@@ -489,7 +489,7 @@ fi
 # the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
 eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$here/sweep-transcripts.sh")"
 dc_reader_ok=0
-declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_hook_matcher >/dev/null && dc_reader_ok=1
+declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_rule_base posture_hook_matcher >/dev/null && dc_reader_ok=1
 # BOTH DENY LISTS, FROM BOTH FILES, through the one emitter: the image's managed settings, and the
 # posture's `require` block that auto-mode writes into user settings. Each line is
 # "<settings-dir><TAB><rule>", because a one-slash permission rule is relative to the file it is in.
@@ -617,7 +617,9 @@ dc_allow_hit=""
 if [ "$dc_reader_ok" = 1 ]; then
     while IFS= read -r dc_a; do
         [ -n "$dc_a" ] || continue
-        dc_a="$(posture_canon "$dc_a")"
+        # A GLOB ENTRY IS ITS LITERAL BASE: the sandbox collapses `~/.claude/**` to `~/.claude`, and
+        # compared as a string it passed as clear while opening every transcript (review round 6).
+        dc_a="$(posture_rule_base "$(posture_canon "$dc_a")")"
         case "$dc_a" in
             /home/*/*|/Users/*/*) dc_a="~/${dc_a#/*/*/}" ;;
             /root/*)              dc_a="~/${dc_a#/root/}" ;;
@@ -663,7 +665,7 @@ esac
 # it ignored CLAUDE_CONFIG_DIR while the sweep honoured it, leaving the real tree unguarded whenever
 # that is set (review round 3). Held together by name here, on comment-stripped text: each must
 # derive a root from CLAUDE_CONFIG_DIR and name both spellings.
-dc_hook_roots="$(dc_strip_comments "$here/deny-transcripts.sh" | sed -n '/^roots=""/,/^done/p')"
+dc_hook_roots="$(dc_strip_comments "$here/deny-transcripts.sh" | sed -n '/^root_list=()/,/^done/p')"
 dc_sweep_roots="$(dc_strip_comments "$here/sweep-transcripts.sh" | grep -E '^[[:space:]]*proots=')"
 dc_roots_missing=""
 for dc_need in 'CLAUDE_CONFIG_DIR' '.claude-state/projects'; do
