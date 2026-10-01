@@ -1348,17 +1348,28 @@ O(files) of argv. What
 - **Paths are split with `read -a`, never an unquoted expansion.** `for seg in $p` also does
   pathname expansion, so a `*` segment became the names of files in the hook's cwd. A hook that
   rewrites the path it is judging into an unrelated one can be steered past itself.
-- **The physical path is judged too** (review round 2). The file tools run unsandboxed and the
-  kernel follows symlinks, so a symlink an agent makes from sandboxed Bash, or `/proc/self/root/…`,
-  landed in the tree without spelling it. Every path is judged as written *and* as `realpath -m`
-  resolves it. Procfs magic links and `/dev/fd` are refused outright and *before* normalising,
-  because `/proc/self` names a different process for the hook than for the tool, and
-  `/proc/self/cwd/../..` normalises to something harmless.
-- **Any tool that can name a path**: the matcher covers `MultiEdit`, `LS` and `mcp__.*` as well,
-  and for a tool whose fields the hook doesn't know, every string in its input is judged. MCP
-  tools run unsandboxed; jkb's own server has an `ingest_path`. Capped at 100 strings, then
-  refused: measured at ~8ms a string, and an over-long payload must not push the hook into its
-  timeout, which fails open.
+- **The physical path is judged too** (review rounds 2 and 3). The file tools run unsandboxed and
+  the kernel follows symlinks, so a symlink an agent makes from sandboxed Bash, or
+  `/proc/self/root/…`, landed in the tree without spelling it. Every path is judged as written *and*
+  as `realpath -m` resolves it, and it is resolved **from the un-normalised join**: resolving the
+  lexically collapsed path let `l2/..` through (with `l2` linked into the tree), because the
+  collapse removed the link before the kernel could follow it. The roots are resolved too, so a
+  `HOME` that passes through a symlink still names the tree. Procfs magic links and `/dev/fd` are
+  refused outright and before normalising, because `/proc/self` names a different process for the
+  hook than for the tool.
+- **Every tool reaches the hook: the matcher is `.*`.** It was an allowlist of file tools, and
+  round 3 found built-ins it left out. Artifact reads a local file and uploads it. Bash is let
+  through inside the hook (the kernel sandbox confines it, and it is what a person repairs a broken
+  container with). Any tool whose fields the hook does not know has every string that *could be a
+  path* judged: one holding a `/`, or starting `~` or `.`, with no newline. A flat cap on all strings
+  refused a long `TodoWrite`. An MCP server resolves relative paths against its own cwd, so for
+  `mcp__*` tools a relative string is judged against the session cwd, `CLAUDE_PROJECT_DIR` and the
+  home. `CLAUDE_CONFIG_DIR`, when set, adds its `projects` tree to the roots.
+- **Nothing can push the hook into its timeout**, which fails open. Any path string over 4096 bytes
+  (`PATH_MAX`) is refused before it is walked; a 24 KB `a/..` chain took up to 15 s against the
+  10 s budget before, and is refused in milliseconds now. The magic-link walk is linear, with no
+  subshell per segment. At most 100 path-like strings are judged per call, which costs well under a
+  second.
 - **Considered and not vectors**, measured: hard links (sandboxed Bash cannot see the tree, and
   `~/repos` is a different filesystem from the state volume, so `ln` would be `EXDEV`); case
   folding (`~/repos` is case-insensitive, but the tree is not, and a case-variant symlink is
@@ -1391,6 +1402,10 @@ tools and its absence is silent:
   `verify.sh`. Three files used to parse rules three ways, and each was wrong differently: one
   missed Claude Code's absolute `//path` spelling, one only looked at rules containing `projects/`,
   one passed a mid-path `**`. A rename now makes both loaders fail loudly.
+- `check-config.sh` also holds what the hook cannot load: no sandbox `allowRead`/`allowWrite`
+  entry may reach the transcript tree, because with no deny rule naming it that entry is the only
+  thing between sandboxed Bash and the transcripts; and the hook's roots and the sweep's must both
+  name `CLAUDE_CONFIG_DIR` and both spellings, because the hook is installed alone and keeps its own.
 - `check-config.sh` (static): no rule may cover the memory path, with Claude Code's subtree
   semantics; nothing may be enumerated per match (a file pattern at the end, or a `**` mid-path)
   except the seven named `~/repos/**` rules below; and the hook must be referenced, installed by the
@@ -1446,6 +1461,12 @@ version asked only about rules under `projects/`, which missed `Read(~/.claude/*
 transcript. See the next section.
 
 ## Transcripts are swept by byte budget, not by age
+
+*Superseded as the defence on 2026-09-30, kept as the backstop.* Everything below describes the
+posture the sweep was written against, when the sandbox enumerated every transcript. On the posture
+that ships, no rule names a transcript, and the sweep stands down and archives nothing. It runs again
+only if a settings layer brings back a rule that enumerates transcripts. The section above, on the
+hook, is the current design.
 
 Every Bash tool call in every container session failed at spawn with `E2BIG`. Not degraded —
 total, from the first call, in a container that had worked the week before, with nothing in the

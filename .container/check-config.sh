@@ -483,9 +483,13 @@ fi
 # `Read(//home/vscode/.claude/projects)` -- the exact bare-directory rule that silently drops
 # MEMORY.md -- passed as clear. A rename in the sweep makes these calls "command not found" and the
 # checks below fail loudly, which is the direction a shared definition must fail in.
-eval "$(sed -n '/^posture_rule_is_path() {/,/^}/p; /^posture_rule_path() {/,/^}/p; /^posture_rule_covers() {/,/^}/p; /^posture_rule_expands() {/,/^}/p; /^posture_hook_tools() {/,/^}/p' "$here/sweep-transcripts.sh")"
+# EVERY posture_* FUNCTION, by one pattern -- not a hand-kept list of names. The list form missed
+# posture_canon when posture_rule_path began calling it: posture_rule_path then printed nothing, an
+# empty pattern "covered" everything, and every rule read as swallowing auto-memory. Loud that time;
+# the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
+eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$here/sweep-transcripts.sh")"
 dc_deny_raw="$(jq -r '.permissions.deny[]?' "$here/managed-settings.json" 2>/dev/null)"
-if ! declare -F posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands >/dev/null; then
+if ! declare -F posture_canon posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_hook_matcher >/dev/null; then
     bad "the deny-rule reader could not be loaded from sweep-transcripts.sh, so nothing below can say whether a rule blows the argv or swallows auto-memory"
 elif [ -z "$dc_deny_raw" ]; then
     bad "no permissions.deny rules could be read from managed-settings.json — the checks that none of them blows the argv or swallows auto-memory examined nothing"
@@ -555,21 +559,15 @@ elif ! stripped_matches "$here/Dockerfile" "^COPY --chown=root:root deny-transcr
 elif [ ! -f "$here/deny-transcripts.sh" ]; then
     bad "there is no .container/deny-transcripts.sh to install, so the transcript deny does not exist"
 else
-    # The matcher has to name the tools that can READ a file. A hook wired only to Read leaves
-    # Grep and Glob able to enumerate and search the tree.
+    # THE MATCHER MUST BE EVERY TOOL. An allowlist of file tools let built-ins it did not name --
+    # Artifact, which reads a local file and uploads it -- skip the hook entirely (review round 3),
+    # and a substring check on that list had already let `Edit` hide inside `NotebookEdit`
+    # (round 1). One shape now, from one shared definition, compared exactly.
     dc_match="$(jq -r --arg h "$dc_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$here/managed-settings.json" 2>/dev/null)"
-    dc_missing=""
-    # WHOLE TOKENS, not substrings. This was `case "$dc_match" in *Edit*)`, and `Edit` is a substring
-    # of `NotebookEdit` -- so a matcher that dropped Edit still passed, and Edit calls on another
-    # session's transcript reached no hook. NotebookEdit is required in its own right too.
-    dc_tokens=" $(tr '|' ' ' <<<"$dc_match") "
-    for dc_tool in $(posture_hook_tools); do
-        case "$dc_tokens" in *" $dc_tool "*) ;; *) dc_missing="$dc_missing $dc_tool" ;; esac
-    done
-    if [ -n "$dc_missing" ]; then
-        bad "the transcript hook's matcher does not cover:$dc_missing — a tool left out can read or enumerate the tree the hook exists to close"
+    if [ "$dc_match" != "$(posture_hook_matcher)" ]; then
+        bad "the transcript hook's matcher is [$dc_match], not [$(posture_hook_matcher)] — any tool it does not match never reaches the hook, and can read or upload another session's transcript"
     else
-        ok "the transcript deny is a wired, root-owned hook covering every file-reading tool"
+        ok "the transcript deny is a wired, root-owned hook that every tool call reaches"
     fi
 fi
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers
@@ -580,6 +578,54 @@ if grep -qF 'rm -f /etc/sudoers.d/vscode' "$here/Dockerfile"; then
     ok "the base image's blanket NOPASSWD:ALL grant is removed"
 else
     bad "the Dockerfile no longer removes /etc/sudoers.d/vscode — the agent can sudo anything, and every root-ownership guard here is bypassable"
+fi
+
+# AND THE SANDBOX'S OWN ALLOW LISTS MUST STAY CLEAR OF THE TREE. With no deny rule naming the
+# transcripts any more, the one thing keeping SANDBOXED BASH out of them is the blanket `denyRead`
+# of `~` -- which an allowRead or allowWrite entry carves back. The per-file `.jsonl` denies used to
+# bind /dev/null over each transcript whatever the allow lists said; now an entry widened to
+# `~/.claude` would expose every transcript to `cat`, with every other guard still green. Review
+# round 3, filed as aggravated: the gap is old, this branch removed what was covering it. Compared in
+# `~` space with the shared canonicaliser, both directions: an entry containing a root, or inside one.
+dc_allow_hit=""
+if ! declare -F posture_canon >/dev/null; then
+    bad "the path canonicaliser could not be loaded from sweep-transcripts.sh, so whether the sandbox allow lists reach the transcript tree is unchecked"
+else
+    while IFS= read -r dc_a; do
+        [ -n "$dc_a" ] || continue
+        dc_a="$(posture_canon "$dc_a")"
+        for dc_root in "~/.claude/projects" "~/.claude-state/projects"; do
+            if [ "$dc_a" = "$dc_root" ] || [ "${dc_root#"$dc_a"/}" != "$dc_root" ] || [ "${dc_a#"$dc_root"/}" != "$dc_a" ] || [ "$dc_a" = "~" ]; then
+                dc_allow_hit="$dc_allow_hit $dc_a"; break
+            fi
+        done
+    done <<<"$(jq -r '.require.sandbox.filesystem | (.allowRead[]?, .allowWrite[]?)' "$posture" 2>/dev/null)"
+    if [ -n "$dc_allow_hit" ]; then
+        bad "a sandbox allowRead/allowWrite entry reaches the transcript tree, so sandboxed Bash can read or write other sessions' transcripts — nothing else stands in the way now that no deny rule names them:$dc_allow_hit"
+    else
+        ok "no sandbox allowRead/allowWrite entry reaches the transcript tree"
+    fi
+fi
+
+# THE HOOK AND THE SWEEP MUST AGREE ON WHERE THE TREE IS. The hook cannot load the shared reader --
+# it is installed alone, root-owned, at /usr/local/bin -- so its roots are its own, and they drifted:
+# it ignored CLAUDE_CONFIG_DIR while the sweep honoured it, leaving the real tree unguarded whenever
+# that is set (review round 3). Held together by name here, on comment-stripped text: each must
+# derive a root from CLAUDE_CONFIG_DIR and name both spellings.
+dc_hook_roots="$(dc_strip_comments "$here/deny-transcripts.sh" | sed -n '/^roots=""/,/^done/p')"
+dc_sweep_roots="$(dc_strip_comments "$here/sweep-transcripts.sh" | grep -E '^[[:space:]]*proots=')"
+dc_roots_missing=""
+for dc_need in 'CLAUDE_CONFIG_DIR' '.claude-state/projects'; do
+    grep -qF -- "$dc_need" <<<"$dc_hook_roots"  || dc_roots_missing="$dc_roots_missing hook:$dc_need"
+    grep -qF -- "$dc_need" <<<"$dc_sweep_roots" || dc_roots_missing="$dc_roots_missing sweep:$dc_need"
+done
+grep -qF -- '.claude/projects' <<<"$dc_hook_roots" || dc_roots_missing="$dc_roots_missing hook:.claude/projects"
+if [ -z "$dc_hook_roots" ] || [ -z "$dc_sweep_roots" ]; then
+    bad "the transcript roots could not be found in deny-transcripts.sh and sweep-transcripts.sh, so whether they agree is unchecked"
+elif [ -n "$dc_roots_missing" ]; then
+    bad "the hook and the sweep disagree about where the transcript tree is — missing:$dc_roots_missing; a tree one of them does not know is guarded by the other alone, or by neither"
+else
+    ok "the hook and the sweep derive the transcript tree from the same spellings, CLAUDE_CONFIG_DIR included"
 fi
 if grep -qF 'takes no arguments' "$here/egress-status.sh"; then
     ok "egress-status.sh refuses arguments"

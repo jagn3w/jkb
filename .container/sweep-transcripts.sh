@@ -441,6 +441,16 @@ posture_rule_is_path() { # posture_rule_is_path <rule> -> rc 0 for a file-tool r
     return 1
 }
 
+# ONE CANONICAL SPELLING for every path this reader compares: runs of `/` collapsed, a trailing `/`
+# dropped. Both sides of every comparison go through it -- the rules did and the roots did not, so
+# a HOME of `/x/h/` gave roots of `/x/h//.claude/projects` that no canonical rule ever matched.
+posture_canon() { # posture_canon <path> -> canonical spelling
+    local p="$1"
+    while :; do case "$p" in *//*) p="${p%%//*}/${p#*//}" ;; *) break ;; esac; done
+    [ "$p" = / ] || p="${p%/}"
+    printf '%s\n' "$p"
+}
+
 posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> -> path pattern
     local r="$1" p
     r="${r#*(}"; r="${r%)}"
@@ -451,18 +461,22 @@ posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> -> path p
         /*)    p="$3$r" ;;
         *)     printf '%s\n' "$r"; return ;;
     esac
-    # CANONICAL SPELLING: runs of `/` collapsed and a trailing `/` dropped. `Read(~/.claude/projects/)`
-    # -- the bare-directory rule with a slash -- resolved to `.../projects/`, whose `$1/*` arm is
-    # `.../projects//*`, so it read as covering nothing while denying MEMORY.md. Review round 2.
-    while :; do case "$p" in *//*) p="${p%%//*}/${p#*//}" ;; *) break ;; esac; done
-    [ "$p" = / ] || p="${p%/}"
-    printf '%s\n' "$p"
+    # CANONICAL: `Read(~/.claude/projects/)` -- the bare-directory rule with a slash -- resolved to
+    # `.../projects/`, whose `$1/*` arm is `.../projects//*`, and read as covering nothing while
+    # denying MEMORY.md. Review round 2.
+    posture_canon "$p"
 }
 
-# The file tools the transcript hook must be wired to, as WHOLE TOKENS of its PreToolUse matcher.
-# One list, read by check-config.sh (the repo's settings) and verify.sh (the installed ones), so the
-# static and runtime checks cannot disagree about what "every file-reading tool" means.
-posture_hook_tools() { printf '%s\n' "Read Edit Write MultiEdit NotebookEdit Grep Glob LS mcp__.*"; }
+# The matcher the transcript hook must be wired with: EVERY tool. It was an allowlist of file tools,
+# and review round 3 found the built-ins it left out -- Artifact reads a local file and uploads it --
+# never reached the hook at all. With `.*`, a tool the hook does not know falls into its
+# judge-every-string arm, so a new one is covered by default instead of exempt by default; Bash is
+# let through inside the hook. Read by check-config.sh (the repo's settings) and verify.sh (the
+# installed ones). MULTI-LINE ON PURPOSE: the loaders extract functions with a sed range ending at
+# the first column-0 `}`, and a one-line body made that range run on into the next function.
+posture_hook_matcher() {
+    printf '%s\n' '.*'
+}
 
 # The literal leading part of a rule's path: every segment before the first holding a wildcard.
 posture_rule_base() { # posture_rule_base <path pattern> -> literal prefix
@@ -526,10 +540,14 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
     [ -r "$1" ] || return 0
     # The transcript tree as the sweep itself finds it -- CLAUDE_CONFIG_DIR honoured exactly as
     # TRANSCRIPT_ROOT honours it -- plus the state volume's spelling.
-    proots="${CLAUDE_CONFIG_DIR:-$home/.claude}/projects $home/.claude-state/projects"
+    proots="$(posture_canon "${CLAUDE_CONFIG_DIR:-$home/.claude}/projects") $(posture_canon "$home/.claude-state/projects")"
     layers="$(posture_layer_files "$1")" || return 0
     while IFS= read -r f; do
-        rules="$(jq -r '.permissions.deny[]?' "$f" 2>/dev/null)" || return 0
+        # BOTH LISTS THAT REACH THE ARGV: permissions.deny, and sandbox.filesystem.denyRead, whose
+        # entries are bare paths. The second was ignored, so a transcript glob there stood the sweep
+        # down while the argv grew (review round 3, measured). Bare entries are wrapped as Read rules
+        # so the one reader handles both.
+        rules="$(jq -r '(.permissions.deny[]?), (.sandbox.filesystem.denyRead[]? | "Read(\(.))")' "$f" 2>/dev/null)" || return 0
         while IFS= read -r rule; do
             [ -n "$rule" ] || continue
             posture_rule_is_path "$rule" || continue
@@ -1417,6 +1435,10 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # against the developer's own HOME would be decided by their machine. `pe` runs in an empty
     # one unless a row hands it another.
     mkdir -p "$work/nohome"
+    # NOT INHERITED: the predicate honours CLAUDE_CONFIG_DIR, so a developer who exports it made six
+    # rows read their real settings and fail on a correct checkout -- and check.sh stops at the
+    # first failing gate. Review round 3. The one row that is ABOUT it sets it for itself.
+    unset CLAUDE_CONFIG_DIR
     pe() { if HOME="${2:-$work/nohome}" posture_enumerates_transcripts "$1"; then echo yes; else echo no; fi; }
     eq "the old per-file globs enumerate transcripts"          "$(pe "$pdir/globs.json")"   yes
     eq "the posture that ships names no transcript"            "$(pe "$pdir/hook.json")"    no
@@ -1457,6 +1479,11 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "non-file rules have no path and enumerate nothing" "$(pe "$pdir/nonfile.json")" no
     # CLAUDE_CONFIG_DIR moves the tree, and the predicate follows it the way TRANSCRIPT_ROOT does.
     printf '%s\n' "{\"permissions\":{\"deny\":[\"Read(/$work/altcfg/projects/**/*.jsonl)\"]}}" >"$pdir/altcfg.json"
+    printf '%s\n' '{"sandbox":{"filesystem":{"denyRead":["~/.claude/projects/**/*.jsonl"]}}}' >"$pdir/sbx.json"
+    eq "a per-file glob in sandbox.filesystem.denyRead enumerates too" "$(pe "$pdir/sbx.json")" yes
+    mkdir -p "$work/slashhome"
+    eq "a HOME with a trailing slash still matches the old per-file globs" \
+       "$(pe "$pdir/globs.json" "$work/slashhome/")" yes
     eq "...and with CLAUDE_CONFIG_DIR set, a glob over THAT tree enumerates" \
        "$(CLAUDE_CONFIG_DIR="$work/altcfg" pe "$pdir/altcfg.json")" yes
 
@@ -1467,6 +1494,8 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "a single /x is relative to the settings file" "$(rp 'Read(/x)')"              /etc/claude-code/x
     eq "a trailing slash is dropped"             "$(rp 'Read(~/.claude/projects/)')"  /h/.claude/projects
     eq "runs of / are collapsed"                 "$(rp 'Read(//h//.claude///projects)')" /h/.claude/projects
+    eq "the canonicaliser keeps / as /"          "$(posture_canon /)"                 /
+    eq "...and strips a trailing slash and runs" "$(posture_canon /x//h/)"            /x/h
     ip() { if posture_rule_is_path "$1"; then echo yes; else echo no; fi; }
     eq "Read and Edit rules have paths"          "$(ip 'Read(~/x)')$(ip 'Edit(~/x)')" yesyes
     eq "Bash and WebFetch rules do not"          "$(ip 'Bash(curl:*)')$(ip 'WebFetch(domain:x)')" nono

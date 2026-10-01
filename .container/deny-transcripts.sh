@@ -161,15 +161,17 @@ join_raw() { # join_raw <path> <home> <cwd> -> absolute, un-normalised
 # because normalising first lets `..` cancel the link it follows: `/proc/self/cwd/../../x`
 # normalises to `/proc/x`, which looks harmless, while the kernel follows cwd and only then climbs.
 through_magic() { # through_magic <absolute un-normalised path> -> rc 0 if it passes through one
-    local out=() seg parts cur
+    # LINEAR, with no subshell per segment. This built `$(printf '/%s' "${out[@]}")` for every
+    # segment -- quadratic, and a fork each time -- so one 24KB path of `a/..` repeated took 15.3s
+    # against a 10s budget, and a timed-out hook FAILS OPEN. Found by review round 3.
+    local seg parts cur=""
     split_path "$1"
     for seg in ${parts[@]+"${parts[@]}"}; do
         case "$seg" in
             ''|.) continue ;;
-            ..) [ "${#out[@]}" -gt 0 ] && unset 'out[${#out[@]}-1]'; continue ;;
+            ..) cur="${cur%/*}"; continue ;;
         esac
-        out+=("$seg")
-        cur="$(printf '/%s' "${out[@]}")"
+        cur="$cur/$seg"
         case "$cur" in
             /proc/*/root|/proc/*/cwd|/proc/*/fd|/proc/*/fdinfo|/proc/*/map_files|/proc/*/exe|/dev/fd) return 0 ;;
         esac
@@ -206,7 +208,8 @@ verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
     # refused before it is normalised -- see through_magic.
     if through_magic "$(join_raw "$1" "$3" "$4")"; then printf 'deny\n'; return; fi
     p="$(resolve "$1" "$3" "$4")"
-    for root in $roots; do
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
         # INSIDE the tree: the root itself, or anything under root/.
         if [ "$p" = "$root" ] || [ "${p#"$root"/}" != "$p" ]; then
             # Auto-memory is the one child of a slug that is not a transcript. EXACTLY one slug
@@ -223,13 +226,14 @@ verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
         # An ANCESTOR of the tree: anything rooted here walks into it. For p=/ this is "/".
         anc="${p%/}/"
         if [ "${root#"$anc"}" != "$root" ]; then printf 'deny\n'; return; fi
-    done
+    done <<<"$roots"
     printf 'allow\n'
 }
 
 if [ "${1:-}" = --self-test ]; then
     fails=0
-    R="/h/.claude/projects /h/.claude-state/projects"
+    R="/h/.claude/projects
+/h/.claude-state/projects"
     t() { # t <label> <path> <want> [cwd]
         local got; got="$(verdict "$2" "$R" /h "${4:-/h/repos/jkb}")"
         if [ "$got" = "$3" ]; then printf '  \033[32mok\033[0m   %s\n' "$1"
@@ -303,6 +307,13 @@ if [ "${1:-}" = --self-test ]; then
     # `verdict` can show. Run as Claude Code runs it: JSON on stdin, decision on stdout or rc 2.
     echo "==> deny-transcripts self-test: hook mode, as Claude Code runs it"
     self="$0"
+    # The hook needs GNU `realpath -m`; macOS's BSD realpath has none. Where it is missing, every
+    # program-level row would get the refusal and read green or red for the wrong reason, so they
+    # are skipped and say so. The hook only ever runs in the container, which has it.
+    if ! realpath -m / >/dev/null 2>&1; then
+        printf '  \033[33mskip\033[0m hook-mode rows: no GNU realpath -m here (the container has it)\n'
+        h() { :; }
+    fi
     h() { # h <label> <want deny|allow> <stdin> [env...]
         local label="$1" want="$2" in="$3" out rc=0; shift 3
         out="$(printf '%s' "$in" | env "$@" "$BASH" "$self" 2>/dev/null)" || rc=$?
@@ -335,7 +346,15 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{}}' HOME=/h
     # SYMLINKS, with real files: the kernel follows a link the lexical check cannot see. A temp HOME
     # holds the tree, and an agent-made link in a repo points into it.
-    sh="$(mktemp -d)"
+    # PHYSICAL, so a temp dir that sits under a symlink (macOS's /var/folders) is not a false red.
+    # And NEVER derived from `cd` alone: `$(cd "$(mktemp -d)" && pwd -P)` prints the CURRENT directory
+    # when mktemp fails (`cd ""` stays put), and the `rm -rf` below would then delete the checkout
+    # this ran from. Claude Code's own removal guard refused exactly that pattern. So mktemp must
+    # succeed and name a directory, and the cleanup refuses anything that is not that directory.
+    sh_tmp="$(mktemp -d)" && [ -n "$sh_tmp" ] && [ -d "$sh_tmp" ] \
+        || { printf '  \033[31mFAIL\033[0m mktemp -d failed; the symlink rows cannot run\n'; exit 1; }
+    sh="$(cd -- "$sh_tmp" && pwd -P)" && [ -n "$sh" ] && [ "$sh" != / ] && [ "$sh" != "$PWD" ] \
+        || { printf '  \033[31mFAIL\033[0m could not resolve the temp dir\n'; exit 1; }
     mkdir -p "$sh/.claude/projects/-s/memory" "$sh/.claude-state/projects/-s" "$sh/repos/r" "$sh/elsewhere"
     : >"$sh/.claude/projects/-s/e.jsonl"; : >"$sh/.claude/projects/-s/memory/MEMORY.md"
     ln -s "$sh/.claude-state/projects" "$sh/repos/r/x"
@@ -349,6 +368,16 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Write","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/x/-s/new.jsonl"}}' HOME="$sh"
     h "a symlink to auto-memory still reads as memory" allow \
       '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/mem/MEMORY.md"}}' HOME="$sh"
+    # A symlink FOLLOWED BY `..`: the kernel follows the link, then climbs. Review round 3.
+    ln -s "$sh/.claude-state/projects/-s" "$sh/repos/r/l2"
+    h "a symlink followed by .. lands where the kernel lands" deny \
+      '{"tool_name":"Grep","cwd":"'"$sh"'/repos/r","tool_input":{"path":"l2/..","pattern":"p"}}' HOME="$sh"
+    h "...for a Read through it too" deny \
+      '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/l2/../-s/e.jsonl"}}' HOME="$sh"
+    # A HOME that passes through a symlink: the roots must be resolved as well.
+    ln -s "$sh" "$sh.link"
+    h "with a symlinked HOME, a direct read of the real tree is denied" deny \
+      '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$sh"'/.claude/projects/-s/e.jsonl"}}' HOME="$sh.link"
     h "a symlink that points elsewhere is allowed" allow \
       '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/ok/f"}}' HOME="$sh"
     h "a HOME with a trailing slash still finds its tree" deny \
@@ -358,7 +387,8 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":["/x","/bin/sh","-c","touch '"$sh"'/INJECTED"]}}' HOME="$sh"
     if [ -e "$sh/INJECTED" ]; then printf '  \033[31mFAIL\033[0m an array-valued field EXECUTED a command\n'; fails=$((fails+1))
     else printf '  \033[32mok\033[0m   ...and nothing was executed\n'; fi
-    rm -rf "$sh"
+    rm -f -- "$sh.link"
+    case "$sh" in */tmp.*) rm -rf -- "$sh" ;; *) printf '  \033[33mnote\033[0m left %s in place: not a mktemp path\n' "$sh" ;; esac
 
     # ANY TOOL THAT CAN NAME A PATH. MCP tools run unsandboxed; for a tool whose fields this does
     # not know, every string in its input is judged.
@@ -374,8 +404,32 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"MultiEdit","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/e.jsonl","edits":[]}}' HOME=/h
     h "a Write whose CONTENT mentions the tree is allowed -- content is not a path" allow \
       '{"tool_name":"Write","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/repos/jkb/notes.md","content":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
-    big="$(python3 -c 'import json; print(json.dumps({"tool_name":"mcp__x__y","cwd":"/h/repos/jkb","tool_input":{"a":["x"]*101}}))')"
-    h "more strings than the cap is a refusal, never a race with the timeout" deny "$big" HOME=/h
+    # Built with jq, not python3: without python3 the payload was empty, the empty-payload refusal
+    # answered, and the row passed without ever reaching the cap. Review round 3.
+    big="$(jq -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{a:[range(101) | "/h/repos/jkb/f\(.)"]}}')"
+    h "more path-like strings than the cap is a refusal, never a race with the timeout" deny "$big" HOME=/h
+    many="$(jq -cn '{tool_name:"TodoWrite", cwd:"/h/repos/jkb", tool_input:{todos:[range(150) | {content:"do thing \(.)", status:"pending"}]}}')"
+    h "a TodoWrite with a long list -- no path-like strings -- is allowed" allow "$many" HOME=/h
+    # EVERY TOOL reaches the hook now; one it does not know is judged by its strings.
+    h "an Artifact publish of a transcript is denied" deny \
+      '{"tool_name":"Artifact","cwd":"/h/repos/jkb","tool_input":{"action":"publish","file_path":"~/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    h "...and through its files map" deny \
+      '{"tool_name":"Artifact","cwd":"/h/repos/jkb","tool_input":{"files":{"a.json":"/h/.claude-state/projects/-s/e.jsonl"}}}' HOME=/h
+    h "Bash is let through -- the kernel sandbox confines it" allow \
+      '{"tool_name":"Bash","cwd":"/h","tool_input":{"command":"cat /h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    # An MCP server resolves relative paths against its OWN cwd, the project root.
+    h "an MCP relative path is judged against the project dir too" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"/h/repos/jkb/a/b","tool_input":{"source":"../../.claude-state/projects/-s/e.jsonl"}}' HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    # CLAUDE_CONFIG_DIR moves the transcript tree, and the hook follows it.
+    h "with CLAUDE_CONFIG_DIR set, its projects tree is denied" deny \
+      '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/cfg/projects/-s/e.jsonl"}}' HOME=/h CLAUDE_CONFIG_DIR=/cfg
+    # A BYTE BUDGET: an `a/..` chain built to be slow is refused before any walk, and fast.
+    long="$(jq -cn '{tool_name:"Read", cwd:"/h", tool_input:{file_path:("/" + ([range(6000)|"a/.."]|join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
+    t0=$(date +%s%N)
+    h "a 24KB a/.. chain is refused" deny "$long" HOME=/h
+    t1=$(( ($(date +%s%N) - t0) / 1000000 ))
+    if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms, nowhere near the 10s timeout\n' "$t1"
+    else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
 
     # FAIL CLOSED: every way of not reaching a verdict is a refusal.
     h "an unparseable payload is denied" deny 'not json {' HOME=/h
@@ -425,7 +479,22 @@ home="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
 # roots became `/home/vscode//.claude/projects`, which no normalised path ever starts with, and
 # every transcript read was allowed.
 home="$(normalise "$home")"
-roots="$home/.claude/projects $home/.claude-state/projects"
+# EVERY SPELLING OF THE TREE, one per line: the home's, the state volume's, CLAUDE_CONFIG_DIR's when
+# it is set (Claude Code writes transcripts there then, and the sweep already honoured it while this
+# did not), and each of those as the kernel resolves it -- a HOME that passes through a symlink
+# gave roots no `realpath -m` output ever starts with, so direct reads went through. Review round 3.
+# Not shared with the sweep by loading it: this file is installed alone, root-owned, at
+# /usr/local/bin, with no sibling to load from. check-config.sh holds the two to the same set.
+roots=""
+for r in "$home/.claude/projects" "$home/.claude-state/projects" \
+         ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/projects"}; do
+    r="$(normalise "$r")"
+    roots="$roots$r
+"
+    rp="$(realpath -m -- "$r" 2>/dev/null)" || exit 3
+    [ "$rp" != "$r" ] && roots="$roots$rp
+"
+done
 
 input="$(cat 2>/dev/null)"
 command -v jq >/dev/null 2>&1 || exit 3
@@ -442,19 +511,33 @@ assign="$(printf '%s' "$input" | jq -er '
 eval "$assign"
 [ -n "$cwd" ] || cwd="$PWD"
 
-check() { # check <path>: deny on deny, return on allow, refuse on anything else
-    local v abs phys
-    v="$(verdict "$1" "$roots" "$home" "$cwd")"
+check() { # check <path> [base]: deny on deny, return on allow, refuse on anything else
+    local base="${2:-$cwd}" v abs raw phys
+    # A BYTE BUDGET, before any walk: PATH_MAX is 4096, so no path the kernel can open is longer,
+    # and anything longer is either garbage or a `a/..`-chain built to be slow. Refused up front so
+    # no input can push this into its timeout.
+    [ "${#1}" -le 4096 ] || exit 3
+    v="$(verdict "$1" "$roots" "$home" "$base")"
     case "$v" in deny) deny ;; allow) ;; *) exit 3 ;; esac
-    # ...and AS THE KERNEL WILL RESOLVE IT. A resolver that fails -- no realpath, a symlink loop --
-    # cannot say where the path lands, so that is a refusal too.
-    abs="$(resolve "$1" "$home" "$cwd")"
-    phys="$(realpath -m -- "$abs" 2>/dev/null)" || exit 3
+    # ...and AS THE KERNEL WILL RESOLVE IT, from the UN-normalised join. Resolving the lexically
+    # collapsed path let a symlink followed by `..` through: `l2/..` with l2 -> the tree collapsed
+    # to the repo before realpath saw the link, while the kernel follows l2 first and then climbs.
+    # Review round 3, reproduced. A resolver that fails cannot say where the path lands: refuse.
+    raw="$(join_raw "$1" "$home" "$base")"
+    abs="$(resolve "$1" "$home" "$base")"
+    phys="$(realpath -m -- "$raw" 2>/dev/null)" || exit 3
     [ -n "$phys" ] || exit 3
     [ "$phys" = "$abs" ] && return 0
-    v="$(verdict "$phys" "$roots" "$home" "$cwd")"
+    v="$(verdict "$phys" "$roots" "$home" "$base")"
     case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac
 }
+
+# BASH IS NOT JUDGED HERE. The matcher is `.*` -- every tool reaches this hook, so a built-in tool
+# added tomorrow lands in the judge-every-string arm below instead of being exempt by default (the
+# allowlist matcher let Artifact, which reads and uploads a local file, past it; review round 3).
+# Bash alone is let through: the kernel sandbox confines it, its command text is not a path, and it
+# is the tool a person repairs a broken container with.
+[ "$tool" = Bash ] && allow
 
 for p in "$fp" "$nb"; do [ -n "$p" ] && check "$p"; done
 case "$tool" in
@@ -471,12 +554,31 @@ case "$tool" in
     Read|Edit|Write|NotebookEdit)
         [ -n "$pth" ] && check "$pth" ;;
     *)
-        # A tool whose fields are not known here: every string it was given is judged. `strings`
-        # filters to strings, so @sh here cannot produce an executable word -- the array case that
-        # made the typed-field guard above necessary does not arise.
-        leaves_sh="$(printf '%s' "$input" | jq -er '[.tool_input | .. | strings] | if length > 100 then error("too many") else @sh "leaves=(\(.))" end' 2>/dev/null)" || exit 3
+        # A tool whose fields are not known here: every string it was given that COULD BE A PATH is
+        # judged -- one holding a `/`, or starting `~` or `.`, and holding no newline. Not every
+        # string: with every tool now routed here, a flat cap on all strings refused a TodoWrite or
+        # an AskUserQuestion with a long list. The exception is a cwd that is itself in or above the
+        # tree, where a bare word like `projects` is a path into it; then every string counts.
+        # `strings` filters to strings, so @sh cannot produce an executable word here.
+        scan_all=0
+        [ "$(verdict "$cwd" "$roots" "$home" "$cwd")" = deny ] && scan_all=1
+        leaves_sh="$(printf '%s' "$input" | jq -er --arg all "$scan_all" '
+            [.tool_input | .. | strings
+             | select($all == "1" or test("^[~.]") or contains("/"))
+             | select(contains("\n") | not)]
+            | if length > 100 then error("too many") else @sh "leaves=(\(.))" end' 2>/dev/null)" || exit 3
         leaves=()
         eval "$leaves_sh"
-        for leaf in ${leaves[@]+"${leaves[@]}"}; do check "$leaf"; done ;;
+        # An MCP server resolves a relative path against ITS OWN cwd, which is not the session's:
+        # the jkb server starts in the project root. So a relative string is judged against every
+        # base it could plausibly mean. Review round 3.
+        bases="$cwd"
+        case "$tool" in mcp__*) bases="$cwd ${CLAUDE_PROJECT_DIR:-} $home" ;; esac
+        for leaf in ${leaves[@]+"${leaves[@]}"}; do
+            case "$leaf" in
+                /*|"~"*) check "$leaf" ;;
+                *) for b in $bases; do [ -n "$b" ] && check "$leaf" "$b"; done ;;
+            esac
+        done ;;
 esac
 allow

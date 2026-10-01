@@ -1342,7 +1342,7 @@ for h in d["hooks"]["PreToolUse"]:
     if "deny-transcripts.sh" in json.dumps(h): h["matcher"] = "Read"
 json.dump(d, open(p, "w"), indent=2)
 PYX
-run "the hook misses the tools that can also read" "matcher does not cover"
+run "the hook misses the tools that can also read" "transcript hook's matcher is [Read]"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys
@@ -1375,9 +1375,9 @@ run "a bare directory rule covers auto-memory's subtree" "covers ~/.claude/proje
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('"Read|Edit|Write|', '"Read|Write|', 1))
+open(p, 'w').write(s.replace('"matcher": ".*"', '"matcher": "Read|Edit|Write|Grep|Glob"', 1))
 PYX
-run "the hook matcher drops only Edit" "matcher does not cover: Edit"
+run "the hook matcher is narrowed back to an allowlist" "transcript hook's matcher is [Read|Edit|Write|Grep|Glob]"
 
 # Claude Code's absolute spelling of the bare-directory rule that drops MEMORY.md.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
@@ -1436,13 +1436,38 @@ open(p, 'w').write(s.replace("COPY --chown=root:root deny-transcripts.sh", "# CO
 PYX
 run "the hook's COPY is commented out" "does not install deny-transcripts.sh root-owned"
 
+# REVIEW ROUND 3. With no deny rule naming the tree, an allow entry reaching it opens it to Bash.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowRead"].append("~/.claude")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a sandbox allowRead entry widened to ~/.claude" "reaches the transcript tree"
+
+# The hook's roots lose CLAUDE_CONFIG_DIR: the sweep still honours it, the hook does not.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/projects"}', '', 1))
+PYX
+run "the hook forgets CLAUDE_CONFIG_DIR" "disagree about where the transcript tree is"
+
+# A helper the reader uses goes missing: the load guard must fail, not the reader pass on nothing.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("posture_hook_matcher() {", "posture_hook_matcher_renamed() {", 1))
+PYX
+run "the shared matcher definition is renamed" "could not be loaded from sweep-transcripts.sh"
+
 # MCP tools run unsandboxed and take paths; a matcher without them leaves every one unguarded.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('|LS|mcp__.*"', '|LS"', 1))
+open(p, 'w').write(s.replace('"matcher": ".*"', '"matcher": "mcp__.*"', 1))
 PYX
-run "the hook matcher drops MCP tools" "matcher does not cover: mcp__.*"
+run "the hook matcher covers MCP tools only" "transcript hook's matcher is [mcp__.*]"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
@@ -1839,7 +1864,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=105
+PINNED_BAD_SITES=109
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

@@ -420,7 +420,11 @@ REC
 # which the transcript-budget check below already relies on). This used to match with its own `case`
 # and parse rules with its own jq+sed, which missed Claude Code's `//path` spelling exactly as
 # check-config.sh's copy did -- the same defect in two places, needing two fixes. One definition now.
-eval "$(sed -n '/^posture_rule_is_path() {/,/^}/p; /^posture_rule_path() {/,/^}/p; /^posture_rule_covers() {/,/^}/p; /^posture_layer_files() {/,/^}/p; /^posture_hook_tools() {/,/^}/p' "$(dirname "$0")/sweep-transcripts.sh")"
+# EVERY posture_* FUNCTION, by one pattern -- not a hand-kept list of names. The list form missed
+# posture_canon when posture_rule_path began calling it: posture_rule_path then printed nothing, an
+# empty pattern "covered" everything, and every rule read as swallowing auto-memory. Loud that time;
+# the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
+eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$(dirname "$0")/sweep-transcripts.sh")"
 memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> clear|shadowed:<pattern>
     local mem="$1" pat
     while IFS= read -r pat; do
@@ -1608,7 +1612,12 @@ esac
 # /etc/claude-code is what Claude Code actually loaded. A repo file that disagrees with it is a
 # different failure, and check-config.sh owns that one.
 mem_managed=/etc/claude-code/managed-settings.json
-if [ ! -f "$mem_managed" ]; then
+# THE SHARED READER MUST HAVE LOADED. If a function it uses were missing, posture_rule_covers would
+# be "command not found", memory_shadow would answer `clear`, and this whole block would pass on
+# nothing -- the quiet direction. check-config.sh guards its own load the same way.
+if ! declare -F posture_canon posture_rule_is_path posture_rule_path posture_rule_covers posture_layer_files posture_hook_matcher >/dev/null; then
+    bad "the deny-rule reader could not be loaded from sweep-transcripts.sh beside this script, so whether any settings layer swallows auto-memory, or whether the hook is wired, is unchecked"
+elif [ ! -f "$mem_managed" ]; then
     bad "there are no managed settings at $mem_managed, so nothing here establishes that the posture leaves auto-memory readable"
 else
     # EVERY LAYER, read the way Claude Code reads it: managed, its drop-ins, the user's settings and
@@ -1708,16 +1717,13 @@ else
     mem_match="$(jq -r --arg h "$mem_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$mem_managed" 2>/dev/null)"
     if [ -z "$mem_match" ]; then
         mem_hook_wrong="$mem_hook_wrong the installed $mem_managed has no PreToolUse entry running it;"
-    else
-        mem_tokens=" $(tr '|' ' ' <<<"$mem_match") "
-        for mem_tool in $(posture_hook_tools); do
-            case "$mem_tokens" in *" $mem_tool "*) ;; *) mem_hook_wrong="$mem_hook_wrong its installed matcher does not cover $mem_tool;" ;; esac
-        done
+    elif [ "$mem_match" != "$(posture_hook_matcher)" ]; then
+        mem_hook_wrong="$mem_hook_wrong its installed matcher is [$mem_match], not [$(posture_hook_matcher)], so a tool it does not match never reaches it;"
     fi
     if [ -n "$mem_hook_wrong" ]; then
         bad "the installed transcript hook is present but wrong:$mem_hook_wrong"
     else
-        ok "the transcript hook is installed root-owned and wired for every file tool, and under both spellings denies a transcript and allows auto-memory"
+        ok "the transcript hook is installed root-owned and reached by every tool call, and under both spellings denies a transcript and allows auto-memory"
     fi
 fi
 
