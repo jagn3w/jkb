@@ -43,7 +43,7 @@ dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 # saying there is no verify.sh statement -- and the cheapest repair for the second is to delete the
 # ordering branch that keeps the sweep from being disabled by an unrelated assertion.
 dc_stmt_line() { # dc_stmt_line <stripped run.sh> <script basename regex> -> line number, or nothing
-    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/$2" \
+    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+(/usr)?(/bin/)?bash[[:space:]]+\.container/$2" \
         <<<"$1" | sed -n '1s/^\([0-9]*\):.*/\1/p'
 }
 
@@ -650,15 +650,46 @@ fi
 # system directories before the first command the script runs.
 dc_shebang="$(head -1 "$here/deny-transcripts.sh")"
 dc_first_cmd="$(dc_strip_comments "$here/deny-transcripts.sh" | sed '1d' | grep -m1 -E '[^[:space:]]')"
+# `-p` REQUIRED, not merely an absolute bash: privileged mode is what makes bash ignore BASH_ENV
+# and functions exported through the environment, and a plain `#!/bin/bash` passed every gate here
+# while losing both (review round 7). The self-test also plants a BASH_ENV and watches it not run.
 case "$dc_shebang" in
-    '#!/bin/bash'|'#!/bin/bash '*|'#!/usr/bin/bash'|'#!/usr/bin/bash '*)
+    '#!/bin/bash -p'|'#!/bin/bash -p '*|'#!/usr/bin/bash -p'|'#!/usr/bin/bash -p '*)
         if [ "$dc_first_cmd" != "PATH=/usr/bin:/bin" ]; then
             bad "deny-transcripts.sh does not fix PATH before it runs anything (its first command is [$dc_first_cmd]) — it runs unsandboxed, and ~/.cargo/bin and ~/.local/bin, which the sandbox can write, come first on the image's PATH"
         else
             ok "the transcript hook has an absolute shebang and fixes PATH before running anything"
         fi ;;
-    *) bad "deny-transcripts.sh's shebang is [$dc_shebang], not an absolute bash — an env shebang finds bash through a PATH the sandbox can write to, and runs it unsandboxed" ;;
+    *) bad "deny-transcripts.sh's shebang is [$dc_shebang], not an absolute bash in privileged mode (\`#!/bin/bash -p\`) — an env shebang finds bash through a PATH the sandbox can write to, and without -p bash runs BASH_ENV and imported functions, all unsandboxed" ;;
 esac
+
+# THE SWEEP RUNS UNSANDBOXED TOO, and the same rule holds for it: the reaper pipes it into
+# `docker exec`, run.sh runs it at start, and the image's PATH begins with directories the sandbox
+# can write. Round 7 found a planted `jq` there running on the next reaper tick. Required: the
+# sweep's real-run arm pins PATH, and every place that starts it -- or verify.sh, which also runs
+# unsandboxed -- names `/bin/bash` by absolute path rather than letting docker exec look it up.
+dc_unsb=""
+# HERE-STRINGS, NEVER `producer | grep -q`: the note above dc_stmt_line is why. The first cut of
+# this guard piped twice into grep -q, which is the race that once failed only on CI.
+dc_sweep_case="$(dc_strip_comments "$here/sweep-transcripts.sh" | sed -n '/^case "\${1:-}" in/,/^esac/p')"
+grep -q '^[[:space:]]*PATH=/usr/bin:/bin' <<<"$dc_sweep_case" \
+    || dc_unsb="$dc_unsb the sweep's real-run arm does not pin PATH;"
+grep -qF -- '"/bin/bash", "-s"' "$here/../crates/jkb-cli/src/transcripts.rs" \
+    || dc_unsb="$dc_unsb the reaper's docker exec does not name /bin/bash;"
+dc_run_stripped="$(dc_strip_comments "$here/run.sh")"
+for dc_s in sweep-transcripts verify; do
+    dc_ln="$(dc_stmt_line "$dc_run_stripped" "$dc_s\\.sh")"
+    dc_line=""; [ -n "$dc_ln" ] && dc_line="$(sed -n "${dc_ln}p" <<<"$dc_run_stripped")"
+    case "$dc_line" in
+        *"/bin/bash .container/$dc_s.sh"*) ;;
+        *) dc_unsb="$dc_unsb run.sh does not start $dc_s.sh with /bin/bash;" ;;
+    esac
+done
+if [ -n "$dc_unsb" ]; then
+    bad "an unsandboxed script can be steered through PATH:$dc_unsb a program planted in ~/.cargo/bin would run outside the sandbox with the container credential readable"
+else
+    ok "the sweep pins PATH, and the reaper and run.sh start the unsandboxed scripts with /bin/bash"
+fi
 
 # THE HOOK AND THE SWEEP MUST AGREE ON WHERE THE TREE IS. The hook cannot load the shared reader --
 # it is installed alone, root-owned, at /usr/local/bin -- so its roots are its own, and they drifted:
@@ -1047,7 +1078,7 @@ else
     # require and no path to agree about, so the guard that compared two paths is gone with them.
     grep -qF -- 'include_str!("../../../.container/sweep-transcripts.sh")' <<<"$ctr_rs" \
         || sweep_problems="$sweep_problems the reaper no longer embeds the sweep, so it runs something other than the script this repository tests;"
-    grep -qF -- '"exec", "-i", "-e", &keep, name, "bash", "-s"' <<<"$ctr_rs" \
+    grep -qF -- '"exec", "-i", "-e", &keep, name, "/bin/bash", "-s"' <<<"$ctr_rs" \
         || sweep_problems="$sweep_problems the reaper no longer feeds the sweep in on stdin, so it depends on a copy inside the container that an already-running one does not have;"
 fi
 

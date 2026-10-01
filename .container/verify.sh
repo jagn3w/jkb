@@ -2204,7 +2204,10 @@ if [ -f "$sweep_sh" ]; then
     sweep_keep_note=""
     if [ -n "${JKB_KEEP_SESSIONS+set}" ]; then
         : # supplied by our caller, and authoritative even when empty
-    elif sweep_live="$(jkb notify sessions --live-ids 2>/dev/null)"; then
+    # THE PINNED, ROOT-OWNED jkb, not whatever is first on PATH: this runs unsandboxed, and the jkb
+    # on PATH lives in ~/.cargo/bin, which the sandbox can write (review round 7). The pinned copy is
+    # the one the harness hooks run, for the same reason.
+    elif sweep_live="$(/usr/local/lib/jkb-hook/jkb notify sessions --live-ids 2>/dev/null)"; then
         JKB_KEEP_SESSIONS="$(printf '%s' "$sweep_live" | tr '\n' ' ')"
         export JKB_KEEP_SESSIONS
     else

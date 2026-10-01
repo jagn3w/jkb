@@ -271,8 +271,12 @@ pub fn sweep_with(name: &str, live: &[String], run: Runner<'_>) -> Sweep {
     // Passed as ONE environment variable rather than arguments: `docker exec -e` leaves the script's
     // own argument dispatch alone, and an id list is data, not a flag.
     let keep = format!("{KEEP_SESSIONS_VAR}={}", live.join(" "));
+    // `/bin/bash` BY ABSOLUTE PATH. `docker exec` resolves a bare `bash` through the container's
+    // PATH, which the image starts with the sandbox-writable ~/.cargo/bin and ~/.local/bin -- and
+    // this runs UNSANDBOXED, so a planted `bash` there would run with the container credential
+    // readable (review round 7). The script pins its own PATH on its first real-run line.
     let Some((ok, out, err)) = run(
-        &["exec", "-i", "-e", &keep, name, "bash", "-s"],
+        &["exec", "-i", "-e", &keep, name, "/bin/bash", "-s"],
         Some(SWEEP_SCRIPT),
     ) else {
         // NOT `Absent`. The probe just answered, so Docker is there and the container is running —
@@ -629,7 +633,7 @@ mod tests {
                 "-e",
                 "JKB_KEEP_SESSIONS=",
                 "jkb-dev",
-                "bash",
+                "/bin/bash",
                 "-s"
             ]
         );
@@ -659,7 +663,7 @@ mod tests {
                 "-e",
                 "JKB_KEEP_SESSIONS=aaaa-1111 bbbb-2222",
                 "jkb-dev",
-                "bash",
+                "/bin/bash",
                 "-s"
             ],
             "space-separated, in one variable, as the sweep splits them"

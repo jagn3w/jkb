@@ -1387,7 +1387,15 @@ O(files) of argv. What
   *already executed* the command. Every `jq` call now goes through one wrapper with
   `HOME=/dev/null`. The hook's other programs load nothing from the home. The general rule, written
   here so it gets applied next time: **anything an unsandboxed process loads automatically from an
-  agent-writable place is a way into it.**
+  agent-writable place is a way into it.** Round 7 applied it beyond the hook. The *sweep* runs
+  unsandboxed too, when the reaper pipes it into `docker exec`, and it looked up `jq` (and, before this
+  branch, `bash` and `find`) through a `PATH` that starts with `~/.cargo/bin`. Its real run now
+  pins `PATH`, its `jq` runs with `HOME=/dev/null`, and the reaper and `run.sh` start it, and
+  `verify.sh`, with `/bin/bash` by absolute path. `check-config.sh` holds all three.
+  **Still open, and older than this branch:** `verify.sh` runs unsandboxed with that same `PATH`, and
+  it has to. It checks the installed toolchain, so it runs the `jkb` in `~/.cargo/bin`, which the
+  sandbox can write. Its one call this branch added, `jkb notify sessions --live-ids`, now uses the
+  root-owned pinned binary at `/usr/local/lib/jkb-hook/jkb`. The rest is filed as its own work.
 - **Built-ins that carry text are let through, along with Bash, before anything that can fail.**
   With every tool reaching a hook that fails closed, judging a todo list's or a subagent prompt's
   strings as paths refused ordinary calls: 40 todos from a home cwd, an empty field read as "the

@@ -112,7 +112,8 @@ jobs:
       #   egress-status   the live-chain report the entrypoint now boots on (D51.1)
       #   fetch-ext...    the marketplace URL and platform mapping
       #   verify.sh       the mount-exclusion regex
-      #   sweep-tra...    the transcript byte budget that keeps the sandbox deny list in one argv
+      #   sweep-tra...    the backstop transcript byte budget (the hook below is the defence)
+      #   deny-tran...    the transcript hook's decisions, run as Claude Code runs it
       - name: container derivations
         run: |
           ./.container/run.sh --self-test

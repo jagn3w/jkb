@@ -200,6 +200,25 @@ through_magic() { # through_magic <absolute un-normalised path> -> rc 0 if it pa
     return 1
 }
 
+# A file: URI AS THE PATH IT NAMES, for every caller -- check() and the over-PATH_MAX branch both,
+# since round 7 found the long branch skipping a rewrite that lived in check() alone. The scheme is
+# compared CASE-INSENSITIVELY: `FILE:///h/.claude/...` is the same URI under RFC 3986, and a
+# lowercase-only match let it through. Prints the path, or nothing if the string is not a file URI;
+# returns 1 for a file URI it will not judge (percent-escapes: a second parser of the same string
+# is a second place to be wrong, and the agent can send the plain path).
+uri_path() { # uri_path <string> -> path on stdout, rc 0; empty for not-a-URI; rc 1 to refuse
+    local p="$1" lc
+    lc="$(printf '%s' "${p:0:17}" | tr 'A-Z' 'a-z')"
+    case "$lc" in
+        file://localhost/*) p="/${p:17}" ;;
+        file:///*)          p="/${p:8}" ;;
+        file:/*)            p="/${p:6}" ;;
+        *) return 0 ;;
+    esac
+    case "$p" in *%*) return 1 ;; esac
+    printf '%s\n' "$p"
+}
+
 # The literal leading part of a glob pattern: every segment before the first that holds a glob
 # character. `**/*.jsonl` -> "" (the search root alone decides), `/a/b/*/c` -> /a/b.
 glob_base() { # glob_base <pattern> -> literal prefix, possibly empty
@@ -504,6 +523,23 @@ if [ "${1:-}" = --self-test ]; then
         h "with HOME redirected, the account home's real tree is still denied" deny \
           '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$acct2"'/.claude-state/projects/-s/e.jsonl"}}' HOME=/h
     fi
+    # REVIEW ROUND 7.
+    h "an UPPER-CASE FILE:// URI to a transcript is denied" deny \
+      '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"FILE:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    lfile="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("file:///" + ([range(1500) | "a/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
+    h "a long file:// chain that collapses into the tree is denied" deny "$lfile" HOME=/h
+    h "a second brace group hiding an absolute path is denied" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{,}{/h/.claude/projects/**/*.jsonl,x}"}}' HOME=/h
+    h "jkb's one-word vector search ~retry is not a home" allow \
+      '{"tool_name":"mcp__jkb__query","cwd":"/h/repos/jkb","tool_input":{"dsl":"~retry"}}' HOME=/h
+    h "a ~2h with no space is not a home either" allow \
+      '{"tool_name":"mcp__x__note","cwd":"/h/repos/jkb","tool_input":{"text":"~2h"}}' HOME=/h
+    h "a Glob whose .. is in the literal prefix is allowed" allow \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb/crates","tool_input":{"pattern":"../docs/*.md"}}' HOME=/h
+    h "a brace of relative multi-segment paths is allowed" allow \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{crates/jkb-core,crates/jkb-cli}/**/*.rs"}}' HOME=/h
+    h "free text that starts with file: is text, not a refusal" allow \
+      '{"tool_name":"mcp__x__note","cwd":"/h/repos/jkb","tool_input":{"text":"file: see crates/a.rs"}}' HOME=/h
     h "an ordinary brace pattern is allowed" allow \
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"**/*.{rs,toml}"}}' HOME=/h
     # A bare ~name is a home, as a server applying expanduser would read it.
@@ -541,6 +577,13 @@ if [ "${1:-}" = --self-test ]; then
     else printf '  \033[32mok\033[0m   with a hostile PATH, no planted program runs\n'; fi
     case "$out" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   ...and the verdict is still a deny\n' ;;
         *) printf '  \033[31mFAIL\033[0m ...but the verdict was not a deny: %s\n' "$out"; fails=$((fails+1)) ;; esac
+    # PRIVILEGED MODE: a BASH_ENV must not run. Without `-p` in the shebang, bash sources it before
+    # the first line of this script -- unsandboxed (review round 7).
+    printf '#!/bin/sh\n: > "%s/RAN-BASH_ENV"\n' "$evil" > "$evil/bash_env"
+    printf '%s' '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/repos/jkb/x"}}' \
+        | HOME=/h BASH_ENV="$evil/bash_env" "$self" >/dev/null 2>&1
+    if [ -e "$evil/RAN-BASH_ENV" ]; then printf '  \033[31mFAIL\033[0m BASH_ENV ran: the shebang has lost -p\n'; fails=$((fails+1))
+    else printf '  \033[32mok\033[0m   a planted BASH_ENV does not run\n'; fi
     case "$evil" in */tmp.*) rm -rf -- "$evil" ;; esac
     if [ "$fails" -eq 0 ]; then printf '\033[32mdeny-transcripts self-test passed\033[0m\n'; exit 0; fi
     printf '\033[31mdeny-transcripts self-test: %s failed\033[0m\n' "$fails"; exit 1
@@ -632,13 +675,9 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
     # judged as /cwd/file:/h/... and an MCP server handed a transcript as a URI was allowed (review
     # round 6). Percent-escapes are refused rather than decoded: a decoder here is a second parser
     # of the same string, and the agent can always send the plain path.
-    case "$p" in
-        file://localhost/*) p="/${p#file://localhost/}" ;;
-        file:///*)          p="/${p#file:///}" ;;
-        file:/*)            p="/${p#file:/}" ;;
-        file:*)             exit 3 ;;
-    esac
-    case "$p" in file:*|*%*) [ "$p" = "$1" ] || exit 3 ;; esac
+    local up
+    up="$(uri_path "$p")" || exit 3
+    [ -n "$up" ] && p="$up"
     set -- "$p" "${2:-}"
     # A BYTE BUDGET, before any walk: PATH_MAX is 4096, so no path the kernel can open is longer,
     # and anything longer is either garbage or a `a/..`-chain built to be slow. Refused up front so
@@ -675,10 +714,25 @@ case "$tool" in
             # wildcard (`*/../../../.claude/projects/*`) or an absolute alternative in braces
             # (`{/h/.claude/projects/**,**/*.rs}`) went unjudged (review round 6). Both are refused;
             # ordinary patterns -- `**/*.{rs,toml}`, `{src,tests}/**` -- hold neither.
-            case "/$pat/" in */../*) [ "$(glob_base "$pat")" != "$pat" ] && deny ;; esac
-            case "$pat" in *"{"*"}"*) bc="${pat#*\{}"; bc="${bc%%\}*}"
-                                      case "$bc" in */*|*..*|*"~"*) deny ;; esac ;; esac
             gb="$(glob_base "$pat")"
+            # A `..` AFTER the literal prefix -- the prefix itself is judged below, so `../docs/*.md`
+            # is fine and only a climb past a wildcard is refused (round 7: refusing any `..` beside
+            # a wildcard refused that ordinary pattern).
+            rest="${pat#"$gb"}"
+            case "/$rest/" in */../*) deny ;; esac
+            # EVERY brace group, and only alternatives that could leave the search root: absolute,
+            # `~`, or a `..` segment. Round 6 looked at the first group alone, so a second group hid
+            # an absolute path, and refused any `/`, so `{crates/a,crates/b}/**` was refused.
+            bp="$pat"
+            while :; do
+                case "$bp" in *"{"*"}"*) ;; *) break ;; esac
+                bc="${bp#*\{}"; bc="${bc%%\}*}"; bp="${bp#*\{}"; bp="${bp#*\}}"
+                IFS=, read -r -a alts <<<"$bc"
+                for alt in ${alts[@]+"${alts[@]}"}; do
+                    case "$alt" in /*|"~"*) deny ;; esac
+                    case "/$alt/" in */../*) deny ;; esac
+                done
+            done
             if [ -n "$gb" ]; then
                 # Joined onto the UN-normalised base, so check()'s realpath meets any link in the
                 # base before the pattern's `..` segments: resolving the base first collapsed
@@ -734,6 +788,19 @@ case "$tool" in
             done
         fi
         for leaf in ${leaves[@]+"${leaves[@]}"}; do
+            # A SLASHLESS ~word in free text is a home only if that account exists. `~retry` is jkb's
+            # own one-word vector search and `~2h` an estimate; reading them as home directories
+            # refused ordinary calls (round 7). A path field keeps the over-approximation.
+            case "$leaf" in
+                "~"*/*|"~") ;;
+                "~"*) getent passwd "${leaf#\~}" >/dev/null 2>&1 || continue ;;
+            esac
+            # A free-text string that merely STARTS `file:` is text, not a refusal (round 7); only a
+            # `file:/...` URI is rewritten, and the same helper serves the long branch below.
+            case "$(printf '%s' "${leaf:0:6}" | tr 'A-Z' 'a-z')" in
+                file:/) up="$(uri_path "$leaf")" || exit 3; [ -n "$up" ] && leaf="$up" ;;
+                file:*) continue ;;
+            esac
             # Over PATH_MAX is either prose or a chain built to be slow. A path field refuses it
             # (check does); here it may be prose, so it gets the lexical verdict alone -- linear now,
             # and the collapse a server would do to get under PATH_MAX is the collapse it mirrors.

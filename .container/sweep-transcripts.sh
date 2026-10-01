@@ -445,9 +445,24 @@ posture_rule_is_path() { # posture_rule_is_path <rule> -> rc 0 for a file-tool r
 # dropped. Both sides of every comparison go through it -- the rules did and the roots did not, so
 # a HOME of `/x/h/` gave roots of `/x/h//.claude/projects` that no canonical rule ever matched.
 posture_canon() { # posture_canon <path> -> canonical spelling
-    local p="$1"
+    # `.` dropped and `..` folded lexically too, as the hook folds them: `~/repos/../.claude/...` read
+    # as a different path from `~/.claude/...` and got past every reader (review round 7). Folded
+    # only above a wildcard-free stretch is not needed -- a glob segment is kept as a segment.
+    local p="$1" seg out=() abs=0
+    case "$p" in /*) abs=1 ;; esac
     while :; do case "$p" in *//*) p="${p%%//*}/${p#*//}" ;; *) break ;; esac; done
-    [ "$p" = / ] || p="${p%/}"
+    local IFS=/
+    read -r -a segs <<<"$p"
+    for seg in ${segs[@]+"${segs[@]}"}; do
+        case "$seg" in
+            ''|.) ;;
+            ..) if [ "${#out[@]}" -gt 0 ] && [ "${out[${#out[@]}-1]}" != .. ]; then unset 'out[${#out[@]}-1]'
+                elif [ "$abs" -eq 0 ]; then out+=(..); fi ;;
+            *) out+=("$seg") ;;
+        esac
+    done
+    if [ "$abs" -eq 1 ]; then p="/${out[*]-}"; else p="${out[*]-}"; fi
+    [ -n "$p" ] || p=.
     printf '%s\n' "$p"
 }
 
@@ -487,6 +502,9 @@ posture_hook_matcher() {
 # re-derived at each caller and got wrong twice (review rounds 3 and 4). `$2` picks the object: `.`
 # for a settings file, `.require` for scripts/auto-mode-posture.json.
 #
+# `HOME=/dev/null` ON EVERY jq: jq sources $HOME/.jq into every program, the Write tool can create
+# ~/.jq, and this runs unsandboxed in the sweep (round 5 found it in the hook; round 7 here).
+#
 # `$3` CHOOSES THE LISTS, because they govern different things: both reach the ARGV (`all`, the
 # default), but only permissions.deny governs the FILE TOOLS (`perm`). sandbox.filesystem.denyRead
 # carries the blanket `~`, which keeps Bash out of the home -- memory included, and rightly -- but
@@ -494,10 +512,10 @@ posture_hook_matcher() {
 # rule swallowing auto-memory.
 posture_deny_rules() { # posture_deny_rules <json file> [jq path to the settings object] [all|perm] -> one rule per line
     case "${3:-all}" in
-        perm) jq -r "${2:-.}"' | .permissions.deny[]?' "$1" ;;
+        perm) HOME=/dev/null jq -r "${2:-.}"' | .permissions.deny[]?' "$1" ;;
         # denyWrite too: it is enumerated per match exactly as denyRead is (review round 5), and
         # wrapped as an Edit rule, which is what a write-side deny means to the reader.
-        *)    jq -r "${2:-.}"' | (.permissions.deny[]?),
+        *)    HOME=/dev/null jq -r "${2:-.}"' | (.permissions.deny[]?),
                   (.sandbox.filesystem.denyRead[]?  | if startswith("/") then "Read(/\(.))" else "Read(\(.))" end),
                   (.sandbox.filesystem.denyWrite[]? | if startswith("/") then "Edit(/\(.))" else "Edit(\(.))" end)' "$1" ;;
     esac
@@ -599,17 +617,39 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
             posture_rule_expands "$pat" || continue
             case "$pat" in
                 /*) ;;
-                *) [ "$kind" = project ] || return 0
-                   pat="$(posture_canon "$proot/${pat#./}")" ;;
+                *) if [ "$kind" = project ]; then
+                       pat="$(posture_canon "$proot/${pat#./}")"
+                   else
+                       # In a managed, user or drop-in layer a relative rule meets a session started
+                       # anywhere. It can reach the tree if it CLIMBS (a `..` segment), matches at ANY
+                       # DEPTH (a leading `**`), or overlaps the tree from the HOME, where a session can
+                       # plausibly start -- `.claude/projects/**/*.jsonl` does. Claude Code's own
+                       # documented example, `Read(./.env)`, `Read(./secrets/**)`, does none of these;
+                       # counting every relative rule as cannot-tell turned the superseded sweep back on
+                       # (review round 7). So resolve it from the home and test overlap like any other.
+                       case "/$pat/" in */../*|/\*\*/*) return 0 ;; esac
+                       pat="$(posture_canon "$home/${pat#./}")"
+                   fi ;;
             esac
             # OVERLAP, not three probes: any expanding rule whose literal prefix contains, or lies
             # inside, the transcript tree is counted. That over-counts a glob that could only match
             # memory notes, which is the cheap direction to be wrong in.
             base="$(posture_rule_base "$pat")"
             for root in "${proots[@]}"; do
+                # The base IS the tree, or lies INSIDE it: counted outright.
                 [ "$base" = "$root" ] && return 0
-                [ "${root#"${base%/}"/}" != "$root" ] && return 0
                 [ "${base#"$root"/}" != "$base" ] && return 0
+                # The base is only an ANCESTOR of the tree: the rule must actually be able to MATCH a
+                # path inside it. A bare ancestor test counted `~/.env.*` -- which can only match
+                # children of the home -- as reaching the tree, and Claude Code's documented example
+                # deny list then turned the sweep back on (review round 7). Probed with transcript
+                # shapes at the depths they really sit; `*` crosses `/` in a case pattern, so this
+                # errs towards counting.
+                if [ "${root#"${base%/}"/}" != "$root" ]; then
+                    for probe in "$root/-p/x.jsonl" "$root/-p/u/subagents/a.jsonl" "$root/-p/u/subagents/workflows/w/a.jsonl"; do
+                        posture_rule_covers "$pat" "$probe" && return 0
+                    done
+                fi
             done
         done <<<"$rules"
     done <<<"$layers"
@@ -1517,6 +1557,14 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...but an unparseable MANAGED file is cannot-tell, so yes" "$(pe "$pdir/badmanaged.json")" yes
     printf '%s\n' '{"permissions":{"deny":["Read(./.env.*)"]}}' >"$lhome/repos/r/.claude/settings.local.json"
     eq "a project's relative rule is resolved in that project, and enumerates nothing here" "$(pe "$pdir/hook.json" "$lhome")" no
+    rm -f "$lhome/repos/r/.claude/settings.local.json"
+    printf '%s\n' '{"permissions":{"deny":["Bash(curl:*)","Read(./.env)","Read(./.env.*)","Read(./secrets/**)"]}}' >"$lhome/.claude/settings.json"
+    eq "Claude Code's documented example deny list in USER settings enumerates nothing" "$(pe "$pdir/hook.json" "$lhome")" no
+    printf '%s\n' '{"permissions":{"deny":["Read(**/*.jsonl)"]}}' >"$lhome/.claude/settings.json"
+    eq "...but a user-layer relative glob that matches at any depth is cannot-tell, so yes" "$(pe "$pdir/hook.json" "$lhome")" yes
+    rm -f "$lhome/.claude/settings.json"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/repos/../.claude/projects/**/*.jsonl)"]}}' >"$pdir/dotdot.json"
+    eq "a per-file glob spelled through repos/.. still enumerates" "$(pe "$pdir/dotdot.json")" yes
     # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/-home-vscode-repos-jkb/**/*.jsonl)"]}}' >"$pdir/slug.json"
     eq "a slug-specific per-file glob enumerates"   "$(pe "$pdir/slug.json")" yes
@@ -1553,6 +1601,8 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "runs of / are collapsed"                 "$(rp 'Read(//h//.claude///projects)')" /h/.claude/projects
     eq "the canonicaliser keeps / as /"          "$(posture_canon /)"                 /
     eq "...and strips a trailing slash and runs" "$(posture_canon /x//h/)"            /x/h
+    eq "...and folds . and .."                   "$(posture_canon /x/./repos/../h)"   /x/h
+    eq "...and keeps a relative path's leading .." "$(posture_canon ../a/./b)"        ../a/b
     ip() { if posture_rule_is_path "$1"; then echo yes; else echo no; fi; }
     eq "Read and Edit rules have paths"          "$(ip 'Read(~/x)')$(ip 'Edit(~/x)')" yesyes
     eq "Bash and WebFetch rules do not"          "$(ip 'Bash(curl:*)')$(ip 'WebFetch(domain:x)')" nono
@@ -1609,11 +1659,20 @@ fi
 
 case "${1:-}" in
     ""|--dry-run)
+        # A FIXED PATH FOR THE REAL RUN. This runs UNSANDBOXED -- the reaper pipes it into
+        # `docker exec ... /bin/bash -s`, run.sh runs it at start -- and the image's PATH begins with
+        # the sandbox-writable ~/.cargo/bin and ~/.local/bin. Everything it runs lives in /usr/bin.
+        # A planted `jq` there ran on the next reaper tick with every transcript and the credential
+        # readable (review round 7; bash and find were already exposed this way, the jq call this
+        # change added made it worse). Not in --self-test, which also runs on macOS, where jq is
+        # not in /usr/bin and nothing unsandboxed is at stake.
+        PATH=/usr/bin:/bin
+        export PATH
         # "nothing to archive" is deliberate: it is one of the reaper's NOTHING_TO_DO phrases, so
         # this is a quiet tick there, and it contains no "does not exist", so verify.sh reads it
         # as a measured, healthy pass rather than an unmeasured one.
         if ! posture_enumerates_transcripts "$MANAGED_SETTINGS"; then
-            printf 'transcript sweep: the deny list in force (%s) names no transcript by path, so they cost the Bash sandbox argv nothing — nothing to archive\n' \
+            printf 'transcript sweep: no settings layer (managed %s, its drop-ins, the user'"'"'s, or any repo'"'"'s) names a transcript by path, so they cost the Bash sandbox argv nothing — nothing to archive\n' \
                 "$MANAGED_SETTINGS"
             exit 0
         fi

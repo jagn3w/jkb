@@ -1083,7 +1083,9 @@ elif [ "$state" = running ]; then
 else
     say "transcript sweep: $NAME was not running, so nothing in it is live"
 fi
-in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/sweep-transcripts.sh || true
+# `/bin/bash` by absolute path: `docker exec` resolves a bare `bash` through the container's PATH,
+# whose first entries the sandbox can write, and these scripts run UNSANDBOXED (review round 7).
+in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" /bin/bash .container/sweep-transcripts.sh || true
 
 if [ "$setup_done" -eq 0 ]; then
     [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
@@ -1129,7 +1131,7 @@ verify_rc=0
 # session holding its whole subagent subtree, was not among them. Reproduced against the real
 # scripts: 120 subagent transcripts under one live session, 40 archivable, budget 30000 —
 # `beyond` with the list, `over` without it.
-in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/verify.sh || verify_rc=$?
+in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" /bin/bash .container/verify.sh || verify_rc=$?
 
 say "attached VS Code windows"
 cat <<EOF

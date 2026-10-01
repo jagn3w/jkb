@@ -213,9 +213,11 @@ else
     echo "   (skipped: python3 not installed; CI runs this gate)"
 fi
 
-# ...and the transcript sweep's budget arithmetic. It is what keeps the Bash sandbox's deny list
-# inside one argv (MAX_ARG_STRLEN = 131072 bytes), and getting it wrong is either a container where
-# no Bash call works or a sweep that archives the session it is running in. Pure — records in,
+# ...and the transcript sweep's budget arithmetic. The sweep is now the BACKSTOP, not the defence:
+# .container/deny-transcripts.sh keeps transcripts out of the deny list, and the sweep stands down
+# unless a settings layer brings back a rule that enumerates them, in which case its budget is what
+# keeps the Bash sandbox's deny list inside one argv (MAX_ARG_STRLEN = 131072 bytes). Getting that
+# wrong is a container where no Bash call works, or a sweep that archives a live session. Pure — records in,
 # paths out — and its filesystem half runs against a scratch tree, so no container and no Docker.
 # Outside the jq group deliberately: it reads no container.json.
 "$(dirname "$0")/../.container/sweep-transcripts.sh" --self-test

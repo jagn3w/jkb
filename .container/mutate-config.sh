@@ -585,9 +585,9 @@ run "the reaper stops embedding the sweep" "no longer embeds the sweep"
 seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '"exec", "-i", "-e", &keep, name, "bash", "-s"'
+old = '"exec", "-i", "-e", &keep, name, "/bin/bash", "-s"'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, '"exec", name, "bash", "/usr/local/bin/sweep-transcripts.sh"', 1))
+open(p, 'w').write(s.replace(old, '"exec", name, "/bin/bash", "/usr/local/bin/sweep-transcripts.sh"', 1))
 PYX
 run "the reaper goes back to a path inside the container" "no longer feeds the sweep in on stdin"
 
@@ -736,9 +736,9 @@ run "the sweep gains a success exit with no phrase behind it" "success exits, pi
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/verify.sh'
+old = 'in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" /bin/bash .container/verify.sh'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh', 1))
+open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" /bin/bash .container/verify.sh', 1))
 PYX
 run "verify.sh measures a different tree from the one the sweep acted on" "verify.sh is measured without the live-session list"
 
@@ -1476,6 +1476,29 @@ open(p, 'w').write(s.replace("PATH=/usr/bin:/bin\nexport PATH\n", "", 1))
 PYX
 run "the hook stops fixing PATH" "does not fix PATH before it runs anything"
 
+# REVIEW ROUND 7. Losing `-p` alone keeps the shebang absolute and lets BASH_ENV in.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("#!/bin/bash -p\n", "#!/bin/bash\n", 1))
+PYX
+run "the hook's shebang loses -p" "not an absolute bash in privileged mode"
+
+# The sweep's PATH pin, and the absolute bash at each place an unsandboxed script is started.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("        PATH=/usr/bin:/bin\n        export PATH\n", "", 1))
+PYX
+run "the sweep stops pinning PATH" "the sweep's real-run arm does not pin PATH"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('/bin/bash .container/sweep-transcripts.sh', 'bash .container/sweep-transcripts.sh', 1))
+PYX
+run "run.sh starts the sweep with a bare bash" "run.sh does not start sweep-transcripts.sh with /bin/bash"
+
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys
@@ -1932,7 +1955,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=110
+PINNED_BAD_SITES=111
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
