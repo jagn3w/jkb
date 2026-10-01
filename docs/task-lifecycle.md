@@ -948,6 +948,19 @@ separator, and a quote inside a comment or a here-doc body opening a quote that 
 each deferring a `land` bash runs. Doing it safely needs redirects, here-docs and comments lexed as
 bash lexes them.
 
+**A ticket goes only on a line whose every `jkb` the hook can see run.** The ticket is exported
+to every child of the command, so a `jkb` whose argv is built out of sight — `sh -c "jkb task land
+x"`, `… | xargs jkb task`, `env -S "…"` — inherits it. Review round 7 measured each of those
+deferred with a ticket minted: a ticketed `land`, unprompted. A `jkb` is *visible* only in command
+position, after nothing but assignments and wrappers that pass the line through unchanged (`env`
+with only assignments, `command`, `exec`, `nohup`, `time`, `timeout <duration>`); anything else
+makes it *hidden*. A line with no visible `jkb` is skipped — no ticket, so a hidden one cannot
+authenticate — unless it also mentions `land`, which is asked; a visible `jkb` beside a hidden one
+is asked, because the hidden one would inherit the ticket. Pinned by
+`run_through_bash_a_hidden_jkb_never_inherits_a_ticket_for_a_land`, whose oracle is a fake `jkb`
+*program* on `PATH` as well as the shell function: the function alone is invisible to a child
+shell and to `xargs`, which is why no earlier test could see this.
+
 **Why `land` alone keeps the prompt.** `land` runs the repository's gate through `sh -c` with a
 command the *caller* supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling.
 Deferring it would let that ride in under a `Bash(jkb:*)` allow rule — a rule whose author said

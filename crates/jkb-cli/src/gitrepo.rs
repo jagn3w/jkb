@@ -2356,8 +2356,9 @@ mod tests {
             "src/rbac_cli.rs",
             "bash_argv",
             "spawns `bash` to word-split literal command strings, with `jkb` shadowed by a shell \
-             function; it calls `env_clear` and sets an empty `PATH`, so it inherits no `GIT_*` \
-             variable to be scrubbed of and can reach no binary in the first place",
+             function; it calls `env_clear`, so it inherits no `GIT_*` variable to be scrubbed \
+             of, and its `PATH` is empty -- or, for the hidden-jkb oracle, a fake `jkb` plus \
+             `/usr/bin:/bin` -- so no row reaches a repository-resolving tool",
         ),
     ];
 
