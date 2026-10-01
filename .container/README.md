@@ -213,8 +213,20 @@ into the container when you *attach*, which is after `run.sh` has finished — s
 to install into and says so. From a terminal in the attached window:
 
 ```sh
-./.container/install-extensions.sh     # marketplace extensions from disk, then the jkb explorer
+./.container/install-extensions.sh     # marketplace extensions from disk, the jkb explorer, machine settings
 ```
+
+The same script merges `vscode-machine-settings.json` into the server's **Machine** settings, which
+apply to every folder opened in the container and never to the host. They exclude `target/` from
+`files.exclude` and turn off `search.followSymlinks`. The reason is a measurement: an extension's
+`workspaceContains` probe (`rg --files --no-ignore --follow -g **/package.json`) spent 25 minutes
+walking the host's `target/debug/deps` through the bind mount. That held Docker's VM process at
+100% of a core while `docker stats` showed about 4%, because the host half of VirtioFS runs in the
+VM process, not in the container. The full note is at `dc_machine_settings_path` in `lib.sh`. The
+settings live in a file this script merges because attaching ignores `customizations` in
+`container.json`. `verify.sh` asserts them. One claim is **not yet measured**: that the probe's
+next run honours the new exclude. After a reload, a `ps` in the container should show
+`-g !**/target` on any such `rg`.
 
 then *Developer: Reload Window*. `run.sh` cannot do it for you: it drives Docker from the host, and
 the container deliberately has none. Automating it means a `postAttachCommand` in VS Code's
