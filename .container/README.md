@@ -1378,7 +1378,14 @@ O(files) of argv. What
   `jq` and `realpath`. The shebang is now `#!/bin/bash -p`, where privileged mode ignores
   `BASH_ENV` and exported functions, and `PATH` is fixed to `/usr/bin:/bin` before the first
   command. `check-config.sh` requires both, and the self-test plants a fake of every program the
-  hook calls and executes it directly.
+  hook calls and executes it directly. **Round 5 found the same class through another door:** `jq`
+  sources `$HOME/.jq` into every program, and the Write tool can create `~/.jq`. A planted
+  `def unique: [];` turned a deny into an allow, and `def error(m): .;` let `eval` run an
+  array-valued field as a command. Shown against the previous hook: it reported *deny* and had
+  *already executed* the command. Every `jq` call now goes through one wrapper with
+  `HOME=/dev/null`. The hook's other programs load nothing from the home. The general rule, written
+  here so it gets applied next time: **anything an unsandboxed process loads automatically from an
+  agent-writable place is a way into it.**
 - **Built-ins that carry text are let through, along with Bash, before anything that can fail.**
   With every tool reaching a hook that fails closed, judging a todo list's or a subagent prompt's
   strings as paths refused ordinary calls: 40 todos from a home cwd, an empty field read as "the
@@ -1423,8 +1430,10 @@ tools and its absence is silent:
 - `check-config.sh` (static): no rule may cover the memory path, with Claude Code's subtree
   semantics; nothing may be enumerated per match (a file pattern at the end, or a `**` mid-path)
   except the seven named `~/repos/**` rules below; and the hook must be referenced, installed by the
-  Dockerfile `--chown=root:root`, and matched against every file-reading tool **as whole tokens**,
-  since `Edit` is a substring of `NotebookEdit` and a substring test passed a matcher without it.
+  Dockerfile `--chown=root:root`, and its matcher must **equal** `.*`, every tool. That's the
+  third form of this check: a substring test let `Edit` hide inside `NotebookEdit` (round 1), a
+  whole-token list let unlisted built-ins such as Artifact skip the hook (round 3), and only
+  "every tool" has neither hole. Don't reintroduce a token list.
 - `verify.sh` (runtime): the installed hook exists, is root-owned and not writable by `vscode`,
   passes its own self-test in the container, and, asked of the installed copy under **both**
   spellings of the tree, denies a transcript and allows auto-memory. It probed one spelling at

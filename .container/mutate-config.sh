@@ -1502,6 +1502,24 @@ open(p, 'w').write(s.replace('\nroots=""\n', '\nroots_moved=""\n', 1))
 PYX
 run "the hook's roots can no longer be found" "transcript roots could not be found"
 
+# REVIEW ROUND 5. Allow arrays merge across layers: an entry in the MANAGED file opens the tree too.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("sandbox", {}).setdefault("filesystem", {}).setdefault("allowRead", []).append("~/.claude")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a managed allowRead entry over ~/.claude" "reaches the transcript tree"
+
+# denyWrite is enumerated per match, as denyRead is.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("sandbox", {}).setdefault("filesystem", {}).setdefault("denyWrite", []).append("~/.claude/projects/**/*.jsonl")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a per-file glob in sandbox.filesystem.denyWrite" "is enumerated per match"
+
 # MCP tools run unsandboxed and take paths; a matcher without them leaves every one unguarded.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys

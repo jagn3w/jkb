@@ -1623,9 +1623,15 @@ else
     # EVERY LAYER, read the way Claude Code reads it: managed, its drop-ins, the user's settings and
     # every repo's. A memory-swallowing rule in a project's settings.local.json breaks memory exactly
     # as one in the image would, and this used to read the managed file alone.
-    mem_deny=""; mem_unread=""; mem_where=""
+    mem_deny=""; mem_unread=""; mem_skipped=""; mem_where=""
     while IFS= read -r mem_f; do
-        mem_rules="$(jq -r '.permissions.deny[]?' "$mem_f" 2>/dev/null)" || { mem_unread="$mem_unread $mem_f"; continue; }
+        mem_rules="$(jq -r '.permissions.deny[]?' "$mem_f" 2>/dev/null)" || {
+            # The MANAGED file unreadable is fatal: it is the posture, and nothing else holds the line.
+            # Any other layer that will not parse is one Claude Code skips as well, so a rule in it is
+            # not in force -- and refusing the whole container over a trailing comma in an unrelated
+            # repo's settings.local.json is the wrong cost (review round 5). Named, not hidden.
+            if [ "$mem_f" = "$mem_managed" ]; then mem_unread="$mem_unread $mem_f"; else mem_skipped="$mem_skipped $mem_f"; fi
+            continue; }
         while IFS= read -r mem_r; do
             [ -n "$mem_r" ] || continue
             posture_rule_is_path "$mem_r" || continue
@@ -1671,7 +1677,7 @@ $mem_src
        argv. Do not narrow it to the transcripts as a per-file glob instead: that is the O(files)
        rule check-config.sh refuses, for blowing the Bash sandbox argv."
     else
-        ok "no deny rule in any settings layer covers the auto-memory location"
+        ok "no deny rule in any settings layer covers the auto-memory location${mem_skipped:+ (skipped, unparseable, as Claude Code skips them:$mem_skipped)}"
     fi
 fi
 
@@ -1713,7 +1719,8 @@ else
     done
     # ...AND THE INSTALLED SETTINGS MUST ACTUALLY RUN IT. A present, correct hook that no PreToolUse
     # entry names guards nothing, and every probe above still passes -- the stale-image and
-    # hand-edited /etc/claude-code cases this block exists for. Whole tokens, one shared list.
+    # hand-edited /etc/claude-code cases this block exists for. The matcher must EQUAL the shared
+    # definition (`.*`, every tool) -- a token list let unlisted built-ins such as Artifact skip it.
     mem_match="$(jq -r --arg h "$mem_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$mem_managed" 2>/dev/null)"
     if [ -z "$mem_match" ]; then
         mem_hook_wrong="$mem_hook_wrong the installed $mem_managed has no PreToolUse entry running it;"

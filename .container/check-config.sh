@@ -628,7 +628,11 @@ if [ "$dc_reader_ok" = 1 ]; then
                 dc_allow_hit="$dc_allow_hit $dc_a"; break
             fi
         done
-    done <<<"$(jq -r '.require.sandbox.filesystem | (.allowRead[]?, .allowWrite[]?)' "$posture" 2>/dev/null)"
+    # FROM BOTH FILES, as the deny arm reads both: allow arrays MERGE across settings layers, so an
+    # entry in managed-settings.json opens the tree exactly as one in the posture does. This read
+    # the posture alone (review round 5).
+    done <<<"$( { jq -r '.sandbox.filesystem | (.allowRead[]?, .allowWrite[]?)' "$here/managed-settings.json"
+                 jq -r '.require.sandbox.filesystem | (.allowRead[]?, .allowWrite[]?)' "$posture"; } 2>/dev/null)"
     if [ -n "$dc_allow_hit" ]; then
         bad "a sandbox allowRead/allowWrite entry reaches the transcript tree, so sandboxed Bash can read or write other sessions' transcripts — nothing else stands in the way now that no deny rule names them:$dc_allow_hit"
     else

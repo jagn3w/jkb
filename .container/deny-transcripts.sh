@@ -121,6 +121,16 @@ PATH=/usr/bin:/bin
 export PATH
 set -uo pipefail
 
+# EVERY jq CALL GOES THROUGH HERE, with HOME pointed where no file can be. jq SOURCES $HOME/.jq into
+# every program it runs, and the Write tool can create ~/.jq -- nothing denies it. Planted there,
+# `def unique: [];` turned a deny into an allow, and `def error(m): .;` defeated the type guard so
+# that `eval` RAN an array-valued field as a command outside the sandbox (review round 5, both
+# reproduced). Round 4's PATH fix closed one door into this unsandboxed process; this is the same
+# class through another. /dev/null is a character device, so $HOME/.jq is never a file. The other
+# programs this script runs -- realpath, sed, cat, getent, id, cut -- load nothing from the home,
+# and `bash -p` skips BASH_ENV.
+jqh() { HOME=/dev/null jq "$@"; }
+
 # Lexical, not `realpath`: the file may not exist yet (a Write), and a resolver that fails on a
 # missing path would answer "cannot tell" for exactly the calls that create one. `..` is collapsed
 # here because `<slug>/memory/../e1d7.jsonl` is a transcript wearing memory's prefix, and a check
@@ -326,13 +336,6 @@ if [ "${1:-}" = --self-test ]; then
     # `verdict` can show. Run as Claude Code runs it: JSON on stdin, decision on stdout or rc 2.
     echo "==> deny-transcripts self-test: hook mode, as Claude Code runs it"
     self="$0"
-    # The hook needs GNU `realpath -m`; macOS's BSD realpath has none. Where it is missing, every
-    # program-level row would get the refusal and read green or red for the wrong reason, so they
-    # are skipped and say so. The hook only ever runs in the container, which has it.
-    if ! realpath -m / >/dev/null 2>&1; then
-        printf '  \033[33mskip\033[0m hook-mode rows: no GNU realpath -m here (the container has it)\n'
-        h() { :; }
-    fi
     h() { # h <label> <want deny|allow> <stdin> [env...]
         local label="$1" want="$2" in="$3" out rc=0; shift 3
         out="$(printf '%s' "$in" | env "$@" "$BASH" "$self" 2>/dev/null)" || rc=$?
@@ -343,6 +346,14 @@ if [ "${1:-}" = --self-test ]; then
         if [ "$got" = "$want" ]; then printf '  \033[32mok\033[0m   %s\n' "$label"
         else printf '  \033[31mFAIL\033[0m %s\n         got %s, wanted %s\n' "$label" "$got" "$want"; fails=$((fails+1)); fi
     }
+    # The hook needs GNU `realpath -m`; macOS's BSD realpath has none. Where it is missing, every
+    # program-level row would get the refusal and read green or red for the wrong reason, so they
+    # are skipped and say so. DEFINED AFTER h(), or the real h() replaced this stub and every row ran
+    # (review round 5). The hook only ever runs in the container, which has GNU realpath.
+    if ! realpath -m / >/dev/null 2>&1; then
+        printf '  \033[33mskip\033[0m hook-mode rows: no GNU realpath -m here (the container has it)\n'
+        h() { :; }
+    fi
     h "a Read of a transcript is denied" deny \
       '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "a Read of memory is allowed" allow \
@@ -397,6 +408,20 @@ if [ "${1:-}" = --self-test ]; then
     ln -s "$sh" "$sh.link"
     h "with a symlinked HOME, a direct read of the real tree is denied" deny \
       '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$sh"'/.claude/projects/-s/e.jsonl"}}' HOME="$sh.link"
+    # A symlinked BASE with a climbing Glob PATTERN: the kernel follows l, then climbs.
+    mkdir -p "$sh/.claude/plugins/cache"
+    ln -s "$sh/.claude/plugins/cache" "$sh/repos/r/l"
+    h "a Glob from base l/.. with a climbing pattern lands where the kernel lands" deny \
+      '{"tool_name":"Glob","cwd":"'"$sh"'/repos/r","tool_input":{"path":"l/..","pattern":"../projects/-s/*.jsonl"}}' HOME="$sh"
+    # A HOSTILE ~/.jq: jq would source it into every program, so the hook must not let it.
+    printf '%s\n' 'def unique: [];' 'def error(m): .;' > "$sh/.jq"
+    h "with a planted ~/.jq, an Artifact of a transcript is still denied" deny \
+      '{"tool_name":"Artifact","cwd":"'"$sh"'/repos/r","tool_input":{"files":{"a":"'"$sh"'/.claude/projects/-s/e.jsonl"}}}' HOME="$sh"
+    h "...and an array-valued field still refused" deny \
+      '{"tool_name":"mcp__x__y","cwd":"/tmp","tool_input":{"file_path":["/x","/bin/sh","-c","touch '"$sh"'/PWNED"]}}' HOME="$sh"
+    if [ -e "$sh/PWNED" ]; then printf '  \033[31mFAIL\033[0m a planted ~/.jq let an array field EXECUTE\n'; fails=$((fails+1))
+    else printf '  \033[32mok\033[0m   ...and nothing executed\n'; fi
+    rm -f -- "$sh/.jq"
     h "a symlink that points elsewhere is allowed" allow \
       '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/ok/f"}}' HOME="$sh"
     h "a HOME with a trailing slash still finds its tree" deny \
@@ -425,9 +450,9 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Write","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/repos/jkb/notes.md","content":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
     # Built with jq, not python3: without python3 the payload was empty, the empty-payload refusal
     # answered, and the row passed without ever reaching the cap. Review round 3.
-    big="$(jq -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{a:[range(101) | "/h/repos/jkb/f\(.)"]}}')"
+    big="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{a:[range(101) | "/h/repos/jkb/f\(.)"]}}')"
     h "more path-like strings than the cap is a refusal, never a race with the timeout" deny "$big" HOME=/h
-    many="$(jq -cn '{tool_name:"TodoWrite", cwd:"/h/repos/jkb", tool_input:{todos:[range(150) | {content:"do thing \(.)", status:"pending"}]}}')"
+    many="$(jqh -cn '{tool_name:"TodoWrite", cwd:"/h/repos/jkb", tool_input:{todos:[range(150) | {content:"do thing \(.)", status:"pending"}]}}')"
     h "a TodoWrite with a long list -- no path-like strings -- is allowed" allow "$many" HOME=/h
     # EVERY TOOL reaches the hook now; one it does not know is judged by its strings.
     h "an Artifact publish of a transcript is denied" deny \
@@ -443,10 +468,12 @@ if [ "${1:-}" = --self-test ]; then
     h "with CLAUDE_CONFIG_DIR set, its projects tree is denied" deny \
       '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/cfg/projects/-s/e.jsonl"}}' HOME=/h CLAUDE_CONFIG_DIR=/cfg
     # A BYTE BUDGET: an `a/..` chain built to be slow is refused before any walk, and fast.
-    long="$(jq -cn '{tool_name:"Read", cwd:"/h", tool_input:{file_path:("/" + ([range(6000)|"a/.."]|join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
+    long="$(jqh -cn '{tool_name:"Read", cwd:"/h", tool_input:{file_path:("/" + ([range(6000)|"a/.."]|join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
+    # Timed only where `date +%N` gives nanoseconds: macOS prints a literal N, and the arithmetic
+    # would fail rather than measure.
     t0=$(date +%s%N)
     h "a 24KB a/.. chain is refused" deny "$long" HOME=/h
-    t1=$(( ($(date +%s%N) - t0) / 1000000 ))
+    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
     if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms, nowhere near the 10s timeout\n' "$t1"
     else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
 
@@ -456,17 +483,20 @@ if [ "${1:-}" = --self-test ]; then
     h "an MCP relative path from a project dir with a space is denied" deny \
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"/tmp","tool_input":{"source":"../../../.claude-state/projects/-s/e.jsonl"}}' HOME=/h "CLAUDE_PROJECT_DIR=/h/repos/a b/c"
     # Pathless built-ins are not refused for carrying text -- from a HOME cwd, with an empty field.
-    todos="$(jq -cn '{tool_name:"TodoWrite", cwd:"/h", tool_input:{todos:[range(40) | {content:"fix crates/a\(.).rs", status:"pending", activeForm:""}]}}')"
+    todos="$(jqh -cn '{tool_name:"TodoWrite", cwd:"/h", tool_input:{todos:[range(40) | {content:"fix crates/a\(.).rs", status:"pending", activeForm:""}]}}')"
     h "40 todos from a home cwd, one with an empty activeForm, are allowed" allow "$todos" HOME=/h
-    agent="$(jq -cn '{tool_name:"Agent", cwd:"/h/repos/jkb", tool_input:{prompt:([range(130) | "Review the change in crates/jkb-core."] | join(" "))}}')"
+    agent="$(jqh -cn '{tool_name:"Agent", cwd:"/h/repos/jkb", tool_input:{prompt:([range(130) | "Review the change in crates/jkb-core."] | join(" "))}}')"
     h "a 4.6KB Agent prompt with slashes is allowed" allow "$agent" HOME=/h
     # Over PATH_MAX in an unknown tool's input: prose passes, a chain that collapses into the tree
     # does not -- the lexical verdict does the collapse a server would.
-    prose="$(jq -cn '{tool_name:"mcp__x__note", cwd:"/h/repos/jkb", tool_input:{text:([range(200) | "see docs/a b.md here"] | join(" "))}}')"
+    prose="$(jqh -cn '{tool_name:"mcp__x__note", cwd:"/h/repos/jkb", tool_input:{text:([range(200) | "see docs/a b.md here"] | join(" "))}}')"
     h "a 5KB prose string with slashes in an MCP call is allowed" allow "$prose" HOME=/h
-    chain="$(jq -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("/" + ([range(1500) | "a b/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
+    chain="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("/" + ([range(1500) | "a b/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
     h "...while a 10KB chain with spaces that collapses into the tree is denied" deny "$chain" HOME=/h
     # A bare ~name is a home, as a server applying expanduser would read it.
+    # A MULTI-LINE string a lexically-normalising server would collapse into the tree.
+    h "a multi-line string that collapses into the tree is denied" deny \
+      '{"tool_name":"mcp__x__read","cwd":"/h/repos/jkb","tool_input":{"p":"/h/.claude\n/../.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "a bare ~name root given to an MCP tool is the home, an ancestor" deny \
       '{"tool_name":"mcp__x__index","cwd":"/h/repos/jkb","tool_input":{"root":"~vscode"}}' HOME=/h
 
@@ -534,7 +564,7 @@ deny() {
 # (review round 4, all reproduced). A subagent's own tool calls reach this hook in their own right.
 input="$(cat 2>/dev/null)"
 command -v jq >/dev/null 2>&1 || exit 3
-tool="$(printf '%s' "$input" | jq -er '.tool_name | strings' 2>/dev/null)" || exit 3
+tool="$(printf '%s' "$input" | jqh -er '.tool_name | strings' 2>/dev/null)" || exit 3
 case "$tool" in
     Bash|TodoWrite|AskUserQuestion|Agent|Task|ToolSearch|SendMessage) allow ;;
 esac
@@ -571,7 +601,7 @@ done
 # so `eval` of a file_path of ["/x","/bin/sh","-c","..."] RAN the command, outside the sandbox,
 # before anything refused it. Reachable only past Claude Code's own schema validation, but a
 # confidentiality hook must not be a command runner on any input: a wrong type is now a refusal.
-assign="$(printf '%s' "$input" | jq -er '
+assign="$(printf '%s' "$input" | jqh -er '
     def s: if . == null then "" elif type == "string" then . else error("not a string") end;
     @sh "tool=\(.tool_name | s) cwd=\(.cwd | s) fp=\(.tool_input.file_path | s) pth=\(.tool_input.path | s) nb=\(.tool_input.notebook_path | s) pat=\(.tool_input.pattern | s)"' 2>/dev/null)" || exit 3
 eval "$assign"
@@ -612,7 +642,12 @@ case "$tool" in
         if [ "$tool" = Glob ] && [ -n "$pat" ]; then
             gb="$(glob_base "$pat")"
             if [ -n "$gb" ]; then
-                case "$gb" in /*|"~"*) check "$gb" ;; *) check "$(resolve "$base" "$home" "$cwd")/$gb" ;; esac
+                # Joined onto the UN-normalised base, so check()'s realpath meets any link in the
+                # base before the pattern's `..` segments: resolving the base first collapsed
+                # `l/..` to the cwd, and a pattern climbing from there was judged from the wrong
+                # directory (review round 5, reproduced) -- round 3's symlink-then-`..` defect in
+                # a composition check() itself never saw.
+                case "$gb" in /*|"~"*) check "$gb" ;; *) check "$(join_raw "$base" "$home" "$cwd")/$gb" ;; esac
             fi
         fi ;;
     Read|Edit|Write|NotebookEdit)
@@ -633,8 +668,10 @@ case "$tool" in
             if [ "$cwd" = "${r%/*}" ] || [ "$cwd" = "$r" ] || [ "${cwd#"$r"/}" != "$cwd" ]; then scan_all=1; fi
         done <<<"$roots"
         # UNIQUE, NON-EMPTY candidates: the cap counts distinct strings, and an empty string is never
-        # a location -- judged as one it resolved to the cwd.
-        leaves_sh="$(printf '%s' "$input" | jq -er --arg all "$scan_all" '
+        # a location -- judged as one it resolved to the cwd. MULTI-LINE STRINGS ARE JUDGED TOO, on
+        # purpose: a server that normalises a path lexically turns `/h/.claude\n/../.claude/projects/x`
+        # into a transcript path, and the lexical verdict here does the same collapse.
+        leaves_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
             [.tool_input | .. | strings
              | select(. != "")
              | select($all == "1" or test("^[~.]") or contains("/"))]

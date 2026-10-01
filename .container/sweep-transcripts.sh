@@ -495,8 +495,11 @@ posture_hook_matcher() {
 posture_deny_rules() { # posture_deny_rules <json file> [jq path to the settings object] [all|perm] -> one rule per line
     case "${3:-all}" in
         perm) jq -r "${2:-.}"' | .permissions.deny[]?' "$1" ;;
+        # denyWrite too: it is enumerated per match exactly as denyRead is (review round 5), and
+        # wrapped as an Edit rule, which is what a write-side deny means to the reader.
         *)    jq -r "${2:-.}"' | (.permissions.deny[]?),
-                  (.sandbox.filesystem.denyRead[]? | if startswith("/") then "Read(/\(.))" else "Read(\(.))" end)' "$1" ;;
+                  (.sandbox.filesystem.denyRead[]?  | if startswith("/") then "Read(/\(.))" else "Read(\(.))" end),
+                  (.sandbox.filesystem.denyWrite[]? | if startswith("/") then "Edit(/\(.))" else "Edit(\(.))" end)' "$1" ;;
     esac
 }
 
@@ -1507,6 +1510,8 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # permission rule, where it would be relative to the settings file). Review round 4.
     printf '%s\n' "{\"sandbox\":{\"filesystem\":{\"denyRead\":[\"$work/nohome/.claude/projects/**/*.jsonl\"]}}}" >"$pdir/sbxabs.json"
     eq "an absolute one-slash denyRead glob enumerates" "$(pe "$pdir/sbxabs.json")" yes
+    printf '%s\n' '{"sandbox":{"filesystem":{"denyWrite":["~/.claude/projects/**/*.jsonl"]}}}' >"$pdir/sbxw.json"
+    eq "a per-file glob in sandbox.filesystem.denyWrite enumerates too" "$(pe "$pdir/sbxw.json")" yes
     eq "posture_deny_rules translates /x in denyRead to Read(//x)" \
        "$(printf '%s' '{"sandbox":{"filesystem":{"denyRead":["/v"]}}}' > "$pdir/tr.json"; posture_deny_rules "$pdir/tr.json")" "Read(//v)"
     mkdir -p "$work/slashhome"
