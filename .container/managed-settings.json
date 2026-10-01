@@ -17,83 +17,23 @@
   },
   "hooks": {
     "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/local/lib/jkb-hook/jkb attest hook",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Read|Edit|Write|NotebookEdit|Grep|Glob",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/local/bin/deny-transcripts.sh",
-            "timeout": 10
-          }
-        ]
-      }
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] },
+      { "matcher": "Read|Edit|Write|NotebookEdit|Grep|Glob", "hooks": [{ "type": "command", "command": "/usr/local/bin/deny-transcripts.sh", "timeout": 10 }] }
     ],
     "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/local/lib/jkb-hook/jkb attest hook",
-            "timeout": 10
-          }
-        ]
-      }
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }
     ],
     "PostToolUseFailure": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/local/lib/jkb-hook/jkb attest hook",
-            "timeout": 10
-          }
-        ]
-      }
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }
     ],
     "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/local/lib/jkb-hook/jkb attest hook",
-            "timeout": 10
-          }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }
     ],
     "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/local/lib/jkb-hook/jkb attest hook",
-            "timeout": 10
-          }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }
     ],
     "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/local/lib/jkb-hook/jkb workflow next --stop-hook",
-            "timeout": 20
-          }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb workflow next --stop-hook", "timeout": 20 }] }
     ]
   }
 }
