@@ -1348,6 +1348,24 @@ O(files) of argv. What
 - **Paths are split with `read -a`, never an unquoted expansion.** `for seg in $p` also does
   pathname expansion, so a `*` segment became the names of files in the hook's cwd. A hook that
   rewrites the path it is judging into an unrelated one can be steered past itself.
+- **The physical path is judged too** (review round 2). The file tools run unsandboxed and the
+  kernel follows symlinks, so a symlink an agent makes from sandboxed Bash, or `/proc/self/root/…`,
+  landed in the tree without spelling it. Every path is judged as written *and* as `realpath -m`
+  resolves it. Procfs magic links and `/dev/fd` are refused outright and *before* normalising,
+  because `/proc/self` names a different process for the hook than for the tool, and
+  `/proc/self/cwd/../..` normalises to something harmless.
+- **Any tool that can name a path**: the matcher covers `MultiEdit`, `LS` and `mcp__.*` as well,
+  and for a tool whose fields the hook doesn't know, every string in its input is judged. MCP
+  tools run unsandboxed; jkb's own server has an `ingest_path`. Capped at 100 strings, then
+  refused: measured at ~8ms a string, and an over-long payload must not push the hook into its
+  timeout, which fails open.
+- **Considered and not vectors**, measured: hard links (sandboxed Bash cannot see the tree, and
+  `~/repos` is a different filesystem from the state volume, so `ln` would be `EXDEV`); case
+  folding (`~/repos` is case-insensitive, but the tree is not, and a case-variant symlink is
+  resolved by the kernel inside `realpath`); bind mounts (an unprivileged namespace changes only
+  the agent's own view). **One residual is left open and written down**: a race in which a
+  background process repoints a symlink between the hook's check and the tool's open. Closing it
+  would mean refusing every symlink in a writable directory.
 - **Prefix tests are string surgery, not `case` patterns.** `case "$root/" in "${p%/}"/*)` with
   `p=/` did not match `/h/.claude/projects/` on bash 5.2.21, so `/` read as "not an ancestor".
 

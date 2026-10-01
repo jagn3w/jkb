@@ -18,7 +18,7 @@
   "hooks": {
     "PreToolUse": [
       { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] },
-      { "matcher": "Read|Edit|Write|NotebookEdit|Grep|Glob", "hooks": [{ "type": "command", "command": "/usr/local/bin/deny-transcripts.sh", "timeout": 10 }] }
+      { "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob|LS|mcp__.*", "hooks": [{ "type": "command", "command": "/usr/local/bin/deny-transcripts.sh", "timeout": 10 }] }
     ],
     "PostToolUse": [
       { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }

@@ -79,6 +79,29 @@
 # -- and refused if either says so. /proc/*/{root,cwd,fd,...} and /dev/fd are refused outright:
 # `/proc/self` is the HOOK's process when this resolves it and Claude Code's when the tool does,
 # so no resolution from in here can be trusted for them, and nothing legitimate reads through them.
+#
+# ANY TOOL THAT CAN NAME A PATH, not only the six built-in file tools. MCP tools run unsandboxed and
+# take whatever arguments their schema says -- jkb's own server has an ingest_path -- so the
+# matcher also covers `mcp__.*`, MultiEdit and LS, and for a tool whose fields this script does not
+# know, EVERY string in its input is judged as a path. Capped at 100 strings, beyond which the call
+# is refused: unbounded, a large payload could drive this past its timeout, and a timed-out hook
+# FAILS OPEN. Measured at ~8ms a string (500 took 4.1s against the 10s budget), and this container
+# has been seen running 5x slow while its VM was saturated -- so the cap leaves 5x headroom, not 2.
+#
+# CONSIDERED AND NOT VECTORS, measured 2026-10-01 rather than assumed:
+#   hard links   sandboxed Bash cannot see ~/.claude-state/projects at all ("No such file or
+#                directory"), so it has no source to name -- and ~/repos is a different
+#                filesystem from the state volume (fuseblk vs a volume), so `ln` would be EXDEV.
+#   case         ~/repos IS case-insensitive (macOS backing), but the tree lives on case-sensitive
+#                Linux filesystems, and a case-variant symlink name under ~/repos is resolved by the
+#                kernel inside `realpath -m`, which the physical check uses.
+#   bind mounts  an unprivileged namespace the agent creates changes only its own view, never the
+#                file tools' -- they run in Claude Code's process, outside it.
+#
+# THE RESIDUAL, stated: a TIME-OF-CHECK/TIME-OF-USE race. A background process from sandboxed Bash
+# could repoint a symlink in an agent-writable directory between this check and the tool's open.
+# Closing it would mean refusing every path through a symlink in a writable directory, which
+# breaks ordinary repositories; it is left open and written down rather than half-closed.
 set -uo pipefail
 
 # Lexical, not `realpath`: the file may not exist yet (a Write), and a resolver that fails on a
@@ -337,6 +360,23 @@ if [ "${1:-}" = --self-test ]; then
     else printf '  \033[32mok\033[0m   ...and nothing was executed\n'; fi
     rm -rf "$sh"
 
+    # ANY TOOL THAT CAN NAME A PATH. MCP tools run unsandboxed; for a tool whose fields this does
+    # not know, every string in its input is judged.
+    h "an MCP tool given a transcript path is denied" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"/h/repos/jkb","tool_input":{"path":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    h "...however deep in its input the path sits" deny \
+      '{"tool_name":"mcp__x__y","cwd":"/h/repos/jkb","tool_input":{"opts":{"files":["/h/repos/a","~/.claude-state/projects/-s/e.jsonl"]}}}' HOME=/h
+    h "...or as an ancestor that a server would walk" deny \
+      '{"tool_name":"mcp__x__index","cwd":"/h/repos/jkb","tool_input":{"root":"/h"}}' HOME=/h
+    h "an MCP tool with ordinary arguments is allowed" allow \
+      '{"tool_name":"mcp__jkb__search","cwd":"/h/repos/jkb","tool_input":{"query":"hello world","limit":5}}' HOME=/h
+    h "MultiEdit into the tree is denied" deny \
+      '{"tool_name":"MultiEdit","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/e.jsonl","edits":[]}}' HOME=/h
+    h "a Write whose CONTENT mentions the tree is allowed -- content is not a path" allow \
+      '{"tool_name":"Write","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/repos/jkb/notes.md","content":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    big="$(python3 -c 'import json; print(json.dumps({"tool_name":"mcp__x__y","cwd":"/h/repos/jkb","tool_input":{"a":["x"]*101}}))')"
+    h "more strings than the cap is a refusal, never a race with the timeout" deny "$big" HOME=/h
+
     # FAIL CLOSED: every way of not reaching a verdict is a refusal.
     h "an unparseable payload is denied" deny 'not json {' HOME=/h
     h "an empty payload is denied" deny '' HOME=/h
@@ -428,6 +468,15 @@ case "$tool" in
                 case "$gb" in /*|"~"*) check "$gb" ;; *) check "$(resolve "$base" "$home" "$cwd")/$gb" ;; esac
             fi
         fi ;;
-    *) [ -n "$pth" ] && check "$pth" ;;
+    Read|Edit|Write|NotebookEdit)
+        [ -n "$pth" ] && check "$pth" ;;
+    *)
+        # A tool whose fields are not known here: every string it was given is judged. `strings`
+        # filters to strings, so @sh here cannot produce an executable word -- the array case that
+        # made the typed-field guard above necessary does not arise.
+        leaves_sh="$(printf '%s' "$input" | jq -er '[.tool_input | .. | strings] | if length > 100 then error("too many") else @sh "leaves=(\(.))" end' 2>/dev/null)" || exit 3
+        leaves=()
+        eval "$leaves_sh"
+        for leaf in ${leaves[@]+"${leaves[@]}"}; do check "$leaf"; done ;;
 esac
 allow

@@ -462,7 +462,7 @@ posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> -> path p
 # The file tools the transcript hook must be wired to, as WHOLE TOKENS of its PreToolUse matcher.
 # One list, read by check-config.sh (the repo's settings) and verify.sh (the installed ones), so the
 # static and runtime checks cannot disagree about what "every file-reading tool" means.
-posture_hook_tools() { printf '%s\n' "Read Edit Write NotebookEdit Grep Glob"; }
+posture_hook_tools() { printf '%s\n' "Read Edit Write MultiEdit NotebookEdit Grep Glob LS mcp__.*"; }
 
 # The literal leading part of a rule's path: every segment before the first holding a wildcard.
 posture_rule_base() { # posture_rule_base <path pattern> -> literal prefix

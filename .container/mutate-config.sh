@@ -1375,7 +1375,7 @@ run "a bare directory rule covers auto-memory's subtree" "covers ~/.claude/proje
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('"Read|Edit|Write|NotebookEdit|Grep|Glob"', '"Read|Write|NotebookEdit|Grep|Glob"', 1))
+open(p, 'w').write(s.replace('"Read|Edit|Write|', '"Read|Write|', 1))
 PYX
 run "the hook matcher drops only Edit" "matcher does not cover: Edit"
 
@@ -1435,6 +1435,14 @@ p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace("COPY --chown=root:root deny-transcripts.sh", "# COPY --chown=root:root deny-transcripts.sh", 1))
 PYX
 run "the hook's COPY is commented out" "does not install deny-transcripts.sh root-owned"
+
+# MCP tools run unsandboxed and take paths; a matcher without them leaves every one unguarded.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('|LS|mcp__.*"', '|LS"', 1))
+PYX
+run "the hook matcher drops MCP tools" "matcher does not cover: mcp__.*"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
