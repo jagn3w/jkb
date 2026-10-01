@@ -83,7 +83,7 @@ MANAGED_SETTINGS="${JKB_MANAGED_SETTINGS:-/etc/claude-code/managed-settings.json
 SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_NOW_SECS JKB_MANAGED_SETTINGS"
 # ...AND EVERY JKB_ INPUT, which is a longer list than the seams. JKB_KEEP_SESSIONS is NOT a
 # seam: it is the sweep's live production input, the sessions a caller knows to be running, and
-# both triggers pass it. Refusing it in shipped files -- the blanket rule the four above earn --
+# both triggers pass it. Refusing it in shipped files -- the blanket rule the seams above earn --
 # would refuse the thing run.sh is supposed to do, with a message saying it silently disables the
 # sweep, which is false for this one variable. It still needs the rest: check-config compares
 # this list against what the script actually reads, and --self-test neutralises all of it so a
@@ -434,16 +434,45 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
 # A rule's path as Claude Code reads it: `//x` is absolute, `~/x` is the home, a single leading `/`
 # is relative to the SETTINGS FILE's directory, anything else relative to the session's cwd (which
 # no static reader can know, so it comes back as written and matches nothing absolute).
+# Only FILE rules have paths. `Bash(curl:*)`, `WebFetch(domain:*.x)` and `mcp__x__*` never reach the
+# bubblewrap argv, and fed through path semantics `Bash(curl:*)` read as an argv expander.
+posture_rule_is_path() { # posture_rule_is_path <rule> -> rc 0 for a file-tool rule
+    case "$1" in Read\(*|Edit\(*|Write\(*|MultiEdit\(*|NotebookEdit\(*) return 0 ;; esac
+    return 1
+}
+
 posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> -> path pattern
-    local r="$1"
+    local r="$1" p
     r="${r#*(}"; r="${r%)}"
     case "$r" in
-        //*)   printf '%s\n' "/${r#//}" ;;
-        "~")   printf '%s\n' "$2" ;;
-        "~/"*) printf '%s\n' "$2/${r#\~/}" ;;
-        /*)    printf '%s\n' "$3$r" ;;
-        *)     printf '%s\n' "$r" ;;
+        //*)   p="/${r#//}" ;;
+        "~")   p="$2" ;;
+        "~/"*) p="$2/${r#\~/}" ;;
+        /*)    p="$3$r" ;;
+        *)     printf '%s\n' "$r"; return ;;
     esac
+    # CANONICAL SPELLING: runs of `/` collapsed and a trailing `/` dropped. `Read(~/.claude/projects/)`
+    # -- the bare-directory rule with a slash -- resolved to `.../projects/`, whose `$1/*` arm is
+    # `.../projects//*`, so it read as covering nothing while denying MEMORY.md. Review round 2.
+    while :; do case "$p" in *//*) p="${p%%//*}/${p#*//}" ;; *) break ;; esac; done
+    [ "$p" = / ] || p="${p%/}"
+    printf '%s\n' "$p"
+}
+
+# The file tools the transcript hook must be wired to, as WHOLE TOKENS of its PreToolUse matcher.
+# One list, read by check-config.sh (the repo's settings) and verify.sh (the installed ones), so the
+# static and runtime checks cannot disagree about what "every file-reading tool" means.
+posture_hook_tools() { printf '%s\n' "Read Edit Write NotebookEdit Grep Glob"; }
+
+# The literal leading part of a rule's path: every segment before the first holding a wildcard.
+posture_rule_base() { # posture_rule_base <path pattern> -> literal prefix
+    local p="$1" out=""
+    while [ -n "$p" ]; do
+        case "${p%%/*}" in *[\*\?\[]*) break ;; esac
+        case "$p" in */*) out="$out${p%%/*}/"; p="${p#*/}" ;; *) out="$out$p"; p="" ;; esac
+    done
+    [ "$out" = / ] || out="${out%/}"
+    printf '%s\n' "$out"
 }
 
 # Whether a rule covers a path, with Claude Code's SUBTREE semantics: a rule naming a directory
@@ -478,7 +507,7 @@ posture_layer_files() { # posture_layer_files <managed-settings.json> -> one pat
     local f h="${HOME:-/nonexistent}"
     printf '%s\n' "$1"
     for f in "$(dirname "$1")"/managed-settings.d/*.json \
-             "$h/.claude/settings.json" "$h/.claude/settings.local.json" \
+             "${CLAUDE_CONFIG_DIR:-$h/.claude}/settings.json" "${CLAUDE_CONFIG_DIR:-$h/.claude}/settings.local.json" \
              "$h"/repos/*/.claude/settings.json "$h"/repos/*/.claude/settings.local.json \
              "$h"/repos/*/.claude/worktrees/*/.claude/settings.json "$h"/repos/*/.claude/worktrees/*/.claude/settings.local.json \
              "$h"/repos/*/.jkb/work/*/.claude/settings.json "$h"/repos/*/.jkb/work/*/.claude/settings.local.json; do
@@ -493,22 +522,32 @@ posture_layer_files() { # posture_layer_files <managed-settings.json> -> one pat
 # have stood the sweep down while the argv grew; asking only "does anything expand" would instead
 # be fooled by the seven `Edit(~/repos/**/...)` rules, which expand but name no transcript.
 posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
-    local f rules rule pat probe layers home="${HOME:-/home/vscode}"
+    local f rules rule pat base root layers home="${HOME:-/home/vscode}" proots
     [ -r "$1" ] || return 0
-    # A COMMAND substitution, not `< <(...)`: a process substitution discards the producer's exit
-    # status, and a layer list that failed half-way would read as a short, clean one. Failing to list
-    # the layers is CANNOT TELL, which means yes. (check-config.sh's procsub guard caught this.)
+    # The transcript tree as the sweep itself finds it -- CLAUDE_CONFIG_DIR honoured exactly as
+    # TRANSCRIPT_ROOT honours it -- plus the state volume's spelling.
+    proots="${CLAUDE_CONFIG_DIR:-$home/.claude}/projects $home/.claude-state/projects"
     layers="$(posture_layer_files "$1")" || return 0
     while IFS= read -r f; do
         rules="$(jq -r '.permissions.deny[]?' "$f" 2>/dev/null)" || return 0
         while IFS= read -r rule; do
             [ -n "$rule" ] || continue
+            posture_rule_is_path "$rule" || continue
             pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")")"
             posture_rule_expands "$pat" || continue
-            for probe in "$home/.claude/projects/-probe/x.jsonl" \
-                         "$home/.claude/projects/-probe/u/subagents/a.jsonl" \
-                         "$home/.claude-state/projects/-probe/x.jsonl"; do
-                posture_rule_covers "$pat" "$probe" && return 0
+            # A cwd-relative rule could cover the tree from a session started in $HOME: CANNOT
+            # TELL, which means yes.
+            case "$pat" in /*) ;; *) return 0 ;; esac
+            # OVERLAP, not three probes. The first version tested three synthetic paths, so
+            # `.../projects/-home-vscode-repos-jkb/**/*.jsonl` and a UUID-shaped `*-*-*-*-*.jsonl`
+            # both read "no" while enumerating the real tree. Any expanding rule whose literal
+            # prefix contains, or lies inside, the transcript tree is counted. That over-counts a
+            # glob that could only match memory notes, which is the cheap direction to be wrong in.
+            base="$(posture_rule_base "$pat")"
+            for root in $proots; do
+                [ "$base" = "$root" ] && return 0
+                [ "${root#"${base%/}"/}" != "$root" ] && return 0
+                [ "${base#"$root"/}" != "$base" ] && return 0
             done
         done <<<"$rules"
     done <<<"$layers"
@@ -1407,12 +1446,31 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     rm -r "$pdir/managed-settings.d"
     printf '%s\n' 'not json {' >"$lhome/repos/r/.claude/settings.local.json"
     eq "an unreadable layer is CANNOT TELL, which means yes" "$(pe "$pdir/hook.json" "$lhome")" yes
+    # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/-home-vscode-repos-jkb/**/*.jsonl)"]}}' >"$pdir/slug.json"
+    eq "a slug-specific per-file glob enumerates"   "$(pe "$pdir/slug.json")" yes
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*-*-*-*-*.jsonl)"]}}' >"$pdir/uuid.json"
+    eq "a UUID-shaped per-file glob enumerates"     "$(pe "$pdir/uuid.json")" yes
+    printf '%s\n' '{"permissions":{"deny":["Read(.claude/projects/**/*.jsonl)"]}}' >"$pdir/rel.json"
+    eq "a cwd-relative per-file glob is CANNOT TELL, so yes" "$(pe "$pdir/rel.json")" yes
+    printf '%s\n' '{"permissions":{"deny":["Bash(curl:*)","WebFetch(domain:*.example.com)"]}}' >"$pdir/nonfile.json"
+    eq "non-file rules have no path and enumerate nothing" "$(pe "$pdir/nonfile.json")" no
+    # CLAUDE_CONFIG_DIR moves the tree, and the predicate follows it the way TRANSCRIPT_ROOT does.
+    printf '%s\n' "{\"permissions\":{\"deny\":[\"Read(/$work/altcfg/projects/**/*.jsonl)\"]}}" >"$pdir/altcfg.json"
+    eq "...and with CLAUDE_CONFIG_DIR set, a glob over THAT tree enumerates" \
+       "$(CLAUDE_CONFIG_DIR="$work/altcfg" pe "$pdir/altcfg.json")" yes
 
     echo "==> sweep-transcripts self-test: the shared deny-rule reader"
     rp() { posture_rule_path "$1" /h /etc/claude-code; }
     eq "~/x is the home"                         "$(rp 'Read(~/.claude/projects)')"   /h/.claude/projects
     eq "//x is absolute"                         "$(rp 'Read(//h/.claude/projects)')" /h/.claude/projects
     eq "a single /x is relative to the settings file" "$(rp 'Read(/x)')"              /etc/claude-code/x
+    eq "a trailing slash is dropped"             "$(rp 'Read(~/.claude/projects/)')"  /h/.claude/projects
+    eq "runs of / are collapsed"                 "$(rp 'Read(//h//.claude///projects)')" /h/.claude/projects
+    ip() { if posture_rule_is_path "$1"; then echo yes; else echo no; fi; }
+    eq "Read and Edit rules have paths"          "$(ip 'Read(~/x)')$(ip 'Edit(~/x)')" yesyes
+    eq "Bash and WebFetch rules do not"          "$(ip 'Bash(curl:*)')$(ip 'WebFetch(domain:x)')" nono
+    eq "a rule's literal base stops at the first wildcard" "$(posture_rule_base '/h/p/-s/**/*.jsonl')" /h/p/-s
     ex() { if posture_rule_expands "$1"; then echo yes; else echo no; fi; }
     eq "no wildcard collapses"                   "$(ex /h/.claude/projects)"          no
     eq "a trailing /** on a literal prefix collapses" "$(ex /h/.ssh/**)"              no

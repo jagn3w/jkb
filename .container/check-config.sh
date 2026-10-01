@@ -468,21 +468,24 @@ fi
 #   memory does not error, it goes QUIET: MEMORY.md stops arriving in context, which reads like an
 #   agent that forgot rather than a broken container.
 #
-# SO THE COLLAPSING SHAPE IS UNAVAILABLE HERE, and that is a finding, not an oversight. It was
-# tried: the rules were changed to `projects/**`, which takes the argv to ~50 bytes, and
-# verify.sh's `memory_shadow` rows caught that the same edit swallows auto-memory on both
-# spellings. The transcript rules therefore MUST end in a file pattern, they are named below as
-# the one exception, and their cost is what .container/sweep-transcripts.sh budgets. Anything
-# else ending in a file pattern is a new O(files) term and is refused.
+# SO NO GLOB CAN BE THE TRANSCRIPT DENY, and that is a finding, not an oversight. `projects/**`
+# collapses the argv to ~50 bytes and swallows auto-memory (verify.sh's memory_shadow rows caught it
+# on both spellings); a bare `projects` does the same, because Claude Code applies a directory rule
+# to its subtree (measured in a rebuilt container); and the per-file `**/*.jsonl` that spares memory
+# is the O(files) term this whole check exists to refuse. So the transcript deny is a PreToolUse
+# hook, .container/deny-transcripts.sh, and no rule here names the tree at all. The only named
+# exceptions below are the `~/repos/**` Edit rules, which are a different, measured term. (This
+# paragraph said the transcript rules "MUST end in a file pattern" and were the exception -- true
+# of the design the branch tried first, and false of the one it shipped. Review round 2.)
 # THE ONE DENY-RULE READER, loaded from sweep-transcripts.sh by name -- not a copy. This block used
 # to parse rules itself (sed, `~` only) while verify.sh parsed them with jq and the sweep a third
 # way, and each was wrong differently: this one missed Claude Code's absolute `//path` spelling, so
 # `Read(//home/vscode/.claude/projects)` -- the exact bare-directory rule that silently drops
 # MEMORY.md -- passed as clear. A rename in the sweep makes these calls "command not found" and the
 # checks below fail loudly, which is the direction a shared definition must fail in.
-eval "$(sed -n '/^posture_rule_path() {/,/^}/p; /^posture_rule_covers() {/,/^}/p; /^posture_rule_expands() {/,/^}/p' "$here/sweep-transcripts.sh")"
+eval "$(sed -n '/^posture_rule_is_path() {/,/^}/p; /^posture_rule_path() {/,/^}/p; /^posture_rule_covers() {/,/^}/p; /^posture_rule_expands() {/,/^}/p; /^posture_hook_tools() {/,/^}/p' "$here/sweep-transcripts.sh")"
 dc_deny_raw="$(jq -r '.permissions.deny[]?' "$here/managed-settings.json" 2>/dev/null)"
-if ! declare -F posture_rule_path posture_rule_covers posture_rule_expands >/dev/null; then
+if ! declare -F posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands >/dev/null; then
     bad "the deny-rule reader could not be loaded from sweep-transcripts.sh, so nothing below can say whether a rule blows the argv or swallows auto-memory"
 elif [ -z "$dc_deny_raw" ]; then
     bad "no permissions.deny rules could be read from managed-settings.json — the checks that none of them blows the argv or swallows auto-memory examined nothing"
@@ -490,7 +493,7 @@ else
     # Rules are read as the INSTALLED file reads them: home is the container's, and a single
     # leading `/` is relative to /etc/claude-code, where the image puts this file -- not $HOME,
     # which on CI is the runner's.
-    # THE KNOWN EXPANDERS, named rather than tolerated by shape. These seven predate this guard and
+    # THE KNOWN EXPANDERS, named rather than tolerated by shape. These predate this guard and
     # keep agents from editing a repo's harness configuration; each `**` sits MID-PATH, so the
     # sandbox enumerates one argv entry per match on disk -- and every task worktree adds a set.
     # That is an O(worktrees) term, bounded by how many worktrees exist, measured in
@@ -505,6 +508,8 @@ Edit(~/repos/**/.mcp.json)'
     dc_mem_hit=""; dc_expanding=""
     while IFS= read -r dc_rule; do
         [ -n "$dc_rule" ] || continue
+        # Only FILE rules have paths: `Bash(curl:*)` fed through path semantics read as an expander.
+        posture_rule_is_path "$dc_rule" || continue
         dc_pat="$(posture_rule_path "$dc_rule" /home/vscode /etc/claude-code)"
         # 1. Nothing may cover auto-memory, with Claude Code's subtree semantics. Two spellings of
         #    the tree, one synthetic slug: no rule names a slug, so a probe answers for every repo.
@@ -528,7 +533,7 @@ Edit(~/repos/**/.mcp.json)'
        a glob cannot express that — make it a PreToolUse hook, as .container/deny-transcripts.sh
        is. .container/README.md carries the measurements."
     else
-        ok "no managed deny rule swallows auto-memory, and none is enumerated per match beyond the seven named ~/repos/** rules"
+        ok "no managed deny rule swallows auto-memory, and none is enumerated per match beyond the $(grep -c . <<<"$dc_known_expanders") named ~/repos/** rules"
     fi
 fi
 
@@ -543,7 +548,9 @@ dc_hook=/usr/local/bin/deny-transcripts.sh
 if ! jq -e --arg h "$dc_hook" '[.hooks.PreToolUse[]?.hooks[]?.command] | index($h)' \
         "$here/managed-settings.json" >/dev/null 2>&1; then
     bad "managed-settings.json no longer runs $dc_hook as a PreToolUse hook — with the transcript globs gone, nothing else keeps a file tool out of another session's transcript"
-elif ! grep -qF -- "COPY --chown=root:root deny-transcripts.sh $dc_hook" "$here/Dockerfile"; then
+# STRIPPED AND ANCHORED: a raw grep matched `# COPY --chown=root:root deny-transcripts.sh ...` and
+# passed an image that ships without the hook. Review round 2.
+elif ! stripped_matches "$here/Dockerfile" "^COPY --chown=root:root deny-transcripts\.sh ${dc_hook//./\\.}([[:space:]]|\$)"; then
     bad "the Dockerfile does not install deny-transcripts.sh root-owned at $dc_hook — the hook managed-settings.json names is either missing or writable by the agent it confines"
 elif [ ! -f "$here/deny-transcripts.sh" ]; then
     bad "there is no .container/deny-transcripts.sh to install, so the transcript deny does not exist"
@@ -556,7 +563,7 @@ else
     # of `NotebookEdit` -- so a matcher that dropped Edit still passed, and Edit calls on another
     # session's transcript reached no hook. NotebookEdit is required in its own right too.
     dc_tokens=" $(tr '|' ' ' <<<"$dc_match") "
-    for dc_tool in Read Edit Write NotebookEdit Grep Glob; do
+    for dc_tool in $(posture_hook_tools); do
         case "$dc_tokens" in *" $dc_tool "*) ;; *) dc_missing="$dc_missing $dc_tool" ;; esac
     done
     if [ -n "$dc_missing" ]; then

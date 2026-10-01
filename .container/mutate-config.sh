@@ -1409,6 +1409,33 @@ open(p, 'w').write(s.replace("posture_rule_covers() {", "posture_rule_covers_ren
 PYX
 run "the shared deny-rule reader cannot be loaded" "could not be loaded from sweep-transcripts.sh"
 
+# REVIEW ROUND 2. The .claude-state spelling of the memory probe had never been made to fail: every
+# row used ~/.claude/projects, and deleting the second probe left all of them CAUGHT.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude-state/projects/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a subtree rule over the .claude-state spelling covers auto-memory" "covers ~/.claude/projects/<slug>/memory"
+
+# The bare-directory rule with a trailing slash: canonicalised, it is the same rule.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects/)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a bare-directory rule with a trailing slash covers auto-memory" "covers ~/.claude/projects/<slug>/memory"
+
+# A commented-out COPY ships an image without the hook; a raw grep passed it.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("COPY --chown=root:root deny-transcripts.sh", "# COPY --chown=root:root deny-transcripts.sh", 1))
+PYX
+run "the hook's COPY is commented out" "does not install deny-transcripts.sh root-owned"
+
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()

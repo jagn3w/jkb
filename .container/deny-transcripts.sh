@@ -69,6 +69,16 @@
 # silently dropped it: the second time in this change that a rule turned out to have a job nobody
 # had written down. A Glob whose PATTERN carries the location (`/home/.../projects/**`,
 # `../../.claude/projects/**`) has its literal prefix checked the same way.
+#
+# AND THE PHYSICAL PATH IS JUDGED, NOT ONLY THE LEXICAL ONE. The file tools run unsandboxed and the
+# kernel follows symlinks, so a path that does not SPELL the tree can still land in it: a symlink
+# an agent makes from sandboxed Bash (`ln -s ~/.claude-state/projects ~/repos/jkb/x` needs no read
+# access to the target), or /proc/self/root/home/... Found by review round 2, reproduced. Every
+# path is now judged twice -- as written, and as `realpath -m` resolves it (symlinks in every
+# existing component, a missing tail kept lexically, which is the kernel's view for a Write too)
+# -- and refused if either says so. /proc/*/{root,cwd,fd,...} and /dev/fd are refused outright:
+# `/proc/self` is the HOOK's process when this resolves it and Claude Code's when the tool does,
+# so no resolution from in here can be trusted for them, and nothing legitimate reads through them.
 set -uo pipefail
 
 # Lexical, not `realpath`: the file may not exist yet (a Write), and a resolver that fails on a
@@ -112,6 +122,38 @@ resolve() { # resolve <path> <home> <cwd> -> normalised absolute path
     normalise "$p"
 }
 
+# The same join as resolve, WITHOUT normalising: the magic-link walk below needs the `..` segments
+# still in place, because the kernel applies them AFTER following a link, not before.
+join_raw() { # join_raw <path> <home> <cwd> -> absolute, un-normalised
+    case "$1" in
+        "~")    printf '%s\n' "$2" ;;
+        "~/"*)  printf '%s\n' "$2/${1#\~/}" ;;
+        "~"*/*) printf '%s\n' "$2/${1#*/}" ;;
+        /*)     printf '%s\n' "$1" ;;
+        *)      printf '%s\n' "$3/$1" ;;
+    esac
+}
+
+# Does the path PASS THROUGH a procfs magic link at any point of its walk? Checked step by step,
+# because normalising first lets `..` cancel the link it follows: `/proc/self/cwd/../../x`
+# normalises to `/proc/x`, which looks harmless, while the kernel follows cwd and only then climbs.
+through_magic() { # through_magic <absolute un-normalised path> -> rc 0 if it passes through one
+    local out=() seg parts cur
+    split_path "$1"
+    for seg in ${parts[@]+"${parts[@]}"}; do
+        case "$seg" in
+            ''|.) continue ;;
+            ..) [ "${#out[@]}" -gt 0 ] && unset 'out[${#out[@]}-1]'; continue ;;
+        esac
+        out+=("$seg")
+        cur="$(printf '/%s' "${out[@]}")"
+        case "$cur" in
+            /proc/*/root|/proc/*/cwd|/proc/*/fd|/proc/*/fdinfo|/proc/*/map_files|/proc/*/exe|/dev/fd) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # The literal leading part of a glob pattern: every segment before the first that holds a glob
 # character. `**/*.jsonl` -> "" (the search root alone decides), `/a/b/*/c` -> /a/b.
 glob_base() { # glob_base <pattern> -> literal prefix, possibly empty
@@ -137,6 +179,9 @@ glob_base() { # glob_base <pattern> -> literal prefix, possibly empty
 # compares bytes and nothing else.
 verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
     local p roots="$2" root rel rest anc
+    # PROCFS MAGIC LINKS: a path through them is resolved in whichever process opens it, so it is
+    # refused before it is normalised -- see through_magic.
+    if through_magic "$(join_raw "$1" "$3" "$4")"; then printf 'deny\n'; return; fi
     p="$(resolve "$1" "$3" "$4")"
     for root in $roots; do
         # INSIDE the tree: the root itself, or anything under root/.
@@ -213,6 +258,13 @@ if [ "${1:-}" = --self-test ]; then
     t "a sibling file is allowed"                 /h/.claude/settings.json                        allow
     t "a path merely containing the root name is allowed" /h/x/.claude/projects-backup/a.jsonl    allow
     t "a sibling whose name starts like the root is not an ancestor" /h/.claude-statement         allow
+    # Procfs and /dev/fd magic links resolve in whichever process opens them.
+    t "/proc/self/root into the tree is refused"  /proc/self/root/h/.claude-state/projects/-s/e.jsonl deny
+    t "/proc/self/cwd is refused, whatever follows" /proc/self/cwd/../../.claude/projects/-s/e.jsonl deny
+    t "another pid's root is refused too"         /proc/1/root/h/.claude/projects                 deny
+    t "an open fd through /proc is refused"       /proc/self/fd/7                                 deny
+    t "...and through /dev/fd"                    /dev/fd/7                                       deny
+    t "an ordinary /proc file is allowed"         /proc/cpuinfo                                   allow
 
     echo "==> deny-transcripts self-test: the literal prefix of a Glob pattern"
     g() { local got; got="$(glob_base "$2")"
@@ -258,13 +310,46 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"**/*.rs"}}' HOME=/h
     h "a call naming no path at all, to a non-search tool, is allowed" allow \
       '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{}}' HOME=/h
+    # SYMLINKS, with real files: the kernel follows a link the lexical check cannot see. A temp HOME
+    # holds the tree, and an agent-made link in a repo points into it.
+    sh="$(mktemp -d)"
+    mkdir -p "$sh/.claude/projects/-s/memory" "$sh/.claude-state/projects/-s" "$sh/repos/r" "$sh/elsewhere"
+    : >"$sh/.claude/projects/-s/e.jsonl"; : >"$sh/.claude/projects/-s/memory/MEMORY.md"
+    ln -s "$sh/.claude-state/projects" "$sh/repos/r/x"
+    ln -s "$sh/.claude/projects/-s/memory" "$sh/repos/r/mem"
+    ln -s "$sh/elsewhere" "$sh/repos/r/ok"
+    h "a Read through a symlink into the tree is denied" deny \
+      '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/x/-s/e.jsonl"}}' HOME="$sh"
+    h "a Grep rooted at a symlink into the tree is denied" deny \
+      '{"tool_name":"Grep","cwd":"'"$sh"'/repos/r","tool_input":{"path":"x","pattern":"p"}}' HOME="$sh"
+    h "a Write through a symlink, to a file not yet there, is denied" deny \
+      '{"tool_name":"Write","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/x/-s/new.jsonl"}}' HOME="$sh"
+    h "a symlink to auto-memory still reads as memory" allow \
+      '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/mem/MEMORY.md"}}' HOME="$sh"
+    h "a symlink that points elsewhere is allowed" allow \
+      '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/ok/f"}}' HOME="$sh"
+    h "a HOME with a trailing slash still finds its tree" deny \
+      '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$sh"'/.claude/projects/-s/e.jsonl"}}' HOME="$sh/"
+    # A field of the wrong TYPE is refused, never interpolated: `eval` of @sh output RUNS an array.
+    h "an array-valued file_path is refused and runs nothing" deny \
+      '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":["/x","/bin/sh","-c","touch '"$sh"'/INJECTED"]}}' HOME="$sh"
+    if [ -e "$sh/INJECTED" ]; then printf '  \033[31mFAIL\033[0m an array-valued field EXECUTED a command\n'; fails=$((fails+1))
+    else printf '  \033[32mok\033[0m   ...and nothing was executed\n'; fi
+    rm -rf "$sh"
+
     # FAIL CLOSED: every way of not reaching a verdict is a refusal.
     h "an unparseable payload is denied" deny 'not json {' HOME=/h
     h "an empty payload is denied" deny '' HOME=/h
     # With HOME unset the hook falls back to the ACCOUNT's home, so the probe is a transcript there.
     acct="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
-    h "HOME unset falls back to the account home and still denies -- never rc 1" deny \
-      '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$acct"'/.claude/projects/-s/e.jsonl"}}' -u HOME
+    if [ -n "$acct" ]; then
+        h "HOME unset falls back to the account home and still denies -- never rc 1" deny \
+          '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$acct"'/.claude/projects/-s/e.jsonl"}}' -u HOME
+    else
+        # Without getent the fallback cannot be exercised, and the row would pass on the empty-home
+        # refusal instead -- green for the wrong reason. Say so rather than count it.
+        printf '  \033[33mskip\033[0m HOME-unset fallback: no getent here, so it cannot be exercised\n'
+    fi
     h "no jq on PATH is a refusal, not a pass" deny \
       '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/repos/jkb/x"}}' HOME=/h PATH=/nonexistent
     if [ "$fails" -eq 0 ]; then printf '\033[32mdeny-transcripts self-test passed\033[0m\n'; exit 0; fi
@@ -296,6 +381,10 @@ deny() {
 # a hook that cannot name the tree it guards cannot classify anything. Still empty -> refuse.
 home="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
 [ -n "$home" ] || exit 3
+# NORMALISED, so a HOME of `/home/vscode/` or `/home//vscode` still names the tree: built raw, the
+# roots became `/home/vscode//.claude/projects`, which no normalised path ever starts with, and
+# every transcript read was allowed.
+home="$(normalise "$home")"
 roots="$home/.claude/projects $home/.claude-state/projects"
 
 input="$(cat 2>/dev/null)"
@@ -303,12 +392,27 @@ command -v jq >/dev/null 2>&1 || exit 3
 # One parse, @sh-quoted so `eval` assigns rather than executes. Every location a file tool can be
 # pointed at: Read/Edit/Write carry file_path, Grep/Glob carry path, NotebookEdit notebook_path,
 # and Glob's pattern can carry the location by itself.
-assign="$(printf '%s' "$input" | jq -er '@sh "tool=\(.tool_name // "") cwd=\(.cwd // "") fp=\(.tool_input.file_path // "") pth=\(.tool_input.path // "") nb=\(.tool_input.notebook_path // "") pat=\(.tool_input.pattern // "")"' 2>/dev/null)" || exit 3
+# EVERY FIELD MUST BE A STRING OR ABSENT. `@sh` quotes a string as one word but an ARRAY as several,
+# so `eval` of a file_path of ["/x","/bin/sh","-c","..."] RAN the command, outside the sandbox,
+# before anything refused it. Reachable only past Claude Code's own schema validation, but a
+# confidentiality hook must not be a command runner on any input: a wrong type is now a refusal.
+assign="$(printf '%s' "$input" | jq -er '
+    def s: if . == null then "" elif type == "string" then . else error("not a string") end;
+    @sh "tool=\(.tool_name | s) cwd=\(.cwd | s) fp=\(.tool_input.file_path | s) pth=\(.tool_input.path | s) nb=\(.tool_input.notebook_path | s) pat=\(.tool_input.pattern | s)"' 2>/dev/null)" || exit 3
 eval "$assign"
 [ -n "$cwd" ] || cwd="$PWD"
 
 check() { # check <path>: deny on deny, return on allow, refuse on anything else
-    local v; v="$(verdict "$1" "$roots" "$home" "$cwd")"
+    local v abs phys
+    v="$(verdict "$1" "$roots" "$home" "$cwd")"
+    case "$v" in deny) deny ;; allow) ;; *) exit 3 ;; esac
+    # ...and AS THE KERNEL WILL RESOLVE IT. A resolver that fails -- no realpath, a symlink loop --
+    # cannot say where the path lands, so that is a refusal too.
+    abs="$(resolve "$1" "$home" "$cwd")"
+    phys="$(realpath -m -- "$abs" 2>/dev/null)" || exit 3
+    [ -n "$phys" ] || exit 3
+    [ "$phys" = "$abs" ] && return 0
+    v="$(verdict "$phys" "$roots" "$home" "$cwd")"
     case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac
 }
 

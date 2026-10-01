@@ -389,9 +389,10 @@ REC
 # are decided in different files by people solving different problems, and nothing else looks at
 # both. `link-claude-memory.sh` MUST put the link at ~/.claude/projects/<slug>/memory: that is
 # where Claude Code reads memory from, it is not negotiable, and the block further down this file
-# treats "not linked" as FATAL. `managed-settings.json` denies paths under that same tree to keep
-# one session from reading another's transcripts. A deny rule written to cover transcripts can
-# therefore cover memory as well, and NOTHING SAYS SO: memory does not error when it is denied, it
+# treats "not linked" as FATAL. The pressure on that same tree comes from the other side: keeping
+# one session out of another's transcripts, which is deny-transcripts.sh's job now and was a deny
+# rule's before it. Any rule someone writes to cover transcripts covers memory as well, and
+# NOTHING SAYS SO: memory does not error when it is denied, it
 # goes quiet -- MEMORY.md simply stops arriving in context, which reads like an agent that forgot
 # rather than like a broken container.
 #
@@ -401,8 +402,12 @@ REC
 # check-config.sh and the README section on the deny list), so the pressure to write it is real
 # and will recur.
 #
-# Bash's `case` lets `*` cross `/`, so `**` and `*` behave the same here. That is the conservative
-# direction: this can over-report a shadow, never miss one.
+# Bash's `case` lets `*` cross `/`, so `**` and `*` behave the same here, which over-reports rather
+# than misses. What it does NOT model is spelling, and it once missed for exactly that reason: the
+# claim here used to be "never miss one", and `Read(~/.claude/projects/)` (trailing slash) missed
+# until the shared reader learned to canonicalise. Spellings it knows: `~/`, `//`, a single leading
+# `/` (relative to the settings file), trailing and repeated slashes. A cwd-relative rule cannot be
+# resolved statically and matches nothing absolute.
 #
 # A RULE COVERS ITS SUBTREE, which is Claude Code's semantics and not bash's -- hence `$pat/*` beside
 # `$pat`. This matched the bare pattern only, so `Read(~/.claude/projects)` -- an exact-path rule
@@ -415,7 +420,7 @@ REC
 # which the transcript-budget check below already relies on). This used to match with its own `case`
 # and parse rules with its own jq+sed, which missed Claude Code's `//path` spelling exactly as
 # check-config.sh's copy did -- the same defect in two places, needing two fixes. One definition now.
-eval "$(sed -n '/^posture_rule_path() {/,/^}/p; /^posture_rule_covers() {/,/^}/p; /^posture_layer_files() {/,/^}/p' "$(dirname "$0")/sweep-transcripts.sh")"
+eval "$(sed -n '/^posture_rule_is_path() {/,/^}/p; /^posture_rule_path() {/,/^}/p; /^posture_rule_covers() {/,/^}/p; /^posture_layer_files() {/,/^}/p; /^posture_hook_tools() {/,/^}/p' "$(dirname "$0")/sweep-transcripts.sh")"
 memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> clear|shadowed:<pattern>
     local mem="$1" pat
     while IFS= read -r pat; do
@@ -1592,9 +1597,9 @@ esac
 
 # ...AND NOTHING IN THE POSTURE MAY SWALLOW THE PLACE THE BLOCK ABOVE INSISTS ON. The two are
 # decided in different files: the block above FAILS unless memory is linked at
-# ~/.claude/projects/<slug>/memory, and managed-settings.json denies paths under that same tree so
-# one session cannot read another's transcripts. A rule written for the second reason can cover
-# the first, and the failure has no symptom -- denied memory does not error, MEMORY.md just stops
+# ~/.claude/projects/<slug>/memory, and keeping sessions out of each other's transcripts pushes
+# rules onto that same tree (the posture carries none now; deny-transcripts.sh holds that line). A
+# rule written for the second reason covers the first, and the failure has no symptom -- denied memory does not error, MEMORY.md just stops
 # arriving, which reads as an agent that forgot. Checked here rather than reasoned about, because
 # the two rule shapes are one character apart and the argv budget actively pushes towards the
 # dangerous one (see the README's deny-list section).
@@ -1609,11 +1614,17 @@ else
     # EVERY LAYER, read the way Claude Code reads it: managed, its drop-ins, the user's settings and
     # every repo's. A memory-swallowing rule in a project's settings.local.json breaks memory exactly
     # as one in the image would, and this used to read the managed file alone.
-    mem_deny=""; mem_unread=""
+    mem_deny=""; mem_unread=""; mem_where=""
     while IFS= read -r mem_f; do
         mem_rules="$(jq -r '.permissions.deny[]?' "$mem_f" 2>/dev/null)" || { mem_unread="$mem_unread $mem_f"; continue; }
         while IFS= read -r mem_r; do
-            [ -n "$mem_r" ] && mem_deny="$mem_deny$(posture_rule_path "$mem_r" "$HOME" "$(dirname "$mem_f")")
+            [ -n "$mem_r" ] || continue
+            posture_rule_is_path "$mem_r" || continue
+            mem_p="$(posture_rule_path "$mem_r" "$HOME" "$(dirname "$mem_f")")"
+            mem_deny="$mem_deny$mem_p
+"
+            # Remembered with its LAYER, so the failure can say which file to edit.
+            mem_where="$mem_where$mem_p	$mem_r in $mem_f
 "
         done <<<"$mem_rules"
     done <<<"$(posture_layer_files "$mem_managed")"
@@ -1641,14 +1652,17 @@ else
     elif [ -n "$mem_shadowed" ]; then
         # FATAL. The container runs, every other check passes, and memory silently stops working
         # -- which is the exact failure profile this file exists to convert into a sentence.
-        bad "a managed deny rule covers the auto-memory location, so MEMORY.md will stop reaching context with no error anywhere:$(printf '%s' "$mem_shadowed" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-       Auto-memory has to live at ~/.claude/projects/<slug>/memory — Claude Code decides that, and
-       the check above FAILS when it is not there — so a deny rule over that tree cannot also be
-       the argv fix. Narrow it to the transcripts (they are <slug>/<uuid>.jsonl and
-       <slug>/<uuid>/subagents/**, memory is the only other child) and re-measure the argv with
-       .container/sweep-transcripts.sh --dry-run."
+        mem_src="$(printf '%s' "$mem_shadowed" | tr ' ' '\n' | sort -u | while IFS= read -r q; do
+            [ -n "$q" ] && awk -F'\t' -v q="$q" '$1 == q { print "         " $2 }' <<<"$mem_where"; done | sort -u)"
+        bad "a deny rule covers the auto-memory location, so MEMORY.md will stop reaching context with no error anywhere:
+$mem_src
+       REMOVE it. Auto-memory has to live at ~/.claude/projects/<slug>/memory — Claude Code decides
+       that — and transcripts are already kept from the file tools by
+       /usr/local/bin/deny-transcripts.sh, which can tell memory from a transcript and costs no
+       argv. Do not narrow it to the transcripts as a per-file glob instead: that is the O(files)
+       rule check-config.sh refuses, for blowing the Bash sandbox argv."
     else
-        ok "no managed deny rule covers the auto-memory location"
+        ok "no deny rule in any settings layer covers the auto-memory location"
     fi
 fi
 
@@ -1688,10 +1702,22 @@ else
         [ "$(mem_probe_hook "$mem_root/-probe/memory/MEMORY.md")" = allow ] \
             || mem_hook_wrong="$mem_hook_wrong auto-memory under $mem_root is NOT allowed;"
     done
+    # ...AND THE INSTALLED SETTINGS MUST ACTUALLY RUN IT. A present, correct hook that no PreToolUse
+    # entry names guards nothing, and every probe above still passes -- the stale-image and
+    # hand-edited /etc/claude-code cases this block exists for. Whole tokens, one shared list.
+    mem_match="$(jq -r --arg h "$mem_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$mem_managed" 2>/dev/null)"
+    if [ -z "$mem_match" ]; then
+        mem_hook_wrong="$mem_hook_wrong the installed $mem_managed has no PreToolUse entry running it;"
+    else
+        mem_tokens=" $(tr '|' ' ' <<<"$mem_match") "
+        for mem_tool in $(posture_hook_tools); do
+            case "$mem_tokens" in *" $mem_tool "*) ;; *) mem_hook_wrong="$mem_hook_wrong its installed matcher does not cover $mem_tool;" ;; esac
+        done
+    fi
     if [ -n "$mem_hook_wrong" ]; then
         bad "the installed transcript hook is present but wrong:$mem_hook_wrong"
     else
-        ok "the transcript hook is installed root-owned, and under both spellings denies a transcript and allows auto-memory"
+        ok "the transcript hook is installed root-owned and wired for every file tool, and under both spellings denies a transcript and allows auto-memory"
     fi
 fi
 

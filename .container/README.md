@@ -1296,7 +1296,8 @@ gitignored `.env`, and unrequested deletion is what this whole mechanism exists 
 
 Two `permissions.deny` globs used to cost more than half the argv budget every Bash call in this
 container gets. They are now one PreToolUse hook, `.container/deny-transcripts.sh`, and the sweep
-below went from the defence to disk hygiene.
+below went from the defence to a backstop: on the posture that ships it stands down and archives
+nothing, and it runs again only if a rule that enumerates transcripts comes back, in any layer.
 
 **Why a glob was the wrong instrument.** Claude Code compiles `permissions.deny` into the
 bubblewrap argv for the Bash sandbox. A rule ending in a directory wildcard *collapses* to one
@@ -1328,7 +1329,8 @@ are siblings, so **no glob separates them**; that is a property of Claude Code's
 something this repo can rule its way out of.
 
 **A hook can, and costs no argv, because it is code rather than a path list.** The trade is one
-process per file-tool call (~7ms, measured over 30 runs) in exchange for O(files) of argv. What
+process per file-tool call (the timing is recorded once, in the script's header) in exchange for
+O(files) of argv. What
 `deny-transcripts.sh` decides, and each clause is there because the first cut got it wrong:
 
 - **Paths are resolved the way the tool resolves them.** A leading `~` is the home, and a relative
@@ -1349,7 +1351,7 @@ process per file-tool call (~7ms, measured over 30 runs) in exchange for O(files
 - **Prefix tests are string surgery, not `case` patterns.** `case "$root/" in "${p%/}"/*)` with
   `p=/` did not match `/h/.claude/projects/` on bash 5.2.21, so `/` read as "not an ancestor".
 
-52 self-test rows, run by `./scripts/check.sh` and CI. They include program-level rows that run the
+Its self-test runs in `./scripts/check.sh`, in CI, and inside the container from verify.sh. It includes program-level rows that run the
 hook exactly as Claude Code does, JSON on stdin and a verdict on stdout or exit 2, because the
 fail-closed contract is about how the script *exits*, which no call to a function can show.
 
@@ -1361,7 +1363,7 @@ script without an explicit allow into exit 2, which Claude Code treats as blocki
 only closed the jq-parse case: with `HOME` unset, `set -u` aborted at rc 1, which Claude Code reads
 as non-blocking, and the call went through. **One edge stays open, and it is the harness's:** a
 hook killed for exceeding its timeout is non-blocking, and nothing inside the script changes that.
-It answers in ~7ms against a 10s budget.
+It answers well inside its 10s budget; the script's header has the measurement.
 
 **What holds it in place**, because the hook is the only thing denying transcripts to the file
 tools and its absence is silent:
