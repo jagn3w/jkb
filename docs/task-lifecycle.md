@@ -938,9 +938,12 @@ plain `jkb` invocation — the command word literally `jkb`, with no path compon
 a shell command, and is not `task land`, which runs the gate. That is what a `Bash(jkb:*)` rule
 would approve, with every request it makes held to the ticket's role. It returns `ask` for one
 thing only: a command that may be `task land`. For everything else that runs `jkb` it returns **no
-`permissionDecision` at all**, and the session's own rules and prompt judge the call — on the
-rewritten command, which is not quite the same thing as before the hook existed (see the two open
-questions below).
+`permissionDecision` at all**, and the session's own rules and prompt judge the call against the
+command as the model wrote it, not the rewritten one carrying `export JKB_ATTEST=…` — measured, see
+below — exactly as they did before this hook existed. A redirect, a comment or a bare `!` (`jkb …
+2>&1`) rules out `allow`, since it is more than the invocation an allow rule for `jkb` approved,
+but cannot put a `land` in jkb's argv, so it is deferred rather than asked; only grouping, brace
+expansion and globs, which can create a word or run a command, still force the prompt.
 
 **Why `land` alone keeps the prompt.** `land` runs the repository's gate through `sh -c` with a
 command the *caller* supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling.
@@ -995,7 +998,7 @@ A trap met while measuring, worth keeping: a probe that itself contains `$` — 
 ${JKB_ATTEST:+present}` — is asked by design, because a command this cannot model cannot be
 cleared of `land`. It looked like the fix failing and was the guard working.
 
-**Rollback**, for either answer: `JKB_ATTEST_DECISION=ask` forces the old prompt on both classes
+**Rollback**: `JKB_ATTEST_DECISION=ask` forces the prompt on every ticketed class
 with no rebuild — the hook binary is pinned and root-owned, so a rollback that needs one is not a
 rollback. It is read from the hook process's environment, and the hook is spawned by the harness,
 so on the host it goes in the environment Claude Code is started with; **inside the dev container

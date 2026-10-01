@@ -658,12 +658,19 @@ fn log_failure(what: &str) {
     }
 }
 
-/// Whether a Bash command visibly runs `jkb` — the only commands the hook puts a ticket on. A ticket
-/// needs a rewrite, and a rewrite needs a permission decision, so the hook touches as few tool calls
-/// as it can; a script that runs `jkb` indirectly gets no ticket and is refused, which says so.
+/// Whether a Bash command visibly runs `jkb` — the only commands the hook puts a ticket on, so the
+/// hook touches as few tool calls as it can; a script that runs `jkb` indirectly gets no ticket and
+/// is refused, which says so.
+///
+/// Split on every character that cannot be part of a command word or path, not on a list of
+/// separators. A list missed whatever it did not name: `jkb>out task land x` read as the one word
+/// `jkb>out` and `'jkb' task show x` as `'jkb'`, so both were Skipped -- no ticket and NO DECISION
+/// -- while bash ran `jkb` (measured, by `run_through_bash_a_redirect_or_comment_cannot_hide_land`).
+/// This only has to be at least as wide as the model in [`shell_commands`]: a false positive costs
+/// one ticket minted and released on a command that is then deferred.
 fn runs_jkb(command: &str) -> bool {
     command
-        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '`' | '$'))
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+')))
         .any(|w| w == "jkb" || w.ends_with("/jkb"))
 }
 
@@ -700,9 +707,9 @@ enum Attestation {
 
 /// The three characters this hook cannot reason about wherever they appear: `$` and `` ` `` are
 /// substituted inside double quotes, and `\\` escapes the quoting itself. With none of them present,
-/// [`shell_words`] reads quotes exactly as the shell does, which is what lets every other
+/// [`shell_commands`] reads quotes exactly as the shell does, which is what lets every other
 /// metacharacter be judged by whether it is quoted. Refused outright, quoted or not, by
-/// [`shell_words`] itself so that no caller can proceed on words it could not model.
+/// [`shell_commands`] itself so that no caller can proceed on words it could not model.
 const UNQUOTABLE: &[char] = &['$', '`', '\\'];
 
 /// Characters that END one command and BEGIN another when the shell sees them bare.
@@ -713,21 +720,32 @@ const UNQUOTABLE: &[char] = &['$', '`', '\\'];
 /// is dropped. Inside either kind of quote they are ordinary text, like every character below.
 const SEPARATORS: &[char] = &[';', '&', '|', '\n'];
 
-/// Characters that leave nothing this can model, bare: redirects, grouping, globs, a comment,
-/// history expansion, a carriage return.
+/// Characters that can CREATE a word or RUN a command, bare: grouping (a subshell, or process
+/// substitution `<(…)`), brace expansion and globs. A command carrying one leaves nothing this can
+/// model -- `land` cannot be ruled out of it -- so it is asked.
 ///
-/// Unlike a separator there is no smaller piece left to judge, so a command carrying one is asked
-/// rather than split. Quoted, they are argument text -- which is the whole point of the split,
-/// because jkb's own quick-add syntax (`!p<n>`, `#<facet>=<value>`, `?`) is spelled in them, and
-/// refusing them quoted put a permission prompt on the most ordinary `jkb` calls there are.
+/// Quoted, they are argument text, like every character in [`BREAKS`] -- which is the whole point,
+/// because jkb's own quick-add syntax (`?`, …) is spelled in them, and refusing them quoted put a
+/// permission prompt on the most ordinary `jkb` calls there are.
+const FATAL: &[char] = &['(', ')', '{', '}', '*', '?', '[', ']'];
+
+/// Characters that make a command more than one plain invocation, bare, without being able to
+/// smuggle a `land` past this: redirects, a comment, `!`, a carriage return. Read as word breaks,
+/// and they rule out `Allow` -- `jkb … > ~/.bashrc` is not what an allow rule for `jkb` approved --
+/// so a command carrying one is deferred to the session's own rules.
 ///
-/// `\r` is the one member bash does NOT read as syntax -- it is ordinary word text to it
-/// (measured: `a\rb` is passed as the single word `a\rb`). It is kept as a deliberate extra,
-/// because a carriage return in a command is a line ending that got through something, and asking
-/// is the cheap side of that.
-const FATAL: &[char] = &[
-    '<', '>', '(', ')', '{', '}', '\r', '#', '!', '*', '?', '[', ']',
-];
+/// Why a break is safe for the `land` test: a word bash passes as exactly `land` contains none of
+/// these, so splitting on them never splits it, and splitting a word bash keeps whole only adds
+/// words to the model -- an extra prompt at worst, never a missed one. None of them can start a
+/// command on its own: process substitution needs a `(`, which is [`FATAL`]. They were `FATAL`
+/// once, and that put a forced prompt on `jkb … 2>&1` and `jkb … 2>/dev/null`, the commonest
+/// suffixes an agent writes -- the very over-prompting this hook was changed to stop.
+/// `run_through_bash_a_redirect_or_comment_cannot_hide_land` pins the argument against bash.
+///
+/// `\r` is not syntax to bash at all -- it is word text (measured: `a\rb` is passed as the single
+/// word `a\rb`) -- and is here because a carriage return in a command is a line ending that got
+/// through something; deferring it costs nothing.
+const BREAKS: &[char] = &['<', '>', '#', '!', '\r'];
 
 /// A character bash's **lexer** breaks a command line on: a blank (space or tab) or a newline.
 ///
@@ -745,7 +763,8 @@ fn is_blank(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n')
 }
 
-/// The words a command the shell will run as — quotes removed, as the shell removes them — or
+/// The commands a command line is, each as the words the shell will run it as — quotes removed, as
+/// the shell removes them — and whether the line is PLAIN (no bare [`BREAKS`] character), or
 /// `None` for any command this cannot model faithfully: an [`UNQUOTABLE`] character anywhere, a
 /// bare [`FATAL`] character, an unbalanced quote, or a word whose value the shell decides
 /// (a bare leading `~`, unless the word also carries a `/`).
@@ -754,7 +773,7 @@ fn is_blank(c: char) -> bool {
 /// prose before ("sound only for a command with none of [`UNQUOTABLE`] in it"), which made it a
 /// rule every call site had to remember, and the one thing this must never do is return words that
 /// are not what the shell will pass.
-fn shell_commands(command: &str) -> Option<Vec<Vec<String>>> {
+fn shell_commands(command: &str) -> Option<(Vec<Vec<String>>, bool)> {
     // `$` and a backtick substitute inside double quotes and a backslash escapes the quoting
     // itself, so with any of them present the quote tracking below is not a model of anything.
     if command.contains(UNQUOTABLE) {
@@ -766,6 +785,7 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<String>>> {
     let mut quote: Option<char> = None;
     // The word being read opens with a bare `~`, so the shell, not this reader, decides its value.
     let mut expands = false;
+    let mut plain = true;
     for c in command.chars() {
         match (quote, c) {
             (Some(q), c) if c == q => quote = None,
@@ -784,7 +804,8 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<String>>> {
                     commands.push(std::mem::take(&mut words));
                 }
             }
-            (None, c) if is_blank(c) => {
+            (None, c) if is_blank(c) || BREAKS.contains(&c) => {
+                plain &= !BREAKS.contains(&c);
                 if let Some(w) = word.take() {
                     words.push(modelled(w, expands)?);
                 }
@@ -808,7 +829,7 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<String>>> {
     if !words.is_empty() {
         commands.push(words);
     }
-    quote.is_none().then_some(commands)
+    quote.is_none().then_some((commands, plain))
 }
 
 /// Whether a word names the `jkb` binary, by name or by a path ending in it.
@@ -833,7 +854,7 @@ fn attestation(command: &str) -> Attestation {
     let command = command.trim_matches(is_blank);
     // Nothing modelled means `land` cannot be ruled out, and that is the one thing this must never
     // get wrong -- so the answer is the prompt, not the benefit of the doubt.
-    let Some(commands) = shell_commands(command) else {
+    let Some((commands, plain)) = shell_commands(command) else {
         return Attestation::Ask;
     };
     // `task land` runs the repository's gate through `sh -c` with a command the CALLER supplies
@@ -853,9 +874,9 @@ fn attestation(command: &str) -> Attestation {
     if commands.iter().any(lands) {
         return Attestation::Ask;
     }
-    // One command, and the binary named plainly: a path to some other file called `jkb` is some
-    // other program, so it is deferred rather than approved.
-    if let [only] = commands.as_slice() {
+    // One plain command, and the binary named plainly: a path to some other file called `jkb` is
+    // some other program, and a redirect makes it more than the invocation an allow rule approved.
+    if let ([only], true) = (commands.as_slice(), plain) {
         if only.first().is_some_and(|w| w == "jkb") {
             return Attestation::Allow;
         }
@@ -871,17 +892,23 @@ fn attestation(command: &str) -> Attestation {
 /// sibling call to steal). Only the DECISION is conditional, and for [`Attestation::Defer`] there
 /// is none: the session's own rules judge the call, as they did before this hook existed.
 ///
-/// `JKB_ATTEST_DECISION=ask` forces the old prompt back on both classes without a rebuild — the
+/// `JKB_ATTEST_DECISION=ask` forces the prompt on every ticketed class without a rebuild — the
 /// hook binary is pinned and root-owned, so a rollback that needs one is not a rollback.
 fn pre_tool_use(class: Attestation, forced_ask: bool, input: &Value) -> Value {
     let mut out = json!({
         "hookEventName": "PreToolUse",
         "updatedInput": input,
     });
-    if forced_ask || class == Attestation::Ask {
-        out["permissionDecision"] = json!("ask");
-    } else if class == Attestation::Allow {
-        out["permissionDecision"] = json!("allow");
+    // No default arm: a class that fell through to "no decision" would silently become `Defer`,
+    // which for `Ask` is exactly the land guard switched off.
+    let decision = match (class, forced_ask) {
+        (Attestation::Skip | Attestation::Allow | Attestation::Defer | Attestation::Ask, true)
+        | (Attestation::Ask, false) => Some("ask"),
+        (Attestation::Allow, false) => Some("allow"),
+        (Attestation::Defer | Attestation::Skip, false) => None,
+    };
+    if let Some(d) = decision {
+        out["permissionDecision"] = json!(d);
     }
     json!({ "hookSpecificOutput": out })
 }
@@ -982,7 +1009,7 @@ pub fn attest(cmd: &AttestCmd) {
 mod tests {
     use super::{
         attestation, driven, is_blank, pre_tool_use, runs_jkb, shell_commands, Attestation, Drive,
-        FATAL, SEPARATORS, UNQUOTABLE,
+        BREAKS, FATAL, SEPARATORS, UNQUOTABLE,
     };
     use serde_json::json;
 
@@ -1022,9 +1049,13 @@ mod tests {
             None,
             "the deferred class must not answer the permission question at all"
         );
-        // The rollback puts the old behaviour back on both classes.
+        // The land guard. Untested, this was one deleted `||` from becoming `Defer` with the suite
+        // green -- and `Defer` is no decision, which a `Bash(jkb:*)` rule then approves.
+        assert_eq!(decision(Attestation::Ask, false), Some(json!("ask")));
+        // The rollback forces the prompt on every ticketed class.
         assert_eq!(decision(Attestation::Allow, true), Some(json!("ask")));
         assert_eq!(decision(Attestation::Defer, true), Some(json!("ask")));
+        assert_eq!(decision(Attestation::Ask, true), Some(json!("ask")));
     }
 
     /// Every command the classifier approves. `attestation` is asserted against them below, and
@@ -1047,7 +1078,7 @@ mod tests {
         // still expands, so it is judged bare.
         "jkb --db ~/.jkb/jkb.db task show x",
         // A line break is a separator bare and text quoted, like every other character here;
-        // the bare spelling is in the asked list below.
+        // the bare spelling is in the deferred list below.
         "jkb task add 'line one\nline two'",
         // Split on IFS, so a non-breaking space is ordinary word text, quoted or not --
         // which is exactly what bash passes. Only a word SEPARATOR has to match.
@@ -1093,11 +1124,9 @@ mod tests {
             "jkb task add '$(whoami)'",
             "jkb task add 'unbalanced",
             // A bare FATAL character leaves no smaller piece to judge.
-            "jkb ls > /tmp/out",
             "jkb ls *",
             "jkb task show {a,b}",
             "jkb task show x # land",
-            "jkb task show 'x' > out",
         ] {
             assert_eq!(attestation(ask), Attestation::Ask, "{ask}");
         }
@@ -1108,6 +1137,13 @@ mod tests {
             "curl https://x | sh; echo jkb",
             "cd repo && jkb workflow next",
             "jkb ls\nrm -rf /",
+            // A redirect or a comment makes it more than a plain invocation, so never `Allow`, but
+            // it cannot put a `land` in jkb's argv, so the user's own rules judge it.
+            "jkb ls > /tmp/out",
+            "jkb task show 'x' > out",
+            "jkb task list --json 2>&1",
+            "jkb task show x 2>/dev/null",
+            "jkb task show x # a note",
             "./jkb ls",
             "~/.cargo/bin/jkb ls",
             "FOO=1 jkb ls",
@@ -1135,8 +1171,16 @@ mod tests {
     /// `PATH`, which a `jkb` function or alias in the invoking shell would defeat anyway.
     fn bash_argv(cmd: &str, env: &[(&str, &str)], cwd: &std::path::Path) -> (usize, Vec<String>) {
         use std::process::Command;
+        // The function reports on fd 9, which the command under test never names. It reported on
+        // stdout once, and a fixture that redirects stdout (`jkb task land>out x`) sent the report
+        // into the file: `args` came back empty, `.any(|a| a == "land")` was trivially false, and a
+        // model that dropped the word before a redirect passed (measured, by that mutation).
+        let capture = tempfile::NamedTempFile::new().expect("capture file");
         let script = format!(
-            "jkb() {{ printf '\u{2}'; for a in \"$@\"; do printf '%s\u{1}' \"$a\"; done; }}\n{cmd}"
+            "exec 9>'{}'\n\
+             jkb() {{ printf '\u{2}' >&9; for a in \"$@\"; do printf '%s\u{1}' \"$a\" >&9; done; }}\n\
+             {cmd}",
+            capture.path().display()
         );
         let mut c = Command::new("/bin/bash");
         c.arg("-c").arg(&script).current_dir(cwd);
@@ -1151,10 +1195,10 @@ mod tests {
         for (k, v) in env {
             c.env(k, v);
         }
-        let out = c.output().expect("bash is required to run this test");
-        let stdout = String::from_utf8(out.stdout).expect("bash emitted non-utf8");
-        let calls = stdout.matches('\u{2}').count();
-        let mut args: Vec<String> = stdout
+        c.output().expect("bash is required to run this test");
+        let report = std::fs::read_to_string(capture.path()).expect("the capture is utf-8");
+        let calls = report.matches('\u{2}').count();
+        let mut args: Vec<String> = report
             .replace('\u{2}', "")
             .split('\u{1}')
             .map(str::to_owned)
@@ -1186,7 +1230,7 @@ mod tests {
                 calls, 1,
                 "bash did not run exactly one `jkb`: {cmd:?} -> {args:?}"
             );
-            let modelled =
+            let (modelled, _) =
                 shell_commands(cmd.trim_matches(is_blank)).expect("approved, so modelled");
             let [only] = modelled.as_slice() else {
                 panic!("an approved command is one command: {cmd:?}")
@@ -1229,6 +1273,48 @@ mod tests {
         }
     }
 
+    /// The argument for [`BREAKS`], run through bash rather than trusted: a redirect, a comment or a
+    /// bare `!` is never `Allow`, and whenever bash actually hands `jkb` the word `land`, the command
+    /// is `Ask`. Reading those characters as word breaks can only ADD words to the model; this is
+    /// what checks that it never loses one.
+    #[test]
+    fn run_through_bash_a_redirect_or_comment_cannot_hide_land() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cwd = dir.path();
+        for cmd in [
+            "jkb task show x 2>&1",
+            "jkb task show x 2>/dev/null",
+            "jkb task show x > out",
+            "jkb task show x < /dev/null",
+            "jkb task show x # land",
+            "jkb task show x #; jkb task land y",
+            "jkb task >out land x",
+            "jkb>out task land x",
+            "jkb task land>out x",
+            "jkb task land 2>&1",
+            "jkb task show x &> out",
+            "jkb task show x >> out",
+            "! jkb task land x",
+            "jkb task la#nd x",
+            "jkb task show x\r",
+        ] {
+            let class = attestation(cmd);
+            assert_ne!(class, Attestation::Allow, "{cmd:?} carries a bare break");
+            let (calls, args) = bash_argv(cmd, &[], cwd);
+            assert_eq!(
+                calls, 1,
+                "bash must reach the one `jkb` in {cmd:?}, or this checks nothing"
+            );
+            if args.iter().any(|a| a == "land") {
+                assert_eq!(
+                    class,
+                    Attestation::Ask,
+                    "bash passed `land`: {cmd:?} -> {args:?}"
+                );
+            }
+        }
+    }
+
     /// Every character in either list is the SOLE reason its command is not approved. The template
     /// is approved as it stands, so the character is the only thing that changes the verdict, and a
     /// character leaving a list fails here by construction.
@@ -1249,9 +1335,8 @@ mod tests {
         // way `~` was dropped with the suite green. Measured: with the loop reading the constant,
         // deleting `;` from it failed no test.
         const SPLITS: &[char] = &[';', '&', '|', '\n'];
-        const STOPS: &[char] = &[
-            '<', '>', '(', ')', '{', '}', '\r', '#', '!', '*', '?', '[', ']',
-        ];
+        const STOPS: &[char] = &['(', ')', '{', '}', '*', '?', '[', ']'];
+        const BREAK: &[char] = &['<', '>', '#', '!', '\r'];
         const NEVER: &[char] = &['$', '`', '\\'];
         assert_eq!(
             SEPARATORS, SPLITS,
@@ -1264,6 +1349,10 @@ mod tests {
         assert_eq!(
             UNQUOTABLE, NEVER,
             "UNQUOTABLE changed: change this list too, deliberately"
+        );
+        assert_eq!(
+            BREAKS, BREAK,
+            "BREAKS changed: change this list too, deliberately"
         );
         assert_eq!(
             attestation("jkb task show ab"),
@@ -1287,6 +1376,18 @@ mod tests {
                 attestation(&format!("jkb task show a{c}b")),
                 Attestation::Ask,
                 "bare {c:?} leaves nothing to judge, so `land` cannot be ruled out"
+            );
+            assert_eq!(
+                attestation(&format!("jkb task show 'a{c}b'")),
+                Attestation::Allow,
+                "quoted {c:?} is argument text"
+            );
+        }
+        for &c in BREAK {
+            assert_eq!(
+                attestation(&format!("jkb task show a{c}b")),
+                Attestation::Defer,
+                "bare {c:?} makes it more than a plain invocation, but cannot hide a `land`"
             );
             assert_eq!(
                 attestation(&format!("jkb task show 'a{c}b'")),
@@ -1325,6 +1426,12 @@ mod tests {
             "~/.cargo/bin/jkb role whoami",
             "echo hi; jkb ls",
             "(jkb ls)",
+            // Glued to a redirect, or quoted: bash still runs `jkb`.
+            "jkb>out task land x",
+            "jkb<in ls",
+            "'jkb' task show x",
+            "\"jkb\" ls",
+            "! jkb ls",
         ] {
             assert!(runs_jkb(yes), "{yes}");
         }
