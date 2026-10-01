@@ -1461,6 +1461,47 @@ open(p, 'w').write(s.replace("posture_hook_matcher() {", "posture_hook_matcher_r
 PYX
 run "the shared matcher definition is renamed" "could not be loaded from sweep-transcripts.sh"
 
+# REVIEW ROUND 4. The unsandboxed hook must not trust PATH: an env shebang, or no PATH reset.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("#!/bin/bash -p\n", "#!/usr/bin/env bash\n", 1))
+PYX
+run "the hook's shebang goes back to env" "not an absolute bash"
+
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("PATH=/usr/bin:/bin\nexport PATH\n", "", 1))
+PYX
+run "the hook stops fixing PATH" "does not fix PATH before it runs anything"
+
+# A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("sandbox", {}).setdefault("filesystem", {}).setdefault("denyRead", []).append("~/.claude/projects/**/*.jsonl")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a per-file glob in sandbox.filesystem.denyRead" "is enumerated per match"
+
+# An ABSOLUTE allow entry under a home reaches the tree as surely as a ~ one.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowRead"].append("/home/vscode/.claude")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "an absolute allowRead entry over ~/.claude" "reaches the transcript tree"
+
+# The roots extraction reads nothing: the agreement check must say so, not pass.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('\nroots=""\n', '\nroots_moved=""\n', 1))
+PYX
+run "the hook's roots can no longer be found" "transcript roots could not be found"
+
 # MCP tools run unsandboxed and take paths; a matcher without them leaves every one unguarded.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
@@ -1864,7 +1905,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=109
+PINNED_BAD_SITES=110
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

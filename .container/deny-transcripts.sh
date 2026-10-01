@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # PreToolUse hook: deny the file tools any session's transcript, while leaving auto-memory alone.
 #
 #   .container/deny-transcripts.sh            # hook mode: tool-call JSON on stdin
@@ -80,13 +80,21 @@
 # `/proc/self` is the HOOK's process when this resolves it and Claude Code's when the tool does,
 # so no resolution from in here can be trusted for them, and nothing legitimate reads through them.
 #
-# ANY TOOL THAT CAN NAME A PATH, not only the six built-in file tools. MCP tools run unsandboxed and
-# take whatever arguments their schema says -- jkb's own server has an ingest_path -- so the
-# matcher also covers `mcp__.*`, MultiEdit and LS, and for a tool whose fields this script does not
-# know, EVERY string in its input is judged as a path. Capped at 100 strings, beyond which the call
-# is refused: unbounded, a large payload could drive this past its timeout, and a timed-out hook
-# FAILS OPEN. Measured at ~8ms a string (500 took 4.1s against the 10s budget), and this container
-# has been seen running 5x slow while its VM was saturated -- so the cap leaves 5x headroom, not 2.
+# EVERY TOOL REACHES THIS HOOK: the matcher is `.*`. It was an allowlist of file tools, and built-ins
+# it did not name -- Artifact reads a local file and uploads it -- skipped the hook (review round 3).
+# Bash and the built-ins that carry text rather than locations (TodoWrite, AskUserQuestion, Agent,
+# Task, ToolSearch, SendMessage) are let through first. The six file tools are judged by their
+# path fields. Anything else -- MCP tools run unsandboxed, and jkb's own server has an ingest_path
+# -- has every distinct, non-empty string that COULD be a path judged: one holding a `/`, or
+# starting `~` or `.`. A relative one is judged against each distinct base an MCP server might
+# resolve it from: the session cwd, CLAUDE_PROJECT_DIR, the home.
+#
+# BOUNDED, because a timed-out hook FAILS OPEN. At most 100 candidates, then refused; a path field
+# over PATH_MAX (4096) is refused before it is walked, and an over-long free-text string gets the
+# linear lexical verdict alone. THE MEASUREMENT, kept here and nowhere else: 100 distinct relative
+# strings to an MCP tool, `date +%s%N` around one invocation in jkb-dev on 2026-10-01 -- ~1.0s when
+# the cwd is the project dir (bases deduplicated), 1.4s with three distinct bases. This container
+# has been seen running 5x slow under a saturated VM, and 5x the worst case is still inside 10s.
 #
 # CONSIDERED AND NOT VECTORS, measured 2026-10-01 rather than assumed:
 #   hard links   sandboxed Bash cannot see ~/.claude-state/projects at all ("No such file or
@@ -102,6 +110,15 @@
 # could repoint a symlink in an agent-writable directory between this check and the tool's open.
 # Closing it would mean refusing every path through a symlink in a writable directory, which
 # breaks ordinary repositories; it is left open and written down rather than half-closed.
+# A FIXED PATH, BEFORE ANYTHING ELSE RUNS, and an absolute shebang in privileged mode. This hook
+# runs UNSANDBOXED on every tool call, and the image puts the agent-writable ~/.local/bin and
+# ~/.cargo/bin first on PATH: sandboxed Bash could drop a `jq` there and have it run outside the
+# sandbox, with the container credential readable, on the next call -- measured by review round 4
+# with a fake jq that touched a marker. `#!/usr/bin/env bash` found bash itself through that PATH.
+# `-p` makes bash ignore BASH_ENV and functions exported through the environment, which are the
+# other two ways to put code in front of this script.
+PATH=/usr/bin:/bin
+export PATH
 set -uo pipefail
 
 # Lexical, not `realpath`: the file may not exist yet (a Write), and a resolver that fails on a
@@ -139,6 +156,7 @@ resolve() { # resolve <path> <home> <cwd> -> normalised absolute path
         "~")      p="$2" ;;
         "~/"*)    p="$2/${p#\~/}" ;;
         "~"*/*)   p="$2/${p#*/}" ;;
+        "~"?*)    p="$2" ;;
         /*)       ;;
         *)        p="$3/$p" ;;
     esac
@@ -152,6 +170,7 @@ join_raw() { # join_raw <path> <home> <cwd> -> absolute, un-normalised
         "~")    printf '%s\n' "$2" ;;
         "~/"*)  printf '%s\n' "$2/${1#\~/}" ;;
         "~"*/*) printf '%s\n' "$2/${1#*/}" ;;
+        "~"?*)  printf '%s\n' "$2" ;;
         /*)     printf '%s\n' "$1" ;;
         *)      printf '%s\n' "$3/$1" ;;
     esac
@@ -431,6 +450,26 @@ if [ "${1:-}" = --self-test ]; then
     if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms, nowhere near the 10s timeout\n' "$t1"
     else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
 
+    # REVIEW ROUND 4. A cwd or project dir with a SPACE must still be judged whole.
+    h "a relative climb from a cwd with a space is denied" deny \
+      '{"tool_name":"Artifact","cwd":"/h/repos/a b/c","tool_input":{"files":{"x":"../../../.claude/projects/-s/e.jsonl"}}}' HOME=/h
+    h "an MCP relative path from a project dir with a space is denied" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"/tmp","tool_input":{"source":"../../../.claude-state/projects/-s/e.jsonl"}}' HOME=/h "CLAUDE_PROJECT_DIR=/h/repos/a b/c"
+    # Pathless built-ins are not refused for carrying text -- from a HOME cwd, with an empty field.
+    todos="$(jq -cn '{tool_name:"TodoWrite", cwd:"/h", tool_input:{todos:[range(40) | {content:"fix crates/a\(.).rs", status:"pending", activeForm:""}]}}')"
+    h "40 todos from a home cwd, one with an empty activeForm, are allowed" allow "$todos" HOME=/h
+    agent="$(jq -cn '{tool_name:"Agent", cwd:"/h/repos/jkb", tool_input:{prompt:([range(130) | "Review the change in crates/jkb-core."] | join(" "))}}')"
+    h "a 4.6KB Agent prompt with slashes is allowed" allow "$agent" HOME=/h
+    # Over PATH_MAX in an unknown tool's input: prose passes, a chain that collapses into the tree
+    # does not -- the lexical verdict does the collapse a server would.
+    prose="$(jq -cn '{tool_name:"mcp__x__note", cwd:"/h/repos/jkb", tool_input:{text:([range(200) | "see docs/a b.md here"] | join(" "))}}')"
+    h "a 5KB prose string with slashes in an MCP call is allowed" allow "$prose" HOME=/h
+    chain="$(jq -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("/" + ([range(1500) | "a b/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
+    h "...while a 10KB chain with spaces that collapses into the tree is denied" deny "$chain" HOME=/h
+    # A bare ~name is a home, as a server applying expanduser would read it.
+    h "a bare ~name root given to an MCP tool is the home, an ancestor" deny \
+      '{"tool_name":"mcp__x__index","cwd":"/h/repos/jkb","tool_input":{"root":"~vscode"}}' HOME=/h
+
     # FAIL CLOSED: every way of not reaching a verdict is a refusal.
     h "an unparseable payload is denied" deny 'not json {' HOME=/h
     h "an empty payload is denied" deny '' HOME=/h
@@ -444,8 +483,22 @@ if [ "${1:-}" = --self-test ]; then
         # refusal instead -- green for the wrong reason. Say so rather than count it.
         printf '  \033[33mskip\033[0m HOME-unset fallback: no getent here, so it cannot be exercised\n'
     fi
-    h "no jq on PATH is a refusal, not a pass" deny \
-      '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/repos/jkb/x"}}' HOME=/h PATH=/nonexistent
+    # A HOSTILE PATH CANNOT CHOOSE WHAT RUNS. This hook is unsandboxed, and the image puts the
+    # agent-writable ~/.cargo/bin first on PATH: a planted `jq` (or `bash`, via an env shebang) ran
+    # outside the sandbox (review round 4, measured). Planted here for every tool the hook calls,
+    # and the hook executed DIRECTLY, so its own shebang is what is tested, not `bash "$self"`.
+    evil="$(mktemp -d)" && [ -d "$evil" ] || { printf '  \033[31mFAIL\033[0m mktemp -d failed\n'; exit 1; }
+    for prog in bash jq realpath getent id cut cat dirname sed env; do
+        printf '#!/bin/sh\n: > "%s/RAN-%s"\nexit 0\n' "$evil" "$prog" > "$evil/$prog"; chmod +x "$evil/$prog"
+    done
+    out="$(printf '%s' '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/e.jsonl"}}' \
+           | HOME=/h PATH="$evil:/usr/bin:/bin" "$self" 2>/dev/null)"
+    ran="$(ls "$evil" | grep '^RAN-' | tr '\n' ' ')"
+    if [ -n "$ran" ]; then printf '  \033[31mFAIL\033[0m a planted program ran: %s\n' "$ran"; fails=$((fails+1))
+    else printf '  \033[32mok\033[0m   with a hostile PATH, no planted program runs\n'; fi
+    case "$out" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   ...and the verdict is still a deny\n' ;;
+        *) printf '  \033[31mFAIL\033[0m ...but the verdict was not a deny: %s\n' "$out"; fails=$((fails+1)) ;; esac
+    case "$evil" in */tmp.*) rm -rf -- "$evil" ;; esac
     if [ "$fails" -eq 0 ]; then printf '\033[32mdeny-transcripts self-test passed\033[0m\n'; exit 0; fi
     printf '\033[31mdeny-transcripts self-test: %s failed\033[0m\n' "$fails"; exit 1
 fi
@@ -470,6 +523,21 @@ deny() {
         '"Session transcripts are not readable, and neither is any directory containing them -- a search rooted there walks into them. They are other agents'"'"' working context, not a source of truth for this repository, and reading them is how one session inherits another'"'"'s mistakes. Auto-memory under <slug>/memory/ IS readable, and ~/.jkb/claude-memory holds the shared store. If you need what another session concluded, read the decision record it left in docs/ or the commit message."'
     exit 0
 }
+
+# BASH, AND THE BUILT-INS THAT TAKE NO PATH, ARE DECIDED FIRST -- before roots, realpath, or anything
+# else that can fail. Bash is the repair tool, and a container broken in some other way must not
+# refuse it too: it is refused now only if jq itself is missing, which verify.sh reports by name.
+# The kernel sandbox confines Bash, and its command text is not a path. The pathless built-ins carry
+# text, not locations -- a todo list, a question, a subagent's prompt -- and judging their strings as
+# paths refused ordinary calls once every tool reached this hook: 40 todos from a home cwd, an empty
+# activeForm read as "the home, an ancestor of the tree", a 4.6KB Agent prompt over the byte budget
+# (review round 4, all reproduced). A subagent's own tool calls reach this hook in their own right.
+input="$(cat 2>/dev/null)"
+command -v jq >/dev/null 2>&1 || exit 3
+tool="$(printf '%s' "$input" | jq -er '.tool_name | strings' 2>/dev/null)" || exit 3
+case "$tool" in
+    Bash|TodoWrite|AskUserQuestion|Agent|Task|ToolSearch|SendMessage) allow ;;
+esac
 
 # HOME from the account database when the environment lost it: the roots are derived from it, and
 # a hook that cannot name the tree it guards cannot classify anything. Still empty -> refuse.
@@ -496,8 +564,6 @@ for r in "$home/.claude/projects" "$home/.claude-state/projects" \
 "
 done
 
-input="$(cat 2>/dev/null)"
-command -v jq >/dev/null 2>&1 || exit 3
 # One parse, @sh-quoted so `eval` assigns rather than executes. Every location a file tool can be
 # pointed at: Read/Edit/Write carry file_path, Grep/Glob carry path, NotebookEdit notebook_path,
 # and Glob's pattern can carry the location by itself.
@@ -532,12 +598,10 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
     case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac
 }
 
-# BASH IS NOT JUDGED HERE. The matcher is `.*` -- every tool reaches this hook, so a built-in tool
-# added tomorrow lands in the judge-every-string arm below instead of being exempt by default (the
-# allowlist matcher let Artifact, which reads and uploads a local file, past it; review round 3).
-# Bash alone is let through: the kernel sandbox confines it, its command text is not a path, and it
-# is the tool a person repairs a broken container with.
-[ "$tool" = Bash ] && allow
+# The matcher is `.*` -- every tool reaches this hook, so a built-in tool added tomorrow lands in the
+# judge-every-string arm below instead of being exempt by default (the allowlist matcher let
+# Artifact, which reads and uploads a local file, past it; review round 3). Bash and the pathless
+# built-ins were already let through above.
 
 for p in "$fp" "$nb"; do [ -n "$p" ] && check "$p"; done
 case "$tool" in
@@ -560,24 +624,55 @@ case "$tool" in
         # an AskUserQuestion with a long list. The exception is a cwd that is itself in or above the
         # tree, where a bare word like `projects` is a path into it; then every string counts.
         # `strings` filters to strings, so @sh cannot produce an executable word here.
+        # EVERY STRING scanned only where a bare word can reach the tree: a cwd that IS a root's
+        # parent (~/.claude, where `projects` is a root) or lies inside one. It used to be "any
+        # ancestor", which made a home cwd scan everything and refuse a long todo list.
         scan_all=0
-        [ "$(verdict "$cwd" "$roots" "$home" "$cwd")" = deny ] && scan_all=1
+        while IFS= read -r r; do
+            [ -n "$r" ] || continue
+            if [ "$cwd" = "${r%/*}" ] || [ "$cwd" = "$r" ] || [ "${cwd#"$r"/}" != "$cwd" ]; then scan_all=1; fi
+        done <<<"$roots"
+        # UNIQUE, NON-EMPTY candidates: the cap counts distinct strings, and an empty string is never
+        # a location -- judged as one it resolved to the cwd.
         leaves_sh="$(printf '%s' "$input" | jq -er --arg all "$scan_all" '
             [.tool_input | .. | strings
-             | select($all == "1" or test("^[~.]") or contains("/"))
-             | select(contains("\n") | not)]
+             | select(. != "")
+             | select($all == "1" or test("^[~.]") or contains("/"))]
+            | unique
             | if length > 100 then error("too many") else @sh "leaves=(\(.))" end' 2>/dev/null)" || exit 3
         leaves=()
         eval "$leaves_sh"
         # An MCP server resolves a relative path against ITS OWN cwd, which is not the session's:
         # the jkb server starts in the project root. So a relative string is judged against every
-        # base it could plausibly mean. Review round 3.
-        bases="$cwd"
-        case "$tool" in mcp__*) bases="$cwd ${CLAUDE_PROJECT_DIR:-} $home" ;; esac
+        # base it could plausibly mean. AN ARRAY, iterated quoted: `for b in $bases` split a cwd
+        # with a space into fragments, the real base was never judged, and a relative climb into
+        # the tree was allowed (review round 4, reproduced).
+        bases=("$cwd")
+        if [ "${tool#mcp__}" != "$tool" ]; then
+            # DISTINCT bases only: the session cwd is usually the project dir, and judging every
+            # string twice against one base doubled the worst case for nothing.
+            bases=("$cwd")
+            for b in "${CLAUDE_PROJECT_DIR:-}" "$home"; do
+                [ -n "$b" ] || continue
+                dup=0; for e in "${bases[@]}"; do [ "$e" = "$b" ] && dup=1; done
+                [ "$dup" -eq 0 ] && bases+=("$b")
+            done
+        fi
         for leaf in ${leaves[@]+"${leaves[@]}"}; do
+            # Over PATH_MAX is either prose or a chain built to be slow. A path field refuses it
+            # (check does); here it may be prose, so it gets the lexical verdict alone -- linear now,
+            # and the collapse a server would do to get under PATH_MAX is the collapse it mirrors.
+            if [ "${#leaf}" -gt 4096 ]; then
+                for b in "${bases[@]}"; do
+                    [ -n "$b" ] || continue
+                    v="$(verdict "$leaf" "$roots" "$home" "$b")"
+                    case "$v" in deny) deny ;; allow) ;; *) exit 3 ;; esac
+                done
+                continue
+            fi
             case "$leaf" in
                 /*|"~"*) check "$leaf" ;;
-                *) for b in $bases; do [ -n "$b" ] && check "$leaf" "$b"; done ;;
+                *) for b in "${bases[@]}"; do [ -n "$b" ] && check "$leaf" "$b"; done ;;
             esac
         done ;;
 esac

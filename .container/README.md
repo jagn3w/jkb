@@ -1368,8 +1368,22 @@ O(files) of argv. What
 - **Nothing can push the hook into its timeout**, which fails open. Any path string over 4096 bytes
   (`PATH_MAX`) is refused before it is walked; a 24 KB `a/..` chain took up to 15 s against the
   10 s budget before, and is refused in milliseconds now. The magic-link walk is linear, with no
-  subshell per segment. At most 100 path-like strings are judged per call, which costs well under a
-  second.
+  subshell per segment, so an over-long free-text string can be judged lexically instead of
+  refused. At most 100 distinct path-like strings are judged per call; what that costs is
+  measured once, with its method, in the script's header.
+- **The hook does not trust `PATH`** (review round 4, the most serious finding in four rounds). It
+  runs unsandboxed on every tool call, and the image puts the agent-writable `~/.local/bin` and
+  `~/.cargo/bin` first on `PATH`. A `jq` planted there by sandboxed Bash ran outside the sandbox,
+  with the container credential readable. Shown against the previous hook: it ran planted `bash`,
+  `jq` and `realpath`. The shebang is now `#!/bin/bash -p`, where privileged mode ignores
+  `BASH_ENV` and exported functions, and `PATH` is fixed to `/usr/bin:/bin` before the first
+  command. `check-config.sh` requires both, and the self-test plants a fake of every program the
+  hook calls and executes it directly.
+- **Built-ins that carry text are let through, along with Bash, before anything that can fail.**
+  With every tool reaching a hook that fails closed, judging a todo list's or a subagent prompt's
+  strings as paths refused ordinary calls: 40 todos from a home cwd, an empty field read as "the
+  home", a 4.6 KB Agent prompt (all reproduced). Bash is decided right after the parse, so a
+  container broken in some other way still has its repair tool.
 - **Considered and not vectors**, measured: hard links (sandboxed Bash cannot see the tree, and
   `~/repos` is a different filesystem from the state volume, so `ln` would be `EXDEV`); case
   folding (`~/repos` is case-insensitive, but the tree is not, and a case-variant symlink is

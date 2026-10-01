@@ -478,6 +478,28 @@ posture_hook_matcher() {
     printf '%s\n' '.*'
 }
 
+# EVERY DENY ENTRY THAT REACHES THE BUBBLEWRAP ARGV, from one settings-shaped object, as rules the
+# rest of this reader understands. Two lists feed it: permissions.deny, and sandbox.filesystem.denyRead.
+# They do NOT share path semantics -- in a permission rule a single leading `/` is relative to the
+# settings file, but in sandbox.filesystem it is absolute (measured: the live profile reads
+# `/Volumes` as /Volumes) -- so a denyRead entry is translated into the rule spelling that means
+# what it means: `/x` -> `Read(//x)`. Defined once because "which lists, and what does each mean" was
+# re-derived at each caller and got wrong twice (review rounds 3 and 4). `$2` picks the object: `.`
+# for a settings file, `.require` for scripts/auto-mode-posture.json.
+#
+# `$3` CHOOSES THE LISTS, because they govern different things: both reach the ARGV (`all`, the
+# default), but only permissions.deny governs the FILE TOOLS (`perm`). sandbox.filesystem.denyRead
+# carries the blanket `~`, which keeps Bash out of the home -- memory included, and rightly -- but
+# says nothing about whether the Read tool can reach MEMORY.md. Read as one list, `~` looked like a
+# rule swallowing auto-memory.
+posture_deny_rules() { # posture_deny_rules <json file> [jq path to the settings object] [all|perm] -> one rule per line
+    case "${3:-all}" in
+        perm) jq -r "${2:-.}"' | .permissions.deny[]?' "$1" ;;
+        *)    jq -r "${2:-.}"' | (.permissions.deny[]?),
+                  (.sandbox.filesystem.denyRead[]? | if startswith("/") then "Read(/\(.))" else "Read(\(.))" end)' "$1" ;;
+    esac
+}
+
 # The literal leading part of a rule's path: every segment before the first holding a wildcard.
 posture_rule_base() { # posture_rule_base <path pattern> -> literal prefix
     local p="$1" out=""
@@ -547,7 +569,7 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
         # entries are bare paths. The second was ignored, so a transcript glob there stood the sweep
         # down while the argv grew (review round 3, measured). Bare entries are wrapped as Read rules
         # so the one reader handles both.
-        rules="$(jq -r '(.permissions.deny[]?), (.sandbox.filesystem.denyRead[]? | "Read(\(.))")' "$f" 2>/dev/null)" || return 0
+        rules="$(posture_deny_rules "$f" 2>/dev/null)" || return 0
         while IFS= read -r rule; do
             [ -n "$rule" ] || continue
             posture_rule_is_path "$rule" || continue
@@ -1481,6 +1503,12 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     printf '%s\n' "{\"permissions\":{\"deny\":[\"Read(/$work/altcfg/projects/**/*.jsonl)\"]}}" >"$pdir/altcfg.json"
     printf '%s\n' '{"sandbox":{"filesystem":{"denyRead":["~/.claude/projects/**/*.jsonl"]}}}' >"$pdir/sbx.json"
     eq "a per-file glob in sandbox.filesystem.denyRead enumerates too" "$(pe "$pdir/sbx.json")" yes
+    # ...and spelled ABSOLUTE with one slash, which is absolute in sandbox.filesystem (unlike a
+    # permission rule, where it would be relative to the settings file). Review round 4.
+    printf '%s\n' "{\"sandbox\":{\"filesystem\":{\"denyRead\":[\"$work/nohome/.claude/projects/**/*.jsonl\"]}}}" >"$pdir/sbxabs.json"
+    eq "an absolute one-slash denyRead glob enumerates" "$(pe "$pdir/sbxabs.json")" yes
+    eq "posture_deny_rules translates /x in denyRead to Read(//x)" \
+       "$(printf '%s' '{"sandbox":{"filesystem":{"denyRead":["/v"]}}}' > "$pdir/tr.json"; posture_deny_rules "$pdir/tr.json")" "Read(//v)"
     mkdir -p "$work/slashhome"
     eq "a HOME with a trailing slash still matches the old per-file globs" \
        "$(pe "$pdir/globs.json" "$work/slashhome/")" yes
