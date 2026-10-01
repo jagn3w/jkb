@@ -1391,7 +1391,26 @@ O(files) of argv. What
   unsandboxed too, when the reaper pipes it into `docker exec`, and it looked up `jq` (and, before this
   branch, `bash` and `find`) through a `PATH` that starts with `~/.cargo/bin`. Its real run now
   pins `PATH`, its `jq` runs with `HOME=/dev/null`, and the reaper and `run.sh` start it, and
-  `verify.sh`, with `/bin/bash` by absolute path. `check-config.sh` holds all three.
+  `verify.sh`, with `/bin/bash` by absolute path. **Round 8 found round 7's application partial,
+  three ways.** The pin sat in the real-run arm, so the sweep's top-level `date` and `stat` ran a
+  planted program first (reproduced; the pin is now the first command, and a self-test row plants
+  eleven programs and runs the sweep through `/bin/bash`). Seven other execs in `run.sh` still
+  named `bash`, `sh` or `sudo` bare, among them the login step and the reap, which ran
+  `bash -lc 'jkb task reap'` and so found both `bash` and `jkb` on `PATH`. Every exec there now
+  names its program by absolute path and pins `PATH` with `-e PATH=/usr/bin:/bin`, the reap runs the
+  root-owned pinned `jkb`, and `check-config.sh` scans every exec in the file, not two of them. The
+  exceptions are named in that scan: the sweep pins its own `PATH`, `sudo` replaces it with
+  `secure_path`, `verify.sh` is the open item below, and `setup.sh` runs the toolchain in
+  `~/.cargo` by design, once, before its marker exists. And nothing checked the `HOME=/dev/null`
+  prefix this paragraph said `check-config.sh` held; it now requires it on every `jq` in the sweep's
+  real run and in `verify.sh`, where one memory-matcher read lacked it.
+  **Two things in the same class are older than this branch, and filed rather than fixed here.**
+  `lib.sh`'s hook mirror runs `docker exec -u root ... sh -c`, so a planted `~/.cargo/bin/sh` runs
+  *as root* on every start. More fundamentally, every unsandboxed script here is loaded from the
+  checkout, which the sandbox can write. `run.sh` and `lib.sh` run on the host, the sweep, `verify.sh`
+  and `setup.sh` run in the container through `docker exec`, and the reaper pipes the checkout's
+  sweep. Editing one of them is as good as planting a binary, which makes the `PATH` work above
+  necessary but not sufficient. The fix is the hook's: a root-owned copy installed in the image.
   **Still open, and older than this branch:** `verify.sh` runs unsandboxed with that same `PATH`, and
   it has to. It checks the installed toolchain, so it runs the `jkb` in `~/.cargo/bin`, which the
   sandbox can write. Its one call this branch added, `jkb notify sessions --live-ids`, now uses the

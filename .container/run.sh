@@ -118,7 +118,7 @@ persist_login() {
         echo "warning: could not start $NAME to move its login into the state volume; if you are logged out after this, that is why" >&2
         return 0
     fi
-    docker exec -w "$ctr" "$NAME" bash -c '. .container/lib.sh && dc_persist_login' \
+    docker exec -e PATH=/usr/bin:/bin -w "$ctr" "$NAME" /bin/bash -c '. .container/lib.sh && dc_persist_login' \
         || echo "warning: could not move $NAME's login into the state volume; if a rebuild logs you out, this is why" >&2
 }
 
@@ -817,7 +817,7 @@ SETTLE_PID1=""
 settle() { # settle -> 0 settled | 1 container gone | 2 could not read PID 1 | 3 budget exhausted
     local i state argv
     for i in $(seq 1 120); do
-        argv="$(docker exec "$NAME" sh -c 'ps -o args= -p 1 2>/dev/null || true' 2>/dev/null)"
+        argv="$(docker exec -e PATH=/usr/bin:/bin "$NAME" /bin/sh -c 'ps -o args= -p 1 2>/dev/null || true' 2>/dev/null)"
         [ -z "$argv" ] || SETTLE_PID1="$argv"
         state="$(settle_step \
             "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" \
@@ -970,7 +970,7 @@ esac
 # verify responsible for — for the one caller that runs it.
 say "egress firewall"
 raise_rc=0
-in_container "$NAME" sudo -n /usr/local/bin/init-firewall.sh || raise_rc=$?
+in_container "$NAME" /usr/bin/sudo -n /usr/local/bin/init-firewall.sh || raise_rc=$?
 if [ "$raise_rc" -ne 0 ]; then
     say "the raise reported a failure (exit $raise_rc) — verify.sh below reports what state it left"
 fi
@@ -991,7 +991,7 @@ fi
 # `container_died` when the container is gone, and redirecting the callee's stderr threw away the
 # one diagnostic that would have named the reason -- while the arm below went on to say the
 # container "is still running".
-setup_probe="$(in_container "$NAME" sh -c "test -e '$JKB_SETUP_MARKER' && echo done || echo missing")" || setup_probe=""
+setup_probe="$(in_container -e PATH=/usr/bin:/bin "$NAME" /bin/sh -c "test -e '$JKB_SETUP_MARKER' && echo done || echo missing")" || setup_probe=""
 case "$setup_probe" in
     done)    setup_done=1 ;;
     missing) setup_done=0 ;;
@@ -1085,12 +1085,15 @@ else
 fi
 # `/bin/bash` by absolute path: `docker exec` resolves a bare `bash` through the container's PATH,
 # whose first entries the sandbox can write, and these scripts run UNSANDBOXED (review round 7).
+# EVERY exec in this file names its program absolutely, and pins PATH for what that program runs
+# unless it pins its own (the sweep), needs the toolchain (setup.sh), or is sudo, whose secure_path
+# replaces it (round 8: the round-7 fix covered two of nine). check-config.sh holds all of them.
 in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" /bin/bash .container/sweep-transcripts.sh || true
 
 if [ "$setup_done" -eq 0 ]; then
     [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
     say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
-    in_container -w "$ctr_repo" "$NAME" bash .container/setup.sh
+    in_container -w "$ctr_repo" "$NAME" /bin/bash .container/setup.sh
 fi
 
 # THE LOGIN, CARRIED ON EVERY START. A container that was stopped outside this script (Docker
@@ -1098,7 +1101,7 @@ fi
 # to move it into the state volume, and it happens before verify.sh looks at the links. Not fatal:
 # verify.sh below reports whatever state it leaves.
 say "login state"
-in_container -w "$ctr_repo" "$NAME" bash -c '. .container/lib.sh && dc_persist_login' \
+in_container -e PATH=/usr/bin:/bin -w "$ctr_repo" "$NAME" /bin/bash -c '. .container/lib.sh && dc_persist_login' \
     || say "the login could not be moved into the state volume — verify.sh below reports what state it is in"
 
 # THE HOST'S GIT HOOKS, COPIED IN ON EVERY START (lib.sh's dc_mirror_host_hooks says why a copy and
@@ -1113,7 +1116,7 @@ dc_mirror_host_hooks "$NAME" "$CONFIG"
 # reaper that can finish container-side archive records, whose /home/vscode/... paths the host's
 # `com.jkb.reap` cannot see, while multi-gigabyte archives accumulate. The deleted postStartCommand
 # ran it unconditionally and this is that shape back.
-in_container -w "$ctr_repo" "$NAME" bash -lc 'jkb task reap || true' || true
+in_container -e PATH=/usr/bin:/bin -w "$ctr_repo" "$NAME" /usr/local/lib/jkb-hook/jkb task reap || true
 
 # ONE VERIFIER, AFTER BOTH ARMS. It used to be the last line of setup.sh on the fresh path and a
 # separate call here on the restart path — so the review's "a fatal verify suppresses everything

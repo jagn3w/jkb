@@ -506,6 +506,16 @@ if [ "$SELF_TEST" = yes ]; then
        "$MEMP" "$(posture_rule_path 'Read(//home/vscode/.claude/projects)' /home/vscode /etc/claude-code)" shadowed
     ms "a rule about another tree leaves memory alone" \
        "$MEMP" '/home/vscode/repos/**/*.env' clear
+    # REVIEW ROUND 8. A RELATIVE rule, resolved against its layer's base by the shared reader.
+    ms "a project's relative rule climbing into the tree covers memory" "$MEMP" \
+       "$(posture_rule_path 'Read(../../.claude/projects)' /home/vscode /home/vscode/repos/jkb/.claude \
+           "$(posture_layer_base /home/vscode/repos/jkb/.claude/settings.local.json /etc/claude-code/managed-settings.json /home/vscode)")" shadowed
+    ms "a user layer's relative rule is resolved from the home" "$MEMP" \
+       "$(posture_rule_path 'Read(.claude/projects)' /home/vscode /home/vscode/.claude \
+           "$(CLAUDE_CONFIG_DIR= posture_layer_base /home/vscode/.claude/settings.json /etc/claude-code/managed-settings.json /home/vscode)")" shadowed
+    ms "...while Claude Code's documented ./.env example stays clear" "$MEMP" \
+       "$(posture_rule_path 'Read(./.env)' /home/vscode /home/vscode/repos/jkb/.claude \
+           "$(posture_layer_base /home/vscode/repos/jkb/.claude/settings.local.json /etc/claude-code/managed-settings.json /home/vscode)")" clear
     # The scan must read EVERY rule, not just the first: a shadowing rule added below a harmless
     # one is the realistic way this arrives.
     ms "a shadowing rule is found when it is not the first" "$MEMP" \
@@ -748,14 +758,14 @@ transcript sweep: 90000 deny bytes are projected and none of them can be archive
     echo "==> verify.sh self-test: machine settings (merge and missing)"
     mt="$(mktemp -d)"; shipped="$(dirname "$0")/vscode-machine-settings.json"
     printf '{"files.exclude":{"**/target":true},"search.followSymlinks":false}\n' > "$mt/want"
-    mm() { dc_merge_machine_settings "$@" | jq -cS .; }
+    mm() { dc_merge_machine_settings "$@" | HOME=/dev/null jq -cS .; }
     ms() { dc_machine_settings_missing "$@" | tr '\n' ' '; }
     # The shipped file is what every other case stands in for, so an empty or broken one must not
     # leave them passing: `{}` would make assertion 8 print `ok` having checked nothing.
     st2 "the shipped settings are a non-empty object" \
-        "$(jq -e 'type == "object" and length > 0' "$shipped" 2>/dev/null)" true
+        "$(HOME=/dev/null jq -e 'type == "object" and length > 0' "$shipped" 2>/dev/null)" true
     st2 "no file yet: the merge is exactly what we want" \
-        "$(mm "$mt/none" "$mt/want")" "$(jq -cS . "$mt/want")"
+        "$(mm "$mt/none" "$mt/want")" "$(HOME=/dev/null jq -cS . "$mt/want")"
     st2 "no file yet: every key is missing" "$(ms "$mt/none" "$mt/want")" "files.exclude search.followSymlinks "
     : > "$mt/empty"
     st2 "an empty file reads as no settings" "$(ms "$mt/empty" "$mt/want")" "files.exclude search.followSymlinks "
@@ -1615,7 +1625,7 @@ mem_managed=/etc/claude-code/managed-settings.json
 # THE SHARED READER MUST HAVE LOADED. If a function it uses were missing, posture_rule_covers would
 # be "command not found", memory_shadow would answer `clear`, and this whole block would pass on
 # nothing -- the quiet direction. check-config.sh guards its own load the same way.
-if ! declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_layer_files posture_hook_matcher >/dev/null; then
+if ! declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_layer_files posture_layer_kind posture_layer_base posture_hook_matcher >/dev/null; then
     bad "the deny-rule reader could not be loaded from sweep-transcripts.sh beside this script, so whether any settings layer swallows auto-memory, or whether the hook is wired, is unchecked"
 elif [ ! -f "$mem_managed" ]; then
     bad "there are no managed settings at $mem_managed, so nothing here establishes that the posture leaves auto-memory readable"
@@ -1632,10 +1642,13 @@ else
             # repo's settings.local.json is the wrong cost (review round 5). Named, not hidden.
             if [ "$mem_f" = "$mem_managed" ]; then mem_unread="$mem_unread $mem_f"; else mem_skipped="$mem_skipped $mem_f"; fi
             continue; }
+        # A relative rule resolved against its LAYER'S base, by the shared reader: read as written it
+        # covered nothing here while Claude Code resolved it into the tree (review round 8).
+        mem_base="$(posture_layer_base "$mem_f" "$mem_managed" "$HOME")"
         while IFS= read -r mem_r; do
             [ -n "$mem_r" ] || continue
             posture_rule_is_path "$mem_r" || continue
-            mem_p="$(posture_rule_path "$mem_r" "$HOME" "$(dirname "$mem_f")")"
+            mem_p="$(posture_rule_path "$mem_r" "$HOME" "$(dirname "$mem_f")" "$mem_base")"
             mem_deny="$mem_deny$mem_p
 "
             # Remembered with its LAYER, so the failure can say which file to edit.
@@ -1721,7 +1734,7 @@ else
     # entry names guards nothing, and every probe above still passes -- the stale-image and
     # hand-edited /etc/claude-code cases this block exists for. The matcher must EQUAL the shared
     # definition (`.*`, every tool) -- a token list let unlisted built-ins such as Artifact skip it.
-    mem_match="$(jq -r --arg h "$mem_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$mem_managed" 2>/dev/null)"
+    mem_match="$(HOME=/dev/null jq -r --arg h "$mem_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$mem_managed" 2>/dev/null)"
     if [ -z "$mem_match" ]; then
         mem_hook_wrong="$mem_hook_wrong the installed $mem_managed has no PreToolUse entry running it;"
     elif [ "$mem_match" != "$(posture_hook_matcher)" ]; then

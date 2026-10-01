@@ -41,7 +41,10 @@
 # non-blocking in Claude Code, and nothing inside the script can change that. Per call, measured
 # 2026-10-01 in jkb-dev as 50 sequential invocations under `date +%s%N`: 13ms for a Bash call (let
 # through right after the parse) and 50ms for a judged Read, against the 10s budget
-# managed-settings.json gives it. It was ~7ms before five review rounds added guards; the number is
+# managed-settings.json gives it. Re-measured after round 8 the same way: 11ms Bash, 29ms Read,
+# 38ms for a Glob whose braces expand to the 64-way cap, 222ms for an MCP call carrying 2000 bare
+# words, each tested on disk, and 270ms for the worst Glob found: 64 expansions of a pattern at the
+# 4096-byte budget (2.8s before the expander skipped finished expansions). It was ~7ms before five review rounds added guards; the number is
 # re-measured rather than carried, because this hook now runs on EVERY tool call.
 #
 # PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
@@ -232,6 +235,53 @@ glob_base() { # glob_base <pattern> -> literal prefix, possibly empty
         first=0
     done
     printf '%s\n' "$out"
+}
+
+# WHAT A GLOB'S BRACES EXPAND TO, nested groups included, into the global array `brace_out`. Judging
+# the raw alternatives let `{x,{/abs,y}}` and a `..` composed across a boundary (`.{.,}`) through
+# (review round 8). In this shell, not a subshell: no fork per pattern. Returns 1 past 64 expansions
+# or on unbalanced braces -- a pattern this cannot expand is a pattern it cannot judge.
+brace_expand() { # brace_expand <pattern>
+    local s i c depth open close pre body post cur a o="${1//[^\{]/}" x="${1//[^\}]/}"
+    local -a todo=("$1") alts
+    brace_out=()
+    [ "${#o}" -eq "${#x}" ] || return 1
+    while [ "${#todo[@]}" -gt 0 ]; do
+        s="${todo[0]}"; todo=("${todo[@]:1}")
+        # Walked from the first `{` only, and not at all when there is none: a finished expansion
+        # walked end to end, 64 times, was most of a 2.8s worst case at the byte budget.
+        case "$s" in *"{"*) ;; *) brace_out+=("$s"); continue ;; esac
+        pre="${s%%\{*}"
+        open=-1; close=-1; depth=0
+        for ((i = ${#pre}; i < ${#s}; i++)); do
+            c="${s:i:1}"
+            if [ "$c" = "{" ]; then
+                [ "$depth" -eq 0 ] && open=$i
+                depth=$((depth + 1))
+            elif [ "$c" = "}" ] && [ "$depth" -gt 0 ]; then
+                depth=$((depth - 1))
+                [ "$depth" -eq 0 ] && { close=$i; break; }
+            fi
+        done
+        if [ "$close" -lt 0 ]; then
+            brace_out+=("$s")
+        else
+            pre="${s:0:open}"; body="${s:open+1:close-open-1}"; post="${s:close+1}"
+            alts=(); cur=""; depth=0
+            for ((i = 0; i < ${#body}; i++)); do
+                c="${body:i:1}"
+                case "$c" in
+                    "{") depth=$((depth + 1)); cur+="$c" ;;
+                    "}") depth=$((depth - 1)); cur+="$c" ;;
+                    ,) if [ "$depth" -eq 0 ]; then alts+=("$cur"); cur=""; else cur+="$c"; fi ;;
+                    *) cur+="$c" ;;
+                esac
+            done
+            alts+=("$cur")
+            for a in "${alts[@]}"; do todo+=("$pre$a$post"); done
+        fi
+        [ $(( ${#todo[@]} + ${#brace_out[@]} )) -le 64 ] || return 1
+    done
 }
 
 # THE DECISION, pure so --self-test can drive it with literals and no Claude Code.
@@ -435,6 +485,18 @@ if [ "${1:-}" = --self-test ]; then
     rm -f -- "$sh/.jq"
     h "a symlink that points elsewhere is allowed" allow \
       '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"'"$sh"'/repos/r/ok/f"}}' HOME="$sh"
+    # REVIEW ROUND 8. A BARE LEAF that names a link in the cwd: an MCP server opens it relative to
+    # its own cwd, so `t` -- or `~t`, which is no account -- reached the tree with nothing judged.
+    ln -s "$sh/.claude-state/projects/-s" "$sh/repos/r/t"
+    ln -s "$sh/.claude-state/projects/-s" "$sh/repos/r/~t"
+    h "a bare word naming a symlink into the tree is denied" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"t"}}' HOME="$sh"
+    h "...and a ~word that is no account, naming one, is denied" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"~t"}}' HOME="$sh"
+    h "a bare word naming a symlink elsewhere is allowed" allow \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"ok"}}' HOME="$sh"
+    h "a bare word naming nothing on disk is allowed" allow \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"nothing-here"}}' HOME="$sh"
     h "a HOME with a trailing slash still finds its tree" deny \
       '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$sh"'/.claude/projects/-s/e.jsonl"}}' HOME="$sh/"
     # A field of the wrong TYPE is refused, never interpolated: `eval` of @sh output RUNS an array.
@@ -548,6 +610,22 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__x__read","cwd":"/h/repos/jkb","tool_input":{"p":"/h/.claude\n/../.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "a bare ~name root given to an MCP tool is the home, an ancestor" deny \
       '{"tool_name":"mcp__x__index","cwd":"/h/repos/jkb","tool_input":{"root":"~vscode"}}' HOME=/h
+    # REVIEW ROUND 8. What a brace group EXPANDS to, not its raw alternatives: a nested group and a
+    # `..` composed across a group boundary both passed the per-alternative test.
+    h "a nested brace hiding an absolute path is denied" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{x,{/h/.claude/projects/**/*.jsonl,y}}"}}' HOME=/h
+    h "...nested first, absolute second" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{{a,b},/h/.claude/projects/*}"}}' HOME=/h
+    h "a .. composed from .{.,} is denied" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":".{.,}/.{.,}/.claude-state/projects/*/*.jsonl"}}' HOME=/h
+    h "an ordinary empty alternative is allowed" allow \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"src/*.rs{,.orig}"}}' HOME=/h
+    h "an ordinary nested brace is allowed" allow \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{src,tests/{unit,e2e}}/**/*.rs"}}' HOME=/h
+    blow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(8) | "{a,b,c}"] | join(""))}}')"
+    h "a brace product too large to expand is refused, never a race with the timeout" deny "$blow" HOME=/h
+    huge="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(3000) | "ab"] | join("") | "{" + . + ",x}")}}')"
+    h "a Glob pattern over the byte budget is refused before it is walked" deny "$huge" HOME=/h
 
     # FAIL CLOSED: every way of not reaching a verdict is a refusal.
     h "an unparseable payload is denied" deny 'not json {' HOME=/h
@@ -718,20 +796,20 @@ case "$tool" in
             # A `..` AFTER the literal prefix -- the prefix itself is judged below, so `../docs/*.md`
             # is fine and only a climb past a wildcard is refused (round 7: refusing any `..` beside
             # a wildcard refused that ordinary pattern).
-            rest="${pat#"$gb"}"
-            case "/$rest/" in */../*) deny ;; esac
-            # EVERY brace group, and only alternatives that could leave the search root: absolute,
-            # `~`, or a `..` segment. Round 6 looked at the first group alone, so a second group hid
-            # an absolute path, and refused any `/`, so `{crates/a,crates/b}/**` was refused.
-            bp="$pat"
-            while :; do
-                case "$bp" in *"{"*"}"*) ;; *) break ;; esac
-                bc="${bp#*\{}"; bc="${bc%%\}*}"; bp="${bp#*\{}"; bp="${bp#*\}}"
-                IFS=, read -r -a alts <<<"$bc"
-                for alt in ${alts[@]+"${alts[@]}"}; do
-                    case "$alt" in /*|"~"*) deny ;; esac
-                    case "/$alt/" in */../*) deny ;; esac
-                done
+            # Judged on EVERY EXPANSION of the braces, never on their raw alternatives: round 6 read
+            # the first group alone, round 7 every group's alternatives as text, and both let a
+            # nested group or a `..` built across a group boundary (`.{.,}`) through (round 8). An
+            # expansion may not climb past the prefix, nor become absolute when the pattern is not.
+            # Ordinary patterns -- `**/*.{rs,toml}`, `{crates/a,crates/b}/**` -- do neither.
+            # The byte budget check() applies to a path, applied to the pattern BEFORE the expander
+            # walks it a character at a time: unbounded, a megabyte pattern was a walk into the
+            # timeout, which fails open.
+            [ "${#pat}" -le 4096 ] || exit 3
+            brace_expand "$pat" || exit 3
+            for e in "${brace_out[@]}"; do
+                case "$pat" in /*|"~"*) ;; *) case "$e" in /*|"~"*) deny ;; esac ;; esac
+                rest="${e#"$gb"}"
+                case "/$rest/" in */../*) deny ;; esac
             done
             if [ -n "$gb" ]; then
                 # Joined onto the UN-normalised base, so check()'s realpath meets any link in the
@@ -746,7 +824,8 @@ case "$tool" in
         [ -n "$pth" ] && check "$pth" ;;
     *)
         # A tool whose fields are not known here: every string it was given that COULD BE A PATH is
-        # judged -- one holding a `/`, or starting `~` or `.` (multi-line strings included, see below). Not every
+        # judged -- one holding a `/`, or starting `~` or `.` (multi-line strings included, see below),
+        # or a bare word that names an existing entry in a base (round 8, below). Not every
         # string: with every tool now routed here, a flat cap on all strings refused a TodoWrite or
         # an AskUserQuestion with a long list. The exception is a cwd that is itself in or above the
         # tree, where a bare word like `projects` is a path into it; then every string counts.
@@ -769,8 +848,17 @@ case "$tool" in
              | select($all == "1" or test("^[~.]") or contains("/"))]
             | unique
             | if length > 100 then error("too many") else @sh "leaves=(\(.))" end' 2>/dev/null)" || exit 3
-        leaves=()
+        # ...and every OTHER string short enough to be one name (NAME_MAX): a bare word is a path
+        # the moment it names something in a base, and a link named `t` there reached the tree with
+        # nothing judged (review round 8, reproduced). Tested on disk below, with no fork per word.
+        bare_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
+            [.tool_input | .. | strings
+             | select(. != "" and length <= 255)
+             | select(($all == "1" or test("^[~.]") or contains("/")) | not)]
+            | unique | @sh "bare=(\(.))"' 2>/dev/null)" || exit 3
+        leaves=(); bare=()
         eval "$leaves_sh"
+        eval "$bare_sh"
         # An MCP server resolves a relative path against ITS OWN cwd, which is not the session's:
         # the jkb server starts in the project root. So a relative string is judged against every
         # base it could plausibly mean. AN ARRAY, iterated quoted: `for b in $bases` split a cwd
@@ -787,13 +875,21 @@ case "$tool" in
                 [ "$dup" -eq 0 ] && bases+=("$b")
             done
         fi
+        for w in ${bare[@]+"${bare[@]}"}; do
+            for b in "${bases[@]}"; do
+                if [ -n "$b" ] && { [ -e "$b/$w" ] || [ -L "$b/$w" ]; }; then leaves+=("./$w"); break; fi
+            done
+        done
+        [ "${#leaves[@]}" -le 100 ] || exit 3
         for leaf in ${leaves[@]+"${leaves[@]}"}; do
             # A SLASHLESS ~word in free text is a home only if that account exists. `~retry` is jkb's
             # own one-word vector search and `~2h` an estimate; reading them as home directories
-            # refused ordinary calls (round 7). A path field keeps the over-approximation.
+            # refused ordinary calls (round 7). Otherwise it is judged as what a server that does
+            # not expand it opens: a relative name. Skipping it let a link named `~t` reach the tree
+            # (round 8). A path field keeps the over-approximation.
             case "$leaf" in
                 "~"*/*|"~") ;;
-                "~"*) getent passwd "${leaf#\~}" >/dev/null 2>&1 || continue ;;
+                "~"*) getent passwd "${leaf#\~}" >/dev/null 2>&1 || leaf="./$leaf" ;;
             esac
             # A free-text string that merely STARTS `file:` is text, not a refusal (round 7); only a
             # `file:/...` URI is rewritten, and the same helper serves the long branch below.

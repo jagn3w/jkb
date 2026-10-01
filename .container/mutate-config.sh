@@ -1488,9 +1488,18 @@ run "the hook's shebang loses -p" "not an absolute bash in privileged mode"
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("        PATH=/usr/bin:/bin\n        export PATH\n", "", 1))
+open(p, 'w').write(s.replace('[ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }\n', "", 1))
 PYX
-run "the sweep stops pinning PATH" "the sweep's real-run arm does not pin PATH"
+run "the sweep stops pinning PATH" "the sweep's first command does not pin PATH"
+
+# REVIEW ROUND 8. The pin back in the real-run arm: still present, and too late for date and stat.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace('[ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }\n', "", 1)
+open(p, 'w').write(s.replace('    ""|--dry-run)\n', '    ""|--dry-run)\n        PATH=/usr/bin:/bin\n        export PATH\n', 1))
+PYX
+run "the sweep's PATH pin moves back into the real-run arm" "the sweep's first command does not pin PATH"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
@@ -1498,6 +1507,86 @@ p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('/bin/bash .container/sweep-transcripts.sh', 'bash .container/sweep-transcripts.sh', 1))
 PYX
 run "run.sh starts the sweep with a bare bash" "run.sh does not start sweep-transcripts.sh with /bin/bash"
+
+# REVIEW ROUND 8. Every exec in run.sh, not only the sweep's and verify's.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container -e PATH=/usr/bin:/bin -w "$ctr_repo" "$NAME" /usr/local/lib/jkb-hook/jkb task reap || true'
+assert old in s
+open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" bash -lc \'jkb task reap || true\' || true', 1))
+PYX
+run "the reap goes back to a login bash found on PATH" "by PATH lookup"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container -e PATH=/usr/bin:/bin -w "$ctr_repo" "$NAME" /bin/bash -c'
+assert old in s
+open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" /bin/bash -c', 1))
+PYX
+run "the login step stops pinning PATH for what its shell runs" "without -e PATH=/usr/bin:/bin"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container "$NAME" /usr/bin/sudo -n'
+assert old in s
+open(p, 'w').write(s.replace(old, 'in_container "${NAME}" sudo -n', 1))
+PYX
+run "an exec spelled so the scan cannot see it" "the scan has stopped seeing them"
+
+# The two exec branches round 7 added and left unmutated.
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"exec", "-i", "-e", &keep, name, "/bin/bash", "-s"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"exec", "-i", "-e", &keep, name, "bash", "-s"', 1))
+PYX
+run "the reaper's docker exec finds bash on PATH" "the reaper's docker exec does not name /bin/bash"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('/bin/bash .container/verify.sh', 'bash .container/verify.sh', 1))
+PYX
+run "run.sh starts verify.sh with a bare bash" "run.sh does not start verify.sh with /bin/bash"
+
+# REVIEW ROUND 8. ~/.jq: every unsandboxed jq carries HOME=/dev/null.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "perm) HOME=/dev/null jq -r"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "perm) jq -r", 1))
+PYX
+run "the sweep's deny reader drops HOME=/dev/null" "run without HOME=/dev/null"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'mem_match="$(HOME=/dev/null jq -r'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'mem_match="$(jq -r', 1))
+PYX
+run "verify.sh's matcher read drops HOME=/dev/null" "run without HOME=/dev/null"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("HOME=/dev/null jq", "HOME=/dev/null  jq"))
+PYX
+run "the prefixed jq calls are spelled so the scan cannot count them" "the scan has stopped seeing them"
+
+# REVIEW ROUND 8. A relative rule is resolved from the home in a non-project layer, by the shared reader.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(.claude/projects)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a relative managed rule over the transcript tree" "MEMORY.md stops reaching context"
 
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
@@ -1995,6 +2084,19 @@ else
     # file says must be watched failing. Claiming more than was established, printed by the harness
     # that exists to catch exactly that.
     printf '  %s mentions of sweep_problems behind the sweep guard, count pinned so a new branch must be decided about\n' "$sweep_appends"
+fi
+
+# THE SAME, FOR THE UNSANDBOXED-EXEC GUARD. dc_unsb gathers every way an unsandboxed script can be
+# steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
+unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
+    | grep -o 'dc_unsb' | grep -c .)"
+PINNED_UNSB_APPENDS=19
+if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
+    fails=$((fails+1))
+    printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"
+    echo "  They all emit through one \`bad \"\`; add a mutation for the new branch and update PINNED_UNSB_APPENDS."
+else
+    printf '  %s mentions of dc_unsb behind the exec guard, count pinned so a new branch must be decided about\n' "$unsb_appends"
 fi
 
 echo

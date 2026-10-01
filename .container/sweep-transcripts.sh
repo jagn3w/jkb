@@ -41,6 +41,15 @@
 # are not deleted — they are one `mv` away, under ~/.claude-state/transcript-archive, in the same
 # volume — so recovering one is copying a file back, but you have to know it is there. That is the
 # whole price, and it is paid against a container in which no Bash call works at all.
+# A FIXED PATH, BEFORE THE FIRST COMMAND. This runs UNSANDBOXED -- the reaper pipes it into
+# `docker exec ... /bin/bash -s`, run.sh runs it at start -- and the image's PATH begins with the
+# sandbox-writable ~/.cargo/bin and ~/.local/bin. Everything it runs lives in /usr/bin. A planted
+# `jq` ran on the next reaper tick with every transcript and the credential readable (review round
+# 7), and the pin then sat in the real-run arm, so the top-level `date` and `stat` below still ran
+# a planted program first (round 8, reproduced). Not in --self-test, which also runs on macOS,
+# where jq is not in /usr/bin and nothing unsandboxed is at stake. check-config.sh holds this line
+# to being the first command.
+[ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }
 set -uo pipefail
 
 # ---------------------------------------------------------------------------------------------
@@ -466,7 +475,7 @@ posture_canon() { # posture_canon <path> -> canonical spelling
     printf '%s\n' "$p"
 }
 
-posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> -> path pattern
+posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> [relative-base] -> path pattern
     local r="$1" p
     r="${r#*(}"; r="${r%)}"
     case "$r" in
@@ -474,12 +483,34 @@ posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> -> path p
         "~")   p="$2" ;;
         "~/"*) p="$2/${r#\~/}" ;;
         /*)    p="$3$r" ;;
-        *)     printf '%s\n' "$r"; return ;;
+        # A RELATIVE rule resolves against its layer's base (posture_layer_base) when the caller
+        # names one, `..` folded by the canon below. Only the sweep did this, so verify.sh and
+        # check-config read `Read(../../.claude/projects)` in a repo's settings as covering nothing
+        # while Claude Code denied MEMORY.md through it (review round 8). Without a base it is
+        # returned as written, for a caller asking about the rule's shape alone.
+        *)     [ -n "${4:-}" ] || { printf '%s\n' "$r"; return; }
+               p="$4/${r#./}" ;;
     esac
     # CANONICAL: `Read(~/.claude/projects/)` -- the bare-directory rule with a slash -- resolved to
     # `.../projects/`, whose `$1/*` arm is `.../projects//*`, and read as covering nothing while
     # denying MEMORY.md. Review round 2.
     posture_canon "$p"
+}
+
+# WHICH LAYER a settings file is, and so what a relative rule in it is relative to. A project's
+# `.claude/settings*.json` resolves against that project; the managed file, its drop-ins and the
+# user's settings meet a session started anywhere, and are resolved from the home, where one
+# plausibly starts. One definition, read by the sweep, verify.sh and check-config.sh.
+posture_layer_kind() { # posture_layer_kind <settings-file> <managed-settings.json> <home> -> managed|dropin|user|project
+    case "$1" in
+        "$2") printf 'managed\n' ;;
+        */managed-settings.d/*) printf 'dropin\n' ;;
+        "${CLAUDE_CONFIG_DIR:-$3/.claude}"/*) printf 'user\n' ;;
+        *) printf 'project\n' ;;
+    esac
+}
+posture_layer_base() { # posture_layer_base <settings-file> <managed-settings.json> <home> -> directory
+    if [ "$(posture_layer_kind "$@")" = project ]; then dirname "$(dirname "$1")"; else printf '%s\n' "$3"; fi
 }
 
 # The matcher the transcript hook must be wired with: EVERY tool. It was an allowlist of file tools,
@@ -592,6 +623,24 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
     # "Application Support" split into fragments that no glob overlapped (review round 6).
     proots=("$(posture_canon "${CLAUDE_CONFIG_DIR:-$home/.claude}/projects")" "$(posture_canon "$home/.claude-state/projects")")
     layers="$(posture_layer_files "$1")" || return 0
+    # THE PROBES ARE REAL SHAPES, and the real files. Made-up leaves (`-p/x.jsonl`) let a rule that
+    # names the actual shape -- `~/.claude/**/agent-*.jsonl`, `*/*/????????-*.jsonl` -- read as
+    # matching nothing while Claude Code enumerated every subagent transcript (review round 8). So:
+    # a session, a subagent and a workflow journal as Claude Code names them, under a slug of the
+    # form it derives from a path, plus every transcript actually on disk, which is exactly what
+    # an enumerating rule costs the argv.
+    local -a probes=()
+    local p_file
+    local p_slug p_uuid=0b1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d
+    p_slug="$(printf '%s' "$home/repos/project" | tr -c 'A-Za-z0-9' '-')"
+    for root in "${proots[@]}"; do
+        probes+=("$root/$p_slug/$p_uuid.jsonl" "$root/$p_slug/$p_uuid/subagents/agent-a1b2c3d4e5f60718.jsonl"
+                 "$root/$p_slug/$p_uuid/subagents/workflows/wf_0a1b2c3d-4e5/journal.jsonl")
+        if [ -d "$root" ]; then
+            while IFS= read -r p_file; do probes+=("$p_file"); done \
+                < <(find "$root" -name '*.jsonl' 2>/dev/null | head -n 5000)
+        fi
+    done
     while IFS= read -r f; do
         # LAYER-AWARE, because "cannot tell" means different things in different layers (review
         # round 6). The MANAGED file unreadable is cannot-tell, so yes. Any other layer that is not
@@ -600,12 +649,8 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
         # unrelated repo. A PROJECT layer's relative rule is relative to that project, which never
         # contains ~/.claude, so it is resolved there; a relative rule in a user or drop-in layer
         # could meet a session started anywhere, and stays cannot-tell.
-        case "$f" in
-            "$1") kind=managed ;;
-            */managed-settings.d/*) kind=dropin ;;
-            "${CLAUDE_CONFIG_DIR:-$home/.claude}"/*) kind=user ;;
-            *) kind=project; proot="$(dirname "$(dirname "$f")")" ;;
-        esac
+        kind="$(posture_layer_kind "$f" "$1" "$home")"
+        proot="$(posture_layer_base "$f" "$1" "$home")"
         if ! rules="$(posture_deny_rules "$f" 2>/dev/null)"; then
             [ "$kind" = managed ] && return 0
             continue
@@ -618,7 +663,7 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
             case "$pat" in
                 /*) ;;
                 *) if [ "$kind" = project ]; then
-                       pat="$(posture_canon "$proot/${pat#./}")"
+                       pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")" "$proot")"
                    else
                        # In a managed, user or drop-in layer a relative rule meets a session started
                        # anywhere. It can reach the tree if it CLIMBS (a `..` segment), matches at ANY
@@ -628,7 +673,7 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
                        # counting every relative rule as cannot-tell turned the superseded sweep back on
                        # (review round 7). So resolve it from the home and test overlap like any other.
                        case "/$pat/" in */../*|/\*\*/*) return 0 ;; esac
-                       pat="$(posture_canon "$home/${pat#./}")"
+                       pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")" "$proot")"
                    fi ;;
             esac
             # OVERLAP, not three probes: any expanding rule whose literal prefix contains, or lies
@@ -642,12 +687,11 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
                 # The base is only an ANCESTOR of the tree: the rule must actually be able to MATCH a
                 # path inside it. A bare ancestor test counted `~/.env.*` -- which can only match
                 # children of the home -- as reaching the tree, and Claude Code's documented example
-                # deny list then turned the sweep back on (review round 7). Probed with transcript
-                # shapes at the depths they really sit; `*` crosses `/` in a case pattern, so this
-                # errs towards counting.
+                # deny list then turned the sweep back on (review round 7). Probed with the shapes
+                # above; `*` crosses `/` in a case pattern, so this errs towards counting.
                 if [ "${root#"${base%/}"/}" != "$root" ]; then
-                    for probe in "$root/-p/x.jsonl" "$root/-p/u/subagents/a.jsonl" "$root/-p/u/subagents/workflows/w/a.jsonl"; do
-                        posture_rule_covers "$pat" "$probe" && return 0
+                    for probe in "${probes[@]}"; do
+                        case "$probe" in "$root"/*) posture_rule_covers "$pat" "$probe" && return 0 ;; esac
                     done
                 fi
             done
@@ -1565,6 +1609,18 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     rm -f "$lhome/.claude/settings.json"
     printf '%s\n' '{"permissions":{"deny":["Read(~/repos/../.claude/projects/**/*.jsonl)"]}}' >"$pdir/dotdot.json"
     eq "a per-file glob spelled through repos/.. still enumerates" "$(pe "$pdir/dotdot.json")" yes
+    # Round 8: ancestor-based rules naming the REAL leaf shapes, which made-up probe leaves missed.
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/agent-*.jsonl)"]}}' >"$pdir/agentleaf.json"
+    eq "an ancestor glob naming subagent transcripts enumerates" "$(pe "$pdir/agentleaf.json")" yes
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/*/*/????????-*.jsonl)"]}}' >"$pdir/uuidleaf.json"
+    eq "an ancestor glob naming session transcripts enumerates" "$(pe "$pdir/uuidleaf.json")" yes
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/journal.jsonl)"]}}' >"$pdir/journal.json"
+    eq "an ancestor glob naming workflow journals enumerates" "$(pe "$pdir/journal.json")" yes
+    # ...and the files actually on disk, whatever they are named: the real argv cost.
+    dhome="$work/diskhome"; mkdir -p "$dhome/.claude/projects/-odd/s"; : >"$dhome/.claude/projects/-odd/s/zz-unusual.jsonl"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/zz-*.jsonl)"]}}' >"$pdir/ondisk.json"
+    eq "an ancestor glob matching only a file on disk enumerates" "$(pe "$pdir/ondisk.json" "$dhome")" yes
+    eq "...and with no such file it does not" "$(pe "$pdir/ondisk.json")" no
     # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/-home-vscode-repos-jkb/**/*.jsonl)"]}}' >"$pdir/slug.json"
     eq "a slug-specific per-file glob enumerates"   "$(pe "$pdir/slug.json")" yes
@@ -1651,6 +1707,19 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...while the same tree under the old globs is archived" \
        "$(find "$pp_arch" -type f | grep -c . )" "2"
 
+    # A HOSTILE PATH CANNOT CHOOSE WHAT RUNS, from the first line: the pin used to sit in the
+    # real-run arm, after the top-level `date` and `stat` had already run a planted program
+    # (review round 8). /bin/bash by name, as the reaper and run.sh start it.
+    pevil="$work/evil"; mkdir -p "$pevil"
+    for pprog in date stat jq find mv mkdir sort awk sed grep cat; do
+        printf '#!/bin/sh\n: > "%s/RAN-%s"\nexit 0\n' "$pevil" "$pprog" > "$pevil/$pprog"; chmod +x "$pevil/$pprog"
+    done
+    env -u CLAUDE_CONFIG_DIR HOME="$phome" PATH="$pevil:$PATH" JKB_TRANSCRIPT_ROOT="$pp_root" \
+        JKB_TRANSCRIPT_ARCHIVE="$pp_arch" JKB_MANAGED_SETTINGS="$pdir/hook.json" \
+        /bin/bash "$self" --dry-run >/dev/null 2>&1
+    eq "with a hostile PATH, no planted program runs" \
+       "$(find "$pevil" -name 'RAN-*' | sed 's,.*/RAN-,,' | sort | tr '\n' ' ')" ""
+
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31msweep-transcripts self-test FAILED (%d)\033[0m\n' "$fails"; exit 1; }
     printf '\033[32msweep-transcripts self-test passed\033[0m\n'
@@ -1659,15 +1728,6 @@ fi
 
 case "${1:-}" in
     ""|--dry-run)
-        # A FIXED PATH FOR THE REAL RUN. This runs UNSANDBOXED -- the reaper pipes it into
-        # `docker exec ... /bin/bash -s`, run.sh runs it at start -- and the image's PATH begins with
-        # the sandbox-writable ~/.cargo/bin and ~/.local/bin. Everything it runs lives in /usr/bin.
-        # A planted `jq` there ran on the next reaper tick with every transcript and the credential
-        # readable (review round 7; bash and find were already exposed this way, the jq call this
-        # change added made it worse). Not in --self-test, which also runs on macOS, where jq is
-        # not in /usr/bin and nothing unsandboxed is at stake.
-        PATH=/usr/bin:/bin
-        export PATH
         # "nothing to archive" is deliberate: it is one of the reaper's NOTHING_TO_DO phrases, so
         # this is a quiet tick there, and it contains no "does not exist", so verify.sh reads it
         # as a measured, healthy pass rather than an unmeasured one.

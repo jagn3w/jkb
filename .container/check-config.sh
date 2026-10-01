@@ -489,7 +489,7 @@ fi
 # the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
 eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$here/sweep-transcripts.sh")"
 dc_reader_ok=0
-declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_rule_base posture_hook_matcher >/dev/null && dc_reader_ok=1
+declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_rule_base posture_layer_base posture_hook_matcher >/dev/null && dc_reader_ok=1
 # BOTH DENY LISTS, FROM BOTH FILES, through the one emitter: the image's managed settings, and the
 # posture's `require` block that auto-mode writes into user settings. Each line is
 # "<settings-dir><TAB><rule>", because a one-slash permission rule is relative to the file it is in.
@@ -534,7 +534,9 @@ Edit(~/repos/**/.mcp.json)'
         [ -n "$dc_rule" ] || continue
         # Only FILE rules have paths: `Bash(curl:*)` fed through path semantics read as an expander.
         posture_rule_is_path "$dc_rule" || continue
-        dc_pat="$(posture_rule_path "$dc_rule" /home/vscode "$dc_dir")"
+        # The managed file and the posture are both non-project layers, so a relative rule in either
+        # resolves from the home -- the shared reader says so, rather than this file (round 8).
+        dc_pat="$(posture_rule_path "$dc_rule" /home/vscode "$dc_dir" "$(posture_layer_base "$dc_dir/managed-settings.json" "$dc_dir/managed-settings.json" /home/vscode)")"
         # 1. Nothing may cover auto-memory, with Claude Code's subtree semantics. Two spellings of
         #    the tree, one synthetic slug: no rule names a slug, so a probe answers for every repo.
         [ "$dc_list" = perm ] && for dc_probe in /home/vscode/.claude/projects/-probe-repo/memory/MEMORY.md \
@@ -666,14 +668,16 @@ esac
 # THE SWEEP RUNS UNSANDBOXED TOO, and the same rule holds for it: the reaper pipes it into
 # `docker exec`, run.sh runs it at start, and the image's PATH begins with directories the sandbox
 # can write. Round 7 found a planted `jq` there running on the next reaper tick. Required: the
-# sweep's real-run arm pins PATH, and every place that starts it -- or verify.sh, which also runs
+# sweep pins PATH as its first command, and every place that starts it -- or verify.sh, which also runs
 # unsandboxed -- names `/bin/bash` by absolute path rather than letting docker exec look it up.
 dc_unsb=""
 # HERE-STRINGS, NEVER `producer | grep -q`: the note above dc_stmt_line is why. The first cut of
 # this guard piped twice into grep -q, which is the race that once failed only on CI.
-dc_sweep_case="$(dc_strip_comments "$here/sweep-transcripts.sh" | sed -n '/^case "\${1:-}" in/,/^esac/p')"
-grep -q '^[[:space:]]*PATH=/usr/bin:/bin' <<<"$dc_sweep_case" \
-    || dc_unsb="$dc_unsb the sweep's real-run arm does not pin PATH;"
+# THE FIRST COMMAND, not "somewhere in the real-run arm": the pin sat in that arm and the top-level
+# `date` and `stat` ran a planted program before it (review round 8).
+dc_sweep_first="$(dc_strip_comments "$here/sweep-transcripts.sh" | sed '1d' | grep -m1 -E '[^[:space:]]')"
+[ "$dc_sweep_first" = '[ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }' ] \
+    || dc_unsb="$dc_unsb the sweep's first command does not pin PATH (it is [$dc_sweep_first]);"
 grep -qF -- '"/bin/bash", "-s"' "$here/../crates/jkb-cli/src/transcripts.rs" \
     || dc_unsb="$dc_unsb the reaper's docker exec does not name /bin/bash;"
 dc_run_stripped="$(dc_strip_comments "$here/run.sh")"
@@ -685,6 +689,55 @@ for dc_s in sweep-transcripts verify; do
         *) dc_unsb="$dc_unsb run.sh does not start $dc_s.sh with /bin/bash;" ;;
     esac
 done
+# EVERY EXEC IN run.sh, not the two above: round 7 fixed the sweep and verify.sh and left seven
+# others -- `bash -c` for the login, `bash -lc` for the reap, `sh`, `sudo` -- resolving through the
+# same PATH (review round 8). Each `docker exec`/`in_container` statement must name its program
+# absolutely, and pin PATH with `-e PATH=/usr/bin:/bin` unless the program is one that answers for
+# its own: the sweep (pins as its first command), setup.sh (runs the toolchain by design, once),
+# verify.sh (task verify-sh-runs-unsandboxed-with--18da6e4b5d893488), or sudo (secure_path).
+dc_execs="$(awk '
+    {
+        n = split($0, t, /[[:space:]]+/)
+        for (i = 1; i <= n; i++) {
+            if (t[i] ~ /(^|[("])in_container$/ || (t[i] == "exec" && i > 1 && t[i-1] ~ /docker$/)) {
+                j = i + 1; pin = 0
+                while (j <= n && t[j] ~ /^-/) {
+                    if (t[j] == "-e" && t[j+1] == "PATH=/usr/bin:/bin") pin = 1
+                    if (t[j] == "-e" || t[j] == "-w" || t[j] == "-u") j += 2; else j++
+                }
+                if (t[j] != "\"$NAME\"") continue
+                print NR "\t" pin "\t" t[j+1] "\t" t[j+2]
+            }
+        }
+    }' <<<"$dc_run_stripped")"
+dc_nexec=0
+while IFS=$'\t' read -r dc_ln dc_pin dc_prog dc_arg; do
+    [ -n "$dc_ln" ] || continue
+    dc_nexec=$((dc_nexec + 1))
+    case "$dc_prog" in
+        /*) ;;
+        *) dc_unsb="$dc_unsb run.sh line $dc_ln starts [$dc_prog] by PATH lookup;"; continue ;;
+    esac
+    [ "$dc_pin" = 1 ] && continue
+    case "$dc_prog $dc_arg" in
+        "/bin/bash .container/sweep-transcripts.sh"|"/bin/bash .container/setup.sh"|"/bin/bash .container/verify.sh"|"/usr/bin/sudo "*) ;;
+        *) dc_unsb="$dc_unsb run.sh line $dc_ln runs [$dc_prog $dc_arg] without -e PATH=/usr/bin:/bin;" ;;
+    esac
+done <<<"$dc_execs"
+# ~/.jq AS WELL AS PATH: jq sources $HOME/.jq into every program it runs, and the sandbox writes
+# $HOME. Every jq the sweep runs outside its self-test, and every jq in verify.sh, carries
+# `HOME=/dev/null`; the README said this guard held that, and nothing did (review round 8).
+dc_jq_text="$( { dc_strip_comments "$here/sweep-transcripts.sh" \
+        | awk 'index($0, "if [ \"${1:-}\" = \"--self-test\" ]") == 1 { skip = 1 } !skip { print } skip && /^fi$/ { skip = 0 }'
+    dc_strip_comments "$here/verify.sh"; } )"
+dc_jq_bare="$(sed 's|HOME=/dev/null jq||g' <<<"$dc_jq_text" | grep -cE '(^|[[:space:]|;(])jq([[:space:]]|$)')"
+dc_jq_held="$(grep -o 'HOME=/dev/null jq' <<<"$dc_jq_text" | grep -c .)"
+[ "$dc_jq_bare" -eq 0 ] \
+    || dc_unsb="$dc_unsb $dc_jq_bare jq call(s) in the sweep or verify.sh run without HOME=/dev/null, so an agent-written ~/.jq is sourced into them;"
+[ "$dc_jq_held" -ge 6 ] \
+    || dc_unsb="$dc_unsb only $dc_jq_held HOME=/dev/null jq call(s) found in the sweep and verify.sh, where there are six -- the scan has stopped seeing them;"
+# A FLOOR, so a parser that stops matching reads as a failure and not as "nothing to check".
+[ "$dc_nexec" -ge 9 ] || dc_unsb="$dc_unsb only $dc_nexec container exec(s) found in run.sh, where there are nine -- the scan has stopped seeing them;"
 if [ -n "$dc_unsb" ]; then
     bad "an unsandboxed script can be steered through PATH:$dc_unsb a program planted in ~/.cargo/bin would run outside the sandbox with the container credential readable"
 else
