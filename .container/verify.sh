@@ -7,6 +7,12 @@
 # but not on one that no longer contains what it should). Each assertion below fails for exactly
 # one such edit.
 set -uo pipefail
+# EVERY jq HERE RUNS WITH HOME WHERE NO FILE CAN BE, the lib.sh functions this script calls
+# included: jq sources $HOME/.jq into every program, and the agent can write $HOME. One wrapper,
+# so no call site has to remember a prefix -- round 8 required the prefix per call and round 9
+# found lib.sh's calls, which no per-call scan of this file could see. check-config.sh requires
+# this line to be the file's first mention of jq.
+jq() { HOME=/dev/null command jq "$@"; }
 
 # The egress verdict path, its `key=value` parser and the verdict-state vocabulary come from here.
 # This script runs from the checkout (`./.container/verify.sh`), which carries egress-lib.sh beside
@@ -510,9 +516,15 @@ if [ "$SELF_TEST" = yes ]; then
     ms "a project's relative rule climbing into the tree covers memory" "$MEMP" \
        "$(posture_rule_path 'Read(../../.claude/projects)' /home/vscode /home/vscode/repos/jkb/.claude \
            "$(posture_layer_base /home/vscode/repos/jkb/.claude/settings.local.json /etc/claude-code/managed-settings.json /home/vscode)")" shadowed
-    ms "a user layer's relative rule is resolved from the home" "$MEMP" \
-       "$(posture_rule_path 'Read(.claude/projects)' /home/vscode /home/vscode/.claude \
-           "$(CLAUDE_CONFIG_DIR= posture_layer_base /home/vscode/.claude/settings.json /etc/claude-code/managed-settings.json /home/vscode)")" shadowed
+    # ...and only a project layer's: elsewhere a relative rule meets a session's cwd, a repo here, and
+    # the arm passes no base (round 9), which is what these two rows hand the reader.
+    ms "a user layer's relative rule, given no base, does not read as covering memory" "$MEMP" \
+       "$(posture_rule_path 'Read(.claude/projects)' /home/vscode /home/vscode/.claude "")" clear
+    ms "...nor does a user layer's Edit(**/*.md)" "$MEMP" \
+       "$(posture_rule_path 'Edit(**/*.md)' /home/vscode /home/vscode/.claude "")" clear
+    lk="$(CLAUDE_CONFIG_DIR='' posture_layer_kind /home/vscode/.claude/settings.json /etc/claude-code/managed-settings.json /home/vscode)"
+    if [ "$lk" = user ]; then printf '  \033[32mok\033[0m   %s\n' "the arm's layer test reads user settings as a user layer, not a project"
+    else printf '  \033[31mFAIL\033[0m the arm'"'"'s layer test read user settings as [%s]\n' "$lk"; st_fail=$((st_fail+1)); fi
     ms "...while Claude Code's documented ./.env example stays clear" "$MEMP" \
        "$(posture_rule_path 'Read(./.env)' /home/vscode /home/vscode/repos/jkb/.claude \
            "$(posture_layer_base /home/vscode/repos/jkb/.claude/settings.local.json /etc/claude-code/managed-settings.json /home/vscode)")" clear
@@ -1642,9 +1654,16 @@ else
             # repo's settings.local.json is the wrong cost (review round 5). Named, not hidden.
             if [ "$mem_f" = "$mem_managed" ]; then mem_unread="$mem_unread $mem_f"; else mem_skipped="$mem_skipped $mem_f"; fi
             continue; }
-        # A relative rule resolved against its LAYER'S base, by the shared reader: read as written it
-        # covered nothing here while Claude Code resolved it into the tree (review round 8).
-        mem_base="$(posture_layer_base "$mem_f" "$mem_managed" "$HOME")"
+        # A PROJECT layer's relative rule is resolved against that project, by the shared reader:
+        # read as written it covered nothing here while Claude Code resolved it into the tree
+        # (review round 8). Any other layer's relative rule is left as written, which covers no
+        # absolute path. It meets whatever cwd a session starts in -- a repo, in this container --
+        # and resolving it from the home made `Edit(**/*.md)` in user settings refuse the whole
+        # container over a reading Claude Code would not take (round 9). The sweep, which only has
+        # to err towards sweeping, keeps the home reading.
+        mem_base=""
+        [ "$(posture_layer_kind "$mem_f" "$mem_managed" "$HOME")" = project ] \
+            && mem_base="$(posture_layer_base "$mem_f" "$mem_managed" "$HOME")"
         while IFS= read -r mem_r; do
             [ -n "$mem_r" ] || continue
             posture_rule_is_path "$mem_r" || continue

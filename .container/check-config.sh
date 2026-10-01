@@ -489,7 +489,7 @@ fi
 # the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
 eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$here/sweep-transcripts.sh")"
 dc_reader_ok=0
-declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_rule_base posture_layer_base posture_hook_matcher >/dev/null && dc_reader_ok=1
+declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_rule_base posture_hook_matcher >/dev/null && dc_reader_ok=1
 # BOTH DENY LISTS, FROM BOTH FILES, through the one emitter: the image's managed settings, and the
 # posture's `require` block that auto-mode writes into user settings. Each line is
 # "<settings-dir><TAB><rule>", because a one-slash permission rule is relative to the file it is in.
@@ -534,9 +534,10 @@ Edit(~/repos/**/.mcp.json)'
         [ -n "$dc_rule" ] || continue
         # Only FILE rules have paths: `Bash(curl:*)` fed through path semantics read as an expander.
         posture_rule_is_path "$dc_rule" || continue
-        # The managed file and the posture are both non-project layers, so a relative rule in either
-        # resolves from the home -- the shared reader says so, rather than this file (round 8).
-        dc_pat="$(posture_rule_path "$dc_rule" /home/vscode "$dc_dir" "$(posture_layer_base "$dc_dir/managed-settings.json" "$dc_dir/managed-settings.json" /home/vscode)")"
+        # No relative base: the managed file and the posture are not project layers, so a relative
+        # rule in either meets a session's cwd -- a repo -- and covers no absolute path (round 9,
+        # which reversed round 8's home reading here; verify.sh's memory arm reads it the same way).
+        dc_pat="$(posture_rule_path "$dc_rule" /home/vscode "$dc_dir")"
         # 1. Nothing may cover auto-memory, with Claude Code's subtree semantics. Two spellings of
         #    the tree, one synthetic slug: no rule names a slug, so a probe answers for every repo.
         [ "$dc_list" = perm ] && for dc_probe in /home/vscode/.claude/projects/-probe-repo/memory/MEMORY.md \
@@ -695,17 +696,25 @@ done
 # absolutely, and pin PATH with `-e PATH=/usr/bin:/bin` unless the program is one that answers for
 # its own: the sweep (pins as its first command), setup.sh (runs the toolchain by design, once),
 # verify.sh (task verify-sh-runs-unsandboxed-with--18da6e4b5d893488), or sudo (secure_path).
+# EVERY OCCURRENCE IS ACCOUNTED FOR, never skipped: a statement whose container or program the scan
+# cannot resolve is a failure, so `in_container --user root "${NAME}" bash` cannot be added unseen
+# (review round 9: the scan skipped anything not spelled `"$NAME"`, and the floor cannot see an
+# addition). The only two occurrences that are not a statement are named: in_container's own
+# `docker exec "$@"`, and the `"docker exec $*"` it prints when the container has died.
 dc_execs="$(awk '
     {
         n = split($0, t, /[[:space:]]+/)
         for (i = 1; i <= n; i++) {
             if (t[i] ~ /(^|[("])in_container$/ || (t[i] == "exec" && i > 1 && t[i-1] ~ /docker$/)) {
+                if (t[i] == "exec" && t[i-1] ~ /^"/) continue
                 j = i + 1; pin = 0
                 while (j <= n && t[j] ~ /^-/) {
-                    if (t[j] == "-e" && t[j+1] == "PATH=/usr/bin:/bin") pin = 1
-                    if (t[j] == "-e" || t[j] == "-w" || t[j] == "-u") j += 2; else j++
+                    if ((t[j] == "-e" || t[j] == "--env") && t[j+1] == "PATH=/usr/bin:/bin") pin = 1
+                    if (t[j] == "--env=PATH=/usr/bin:/bin") pin = 1
+                    if (t[j] ~ /^(-e|-w|-u|--env|--workdir|--user)$/) j += 2; else j++
                 }
-                if (t[j] != "\"$NAME\"") continue
+                if (t[j] == "\"$@\"") continue
+                if (t[j] != "\"$NAME\"" || t[j+1] == "") { print NR "\tUNRESOLVED\t" t[j] "\t" t[j+1]; continue }
                 print NR "\t" pin "\t" t[j+1] "\t" t[j+2]
             }
         }
@@ -714,6 +723,10 @@ dc_nexec=0
 while IFS=$'\t' read -r dc_ln dc_pin dc_prog dc_arg; do
     [ -n "$dc_ln" ] || continue
     dc_nexec=$((dc_nexec + 1))
+    if [ "$dc_pin" = UNRESOLVED ]; then
+        dc_unsb="$dc_unsb run.sh line $dc_ln has a container exec the scan cannot read (container [$dc_prog], program [$dc_arg]) -- spell it \`\"\$NAME\" /absolute/program\`;"
+        continue
+    fi
     case "$dc_prog" in
         /*) ;;
         *) dc_unsb="$dc_unsb run.sh line $dc_ln starts [$dc_prog] by PATH lookup;"; continue ;;
@@ -725,17 +738,20 @@ while IFS=$'\t' read -r dc_ln dc_pin dc_prog dc_arg; do
     esac
 done <<<"$dc_execs"
 # ~/.jq AS WELL AS PATH: jq sources $HOME/.jq into every program it runs, and the sandbox writes
-# $HOME. Every jq the sweep runs outside its self-test, and every jq in verify.sh, carries
-# `HOME=/dev/null`; the README said this guard held that, and nothing did (review round 8).
-dc_jq_text="$( { dc_strip_comments "$here/sweep-transcripts.sh" \
-        | awk 'index($0, "if [ \"${1:-}\" = \"--self-test\" ]") == 1 { skip = 1 } !skip { print } skip && /^fi$/ { skip = 0 }'
-    dc_strip_comments "$here/verify.sh"; } )"
-dc_jq_bare="$(sed 's|HOME=/dev/null jq||g' <<<"$dc_jq_text" | grep -cE '(^|[[:space:]|;(])jq([[:space:]]|$)')"
-dc_jq_held="$(grep -o 'HOME=/dev/null jq' <<<"$dc_jq_text" | grep -c .)"
-[ "$dc_jq_bare" -eq 0 ] \
-    || dc_unsb="$dc_unsb $dc_jq_bare jq call(s) in the sweep or verify.sh run without HOME=/dev/null, so an agent-written ~/.jq is sourced into them;"
-[ "$dc_jq_held" -ge 6 ] \
-    || dc_unsb="$dc_unsb only $dc_jq_held HOME=/dev/null jq call(s) found in the sweep and verify.sh, where there are six -- the scan has stopped seeing them;"
+# $HOME. The sweep and verify.sh each define ONE wrapper that runs jq with HOME=/dev/null, as their
+# first mention of jq, so every call -- lib.sh's included, which round 9 found a per-call scan of
+# these files could not see -- goes through it. Bypassing it takes `command jq` or an absolute
+# `/usr/bin/jq`, and either is refused outside the wrapper line itself.
+dc_jq_wrap='jq() { HOME=/dev/null command jq "$@"; }'
+for dc_f in sweep-transcripts verify; do
+    dc_jq_text="$(dc_strip_comments "$here/$dc_f.sh")"
+    dc_jq_first="$(grep -m1 -E '(^|[^A-Za-z0-9_.-])jq([^A-Za-z0-9_.-]|$)' <<<"$dc_jq_text")"
+    [ "$dc_jq_first" = "$dc_jq_wrap" ] \
+        || dc_unsb="$dc_unsb $dc_f.sh does not define the HOME=/dev/null jq wrapper before its first jq (first mention: [$dc_jq_first]), so an agent-written ~/.jq is sourced into its jq;"
+    dc_jq_bypass="$(grep -vxF -- "$dc_jq_wrap" <<<"$dc_jq_text" | grep -cE 'command jq|/jq([[:space:]]|$)')"
+    [ "$dc_jq_bypass" -eq 0 ] \
+        || dc_unsb="$dc_unsb $dc_f.sh calls jq around its wrapper ($dc_jq_bypass time(s), by \`command jq\` or an absolute path);"
+done
 # A FLOOR, so a parser that stops matching reads as a failure and not as "nothing to check".
 [ "$dc_nexec" -ge 9 ] || dc_unsb="$dc_unsb only $dc_nexec container exec(s) found in run.sh, where there are nine -- the scan has stopped seeing them;"
 if [ -n "$dc_unsb" ]; then
@@ -757,6 +773,10 @@ for dc_need in 'CLAUDE_CONFIG_DIR' '.claude-state/projects'; do
     grep -qF -- "$dc_need" <<<"$dc_sweep_roots" || dc_roots_missing="$dc_roots_missing sweep:$dc_need"
 done
 grep -qF -- '.claude/projects' <<<"$dc_hook_roots" || dc_roots_missing="$dc_roots_missing hook:.claude/projects"
+# The archive is where the sweep moves transcripts, so it is a root of the hook's (review round 9).
+grep -qF -- '.claude-state/transcript-archive' <<<"$dc_hook_roots" || dc_roots_missing="$dc_roots_missing hook:.claude-state/transcript-archive"
+grep -qE '^TRANSCRIPT_ARCHIVE=.*/\.claude-state/transcript-archive' <<<"$(dc_strip_comments "$here/sweep-transcripts.sh")" \
+    || dc_roots_missing="$dc_roots_missing sweep:TRANSCRIPT_ARCHIVE"
 if [ -z "$dc_hook_roots" ] || [ -z "$dc_sweep_roots" ]; then
     bad "the transcript roots could not be found in deny-transcripts.sh and sweep-transcripts.sh, so whether they agree is unchecked"
 elif [ -n "$dc_roots_missing" ]; then

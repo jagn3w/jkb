@@ -1534,7 +1534,7 @@ old = 'in_container "$NAME" /usr/bin/sudo -n'
 assert old in s
 open(p, 'w').write(s.replace(old, 'in_container "${NAME}" sudo -n', 1))
 PYX
-run "an exec spelled so the scan cannot see it" "the scan has stopped seeing them"
+run "an exec spelled so the scan cannot see it" "has a container exec the scan cannot read"
 
 # The two exec branches round 7 added and left unmutated.
 seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
@@ -1553,40 +1553,62 @@ open(p, 'w').write(s.replace('/bin/bash .container/verify.sh', 'bash .container/
 PYX
 run "run.sh starts verify.sh with a bare bash" "run.sh does not start verify.sh with /bin/bash"
 
-# REVIEW ROUND 8. ~/.jq: every unsandboxed jq carries HOME=/dev/null.
+# REVIEW ROUNDS 8-9. ~/.jq: one HOME=/dev/null wrapper per unsandboxed script, never bypassed.
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = "perm) HOME=/dev/null jq -r"
+old = 'jq() { HOME=/dev/null command jq "$@"; }\n'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, "perm) jq -r", 1))
+open(p, 'w').write(s.replace(old, "", 1))
 PYX
-run "the sweep's deny reader drops HOME=/dev/null" "run without HOME=/dev/null"
+run "the sweep loses its jq wrapper" "does not define the HOME=/dev/null jq wrapper"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'jq() { HOME=/dev/null command jq "$@"; }\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "verify.sh loses its jq wrapper" "does not define the HOME=/dev/null jq wrapper"
 
 seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = 'mem_match="$(HOME=/dev/null jq -r'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'mem_match="$(jq -r', 1))
+open(p, 'w').write(s.replace(old, 'mem_match="$(command jq -r', 1))
 PYX
-run "verify.sh's matcher read drops HOME=/dev/null" "run without HOME=/dev/null"
+run "verify.sh calls jq around its wrapper" "calls jq around its wrapper"
 
-seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace("HOME=/dev/null jq", "HOME=/dev/null  jq"))
+old = "perm) HOME=/dev/null jq -r"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "perm) /usr/bin/jq -r", 1))
 PYX
-run "the prefixed jq calls are spelled so the scan cannot count them" "the scan has stopped seeing them"
+run "the sweep names jq by absolute path" "calls jq around its wrapper"
 
-# REVIEW ROUND 8. A relative rule is resolved from the home in a non-project layer, by the shared reader.
-seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
-import json, sys
-p = sys.argv[1]; d = json.load(open(p))
-d["permissions"]["deny"].append("Read(.claude/projects)")
-json.dump(d, open(p, "w"), indent=2)
+# REVIEW ROUND 9. An ADDED exec the scan cannot read is a failure, not a skip.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'say "login state"\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, old + 'in_container --user root "$CONTAINER" bash -c true\n', 1))
 PYX
-run "a relative managed rule over the transcript tree" "MEMORY.md stops reaching context"
+run "an exec added with a container the scan cannot read" "has a container exec the scan cannot read"
+
+# The archive is a root of the hook's.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '/.claude-state/transcript-archive"'
+assert s.count(old) == 2, "mutation target absent"
+open(p, 'w').write(s.replace(old, '/.claude-state/elsewhere"'))
+PYX
+run "the hook forgets the transcript archive" "hook:.claude-state/transcript-archive"
 
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
@@ -2090,7 +2112,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=19
+PINNED_UNSB_APPENDS=21
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

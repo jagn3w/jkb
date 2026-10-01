@@ -51,6 +51,12 @@
 # to being the first command.
 [ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }
 set -uo pipefail
+# EVERY jq HERE RUNS WITH HOME WHERE NO FILE CAN BE, the lib.sh functions this script calls
+# included: jq sources $HOME/.jq into every program, and the agent can write $HOME. One wrapper,
+# so no call site has to remember a prefix -- round 8 required the prefix per call and round 9
+# found lib.sh's calls, which no per-call scan of this file could see. check-config.sh requires
+# this line to be the file's first mention of jq.
+jq() { HOME=/dev/null command jq "$@"; }
 
 # ---------------------------------------------------------------------------------------------
 # The budget. Pure constants, so --self-test can state them rather than rediscover them.
@@ -637,8 +643,10 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
         probes+=("$root/$p_slug/$p_uuid.jsonl" "$root/$p_slug/$p_uuid/subagents/agent-a1b2c3d4e5f60718.jsonl"
                  "$root/$p_slug/$p_uuid/subagents/workflows/wf_0a1b2c3d-4e5/journal.jsonl")
         if [ -d "$root" ]; then
+            # `-L`: ~/.claude/projects IS a symlink to the state volume's tree, and without it find
+            # printed nothing under that spelling (review round 9, measured on GNU find 4.9.0).
             while IFS= read -r p_file; do probes+=("$p_file"); done \
-                < <(find "$root" -name '*.jsonl' 2>/dev/null | head -n 5000)
+                < <(find -L "$root" -name '*.jsonl' 2>/dev/null | head -n 5000)
         fi
     done
     while IFS= read -r f; do
@@ -1621,6 +1629,12 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/zz-*.jsonl)"]}}' >"$pdir/ondisk.json"
     eq "an ancestor glob matching only a file on disk enumerates" "$(pe "$pdir/ondisk.json" "$dhome")" yes
     eq "...and with no such file it does not" "$(pe "$pdir/ondisk.json")" no
+    # Round 9: the home's tree is a SYMLINK to the state volume's, as in the container.
+    lhome2="$work/linkhome"; mkdir -p "$lhome2/.claude-state/projects/-home-x-repos-y/s" "$lhome2/.claude"
+    : >"$lhome2/.claude-state/projects/-home-x-repos-y/s/e.jsonl"
+    ln -s "$lhome2/.claude-state/projects" "$lhome2/.claude/projects"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/-home-x-repos-y/**/*.jsonl)"]}}' >"$pdir/linked.json"
+    eq "a rule matching only files under the SYMLINKED spelling enumerates" "$(pe "$pdir/linked.json" "$lhome2")" yes
     # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/-home-vscode-repos-jkb/**/*.jsonl)"]}}' >"$pdir/slug.json"
     eq "a slug-specific per-file glob enumerates"   "$(pe "$pdir/slug.json")" yes
@@ -1711,6 +1725,9 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # real-run arm, after the top-level `date` and `stat` had already run a planted program
     # (review round 8). /bin/bash by name, as the reaper and run.sh start it.
     pevil="$work/evil"; mkdir -p "$pevil"
+    # ...and a planted ~/.jq, which a jq run with the agent's HOME would load (a syntax error makes
+    # that loud); every jq here goes through the HOME=/dev/null wrapper (review round 9).
+    printf '%s\n' 'def planted_by_the_agent(: ;' > "$phome/.jq"
     for pprog in date stat jq find mv mkdir sort awk sed grep cat; do
         printf '#!/bin/sh\n: > "%s/RAN-%s"\nexit 0\n' "$pevil" "$pprog" > "$pevil/$pprog"; chmod +x "$pevil/$pprog"
     done
@@ -1719,6 +1736,13 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
         /bin/bash "$self" --dry-run >/dev/null 2>&1
     eq "with a hostile PATH, no planted program runs" \
        "$(find "$pevil" -name 'RAN-*' | sed 's,.*/RAN-,,' | sort | tr '\n' ' ')" ""
+    pjq_out="$(env -u CLAUDE_CONFIG_DIR HOME="$phome" JKB_TRANSCRIPT_ROOT="$pp_root" \
+        JKB_TRANSCRIPT_ARCHIVE="$pp_arch" JKB_MANAGED_SETTINGS="$pdir/hook.json" JKB_DENY_BUDGET_BYTES=1 \
+        /bin/bash "$self" --dry-run 2>&1)"
+    # The shipped posture names no transcript, so the run stands down. A jq that loaded the broken
+    # ~/.jq could not read the managed file, would call it cannot-tell, and would sweep instead.
+    eq "with a planted ~/.jq, no jq loads it" "$(grep -c 'names a transcript by path' <<<"$pjq_out")" "1"
+    rm -f "$phome/.jq"
 
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31msweep-transcripts self-test FAILED (%d)\033[0m\n' "$fails"; exit 1; }

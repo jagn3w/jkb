@@ -81,27 +81,18 @@
 # starting `~` or `.`. A relative one is judged against each distinct base an MCP server might
 # resolve it from: the session cwd, CLAUDE_PROJECT_DIR, the home.
 #
-# BOUNDED, because a timed-out hook FAILS OPEN. At most 100 candidates, then refused; a path field
+# BOUNDED, because a timed-out hook FAILS OPEN. At most 100 path-shaped candidates and 2000 bare
+# words (each tested on disk; round 9 timed 20000 at 2s), then refused; a Glob pattern and a path field
 # over PATH_MAX (4096) is refused before it is walked, and an over-long free-text string gets the
 # linear lexical verdict alone. THE MEASUREMENT, kept here and nowhere else: 100 distinct relative
 # strings to an MCP tool, `date +%s%N` around one invocation in jkb-dev on 2026-10-01 -- ~1.0s when
 # the cwd is the project dir (bases deduplicated), 1.4s with three distinct bases. This container
 # has been seen running 5x slow under a saturated VM, and 5x the worst case is still inside 10s.
 #
-# CONSIDERED AND NOT VECTORS, measured 2026-10-01 rather than assumed:
-#   hard links   sandboxed Bash cannot see ~/.claude-state/projects at all ("No such file or
-#                directory"), so it has no source to name -- and ~/repos is a different
-#                filesystem from the state volume (fuseblk vs a volume), so `ln` would be EXDEV.
-#   case         ~/repos IS case-insensitive (macOS backing), but the tree lives on case-sensitive
-#                Linux filesystems, and a case-variant symlink name under ~/repos is resolved by the
-#                kernel inside `realpath -m`, which the physical check uses.
-#   bind mounts  an unprivileged namespace the agent creates changes only its own view, never the
-#                file tools' -- they run in Claude Code's process, outside it.
+# WHAT IS RULED OUT AND WHAT IS LEFT OPEN -- hard links, case folding and bind mounts measured as
+# not vectors; the symlink-swap race between this check and the tool's open left open -- is recorded
+# once, in .container/README.md ("The transcript deny is a hook"), and not restated here.
 #
-# THE RESIDUAL, stated: a TIME-OF-CHECK/TIME-OF-USE race. A background process from sandboxed Bash
-# could repoint a symlink in an agent-writable directory between this check and the tool's open.
-# Closing it would mean refusing every path through a symlink in a writable directory, which
-# breaks ordinary repositories; it is left open and written down rather than half-closed.
 # A FIXED PATH, BEFORE ANYTHING ELSE RUNS, and an absolute shebang in privileged mode. This hook
 # runs UNSANDBOXED on every tool call, and the image puts the agent-writable ~/.local/bin and
 # ~/.cargo/bin first on PATH: sandboxed Bash could drop a `jq` there and have it run outside the
@@ -263,8 +254,10 @@ brace_expand() { # brace_expand <pattern>
                 [ "$depth" -eq 0 ] && { close=$i; break; }
             fi
         done
+        # An OPEN that never closes is refused, not kept literal: a later group would still expand
+        # in a real engine, and keeping the string whole hid a `..` built across that group (round 9).
         if [ "$close" -lt 0 ]; then
-            brace_out+=("$s")
+            return 1
         else
             pre="${s:0:open}"; body="${s:open+1:close-open-1}"; post="${s:close+1}"
             alts=(); cur=""; depth=0
@@ -497,6 +490,12 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"ok"}}' HOME="$sh"
     h "a bare word naming nothing on disk is allowed" allow \
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"nothing-here"}}' HOME="$sh"
+    # REVIEW ROUND 9. `~t/...` read only as a home let the cwd's `~t` link through.
+    : >"$sh/.claude-state/projects/-s/e.jsonl"
+    h "a ~name/ path through a cwd link of that name is denied, to an MCP tool" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"~t/e.jsonl"}}' HOME="$sh"
+    h "...and to Read" deny \
+      '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"~t/e.jsonl"}}' HOME="$sh"
     h "a HOME with a trailing slash still finds its tree" deny \
       '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$sh"'/.claude/projects/-s/e.jsonl"}}' HOME="$sh/"
     # A field of the wrong TYPE is refused, never interpolated: `eval` of @sh output RUNS an array.
@@ -624,6 +623,15 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{src,tests/{unit,e2e}}/**/*.rs"}}' HOME=/h
     blow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(8) | "{a,b,c}"] | join(""))}}')"
     h "a brace product too large to expand is refused, never a race with the timeout" deny "$blow" HOME=/h
+    # REVIEW ROUND 9.
+    h "a leading brace that never closes is refused, not kept literal" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos","tool_input":{"pattern":"x}{{/.,/}./{.,}./.claude/projects/**"}}' HOME=/h
+    h "an archived transcript is denied" deny \
+      '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude-state/transcript-archive/-s/e.jsonl"}}' HOME=/h
+    words="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{w:[range(2001) | "w\(.)"]}}')"
+    h "more bare words than the cap is a refusal, never a race with the timeout" deny "$words" HOME=/h
+    words="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{w:[range(2000) | "w\(.)"]}}')"
+    h "...while 2000 is allowed" allow "$words" HOME=/h
     huge="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(3000) | "ab"] | join("") | "{" + . + ",x}")}}')"
     h "a Glob pattern over the byte budget is refused before it is walked" deny "$huge" HOME=/h
 
@@ -725,8 +733,11 @@ home="$(normalise "$home")"
 # /usr/local/bin, with no sibling to load from. check-config.sh holds the two to the same set.
 # ONE realpath for every root, not one per root: this runs on every tool call.
 root_list=()
-for r in "$home/.claude/projects" "$home/.claude-state/projects" \
-         ${acct_home:+"$acct_home/.claude/projects" "$acct_home/.claude-state/projects"} \
+# THE ARCHIVE IS A ROOT TOO: the sweep moves transcripts to ~/.claude-state/transcript-archive, and
+# outside every root they were one plain Read away (review round 9). check-config.sh holds this list
+# and the sweep's TRANSCRIPT_ARCHIVE to the same spelling.
+for r in "$home/.claude/projects" "$home/.claude-state/projects" "$home/.claude-state/transcript-archive" \
+         ${acct_home:+"$acct_home/.claude/projects" "$acct_home/.claude-state/projects" "$acct_home/.claude-state/transcript-archive"} \
          ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/projects"}; do
     root_list+=("$(normalise "$r")")
 done
@@ -771,9 +782,16 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
     abs="$(resolve "$1" "$home" "$base")"
     phys="$(realpath -m -- "$raw" 2>/dev/null)" || exit 3
     [ -n "$phys" ] || exit 3
-    [ "$phys" = "$abs" ] && return 0
-    v="$(verdict "$phys" "$roots" "$home" "$base")"
-    case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac
+    if [ "$phys" != "$abs" ]; then
+        v="$(verdict "$phys" "$roots" "$home" "$base")"
+        case "$v" in deny) deny ;; allow) ;; *) exit 3 ;; esac
+    fi
+    # `~name/...` HAS TWO READINGS, and both are judged. A shell or a server that expands it opens a
+    # home; one that does not -- jkb's ingest_path, Rust's fs::read -- opens a directory literally
+    # named `~name` in its cwd. Judged as the home alone, a cwd link named `~t` pointing into the
+    # tree was allowed (review round 9, reproduced). `./` makes the second reading relative.
+    case "$1" in "~/"*|"~") ;; "~"?*) check "./$1" "$base" ;; esac
+    return 0
 }
 
 # The matcher is `.*` -- every tool reaches this hook, so a built-in tool added tomorrow lands in the
@@ -855,7 +873,8 @@ case "$tool" in
             [.tool_input | .. | strings
              | select(. != "" and length <= 255)
              | select(($all == "1" or test("^[~.]") or contains("/")) | not)]
-            | unique | @sh "bare=(\(.))"' 2>/dev/null)" || exit 3
+            | unique
+            | if length > 2000 then error("too many") else @sh "bare=(\(.))" end' 2>/dev/null)" || exit 3
         leaves=(); bare=()
         eval "$leaves_sh"
         eval "$bare_sh"
@@ -909,7 +928,9 @@ case "$tool" in
                 continue
             fi
             case "$leaf" in
-                /*|"~"*) check "$leaf" ;;
+                /*|"~/"*|"~") check "$leaf" ;;
+                # Both readings of `~name...` (check does the second), from every base.
+                "~"*) for b in "${bases[@]}"; do [ -n "$b" ] && check "$leaf" "$b"; done ;;
                 *) for b in "${bases[@]}"; do [ -n "$b" ] && check "$leaf" "$b"; done ;;
             esac
         done ;;
