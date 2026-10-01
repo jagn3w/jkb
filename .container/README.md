@@ -1337,6 +1337,30 @@ is the VM's memory limit, not a broken toolchain. Raise the runtime's memory (Do
 Resources pane, `colima start --memory`), or cap parallelism with `CARGO_BUILD_JOBS=2`, which
 lowers peak usage far more than it costs in wall-clock.
 
+## Cargo links with lld
+
+The Dockerfile installs Ubuntu's `lld` and sets `CARGO_TARGET_{AARCH64,X86_64}_UNKNOWN_LINUX_GNU_RUSTFLAGS`
+to `-C link-arg=-fuse-ld=lld`, so cargo links with lld instead of GNU `ld`. Measured on
+2026-10-01 in this container on arm64: touch `crates/jkb-cli/tests/sessions.rs`, then rebuild
+`cargo test -p jkb-cli --test sessions --no-run`, four alternating runs per linker, best of each.
+
+| linker | wall | CPU (user + sys) |
+|---|---|---|
+| GNU `ld` | 21.2s | 7.8s |
+| lld | 14.9s | 6.4s |
+
+Two other Claude sessions were running at the time, so the CPU column is the more reliable of
+the two. Most of the remaining wall time is not linking. The lld measured was the toolchain's own
+`rust-lld` 22.1.2, through its `gcc-ld` shim. What ships is Ubuntu's `lld`, because the shim's path
+names the toolchain version, and an ENV pointing at it would break silently at the next
+`rust-toolchain.toml` bump.
+
+`verify.sh` asserts the result rather than the setting: it links a probe crate and reads the
+binary's `.comment` stamp. A `RUSTFLAGS` export in a session overrides the per-target flags and
+quietly falls back to GNU `ld`, and that check is how you find out. The first build after
+rebuilding the image recompiles everything in the target volume, because changing the flags
+invalidates every cached unit.
+
 ## The container never opens the knowledge base — measured, not assumed
 
 `~/.jkb` is still bind-mounted (auto-memory, worktree archives, logs, the daemon's token), but no
