@@ -948,18 +948,29 @@ separator, and a quote inside a comment or a here-doc body opening a quote that 
 each deferring a `land` bash runs. Doing it safely needs redirects, here-docs and comments lexed as
 bash lexes them.
 
-**A ticket goes only on a line whose every `jkb` the hook can see run.** The ticket is exported
-to every child of the command, so a `jkb` whose argv is built out of sight — `sh -c "jkb task land
-x"`, `… | xargs jkb task`, `env -S "…"` — inherits it. Review round 7 measured each of those
-deferred with a ticket minted: a ticketed `land`, unprompted. A `jkb` is *visible* only in command
-position, after nothing but assignments and wrappers that pass the line through unchanged (`env`
-with only assignments, `command`, `exec`, `nohup`, `time`, `timeout <duration>`); anything else
-makes it *hidden*. A line with no visible `jkb` is skipped — no ticket, so a hidden one cannot
-authenticate — unless it also mentions `land`, which is asked; a visible `jkb` beside a hidden one
-is asked, because the hidden one would inherit the ticket. Pinned by
-`run_through_bash_a_hidden_jkb_never_inherits_a_ticket_for_a_land`, whose oracle is a fake `jkb`
-*program* on `PATH` as well as the shell function: the function alone is invisible to a child
-shell and to `xargs`, which is why no earlier test could see this.
+**A ticket goes only where nothing but `jkb` can use it.** The ticket is `export`ed for the whole
+line, so every child of the command inherits it. A line is deferred only when every command in it
+is `jkb` itself — by that exact command word, resolved on `PATH` — or one of a short `HARMLESS`
+allowlist (`cd`, `true`, `false`, `:`, `echo`, `cat`, `head`, `tail`, `wc`, `uniq`, `grep`, `jq`)
+that cannot run other code or repoint `jkb`. Anything else on the line is asked, with the ticket
+minted so an approved line still works; a line that only *mentions* jkb, as a harmless command's
+argument, is skipped. `cd` is on the list only because `PATH` holds no relative or empty entry, so
+the directory cannot change which `jkb` runs (measured: ten entries, all absolute); `sort`,
+`printf`, `sed` and `awk` are deliberately off it (`--compress-program`, `printf -v PATH`, `e`,
+`system()`).
+
+**Superseded twice on the way there.** Round 7 found a ticket inherited by a `jkb` the model never
+saw run — `sh -c "jkb task land x"`, `… | xargs jkb task`, `env -S "…"` — each deferred, each a
+ticketed `land` unprompted. The answer then was to model which `jkb` is *visible* (command position,
+after assignments and argv-preserving wrappers) and treat the rest as hidden. Round 8 measured that
+answer unsound: whether a hidden `jkb` exists cannot be read off the text — a glob inside quotes
+(`sh -c '~/.cargo/bin/jk? task land x'`), a script file, `make`, `jkb ls | ./evil.sh`, `LD_PRELOAD=`
+or `PATH=` in front of the `jkb`, `hash -p`, `printf -v PATH` each ran or repointed one out of sight.
+Naming the dangerous cases kept falling short; naming the safe ones does not. Pinned by
+`run_through_bash_a_hidden_jkb_never_inherits_a_ticket_for_a_land`, whose oracle puts a fake `jkb`
+*program* on `PATH` as well as the shell function — the function alone is invisible to a child shell
+and to `xargs`, which is why no earlier test could see any of this — and by `HARMLESS` being pinned
+as a literal list, since growing it is the dangerous direction.
 
 **Why `land` alone keeps the prompt.** `land` runs the repository's gate through `sh -c` with a
 command the *caller* supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling.

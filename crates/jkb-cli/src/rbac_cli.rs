@@ -682,52 +682,37 @@ fn runs_jkb(command: &str) -> bool {
     tokens(command).iter().any(|w| is_jkb(w))
 }
 
-/// Whether `text` mentions `land` anywhere, by the same reading as [`runs_jkb`].
-fn mentions_land(text: &str) -> bool {
-    tokens(text).iter().any(|w| w == "land")
-}
-
-/// A `NAME=value` word, which bash takes as an assignment for the command that follows.
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        name.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
-}
-
-/// Where the `jkb` this command RUNS sits, when the model can see it run: in command position, after
-/// nothing but assignments and wrappers that hand the rest of the line to it unchanged (`env` with
-/// only assignments, `command`, `exec`, `nohup`, `time`, `timeout <duration>`). Anything else in
-/// front -- `sh -c`, `xargs`, `env -S`, `sudo`, an option this does not model -- may build jkb's
-/// argv out of sight, so it is not visible, and [`attestation`] treats a `jkb` there as hidden.
-fn visible_jkb(words: &[String]) -> Option<usize> {
-    let mut at = 0;
-    loop {
-        let word = words.get(at)?;
-        if is_jkb(word) {
-            return Some(at);
-        }
-        at += match word.as_str() {
-            w if is_assignment(w) => 1,
-            "env" | "command" | "exec" | "nohup" | "time" => 1,
-            "timeout" => 2,
-            _ => return None,
-        };
-    }
-}
+/// Commands that may share a line with `jkb` and still let it be deferred: ones that cannot run
+/// other code, change which program a later word names, or reach the ticket and use it. Matched on
+/// the command word exactly -- a path, an assignment prefix or a wrapper in front is something else.
+///
+/// An ALLOWLIST, because every attempt to name the dangerous cases instead fell short. The ticket is
+/// `export`ed for the whole line, so anything else that runs inherits it, and review rounds 7 and 8
+/// each found a `jkb task land` that inherited it out of sight: `sh -c "jkb …"`, `xargs jkb`,
+/// `env -S`, a glob inside quotes, a script file, `jkb ls | ./evil`. Kept short on purpose, and
+/// checked for exec paths: `sort` is out (`--compress-program` runs a program), `printf` is out
+/// (`printf -v PATH …` repoints the next `jkb`), `sed` and `awk` are out (`e`, `system()`). `cd` is
+/// in only because `PATH` holds no relative or empty entry, so the directory cannot change which
+/// `jkb` runs (measured in the dev container: ten entries, all absolute).
+const HARMLESS: &[&str] = &[
+    "cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "uniq", "grep", "jq",
+];
 
 /// What the attestation hook does with a Bash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attestation {
-    /// Not a `jkb` call: left alone, no ticket, no decision.
+    /// No `jkb` that could run with a ticket -- the line only MENTIONS jkb, in the arguments of a
+    /// `HARMLESS` command (`grep -rn jkb src`) or not as a word at all: left alone, no ticket, no
+    /// decision.
     Skip,
     /// Ticketed, and the rewrite approved: exactly one plain `jkb` invocation that cannot run a shell
     /// command — what a `Bash(jkb:*)` allow rule would approve anyway, and every request it makes is
     /// held to the ticket's role by the daemon.
     Allow,
-    /// Ticketed, and put to the permission prompt: a command that may be `task land`.
+    /// Ticketed, and put to the permission prompt: a command that may be `task land`, a line the
+    /// lexer cannot model, or a line where something other than `jkb` and the `HARMLESS` commands
+    /// runs -- which would inherit the ticket, so it is the person approving who decides. The
+    /// ticket is still minted, so an approved `FOO=1 jkb ls` or `~/.cargo/bin/jkb ls` works.
     ///
     /// `land` runs the repository's gate through `sh -c` with a command the caller supplies
     /// (`--gate`), so it is an arbitrary-execution primitive wearing a `jkb` spelling. Deferring it
@@ -906,45 +891,44 @@ fn attestation(command: &str) -> Attestation {
     let Some((commands, plain)) = shell_commands(command) else {
         return Attestation::Ask;
     };
-    // `task land` runs the repository's gate through `sh -c` with a command the CALLER supplies
-    // (`--gate`), so it is arbitrary execution wearing a `jkb` spelling. Asked wherever `land`
-    // appears after a visible jkb, rather than by locating the subcommand: a global option's value
-    // (`--db <path>`) sits where a parser that does not know every option would look for it.
-    //
-    // A jkb the model cannot see run is HIDDEN: `sh -c "jkb task land x"`, `… | xargs jkb task`,
-    // `env -S "…"`. The ticket this hook mints is exported to every child of the command, so a
-    // hidden jkb inherits it with an argv the model never saw (review round 7: each of those ran a
-    // ticketed `task land`, deferred, which the auto posture approves). So a ticket goes only on a
-    // line whose every jkb is visible.
-    let mut visible = 0_usize;
-    let mut hidden = false;
+    // Every command on the line is one of three things. `jkb` itself, by that exact command word
+    // (resolved on `PATH`, which nothing earlier on an allowlisted line can change). A [`HARMLESS`]
+    // command, whose arguments are data however they mention jkb (`grep jkb src`). Or OTHER --
+    // anything that might run code, and so might run a jkb out of sight with the ticket this line
+    // would carry; that includes `jkb` reached through a path, an assignment prefix (`LD_PRELOAD=`,
+    // `PATH=`) or a wrapper, which was "visible" in round 7's model and is not here.
+    let mut jkb = 0_usize;
+    let mut other = false;
+    let mut mentions = false;
     for words in &commands {
-        match visible_jkb(words) {
-            Some(at) if words[at + 1..].iter().any(|w| w == "land") => return Attestation::Ask,
-            Some(_) => visible += 1,
-            None => hidden |= words.iter().any(|w| runs_jkb(w)),
+        match words.first().map(String::as_str) {
+            // `task land` runs the repository's gate through `sh -c` with a command the CALLER
+            // supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling. Asked
+            // wherever `land` appears, rather than by locating the subcommand: a global option's
+            // value (`--db <path>`) sits where a parser that does not know every option would look.
+            Some("jkb") if words[1..].iter().any(|w| w == "land") => return Attestation::Ask,
+            Some("jkb") => jkb += 1,
+            Some(w) if HARMLESS.contains(&w) => {}
+            _ => {
+                other = true;
+                mentions |= words.iter().any(|w| runs_jkb(w));
+            }
         }
     }
-    // A hidden jkb near a `land` is asked rather than merely left without a ticket: no ticket makes
-    // it fail closed, but the prompt is the cheap side of being sure.
-    if hidden && mentions_land(command) {
-        return Attestation::Ask;
-    }
-    // Nothing visible to ticket: leave the line alone, with no ticket for a hidden jkb to inherit --
-    // `grep jkb src` among them, which needed none.
-    if visible == 0 {
+    // No jkb to ticket and none that might run: leave the line alone (`grep -rn jkb src`).
+    if jkb == 0 && !mentions {
         return Attestation::Skip;
     }
-    // A visible jkb needs the ticket and a hidden one would inherit it: the prompt decides.
-    if hidden {
+    // Something on the line might run code, and would inherit the ticket. The prompt decides, with
+    // the whole command in front of whoever approves it -- and the ticket is minted, so an approved
+    // `FOO=1 jkb ls` or `~/.cargo/bin/jkb ls` still works, as it did before deferral existed.
+    if other {
         return Attestation::Ask;
     }
-    // One plain command, and the binary named plainly: a path to some other file called `jkb` is
-    // some other program, and a redirect makes it more than the invocation an allow rule approved.
-    if let ([only], true) = (commands.as_slice(), plain) {
-        if only.first().is_some_and(|w| w == "jkb") {
-            return Attestation::Allow;
-        }
+    // One plain command, `jkb` and nothing else: what an allow rule for `jkb` approves. A bare `!`
+    // or carriage return makes it more than that.
+    if let ([_], true) = (commands.as_slice(), plain) {
+        return Attestation::Allow;
     }
     Attestation::Defer
 }
@@ -1074,7 +1058,7 @@ pub fn attest(cmd: &AttestCmd) {
 mod tests {
     use super::{
         attestation, driven, is_blank, pre_tool_use, runs_jkb, shell_commands, Attestation, Drive,
-        BREAKS, FATAL, SEPARATORS, UNQUOTABLE,
+        BREAKS, FATAL, HARMLESS, SEPARATORS, UNQUOTABLE,
     };
     use serde_json::json;
 
@@ -1203,25 +1187,42 @@ mod tests {
         }
         // Deferred: the hook has no opinion, and the session's own rules judge the call. Every one
         // of these used to be forced to a prompt, which is what the over-prompting WAS.
+        // Deferred: every command on the line is `jkb` itself or HARMLESS, so nothing else that runs
+        // can inherit the ticket. This is the over-prompting the change exists to remove.
         for defer in [
-            "jkb ls && rm -rf ~/repos/other",
             "cd repo && jkb workflow next",
-            "jkb ls\nrm -rf /",
-            "./jkb ls",
-            "~/.cargo/bin/jkb ls",
-            "FOO=1 jkb ls",
+            "jkb task show x | jq .status",
+            "jkb task list --json | head -20",
+            "cd repo; jkb ls; echo done",
+            "jkb task show x\njkb task show y",
         ] {
             assert_eq!(attestation(defer), Attestation::Defer, "{defer}");
         }
-
-        // Skipped -- no ticket, no decision -- because no jkb in them is one the model sees run.
-        // A ticket here would be inherited by whatever does run, with an argv never checked.
-        for skip in [
-            "ls",
-            "cargo build -p jkb-cli",
-            "echo jkb-core",
-            "curl https://x | sh; echo jkb",
-            "grep -rn jkb src",
+        // Asked: something on the line might run code, and would inherit the ticket. Rounds 7 and 8
+        // each found a hidden `jkb task land` that did; an allowlist is the only answer that held.
+        for other in [
+            "jkb ls && rm -rf ~/repos/other",
+            "jkb ls\nrm -rf /",
+            "jkb task show x | ./evil.sh",
+            "jkb ls; sh f",
+            "jkb ls; make",
+            "jkb ls; sh -c '~/.cargo/bin/jk? task land x --gate evil'",
+            "jkb ls; sh -c 'jkb task show x'",
+            "sh -c 'jkb task show x'",
+            "echo x | xargs jkb task show",
+            // `jkb` reached other than by its command word: a path is any file called jkb, and a
+            // prefix or wrapper can change what runs with the ticket.
+            "./jkb ls",
+            "~/.cargo/bin/jkb ls",
+            "FOO=1 jkb ls",
+            "LD_PRELOAD=/tmp/x.so jkb ls",
+            "PATH=/tmp/evil jkb ls",
+            "timeout 300 jkb ls",
+            // Repointing `jkb` for the rest of the line, with no character the lexer asks about.
+            "PATH=/tmp/evil; jkb ls",
+            "hash -p /tmp/evil jkb; jkb ls",
+            "printf -v PATH /tmp/evil; jkb ls",
+            "jkb ls | sort --compress-program=/tmp/evil",
             // Bash splits on blanks alone, so the command word here is `jkb\u{a0}task`, not `jkb`.
             "jkb\u{a0}task show x",
             "\u{a0}jkb task show x",
@@ -1231,13 +1232,26 @@ mod tests {
             "jkb\u{a0}./x --gate 'sh /tmp/p.sh'",
             "jkb\u{a0}evil",
         ] {
+            assert_eq!(attestation(other), Attestation::Ask, "{other}");
+        }
+        // Skipped -- no ticket, no decision -- because jkb is only mentioned, by a HARMLESS
+        // command or not as a word at all.
+        for skip in [
+            "ls",
+            "cargo build -p jkb-cli",
+            "echo jkb-core",
+            "grep -rn jkb src",
+            "echo jkb",
+        ] {
             assert_eq!(attestation(skip), Attestation::Skip, "{skip}");
         }
     }
 
     /// The words bash passes for a command, and how many times it ran `jkb`. `jkb` is installed as
     /// a shell FUNCTION: bash resolves a command word function -> builtin -> `PATH`, so the function
-    /// fires only when the word is exactly `jkb`, and nothing is executed. It therefore proves the
+    /// fires only when the word is exactly `jkb`, and -- unless `executable` -- nothing is executed.
+    /// With `executable`, a fake `jkb` program and `/usr/bin:/bin` are on `PATH`, and a fixture runs
+    /// real system binaries (`sh`, `xargs`, `env`): its safety is the literal fixture list. It proves the
     /// command word is literally `jkb` with no path component -- NOT that the binary came from
     /// `PATH`, which a `jkb` function or alias in the invoking shell would defeat anyway.
     fn bash_argv(
@@ -1275,8 +1289,8 @@ mod tests {
         }
         let mut c = Command::new("/bin/bash");
         c.arg("-c").arg(&script).current_dir(cwd);
-        // Nothing is inherited, so "nothing is executed" is a property of this function rather than
-        // of whatever `ALLOWED` happens to hold. `bash -c` sources `$BASH_ENV`, which would let the
+        // Nothing is inherited, so -- unless `executable` -- "nothing is executed" is a property of
+        // this function rather than of whatever `ALLOWED` happens to hold. `bash -c` sources `$BASH_ENV`, which would let the
         // developer's shell configure the oracle for a security classifier; an inherited `PATH`
         // would let a row that is one bad edit away from approving too much actually run something;
         // and an inherited `GIT_DIR`/`GIT_WORK_TREE` is the measured damage the crate's spawn guard
@@ -1452,6 +1466,8 @@ mod tests {
             "time -p jkb task land x",
             "j''kb task land x",
             "j'k'b task land x",
+            // Round 8: a glob inside quotes is not a jkb word to the lexer, and is to `sh`.
+            "jkb task show x; sh -c '~/.cargo/bin/jk? task land x'",
         ] {
             let class = attestation(cmd);
             let (calls, args) = bash_argv(cmd, &[], cwd, true);
@@ -1469,7 +1485,9 @@ mod tests {
         }
         // Mentioning jkb where nothing runs it needs no ticket at all.
         assert_eq!(attestation("grep -rn jkb src"), Attestation::Skip);
-        assert_eq!(attestation("sh -c 'jkb task show x'"), Attestation::Skip);
+        // A jkb that only something else could run is asked, not skipped: the prompt shows the
+        // whole line, and an approved one still gets its ticket.
+        assert_eq!(attestation("sh -c 'jkb task show x'"), Attestation::Ask);
     }
 
     /// Every character in either list is the SOLE reason its command is not approved. The template
@@ -1511,6 +1529,16 @@ mod tests {
             BREAKS, BREAK,
             "BREAKS changed: change this list too, deliberately"
         );
+        // Growing HARMLESS is the dangerous direction -- each member may share a line with a
+        // ticketed jkb -- so it is pinned like the character lists.
+        assert_eq!(
+            HARMLESS,
+            &[
+                "cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "uniq", "grep",
+                "jq"
+            ],
+            "HARMLESS changed: check the new member for an exec path, then change this too"
+        );
         assert_eq!(
             attestation("jkb task show ab"),
             Attestation::Allow,
@@ -1518,7 +1546,7 @@ mod tests {
         );
         for &c in SPLITS {
             assert_eq!(
-                attestation(&format!("jkb task show a{c}b")),
+                attestation(&format!("jkb task show a{c}true")),
                 Attestation::Defer,
                 "bare {c:?} ends the command, so this is a list and not one invocation"
             );
