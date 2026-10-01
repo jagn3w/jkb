@@ -66,9 +66,10 @@ impl<'a> Kb<'a> {
     }
 
     pub(crate) fn call(&self, request: Request) -> Result<Response> {
+        let op = request.op();
         self.backend
             .call(request)
-            .map_err(|e| op_error(e, self.remote))
+            .map_err(|e| op_error(e, self.remote, op))
     }
 
     /// `task.facts`.
@@ -343,7 +344,7 @@ impl<'a> Kb<'a> {
                     Ok(Verdict::Refused(e.message))
                 }
             }
-            Err(e) => Err(op_error(e, self.remote)),
+            Err(e) => Err(op_error(e, self.remote, "task.landed")),
         }
     }
 

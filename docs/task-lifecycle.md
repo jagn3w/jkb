@@ -1061,6 +1061,12 @@ merge queue re-landing a branch its live landing already records is admitted her
 there. Pinned by `a_caller_who_may_not_land_is_refused_before_the_target_moves`, which makes the task
 otherwise landable — a clean review round, no gate — because without that the review gate refuses
 first, before the graft, under the old code too, and the test would pass for the wrong reason.
+**Deploy order:** `task.land_check` is a new op, so a container client is ahead of a host
+`jkb serve` that has not been rebuilt, and that daemon answers it `bad_request` — "unknown variant".
+It fails closed, but no `jkb task land` works until `./scripts/setup.sh` runs on the host. `op_error`
+reports exactly that rather than the old daemon's list of every op it knows, for any op a stale
+daemon lacks, keyed on the op actually sent (serde words an unknown value inside a request the same
+way). Update the host before, or with, the container.
 
 **Swarm landings follow the task's strategy.** `scripts/merge-queue.sh` records a landing with
 `jkb task landed`, and under the default `design-reviewed` only the operator lands — so a batch
