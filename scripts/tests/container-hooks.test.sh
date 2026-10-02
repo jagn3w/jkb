@@ -723,7 +723,7 @@ case31_a_planted_symlink_is_refused_not_followed() {
     printf 'HOST SECRET\n' > "$d/host/id_ed25519"
     mkdir -p "$co/.container/.jkb"; ln -s "$d/host/id_ed25519" "$co/.container/.jkb/k"
     err="$(dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
-    if [ "$rc" -ne 0 ] && grep -q 'not a regular file' <<<"$err" && [ ! -e "$kit/.container/.jkb/k" ] \
+    if [ "$rc" -ne 0 ] && grep -q 'not a plain file' <<<"$err" && [ ! -e "$kit/.container/.jkb/k" ] \
        && ! grep -rqs 'HOST SECRET' "$kit"; then
         ok "a symlink planted in the checkout is refused, named, and nothing it points at reaches the kit"
     else
@@ -785,6 +785,23 @@ case34_a_link_that_appears_during_the_copy_is_refused() {
     fi
 }
 
+# A HARD LINK is refused as a symlink is: it passes a type test and copies the linked file's bytes
+# (review round 15).
+case35_a_hard_link_in_the_checkout_is_refused() {
+    local d="$work/hl-$RANDOM" co kit p err rc=0
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts" "$d/host"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    printf 'HOST SECRET\n' > "$d/host/key"
+    ln "$d/host/key" "$co/.container/k" 2>/dev/null || { skip "case35: cannot make a hard link here"; return 0; }
+    err="$(dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'second hard link' <<<"$err" && [ ! -e "$kit" ]; then
+        ok "a hard link in the checkout is refused, and nothing it points at reaches the kit"
+    else
+        fail "a hard link in the checkout is refused, and nothing it points at reaches the kit" "rc=$rc err=$err"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -818,5 +835,6 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case31_a_planted_symlink_is_refused_not_followed \
           case32_the_mirror_stages_nothing_in_tmpdir \
           case33_an_older_flat_kit_is_removed \
-          case34_a_link_that_appears_during_the_copy_is_refused
+          case34_a_link_that_appears_during_the_copy_is_refused \
+          case35_a_hard_link_in_the_checkout_is_refused
 finish

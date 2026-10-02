@@ -1197,7 +1197,7 @@ fi
 # NO LINK IN WHAT IS MIRRORED: the mirror's tar dereferences (-h, for the host's hooks), so a link
 # in the kit would put its target's bytes in the container. dc_install_kit refuses them in the copy
 # it makes; this holds the line for a kit made any other way (review round 14).
-kit_odd="$(find "$kit_src" ! -type f ! -type d 2>&1 | head -3)"
+kit_odd="$(dc_unsafe_entries "$kit_src")"
 [ -z "$kit_odd" ] || die "the kit at $kit_src holds something that is not a regular file or a directory, so it is not mirrored: $kit_odd -- reinstall it: run.sh --install-kit"
 kit_rc=0; dc_mirror_hooks "$kit_src" "$DC_CTR_KIT" "$NAME" docker "the container kit" || kit_rc=$?
 [ -z "$kit_stage" ] || rm -rf "$kit_stage"

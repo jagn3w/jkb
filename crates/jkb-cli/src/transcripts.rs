@@ -344,8 +344,8 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
         // EVERY PIPE GETS A THREAD, and all three for the same reason: a pipe nobody is moving
         // blocks whoever is on the other end of it.
         //
-        // The WRITER, because the script is larger than a pipe buffer (127,439 bytes by `wc -c` on
-        // 2026-10-02, against 64KB) and
+        // The WRITER, because the script is well over a 64KB pipe buffer (`wc -c` it; a dated
+        // figure here went stale within a day) and
         // `bash -s` executes as it reads, so a blocking write from here deadlocks the moment the
         // child pauses to run a `find`. The handle is moved in, so the pipe closes when the thread
         // ends and `bash` sees EOF.

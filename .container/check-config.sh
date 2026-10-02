@@ -829,12 +829,24 @@ dc_kit_tilde="~${dc_kit_home#/kit-home-probe}"
 dc_kit_where=""
 case "$dc_kit_home" in /kit-home-probe/?*) ;; *) dc_kit_where=" lib.sh's DC_KIT_HOME [$dc_kit_home] is not under the home;" ;; esac
 dc_posture="$here/../scripts/auto-mode-posture.json"
+# ONE REACH TEST over every place run.sh's trust rests on: the kit, the Homebrew prefixes it keeps
+# on PATH, the directories /usr/local/bin's links point into, and ~/.docker, whose CLI plugins
+# `docker info` runs. An allowWrite entry that is any of them, or an ancestor, lets sandboxed Bash
+# plant code there; the Homebrew arm checked only the Edit deny (review round 15).
+dc_protected="$dc_kit_tilde
+/opt/homebrew
+/usr/local
+/Applications
+~/.docker"
 while IFS= read -r dc_aw; do
     [ -n "$dc_aw" ] || continue
     dc_aw="$(dc_tilde_base "$dc_aw")"
-    if [ "$dc_aw" = "~" ] || [ "$dc_kit_tilde" = "$dc_aw" ] || [ "${dc_kit_tilde#"$dc_aw"/}" != "$dc_kit_tilde" ]; then
-        dc_kit_where="$dc_kit_where the posture's allowWrite entry [$dc_aw] covers it;"
-    fi
+    while IFS= read -r dc_pp; do
+        case "$dc_pp:$dc_aw" in "~"*":~"|*":/") dc_kit_where="$dc_kit_where the posture's allowWrite entry [$dc_aw] covers $dc_pp;"; continue ;; esac
+        if [ "$dc_pp" = "$dc_aw" ] || [ "${dc_pp#"$dc_aw"/}" != "$dc_pp" ]; then
+            dc_kit_where="$dc_kit_where the posture's allowWrite entry [$dc_aw] covers $dc_pp;"
+        fi
+    done <<<"$dc_protected"
 done <<<"$(HOME=/dev/null jq -r '.require.sandbox.filesystem.allowWrite[]? // empty' "$dc_posture" 2>/dev/null)"
 HOME=/dev/null jq -e --arg r "Edit($dc_kit_tilde/**)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
     || dc_kit_where="$dc_kit_where the posture has no Edit($dc_kit_tilde/**) deny, so the in-process file tools can write it;"
@@ -854,7 +866,12 @@ done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(
 # keeps the system and Homebrew prefixes, where docker and jq live. Homebrew's are owned by the user,
 # so the in-process Write tool, which no sandbox confines, could replace a jq there that run.sh then
 # runs as the user (review round 14). The posture denies Edit on both.
-for dc_pfx in //opt/homebrew //usr/local; do
+# ~/.cargo/env too, a FILE: every login shell rustup set up sources it, unsandboxed, while the posture
+# lets sandboxed agents write ~/.cargo for builds (review round 15). One Edit rule is both the Write
+# tool's deny and, merged by Claude Code, the sandbox's denyWrite.
+HOME=/dev/null jq -e '.require.permissions.deny | index("Edit(~/.cargo/env)")' "$dc_posture" >/dev/null 2>&1 \
+    || dc_kit_where="$dc_kit_where the posture has no Edit(~/.cargo/env) deny, so an agent can plant code every login shell sources;"
+for dc_pfx in //opt/homebrew //usr/local //Applications '~/.docker'; do
     HOME=/dev/null jq -e --arg r "Edit($dc_pfx/**)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
         || dc_kit_where="$dc_kit_where the posture has no Edit($dc_pfx/**) deny, so the Write tool can replace a program run.sh runs from there;"
 done
@@ -894,6 +911,19 @@ else
     else
         ok "the repo's committed Claude settings replace none of the $(grep -c . <<<"$dc_envp_names") environment names the container sets"
     fi
+fi
+
+# run.sh CHECKS THE KIT BEFORE IT MIRRORS IT. The mirror's tar dereferences, so a link in the kit
+# would put its target in the container; dc_install_kit refuses one in the copy it makes, and run.sh
+# holds the line for a kit made any other way. No test drives run.sh to that step, so this holds the
+# call in place, ahead of the mirror (review round 15: deleting it left everything green).
+dc_kit_chk="$(grep -n 'kit_odd="$(dc_unsafe_entries "$kit_src")"' <<<"$dc_run_stripped" | head -1 | cut -d: -f1)"
+dc_kit_mir="$(grep -n 'dc_mirror_hooks "$kit_src" "$DC_CTR_KIT"' <<<"$dc_run_stripped" | head -1 | cut -d: -f1)"
+if [ -n "$dc_kit_chk" ] && [ -n "$dc_kit_mir" ] && [ "$dc_kit_chk" -lt "$dc_kit_mir" ] \
+   && grep -qF '[ -z "$kit_odd" ] || die' <<<"$dc_run_stripped"; then
+    ok "run.sh refuses to mirror a kit holding a link, a special file or a hard link, before it mirrors one"
+else
+    bad "run.sh does not check the kit with dc_unsafe_entries, and refuse, before dc_mirror_hooks copies it into the container — a link in the kit would carry its target's bytes in"
 fi
 
 # THE HOOK AND THE SWEEP MUST AGREE ON WHERE THE TREE IS. The hook cannot load the shared reader --

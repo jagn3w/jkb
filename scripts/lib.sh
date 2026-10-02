@@ -131,6 +131,18 @@ git_hooks_dir() {
     printf '%s\n' "$(_real_dir "$common")/hooks"
 }
 
+# is_linked_worktree <repo_root> — rc 0 when <repo_root> is a LINKED worktree (`git worktree add`),
+# rc 1 for a main checkout, and rc 2 outside a repository. Decided by --git-dir against
+# --git-common-dir, which differ only in a linked worktree. Taking the common dir's parent as the
+# main checkout misread a `--separate-git-dir` clone as a linked worktree, so setup.sh never
+# installed the kit there (review round 15).
+is_linked_worktree() {
+    local gd cd
+    gd="$(_git -C "$1" rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 2
+    cd="$(_git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 2
+    [ "$(_real_dir "$gd")" != "$(_real_dir "$cd")" ]
+}
+
 # main_checkout_of <repo_root> — the MAIN checkout of the repository <repo_root> is in: the parent of
 # its common git dir, so a linked worktree answers with the checkout it was added from. Fails outside
 # a repository. setup.sh refreshes the dev container's kit only from here (review round 10).

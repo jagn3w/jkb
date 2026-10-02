@@ -2685,6 +2685,19 @@ case_kit_main() {
     fi
 }
 
-run_cases case_kit_main case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m
+case_kit_linked() {
+    local sep="$work/sep-$RANDOM" r1=9 r2=9 r3=9
+    git_q init -q --separate-git-dir "$sep.git" "$sep" >/dev/null 2>&1
+    is_linked_worktree "$main"; r1=$?
+    is_linked_worktree "$wt"; r2=$?
+    is_linked_worktree "$sep"; r3=$?
+    if [ "$r1$r2$r3" = 101 ]; then
+        ok "is_linked_worktree: main checkout no, linked worktree yes, a --separate-git-dir checkout no"
+    else
+        fail "kit: linked worktree" "main=$r1 worktree=$r2 separate=$r3 (want 1 0 1)"
+    fi
+}
+
+run_cases case_kit_main case_kit_linked case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m
 
 finish

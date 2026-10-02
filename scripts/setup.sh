@@ -218,7 +218,7 @@ fi
 # directory `jkb task land` deleted (review round 10). The main checkout is the parent of the
 # common git dir, which git_hooks_dir already resolves.
 kit_main="$(main_checkout_of "$repo_root" 2>/dev/null)" || kit_main=""
-if [ "$do_kit" -eq 1 ] && [ -n "$kit_main" ] && [ "$(_real_dir "$repo_root")" != "$kit_main" ]; then
+if [ "$do_kit" -eq 1 ] && is_linked_worktree "$repo_root"; then
   kit_state=worktree
   warn "not refreshing the dev container kit from a linked worktree; it follows the main checkout ($kit_main)"
 elif [ "$do_kit" -eq 1 ]; then

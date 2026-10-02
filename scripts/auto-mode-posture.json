@@ -39,7 +39,10 @@
         "Edit(~/.claude/plugins/**)",
       "Edit(~/.local/share/jkb-container-kit/**)",
       "Edit(//opt/homebrew/**)",
-      "Edit(//usr/local/**)"
+      "Edit(//usr/local/**)",
+      "Edit(//Applications/**)",
+      "Edit(~/.docker/**)",
+      "Edit(~/.cargo/env)"
       ]
     },
     "sandbox": {

@@ -471,6 +471,20 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   covers both. The host's own `jkb` lives in `~/.cargo/bin` and is dropped
   too, so the start-time sweep no longer asks it which sessions are live. It holds sessions by its
   recency window instead.
+- **What else run.sh trusts is out of reach too** (review rounds 14 and 15). The posture denies
+  `Edit` on the Homebrew prefixes run.sh keeps on `PATH` (`/opt/homebrew`, `/usr/local`), on
+  `/Applications`, where `/usr/local/bin`'s `docker` and `code` links point, and on `~/.docker`, whose
+  CLI plugins `docker info` runs. `check-config.sh` holds every one of those denies, and refuses an
+  `allowWrite` that covers any of them. Claude Code merges an `Edit` deny into the sandbox's
+  `denyWrite`, so each one rule covers both the Write tool and sandboxed Bash.
+- **`~/.cargo` is half closed, and the open half is a decision.** The posture lets sandboxed agents
+  write `~/.cargo` for builds. Every login shell rustup set up sources `~/.cargo/env`, and
+  `~/.cargo/bin` leads your `PATH`, so a planted file there runs as you in your next terminal, not
+  only in `run.sh`. That predates this branch (review round 15). `~/.cargo/env` is now
+  `Edit`-denied, which costs nothing: only rustup's installer writes it. **`~/.cargo/bin` is not**,
+  because denying it breaks every sandboxed `cargo install`. That includes the container's
+  `post-merge` rebuild of `jkb`, which runs inside an agent's sandbox. `run.sh` drops `~/.cargo/bin`
+  from its own `PATH`; your shells do not.
 - **The checkout's `run.sh` refuses** to start or stop anything and names the kit. That protects the
   habit, not the file: an agent can edit that refusal out. What protects you is that you start the
   kit's `run.sh`.
@@ -2086,8 +2100,8 @@ this way for `.claude/commands/*.md`) and fed to `docker exec -i … bash -s` on
 then no copy in the image to drift, no rebuild to require, and no path for two files to agree about —
 the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was built from. (The kit's
 mirror is a second copy now; see the superseded note above.) It is written
-from a thread, because the script is larger than a 64KB pipe buffer (127,439 bytes by `wc -c` on
-2026-10-02; it was 74KB when this was written) and `bash -s` executes as it
+from a thread, because the script is well over a 64KB pipe buffer (`wc -c` it; it was 74KB when
+this was written, and a dated figure here went stale within a day) and `bash -s` executes as it
 reads: a blocking write from the main thread deadlocks the moment the child pauses to run a `find`.
 
 Two things the same round caught about the tick itself. It had **no timeout**, and it runs *before*

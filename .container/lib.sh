@@ -472,6 +472,14 @@ dc_kit_paths() { # one path per line, relative to a checkout
     printf '%s\n' .container scripts/lib.sh scripts/link-claude-memory.sh scripts/auto-mode.sh scripts/auto-mode-posture.json
 }
 
+# dc_unsafe_entries <path> -> up to three entries under <path> that could carry a host file into the
+# kit, or nothing: a symlink, a special file, or a regular file with a second hard link. A find error
+# prints too, so an unreadable tree is not read as clean. ONE predicate for the three places that
+# ask -- the checkout before the copy, the staged copy after it, and run.sh before it mirrors a kit.
+dc_unsafe_entries() { # dc_unsafe_entries <path>
+    find "$1" \( ! -type f ! -type d \) -o \( -type f -links +1 \) 2>&1 | head -3
+}
+
 # dc_install_kit <checkout> <kit dir> -- copy the kit's paths from <checkout> into <kit dir>, whole
 # or not at all: assembled beside it, then swapped in by rename, so a failed copy leaves the old kit
 # in place and a half-copied one is never what runs. Records <checkout> in the marker, which is how
@@ -488,8 +496,12 @@ dc_install_kit() { # dc_install_kit <checkout> <kit dir>
     local odd
     while IFS= read -r p; do
         [ -e "$src/$p" ] || { echo "dc_install_kit: $src has no $p, so it is not a checkout this kit can come from" >&2; return 1; }
-        odd="$(find "$src/$p" ! -type f ! -type d 2>&1 | head -3)"
-        [ -z "$odd" ] || { echo "dc_install_kit: refusing $p: it holds something that is not a regular file or a directory (a symlink could copy a host file into the kit): $odd" >&2; return 1; }
+        # ...nor a regular file with a second hard link: `ln ~/.jkb-container/credential .container/k`
+        # passes the type test and copies the credential's bytes (review round 15). Measured in the
+        # container: the sandbox cannot even see a read-denied file there, so `ln` fails; on the macOS
+        # host that is unmeasured, which is why this is checked rather than assumed.
+        odd="$(dc_unsafe_entries "$src/$p")"
+        [ -z "$odd" ] || { echo "dc_install_kit: refusing $p: it holds something that is not a plain file or directory -- a symlink, a special file, or a file with a second hard link, any of which could copy a host file into the kit: $odd" >&2; return 1; }
     done <<EOF
 $(dc_kit_paths)
 EOF
@@ -505,7 +517,7 @@ EOF
     # ...AND THE COPY IS CHECKED, not only the source: the source check runs before the copy, and a
     # link the agent made between the two landed in the kit (review round 14, reproduced in 6 of 40
     # runs with a toggling link). Nothing but this function writes $new, so this answer holds.
-    odd="$(find "$new" ! -type f ! -type d 2>&1 | head -3)"
+    odd="$(dc_unsafe_entries "$new")"
     [ -z "$odd" ] || { echo "dc_install_kit: refusing: the copy holds something that is not a regular file or a directory (it appeared in the checkout during the copy): $odd" >&2; rm -rf "$new"; return 1; }
     printf 'checkout=%s\n' "$src" > "$new/$DC_KIT_MARKER" || { rm -rf "$new"; return 1; }
     chmod -R go-w "$new" && chmod 0755 "$new" || { rm -rf "$new"; return 1; }

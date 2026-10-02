@@ -581,6 +581,43 @@ posture_rule_base() { # posture_rule_base <path pattern> -> literal prefix
     printf '%s\n' "$out"
 }
 
+# posture_brace_expand <pattern> -> the global array posture_brace_out: every expansion of its
+# braces, nested groups included. Returns 1 past 64 expansions or on unbalanced braces, where the
+# caller falls back. The same walk as deny-transcripts.sh's brace_expand, which cannot load this
+# file: it is installed alone, root-owned.
+posture_brace_expand() { # posture_brace_expand <pattern>
+    local s i c depth open close pre body post cur a o="${1//[^\{]/}" x="${1//[^\}]/}"
+    local -a todo=("$1") alts
+    posture_brace_out=()
+    [ "${#o}" -eq "${#x}" ] || return 1
+    while [ "${#todo[@]}" -gt 0 ]; do
+        s="${todo[0]}"; todo=("${todo[@]:1}")
+        case "$s" in *"{"*) ;; *) posture_brace_out+=("$s"); continue ;; esac
+        pre="${s%%\{*}"; open=-1; close=-1; depth=0
+        for ((i = ${#pre}; i < ${#s}; i++)); do
+            c="${s:i:1}"
+            if [ "$c" = "{" ]; then [ "$depth" -eq 0 ] && open=$i; depth=$((depth + 1))
+            elif [ "$c" = "}" ] && [ "$depth" -gt 0 ]; then depth=$((depth - 1)); [ "$depth" -eq 0 ] && { close=$i; break; }
+            fi
+        done
+        [ "$close" -ge 0 ] || return 1
+        pre="${s:0:open}"; body="${s:open+1:close-open-1}"; post="${s:close+1}"
+        alts=(); cur=""; depth=0
+        for ((i = 0; i < ${#body}; i++)); do
+            c="${body:i:1}"
+            case "$c" in
+                "{") depth=$((depth + 1)); cur+="$c" ;;
+                "}") depth=$((depth - 1)); cur+="$c" ;;
+                ,) if [ "$depth" -eq 0 ]; then alts+=("$cur"); cur=""; else cur+="$c"; fi ;;
+                *) cur+="$c" ;;
+            esac
+        done
+        alts+=("$cur")
+        for a in "${alts[@]}"; do todo+=("$pre$a$post"); done
+        [ $(( ${#todo[@]} + ${#posture_brace_out[@]} )) -le 64 ] || return 1
+    done
+}
+
 # Whether a rule covers a path, with Claude Code's SUBTREE semantics: a rule naming a directory
 # covers everything under it -- measured, a bare `Read(~/.claude/projects)` denied a Read of
 # <slug>/memory/MEMORY.md. `$1` is deliberately unquoted: it is the rule's glob.
@@ -595,32 +632,23 @@ posture_rule_covers() { # posture_rule_covers <path pattern> <path> -> rc 0 cove
     # is covered. A `case` pattern does not expand braces, so `{projects,x}` read as one literal
     # directory and covered nothing, while Claude Code may expand it -- unmeasured, so this errs
     # towards finding a rule that reaches the tree or memory (review round 13).
-    # A GROUP WITH NO `/` names one segment's alternatives, and is matched as exactly those, an
-    # extglob `@(a|b)`: read as "anything under the base", `~/.{ssh,aws}/**` covered every transcript
-    # and auto-memory, refused the container and switched the sweep on (review round 14). A group
-    # holding a `/`, or nested, spans segments, and only that falls back to the base's subtree.
+    # A BRACE IS EXPANDED, boundedly, and every expansion canonicalised and matched on its own:
+    # `{,x}` is a real `~/.claude//` and `{..,x}` a real climb, which an extglob alternation read as
+    # naming nothing, and an alternation's cost grew exponentially with the number of groups
+    # (review round 15, replacing round 14's extglob). Past 64 expansions, or with unbalanced
+    # braces, it falls back to everything under the rule's literal base -- erring towards guarding.
     case "$1" in
         *"{"*)
-            local pat="$1" conv="" grp rc=1 had_ext
-            while :; do
-                case "$pat" in *"{"*) ;; *) conv="$conv$pat"; break ;; esac
-                conv="$conv${pat%%\{*}"; pat="${pat#*\{}"
-                case "$pat" in *"}"*) ;; *) conv=""; break ;; esac
-                grp="${pat%%\}*}"; pat="${pat#*\}}"
-                case "$grp" in */*|*"{"*) conv=""; break ;; esac
-                conv="$conv@(${grp//,/|})"
-            done
-            if [ -z "$conv" ]; then
-                local b; b="$(posture_rule_base "$1")"
-                [ "$2" = "$b" ] || [ "${2#"${b%/}"/}" != "$2" ] && return 0
+            local e
+            if posture_brace_expand "$1"; then
+                for e in "${posture_brace_out[@]}"; do
+                    posture_rule_covers "$(posture_canon "$e")" "$2" && return 0
+                done
                 return 1
             fi
-            had_ext=0; shopt -q extglob && had_ext=1
-            shopt -s extglob
-            # shellcheck disable=SC2254
-            case "$2" in $conv|$conv/*) rc=0 ;; esac
-            [ "$had_ext" -eq 1 ] || shopt -u extglob
-            return "$rc" ;;
+            local b; b="$(posture_rule_base "$1")"
+            [ "$2" = "$b" ] || [ "${2#"${b%/}"/}" != "$2" ] && return 0
+            return 1 ;;
     esac
     case "$2" in $1|$1/*) return 0 ;; esac
     return 1
@@ -667,7 +695,7 @@ posture_layer_files() { # posture_layer_files <managed-settings.json> -> one pat
 # have stood the sweep down while the argv grew; asking only "does anything expand" would instead
 # be fooled by the seven `Edit(~/repos/**/...)` rules, which expand but name no transcript.
 posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
-    local f rules rule pat base root layers kind proot home="${HOME:-/home/vscode}" proots
+    local f rules rule pat base root layers kind proot home="${HOME:-/home/vscode}" proots e
     [ -r "$1" ] || return 0
     # The transcript tree as the sweep itself finds it -- CLAUDE_CONFIG_DIR honoured exactly as
     # TRANSCRIPT_ROOT honours it -- plus the state volume's spelling. AN ARRAY: a config dir under
@@ -735,6 +763,16 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
             # OVERLAP, not three probes: any expanding rule whose literal prefix contains, or lies
             # inside, the transcript tree is counted. That over-counts a glob that could only match
             # memory notes, which is the cheap direction to be wrong in.
+            # A BRACE RULE IS JUDGED BY EVERY EXPANSION, each canonicalised, since its literal base
+            # stops before the brace: `~/repos/{..,x}/.claude/projects/**` cut to `~/repos`, which
+            # holds no transcript, while its first expansion climbs into the tree (review round 15).
+            # One it cannot expand is cannot-tell, so yes.
+            local -a pats=("$pat")
+            case "$pat" in
+                *"{"*) posture_brace_expand "$pat" || return 0
+                       pats=(); for e in "${posture_brace_out[@]}"; do pats+=("$(posture_canon "$e")"); done ;;
+            esac
+            for pat in "${pats[@]}"; do
             base="$(posture_rule_base "$pat")"
             for root in "${proots[@]}"; do
                 # The base IS the tree, or lies INSIDE it: counted outright.
@@ -750,6 +788,7 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
                         case "$probe" in "$root"/*) posture_rule_covers "$pat" "$probe" && return 0 ;; esac
                     done
                 fi
+            done
             done
         done <<<"$rules"
     done <<<"$layers"
@@ -1706,6 +1745,19 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
        "$(posture_rule_covers '/h/.{ssh,aws}/**' /h/.aws/credentials && echo covered || echo clear)" covered
     eq "a brace that spans segments still covers its base's subtree" \
        "$(posture_rule_covers '/h/{.claude/projects,x}/**' /h/.claude/projects/-p/e.jsonl && echo covered || echo clear)" covered
+    # Round 15: an EMPTY or `..` alternative is a real expansion, and the group count is bounded.
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/{,x}/**/*.jsonl)"]}}' >"$pdir/brace2.json"
+    eq "a brace with an empty first alternative still enumerates" "$(pe "$pdir/brace2.json")" yes
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/{x,}/**/*.jsonl)"]}}' >"$pdir/brace3.json"
+    eq "...and with an empty last one" "$(pe "$pdir/brace3.json")" yes
+    printf '%s\n' '{"permissions":{"deny":["Read(~/repos/{..,x}/.claude/projects/**/*.jsonl)"]}}' >"$pdir/brace4.json"
+    eq "...and a .. alternative that climbs into the tree" "$(pe "$pdir/brace4.json")" yes
+    eq "a nested group expands too" \
+       "$(posture_rule_covers '/h/{x,{.aws,.ssh}}/**' /h/.ssh/id && echo covered || echo clear)" covered
+    bt0=$(date +%s%N)
+    posture_rule_covers '/h/*{a,b}*{a,b}*{a,b}*{a,b}*{a,b}*{a,b}*{a,b}*{a,b}*' /h/.claude/projects/-p/e.jsonl >/dev/null
+    case "$bt0" in *N) bt1=0 ;; *) bt1=$(( ($(date +%s%N) - bt0) / 1000000 )) ;; esac
+    eq "eight brace groups are answered fast, past the expansion cap" "$([ "$bt1" -lt 500 ] && echo fast || echo "slow: ${bt1}ms")" fast
     printf '%s\n' '{"permissions":{"deny":["Read(~/.{ssh,aws}/**)"]}}' >"$pdir/brace1.json"
     eq "a one-segment brace rule outside the tree does not switch the sweep on" "$(pe "$pdir/brace1.json")" no
     # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.

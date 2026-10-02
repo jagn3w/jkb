@@ -51,8 +51,10 @@
 # 32768 a `~`-led 8-way 4KB pattern still took 2.9s, because a `~name` prefix is judged twice
 # (round 14), so the cap is 12288: the slowest Glob under it, `~{a0..a7}/` and 745 segments, takes
 # 0.82s. It refuses `{d0,...,d63}/**/*.rs` (17KB of work), the price of the margin. The MCP arm caps
-# path segments x bases at 12000 (round 14: 100 leaves of 2000 segments reached 10s); the slowest
-# call under that cap, two 1990-segment relative strings from three bases, takes 1.32s. It was ~7ms before five review rounds added guards; the number is
+# path segments x bases at 12000 (round 14: 100 leaves of 2000 segments reached 10s) AND check()
+# calls at 32 (round 15: 600 calls passed the segment cap and ran 4.6s idle, 20s with 10 busy
+# loops on 10 cores). The slowest call under both, five `~name/` strings from three bases (30
+# calls), takes 0.26s idle and 2.14s with 10 busy loops, measured that way on 2026-10-02. It was ~7ms before five review rounds added guards; the number is
 # re-measured rather than carried, because this hook now runs on EVERY tool call.
 #
 # PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
@@ -673,6 +675,14 @@ if [ "${1:-}" = --self-test ]; then
     case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
     if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
     else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
+    # REVIEW ROUND 15. The cost is check() calls, not segments: 100 short `~name/` strings from three
+    # bases passed the segment cap and ran 4.6s idle, 20s under load. Refused on a count, and fast.
+    many="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb/a", tool_input:{p:[range(100) as $i | ("~u\($i)/" + ([range(37)|"a/"]|join("")))]}}')"
+    t0=$(date +%s%N)
+    h "100 ~name strings from three bases are refused on a check count" deny "$many" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
+    if [ "$t1" -lt 1500 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
+    else printf '  \033[31mFAIL\033[0m ...but it took %sms\n' "$t1"; fails=$((fails+1)); fi
     # REVIEW ROUND 13. 64 long, distinct prefixes made glob_base's per-prefix work run past the
     # timeout, which fails open: refused on a budget before any prefix is walked, and fast.
     slow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:("~/.claude/projects/" + ([range(6)|"{.,./}"]|join("")) + ([range(1960)|"./"]|join("")) + "*/*.jsonl")}}')"
@@ -1001,6 +1011,19 @@ case "$tool" in
         segs=0
         for leaf in ${leaves[@]+"${leaves[@]}"}; do sl="${leaf//[^\/]/}"; segs=$((segs + ${#sl} + 1)); done
         [ $(( segs * ${#bases[@]} )) -le 12000 ] || exit 3
+        # ...AND ON THE NUMBER OF check() CALLS, which is what the time goes on: each forks realpath
+        # and walks the path. Under the segment cap, 100 short `~name/` strings from three bases
+        # made 600 calls and ran 4.6s idle, 20s under load (review round 15). An absolute path is
+        # one call, a relative one one per base, a `~name` one two per base (both readings).
+        nchk=0
+        for leaf in ${leaves[@]+"${leaves[@]}"}; do
+            case "$leaf" in
+                /*|"~/"*|"~") nchk=$((nchk + 1)) ;;
+                "~"*) nchk=$((nchk + 2 * ${#bases[@]})) ;;
+                *) nchk=$((nchk + ${#bases[@]})) ;;
+            esac
+        done
+        [ "$nchk" -le 32 ] || exit 3
         for leaf in ${leaves[@]+"${leaves[@]}"}; do
             # A SLASHLESS ~word in free text is a home only if that account exists. `~retry` is jkb's
             # own one-word vector search and `~2h` an estimate; reading them as home directories

@@ -1685,7 +1685,7 @@ p = sys.argv[1]; d = json.load(open(p))
 d["require"]["sandbox"]["filesystem"]["allowWrite"].append("~/.local/share")
 json.dump(d, open(p, "w"), indent=2)
 PYX
-run "the posture lets sandboxed Bash write over the kit" "covers it"
+run "the posture lets sandboxed Bash write over the kit" "covers ~/.local/share/jkb-container-kit"
 
 seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
 import json, sys
@@ -1702,7 +1702,7 @@ old = '$HOME/.local/share/jkb-container-kit}'
 assert old in s, "mutation target absent"
 open(p, 'w').write(s.replace(old, '$HOME/.jkb/container-kit}', 1))
 PYX
-run "the kit moves back under ~/.jkb" "covers it"
+run "the kit moves back under ~/.jkb" "covers ~/.jkb/container-kit"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
@@ -1803,7 +1803,7 @@ p = sys.argv[1]; d = json.load(open(p))
 d["require"]["sandbox"]["filesystem"]["allowWrite"].append("~/.local/**")
 json.dump(d, open(p, "w"), indent=2)
 PYX
-run "a glob allowWrite entry over the kit" "covers it"
+run "a glob allowWrite entry over the kit" "covers ~/.local/share/jkb-container-kit"
 
 seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
 import json, sys
@@ -1811,7 +1811,41 @@ p = sys.argv[1]; d = json.load(open(p))
 d["require"]["sandbox"]["filesystem"]["allowWrite"].append("/Users/someone/.local/share")
 json.dump(d, open(p, "w"), indent=2)
 PYX
-run "an absolute allowWrite entry over the kit" "covers it"
+run "an absolute allowWrite entry over the kit" "covers ~/.local/share/jkb-container-kit"
+
+# REVIEW ROUND 15. Every place run.sh's trust rests on, and the kit checked before it is mirrored.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowWrite"].append("/opt/homebrew")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "an allowWrite entry over /opt/homebrew" "covers /opt/homebrew"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(//opt/homebrew/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on /opt/homebrew" "no Edit(//opt/homebrew/**) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.cargo/env)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on ~/.cargo/env" "no Edit(~/.cargo/env) deny"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'kit_odd="$(dc_unsafe_entries "$kit_src")"\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'kit_odd=""\n', 1))
+PYX
+run "run.sh stops checking the kit before mirroring it" "does not check the kit with dc_unsafe_entries"
 
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
@@ -2269,7 +2303,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=116
+PINNED_BAD_SITES=117
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
