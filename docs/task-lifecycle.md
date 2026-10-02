@@ -963,8 +963,10 @@ absolute. `sort`, `printf`, `sed`, `awk` and `uniq` are deliberately off the lis
 prompts in front of the person, including on commands that only mentioned the repo's path
 (`cd /home/vscode/repos/jkb && … 2>&1`, which an unmodellable-line rule asked). The user's rule
 reversed it: the ticket is authorization, and RBAC decides. Each prompt was standing in for
-something already covered. *Who* may land is `may_land`, asked before anything moves
-(`task.land_check`). *What* a landing's gate runs is `sh -c` inside the same Bash sandbox as every
+something already covered. *Who* may land is `may_land`, asked before the graft moves the
+target, the gate runs or the session is archived (`task.land_check`) — though not before every
+side effect: the `.git/info/exclude` entry, the land lease and adopting the target from its remote
+come first. *What* a landing's gate runs is `sh -c` inside the same Bash sandbox as every
 agent command, so it reaches nothing the agent could not reach itself — and the default gate is a
 repo script the agent can edit anyway, so a prompt on `--gate` guarded nothing. A stored gate cannot
 be set from the container at all (`remote.rs` refuses it); `--gate-on-host` needs `task.ran_on_host`,
@@ -986,7 +988,7 @@ and `run_through_bash_a_redirect_comment_or_heredoc_is_never_approved` for round
 hold that none of them is ever approved. `HARMLESS` is pinned as a literal list, since growing it is
 the dangerous direction.
 
-**Superseded: `ask` for anything that is not one plain invocation.** That was the whole of the
+**Superseded, twice: `ask` for anything that is not one plain invocation.** That was the whole of the
 over-prompting, and it was a design error rather than a tuning problem. A `PreToolUse` `ask`
 *overrides* an allow rule, so adding attestation quietly took a decision that belonged to the
 user's settings and made it more conservatively than they had: every `cd repo && jkb …` and
@@ -996,8 +998,9 @@ user's settings and made it more conservatively than they had: every `cd repo &&
 the ticket. It was first applied to every non-plain line, on the reasoning that it "costs nothing
 on the security axis" because a ticket is an authorization fact rather than a permission grant.
 Rounds 7 and 8 refuted that: the ticket is exported for the whole line, so any other program on it
-inherits the authorization, and `jkb ls && rm -rf …` — the very example above — is asked again
-for that reason.
+inherits the authorization, and `jkb ls && rm -rf …` — the very example above — was asked again
+for that reason, until the 2026-10-02 reversal above: it is now deferred, ticketed, with RBAC
+bounding what the inherited ticket may do.
 
 The rewrite still goes out for every ticketed class, because that is how the ticket reaches `jkb`
 and it is a genuine per-tool-call secret: **each Bash tool call runs in its own PID namespace**
@@ -1013,7 +1016,7 @@ either answer.
 
 *`updatedInput` is applied with no `permissionDecision`.* `cd /tmp && ~/.cargo/bin/jkb role
 whoami` — a two-command list, deferred at the time, for which the hook then emitted no decision
-(under the allowlist that followed, a path to `jkb` is asked; the mechanism measured still holds) —
+(a path to `jkb` was later asked, and is now deferred again; the mechanism measured holds) —
 arrived with `JKB_ATTEST` set, and the daemon answered `coordinator` rather than `Unauthorized`.
 The schema had marked the field optional, but that was read out of the installed bundle; this is
 the observation. Had it gone the other way, every deferred call would have lost its ticket.
@@ -1023,13 +1026,14 @@ jkb role whoami` ran with **no** permission prompt, where the old hook forced on
 here had been that the rules match the rewritten command (`export JKB_ATTEST=…; cd … && jkb …`), in
 which case the `export` part would match no rule and prompt anyway. The deny-rule probe
 (`Bash(export:*)` in `permissions.deny`, then one deferred call) produced an approval prompt rather
-than a refusal, so the rules see the original text. That is also why the prefix spellings matter:
-a `Bash(jkb:*)` rule is matched against the text the model wrote, which is why `land` is located
-wherever the `jkb` word sits rather than only at index 0.
+than a refusal, so the rules see the original text: a `Bash(jkb:*)` rule is matched against the
+text the model wrote. (That once mattered for locating `land` behind a prefix; the classifier no
+longer looks for `land` at all.)
 
 A trap met while measuring, worth keeping: a probe that itself contains `$` — `echo
-${JKB_ATTEST:+present}` — is asked by design, because a command this cannot model cannot be
-cleared of `land`. It looked like the fix failing and was the guard working.
+${JKB_ATTEST:+present}` — was asked by design at the time, because a command the classifier cannot
+model could not be cleared of `land`. It looked like the fix failing and was the guard working.
+(It is now deferred: an unmodellable line is simply not approved.)
 
 **Rollback**: `JKB_ATTEST_DECISION=ask` forces the prompt on every ticketed class
 with no rebuild — the hook binary is pinned and root-owned, so a rollback that needs one is not a
@@ -1048,8 +1052,11 @@ ordinary calls there are. The rule now turns on whether the shell would read a c
 - `$`, a backtick and a backslash are refused **anywhere**, quoted or not. They are what the word
   reader cannot model — the first two substitute inside double quotes, the third escapes the quoting
   itself — so with any of them present its output is not a model of anything.
-- Every other metacharacter (`; & | < > ( ) { } # ! * ? [ ]` and a line break) is refused only when
-  it appears **bare**. Inside either kind of quote the shell passes it through as text.
+- Every other metacharacter matters only when it appears **bare**; inside either kind of quote the
+  shell passes it through as text. Bare, the separators `; & |` and a line break SPLIT the line into
+  commands, each judged on its own; `< > ( ) { } # * ? [ ]` leave nothing the classifier can model,
+  and `!` and a carriage return are read as word breaks — a line carrying any of these is not
+  approved (it was "refused" when this was written; it is now deferred).
 - A `~` is in neither list, because it has no quoted spelling that still expands. A word holding an
   unquoted `~` anywhere is accepted only when it also carries a `/`, so that whatever the tilde
   expands to, the `/` survives. "Anywhere" is load-bearing: bash expands a tilde after an

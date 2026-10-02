@@ -682,22 +682,21 @@ fn runs_jkb(command: &str) -> bool {
     tokens(command).iter().any(|w| is_jkb(w))
 }
 
-/// Commands that may share a line with `jkb` and still let it be deferred: ones with no path to
-/// run other code, WRITE a file, or change which program a later word names -- so nothing on the
-/// line but `jkb` can reach the ticket and use it. Matched on
-/// the command word exactly -- a path, an assignment prefix or a wrapper in front is something else.
+/// Commands that may share a line with `jkb` and still let the hook APPROVE the line -- an approval
+/// that overrides the session's own permission rules for every command on it. So a member must
+/// have no path to run other code, WRITE a file, or change which program a later word names.
+/// Matched on the command word exactly -- a path, an assignment prefix or a wrapper in front is
+/// something else.
 ///
-/// An ALLOWLIST, because every attempt to name the dangerous cases instead fell short. The ticket is
-/// `export`ed for the whole line, so anything else that runs inherits it, and review rounds 7 and 8
-/// each found a `jkb task land` that inherited it out of sight: `sh -c "jkb …"`, `xargs jkb`,
-/// `env -S`, a glob inside quotes, a script file, `jkb ls | ./evil`. Kept short on purpose, and
+/// An ALLOWLIST, because every attempt to name the dangerous cases instead fell short: review
+/// rounds 7 and 8 each found a jkb run out of sight -- `sh -c "jkb …"`, `xargs jkb`, `env -S`, a glob
+/// inside quotes, a script file, `jkb ls | ./evil` -- that a denylist missed. Kept short on purpose, and
 /// checked for exec AND write paths: `sort` is out (`--compress-program` runs a program), `printf`
 /// is out (`printf -v PATH …` repoints the next `jkb`), `sed` and `awk` are out (`e`, `system()`),
 /// and `uniq` is out -- `uniq IN OUT` writes OUT, and `uniq evil ~/.cargo/bin/jkb; jkb ls` replaced
-/// the binary the next command ran, exec bit kept (review round 9, coreutils 9.4). `cd` is
-/// in only because `PATH` holds no relative or empty entry, so the directory cannot change which
-/// `jkb` runs (measured on the container's real PATH: eleven entries, all absolute -- not the Mac
-/// PATH a stray `env.PATH` in the shared `.claude/settings.local.json` once substituted for it).
+/// the binary the next command ran, exec bit kept (review round 9, coreutils 9.4). `cd` is in only
+/// because `PATH` holds no relative or empty entry, so the directory cannot change which `jkb`
+/// runs; the measurement is recorded once, in D52.9 of docs/task-lifecycle.md.
 const HARMLESS: &[&str] = &[
     "cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "grep", "jq",
 ];
@@ -725,7 +724,8 @@ enum Attestation {
     /// OVERRIDES an allow rule, so a mechanism meant to be invisible kept putting prompts in front of
     /// the person. Superseded by the user's rule, 2026-10-02: the ticket is authorization, and the
     /// daemon's RBAC decides what it may do. Each prompt was standing in for something already
-    /// covered: who may land is `may_land`, asked before anything moves (`task.land_check`); the gate
+    /// covered: who may land is `may_land`, asked before the graft, the gate or the session's
+    /// disposal (`task.land_check`; an exclude entry, the lease and remote adoption come first); the gate
     /// a landing runs is `sh -c` inside the same Bash sandbox as every agent command; a stored gate
     /// cannot be set from the container at all; `--gate-on-host` is operator-only; and `main` changes
     /// only through a PR, whose CI is the verification that counts. A ticket inherited by another
@@ -1113,101 +1113,102 @@ mod tests {
         "jkb task show\u{3000}x",
     ];
 
+    /// Lines approved as a whole: every command on them is `jkb` itself or HARMLESS, so nothing on
+    /// them can run or write anything but jkb -- the over-prompting the hook was changed to remove.
+    /// Some were once forced to a prompt (`land`, `gate`): what a jkb may do is the daemon's RBAC,
+    /// the gate runs in the same sandbox as every agent command, and a stored gate cannot be set
+    /// from the container at all.
+    const APPROVED_LINES: &[&str] = &[
+        "cd repo && jkb workflow next",
+        "jkb task show x | jq .status",
+        "jkb task list --json | head -20",
+        "cd repo; jkb ls; echo done",
+        "jkb task show x\njkb task show y",
+        "jkb task land task:x",
+        "jkb --json task land task:x --gate true",
+        "jkb task 'land' task:x --gate 'sh /tmp/p.sh'",
+        "jkb task gate",
+        "jkb task add 'ok' && jkb task land task:x",
+    ];
+
+    /// Lines the classifier cannot model, so it does not approve them -- only an approval overrides
+    /// the session's own rules -- but tickets them, and those rules judge them.
+    const UNMODELLED: &[&str] = &[
+        "jkb task show ~",
+        "jkb task show ~+",
+        "jkb task edit x --text \"$(cat /etc/passwd)\"",
+        "jkb task add 'x' `whoami`",
+        "jkb task add \"x\" \\; rm -rf /",
+        "jkb task add '$(whoami)'",
+        "jkb task add 'unbalanced",
+        "jkb ls > /tmp/out",
+        "jkb task list --json 2>&1",
+        "jkb task show x 2>/dev/null",
+        "jkb task show x # a note",
+        "jkb ls *",
+        "jkb task show {a,b}",
+        // A bare `!` is understood, but makes the line more than plain invocations.
+        "jkb task show x!y",
+    ];
+
+    /// Lines with something that is neither `jkb` nor HARMLESS on them, or `jkb` reached other than
+    /// by its command word: approving the line would approve the rest past the person's own rule.
+    const OTHER: &[&str] = &[
+        "jkb ls && rm -rf ~/repos/other",
+        "jkb ls\nrm -rf /",
+        "jkb task show x | ./evil.sh",
+        "jkb ls; sh f",
+        "jkb ls; make",
+        "jkb ls; sh -c '~/.cargo/bin/jk? task land x --gate evil'",
+        "jkb ls; sh -c 'jkb task show x'",
+        "sh -c 'jkb task show x'",
+        "echo x | xargs jkb task show",
+        // `jkb` reached other than by its command word: a path is any file called jkb, and a
+        // prefix or wrapper can change what runs with the ticket.
+        "./jkb ls",
+        "~/.cargo/bin/jkb ls",
+        "FOO=1 jkb ls",
+        "LD_PRELOAD=/tmp/x.so jkb ls",
+        "PATH=/tmp/evil jkb ls",
+        "timeout 300 jkb ls",
+        // Repointing `jkb` for the rest of the line, with no character the lexer asks about.
+        "PATH=/tmp/evil; jkb ls",
+        "hash -p /tmp/evil jkb; jkb ls",
+        "printf -v PATH /tmp/evil; jkb ls",
+        "jkb ls | sort --compress-program=/tmp/evil",
+        // Bash splits on blanks alone, so the command word here is `jkb\u{a0}task`, not `jkb`.
+        "jkb\u{a0}task show x",
+        "\u{a0}jkb task show x",
+        // Measured: this ran an arbitrary program with only a writable cwd. A command word
+        // containing `/` is never searched on PATH, so `jkb\u{a0}./x` is the relative path
+        // `jkb\u{a0}.` / `x` -- no PATH entry needed, and no character from either list used.
+        "jkb\u{a0}./x --gate 'sh /tmp/p.sh'",
+        "jkb\u{a0}evil",
+        "sudo jkb task land task:x",
+    ];
+
+    /// Lines that only MENTION jkb -- in a HARMLESS command's arguments, or not as a word at all.
+    const MENTIONS: &[&str] = &[
+        "ls",
+        "cargo build -p jkb-cli",
+        "echo jkb-core",
+        "grep -rn jkb src",
+        "echo jkb",
+    ];
+
     #[test]
     fn a_line_of_only_jkb_and_harmless_commands_is_approved_and_the_rest_is_deferred() {
         for allow in ALLOWED {
             assert_eq!(attestation(allow), Attestation::Allow, "{allow}");
         }
-        // Approved as lines: every command is `jkb` itself or HARMLESS, so nothing on them can run
-        // or write anything but jkb. This is the over-prompting the hook was changed to remove.
-        for allow in [
-            "cd repo && jkb workflow next",
-            "jkb task show x | jq .status",
-            "jkb task list --json | head -20",
-            "cd repo; jkb ls; echo done",
-            "jkb task show x\njkb task show y",
-        ] {
+        for allow in APPROVED_LINES {
             assert_eq!(attestation(allow), Attestation::Allow, "{allow}");
         }
-        // Approved too, though each was once forced to a prompt: what a jkb may do is the daemon's
-        // RBAC (`may_land`, asked before anything moves), the gate runs in the same sandbox as every
-        // agent command, and a stored gate cannot be set from the container at all.
-        for allow in [
-            "jkb task land task:x",
-            "jkb --json task land task:x --gate true",
-            "jkb task 'land' task:x --gate 'sh /tmp/p.sh'",
-            "jkb task gate",
-            "jkb task add 'ok' && jkb task land task:x",
-        ] {
-            assert_eq!(attestation(allow), Attestation::Allow, "{allow}");
-        }
-        // Deferred: the line cannot be modelled, so it is not approved -- only an approval overrides
-        // the session's own rules -- but it is ticketed, and those rules judge it.
-        for defer in [
-            "jkb task show ~",
-            "jkb task show ~+",
-            "jkb task edit x --text \"$(cat /etc/passwd)\"",
-            "jkb task add 'x' `whoami`",
-            "jkb task add \"x\" \\; rm -rf /",
-            "jkb task add '$(whoami)'",
-            "jkb task add 'unbalanced",
-            "jkb ls > /tmp/out",
-            "jkb task list --json 2>&1",
-            "jkb task show x 2>/dev/null",
-            "jkb task show x # a note",
-            "jkb ls *",
-            "jkb task show {a,b}",
-            // A bare `!` is understood, but makes the line more than plain invocations.
-            "jkb task show x!y",
-        ] {
+        for defer in UNMODELLED.iter().chain(OTHER) {
             assert_eq!(attestation(defer), Attestation::Defer, "{defer}");
         }
-        // Deferred: something on the line is not jkb and not harmless, so approving the line would
-        // approve it too, past the rule the person set for it.
-        for other in [
-            "jkb ls && rm -rf ~/repos/other",
-            "jkb ls\nrm -rf /",
-            "jkb task show x | ./evil.sh",
-            "jkb ls; sh f",
-            "jkb ls; make",
-            "jkb ls; sh -c '~/.cargo/bin/jk? task land x --gate evil'",
-            "jkb ls; sh -c 'jkb task show x'",
-            "sh -c 'jkb task show x'",
-            "echo x | xargs jkb task show",
-            // `jkb` reached other than by its command word: a path is any file called jkb, and a
-            // prefix or wrapper can change what runs with the ticket.
-            "./jkb ls",
-            "~/.cargo/bin/jkb ls",
-            "FOO=1 jkb ls",
-            "LD_PRELOAD=/tmp/x.so jkb ls",
-            "PATH=/tmp/evil jkb ls",
-            "timeout 300 jkb ls",
-            // Repointing `jkb` for the rest of the line, with no character the lexer asks about.
-            "PATH=/tmp/evil; jkb ls",
-            "hash -p /tmp/evil jkb; jkb ls",
-            "printf -v PATH /tmp/evil; jkb ls",
-            "jkb ls | sort --compress-program=/tmp/evil",
-            // Bash splits on blanks alone, so the command word here is `jkb\u{a0}task`, not `jkb`.
-            "jkb\u{a0}task show x",
-            "\u{a0}jkb task show x",
-            // Measured: this ran an arbitrary program with only a writable cwd. A command word
-            // containing `/` is never searched on PATH, so `jkb\u{a0}./x` is the relative path
-            // `jkb\u{a0}.` / `x` -- no PATH entry needed, and no character from either list used.
-            "jkb\u{a0}./x --gate 'sh /tmp/p.sh'",
-            "jkb\u{a0}evil",
-            "sudo jkb task land task:x",
-        ] {
-            assert_eq!(attestation(other), Attestation::Defer, "{other}");
-        }
-        // Skipped -- no ticket, no decision -- because jkb is only mentioned, by a HARMLESS
-        // command or not as a word at all.
-        for skip in [
-            "ls",
-            "cargo build -p jkb-cli",
-            "echo jkb-core",
-            "grep -rn jkb src",
-            "echo jkb",
-        ] {
+        // Skipped -- no ticket, no decision.
+        for skip in MENTIONS {
             assert_eq!(attestation(skip), Attestation::Skip, "{skip}");
         }
     }
@@ -1224,18 +1225,29 @@ mod tests {
         env: &[(&str, &str)],
         cwd: &std::path::Path,
         executable: bool,
-    ) -> (usize, Vec<String>) {
+    ) -> (usize, Vec<String>, Vec<String>) {
         use std::process::Command;
         // The function reports on fd 9, which the command under test never names. It reported on
         // stdout once, and a fixture that redirects stdout (`jkb task land>out x`) sent the report
         // into the file: `args` came back empty, `.any(|a| a == "land")` was trivially false, and a
         // model that dropped the word before a redirect passed (measured, by that mutation).
         let capture = tempfile::NamedTempFile::new().expect("capture file");
+        // And every simple command bash runs is logged by its command word, on fd 8, through a
+        // DEBUG trap -- which fires once per simple command, pipeline members included, and not
+        // inside function bodies (measured; `set -T` would descend into them). Quote characters are
+        // stripped from the word, as bash removes them. The HARMLESS externals are stand-in
+        // functions, so they "run" under the empty PATH without any binary.
+        let ran = tempfile::NamedTempFile::new().expect("command log");
         let script = format!(
             "exec 9>'{}'\n\
+             exec 8>'{}'\n\
              jkb() {{ printf '\u{2}' >&9; for a in \"$@\"; do printf '%s\u{1}' \"$a\" >&9; done; }}\n\
+             cat() {{ :; }}; head() {{ :; }}; tail() {{ :; }}; wc() {{ :; }}; grep() {{ :; }}; jq() {{ :; }}\n\
+             __ran() {{ local w=${{BASH_COMMAND%% *}}; w=${{w//\\'/}}; w=${{w//\\\"/}}; printf '%s\u{1}' \"$w\" >&8; }}\n\
+             trap __ran DEBUG\n\
              {cmd}",
-            capture.path().display()
+            capture.path().display(),
+            ran.path().display()
         );
         // With `executable`, a `jkb` program is on `PATH` as well as the function, reporting the same
         // way: a function is visible only to this shell, so `sh -c "jkb …"`, `xargs jkb` and
@@ -1282,7 +1294,13 @@ mod tests {
             .map(str::to_owned)
             .collect();
         args.pop(); // the empty tail after the final separator
-        (calls, args)
+        let mut commands: Vec<String> = std::fs::read_to_string(ran.path())
+            .expect("the command log is utf-8")
+            .split('\u{1}')
+            .map(str::to_owned)
+            .collect();
+        commands.pop();
+        (calls, args, commands)
     }
 
     /// The table above asserts what the classifier decides; this asserts the decision was about the
@@ -1303,7 +1321,7 @@ mod tests {
         let cwd = dir.path();
         std::fs::create_dir(cwd.join("land")).expect("a `land` directory to point OLDPWD at");
         for cmd in ALLOWED {
-            let (calls, args) = bash_argv(cmd, &[], cwd, false);
+            let (calls, args, _) = bash_argv(cmd, &[], cwd, false);
             assert_eq!(
                 calls, 1,
                 "bash did not run exactly one `jkb`: {cmd:?} -> {args:?}"
@@ -1338,7 +1356,7 @@ mod tests {
             // naming a missing one (measured -- it was silently empty here, so `~-` stayed literal
             // and this half of the check proved nothing). The call count is asserted too, so an
             // empty `hostile` cannot pass `.any()` trivially.
-            let (calls, hostile) = bash_argv(
+            let (calls, hostile, _) = bash_argv(
                 cmd,
                 &[("HOME", "land"), ("OLDPWD", "land"), ("PWD", "land")],
                 cwd,
@@ -1350,6 +1368,45 @@ mod tests {
                 "a hostile HOME made an approved command pass `land`: {cmd:?} -> {hostile:?}"
             );
         }
+    }
+
+    /// The one property an approval rests on, measured in bash rather than read off the model: on a
+    /// line the classifier APPROVES, bash runs nothing but `jkb` and HARMLESS commands. Every row of
+    /// the classification table goes through, approved or not, so a classifier that wrongly
+    /// approved a line with anything else on it fails here. The approved lists were first checked
+    /// only against the model, and the bash oracle took single commands only (review of the
+    /// never-ask change).
+    #[test]
+    fn run_through_bash_an_approved_line_runs_nothing_but_jkb_and_harmless_commands() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cwd = dir.path();
+        std::fs::create_dir(cwd.join("repo")).expect("a `repo` directory for `cd repo`");
+        let mut approved = 0;
+        let rows = ALLOWED
+            .iter()
+            .chain(APPROVED_LINES)
+            .chain(UNMODELLED)
+            .chain(OTHER)
+            .chain(MENTIONS);
+        for line in rows {
+            if attestation(line) != Attestation::Allow {
+                continue;
+            }
+            approved += 1;
+            let (calls, _, ran) = bash_argv(line, &[], cwd, false);
+            assert!(calls >= 1, "bash ran no jkb in approved {line:?}: {ran:?}");
+            for word in &ran {
+                assert!(
+                    word == "jkb" || HARMLESS.contains(&word.as_str()),
+                    "approved {line:?} ran `{word}` ({ran:?})"
+                );
+            }
+        }
+        assert_eq!(
+            approved,
+            ALLOWED.len() + APPROVED_LINES.len(),
+            "the approved rows are exactly the approved lists"
+        );
     }
 
     /// Run through bash rather than trusted: a line carrying a bare redirect, comment, here-doc, `!`
@@ -1394,7 +1451,7 @@ mod tests {
                 Attestation::Defer,
                 "{cmd:?} may run differently from how it is read, so it is not approved"
             );
-            let (calls, _) = bash_argv(cmd, &[], cwd, false);
+            let (calls, _, _) = bash_argv(cmd, &[], cwd, false);
             // At least one: a comment or here-doc fixture spans lines and can run jkb on each. A row
             // bash never ran jkb in is not a line the hook would ticket, and checks nothing.
             assert!(
@@ -1429,7 +1486,7 @@ mod tests {
             // matched nothing and the row could never reach a jkb (round 9).
             "jkb task show x; sh -c './jk? task land x'",
         ] {
-            let (calls, args) = bash_argv(cmd, &[], cwd, true);
+            let (calls, args, _) = bash_argv(cmd, &[], cwd, true);
             // Every row is built so that some jkb really runs, with `land` in its argv: one that did
             // not would check nothing, whatever the classifier said (round 9 found a row that could not).
             assert!(
