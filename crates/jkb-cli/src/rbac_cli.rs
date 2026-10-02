@@ -697,15 +697,18 @@ fn runs_jkb(command: &str) -> bool {
 /// the binary the next command ran, exec bit kept (review round 9, coreutils 9.4). `cd` is in only
 /// because `PATH` holds no relative or empty entry, so the directory cannot change which `jkb`
 /// runs; the measurement is recorded once, in D52.9 of docs/task-lifecycle.md.
-const HARMLESS: &[&str] = &[
-    "cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "grep", "jq",
-];
+///
+/// No READER is on it either, by the user's decision (2026-10-02): `cat`, `grep`, `head`, `tail`,
+/// `wc` and `jq` were, and approving `jkb ls; cat ~/repos/other/.env` then read a file past any
+/// rule the person had for reads. Every member left is a shell builtin that reads no file, so
+/// `jkb … | jq` is deferred -- under the auto posture still unprompted, under stricter rules theirs.
+const HARMLESS: &[&str] = &["cd", "true", "false", ":", "echo"];
 
 /// What the attestation hook does with a Bash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attestation {
     /// No `jkb` that could run with a ticket -- the line only MENTIONS jkb, in the arguments of a
-    /// `HARMLESS` command (`grep -rn jkb src`) or not as a word at all: left alone, no ticket, no
+    /// `HARMLESS` command (`echo jkb`) or not as a word at all: left alone, no ticket, no
     /// decision.
     Skip,
     /// Ticketed, and the line approved: every command on it is `jkb` itself or `HARMLESS`, so
@@ -902,7 +905,7 @@ fn attestation(command: &str) -> Attestation {
             }
         }
     }
-    // No jkb to ticket and none that might run: leave the line alone (`grep -rn jkb src`).
+    // No jkb to ticket and none that might run: leave the line alone (`echo jkb`).
     if jkb == 0 && !mentions {
         return Attestation::Skip;
     }
@@ -911,9 +914,9 @@ fn attestation(command: &str) -> Attestation {
     if other || !plain {
         return Attestation::Defer;
     }
-    // Every command is jkb or harmless: approved, so `cd repo && jkb workflow next` and
-    // `jkb task show x | jq .status` never prompt. What each jkb may DO is the daemon's RBAC, held
-    // against the ticket on every request -- not this hook's.
+    // Every command is jkb or harmless: approved, so `jkb task show x` and `cd repo && jkb workflow
+    // next` never prompt. What each jkb may DO is the daemon's RBAC, held against the ticket on
+    // every request -- not this hook's.
     Attestation::Allow
 }
 
@@ -1120,8 +1123,6 @@ mod tests {
     /// from the container at all.
     const APPROVED_LINES: &[&str] = &[
         "cd repo && jkb workflow next",
-        "jkb task show x | jq .status",
-        "jkb task list --json | head -20",
         "cd repo; jkb ls; echo done",
         "jkb task show x\njkb task show y",
         "jkb task land task:x",
@@ -1154,6 +1155,12 @@ mod tests {
     /// Lines with something that is neither `jkb` nor HARMLESS on them, or `jkb` reached other than
     /// by its command word: approving the line would approve the rest past the person's own rule.
     const OTHER: &[&str] = &[
+        // Readers are not harmless (the user's decision): approving the line would read past the
+        // person's own rules. Deferred -- under the auto posture still unprompted.
+        "jkb task show x | jq .status",
+        "jkb task list --json | head -20",
+        "jkb ls; cat ~/repos/other/.env",
+        "grep -rn jkb src",
         "jkb ls && rm -rf ~/repos/other",
         "jkb ls\nrm -rf /",
         "jkb task show x | ./evil.sh",
@@ -1188,13 +1195,7 @@ mod tests {
     ];
 
     /// Lines that only MENTION jkb -- in a HARMLESS command's arguments, or not as a word at all.
-    const MENTIONS: &[&str] = &[
-        "ls",
-        "cargo build -p jkb-cli",
-        "echo jkb-core",
-        "grep -rn jkb src",
-        "echo jkb",
-    ];
+    const MENTIONS: &[&str] = &["ls", "cargo build -p jkb-cli", "echo jkb-core", "echo jkb"];
 
     #[test]
     fn a_line_of_only_jkb_and_harmless_commands_is_approved_and_the_rest_is_deferred() {
@@ -1235,14 +1236,13 @@ mod tests {
         // And every simple command bash runs is logged by its command word, on fd 8, through a
         // DEBUG trap -- which fires once per simple command, pipeline members included, and not
         // inside function bodies (measured; `set -T` would descend into them). Quote characters are
-        // stripped from the word, as bash removes them. The HARMLESS externals are stand-in
-        // functions, so they "run" under the empty PATH without any binary.
+        // stripped from the word, as bash removes them. Every HARMLESS command is a builtin, so an
+        // approved line runs under the empty PATH without any binary.
         let ran = tempfile::NamedTempFile::new().expect("command log");
         let script = format!(
             "exec 9>'{}'\n\
              exec 8>'{}'\n\
              jkb() {{ printf '\u{2}' >&9; for a in \"$@\"; do printf '%s\u{1}' \"$a\" >&9; done; }}\n\
-             cat() {{ :; }}; head() {{ :; }}; tail() {{ :; }}; wc() {{ :; }}; grep() {{ :; }}; jq() {{ :; }}\n\
              __ran() {{ local w=${{BASH_COMMAND%% *}}; w=${{w//\\'/}}; w=${{w//\\\"/}}; printf '%s\u{1}' \"$w\" >&8; }}\n\
              trap __ran DEBUG\n\
              {cmd}",
@@ -1500,7 +1500,7 @@ mod tests {
             );
         }
         // Mentioning jkb where nothing runs it needs no ticket at all.
-        assert_eq!(attestation("grep -rn jkb src"), Attestation::Skip);
+        assert_eq!(attestation("echo jkb"), Attestation::Skip);
         // Spelled with quotes inside the word, bash still runs `jkb`, and the line is approved like
         // the plain spelling: quote removal is modelled.
         assert_eq!(attestation("j''kb task land x"), Attestation::Allow);
@@ -1550,7 +1550,7 @@ mod tests {
         // ticketed jkb -- so it is pinned like the character lists.
         assert_eq!(
             HARMLESS,
-            &["cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "grep", "jq"],
+            &["cd", "true", "false", ":", "echo"],
             "HARMLESS changed: check the new member for an exec AND a file-write path, then change \
              this too"
         );

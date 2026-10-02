@@ -938,9 +938,13 @@ the way; it never forces a prompt. What a ticketed `jkb` may DO is the daemon's 
 the ticket on every request. Three answers:
 
 - **`allow`** for a line whose every command is `jkb` itself — the command word literally `jkb` —
-  or one of a short `HARMLESS` allowlist (`cd`, `true`, `false`, `:`, `echo`, `cat`, `head`, `tail`,
-  `wc`, `grep`, `jq`) with no path to run other code, write a file or repoint `jkb`. So `jkb task show
-  x`, `cd repo && jkb workflow next` and `jkb … | jq .status` never prompt, in any mode.
+  or one of a short `HARMLESS` allowlist (`cd`, `true`, `false`, `:`, `echo` — shell builtins with
+  no path to run other code, read or write a file, or repoint `jkb`). So `jkb task show x` and
+  `cd repo && jkb workflow next` never prompt, in any mode. No reader is on the list, by the user's
+  decision (2026-10-02): with `cat`, `grep`, `head`, `tail`, `wc` and `jq` on it, `jkb ls; cat
+  ~/repos/other/.env` was approved and read a file past any rule the person had for reads. So
+  `jkb … | jq .status` is deferred — under the auto posture still unprompted, under stricter rules
+  theirs.
 - **no `permissionDecision`** for any other line that mentions `jkb`: one that also runs something
   else (`jkb ls && git status`), one the classifier cannot model (a redirect, `$`, a glob, a bare
   tilde), one that reaches `jkb` by a path, a prefix or a wrapper (`~/.cargo/bin/jkb`, `FOO=1 jkb`,
@@ -948,7 +952,8 @@ the ticket on every request. Three answers:
   the model wrote it, not the rewritten one carrying `export JKB_ATTEST=…` (measured, below) —
   approving it would approve the rest of the line past whatever rule the person set for that.
 - **nothing at all**, no ticket either, for a line that only *mentions* jkb as a harmless command's
-  argument (`grep -rn jkb src`).
+  argument (`echo jkb`). A reader's mention (`grep -rn jkb src`) is now deferred and ticketed, since a
+  reader is not on the list; the unused ticket costs nothing.
 
 Only an `allow` overrides the session's rules, so only an approved line has to be understood, and
 the property the tests hold is that one: an approved line runs nothing but `jkb` and harmless
