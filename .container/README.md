@@ -181,8 +181,15 @@ Needs a container runtime on the host (Docker Desktop, OrbStack, colima, or Appl
 which macOS does not ship.
 
 ```sh
-./.container/run.sh             # build if needed, start, firewall, setup, verify
+./.container/run.sh --install-kit      # once, and after reviewing a change to .container/ or scripts/
+~/.jkb/container-kit/.container/run.sh # build if needed, start, firewall, setup, verify
 ```
+
+**Start it from the kit, not from the checkout** (see *Everything unsandboxed runs from the kit*
+below). `scripts/setup.sh` installs and refreshes the kit too. The checkout's `run.sh` refuses to
+start or stop anything. Its `--self-test`, `--print-args`, `--dry-run` and `--install-kit` still
+work, and `JKB_RUN_FROM_CHECKOUT=1` lets it start the container while you iterate on this directory.
+Every `run.sh` below means the kit's.
 
 ### On an AppArmor host, the profile must be loaded — and a reboot unloads it
 
@@ -398,6 +405,68 @@ derivation, because a rename dropping `publisher` from `ui/vscode/package.json` 
 make that assertion silently check one fewer extension — the invisible-again failure. Both steps
 are skipped where the repo builds no extension of its own, since this container is meant to serve
 any repo under `~/repos`.
+
+## Everything unsandboxed runs from the kit
+
+**The failure, found in review round 8's self-review.** The sandbox can write the checkout (probed:
+`touch .container/x` succeeds from sandboxed Bash), and every script that runs *outside* the sandbox
+ran from it:
+
+- on the host, `run.sh` and the `lib.sh` it sources, as you, on every start;
+- in the container, through `docker exec`, the sweep, `setup.sh`, `verify.sh`, `lib.sh` for the
+  login step, and the `scripts/link-claude-memory.sh` and `scripts/auto-mode.sh` that `verify.sh`
+  executes on every start, all with the container credential readable.
+
+Editing one of them was as good as planting a binary on `PATH`, which rounds 4 to 8 had closed one
+door at a time. Read-only binds over those files would have been the speed bump the git-config
+binds above are documented as, because renaming the directory around a bind gets past it.
+
+**What runs now.** One list, `dc_kit_paths` in `lib.sh`, names `.container/` and the four files
+under `scripts/` that those scripts run or read. `run.sh --install-kit` copies them to
+`~/.jkb/container-kit` (`DC_KIT_DIR`), whole or not at all, and records the checkout they came from.
+It copies and runs nothing. The container cannot see `~/.jkb` beyond two subdirectories (the table
+above), so it cannot change the kit.
+
+- **On the host**, the kit's `run.sh` starts the container. Its `repo` is the recorded checkout, the
+  one the container is for. Every file it runs or hands docker comes from the kit: `lib.sh`,
+  `container.json`, the Dockerfile and build context, and the seccomp profile, which docker reads
+  from `${localWorkspaceFolder}`, now the kit's root.
+- **In the container**, every start mirrors the kit to `/usr/local/lib/jkb-container`
+  (`DC_CTR_KIT`), root-owned, through the same root step that copies the host's git hooks. The sweep,
+  `setup.sh`, the login step and `verify.sh` run from there, and learn the checkout from
+  `JKB_REPO_ROOT`. A failed mirror stops the start rather than falling back to the checkout.
+  `verify.sh` asserts the mirror is root's, carries its marker, is not writable by the container
+  user, and is where `verify.sh` itself is running from.
+- **The checkout's `run.sh` refuses** to start or stop anything and names the kit. That protects the
+  habit, not the file: an agent can edit that refusal out. What protects you is that you start the
+  kit's `run.sh`.
+- **A stale kit is reported, not followed.** On every start the kit's `run.sh` names any kit path the
+  checkout has changed since install, and keeps using the kit. Taking a change is
+  `run.sh --install-kit`, which lists the changed paths first. `scripts/setup.sh` refreshes the kit
+  as well, so a pull that touches code refreshes it through `post-merge`. A pull that touches only
+  `.container/` does not trigger `post-merge`, and leaves the kit stale until you run
+  `--install-kit`. A pull is already the point where you review what an agent changed (*Git runs
+  the host's hooks* above).
+
+**Held by** `check-config.sh`. Every `docker exec` in `run.sh` and `lib.sh` names an absolute program
+and pins `PATH`, and none runs a `.container/` path outside `"$DC_CTR_KIT"`. Every script that
+`setup.sh`, `verify.sh` and `install-extensions.sh` run from `scripts/` is in `dc_kit_paths`, and none
+reaches the checkout's `scripts/` or `.container/`. A mutation exists for each.
+`scripts/tests/container-hooks.test.sh` covers the installer, the stale report and the pinned execs.
+`scripts/tests/container-login.test.sh` covers the checkout's refusal and the kit's `--stop`, which
+sources the mirror's `lib.sh`.
+
+**Residuals, stated.**
+
+- *First-run setup builds the checkout.* `setup.sh` runs `cargo install` on the checkout, and
+  `install-extensions.sh` runs `scripts/install-extension.sh` from it, which builds `ui/` through
+  pnpm. Both execute checkout code unsandboxed, in the container, once per container. That is what
+  setup is for, and it is the same exposure as the host's `post-merge` build (*Git runs the host's
+  hooks*). The mitigation is the same too: review before you rebuild.
+- *The kit is trusted at install.* The first `--install-kit`, and every `setup.sh` run, copy whatever
+  the checkout holds at that moment.
+- *`verify.sh` still inherits the image's `PATH`* for the toolchain it checks
+  (`task:verify-sh-runs-unsandboxed-with--18da6e4b5d893488`). Its own code now comes from the kit.
 
 ## The mount list is the security boundary
 
@@ -1404,13 +1473,12 @@ O(files) of argv. What
   `~/.cargo` by design, once, before its marker exists. And nothing checked the `HOME=/dev/null`
   prefix this paragraph said `check-config.sh` held; it now requires it on every `jq` in the sweep's
   real run and in `verify.sh`, where one memory-matcher read lacked it.
-  **Two things in the same class are older than this branch, and filed rather than fixed here.**
-  `lib.sh`'s hook mirror runs `docker exec -u root ... sh -c`, so a planted `~/.cargo/bin/sh` runs
-  *as root* on every start. More fundamentally, every unsandboxed script here is loaded from the
-  checkout, which the sandbox can write. `run.sh` and `lib.sh` run on the host, the sweep, `verify.sh`
-  and `setup.sh` run in the container through `docker exec`, and the reaper pipes the checkout's
-  sweep. Editing one of them is as good as planting a binary, which makes the `PATH` work above
-  necessary but not sufficient. The fix is the hook's: a root-owned copy installed in the image.
+  **Two older problems in the same class came up in that round's self-review, and both are fixed
+  here.** `lib.sh`'s hook mirror ran `docker exec -u root ... sh -c`, so a planted `~/.cargo/bin/sh`
+  ran *as root* on every start. Its four execs now name absolute programs and pin `PATH`, and the
+  exec scan covers `lib.sh` as well as `run.sh`. More fundamentally, every unsandboxed script was
+  loaded from the checkout, which the sandbox writes, so editing one was as good as planting a
+  binary. They run from a kit now, described in *Everything unsandboxed runs from the kit* above.
   **Still open, and older than this branch:** `verify.sh` runs unsandboxed with that same `PATH`, and
   it has to. It checks the installed toolchain, so it runs the `jkb` in `~/.cargo/bin`, which the
   sandbox can write. Its one call this branch added, `jkb notify sessions --live-ids`, now uses the

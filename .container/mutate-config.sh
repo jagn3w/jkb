@@ -428,9 +428,9 @@ run "a transcript that raced away is counted as a failure again" "counts a trans
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'bash .container/sweep-transcripts.sh || true'
+old = 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh" || true'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'JKB_DENY_BUDGET_BYTES=99999999 bash .container/sweep-transcripts.sh || true', 1))
+open(p, 'w').write(s.replace(old, 'JKB_DENY_BUDGET_BYTES=99999999 bash "$DC_CTR_KIT/.container/sweep-transcripts.sh" || true', 1))
 PYX
 run "run.sh wires the self-test budget seam into the container" "sets JKB_DENY_BUDGET_BYTES"
 
@@ -736,9 +736,9 @@ run "the sweep gains a success exit with no phrase behind it" "success exits, pi
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" /bin/bash .container/verify.sh'
+old = 'in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/verify.sh"'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" /bin/bash .container/verify.sh', 1))
+open(p, 'w').write(s.replace(old, 'in_container -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/verify.sh"', 1))
 PYX
 run "verify.sh measures a different tree from the one the sweep acted on" "verify.sh is measured without the live-session list"
 
@@ -834,9 +834,9 @@ run "the irreducible measure is renamed, so the guard reads nothing" "no transcr
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'bash .container/verify.sh'
+old = 'bash "$DC_CTR_KIT/.container/verify.sh"'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'bash .container/verify-renamed.sh', 1))
+open(p, 'w').write(s.replace(old, 'bash "$DC_CTR_KIT/.container/verify-renamed.sh"', 1))
 PYX
 run "run.sh has no verify statement to order the sweep against" "no verify.sh statement to order it against"
 
@@ -892,7 +892,7 @@ seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
 lines = s.split('\n')
-hit = [i for i, l in enumerate(lines) if 'bash .container/sweep-transcripts.sh' in l and not l.lstrip().startswith('#')]
+hit = [i for i, l in enumerate(lines) if 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"' in l and not l.lstrip().startswith('#')]
 assert len(hit) == 1, "mutation target absent"
 del lines[hit[0]]
 open(p, 'w').write('\n'.join(lines))
@@ -907,7 +907,7 @@ def only(needle):
     hit = [i for i, l in enumerate(lines) if needle in l and not l.lstrip().startswith('#')]
     assert len(hit) == 1, "mutation target absent"
     return hit[0]
-sweep, verify = only('bash .container/sweep-transcripts.sh'), only('bash .container/verify.sh')
+sweep, verify = only('bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"'), only('bash "$DC_CTR_KIT/.container/verify.sh"')
 assert sweep < verify, "mutation target absent"
 line = lines.pop(sweep)
 lines.insert(verify, line)
@@ -923,9 +923,9 @@ run "the sweep moves after the verify, where a failing assertion disables it" "A
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'bash .container/sweep-transcripts.sh || true'
+old = 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh" || true'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'bash .container/sweep-transcripts.sh', 1))
+open(p, 'w').write(s.replace(old, 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"', 1))
 PYX
 run "the sweep invocation stops being non-fatal" "does not append \`|| true\` to it"
 
@@ -1255,7 +1255,7 @@ seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys, re
 p = sys.argv[1]; s = open(p).read()
 out = [l for l in s.split("\n")
-       if not re.match(r'^\s*(in_container|docker exec).*bash \.container/verify\.sh', l)]
+       if not re.match(r'^\s*(in_container|docker exec).*bash "\$DC_CTR_KIT/\.container/verify\.sh"', l)]
 assert len(out) < len(s.split("\n")), "no verify invocation line to delete"
 open(p, 'w').write("\n".join(out))
 PYX
@@ -1504,7 +1504,7 @@ run "the sweep's PATH pin moves back into the real-run arm" "the sweep's first c
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('/bin/bash .container/sweep-transcripts.sh', 'bash .container/sweep-transcripts.sh', 1))
+open(p, 'w').write(s.replace('/bin/bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"', 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"', 1))
 PYX
 run "run.sh starts the sweep with a bare bash" "run.sh does not start sweep-transcripts.sh with /bin/bash"
 
@@ -1549,7 +1549,7 @@ run "the reaper's docker exec finds bash on PATH" "the reaper's docker exec does
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-open(p, 'w').write(s.replace('/bin/bash .container/verify.sh', 'bash .container/verify.sh', 1))
+open(p, 'w').write(s.replace('/bin/bash "$DC_CTR_KIT/.container/verify.sh"', 'bash "$DC_CTR_KIT/.container/verify.sh"', 1))
 PYX
 run "run.sh starts verify.sh with a bare bash" "run.sh does not start verify.sh with /bin/bash"
 
@@ -1609,6 +1609,70 @@ assert s.count(old) == 2, "mutation target absent"
 open(p, 'w').write(s.replace(old, '/.claude-state/elsewhere"'))
 PYX
 run "the hook forgets the transcript archive" "hook:.claude-state/transcript-archive"
+
+# THE KIT (review round 8's self-review). What runs unsandboxed comes from the kit, never the checkout.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '/bin/bash "$DC_CTR_KIT/.container/setup.sh"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '/bin/bash .container/setup.sh', 1))
+PYX
+run "run.sh runs setup.sh from the checkout again" "runs a script from the checkout's .container/"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = """/bin/bash -c '. "$1" && dc_persist_login' _ "$DC_CTR_KIT/.container/lib.sh" \\\n    || say"""
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, """/bin/bash -c '. .container/lib.sh && dc_persist_login' \\\n    || say""", 1))
+PYX
+run "the login step sources the checkout's lib.sh again" "runs a script from the checkout's .container/"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"$docker" exec -i -u root -e PATH=/usr/bin:/bin "$name" /bin/sh -c \''
+assert s.count(old) == 2, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"$docker" exec -i -u root "$name" sh -c \'', 1))
+PYX
+run "the hook mirror's root step finds sh on PATH again" "starts [sh] by PATH lookup"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"$docker" exec -e PATH=/usr/bin:/bin "$name" /bin/mkdir -p'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"$docker" exec "$name" /bin/mkdir -p', 1))
+PYX
+run "the hook mirror's mkdir stops pinning PATH" "without -e PATH=/usr/bin:/bin"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'if "$kit_dc/scripts/auto-mode.sh" check'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'if "$mem_repo/scripts/auto-mode.sh" check', 1))
+PYX
+run "verify.sh runs the checkout's auto-mode.sh again" "reaches the checkout's scripts"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ' scripts/auto-mode.sh scripts/auto-mode-posture.json'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, ' scripts/auto-mode-posture.json', 1))
+PYX
+run "the kit stops carrying a script verify.sh runs" "which the kit does not carry"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    printf '%s\\n' .container scripts/lib.sh"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "    : printf '%s\\n' .container scripts/lib.sh", 1))
+PYX
+run "the kit list prints nothing" "dc_kit_paths printed nothing"
 
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
@@ -1962,11 +2026,11 @@ PS='< <'
 seed; python3 - "$work/t/.container/run.sh" "$PS" <<'PYX'
 import sys
 p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
-old = ('ARGS_OUT="$(assembled_args "$repo")" || die "container.json could not be read; '
+old = ('ARGS_OUT="$(assembled_args "${KIT_ROOT:-$repo}")" || die "container.json could not be read; '
        'refusing to start a container from a partial declaration"\n'
        'while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"')
 assert old in s, "mutation target absent"
-new = 'while IFS= read -r line; do ARGS+=("$line"); done %s(assembled_args "$repo")' % ps
+new = 'while IFS= read -r line; do ARGS+=("$line"); done %s(assembled_args "${KIT_ROOT:-$repo}")' % ps
 open(p, 'w').write(s.replace(old, new, 1))
 PYX
 run "run.sh reads its assembly through a process substitution again" "which discards its refusal"
@@ -2066,7 +2130,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=111
+PINNED_BAD_SITES=112
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
@@ -2112,7 +2176,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=21
+PINNED_UNSB_APPENDS=23
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

@@ -118,7 +118,9 @@ persist_login() {
         echo "warning: could not start $NAME to move its login into the state volume; if you are logged out after this, that is why" >&2
         return 0
     fi
-    docker exec -e PATH=/usr/bin:/bin -w "$ctr" "$NAME" /bin/bash -c '. .container/lib.sh && dc_persist_login' \
+    # From the root-owned kit mirror, never the checkout (lib.sh's DC_KIT_DIR says why). A container
+    # whose mirror predates the kit has none, and this warns below.
+    docker exec -e PATH=/usr/bin:/bin -w "$ctr" "$NAME" /bin/bash -c '. "$1" && dc_persist_login' _ "$DC_CTR_KIT/.container/lib.sh" \
         || echo "warning: could not move $NAME's login into the state volume; if a rebuild logs you out, this is why" >&2
 }
 
@@ -550,6 +552,31 @@ fi
 # shellcheck source=/dev/null
 . "$here/lib.sh"
 
+# RUN FROM THE KIT, NOT FROM A CHECKOUT (lib.sh's DC_KIT_DIR has the record). This script, lib.sh and
+# everything they start used to run from the checkout, which the agent's sandbox can write, so an
+# agent's edit here ran as you at the next start. In the kit, `repo` is the checkout recorded at
+# install -- the repository the container is for -- and everything this script RUNS comes from the
+# kit. From a checkout, only the modes that start nothing work (--self-test, --print-args,
+# --dry-run, --consumed-keys) and --install-kit; JKB_RUN_FROM_CHECKOUT=1 is the developer's
+# override, for iterating on this directory, and it says so.
+KIT_ROOT=""
+if [ -f "$here/../$DC_KIT_MARKER" ]; then
+    KIT_ROOT="$(cd "$here/.." && pwd)"
+    repo="$(dc_kit_checkout "$KIT_ROOT")" && [ -d "$repo" ] \
+        || die "the kit at $KIT_ROOT records no checkout that exists (${repo:-none}) -- reinstall it from one: <checkout>/.container/run.sh --install-kit"
+fi
+require_kit() {
+    [ -n "$KIT_ROOT" ] && return 0
+    if [ "${JKB_RUN_FROM_CHECKOUT:-0}" = 1 ]; then
+        echo "warning: running from the checkout ($here) because JKB_RUN_FROM_CHECKOUT=1 -- the agent can write every script this runs" >&2
+        return 0
+    fi
+    die "this is the checkout's run.sh, which the agent's sandbox can write -- start the container from the installed kit instead:
+    $DC_KIT_DIR/.container/run.sh${1:+ $1}
+  Install or refresh the kit from this checkout, after reviewing what changed in .container/ and scripts/:
+    $here/run.sh --install-kit"
+}
+
 BUILD=0 DRY=0 OPEN=0 open_path=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -557,6 +584,18 @@ while [ $# -gt 0 ]; do
         --dry-run)       DRY=1; shift ;;
         --open)          OPEN=1; shift; case "${1:-}" in -*|"") ;; *) open_path="$1"; shift ;; esac ;;
         --consumed-keys) consumed_keys; exit 0 ;;
+        # COPIES, never runs: dc_install_kit copies the kit's paths from the checkout and executes
+        # nothing in it. From the kit, the checkout is the one recorded at install, and what changed
+        # since is listed first, so a refresh is a decision about named files.
+        --install-kit)   if [ -f "$DC_KIT_DIR/$DC_KIT_MARKER" ]; then
+                             kit_changed="$(dc_kit_stale "$DC_KIT_DIR" "$repo")"
+                             if [ -z "$kit_changed" ] && [ "$(dc_kit_checkout "$DC_KIT_DIR")" = "$(cd "$repo" && pwd -P)" ]; then
+                                 echo "the kit at $DC_KIT_DIR already matches $repo"; exit 0
+                             fi
+                             [ -z "$kit_changed" ] || { echo "changed in $repo since the kit was installed:"; printf '    %s\n' $kit_changed; }
+                         fi
+                         dc_install_kit "$repo" "$DC_KIT_DIR" || die "the kit was not installed"
+                         echo "start the container from it: $DC_KIT_DIR/.container/run.sh"; exit 0 ;;
         # THE CONTROL'S FLAGS COME FROM HERE (D54.1). Deliberately before the `container_path`
         # check below: that refuses a checkout outside ~/repos, which is right for STARTING a
         # container and wrong for printing what one would be started with -- CI checks out to
@@ -597,9 +636,9 @@ while [ $# -gt 0 ]; do
                              || die "container.json could not be read; refusing to print a partial declaration"
                          [ -n "$args_out" ] || die "the assembly produced no arguments"
                          printf '%s\n' "$args_out"; exit 0 ;;
-        --stop)          persist_login
+        --stop)          require_kit --stop; persist_login
                          docker stop "$NAME" >/dev/null 2>&1 && echo "stopped $NAME" || echo "$NAME was not running"; exit 0 ;;
-        --rm)            persist_login
+        --rm)            require_kit --rm; persist_login
                          docker rm -f "$NAME" >/dev/null 2>&1 && echo "removed $NAME" || echo "$NAME did not exist"; exit 0 ;;
         *)               die "unknown argument '$1' (see the header of $0)" ;;
     esac
@@ -619,7 +658,9 @@ ctr_repo="$(container_path "$repo")" || die "this checkout ($repo) is not under 
 # leaving a truncated argument list here — a container started without the mounts or the security
 # flags it declares. See lib.sh.
 ARGS=()
-ARGS_OUT="$(assembled_args "$repo")" || die "container.json could not be read; refusing to start a container from a partial declaration"
+# THE KIT'S ROOT substitutes ${localWorkspaceFolder}: docker reads the seccomp profile from that path
+# on the host, and from a checkout it was a file the agent could rewrite.
+ARGS_OUT="$(assembled_args "${KIT_ROOT:-$repo}")" || die "container.json could not be read; refusing to start a container from a partial declaration"
 while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"
 
 # THE APPARMOR PROFILE IS A HOST FACT, so it is decided here rather than declared in
@@ -649,6 +690,12 @@ if [ "$DRY" -eq 1 ]; then
     printf ' %q' "${ARGS[@]}" "$IMAGE" sleep infinity
     printf '\n'
     exit 0
+fi
+
+require_kit
+if [ -n "$KIT_ROOT" ]; then
+    kit_changed="$(dc_kit_stale "$KIT_ROOT" "$repo")"
+    [ -z "$kit_changed" ] || echo "note: the checkout has changed since the kit was installed ($(printf '%s ' $kit_changed)) -- this start uses the kit; to take the changes, review them, then: $KIT_ROOT/.container/run.sh --install-kit" >&2
 fi
 
 command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
@@ -1065,6 +1112,22 @@ esac
 # three or four dead sessions' whole subagent subtrees, which the README measures as exceeding the
 # entire budget: the recovery reclaimed nothing for up to six hours, where before this trigger
 # carried any list at all it recovered in one pass.
+# THE KIT, MIRRORED IN ROOT-OWNED, before anything below runs a script in the container. The sweep,
+# setup.sh, the login step and verify.sh run unsandboxed in here, and they ran from the bind-mounted
+# checkout, which the sandbox writes. Now they run from $DC_CTR_KIT, which only this step changes,
+# through the same root step that copies the host's git hooks. Fatal, because the alternative is
+# running them from the checkout.
+say "container kit"
+kit_src="$KIT_ROOT"; kit_stage=""
+if [ -z "$kit_src" ]; then
+    kit_stage="$(mktemp -d)"
+    dc_install_kit "$repo" "$kit_stage/kit" >/dev/null || die "could not stage the kit from $repo"
+    kit_src="$kit_stage/kit"
+fi
+kit_rc=0; dc_mirror_hooks "$kit_src" "$DC_CTR_KIT" "$NAME" docker "the container kit" || kit_rc=$?
+[ -z "$kit_stage" ] || rm -rf "$kit_stage"
+[ "$kit_rc" -eq 0 ] || die "could not install the container kit at $DC_CTR_KIT in $NAME -- the sweep, setup.sh and verify.sh run only from there, never from the checkout the agent can write"
+
 sweep_keep=""
 sweep_ok=yes
 if [ "$state" = running ]; then
@@ -1088,12 +1151,12 @@ fi
 # EVERY exec in this file names its program absolutely, and pins PATH for what that program runs
 # unless it pins its own (the sweep), needs the toolchain (setup.sh), or is sudo, whose secure_path
 # replaces it (round 8: the round-7 fix covered two of nine). check-config.sh holds all of them.
-in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" /bin/bash .container/sweep-transcripts.sh || true
+in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/sweep-transcripts.sh" || true
 
 if [ "$setup_done" -eq 0 ]; then
     [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
     say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
-    in_container -w "$ctr_repo" "$NAME" /bin/bash .container/setup.sh
+    in_container -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/setup.sh"
 fi
 
 # THE LOGIN, CARRIED ON EVERY START. A container that was stopped outside this script (Docker
@@ -1101,7 +1164,7 @@ fi
 # to move it into the state volume, and it happens before verify.sh looks at the links. Not fatal:
 # verify.sh below reports whatever state it leaves.
 say "login state"
-in_container -e PATH=/usr/bin:/bin -w "$ctr_repo" "$NAME" /bin/bash -c '. .container/lib.sh && dc_persist_login' \
+in_container -e PATH=/usr/bin:/bin -w "$ctr_repo" "$NAME" /bin/bash -c '. "$1" && dc_persist_login' _ "$DC_CTR_KIT/.container/lib.sh" \
     || say "the login could not be moved into the state volume — verify.sh below reports what state it is in"
 
 # THE HOST'S GIT HOOKS, COPIED IN ON EVERY START (lib.sh's dc_mirror_host_hooks says why a copy and
@@ -1134,7 +1197,7 @@ verify_rc=0
 # session holding its whole subagent subtree, was not among them. Reproduced against the real
 # scripts: 120 subagent transcripts under one live session, 40 archivable, budget 30000 —
 # `beyond` with the list, `over` without it.
-in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" /bin/bash .container/verify.sh || verify_rc=$?
+in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/verify.sh" || verify_rc=$?
 
 say "attached VS Code windows"
 cat <<EOF

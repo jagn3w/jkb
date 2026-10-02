@@ -172,8 +172,12 @@ case10_a_failed_move_is_recorded_and_then_cleared() {
 # run.sh's --stop and --rm, against a stub `docker` that logs its calls. HOME/repos points at this
 # checkout's parent so run.sh's container_path resolves as it does on a real host.
 # STUB_STATE is what `docker inspect` answers: true, false, or missing (no such container).
-run_sh_with_stub() { # run_sh_with_stub <state> <flag> -> sets $calls (one docker call per line)
+# THE CHECKOUT'S run.sh REFUSES to start or stop anything unless JKB_RUN_FROM_CHECKOUT=1 (lib.sh's
+# DC_KIT_DIR says why), so these cases set it -- RS_SCRIPT and RS_ENV let the kit cases below run
+# the KIT's run.sh, or the checkout's without the override, through the same stub.
+run_sh_with_stub() { # run_sh_with_stub <state> <flag> -> sets $calls (one docker call per line) and $execs
     local d="$work/rs-$RANDOM"; mkdir -p "$d/bin" "$d/home"
+    rs_home="$d/home"
     ln -s "$(dirname "$repo_root")" "$d/home/repos"
     cat > "$d/bin/docker" <<'STUB'
 #!/usr/bin/env bash
@@ -185,9 +189,14 @@ exit 0
 STUB
     chmod +x "$d/bin/docker"
     : > "$d/calls"
-    HOME="$d/home" PATH="$d/bin:$PATH" STUB_LOG="$d/calls" STUB_STATE="$1" \
-        bash "$repo_root/.container/run.sh" "$2" >/dev/null 2>&1
+    [ -z "${RS_KIT:-}" ] || JKB_CONTAINER_KIT="$d/home/.jkb/container-kit" bash -c '. "$1/.container/lib.sh" && dc_install_kit "$1" "$2"' _ "$repo_root" "$d/home/.jkb/container-kit" >/dev/null 2>&1
+    local script="$repo_root/.container/run.sh"
+    [ -z "${RS_KIT:-}" ] || script="$d/home/.jkb/container-kit/.container/run.sh"
+    env HOME="$d/home" PATH="$d/bin:$PATH" STUB_LOG="$d/calls" STUB_STATE="$1" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} \
+        bash "$script" "$2" >"$d/out" 2>&1
+    rs_out="$(cat "$d/out")"
     calls="$(cut -d' ' -f1 "$d/calls" | tr '\n' ' ')"
+    execs="$(grep '^exec ' "$d/calls" || true)"
 }
 
 case11_run_sh_carries_the_login_before_stop_and_rm() {
@@ -215,10 +224,30 @@ case12_run_sh_starts_a_stopped_container_to_carry_it() {
     else fail "run.sh --rm with no container carries nothing and still removes" "calls: $calls"; fi
 }
 
+# THE KIT. From a checkout, run.sh starts and stops nothing without the developer's override, and
+# runs no docker command at all; it names the kit's run.sh instead (review round 8's self-review:
+# the checkout's run.sh is a file the agent can write, and it ran as you).
+case13_the_checkouts_run_sh_refuses_without_the_override() {
+    RS_ENV=JKB_RUN_FROM_CHECKOUT=0 run_sh_with_stub true --stop
+    if [ -z "$calls" ] && grep -q 'installed kit' <<<"$rs_out"; then ok "the checkout's run.sh --stop refuses, runs no docker command, and names the kit"
+    else fail "the checkout's run.sh --stop refuses, runs no docker command, and names the kit" "calls: $calls out: $rs_out"; fi
+}
+
+# From the kit, with no override, it stops -- and the login step sources lib.sh from the root-owned
+# mirror, never from the checkout.
+case14_the_kits_run_sh_stops_and_sources_the_mirror() {
+    RS_KIT=1 RS_ENV=JKB_RUN_FROM_CHECKOUT=0 run_sh_with_stub true --stop
+    if [ "$calls" = "inspect exec stop " ] && grep -qF '/usr/local/lib/jkb-container/.container/lib.sh' <<<"$execs" \
+       && ! grep -qE "(^| |')\.container/lib\.sh" <<<"$execs"; then
+        ok "the kit's run.sh --stop carries the login from the mirror's lib.sh, then stops"
+    else fail "the kit's run.sh --stop carries the login from the mirror's lib.sh, then stops" "calls: $calls execs: $execs out: $rs_out"; fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
           case7_a_directory_is_refused_not_masked case8_dc_link_state_carries_the_login \
           case9_at_setup_the_volume_copy_wins_over_an_image_file case10_a_failed_move_is_recorded_and_then_cleared \
-          case11_run_sh_carries_the_login_before_stop_and_rm case12_run_sh_starts_a_stopped_container_to_carry_it
+          case11_run_sh_carries_the_login_before_stop_and_rm case12_run_sh_starts_a_stopped_container_to_carry_it \
+          case13_the_checkouts_run_sh_refuses_without_the_override case14_the_kits_run_sh_stops_and_sources_the_mirror
 finish

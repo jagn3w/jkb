@@ -19,7 +19,9 @@
 # what you do after changing `ui/vscode` or the pinned extension list.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-repo="$(cd "$here/.." && pwd)"
+# The checkout whose extension is built: run.sh's setup names it in JKB_REPO_ROOT, because this
+# runs from the kit mirror (lib.sh's DC_KIT_DIR); run by hand from a checkout, it is that one.
+repo="${JKB_REPO_ROOT:-$(cd "$here/.." && pwd)}"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 # shellcheck source=/dev/null
 . "$here/lib.sh"
@@ -61,7 +63,7 @@ while read -r ext; do
     "$code_server" --server-data-dir "$HOME/.vscode-server" \
                    --install-extension "$vsix" --force >/dev/null
     echo "  installed $id@$version from disk"
-done <<<"$(dc_extensions "$repo/.container/container.json")"
+done <<<"$(dc_extensions "$here/container.json")"
 
 # ...and the one this repo BUILDS. The jkb explorer is not on the marketplace, so it is not in the
 # list above and fetch-extensions.sh cannot stage it — which is why the side panel was missing from
@@ -78,6 +80,9 @@ if [ -f "$repo/ui/vscode/package.json" ]; then
     # native binary differs per platform and pnpm links only the current one, so building here
     # would break the HOST's `./scripts/check.sh`, which runs `pnpm run build` with no install in
     # front of it. See the flag's comment in that script.
+    # FROM THE CHECKOUT, deliberately, and the one place this script runs checkout code: it BUILDS
+    # ui/ from the checkout (pnpm runs its package scripts), so the builder is part of what is
+    # built. First run only, from setup.sh; .container/README.md records it with cargo install.
     "$repo/scripts/install-extension.sh" --build-in "$HOME/.jkb-ui-build"
 fi
 

@@ -3,7 +3,13 @@
 # run.sh — which is what starts the container now that this is not a Dev Containers config. It is
 # also safe to run by hand inside an attached window.
 set -euo pipefail
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+# TWO ROOTS. `kit` is where this script and the scripts it RUNS live: run.sh starts it from the
+# root-owned kit mirror, never from the checkout the agent can write (lib.sh's DC_KIT_DIR). `repo` is
+# the checkout it sets the container up for, which run.sh names in JKB_REPO_ROOT; it is BUILT from
+# (cargo install), which is the one way checkout code runs here -- first run only, and recorded as a
+# residual in .container/README.md. Run by hand from a checkout, both are that checkout.
+kit="$(cd "$(dirname "$0")/.." && pwd)"
+repo="${JKB_REPO_ROOT:-$kit}"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 # FIRST, before anything else runs or reaches the network — otherwise the whole of this script,
@@ -23,7 +29,7 @@ sudo -n /usr/local/bin/init-firewall.sh
 # sit in the container's writable layer and go with it.
 say "claude state"
 # shellcheck source=/dev/null
-. "$repo/.container/lib.sh"
+. "$kit/.container/lib.sh"
 dc_link_state /home/vscode
 
 # ...and auto-memory, which the volume alone does NOT solve. Claude Code keys memory by the
@@ -43,13 +49,13 @@ say "shared claude memory"
 # harmless `unsafe` and not the `exposed` that was true at create. It is not a substitute for
 # asking — that made the store guard unfirable after create — and verify.sh consumes an `exposed`
 # record once it has reported it, so the remedy it prints can clear it.
-"$repo/scripts/link-claude-memory.sh" --status-file /home/vscode/.claude-state/memory-status \
+"$kit/scripts/link-claude-memory.sh" --status-file /home/vscode/.claude-state/memory-status \
     || echo "  (some repos need attention — see above)" >&2
 
 say "auto-mode posture"
 # The same posture file the host uses. It ends by running `check`, so a merge that did not take
 # fails here rather than at the first unattended command.
-"$repo/scripts/auto-mode.sh" install
+"$kit/scripts/auto-mode.sh" install
 
 say "rust toolchain (pinned by rust-toolchain.toml)"
 ( cd "$repo" && rustup show >/dev/null && cargo --version )
@@ -90,7 +96,7 @@ sudo -n /usr/local/bin/pin-jkb-hook.sh
 # that is already up. So on a fresh container this legitimately finds nothing and says so, and the
 # install happens when you run that script from an attached window. Under Dev Containers the order
 # was the reverse and this was never a separate step.
-"$repo/.container/install-extensions.sh"
+JKB_REPO_ROOT="$repo" "$kit/.container/install-extensions.sh"
 
 # LAST, and only on success — `set -e` means an earlier failure never reaches this line. run.sh
 # chooses between "run setup" and "skip to verify" on this marker, so it has to mean setup

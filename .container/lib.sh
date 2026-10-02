@@ -419,6 +419,80 @@ DC_LOGIN_CARRY_FAILED=".claude/.jkb-login-carry-failed"
 # volume would carry the marker into a container that had never been set up.
 JKB_SETUP_MARKER="/home/vscode/.jkb-container-setup-complete"
 
+# THE CONTAINER KIT. Every script that runs OUTSIDE the agent's sandbox -- run.sh and this file on
+# the host; the sweep, setup.sh and verify.sh in the container, and the scripts they execute -- used
+# to run from the checkout, which the sandbox can write. Editing one was as good as planting a
+# binary: an agent's edit to run.sh ran as you on the host at the next start (found in review round
+# 8's self-review). So they run from a KIT instead:
+#   on the host,       $DC_KIT_DIR, a copy of exactly these paths, outside every bind -- the
+#                      container cannot see ~/.jkb beyond two subdirectories (D52.8);
+#   in the container,  $DC_CTR_KIT, the same tree mirrored in root-owned on every start
+#                      (dc_mirror_hooks), so nothing the agent can write is ever what runs.
+# The kit changes only by `run.sh --install-kit`, an explicit step that COPIES the checkout and
+# executes none of it. Run from the kit, it refreshes from the checkout recorded at install.
+# check-config.sh requires every file verify.sh and setup.sh execute from scripts/ to be listed.
+DC_KIT_DIR="${JKB_CONTAINER_KIT:-$HOME/.jkb/container-kit}"
+DC_CTR_KIT=/usr/local/lib/jkb-container
+DC_KIT_MARKER=".jkb-container-kit"
+dc_kit_paths() { # one path per line, relative to a checkout
+    printf '%s\n' .container scripts/lib.sh scripts/link-claude-memory.sh scripts/auto-mode.sh scripts/auto-mode-posture.json
+}
+
+# dc_install_kit <checkout> <kit dir> -- copy the kit's paths from <checkout> into <kit dir>, whole
+# or not at all: assembled beside it, then swapped in by rename, so a failed copy leaves the old kit
+# in place and a half-copied one is never what runs. Records <checkout> in the marker, which is how
+# the kit's run.sh finds the repository it starts a container for. Nothing in <checkout> is run.
+dc_install_kit() { # dc_install_kit <checkout> <kit dir>
+    local src="$1" kit="${2%/}" new old p
+    [ -n "$kit" ] && [ "$kit" != / ] || { echo "dc_install_kit: refusing kit directory '$2'" >&2; return 1; }
+    src="$(cd "$src" 2>/dev/null && pwd -P)" || { echo "dc_install_kit: no checkout at $1" >&2; return 1; }
+    while IFS= read -r p; do
+        [ -e "$src/$p" ] || { echo "dc_install_kit: $src has no $p, so it is not a checkout this kit can come from" >&2; return 1; }
+    done <<EOF
+$(dc_kit_paths)
+EOF
+    mkdir -p "$(dirname "$kit")" || return 1
+    new="$(mktemp -d "$kit.new.XXXXXX")" || { echo "dc_install_kit: could not make a staging directory beside $kit" >&2; return 1; }
+    while IFS= read -r p; do
+        mkdir -p "$new/$(dirname "$p")" && cp -RL "$src/$p" "$new/$p" \
+            || { echo "dc_install_kit: could not copy $p; the kit is unchanged" >&2; rm -rf "$new"; return 1; }
+    done <<EOF
+$(dc_kit_paths)
+EOF
+    printf 'checkout=%s\n' "$src" > "$new/$DC_KIT_MARKER" || { rm -rf "$new"; return 1; }
+    chmod -R go-w "$new" && chmod 0755 "$new" || { rm -rf "$new"; return 1; }
+    old=""
+    if [ -e "$kit" ] || [ -L "$kit" ]; then
+        old="$kit.old.$$"
+        mv "$kit" "$old" || { echo "dc_install_kit: could not move the old kit aside; it is unchanged" >&2; rm -rf "$new"; return 1; }
+    fi
+    if ! mv "$new" "$kit"; then
+        [ -n "$old" ] && mv "$old" "$kit"
+        echo "dc_install_kit: could not put the new kit in place; the old one is back" >&2
+        rm -rf "$new"; return 1
+    fi
+    [ -n "$old" ] && rm -rf "$old"
+    echo "installed the container kit from $src to $kit"
+}
+
+# dc_kit_checkout <kit dir> -> the checkout recorded at install, or rc 1.
+dc_kit_checkout() { # dc_kit_checkout <kit dir>
+    local c
+    c="$(sed -n 's/^checkout=//p' "$1/$DC_KIT_MARKER" 2>/dev/null | head -1)"
+    [ -n "$c" ] || return 1
+    printf '%s\n' "$c"
+}
+
+# dc_kit_stale <kit dir> <checkout> -> the kit paths that differ from the checkout, one per line.
+dc_kit_stale() { # dc_kit_stale <kit dir> <checkout>
+    local p
+    while IFS= read -r p; do
+        diff -rq "$1/$p" "$2/$p" >/dev/null 2>&1 || printf '%s\n' "$p"
+    done <<EOF
+$(dc_kit_paths)
+EOF
+}
+
 # EVERY PATH THE DOCKERFILE INSTALLS AS ROOT, derived from its own COPY lines (D52.5).
 #
 # verify.sh asserts at runtime that these cannot be replaced by the agent -- the sudoers grant runs
@@ -642,13 +716,21 @@ EOF
     if [ -n "$best" ]; then dc_type_for_target "$2" "$best"; else printf 'none'; fi
 }
 
-# dc_mirror_hooks <host dir> <container dir> <container name> [docker command]
+# dc_mirror_hooks <host dir> <container dir> <container name> [docker command] [what]
 # Copy <host dir> into the running container at <container dir>, root-owned and not writable by
 # anyone else, with the marker added. Prints one line saying what it did. Returns 1 when it did not
 # mirror, with the reason on stderr, and then the container is left exactly as it was. The docker
-# command is a parameter so a test can stub it.
+# command is a parameter so a test can stub it. <what> names the copy in that line: the host's git
+# hooks by default, and run.sh's container kit (dc_install_kit) is the other user.
+# EVERY EXEC NAMES ITS PROGRAM ABSOLUTELY AND PINS PATH. The image's PATH begins with ~/.local/bin and
+# ~/.cargo/bin, which the sandbox writes, and docker exec hands that PATH to `-u root` as well: a
+# planted ~/.cargo/bin/sh ran AS ROOT here on every start, and so would a planted tar, chown or
+# mkdir inside the step (found in review round 8's self-review). check-config.sh scans these execs
+# with run.sh's.
 dc_mirror_hooks() {
-    local src="$1" dst="$2" name="$3" docker="${4:-docker}" parent archive rc=0
+    local src="$1" dst="$2" name="$3" docker="${4:-docker}" what="${5:-}" parent archive rc=0
+    # Not `${5:-the host's ...}`: an apostrophe inside a quoted default opens a quote to bash.
+    [ -n "$what" ] || what="the host's git hooks"
     [ -d "$src" ] || { echo "dc_mirror_hooks: $src is not a directory on the host" >&2; return 1; }
     case "$dst" in /?*) ;; *) echo "dc_mirror_hooks: '$dst' is not an absolute directory" >&2; return 1 ;; esac
     parent="$(dirname "$dst")"
@@ -656,7 +738,7 @@ dc_mirror_hooks() {
     # --global` or a tool writing ~/.config still owns its own directory. Elsewhere (/Users/...),
     # only root can create it, and the root step below does.
     case "$parent" in
-        /home/vscode/*) "$docker" exec "$name" mkdir -p "$parent" >/dev/null 2>&1 || true ;;
+        /home/vscode/*) "$docker" exec -e PATH=/usr/bin:/bin "$name" /bin/mkdir -p "$parent" >/dev/null 2>&1 || true ;;
     esac
     # THE ARCHIVE IS BUILT WHOLE BEFORE ANYTHING IS SENT. Streamed, a tar that failed part way (a
     # hook that is a dangling symlink, measured) still delivered what it had, the container side
@@ -686,7 +768,7 @@ dc_mirror_hooks() {
     #   - `mv -T` replaces the target NAME, so a symlink raced into its place is not followed.
     # GNU tools (`stat -c`, `mv -T`, `tar --warning`): this runs in the container, which is Ubuntu.
     # shellcheck disable=SC2016
-    "$docker" exec -i -u root "$name" sh -c '
+    "$docker" exec -i -u root -e PATH=/usr/bin:/bin "$name" /bin/sh -c '
         set -e
         dst="$1"; marker="$2"; parent="$(dirname "$dst")"; base="$(basename "$dst")"
         refuse() { echo "dc_mirror_hooks: $*; not writing through it" >&2; exit 3; }
@@ -721,7 +803,7 @@ dc_mirror_hooks() {
         echo "dc_mirror_hooks: could not copy $src into $name at $dst" >&2
         return 1
     fi
-    echo "mirrored the host's git hooks ($src) to $dst"
+    echo "mirrored $what ($src) to $dst"
 }
 
 # _dc_apply_host_hooks <name> <docker> <set|unset|keep> <value> <record text> -- set core.hooksPath
@@ -737,7 +819,7 @@ _dc_apply_host_hooks() { # _dc_apply_host_hooks <name> <docker> <set|unset|keep>
     local name="$1" docker="$2" mode="$3" value="$4" record="$5" applied
     case "$mode" in set) applied="$value" ;; unset) applied=- ;; *) applied=kept ;; esac
     # shellcheck disable=SC2016
-    if [ "$mode" != keep ] && ! printf '%s\n' "$value" | "$docker" exec -i "$name" sh -c '
+    if [ "$mode" != keep ] && ! printf '%s\n' "$value" | "$docker" exec -i -e PATH=/usr/bin:/bin "$name" /bin/sh -c '
         IFS= read -r v || v=""
         mkdir -p "$(dirname "$1")" || exit 1
         if [ "$2" = unset ]; then
@@ -751,7 +833,7 @@ _dc_apply_host_hooks() { # _dc_apply_host_hooks <name> <docker> <set|unset|keep>
         echo "warning: could not set core.hooksPath in $DC_HOOKS_XDG_CONFIG in $name (a leftover config.lock beside it is one cause); verify.sh reports it" >&2
     fi
     # shellcheck disable=SC2016
-    printf '%s\napplied=%s\n' "$record" "$applied" | "$docker" exec -i -u root "$name" sh -c '
+    printf '%s\napplied=%s\n' "$record" "$applied" | "$docker" exec -i -u root -e PATH=/usr/bin:/bin "$name" /bin/sh -c '
         set -e
         mkdir -p "$(dirname "$1")"; chown 0:0 "$(dirname "$1")"; chmod 755 "$(dirname "$1")"
         cat > "$1.new"; chmod 644 "$1.new"; mv -f "$1.new" "$1"

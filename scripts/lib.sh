@@ -1631,6 +1631,14 @@ render_setup_summary() {
                     failed)    printf '  • jkb serve:  NOT up; its log is serve.log beside the database (macOS) or journalctl --user -u com.jkb.serve (Linux)\n' ;;
                     *)         warn "unrecognised serve state: $line" ;;
                 esac ;;
+            kit=*)
+                case "$state" in
+                    installed) printf '  • container:  start the dev container from the kit: %s/.container/run.sh\n' "$detail" ;;
+                    unchanged) printf '  • container:  the kit already matched this checkout; start it from %s/.container/run.sh\n' "$detail" ;;
+                    skipped)   printf '  • container:  kit skipped (--no-kit)\n' ;;
+                    failed)    printf '  • container:  kit NOT installed; see the warnings above\n' ;;
+                    *)         warn "unrecognised kit state: $line" ;;
+                esac ;;
             topic=*)
                 case "$state" in
                     ready)    printf '  • topic:      %s ready\n' "$detail" ;;

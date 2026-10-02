@@ -78,17 +78,24 @@ SHIM
     cat > "$stub_dir/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 [ "$1" = exec ] || { echo "stub docker: only exec" >&2; exit 2; }
-shift; user=vscode
+shift; user=vscode; pinned=no
 while [ $# -gt 0 ]; do
     case "$1" in
         -i) shift ;;
         -u) user="$2"; shift 2 ;;
+        -e) [ "$2" = PATH=/usr/bin:/bin ] && pinned=yes; shift 2 ;;
         *)  break ;;
     esac
 done
 shift   # the container name
-printf '%s %s\n' "$user" "$1" >> "$DOCKER_LOG"
-args=()
+# Logged by the program's NAME, so the cases read `root sh` whether it was spelled `sh` or `/bin/sh`;
+# how it was spelled, and whether PATH was pinned, go to a second log a case asserts on.
+printf '%s %s\n' "$user" "${1##*/}" >> "$DOCKER_LOG"
+printf '%s %s pinned=%s\n' "$user" "$1" "$pinned" >> "$DOCKER_LOG.exec"
+# THE PROGRAM IS NOT RE-ROOTED: it is the container's /bin/sh, which the scratch root does not hold.
+# Every other absolute argument names a place to act on, and is.
+prog="$1"; shift
+args=("$prog")
 for a in "$@"; do case "$a" in /*) args+=("$CTR_ROOT$a") ;; *) args+=("$a") ;; esac; done
 # TMPDIR inside the scratch root, so the root step's staging directory is on the same filesystem
 # as its target and a move keeps inodes, as it does in the container (/tmp there).
@@ -97,7 +104,7 @@ exec "${args[@]}"
 STUB
     chmod +x "$stub_dir/bin/docker"
     export CTR_ROOT="$stub_dir/root" ROOT_SHIM="$stub_dir/shim" DOCKER_LOG="$stub_dir/log" TAR_LOG="$stub_dir/tar-log"
-    : > "$DOCKER_LOG"
+    : > "$DOCKER_LOG"; : > "$DOCKER_LOG.exec"
     docker_cmd="$stub_dir/bin/docker"
 }
 
@@ -636,6 +643,71 @@ case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale() {
     fi
 }
 
+# EVERY EXEC NAMES ITS PROGRAM ABSOLUTELY AND PINS PATH. The image's PATH begins with directories the
+# sandbox writes and docker exec hands it to `-u root` too: a planted ~/.cargo/bin/sh ran as root in
+# the copy's root step on every start (review round 8's self-review).
+case28_every_exec_names_its_program_and_pins_path() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local cfg="$HOME/.gitconfig" bad_lines
+    # A ~/ path, so the copy lands under /home/vscode and the user-side mkdir runs too: four execs.
+    mkdir -p "$HOME/.config/git/hooks"; cp "$src/commit-msg" "$HOME/.config/git/hooks/"
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "~/.config/git/hooks"
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    bad_lines="$(grep -v '^[a-z]* /[^ ]* pinned=yes$' "$DOCKER_LOG.exec")"
+    if [ "$(grep -c . "$DOCKER_LOG.exec")" -eq 4 ] && [ -z "$bad_lines" ]; then
+        ok "every docker exec of the hooks step names an absolute program and pins PATH (mkdir, the copy, the config, the record)"
+    else
+        fail "every docker exec of the hooks step names an absolute program and pins PATH (mkdir, the copy, the config, the record)" "execs: $(tr '\n' ';' < "$DOCKER_LOG.exec")"
+    fi
+}
+
+# THE KIT: what run.sh, the sweep, setup.sh and verify.sh run from instead of the agent-writable
+# checkout. Installed whole or not at all, recording where it came from.
+case29_the_kit_installs_whole_and_records_its_checkout() {
+    local d="$work/kit-$RANDOM" co kit got p missing=""
+    co="$d/checkout"; kit="$d/home/.jkb/container-kit"
+    mkdir -p "$co/scripts"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    dc_install_kit "$co" "$kit" >/dev/null 2>&1 || { fail "the kit installs whole and records its checkout" "install failed"; return; }
+    while IFS= read -r p; do [ -e "$kit/$p" ] || missing="$missing $p"; done <<<"$(dc_kit_paths)"
+    got="$(dc_kit_checkout "$kit")"
+    [ -z "$missing" ] && [ "$got" = "$(cd "$co" && pwd -P)" ] && [ -z "$(find "$kit" -perm -o+w ! -type l)" ] \
+        || { fail "the kit installs whole and records its checkout" "missing:$missing checkout=$got"; return; }
+    # A re-install REPLACES: a file gone from the checkout is gone from the kit, nothing left beside it.
+    : > "$kit/.container/stale-file"
+    echo '# changed' >> "$co/.container/run.sh"
+    dc_install_kit "$co" "$kit" >/dev/null 2>&1
+    [ ! -e "$kit/.container/stale-file" ] && [ "$(tail -1 "$kit/.container/run.sh")" = '# changed' ] \
+        && [ -z "$(ls -d "$kit".new.* "$kit".old.* 2>/dev/null)" ] \
+        || { fail "the kit installs whole and records its checkout" "a re-install did not replace cleanly: $(ls -a "$kit/.container" | tr '\n' ' ') $(ls -d "$kit".* 2>/dev/null)"; return; }
+    # A checkout missing a kit path is refused, and the kit is left as it was.
+    rm "$co/scripts/auto-mode.sh"
+    if ! dc_install_kit "$co" "$kit" >/dev/null 2>&1 && [ -e "$kit/scripts/auto-mode.sh" ]; then
+        ok "the kit installs whole, records its checkout, replaces on re-install, and refuses a checkout missing a path"
+    else
+        fail "the kit installs whole and records its checkout" "an incomplete checkout was installed, or the old kit was lost"
+    fi
+}
+
+case30_the_kit_says_which_paths_the_checkout_has_changed() {
+    local d="$work/stale-$RANDOM" co kit p
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    dc_install_kit "$co" "$kit" >/dev/null 2>&1
+    local before after
+    before="$(dc_kit_stale "$kit" "$co")"
+    echo '# agent edit' >> "$co/scripts/auto-mode.sh"
+    after="$(dc_kit_stale "$kit" "$co")"
+    if [ -z "$before" ] && [ "$after" = scripts/auto-mode.sh ]; then
+        ok "the kit names exactly the paths the checkout has changed since it was installed"
+    else
+        fail "the kit names exactly the paths the checkout has changed since it was installed" "before=[$before] after=[$after]"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -662,5 +734,8 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case24_an_unreadable_host_config_keeps_the_container_key \
           case25_a_failed_config_write_is_recorded_as_failed \
           case26_a_hooks_path_inside_a_volume_is_not_mirrored \
-          case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale
+          case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale \
+          case28_every_exec_names_its_program_and_pins_path \
+          case29_the_kit_installs_whole_and_records_its_checkout \
+          case30_the_kit_says_which_paths_the_checkout_has_changed
 finish

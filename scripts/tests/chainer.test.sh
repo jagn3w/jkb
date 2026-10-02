@@ -1477,6 +1477,10 @@ case15() {
         'notifier=undecided |could not read whether it subscribed'
         'notifier=skipped|skipped (--no-service)'
         'notifier=not-macos|none on this platform'
+        'kit=installed /h/.jkb/container-kit|from the kit: /h/.jkb/container-kit/.container/run.sh'
+        'kit=unchanged /h/.jkb/container-kit|already matched this checkout'
+        'kit=skipped /h/k|kit skipped (--no-kit)'
+        'kit=failed /h/k|kit NOT installed'
     )
     for entry in "${table[@]}"; do
         line="${entry%%|*}"; want="${entry#*|}"
@@ -1523,7 +1527,7 @@ case15() {
             *unrecognised*) states_ok=0; unknown="$unknown [$word]" ;;
         esac
     done <<EOF
-$(grep -hoE '(scaffold|extension|watcher|serve|notify_topic|notifier)_state=[a-z-]+' "$setup" "$repo_root/scripts/lib.sh" \
+$(grep -hoE '(scaffold|extension|watcher|serve|notify_topic|notifier|kit)_state=[a-z-]+' "$setup" "$repo_root/scripts/lib.sh" \
     | sed 's/^notify_topic_state=/topic_state=/' | sort -u)
 EOF
     [ "$states_ok" = 1 ] \
@@ -1532,7 +1536,7 @@ EOF
 
     # Default arms, as everywhere else in this protocol.
     local defaults_ok=1 noisy=""
-    for line in 'invented=1' 'scaffold=sideways' 'extension=sideways' 'watcher=sideways' 'serve=sideways' 'topic=sideways' 'notifier=sideways'; do
+    for line in 'invented=1' 'scaffold=sideways' 'extension=sideways' 'watcher=sideways' 'serve=sideways' 'topic=sideways' 'notifier=sideways' 'kit=sideways'; do
         rendered="$(printf '%s\n' "$line" | render_setup_summary 2>&1)"
         case "$rendered" in
             *unrecognised*) ;;

@@ -43,7 +43,8 @@ dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 # saying there is no verify.sh statement -- and the cheapest repair for the second is to delete the
 # ordering branch that keeps the sweep from being disabled by an unrelated assertion.
 dc_stmt_line() { # dc_stmt_line <stripped run.sh> <script basename regex> -> line number, or nothing
-    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+(/usr)?(/bin/)?bash[[:space:]]+\.container/$2" \
+    # FROM THE KIT MIRROR: a statement running the checkout's copy is not the statement this asks for.
+    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+(/usr)?(/bin/)?bash[[:space:]]+\"\\\$DC_CTR_KIT/\.container/$2" \
         <<<"$1" | sed -n '1s/^\([0-9]*\):.*/\1/p'
 }
 
@@ -686,8 +687,8 @@ for dc_s in sweep-transcripts verify; do
     dc_ln="$(dc_stmt_line "$dc_run_stripped" "$dc_s\\.sh")"
     dc_line=""; [ -n "$dc_ln" ] && dc_line="$(sed -n "${dc_ln}p" <<<"$dc_run_stripped")"
     case "$dc_line" in
-        *"/bin/bash .container/$dc_s.sh"*) ;;
-        *) dc_unsb="$dc_unsb run.sh does not start $dc_s.sh with /bin/bash;" ;;
+        *'/bin/bash "$DC_CTR_KIT/.container/'"$dc_s"'.sh"'*) ;;
+        *) dc_unsb="$dc_unsb run.sh does not start $dc_s.sh with /bin/bash from the kit mirror;" ;;
     esac
 done
 # EVERY EXEC IN run.sh, not the two above: round 7 fixed the sweep and verify.sh and left seven
@@ -701,12 +702,18 @@ done
 # (review round 9: the scan skipped anything not spelled `"$NAME"`, and the floor cannot see an
 # addition). The only two occurrences that are not a statement are named: in_container's own
 # `docker exec "$@"`, and the `"docker exec $*"` it prints when the container has died.
-dc_execs="$(awk '
+# run.sh AND lib.sh, whose hook mirror runs four execs -- one of them `sh -c` as root, which found
+# `sh` on the agent-writable PATH until review round 8's self-review. lib.sh's container token is
+# `"$name"` and its docker `"$docker"`. Each line is tagged with its file, so a failure says which.
+# AND NOTHING FROM THE CHECKOUT: a `.container/` path in an exec that is not under "$DC_CTR_KIT" is
+# the checkout's copy, which the agent writes (the kit's whole point; lib.sh's DC_KIT_DIR).
+dc_exec_awk='
     {
         n = split($0, t, /[[:space:]]+/)
+        l = $0; gsub(/"\$DC_CTR_KIT\/\.container\//, "", l); ck = (l ~ /\.container\//) ? 1 : 0
         for (i = 1; i <= n; i++) {
-            if (t[i] ~ /(^|[("])in_container$/ || (t[i] == "exec" && i > 1 && t[i-1] ~ /docker$/)) {
-                if (t[i] == "exec" && t[i-1] ~ /^"/) continue
+            if (t[i] ~ /(^|[("])in_container$/ || (t[i] == "exec" && i > 1 && t[i-1] ~ /docker"?$/)) {
+                if (t[i] == "exec" && t[i-1] == "\"docker") continue
                 j = i + 1; pin = 0
                 while (j <= n && t[j] ~ /^-/) {
                     if ((t[j] == "-e" || t[j] == "--env") && t[j+1] == "PATH=/usr/bin:/bin") pin = 1
@@ -714,27 +721,30 @@ dc_execs="$(awk '
                     if (t[j] ~ /^(-e|-w|-u|--env|--workdir|--user)$/) j += 2; else j++
                 }
                 if (t[j] == "\"$@\"") continue
-                if (t[j] != "\"$NAME\"" || t[j+1] == "") { print NR "\tUNRESOLVED\t" t[j] "\t" t[j+1]; continue }
-                print NR "\t" pin "\t" t[j+1] "\t" t[j+2]
+                if ((t[j] != "\"$NAME\"" && t[j] != "\"$name\"") || t[j+1] == "") { print F ":" NR "\tUNRESOLVED\t" t[j] "\t" t[j+1] "\t" ck; continue }
+                print F ":" NR "\t" pin "\t" t[j+1] "\t" t[j+2] "\t" ck
             }
         }
-    }' <<<"$dc_run_stripped")"
-dc_nexec=0
-while IFS=$'\t' read -r dc_ln dc_pin dc_prog dc_arg; do
+    }'
+dc_execs="$(awk -v F=run.sh "$dc_exec_awk" <<<"$dc_run_stripped"; awk -v F=lib.sh "$dc_exec_awk" <<<"$(dc_strip_comments "$here/lib.sh")")"
+dc_nexec=0; dc_nlib=0
+while IFS=$'\t' read -r dc_ln dc_pin dc_prog dc_arg dc_ck; do
     [ -n "$dc_ln" ] || continue
     dc_nexec=$((dc_nexec + 1))
+    case "$dc_ln" in lib.sh:*) dc_nlib=$((dc_nlib + 1)) ;; esac
+    [ "$dc_ck" = 1 ] && dc_unsb="$dc_unsb $dc_ln runs a script from the checkout's .container/, not from \"\$DC_CTR_KIT\";"
     if [ "$dc_pin" = UNRESOLVED ]; then
-        dc_unsb="$dc_unsb run.sh line $dc_ln has a container exec the scan cannot read (container [$dc_prog], program [$dc_arg]) -- spell it \`\"\$NAME\" /absolute/program\`;"
+        dc_unsb="$dc_unsb $dc_ln has a container exec the scan cannot read (container [$dc_prog], program [$dc_arg]) -- spell it \`\"\$NAME\" /absolute/program\`;"
         continue
     fi
     case "$dc_prog" in
         /*) ;;
-        *) dc_unsb="$dc_unsb run.sh line $dc_ln starts [$dc_prog] by PATH lookup;"; continue ;;
+        *) dc_unsb="$dc_unsb $dc_ln starts [$dc_prog] by PATH lookup;"; continue ;;
     esac
     [ "$dc_pin" = 1 ] && continue
     case "$dc_prog $dc_arg" in
-        "/bin/bash .container/sweep-transcripts.sh"|"/bin/bash .container/setup.sh"|"/bin/bash .container/verify.sh"|"/usr/bin/sudo "*) ;;
-        *) dc_unsb="$dc_unsb run.sh line $dc_ln runs [$dc_prog $dc_arg] without -e PATH=/usr/bin:/bin;" ;;
+        '/bin/bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"'|'/bin/bash "$DC_CTR_KIT/.container/setup.sh"'|'/bin/bash "$DC_CTR_KIT/.container/verify.sh"'|"/usr/bin/sudo "*) ;;
+        *) dc_unsb="$dc_unsb $dc_ln runs [$dc_prog $dc_arg] without -e PATH=/usr/bin:/bin;" ;;
     esac
 done <<<"$dc_execs"
 # ~/.jq AS WELL AS PATH: jq sources $HOME/.jq into every program it runs, and the sandbox writes
@@ -753,11 +763,38 @@ for dc_f in sweep-transcripts verify; do
         || dc_unsb="$dc_unsb $dc_f.sh calls jq around its wrapper ($dc_jq_bypass time(s), by \`command jq\` or an absolute path);"
 done
 # A FLOOR, so a parser that stops matching reads as a failure and not as "nothing to check".
-[ "$dc_nexec" -ge 9 ] || dc_unsb="$dc_unsb only $dc_nexec container exec(s) found in run.sh, where there are nine -- the scan has stopped seeing them;"
+[ "$dc_nexec" -ge 13 ] && [ "$dc_nlib" -eq 4 ] \
+    || dc_unsb="$dc_unsb only $dc_nexec container exec(s) found in run.sh and lib.sh ($dc_nlib in lib.sh), where there are nine and four -- the scan has stopped seeing them;"
 if [ -n "$dc_unsb" ]; then
     bad "an unsandboxed script can be steered through PATH:$dc_unsb a program planted in ~/.cargo/bin would run outside the sandbox with the container credential readable"
 else
     ok "the sweep pins PATH, and the reaper and run.sh start the unsandboxed scripts with /bin/bash"
+fi
+
+# THE KIT HOLDS EVERYTHING ITS SCRIPTS RUN. setup.sh and verify.sh run from the root-owned kit mirror
+# and execute scripts from `scripts/` beside it; one that is not in lib.sh's dc_kit_paths would be
+# missing from the mirror, and one reached through the CHECKOUT ($repo, $mem_repo) is the agent's
+# copy, which is what the kit exists to stop (review round 8's self-review: verify.sh ran the
+# checkout's link-claude-memory.sh and auto-mode.sh on every start). setup.sh's `cargo install` and
+# the extension build are the named exception: they BUILD the checkout, which is their job.
+dc_kit_list="$(bash -c '. "$1" && dc_kit_paths' _ "$here/lib.sh" 2>/dev/null)"
+dc_kit_bad=""
+[ -n "$dc_kit_list" ] || dc_kit_bad=" lib.sh's dc_kit_paths printed nothing;"
+for dc_f in setup verify install-extensions; do
+    dc_t="$(dc_strip_comments "$here/$dc_f.sh")"
+    while IFS= read -r dc_ref; do
+        [ -n "$dc_ref" ] || continue
+        grep -qxF -- "scripts/$dc_ref" <<<"$dc_kit_list" || dc_kit_bad="$dc_kit_bad $dc_f.sh runs scripts/$dc_ref, which the kit does not carry;"
+    done <<<"$(grep -oE '\$(kit|kit_dc)/scripts/[A-Za-z0-9._-]+' <<<"$dc_t" | sed 's,.*/scripts/,,' | sort -u)"
+    # The one named exception: the extension's builder, run on the checkout it builds.
+    dc_ck="$(grep -nE '\$\{?(repo|mem_repo)\}?/(scripts|\.container)/' <<<"$dc_t" \
+        | grep -vF '"$repo/scripts/install-extension.sh" --build-in' | head -3 | tr '\n' ' ')"
+    [ -z "$dc_ck" ] || dc_kit_bad="$dc_kit_bad $dc_f.sh reaches the checkout's scripts ($dc_ck);"
+done
+if [ -n "$dc_kit_bad" ]; then
+    bad "the container kit does not hold what its scripts run:$dc_kit_bad what runs unsandboxed must come from the kit, never from the checkout the agent can write"
+else
+    ok "setup.sh, verify.sh and install-extensions.sh run scripts only from the kit, and the kit carries each one"
 fi
 
 # THE HOOK AND THE SWEEP MUST AGREE ON WHERE THE TREE IS. The hook cannot load the shared reader --

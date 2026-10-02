@@ -11,11 +11,14 @@
 #      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
 #   6. builds + installs the notifier behind sticky Claude Code notifications, and reports
 #      the two things it cannot do for you: the one-time Allow, and the Alerts style
+#   7. installs or refreshes the dev container's KIT (~/.jkb/container-kit), the copy of
+#      .container/ and the scripts it runs that the container is started from, so nothing the
+#      agent's sandbox can write in the checkout runs outside it (.container/README.md)
 #
 # With JKB_REMOTE set (the dev container) only step 1 runs: the rest belongs to the machine
 # that serves the knowledge base.
 #
-# Flags: --no-extension, --no-service, --no-scaffold, --link-memory, --db <path>, -h/--help.
+# Flags: --no-extension, --no-service, --no-scaffold, --no-kit, --link-memory, --db <path>, -h/--help.
 #
 # --link-memory is opt-in, and deliberately not the default: it writes symlinks under
 # ~/.claude/projects so the dev container and the host share one auto-memory store, and this
@@ -32,6 +35,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 do_extension=1
 do_service=1
 do_scaffold=1
+do_kit=1
 link_memory=0
 # One state word per section, rendered at the end by `render_setup_summary` in lib.sh. Each
 # means what actually happened, not what was attempted: `watcher=running` is set to `failed`
@@ -43,6 +47,7 @@ scaffold_state=created
 extension_state=installed
 watcher_state=running
 serve_state=unchecked
+kit_state=installed
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -50,6 +55,7 @@ while [ "$#" -gt 0 ]; do
     --no-extension) do_extension=0 ;;
     --no-service) do_service=0 ;;
     --no-scaffold) do_scaffold=0 ;;
+    --no-kit) do_kit=0 ;;
     --link-memory) link_memory=1 ;;
     --db) shift; db="$1" ;;
     -h|--help)
@@ -201,6 +207,26 @@ if setup_roles; then :; else
   warn "could not set up roles — the dev container cannot reach jkb serve without its credential (re-run, or: jkb role rotate-container --write)."
 fi
 
+# --- the dev container's kit ------------------------------------------------
+# A pull is where you review what an agent changed, and this script runs after one (post-merge), so
+# this is where the kit is refreshed: it COPIES .container/ and the scripts it runs out of the
+# checkout, which the container can write, into ~/.jkb, which it cannot see. The kit's run.sh is then
+# what starts the container. Wrapped like the steps around it: a failure here must not end the run.
+if [ "$do_kit" -eq 1 ]; then
+  say "dev container kit (what the container is started from)"
+  if kit_out="$("$repo_root/.container/run.sh" --install-kit 2>&1)"; then
+    printf '%s\n' "$kit_out"
+    case "$kit_out" in *"already matches"*) kit_state=unchanged ;; *) kit_state=installed ;; esac
+  else
+    printf '%s\n' "$kit_out" >&2
+    kit_state=failed
+    warn "could not install the dev container kit — continuing."
+  fi
+else
+  kit_state=skipped
+  warn "skipping the dev container kit (--no-kit)"
+fi
+
 # --- 3. VS Code extension ----------------------------------------------------
 if [ "$do_extension" -eq 1 ]; then
   say "build + install VS Code extension"
@@ -339,6 +365,7 @@ render_setup_summary < <(
   printf 'extension=%s\n' "$extension_state"
   printf 'watcher=%s\n' "$watcher_state"
   printf 'serve=%s\n' "$serve_state"
+  printf 'kit=%s %s\n' "$kit_state" "${JKB_CONTAINER_KIT:-$HOME/.jkb/container-kit}"
   printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
   printf 'notifier=%s %s\n' "$notifier_state" "${notifier_pid:-}"
 )

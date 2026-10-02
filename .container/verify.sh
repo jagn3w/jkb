@@ -823,7 +823,7 @@ if [ ! -r /proc/self/mountinfo ]; then
     echo "  /proc/self/mountinfo is not readable here, so the mount boundary — the assertion this" >&2
     echo "  file exists for — could not be checked at all." >&2
     echo >&2
-    echo "  In VS Code:  ./.container/run.sh, attach to the container, then run this" >&2
+    echo "  In VS Code:  ~/.jkb/container-kit/.container/run.sh, attach to the container, then run this" >&2
     echo "  With Docker: ./.container/mutate-verify.sh --control   (one healthy run)" >&2
     echo "               ./.container/mutate-verify.sh             (every guard, watched failing)" >&2
     echo >&2
@@ -872,7 +872,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "  The fresh procfs is why /proc/1 and the mount table are not this container's."
             echo
             echo "  Run it from a plain terminal in the attached container, or from the host:"
-            echo "    ./.container/run.sh                       (runs this for you, via docker exec)"
+            echo "    ~/.jkb/container-kit/.container/run.sh                       (runs this for you, via docker exec)"
             echo "    ./.container/mutate-verify.sh --control   (one healthy run)"
         } >&2
         exit 2
@@ -886,7 +886,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "  one of:"
             echo "    * the container was started with --entrypoint, bypassing entrypoint.sh;"
             echo "    * its start did not finish (check \`docker logs\`);"
-            echo "    * the image predates the marker — rebuild: ./.container/run.sh --rm && ./.container/run.sh --build"
+            echo "    * the image predates the marker — rebuild: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build"
             echo
             echo "  On an ordinary Linux host there is no marker either, and that is the honest"
             echo "  answer: this script asserts what a CONTAINER is and has no subject here."
@@ -904,7 +904,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "    docker stats --no-stream <name>   # PIDS = the counter --pids-limit bounds"
             echo
             echo "  If that is near the limit, recreate it:"
-            echo "    ./.container/run.sh --rm && ./.container/run.sh --build"
+            echo "    ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build"
         } >&2
         exit 2
         ;;
@@ -1013,7 +1013,7 @@ fi
 
 case "$(reaper_verdict "$pid1_argv" "$orphan" "$adopted" "$final")" in
     reaped)     ok  "PID 1 reaps the orphans it adopts (PID 1 is: $pid1_argv)" ;;
-    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
+    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build" ;;
     fork-failed)      bad "could not establish whether PID 1 reaps: the fork for the test orphan failed, which is how a container at its --pids-limit fails — the end state of a PID 1 that does not reap (PID 1 is: $pid1_argv)" ;;
     pid1-unreadable)  bad "could not establish whether PID 1 reaps: $PROC/1/cmdline could not be read, so nothing here observed what PID 1 even is" ;;
     proc-unreadable)  bad "could not establish whether PID 1 reaps: this process's own $PROC entry is unreadable, so an absent orphan would say nothing about reaping" ;;
@@ -1307,12 +1307,42 @@ esac
 # the gate that reviews the boundary and the check that enforces it cannot read it differently.
 here_dc="$(cd "$(dirname "$0")" && pwd)"
 DC="$here_dc/container.json"
-# The checkout being verified: the one this script is in. Every assertion below that used to name
-# /home/vscode/repos/jkb reads this instead — with all of ~/repos mounted, that literal is a
-# statement about whichever repo happens to sit there, which is not necessarily this one.
-mem_repo="$(cd "$here_dc/.." && pwd)"
+# The checkout being verified: the one run.sh names in JKB_REPO_ROOT, since this script runs from
+# the root-owned kit mirror rather than from the checkout (lib.sh's DC_KIT_DIR); run by hand from a
+# checkout, the one it is in. Every assertion below that used to name /home/vscode/repos/jkb reads
+# this instead. `kit_dc` is where the scripts this RUNS come from: the kit, never the checkout.
+kit_dc="$(cd "$here_dc/.." && pwd)"
+mem_repo="${JKB_REPO_ROOT:-$kit_dc}"
 # shellcheck source=/dev/null
 . "$here_dc/lib.sh"
+
+# THE KIT MIRROR IS ROOT'S, and this script runs from it. Everything run.sh starts in here runs
+# unsandboxed and comes from $DC_CTR_KIT; a mirror the container user could write would put the
+# agent's code back in that position, which is the whole of what the kit closed.
+kit_wrong=""
+if [ ! -d "$DC_CTR_KIT" ]; then
+    kit_wrong="$DC_CTR_KIT does not exist -- run.sh mirrors it in on every start;"
+else
+    [ "$(stat -c %u "$DC_CTR_KIT" 2>/dev/null)" = 0 ] || kit_wrong="$kit_wrong it is not owned by root;"
+    [ -L "$DC_CTR_KIT" ] && kit_wrong="$kit_wrong it is a symlink;"
+    [ -f "$DC_CTR_KIT/$DC_HOOKS_MIRROR_MARKER" ] || kit_wrong="$kit_wrong it carries no $DC_HOOKS_MIRROR_MARKER;"
+    for kit_p in "$DC_CTR_KIT" "$DC_CTR_KIT/.container" "$DC_CTR_KIT/.container/verify.sh" "$DC_CTR_KIT/.container/lib.sh" "$DC_CTR_KIT/scripts"; do
+        [ -w "$kit_p" ] && kit_wrong="$kit_wrong $kit_p is writable by $(id -un);"
+    done
+fi
+if [ -n "${JKB_REPO_ROOT:-}" ] && [ "$kit_dc" != "$DC_CTR_KIT" ]; then
+    kit_wrong="$kit_wrong this verify.sh runs from $kit_dc, not from the mirror;"
+fi
+# A FAILURE WHEN run.sh STARTED THIS (it names JKB_REPO_ROOT, and it mirrors the kit first). Run by
+# hand, or by mutate-verify.sh against a bare image no run.sh ever touched, a missing mirror is a
+# note: nothing in that container was started from it.
+if [ -n "$kit_wrong" ] && [ -z "${JKB_REPO_ROOT:-}" ] && [ ! -d "$DC_CTR_KIT" ]; then
+    note "no container kit at $DC_CTR_KIT -- this verify.sh was not started by run.sh, which mirrors one in first"
+elif [ -n "$kit_wrong" ]; then
+    bad "the container kit is not what runs unsandboxed in here:$kit_wrong rerun the kit's run.sh"
+else
+    ok "the container kit at $DC_CTR_KIT is root-owned and not writable here$([ -n "${JKB_REPO_ROOT:-}" ] && echo ", and this verify.sh runs from it")"
+fi
 EXPECTED="$(dc_mount_targets "$DC")"
 # RUNTIME_OWNED — the exclusion list — is defined at the top of this file, above the
 # inside-the-container refusal, so `--self-test` can exercise it on a host with no Docker.
@@ -1553,7 +1583,7 @@ fi
 # consumed once reported — which is what makes the documented remedy actually clear it.
 mem_key="$(basename "$mem_repo")"
 mem_status_file=/home/vscode/.claude-state/memory-status
-mem_live="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
+mem_live="$("$kit_dc/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
 mem_recorded="$(awk -v k="$mem_key" '$1 == k { print $2 }' "$mem_status_file" 2>/dev/null | tail -1)"
 # The two states ONLY THE RUN can know, so only the record can carry them. `exposed` because the
 # repair clears its own alarm; `error` because it means the run stopped part-way — a migration that
@@ -2057,7 +2087,7 @@ case "$eg_daemon" in
     unresolved) $dm_bad "${daemon_at%:*} did not resolve when the firewall was raised, so no address is open for jkb serve on the host — re-run init-firewall.sh; on Linux add --add-host=${daemon_at%:*}:host-gateway" ;;
     absent)     $dm_bad "the firewall has no rule for jkb serve on the host ($daemon_at), so this container cannot reach the knowledge base" ;;
     wide)       $dm_bad "the host's address is in the egress allowlist, which opens EVERY port on the host's loopback to this container — jkb serve must be reached through its port-only rule alone" ;;
-    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
+    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build" ;;
 esac
 
 # ...and what actually answers. The token is read from the ~/.jkb bind, where the host's daemon
@@ -2102,7 +2132,7 @@ else
             if [ -z "$jkb_remote_at" ] || ! command -v jkb >/dev/null 2>&1; then
                 :   # asserted above: remote mode unset fails there, no jkb is a note there
             elif [ "$jkb_remote_at" != "$daemon_at" ]; then
-                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ./.container/run.sh --rm && ./.container/run.sh --build"
+                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build"
             else
                 if jkb_answer="$(env -u JKB_DB jkb --json mq topic ls 2>&1)"; then
                     ok "the installed jkb reaches jkb serve through JKB_REMOTE"
@@ -2117,7 +2147,7 @@ fi
 
 # 6. The inner posture. `check` is the drift rule from D48; here it also proves the posture
 #    survived being installed into a fresh container HOME.
-if "$mem_repo/scripts/auto-mode.sh" check >/dev/null 2>&1; then
+if "$kit_dc/scripts/auto-mode.sh" check >/dev/null 2>&1; then
     ok "Claude Code posture is intact"
 else
     bad "Claude Code posture is NOT intact (scripts/auto-mode.sh check)"
@@ -2155,7 +2185,7 @@ else
     # not on the marketplace. It was absent from every container ever built precisely because
     # nothing declared it, so nothing checked it. Appended rather than checked separately so the
     # one matcher the self-test exercises covers it too.
-    if local_ext="$(dc_local_extension "$(cd "$here_dc/.." && pwd)")"; then
+    if local_ext="$(dc_local_extension "$mem_repo")"; then
         declared="$declared"$'\n'"$local_ext"
     fi
     missing="$(missing_extensions "$declared" "$installed")"
@@ -2170,7 +2200,7 @@ else
     else
         bad "declared extensions are not installed:$missing — $present other(s) are, so this is not the
        never-installed state. Run ./.container/install-extensions.sh from an attached terminal; if it
-       reports one was not staged into the image, rebuild: ./.container/run.sh --rm && ./.container/run.sh --build"
+       reports one was not staged into the image, rebuild: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build"
     fi
 fi
 
