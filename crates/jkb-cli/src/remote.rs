@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use super::rbac_cli::RoleCmd;
-use super::{Cli, Command, CommandsCmd, NsCmd, TaskCmd};
+use super::{Cli, Command, CommandsCmd, NsCmd, TaskCmd, TaskReviewCmd};
 
 /// How a command behaves with `JKB_REMOTE` set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +160,72 @@ pub const fn support(command: &Command) -> Support {
         Command::Undo { .. } => Support::Refused(
             "it reverts any transaction, the host's own included, so it runs only on the host",
         ),
+    }
+}
+
+/// Whether `command` reads a file the caller NAMES, here, and sends what it read on to the daemon.
+///
+/// The daemon's RBAC cannot judge that read: only the text arrives, so whether `jkb ingest
+/// ~/repos/other/.env` may run is a question about the ingest op, never about the file. The
+/// attestation hook therefore never approves a line carrying one (`rbac_cli::attestation`): an
+/// approval overrides the session's own rules, a read rule among them, so the line is deferred to
+/// those rules -- the user's decision (2026-10-02), the same one that took the readers off
+/// `HARMLESS`. Reading jkb's own state -- the checkout's git, the container credential -- is not
+/// this: the caller names no path.
+///
+/// Exhaustive like [`support`], for the same reason: a new subcommand does not compile until
+/// somebody decides whether it reads a named file. The one wildcard is inside `task`, whose verbs
+/// are task ops; a new `task` verb that reads a named file has to be added here by hand.
+#[must_use]
+pub fn reads_named_file(command: &Command) -> bool {
+    match command {
+        // A file is read and parsed here; a URL is rendered, which reads no local file.
+        Command::Ingest { path, .. } => !jkb_ingest::is_url(path),
+        // Its `ingest_path` tool reads a file here, named in a request on stdin this cannot see.
+        Command::Mcp => true,
+        // The review result, from a file -- or from stdin with `-`, which an approved line can fill
+        // only from `echo`, with text the model wrote: a redirect, or any other command piping in,
+        // is never approved.
+        Command::Task {
+            cmd: TaskCmd::Review {
+                cmd: TaskReviewCmd::File { from, .. },
+            },
+        } => from.as_os_str() != "-",
+        Command::Task { .. }
+        // Refused with `JKB_REMOTE` set ([`support`]): they would read here, but never run here.
+        | Command::Mount { .. }
+        | Command::Sync { .. }
+        | Command::Service { .. }
+        | Command::Serve { .. }
+        | Command::Index { .. }
+        | Command::Undo { .. }
+        // Name no local file to read.
+        | Command::Query { .. }
+        | Command::Search { .. }
+        | Command::Ns { .. }
+        | Command::Tag { .. }
+        | Command::Staging { .. }
+        | Command::Commands { .. }
+        | Command::View { .. }
+        | Command::Doctor { .. }
+        | Command::Notify { .. }
+        | Command::Role { .. }
+        | Command::Workflow { .. }
+        | Command::Attest { .. }
+        | Command::Mq { .. }
+        | Command::Ls { .. }
+        | Command::Grep { .. }
+        | Command::Cat { .. }
+        | Command::Tree { .. }
+        | Command::Find { .. }
+        | Command::Recent { .. }
+        | Command::Stat { .. }
+        | Command::Guide
+        | Command::Item { .. }
+        | Command::Related { .. }
+        | Command::Inv { .. }
+        | Command::Blob { .. }
+        | Command::History { .. } => false,
     }
 }
 

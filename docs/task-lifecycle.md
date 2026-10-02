@@ -944,7 +944,13 @@ the ticket on every request. Three answers:
   decision (2026-10-02): with `cat`, `grep`, `head`, `tail`, `wc` and `jq` on it, `jkb ls; cat
   ~/repos/other/.env` was approved and read a file past any rule the person had for reads. So
   `jkb … | jq .status` is deferred — under the auto posture still unprompted, under stricter rules
-  theirs.
+  theirs. The same decision covers `jkb` itself where it reads a file the caller *names* and sends
+  the daemon only the text — `jkb ingest <path>` (a URL is rendered, and stays approved), `jkb mcp`
+  (its `ingest_path` tool), `jkb task review file --from <file>` (from `-` stays approved). RBAC
+  judges the op, never which file fed it, so `jkb ingest ~/repos/other/.env` approved would read
+  past a read rule exactly as `cat` did; the container sees every project under `~/repos`. Which
+  subcommands read is `remote::reads_named_file`, an exhaustive match beside `remote::support`, asked
+  of the words as `jkb`'s own clap parser reads them; words that parser refuses are deferred too.
 - **no `permissionDecision`** for any other line that mentions `jkb`: one that also runs something
   else (`jkb ls && git status`), one the classifier cannot model (a redirect, `$`, a glob, a bare
   tilde), one that reaches `jkb` by a path, a prefix or a wrapper (`~/.cargo/bin/jkb`, `FOO=1 jkb`,
@@ -1054,7 +1060,8 @@ so `jkb query 'status!=done'` and `jkb task add 'Fix it !p1 #area=hook'` were as
 `PreToolUse` `ask` overrides an allow rule, anyone with `Bash(jkb:*)` newly saw a prompt on the most
 ordinary calls there are. The rule now turns on whether the shell would read a character as syntax:
 
-- `$`, a backtick and a backslash are refused **anywhere**, quoted or not. They are what the word
+- `$`, a backtick and a backslash keep a line from being approved **anywhere**, quoted or not
+  (they were "refused" when this was written; such a line is now deferred). They are what the word
   reader cannot model — the first two substitute inside double quotes, the third escapes the quoting
   itself — so with any of them present its output is not a model of anything.
 - Every other metacharacter matters only when it appears **bare**; inside either kind of quote the

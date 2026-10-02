@@ -712,8 +712,9 @@ enum Attestation {
     /// decision.
     Skip,
     /// Ticketed, and the line approved: every command on it is `jkb` itself or `HARMLESS`, so
-    /// nothing on it but `jkb` can run or write anything. What each `jkb` may DO is the daemon's
-    /// RBAC, held against the ticket on every request.
+    /// nothing on it but `jkb` can run or write anything, and no `jkb` on it reads a file the caller
+    /// names ([`remote::reads_named_file`]). What each `jkb` may DO is the daemon's RBAC, held
+    /// against the ticket on every request.
     Allow,
     /// Ticketed, and the permission decision left to whoever it belonged to: a line that runs
     /// something besides `jkb` and the `HARMLESS` commands, or one the lexer cannot model. The hook
@@ -890,14 +891,18 @@ fn attestation(command: &str) -> Attestation {
         return Attestation::Defer;
     };
     // Every command on the line is one of three things. `jkb` itself, by that exact command word.
-    // A [`HARMLESS`] command, whose arguments are data however they mention jkb (`grep jkb src`).
+    // A [`HARMLESS`] command, whose arguments are data however they mention jkb (`echo jkb`).
     // Or OTHER -- anything that might run or write something, which the session's own rules judge.
+    // A jkb that reads a file the caller names counts as OTHER too ([`reads_named_file`]).
     let mut jkb = 0_usize;
     let mut other = false;
     let mut mentions = false;
     for words in &commands {
         match words.first().map(String::as_str) {
-            Some("jkb") => jkb += 1,
+            Some("jkb") => {
+                jkb += 1;
+                other |= reads_named_file(words);
+            }
             Some(w) if HARMLESS.contains(&w) => {}
             _ => {
                 other = true;
@@ -918,6 +923,15 @@ fn attestation(command: &str) -> Attestation {
     // next` never prompt. What each jkb may DO is the daemon's RBAC, held against the ticket on
     // every request -- not this hook's.
     Attestation::Allow
+}
+
+/// Whether one `jkb` command's words read a file the caller names -- [`remote::reads_named_file`],
+/// asked of the words as the binary itself would parse them, so a flag or an `=` spelling cannot read
+/// differently here. Words the parser refuses count as a read: such a line is not approved, and the
+/// session's own rules judge it.
+fn reads_named_file(words: &[String]) -> bool {
+    use clap::Parser as _;
+    crate::Cli::try_parse_from(words).map_or(true, |cli| remote::reads_named_file(&cli.command))
 }
 
 /// The `PreToolUse` answer for one classified command.
@@ -1102,7 +1116,7 @@ mod tests {
         "jkb query 'status!=done'",
         "jkb task add 'Fix the sweep !p1 @2026-10-01 +tasks/inbox #area=container'",
         "jkb search 'what changed?'",
-        "jkb task edit x --text \"a # hash, a ! bang and a [bracket]\"",
+        "jkb task edit x \"a # hash, a ! bang and a [bracket]\"",
         "jkb grep '*.rs' repos/jkb",
         // Tilde expansion yields one word and always a path, and has no quoted spelling that
         // still expands, so it is judged bare.
@@ -1113,7 +1127,7 @@ mod tests {
         // Split on IFS, so a non-breaking space is ordinary word text, quoted or not --
         // which is exactly what bash passes. Only a word SEPARATOR has to match.
         "jkb task add 'a\u{a0}b'",
-        "jkb task show\u{3000}x",
+        "jkb task add x\u{3000}y",
     ];
 
     /// Lines approved as a whole: every command on them is `jkb` itself or HARMLESS, so nothing on
@@ -1130,6 +1144,11 @@ mod tests {
         "jkb task 'land' task:x --gate 'sh /tmp/p.sh'",
         "jkb task gate",
         "jkb task add 'ok' && jkb task land task:x",
+        // A jkb that reads no file the caller names: a page to render, or a review result typed
+        // on the line itself.
+        "jkb ingest https://example.com/page",
+        "jkb --json ingest --ns inbox https://example.com/page",
+        "echo '{}' | jkb task review file --findings repos/x/codereviews/y --from -",
     ];
 
     /// Lines the classifier cannot model, so it does not approve them -- only an approval overrides
@@ -1161,6 +1180,23 @@ mod tests {
         "jkb task list --json | head -20",
         "jkb ls; cat ~/repos/other/.env",
         "grep -rn jkb src",
+        // A jkb that reads a file the caller NAMES ([`remote::reads_named_file`]): the daemon sees
+        // only the text, so approving it would read past the person's own rules like `cat` -- the
+        // same decision. However the flags are spelled, since the binary's own parser reads them.
+        "jkb ingest ~/repos/other/.env",
+        "jkb ingest notes.md && jkb cat x",
+        "jkb --json ingest --ns inbox ./notes.md",
+        "jkb ingest --ns=inbox notes.md",
+        "jkb ingest file:///home/vscode/repos/other/.env",
+        "jkb ingest HTTPS://example.com",
+        "jkb mcp",
+        "echo '{}' | jkb mcp",
+        "jkb task review file --findings repos/x/codereviews/y --from result.json",
+        "jkb task review file --findings=n --from=result.json",
+        "cd repo && jkb task review file --from r.json --findings n",
+        // Words jkb's parser refuses are not approved either: what they would do is not known.
+        "jkb --no-such-flag ls",
+        "jkb no-such-command",
         "jkb ls && rm -rf ~/repos/other",
         "jkb ls\nrm -rf /",
         "jkb task show x | ./evil.sh",
@@ -1479,7 +1515,7 @@ mod tests {
             "env -S 'jkb task land z'",
             "jkb task show x; sh -c 'jkb task land y'",
             "jkb task show x && echo land | xargs jkb task",
-            // (`sudo jkb …` cannot run here at all; the static table pins it as asked.)
+            // (`sudo jkb …` cannot run here at all; the static table pins it as deferred.)
             "time -p jkb task land x",
             // Round 8: a glob inside quotes is not a jkb word to the lexer, and is to `sh`. Aimed
             // at the fake in the working directory: with `~`, and no HOME in the child, the glob

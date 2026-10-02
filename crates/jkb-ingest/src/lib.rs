@@ -24,6 +24,13 @@ mod pipeline;
 pub use error::{Error, Result};
 pub use pipeline::{text_address, Outcome, Pipeline};
 
+/// Whether [`read_source`] takes `source` as a page to render rather than a file to read -- its own
+/// test, so a caller asking "does this read the local filesystem?" asks the same question.
+#[must_use]
+pub fn is_url(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
 /// Read and parse a source named on the command line: an `http(s)` URL is rendered in a headless
 /// browser and its DOM parsed as HTML; anything else is a file, parsed by its extension. Returns the raw
 /// bytes with the parsed document.
@@ -38,7 +45,7 @@ pub use pipeline::{text_address, Outcome, Pipeline};
 /// or the adapter's parse error.
 pub fn read_source(source: &str) -> Result<(Vec<u8>, adapter::ParsedDocument)> {
     use adapter::SourceAdapter as _;
-    if source.starts_with("http://") || source.starts_with("https://") {
+    if is_url(source) {
         let html = fetch::render_url(source)?;
         let parsed = adapter::HtmlAdapter.parse(html.as_bytes())?;
         return Ok((html.into_bytes(), parsed));
