@@ -175,6 +175,7 @@ else
 # entrypoint now boots on: it reads the live chains, so unlike the record it was reading before, it
 # cannot describe a network that no longer exists.
 "$(dirname "$0")/../.container/egress-lib.sh" --self-test
+"$(dirname "$0")/../.container/deny-transcripts.sh" --self-test
 "$(dirname "$0")/../.container/egress-status.sh" --self-test
 
 # ...and verify.sh's exclusion list. The rest of verify.sh needs a container, but RUNTIME_OWNED is

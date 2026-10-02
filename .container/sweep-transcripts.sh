@@ -53,6 +53,11 @@ set -uo pipefail
 CLAUDE_BASE="${CLAUDE_CONFIG_DIR:-${HOME:-/home/vscode}/.claude}"
 TRANSCRIPT_ROOT="${JKB_TRANSCRIPT_ROOT:-$CLAUDE_BASE/projects}"
 TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-state/transcript-archive}"
+# The posture Claude Code actually loaded, which decides whether this file has a job at all -- see
+# posture_enumerates_transcripts. A TEST SEAM like the three above: inside the container it is
+# always the image's copy, and --self-test points it somewhere hermetic, because check.sh runs that
+# self-test INSIDE a container whose real posture would otherwise decide every program-level row.
+MANAGED_SETTINGS="${JKB_MANAGED_SETTINGS:-/etc/claude-code/managed-settings.json}"
 
 # THE SEAMS, NAMED ONCE AND IN ONE PLACE: every JKB_ input this file reads. Most exist for
 # --self-test, which cannot drive this file as a program without them; JKB_KEEP_SESSIONS is the
@@ -68,7 +73,7 @@ TRANSCRIPT_ARCHIVE="${JKB_TRANSCRIPT_ARCHIVE:-${HOME:-/home/vscode}/.claude-stat
 # HAND-WRITTEN, AND CHECKED AGAINST REALITY BY check-config.sh, which derives the same set from
 # every `${JKB_…:-}` this file actually reads and requires the two to agree. A declaration nothing
 # compares to the code is a fourth seam waiting to be refused by nothing.
-SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_NOW_SECS"
+SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_NOW_SECS JKB_MANAGED_SETTINGS"
 # ...AND EVERY JKB_ INPUT, which is a longer list than the seams. JKB_KEEP_SESSIONS is NOT a
 # seam: it is the sweep's live production input, the sessions a caller knows to be running, and
 # both triggers pass it. Refusing it in shipped files -- the blanket rule the four above earn --
@@ -397,6 +402,41 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
 # path first (which makes every enumerated path start with `/`), the relative directory comes from
 # `${rel%/*}` parameter expansion rather than from dirname, and every external command that takes
 # a path here is given `--`.
+# WHETHER THIS FILE HAS A JOB. Everything above budgets a deny list that names every transcript by
+# path, because that is what `Read(~/.claude/projects/**/*.jsonl)` compiled to: one bubblewrap
+# argument per file, and past ~200 of them every Bash call died at spawn. That rule is gone. The
+# transcript deny is .container/deny-transcripts.sh now, a hook that costs no argv, and what is
+# left in managed-settings.json is `Read(~/.claude/projects)` -- one entry, whatever is under it.
+# Measured after the change: the live sandbox profile lists the tree as two paths where it had
+# listed ~412.
+#
+# So a budget computed from file count describes a list that no longer exists, and it did harm the
+# moment it outlived its premise: it reported "69776 deny bytes ... Bash may still fail at spawn
+# with E2BIG" in a container where Bash was fine, verify.sh read that as `over`, and run.sh refused
+# to open a window on every start -- while both triggers went on archiving transcripts to satisfy
+# a limit nothing enforced. Asked HERE, at the entry every caller shares (run.sh, the reaper's
+# tick, verify.sh's --dry-run), rather than at each of them.
+#
+# CANNOT TELL MEANS YES. A posture that is missing, unreadable or not JSON answers "enumerates",
+# which keeps the old behaviour: sweeping when it was not needed costs an archived transcript,
+# not sweeping when it was costs every Bash call in the container. The rule it looks for is the
+# one check-config.sh refuses outright -- a deny under a projects tree ending in a file pattern --
+# so on a correctly built image this answers "no", and would answer "yes" again the day someone
+# brought such a rule back.
+posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
+    local rules rule last
+    [ -r "$1" ] || return 0
+    rules="$(jq -r '.permissions.deny[]?' "$1" 2>/dev/null)" || return 0
+    while IFS= read -r rule; do
+        [ -n "$rule" ] || continue
+        rule="${rule#*(}"; rule="${rule%)}"
+        case "$rule" in *projects/*) ;; *) continue ;; esac
+        last="${rule##*/}"
+        case "$last" in '**') ;; *'*'*) return 0 ;; esac
+    done <<<"$rules"
+    return 1
+}
+
 sweep_transcripts() { # sweep_transcripts <root> <archive> [--dry-run]
     local root="$1" archive="$2" dry="${3:-}"
     local abs phys_root phys_archive records plan planned irreducible err
@@ -1162,7 +1202,13 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # `${envs[@]+...}` because bash 3.2 (which is what a Mac ships, and this file self-tests on
     # macOS) treats an empty array under `set -u` as unbound.
     prog() {
-        local envs=() unset_args=(-u CLAUDE_CONFIG_DIR) seam
+        # THE POSTURE IS PINNED, NOT INHERITED. Unsetting JKB_MANAGED_SETTINGS alone would send
+        # every row below to /etc/claude-code/managed-settings.json -- which check.sh reaches when
+        # it runs this self-test inside the container, where that posture names no transcript and
+        # would turn every archiving row into "nothing to archive". An absent file means "assume
+        # it enumerates", which is exactly the behaviour these rows were written against; a row
+        # that is ABOUT the posture passes its own after this default and wins.
+        local envs=("JKB_MANAGED_SETTINGS=$work/no-such-posture.json") unset_args=(-u CLAUDE_CONFIG_DIR) seam
         # DERIVED FROM $INPUTS -- every JKB_ the script reads, not only the refusable ones --
         # and not retyped. The list named three of four, so an exported JKB_KEEP_SESSIONS
         # reached every row below, and nothing but this comment would have stopped the next
@@ -1231,6 +1277,51 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...while the same run without it archives them" \
        "$(find "$prog_arch" -type f | grep -c . )" "2"
 
+    echo "==> sweep-transcripts self-test: whether the posture gives this file a job at all"
+    pdir="$work/posture"; mkdir -p "$pdir"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)","Read(~/.claude-state/projects/**/*.jsonl)"]}}' >"$pdir/globs.json"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.jkb-container/**)","Read(~/.claude/projects)","Read(~/.claude-state/projects)"]}}' >"$pdir/hook.json"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**)"]}}' >"$pdir/subtree.json"
+    printf '%s\n' '{"hooks":{}}' >"$pdir/nodeny.json"
+    printf '%s\n' 'not json {' >"$pdir/broken.json"
+    pe() { if posture_enumerates_transcripts "$1"; then echo yes; else echo no; fi; }
+    eq "the old per-file globs enumerate transcripts"          "$(pe "$pdir/globs.json")"   yes
+    eq "the hook posture's exact-path rules do not"            "$(pe "$pdir/hook.json")"    no
+    eq "a subtree wildcard collapses, so it does not either"   "$(pe "$pdir/subtree.json")" no
+    eq "a posture with no deny rules names nothing"            "$(pe "$pdir/nodeny.json")"  no
+    # CANNOT TELL MEANS YES -- the direction that keeps sweeping. Getting these backwards is the
+    # expensive way round: a sweep that stood down on an unreadable posture would leave a tree
+    # growing towards every Bash call dying at spawn, and say nothing.
+    eq "a missing posture is treated as enumerating"           "$(pe "$pdir/absent.json")"  yes
+    eq "an unparseable posture is treated as enumerating"      "$(pe "$pdir/broken.json")"  yes
+
+    # THROUGH THE PROGRAM, for real rather than --dry-run, on the same over-budget recipe the rows
+    # above archive from: the posture decides whether anything moves at all. Both halves, or a
+    # premise check that never fired would pass this as "moved nothing" too.
+    pp_root="$work/pp/projects"; pp_arch="$work/pp/archive"
+    i=0
+    while [ "$i" -lt "$((DEFAULT_KEEP + 2))" ]; do
+        mk "$pp_root/-slug/$(printf '%04d' "$i").jsonl" "20260101$(printf '%02d' $((i / 60)))$(printf '%02d' $((i % 60)))"
+        i=$((i + 1))
+    done
+    pp_out="$(prog HOME="$phome" JKB_TRANSCRIPT_ROOT="$pp_root" JKB_TRANSCRIPT_ARCHIVE="$pp_arch" \
+        JKB_DENY_BUDGET_BYTES=1 JKB_MANAGED_SETTINGS="$pdir/hook.json" -- 2>&1)"; pp_rc=$?
+    eq "under the hook posture an over-budget tree is left alone" \
+       "$([ -e "$pp_arch" ] && find "$pp_arch" -type f | grep -c . || echo 0)" "0"
+    eq "...exits 0" "$pp_rc" "0"
+    # The reaper keys its quiet tick on this phrase and verify.sh keys `unmeasured` on "does not
+    # exist"; the one sentence has to satisfy both, so both are asserted.
+    eq "...says the reaper's quiet phrase" \
+       "$(grep -c 'nothing to archive' <<<"$pp_out")" "1"
+    eq "...and not verify.sh's unmeasured one" \
+       "$(grep -c 'does not exist' <<<"$pp_out")" "0"
+    eq "...and names no E2BIG, which is the false alarm this exists to stop" \
+       "$(grep -c 'E2BIG' <<<"$pp_out")" "0"
+    prog HOME="$phome" JKB_TRANSCRIPT_ROOT="$pp_root" JKB_TRANSCRIPT_ARCHIVE="$pp_arch" \
+        JKB_DENY_BUDGET_BYTES=1 JKB_MANAGED_SETTINGS="$pdir/globs.json" -- >/dev/null 2>&1
+    eq "...while the same tree under the old globs is archived" \
+       "$(find "$pp_arch" -type f | grep -c . )" "2"
+
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31msweep-transcripts self-test FAILED (%d)\033[0m\n' "$fails"; exit 1; }
     printf '\033[32msweep-transcripts self-test passed\033[0m\n'
@@ -1238,6 +1329,15 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
 fi
 
 case "${1:-}" in
-    ""|--dry-run) sweep_transcripts "$TRANSCRIPT_ROOT" "$TRANSCRIPT_ARCHIVE" "${1:-}" ;;
+    ""|--dry-run)
+        # "nothing to archive" is deliberate: it is one of the reaper's NOTHING_TO_DO phrases, so
+        # this is a quiet tick there, and it contains no "does not exist", so verify.sh reads it
+        # as a measured, healthy pass rather than an unmeasured one.
+        if ! posture_enumerates_transcripts "$MANAGED_SETTINGS"; then
+            printf 'transcript sweep: the deny list in force (%s) names no transcript by path, so they cost the Bash sandbox argv nothing — nothing to archive\n' \
+                "$MANAGED_SETTINGS"
+            exit 0
+        fi
+        sweep_transcripts "$TRANSCRIPT_ROOT" "$TRANSCRIPT_ARCHIVE" "${1:-}" ;;
     *) printf 'usage: %s [--dry-run|--self-test]\n' "$0" >&2; exit 2 ;;
 esac

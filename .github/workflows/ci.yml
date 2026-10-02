@@ -120,6 +120,7 @@ jobs:
           ./.container/entrypoint.sh --self-test
           ./.container/init-firewall.sh --self-test
           ./.container/egress-lib.sh --self-test
+          ./.container/deny-transcripts.sh --self-test
           ./.container/egress-status.sh --self-test
           ./.container/fetch-extensions.sh --self-test
           ./.container/verify.sh --self-test

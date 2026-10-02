@@ -437,10 +437,121 @@ fi
 hook_cmds="$(jq -r '.hooks[][].hooks[].command' "$here/managed-settings.json" 2>/dev/null)"
 if [ -z "$hook_cmds" ]; then
     bad "no hook commands could be read from managed-settings.json — the check that they run the pinned binary examined nothing"
-elif grep -qv '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds"; then
-    bad "a managed hook does not run /usr/local/lib/jkb-hook/jkb — one found on PATH is replaceable from the sandbox: $(grep -m1 -v '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds")"
+elif grep -qvE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.sh$)' <<<"$hook_cmds"; then
+    # TWO PINNED PATHS, NOT A RELAXED PATTERN. The rule is "absolute, root-owned, and not writable
+    # from inside the sandbox", and both satisfy it: the Dockerfile installs each --chown=root:root
+    # and the sandbox's allowOnly write list reaches neither. deny-transcripts.sh joined the list
+    # when the transcript deny moved out of permissions.deny and into a hook, because a
+    # `Read(...*.jsonl)` glob is named per-matching-file in the bubblewrap argv and blew it. A
+    # THIRD entry here should be suspicious: each one is a program that runs outside the sandbox
+    # with the container credential readable.
+    bad "a managed hook runs neither pinned root-owned program — one found on PATH is replaceable from the sandbox: $(grep -m1 -vE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.sh$)' <<<"$hook_cmds")"
 else
     ok "every managed hook runs the pinned, root-owned jkb"
+fi
+# THE TWO THINGS A DENY RULE OVER THE TRANSCRIPT TREE CAN BREAK, and they pull in OPPOSITE
+# directions. This is one check because treating either alone produces the other's failure.
+#
+#   ARGV. Claude Code compiles `permissions.deny` into the bubblewrap argv for the Bash sandbox.
+#   A rule ending in a directory wildcard COLLAPSES -- `Read(~/.ssh/**)` becomes the single path
+#   `~/.ssh`, as it does for ~/.aws, ~/Documents, ~/.pki and ~/.jkb-container. A rule ending in a
+#   FILE pattern cannot: the sandbox names every match and binds /dev/null over each, so the argv
+#   grows by one path per file on disk. Measured 2026-09-30, after a sweep had already run: the
+#   two transcript rules expanded to 206 paths, 33,819 bytes per spelling, 67,638 across both,
+#   against a MAX_ARG_STRLEN of 131,072 Linux does not let you raise -- 52% of the ceiling. Past
+#   it EVERY Bash call in the container dies at spawn with E2BIG, including `:`, with nothing in
+#   the message naming transcripts.
+#
+#   MEMORY. Claude Code keeps auto-memory at ~/.claude/projects/<slug>/memory/. That location is
+#   not ours to choose, `scripts/link-claude-memory.sh` exists to put the link there, and
+#   verify.sh FAILS when it is missing. A subtree rule over `projects/**` covers it -- and denied
+#   memory does not error, it goes QUIET: MEMORY.md stops arriving in context, which reads like an
+#   agent that forgot rather than a broken container.
+#
+# SO THE COLLAPSING SHAPE IS UNAVAILABLE HERE, and that is a finding, not an oversight. It was
+# tried: the rules were changed to `projects/**`, which takes the argv to ~50 bytes, and
+# verify.sh's `memory_shadow` rows caught that the same edit swallows auto-memory on both
+# spellings. The transcript rules therefore MUST end in a file pattern, they are named below as
+# the one exception, and their cost is what .container/sweep-transcripts.sh budgets. Anything
+# else ending in a file pattern is a new O(files) term and is refused.
+dc_deny_raw="$(jq -r '.permissions.deny[]?' "$here/managed-settings.json" 2>/dev/null)"
+if [ -z "$dc_deny_raw" ]; then
+    bad "no permissions.deny rules could be read from managed-settings.json — the checks that none of them blows the argv or swallows auto-memory examined nothing"
+else
+    # TILDES NORMALISED ON BOTH SIDES, and this is not cosmetic: bash performs tilde expansion on
+    # an UNQUOTED `case` pattern but not on the quoted word being matched, so a literal `~` on one
+    # side and an expanded `/home/vscode` on the other never match and the memory check silently
+    # passes everything. It did, until the mutation rows below were run against it. `/home/vscode`
+    # rather than `$HOME` because this file also runs on CI, where $HOME is the runner's and the
+    # rules being read describe the container's.
+    dc_deny="$(sed -E 's/^[A-Za-z]+\((.*)\)$/\1/' <<<"$dc_deny_raw" | sed 's|^~|/home/vscode|')"
+    # 1. Nothing may cover auto-memory. Two spellings of the tree, one synthetic slug: no rule
+    #    names a slug, so a probe path answers for every repo at once and keeps a second copy of
+    #    the linker's slugify out of this file.
+    dc_mem_hit=""
+    for dc_root in /home/vscode/.claude/projects /home/vscode/.claude-state/projects; do
+        while IFS= read -r dc_pat; do
+            [ -n "$dc_pat" ] || continue
+            case "$dc_root/-probe-repo/memory/MEMORY.md" in
+                $dc_pat) dc_mem_hit="$dc_mem_hit $dc_pat" ;;
+            esac
+        done <<<"$dc_deny"
+    done
+    # 2. NOTHING may expand per-file. There is no exception left: the transcript rules were the
+    #    only ones that needed a file pattern, and they became deny-transcripts.sh precisely so
+    #    this ban could be absolute. Re-introducing an exception list is how the 67,638 bytes come
+    #    back one reasonable-looking rule at a time.
+    dc_expanding=""
+    while IFS= read -r dc_rule; do
+        [ -n "$dc_rule" ] || continue
+        dc_last="${dc_rule##*/}"
+        case "$dc_last" in
+            '**') continue ;;
+            *'*'*) dc_expanding="$dc_expanding $dc_rule" ;;
+        esac
+    done <<<"$dc_deny"
+    if [ -n "$dc_mem_hit" ]; then
+        bad "a managed deny rule covers ~/.claude/projects/<slug>/memory, so MEMORY.md stops reaching context with no error anywhere:$dc_mem_hit
+       Auto-memory's location is Claude Code's, not ours, and verify.sh FAILS when it is not
+       linked there — so a subtree rule over the transcript tree cannot also be the argv fix."
+    elif [ -n "$dc_expanding" ]; then
+        bad "a managed deny rule ends in a file pattern, so the Bash sandbox must name every matching file and the argv grows with the file count until every Bash call in the container dies at spawn:$dc_expanding
+       Use the whole-subtree form (\`dir/**\`), which collapses to a single argv entry. If it has
+       to spare a sibling the way the transcript deny spares auto-memory, a glob cannot express
+       that at all — make it a PreToolUse hook, as .container/deny-transcripts.sh is, and it costs
+       no argv. .container/README.md carries the measurements."
+    else
+        ok "no managed deny rule swallows auto-memory, and none expands per-file into the Bash sandbox argv"
+    fi
+fi
+
+# AND THE HOOK THAT REPLACED THEM MUST ACTUALLY BE WIRED. With the globs gone, deny-transcripts.sh
+# is the ONLY thing stopping a file tool reading another session's transcript -- the exact-path
+# rules above cover Bash, not Read/Edit/Write. Deleting the hook entry, or the COPY that installs
+# it, leaves every gate here green and the confidentiality boundary simply absent. Three things
+# have to hold together, so all three are asked: it is referenced, it is installed, and it is
+# installed root-owned (a hook the sandbox can rewrite is a hook the agent controls).
+dc_hook=/usr/local/bin/deny-transcripts.sh
+if ! jq -e --arg h "$dc_hook" '[.hooks.PreToolUse[]?.hooks[]?.command] | index($h)' \
+        "$here/managed-settings.json" >/dev/null 2>&1; then
+    bad "managed-settings.json no longer runs $dc_hook as a PreToolUse hook — with the transcript globs gone, nothing else keeps a file tool out of another session's transcript"
+elif ! grep -qF -- "COPY --chown=root:root deny-transcripts.sh $dc_hook" "$here/Dockerfile"; then
+    bad "the Dockerfile does not install deny-transcripts.sh root-owned at $dc_hook — the hook managed-settings.json names is either missing or writable by the agent it confines"
+elif [ ! -f "$here/deny-transcripts.sh" ]; then
+    bad "there is no .container/deny-transcripts.sh to install, so the transcript deny does not exist"
+else
+    # The matcher has to name the tools that can READ a file. A hook wired only to Read leaves
+    # Grep and Glob able to enumerate and search the tree.
+    dc_match="$(jq -r --arg h "$dc_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$here/managed-settings.json" 2>/dev/null)"
+    dc_missing=""
+    for dc_tool in Read Edit Write Grep Glob; do
+        case "$dc_match" in *"$dc_tool"*) ;; *) dc_missing="$dc_missing $dc_tool" ;; esac
+    done
+    if [ -n "$dc_missing" ]; then
+        bad "the transcript hook's matcher does not cover:$dc_missing — a tool left out can read or enumerate the tree the hook exists to close"
+    else
+        ok "the transcript deny is a wired, root-owned hook covering every file-reading tool"
+    fi
 fi
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers
 # base ships /etc/sudoers.d/vscode = `NOPASSWD:ALL`, under which the agent can flush the firewall,
