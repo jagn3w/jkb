@@ -20,9 +20,15 @@
 //! which **no already-running container has**, because only a rebuilt image carries it and nothing
 //! forces a rebuild. On every live container that exec would have exited 127, been reported once
 //! into `reap.log`, and deduped for ever, with every gate green. So the script is embedded in this
-//! binary at compile time and fed to `bash -s` on stdin. There is then no second copy to drift, no
-//! rebuild to require, and no path to agree about: the reaper runs exactly the sweep the `jkb` that
-//! `setup.sh` installed was built from.
+//! binary at compile time and fed to `bash -s` on stdin. There is then no rebuild to require and no
+//! path to agree about: the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was
+//! built from. **It is one of two copies now.** Since the container kit, `run.sh`'s start sweep and
+//! `verify.sh` run the kit mirror's copy (`.container/README.md`, "Everything unsandboxed runs from
+//! the kit"). They agree when the binary and the kit come from one checkout, and differ when
+//! `setup.sh` runs in a linked worktree: it builds that branch's `jkb` and leaves the kit on the main
+//! checkout. Accepted, not closed: the sweep is a backstop that stands down on the shipped posture,
+//! and making this exec the mirror's copy would leave the stdin writer below pushing the embedded
+//! one at a child that never reads it.
 //!
 //! **It is never fatal, and silent unless something is wrong.** A host with no Docker, or no such
 //! container, or a stopped one, is the ordinary case for anyone not using the dev container and says
@@ -338,7 +344,8 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
         // EVERY PIPE GETS A THREAD, and all three for the same reason: a pipe nobody is moving
         // blocks whoever is on the other end of it.
         //
-        // The WRITER, because the script is larger than a pipe buffer (74KB against 64KB) and
+        // The WRITER, because the script is larger than a pipe buffer (127,439 bytes by `wc -c` on
+        // 2026-10-02, against 64KB) and
         // `bash -s` executes as it reads, so a blocking write from here deadlocks the moment the
         // child pauses to run a `find`. The handle is moved in, so the pipe closes when the thread
         // ends and `bash` sees EOF.

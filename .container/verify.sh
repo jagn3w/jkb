@@ -865,7 +865,7 @@ if [ ! -r /proc/self/mountinfo ]; then
     echo "  /proc/self/mountinfo is not readable here, so the mount boundary — the assertion this" >&2
     echo "  file exists for — could not be checked at all." >&2
     echo >&2
-    echo "  In VS Code:  ~/.local/share/jkb-container-kit/.container/run.sh, attach to the container, then run this" >&2
+    echo "  In VS Code:  ~/.local/share/jkb-container-kit/kit/.container/run.sh, attach to the container, then run this" >&2
     echo "  With Docker: ./.container/mutate-verify.sh --control   (one healthy run)" >&2
     echo "               ./.container/mutate-verify.sh             (every guard, watched failing)" >&2
     echo >&2
@@ -914,7 +914,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "  The fresh procfs is why /proc/1 and the mount table are not this container's."
             echo
             echo "  Run it from a plain terminal in the attached container, or from the host:"
-            echo "    ~/.local/share/jkb-container-kit/.container/run.sh                       (runs this for you, via docker exec)"
+            echo "    ~/.local/share/jkb-container-kit/kit/.container/run.sh                       (runs this for you, via docker exec)"
             echo "    ./.container/mutate-verify.sh --control   (one healthy run)"
         } >&2
         exit 2
@@ -928,7 +928,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "  one of:"
             echo "    * the container was started with --entrypoint, bypassing entrypoint.sh;"
             echo "    * its start did not finish (check \`docker logs\`);"
-            echo "    * the image predates the marker — rebuild: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build"
+            echo "    * the image predates the marker — rebuild: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build"
             echo
             echo "  On an ordinary Linux host there is no marker either, and that is the honest"
             echo "  answer: this script asserts what a CONTAINER is and has no subject here."
@@ -946,7 +946,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "    docker stats --no-stream <name>   # PIDS = the counter --pids-limit bounds"
             echo
             echo "  If that is near the limit, recreate it:"
-            echo "    ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build"
+            echo "    ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build"
         } >&2
         exit 2
         ;;
@@ -1055,7 +1055,7 @@ fi
 
 case "$(reaper_verdict "$pid1_argv" "$orphan" "$adopted" "$final")" in
     reaped)     ok  "PID 1 reaps the orphans it adopts (PID 1 is: $pid1_argv)" ;;
-    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build" ;;
+    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build" ;;
     fork-failed)      bad "could not establish whether PID 1 reaps: the fork for the test orphan failed, which is how a container at its --pids-limit fails — the end state of a PID 1 that does not reap (PID 1 is: $pid1_argv)" ;;
     pid1-unreadable)  bad "could not establish whether PID 1 reaps: $PROC/1/cmdline could not be read, so nothing here observed what PID 1 even is" ;;
     proc-unreadable)  bad "could not establish whether PID 1 reaps: this process's own $PROC entry is unreadable, so an absent orphan would say nothing about reaping" ;;
@@ -1696,7 +1696,7 @@ mem_managed=/etc/claude-code/managed-settings.json
 # THE SHARED READER MUST HAVE LOADED. If a function it uses were missing, posture_rule_covers would
 # be "command not found", memory_shadow would answer `clear`, and this whole block would pass on
 # nothing -- the quiet direction. check-config.sh guards its own load the same way.
-if ! declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_layer_files posture_layer_kind posture_layer_base posture_hook_matcher >/dev/null; then
+if ! declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_layer_files posture_layer_kind posture_layer_base posture_hook_matcher posture_transcript_roots >/dev/null; then
     bad "the deny-rule reader could not be loaded from sweep-transcripts.sh beside this script, so whether any settings layer swallows auto-memory, or whether the hook is wired, is unchecked"
 elif [ ! -f "$mem_managed" ]; then
     bad "there are no managed settings at $mem_managed, so nothing here establishes that the posture leaves auto-memory readable"
@@ -1802,12 +1802,20 @@ else
         esac
     }
     mem_hook_wrong=""
-    for mem_root in "$HOME/.claude/projects" "$HOME/.claude-state/projects"; do
+    # EVERY ROOT in the shared list, the archive included (review round 11: this probed the two
+    # spellings of the tree, so a hook that lost the archive root passed). Auto-memory lives only
+    # under the tree, so only those two are asked about it.
+    for mem_root in $(posture_transcript_roots); do
+        mem_root="$HOME/${mem_root#\~/}"
         [ "$(mem_probe_hook "$mem_root/-probe/x.jsonl")" = deny ] \
             || mem_hook_wrong="$mem_hook_wrong a transcript under $mem_root is NOT denied;"
-        [ "$(mem_probe_hook "$mem_root/-probe/memory/MEMORY.md")" = allow ] \
-            || mem_hook_wrong="$mem_hook_wrong auto-memory under $mem_root is NOT allowed;"
+        case "$mem_root" in */projects)
+            [ "$(mem_probe_hook "$mem_root/-probe/memory/MEMORY.md")" = allow ] \
+                || mem_hook_wrong="$mem_hook_wrong auto-memory under $mem_root is NOT allowed;" ;;
+        esac
     done
+    [ -n "$(posture_transcript_roots 2>/dev/null)" ] \
+        || mem_hook_wrong="$mem_hook_wrong the shared root list could not be loaded, so no root was probed;"
     # ...AND THE INSTALLED SETTINGS MUST ACTUALLY RUN IT. A present, correct hook that no PreToolUse
     # entry names guards nothing, and every probe above still passes -- the stale-image and
     # hand-edited /etc/claude-code cases this block exists for. The matcher must EQUAL the shared
@@ -1821,7 +1829,7 @@ else
     if [ -n "$mem_hook_wrong" ]; then
         bad "the installed transcript hook is present but wrong:$mem_hook_wrong"
     else
-        ok "the transcript hook is installed root-owned and reached by every tool call, and under both spellings denies a transcript and allows auto-memory"
+        ok "the transcript hook is installed root-owned and reached by every tool call, denies a transcript under every root (archive included) and allows auto-memory"
     fi
 fi
 
@@ -2116,7 +2124,7 @@ case "$eg_daemon" in
     unresolved) $dm_bad "${daemon_at%:*} did not resolve when the firewall was raised, so no address is open for jkb serve on the host — re-run init-firewall.sh; on Linux add --add-host=${daemon_at%:*}:host-gateway" ;;
     absent)     $dm_bad "the firewall has no rule for jkb serve on the host ($daemon_at), so this container cannot reach the knowledge base" ;;
     wide)       $dm_bad "the host's address is in the egress allowlist, which opens EVERY port on the host's loopback to this container — jkb serve must be reached through its port-only rule alone" ;;
-    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build" ;;
+    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build" ;;
 esac
 
 # ...and what actually answers. The token is read from the ~/.jkb bind, where the host's daemon
@@ -2161,7 +2169,7 @@ else
             if [ -z "$jkb_remote_at" ] || ! command -v jkb >/dev/null 2>&1; then
                 :   # asserted above: remote mode unset fails there, no jkb is a note there
             elif [ "$jkb_remote_at" != "$daemon_at" ]; then
-                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build"
+                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build"
             else
                 if jkb_answer="$(env -u JKB_DB jkb --json mq topic ls 2>&1)"; then
                     ok "the installed jkb reaches jkb serve through JKB_REMOTE"
@@ -2225,11 +2233,11 @@ else
         # Nothing at all has been installed into this server, which is what attaching leaves behind
         # — not a broken install. The remedy is a command, and it is the command that exists for it.
         echo "  note this VS Code server has no extensions yet — attaching does not install them."
-        echo "       Run  ./.container/install-extensions.sh  from a terminal in the attached window."
+        echo "       Run  /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo)  from a terminal in the attached window."
     else
         bad "declared extensions are not installed:$missing — $present other(s) are, so this is not the
-       never-installed state. Run ./.container/install-extensions.sh from an attached terminal; if it
-       reports one was not staged into the image, rebuild: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build"
+       never-installed state. Run /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo) from an attached terminal; if it
+       reports one was not staged into the image, rebuild: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build"
     fi
 fi
 
@@ -2247,10 +2255,10 @@ if [ -n "$code_server" ]; then
         ok "VS Code machine settings carry vscode-machine-settings.json"
     elif [ ! -s "$machine_settings" ]; then
         echo "  note this VS Code server has no machine settings yet — attaching does not write them."
-        echo "       Run  ./.container/install-extensions.sh  from a terminal in the attached window."
+        echo "       Run  /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo)  from a terminal in the attached window."
     else
         bad "VS Code machine settings are missing or override: $(printf '%s' "$unset_keys" | tr '\n' ' ')— run
-       ./.container/install-extensions.sh from an attached terminal, then Developer: Reload Window"
+       /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo) from an attached terminal, then Developer: Reload Window"
     fi
 fi
 

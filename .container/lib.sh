@@ -435,7 +435,14 @@ JKB_SETUP_MARKER="/home/vscode/.jkb-container-setup-complete"
 # The kit changes only by `run.sh --install-kit`, an explicit step that COPIES the checkout and
 # executes none of it. Run from the kit, it refreshes from the checkout recorded at install.
 # check-config.sh requires every file verify.sh and setup.sh execute from scripts/ to be listed.
-DC_KIT_DIR="${JKB_CONTAINER_KIT:-$HOME/.local/share/jkb-container-kit}"
+# ONE PROTECTED PARENT, and the kit inside it. Everything the kit's machinery writes on the host --
+# the kit, the staging and old copies dc_install_kit swaps through, the archive dc_mirror_hooks
+# builds before root extracts it in the container -- lives under $DC_KIT_HOME, which is what the
+# posture's Edit deny and check-config's reach test cover. Staged in ${TMPDIR:-/tmp} or beside the
+# kit, a same-uid agent could swap the archive in the window before root extracted it, and become the
+# mirror that runs unsandboxed in the container (review round 11).
+DC_KIT_HOME="${JKB_CONTAINER_KIT_HOME:-$HOME/.local/share/jkb-container-kit}"
+DC_KIT_DIR="$DC_KIT_HOME/kit"
 DC_CTR_KIT=/usr/local/lib/jkb-container
 DC_KIT_MARKER=".jkb-container-kit"
 dc_kit_paths() { # one path per line, relative to a checkout
@@ -463,7 +470,8 @@ dc_install_kit() { # dc_install_kit <checkout> <kit dir>
     done <<EOF
 $(dc_kit_paths)
 EOF
-    mkdir -p "$(dirname "$kit")" || return 1
+    # The kit's home is the user's alone: the staging and old copies sit in it beside the kit.
+    mkdir -p "$(dirname "$kit")" && chmod 0700 "$(dirname "$kit")" || return 1
     new="$(mktemp -d "$kit.new.XXXXXX")" || { echo "dc_install_kit: could not make a staging directory beside $kit" >&2; return 1; }
     while IFS= read -r p; do
         mkdir -p "$new/$(dirname "$p")" && cp -RP "$src/$p" "$new/$p" \
@@ -759,7 +767,10 @@ dc_mirror_hooks() {
     # -h: a hook that is a symlink on the host would dangle in here, so its target is copied.
     # COPYFILE_DISABLE and --no-xattrs keep macOS metadata out of the archive, which GNU tar
     # would otherwise warn about, file by file, on every start.
-    archive="$(mktemp "${TMPDIR:-/tmp}/jkb-hooks.XXXXXX")" || { echo "dc_mirror_hooks: could not make a temporary file on the host" >&2; return 1; }
+    # Under $DC_KIT_HOME, not ${TMPDIR:-/tmp}: an agent can write the temp roots, and this file is what
+    # root extracts in the container (lib.sh's DC_KIT_HOME says why).
+    archive="$(mkdir -p "$DC_KIT_HOME" && chmod 0700 "$DC_KIT_HOME" && mktemp "$DC_KIT_HOME/stage.XXXXXX")" \
+        || { echo "dc_mirror_hooks: could not make a staging file under $DC_KIT_HOME on the host" >&2; return 1; }
     if ! (cd "$src" && COPYFILE_DISABLE=1 tar -h --no-xattrs -cf - .) > "$archive"; then
         rm -f "$archive"
         echo "dc_mirror_hooks: could not read all of $src on the host (tar above says which file); nothing was copied" >&2

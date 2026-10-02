@@ -404,9 +404,14 @@ if [ "${1:-}" = --self-test ]; then
     # program-level row would get the refusal and read green or red for the wrong reason, so they
     # are skipped and say so. DEFINED AFTER h(), or the real h() replaced this stub and every row ran
     # (review round 5). The hook only ever runs in the container, which has GNU realpath.
-    if ! realpath -m / >/dev/null 2>&1; then
-        printf '  \033[33mskip\033[0m hook-mode rows: no GNU realpath -m here (the container has it)\n'
-        h() { :; }
+    # EVERY hook-mode row, not only the h() calls: the hostile-PATH, BASH_ENV and timing rows run the
+    # hook too, and with h() stubbed they failed on the refusal or passed on nothing, so check.sh went
+    # red on a Mac (review round 11). The probe uses the hook's OWN pinned PATH, which is what it runs
+    # with; a GNU realpath elsewhere on the caller's PATH proves nothing about it.
+    if ! PATH=/usr/bin:/bin realpath -m / >/dev/null 2>&1; then
+        printf '  \033[33mskip\033[0m every hook-mode row: no GNU realpath -m in /usr/bin:/bin here (the container has it)\n'
+        if [ "$fails" -eq 0 ]; then printf '\033[32mdeny-transcripts self-test passed (pure rows only)\033[0m\n'; exit 0; fi
+        printf '\033[31mdeny-transcripts self-test: %s failed\033[0m\n' "$fails"; exit 1
     fi
     h "a Read of a transcript is denied" deny \
       '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h

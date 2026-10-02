@@ -197,11 +197,12 @@ STUB
         cp -R "$repo_root/.container" "$kit_src/.container"
         for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$kit_src/scripts/$p"; done
     fi
-    [ -z "${RS_KIT:-}" ] || bash -c '. "$1/.container/lib.sh" && dc_install_kit "$1" "$2"' _ "$kit_src" "$d/home/.local/share/jkb-container-kit" >/dev/null 2>&1
+    [ -z "${RS_KIT:-}" ] || bash -c '. "$1/.container/lib.sh" && dc_install_kit "$1" "$2"' _ "$kit_src" "$d/home/.local/share/jkb-container-kit/kit" >/dev/null 2>&1
     [ -z "${RS_GONE:-}" ] || rm -rf "$kit_src"
     local script="$repo_root/.container/run.sh"
-    [ -z "${RS_KIT:-}" ] || script="$d/home/.local/share/jkb-container-kit/.container/run.sh"
-    env HOME="$d/home" PATH="$d/bin:$PATH" STUB_LOG="$d/calls" STUB_STATE="$1" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} \
+    [ -z "${RS_KIT:-}" ] || script="$d/home/.local/share/jkb-container-kit/kit/.container/run.sh"
+    # JKB_RUN_PATH_KEEP: run.sh drops PATH entries under /tmp, where this stub lives (see its top).
+    env HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" JKB_RUN_PATH_KEEP="$d/bin" STUB_LOG="$d/calls" STUB_STATE="$1" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} \
         bash "$script" "$2" >"$d/out" 2>&1
     rs_out="$(cat "$d/out")"
     calls="$(cut -d' ' -f1 "$d/calls" | tr '\n' ' ')"
@@ -265,6 +266,17 @@ case15_a_kit_whose_checkout_is_gone_still_stops() {
     fi
 }
 
+# NO PROGRAM FROM A PLACE AN AGENT CAN WRITE: a jq planted first on PATH, in ~/.cargo/bin, does not
+# run when run.sh does (review round 11 -- the host posture lets a sandboxed agent write ~/.cargo).
+case16_a_program_planted_on_path_under_home_does_not_run() {
+    local h="$work/plant-$RANDOM"; mkdir -p "$h/.cargo/bin"
+    printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$h" > "$h/.cargo/bin/jq"; chmod +x "$h/.cargo/bin/jq"
+    env HOME="$h" PATH="$h/.cargo/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
+    local rc=$?
+    if [ ! -e "$h/RAN" ] && [ "$rc" -eq 0 ]; then ok "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one"
+    else fail "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one" "rc=$rc ran=$([ -e "$h/RAN" ] && echo yes || echo no)"; fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -272,5 +284,5 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case9_at_setup_the_volume_copy_wins_over_an_image_file case10_a_failed_move_is_recorded_and_then_cleared \
           case11_run_sh_carries_the_login_before_stop_and_rm case12_run_sh_starts_a_stopped_container_to_carry_it \
           case13_the_checkouts_run_sh_refuses_without_the_override case14_the_kits_run_sh_stops_and_sources_the_mirror \
-          case15_a_kit_whose_checkout_is_gone_still_stops
+          case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run
 finish

@@ -503,6 +503,16 @@ posture_rule_path() { # posture_rule_path <rule> <home> <settings-dir> [relative
     posture_canon "$p"
 }
 
+# EVERY PLACE A TRANSCRIPT CAN LIVE, in `~` space, one per line: both spellings of the tree and the
+# archive this script moves transcripts to. ONE list, read by check-config.sh's allow-list guard and
+# its agreement check against the hook's roots, and by verify.sh's probe of the installed hook.
+# Each kept its own copy, and round 9 added the archive to the hook while both copies stayed short
+# of it (review round 11). CLAUDE_CONFIG_DIR's tree is the one root not listed here: it has no `~`
+# spelling, and every reader adds it where it applies.
+posture_transcript_roots() {
+    printf '%s\n' "~/.claude/projects" "~/.claude-state/projects" "~/.claude-state/transcript-archive"
+}
+
 # WHICH LAYER a settings file is, and so what a relative rule in it is relative to. A project's
 # `.claude/settings*.json` resolves against that project; the managed file, its drop-ins and the
 # user's settings meet a session started anywhere, and are resolved from the home, where one

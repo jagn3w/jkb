@@ -18,6 +18,9 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 
 new_workdir
 isolate_git "$work/home"
+# lib.sh computed the kit's home from the REAL HOME when it was sourced above; the mirror stages its
+# archive there, so it is pointed into the scratch home before any case runs.
+DC_KIT_HOME="$HOME/.local/share/jkb-container-kit"; DC_KIT_DIR="$DC_KIT_HOME/kit"
 
 # A stub `docker` for `exec`. Every absolute path argument is re-rooted under $CTR_ROOT, so "the
 # container" is a scratch directory. `-u root` runs the script with three tools shimmed to behave
@@ -666,7 +669,7 @@ case28_every_exec_names_its_program_and_pins_path() {
 # checkout. Installed whole or not at all, recording where it came from.
 case29_the_kit_installs_whole_and_records_its_checkout() {
     local d="$work/kit-$RANDOM" co kit got p missing=""
-    co="$d/checkout"; kit="$d/home/.local/share/jkb-container-kit"
+    co="$d/checkout"; kit="$d/home/.local/share/jkb-container-kit/kit"
     mkdir -p "$co/scripts"
     cp -R "$repo_root/.container" "$co/.container"
     for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
@@ -728,6 +731,24 @@ case31_a_planted_symlink_is_refused_not_followed() {
     fi
 }
 
+# THE ARCHIVE IS STAGED WHERE NO AGENT CAN WRITE, never in $TMPDIR: an agent could swap it there in
+# the window before root extracted it in the container (review round 11). With TMPDIR read-only the
+# mirror still succeeds, and the kit's home is the user's alone.
+case32_the_mirror_stages_nothing_in_tmpdir() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local ro="$work/ro-tmp-$RANDOM" out rc mode
+    mkdir -p "$ro"; chmod a-w "$ro"
+    out="$(TMPDIR="$ro" dc_mirror_hooks "$src" /home/vscode/.config/git/hooks ctr "$docker_cmd" 2>&1)"; rc=$?
+    mode="$(stat -c '%a' "$DC_KIT_HOME" 2>/dev/null || stat -f '%Lp' "$DC_KIT_HOME")"
+    chmod u+w "$ro"
+    if [ "$rc" -eq 0 ] && [ -z "$(ls -A "$ro")" ] && [ "$mode" = 700 ] && [ -z "$(ls -A "$DC_KIT_HOME" | grep '^stage\.')" ]; then
+        ok "the mirror stages its archive under the kit's home (0700), never in TMPDIR, and leaves nothing behind"
+    else
+        fail "the mirror stages its archive under the kit's home (0700), never in TMPDIR, and leaves nothing behind" "rc=$rc mode=$mode out=$out"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -758,5 +779,6 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case28_every_exec_names_its_program_and_pins_path \
           case29_the_kit_installs_whole_and_records_its_checkout \
           case30_the_kit_says_which_paths_the_checkout_has_changed \
-          case31_a_planted_symlink_is_refused_not_followed
+          case31_a_planted_symlink_is_refused_not_followed \
+          case32_the_mirror_stages_nothing_in_tmpdir
 finish

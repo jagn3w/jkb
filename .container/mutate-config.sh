@@ -1709,6 +1709,44 @@ open(p, 'w').write(s.replace(old, 'want_hash="$(fingerprint "$repo" ', 1))
 PYX
 run "the fingerprint strips a different root from the one the arguments came from" "do not both use"
 
+# REVIEW ROUND 11. run.sh runs as you on the host: an absolute shebang and the PATH filter.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert s.startswith("#!/bin/bash\n"), "mutation target absent"
+open(p, 'w').write("#!/usr/bin/env bash\n" + s[len("#!/bin/bash\n"):])
+PYX
+run "run.sh's shebang goes back to env" "shebang is not #!/bin/bash"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+lines = s.split("\n")
+hit = [i for i, l in enumerate(lines) if l.startswith('if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ]')]
+assert len(hit) == 1, "mutation target absent"
+del lines[hit[0]]
+open(p, 'w').write("\n".join(lines))
+PYX
+run "run.sh stops dropping agent-writable PATH entries" "does not drop agent-writable PATH entries"
+
+# The transcript archive is one of the roots the allow-list guard protects.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowRead"].append("~/.claude-state/transcript-archive")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "an allowRead entry over the transcript archive" "reaches the transcript tree"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"~/.claude-state/transcript-archive"\n}'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"~/.claude-state/transcript-archive" "~/.claude-state/elsewhere"\n}', 1))
+PYX
+run "the shared root list names a root the hook does not" "hook:.claude-state/elsewhere"
+
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys
@@ -2211,7 +2249,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=23
+PINNED_UNSB_APPENDS=27
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

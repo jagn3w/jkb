@@ -210,7 +210,8 @@ fi
 # --- the dev container's kit ------------------------------------------------
 # A pull is where you review what an agent changed, and this script runs after one (post-merge), so
 # this is where the kit is refreshed: it COPIES .container/ and the scripts it runs out of the
-# checkout, which the container can write, into ~/.jkb, which it cannot see. The kit's run.sh is then
+# checkout, which agents can write, into the kit's home under ~/.local/share, which none can
+# (.container/lib.sh's DC_KIT_HOME says where and why). The kit's run.sh is then
 # what starts the container. Wrapped like the steps around it: a failure here must not end the run.
 # ONE KIT, FROM THE MAIN CHECKOUT. A linked worktree is a task branch: post-merge fires there on a
 # `git merge main`, and refreshing from it pointed the shared kit at an unlanded branch, then at a
@@ -373,7 +374,7 @@ render_setup_summary < <(
   printf 'extension=%s\n' "$extension_state"
   printf 'watcher=%s\n' "$watcher_state"
   printf 'serve=%s\n' "$serve_state"
-  printf 'kit=%s %s\n' "$kit_state" "${JKB_CONTAINER_KIT:-$HOME/.local/share/jkb-container-kit}"
+  printf 'kit=%s %s\n' "$kit_state" "$("$repo_root/.container/run.sh" --kit-path 2>/dev/null || echo '(unknown)')"
   printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
   printf 'notifier=%s %s\n' "$notifier_state" "${notifier_pid:-}"
 )

@@ -490,7 +490,7 @@ fi
 # the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
 eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$here/sweep-transcripts.sh")"
 dc_reader_ok=0
-declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_rule_base posture_hook_matcher >/dev/null && dc_reader_ok=1
+declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_rule_base posture_hook_matcher posture_transcript_roots >/dev/null && dc_reader_ok=1
 # BOTH DENY LISTS, FROM BOTH FILES, through the one emitter: the image's managed settings, and the
 # posture's `require` block that auto-mode writes into user settings. Each line is
 # "<settings-dir><TAB><rule>", because a one-slash permission rule is relative to the file it is in.
@@ -629,7 +629,7 @@ if [ "$dc_reader_ok" = 1 ]; then
             /root/*)              dc_a="~/${dc_a#/root/}" ;;
             /home/*|/Users/*|/root|/home|/Users|/) dc_a="~" ;;
         esac
-        for dc_root in "~/.claude/projects" "~/.claude-state/projects"; do
+        for dc_root in $(posture_transcript_roots); do
             if [ "$dc_a" = "$dc_root" ] || [ "${dc_root#"$dc_a"/}" != "$dc_root" ] || [ "${dc_a#"$dc_root"/}" != "$dc_a" ] || [ "$dc_a" = "~" ]; then
                 dc_allow_hit="$dc_allow_hit $dc_a"; break
             fi
@@ -691,6 +691,17 @@ for dc_s in sweep-transcripts verify; do
         *) dc_unsb="$dc_unsb run.sh does not start $dc_s.sh with /bin/bash from the kit mirror;" ;;
     esac
 done
+# run.sh ITSELF runs as you on the host, and finds bash, jq and docker by name: an absolute shebang,
+# and as its first command after `set`, the filter dropping every PATH entry an agent can write
+# (under $HOME, /tmp, /private). A planted ~/.cargo/bin/jq ran as you at the next start without it
+# (review round 11).
+dc_run_cmds="$(dc_strip_comments "$here/run.sh" | sed '1d' | grep -E '[^[:space:]]' | head -2)"
+[ "$(head -1 "$here/run.sh")" = '#!/bin/bash' ] \
+    || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash, so bash itself is found through PATH;"
+case "$(sed -n 2p <<<"$dc_run_cmds")" in
+    *'"$HOME"/*'*'/tmp/*'*'/private/*'*'PATH="${jkb_path:-/usr/bin:/bin}"; export PATH'*) ;;
+    *) dc_unsb="$dc_unsb run.sh does not drop agent-writable PATH entries as its first command after set;" ;;
+esac
 # EVERY EXEC IN run.sh, not the two above: round 7 fixed the sweep and verify.sh and left seven
 # others -- `bash -c` for the login, `bash -lc` for the reap, `sh`, `sudo` -- resolving through the
 # same PATH (review round 8). Each `docker exec`/`in_container` statement must name its program
@@ -802,10 +813,11 @@ fi
 # it), and of the in-process file tools (a posture Edit deny names it). It sat under ~/.jkb first,
 # which the posture's allowWrite grants, so any sandboxed host agent could rewrite the kit's run.sh
 # (review round 10). The default comes from lib.sh with HOME pinned, in ~ space like the posture.
-dc_kit_home="$(env -u JKB_CONTAINER_KIT HOME=/kit-home-probe bash -c '. "$1" && printf "%s" "$DC_KIT_DIR"' _ "$here/lib.sh" 2>/dev/null)"
+# The kit's HOME, not only the kit: the staging copies and the mirror's archive live under it too.
+dc_kit_home="$(env -u JKB_CONTAINER_KIT_HOME HOME=/kit-home-probe bash -c '. "$1" && printf "%s" "$DC_KIT_HOME"' _ "$here/lib.sh" 2>/dev/null)"
 dc_kit_tilde="~${dc_kit_home#/kit-home-probe}"
 dc_kit_where=""
-case "$dc_kit_home" in /kit-home-probe/?*) ;; *) dc_kit_where=" lib.sh's DC_KIT_DIR [$dc_kit_home] is not under the home;" ;; esac
+case "$dc_kit_home" in /kit-home-probe/?*) ;; *) dc_kit_where=" lib.sh's DC_KIT_HOME [$dc_kit_home] is not under the home;" ;; esac
 dc_posture="$here/../scripts/auto-mode-posture.json"
 while IFS= read -r dc_aw; do
     [ -n "$dc_aw" ] || continue
@@ -857,9 +869,11 @@ for dc_need in 'CLAUDE_CONFIG_DIR' '.claude-state/projects'; do
     grep -qF -- "$dc_need" <<<"$dc_hook_roots"  || dc_roots_missing="$dc_roots_missing hook:$dc_need"
     grep -qF -- "$dc_need" <<<"$dc_sweep_roots" || dc_roots_missing="$dc_roots_missing sweep:$dc_need"
 done
-grep -qF -- '.claude/projects' <<<"$dc_hook_roots" || dc_roots_missing="$dc_roots_missing hook:.claude/projects"
-# The archive is where the sweep moves transcripts, so it is a root of the hook's (review round 9).
-grep -qF -- '.claude-state/transcript-archive' <<<"$dc_hook_roots" || dc_roots_missing="$dc_roots_missing hook:.claude-state/transcript-archive"
+# EVERY ROOT IN THE SHARED LIST is named by the hook, the archive included (review rounds 9 and 11).
+for dc_need in $(posture_transcript_roots 2>/dev/null); do
+    grep -qF -- "${dc_need#\~/}" <<<"$dc_hook_roots" || dc_roots_missing="$dc_roots_missing hook:${dc_need#\~/}"
+done
+[ -n "$(posture_transcript_roots 2>/dev/null)" ] || dc_roots_missing="$dc_roots_missing (the shared root list printed nothing)"
 grep -qE '^TRANSCRIPT_ARCHIVE=.*/\.claude-state/transcript-archive' <<<"$(dc_strip_comments "$here/sweep-transcripts.sh")" \
     || dc_roots_missing="$dc_roots_missing sweep:TRANSCRIPT_ARCHIVE"
 if [ -z "$dc_hook_roots" ] || [ -z "$dc_sweep_roots" ]; then

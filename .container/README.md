@@ -182,7 +182,7 @@ which macOS does not ship.
 
 ```sh
 ./.container/run.sh --install-kit      # once, and after reviewing a change to .container/ or scripts/
-~/.local/share/jkb-container-kit/.container/run.sh # build if needed, start, firewall, setup, verify
+~/.local/share/jkb-container-kit/kit/.container/run.sh # build if needed, start, firewall, setup, verify
 ```
 
 **Start it from the kit, not from the checkout** (see *Everything unsandboxed runs from the kit*
@@ -220,7 +220,7 @@ into the container when you *attach*, which is after `run.sh` has finished — s
 to install into and says so. From a terminal in the attached window:
 
 ```sh
-./.container/install-extensions.sh     # marketplace extensions from disk, the jkb explorer, machine settings
+/usr/local/lib/jkb-container/.container/install-extensions.sh  # from the repo: marketplace extensions, the jkb explorer, machine settings
 ```
 
 The same script merges `vscode-machine-settings.json` into the server's **Machine** settings, which
@@ -426,14 +426,19 @@ binds above are documented as, because renaming the directory around a bind gets
 
 **What runs now.** One list, `dc_kit_paths` in `lib.sh`, names `.container/` and the four files
 under `scripts/` that those scripts run or read. `run.sh --install-kit` copies them to
-`~/.local/share/jkb-container-kit` (`DC_KIT_DIR`), whole or not at all, and records the checkout they came from.
+`~/.local/share/jkb-container-kit/kit` (`DC_KIT_DIR`), whole or not at all, and records the
+checkout they came from.
 It copies and runs nothing, and it copies only regular files and directories. It dereferenced
 symlinks at first, so a link the agent planted in an untracked corner of `.container/` copied a host
 file (an SSH key, in the reproduction) into the kit, and every start then mirrored it world-readable
 into the container (review round 10). A symlink or special file anywhere under the kit's paths is now
 a refusal that names it.
 
-**Where the kit lives is chosen so that no agent can write it**: `~/.local/share/jkb-container-kit`.
+**Where the kit lives is chosen so that no agent can write it**: `~/.local/share/jkb-container-kit`
+(`DC_KIT_HOME`). The kit is `kit/` inside it. The copies `--install-kit` stages and swaps through
+are there too, and so is the archive the mirror builds before root extracts it in the container.
+That archive used to be staged in `$TMPDIR`, which an agent can write, so a same-uid agent could
+swap it in the window before extraction and become the root-owned mirror (review round 11).
 That path is outside every container bind. It is also outside the host auto-mode posture's
 `allowWrite`, and that posture denies `Edit` on it for the in-process tools the Bash sandbox does not
 confine. The first location, `~/.jkb/container-kit`, satisfied only the first condition. The posture
@@ -471,11 +476,14 @@ sources the mirror's `lib.sh`.
 
 **Residuals, stated.**
 
-- *First-run setup builds the checkout.* `setup.sh` runs `cargo install` on the checkout, and
-  `install-extensions.sh` runs `scripts/install-extension.sh` from it, which builds `ui/` through
-  pnpm. Both execute checkout code unsandboxed, in the container, once per container. That is what
-  setup is for, and it is the same exposure as the host's `post-merge` build (*Git runs the host's
-  hooks*). The mitigation is the same too: review before you rebuild.
+- *Building the checkout runs checkout code.* `setup.sh` runs `cargo install` on the checkout,
+  unsandboxed in the container, once per container. `install-extensions.sh` runs
+  `scripts/install-extension.sh` from the checkout, which builds `ui/` through pnpm. That build rarely
+  happens from `setup.sh`, whose call finds no VS Code server on a first start. It usually happens
+  when you run the mirror's `install-extensions.sh` by hand after attaching, as `verify.sh` advises,
+  and then it builds the checkout you are standing in. Building is what these steps are for, and it
+  is the same exposure as the host's `post-merge` build (*Git runs the host's hooks*). The
+  mitigation is the same too: review what you build.
 - *The kit is trusted at install.* The first `--install-kit`, and every `setup.sh` run, copy whatever
   the checkout holds at that moment.
 - *`verify.sh` still inherits the image's `PATH`* for the toolchain it checks
@@ -1946,7 +1954,12 @@ tree's copy of the script. It feeds the sweep to `docker exec -i … bash -s` on
 > the four older scripts. Only a rebuilt image carries a new file, nothing forces a rebuild, so
 > `bash` would have exited 127 — the trigger dead on every live container, reported once into
 > `reap.log` and deduped for ever, with every gate green. Embedding removes the second copy instead
-> of guarding it: no drift, no rebuild, no path for two files to agree about.
+> of guarding it: no drift, no rebuild, no path for two files to agree about. **Since the kit there
+> are two copies again:** `run.sh` and `verify.sh` run the kit mirror's sweep, and the reaper runs the
+> one compiled into `jkb`. They differ only when the binary and the kit come from different
+> checkouts, such as `setup.sh` run in a linked worktree, which builds that branch's `jkb` and leaves
+> the kit on main. That is accepted for a backstop that stands down on the shipped posture
+> (review round 11; `transcripts.rs`'s module docs say why the reaper does not exec the mirror's copy).
 
 The container's **name** must agree across the two files that spell it, and it is **silent when
 wrong**: a reaper poking a name nothing creates reports nothing for ever — the same end state as
@@ -2019,8 +2032,10 @@ The fix removes the possibility rather than guarding it, which is this directory
 script is embedded in the `jkb` binary with `include_str!` (the crate already reaches out of itself
 this way for `.claude/commands/*.md`) and fed to `docker exec -i … bash -s` on **stdin**. There is
 then no copy in the image to drift, no rebuild to require, and no path for two files to agree about —
-the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was built from. It is written
-from a thread, because the script is 74KB against a 64KB pipe buffer and `bash -s` executes as it
+the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was built from. (The kit's
+mirror is a second copy now; see the superseded note above.) It is written
+from a thread, because the script is larger than a 64KB pipe buffer (127,439 bytes by `wc -c` on
+2026-10-02; it was 74KB when this was written) and `bash -s` executes as it
 reads: a blocking write from the main thread deadlocks the moment the child pauses to run a `find`.
 
 Two things the same round caught about the tick itself. It had **no timeout**, and it runs *before*

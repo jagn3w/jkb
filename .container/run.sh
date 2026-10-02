@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Start the jkb container from .container/container.json, then ATTACH VS Code to it.
 #
 #   ./.container/run.sh                 build if needed, start, run the lifecycle, say how to attach
@@ -27,6 +27,18 @@
 # ONE CONTAINER, EVERY REPO. All of ~/repos is mounted, so attaching once reaches every checkout
 # — including a `jkb task work` session inside one — instead of one container per opened folder.
 set -euo pipefail
+
+# NO PROGRAM FROM A PLACE AN AGENT CAN WRITE. This runs as you, on the host, unsandboxed, and it runs
+# bash, jq, docker, tar and the rest by name. The host auto-mode posture lets a sandboxed agent write
+# ~/.cargo (rustup puts ~/.cargo/bin first on PATH), ~/.jkb, ~/.cache, /tmp and the macOS temp roots,
+# so a planted ~/.cargo/bin/jq or docker ran as you at the next start (review round 11; the
+# kit had moved out of reach and this was the door left). So: an absolute shebang, `#!/usr/bin/env
+# bash` having found bash itself through that PATH, and before anything runs, every PATH entry under
+# $HOME, /tmp or /private, or relative, is dropped. System and Homebrew locations stay, which is
+# where docker and jq live; a docker under ~ (~/.docker/bin, ~/.orbstack/bin) has to be linked from
+# one of them. JKB_RUN_PATH_KEEP names one directory to keep anyway: the tests' stubs live in /tmp.
+# Not in --self-test, which check.sh runs and which starts nothing. check-config.sh holds this.
+if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=""; IFS=: read -r -a jkb_path_in <<<"$PATH"; for jkb_d in ${jkb_path_in[@]+"${jkb_path_in[@]}"}; do if [ -n "${JKB_RUN_PATH_KEEP:-}" ] && [ "$jkb_d" = "$JKB_RUN_PATH_KEEP" ]; then :; else case "$jkb_d" in ""|[!/]*|"$HOME"|"$HOME"/*|/tmp|/tmp/*|/private|/private/*|/var/folders|/var/folders/*) continue ;; esac; fi; jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; done; PATH="${jkb_path:-/usr/bin:/bin}"; export PATH; fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
@@ -165,9 +177,15 @@ file_sha() { # file_sha <path>
 fingerprint() { # fingerprint <repo-root> <arg>...
     local root="$1"; shift
     local a profile="" norm=()
+    # ONLY THE SECCOMP ARGUMENT is normalised, and its content is hashed below instead. Stripping
+    # the root from every argument as text moved a repo's own .git bind source to ${WORKSPACE} when
+    # the root was the checkout and left it raw when the root was the kit, so switching between the
+    # kit and JKB_RUN_FROM_CHECKOUT=1 recreated the container (review round 11).
     for a in "$@"; do
-        norm+=("${a//$root/\$\{WORKSPACE\}}")
-        case "$a" in *seccomp=*) profile="${a#*seccomp=}" ;; esac
+        case "$a" in
+            *seccomp=*) profile="${a#*seccomp=}"; norm+=("${a//$root/\$\{WORKSPACE\}}") ;;
+            *)          norm+=("$a") ;;
+        esac
     done
     [ -n "$profile" ] && [ -f "$profile" ] && norm+=("seccomp-content=$(file_sha "$profile")")
     args_hash ${norm[@]+"${norm[@]}"}
@@ -496,6 +514,15 @@ if [ "${1:-}" = --self-test ]; then
     cp "$here/seccomp-bwrap.json" "$twin/.container/seccomp-bwrap.json"
     eq "two checkouts of the same declaration agree" \
        "$(config_hash "$twin/.container/container.json" "$twin")" "$same"
+    # ...and a root that appears in ANOTHER argument is not stripped from it: with the checkout as
+    # root its own .git bind source turned into ${WORKSPACE}, with the kit as root it stayed raw, and
+    # switching between them recreated the container (review round 11).
+    fpk="$(mktemp -d)"; mkdir -p "$fpk/kit/.container" "$fpk/co/.container"
+    printf '{}\n' > "$fpk/kit/.container/s.json"; printf '{}\n' > "$fpk/co/.container/s.json"
+    eq "the kit and the checkout fingerprint one container the same" \
+       "$(fingerprint "$fpk/kit" "seccomp=$fpk/kit/.container/s.json" "source=$fpk/co/.git/config")" \
+       "$(fingerprint "$fpk/co" "seccomp=$fpk/co/.container/s.json" "source=$fpk/co/.git/config")"
+    rm -rf "$fpk"
     # ...and normalising the path away must not have taken the profile's CONTENT with it, or the
     # check would be blind to the one file it exists to pin.
     printf '{"tampered":true}\n' > "$twin/.container/seccomp-bwrap.json"
@@ -597,6 +624,9 @@ while [ $# -gt 0 ]; do
         --dry-run)       DRY=1; shift ;;
         --open)          OPEN=1; shift; case "${1:-}" in -*|"") ;; *) open_path="$1"; shift ;; esac ;;
         --consumed-keys) consumed_keys; exit 0 ;;
+        # Where the kit is: one answer, lib.sh's, for setup.sh's summary and anything else that
+        # would otherwise spell the path again.
+        --kit-path)      printf '%s\n' "$DC_KIT_DIR"; exit 0 ;;
         # COPIES, never runs: dc_install_kit copies the kit's paths from the checkout and executes
         # nothing in it. From the kit, the checkout is the one recorded at install, and what changed
         # since is listed first, so a refresh is a decision about named files.
@@ -1151,6 +1181,9 @@ sweep_keep=""
 sweep_ok=yes
 if [ "$state" = running ]; then
     sweep_ok=no
+    # On the host `jkb` lives in ~/.cargo/bin, which the PATH filter at the top drops: an agent can
+    # write it, so this no longer runs it, and the sweep holds sessions by its recency window and
+    # floor instead (the arm below says so). A jkb on a system PATH is still asked.
     if command -v jkb >/dev/null 2>&1; then
         if sweep_ids="$(jkb notify sessions --live-ids 2>/dev/null)"; then
             sweep_ok=yes

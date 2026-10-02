@@ -18,13 +18,21 @@
 # Idempotent — `--force` reinstalls and the explorer rebuilds — so running it again is safe and is
 # what you do after changing `ui/vscode` or the pinned extension list.
 set -euo pipefail
+# The caller's repository selection, dropped before the one git call below: an exported GIT_WORK_TREE
+# outranks the cwd and would name a different checkout to build.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 here="$(cd "$(dirname "$0")" && pwd)"
-# The checkout whose extension is built: run.sh's setup names it in JKB_REPO_ROOT, because this
-# runs from the kit mirror (lib.sh's DC_KIT_DIR); run by hand from a checkout, it is that one.
-repo="${JKB_REPO_ROOT:-$(cd "$here/.." && pwd)}"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 # shellcheck source=/dev/null
 . "$here/lib.sh"
+# The checkout whose extension is built. setup.sh names it in JKB_REPO_ROOT. Run by hand from the kit
+# mirror -- which is how verify.sh says to run it, because the mirror is what nothing in here can
+# write -- it is the checkout you are standing in; run from a checkout, that checkout. Defaulting to
+# the mirror's parent built nothing at all and said so nowhere (review round 11).
+if [ -n "${JKB_REPO_ROOT:-}" ]; then repo="$JKB_REPO_ROOT"
+elif [ "$(cd "$here/.." && pwd)" = "$DC_CTR_KIT" ]; then
+    repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+else repo="$(cd "$here/.." && pwd)"; fi
 
 say "vs code extensions"
 code_server="$(ls -d "$HOME"/.vscode-server/bin/*/bin/code-server 2>/dev/null | head -1 || true)"
