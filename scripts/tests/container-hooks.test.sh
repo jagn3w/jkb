@@ -749,6 +749,22 @@ case32_the_mirror_stages_nothing_in_tmpdir() {
     fi
 }
 
+# A KIT IN ROUND 10'S FLAT LAYOUT, left directly in the kit's home, is removed by the next install:
+# its run.sh had no PATH filter, and its --install-kit moved the whole home aside (review round 12).
+case33_an_older_flat_kit_is_removed() {
+    local d="$work/flat-$RANDOM" co home p
+    co="$d/checkout"; home="$d/home/.local/share/jkb-container-kit"; mkdir -p "$co/scripts" "$home"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    cp -R "$repo_root/.container" "$home/.container"; mkdir -p "$home/scripts"; printf 'checkout=%s\n' "$co" > "$home/$DC_KIT_MARKER"
+    dc_install_kit "$co" "$home/kit" >/dev/null 2>&1
+    if [ -f "$home/kit/.container/run.sh" ] && [ ! -e "$home/.container" ] && [ ! -e "$home/scripts" ] && [ ! -e "$home/$DC_KIT_MARKER" ]; then
+        ok "an older kit left directly in the kit's home is removed, and the new one is in kit/"
+    else
+        fail "an older kit left directly in the kit's home is removed, and the new one is in kit/" "$(ls -a "$home" | tr '\n' ' ')"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -780,5 +796,6 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case29_the_kit_installs_whole_and_records_its_checkout \
           case30_the_kit_says_which_paths_the_checkout_has_changed \
           case31_a_planted_symlink_is_refused_not_followed \
-          case32_the_mirror_stages_nothing_in_tmpdir
+          case32_the_mirror_stages_nothing_in_tmpdir \
+          case33_an_older_flat_kit_is_removed
 finish

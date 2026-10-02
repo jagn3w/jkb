@@ -36,9 +36,15 @@ set -euo pipefail
 # bash` having found bash itself through that PATH, and before anything runs, every PATH entry under
 # $HOME, /tmp or /private, or relative, is dropped. System and Homebrew locations stay, which is
 # where docker and jq live; a docker under ~ (~/.docker/bin, ~/.orbstack/bin) has to be linked from
-# one of them. JKB_RUN_PATH_KEEP names one directory to keep anyway: the tests' stubs live in /tmp.
+# one of them. JKB_RUN_PATH_KEEP is a colon-separated list of directories to keep anyway -- a docker
+# in ~/.docker/bin, which no posture lets an agent write, or the tests' stubs in /tmp. A tool the
+# filter hid is named, with the directory it was in, by `need_tool` below (review round 12).
 # Not in --self-test, which check.sh runs and which starts nothing. check-config.sh holds this.
-if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=""; IFS=: read -r -a jkb_path_in <<<"$PATH"; for jkb_d in ${jkb_path_in[@]+"${jkb_path_in[@]}"}; do if [ -n "${JKB_RUN_PATH_KEEP:-}" ] && [ "$jkb_d" = "$JKB_RUN_PATH_KEEP" ]; then :; else case "$jkb_d" in ""|[!/]*|"$HOME"|"$HOME"/*|/tmp|/tmp/*|/private|/private/*|/var/folders|/var/folders/*) continue ;; esac; fi; jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; done; PATH="${jkb_path:-/usr/bin:/bin}"; export PATH; fi
+if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=""; JKB_PATH_DROPPED=""; IFS=: read -r -a jkb_path_in <<<"$PATH"; for jkb_d in ${jkb_path_in[@]+"${jkb_path_in[@]}"}; do case ":${JKB_RUN_PATH_KEEP:-}:" in *":$jkb_d:"*) [ -n "$jkb_d" ] && { jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; continue; } ;; esac; case "$jkb_d" in ""|[!/]*|"$HOME"|"$HOME"/*|/tmp|/tmp/*|/private|/private/*|/var/folders|/var/folders/*) JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue ;; esac; jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; done; PATH="${jkb_path:-/usr/bin:/bin}"; export PATH; fi
+# ...and jq with HOME where no file can be: jq sources $HOME/.jq into every program, and the Write
+# tool can create ~/.jq. This file's jq readers build the mount list handed to `docker run`, which
+# README calls the security boundary (review round 12). check-config.sh holds the line in place.
+jq() { HOME=/dev/null command jq "$@"; }
 
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
@@ -55,6 +61,18 @@ CTR_REPOS="/home/vscode/repos"
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+# need_tool <program> <message> -- the program as a BINARY (`type -P`, never `command -v`, which finds
+# the jq wrapper above), or a refusal. One the PATH filter at the top hid is named with the directory
+# it was in: a per-user Docker in ~/.docker/bin otherwise failed as a bare "docker is not on PATH"
+# (review round 12).
+need_tool() {
+    type -P "$1" >/dev/null 2>&1 && return 0
+    local d hidden=""
+    IFS=: read -r -a need_dropped <<<"${JKB_PATH_DROPPED:-}"
+    for d in ${need_dropped[@]+"${need_dropped[@]}"}; do [ -z "$hidden" ] && [ -x "$d/$1" ] && hidden="$d"; done
+    [ -z "$hidden" ] || die "$1 is in $hidden, which this script drops from PATH: it runs as you, and an agent could plant a program in a directory under your home. If no agent can write $hidden -- it is not under ~/.cargo, ~/.jkb, ~/.cache, ~/.local/bin or a temp root -- keep it: JKB_RUN_PATH_KEEP=$hidden (for Docker Desktop that directory also holds its credential helper)"
+    die "$2"
+}
 
 # EVERY TOP-LEVEL KEY of container.json must appear here, with the thing that reads it. A key
 # nobody reads is a declaration that does nothing while looking like configuration — and the one
@@ -671,7 +689,7 @@ while [ $# -gt 0 ]; do
                          # would reject at run time, from a command that exited 0.
                          [ -d "$pa_root" ] \
                              || die "--print-args: '$pa_root' is not a directory, and it is substituted into every \${localWorkspaceFolder}"
-                         command -v jq >/dev/null 2>&1 || die "jq is required to read $CONFIG"
+                         need_tool jq "jq is required to read $CONFIG"
                          [ -f "$CONFIG" ] || die "no $CONFIG"
                          # `$( )`, not a bare call: a `die` inside assembled_args exits only the
                          # subshell, and a partial argument list printed as if it were whole is
@@ -689,7 +707,7 @@ while [ $# -gt 0 ]; do
 done
 
 kit_need_checkout
-command -v jq >/dev/null 2>&1 || die "jq is required to read $CONFIG"
+need_tool jq "jq is required to read $CONFIG"
 [ -f "$CONFIG" ] || die "no $CONFIG"
 
 ctr_repo="$(container_path "$repo")" || die "this checkout ($repo) is not under $HOST_REPOS,
@@ -747,7 +765,7 @@ if [ -n "$KIT_ROOT" ]; then
     [ -z "$kit_changed" ] || echo "note: the checkout has changed since the kit was installed ($(printf '%s ' $kit_changed)) -- this start uses the kit; to take the changes, review them, then: $KIT_ROOT/.container/run.sh --install-kit" >&2
 fi
 
-command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
+need_tool docker "docker is not on PATH"
 docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
 
 # The narrowed ~/.jkb binds and the credential's directory must exist on the host: a bind whose source

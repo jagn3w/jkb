@@ -277,6 +277,20 @@ case16_a_program_planted_on_path_under_home_does_not_run() {
     else fail "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one" "rc=$rc ran=$([ -e "$h/RAN" ] && echo yes || echo no)"; fi
 }
 
+# A TOOL THE FILTER HID IS NAMED, with where it was and the way to keep it: a per-user Docker in
+# ~/.docker/bin failed as a bare "docker is not on PATH" (review round 12). Skipped where a docker
+# outside the home would be found anyway.
+case17_a_tool_the_path_filter_hid_is_named() {
+    if type -P docker >/dev/null 2>&1; then skip "case17: a docker outside the home is on PATH here, so the filter hides nothing"; return 0; fi
+    local h="$work/hid-$RANDOM" out
+    mkdir -p "$h/.docker/bin"; printf '#!/bin/sh\nexit 0\n' > "$h/.docker/bin/docker"; chmod +x "$h/.docker/bin/docker"
+    ln -s "$(dirname "$repo_root")" "$h/repos"
+    out="$(env HOME="$h" PATH="$h/.docker/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" 2>&1)"
+    if grep -qF "docker is in $h/.docker/bin" <<<"$out" && grep -qF "JKB_RUN_PATH_KEEP=$h/.docker/bin" <<<"$out"; then
+        ok "a docker the PATH filter hid is named with its directory and how to keep it"
+    else fail "a docker the PATH filter hid is named with its directory and how to keep it" "out: $(tail -3 <<<"$out")"; fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -284,5 +298,6 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case9_at_setup_the_volume_copy_wins_over_an_image_file case10_a_failed_move_is_recorded_and_then_cleared \
           case11_run_sh_carries_the_login_before_stop_and_rm case12_run_sh_starts_a_stopped_container_to_carry_it \
           case13_the_checkouts_run_sh_refuses_without_the_override case14_the_kits_run_sh_stops_and_sources_the_mirror \
-          case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run
+          case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run \
+          case17_a_tool_the_path_filter_hid_is_named
 finish

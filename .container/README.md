@@ -455,6 +455,19 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   `JKB_REPO_ROOT`. A failed mirror stops the start rather than falling back to the checkout.
   `verify.sh` asserts the mirror is root's, carries its marker, is not writable by the container
   user, and is where `verify.sh` itself is running from.
+- **The kit's `run.sh` trusts nothing an agent can write on your `PATH` either** (review rounds 11
+  and 12). It runs as you, and the host posture lets a sandboxed agent write `~/.cargo`, `~/.jkb`,
+  `~/.cache` and the temp roots. `~/.cargo/bin` comes first on `PATH`, so a planted `jq` or `docker`
+  ran at the next start. The shebang is `#!/bin/bash`, and the first command drops every `PATH`
+  entry under your home, `/tmp` or `/private`, along with relative ones. Every `jq` it runs goes
+  through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq` readers build
+  the mount list. **What this costs:** a Docker installed per-user (`~/.docker/bin`, OrbStack's
+  `~/.orbstack/bin`) or a `jq` from `~/.nix-profile` is dropped as well. `run.sh` then names the
+  directory it was in. If no agent can write that directory, keep it with
+  `JKB_RUN_PATH_KEEP=<dir>[:<dir>...]`. Docker Desktop's credential helper lives in the same
+  directory, so keeping it covers both. The host's own `jkb` lives in `~/.cargo/bin` and is dropped
+  too, so the start-time sweep no longer asks it which sessions are live. It holds sessions by its
+  recency window instead.
 - **The checkout's `run.sh` refuses** to start or stop anything and names the kit. That protects the
   habit, not the file: an agent can edit that refusal out. What protects you is that you start the
   kit's `run.sh`.

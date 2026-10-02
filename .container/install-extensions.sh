@@ -90,7 +90,9 @@ if [ -f "$repo/ui/vscode/package.json" ]; then
     # front of it. See the flag's comment in that script.
     # FROM THE CHECKOUT, deliberately, and the one place this script runs checkout code: it BUILDS
     # ui/ from the checkout (pnpm runs its package scripts), so the builder is part of what is
-    # built. First run only, from setup.sh; .container/README.md records it with cargo install.
+    # built. setup.sh's call rarely reaches here (no VS Code server on a first start); it usually
+    # runs when you invoke this by hand after attaching. .container/README.md records it with cargo
+    # install, as a residual.
     "$repo/scripts/install-extension.sh" --build-in "$HOME/.jkb-ui-build"
 fi
 

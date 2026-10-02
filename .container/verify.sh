@@ -1799,12 +1799,6 @@ $mem_src
     fi
 fi
 
-# ...AND THE HOOK THAT NOW CARRIES THE TRANSCRIPT DENY IS PRESENT AND ROOT-OWNED. check-config.sh
-# asks whether the repo WIRES it; this asks whether the running container HAS it, which is a
-# different question and the one that matters after a rebuild from a stale image or a hand-edited
-# /etc/claude-code. With the per-file globs gone (they cost 52% of MAX_ARG_STRLEN in argv), this
-# script is the only thing keeping a file tool out of another session's transcript, and its
-# absence is silent: every tool call simply succeeds.
 # NO SETTINGS FILE REPLACES THE CONTAINER'S OWN ENVIRONMENT. Claude Code puts a settings file's `env`
 # into every session, over the image's ENV and containerEnv, and a repo's .claude/settings*.json is
 # in the checkout the HOST shares. An `env.PATH` written for the Mac in settings.local.json replaced
@@ -1826,6 +1820,12 @@ else
     fi
 fi
 
+# ...AND THE HOOK THAT NOW CARRIES THE TRANSCRIPT DENY IS PRESENT AND ROOT-OWNED. check-config.sh
+# asks whether the repo WIRES it; this asks whether the running container HAS it, which is a
+# different question and the one that matters after a rebuild from a stale image or a hand-edited
+# /etc/claude-code. With the per-file globs gone (they cost 52% of MAX_ARG_STRLEN in argv), this
+# script is the only thing keeping a file tool out of another session's transcript, and its
+# absence is silent: every tool call simply succeeds.
 mem_hook=/usr/local/bin/deny-transcripts.sh
 if [ ! -x "$mem_hook" ]; then
     bad "$mem_hook is missing or not executable, so nothing stops a file tool reading another session's transcript — rebuild the image"
@@ -2382,9 +2382,10 @@ if [ -f "$sweep_sh" ]; then
         # A SWEEP THAT FOUND NO TREE IS NOT A MEASURED PASS. It exits 0 for "nothing to sweep", and
         # the arm above printed `ok the transcript deny list fits in one argv` over a budget nobody
         # measured — the exact rule the sweep's own header states and that broke: a sweep that
-        # cannot find its subject must not look successful. Reachable whenever
-        # `$CLAUDE_BASE/projects` is missing: a second config dir, or a `dc_link_state` that failed
-        # and which run.sh deliberately tolerates and defers to this file.
+        # cannot find its subject must not look successful. Reachable when `$CLAUDE_BASE/projects`
+        # is missing AND a settings layer enumerates transcripts: on the shipped posture the sweep
+        # stands down before it looks for the tree, and a missing default link is caught instead
+        # by the ~/.claude/projects link check earlier in this file (review round 12).
         #
         # "DOES NOT EXIST" ONLY, and not "no transcripts". A root that exists and is EMPTY has been
         # measured: the deny list is zero bytes and Bash can spawn — which is every freshly created

@@ -1769,6 +1769,25 @@ open(p, 'w').write(s.replace(old, "", 1))
 PYX
 run "the image's ENV PATH can no longer be found" "environment names the container sets could not be derived"
 
+# REVIEW ROUND 12. run.sh's jq wrapper, and the macOS temp root in its PATH filter.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'jq() { HOME=/dev/null command jq "$@"; }\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "run.sh loses its jq wrapper" "run.sh does not define the HOME=/dev/null jq wrapper"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '|/var/folders|/var/folders/*)'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, ')', 1))
+PYX
+run "run.sh's PATH filter stops dropping the macOS temp root" "does not drop agent-writable PATH entries"
+
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys

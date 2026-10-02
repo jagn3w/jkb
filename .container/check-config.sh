@@ -699,7 +699,7 @@ dc_run_cmds="$(dc_strip_comments "$here/run.sh" | sed '1d' | grep -E '[^[:space:
 [ "$(head -1 "$here/run.sh")" = '#!/bin/bash' ] \
     || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash, so bash itself is found through PATH;"
 case "$(sed -n 2p <<<"$dc_run_cmds")" in
-    *'"$HOME"/*'*'/tmp/*'*'/private/*'*'PATH="${jkb_path:-/usr/bin:/bin}"; export PATH'*) ;;
+    *'"$HOME"/*'*'/tmp/*'*'/private/*'*'/var/folders/*'*'PATH="${jkb_path:-/usr/bin:/bin}"; export PATH'*) ;;
     *) dc_unsb="$dc_unsb run.sh does not drop agent-writable PATH entries as its first command after set;" ;;
 esac
 # EVERY EXEC IN run.sh, not the two above: round 7 fixed the sweep and verify.sh and left seven
@@ -764,7 +764,8 @@ done <<<"$dc_execs"
 # these files could not see -- goes through it. Bypassing it takes `command jq` or an absolute
 # `/usr/bin/jq`, and either is refused outside the wrapper line itself.
 dc_jq_wrap='jq() { HOME=/dev/null command jq "$@"; }'
-for dc_f in sweep-transcripts verify; do
+# run.sh too: its jq readers build the mount list handed to `docker run` (review round 12).
+for dc_f in sweep-transcripts verify run; do
     dc_jq_text="$(dc_strip_comments "$here/$dc_f.sh")"
     dc_jq_first="$(grep -m1 -E '(^|[^A-Za-z0-9_.-])jq([^A-Za-z0-9_.-]|$)' <<<"$dc_jq_text")"
     [ "$dc_jq_first" = "$dc_jq_wrap" ] \

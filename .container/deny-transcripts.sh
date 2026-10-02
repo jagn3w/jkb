@@ -44,7 +44,8 @@
 # managed-settings.json gives it. Re-measured after round 8 the same way: 11ms Bash, 29ms Read,
 # 38ms for a Glob whose braces expand to the 64-way cap, 222ms for an MCP call carrying 2000 bare
 # words, each tested on disk, and 270ms for the worst Glob found: 64 expansions of a pattern at the
-# 4096-byte budget (2.8s before the expander skipped finished expansions). It was ~7ms before five review rounds added guards; the number is
+# 4096-byte budget (2.8s before the expander skipped finished expansions). Round 12 judges each
+# expansion's own literal prefix: a Glob with 64 distinct prefixes, every one checked, took 1.17s. It was ~7ms before five review rounds added guards; the number is
 # re-measured rather than carried, because this hook now runs on EVERY tool call.
 #
 # PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
@@ -408,8 +409,11 @@ if [ "${1:-}" = --self-test ]; then
     # hook too, and with h() stubbed they failed on the refusal or passed on nothing, so check.sh went
     # red on a Mac (review round 11). The probe uses the hook's OWN pinned PATH, which is what it runs
     # with; a GNU realpath elsewhere on the caller's PATH proves nothing about it.
-    if ! PATH=/usr/bin:/bin realpath -m / >/dev/null 2>&1; then
-        printf '  \033[33mskip\033[0m every hook-mode row: no GNU realpath -m in /usr/bin:/bin here (the container has it)\n'
+    # ...and jq IN THAT PATH: the hook runs `jq` from /usr/bin:/bin, so a jq only in ~/.local/bin,
+    # nix or Linuxbrew passed check.sh's gate and then failed every allow row (review round 12).
+    # Decided here, in the callee, so every caller of the self-test gets it.
+    if ! PATH=/usr/bin:/bin realpath -m / >/dev/null 2>&1 || ! PATH=/usr/bin:/bin type -P jq >/dev/null 2>&1; then
+        printf '  \033[33mskip\033[0m every hook-mode row: no GNU realpath -m, or no jq, in /usr/bin:/bin here (the container has both)\n'
         if [ "$fails" -eq 0 ]; then printf '\033[32mdeny-transcripts self-test passed (pure rows only)\033[0m\n'; exit 0; fi
         printf '\033[31mdeny-transcripts self-test: %s failed\033[0m\n' "$fails"; exit 1
     fi
@@ -628,6 +632,18 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{src,tests/{unit,e2e}}/**/*.rs"}}' HOME=/h
     blow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(8) | "{a,b,c}"] | join(""))}}')"
     h "a brace product too large to expand is refused, never a race with the timeout" deny "$blow" HOME=/h
+    # REVIEW ROUND 12. A ~ before the first brace: its literal prefix is empty, and only the cwd was
+    # judged while the first expansion is the denied tree.
+    h "a Glob ~{,x}/.claude/projects/** is denied like its first expansion" deny \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"~{,x}/.claude/projects/**"}}' HOME=/h
+    h "a Glob whose alternatives are ordinary relative paths is still allowed" allow \
+      '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{src,tests/{unit,e2e}}/**/*.rs"}}' HOME=/h
+    # ...and ~word in free text is an account only BY NAME, judged at the home it really has: getent
+    # also answers a uid (`~5`) and system accounts (`~sync`, home /bin), all denied as $HOME.
+    h "jkb's vector search ~sync is not the home of the sync account's tree" allow \
+      '{"tool_name":"mcp__jkb__query","cwd":"/h/repos/jkb","tool_input":{"dsl":"~sync"}}' HOME=/h
+    h "a ~5 is not uid 5's home" allow \
+      '{"tool_name":"mcp__x__note","cwd":"/h/repos/jkb","tool_input":{"text":"~5"}}' HOME=/h
     # REVIEW ROUND 9.
     h "a leading brace that never closes is refused, not kept literal" deny \
       '{"tool_name":"Glob","cwd":"/h/repos","tool_input":{"pattern":"x}{{/.,/}./{.,}./.claude/projects/**"}}' HOME=/h
@@ -815,33 +831,42 @@ case "$tool" in
             # wildcard (`*/../../../.claude/projects/*`) or an absolute alternative in braces
             # (`{/h/.claude/projects/**,**/*.rs}`) went unjudged (review round 6). Both are refused;
             # ordinary patterns -- `**/*.{rs,toml}`, `{src,tests}/**` -- hold neither.
-            gb="$(glob_base "$pat")"
-            # A `..` AFTER the literal prefix -- the prefix itself is judged below, so `../docs/*.md`
-            # is fine and only a climb past a wildcard is refused (round 7: refusing any `..` beside
-            # a wildcard refused that ordinary pattern).
             # Judged on EVERY EXPANSION of the braces, never on their raw alternatives: round 6 read
             # the first group alone, round 7 every group's alternatives as text, and both let a
-            # nested group or a `..` built across a group boundary (`.{.,}`) through (round 8). An
-            # expansion may not climb past the prefix, nor become absolute when the pattern is not.
-            # Ordinary patterns -- `**/*.{rs,toml}`, `{crates/a,crates/b}/**` -- do neither.
+            # nested group or a `..` built across a group boundary (`.{.,}`) through (round 8).
             # The byte budget check() applies to a path, applied to the pattern BEFORE the expander
             # walks it a character at a time: unbounded, a megabyte pattern was a walk into the
             # timeout, which fails open.
             [ "${#pat}" -le 4096 ] || exit 3
             brace_expand "$pat" || exit 3
+            # EACH EXPANSION'S OWN LITERAL PREFIX is judged, not the raw pattern's. The raw prefix of
+            # `~{,x}/.claude/projects/**` is empty -- glob_base stops at the first segment holding a
+            # brace -- so only the cwd was judged while the first expansion is the denied tree
+            # (review round 12, reproduced). A `..` is allowed IN a prefix, which is judged, and
+            # refused only past one (round 7: `../docs/*.md` is ordinary); an expansion may not turn
+            # absolute when the pattern is not. Ordinary patterns -- `**/*.{rs,toml}`,
+            # `{crates/a,crates/b}/**` -- share one prefix, so this judges each distinct prefix once.
+            gbs=""
             for e in "${brace_out[@]}"; do
                 case "$pat" in /*|"~"*) ;; *) case "$e" in /*|"~"*) deny ;; esac ;; esac
+                gb="$(glob_base "$e")"
                 rest="${e#"$gb"}"
                 case "/$rest/" in */../*) deny ;; esac
+                case "
+$gbs" in *"
+$gb
+"*) ;; *) gbs="$gbs$gb
+" ;; esac
             done
-            if [ -n "$gb" ]; then
+            while IFS= read -r gb; do
+                [ -n "$gb" ] || continue
                 # Joined onto the UN-normalised base, so check()'s realpath meets any link in the
                 # base before the pattern's `..` segments: resolving the base first collapsed
                 # `l/..` to the cwd, and a pattern climbing from there was judged from the wrong
                 # directory (review round 5, reproduced) -- round 3's symlink-then-`..` defect in
                 # a composition check() itself never saw.
                 case "$gb" in /*|"~"*) check "$gb" ;; *) check "$(join_raw "$base" "$home" "$cwd")/$gb" ;; esac
-            fi
+            done <<<"$gbs"
         fi ;;
     Read|Edit|Write|NotebookEdit)
         [ -n "$pth" ] && check "$pth" ;;
@@ -913,7 +938,14 @@ case "$tool" in
             # (round 8). A path field keeps the over-approximation.
             case "$leaf" in
                 "~"*/*|"~") ;;
-                "~"*) getent passwd "${leaf#\~}" >/dev/null 2>&1 || leaf="./$leaf" ;;
+                # BY NAME, AT ITS REAL HOME: getent also answers a uid (`~5`) and system accounts
+                # (`~sync`, whose home is /bin), and reading every one as $HOME refused jkb's own
+                # `~sync` search (review round 12). An account whose first field is the word is
+                # judged at the home it has; anything else is a relative name.
+                "~"*) ent="$(getent passwd "${leaf#\~}" 2>/dev/null | head -1)"
+                      ent_home="$(printf '%s' "$ent" | cut -d: -f6)"
+                      if [ "${ent%%:*}" = "${leaf#\~}" ] && [ -n "$ent_home" ]; then leaf="$ent_home"
+                      else leaf="./$leaf"; fi ;;
             esac
             # A free-text string that merely STARTS `file:` is text, not a refusal (round 7); only a
             # `file:/...` URI is rewritten, and the same helper serves the long branch below.

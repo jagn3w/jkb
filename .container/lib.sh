@@ -515,6 +515,15 @@ EOF
         rm -rf "$new"; return 1
     fi
     [ -n "$old" ] && rm -rf "$old"
+    # A KIT IN THE FLAT LAYOUT ROUND 10 INSTALLED -- the kit's paths and marker directly in its home,
+    # before kit/ existed -- is removed: its run.sh staged in TMPDIR and had no PATH filter, and its
+    # --install-kit would move this home aside, new kit and all (review round 12). Only our own
+    # names, and only beside the marker that says it is one.
+    local home_dir; home_dir="$(dirname "$kit")"
+    if [ -f "$home_dir/$DC_KIT_MARKER" ]; then
+        rm -rf "${home_dir:?}/.container" "${home_dir:?}/scripts" "${home_dir:?}/$DC_KIT_MARKER" \
+            && echo "removed the older kit left directly in $home_dir"
+    fi
     echo "installed the container kit from $src to $kit"
 }
 
