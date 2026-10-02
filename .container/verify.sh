@@ -1864,6 +1864,21 @@ else
     done
     [ -n "$(posture_transcript_roots 2>/dev/null)" ] \
         || mem_hook_wrong="$mem_hook_wrong the shared root list could not be loaded, so no root was probed;"
+    # ...AND IT HOLDS THE FILE TOOLS TO THE SANDBOX'S BOUNDARY (design A, after review round 15): with
+    # the sandbox enabled in this container's settings, a Write outside every allowWrite path -- the
+    # home itself -- is refused, and one inside the workspace is not.
+    if [ "$(HOME=/dev/null jq -r '.sandbox.enabled // false' "$HOME/.claude/settings.json" 2>/dev/null)" = true ]; then
+        mem_probe_write() { # mem_probe_write <path> -> deny|allow|broken
+            local out rc=0
+            out="$(printf '{"tool_name":"Write","cwd":"%s","tool_input":{"file_path":"%s","content":""}}' "$mem_repo" "$1" \
+                   | CLAUDE_PROJECT_DIR="$mem_repo" "$mem_hook" 2>/dev/null)" || rc=$?
+            case "$rc:$out" in 0:*'"permissionDecision":"deny"'*|2:*) echo deny ;; 0:*) echo allow ;; *) echo broken ;; esac
+        }
+        [ "$(mem_probe_write "$HOME/.jkb-boundary-probe")" = deny ] \
+            || mem_hook_wrong="$mem_hook_wrong a Write to the home, outside every allowWrite path, is NOT refused;"
+        [ "$(mem_probe_write "$mem_repo/.jkb-boundary-probe")" = allow ] \
+            || mem_hook_wrong="$mem_hook_wrong a Write inside the workspace is refused;"
+    fi
     # ...AND THE INSTALLED SETTINGS MUST ACTUALLY RUN IT. A present, correct hook that no PreToolUse
     # entry names guards nothing, and every probe above still passes -- the stale-image and
     # hand-edited /etc/claude-code cases this block exists for. The matcher must EQUAL the shared

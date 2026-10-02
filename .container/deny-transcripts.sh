@@ -99,6 +99,11 @@
 # the cwd is the project dir (bases deduplicated), 1.4s with three distinct bases. This container
 # has been seen running 5x slow under a saturated VM, and 5x the worst case is still inside 10s.
 #
+# AND THE SANDBOX'S OWN BOUNDARY: when the Claude settings enable the sandbox, every path a tool is
+# handed is also held to the allow lists the sandbox enforces on Bash (`boundary` below; design A,
+# chosen after review round 15). .container/README.md, "The file tools are held to the sandbox's
+# own boundary", has the decision and its cost.
+#
 # WHAT IS RULED OUT AND WHAT IS LEFT OPEN -- hard links, case folding and bind mounts measured as
 # not vectors; the symlink-swap race between this check and the tool's open left open -- is recorded
 # once, in .container/README.md ("The transcript deny is a hook"), and not restated here.
@@ -406,7 +411,9 @@ if [ "${1:-}" = --self-test ]; then
     self="$0"
     h() { # h <label> <want deny|allow> <stdin> [env...]
         local label="$1" want="$2" in="$3" out rc=0; shift 3
-        out="$(printf '%s' "$in" | env "$@" "$BASH" "$self" 2>/dev/null)" || rc=$?
+        # The session's own CLAUDE_PROJECT_DIR and CLAUDE_CONFIG_DIR are not inherited: they would
+        # point the boundary at this machine's real settings. A row that is about them sets them.
+        out="$(printf '%s' "$in" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR "$@" "$BASH" "$self" 2>/dev/null)" || rc=$?
         local got=allow
         case "$out" in *'"permissionDecision":"deny"'*) got=deny ;; esac
         [ "$rc" -eq 2 ] && got=deny
@@ -540,6 +547,56 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"~t/e.jsonl"}}' HOME="$sh"
     h "...and to Read" deny \
       '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"~t/e.jsonl"}}' HOME="$sh"
+    # DESIGN A: THE FILE TOOLS HELD TO THE SANDBOX'S OWN BOUNDARY. A scratch home whose user settings
+    # enable the sandbox with the posture's shape of lists.
+    # OUTSIDE THE TEMP ROOTS: /tmp and $TMPDIR are writable to the sandbox, so a scratch home there
+    # passes every write test whatever the lists say. ~/.cache is writable here and on CI.
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    bh="$(mktemp -d "$HOME/.cache/jkb-boundary.XXXXXX" 2>/dev/null)" && [ -d "$bh" ] \
+        || { printf '  \033[31mFAIL\033[0m could not make a scratch home under ~/.cache for the boundary rows\n'; fails=$((fails+1)); bh="$sh/bhome"; }
+    mkdir -p "$bh/.claude" "$bh/repos/w" "$bh/.ssh" "$bh/.jkb/claude-memory/w" "$bh/.claude/projects/-w"
+    : >"$bh/.ssh/id"; : >"$bh/.jkb/claude-memory/w/MEMORY.md"
+    ln -s "$bh/.jkb/claude-memory/w" "$bh/.claude/projects/-w/memory"
+    ln -s "$bh/.ssh" "$bh/repos/w/keys"
+    printf '%s\n' '{"sandbox":{"enabled":true,"filesystem":{"denyRead":["~"],"allowRead":["~/.claude/settings.json"],"allowWrite":["~/repos","~/.jkb"]}}}' > "$bh/.claude/settings.json"
+    h "boundary: a Write inside allowWrite is allowed" allow \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/x.rs","content":""}}' HOME="$bh"
+    h "boundary: a Write outside allowWrite is denied" deny \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh"
+    h "boundary: an Edit of a system file is denied" deny \
+      '{"tool_name":"Edit","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"/etc/hosts","old_string":"a","new_string":"b"}}' HOME="$bh"
+    h "boundary: a Read under denyRead is denied" deny \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.ssh/id"}}' HOME="$bh"
+    h "boundary: ...and through a link in the workspace" deny \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/keys/id"}}' HOME="$bh"
+    h "boundary: a Read outside every deny root is allowed" allow \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"/etc/hosts"}}' HOME="$bh"
+    h "boundary: a Read of allowRead inside denyRead is allowed" allow \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/settings.json"}}' HOME="$bh"
+    h "boundary: auto-memory through its link into ~/.jkb is readable" allow \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/projects/-w/memory/MEMORY.md"}}' HOME="$bh"
+    mkdir -p "$bh/.claude/projects/-u/memory"
+    h "boundary: an UNLINKED auto-memory directory is writable too" allow \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/projects/-u/memory/n.md","content":""}}' HOME="$bh"
+    h "boundary: ...while the tree around it is not" deny \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/projects/-u/notes.md","content":""}}' HOME="$bh"
+    h "boundary: ...and writable" allow \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/projects/-w/memory/new.md","content":""}}' HOME="$bh"
+    h "boundary: an MCP server handed a denied path is refused" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'/.ssh/id"}}' HOME="$bh"
+    h "boundary: a Grep rooted at the home is refused" deny \
+      '{"tool_name":"Grep","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'","pattern":"p"}}' HOME="$bh"
+    h "boundary: a Write to the session's TMPDIR is allowed" allow \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$sh"'/tmpdir/x","content":""}}' HOME="$bh" TMPDIR="$sh/tmpdir"
+    h "boundary: a plan file under ~/.claude/plans is writable" allow \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/plans/p.md","content":""}}' HOME="$bh"
+    printf '%s\n' '{"sandbox":{"enabled":false,"filesystem":{"denyRead":["~"],"allowWrite":["~/repos"]}}}' > "$bh/.claude/settings.json"
+    h "boundary: with the sandbox disabled there is no boundary to mirror" allow \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh"
+    printf '%s\n' 'not json {' > "$bh/.claude/settings.json"
+    h "boundary: an unparseable settings layer contributes nothing, as Claude Code skips it" allow \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh"
+    case "$bh" in */jkb-boundary.*) rm -rf -- "$bh" ;; esac
     h "a HOME with a trailing slash still finds its tree" deny \
       '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":"'"$sh"'/.claude/projects/-s/e.jsonl"}}' HOME="$sh/"
     # A field of the wrong TYPE is refused, never interpolated: `eval` of @sh output RUNS an array.
@@ -769,8 +826,13 @@ on_exit() {
 trap on_exit EXIT
 
 allow() { decided=allow; exit 0; }
+# deny [reason] -- the transcript reason unless another is given; the boundary has its own (below).
 deny() {
     decided=deny
+    if [ -n "${1:-}" ]; then
+        printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":%s}}\n' "$(printf '%s' "$1" | jqh -Rs .)"
+        exit 0
+    fi
     printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":%s}}\n' \
         '"Session transcripts are not readable, and neither is any directory containing them -- a search rooted there walks into them. They are other agents'"'"' working context, not a source of truth for this repository, and reading them is how one session inherits another'"'"'s mistakes. Auto-memory under <slug>/memory/ IS readable, and ~/.jkb/claude-memory holds the shared store. If you need what another session concluded, read the decision record it left in docs/ or the commit message."'
     exit 0
@@ -838,6 +900,97 @@ assign="$(printf '%s' "$input" | jqh -er '
 eval "$assign"
 [ -n "$cwd" ] || cwd="$PWD"
 
+# THE SANDBOX'S OWN BOUNDARY, FOR THE TOOLS IT DOES NOT CONFINE. Claude Code's file tools and MCP
+# servers run in its own process, outside the Bash sandbox, and were held only by deny rules: a list
+# of what is FORBIDDEN, to which every review round added the place nobody had thought of
+# (~/.docker, /Applications, ~/.cargo/env...). So every path a tool is handed is also judged against
+# the same allow lists the sandbox enforces on Bash, read from the same settings layers: a write
+# must land under allowWrite; a read must not land under denyRead unless allowRead or allowWrite
+# covers it. One list, two enforcers (design A, chosen after review round 15). Judged on the PHYSICAL
+# path, as the kernel sandbox judges it, so auto-memory reached through its ~/.claude/projects link
+# into ~/.jkb is readable, and a link in ~/repos pointing at ~/.ssh is not.
+# Mirrored only when the merged settings ENABLE the sandbox; with no sandbox there is no boundary to
+# mirror, and the transcript rule above still applies. An agent cannot turn it off: every layer read
+# here is write-denied to the sandbox and Edit-denied to the tools.
+sb_on=0; sb_w=(); sb_r=(); sb_dr=()
+sb_layers=(/etc/claude-code/managed-settings.json /etc/claude-code/managed-settings.d/*.json
+           "${CLAUDE_CONFIG_DIR:-$home/.claude}/settings.json")
+[ -n "${CLAUDE_PROJECT_DIR:-}" ] && sb_layers+=("$CLAUDE_PROJECT_DIR/.claude/settings.json" "$CLAUDE_PROJECT_DIR/.claude/settings.local.json")
+sb_args=(); sb_names=()
+sb_i=0
+for f in "${sb_layers[@]}"; do
+    [ -f "$f" ] && [ -r "$f" ] || continue
+    sb_args+=(--rawfile "s$sb_i" "$f"); sb_names+=("\$s$sb_i"); sb_i=$((sb_i + 1))
+done
+if [ "$sb_i" -gt 0 ]; then
+    # ONE jq, every layer as raw text parsed inside: a file that is not valid JSON contributes nothing,
+    # as Claude Code skips it, instead of failing the whole read. `enabled` is the last layer's word
+    # in the order read (user, project, local, managed last); the lists are unions, as Claude Code
+    # merges arrays across layers.
+    sb_names_csv="$(IFS=,; printf '%s' "${sb_names[*]}")"
+    sb_sh="$(jqh -nr "${sb_args[@]}" '
+        def p: try fromjson catch {};
+        def str: if type == "string" then . else empty end;
+        [ ('"$sb_names_csv"') | p | .sandbox // {} ] as $l
+        | ([ $l[] | .enabled | select(. != null) ] | last // false) as $on
+        | @sh "sb_on=\(if $on == true then 1 else 0 end)
+               sb_w=(\([ $l[] | .filesystem.allowWrite[]? | str ] | unique))
+               sb_r=(\([ $l[] | .filesystem.allowRead[]? | str ] | unique))
+               sb_dr=(\([ $l[] | .filesystem.denyRead[]? | str ] | unique))"' 2>/dev/null)" || exit 3
+    eval "$sb_sh"
+fi
+if [ "$sb_on" = 1 ]; then
+    # `~` is the home; a relative entry (".") is the project's, as Claude Code reads it. Then every
+    # entry resolved the way the path it is compared with is: physically.
+    sb_abs() { case "$1" in "~") printf '%s\n' "$home" ;; "~/"*) printf '%s\n' "$home/${1#\~/}" ;; /*) printf '%s\n' "$1" ;;
+               *) printf '%s\n' "${CLAUDE_PROJECT_DIR:-$cwd}/${1#./}" ;; esac; }
+    # Claude Code's own writable places, which the Bash sandbox also grants: the session's cwd and
+    # project, the temp roots it hands tools, and ~/.claude/plans, where plan mode writes.
+    sb_w+=("$cwd" "${CLAUDE_PROJECT_DIR:-$cwd}" "${TMPDIR:-/tmp}" "/tmp/claude" "/tmp/claude-$UID" "~/.claude/plans")
+    sb_resolve() { # sb_resolve <name of array> -- each entry, absolute and physical, in place
+        local -n arr="$1"; local e out=()
+        for e in "${arr[@]}"; do out+=("$(sb_abs "$e")"); done
+        [ "${#out[@]}" -gt 0 ] || { arr=(); return 0; }
+        # `$( )`, never `< <( )`: a resolver that fails must refuse, not hand back a short list.
+        local res; res="$(realpath -m -- "${out[@]}" 2>/dev/null)" || exit 3
+        mapfile -t arr <<<"$res"
+    }
+    sb_resolve sb_w; sb_resolve sb_r; sb_resolve sb_dr
+fi
+sb_under() { # sb_under <path> <entry>... -> rc 0 when <path> is an entry or lies inside one
+    local p="$1" e; shift
+    for e in "$@"; do
+        [ -n "$e" ] || continue
+        [ "$e" = / ] && return 0
+        [ "$p" = "$e" ] || [ "${p#"${e%/}"/}" != "$p" ] && return 0
+    done
+    return 1
+}
+# boundary <physical path> -- deny a path the sandbox would not let Bash reach in this tool's mode.
+boundary() {
+    [ "$sb_on" = 1 ] || return 0
+    # AUTO-MEMORY IS THE ONE DELIBERATE DIFFERENCE from what Bash may reach: `<root>/<slug>/memory/`
+    # is Claude Code's own memory, which its tools must read and write, linked into ~/.jkb or not.
+    # Sandboxed Bash cannot see the tree at all. The transcript rule above draws the same line.
+    local r rest
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        rest="${1#"$r"/}"; [ "$rest" != "$1" ] || continue
+        rest="${rest#*/}"
+        [ "$rest" = memory ] || [ "${rest#memory/}" != "$rest" ] && return 0
+    done <<<"$roots"
+    if [ "$sb_mode" = write ]; then
+        sb_under "$1" ${sb_w[@]+"${sb_w[@]}"} && return 0
+        deny "$1 is outside the sandbox's writable paths (allowWrite in the Claude settings), and the file tools are held to the same boundary as Bash. Write inside the workspace or another allowWrite directory."
+    fi
+    sb_under "$1" ${sb_w[@]+"${sb_w[@]}"} ${sb_r[@]+"${sb_r[@]}"} && return 0
+    sb_under "$1" ${sb_dr[@]+"${sb_dr[@]}"} || return 0
+    deny "$1 is under a path the sandbox denies reading (denyRead in the Claude settings), and the file tools are held to the same boundary as Bash."
+}
+# Writes for the tools that write; everything else -- Read, Grep, Glob, MCP servers, unknown tools --
+# is judged as a read, the weaker test, since what an unknown tool does with a path is unknown.
+case "$tool" in Write|Edit|MultiEdit|NotebookEdit) sb_mode=write ;; *) sb_mode=read ;; esac
+
 check() { # check <path> [base]: deny on deny, return on allow, refuse on anything else
     local base="${2:-$cwd}" v abs raw phys p="$1"
     # A file:// URI IS ITS PATH. Joined onto the cwd as a relative string, `file:///h/.claude/...`
@@ -866,6 +1019,8 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
     phys="$(realpath -m -- "$raw" 2>/dev/null && printf .)" || exit 3
     phys="${phys%.}"; phys="${phys%$'\n'}"
     [ -n "$phys" ] || exit 3
+    # The sandbox's boundary, on the path the kernel would open.
+    boundary "$phys"
     if [ "$phys" != "$abs" ]; then
         v="$(verdict "$phys" "$roots" "$home" "$base")"
         case "$v" in deny) deny ;; allow) ;; *) exit 3 ;; esac

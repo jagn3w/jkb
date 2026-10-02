@@ -1449,6 +1449,49 @@ deliberately not pruned — `git clean -X` deletes exactly the regenerable files
 gitignored `.env`, and unrequested deletion is what this whole mechanism exists to avoid. Shorten
 `--retain-days` if size matters more than the safety net.
 
+## The file tools are held to the sandbox's own boundary (design A)
+
+**Why.** Claude Code's file tools (Read, Write, Edit, Grep, Glob, Artifact) and every MCP server run
+in its own process, outside the Bash sandbox. They were held only by permission deny rules, which
+list what is forbidden. Rounds 13 to 15 of the review on `jkb/argv-root-fix` kept adding the place
+nobody had thought of: `~/.docker`, `/Applications`, `~/.cargo/env`. Reviewing the security model
+after round 15, the user chose to hold the file tools to the same allow lists the sandbox enforces
+on Bash. One list, two enforcers. The longer-term fix, a separate Unix user for agents, is filed as
+`task:separate-unix-user-for-agents-ke-18dabb26d2f5dca8`.
+
+**What it does.** `deny-transcripts.sh`, which every tool call already reaches, reads the sandbox
+settings from the same layers Claude Code merges: managed and its drop-ins, the user's settings, and
+the project's `settings.json` and `settings.local.json`. When they enable the sandbox, every path a
+tool is handed is judged on its physical path, as the kernel sandbox judges it:
+
+- **A write** (Write, Edit, MultiEdit, NotebookEdit) must land under an `allowWrite` entry. Claude
+  Code's own writable places are added: the session's cwd and project, the temp roots, and
+  `~/.claude/plans`, where plan mode writes.
+- **Anything else** (Read, Grep, Glob, MCP servers, unknown tools) is judged as a read. It must not
+  land under `denyRead` unless `allowRead` or `allowWrite` covers it.
+- **Auto-memory is the one deliberate difference.** `<root>/<slug>/memory/` is readable and writable,
+  linked into `~/.jkb` or not. It is Claude Code's own memory, while sandboxed Bash cannot see the
+  tree at all.
+- **No sandbox, no boundary.** With the sandbox disabled there is nothing to mirror, and the
+  transcript rule still applies. An agent cannot turn it off: every layer read is write-denied to the
+  sandbox and `Edit`-denied to the tools. A layer that is not valid JSON contributes nothing, as
+  Claude Code skips it.
+
+**What it costs.** A judged Read went from about 29ms to 58ms per call, measured over 30 calls in
+jkb-dev against its real settings. Bash is still decided first, in 7ms. A tool reading or writing
+outside the sandbox's lists is now refused, with a reason naming the list. The deny rules stay, as a
+second layer.
+
+**What it does not cover.** An unknown or MCP tool is judged as a read, the weaker test, because what
+it does with a path is unknown. One that writes to a path the lists only let it read passes. And the
+hook is installed only in the container's managed settings. On the host the file tools are still
+held only by the posture's deny rules, and the separate-user task is where that ends.
+
+**Held by** seventeen boundary rows in the hook's self-test, which run against a scratch home outside
+the temp roots, because `/tmp` is writable to the sandbox and would pass every write. Five of them
+were watched failing with the boundary call removed. `verify.sh` probes the installed hook: with the
+sandbox enabled, a Write to the home must be refused and one in the workspace allowed.
+
 ## The transcript deny is a hook, so the sandbox argv is O(1)
 
 Two `permissions.deny` globs used to cost more than half the argv budget every Bash call in this
