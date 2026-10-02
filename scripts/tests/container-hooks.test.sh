@@ -711,11 +711,16 @@ case30_the_kit_says_which_paths_the_checkout_has_changed() {
     rm "$co/.container/run.sh"; mkdir "$co/.container/run.sh"; : >"$co/.container/run.sh/x"
     rm -f "$kit/scripts/lib.sh"
     local more; more="$(dc_kit_changes "$kit" "$co" | sort | tr '\n' ';')"
+    # ...and under the caller's own options, `set -euo pipefail`, with a kit path missing on one side.
+    # A PLAIN STATEMENT, not the left of `&&`: `set -e` is suspended for anything there, the whole
+    # function body included, which is how this row first passed against the broken version.
+    local strict; strict="$(set -euo pipefail; dc_kit_changes "$kit" "$co" >/dev/null; echo survived)"
     if [ -z "$before" ] && [ "$after" = scripts/auto-mode.sh ] && [ "$files" = scripts/auto-mode.sh ] \
-       && [ "$more" = ".container/run.sh (removed);.container/run.sh/x (new);.container/sub/a (new);.container/sub/b (new);scripts/auto-mode.sh;scripts/lib.sh (new);" ]; then
+       && [ "$more" = ".container/run.sh (removed);.container/run.sh/x (new);.container/sub/a (new);.container/sub/b (new);scripts/auto-mode.sh;scripts/lib.sh (new);" ] \
+       && [ "$strict" = survived ]; then
         ok "the kit names exactly the paths the checkout has changed since it was installed"
     else
-        fail "the kit names exactly the paths the checkout has changed since it was installed" "before=[$before] after=[$after] files=[$files] more=[$more]"
+        fail "the kit names exactly the paths the checkout has changed since it was installed" "before=[$before] after=[$after] files=[$files] more=[$more] strict=[$strict]"
     fi
 }
 
@@ -819,10 +824,16 @@ case36_the_checkout_a_kit_script_serves() {
     a="$(JKB_REPO_ROOT=/x/y dc_repo_root "$d/mirror")"
     b="$(cd "$d/co/sub" && DC_CTR_KIT="$(cd "$d/mirror" && pwd -P)" dc_repo_root "$d/mirror")"
     c="$(dc_repo_root "$d/co")"
-    if [ "$a" = /x/y ] && [ "$b" = "$(cd "$d/co" && pwd -P)" ] && [ "$c" = "$d/co" ]; then
+    # ...an exported GIT_WORK_TREE does not redirect the mirror arm, and outside any repository it
+    # falls back to the directory you stand in (review round 19).
+    local e f; mkdir -p "$d/plain" "$d/other"; git -C "$d/other" init -q 2>/dev/null
+    e="$(cd "$d/co/sub" && GIT_WORK_TREE="$d/other" GIT_DIR="$d/other/.git" DC_CTR_KIT="$(cd "$d/mirror" && pwd -P)" dc_repo_root "$d/mirror")"
+    f="$(cd "$d/plain" && DC_CTR_KIT="$(cd "$d/mirror" && pwd -P)" dc_repo_root "$d/mirror")"
+    if [ "$a" = /x/y ] && [ "$b" = "$(cd "$d/co" && pwd -P)" ] && [ "$c" = "$d/co" ] \
+       && [ "$e" = "$(cd "$d/co" && pwd -P)" ] && [ "$f" = "$(cd "$d/plain" && pwd -P)" ]; then
         ok "dc_repo_root: JKB_REPO_ROOT first, the checkout you stand in from the mirror, else the script's own"
     else
-        fail "dc_repo_root: JKB_REPO_ROOT first, the checkout you stand in from the mirror, else the script's own" "a=$a b=$b c=$c"
+        fail "dc_repo_root: JKB_REPO_ROOT first, the checkout you stand in from the mirror, else the script's own" "a=$a b=$b c=$c e=$e f=$f"
     fi
 }
 

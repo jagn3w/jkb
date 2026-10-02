@@ -587,8 +587,12 @@ dc_kit_changes() { # dc_kit_changes <kit dir> <checkout>
     # a new subdirectory as one line (review round 18). A file that cannot be compared says so.
     local p f kfiles cfiles
     while IFS= read -r p; do
-        kfiles="$( [ -e "$1/$p" ] && (cd "$1" && find "$p" -type f 2>&1) | sort)"
-        cfiles="$( [ -e "$2/$p" ] && (cd "$2" && find "$p" -type f 2>&1) | sort)"
+        # STATUS-SAFE: run.sh calls this under `set -euo pipefail`, and `[ -e ] && ...` answering 1
+        # for a path missing on one side ended --install-kit silently, before it installed anything
+        # (review round 19). A find error prints into the list, so it is seen, not fatal.
+        kfiles=""; cfiles=""
+        if [ -e "$1/$p" ]; then kfiles="$( (cd "$1" && find "$p" -type f 2>&1) | sort || true)"; fi
+        if [ -e "$2/$p" ]; then cfiles="$( (cd "$2" && find "$p" -type f 2>&1) | sort || true)"; fi
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             if ! grep -qxF -- "$f" <<<"$kfiles"; then printf '%s (new)\n' "$f"

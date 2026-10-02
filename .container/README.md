@@ -1482,9 +1482,13 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
   MCP or unknown tool call, a path-shaped string with a `..` segment or a `~name/` prefix is refused
   outright. Resolving those meant guessing how an unknown server treats them: whether it normalises
   before opening, whether it expands `~name`. Rounds 16 to 18 each found a spelling the guess missed,
-  such as a climb padded past `PATH_MAX`, or `~sync/../`. Prose that merely mentions `../` is not a
-  path segment and passes. A long string with no `..` resolves only inside the cwd or project, so
-  there is no length rule.
+  such as a climb padded past `PATH_MAX`, or `~sync/../`. Only a string that is a path as a whole,
+  with no whitespace, is refused for `..`, so prose with a markdown link `](../../x.md)` passes. A
+  climb in a string with a space in it is still resolved and judged. A `~name/` is refused only when
+  the name is account-shaped, so jkb's own `~"term" ns:a/b` query passes (review round 19). There is
+  no length rule. An over-long string has its `.` and empty segments collapsed, which is exact once
+  `..` is refused. If it then fits under `PATH_MAX` it is judged in full, links included. Round 19
+  found a cwd link padded with `./` that was followed by no check at all.
 - **Only the home-base guess is spared.** An unknown tool's relative free text is read from each base
   it might be resolved against: the session cwd, the project dir and the home. The cwd and project
   readings are judged in full, because that is where a server resolves a relative path. jkb's

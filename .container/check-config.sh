@@ -926,6 +926,22 @@ else
     bad "run.sh does not check the kit with dc_unsafe_entries, and refuse, before dc_mirror_hooks copies it into the container — a link in the kit would carry its target's bytes in"
 fi
 
+# ONE DERIVATION OF THE SERVED CHECKOUT. setup.sh, verify.sh and install-extensions.sh each spelled
+# it, and two took the kit mirror for the checkout when run there (review round 18); each now calls
+# lib.sh's dc_repo_root, and none spells `${JKB_REPO_ROOT:-` itself (review round 19: nothing held it).
+dc_rr_bad=""
+for dc_f in setup verify install-extensions; do
+    dc_t="$(dc_strip_comments "$here/$dc_f.sh")"
+    grep -q 'dc_repo_root "' <<<"$dc_t" || dc_rr_bad="$dc_rr_bad $dc_f.sh does not call dc_repo_root;"
+    # A DEFAULT naming a directory is a derivation; `${JKB_REPO_ROOT:-}` only asks whether run.sh set it.
+    grep -qE '\$\{JKB_REPO_ROOT:-[^}]' <<<"$dc_t" && dc_rr_bad="$dc_rr_bad $dc_f.sh derives the checkout itself;"
+done
+if [ -n "$dc_rr_bad" ]; then
+    bad "the served checkout is derived outside lib.sh's dc_repo_root:$dc_rr_bad run from the kit mirror, such a script takes the mirror itself for the checkout"
+else
+    ok "setup.sh, verify.sh and install-extensions.sh derive the checkout through dc_repo_root alone"
+fi
+
 # THE HOOK AND THE SWEEP MUST AGREE ON WHERE THE TREE IS. The hook cannot load the shared reader --
 # it is installed alone, root-owned, at /usr/local/bin -- so its roots are its own, and they drifted:
 # it ignored CLAUDE_CONFIG_DIR while the sweep honoured it, leaving the real tree unguarded whenever

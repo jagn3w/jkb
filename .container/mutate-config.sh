@@ -1847,6 +1847,16 @@ open(p, 'w').write(s.replace(old, 'kit_odd=""\n', 1))
 PYX
 run "run.sh stops checking the kit before mirroring it" "does not check the kit with dc_unsafe_entries"
 
+# REVIEW ROUND 19. The served checkout through dc_repo_root alone.
+seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'repo="$(dc_repo_root "$kit")"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'repo="${JKB_REPO_ROOT:-$kit}"', 1))
+PYX
+run "setup.sh derives the checkout itself again" "derives the checkout itself"
+
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys
@@ -2303,7 +2313,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=117
+PINNED_BAD_SITES=118
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

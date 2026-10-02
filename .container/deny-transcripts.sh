@@ -640,6 +640,19 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"src/../README.md"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 18: prose that merely mentions ../ is not a path segment, and is allowed" allow \
       '{"tool_name":"mcp__jkb__task_create","cwd":"'"$bh"'/repos/w","tool_input":{"title":"t","description":"see ../docs and crates/a.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 19. A cwd link padded with `./` past PATH_MAX; jkb's own vector query and prose
+    # with a `~`, a markdown relative link, are not paths; a climb hidden behind a space is still met.
+    ln -s "$bh/.ssh" "$bh/repos/w/k"
+    padl="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{path:("k" + ([range(2100)|"/."]|join("")) + "/id_rsa")}}')"
+    h "round 19: a cwd link padded with ./ past PATH_MAX is still followed and judged" deny "$padl" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 19: jkb's own ~\"term\" ns:a/b query is not a ~name/ path" allow \
+      '{"tool_name":"mcp__jkb__query","cwd":"'"$bh"'/repos/w","tool_input":{"query":"~\"merge conflict\" ns:repos/jkb"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 19: prose starting ~2h that later names a file is allowed" allow \
+      '{"tool_name":"mcp__jkb__task_create","cwd":"'"$bh"'/repos/w","tool_input":{"title":"t","description":"~2h of work, see crates/a.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 19: prose with a markdown relative link is allowed" allow \
+      '{"tool_name":"mcp__x__note","cwd":"'"$bh"'/repos/w","tool_input":{"text":"See [the record](../../docs/task-lifecycle.md) for D52."}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    spl="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{path:("a b/" + ([range(2100)|"./"]|join("")) + "../../../.ssh/id_rsa")}}')"
+    h "round 19: an over-long climb with a space in it still meets the boundary" deny "$spl" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     longp="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + ([range(2100)|"/."]|join("")) + "/.ssh/id_rsa")}}')"
     h "round 17: an over-long padded path still meets the boundary" deny "$longp" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     mkdir -p "$bh/repos/w/.claude"
@@ -1326,11 +1339,23 @@ case "$tool" in
             # 18 each found a spelling the guess missed: a climb padded past PATH_MAX, `~sync/../`.
             # Refusing the form ends that. Prose that merely mentions `../` is not a segment and
             # passes; a tool that genuinely needs `../x` is told why.
-            case "/$leaf/" in
-                */../*) deny "An MCP or unknown tool was handed a path with a '..' segment. The file-tool boundary refuses that form rather than guess how the server resolves it; pass the path without '..' (an absolute path, or one relative to the workspace)." ;;
-            esac
+            # ONLY A STRING THAT IS A PATH AS A WHOLE -- no whitespace -- is refused for a `..`: prose
+            # holding a markdown link `](../../x.md)` was refused as one (review round 19). A climb in a
+            # string with a space in it is still RESOLVED and judged below, the long branch included.
             case "$leaf" in
-                "~"[!/]*/*) deny "An MCP or unknown tool was handed a '~name/' path. The file-tool boundary refuses that form rather than guess whether the server expands it; pass an absolute path instead." ;;
+                *[[:space:]]*) ;;
+                *) case "/$leaf/" in
+                       */../*) deny "An MCP or unknown tool was handed a path with a '..' segment. The file-tool boundary refuses that form rather than guess how the server resolves it; pass the path without '..' (an absolute path, or one relative to the workspace)." ;;
+                   esac ;;
+            esac
+            # `~name/` only when the name is ACCOUNT-SHAPED: `[!/]*` ran across spaces and quotes, and
+            # refused jkb's own `~"term" ns:a/b` vector query and `~2h ... crates/a.rs` (round 19).
+            case "$leaf" in
+                "~"[!/]*/*) tn="${leaf#\~}"; tn="${tn%%/*}"
+                            case "$tn" in
+                                *[!A-Za-z0-9._-]*) ;;
+                                *) deny "An MCP or unknown tool was handed a '~name/' path. The file-tool boundary refuses that form rather than guess whether the server expands it; pass an absolute path instead." ;;
+                            esac ;;
             esac
             # A SLASHLESS ~word in free text is a home only if that account exists. `~retry` is jkb's
             # own one-word vector search and `~2h` an estimate; reading them as home directories
@@ -1357,9 +1382,22 @@ case "$tool" in
                 file:/) up="$(uri_path "$leaf")" || exit 3; [ -n "$up" ] && leaf="$up" ;;
                 file:*) continue ;;
             esac
-            # Over PATH_MAX is either prose or a chain built to be slow. A path field refuses it
-            # (check does); here it may be prose, so it gets the lexical verdict alone -- linear now,
-            # and the collapse a server would do to get under PATH_MAX is the collapse it mirrors.
+            # OVER PATH_MAX, `.` and empty segments are COLLAPSED first -- exact, since a `..` in a
+            # path-shaped string is refused above -- and a string that then fits is judged in full: a
+            # cwd link padded with `./` past PATH_MAX was followed by no check (review round 19).
+            if [ "${#leaf}" -gt 4096 ]; then
+                lc="$leaf"
+                while :; do
+                    ln0="${#lc}"
+                    lc="${lc//\/.\//\/}"; lc="${lc//\/\//\/}"
+                    case "$lc" in ./*) lc="${lc#./}" ;; esac
+                    [ "${#lc}" -lt "$ln0" ] || break
+                done
+                case "$lc" in */.) lc="${lc%/.}" ;; esac
+                [ "${#lc}" -le 4096 ] && leaf="$lc"
+            fi
+            # Still over PATH_MAX: prose, or a chain no kernel opens unnormalised. It gets the lexical
+            # verdict -- linear, and the collapse a server would do is the collapse it mirrors.
             if [ "${#leaf}" -gt 4096 ]; then
                 for b in "${bases[@]}"; do
                     [ -n "$b" ] || continue
@@ -1369,7 +1407,16 @@ case "$tool" in
                 # ...and an absolute or `~/` one meets the boundary on its lexical form: padded past
                 # PATH_MAX with `./` it skipped every allow-list check, and a normalising server would
                 # open ~/.ssh (review round 17).
-                case "$leaf" in /*|"~/"*|"~") boundary "$(resolve "$leaf" "$home" "$cwd")" ;; esac
+                case "$leaf" in
+                    /*|"~/"*|"~") boundary "$(resolve "$leaf" "$home" "$cwd")" ;;
+                    # ...and a relative one from each base a server resolves it from -- not the home,
+                    # the guess -- so a climb hidden behind a space still meets it (round 19).
+                    *) for b in "${bases[@]}"; do
+                           [ -n "$b" ] || continue
+                           [ "$b" = "$home" ] && [ "$b" != "$cwd" ] && [ "$b" != "${CLAUDE_PROJECT_DIR:-}" ] && continue
+                           boundary "$(resolve "$leaf" "$home" "$b")"
+                       done ;;
+                esac
                 continue
             fi
             case "$leaf" in
@@ -1381,6 +1428,10 @@ case "$tool" in
                 # ingest_path opens it from the project root, and round 16's skip of every base let
                 # `../../.ssh/id_rsa` through (review round 17). The home reading of a `~name/` string
                 # comes from the cwd base's call, unmarked, so it is judged too.
+                # A `~`-led string with a `/` that survived the `~name/` refusal above is not an account
+                # path -- its name is not account-shaped, so it is prose like jkb's `~"term" ns:a/b` --
+                # and every reading of it is a guess, held to the transcript rule alone (round 19).
+                "~"*/*) for b in "${bases[@]}"; do [ -n "$b" ] && sb_guess=1 check "$leaf" "$b"; done ;;
                 "~"*|*) for b in "${bases[@]}"; do
                             [ -n "$b" ] || continue
                             if [ "$b" = "$home" ] && [ "$b" != "$cwd" ] && [ "$b" != "${CLAUDE_PROJECT_DIR:-}" ]; then
