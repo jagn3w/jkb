@@ -109,6 +109,10 @@ container_path() { # container_path <host-path>
 # The caller stops or removes the container straight after, so it does not stay up.
 persist_login() {
     local state ctr
+    if [ -z "$repo" ]; then
+        echo "warning: the kit's recorded checkout (${KIT_GONE:-none}) is gone, so the login was not carried into the state volume first" >&2
+        return 0
+    fi
     state="$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" || return 0
     if ! ctr="$(container_path "$repo")"; then
         echo "warning: $repo is not under $HOST_REPOS, so the container cannot see lib.sh; a login written since $NAME started was not moved into the state volume" >&2
@@ -562,9 +566,18 @@ fi
 KIT_ROOT=""
 if [ -f "$here/../$DC_KIT_MARKER" ]; then
     KIT_ROOT="$(cd "$here/.." && pwd)"
-    repo="$(dc_kit_checkout "$KIT_ROOT")" && [ -d "$repo" ] \
-        || die "the kit at $KIT_ROOT records no checkout that exists (${repo:-none}) -- reinstall it from one: <checkout>/.container/run.sh --install-kit"
+    # A RECORDED CHECKOUT THAT IS GONE stops a start and an install, never a stop or a remove: dying
+    # here, before the arguments were read, left a kit whose checkout had been deleted unable to
+    # stop its own container (review round 10).
+    KIT_GONE=""
+    if ! repo="$(dc_kit_checkout "$KIT_ROOT")" || [ ! -d "$repo" ]; then
+        KIT_GONE="${repo:-none}"; repo=""
+    fi
 fi
+kit_need_checkout() {
+    [ -z "${KIT_GONE:-}" ] && return 0
+    die "the kit at $KIT_ROOT records a checkout that no longer exists ($KIT_GONE) -- reinstall it from one: <checkout>/.container/run.sh --install-kit"
+}
 require_kit() {
     [ -n "$KIT_ROOT" ] && return 0
     if [ "${JKB_RUN_FROM_CHECKOUT:-0}" = 1 ]; then
@@ -587,7 +600,8 @@ while [ $# -gt 0 ]; do
         # COPIES, never runs: dc_install_kit copies the kit's paths from the checkout and executes
         # nothing in it. From the kit, the checkout is the one recorded at install, and what changed
         # since is listed first, so a refresh is a decision about named files.
-        --install-kit)   if [ -f "$DC_KIT_DIR/$DC_KIT_MARKER" ]; then
+        --install-kit)   kit_need_checkout
+                         if [ -f "$DC_KIT_DIR/$DC_KIT_MARKER" ]; then
                              kit_changed="$(dc_kit_stale "$DC_KIT_DIR" "$repo")"
                              if [ -z "$kit_changed" ] && [ "$(dc_kit_checkout "$DC_KIT_DIR")" = "$(cd "$repo" && pwd -P)" ]; then
                                  echo "the kit at $DC_KIT_DIR already matches $repo"; exit 0
@@ -644,6 +658,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+kit_need_checkout
 command -v jq >/dev/null 2>&1 || die "jq is required to read $CONFIG"
 [ -f "$CONFIG" ] || die "no $CONFIG"
 
@@ -659,8 +674,12 @@ ctr_repo="$(container_path "$repo")" || die "this checkout ($repo) is not under 
 # flags it declares. See lib.sh.
 ARGS=()
 # THE KIT'S ROOT substitutes ${localWorkspaceFolder}: docker reads the seccomp profile from that path
-# on the host, and from a checkout it was a file the agent could rewrite.
-ARGS_OUT="$(assembled_args "${KIT_ROOT:-$repo}")" || die "container.json could not be read; refusing to start a container from a partial declaration"
+# on the host, and from a checkout it was a file the agent could rewrite. ONE VARIABLE for the
+# assembly and the fingerprint below: the fingerprint strips this root out of the arguments, and
+# handed `$repo` while the arguments came from the kit, it hashed the kit's absolute path, so every
+# existing container read as "created from a different container.json" (review round 10).
+args_root="${KIT_ROOT:-$repo}"
+ARGS_OUT="$(assembled_args "$args_root")" || die "container.json could not be read; refusing to start a container from a partial declaration"
 while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"
 
 # THE APPARMOR PROFILE IS A HOST FACT, so it is decided here rather than declared in
@@ -682,7 +701,7 @@ while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"
 AA_PROFILE="$(dc_require_apparmor_profile "$here/apparmor-jkb-dev")"
 
 # Hashed BEFORE the label is appended, or the value would have to contain itself.
-want_hash="$(fingerprint "$repo" "${ARGS[@]}")"
+want_hash="$(fingerprint "$args_root" "${ARGS[@]}")"
 ARGS+=(--label "jkb.args-hash=$want_hash")
 
 if [ "$DRY" -eq 1 ]; then

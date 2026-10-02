@@ -36,7 +36,8 @@
         "Read(~/Downloads/**)",
         "Edit(~/.claude/settings.json)",
         "Edit(~/.claude/settings.local.json)",
-        "Edit(~/.claude/plugins/**)"
+        "Edit(~/.claude/plugins/**)",
+      "Edit(~/.local/share/jkb-container-kit/**)"
       ]
     },
     "sandbox": {

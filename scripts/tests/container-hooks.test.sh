@@ -666,7 +666,7 @@ case28_every_exec_names_its_program_and_pins_path() {
 # checkout. Installed whole or not at all, recording where it came from.
 case29_the_kit_installs_whole_and_records_its_checkout() {
     local d="$work/kit-$RANDOM" co kit got p missing=""
-    co="$d/checkout"; kit="$d/home/.jkb/container-kit"
+    co="$d/checkout"; kit="$d/home/.local/share/jkb-container-kit"
     mkdir -p "$co/scripts"
     cp -R "$repo_root/.container" "$co/.container"
     for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
@@ -708,6 +708,26 @@ case30_the_kit_says_which_paths_the_checkout_has_changed() {
     fi
 }
 
+# A SYMLINK IN THE CHECKOUT IS REFUSED, never followed: copied with -L, a link the agent planted in an
+# untracked corner of .container/ put a HOST file into the kit, which every start mirrored into the
+# container (review round 10, reproduced).
+case31_a_planted_symlink_is_refused_not_followed() {
+    local d="$work/link-$RANDOM" co kit p err rc=0
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts" "$d/host"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    dc_install_kit "$co" "$kit" >/dev/null 2>&1
+    printf 'HOST SECRET\n' > "$d/host/id_ed25519"
+    mkdir -p "$co/.container/.jkb"; ln -s "$d/host/id_ed25519" "$co/.container/.jkb/k"
+    err="$(dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'not a regular file' <<<"$err" && [ ! -e "$kit/.container/.jkb/k" ] \
+       && ! grep -rqs 'HOST SECRET' "$kit"; then
+        ok "a symlink planted in the checkout is refused, named, and nothing it points at reaches the kit"
+    else
+        fail "a symlink planted in the checkout is refused, named, and nothing it points at reaches the kit" "rc=$rc err=$err"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -737,5 +757,6 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale \
           case28_every_exec_names_its_program_and_pins_path \
           case29_the_kit_installs_whole_and_records_its_checkout \
-          case30_the_kit_says_which_paths_the_checkout_has_changed
+          case30_the_kit_says_which_paths_the_checkout_has_changed \
+          case31_a_planted_symlink_is_refused_not_followed
 finish

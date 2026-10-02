@@ -643,10 +643,13 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
         probes+=("$root/$p_slug/$p_uuid.jsonl" "$root/$p_slug/$p_uuid/subagents/agent-a1b2c3d4e5f60718.jsonl"
                  "$root/$p_slug/$p_uuid/subagents/workflows/wf_0a1b2c3d-4e5/journal.jsonl")
         if [ -d "$root" ]; then
-            # `-L`: ~/.claude/projects IS a symlink to the state volume's tree, and without it find
-            # printed nothing under that spelling (review round 9, measured on GNU find 4.9.0).
+            # `"$root/"`: ~/.claude/projects IS a symlink to the state volume's tree, and a bare
+            # `find "$root"` printed nothing under that spelling (review round 9, measured on GNU
+            # find 4.9.0). The trailing slash follows THAT link and no other. `-L` followed every
+            # link inside too, and <slug>/memory links into ~/.jkb/claude-memory, which the agent
+            # writes: a link planted there walked any tree, unsandboxed, on every tick (round 10).
             while IFS= read -r p_file; do probes+=("$p_file"); done \
-                < <(find -L "$root" -name '*.jsonl' 2>/dev/null | head -n 5000)
+                < <(find "$root/" -name '*.jsonl' 2>/dev/null | head -n 5000)
         fi
     done
     while IFS= read -r f; do
@@ -1635,6 +1638,12 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     ln -s "$lhome2/.claude-state/projects" "$lhome2/.claude/projects"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/-home-x-repos-y/**/*.jsonl)"]}}' >"$pdir/linked.json"
     eq "a rule matching only files under the SYMLINKED spelling enumerates" "$(pe "$pdir/linked.json" "$lhome2")" yes
+    # Round 10: a link INSIDE the tree is not followed -- <slug>/memory links into a store the agent
+    # writes, and a link planted there must not send the probe walking another tree.
+    mkdir -p "$work/elsewhere-tree"; : >"$work/elsewhere-tree/zz-outside.jsonl"
+    ln -s "$work/elsewhere-tree" "$lhome2/.claude-state/projects/-home-x-repos-y/memory"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/zz-outside*.jsonl)"]}}' >"$pdir/outside.json"
+    eq "a link inside the tree is not followed by the probe walk" "$(pe "$pdir/outside.json" "$lhome2")" no
     # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/-home-vscode-repos-jkb/**/*.jsonl)"]}}' >"$pdir/slug.json"
     eq "a slug-specific per-file glob enumerates"   "$(pe "$pdir/slug.json")" yes

@@ -424,14 +424,18 @@ JKB_SETUP_MARKER="/home/vscode/.jkb-container-setup-complete"
 # to run from the checkout, which the sandbox can write. Editing one was as good as planting a
 # binary: an agent's edit to run.sh ran as you on the host at the next start (found in review round
 # 8's self-review). So they run from a KIT instead:
-#   on the host,       $DC_KIT_DIR, a copy of exactly these paths, outside every bind -- the
-#                      container cannot see ~/.jkb beyond two subdirectories (D52.8);
+#   on the host,       $DC_KIT_DIR, a copy of exactly these paths, where NO agent can write it:
+#                      outside every container bind, and outside the host auto-mode posture's
+#                      allowWrite, with an Edit deny for the in-process tools. It was under ~/.jkb
+#                      first, which that posture lets every sandboxed host agent write, so the
+#                      kit's run.sh was the round-8 failure in a new directory (review round 10).
+#                      check-config.sh holds all three;
 #   in the container,  $DC_CTR_KIT, the same tree mirrored in root-owned on every start
 #                      (dc_mirror_hooks), so nothing the agent can write is ever what runs.
 # The kit changes only by `run.sh --install-kit`, an explicit step that COPIES the checkout and
 # executes none of it. Run from the kit, it refreshes from the checkout recorded at install.
 # check-config.sh requires every file verify.sh and setup.sh execute from scripts/ to be listed.
-DC_KIT_DIR="${JKB_CONTAINER_KIT:-$HOME/.jkb/container-kit}"
+DC_KIT_DIR="${JKB_CONTAINER_KIT:-$HOME/.local/share/jkb-container-kit}"
 DC_CTR_KIT=/usr/local/lib/jkb-container
 DC_KIT_MARKER=".jkb-container-kit"
 dc_kit_paths() { # one path per line, relative to a checkout
@@ -442,19 +446,27 @@ dc_kit_paths() { # one path per line, relative to a checkout
 # or not at all: assembled beside it, then swapped in by rename, so a failed copy leaves the old kit
 # in place and a half-copied one is never what runs. Records <checkout> in the marker, which is how
 # the kit's run.sh finds the repository it starts a container for. Nothing in <checkout> is run.
+# REGULAR FILES AND DIRECTORIES ONLY, copied with -P. It dereferenced (-L), so a link the agent
+# planted in an untracked corner of .container/ (`.container/.jkb/k -> ~/.ssh/id_ed25519`) copied
+# the HOST file into the kit, and every start then mirrored it, world-readable, into the container
+# (review round 10, reproduced). A symlink, fifo, socket or device anywhere under the kit's paths
+# is now a refusal that names it, and the kit is left as it was.
 dc_install_kit() { # dc_install_kit <checkout> <kit dir>
     local src="$1" kit="${2%/}" new old p
     [ -n "$kit" ] && [ "$kit" != / ] || { echo "dc_install_kit: refusing kit directory '$2'" >&2; return 1; }
     src="$(cd "$src" 2>/dev/null && pwd -P)" || { echo "dc_install_kit: no checkout at $1" >&2; return 1; }
+    local odd
     while IFS= read -r p; do
         [ -e "$src/$p" ] || { echo "dc_install_kit: $src has no $p, so it is not a checkout this kit can come from" >&2; return 1; }
+        odd="$(find "$src/$p" ! -type f ! -type d 2>&1 | head -3)"
+        [ -z "$odd" ] || { echo "dc_install_kit: refusing $p: it holds something that is not a regular file or a directory (a symlink could copy a host file into the kit): $odd" >&2; return 1; }
     done <<EOF
 $(dc_kit_paths)
 EOF
     mkdir -p "$(dirname "$kit")" || return 1
     new="$(mktemp -d "$kit.new.XXXXXX")" || { echo "dc_install_kit: could not make a staging directory beside $kit" >&2; return 1; }
     while IFS= read -r p; do
-        mkdir -p "$new/$(dirname "$p")" && cp -RL "$src/$p" "$new/$p" \
+        mkdir -p "$new/$(dirname "$p")" && cp -RP "$src/$p" "$new/$p" \
             || { echo "dc_install_kit: could not copy $p; the kit is unchanged" >&2; rm -rf "$new"; return 1; }
     done <<EOF
 $(dc_kit_paths)

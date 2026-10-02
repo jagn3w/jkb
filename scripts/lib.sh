@@ -131,6 +131,15 @@ git_hooks_dir() {
     printf '%s\n' "$(_real_dir "$common")/hooks"
 }
 
+# main_checkout_of <repo_root> — the MAIN checkout of the repository <repo_root> is in: the parent of
+# its common git dir, so a linked worktree answers with the checkout it was added from. Fails outside
+# a repository. setup.sh refreshes the dev container's kit only from here (review round 10).
+main_checkout_of() {
+    local hooks
+    hooks="$(git_hooks_dir "$1")" || return 1
+    _real_dir "$(dirname "$(dirname "$hooks")")"
+}
+
 # _real_dir <path> — a directory's physical path, or the path itself when it does not exist.
 # Two spellings of one directory (a trailing slash, a symlink, a `..`) must compare equal.
 _real_dir() {
@@ -1636,6 +1645,7 @@ render_setup_summary() {
                     installed) printf '  • container:  start the dev container from the kit: %s/.container/run.sh\n' "$detail" ;;
                     unchanged) printf '  • container:  the kit already matched this checkout; start it from %s/.container/run.sh\n' "$detail" ;;
                     skipped)   printf '  • container:  kit skipped (--no-kit)\n' ;;
+                    worktree)  printf '  • container:  kit left alone: this is a linked worktree, and the kit follows the main checkout\n' ;;
                     failed)    printf '  • container:  kit NOT installed; see the warnings above\n' ;;
                     *)         warn "unrecognised kit state: $line" ;;
                 esac ;;

@@ -302,6 +302,26 @@ memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> cl
     printf 'clear\n'
 }
 
+# What is wrong with the container kit's mirror, one clause per problem, or nothing. A FUNCTION so
+# --self-test drives every arm: mutate-verify.sh runs against a bare image with no mirror, where only
+# the "not started by run.sh" note is reachable (review round 10). <root-uid> is the uid that must own
+# it -- 0, and the self-test passes its own; <self-kit> is the kit this verify.sh runs from, and
+# <launched> is non-empty when run.sh started it, which is when it must be the mirror.
+kit_mirror_problems() { # kit_mirror_problems <dir> <root-uid> <marker> <self-kit> <launched>
+    local d="$1" p out=""
+    if [ ! -d "$d" ]; then
+        printf '%s does not exist -- run.sh mirrors it in on every start;' "$d"; return
+    fi
+    [ -L "$d" ] && out="$out it is a symlink;"
+    [ "$(stat -c %u "$d" 2>/dev/null || stat -f %u "$d" 2>/dev/null)" = "$2" ] || out="$out it is not owned by uid $2;"
+    [ -f "$d/$3" ] || out="$out it carries no $3;"
+    for p in "$d" "$d/.container" "$d/.container/verify.sh" "$d/.container/lib.sh" "$d/scripts"; do
+        [ -w "$p" ] && out="$out $p is writable by $(id -un);"
+    done
+    [ -n "$5" ] && [ "$4" != "$d" ] && out="$out this verify.sh runs from $4, not from the mirror;"
+    printf '%s' "$out"
+}
+
 reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
     [ -n "$1" ] || { printf 'pid1-unreadable'; return; }
     # A container at its --pids-limit fails exactly here -- which is the SYMPTOM of a PID 1 that
@@ -478,6 +498,28 @@ if [ "$SELF_TEST" = yes ]; then
              /home/vscode/repos /home/vscode/.jkb /host; do
         st "$p" checked
     done
+
+    echo "==> verify.sh self-test: the container kit's mirror"
+    km="$(mktemp -d)"; mkdir -p "$km/kit/.container" "$km/kit/scripts"
+    : >"$km/kit/.container/verify.sh"; : >"$km/kit/.container/lib.sh"; : >"$km/kit/.jkb-host-mirror"
+    kmu="$(id -u)"
+    kmr() { # kmr <label> <got> <want: "" for clean, or a fragment>
+        if { [ -z "$3" ] && [ -z "$2" ]; } || { [ -n "$3" ] && [ "${2#*"$3"}" != "$2" ]; }; then
+            printf '  \033[32mok\033[0m   %s\n' "$1"
+        else printf '  \033[31mFAIL\033[0m %s\n         got: [%s]\n' "$1" "$2"; st_fail=$((st_fail+1)); fi
+    }
+    kmr "a writable mirror is refused" "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror "$km/kit" x)" "is writable by"
+    chmod -R a-w "$km/kit"
+    kmr "a root-owned, read-only, marked mirror that verify.sh runs from is clean" \
+        "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror "$km/kit" x)" ""
+    kmr "...owned by anyone else, it is refused" "$(kit_mirror_problems "$km/kit" 99999 .jkb-host-mirror "$km/kit" x)" "not owned by uid 99999"
+    kmr "...without its marker, it is refused" "$(kit_mirror_problems "$km/kit" "$kmu" .no-such-marker "$km/kit" x)" "carries no .no-such-marker"
+    kmr "...started by run.sh from somewhere else, it is refused" \
+        "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror /home/vscode/repos/jkb x)" "not from the mirror"
+    kmr "...but run by hand from a checkout, where it is" \
+        "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror /home/vscode/repos/jkb "")" ""
+    kmr "a missing mirror is named" "$(kit_mirror_problems "$km/none" "$kmu" .jkb-host-mirror "$km/kit" x)" "does not exist"
+    chmod -R u+w "$km"; rm -rf "$km"
 
     echo "==> verify.sh self-test: does a deny rule swallow auto-memory"
     # Literal inputs on both sides, so this needs no container and no Claude Code. The point of
@@ -823,7 +865,7 @@ if [ ! -r /proc/self/mountinfo ]; then
     echo "  /proc/self/mountinfo is not readable here, so the mount boundary — the assertion this" >&2
     echo "  file exists for — could not be checked at all." >&2
     echo >&2
-    echo "  In VS Code:  ~/.jkb/container-kit/.container/run.sh, attach to the container, then run this" >&2
+    echo "  In VS Code:  ~/.local/share/jkb-container-kit/.container/run.sh, attach to the container, then run this" >&2
     echo "  With Docker: ./.container/mutate-verify.sh --control   (one healthy run)" >&2
     echo "               ./.container/mutate-verify.sh             (every guard, watched failing)" >&2
     echo >&2
@@ -872,7 +914,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "  The fresh procfs is why /proc/1 and the mount table are not this container's."
             echo
             echo "  Run it from a plain terminal in the attached container, or from the host:"
-            echo "    ~/.jkb/container-kit/.container/run.sh                       (runs this for you, via docker exec)"
+            echo "    ~/.local/share/jkb-container-kit/.container/run.sh                       (runs this for you, via docker exec)"
             echo "    ./.container/mutate-verify.sh --control   (one healthy run)"
         } >&2
         exit 2
@@ -886,7 +928,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "  one of:"
             echo "    * the container was started with --entrypoint, bypassing entrypoint.sh;"
             echo "    * its start did not finish (check \`docker logs\`);"
-            echo "    * the image predates the marker — rebuild: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build"
+            echo "    * the image predates the marker — rebuild: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build"
             echo
             echo "  On an ordinary Linux host there is no marker either, and that is the honest"
             echo "  answer: this script asserts what a CONTAINER is and has no subject here."
@@ -904,7 +946,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "    docker stats --no-stream <name>   # PIDS = the counter --pids-limit bounds"
             echo
             echo "  If that is near the limit, recreate it:"
-            echo "    ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build"
+            echo "    ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build"
         } >&2
         exit 2
         ;;
@@ -1013,7 +1055,7 @@ fi
 
 case "$(reaper_verdict "$pid1_argv" "$orphan" "$adopted" "$final")" in
     reaped)     ok  "PID 1 reaps the orphans it adopts (PID 1 is: $pid1_argv)" ;;
-    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build" ;;
+    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build" ;;
     fork-failed)      bad "could not establish whether PID 1 reaps: the fork for the test orphan failed, which is how a container at its --pids-limit fails — the end state of a PID 1 that does not reap (PID 1 is: $pid1_argv)" ;;
     pid1-unreadable)  bad "could not establish whether PID 1 reaps: $PROC/1/cmdline could not be read, so nothing here observed what PID 1 even is" ;;
     proc-unreadable)  bad "could not establish whether PID 1 reaps: this process's own $PROC entry is unreadable, so an absent orphan would say nothing about reaping" ;;
@@ -1319,20 +1361,7 @@ mem_repo="${JKB_REPO_ROOT:-$kit_dc}"
 # THE KIT MIRROR IS ROOT'S, and this script runs from it. Everything run.sh starts in here runs
 # unsandboxed and comes from $DC_CTR_KIT; a mirror the container user could write would put the
 # agent's code back in that position, which is the whole of what the kit closed.
-kit_wrong=""
-if [ ! -d "$DC_CTR_KIT" ]; then
-    kit_wrong="$DC_CTR_KIT does not exist -- run.sh mirrors it in on every start;"
-else
-    [ "$(stat -c %u "$DC_CTR_KIT" 2>/dev/null)" = 0 ] || kit_wrong="$kit_wrong it is not owned by root;"
-    [ -L "$DC_CTR_KIT" ] && kit_wrong="$kit_wrong it is a symlink;"
-    [ -f "$DC_CTR_KIT/$DC_HOOKS_MIRROR_MARKER" ] || kit_wrong="$kit_wrong it carries no $DC_HOOKS_MIRROR_MARKER;"
-    for kit_p in "$DC_CTR_KIT" "$DC_CTR_KIT/.container" "$DC_CTR_KIT/.container/verify.sh" "$DC_CTR_KIT/.container/lib.sh" "$DC_CTR_KIT/scripts"; do
-        [ -w "$kit_p" ] && kit_wrong="$kit_wrong $kit_p is writable by $(id -un);"
-    done
-fi
-if [ -n "${JKB_REPO_ROOT:-}" ] && [ "$kit_dc" != "$DC_CTR_KIT" ]; then
-    kit_wrong="$kit_wrong this verify.sh runs from $kit_dc, not from the mirror;"
-fi
+kit_wrong="$(kit_mirror_problems "$DC_CTR_KIT" 0 "$DC_HOOKS_MIRROR_MARKER" "$kit_dc" "${JKB_REPO_ROOT:-}")"
 # A FAILURE WHEN run.sh STARTED THIS (it names JKB_REPO_ROOT, and it mirrors the kit first). Run by
 # hand, or by mutate-verify.sh against a bare image no run.sh ever touched, a missing mirror is a
 # note: nothing in that container was started from it.
@@ -2087,7 +2116,7 @@ case "$eg_daemon" in
     unresolved) $dm_bad "${daemon_at%:*} did not resolve when the firewall was raised, so no address is open for jkb serve on the host — re-run init-firewall.sh; on Linux add --add-host=${daemon_at%:*}:host-gateway" ;;
     absent)     $dm_bad "the firewall has no rule for jkb serve on the host ($daemon_at), so this container cannot reach the knowledge base" ;;
     wide)       $dm_bad "the host's address is in the egress allowlist, which opens EVERY port on the host's loopback to this container — jkb serve must be reached through its port-only rule alone" ;;
-    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build" ;;
+    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build" ;;
 esac
 
 # ...and what actually answers. The token is read from the ~/.jkb bind, where the host's daemon
@@ -2132,7 +2161,7 @@ else
             if [ -z "$jkb_remote_at" ] || ! command -v jkb >/dev/null 2>&1; then
                 :   # asserted above: remote mode unset fails there, no jkb is a note there
             elif [ "$jkb_remote_at" != "$daemon_at" ]; then
-                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build"
+                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build"
             else
                 if jkb_answer="$(env -u JKB_DB jkb --json mq topic ls 2>&1)"; then
                     ok "the installed jkb reaches jkb serve through JKB_REMOTE"
@@ -2200,7 +2229,7 @@ else
     else
         bad "declared extensions are not installed:$missing — $present other(s) are, so this is not the
        never-installed state. Run ./.container/install-extensions.sh from an attached terminal; if it
-       reports one was not staged into the image, rebuild: ~/.jkb/container-kit/.container/run.sh --rm && ~/.jkb/container-kit/.container/run.sh --build"
+       reports one was not staged into the image, rebuild: ~/.local/share/jkb-container-kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/.container/run.sh --build"
     fi
 fi
 

@@ -2671,6 +2671,20 @@ refuses is still code 2" \
     git_q config --global user.name "Test"
 }
 
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m
+# --- the dev container kit follows the MAIN checkout ----------------------------------------
+# setup.sh refreshes the kit only where main_checkout_of answers with the tree it runs in, so a
+# linked worktree (a task branch) cannot repoint the shared kit (review round 10).
+case_kit_main() {
+    local m w main_real
+    main_real="$(cd "$main" && pwd -P)"
+    m="$(main_checkout_of "$main")"; w="$(main_checkout_of "$wt")"
+    if [ "$m" = "$main_real" ] && [ "$w" = "$main_real" ] && ! main_checkout_of "$work" >/dev/null 2>&1; then
+        ok "main_checkout_of answers the main checkout from both it and its linked worktree, and fails outside a repository"
+    else
+        fail "kit: main checkout" "main=$m worktree=$w want=$main_real"
+    fi
+}
+
+run_cases case_kit_main case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m
 
 finish

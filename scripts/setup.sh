@@ -11,7 +11,7 @@
 #      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
 #   6. builds + installs the notifier behind sticky Claude Code notifications, and reports
 #      the two things it cannot do for you: the one-time Allow, and the Alerts style
-#   7. installs or refreshes the dev container's KIT (~/.jkb/container-kit), the copy of
+#   7. installs or refreshes the dev container's KIT (~/.local/share/jkb-container-kit), the copy of
 #      .container/ and the scripts it runs that the container is started from, so nothing the
 #      agent's sandbox can write in the checkout runs outside it (.container/README.md)
 #
@@ -212,7 +212,15 @@ fi
 # this is where the kit is refreshed: it COPIES .container/ and the scripts it runs out of the
 # checkout, which the container can write, into ~/.jkb, which it cannot see. The kit's run.sh is then
 # what starts the container. Wrapped like the steps around it: a failure here must not end the run.
-if [ "$do_kit" -eq 1 ]; then
+# ONE KIT, FROM THE MAIN CHECKOUT. A linked worktree is a task branch: post-merge fires there on a
+# `git merge main`, and refreshing from it pointed the shared kit at an unlanded branch, then at a
+# directory `jkb task land` deleted (review round 10). The main checkout is the parent of the
+# common git dir, which git_hooks_dir already resolves.
+kit_main="$(main_checkout_of "$repo_root" 2>/dev/null)" || kit_main=""
+if [ "$do_kit" -eq 1 ] && [ -n "$kit_main" ] && [ "$(_real_dir "$repo_root")" != "$kit_main" ]; then
+  kit_state=worktree
+  warn "not refreshing the dev container kit from a linked worktree; it follows the main checkout ($kit_main)"
+elif [ "$do_kit" -eq 1 ]; then
   say "dev container kit (what the container is started from)"
   if kit_out="$("$repo_root/.container/run.sh" --install-kit 2>&1)"; then
     printf '%s\n' "$kit_out"
@@ -365,7 +373,7 @@ render_setup_summary < <(
   printf 'extension=%s\n' "$extension_state"
   printf 'watcher=%s\n' "$watcher_state"
   printf 'serve=%s\n' "$serve_state"
-  printf 'kit=%s %s\n' "$kit_state" "${JKB_CONTAINER_KIT:-$HOME/.jkb/container-kit}"
+  printf 'kit=%s %s\n' "$kit_state" "${JKB_CONTAINER_KIT:-$HOME/.local/share/jkb-container-kit}"
   printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
   printf 'notifier=%s %s\n' "$notifier_state" "${notifier_pid:-}"
 )

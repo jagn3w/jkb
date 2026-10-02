@@ -1477,9 +1477,10 @@ case15() {
         'notifier=undecided |could not read whether it subscribed'
         'notifier=skipped|skipped (--no-service)'
         'notifier=not-macos|none on this platform'
-        'kit=installed /h/.jkb/container-kit|from the kit: /h/.jkb/container-kit/.container/run.sh'
-        'kit=unchanged /h/.jkb/container-kit|already matched this checkout'
+        'kit=installed /h/.local/share/jkb-container-kit|from the kit: /h/.local/share/jkb-container-kit/.container/run.sh'
+        'kit=unchanged /h/.local/share/jkb-container-kit|already matched this checkout'
         'kit=skipped /h/k|kit skipped (--no-kit)'
+        'kit=worktree /h/k|kit left alone: this is a linked worktree'
         'kit=failed /h/k|kit NOT installed'
     )
     for entry in "${table[@]}"; do

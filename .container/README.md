@@ -182,7 +182,7 @@ which macOS does not ship.
 
 ```sh
 ./.container/run.sh --install-kit      # once, and after reviewing a change to .container/ or scripts/
-~/.jkb/container-kit/.container/run.sh # build if needed, start, firewall, setup, verify
+~/.local/share/jkb-container-kit/.container/run.sh # build if needed, start, firewall, setup, verify
 ```
 
 **Start it from the kit, not from the checkout** (see *Everything unsandboxed runs from the kit*
@@ -291,9 +291,12 @@ interrupted first run used to leave setup unreachable for the container's whole 
 sweeps deferred worktree archives — the container's job, because a session cannot archive its own
 checkout and the host's reaper cannot see `/home/vscode/...` paths — and it does that *before*
 verifying, so a failing assertion about something else cannot disable it. Beside it, and for the
-same ordering reason, it sweeps session transcripts by byte budget: without that, the sandbox's
-deny list outgrows a single argv and **every** Bash call in **every** session fails at spawn. See
-*Transcripts are swept by byte budget, not by age* at the end of this file for the measurement.
+same ordering reason, it runs the transcript sweep, which is now a **backstop**. On the shipped
+posture no deny rule names a transcript (the deny is a hook; see *The transcript deny is a hook*),
+so the sweep stands down and says so. It archives by byte budget only if a settings layer brings
+back a rule that enumerates transcripts. Then the sandbox's deny list would outgrow a single argv,
+and **every** Bash call in **every** session would fail at spawn. *Transcripts are swept by byte
+budget, not by age*, at the end of this file, has the measurement.
 
 ```sh
 ./.container/run.sh --build     # rebuild the image (needed after a Dockerfile or extension change)
@@ -423,9 +426,19 @@ binds above are documented as, because renaming the directory around a bind gets
 
 **What runs now.** One list, `dc_kit_paths` in `lib.sh`, names `.container/` and the four files
 under `scripts/` that those scripts run or read. `run.sh --install-kit` copies them to
-`~/.jkb/container-kit` (`DC_KIT_DIR`), whole or not at all, and records the checkout they came from.
-It copies and runs nothing. The container cannot see `~/.jkb` beyond two subdirectories (the table
-above), so it cannot change the kit.
+`~/.local/share/jkb-container-kit` (`DC_KIT_DIR`), whole or not at all, and records the checkout they came from.
+It copies and runs nothing, and it copies only regular files and directories. It dereferenced
+symlinks at first, so a link the agent planted in an untracked corner of `.container/` copied a host
+file (an SSH key, in the reproduction) into the kit, and every start then mirrored it world-readable
+into the container (review round 10). A symlink or special file anywhere under the kit's paths is now
+a refusal that names it.
+
+**Where the kit lives is chosen so that no agent can write it**: `~/.local/share/jkb-container-kit`.
+That path is outside every container bind. It is also outside the host auto-mode posture's
+`allowWrite`, and that posture denies `Edit` on it for the in-process tools the Bash sandbox does not
+confine. The first location, `~/.jkb/container-kit`, satisfied only the first condition. The posture
+lets every sandboxed host agent write `~/.jkb`, so a host agent could rewrite the kit's `run.sh`, and
+you would then run it (review round 10). `check-config.sh` holds all three conditions.
 
 - **On the host**, the kit's `run.sh` starts the container. Its `repo` is the recorded checkout, the
   one the container is for. Every file it runs or hands docker comes from the kit: `lib.sh`,
@@ -964,8 +977,13 @@ forwards the Vite port to the Mac. No port publishing and no permission change i
   `allowRead` entry, so it fails with `Operation not permitted`. That is the posture working: an
   unattended agent that can talk to Docker can mount `/` into a container and is root on the host.
   Allowlisting it to make the harness runnable would trade the boundary for convenience.
-- `mutate-verify.sh` — needs a Docker host. Breaks each property in turn and asserts `verify.sh`
-  fails naming it. A guard nobody has watched fail is not a guard.
+- `mutate-verify.sh` — needs a Docker host. Breaks the properties it carries cases for in turn,
+  and asserts `verify.sh` fails naming each one. A guard nobody has watched fail is not a guard.
+  **Not every guard has a case.** Its container is started without `run.sh`, so it has no kit
+  mirror, and this branch's live checks have none: the kit mirror, the installed transcript hook and
+  its matcher, and the auto-memory shadow. Those verdicts are driven instead by `verify.sh
+  --self-test` from injected facts (`kit_mirror_problems`, `memory_shadow`). Cases for them are open
+  work (review round 10).
 - `mutate-verify.sh --control` — **the one way to ask "is this container healthy" from outside**.
   One healthy run, printed verbatim, using the same flags and the same preamble every mutation
   runs against. Do not hand-roll the `docker run`: it needs the seccomp profile, `NET_ADMIN`, both

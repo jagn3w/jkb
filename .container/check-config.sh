@@ -797,6 +797,54 @@ else
     ok "setup.sh, verify.sh and install-extensions.sh run scripts only from the kit, and the kit carries each one"
 fi
 
+# NO AGENT CAN WRITE THE KIT. It is what runs outside every sandbox, so it must be out of reach of
+# the container (no bind reaches it), of sandboxed Bash on the host (no posture allowWrite covers
+# it), and of the in-process file tools (a posture Edit deny names it). It sat under ~/.jkb first,
+# which the posture's allowWrite grants, so any sandboxed host agent could rewrite the kit's run.sh
+# (review round 10). The default comes from lib.sh with HOME pinned, in ~ space like the posture.
+dc_kit_home="$(env -u JKB_CONTAINER_KIT HOME=/kit-home-probe bash -c '. "$1" && printf "%s" "$DC_KIT_DIR"' _ "$here/lib.sh" 2>/dev/null)"
+dc_kit_tilde="~${dc_kit_home#/kit-home-probe}"
+dc_kit_where=""
+case "$dc_kit_home" in /kit-home-probe/?*) ;; *) dc_kit_where=" lib.sh's DC_KIT_DIR [$dc_kit_home] is not under the home;" ;; esac
+dc_posture="$here/../scripts/auto-mode-posture.json"
+while IFS= read -r dc_aw; do
+    [ -n "$dc_aw" ] || continue
+    dc_aw="${dc_aw%/}"
+    if [ "$dc_kit_tilde" = "$dc_aw" ] || [ "${dc_kit_tilde#"$dc_aw"/}" != "$dc_kit_tilde" ]; then
+        dc_kit_where="$dc_kit_where the posture's allowWrite entry [$dc_aw] covers it;"
+    fi
+done <<<"$(HOME=/dev/null jq -r '.require.sandbox.filesystem.allowWrite[]? // empty' "$dc_posture" 2>/dev/null)"
+HOME=/dev/null jq -e --arg r "Edit($dc_kit_tilde/**)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
+    || dc_kit_where="$dc_kit_where the posture has no Edit($dc_kit_tilde/**) deny, so the in-process file tools can write it;"
+dc_kit_nsrc=0
+while IFS= read -r dc_src; do
+    [ -n "$dc_src" ] || continue
+    dc_kit_nsrc=$((dc_kit_nsrc + 1))
+    # A named volume reaches no host path; only a ${localEnv:HOME} bind can hold the kit.
+    case "$dc_src" in '${localEnv:HOME}'*) ;; *) continue ;; esac
+    dc_src="~${dc_src#\$\{localEnv:HOME\}}"; dc_src="${dc_src%/}"
+    if [ "$dc_kit_tilde" = "$dc_src" ] || [ "${dc_kit_tilde#"$dc_src"/}" != "$dc_kit_tilde" ]; then
+        dc_kit_where="$dc_kit_where container.json binds [$dc_src], which holds it;"
+    fi
+done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(.mounts // [])[] | split(",")[] | select(startswith("source=")) | ltrimstr("source=")' 2>/dev/null)"
+[ "$dc_kit_nsrc" -gt 0 ] || dc_kit_where="$dc_kit_where container.json's mount sources could not be read, so whether a bind holds it is unchecked;"
+if [ -n "$dc_kit_where" ]; then
+    bad "an agent can write the container kit ($dc_kit_tilde), which runs outside every sandbox:$dc_kit_where"
+else
+    ok "no agent can write the container kit ($dc_kit_tilde): no container bind, posture allowWrite or missing Edit deny reaches it"
+fi
+
+# THE FINGERPRINT STRIPS THE ROOT THE ARGUMENTS WERE ASSEMBLED FROM. run.sh assembled from the kit
+# and fingerprinted with the checkout, so the kit's seccomp path entered the hash and every existing
+# container read as stale, with `--rm` as the advice (review round 10). The self-test proves the
+# function; this holds the two call sites to one root.
+if stripped_matches "$here/run.sh" '^ARGS_OUT="\$\(assembled_args "\$args_root"\)"' \
+   && stripped_matches "$here/run.sh" '^want_hash="\$\(fingerprint "\$args_root" '; then
+    ok "run.sh fingerprints the container with the same root it assembles the arguments from"
+else
+    bad "run.sh's live fingerprint and its assembly do not both use \$args_root — a root the fingerprint does not strip enters the hash, and every existing container reads as created from a different container.json"
+fi
+
 # THE HOOK AND THE SWEEP MUST AGREE ON WHERE THE TREE IS. The hook cannot load the shared reader --
 # it is installed alone, root-owned, at /usr/local/bin -- so its roots are its own, and they drifted:
 # it ignored CLAUDE_CONFIG_DIR while the sweep honoured it, leaving the real tree unguarded whenever

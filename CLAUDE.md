@@ -133,7 +133,7 @@ implementation checklist and the **source of truth for what's done**.
   `cargo install`s the `jkb` binary, scaffolds the standard KB roots via `jkb ns mk repos
   tasks media references memory`, builds+installs the VS Code extension (`install-extension.sh`),
   installs+activates the file-sync watcher service (launchd/systemd), and installs the dev container's
-  **kit** (`~/.jkb/container-kit`, via `.container/run.sh --install-kit`). Start the container from
+  **kit** (`~/.local/share/jkb-container-kit`, via `.container/run.sh --install-kit`). Start the container from
   the kit's `run.sh`, never the checkout's, which refuses: everything that runs outside the agent's
   sandbox comes from the kit (`.container/README.md`, "Everything unsandboxed runs from the kit").
   Flags: `--no-extension`/`--no-service`/`--no-scaffold`/`--no-kit`/`--db`. `jkb ns mk <path>…` creates namespaces

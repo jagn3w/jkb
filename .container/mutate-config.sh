@@ -1674,6 +1674,41 @@ open(p, 'w').write(s.replace(old, "    : printf '%s\\n' .container scripts/lib.s
 PYX
 run "the kit list prints nothing" "dc_kit_paths printed nothing"
 
+# REVIEW ROUND 10. No agent can write the kit, and the fingerprint strips the root it was assembled from.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowWrite"].append("~/.local/share")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture lets sandboxed Bash write over the kit" "covers it"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.local/share/jkb-container-kit/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on the kit" "so the in-process file tools can write it"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '$HOME/.local/share/jkb-container-kit}'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '$HOME/.jkb/container-kit}', 1))
+PYX
+run "the kit moves back under ~/.jkb" "covers it"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'want_hash="$(fingerprint "$args_root" '
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'want_hash="$(fingerprint "$repo" ', 1))
+PYX
+run "the fingerprint strips a different root from the one the arguments came from" "do not both use"
+
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys
@@ -2026,11 +2061,11 @@ PS='< <'
 seed; python3 - "$work/t/.container/run.sh" "$PS" <<'PYX'
 import sys
 p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
-old = ('ARGS_OUT="$(assembled_args "${KIT_ROOT:-$repo}")" || die "container.json could not be read; '
+old = ('ARGS_OUT="$(assembled_args "$args_root")" || die "container.json could not be read; '
        'refusing to start a container from a partial declaration"\n'
        'while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"')
 assert old in s, "mutation target absent"
-new = 'while IFS= read -r line; do ARGS+=("$line"); done %s(assembled_args "${KIT_ROOT:-$repo}")' % ps
+new = 'while IFS= read -r line; do ARGS+=("$line"); done %s(assembled_args "$args_root")' % ps
 open(p, 'w').write(s.replace(old, new, 1))
 PYX
 run "run.sh reads its assembly through a process substitution again" "which discards its refusal"
@@ -2130,7 +2165,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=112
+PINNED_BAD_SITES=114
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

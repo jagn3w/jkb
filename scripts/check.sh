@@ -219,8 +219,14 @@ fi
 # keeps the Bash sandbox's deny list inside one argv (MAX_ARG_STRLEN = 131072 bytes). Getting that
 # wrong is a container where no Bash call works, or a sweep that archives a live session. Pure — records in,
 # paths out — and its filesystem half runs against a scratch tree, so no container and no Docker.
-# Outside the jq group deliberately: it reads no container.json.
-"$(dirname "$0")/../.container/sweep-transcripts.sh" --self-test
+# GUARDED ON jq, not in the jq group (it reads no container.json): its posture rows read settings
+# files through jq, and unguarded, a machine without jq failed eleven of them, stopped this script
+# under set -e, and skipped every gate below (review round 10). A named skip, as for python3 above.
+if command -v jq >/dev/null 2>&1; then
+    "$(dirname "$0")/../.container/sweep-transcripts.sh" --self-test
+else
+    echo "   (skipped: jq not installed; the sweep's posture rows read settings through it; CI runs this gate)"
+fi
 
 # The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
 # path encoding and its migration step is the only thing here that can lose a file, so both are
