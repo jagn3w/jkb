@@ -958,7 +958,11 @@ allowlist (`cd`, `true`, `false`, `:`, `echo`, `cat`, `head`, `tail`, `wc`, `uni
 that cannot run other code or repoint `jkb`. Anything else on the line is asked, with the ticket
 minted so an approved line still works; a line that only *mentions* jkb, as a harmless command's
 argument, is skipped. `cd` is on the list only because `PATH` holds no relative or empty entry, so
-the directory cannot change which `jkb` runs (measured: ten entries, all absolute); `sort`,
+the directory cannot change which `jkb` runs — measured on the container's real `PATH`, eleven
+entries, all absolute. (A first measurement, ten entries, was of the Mac's `PATH`, which a stray
+`env.PATH` in the shared `.claude/settings.local.json` had substituted for the image's; same
+conclusion, wrong `PATH`. That substitution is what a session sees when `jkb` will not resolve by
+name.) `sort`,
 `printf`, `sed` and `awk` are deliberately off it (`--compress-program`, `printf -v PATH`, `e`,
 `system()`).
 

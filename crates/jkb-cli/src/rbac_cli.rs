@@ -696,7 +696,8 @@ fn runs_jkb(command: &str) -> bool {
 /// and `uniq` is out -- `uniq IN OUT` writes OUT, and `uniq evil ~/.cargo/bin/jkb; jkb ls` replaced
 /// the binary the next command ran, exec bit kept (review round 9, coreutils 9.4). `cd` is
 /// in only because `PATH` holds no relative or empty entry, so the directory cannot change which
-/// `jkb` runs (measured in the dev container: ten entries, all absolute).
+/// `jkb` runs (measured on the container's real PATH: eleven entries, all absolute -- not the Mac
+/// PATH a stray `env.PATH` in the shared `.claude/settings.local.json` once substituted for it).
 const HARMLESS: &[&str] = &[
     "cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "grep", "jq",
 ];
