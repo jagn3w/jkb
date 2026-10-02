@@ -463,9 +463,12 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq` readers build
   the mount list. **What this costs:** a Docker installed per-user (`~/.docker/bin`, OrbStack's
   `~/.orbstack/bin`) or a `jq` from `~/.nix-profile` is dropped as well. `run.sh` then names the
-  directory it was in. If no agent can write that directory, keep it with
-  `JKB_RUN_PATH_KEEP=<dir>[:<dir>...]`. Docker Desktop's credential helper lives in the same
-  directory, so keeping it covers both. The host's own `jkb` lives in `~/.cargo/bin` and is dropped
+  directory it was in. Keep a directory with `JKB_RUN_PATH_KEEP=<dir>[:<dir>...]` only if no
+  agent can write it. That takes two things in `scripts/auto-mode-posture.json`: the sandbox
+  `allowWrite` must not cover it, and the permissions must deny `Edit` on it, because the in-process
+  Write tool is not sandboxed. `~/.docker/bin` passes the first test by default and not the second
+  (review round 13). Docker Desktop's credential helper lives in the same directory, so keeping it
+  covers both. The host's own `jkb` lives in `~/.cargo/bin` and is dropped
   too, so the start-time sweep no longer asks it which sessions are live. It holds sessions by its
   recency window instead.
 - **The checkout's `run.sh` refuses** to start or stop anything and names the kit. That protects the
@@ -1588,7 +1591,13 @@ tools and its absence is silent:
   anything; the reaper pipes it in over `bash -s`) and loaded by name into `check-config.sh` and
   `verify.sh`. Three files used to parse rules three ways, and each was wrong differently: one
   missed Claude Code's absolute `//path` spelling, one only looked at rules containing `projects/`,
-  one passed a mid-path `**`. A rename now makes both loaders fail loudly.
+  one passed a mid-path `**`. A rename now makes both loaders fail loudly. **One question is unmeasured, and the reader errs the
+  safe way on it:** whether Claude Code's permission and sandbox matching expands `{a,b}`. A `case`
+  pattern does not, so `Read(~/.claude/{projects,x}/**/*.jsonl)` read as one literal directory, and
+  matched nothing (review round 13). A brace now counts as a wildcard: the rule's base stops before
+  it, and it covers everything under that base. A brace rule over the tree therefore turns the sweep
+  on, fails `check-config.sh`'s argv guard, and fails `verify.sh`'s memory check. If matching is
+  measured not to expand braces, that is a false alarm to correct here.
 - `check-config.sh` also holds what the hook cannot load: no sandbox `allowRead`/`allowWrite`
   entry may reach the transcript tree, because with no deny rule naming it that entry is the only
   thing between sandboxed Bash and the transcripts; and the hook's roots and the sweep's must both

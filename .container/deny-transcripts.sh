@@ -45,7 +45,11 @@
 # 38ms for a Glob whose braces expand to the 64-way cap, 222ms for an MCP call carrying 2000 bare
 # words, each tested on disk, and 270ms for the worst Glob found: 64 expansions of a pattern at the
 # 4096-byte budget (2.8s before the expander skipped finished expansions). Round 12 judges each
-# expansion's own literal prefix: a Glob with 64 distinct prefixes, every one checked, took 1.17s. It was ~7ms before five review rounds added guards; the number is
+# expansion's own literal prefix: a Glob with 64 short distinct prefixes, every one checked, took
+# 1.05s. That made glob_base's quadratic prefix-building reachable, and 64 distinct ~4KB prefixes
+# then took 30s (round 13). glob_base is linear now, and expansions x pattern bytes is capped at
+# 32768: the slowest Glob under that cap (8 distinct 4KB prefixes) takes 0.82s, the refused one
+# 0.38s. It was ~7ms before five review rounds added guards; the number is
 # re-measured rather than carried, because this hook now runs on EVERY tool call.
 #
 # PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
@@ -217,16 +221,20 @@ uri_path() { # uri_path <string> -> path on stdout, rc 0; empty for not-a-URI; r
 # The literal leading part of a glob pattern: every segment before the first that holds a glob
 # character. `**/*.jsonl` -> "" (the search root alone decides), `/a/b/*/c` -> /a/b.
 glob_base() { # glob_base <pattern> -> literal prefix, possibly empty
-    local pat="$1" out="" seg first=1 parts
-    case "$pat" in /*) out="/" ;; esac
+    # LINEAR: one substring of the pattern, up to the end of its last literal segment. It rebuilt the
+    # prefix by appending each segment to a growing string, which is quadratic, and with every brace
+    # expansion now judged that ran 64 x 4KB prefixes past the timeout (review round 13). The prefix
+    # is also exactly the pattern's own text now, so stripping it from an expansion cannot miss.
+    local pat="$1" seg pos=0 end=0 parts
+    case "$pat" in /*) end=1 ;; esac
     split_path "$pat"
     for seg in ${parts[@]+"${parts[@]}"}; do
-        [ -n "$seg" ] || continue
         case "$seg" in *[\*\?\[\{]*) break ;; esac
-        if [ "$first" -eq 1 ] && [ "$out" != "/" ]; then out="$seg"; else out="${out%/}/$seg"; fi
-        first=0
+        pos=$((pos + ${#seg}))
+        [ -n "$seg" ] && end=$pos
+        pos=$((pos + 1))
     done
-    printf '%s\n' "$out"
+    printf '%s\n' "${pat:0:end}"
 }
 
 # WHAT A GLOB'S BRACES EXPAND TO, nested groups included, into the global array `brace_out`. Judging
@@ -499,6 +507,23 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"ok"}}' HOME="$sh"
     h "a bare word naming nothing on disk is allowed" allow \
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"nothing-here"}}' HOME="$sh"
+    # REVIEW ROUND 13. A cwd link named after an EXISTING account: judged only at that account's
+    # home (/bin for sync), it reached the tree. Both readings, from every base.
+    ln -s "$sh/.claude-state/projects/-s" "$sh/repos/r/~sync"
+    h "a cwd link named ~sync, an existing account, is denied" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"path":"~sync"}}' HOME="$sh"
+    # ...and a NEWLINE in a path is refused: `$( )` drops a trailing one, so a link named "x\n" was
+    # judged as "x" and the tool opened the link.
+    ln -s "$sh/.claude-state/projects/-s" "$sh/repos/r/nl
+"
+    h "a Read whose path ends in a newline is refused" deny \
+      '{"tool_name":"Read","cwd":"'"$sh"'/repos/r","tool_input":{"file_path":"nl\n/e.jsonl"}}' HOME="$sh"
+    h "a Grep rooted at a link whose name ends in a newline is refused" deny \
+      '{"tool_name":"Grep","cwd":"'"$sh"'/repos/r","tool_input":{"path":"nl\n","pattern":"p"}}' HOME="$sh"
+    h "an MCP string naming that link is denied" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"path":"./nl\n"}}' HOME="$sh"
+    h "a Glob with a newline is refused" deny \
+      '{"tool_name":"Glob","cwd":"'"$sh"'/repos/r","tool_input":{"pattern":"x\n/../../.claude/projects/*"}}' HOME="$sh"
     # REVIEW ROUND 9. `~t/...` read only as a home let the cwd's `~t` link through.
     : >"$sh/.claude-state/projects/-s/e.jsonl"
     h "a ~name/ path through a cwd link of that name is denied, to an MCP tool" deny \
@@ -632,6 +657,14 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{src,tests/{unit,e2e}}/**/*.rs"}}' HOME=/h
     blow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(8) | "{a,b,c}"] | join(""))}}')"
     h "a brace product too large to expand is refused, never a race with the timeout" deny "$blow" HOME=/h
+    # REVIEW ROUND 13. 64 long, distinct prefixes made glob_base's per-prefix work run past the
+    # timeout, which fails open: refused on a budget before any prefix is walked, and fast.
+    slow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:("~/.claude/projects/" + ([range(6)|"{.,./}"]|join("")) + ([range(1960)|"./"]|join("")) + "*/*.jsonl")}}')"
+    t0=$(date +%s%N)
+    h "64 long distinct Glob prefixes are refused" deny "$slow" HOME=/h
+    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
+    if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
+    else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
     # REVIEW ROUND 12. A ~ before the first brace: its literal prefix is empty, and only the cwd was
     # judged while the first expansion is the denied tree.
     h "a Glob ~{,x}/.claude/projects/** is denied like its first expansion" deny \
@@ -799,9 +832,13 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
     # collapsed path let a symlink followed by `..` through: `l2/..` with l2 -> the tree collapsed
     # to the repo before realpath saw the link, while the kernel follows l2 first and then climbs.
     # Review round 3, reproduced. A resolver that fails cannot say where the path lands: refuse.
-    raw="$(join_raw "$1" "$home" "$base")"
+    # SENTINEL CAPTURES: `$( )` drops every trailing newline, so a path ending in one -- a link
+    # named "x\n" -- was judged as "x" while the tool opened the link (review round 13). The `.`
+    # keeps the path's own newlines; only the one the producer adds is removed.
+    raw="$(join_raw "$1" "$home" "$base"; printf .)"; raw="${raw%.}"; raw="${raw%$'\n'}"
     abs="$(resolve "$1" "$home" "$base")"
-    phys="$(realpath -m -- "$raw" 2>/dev/null)" || exit 3
+    phys="$(realpath -m -- "$raw" 2>/dev/null && printf .)" || exit 3
+    phys="${phys%.}"; phys="${phys%$'\n'}"
     [ -n "$phys" ] || exit 3
     if [ "$phys" != "$abs" ]; then
         v="$(verdict "$phys" "$roots" "$home" "$base")"
@@ -820,6 +857,11 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
 # Artifact, which reads and uploads a local file, past it; review round 3). Bash and the pathless
 # built-ins were already let through above.
 
+# A NEWLINE IN A PATH FIELD OR A GLOB PATTERN is refused outright: no real path needs one, and every
+# helper here passes paths through lines (review round 13). Free text in other tools keeps its
+# multi-line judging, with check()'s sentinel captures.
+case "$fp$nb$pth" in *$'\n'*) deny ;; esac
+[ "$tool" = Glob ] && case "$pat" in *$'\n'*) deny ;; esac
 for p in "$fp" "$nb"; do [ -n "$p" ] && check "$p"; done
 case "$tool" in
     Grep|Glob)
@@ -846,19 +888,22 @@ case "$tool" in
             # refused only past one (round 7: `../docs/*.md` is ordinary); an expansion may not turn
             # absolute when the pattern is not. Ordinary patterns -- `**/*.{rs,toml}`,
             # `{crates/a,crates/b}/**` -- share one prefix, so this judges each distinct prefix once.
-            gbs=""
+            # A BUDGET ON THE WORK, before any prefix is walked: 64 distinct ~4KB prefixes ran past
+            # the 10s timeout, which fails open (review round 13, measured at 30s). Expansions times
+            # pattern bytes; an ordinary pattern is a few hundred.
+            [ $(( ${#brace_out[@]} * ${#pat} )) -le 32768 ] || exit 3
+            # AN ARRAY of distinct prefixes, never newline-joined text: a newline in an expansion
+            # split one prefix into two harmless ones (round 13; newlines are refused above too).
+            gbs=()
             for e in "${brace_out[@]}"; do
                 case "$pat" in /*|"~"*) ;; *) case "$e" in /*|"~"*) deny ;; esac ;; esac
-                gb="$(glob_base "$e")"
+                gb="$(glob_base "$e"; printf .)"; gb="${gb%.}"; gb="${gb%$'\n'}"
                 rest="${e#"$gb"}"
                 case "/$rest/" in */../*) deny ;; esac
-                case "
-$gbs" in *"
-$gb
-"*) ;; *) gbs="$gbs$gb
-" ;; esac
+                seen=0; for g in ${gbs[@]+"${gbs[@]}"}; do [ "$g" = "$gb" ] && seen=1; done
+                [ "$seen" -eq 1 ] || gbs+=("$gb")
             done
-            while IFS= read -r gb; do
+            for gb in ${gbs[@]+"${gbs[@]}"}; do
                 [ -n "$gb" ] || continue
                 # Joined onto the UN-normalised base, so check()'s realpath meets any link in the
                 # base before the pattern's `..` segments: resolving the base first collapsed
@@ -866,7 +911,7 @@ $gb
                 # directory (review round 5, reproduced) -- round 3's symlink-then-`..` defect in
                 # a composition check() itself never saw.
                 case "$gb" in /*|"~"*) check "$gb" ;; *) check "$(join_raw "$base" "$home" "$cwd")/$gb" ;; esac
-            done <<<"$gbs"
+            done
         fi ;;
     Read|Edit|Write|NotebookEdit)
         [ -n "$pth" ] && check "$pth" ;;
@@ -944,8 +989,11 @@ $gb
                 # judged at the home it has; anything else is a relative name.
                 "~"*) ent="$(getent passwd "${leaf#\~}" 2>/dev/null | head -1)"
                       ent_home="$(printf '%s' "$ent" | cut -d: -f6)"
-                      if [ "${ent%%:*}" = "${leaf#\~}" ] && [ -n "$ent_home" ]; then leaf="$ent_home"
-                      else leaf="./$leaf"; fi ;;
+                      # BOTH READINGS for an account: its home, and the literal name a server that
+                      # does not expand it opens. Judged at the home alone, a cwd link named `~sync`
+                      # reached the tree (review round 13).
+                      [ "${ent%%:*}" = "${leaf#\~}" ] && [ -n "$ent_home" ] && check "$ent_home"
+                      leaf="./$leaf" ;;
             esac
             # A free-text string that merely STARTS `file:` is text, not a refusal (round 7); only a
             # `file:/...` URI is rewritten, and the same helper serves the long branch below.

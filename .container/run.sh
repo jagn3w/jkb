@@ -36,9 +36,11 @@ set -euo pipefail
 # bash` having found bash itself through that PATH, and before anything runs, every PATH entry under
 # $HOME, /tmp or /private, or relative, is dropped. System and Homebrew locations stay, which is
 # where docker and jq live; a docker under ~ (~/.docker/bin, ~/.orbstack/bin) has to be linked from
-# one of them. JKB_RUN_PATH_KEEP is a colon-separated list of directories to keep anyway -- a docker
-# in ~/.docker/bin, which no posture lets an agent write, or the tests' stubs in /tmp. A tool the
-# filter hid is named, with the directory it was in, by `need_tool` below (review round 12).
+# one of them. JKB_RUN_PATH_KEEP is a colon-separated list of directories to keep anyway, and is safe
+# only for one NO agent can write: outside the posture's sandbox allowWrite AND Edit-denied, since the
+# in-process Write tool is not sandboxed (review round 13 -- ~/.docker/bin passes the first test and
+# not the second unless the posture denies it). The tests' stubs in /tmp use it. A tool the filter
+# hid is named, with the directory it was in, by `need_tool` below (review round 12).
 # Not in --self-test, which check.sh runs and which starts nothing. check-config.sh holds this.
 if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=""; JKB_PATH_DROPPED=""; IFS=: read -r -a jkb_path_in <<<"$PATH"; for jkb_d in ${jkb_path_in[@]+"${jkb_path_in[@]}"}; do case ":${JKB_RUN_PATH_KEEP:-}:" in *":$jkb_d:"*) [ -n "$jkb_d" ] && { jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; continue; } ;; esac; case "$jkb_d" in ""|[!/]*|"$HOME"|"$HOME"/*|/tmp|/tmp/*|/private|/private/*|/var/folders|/var/folders/*) JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue ;; esac; jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; done; PATH="${jkb_path:-/usr/bin:/bin}"; export PATH; fi
 # ...and jq with HOME where no file can be: jq sources $HOME/.jq into every program, and the Write
@@ -70,7 +72,7 @@ need_tool() {
     local d hidden=""
     IFS=: read -r -a need_dropped <<<"${JKB_PATH_DROPPED:-}"
     for d in ${need_dropped[@]+"${need_dropped[@]}"}; do [ -z "$hidden" ] && [ -x "$d/$1" ] && hidden="$d"; done
-    [ -z "$hidden" ] || die "$1 is in $hidden, which this script drops from PATH: it runs as you, and an agent could plant a program in a directory under your home. If no agent can write $hidden -- it is not under ~/.cargo, ~/.jkb, ~/.cache, ~/.local/bin or a temp root -- keep it: JKB_RUN_PATH_KEEP=$hidden (for Docker Desktop that directory also holds its credential helper)"
+    [ -z "$hidden" ] || die "$1 is in $hidden, which this script drops from PATH: it runs as you, and an agent can plant a program under your home. Keep $hidden only if NO agent can write it: the host posture's sandbox allowWrite must not cover it AND its permissions must deny Edit on it (the in-process Write tool is not sandboxed) -- scripts/auto-mode-posture.json is where both live. Then: JKB_RUN_PATH_KEEP=$hidden (for Docker Desktop, that directory also holds its credential helper)"
     die "$2"
 }
 
@@ -698,9 +700,9 @@ while [ $# -gt 0 ]; do
                              || die "container.json could not be read; refusing to print a partial declaration"
                          [ -n "$args_out" ] || die "the assembly produced no arguments"
                          printf '%s\n' "$args_out"; exit 0 ;;
-        --stop)          require_kit --stop; persist_login
+        --stop)          require_kit --stop; need_tool docker "docker is not on PATH"; persist_login
                          docker stop "$NAME" >/dev/null 2>&1 && echo "stopped $NAME" || echo "$NAME was not running"; exit 0 ;;
-        --rm)            require_kit --rm; persist_login
+        --rm)            require_kit --rm; need_tool docker "docker is not on PATH"; persist_login
                          docker rm -f "$NAME" >/dev/null 2>&1 && echo "removed $NAME" || echo "$NAME did not exist"; exit 0 ;;
         *)               die "unknown argument '$1' (see the header of $0)" ;;
     esac
@@ -1331,7 +1333,7 @@ elif [ "$OPEN" -eq 1 ]; then
         [ "$translated" = "$open_path" ] || say "opening the container's $translated (you named the host path)"
         open_path="$translated"
     fi
-    command -v code >/dev/null 2>&1 || die "the 'code' CLI is not on PATH (VS Code: 'Shell Command: Install code in PATH')"
+    need_tool code "the 'code' CLI is not on PATH (VS Code: 'Shell Command: Install code in PATH')"
     # Attached containers are addressed by a hex-encoded JSON authority. This spelling is VS Code's
     # and is not something this repo can verify from a test, so it is a convenience on top of the
     # Command Palette route above rather than the documented way in: if it stops working, the

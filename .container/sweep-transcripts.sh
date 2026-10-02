@@ -51,11 +51,11 @@
 # to being the first command.
 [ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }
 set -uo pipefail
-# EVERY jq HERE RUNS WITH HOME WHERE NO FILE CAN BE, the lib.sh functions this script calls
-# included: jq sources $HOME/.jq into every program, and the agent can write $HOME. One wrapper,
-# so no call site has to remember a prefix -- round 8 required the prefix per call and round 9
-# found lib.sh's calls, which no per-call scan of this file could see. check-config.sh requires
-# this line to be the file's first mention of jq.
+# EVERY jq HERE RUNS WITH HOME WHERE NO FILE CAN BE: jq sources $HOME/.jq into every program, and
+# the agent can write $HOME. This file sources nothing; one wrapper means no call site, present or
+# future, has to remember a prefix -- round 8 required it per call, and round 9 found calls a
+# per-call scan could not see (verify.sh's, through lib.sh). check-config.sh requires this line to
+# be the file's first mention of jq.
 jq() { HOME=/dev/null command jq "$@"; }
 
 # ---------------------------------------------------------------------------------------------
@@ -572,7 +572,9 @@ posture_deny_rules() { # posture_deny_rules <json file> [jq path to the settings
 posture_rule_base() { # posture_rule_base <path pattern> -> literal prefix
     local p="$1" out=""
     while [ -n "$p" ]; do
-        case "${p%%/*}" in *[\*\?\[]*) break ;; esac
+        # `{` too: whether Claude Code's rule matching expands braces is UNMEASURED, so a brace is a
+        # wildcard here -- the reading that errs towards guarding (review round 13).
+        case "${p%%/*}" in *[\*\?\[\{]*) break ;; esac
         case "$p" in */*) out="$out${p%%/*}/"; p="${p#*/}" ;; *) out="$out$p"; p="" ;; esac
     done
     [ "$out" = / ] || out="${out%/}"
@@ -589,6 +591,15 @@ posture_rule_covers() { # posture_rule_covers <path pattern> <path> -> rc 0 cove
     # repo's `Edit(**/*.md)` made verify.sh refuse the whole container (review round 6). Decided in
     # the callee, so no caller can forget it.
     case "$1" in /*) ;; *) case "$2" in /*) return 1 ;; esac ;; esac
+    # A BRACE is matched as if it could expand to anything: everything under the rule's literal base
+    # is covered. A `case` pattern does not expand braces, so `{projects,x}` read as one literal
+    # directory and covered nothing, while Claude Code may expand it -- unmeasured, so this errs
+    # towards finding a rule that reaches the tree or memory (review round 13).
+    case "$1" in
+        *"{"*) local b; b="$(posture_rule_base "$1")"
+               [ "$2" = "$b" ] || [ "${2#"${b%/}"/}" != "$2" ] && return 0
+               return 1 ;;
+    esac
     case "$2" in $1|$1/*) return 0 ;; esac
     return 1
 }
@@ -600,10 +611,12 @@ posture_rule_covers() { # posture_rule_covers <path pattern> <path> -> rc 0 cove
 # The first cut looked only at the last segment and so passed the mid-path shape.
 posture_rule_expands() { # posture_rule_expands <path pattern> -> rc 0 expands per match
     local pre
-    case "$1" in *[\*\?\[]*) ;; *) return 1 ;; esac
+    # `{` counts as a wildcard: a brace rule is read as enumerated per match unless measured not to
+    # be (review round 13; the same unmeasured question as posture_rule_base).
+    case "$1" in *[\*\?\[\{]*) ;; *) return 1 ;; esac
     case "$1" in
         */\*\*) pre="${1%/\*\*}"
-                case "$pre" in *[\*\?\[]*) return 0 ;; esac
+                case "$pre" in *[\*\?\[\{]*) return 0 ;; esac
                 return 1 ;;
     esac
     return 0
@@ -1654,6 +1667,14 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     ln -s "$work/elsewhere-tree" "$lhome2/.claude-state/projects/-home-x-repos-y/memory"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/**/zz-outside*.jsonl)"]}}' >"$pdir/outside.json"
     eq "a link inside the tree is not followed by the probe walk" "$(pe "$pdir/outside.json" "$lhome2")" no
+    # Round 13: a BRACE rule, which a `case` pattern reads as one literal directory. Whether Claude
+    # Code expands it is unmeasured, so it is counted.
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/{projects,x}/**/*.jsonl)"]}}' >"$pdir/brace.json"
+    eq "a brace rule over the tree is counted as enumerating" "$(pe "$pdir/brace.json")" yes
+    eq "posture_rule_covers reads a brace as covering its base's subtree" \
+       "$(posture_rule_covers '/h/.claude/{projects,x}' /h/.claude/projects/-p/memory/MEMORY.md && echo covered || echo clear)" covered
+    eq "...and nothing outside that base" \
+       "$(posture_rule_covers '/h/.claude/{projects,x}' /h/repos/x && echo covered || echo clear)" clear
     # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/-home-vscode-repos-jkb/**/*.jsonl)"]}}' >"$pdir/slug.json"
     eq "a slug-specific per-file glob enumerates"   "$(pe "$pdir/slug.json")" yes
