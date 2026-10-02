@@ -659,8 +659,7 @@ pub fn land(
     roots: Option<&FileRoots>,
 ) -> Result<Landing, ApiError> {
     use jkb_fsm::Fact;
-    landed.check()?;
-    let id = writable(conn, uid, roots)?;
+    let id = land_check(conn, uid, landed, roots)?;
     let facts = lifecycle::TaskFacts {
         session_exists: Fact::Yes,
         work_dirty: Fact::No,
@@ -671,6 +670,23 @@ pub fn land(
     };
     let outcome = transition::perform(conn, meta, id, &facts, TaskEvent::Land, &landed.labels())?;
     landing(conn, id, outcome.refusal())
+}
+
+/// `task.land_check`: what [`land`] refuses before it records anything — a malformed payload, and a
+/// task filed where this client may not write — with nothing recorded. [`land`] calls it, so the two
+/// cannot drift. Who may land at all is not here: that is `rbac::authorize`'s, asked of both ops at
+/// admission with the same payload.
+///
+/// # Errors
+/// The payload is malformed, the task is unknown, or it is filed outside this client's roots.
+pub fn land_check(
+    conn: &Connection,
+    uid: &str,
+    landed: &Landed,
+    roots: Option<&FileRoots>,
+) -> Result<jkb_types::ItemId, ApiError> {
+    landed.check()?;
+    writable(conn, uid, roots)
 }
 
 /// `task.landed`: a landing somebody else performed — the merge queue's graft — recorded for one task

@@ -292,10 +292,11 @@ impl<'a> Ops<'a> {
     /// Every op goes through here, so a cut answer is reported here — once, for every command, rather
     /// than in each place an answer is taken apart, where one arm could forget.
     pub(crate) fn call(&self, request: Request) -> Result<Response> {
+        let op = request.op();
         let response = self
             .backend
             .call(request)
-            .map_err(|e| op_error(e, self.remote))?;
+            .map_err(|e| op_error(e, self.remote, op))?;
         // What cut it decides what lifts it: the daemon's byte budget is lifted on the host, which has
         // none; a tree's node cap is the same everywhere.
         let notice = match &response {
@@ -761,13 +762,26 @@ impl<'a> Ops<'a> {
 
 /// An op's refusal as this command's error — the one mapping, for [`Ops`] and every client module
 /// that speaks to a backend directly.
-pub(crate) fn op_error(e: ApiError, remote: bool) -> anyhow::Error {
+pub(crate) fn op_error(e: ApiError, remote: bool, op: &str) -> anyhow::Error {
     match e.code {
         // The daemon's body cap is its own; the host takes the same request whole.
         ErrorCode::TooLarge if remote => anyhow::anyhow!(
             "{} — larger than the daemon accepts in one request; run it on the host",
             e.message
         ),
+        // A daemon from an older build than this client does not know an op added since, and serde
+        // says so as "unknown variant `<op>`, expected one of …" followed by every op it does know
+        // (measured against a `jkb serve` sent an op it lacks). Normal here: a pull rebuilds this
+        // client and not the host's daemon. Keyed on the op actually sent, because serde words an
+        // unknown value INSIDE a request (a status, say) the same way, and that is not a stale daemon.
+        ErrorCode::BadRequest
+            if remote && e.message.starts_with(&format!("unknown variant `{op}`")) =>
+        {
+            anyhow::anyhow!(
+                "the daemon does not know `{op}`: its jkb is older than this client. Update the \
+                 machine running `jkb serve` (./scripts/setup.sh there) and try again"
+            )
+        }
         _ => anyhow::Error::msg(e.message),
     }
 }
@@ -1066,6 +1080,31 @@ mod tests {
     use clap::Parser as _;
     use jkb_api::kb::{GrepAnswer, GrepHit, ItemDetail, TaskDetail};
     use jkb_api::{ApiError, Backend, Request, Response};
+
+    /// A daemon older than this client rejects an op added since with serde's "unknown variant
+    /// `<op>`, expected one of …" -- the wording measured against a real `jkb serve` -- and the
+    /// client says what that means instead of printing every op the old daemon knows. Only for the
+    /// op actually sent: an unknown value inside a request is worded the same way and is the
+    /// caller's mistake, not a stale daemon.
+    #[test]
+    fn an_op_the_daemon_does_not_know_is_reported_as_a_stale_daemon() {
+        let unknown = |what: &str| {
+            ApiError::bad_request(format!(
+                "unknown variant `{what}`, expected one of `mq.topic_create`, `mq.send`"
+            ))
+        };
+        let stale =
+            super::op_error(unknown("task.land_check"), true, "task.land_check").to_string();
+        assert!(stale.contains("older than this client"), "{stale}");
+        assert!(stale.contains("setup.sh"), "{stale}");
+        // An unknown value inside the request, not the op: passed through as the daemon said it.
+        let inner = super::op_error(unknown("bogus"), true, "task.set").to_string();
+        assert!(inner.starts_with("unknown variant `bogus`"), "{inner}");
+        // Never on the host, where nothing crosses a wire to be stale.
+        let local =
+            super::op_error(unknown("task.land_check"), false, "task.land_check").to_string();
+        assert!(local.starts_with("unknown variant"), "{local}");
+    }
 
     use super::Ops;
     use crate::Cli;

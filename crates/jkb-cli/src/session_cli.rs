@@ -66,9 +66,10 @@ impl<'a> Kb<'a> {
     }
 
     pub(crate) fn call(&self, request: Request) -> Result<Response> {
+        let op = request.op();
         self.backend
             .call(request)
-            .map_err(|e| op_error(e, self.remote))
+            .map_err(|e| op_error(e, self.remote, op))
     }
 
     /// `task.facts`.
@@ -288,6 +289,19 @@ impl<'a> Kb<'a> {
         )
     }
 
+    /// `task.land_check`: refuses exactly when [`Self::land`] with this payload would, and records
+    /// nothing. Asked before anything moves, so a caller who may not land is refused while the target
+    /// branch is still where it was.
+    pub(crate) fn land_check(&self, uid: &str, landed: &Landed) -> Result<()> {
+        match self.call(Request::TaskLandCheck {
+            uid: uid.to_owned(),
+            landed: landed.clone(),
+        })? {
+            Response::LandAdmitted {} => Ok(()),
+            other => unexpected("task.land_check", &other),
+        }
+    }
+
     /// `task.landed`.
     ///
     /// What `task.landed` made of `uid`, for the merge queue recording a whole group branch task by
@@ -330,7 +344,7 @@ impl<'a> Kb<'a> {
                     Ok(Verdict::Refused(e.message))
                 }
             }
-            Err(e) => Err(op_error(e, self.remote)),
+            Err(e) => Err(op_error(e, self.remote, "task.landed")),
         }
     }
 

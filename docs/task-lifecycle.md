@@ -1046,6 +1046,28 @@ serialized from admission to that undo, so it never undoes a binding a concurren
 relied on — and a reviewer must be bound before it records or files a review. `--no-review` asks who the client is before anything moves, whatever
 credential it presents.
 
+**So does the Land permission itself.** It used to be asked first by `task.land` — the record,
+the last step of `jkb task land` — so a caller the strategy does not let land got its branch
+grafted onto the target, its gate run (a caller-supplied `sh -c`) and its session archived, and was
+refused only the record: landed in git, not in jkb. Measured, not inferred: with the new check
+removed, the regression test's target moves and its worktree is archived. Who could reach it is
+narrower than first reported — a task-scoped grant is refused the repo's land lease (`lease.take`
+writes state no one task owns) before the graft — but an unscoped caller who may not land reaches
+it, and under the default `design-reviewed` that is the coordinator, the role a main session is
+attested as. `task.land_check` now asks it as soon as the branch, target and
+head are known, before the review gate, the graft and the gate. It carries the same payload as
+`task.land` and is answered by the same `authorize`, so there is one rule rather than a copy, and a
+merge queue re-landing a branch its live landing already records is admitted here exactly as it is
+there. Pinned by `a_caller_who_may_not_land_is_refused_before_the_target_moves`, which makes the task
+otherwise landable — a clean review round, no gate — because without that the review gate refuses
+first, before the graft, under the old code too, and the test would pass for the wrong reason.
+**Deploy order:** `task.land_check` is a new op, so a container client is ahead of a host
+`jkb serve` that has not been rebuilt, and that daemon answers it `bad_request` — "unknown variant".
+It fails closed, but no `jkb task land` works until `./scripts/setup.sh` runs on the host. `op_error`
+reports exactly that rather than the old daemon's list of every op it knows, for any op a stale
+daemon lacks, keyed on the op actually sent (serde words an unknown value inside a request the same
+way). Update the host before, or with, the container.
+
 **Swarm landings follow the task's strategy.** `scripts/merge-queue.sh` records a landing with
 `jkb task landed`, and under the default `design-reviewed` only the operator lands — so a batch
 the swarm lands on its own runs under a strategy whose `lands` toggle includes the coordinator

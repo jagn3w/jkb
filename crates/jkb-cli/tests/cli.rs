@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 mod common;
 use common::isolate_git_env;
+use common::Daemon;
 
 /// A `jkb` invocation against database `db`.
 fn jkb(db: &Path) -> Command {
@@ -3608,51 +3609,14 @@ fn task_reap_compacts_the_message_queue() {
     let _ = watch.wait();
 }
 
-/// A `jkb serve` child, killed when dropped — so a failed assertion does not leave a daemon running
-/// past the test.
-struct Daemon(std::process::Child);
-
 impl Daemon {
-    /// Start `jkb serve` on an ephemeral port; the daemon and its `http://` address.
+    /// Start `jkb serve` on an ephemeral port; the daemon and its `http://` address. The process
+    /// lifecycle is [`common::Daemon`]'s; only the command is this file's, built by its own `jkb`.
     fn start(db: &Path, token: &Path) -> (Self, String) {
         let mut cmd = jkb(db);
         cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
             .arg(token);
         Self::spawn(cmd)
-    }
-
-    /// Start `jkb serve` from `cmd` (already carrying its arguments).
-    fn spawn(mut cmd: std::process::Command) -> (Self, String) {
-        use std::io::BufRead as _;
-        let mut child = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let daemon = Self(child);
-        let banner = std::io::BufReader::new(stdout)
-            .lines()
-            .next()
-            .unwrap()
-            .unwrap();
-        let url = banner
-            .split_whitespace()
-            .find(|w| w.starts_with("http://"))
-            .unwrap_or_else(|| panic!("no address in {banner}"))
-            .to_owned();
-        (daemon, url)
-    }
-
-    fn stop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 

@@ -320,6 +320,14 @@ fn samples() -> Vec<Request> {
                 head: None,
             },
         },
+        Request::TaskLandCheck {
+            uid: "u".into(),
+            landed: super::sessions::Landed {
+                branch: "b".into(),
+                onto: "o".into(),
+                head: None,
+            },
+        },
         Request::TaskLanded {
             uid: "u".into(),
             landed: super::sessions::Landed {
@@ -1926,7 +1934,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 27, "every write naming an item was asked");
+    assert_eq!(checked, 28, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {
@@ -2283,6 +2291,10 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         json!({ "op": "task.landed", "uid": inside,
                 "landed": { "branch": "b2", "onto": "o", "head": "abcd" } }),
         json!({ "op": "task.land", "uid": inside,
+                "landed": { "branch": "b2", "onto": "o" } }),
+        // Records nothing, but it is served on the writer (its admission can bind an attested
+        // subagent), so it is held to the line like every op there.
+        json!({ "op": "task.land_check", "uid": inside,
                 "landed": { "branch": "b2", "onto": "o" } }),
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "reviews/rt",
                 "findings": [{ "severity": "nit", "summary": "x" }] }),
