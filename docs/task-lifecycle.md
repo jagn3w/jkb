@@ -936,9 +936,12 @@ types and the generic ones map to nothing; and **a `PreToolUse` can be followed 
 **What the hook approves, and what it declines to answer.** The hook returns `allow` only for one
 plain `jkb` invocation — the command word literally `jkb`, with no path component — that cannot run
 a shell command, and is not `task land`, which runs the gate. That is what a `Bash(jkb:*)` rule
-would approve, with every request it makes held to the ticket's role. It returns `ask` for one
-thing only: a command that may be `task land`. For everything else that runs `jkb` it returns **no
-`permissionDecision` at all**, and the session's own rules and prompt judge the call against the
+would approve, with every request it makes held to the ticket's role. It returns `ask` for a
+command that may be `task land` or `task gate` (which stores the command the next land runs, out
+of that land's prompt), for a line it cannot model, and for a line where anything but `jkb` and a
+short allowlist runs (below). For the rest — every command `jkb` itself or allowlisted — it
+returns **no `permissionDecision` at all**, and the session's own rules and prompt judge the call
+against the
 command as the model wrote it, not the rewritten one carrying `export JKB_ATTEST=…` — measured, see
 below — exactly as they did before this hook existed. A command the classifier cannot model is asked,
 because `land` cannot be ruled out of it — and that includes a redirect or a comment, so `jkb …
@@ -990,9 +993,12 @@ over-prompting, and it was a design error rather than a tuning problem. A `PreTo
 user's settings and made it more conservatively than they had: every `cd repo && jkb …` and
 `jkb … | jq` began prompting for a mechanism whose whole purpose is to be invisible. Returning
 `allow` there is not the alternative — it would approve whatever rode along with the `jkb`
-(`jkb ls && rm -rf …`). Declining to answer is, and it costs nothing on the security axis, because
-a ticket is an **authorization** fact the daemon holds every request to, not a permission grant.
-Authorization and human oversight are separate concerns, and the hook only ever needed the first.
+(`jkb ls && rm -rf …`). Declining to answer is — but only where nothing else on the line can use
+the ticket. It was first applied to every non-plain line, on the reasoning that it "costs nothing
+on the security axis" because a ticket is an authorization fact rather than a permission grant.
+Rounds 7 and 8 refuted that: the ticket is exported for the whole line, so any other program on it
+inherits the authorization, and `jkb ls && rm -rf …` — the very example above — is asked again
+for that reason.
 
 The rewrite still goes out for every ticketed class, because that is how the ticket reaches `jkb`
 and it is a genuine per-tool-call secret: **each Bash tool call runs in its own PID namespace**
@@ -1007,7 +1013,8 @@ questions gated it, and until they were measured this paragraph said so rather t
 either answer.
 
 *`updatedInput` is applied with no `permissionDecision`.* `cd /tmp && ~/.cargo/bin/jkb role
-whoami` — a two-command list, so the deferred class, for which the hook now emits no decision —
+whoami` — a two-command list, deferred at the time, for which the hook then emitted no decision
+(under the allowlist that followed, a path to `jkb` is asked; the mechanism measured still holds) —
 arrived with `JKB_ATTEST` set, and the daemon answered `coordinator` rather than `Unauthorized`.
 The schema had marked the field optional, but that was read out of the installed bundle; this is
 the observation. Had it gone the other way, every deferred call would have lost its ticket.

@@ -682,20 +682,23 @@ fn runs_jkb(command: &str) -> bool {
     tokens(command).iter().any(|w| is_jkb(w))
 }
 
-/// Commands that may share a line with `jkb` and still let it be deferred: ones that cannot run
-/// other code, change which program a later word names, or reach the ticket and use it. Matched on
+/// Commands that may share a line with `jkb` and still let it be deferred: ones with no path to
+/// run other code, WRITE a file, or change which program a later word names -- so nothing on the
+/// line but `jkb` can reach the ticket and use it. Matched on
 /// the command word exactly -- a path, an assignment prefix or a wrapper in front is something else.
 ///
 /// An ALLOWLIST, because every attempt to name the dangerous cases instead fell short. The ticket is
 /// `export`ed for the whole line, so anything else that runs inherits it, and review rounds 7 and 8
 /// each found a `jkb task land` that inherited it out of sight: `sh -c "jkb …"`, `xargs jkb`,
 /// `env -S`, a glob inside quotes, a script file, `jkb ls | ./evil`. Kept short on purpose, and
-/// checked for exec paths: `sort` is out (`--compress-program` runs a program), `printf` is out
-/// (`printf -v PATH …` repoints the next `jkb`), `sed` and `awk` are out (`e`, `system()`). `cd` is
+/// checked for exec AND write paths: `sort` is out (`--compress-program` runs a program), `printf`
+/// is out (`printf -v PATH …` repoints the next `jkb`), `sed` and `awk` are out (`e`, `system()`),
+/// and `uniq` is out -- `uniq IN OUT` writes OUT, and `uniq evil ~/.cargo/bin/jkb; jkb ls` replaced
+/// the binary the next command ran, exec bit kept (review round 9, coreutils 9.4). `cd` is
 /// in only because `PATH` holds no relative or empty entry, so the directory cannot change which
 /// `jkb` runs (measured in the dev container: ten entries, all absolute).
 const HARMLESS: &[&str] = &[
-    "cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "uniq", "grep", "jq",
+    "cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "grep", "jq",
 ];
 
 /// What the attestation hook does with a Bash command.
@@ -715,22 +718,25 @@ enum Attestation {
     /// ticket is still minted, so an approved `FOO=1 jkb ls` or `~/.cargo/bin/jkb ls` works.
     ///
     /// `land` runs the repository's gate through `sh -c` with a command the caller supplies
-    /// (`--gate`), so it is an arbitrary-execution primitive wearing a `jkb` spelling. Deferring it
-    /// would let that ride in under a `Bash(jkb:*)` allow rule -- a rule whose author said "jkb
-    /// commands are fine", not "any shell command spelled as a jkb command is fine". This is the one
-    /// case where the hook's `ask` was the only thing in the way, so it is the one case kept.
+    /// (`--gate`, or stored earlier by `task gate`), so it is an arbitrary-execution primitive
+    /// wearing a `jkb` spelling. Deferring it would let that ride in under a `Bash(jkb:*)` allow
+    /// rule -- a rule whose author said "jkb commands are fine", not "any shell command spelled as a
+    /// jkb command is fine".
     Ask,
-    /// Ticketed, and the permission decision left to whoever it belonged to: anything else that runs
-    /// `jkb`. The hook returns no `permissionDecision` at all, so the session's own rules and prompt
-    /// judge the call exactly as they did before this hook existed.
+    /// Ticketed, and the permission decision left to whoever it belonged to: a line whose every
+    /// command is `jkb` itself or `HARMLESS`, so nothing but `jkb` can use the ticket. The hook
+    /// returns no `permissionDecision` at all, so the session's own rules and prompt judge the call
+    /// against the command as the model wrote it.
     ///
     /// It used to return `ask` here, and that was the whole of the over-prompting. A `PreToolUse`
     /// `ask` OVERRIDES an allow rule, so adding attestation quietly took a decision that belonged to
     /// the user's settings and made it more conservatively than they had — every `cd repo && jkb …`
     /// and `jkb … | jq` began prompting for a mechanism that is supposed to be invisible. Returning
     /// `allow` instead is not the alternative: that would approve whatever rode along with the `jkb`
-    /// in it (`jkb ls && rm -rf …`). Declining to answer is, and it costs nothing, because the
-    /// ticket is an AUTHORIZATION fact the daemon holds every request to, not a permission grant.
+    /// in it (`jkb ls && rm -rf …`). Declining to answer is -- but only where nothing else on the
+    /// line can use the ticket: it was first applied to every non-plain line on the reasoning that a
+    /// ticket "costs nothing", and rounds 7 and 8 refuted that, since the ticket is exported for the
+    /// whole line and any other program on it inherits it.
     Defer,
 }
 
@@ -903,10 +909,14 @@ fn attestation(command: &str) -> Attestation {
     for words in &commands {
         match words.first().map(String::as_str) {
             // `task land` runs the repository's gate through `sh -c` with a command the CALLER
-            // supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling. Asked
-            // wherever `land` appears, rather than by locating the subcommand: a global option's
-            // value (`--db <path>`) sits where a parser that does not know every option would look.
-            Some("jkb") if words[1..].iter().any(|w| w == "land") => return Attestation::Ask,
+            // supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling. And
+            // `task gate "<cmd>"` STORES that command for the next land, whose prompt then shows
+            // only `jkb task land x` -- so setting it is asked too. Asked wherever either word
+            // appears, rather than by locating the subcommand: a global option's value (`--db
+            // <path>`) sits where a parser that does not know every option would look.
+            Some("jkb") if words[1..].iter().any(|w| w == "land" || w == "gate") => {
+                return Attestation::Ask
+            }
             Some("jkb") => jkb += 1,
             Some(w) if HARMLESS.contains(&w) => {}
             _ => {
@@ -1153,6 +1163,9 @@ mod tests {
             "jkb 'task' land x",
             // A quote boundary does not end a word, so it cannot hide the subcommand.
             "jkb task 'la'nd task:x",
+            // `task gate` stores the command the next land runs, out of that land's prompt.
+            "jkb task gate 'sh /tmp/p.sh'",
+            "jkb task gate",
             // In a list, the `land` may be in any of the commands.
             "jkb task add 'ok' && jkb task land task:x",
             // The command word need not be the FIRST word: an assignment prefix or a wrapper
@@ -1286,6 +1299,8 @@ mod tests {
             .expect("fake jkb");
             std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
                 .expect("chmod fake jkb");
+            // And one in the working directory, for a row that reaches jkb by a relative glob.
+            std::fs::copy(&fake, cwd.join("jkb")).expect("fake jkb in cwd");
         }
         let mut c = Command::new("/bin/bash");
         c.arg("-c").arg(&script).current_dir(cwd);
@@ -1466,22 +1481,24 @@ mod tests {
             "time -p jkb task land x",
             "j''kb task land x",
             "j'k'b task land x",
-            // Round 8: a glob inside quotes is not a jkb word to the lexer, and is to `sh`.
-            "jkb task show x; sh -c '~/.cargo/bin/jk? task land x'",
+            // Round 8: a glob inside quotes is not a jkb word to the lexer, and is to `sh`. Aimed
+            // at the fake in the working directory: with `~`, and no HOME in the child, the glob
+            // matched nothing and the row could never reach `land` (round 9).
+            "jkb task show x; sh -c './jk? task land x'",
         ] {
             let class = attestation(cmd);
             let (calls, args) = bash_argv(cmd, &[], cwd, true);
+            // Every row is built to hand some jkb the word `land`: one that did not checks nothing,
+            // whatever the classifier said (round 9 found a row that never could).
             assert!(
-                calls >= 1,
-                "bash must reach a `jkb` in {cmd:?}, or this checks nothing"
+                calls >= 1 && args.iter().any(|a| a == "land"),
+                "bash never handed a jkb `land` in {cmd:?} ({args:?}), so this row checks nothing"
             );
-            if args.iter().any(|a| a == "land") {
-                assert_eq!(
-                    class,
-                    Attestation::Ask,
-                    "bash passed `land`: {cmd:?} -> {args:?}"
-                );
-            }
+            assert_eq!(
+                class,
+                Attestation::Ask,
+                "bash passed `land`: {cmd:?} -> {args:?}"
+            );
         }
         // Mentioning jkb where nothing runs it needs no ticket at all.
         assert_eq!(attestation("grep -rn jkb src"), Attestation::Skip);
@@ -1533,11 +1550,9 @@ mod tests {
         // ticketed jkb -- so it is pinned like the character lists.
         assert_eq!(
             HARMLESS,
-            &[
-                "cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "uniq", "grep",
-                "jq"
-            ],
-            "HARMLESS changed: check the new member for an exec path, then change this too"
+            &["cd", "true", "false", ":", "echo", "cat", "head", "tail", "wc", "grep", "jq"],
+            "HARMLESS changed: check the new member for an exec AND a file-write path, then change \
+             this too"
         );
         assert_eq!(
             attestation("jkb task show ab"),
