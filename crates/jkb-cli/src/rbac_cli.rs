@@ -684,7 +684,7 @@ fn runs_jkb(command: &str) -> bool {
 
 /// Commands that may share a line with `jkb` and still let the hook APPROVE the line -- an approval
 /// that overrides the session's own permission rules for every command on it. So a member must
-/// have no path to run other code, WRITE a file, or change which program a later word names.
+/// have no path to run other code, READ or WRITE a file, or change which program a later word names.
 /// Matched on the command word exactly -- a path, an assignment prefix or a wrapper in front is
 /// something else.
 ///
@@ -1551,8 +1551,8 @@ mod tests {
         assert_eq!(
             HARMLESS,
             &["cd", "true", "false", ":", "echo"],
-            "HARMLESS changed: check the new member for an exec AND a file-write path, then change \
-             this too"
+            "HARMLESS changed: check the new member for an exec, a file-read AND a file-write path, \
+             then change this too"
         );
         assert_eq!(
             attestation("jkb task show ab"),
