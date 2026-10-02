@@ -481,6 +481,23 @@ dc_kit_paths() { # one path per line, relative to a checkout
     printf '%s\n' .container scripts/lib.sh scripts/link-claude-memory.sh scripts/auto-mode.sh scripts/auto-mode-posture.json
 }
 
+# dc_repo_root <kit dir> -> the checkout a script running from <kit dir> serves. ONE derivation for
+# setup.sh, verify.sh and install-extensions.sh, which each spelled it, and two of them took the kit
+# mirror itself for the checkout when run there by hand (review round 18):
+#   JKB_REPO_ROOT, which run.sh names, when it is set;
+#   the checkout you stand in, when <kit dir> is the root-owned mirror;
+#   <kit dir> itself otherwise -- a script run from a checkout serves that checkout.
+dc_repo_root() { # dc_repo_root <kit dir>
+    if [ -n "${JKB_REPO_ROOT:-}" ]; then printf '%s\n' "$JKB_REPO_ROOT"; return 0; fi
+    if [ "$(cd "$1" 2>/dev/null && pwd -P)" = "$DC_CTR_KIT" ]; then
+        # The caller's repository selection dropped first: an exported GIT_WORK_TREE outranks the cwd.
+        ( unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+          git rev-parse --show-toplevel 2>/dev/null ) || pwd
+        return 0
+    fi
+    printf '%s\n' "$1"
+}
+
 # dc_unsafe_entries <path> -> up to three entries under <path> that could carry a host file into the
 # kit, or nothing: a symlink, a special file, or a regular file with a second hard link. A find error
 # prints too, so an unreadable tree is not read as clean. ONE predicate for the three places that
@@ -565,14 +582,23 @@ dc_kit_checkout() { # dc_kit_checkout <kit dir>
 # one per line, relative to the checkout: what a refresh will copy in. dc_kit_stale below answers
 # per kit path (`.container`), which named one directory for ~25 files (review round 17).
 dc_kit_changes() { # dc_kit_changes <kit dir> <checkout>
-    local p
+    # BY WALKING BOTH TREES, file by file, not by parsing `diff -rq`: its messages missed a file that
+    # became a directory, a path absent from the old kit (diff's complaint went to stderr), and named
+    # a new subdirectory as one line (review round 18). A file that cannot be compared says so.
+    local p f kfiles cfiles
     while IFS= read -r p; do
-        diff -rq "$1/$p" "$2/$p" 2>/dev/null | sed -n \
-            -e "s|^Files $1/\(.*\) and $2/.* differ\$|\1|p" \
-            -e "s|^Only in $2/\(.*\): \(.*\)\$|\1/\2 (new)|p" \
-            -e "s|^Only in $2: \(.*\)\$|\1 (new)|p" \
-            -e "s|^Only in $1/\(.*\): \(.*\)\$|\1/\2 (removed)|p" \
-            -e "s|^Only in $1: \(.*\)\$|\1 (removed)|p"
+        kfiles="$( [ -e "$1/$p" ] && (cd "$1" && find "$p" -type f 2>&1) | sort)"
+        cfiles="$( [ -e "$2/$p" ] && (cd "$2" && find "$p" -type f 2>&1) | sort)"
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if ! grep -qxF -- "$f" <<<"$kfiles"; then printf '%s (new)\n' "$f"
+            elif ! cmp -s -- "$1/$f" "$2/$f"; then printf '%s\n' "$f"
+            fi
+        done <<<"$cfiles"
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            grep -qxF -- "$f" <<<"$cfiles" || printf '%s (removed)\n' "$f"
+        done <<<"$kfiles"
     done <<EOF
 $(dc_kit_paths)
 EOF

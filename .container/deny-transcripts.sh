@@ -629,6 +629,17 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"~vscode/.cargo/credentials.toml"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 17: a walker handed a directory holding a credential is refused" deny \
       '{"tool_name":"mcp__x__index","cwd":"'"$bh"'/repos/w","tool_input":{"root":"'"$bh"'/.cargo"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 18, AND THE USER'S CHOICE AFTER IT: ambiguous path forms in an MCP or unknown tool
+    # call are REFUSED, not resolved. A `..` segment or a `~name/` prefix meant guessing how the server
+    # resolves it, and every round found the next spelling the guess missed.
+    lrel="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{path:(([range(2100)|"./"]|join("")) + "../../.ssh/id_rsa")}}')"
+    h "round 18: an over-long relative climb is refused" deny "$lrel" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 18: a ~name/.. string is refused" deny \
+      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"~sync/../home/x/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 18: a .. segment inside the workspace is refused too -- the form, not the target" deny \
+      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"src/../README.md"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 18: prose that merely mentions ../ is not a path segment, and is allowed" allow \
+      '{"tool_name":"mcp__jkb__task_create","cwd":"'"$bh"'/repos/w","tool_input":{"title":"t","description":"see ../docs and crates/a.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     longp="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + ([range(2100)|"/."]|join("")) + "/.ssh/id_rsa")}}')"
     h "round 17: an over-long padded path still meets the boundary" deny "$longp" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     mkdir -p "$bh/repos/w/.claude"
@@ -642,10 +653,16 @@ if [ "${1:-}" = --self-test ]; then
     mkdir -p "$bh/managed"
     printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/managed/managed-settings.json"
     printf '%s\n' '{"sandbox":{"enabled":false}}' > "$bh/repos/w/.claude/settings.local.json"
-    h "round 17: managed enabling beats a local disable" deny \
-      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_MANAGED_DIR="$bh/managed"
+    # RUN FROM A COPY: the installed hook ignores the managed-directory override by design, and
+    # verify.sh runs THIS self-test from the installed path, where these rows failed on every start
+    # and hid every probe after them (review round 18). A copy elsewhere honours it.
     sbq_self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
-    sbq="$(cd "$bh/repos/w" && env HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_MANAGED_DIR="$bh/managed" "$BASH" "$sbq_self" --sandbox-enabled 2>/dev/null)"
+    dtc="$bh/dt-copy.sh"; cp "$sbq_self" "$dtc"
+    out="$(printf '%s' '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' \
+           | env -u CLAUDE_CONFIG_DIR HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_MANAGED_DIR="$bh/managed" "$BASH" "$dtc" 2>/dev/null)"
+    case "$out" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 17: managed enabling beats a local disable\n' ;;
+        *) printf '  \033[31mFAIL\033[0m round 17: managed enabling beats a local disable\n'; fails=$((fails+1)) ;; esac
+    sbq="$(cd "$bh/repos/w" && env -u CLAUDE_CONFIG_DIR HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_MANAGED_DIR="$bh/managed" "$BASH" "$dtc" --sandbox-enabled 2>/dev/null)"
     if [ "$sbq" = 1 ]; then printf '  \033[32mok\033[0m   round 17: --sandbox-enabled prints the merged answer (1)\n'
     else printf '  \033[31mFAIL\033[0m round 17: --sandbox-enabled printed [%s]\n' "$sbq"; fails=$((fails+1)); fi
     rm -f "$bh/repos/w/.claude/settings.local.json"; rm -rf "$bh/managed"
@@ -1303,6 +1320,18 @@ case "$tool" in
         done
         [ "$nchk" -le 32 ] || exit 3
         for leaf in ${leaves[@]+"${leaves[@]}"}; do
+            # AMBIGUOUS FORMS ARE REFUSED, NOT RESOLVED (the user's choice after review round 18). A
+            # `..` segment or a `~name/` prefix asks this hook to guess how an unknown server will
+            # resolve a path -- normalising first or not, expanding ~name or not -- and rounds 16 to
+            # 18 each found a spelling the guess missed: a climb padded past PATH_MAX, `~sync/../`.
+            # Refusing the form ends that. Prose that merely mentions `../` is not a segment and
+            # passes; a tool that genuinely needs `../x` is told why.
+            case "/$leaf/" in
+                */../*) deny "An MCP or unknown tool was handed a path with a '..' segment. The file-tool boundary refuses that form rather than guess how the server resolves it; pass the path without '..' (an absolute path, or one relative to the workspace)." ;;
+            esac
+            case "$leaf" in
+                "~"[!/]*/*) deny "An MCP or unknown tool was handed a '~name/' path. The file-tool boundary refuses that form rather than guess whether the server expands it; pass an absolute path instead." ;;
+            esac
             # A SLASHLESS ~word in free text is a home only if that account exists. `~retry` is jkb's
             # own one-word vector search and `~2h` an estimate; reading them as home directories
             # refused ordinary calls (round 7). Otherwise it is judged as what a server that does

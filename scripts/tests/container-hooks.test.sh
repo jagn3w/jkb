@@ -705,10 +705,17 @@ case30_the_kit_says_which_paths_the_checkout_has_changed() {
     echo '# agent edit' >> "$co/scripts/auto-mode.sh"
     after="$(dc_kit_stale "$kit" "$co")"
     local files; files="$(dc_kit_changes "$kit" "$co")"
-    if [ -z "$before" ] && [ "$after" = scripts/auto-mode.sh ] && [ "$files" = scripts/auto-mode.sh ]; then
+    # ...and a new subdirectory is listed FILE BY FILE, a file that became a directory is seen, and a
+    # path missing from the old kit is listed (review round 18).
+    mkdir -p "$co/.container/sub"; : >"$co/.container/sub/a"; : >"$co/.container/sub/b"
+    rm "$co/.container/run.sh"; mkdir "$co/.container/run.sh"; : >"$co/.container/run.sh/x"
+    rm -f "$kit/scripts/lib.sh"
+    local more; more="$(dc_kit_changes "$kit" "$co" | sort | tr '\n' ';')"
+    if [ -z "$before" ] && [ "$after" = scripts/auto-mode.sh ] && [ "$files" = scripts/auto-mode.sh ] \
+       && [ "$more" = ".container/run.sh (removed);.container/run.sh/x (new);.container/sub/a (new);.container/sub/b (new);scripts/auto-mode.sh;scripts/lib.sh (new);" ]; then
         ok "the kit names exactly the paths the checkout has changed since it was installed"
     else
-        fail "the kit names exactly the paths the checkout has changed since it was installed" "before=[$before] after=[$after]"
+        fail "the kit names exactly the paths the checkout has changed since it was installed" "before=[$before] after=[$after] files=[$files] more=[$more]"
     fi
 }
 
@@ -803,6 +810,22 @@ case35_a_hard_link_in_the_checkout_is_refused() {
     fi
 }
 
+# ONE derivation of the checkout a kit script serves, for setup.sh, verify.sh and
+# install-extensions.sh (review round 18): JKB_REPO_ROOT, else the checkout you stand in when running
+# from the mirror, else the script's own checkout.
+case36_the_checkout_a_kit_script_serves() {
+    local d="$work/rr-$RANDOM" a b c
+    mkdir -p "$d/mirror" "$d/co"; git -C "$d/co" init -q 2>/dev/null; mkdir -p "$d/co/sub"
+    a="$(JKB_REPO_ROOT=/x/y dc_repo_root "$d/mirror")"
+    b="$(cd "$d/co/sub" && DC_CTR_KIT="$(cd "$d/mirror" && pwd -P)" dc_repo_root "$d/mirror")"
+    c="$(dc_repo_root "$d/co")"
+    if [ "$a" = /x/y ] && [ "$b" = "$(cd "$d/co" && pwd -P)" ] && [ "$c" = "$d/co" ]; then
+        ok "dc_repo_root: JKB_REPO_ROOT first, the checkout you stand in from the mirror, else the script's own"
+    else
+        fail "dc_repo_root: JKB_REPO_ROOT first, the checkout you stand in from the mirror, else the script's own" "a=$a b=$b c=$c"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -837,5 +860,6 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case32_the_mirror_stages_nothing_in_tmpdir \
           case33_an_older_flat_kit_is_removed \
           case34_a_link_that_appears_during_the_copy_is_refused \
-          case35_a_hard_link_in_the_checkout_is_refused
+          case35_a_hard_link_in_the_checkout_is_refused \
+          case36_the_checkout_a_kit_script_serves
 finish

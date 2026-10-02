@@ -269,12 +269,17 @@ case15_a_kit_whose_checkout_is_gone_still_stops() {
 # NO PROGRAM FROM A PLACE AN AGENT CAN WRITE: a jq planted first on PATH, in ~/.cargo/bin, does not
 # run when run.sh does (review round 11 -- the host posture lets a sandboxed agent write ~/.cargo).
 case16_a_program_planted_on_path_under_home_does_not_run() {
-    local h="$work/plant-$RANDOM"; mkdir -p "$h/.cargo/bin"
+    # OUTSIDE THE TEMP ROOTS: under /tmp the filter's /tmp arm drops the entry, so the case could not
+    # fail with the "$HOME" arm removed (review round 18). The real ~/.cache is writable here and on CI.
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h; h="$(mktemp -d "$HOME/.cache/jkb-plant.XXXXXX")" || { fail "case16" "no scratch home under ~/.cache"; return; }
+    mkdir -p "$h/.cargo/bin"
     printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$h" > "$h/.cargo/bin/jq"; chmod +x "$h/.cargo/bin/jq"
     env HOME="$h" PATH="$h/.cargo/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
     local rc=$?
     if [ ! -e "$h/RAN" ] && [ "$rc" -eq 0 ]; then ok "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one"
     else fail "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one" "rc=$rc ran=$([ -e "$h/RAN" ] && echo yes || echo no)"; fi
+    case "$h" in */jkb-plant.*) rm -rf -- "$h" ;; esac
 }
 
 # A TOOL THE FILTER HID IS NAMED, with where it was and the way to keep it: a per-user Docker in
@@ -282,13 +287,15 @@ case16_a_program_planted_on_path_under_home_does_not_run() {
 # outside the home would be found anyway.
 case17_a_tool_the_path_filter_hid_is_named() {
     if type -P docker >/dev/null 2>&1; then skip "case17: a docker outside the home is on PATH here, so the filter hides nothing"; return 0; fi
-    local h="$work/hid-$RANDOM" out
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h out; h="$(mktemp -d "$HOME/.cache/jkb-hid.XXXXXX")" || { fail "case17" "no scratch home under ~/.cache"; return; }
     mkdir -p "$h/.docker/bin"; printf '#!/bin/sh\nexit 0\n' > "$h/.docker/bin/docker"; chmod +x "$h/.docker/bin/docker"
     ln -s "$(dirname "$repo_root")" "$h/repos"
     out="$(env HOME="$h" PATH="$h/.docker/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" 2>&1)"
     if grep -qF "docker is in $h/.docker/bin" <<<"$out" && grep -qF "JKB_RUN_PATH_KEEP=$h/.docker/bin" <<<"$out"; then
         ok "a docker the PATH filter hid is named with its directory and how to keep it"
     else fail "a docker the PATH filter hid is named with its directory and how to keep it" "out: $(tail -3 <<<"$out")"; fi
+    case "$h" in */jkb-hid.*) rm -rf -- "$h" ;; esac
 }
 
 # A MARKER PLANTED IN A CHECKOUT does not make its run.sh the kit, so --install-kit copies the

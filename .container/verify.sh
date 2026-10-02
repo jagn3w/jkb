@@ -1386,9 +1386,9 @@ DC="$here_dc/container.json"
 # checkout, the one it is in. Every assertion below that used to name /home/vscode/repos/jkb reads
 # this instead. `kit_dc` is where the scripts this RUNS come from: the kit, never the checkout.
 kit_dc="$(cd "$here_dc/.." && pwd)"
-mem_repo="${JKB_REPO_ROOT:-$kit_dc}"
 # shellcheck source=/dev/null
 . "$here_dc/lib.sh"
+mem_repo="$(dc_repo_root "$kit_dc")"
 
 # THE KIT MIRROR IS ROOT'S, and this script runs from it. Everything run.sh starts in here runs
 # unsandboxed and comes from $DC_CTR_KIT; a mirror the container user could write would put the
@@ -1874,7 +1874,18 @@ else
     # home itself -- is refused, and one inside the workspace is not.
     # ASKED OF THE HOOK, which merges the layers in Claude Code's precedence: reading the user layer
     # here was a second copy of that rule, wrong whenever managed or local set `enabled` (round 17).
-    if [ "$(cd "$mem_repo" 2>/dev/null && CLAUDE_PROJECT_DIR="$mem_repo" "$mem_hook" --sandbox-enabled 2>/dev/null)" = 1 ]; then
+    # ...BUT THE HOOK DOES NOT GET TO DECIDE WHETHER IT IS TESTED: an answer other than 0 or 1 (an
+    # image whose hook predates the query prints nothing) is a finding, and so is a 0 while this
+    # container's user settings enable the sandbox, the regression that would skip exactly the
+    # probe below (review round 18).
+    mem_sb="$(cd "$mem_repo" 2>/dev/null && CLAUDE_PROJECT_DIR="$mem_repo" "$mem_hook" --sandbox-enabled 2>/dev/null)"
+    case "$mem_sb" in
+        0) [ "$(HOME=/dev/null jq -r '.sandbox.enabled // false' "$HOME/.claude/settings.json" 2>/dev/null)" = true ] \
+               && mem_hook_wrong="$mem_hook_wrong it says the sandbox is disabled while this container's user settings enable it, so the file tools are not held to its boundary;" ;;
+        1) ;;
+        *) mem_hook_wrong="$mem_hook_wrong it did not answer --sandbox-enabled with 0 or 1 ([$mem_sb]) -- an image older than the boundary; rebuild it;" ;;
+    esac
+    if [ "$mem_sb" = 1 ]; then
         mem_probe_write() { # mem_probe_write <path> -> deny|allow|broken
             local out rc=0
             out="$(printf '{"tool_name":"Write","cwd":"%s","tool_input":{"file_path":"%s","content":""}}' "$mem_repo" "$1" \

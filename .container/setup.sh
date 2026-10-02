@@ -9,7 +9,9 @@ set -euo pipefail
 # (cargo install), which is the one way checkout code runs here -- first run only, and recorded as a
 # residual in .container/README.md. Run by hand from a checkout, both are that checkout.
 kit="$(cd "$(dirname "$0")/.." && pwd)"
-repo="${JKB_REPO_ROOT:-$kit}"
+# shellcheck source=/dev/null
+. "$kit/.container/lib.sh"
+repo="$(dc_repo_root "$kit")"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 # FIRST, before anything else runs or reaches the network — otherwise the whole of this script,

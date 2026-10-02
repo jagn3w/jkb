@@ -215,8 +215,9 @@ fi
 # what starts the container. Wrapped like the steps around it: a failure here must not end the run.
 # ONE KIT, FROM THE MAIN CHECKOUT. A linked worktree is a task branch: post-merge fires there on a
 # `git merge main`, and refreshing from it pointed the shared kit at an unlanded branch, then at a
-# directory `jkb task land` deleted (review round 10). The main checkout is the parent of the
-# common git dir, which git_hooks_dir already resolves.
+# directory `jkb task land` deleted (review round 10). Whether this is a linked worktree is
+# is_linked_worktree's answer (--git-dir against --git-common-dir); main_checkout_of only names the
+# main checkout in the message.
 kit_main="$(main_checkout_of "$repo_root" 2>/dev/null)" || kit_main=""
 if [ "$do_kit" -eq 1 ] && is_linked_worktree "$repo_root"; then
   kit_state=worktree

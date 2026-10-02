@@ -154,6 +154,10 @@ main_checkout_of() {
         # Not a linked worktree: it IS the main checkout. Its toplevel, not `worktree list`, which
         # names the git dir itself for a --separate-git-dir checkout (measured on git 2.51.1).
         1) m="$(_git -C "$1" rev-parse --show-toplevel 2>/dev/null)" ;;
+        # A linked worktree: git's own answer, the first `worktree list` entry. For a worktree of a
+        # --separate-git-dir checkout that answer is the git dir, and there is no better one: git
+        # records no path for that main checkout, neither in the list nor as core.worktree
+        # (measured on git 2.51.1, review round 18). setup.sh only names it in a message.
         0) m="$(_git -C "$1" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" ;;
         *) return 1 ;;
     esac

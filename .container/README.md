@@ -1478,6 +1478,13 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
 - **Denies still win.** A permissions `Read(...)` deny or a `sandbox.credentials.files` deny is
   checked before the allow lists. Round 16 found an MCP server reading `~/.cargo/credentials.toml`
   because `~/.cargo` is in `allowWrite`.
+- **Ambiguous path forms are refused, not resolved** (the user's choice after review round 18). In an
+  MCP or unknown tool call, a path-shaped string with a `..` segment or a `~name/` prefix is refused
+  outright. Resolving those meant guessing how an unknown server treats them: whether it normalises
+  before opening, whether it expands `~name`. Rounds 16 to 18 each found a spelling the guess missed,
+  such as a climb padded past `PATH_MAX`, or `~sync/../`. Prose that merely mentions `../` is not a
+  path segment and passes. A long string with no `..` resolves only inside the cwd or project, so
+  there is no length rule.
 - **Only the home-base guess is spared.** An unknown tool's relative free text is read from each base
   it might be resolved against: the session cwd, the project dir and the home. The cwd and project
   readings are judged in full, because that is where a server resolves a relative path. jkb's

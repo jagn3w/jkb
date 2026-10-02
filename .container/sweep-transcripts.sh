@@ -95,7 +95,7 @@ MANAGED_SETTINGS="${JKB_MANAGED_SETTINGS:-/etc/claude-code/managed-settings.json
 # HAND-WRITTEN, AND CHECKED AGAINST REALITY BY check-config.sh, which derives the same set from
 # every `${JKB_…:-}` this file actually reads and requires the two to agree. A declaration nothing
 # compares to the code is a fourth seam waiting to be refused by nothing.
-SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_NOW_SECS JKB_MANAGED_SETTINGS"
+SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_NOW_SECS JKB_MANAGED_SETTINGS JKB_PROBE_BUDGET"
 # ...AND EVERY JKB_ INPUT, which is a longer list than the seams. JKB_KEEP_SESSIONS is NOT a
 # seam: it is the sweep's live production input, the sessions a caller knows to be running, and
 # both triggers pass it. Refusing it in shipped files -- the blanket rule the seams above earn --
@@ -703,7 +703,7 @@ posture_layer_files() { # posture_layer_files <managed-settings.json> -> one pat
 # have stood the sweep down while the argv grew; asking only "does anything expand" would instead
 # be fooled by the seven `Edit(~/repos/**/...)` rules, which expand but name no transcript.
 posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
-    local f rules rule pat base root layers kind proot home="${HOME:-/home/vscode}" proots e pe_seen="
+    local f rules rule pat base root layers kind proot home="${HOME:-/home/vscode}" proots e p_last p_comp pe_seen="
 " pe_work=0
     [ -r "$1" ] || return 0
     # The transcript tree as the sweep itself finds it -- CLAUDE_CONFIG_DIR honoured exactly as
@@ -811,9 +811,17 @@ $pat
             # names no transcript: what it enumerates is files of that name. It was probed against
             # every transcript anyway, and five ordinary secret rules spent the whole budget (review
             # round 17). Wildcards, `*.jsonl` and the tree's own directory names are still probed.
-            case "${pat##*/}" in
-                *[\*\?\[\{]*|*.jsonl|memory|subagents|workflows|tool-results) ;;
-                *) continue ;;
+            # A plain name that CAN be a directory of the tree is still probed: a component of a root's
+            # own path (`projects`, `.claude`), a slug (`-...`), a session id, a workflow
+            # (`wf_...`), or one of the tree's fixed names. Whether the sandbox enumerates a matched
+            # directory per file is unmeasured, so those are judged by the probes, not skipped
+            # (review round 18: `~/**/.claude/projects` was skipped while its `/**` twin was not).
+            p_last="${pat##*/}"
+            case "$p_last" in
+                *[\*\?\[\{]*|*.jsonl|memory|subagents|workflows|tool-results|-*|wf_*|[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*) ;;
+                *) p_comp=0
+                   for root in "${proots[@]}"; do case "/$root/" in */"$p_last"/*) p_comp=1 ;; esac; done
+                   [ "$p_comp" -eq 1 ] || continue ;;
             esac
             base="$(posture_rule_base "$pat")"
             for root in "${proots[@]}"; do
@@ -832,7 +840,7 @@ $pat
                         # Charged only for a probe IN this root: the other spelling's were counted too,
                         # about four per transcript per rule (review round 17).
                         case "$probe" in
-                            "$root"/*) pe_work=$((pe_work + 1)); [ "$pe_work" -le 300000 ] || return 0
+                            "$root"/*) pe_work=$((pe_work + 1)); [ "$pe_work" -le "${JKB_PROBE_BUDGET:-300000}" ] || return 0
                                        posture_rule_covers "$pat" "$probe" && return 0 ;;
                         esac
                     done
@@ -1821,6 +1829,16 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     for i in $(seq 1 3000); do : >"$sh4/.claude-state/projects/-h-r/s$i.jsonl"; done
     printf '%s\n' '{"permissions":{"deny":["Read(~/**/.env)","Read(~/**/.env.*)","Read(~/**/*.pem)","Read(~/**/*.key)","Read(~/**/id_rsa)"]}}' >"$pdir/secrets5.json"
     eq "five ordinary secret rules over 3000 transcripts leave the sweep standing down" "$(pe "$pdir/secrets5.json" "$sh4")" no
+    # Round 18: each round-17 change pinned by a row that FAILS without it, through a small probe
+    # budget (the seam exists for exactly this).
+    printf '%s\n' '{"permissions":{"deny":["Read(~/**/.env)","Read(~/**/id_rsa)"]}}' >"$pdir/plain2.json"
+    eq "plain-name rules are skipped, not probed (budget 1000 over 3000 transcripts)" \
+       "$(JKB_PROBE_BUDGET=1000 pe "$pdir/plain2.json" "$sh4")" no
+    printf '%s\n' '{"permissions":{"deny":["Read(~/**/*.pem)"]}}' >"$pdir/pem1.json"
+    eq "a probe is charged only in its own root (budget 8000: ~6000 in-root, ~12000 counted twice)" \
+       "$(JKB_PROBE_BUDGET=8000 pe "$pdir/pem1.json" "$sh4")" no
+    printf '%s\n' '{"permissions":{"deny":["Read(~/**/.claude/projects)"]}}' >"$pdir/projdir.json"
+    eq "a plain last segment that is a directory of the tree is still probed" "$(pe "$pdir/projdir.json" "$sh4")" yes
     eq "a nested group expands too" \
        "$(posture_rule_covers '/h/{x,{.aws,.ssh}}/**' /h/.ssh/id && echo covered || echo clear)" covered
     bt0=$(date +%s%N)

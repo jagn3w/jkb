@@ -25,14 +25,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 # shellcheck source=/dev/null
 . "$here/lib.sh"
-# The checkout whose extension is built. setup.sh names it in JKB_REPO_ROOT. Run by hand from the kit
-# mirror -- which is how verify.sh says to run it, because the mirror is what nothing in here can
-# write -- it is the checkout you are standing in; run from a checkout, that checkout. Defaulting to
-# the mirror's parent built nothing at all and said so nowhere (review round 11).
-if [ -n "${JKB_REPO_ROOT:-}" ]; then repo="$JKB_REPO_ROOT"
-elif [ "$(cd "$here/.." && pwd)" = "$DC_CTR_KIT" ]; then
-    repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-else repo="$(cd "$here/.." && pwd)"; fi
+# The checkout whose extension is built: lib.sh's dc_repo_root, shared with setup.sh and verify.sh.
+repo="$(dc_repo_root "$(cd "$here/.." && pwd)")"
 
 say "vs code extensions"
 code_server="$(ls -d "$HOME"/.vscode-server/bin/*/bin/code-server 2>/dev/null | head -1 || true)"
