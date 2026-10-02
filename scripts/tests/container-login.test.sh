@@ -291,6 +291,26 @@ case17_a_tool_the_path_filter_hid_is_named() {
     else fail "a docker the PATH filter hid is named with its directory and how to keep it" "out: $(tail -3 <<<"$out")"; fi
 }
 
+# A MARKER PLANTED IN A CHECKOUT does not make its run.sh the kit, so --install-kit copies the
+# checkout itself, never the directory the marker names (review round 16).
+case18_a_planted_kit_marker_is_ignored() {
+    local d="$work/mk-$RANDOM" co evil p kit
+    mkdir -p "$d/home"
+    for co in "$d/co" "$d/evil"; do
+        mkdir -p "$co/scripts"; cp -R "$repo_root/.container" "$co/.container"
+        for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    done
+    co="$d/co"; evil="$d/evil"; echo '# EVIL' >> "$evil/.container/run.sh"
+    printf 'checkout=%s\n' "$evil" > "$co/.jkb-container-kit"
+    env HOME="$d/home" bash "$co/.container/run.sh" --install-kit >/dev/null 2>&1
+    kit="$d/home/.local/share/jkb-container-kit/kit"
+    if [ "$(sed -n 's/^checkout=//p' "$kit/.jkb-container-kit" 2>/dev/null)" = "$(cd "$co" && pwd -P)" ] && ! grep -q '# EVIL' "$kit/.container/run.sh"; then
+        ok "a kit marker planted in a checkout is ignored: --install-kit copies the checkout itself"
+    else
+        fail "a kit marker planted in a checkout is ignored: --install-kit copies the checkout itself" "marker: $(cat "$kit/.jkb-container-kit" 2>&1)"
+    fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -299,5 +319,5 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case11_run_sh_carries_the_login_before_stop_and_rm case12_run_sh_starts_a_stopped_container_to_carry_it \
           case13_the_checkouts_run_sh_refuses_without_the_override case14_the_kits_run_sh_stops_and_sources_the_mirror \
           case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run \
-          case17_a_tool_the_path_filter_hid_is_named
+          case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored
 finish

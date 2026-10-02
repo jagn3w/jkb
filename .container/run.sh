@@ -612,7 +612,12 @@ fi
 # --dry-run, --consumed-keys) and --install-kit; JKB_RUN_FROM_CHECKOUT=1 is the developer's
 # override, for iterating on this directory, and it says so.
 KIT_ROOT=""
-if [ -f "$here/../$DC_KIT_MARKER" ]; then
+# THE KIT IS WHERE THE KIT LIVES, not wherever a marker file sits: an agent can write a
+# .jkb-container-kit into a checkout naming any directory as its source, and the checkout's
+# --install-kit then copied the kit from there (review round 16, reproduced). So this is the kit only
+# when its directory is, physically, DC_KIT_DIR; a checkout's --install-kit always copies itself.
+if [ -f "$here/../$DC_KIT_MARKER" ] \
+   && [ "$(cd "$here/.." && pwd -P)" = "$(cd "$DC_KIT_DIR" 2>/dev/null && pwd -P)" ]; then
     KIT_ROOT="$(cd "$here/.." && pwd)"
     # A RECORDED CHECKOUT THAT IS GONE stops a start and an install, never a stop or a remove: dying
     # here, before the arguments were read, left a kit whose checkout had been deleted unable to

@@ -321,7 +321,15 @@ verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
             rel="${p#"$root"}"; rel="${rel#/}"
             case "$rel" in
                 */*) rest="${rel#*/}"
-                     case "$rest" in memory|memory/*) printf 'allow\n'; return ;; esac ;;
+                     case "$rest" in memory|memory/*) printf 'allow\n'; return ;; esac
+                     # ...and Claude Code's own saved TOOL OUTPUT: what it could not show inline it
+                     # writes to `<slug>/<session>/tool-results/` and tells the agent to Read. EXACTLY
+                     # that depth, by string surgery as above; a transcript beside it stays denied
+                     # (review round 16: this branch had made large outputs unreadable).
+                     case "$rest" in
+                         */*) local after="${rest#*/}"
+                              case "$after" in tool-results|tool-results/*) printf 'allow\n'; return ;; esac ;;
+                     esac ;;
             esac
             printf 'deny\n'; return
         fi
@@ -590,6 +598,31 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$sh"'/tmpdir/x","content":""}}' HOME="$bh" TMPDIR="$sh/tmpdir"
     h "boundary: a plan file under ~/.claude/plans is writable" allow \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/plans/p.md","content":""}}' HOME="$bh"
+    # REVIEW ROUND 16. Claude Code's own saved tool output is readable; relative free text in an MCP
+    # call is not judged as a path under the home; a Read() deny or a credential inside an allowed
+    # tree is still denied; the settings layers the boundary reads are not writable through it.
+    mkdir -p "$bh/.claude/projects/-w/sess1/tool-results" "$bh/.claude/projects/-w/sess1/subagents" "$bh/notes" "$bh/.cargo"
+    : >"$bh/.claude/projects/-w/sess1/tool-results/out.txt"; : >"$bh/.cargo/credentials.toml"
+    h "round 16: a saved tool result is readable" allow \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/projects/-w/sess1/tool-results/out.txt"}}' HOME="$bh"
+    h "round 16: ...while a subagent transcript beside it is not" deny \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/projects/-w/sess1/subagents/a.jsonl"}}' HOME="$bh"
+    h "round 16: an MCP namespace path is not read as a home path" allow \
+      '{"tool_name":"mcp__jkb__task_create","cwd":"'"$bh"'/repos/w","tool_input":{"title":"t","place":"tasks/inbox"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 16: ...nor a URL" allow \
+      '{"tool_name":"mcp__jkb__ingest_url","cwd":"'"$bh"'/repos/w","tool_input":{"url":"https://example.com/x"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 16: ...nor a word naming a directory in the home" allow \
+      '{"tool_name":"mcp__jkb__search","cwd":"'"$bh"'/repos/w","tool_input":{"query":"notes"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.cargo/credentials.toml)"]},"sandbox":{"enabled":true,"filesystem":{"denyRead":["~"],"allowWrite":["~/repos","~/.jkb","~/.cargo"]}}}' > "$bh/.claude/settings.json"
+    h "round 16: a Read() deny inside an allowWrite tree still refuses an MCP read" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'/.cargo/credentials.toml"}}' HOME="$bh"
+    mkdir -p "$bh/repos/w/.claude"
+    h "round 16: the project's own settings layer is not writable through the boundary" deny \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/.claude/settings.local.json","content":"{}"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    printf '%s\n' '{"sandbox":{"enabled":false}}' > "$bh/repos/w/.claude/settings.local.json"
+    h "round 16: a later layer that disables wins over the user's enable, as in Claude Code" allow \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    rm -f "$bh/repos/w/.claude/settings.local.json"
     printf '%s\n' '{"sandbox":{"enabled":false,"filesystem":{"denyRead":["~"],"allowWrite":["~/repos"]}}}' > "$bh/.claude/settings.json"
     h "boundary: with the sandbox disabled there is no boundary to mirror" allow \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh"
@@ -912,10 +945,13 @@ eval "$assign"
 # Mirrored only when the merged settings ENABLE the sandbox; with no sandbox there is no boundary to
 # mirror, and the transcript rule above still applies. An agent cannot turn it off: every layer read
 # here is write-denied to the sandbox and Edit-denied to the tools.
-sb_on=0; sb_w=(); sb_r=(); sb_dr=()
-sb_layers=(/etc/claude-code/managed-settings.json /etc/claude-code/managed-settings.d/*.json
-           "${CLAUDE_CONFIG_DIR:-$home/.claude}/settings.json")
+sb_on=0; sb_w=(); sb_r=(); sb_dr=(); sb_md=()
+# IN PRECEDENCE ORDER, lowest first, because `enabled` takes the last layer's word: user, project,
+# local, then managed and its drop-ins, which win in Claude Code. Managed came first, so a lower
+# layer's `enabled:false` would have outranked it (review round 16).
+sb_layers=("${CLAUDE_CONFIG_DIR:-$home/.claude}/settings.json")
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] && sb_layers+=("$CLAUDE_PROJECT_DIR/.claude/settings.json" "$CLAUDE_PROJECT_DIR/.claude/settings.local.json")
+sb_layers+=(/etc/claude-code/managed-settings.json /etc/claude-code/managed-settings.d/*.json)
 sb_args=(); sb_names=()
 sb_i=0
 for f in "${sb_layers[@]}"; do
@@ -933,13 +969,24 @@ if [ "$sb_i" -gt 0 ]; then
         def str: if type == "string" then . else empty end;
         [ ('"$sb_names_csv"') | p | .sandbox // {} ] as $l
         | ([ $l[] | .enabled | select(. != null) ] | last // false) as $on
-        | @sh "sb_on=\(if $on == true then 1 else 0 end)
+        | def dpath: if type == "string" then (capture("^Read\\((?<p>.*)\\)$").p // empty) else empty end;
+          @sh "sb_on=\(if $on == true then 1 else 0 end)
+               sb_md=(\([ ( [ '"$sb_names_csv"' ] | .[] | p | .permissions.deny[]? | dpath ),
+                           ( $l[] | .credentials.files[]? | select(.mode == "deny") | .path | str ) ] | unique))
                sb_w=(\([ $l[] | .filesystem.allowWrite[]? | str ] | unique))
                sb_r=(\([ $l[] | .filesystem.allowRead[]? | str ] | unique))
                sb_dr=(\([ $l[] | .filesystem.denyRead[]? | str ] | unique))"' 2>/dev/null)" || exit 3
     eval "$sb_sh"
 fi
 if [ "$sb_on" = 1 ]; then
+    # MUST-DENY entries (permissions.deny `Read(...)`, sandbox.credentials.files with mode deny) are
+    # patterns: `//abs`, `~/x`, globs. Normalised to absolute here and matched as case patterns, so
+    # `*` crosses `/`, the direction that errs towards refusing. A relative one is skipped: it is
+    # Claude Code's to resolve against a settings file, and the native tools still enforce it.
+    sb_md_abs=()
+    for e in ${sb_md[@]+"${sb_md[@]}"}; do
+        case "$e" in "//"*) sb_md_abs+=("/${e#//}") ;; "~") sb_md_abs+=("$home") ;; "~/"*) sb_md_abs+=("$home/${e#\~/}") ;; /*) sb_md_abs+=("$e") ;; esac
+    done
     # `~` is the home; a relative entry (".") is the project's, as Claude Code reads it. Then every
     # entry resolved the way the path it is compared with is: physically.
     sb_abs() { case "$1" in "~") printf '%s\n' "$home" ;; "~/"*) printf '%s\n' "$home/${1#\~/}" ;; /*) printf '%s\n' "$1" ;;
@@ -956,6 +1003,7 @@ if [ "$sb_on" = 1 ]; then
         mapfile -t arr <<<"$res"
     }
     sb_resolve sb_w; sb_resolve sb_r; sb_resolve sb_dr
+    sb_layers_phys=(); for e in "${sb_layers[@]}"; do sb_layers_phys+=("$(realpath -m -- "$e" 2>/dev/null)"); done
 fi
 sb_under() { # sb_under <path> <entry>... -> rc 0 when <path> is an entry or lies inside one
     local p="$1" e; shift
@@ -969,15 +1017,40 @@ sb_under() { # sb_under <path> <entry>... -> rc 0 when <path> is an entry or lie
 # boundary <physical path> -- deny a path the sandbox would not let Bash reach in this tool's mode.
 boundary() {
     [ "$sb_on" = 1 ] || return 0
+    # A GUESSED RELATIVE READING of free text is not a path anyone named: judged against the home it
+    # turned a namespace (`tasks/inbox`), a URL or a word into a home path and refused ordinary MCP
+    # calls (review round 16). The generic arm marks those calls; path fields, absolute strings and
+    # `~/` strings are judged.
+    [ "${sb_guess:-0}" = 1 ] && return 0
     # AUTO-MEMORY IS THE ONE DELIBERATE DIFFERENCE from what Bash may reach: `<root>/<slug>/memory/`
     # is Claude Code's own memory, which its tools must read and write, linked into ~/.jkb or not.
     # Sandboxed Bash cannot see the tree at all. The transcript rule above draws the same line.
-    local r rest
+    local r rest e
+    # MUST-DENY FIRST: a Read() deny or a credential file inside an allowed tree (~/.cargo holds
+    # credentials.toml) was reachable through an MCP tool, because an allow match won before any deny
+    # was looked at (review round 16). The native tools enforce these themselves; MCP servers do not.
+    for e in ${sb_md_abs[@]+"${sb_md_abs[@]}"}; do
+        # shellcheck disable=SC2254
+        case "$1" in $e|$e/*) deny "$1 is denied by the Claude settings (a Read() permission deny or a credential file), and the file tools and MCP servers are held to it as the native Read is." ;; esac
+    done
+    # THE SETTINGS LAYERS THIS READS are never writable through it: for a project outside ~/repos
+    # the cwd is writable, and a Write of its .claude/settings.local.json could have switched the
+    # boundary off (review round 16).
+    if [ "$sb_mode" = write ]; then
+        for e in ${sb_layers_phys[@]+"${sb_layers_phys[@]}"}; do
+            [ "$1" = "$e" ] && deny "$1 is a Claude settings file this boundary reads; it is not writable by the tools it confines."
+        done
+    fi
     while IFS= read -r r; do
         [ -n "$r" ] || continue
         rest="${1#"$r"/}"; [ "$rest" != "$1" ] || continue
         rest="${rest#*/}"
         [ "$rest" = memory ] || [ "${rest#memory/}" != "$rest" ] && return 0
+        # Saved tool output, which Claude Code asks the agent to Read, is a read-only exception.
+        if [ "$sb_mode" = read ]; then
+            rest="${rest#*/}"
+            [ "$rest" = tool-results ] || [ "${rest#tool-results/}" != "$rest" ] && return 0
+        fi
     done <<<"$roots"
     if [ "$sb_mode" = write ]; then
         sb_under "$1" ${sb_w[@]+"${sb_w[@]}"} && return 0
@@ -1218,9 +1291,10 @@ case "$tool" in
             fi
             case "$leaf" in
                 /*|"~/"*|"~") check "$leaf" ;;
-                # Both readings of `~name...` (check does the second), from every base.
-                "~"*) for b in "${bases[@]}"; do [ -n "$b" ] && check "$leaf" "$b"; done ;;
-                *) for b in "${bases[@]}"; do [ -n "$b" ] && check "$leaf" "$b"; done ;;
+                # Both readings of `~name...` (check does the second), from every base. The relative
+                # ones are guesses, held to the transcript rule but not to the boundary.
+                "~"*) for b in "${bases[@]}"; do [ -n "$b" ] && sb_guess=1 check "$leaf" "$b"; done ;;
+                *) for b in "${bases[@]}"; do [ -n "$b" ] && sb_guess=1 check "$leaf" "$b"; done ;;
             esac
         done ;;
 esac

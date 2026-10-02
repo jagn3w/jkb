@@ -1469,13 +1469,27 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
   `~/.claude/plans`, where plan mode writes.
 - **Anything else** (Read, Grep, Glob, MCP servers, unknown tools) is judged as a read. It must not
   land under `denyRead` unless `allowRead` or `allowWrite` covers it.
-- **Auto-memory is the one deliberate difference.** `<root>/<slug>/memory/` is readable and writable,
-  linked into `~/.jkb` or not. It is Claude Code's own memory, while sandboxed Bash cannot see the
-  tree at all.
+- **Two deliberate differences from what Bash may reach, both Claude Code's own.** Auto-memory,
+  `<root>/<slug>/memory/`, is readable and writable, linked into `~/.jkb` or not. Saved tool output,
+  `<root>/<slug>/<session>/tool-results/`, is readable: Claude Code writes output too large to show
+  inline there and tells the agent to Read it. That exception arrived in review round 16, after this
+  branch had made such output unreadable. The transcript rule draws the same two lines.
+- **Denies still win.** A permissions `Read(...)` deny or a `sandbox.credentials.files` deny is
+  checked before the allow lists. Round 16 found an MCP server reading `~/.cargo/credentials.toml`
+  because `~/.cargo` is in `allowWrite`.
+- **Only paths someone named are judged.** An unknown tool's free text yields guesses: a relative
+  string read from each base it might be resolved against. Those guesses are held to the transcript
+  rule but not to the boundary. Judged against the home, `tasks/inbox`, a URL or a plain word
+  became a home path, and ordinary MCP calls were refused (review round 16). Path fields, absolute
+  strings and `~/` strings are judged.
 - **No sandbox, no boundary.** With the sandbox disabled there is nothing to mirror, and the
-  transcript rule still applies. An agent cannot turn it off: every layer read is write-denied to the
-  sandbox and `Edit`-denied to the tools. A layer that is not valid JSON contributes nothing, as
-  Claude Code skips it.
+  transcript rule still applies. `enabled` takes the word of the highest-precedence layer that sets
+  it: managed and its drop-ins, then local, project and user. A layer that is not valid JSON
+  contributes nothing, as Claude Code skips it. **The layers it reads are never writable through it.**
+  The first version claimed no agent could turn the boundary off. For a project outside `~/repos`
+  the cwd is writable, though, and a Write of its `.claude/settings.local.json` could have done it
+  (review round 16). Every layer file is now refused to the write tools. The deny rules cover the
+  `~/repos` ones as before.
 
 **What it costs.** A judged Read went from about 29ms to 58ms per call, measured over 30 calls in
 jkb-dev against its real settings. Bash is still decided first, in 7ms. A tool reading or writing

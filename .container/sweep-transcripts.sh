@@ -651,6 +651,14 @@ posture_rule_covers() { # posture_rule_covers <path pattern> <path> -> rc 0 cove
             return 1 ;;
     esac
     case "$2" in $1|$1/*) return 0 ;; esac
+    # `**/` MATCHES ZERO DIRECTORIES in Claude Code's (gitignore) globs, and a `case` pattern's `*/`
+    # needs a slash, so `~/**/.claude/projects/**` read as matching nothing directly under the home
+    # (review round 16). The pattern is tried with every `/**/` collapsed to `/` as well.
+    local z="${1//\/\*\*\///}"
+    if [ "$z" != "$1" ]; then
+        # shellcheck disable=SC2254
+        case "$2" in $z|$z/*) return 0 ;; esac
+    fi
     return 1
 }
 
@@ -695,7 +703,8 @@ posture_layer_files() { # posture_layer_files <managed-settings.json> -> one pat
 # have stood the sweep down while the argv grew; asking only "does anything expand" would instead
 # be fooled by the seven `Edit(~/repos/**/...)` rules, which expand but name no transcript.
 posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
-    local f rules rule pat base root layers kind proot home="${HOME:-/home/vscode}" proots e
+    local f rules rule pat base root layers kind proot home="${HOME:-/home/vscode}" proots e pe_seen="
+" pe_work=0
     [ -r "$1" ] || return 0
     # The transcript tree as the sweep itself finds it -- CLAUDE_CONFIG_DIR honoured exactly as
     # TRANSCRIPT_ROOT honours it -- plus the state volume's spelling. AN ARRAY: a config dir under
@@ -744,35 +753,42 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
             posture_rule_is_path "$rule" || continue
             pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")")"
             posture_rule_expands "$pat" || continue
-            case "$pat" in
-                /*) ;;
-                *) if [ "$kind" = project ]; then
-                       pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")" "$proot")"
-                   else
-                       # In a managed, user or drop-in layer a relative rule meets a session started
-                       # anywhere. It can reach the tree if it CLIMBS (a `..` segment), matches at ANY
-                       # DEPTH (a leading `**`), or overlaps the tree from the HOME, where a session can
-                       # plausibly start -- `.claude/projects/**/*.jsonl` does. Claude Code's own
-                       # documented example, `Read(./.env)`, `Read(./secrets/**)`, does none of these;
-                       # counting every relative rule as cannot-tell turned the superseded sweep back on
-                       # (review round 7). So resolve it from the home and test overlap like any other.
-                       case "/$pat/" in */../*|/\*\*/*) return 0 ;; esac
-                       pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")" "$proot")"
-                   fi ;;
-            esac
+            # BRACES FIRST, then every expansion resolved and judged on its own: the relative-climb
+            # test below ran on the raw rule, so `{../..,x}/.claude/projects/**` hid its climb inside
+            # a group (review round 16), and the literal base of a brace rule stops before the brace
+            # (round 15). A rule it cannot expand is cannot-tell, so yes.
+            local -a raws=("$pat") pats=()
+            case "$pat" in *"{"*) posture_brace_expand "$pat" || return 0; raws=("${posture_brace_out[@]}") ;; esac
+            for e in "${raws[@]}"; do
+                case "$e" in
+                    /*) pats+=("$(posture_canon "$e")") ;;
+                    *) if [ "$kind" = project ]; then
+                           pats+=("$(posture_canon "$proot/${e#./}")")
+                       else
+                           # In a managed, user or drop-in layer a relative rule meets a session started
+                           # anywhere. It can reach the tree if it CLIMBS (a `..` segment), matches at
+                           # ANY DEPTH (a leading `**`), or overlaps the tree from the HOME, where a
+                           # session can plausibly start. Claude Code's documented example,
+                           # `Read(./.env)`, `Read(./secrets/**)`, does none of these; counting every
+                           # relative rule as cannot-tell turned the superseded sweep back on (review
+                           # round 7). So resolve it from the home and test overlap like any other.
+                           case "/$e/" in */../*|/\*\*/*) return 0 ;; esac
+                           pats+=("$(posture_canon "$home/${e#./}")")
+                       fi ;;
+                esac
+            done
             # OVERLAP, not three probes: any expanding rule whose literal prefix contains, or lies
             # inside, the transcript tree is counted. That over-counts a glob that could only match
             # memory notes, which is the cheap direction to be wrong in.
-            # A BRACE RULE IS JUDGED BY EVERY EXPANSION, each canonicalised, since its literal base
-            # stops before the brace: `~/repos/{..,x}/.claude/projects/**` cut to `~/repos`, which
-            # holds no transcript, while its first expansion climbs into the tree (review round 15).
-            # One it cannot expand is cannot-tell, so yes.
-            local -a pats=("$pat")
-            case "$pat" in
-                *"{"*) posture_brace_expand "$pat" || return 0
-                       pats=(); for e in "${posture_brace_out[@]}"; do pats+=("$(posture_canon "$e")"); done ;;
-            esac
             for pat in "${pats[@]}"; do
+            # ONCE PER DISTINCT PATTERN across every layer: a checked-in rule is copied into every
+            # worktree's settings, and 40 worktrees of 30 rules walked every probe 1200 times, past
+            # the reaper's one-minute timeout (review round 16).
+            case "$pe_seen" in *"
+$pat
+"*) continue ;; esac
+            pe_seen="$pe_seen$pat
+"
             base="$(posture_rule_base "$pat")"
             for root in "${proots[@]}"; do
                 # The base IS the tree, or lies INSIDE it: counted outright.
@@ -785,6 +801,9 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
                 # above; `*` crosses `/` in a case pattern, so this errs towards counting.
                 if [ "${root#"${base%/}"/}" != "$root" ]; then
                     for probe in "${probes[@]}"; do
+                        # A BUDGET on the probe matches, which fails towards yes: past it the sweep
+                        # runs rather than the tick outrunning its timeout (review round 16).
+                        pe_work=$((pe_work + 1)); [ "$pe_work" -le 100000 ] || return 0
                         case "$probe" in "$root"/*) posture_rule_covers "$pat" "$probe" && return 0 ;; esac
                     done
                 fi
@@ -1752,6 +1771,19 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...and with an empty last one" "$(pe "$pdir/brace3.json")" yes
     printf '%s\n' '{"permissions":{"deny":["Read(~/repos/{..,x}/.claude/projects/**/*.jsonl)"]}}' >"$pdir/brace4.json"
     eq "...and a .. alternative that climbs into the tree" "$(pe "$pdir/brace4.json")" yes
+    # Round 16: a climb hidden in a group, `**/` matching zero directories, and repeated rules.
+    lh3="$work/lhome3"; mkdir -p "$lh3/.claude"
+    printf '%s\n' '{"permissions":{"deny":["Read({../..,x}/.claude/projects/**/*.jsonl)"]}}' >"$lh3/.claude/settings.json"
+    eq "a relative climb inside a brace group in a user layer is cannot-tell, so yes" "$(pe "$pdir/hook.json" "$lh3")" yes
+    rm -f "$lh3/.claude/settings.json"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/**/.claude/projects/**/*.jsonl)"]}}' >"$pdir/zerodir.json"
+    eq "a ~/**/ rule reaches the tree directly under the home" "$(pe "$pdir/zerodir.json")" yes
+    eq "...and covers auto-memory there" \
+       "$(posture_rule_covers '/h/**/.claude/projects' /h/.claude/projects/-p/memory/MEMORY.md && echo covered || echo clear)" covered
+    jq -n '{permissions:{deny:[range(1200) | "Read(~/.secret*/**/*.key)"]}}' >"$pdir/dups.json" 2>/dev/null
+    dt0=$(date +%s%N); pe "$pdir/dups.json" >/dev/null
+    case "$dt0" in *N) dt1=0 ;; *) dt1=$(( ($(date +%s%N) - dt0) / 1000000 )) ;; esac
+    eq "1200 copies of one rule are judged once, fast" "$([ "$dt1" -lt 3000 ] && echo fast || echo "slow: ${dt1}ms")" fast
     eq "a nested group expands too" \
        "$(posture_rule_covers '/h/{x,{.aws,.ssh}}/**' /h/.ssh/id && echo covered || echo clear)" covered
     bt0=$(date +%s%N)

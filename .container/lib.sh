@@ -119,7 +119,13 @@ dc_protected_env() { # dc_protected_env <Dockerfile> <container.json>
             for (i = 1; i <= n; i++) if (w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { sub(/=.*/, "", w[i]); print w[i] }
             if (!cont) on = 0
         }' "$1"
-        dc_strip "$2" | jq -r '(.containerEnv // {}) | keys[]'; } 2>/dev/null | sort -u)"
+        } 2>/dev/null | sort -u)"
+    # The containerEnv half read ON ITS OWN, with its status: piped into the same list, a container.json
+    # that did not parse dropped every one of its names and the whole still answered 0 (review round 16).
+    local ce
+    ce="$(dc_strip "$2" | jq -r '(.containerEnv // {}) | keys[]' 2>/dev/null)" \
+        || { echo "dc_protected_env: $2 does not parse, so its containerEnv names could not be derived" >&2; return 1; }
+    names="$(printf '%s\n%s\n' "$names" "$ce" | grep -v '^$' | sort -u)"
     grep -qx PATH <<<"$names" || { echo "dc_protected_env: no ENV PATH found in $1, so the protected names could not be derived" >&2; return 1; }
     printf '%s\n' "$names"
 }
