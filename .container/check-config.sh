@@ -857,6 +857,27 @@ else
     bad "run.sh's live fingerprint and its assembly do not both use \$args_root — a root the fingerprint does not strip enters the hash, and every existing container reads as created from a different container.json"
 fi
 
+# THE REPO'S OWN SETTINGS DO NOT REPLACE THE CONTAINER'S ENVIRONMENT. Claude Code puts a settings
+# file's `env` into every session, over the image's ENV, and .claude/settings.json is committed and
+# shared with the host. verify.sh checks every layer a container session loads, settings.local.json
+# included; this holds the committed file at review time, before any container sees it.
+if ! dc_envp_names="$(dc_protected_env "$here/Dockerfile" "$here/container.json" 2>&1)"; then
+    bad "the environment names the container sets could not be derived ($dc_envp_names), so whether the repo's Claude settings replace one is unchecked"
+else
+    dc_envp_hit=""
+    for dc_sf in "$here/../.claude/settings.json"; do
+        [ -f "$dc_sf" ] || continue
+        while IFS= read -r dc_k; do
+            [ -n "$dc_k" ] && grep -qxF -- "$dc_k" <<<"$dc_envp_names" && dc_envp_hit="$dc_envp_hit $dc_k"
+        done <<<"$(HOME=/dev/null jq -r '(.env // {}) | keys[]?' "$dc_sf" 2>/dev/null)"
+    done
+    if [ -n "$dc_envp_hit" ]; then
+        bad "the repo's .claude/settings.json sets env that the container itself sets ($dc_envp_hit ), so every container session gets the file's value instead of the image's — a PATH written for one machine breaks jkb's resolution on the other"
+    else
+        ok "the repo's committed Claude settings replace none of the $(grep -c . <<<"$dc_envp_names") environment names the container sets"
+    fi
+fi
+
 # THE HOOK AND THE SWEEP MUST AGREE ON WHERE THE TREE IS. The hook cannot load the shared reader --
 # it is installed alone, root-owned, at /usr/local/bin -- so its roots are its own, and they drifted:
 # it ignored CLAUDE_CONFIG_DIR while the sweep honoured it, leaving the real tree unguarded whenever

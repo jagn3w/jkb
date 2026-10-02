@@ -101,6 +101,29 @@ dc_container_env() { # dc_container_env <container.json> <repo-root>  -> one KEY
     done <<<"$raw"
 }
 
+# dc_protected_env <Dockerfile> <container.json> -> every environment NAME the container sets, one per
+# line: the Dockerfile's ENV keys and container.json's containerEnv keys. Claude Code puts a settings
+# file's `env` into every session's environment, OVER these, and a repo's .claude/settings*.json is in
+# the checkout the host shares: an `env.PATH` written for the Mac replaced the image's PATH in every
+# container session, so `jkb` stopped resolving by name and the attest hook, which approves only the
+# bare `jkb` word, asked about every call (2026-10-02, measured by another session). verify.sh and
+# check-config.sh refuse a settings `env` that names one of these. Refuses (rc 1) when either file
+# yields nothing, so a broken parse is not read as "nothing to protect".
+dc_protected_env() { # dc_protected_env <Dockerfile> <container.json>
+    local names
+    names="$( { awk '
+        /^ENV[[:space:]]/ { on = 1; sub(/^ENV[[:space:]]+/, "") }
+        on {
+            line = $0; cont = (line ~ /\\[[:space:]]*$/); sub(/\\[[:space:]]*$/, "", line)
+            n = split(line, w, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) if (w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { sub(/=.*/, "", w[i]); print w[i] }
+            if (!cont) on = 0
+        }' "$1"
+        dc_strip "$2" | jq -r '(.containerEnv // {}) | keys[]'; } 2>/dev/null | sort -u)"
+    grep -qx PATH <<<"$names" || { echo "dc_protected_env: no ENV PATH found in $1, so the protected names could not be derived" >&2; return 1; }
+    printf '%s\n' "$names"
+}
+
 # READ A REFUSING PRODUCER THROUGH `$( )`, NEVER THROUGH `< <( )`. `dc_subst`, `dc_run_args`,
 # `dc_container_env` and run.sh's `docker_args` all REFUSE — that is the whole point of the unset-${localEnv:…} error
 # above — and bash discards a process substitution's exit status, so a refusal inside one kills

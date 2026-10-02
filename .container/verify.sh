@@ -322,6 +322,19 @@ kit_mirror_problems() { # kit_mirror_problems <dir> <root-uid> <marker> <self-ki
     printf '%s' "$out"
 }
 
+# Which settings files set an `env` key the container itself sets, one `<file>\t<KEY>` per line.
+# <names> is dc_protected_env's list. A file that is not valid JSON is skipped, as Claude Code skips
+# it; its key is not in force.
+settings_env_shadows() { # settings_env_shadows <names, one per line> <settings file>...
+    local names="$1" f k; shift
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        while IFS= read -r k; do
+            [ -n "$k" ] && grep -qxF -- "$k" <<<"$names" && printf '%s\t%s\n' "$f" "$k"
+        done <<<"$(HOME=/dev/null jq -r '(.env // {}) | keys[]?' "$f" 2>/dev/null)"
+    done
+}
+
 reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
     [ -n "$1" ] || { printf 'pid1-unreadable'; return; }
     # A container at its --pids-limit fails exactly here -- which is the SYMPTOM of a PID 1 that
@@ -520,6 +533,20 @@ if [ "$SELF_TEST" = yes ]; then
         "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror /home/vscode/repos/jkb "")" ""
     kmr "a missing mirror is named" "$(kit_mirror_problems "$km/none" "$kmu" .jkb-host-mirror "$km/kit" x)" "does not exist"
     chmod -R u+w "$km"; rm -rf "$km"
+
+    echo "==> verify.sh self-test: a settings env that replaces the container's own"
+    se="$(mktemp -d)"
+    printf '%s\n' '{"env":{"PATH":"/Users/me/.cargo/bin:/usr/bin","FOO":"1"}}' >"$se/a.json"
+    printf '%s\n' '{"env":{"FOO":"1"},"permissions":{}}' >"$se/b.json"
+    printf '%s\n' 'not json {' >"$se/c.json"
+    se_got="$(settings_env_shadows "$(printf 'PATH\nJKB_REMOTE\n')" "$se/a.json" "$se/b.json" "$se/c.json" "$se/missing.json")"
+    if [ "$se_got" = "$se/a.json	PATH" ]; then printf '  \033[32mok\033[0m   %s\n' "a settings env.PATH is named with its file; other keys, other files, unparseable and missing files are not"
+    else printf '  \033[31mFAIL\033[0m settings_env_shadows\n         got: [%s]\n' "$se_got"; st_fail=$((st_fail+1)); fi
+    se_names="$(. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$(dirname "$0")/container.json")"
+    if grep -qx PATH <<<"$se_names" && grep -qx JKB_REMOTE <<<"$se_names" && grep -qx JKB_NS_MARKER <<<"$se_names"; then
+        printf '  \033[32mok\033[0m   %s\n' "the protected names come from the Dockerfile's ENV and containerEnv: PATH, JKB_NS_MARKER, JKB_REMOTE among them"
+    else printf '  \033[31mFAIL\033[0m dc_protected_env derived [%s]\n' "$(tr '\n' ' ' <<<"$se_names")"; st_fail=$((st_fail+1)); fi
+    rm -rf "$se"
 
     echo "==> verify.sh self-test: does a deny rule swallow auto-memory"
     # Literal inputs on both sides, so this needs no container and no Claude Code. The point of
@@ -1778,6 +1805,27 @@ fi
 # /etc/claude-code. With the per-file globs gone (they cost 52% of MAX_ARG_STRLEN in argv), this
 # script is the only thing keeping a file tool out of another session's transcript, and its
 # absence is silent: every tool call simply succeeds.
+# NO SETTINGS FILE REPLACES THE CONTAINER'S OWN ENVIRONMENT. Claude Code puts a settings file's `env`
+# into every session, over the image's ENV and containerEnv, and a repo's .claude/settings*.json is
+# in the checkout the HOST shares. An `env.PATH` written for the Mac in settings.local.json replaced
+# the image's PATH in every container session: `jkb` stopped resolving by name, and the attest hook,
+# which approves only the bare `jkb` word, then asked about every call (2026-10-02). The agent cannot
+# fix a hit -- those files are write-denied to it -- so the failure names the file and the key for a
+# person. This cannot ask a SESSION's PATH (it runs through docker exec, with the image's); a session
+# whose PATH arrives by another route is not caught here.
+if ! envp_names="$(dc_protected_env "$here_dc/Dockerfile" "$DC" 2>&1)"; then
+    bad "the environment names the container sets could not be derived ($envp_names), so whether a Claude settings file replaces one is unchecked"
+else
+    envp_files=()
+    while IFS= read -r envp_f; do [ -n "$envp_f" ] && envp_files+=("$envp_f"); done <<<"$(posture_layer_files "$mem_managed" 2>/dev/null)"
+    envp_hits="$(settings_env_shadows "$envp_names" ${envp_files[@]+"${envp_files[@]}"})"
+    if [ -n "$envp_hits" ]; then
+        bad "a Claude settings file sets an environment variable the container itself sets, and every session here gets the file's value instead: $(printf '%s' "$envp_hits" | awk -F'\t' '{printf "%s in %s; ", $2, $1}')remove that key from the file -- the agent cannot, it is write-denied to it. A repo's .claude/settings*.json is SHARED with the host; if the host needs the value, set it in the host's own ~/.claude/settings.json, which this container does not load"
+    else
+        ok "no Claude settings file a session here loads replaces an environment variable the container sets ($(grep -c . <<<"$envp_names") names, PATH among them)"
+    fi
+fi
+
 mem_hook=/usr/local/bin/deny-transcripts.sh
 if [ ! -x "$mem_hook" ]; then
     bad "$mem_hook is missing or not executable, so nothing stops a file tool reading another session's transcript — rebuild the image"

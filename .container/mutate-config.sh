@@ -42,6 +42,10 @@ seed() {
     # has none — so without this the mutation below could not be watched failing.
     mkdir -p "$work/t/ui/vscode"
     cp "$repo/ui/vscode/package.json" "$work/t/ui/vscode/"
+    # ...and the repo's committed Claude settings, whose `env` check-config.sh holds to the names the
+    # container sets.
+    mkdir -p "$work/t/.claude"
+    cp "$repo/.claude/settings.json" "$work/t/.claude/"
     # ...and jkb-daemon's DEFAULT_ADDR, which check-config.sh holds the firewall's daemon port to.
     mkdir -p "$work/t/crates/jkb-daemon/src"
     cp "$repo/crates/jkb-daemon/src/lib.rs" "$work/t/crates/jkb-daemon/src/"
@@ -1747,6 +1751,24 @@ open(p, 'w').write(s.replace(old, '"~/.claude-state/transcript-archive" "~/.clau
 PYX
 run "the shared root list names a root the hook does not" "hook:.claude-state/elsewhere"
 
+# A Claude settings `env` must not replace what the container sets (2026-10-02: a Mac PATH did).
+seed; python3 - "$work/t/.claude/settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("env", {})["PATH"] = "/Users/me/.cargo/bin:/usr/bin:/bin"
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the repo's settings set env.PATH" "sets env that the container itself sets"
+
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "ENV PATH=/home/vscode/.local/bin:/home/vscode/.cargo/bin:$PATH\n"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "the image's ENV PATH can no longer be found" "environment names the container sets could not be derived"
+
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys
@@ -2203,7 +2225,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=114
+PINNED_BAD_SITES=116
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

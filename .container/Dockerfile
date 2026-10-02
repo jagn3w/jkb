@@ -66,6 +66,15 @@ RUN apt-get update -qq \
 #    host's, while every other image ENV, JKB_NS_MARKER included, did arrive), and /usr/local/bin
 #    is on every PATH, that one included. Only the named executables are linked; a project's own
 #    come from `bundle exec` or its binstubs.
+#    CAUSE FOUND 2026-10-02, corrected here rather than rewritten: this was recorded as unexplained
+#    harness behaviour, and it was not. The repo's .claude/settings.local.json carried an
+#    `"env": {"PATH": "/Users/<user>/.cargo/bin:..."}` block written for the Mac. Claude Code puts
+#    settings `env` into every session, and that file is in the checkout the host shares, so the
+#    Mac's PATH replaced this image's in container sessions. Only PATH was replaced because only PATH
+#    was in that block, which is why every other ENV arrived. Deleting the block restored the
+#    image's PATH (measured by another session). verify.sh and check-config.sh now refuse a settings
+#    `env` that names any variable this image or containerEnv sets. The linking still stands: it
+#    costs nothing and survives a PATH replaced by any other route.
 #
 # The distro's `postgresql` would create a root-managed `main` cluster that nothing here can start
 # (starting a service needs root), so it is suppressed and each user runs their own with pg_ctl.

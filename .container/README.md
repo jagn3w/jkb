@@ -489,6 +489,36 @@ sources the mirror's `lib.sh`.
 - *`verify.sh` still inherits the image's `PATH`* for the toolchain it checks
   (`task:verify-sh-runs-unsandboxed-with--18da6e4b5d893488`). Its own code now comes from the kit.
 
+## A Claude settings `env` does not replace the container's environment
+
+**The failure, measured by another session on 2026-10-02.** Claude sessions in here were getting the
+Mac's `PATH` (`/Users/<user>/.cargo/bin`, `/System/Cryptexes/...`) instead of the image's, so `jkb`
+did not resolve by name. The cause was an `"env": {"PATH": ...}` block in the repo's
+`.claude/settings.local.json`. Claude Code puts a settings file's `env` into every session's
+environment, over the image's `ENV`, and that file is in the checkout the host shares. A value
+written for the Mac therefore replaced the container's in every container session. Deleting the
+block restored the image's `PATH`, 11 absolute entries. It is not only an inconvenience: the attest
+hook approves only the bare `jkb` command word, so a `PATH` that hides `jkb` means agents type
+`~/.cargo/bin/jkb`, and every call prompts. This is also the explanation the Dockerfile's "a session
+can inherit a PATH that never saw this image's ENV" note lacked, corrected there in place.
+
+**Held by** `dc_protected_env` in `lib.sh`, which derives every name the container sets from the
+Dockerfile's `ENV` lines and `containerEnv`, `PATH` among them, and refuses if it cannot find
+`ENV PATH`.
+
+- `verify.sh` fails when any settings layer a session in here loads sets one of those names in
+  `env`. The layers are managed, drop-ins, the user's settings, and every repo's and worktree's
+  `.claude/settings*.json`. The failure names the file and the key for a person, because the agent
+  cannot fix it: those files are write-denied to it. It also says that a repo's file is shared with
+  the host, and that a host-only value belongs in the host's own `~/.claude/settings.json`, which
+  this container does not load.
+- `check-config.sh` holds the repo's committed `.claude/settings.json` to the same rule at review
+  time.
+
+**What it cannot see.** `verify.sh` runs through `docker exec`, with the image's environment, so it
+cannot ask a *session's* `PATH`. A `PATH` replaced by some route other than a settings file is not
+caught here. The Ruby and PostgreSQL links into `/usr/local/bin` stay for that reason.
+
 ## The mount list is the security boundary
 
 Everything absent from `container.json`'s `mounts` does not exist inside the container. Add to
