@@ -1788,6 +1788,31 @@ open(p, 'w').write(s.replace(old, ')', 1))
 PYX
 run "run.sh's PATH filter stops dropping the macOS temp root" "does not drop agent-writable PATH entries"
 
+# REVIEW ROUND 14. The Homebrew prefixes run.sh keeps, and allow entries read as the sandbox reads them.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(//usr/local/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on /usr/local" "no Edit(//usr/local/**) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowWrite"].append("~/.local/**")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a glob allowWrite entry over the kit" "covers it"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowWrite"].append("/Users/someone/.local/share")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "an absolute allowWrite entry over the kit" "covers it"
+
 # A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import json, sys

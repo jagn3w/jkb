@@ -595,10 +595,32 @@ posture_rule_covers() { # posture_rule_covers <path pattern> <path> -> rc 0 cove
     # is covered. A `case` pattern does not expand braces, so `{projects,x}` read as one literal
     # directory and covered nothing, while Claude Code may expand it -- unmeasured, so this errs
     # towards finding a rule that reaches the tree or memory (review round 13).
+    # A GROUP WITH NO `/` names one segment's alternatives, and is matched as exactly those, an
+    # extglob `@(a|b)`: read as "anything under the base", `~/.{ssh,aws}/**` covered every transcript
+    # and auto-memory, refused the container and switched the sweep on (review round 14). A group
+    # holding a `/`, or nested, spans segments, and only that falls back to the base's subtree.
     case "$1" in
-        *"{"*) local b; b="$(posture_rule_base "$1")"
-               [ "$2" = "$b" ] || [ "${2#"${b%/}"/}" != "$2" ] && return 0
-               return 1 ;;
+        *"{"*)
+            local pat="$1" conv="" grp rc=1 had_ext
+            while :; do
+                case "$pat" in *"{"*) ;; *) conv="$conv$pat"; break ;; esac
+                conv="$conv${pat%%\{*}"; pat="${pat#*\{}"
+                case "$pat" in *"}"*) ;; *) conv=""; break ;; esac
+                grp="${pat%%\}*}"; pat="${pat#*\}}"
+                case "$grp" in */*|*"{"*) conv=""; break ;; esac
+                conv="$conv@(${grp//,/|})"
+            done
+            if [ -z "$conv" ]; then
+                local b; b="$(posture_rule_base "$1")"
+                [ "$2" = "$b" ] || [ "${2#"${b%/}"/}" != "$2" ] && return 0
+                return 1
+            fi
+            had_ext=0; shopt -q extglob && had_ext=1
+            shopt -s extglob
+            # shellcheck disable=SC2254
+            case "$2" in $conv|$conv/*) rc=0 ;; esac
+            [ "$had_ext" -eq 1 ] || shopt -u extglob
+            return "$rc" ;;
     esac
     case "$2" in $1|$1/*) return 0 ;; esac
     return 1
@@ -1675,6 +1697,17 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
        "$(posture_rule_covers '/h/.claude/{projects,x}' /h/.claude/projects/-p/memory/MEMORY.md && echo covered || echo clear)" covered
     eq "...and nothing outside that base" \
        "$(posture_rule_covers '/h/.claude/{projects,x}' /h/repos/x && echo covered || echo clear)" clear
+    # Round 14: a one-segment group is its alternatives, not the whole base.
+    eq "a one-segment brace ~/.{ssh,aws}/** does not cover auto-memory" \
+       "$(posture_rule_covers '/h/.{ssh,aws}/**' /h/.claude/projects/-p/memory/MEMORY.md && echo covered || echo clear)" clear
+    eq "...nor a transcript" \
+       "$(posture_rule_covers '/h/.{ssh,aws}/**' /h/.claude/projects/-p/e.jsonl && echo covered || echo clear)" clear
+    eq "...but does cover what it names" \
+       "$(posture_rule_covers '/h/.{ssh,aws}/**' /h/.aws/credentials && echo covered || echo clear)" covered
+    eq "a brace that spans segments still covers its base's subtree" \
+       "$(posture_rule_covers '/h/{.claude/projects,x}/**' /h/.claude/projects/-p/e.jsonl && echo covered || echo clear)" covered
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.{ssh,aws}/**)"]}}' >"$pdir/brace1.json"
+    eq "a one-segment brace rule outside the tree does not switch the sweep on" "$(pe "$pdir/brace1.json")" no
     # Round 2: shapes the three synthetic probes missed, each enumerated per match on disk.
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/-home-vscode-repos-jkb/**/*.jsonl)"]}}' >"$pdir/slug.json"
     eq "a slug-specific per-file glob enumerates"   "$(pe "$pdir/slug.json")" yes

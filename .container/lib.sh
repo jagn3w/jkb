@@ -502,6 +502,11 @@ EOF
     done <<EOF
 $(dc_kit_paths)
 EOF
+    # ...AND THE COPY IS CHECKED, not only the source: the source check runs before the copy, and a
+    # link the agent made between the two landed in the kit (review round 14, reproduced in 6 of 40
+    # runs with a toggling link). Nothing but this function writes $new, so this answer holds.
+    odd="$(find "$new" ! -type f ! -type d 2>&1 | head -3)"
+    [ -z "$odd" ] || { echo "dc_install_kit: refusing: the copy holds something that is not a regular file or a directory (it appeared in the checkout during the copy): $odd" >&2; rm -rf "$new"; return 1; }
     printf 'checkout=%s\n' "$src" > "$new/$DC_KIT_MARKER" || { rm -rf "$new"; return 1; }
     chmod -R go-w "$new" && chmod 0755 "$new" || { rm -rf "$new"; return 1; }
     old=""

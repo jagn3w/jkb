@@ -47,9 +47,12 @@
 # 4096-byte budget (2.8s before the expander skipped finished expansions). Round 12 judges each
 # expansion's own literal prefix: a Glob with 64 short distinct prefixes, every one checked, took
 # 1.05s. That made glob_base's quadratic prefix-building reachable, and 64 distinct ~4KB prefixes
-# then took 30s (round 13). glob_base is linear now, and expansions x pattern bytes is capped at
-# 32768: the slowest Glob under that cap (8 distinct 4KB prefixes) takes 0.82s, the refused one
-# 0.38s. It was ~7ms before five review rounds added guards; the number is
+# then took 30s (round 13). glob_base is linear now, and expansions x pattern bytes is capped. At
+# 32768 a `~`-led 8-way 4KB pattern still took 2.9s, because a `~name` prefix is judged twice
+# (round 14), so the cap is 12288: the slowest Glob under it, `~{a0..a7}/` and 745 segments, takes
+# 0.82s. It refuses `{d0,...,d63}/**/*.rs` (17KB of work), the price of the margin. The MCP arm caps
+# path segments x bases at 12000 (round 14: 100 leaves of 2000 segments reached 10s); the slowest
+# call under that cap, two 1990-segment relative strings from three bases, takes 1.32s. It was ~7ms before five review rounds added guards; the number is
 # re-measured rather than carried, because this hook now runs on EVERY tool call.
 #
 # PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
@@ -510,6 +513,11 @@ if [ "${1:-}" = --self-test ]; then
     # REVIEW ROUND 13. A cwd link named after an EXISTING account: judged only at that account's
     # home (/bin for sync), it reached the tree. Both readings, from every base.
     ln -s "$sh/.claude-state/projects/-s" "$sh/repos/r/~sync"
+    # REVIEW ROUND 14. A Glob with path= and a ~name/ pattern: the literal ./~name reading must be
+    # taken from the Glob's path, not the session cwd.
+    mkdir -p "$sh/repos/b"; ln -s "$sh/.claude-state/projects" "$sh/repos/b/~x"
+    h "a Glob ~x/ pattern under path= reaches the tree through a link there, and is denied" deny \
+      '{"tool_name":"Glob","cwd":"'"$sh"'/repos/r","tool_input":{"path":"'"$sh"'/repos/b","pattern":"~x/-s/*.jsonl"}}' HOME="$sh"
     h "a cwd link named ~sync, an existing account, is denied" deny \
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"path":"~sync"}}' HOME="$sh"
     # ...and a NEWLINE in a path is refused: `$( )` drops a trailing one, so a link named "x\n" was
@@ -657,6 +665,14 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{src,tests/{unit,e2e}}/**/*.rs"}}' HOME=/h
     blow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(8) | "{a,b,c}"] | join(""))}}')"
     h "a brace product too large to expand is refused, never a race with the timeout" deny "$blow" HOME=/h
+    # REVIEW ROUND 14. The MCP arm had no budget on total work: 99 padding strings of ~4KB and ~2000
+    # segments each pushed a transcript path past the timeout, which fails open.
+    pad="$(jqh -cn '{tool_name:"mcp__jkb__ingest_path", cwd:"/h/repos/jkb", tool_input:{path:"/h/.claude/projects/-s/e.jsonl", pad:[range(99) as $i | ("/a\($i)/" + ([range(2000)|"a/"]|join("")))]}}')"
+    t0=$(date +%s%N)
+    h "an MCP call padded to run past the timeout is refused" deny "$pad" HOME=/h
+    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
+    if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
+    else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
     # REVIEW ROUND 13. 64 long, distinct prefixes made glob_base's per-prefix work run past the
     # timeout, which fails open: refused on a budget before any prefix is walked, and fast.
     slow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:("~/.claude/projects/" + ([range(6)|"{.,./}"]|join("")) + ([range(1960)|"./"]|join("")) + "*/*.jsonl")}}')"
@@ -891,7 +907,7 @@ case "$tool" in
             # A BUDGET ON THE WORK, before any prefix is walked: 64 distinct ~4KB prefixes ran past
             # the 10s timeout, which fails open (review round 13, measured at 30s). Expansions times
             # pattern bytes; an ordinary pattern is a few hundred.
-            [ $(( ${#brace_out[@]} * ${#pat} )) -le 32768 ] || exit 3
+            [ $(( ${#brace_out[@]} * ${#pat} )) -le 12288 ] || exit 3
             # AN ARRAY of distinct prefixes, never newline-joined text: a newline in an expansion
             # split one prefix into two harmless ones (round 13; newlines are refused above too).
             gbs=()
@@ -910,7 +926,10 @@ case "$tool" in
                 # `l/..` to the cwd, and a pattern climbing from there was judged from the wrong
                 # directory (review round 5, reproduced) -- round 3's symlink-then-`..` defect in
                 # a composition check() itself never saw.
-                case "$gb" in /*|"~"*) check "$gb" ;; *) check "$(join_raw "$base" "$home" "$cwd")/$gb" ;; esac
+                # A `~name` prefix's literal reading (check's ./~name) is taken from the Glob's own
+                # `path`, not the session cwd: aimed at the cwd, a `~x` link under `path` reached the
+                # tree (review round 14).
+                case "$gb" in /*|"~"*) check "$gb" "$(join_raw "$base" "$home" "$cwd")" ;; *) check "$(join_raw "$base" "$home" "$cwd")/$gb" ;; esac
             done
         fi ;;
     Read|Edit|Write|NotebookEdit)
@@ -975,6 +994,13 @@ case "$tool" in
             done
         done
         [ "${#leaves[@]}" -le 100 ] || exit 3
+        # A BUDGET ON THE WORK, as the Glob arm has: path segments, times the bases each relative
+        # one is judged from. 100 leaves of ~2000 segments ran a transcript path past the 10s
+        # timeout, which fails open (review round 14, reproduced at 10s; the leaf cap alone allowed
+        # it). Ordinary calls are a few hundred segment-bases.
+        segs=0
+        for leaf in ${leaves[@]+"${leaves[@]}"}; do sl="${leaf//[^\/]/}"; segs=$((segs + ${#sl} + 1)); done
+        [ $(( segs * ${#bases[@]} )) -le 12000 ] || exit 3
         for leaf in ${leaves[@]+"${leaves[@]}"}; do
             # A SLASHLESS ~word in free text is a home only if that account exists. `~retry` is jkb's
             # own one-word vector search and `~2h` an estimate; reading them as home directories

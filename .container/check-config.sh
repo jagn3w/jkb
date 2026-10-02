@@ -617,18 +617,27 @@ fi
 # (review round 4, reproduced). The posture applies on the host AND in the container, so an entry
 # under any home -- /home/<user>/..., /Users/<user>/..., /root/... -- is mapped into `~` space, and
 # `/`, `/home`, `/Users` are ancestors of every home.
+# AN ALLOW ENTRY IN `~` SPACE, as the sandbox reads it: canonicalised, cut to its literal base (the
+# sandbox collapses `~/.claude/**` to `~/.claude`), and with an absolute path under any home mapped to
+# `~`. ONE helper for both allow guards: the kit's guard compared raw strings, so `~/.local/**` or
+# `/Users/<u>/.local/share` read as not covering the kit (review round 14).
+dc_tilde_base() { # dc_tilde_base <allow entry> -> its literal base in ~ space
+    local a
+    a="$(posture_rule_base "$(posture_canon "$1")")"
+    case "$a" in
+        /home/*/*|/Users/*/*) a="~/${a#/*/*/}" ;;
+        /root/*)              a="~/${a#/root/}" ;;
+        /home/*|/Users/*|/root|/home|/Users|/) a="~" ;;
+    esac
+    printf '%s\n' "$a"
+}
 dc_allow_hit=""
 if [ "$dc_reader_ok" = 1 ]; then
     while IFS= read -r dc_a; do
         [ -n "$dc_a" ] || continue
         # A GLOB ENTRY IS ITS LITERAL BASE: the sandbox collapses `~/.claude/**` to `~/.claude`, and
         # compared as a string it passed as clear while opening every transcript (review round 6).
-        dc_a="$(posture_rule_base "$(posture_canon "$dc_a")")"
-        case "$dc_a" in
-            /home/*/*|/Users/*/*) dc_a="~/${dc_a#/*/*/}" ;;
-            /root/*)              dc_a="~/${dc_a#/root/}" ;;
-            /home/*|/Users/*|/root|/home|/Users|/) dc_a="~" ;;
-        esac
+        dc_a="$(dc_tilde_base "$dc_a")"
         for dc_root in $(posture_transcript_roots); do
             if [ "$dc_a" = "$dc_root" ] || [ "${dc_root#"$dc_a"/}" != "$dc_root" ] || [ "${dc_a#"$dc_root"/}" != "$dc_a" ] || [ "$dc_a" = "~" ]; then
                 dc_allow_hit="$dc_allow_hit $dc_a"; break
@@ -822,8 +831,8 @@ case "$dc_kit_home" in /kit-home-probe/?*) ;; *) dc_kit_where=" lib.sh's DC_KIT_
 dc_posture="$here/../scripts/auto-mode-posture.json"
 while IFS= read -r dc_aw; do
     [ -n "$dc_aw" ] || continue
-    dc_aw="${dc_aw%/}"
-    if [ "$dc_kit_tilde" = "$dc_aw" ] || [ "${dc_kit_tilde#"$dc_aw"/}" != "$dc_kit_tilde" ]; then
+    dc_aw="$(dc_tilde_base "$dc_aw")"
+    if [ "$dc_aw" = "~" ] || [ "$dc_kit_tilde" = "$dc_aw" ] || [ "${dc_kit_tilde#"$dc_aw"/}" != "$dc_kit_tilde" ]; then
         dc_kit_where="$dc_kit_where the posture's allowWrite entry [$dc_aw] covers it;"
     fi
 done <<<"$(HOME=/dev/null jq -r '.require.sandbox.filesystem.allowWrite[]? // empty' "$dc_posture" 2>/dev/null)"
@@ -841,10 +850,18 @@ while IFS= read -r dc_src; do
     fi
 done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(.mounts // [])[] | split(",")[] | select(startswith("source=")) | ltrimstr("source=")' 2>/dev/null)"
 [ "$dc_kit_nsrc" -gt 0 ] || dc_kit_where="$dc_kit_where container.json's mount sources could not be read, so whether a bind holds it is unchecked;"
+# ...AND THE PATH run.sh KEEPS. Its filter drops everything under the home and the temp roots and
+# keeps the system and Homebrew prefixes, where docker and jq live. Homebrew's are owned by the user,
+# so the in-process Write tool, which no sandbox confines, could replace a jq there that run.sh then
+# runs as the user (review round 14). The posture denies Edit on both.
+for dc_pfx in //opt/homebrew //usr/local; do
+    HOME=/dev/null jq -e --arg r "Edit($dc_pfx/**)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
+        || dc_kit_where="$dc_kit_where the posture has no Edit($dc_pfx/**) deny, so the Write tool can replace a program run.sh runs from there;"
+done
 if [ -n "$dc_kit_where" ]; then
     bad "an agent can write the container kit ($dc_kit_tilde), which runs outside every sandbox:$dc_kit_where"
 else
-    ok "no agent can write the container kit ($dc_kit_tilde): no container bind, posture allowWrite or missing Edit deny reaches it"
+    ok "no agent can write the container kit ($dc_kit_tilde) or the Homebrew prefixes run.sh keeps on PATH: no container bind, posture allowWrite or missing Edit deny reaches them"
 fi
 
 # THE FINGERPRINT STRIPS THE ROOT THE ARGUMENTS WERE ASSEMBLED FROM. run.sh assembled from the kit

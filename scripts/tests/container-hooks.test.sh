@@ -765,6 +765,26 @@ case33_an_older_flat_kit_is_removed() {
     fi
 }
 
+# A LINK THAT APPEARS DURING THE COPY is refused too: the source check ran before the copy, and a
+# link made in between landed in the kit (review round 14). A `cp` that plants one after copying
+# reproduces that race on every run.
+case34_a_link_that_appears_during_the_copy_is_refused() {
+    local d="$work/race-$RANDOM" co kit p err rc=0 realcp
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts" "$d/bin" "$d/host"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    printf 'HOST SECRET\n' > "$d/host/key"
+    realcp="$(command -v cp)"
+    printf '#!/bin/sh\n"%s" "$@" || exit\neval "last=\\${$#}"\n[ -d "$last" ] && ln -s "%s" "$last/zz-raced" 2>/dev/null\nexit 0\n' "$realcp" "$d/host/key" > "$d/bin/cp"
+    chmod +x "$d/bin/cp"
+    err="$(PATH="$d/bin:$PATH" dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'appeared in the checkout during the copy' <<<"$err" && [ ! -e "$kit" ]; then
+        ok "a link that appears during the copy is refused, and no kit is installed"
+    else
+        fail "a link that appears during the copy is refused, and no kit is installed" "rc=$rc err=$err kit=$(ls -a "$kit" 2>&1 | tr '\n' ' ')"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -797,5 +817,6 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case30_the_kit_says_which_paths_the_checkout_has_changed \
           case31_a_planted_symlink_is_refused_not_followed \
           case32_the_mirror_stages_nothing_in_tmpdir \
-          case33_an_older_flat_kit_is_removed
+          case33_an_older_flat_kit_is_removed \
+          case34_a_link_that_appears_during_the_copy_is_refused
 finish

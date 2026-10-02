@@ -37,7 +37,9 @@
         "Edit(~/.claude/settings.json)",
         "Edit(~/.claude/settings.local.json)",
         "Edit(~/.claude/plugins/**)",
-      "Edit(~/.local/share/jkb-container-kit/**)"
+      "Edit(~/.local/share/jkb-container-kit/**)",
+      "Edit(//opt/homebrew/**)",
+      "Edit(//usr/local/**)"
       ]
     },
     "sandbox": {

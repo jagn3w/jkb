@@ -35,7 +35,8 @@ set -euo pipefail
 # kit had moved out of reach and this was the door left). So: an absolute shebang, `#!/usr/bin/env
 # bash` having found bash itself through that PATH, and before anything runs, every PATH entry under
 # $HOME, /tmp or /private, or relative, is dropped. System and Homebrew locations stay, which is
-# where docker and jq live; a docker under ~ (~/.docker/bin, ~/.orbstack/bin) has to be linked from
+# where docker and jq live -- Homebrew's are user-owned, so the posture denies Edit on /opt/homebrew
+# and /usr/local for the unsandboxed Write tool (review round 14; check-config.sh holds it); a docker under ~ (~/.docker/bin, ~/.orbstack/bin) has to be linked from
 # one of them. JKB_RUN_PATH_KEEP is a colon-separated list of directories to keep anyway, and is safe
 # only for one NO agent can write: outside the posture's sandbox allowWrite AND Edit-denied, since the
 # in-process Write tool is not sandboxed (review round 13 -- ~/.docker/bin passes the first test and
@@ -1193,6 +1194,11 @@ if [ -z "$kit_src" ]; then
     dc_install_kit "$repo" "$kit_stage/kit" >/dev/null || die "could not stage the kit from $repo"
     kit_src="$kit_stage/kit"
 fi
+# NO LINK IN WHAT IS MIRRORED: the mirror's tar dereferences (-h, for the host's hooks), so a link
+# in the kit would put its target's bytes in the container. dc_install_kit refuses them in the copy
+# it makes; this holds the line for a kit made any other way (review round 14).
+kit_odd="$(find "$kit_src" ! -type f ! -type d 2>&1 | head -3)"
+[ -z "$kit_odd" ] || die "the kit at $kit_src holds something that is not a regular file or a directory, so it is not mirrored: $kit_odd -- reinstall it: run.sh --install-kit"
 kit_rc=0; dc_mirror_hooks "$kit_src" "$DC_CTR_KIT" "$NAME" docker "the container kit" || kit_rc=$?
 [ -z "$kit_stage" ] || rm -rf "$kit_stage"
 [ "$kit_rc" -eq 0 ] || die "could not install the container kit at $DC_CTR_KIT in $NAME -- the sweep, setup.sh and verify.sh run only from there, never from the checkout the agent can write"
