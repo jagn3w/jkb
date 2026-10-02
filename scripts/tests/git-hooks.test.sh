@@ -2691,7 +2691,8 @@ case_kit_linked() {
     is_linked_worktree "$main"; r1=$?
     is_linked_worktree "$wt"; r2=$?
     is_linked_worktree "$sep"; r3=$?
-    if [ "$r1$r2$r3" = 101 ]; then
+    local sm; sm="$(main_checkout_of "$sep")"
+    if [ "$r1$r2$r3" = 101 ] && [ "$sm" = "$(cd "$sep" && pwd -P)" ]; then
         ok "is_linked_worktree: main checkout no, linked worktree yes, a --separate-git-dir checkout no"
     else
         fail "kit: linked worktree" "main=$r1 worktree=$r2 separate=$r3 (want 1 0 1)"

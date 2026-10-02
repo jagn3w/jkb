@@ -546,6 +546,11 @@ if [ "$SELF_TEST" = yes ]; then
     if grep -qx PATH <<<"$se_names" && grep -qx JKB_REMOTE <<<"$se_names" && grep -qx JKB_NS_MARKER <<<"$se_names"; then
         printf '  \033[32mok\033[0m   %s\n' "the protected names come from the Dockerfile's ENV and containerEnv: PATH, JKB_NS_MARKER, JKB_REMOTE among them"
     else printf '  \033[31mFAIL\033[0m dc_protected_env derived [%s]\n' "$(tr '\n' ' ' <<<"$se_names")"; st_fail=$((st_fail+1)); fi
+    printf '{bad' > "$se/bad.json"
+    if ! (. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$se/bad.json") >/dev/null 2>&1 \
+       && ! (. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$se/missing.json") >/dev/null 2>&1; then
+        printf '  \033[32mok\033[0m   %s\n' "dc_protected_env refuses a container.json that does not parse, and one that is missing"
+    else printf '  \033[31mFAIL\033[0m dc_protected_env answered for an unparseable or missing container.json\n'; st_fail=$((st_fail+1)); fi
     rm -rf "$se"
 
     echo "==> verify.sh self-test: does a deny rule swallow auto-memory"
@@ -1867,7 +1872,9 @@ else
     # ...AND IT HOLDS THE FILE TOOLS TO THE SANDBOX'S BOUNDARY (design A, after review round 15): with
     # the sandbox enabled in this container's settings, a Write outside every allowWrite path -- the
     # home itself -- is refused, and one inside the workspace is not.
-    if [ "$(HOME=/dev/null jq -r '.sandbox.enabled // false' "$HOME/.claude/settings.json" 2>/dev/null)" = true ]; then
+    # ASKED OF THE HOOK, which merges the layers in Claude Code's precedence: reading the user layer
+    # here was a second copy of that rule, wrong whenever managed or local set `enabled` (round 17).
+    if [ "$(cd "$mem_repo" 2>/dev/null && CLAUDE_PROJECT_DIR="$mem_repo" "$mem_hook" --sandbox-enabled 2>/dev/null)" = 1 ]; then
         mem_probe_write() { # mem_probe_write <path> -> deny|allow|broken
             local out rc=0
             out="$(printf '{"tool_name":"Write","cwd":"%s","tool_input":{"file_path":"%s","content":""}}' "$mem_repo" "$1" \

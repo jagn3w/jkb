@@ -718,7 +718,13 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
     # form it derives from a path, plus every transcript actually on disk, which is exactly what
     # an enumerating rule costs the argv.
     local -a probes=()
-    local p_file
+    local p_file p_rp p_other
+    # ONE WALK PER PHYSICAL TREE: ~/.claude/projects is a link to the state volume's tree, and walking
+    # both spellings doubled every probe and the budget they spend (review round 17). The second
+    # spelling's on-disk probes are the first's, re-prefixed.
+    # A list of "<physical>\t<spelling>" lines, not an associative array: the self-test runs on
+    # macOS's bash 3.2 too.
+    local p_walked="" p_line
     local p_slug p_uuid=0b1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d
     p_slug="$(printf '%s' "$home/repos/project" | tr -c 'A-Za-z0-9' '-')"
     for root in "${proots[@]}"; do
@@ -730,8 +736,20 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
             # find 4.9.0). The trailing slash follows THAT link and no other. `-L` followed every
             # link inside too, and <slug>/memory links into ~/.jkb/claude-memory, which the agent
             # writes: a link planted there walked any tree, unsandboxed, on every tick (round 10).
-            while IFS= read -r p_file; do probes+=("$p_file"); done \
-                < <(find "$root/" -name '*.jsonl' 2>/dev/null | head -n 5000)
+            p_rp="$(realpath -m -- "$root" 2>/dev/null)" || p_rp="$root"
+            p_other=""
+            while IFS= read -r p_line; do
+                [ "${p_line%%$'\t'*}" = "$p_rp" ] && p_other="${p_line#*$'\t'}"
+            done <<<"$p_walked"
+            if [ -n "$p_other" ]; then
+                for p_file in "${probes[@]}"; do
+                    case "$p_file" in "$p_other"/*) probes+=("$root/${p_file#"$p_other"/}") ;; esac
+                done
+            else
+                p_walked="$p_walked$p_rp"$'\t'"$root"$'\n'
+                while IFS= read -r p_file; do probes+=("$p_file"); done \
+                    < <(find "$root/" -name '*.jsonl' 2>/dev/null | head -n 5000)
+            fi
         fi
     done
     while IFS= read -r f; do
@@ -789,6 +807,14 @@ $pat
 "*) continue ;; esac
             pe_seen="$pe_seen$pat
 "
+            # A RULE WHOSE LAST SEGMENT IS A PLAIN NAME no transcript path ends in (`.env`, `id_rsa`)
+            # names no transcript: what it enumerates is files of that name. It was probed against
+            # every transcript anyway, and five ordinary secret rules spent the whole budget (review
+            # round 17). Wildcards, `*.jsonl` and the tree's own directory names are still probed.
+            case "${pat##*/}" in
+                *[\*\?\[\{]*|*.jsonl|memory|subagents|workflows|tool-results) ;;
+                *) continue ;;
+            esac
             base="$(posture_rule_base "$pat")"
             for root in "${proots[@]}"; do
                 # The base IS the tree, or lies INSIDE it: counted outright.
@@ -803,8 +829,12 @@ $pat
                     for probe in "${probes[@]}"; do
                         # A BUDGET on the probe matches, which fails towards yes: past it the sweep
                         # runs rather than the tick outrunning its timeout (review round 16).
-                        pe_work=$((pe_work + 1)); [ "$pe_work" -le 100000 ] || return 0
-                        case "$probe" in "$root"/*) posture_rule_covers "$pat" "$probe" && return 0 ;; esac
+                        # Charged only for a probe IN this root: the other spelling's were counted too,
+                        # about four per transcript per rule (review round 17).
+                        case "$probe" in
+                            "$root"/*) pe_work=$((pe_work + 1)); [ "$pe_work" -le 300000 ] || return 0
+                                       posture_rule_covers "$pat" "$probe" && return 0 ;;
+                        esac
                     done
                 fi
             done
@@ -1784,6 +1814,13 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     dt0=$(date +%s%N); pe "$pdir/dups.json" >/dev/null
     case "$dt0" in *N) dt1=0 ;; *) dt1=$(( ($(date +%s%N) - dt0) / 1000000 )) ;; esac
     eq "1200 copies of one rule are judged once, fast" "$([ "$dt1" -lt 3000 ] && echo fast || echo "slow: ${dt1}ms")" fast
+    # Round 17: five ordinary secret rules against a few thousand transcripts under a linked tree do
+    # not exhaust the budget and switch the sweep on.
+    sh4="$work/sechome"; mkdir -p "$sh4/.claude-state/projects/-h-r" "$sh4/.claude"
+    ln -s "$sh4/.claude-state/projects" "$sh4/.claude/projects"
+    for i in $(seq 1 3000); do : >"$sh4/.claude-state/projects/-h-r/s$i.jsonl"; done
+    printf '%s\n' '{"permissions":{"deny":["Read(~/**/.env)","Read(~/**/.env.*)","Read(~/**/*.pem)","Read(~/**/*.key)","Read(~/**/id_rsa)"]}}' >"$pdir/secrets5.json"
+    eq "five ordinary secret rules over 3000 transcripts leave the sweep standing down" "$(pe "$pdir/secrets5.json" "$sh4")" no
     eq "a nested group expands too" \
        "$(posture_rule_covers '/h/{x,{.aws,.ssh}}/**' /h/.ssh/id && echo covered || echo clear)" covered
     bt0=$(date +%s%N)

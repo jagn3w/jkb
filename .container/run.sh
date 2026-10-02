@@ -655,14 +655,15 @@ while [ $# -gt 0 ]; do
         --kit-path)      printf '%s\n' "$DC_KIT_DIR"; exit 0 ;;
         # COPIES, never runs: dc_install_kit copies the kit's paths from the checkout and executes
         # nothing in it. From the kit, the checkout is the one recorded at install, and what changed
-        # since is listed first, so a refresh is a decision about named files.
+        # since is listed FILE BY FILE as it copies -- a record of what came in, not a gate: review the
+        # checkout's changes before running this (round 17 found it naming only `.container`).
         --install-kit)   kit_need_checkout
                          if [ -f "$DC_KIT_DIR/$DC_KIT_MARKER" ]; then
                              kit_changed="$(dc_kit_stale "$DC_KIT_DIR" "$repo")"
                              if [ -z "$kit_changed" ] && [ "$(dc_kit_checkout "$DC_KIT_DIR")" = "$(cd "$repo" && pwd -P)" ]; then
                                  echo "the kit at $DC_KIT_DIR already matches $repo"; exit 0
                              fi
-                             [ -z "$kit_changed" ] || { echo "changed in $repo since the kit was installed:"; printf '    %s\n' $kit_changed; }
+                             [ -z "$kit_changed" ] || { echo "copying these files, changed in $repo since the kit was installed:"; dc_kit_changes "$DC_KIT_DIR" "$repo" | sed 's/^/    /'; }
                          fi
                          dc_install_kit "$repo" "$DC_KIT_DIR" || die "the kit was not installed"
                          echo "start the container from it: $DC_KIT_DIR/.container/run.sh"; exit 0 ;;

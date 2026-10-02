@@ -143,13 +143,22 @@ is_linked_worktree() {
     [ "$(_real_dir "$gd")" != "$(_real_dir "$cd")" ]
 }
 
-# main_checkout_of <repo_root> — the MAIN checkout of the repository <repo_root> is in: the parent of
-# its common git dir, so a linked worktree answers with the checkout it was added from. Fails outside
-# a repository. setup.sh refreshes the dev container's kit only from here (review round 10).
+# main_checkout_of <repo_root> — the MAIN checkout of the repository <repo_root> is in: itself when
+# it is not a linked worktree, else the first entry `git worktree list` gives. Taking the common
+# dir's parent named a --separate-git-dir checkout's git-dir parent instead (review round 17). setup.sh decides with is_linked_worktree and uses this
+# only to name the main checkout in its message.
 main_checkout_of() {
-    local hooks
-    hooks="$(git_hooks_dir "$1")" || return 1
-    _real_dir "$(dirname "$(dirname "$hooks")")"
+    local m rc=0
+    is_linked_worktree "$1" || rc=$?
+    case "$rc" in
+        # Not a linked worktree: it IS the main checkout. Its toplevel, not `worktree list`, which
+        # names the git dir itself for a --separate-git-dir checkout (measured on git 2.51.1).
+        1) m="$(_git -C "$1" rev-parse --show-toplevel 2>/dev/null)" ;;
+        0) m="$(_git -C "$1" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" ;;
+        *) return 1 ;;
+    esac
+    [ -n "$m" ] || return 1
+    _real_dir "$m"
 }
 
 # _real_dir <path> — a directory's physical path, or the path itself when it does not exist.

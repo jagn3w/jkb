@@ -490,7 +490,8 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   kit's `run.sh`.
 - **A stale kit is reported, not followed.** On every start the kit's `run.sh` names any kit path the
   checkout has changed since install, and keeps using the kit. Taking a change is
-  `run.sh --install-kit`, which lists the changed paths first. `scripts/setup.sh` refreshes the kit
+  `run.sh --install-kit`, which lists every file it copies as it copies them. That listing is a
+  record, not a gate: review the checkout's changes before running it. `scripts/setup.sh` refreshes the kit
   as well, so a pull that touches code refreshes it through `post-merge`. A pull that touches only
   `.container/` does not trigger `post-merge`, and leaves the kit stale until you run
   `--install-kit`. A pull is already the point where you review what an agent changed (*Git runs
@@ -1477,11 +1478,15 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
 - **Denies still win.** A permissions `Read(...)` deny or a `sandbox.credentials.files` deny is
   checked before the allow lists. Round 16 found an MCP server reading `~/.cargo/credentials.toml`
   because `~/.cargo` is in `allowWrite`.
-- **Only paths someone named are judged.** An unknown tool's free text yields guesses: a relative
-  string read from each base it might be resolved against. Those guesses are held to the transcript
-  rule but not to the boundary. Judged against the home, `tasks/inbox`, a URL or a plain word
-  became a home path, and ordinary MCP calls were refused (review round 16). Path fields, absolute
-  strings and `~/` strings are judged.
+- **Only the home-base guess is spared.** An unknown tool's relative free text is read from each base
+  it might be resolved against: the session cwd, the project dir and the home. The cwd and project
+  readings are judged in full, because that is where a server resolves a relative path. jkb's
+  `ingest_path` opens one from the project root, and round 16's version, which spared every base,
+  let `../../.ssh/id_rsa` through (review round 17). Only the home reading is a guess no server
+  makes. It is held to the transcript rule and not to the boundary, so `tasks/inbox`, a URL or a
+  plain word is not refused as a home path. Absolute, `~/` and over-long strings are judged too, the
+  last on their lexical form. A read of a directory that holds a denied entry is refused, so a
+  walker cannot be handed `~/.cargo`.
 - **No sandbox, no boundary.** With the sandbox disabled there is nothing to mirror, and the
   transcript rule still applies. `enabled` takes the word of the highest-precedence layer that sets
   it: managed and its drop-ins, then local, project and user. A layer that is not valid JSON

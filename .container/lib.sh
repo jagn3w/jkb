@@ -111,6 +111,9 @@ dc_container_env() { # dc_container_env <container.json> <repo-root>  -> one KEY
 # yields nothing, so a broken parse is not read as "nothing to protect".
 dc_protected_env() { # dc_protected_env <Dockerfile> <container.json>
     local names
+    # Readable first, like dc_remote_user: without pipefail an unreadable file reached jq as empty
+    # input, which answers 0 (review round 17).
+    [ -r "$1" ] && [ -r "$2" ] || { echo "dc_protected_env: cannot read $1 or $2" >&2; return 1; }
     names="$( { awk '
         /^ENV[[:space:]]/ { on = 1; sub(/^ENV[[:space:]]+/, "") }
         on {
@@ -556,6 +559,23 @@ dc_kit_checkout() { # dc_kit_checkout <kit dir>
     c="$(sed -n 's/^checkout=//p' "$1/$DC_KIT_MARKER" 2>/dev/null | head -1)"
     [ -n "$c" ] || return 1
     printf '%s\n' "$c"
+}
+
+# dc_kit_changes <kit dir> <checkout> -> every FILE that differs between the kit and the checkout,
+# one per line, relative to the checkout: what a refresh will copy in. dc_kit_stale below answers
+# per kit path (`.container`), which named one directory for ~25 files (review round 17).
+dc_kit_changes() { # dc_kit_changes <kit dir> <checkout>
+    local p
+    while IFS= read -r p; do
+        diff -rq "$1/$p" "$2/$p" 2>/dev/null | sed -n \
+            -e "s|^Files $1/\(.*\) and $2/.* differ\$|\1|p" \
+            -e "s|^Only in $2/\(.*\): \(.*\)\$|\1/\2 (new)|p" \
+            -e "s|^Only in $2: \(.*\)\$|\1 (new)|p" \
+            -e "s|^Only in $1/\(.*\): \(.*\)\$|\1/\2 (removed)|p" \
+            -e "s|^Only in $1: \(.*\)\$|\1 (removed)|p"
+    done <<EOF
+$(dc_kit_paths)
+EOF
 }
 
 # dc_kit_stale <kit dir> <checkout> -> the kit paths that differ from the checkout, one per line.

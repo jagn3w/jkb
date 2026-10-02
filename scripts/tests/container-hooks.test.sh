@@ -704,7 +704,8 @@ case30_the_kit_says_which_paths_the_checkout_has_changed() {
     before="$(dc_kit_stale "$kit" "$co")"
     echo '# agent edit' >> "$co/scripts/auto-mode.sh"
     after="$(dc_kit_stale "$kit" "$co")"
-    if [ -z "$before" ] && [ "$after" = scripts/auto-mode.sh ]; then
+    local files; files="$(dc_kit_changes "$kit" "$co")"
+    if [ -z "$before" ] && [ "$after" = scripts/auto-mode.sh ] && [ "$files" = scripts/auto-mode.sh ]; then
         ok "the kit names exactly the paths the checkout has changed since it was installed"
     else
         fail "the kit names exactly the paths the checkout has changed since it was installed" "before=[$before] after=[$after]"

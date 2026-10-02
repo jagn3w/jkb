@@ -616,6 +616,21 @@ if [ "${1:-}" = --self-test ]; then
     printf '%s\n' '{"permissions":{"deny":["Read(~/.cargo/credentials.toml)"]},"sandbox":{"enabled":true,"filesystem":{"denyRead":["~"],"allowWrite":["~/repos","~/.jkb","~/.cargo"]}}}' > "$bh/.claude/settings.json"
     h "round 16: a Read() deny inside an allowWrite tree still refuses an MCP read" deny \
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'/.cargo/credentials.toml"}}' HOME="$bh"
+    # REVIEW ROUND 17. Only the HOME-base reading of free text is a guess: a relative climb from the
+    # project dir is what jkb's ingest_path opens. A `~name/` string's home reading is judged; a
+    # directory holding a must-deny entry is refused to a walker; a padded over-long path still meets
+    # the boundary.
+    mkdir -p "$bh/.ssh"; : >"$bh/.ssh/id_rsa"
+    h "round 17: a relative climb from the project into denyRead is refused to an MCP server" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"../../.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 17: ...and into a credential under an allowWrite root" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"../../.cargo/credentials.toml"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 17: a ~name/ string is judged at the home it names" deny \
+      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"~vscode/.cargo/credentials.toml"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 17: a walker handed a directory holding a credential is refused" deny \
+      '{"tool_name":"mcp__x__index","cwd":"'"$bh"'/repos/w","tool_input":{"root":"'"$bh"'/.cargo"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    longp="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + ([range(2100)|"/."]|join("")) + "/.ssh/id_rsa")}}')"
+    h "round 17: an over-long padded path still meets the boundary" deny "$longp" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     mkdir -p "$bh/repos/w/.claude"
     h "round 16: the project's own settings layer is not writable through the boundary" deny \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/.claude/settings.local.json","content":"{}"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
@@ -623,6 +638,17 @@ if [ "${1:-}" = --self-test ]; then
     h "round 16: a later layer that disables wins over the user's enable, as in Claude Code" allow \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     rm -f "$bh/repos/w/.claude/settings.local.json"
+    # REVIEW ROUND 17: MANAGED WINS for `enabled`, watched failing under the old order.
+    mkdir -p "$bh/managed"
+    printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/managed/managed-settings.json"
+    printf '%s\n' '{"sandbox":{"enabled":false}}' > "$bh/repos/w/.claude/settings.local.json"
+    h "round 17: managed enabling beats a local disable" deny \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_MANAGED_DIR="$bh/managed"
+    sbq_self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+    sbq="$(cd "$bh/repos/w" && env HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_MANAGED_DIR="$bh/managed" "$BASH" "$sbq_self" --sandbox-enabled 2>/dev/null)"
+    if [ "$sbq" = 1 ]; then printf '  \033[32mok\033[0m   round 17: --sandbox-enabled prints the merged answer (1)\n'
+    else printf '  \033[31mFAIL\033[0m round 17: --sandbox-enabled printed [%s]\n' "$sbq"; fails=$((fails+1)); fi
+    rm -f "$bh/repos/w/.claude/settings.local.json"; rm -rf "$bh/managed"
     printf '%s\n' '{"sandbox":{"enabled":false,"filesystem":{"denyRead":["~"],"allowWrite":["~/repos"]}}}' > "$bh/.claude/settings.json"
     h "boundary: with the sandbox disabled there is no boundary to mirror" allow \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh"
@@ -881,7 +907,16 @@ deny() {
 # (review round 4, all reproduced). A subagent's own tool calls reach this hook in their own right.
 # Read with the builtin, not `cat`: every tool call pays for this hook now, so a fork saved here is
 # saved on every Bash call.
-IFS= read -r -d '' input || true
+# `--sandbox-enabled` asks this hook's own merged answer (1 or 0) for the cwd, so verify.sh does not
+# keep a second copy of the layer-precedence rule (review round 17). It runs the same path as a tool
+# call, with a synthetic payload, and prints instead of deciding.
+sb_query=0
+if [ "${1:-}" = --sandbox-enabled ]; then
+    sb_query=1
+    input="$(printf '{"tool_name":"__sandbox_query__","cwd":%s,"tool_input":{}}' "$(printf '%s' "$PWD" | HOME=/dev/null jq -Rs .)")"
+else
+    IFS= read -r -d '' input || true
+fi
 command -v jq >/dev/null 2>&1 || exit 3
 tool="$(printf '%s' "$input" | jqh -er '.tool_name | strings' 2>/dev/null)" || exit 3
 case "$tool" in
@@ -951,7 +986,12 @@ sb_on=0; sb_w=(); sb_r=(); sb_dr=(); sb_md=()
 # layer's `enabled:false` would have outranked it (review round 16).
 sb_layers=("${CLAUDE_CONFIG_DIR:-$home/.claude}/settings.json")
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] && sb_layers+=("$CLAUDE_PROJECT_DIR/.claude/settings.json" "$CLAUDE_PROJECT_DIR/.claude/settings.local.json")
-sb_layers+=(/etc/claude-code/managed-settings.json /etc/claude-code/managed-settings.d/*.json)
+# THE MANAGED DIRECTORY is fixed, except to this file's own --self-test, which points it at a scratch
+# directory to watch managed precedence fire (review round 17). The INSTALLED copy never honours the
+# override, whatever its environment holds -- a settings `env` must not be able to move it.
+sb_mdir=/etc/claude-code
+[ -n "${DT_SELFTEST_MANAGED_DIR:-}" ] && [ "$0" != /usr/local/bin/deny-transcripts.sh ] && sb_mdir="$DT_SELFTEST_MANAGED_DIR"
+sb_layers+=("$sb_mdir/managed-settings.json" "$sb_mdir"/managed-settings.d/*.json)
 sb_args=(); sb_names=()
 sb_i=0
 for f in "${sb_layers[@]}"; do
@@ -985,7 +1025,9 @@ if [ "$sb_on" = 1 ]; then
     # Claude Code's to resolve against a settings file, and the native tools still enforce it.
     sb_md_abs=()
     for e in ${sb_md[@]+"${sb_md[@]}"}; do
-        case "$e" in "//"*) sb_md_abs+=("/${e#//}") ;; "~") sb_md_abs+=("$home") ;; "~/"*) sb_md_abs+=("$home/${e#\~/}") ;; /*) sb_md_abs+=("$e") ;; esac
+        # `//x` is absolute and `/x` is RELATIVE to its settings file in Claude Code's rule syntax, so
+        # a single-slash entry is skipped with the other relative ones (review round 17).
+        case "$e" in "//"*) sb_md_abs+=("/${e#//}") ;; "~") sb_md_abs+=("$home") ;; "~/"*) sb_md_abs+=("$home/${e#\~/}") ;; esac
     done
     # `~` is the home; a relative entry (".") is the project's, as Claude Code reads it. Then every
     # entry resolved the way the path it is compared with is: physically.
@@ -1032,6 +1074,13 @@ boundary() {
     for e in ${sb_md_abs[@]+"${sb_md_abs[@]}"}; do
         # shellcheck disable=SC2254
         case "$1" in $e|$e/*) deny "$1 is denied by the Claude settings (a Read() permission deny or a credential file), and the file tools and MCP servers are held to it as the native Read is." ;; esac
+        # ...and a READ of a directory that HOLDS one: a walker handed ~/.cargo reads credentials.toml
+        # inside it (review round 17). The entry's literal base is compared, so a glob errs to refuse.
+        if [ "$sb_mode" = read ]; then
+            local eb="${e%%[\*\?\[\{]*}"; eb="${eb%/}"
+            [ -n "$eb" ] && [ "${eb#"${1%/}"/}" != "$eb" ] \
+                && deny "$1 holds $eb, which the Claude settings deny reading, and a tool rooted here would read it."
+        fi
     done
     # THE SETTINGS LAYERS THIS READS are never writable through it: for a project outside ~/repos
     # the cwd is writable, and a Write of its .claude/settings.local.json could have switched the
@@ -1063,6 +1112,7 @@ boundary() {
 # Writes for the tools that write; everything else -- Read, Grep, Glob, MCP servers, unknown tools --
 # is judged as a read, the weaker test, since what an unknown tool does with a path is unknown.
 case "$tool" in Write|Edit|MultiEdit|NotebookEdit) sb_mode=write ;; *) sb_mode=read ;; esac
+if [ "$sb_query" = 1 ]; then printf '%s\n' "$sb_on"; decided=allow; exit 0; fi
 
 check() { # check <path> [base]: deny on deny, return on allow, refuse on anything else
     local base="${2:-$cwd}" v abs raw phys p="$1"
@@ -1287,14 +1337,29 @@ case "$tool" in
                     v="$(verdict "$leaf" "$roots" "$home" "$b")"
                     case "$v" in deny) deny ;; allow) ;; *) exit 3 ;; esac
                 done
+                # ...and an absolute or `~/` one meets the boundary on its lexical form: padded past
+                # PATH_MAX with `./` it skipped every allow-list check, and a normalising server would
+                # open ~/.ssh (review round 17).
+                case "$leaf" in /*|"~/"*|"~") boundary "$(resolve "$leaf" "$home" "$cwd")" ;; esac
                 continue
             fi
             case "$leaf" in
                 /*|"~/"*|"~") check "$leaf" ;;
                 # Both readings of `~name...` (check does the second), from every base. The relative
                 # ones are guesses, held to the transcript rule but not to the boundary.
-                "~"*) for b in "${bases[@]}"; do [ -n "$b" ] && sb_guess=1 check "$leaf" "$b"; done ;;
-                *) for b in "${bases[@]}"; do [ -n "$b" ] && sb_guess=1 check "$leaf" "$b"; done ;;
+                # ONLY THE HOME-BASE READING is a guess: no server named the home as its cwd, while the
+                # session cwd and project dir are where one resolves a relative path -- jkb's
+                # ingest_path opens it from the project root, and round 16's skip of every base let
+                # `../../.ssh/id_rsa` through (review round 17). The home reading of a `~name/` string
+                # comes from the cwd base's call, unmarked, so it is judged too.
+                "~"*|*) for b in "${bases[@]}"; do
+                            [ -n "$b" ] || continue
+                            if [ "$b" = "$home" ] && [ "$b" != "$cwd" ] && [ "$b" != "${CLAUDE_PROJECT_DIR:-}" ]; then
+                                sb_guess=1 check "$leaf" "$b"
+                            else
+                                check "$leaf" "$b"
+                            fi
+                        done ;;
             esac
         done ;;
 esac
