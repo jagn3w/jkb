@@ -1554,7 +1554,9 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
   WebFetch, StructuredOutput, the task and cron tools and the like) is let through. **Any other
   tool, MCP or built-in, has the fields whose names say they are paths judged** (`file_path`,
   `path`, `paths`, `file`, `dir`, `root`, `source`, `target`, `uri`, `url` and the like, at any depth,
-  as a string or an array; a URL only when it is `file:`), and everything else it carries passes.
+  as a string or an array, every value judged as a path, a URL included: a link named `x:` (round
+  28) or `https:` (round 29) in the cwd is what a server that open()s the value reads), and
+  everything else it carries passes.
   Round 27 refused unlisted tools outright. That refused StructuredOutput, which every schema agent
   must call, so `/jkb-review` and the swarm returned nothing in the container. It also refused every
   connector, though a claude.ai connector cannot open a local file at all. The user chose names
@@ -1606,7 +1608,19 @@ under `denyRead` is refused but one the lists only let Bash read is not. And the
 hook is installed only in the container's managed settings. On the host the file tools are still
 held only by the posture's deny rules, and the separate-user task is where that ends.
 
-**Held by** seventeen boundary rows in the hook's self-test, which run against a scratch home outside
+**The boundary's locations come from the account, not the environment** (review rounds 31 and 32). A
+settings layer's `env` reaches the hook's environment, and a project or local layer is one sandboxed
+Bash can create. Its `HOME` or `CLAUDE_CONFIG_DIR` pointed the trusted user layer at an agent's file.
+A forged home whose `.claude/projects` linked to `~/.claude` made all of it a writable "memory"
+directory. `TMPDIR=/` or `CLAUDE_PROJECT_DIR=/` made every path a write root. The installed hook
+therefore takes the user layer, `~` in its lists, and the roots of its memory and tool-output
+exceptions from the passwd home. It takes `TMPDIR` as a write root only under `/tmp`, and
+`CLAUDE_PROJECT_DIR` only when it is the cwd or an ancestor of it, strictly inside the home. The
+transcript rule still adds every spelling of the tree as a root, because there a root only denies.
+Whether a settings `env` can override the `CLAUDE_PROJECT_DIR` Claude Code hands its hooks is not
+measured; the bound makes the answer irrelevant.
+
+**Held by** the boundary rows in the hook's self-test, which run against a scratch home outside
 the temp roots, because `/tmp` is writable to the sandbox and would pass every write. Five of them
 were watched failing with the boundary call removed. `verify.sh` probes the installed hook: with the
 sandbox enabled, a Write to the home must be refused and one in the workspace allowed.

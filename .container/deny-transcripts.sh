@@ -42,6 +42,12 @@ export PATH
 # in jkb-dev). It also makes ${#x} count bytes, which is what PATH_MAX counts.
 LC_ALL=C
 export LC_ALL
+# WHERE THE INSTALLED COPY LIVES, once. The installed hook trusts none of the self-test seams and none
+# of the environment's say over the boundary's locations; a copy anywhere else is the self-test's.
+# check-config.sh holds this literal to the managed hook command (review round 32: four copies of it,
+# tied to nothing, and a moved install would have put the live hook into test mode).
+DT_INSTALLED_PATH=/usr/local/bin/deny-transcripts.sh
+dt_installed=0; [ "$0" = "$DT_INSTALLED_PATH" ] && dt_installed=1
 set -uo pipefail
 
 # EVERY jq CALL GOES THROUGH HERE, with HOME pointed where no file can be. jq SOURCES $HOME/.jq into
@@ -597,7 +603,7 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__fs__read_many","cwd":"'"$bh"'/repos/w","tool_input":{"opts":{"paths":["'"$bh"'/repos/w/a","'"$bh"'/.ssh/id_rsa"]}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: ...and a file: URL in a uri field" deny \
       '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"file:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
-    h "round 27: ...while an https url field is not a path" allow \
+    h "round 27: ...while an https url field resolves to a harmless relative path" allow \
       '{"tool_name":"mcp__x__fetch","cwd":"'"$bh"'/repos/w","tool_input":{"url":"https://example.com'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     ln -s "$bh/.ssh" "$bh/repos/w/x:"
     h "round 28: an unlisted tool's x:// path through a cwd link named x: is judged" deny \
@@ -666,17 +672,32 @@ if [ "${1:-}" = --self-test ]; then
     mkdir -p "$bh/forged/.claude"
     printf '%s\n' '{"sandbox":{"enabled":true,"filesystem":{"allowWrite":["/"],"allowRead":["/"]}}}' > "$bh/forged/.claude/settings.json"
     aic="$bh/dt-as-installed.sh"; cp "$self" "$aic" && chmod +x "$aic"
+    # A SCRATCH MANAGED LAYER enables the sandbox for these rows, so they run on any machine -- on CI,
+    # with no user settings, they skipped, and reverting round 31 stayed green (review round 32).
+    mkdir -p "$bh/aimgd"; printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/aimgd/managed-settings.json"
+    acct3="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    ai() { printf '%s' "$1" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR DT_SELFTEST_AS_INSTALLED=1 DT_SELFTEST_MANAGED_DIR="$bh/aimgd" "${@:2}" "$BASH" "$aic" 2>/dev/null; }
     aiw='{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"/opt/evil","content":""}}'
-    aib="$(printf '%s' "$aiw" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR DT_SELFTEST_AS_INSTALLED=1 "$BASH" "$aic" 2>/dev/null)"
-    case "$aib" in
-        *'"permissionDecision":"deny"'*)
-            for aiv in "HOME=$bh/forged" "CLAUDE_CONFIG_DIR=$bh/forged/.claude"; do
-                aio="$(printf '%s' "$aiw" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR DT_SELFTEST_AS_INSTALLED=1 "$aiv" "$BASH" "$aic" 2>/dev/null)"
-                case "$aio" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 31: installed, a forged %s does not move the trusted user layer\n' "${aiv%%=*}" ;;
-                    *) printf '  \033[31mFAIL\033[0m round 31: installed, a forged %s moved the trusted user layer\n' "${aiv%%=*}"; fails=$((fails+1)) ;; esac
-            done ;;
-        *) printf '  \033[33mskip\033[0m round 31: this machine'"'"'s own settings do not hold /opt out of the boundary, so a forged HOME cannot be told from them\n' ;;
-    esac
+    if [ -n "$acct3" ]; then
+        case "$(ai "$aiw")" in
+            *'"permissionDecision":"deny"'*)
+                for aiv in "HOME=$bh/forged" "CLAUDE_CONFIG_DIR=$bh/forged/.claude"; do
+                    case "$(ai "$aiw" "$aiv")" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 31: installed, a forged %s does not move the trusted user layer\n' "${aiv%%=*}" ;;
+                        *) printf '  \033[31mFAIL\033[0m round 31: installed, a forged %s moved the trusted user layer\n' "${aiv%%=*}"; fails=$((fails+1)) ;; esac
+                done
+                # ...nor make an exception root of it: a forged home whose .claude/projects links to the
+                # real ~/.claude made all of it "memory", and writable (round 32).
+                mkdir -p "$bh/forged2/.claude"; ln -sfn "$acct3/.claude" "$bh/forged2/.claude/projects"
+                aim='{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$acct3"'/.claude/commands/memory/x.md","content":""}}'
+                case "$(ai "$aim" "HOME=$bh/forged2")" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 32: installed, a forged home linked into ~/.claude is no memory exception\n' ;;
+                    *) printf '  \033[31mFAIL\033[0m round 32: installed, a forged home linked into ~/.claude made it writable as memory\n'; fails=$((fails+1)) ;; esac
+                case "$(ai "$aiw" "CLAUDE_PROJECT_DIR=/")" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 32: a CLAUDE_PROJECT_DIR of / is not a write root\n' ;;
+                    *) printf '  \033[31mFAIL\033[0m round 32: a CLAUDE_PROJECT_DIR of / made every path writable\n'; fails=$((fails+1)) ;; esac ;;
+            *) printf '  \033[31mFAIL\033[0m round 31: with the sandbox enabled by a scratch managed layer, /opt was still writable\n'; fails=$((fails+1)) ;;
+        esac
+    else
+        printf '  \033[33mskip\033[0m round 31/32: no passwd entry for this uid, so the installed home cannot be exercised\n'
+    fi
     # REVIEW ROUND 17: MANAGED WINS for `enabled`, watched failing under the old order.
     mkdir -p "$bh/managed"
     printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/managed/managed-settings.json"
@@ -917,7 +938,7 @@ deny() {
 # in the installed copy, as DT_SELFTEST_MANAGED_DIR is.
 if [ "${1:-}" != --judge ] && [ "${1:-}" != --sandbox-enabled ]; then
     dt_deadline=8
-    [ -n "${DT_SELFTEST_DEADLINE:-}" ] && [ "$0" != /usr/local/bin/deny-transcripts.sh ] && dt_deadline="$DT_SELFTEST_DEADLINE"
+    [ -n "${DT_SELFTEST_DEADLINE:-}" ] && [ "$dt_installed" = 0 ] && dt_deadline="$DT_SELFTEST_DEADLINE"
     dt_rc=0; /usr/bin/timeout -s KILL "$dt_deadline" /bin/bash -p "$0" --judge || dt_rc=$?
     case "$dt_rc" in
         0|2) decided=child; exit "$dt_rc" ;;
@@ -925,7 +946,7 @@ if [ "${1:-}" != --judge ] && [ "${1:-}" != --sandbox-enabled ]; then
         *) exit 2 ;;
     esac
 fi
-[ -n "${DT_SELFTEST_SLOW:-}" ] && [ "$0" != /usr/local/bin/deny-transcripts.sh ] && sleep "$DT_SELFTEST_SLOW"
+[ -n "${DT_SELFTEST_SLOW:-}" ] && [ "$dt_installed" = 0 ] && sleep "$DT_SELFTEST_SLOW"
 
 # BASH, AND THE BUILT-INS THAT TAKE NO PATH, ARE DECIDED FIRST -- before roots, realpath, or anything
 # else that can fail. Bash is the repair tool, and a container broken in some other way must not
@@ -1028,8 +1049,15 @@ sb_on=0; sb_w=(); sb_r=(); sb_dr=(); sb_md=()
 # so its rows can use a scratch home; DT_SELFTEST_AS_INSTALLED makes a copy behave as installed, which
 # only ever tightens it.
 sb_home="$home"; sb_cfg="${CLAUDE_CONFIG_DIR:-$home/.claude}"
-if { [ "$0" = /usr/local/bin/deny-transcripts.sh ] || [ -n "${DT_SELFTEST_AS_INSTALLED:-}" ]; } && [ -n "$acct_home" ]; then
+sb_roots="$roots"
+if { [ "$dt_installed" = 1 ] || [ -n "${DT_SELFTEST_AS_INSTALLED:-}" ]; } && [ -n "$acct_home" ]; then
     sb_home="$(normalise "$acct_home")"; sb_cfg="$sb_home/.claude"
+    # ...and the roots its EXCEPTIONS come from (auto-memory, saved tool output), which ALLOW: built from
+    # $HOME or CLAUDE_CONFIG_DIR, a forged home whose .claude/projects linked to ~/.claude made all of
+    # ~/.claude a "memory" directory, writable (review round 32). The transcript rule may still use
+    # every spelling: a root there only denies.
+    sb_rl=("$sb_home/.claude/projects" "$sb_home/.claude-state/projects" "$sb_home/.claude-state/transcript-archive")
+    sb_roots="$(printf '%s\n' "${sb_rl[@]}" "$(realpath -m -- "${sb_rl[@]}" 2>/dev/null)" | awk 'NF && !seen[$0]++')"
 fi
 sb_layers=("$sb_cfg/settings.json")
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] && sb_layers+=("$CLAUDE_PROJECT_DIR/.claude/settings.json" "$CLAUDE_PROJECT_DIR/.claude/settings.local.json")
@@ -1037,7 +1065,7 @@ sb_layers=("$sb_cfg/settings.json")
 # directory to watch managed precedence fire (review round 17). The INSTALLED copy never honours the
 # override, whatever its environment holds -- a settings `env` must not be able to move it.
 sb_mdir=/etc/claude-code
-[ -n "${DT_SELFTEST_MANAGED_DIR:-}" ] && [ "$0" != /usr/local/bin/deny-transcripts.sh ] && sb_mdir="$DT_SELFTEST_MANAGED_DIR"
+[ -n "${DT_SELFTEST_MANAGED_DIR:-}" ] && [ "$dt_installed" = 0 ] && sb_mdir="$DT_SELFTEST_MANAGED_DIR"
 sb_nm_layers=${#sb_layers[@]}
 sb_layers+=("$sb_mdir/managed-settings.json" "$sb_mdir"/managed-settings.d/*.json)
 sb_args=(); sb_names=()
@@ -1101,7 +1129,18 @@ if [ "$sb_on" = 1 ]; then
     # project, the temp roots it hands tools, and ~/.claude/plans, where plan mode writes.
     # TMPDIR only where a temp root can be: a settings `env` set it to `/`, and every path became a write
     # root (review round 31).
-    sb_w+=("$cwd" "${CLAUDE_PROJECT_DIR:-$cwd}" "/tmp/claude" "/tmp/claude-$UID" "~/.claude/plans")
+    sb_w+=("$cwd" "/tmp/claude" "/tmp/claude-$UID" "~/.claude/plans")
+    # CLAUDE_PROJECT_DIR only where a project can be: the cwd or an ancestor of it, strictly inside the
+    # home. Whether a settings `env` can override the value Claude Code hands its hooks is unmeasured,
+    # and set to `/` every path became a write root (review round 32), as TMPDIR's did in round 31.
+    if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+        sb_pd="$(realpath -m -- "$CLAUDE_PROJECT_DIR" 2>/dev/null)" || sb_pd=""
+        sb_cw="$(realpath -m -- "$cwd" 2>/dev/null)" || sb_cw=""
+        if [ -n "$sb_pd" ] && under "$sb_pd" "$(realpath -m -- "$sb_home" 2>/dev/null)" \
+           && { [ "$sb_pd" = "$sb_cw" ] || under "$sb_cw" "$sb_pd"; }; then
+            sb_w+=("$sb_pd")
+        fi
+    fi
     sb_tmp="$(realpath -m -- "${TMPDIR:-/tmp}" 2>/dev/null)" || sb_tmp=""
     case "$sb_tmp" in /tmp|/tmp/*) sb_w+=("$sb_tmp") ;; esac
     sb_resolve() { # sb_resolve <name of array> -- each entry, absolute and physical, in place
@@ -1164,7 +1203,7 @@ boundary() {
             rest="${rest#*/}"
             [ "$rest" = tool-results ] || [ "${rest#tool-results/}" != "$rest" ] && return 0
         fi
-    done <<<"$roots"
+    done <<<"$sb_roots"
     if [ "$sb_mode" = write ]; then
         sb_under "$1" ${sb_w[@]+"${sb_w[@]}"} && return 0
         deny "$1 is outside the sandbox's writable paths (allowWrite in the Claude settings), and the file tools are held to the same boundary as Bash. Write inside the workspace or another allowWrite directory."

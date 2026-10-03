@@ -9,7 +9,9 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the
 conventions every session is expected to know.
 
 - **`scripts/hooks/post-merge`** (installed by `setup.sh`) runs `setup.sh` when the pull
-  touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
+  touched `crates/`/`ui/`/`scripts/`/`macos/`/`.container/`/`Cargo.*` (`.container/` so the dev
+  container kit, which `setup.sh` refreshes, follows a pull; see `.container/README.md`), then
+  `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
   `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
 - **In the dev container, `setup.sh` rebuilds the binary and stops** (`JKB_REMOTE` set). Once the

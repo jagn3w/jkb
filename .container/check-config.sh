@@ -598,6 +598,11 @@ else
     # An INTEGER timeout, or `[ -ge ]` errors, the elif is skipped and this reads as fine (round 28).
     elif ! [[ "$dc_tmo" =~ ^[0-9]+$ ]] || [ -z "$dc_dl" ] || [ "$dc_dl" -ge "$dc_tmo" ]; then
         bad "the transcript hook's own deadline [${dc_dl:-not found}s] does not end before its managed timeout [${dc_tmo:-not set}s] — Claude Code would kill it first and let the call through"
+    # ...AND IT KNOWS WHERE IT IS INSTALLED: the hook trusts its environment and its test seams only when
+    # it is NOT at DT_INSTALLED_PATH, so a hook command elsewhere would run the live hook in test mode
+    # (review round 32).
+    elif [ "$(sed -n 's/^DT_INSTALLED_PATH=\(.*\)$/\1/p' "$here/deny-transcripts.sh" | head -1)" != "$dc_hook" ]; then
+        bad "the transcript hook's DT_INSTALLED_PATH is not the managed hook command [$dc_hook] — the live hook would take itself for a test copy, trusting its environment and its self-test seams"
     else
         ok "the transcript deny is a wired, root-owned hook that every tool call reaches"
     fi

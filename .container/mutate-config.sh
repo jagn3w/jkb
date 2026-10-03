@@ -1609,7 +1609,7 @@ seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = '/.claude-state/transcript-archive"'
-assert s.count(old) == 2, "mutation target absent"
+assert s.count(old) == 3, "mutation target absent"
 open(p, 'w').write(s.replace(old, '/.claude-state/elsewhere"'))
 PYX
 run "the hook forgets the transcript archive" "hook:.claude-state/transcript-archive"
@@ -2069,6 +2069,16 @@ open(p, 'w').write(s.replace(o, '"command": "/usr/local/bin/deny-transcripts.sh"
 PYX
 run "the hook's managed timeout is a fraction under its deadline" "does not end before its managed timeout"
 
+# REVIEW ROUND 32. The hook's own idea of its install path must be the managed hook command.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'DT_INSTALLED_PATH=/usr/local/bin/deny-transcripts.sh'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'DT_INSTALLED_PATH=/usr/local/lib/deny-transcripts.sh', 1))
+PYX
+run "the hook's DT_INSTALLED_PATH drifts from the managed command" "DT_INSTALLED_PATH is not the managed hook command"
+
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -2464,7 +2474,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=119
+PINNED_BAD_SITES=120
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
