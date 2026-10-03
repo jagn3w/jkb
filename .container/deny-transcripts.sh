@@ -724,9 +724,9 @@ if [ "${1:-}" = --self-test ]; then
     mkdir -p "$bh/managed"
     printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/managed/managed-settings.json"
     printf '%s\n' '{"sandbox":{"enabled":false}}' > "$bh/repos/w/.claude/settings.local.json"
-    # RUN FROM A COPY: the installed hook ignores the managed-directory override by design, and
-    # verify.sh runs THIS self-test from the installed path, where these rows failed on every start
-    # and hid every probe after them (review round 18). A copy elsewhere honours it.
+    # RUN FROM A COPY: only a copy that is not the installed hook honours the managed-directory
+    # override. (Round 18 added this when verify.sh ran the installed self-test; since round 34 it does
+    # not, and the installed copy refuses --self-test.)
     sbq_self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
     dtc="$bh/dt-copy.sh"; cp "$sbq_self" "$dtc"
     out="$(printf '%s' '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' \

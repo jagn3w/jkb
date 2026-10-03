@@ -725,7 +725,7 @@ dc_run_env="$(sed -n 2p <<<"$dc_run_cmds")"
 [ "$(head -1 "$here/run.sh")" = '#!/bin/bash -p' ] \
     || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash -p, so bash itself is found through PATH, or runs the launching terminal's BASH_ENV and exported functions;"
 case "$dc_run_env" in
-    *'eval "jkb_home=~$jkb_u"'*'jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin;'*'jkb_keepf="$jkb_home/.local/share/jkb-container-kit/path-keep"'*'jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" '*'compgen -e'*'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"'*) ;;
+    *'jkb_home="$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)"'*'jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin;'*'jkb_keepf="$jkb_home/.local/share/jkb-container-kit/path-keep"'*'jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" '*'compgen -e'*'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"'*) ;;
     *) dc_unsb="$dc_unsb run.sh does not rebuild its environment as its first command (env -i, a PATH built from fixed directories and path-keep, an allowlist), so it runs with what the launching terminal gave it;" ;;
 esac
 # The built PATH takes nothing from the inherited one, which travels only as JKB_USER_PATH for need_tool's
@@ -747,6 +747,12 @@ for dc_v in $(grep -oE '[$][{]?JKB_[A-Z_]+' "$here/run.sh" | tr -d '${' | sort -
 done
 grep -qF '[ "$IMAGE" != jkb-dev ]' <<<"$(dc_strip_comments "$here/run.sh")" \
     || dc_unsb="$dc_unsb run.sh may run an existing image named by JKB_CONTAINER_IMAGE without building it from the kit;"
+# THE INSTALLED HOOK REFUSES ITS SELF-TEST, before the self-test stages any copy: run unsandboxed, its
+# copies in agent-writable /tmp and ~/.cache could be swapped and run outside the sandbox (review
+# rounds 34 and 35; nothing held the refusal).
+dc_st="$(dc_strip_comments "$here/deny-transcripts.sh" | sed -n '/^if \[ "\${1:-}" = --self-test \]; then/,/mktemp/p')"
+grep -qF 'if [ "$dt_installed" = 1 ]; then' <<<"$dc_st" && grep -qF 'exit 1' <<<"$dc_st" \
+    || dc_unsb="$dc_unsb the installed transcript hook does not refuse --self-test before staging copies, which run unsandboxed from agent-writable directories;"
 grep -q 'JKB_CONTAINER_KIT_HOME' <<<"$(dc_strip_comments "$here/lib.sh")" \
     && dc_unsb="$dc_unsb lib.sh lets JKB_CONTAINER_KIT_HOME move the kit, and a launching terminal sets it;"
 # EVERY EXEC IN run.sh, not the two above: round 7 fixed the sweep and verify.sh and left seven

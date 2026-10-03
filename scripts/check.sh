@@ -215,7 +215,7 @@ fi
 
 # ...and the transcript sweep's budget arithmetic. The sweep is now the BACKSTOP, not the defence:
 # .container/deny-transcripts.sh keeps transcripts out of the deny list, and the sweep stands down
-# unless a settings layer brings back a rule that enumerates them, in which case its budget is what
+# unless the managed settings or a drop-in bring back a rule that enumerates them, in which case its budget is what
 # keeps the Bash sandbox's deny list inside one argv (MAX_ARG_STRLEN = 131072 bytes). Getting that
 # wrong is a container where no Bash call works, or a sweep that archives a live session. Pure — records in,
 # paths out — and its filesystem half runs against a scratch tree, so no container and no Docker.

@@ -1,5 +1,10 @@
 //! Telling the dev container to bound its own Bash-sandbox deny list.
 //!
+//! *Superseded as the defence on 2026-09-30, kept as the backstop:* the transcript deny moved into a
+//! hook (`.container/deny-transcripts.sh`), so on the posture that ships no rule enumerates a
+//! transcript and the sweep stands down. What follows is the posture it was written against;
+//! `.container/README.md` has the record.
+//!
 //! **Why this lives on the host.** Claude Code's Bash sandbox enumerates every session transcript
 //! into one argv, Linux caps one argument at `MAX_ARG_STRLEN`, and a dev container over that limit
 //! fails *every* Bash tool call at spawn with `E2BIG` — total, from the first call, with nothing in

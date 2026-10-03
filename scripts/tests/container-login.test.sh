@@ -446,8 +446,10 @@ case26_a_forged_home_does_not_choose_path_keep() {
     mkdir -p "$h/.local/share/jkb-container-kit" "$h/bin"
     printf '#!/bin/sh\n: > "%s/RAN-dirname"\nexec /usr/bin/dirname "$@"\n' "$h" > "$h/bin/dirname"; chmod +x "$h/bin/dirname"
     printf '%s\n' "$h/bin" > "$h/.local/share/jkb-container-kit/path-keep"
-    env HOME="$h" PATH="/usr/bin:/bin" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
-    if [ ! -e "$h/RAN-dirname" ]; then ok "a forged HOME does not choose run.sh's path-keep: its home is the account's"
+    # ...and GOT PAST the home lookup: exiting at it would also keep the stub from running (round 35).
+    local rc=0
+    env HOME="$h" PATH="/usr/bin:/bin" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1 || rc=$?
+    if [ ! -e "$h/RAN-dirname" ] && [ "$rc" -eq 0 ]; then ok "a forged HOME does not choose run.sh's path-keep: its home is the account's"
     else fail "a forged HOME does not choose run.sh's path-keep: its home is the account's" "the forged path-keep's dirname ran"; fi
     case "$h" in */jkb-fh.*) rm -rf -- "$h" ;; esac
 }

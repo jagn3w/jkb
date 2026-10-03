@@ -1796,11 +1796,21 @@ run "run.sh's environment allowlist keeps the inherited HOME again" "names a var
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-o = 'eval "jkb_home=~$jkb_u"'
+o = 'jkb_home="$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)"'
 assert o in s, "mutation target absent"
 open(p, 'w').write(s.replace(o, 'jkb_home="$HOME"', 1))
 PYX
 run "run.sh takes its home from the environment again" "does not rebuild its environment"
+
+# REVIEW ROUND 35. The installed hook refuses --self-test before staging any copy.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '    if [ "$dt_installed" = 1 ]; then\n        echo "the installed hook does not run its self-test'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '    if false; then\n        echo "the installed hook does not run its self-test', 1))
+PYX
+run "the installed hook runs its self-test again" "does not refuse --self-test before staging copies"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
@@ -2539,7 +2549,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=37
+PINNED_UNSB_APPENDS=39
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

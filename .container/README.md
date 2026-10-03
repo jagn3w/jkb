@@ -475,7 +475,7 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
     it is yours: behind `/usr/bin`, the tests' stub `docker` lost to a real one, and `--rm` would
     have removed a developer's container (review round 27). Homebrew's prefixes are user-owned, so
     the posture denies `Edit` on them. The kit home is mode 0700 and `Edit`-denied.
-  - **an allowlist of names:** `HOME`, the terminal and locale names, `USER`/`LOGNAME`,
+  - **an allowlist of names:** the terminal and locale names (`HOME` is built, below), `USER`/`LOGNAME`,
     `DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`, and on a
     Linux desktop `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `XAUTHORITY` (the X cookie Electron needs on X11). `DOCKER_CONTEXT`'s endpoints
     live in the `Edit`-denied `~/.docker`. `DOCKER_HOST` is not kept (review round 27): a terminal
@@ -1635,7 +1635,8 @@ sandbox enabled, a Write to the home must be refused and one in the workspace al
 Two `permissions.deny` globs used to cost more than half the argv budget every Bash call in this
 container gets. They are now one PreToolUse hook, `.container/deny-transcripts.sh`, and the sweep
 below went from the defence to a backstop: on the posture that ships it stands down and archives
-nothing, and it runs again only if a rule that enumerates transcripts comes back, in any layer.
+nothing, and it runs again only if a rule that enumerates transcripts comes back in the managed settings
+or a drop-in, the only layers it reads (see *It reads only the image's own layers*).
 
 **Why a glob was the wrong instrument.** Claude Code compiles `permissions.deny` into the
 bubblewrap argv for the Bash sandbox. A rule ending in a directory wildcard *collapses* to one
@@ -1883,7 +1884,7 @@ transcript. See the next section.
 *Superseded as the defence on 2026-09-30, kept as the backstop.* Everything below describes the
 posture the sweep was written against, when the sandbox enumerated every transcript. On the posture
 that ships, no rule names a transcript, and the sweep stands down and archives nothing. It runs again
-only if a settings layer brings back a rule that enumerates transcripts. The section above, on the
+only if the managed settings or a drop-in brings back a rule that enumerates transcripts. The section above, on the
 hook, is the current design.
 
 Every Bash tool call in every container session failed at spawn with `E2BIG`. Not degraded —
