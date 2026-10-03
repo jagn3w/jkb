@@ -163,21 +163,22 @@ pub const fn support(command: &Command) -> Support {
     }
 }
 
-/// Whether `command` reads a file the caller NAMES, here, and sends what it read on to the daemon.
+/// Whether `command` does work here that the daemon's RBAC cannot judge: it reads a file the caller
+/// NAMES and sends on only what it read, or it runs a command the caller WROTE.
 ///
-/// The daemon's RBAC cannot judge that read: only the text arrives, so whether `jkb ingest
-/// ~/repos/other/.env` may run is a question about the ingest op, never about the file. The
-/// attestation hook therefore never approves a line carrying one (`rbac_cli::attestation`): an
-/// approval overrides the session's own rules, a read rule among them, so the line is deferred to
-/// those rules -- the user's decision (2026-10-02), the same one that took the readers off
-/// `HARMLESS`. Reading jkb's own state -- the checkout's git, the container credential -- is not
-/// this: the caller names no path.
+/// RBAC judges the op, never which file fed it or what an inline gate does: whether `jkb ingest
+/// ~/repos/other/.env` or `jkb task land x --gate 'cat …'` may run is a question about ingesting or
+/// landing. The attestation hook therefore never approves a line carrying one
+/// (`rbac_cli::attestation`): an approval overrides the session's own rules, a read rule among
+/// them, so the line is deferred to those rules -- the user's decision (2026-10-02), the same one
+/// that took the readers off `HARMLESS`. Reading jkb's own state -- the checkout's git, the
+/// container credential, a gate the host stored -- is not this: the caller names none of it.
 ///
 /// Exhaustive like [`support`], for the same reason: a new subcommand does not compile until
-/// somebody decides whether it reads a named file. The one wildcard is inside `task`, whose verbs
-/// are task ops; a new `task` verb that reads a named file has to be added here by hand.
+/// somebody decides. The one wildcard is inside `task`, whose verbs are task ops; a new `task` verb
+/// that reads a named file or runs a given command has to be added here by hand.
 #[must_use]
-pub fn reads_named_file(command: &Command) -> bool {
+pub fn beyond_rbac(command: &Command) -> bool {
     match command {
         // A file is read and parsed here; a URL is rendered, which reads no local file.
         Command::Ingest { path, .. } => !jkb_ingest::is_url(path),
@@ -191,6 +192,11 @@ pub fn reads_named_file(command: &Command) -> bool {
                 cmd: TaskReviewCmd::File { from, .. },
             },
         } => from.as_os_str() != "-",
+        // An inline gate is a shell command the caller wrote, run here with `sh -c`. Landing on the
+        // gate the host stored names nothing, and stays approvable.
+        Command::Task {
+            cmd: TaskCmd::Land { gate, .. },
+        } => gate.is_some(),
         Command::Task { .. }
         // Refused with `JKB_REMOTE` set ([`support`]): they would read here, but never run here.
         | Command::Mount { .. }

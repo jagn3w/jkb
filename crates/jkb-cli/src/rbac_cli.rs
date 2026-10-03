@@ -713,11 +713,13 @@ enum Attestation {
     Skip,
     /// Ticketed, and the line approved: every command on it is `jkb` itself or `HARMLESS`, so
     /// nothing on it but `jkb` can run or write anything, and no `jkb` on it reads a file the caller
-    /// names ([`remote::reads_named_file`]). What each `jkb` may DO is the daemon's RBAC, held
+    /// names or runs a command the caller wrote ([`remote::beyond_rbac`]). What each `jkb` may DO is the daemon's RBAC, held
     /// against the ticket on every request.
     Allow,
     /// Ticketed, and the permission decision left to whoever it belonged to: a line that runs
-    /// something besides `jkb` and the `HARMLESS` commands, or one the lexer cannot model. The hook
+    /// something besides `jkb` and the `HARMLESS` commands, one the lexer cannot model, or one whose
+    /// `jkb` does work RBAC cannot judge -- reads a file the caller names, runs a command the caller
+    /// wrote ([`remote::beyond_rbac`]) -- or is refused by jkb's own parser. The hook
     /// returns no `permissionDecision`, so the session's own rules judge the call against the command
     /// as the model wrote it -- approving the line would approve the rest of it too, past whatever
     /// rule the person set for that.
@@ -893,7 +895,7 @@ fn attestation(command: &str) -> Attestation {
     // Every command on the line is one of three things. `jkb` itself, by that exact command word.
     // A [`HARMLESS`] command, whose arguments are data however they mention jkb (`echo jkb`).
     // Or OTHER -- anything that might run or write something, which the session's own rules judge.
-    // A jkb that reads a file the caller names counts as OTHER too ([`reads_named_file`]).
+    // A jkb doing work RBAC cannot judge counts as OTHER too ([`beyond_rbac`]).
     let mut jkb = 0_usize;
     let mut other = false;
     let mut mentions = false;
@@ -901,7 +903,7 @@ fn attestation(command: &str) -> Attestation {
         match words.first().map(String::as_str) {
             Some("jkb") => {
                 jkb += 1;
-                other |= reads_named_file(words);
+                other |= beyond_rbac(words);
             }
             Some(w) if HARMLESS.contains(&w) => {}
             _ => {
@@ -925,13 +927,22 @@ fn attestation(command: &str) -> Attestation {
     Attestation::Allow
 }
 
-/// Whether one `jkb` command's words read a file the caller names -- [`remote::reads_named_file`],
-/// asked of the words as the binary itself would parse them, so a flag or an `=` spelling cannot read
-/// differently here. Words the parser refuses count as a read: such a line is not approved, and the
-/// session's own rules judge it.
-fn reads_named_file(words: &[String]) -> bool {
-    use clap::Parser as _;
-    crate::Cli::try_parse_from(words).map_or(true, |cli| remote::reads_named_file(&cli.command))
+/// Whether one `jkb` command's words do work RBAC cannot judge -- [`remote::beyond_rbac`], asked of
+/// the words as the binary itself would parse them, so a flag or an `=` spelling cannot read
+/// differently here. Words the parser refuses count too: what they would do is not known, so such a
+/// line is not approved and the session's own rules judge it. Help and the version are not refusals
+/// -- clap reports them as errors, but they print and exit having read nothing.
+fn beyond_rbac(words: &[String]) -> bool {
+    use clap::{error::ErrorKind, Parser as _};
+    match crate::Cli::try_parse_from(words) {
+        Ok(cli) => remote::beyond_rbac(&cli.command),
+        Err(e) => !matches!(
+            e.kind(),
+            ErrorKind::DisplayHelp
+                | ErrorKind::DisplayVersion
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        ),
+    }
 }
 
 /// The `PreToolUse` answer for one classified command.
@@ -1128,6 +1139,10 @@ mod tests {
         // which is exactly what bash passes. Only a word SEPARATOR has to match.
         "jkb task add 'a\u{a0}b'",
         "jkb task add x\u{3000}y",
+        // Help and the version are clap "errors" that read nothing: still approved.
+        "jkb task show --help",
+        "jkb --version",
+        "jkb task",
     ];
 
     /// Lines approved as a whole: every command on them is `jkb` itself or HARMLESS, so nothing on
@@ -1140,8 +1155,6 @@ mod tests {
         "cd repo; jkb ls; echo done",
         "jkb task show x\njkb task show y",
         "jkb task land task:x",
-        "jkb --json task land task:x --gate true",
-        "jkb task 'land' task:x --gate 'sh /tmp/p.sh'",
         "jkb task gate",
         "jkb task add 'ok' && jkb task land task:x",
         // A jkb that reads no file the caller names: a page to render, or a review result typed
@@ -1180,7 +1193,12 @@ mod tests {
         "jkb task list --json | head -20",
         "jkb ls; cat ~/repos/other/.env",
         "grep -rn jkb src",
-        // A jkb that reads a file the caller NAMES ([`remote::reads_named_file`]): the daemon sees
+        // An inline gate is a command the caller wrote, run with `sh -c`: approving it would run
+        // and read past the person's own rules ([`remote::beyond_rbac`]).
+        "jkb --json task land task:x --gate true",
+        "jkb task 'land' task:x --gate 'sh /tmp/p.sh'",
+        "jkb task land task:x --gate='cat ~/repos/other/.env'",
+        // A jkb that reads a file the caller NAMES ([`remote::beyond_rbac`]): the daemon sees
         // only the text, so approving it would read past the person's own rules like `cat` -- the
         // same decision. However the flags are spelled, since the binary's own parser reads them.
         "jkb ingest ~/repos/other/.env",

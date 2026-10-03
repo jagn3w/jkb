@@ -948,9 +948,13 @@ the ticket on every request. Three answers:
   the daemon only the text — `jkb ingest <path>` (a URL is rendered, and stays approved), `jkb mcp`
   (its `ingest_path` tool), `jkb task review file --from <file>` (from `-` stays approved). RBAC
   judges the op, never which file fed it, so `jkb ingest ~/repos/other/.env` approved would read
-  past a read rule exactly as `cat` did; the container sees every project under `~/repos`. Which
-  subcommands read is `remote::reads_named_file`, an exhaustive match beside `remote::support`, asked
-  of the words as `jkb`'s own clap parser reads them; words that parser refuses are deferred too.
+  past a read rule exactly as `cat` did; the container sees every project under `~/repos`. An
+  inline gate is deferred for the same reason and more: `jkb task land x --gate '<cmd>'` runs a
+  command the caller wrote with `sh -c`, so `--gate 'cat ~/repos/other/.env'` is `cat` again
+  (review round 2 of this change). `jkb task land x` with the gate the host stored stays approved.
+  Which commands these are is `remote::beyond_rbac`, an exhaustive match beside `remote::support`,
+  asked of the words as `jkb`'s own clap parser reads them; words that parser refuses are deferred
+  too, except help and the version, which it reports as errors but which read nothing.
 - **no `permissionDecision`** for any other line that mentions `jkb`: one that also runs something
   else (`jkb ls && git status`), one the classifier cannot model (a redirect, `$`, a glob, a bare
   tilde), one that reaches `jkb` by a path, a prefix or a wrapper (`~/.cargo/bin/jkb`, `FOO=1 jkb`,
@@ -979,7 +983,10 @@ target, the gate runs or the session is archived (`task.land_check`) — though 
 side effect: the `.git/info/exclude` entry, the land lease and adopting the target from its remote
 come first. *What* a landing's gate runs is `sh -c` inside the same Bash sandbox as every
 agent command, so it reaches nothing the agent could not reach itself — and the default gate is a
-repo script the agent can edit anyway, so a prompt on `--gate` guarded nothing. A stored gate cannot
+repo script the agent can edit anyway, so a prompt on `--gate` guarded nothing. (That held against
+a *prompt*, not against an *approval*: "nothing the agent could not reach itself" is the sandbox's
+reach, the very bar the reader decision rejected, so an inline `--gate` is now deferred to the
+person's rules — never asked — as recorded above.) A stored gate cannot
 be set from the container at all (`remote.rs` refuses it); `--gate-on-host` needs `task.ran_on_host`,
 operator-only. And `main` changes only through a PR, whose CI is the verification that counts — the
 in-sandbox gate is a fast pre-check a session can weaken only for itself. A ticket inherited by
