@@ -1533,6 +1533,26 @@ case10k() {
 #
 # So this drives an actual merge and reads what the hook actually prints. Three layouts, and the
 # middle one is the harm: without the guard an unrelated repository's setup.sh executes.
+# A MERGE THAT TOUCHES ONLY .container/ RUNS setup.sh, which refreshes the dev container kit from it:
+# left out of the trigger, such a pull left the kit stale (review round 31).
+case10n() {
+    local r="$work/pm-container" hook out
+    hook="$(cd "$(dirname "$0")/../.." && pwd)/scripts/hooks/post-merge"
+    mkdir -p "$r/scripts"; git_q init -q "$r" >/dev/null 2>&1
+    printf 'seed\n' >"$r/seed"
+    printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN"' >"$r/scripts/setup.sh"; chmod +x "$r/scripts/setup.sh"
+    git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm seed >/dev/null
+    mkdir -p "$r/.container"; printf 'x\n' >"$r/.container/run.sh"
+    git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm container >/dev/null
+    git_q -C "$r" branch -q feature 2>/dev/null; git_q -C "$r" reset -q --hard HEAD~1
+    cp "$hook" "$r/.git/hooks/post-merge"; chmod +x "$r/.git/hooks/post-merge"
+    out="$(git_q -C "$r" merge --no-edit feature 2>&1)"
+    case "$out" in
+        *"running setup.sh"*"SETUP-RAN"*) ok "a merge touching only .container/ runs setup.sh, which refreshes the kit" ;;
+        *) fail "post-merge: .container/" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+}
+
 case10l() {
     local d="$work/hookenv" hook out
     hook="$(cd "$(dirname "$0")/../.." && pwd)/scripts/hooks/post-merge"
@@ -2709,6 +2729,6 @@ case_kit_linked() {
     fi
 }
 
-run_cases case_kit_main case_kit_linked case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m
+run_cases case_kit_main case_kit_linked case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m case10n
 
 finish

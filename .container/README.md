@@ -556,9 +556,8 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   checkout has changed since install, and keeps using the kit. Taking a change is
   `run.sh --install-kit`, which lists every file it copies as it copies them. That listing is a
   record, not a gate: review the checkout's changes before running it. `scripts/setup.sh` refreshes the kit
-  as well, so a pull that touches code refreshes it through `post-merge`. A pull that touches only
-  `.container/` does not trigger `post-merge`, and leaves the kit stale until you run
-  `--install-kit`. A pull is already the point where you review what an agent changed (*Git runs
+  as well, so a pull that touches code or `.container/` refreshes it through `post-merge` (`.container/`
+  joined the trigger in review round 31; before, such a pull left the kit stale). A pull is already the point where you review what an agent changed (*Git runs
   the host's hooks* above). `setup.sh` refreshes only from the main checkout. A linked worktree is a
   task branch and is left alone (review round 10). So is a checkout where git will not say which it
   is, for example an old git or a safe.directory refusal: that case once read as "main checkout"

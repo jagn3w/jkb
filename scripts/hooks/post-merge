@@ -4,8 +4,8 @@
 # Fires after any merge that changes the work tree — which is every `git pull` that brings
 # something in. Two chores that were previously manual:
 #
-#   1. re-run setup.sh, so the installed `jkb` binary and the VS Code extension match what
-#      was just pulled — but ONLY when the merge touched something setup.sh installs;
+#   1. re-run setup.sh, so the installed `jkb` binary, the VS Code extension and the dev container
+#      kit match what was just pulled — but ONLY when the merge touched something setup.sh installs;
 #   2. close tasks whose pull request has merged (`jkb task close-merged`).
 #
 # Never fails the merge. A hook that can break `git pull` is worse than the chore it
@@ -486,8 +486,10 @@ elif [ -x "$repo_root/scripts/setup.sh" ] &&
    # mutate-config.sh), where the identical idiom made CI report "run.sh no longer runs
    # verify.sh" about a file that did. Note trunk's own account exempts `printf "$var" | grep -q`
    # as "a single write, safe" — measured false above, and it is the exact shape this line was.
-   grep -qE '^(crates/|ui/|scripts/|macos/|Cargo\.(toml|lock)$)' <<<"$changed"; then
-    echo "jkb: pulled changes touch crates/ ui/ scripts/ or macos/ — running setup.sh"
+   # .container/ TOO: setup.sh refreshes the dev container kit from it, and a pull that touched only
+   # .container/ -- the usual shape of a container fix -- left the kit stale (review round 31).
+   grep -qE '^(crates/|ui/|scripts/|macos/|\.container/|Cargo\.(toml|lock)$)' <<<"$changed"; then
+    echo "jkb: pulled changes touch crates/ ui/ scripts/ macos/ or .container/ — running setup.sh"
     "$repo_root/scripts/setup.sh" || echo "jkb: setup.sh failed (continuing; re-run by hand)"
 else
     echo "jkb: no build-affecting changes pulled — skipping setup.sh"

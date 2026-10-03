@@ -659,6 +659,24 @@ if [ "${1:-}" = --self-test ]; then
     h "round 30: ...while its Read() deny still narrows it" deny \
       '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/secret/k"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     rm -f "$bh/repos/w/.claude/settings.local.json"
+    # REVIEW ROUND 31: ...nor through the environment a layer's `env` sets. TMPDIR=/ made every path a
+    # write root; a forged HOME or CLAUDE_CONFIG_DIR pointed the trusted user layer at an agent's file.
+    h "round 31: a TMPDIR of / is not a write root" deny \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"/opt/evil","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" TMPDIR=/
+    mkdir -p "$bh/forged/.claude"
+    printf '%s\n' '{"sandbox":{"enabled":true,"filesystem":{"allowWrite":["/"],"allowRead":["/"]}}}' > "$bh/forged/.claude/settings.json"
+    aic="$bh/dt-as-installed.sh"; cp "$self" "$aic" && chmod +x "$aic"
+    aiw='{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"/opt/evil","content":""}}'
+    aib="$(printf '%s' "$aiw" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR DT_SELFTEST_AS_INSTALLED=1 "$BASH" "$aic" 2>/dev/null)"
+    case "$aib" in
+        *'"permissionDecision":"deny"'*)
+            for aiv in "HOME=$bh/forged" "CLAUDE_CONFIG_DIR=$bh/forged/.claude"; do
+                aio="$(printf '%s' "$aiw" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR DT_SELFTEST_AS_INSTALLED=1 "$aiv" "$BASH" "$aic" 2>/dev/null)"
+                case "$aio" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 31: installed, a forged %s does not move the trusted user layer\n' "${aiv%%=*}" ;;
+                    *) printf '  \033[31mFAIL\033[0m round 31: installed, a forged %s moved the trusted user layer\n' "${aiv%%=*}"; fails=$((fails+1)) ;; esac
+            done ;;
+        *) printf '  \033[33mskip\033[0m round 31: this machine'"'"'s own settings do not hold /opt out of the boundary, so a forged HOME cannot be told from them\n' ;;
+    esac
     # REVIEW ROUND 17: MANAGED WINS for `enabled`, watched failing under the old order.
     mkdir -p "$bh/managed"
     printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/managed/managed-settings.json"
@@ -1002,7 +1020,18 @@ sb_on=0; sb_w=(); sb_r=(); sb_dr=(); sb_md=()
 # IN PRECEDENCE ORDER, lowest first, because `enabled` takes the last layer's word: user, project,
 # local, then managed and its drop-ins, which win in Claude Code. Managed came first, so a lower
 # layer's `enabled:false` would have outranked it (review round 16).
-sb_layers=("${CLAUDE_CONFIG_DIR:-$home/.claude}/settings.json")
+# THE BOUNDARY'S HOME IS THE ACCOUNT'S, NOT $HOME (review round 31). A settings layer's `env` reaches
+# this hook's environment, and a project or local layer is one sandboxed Bash can create in a new
+# worktree: its env HOME or CLAUDE_CONFIG_DIR pointed the "user" layer -- the one trusted to widen the
+# boundary -- at a file the agent wrote, and moved every `~` in the lists. So the installed hook finds
+# the user layer and expands `~` from the passwd home. A copy elsewhere (the self-test's) keeps $HOME,
+# so its rows can use a scratch home; DT_SELFTEST_AS_INSTALLED makes a copy behave as installed, which
+# only ever tightens it.
+sb_home="$home"; sb_cfg="${CLAUDE_CONFIG_DIR:-$home/.claude}"
+if { [ "$0" = /usr/local/bin/deny-transcripts.sh ] || [ -n "${DT_SELFTEST_AS_INSTALLED:-}" ]; } && [ -n "$acct_home" ]; then
+    sb_home="$(normalise "$acct_home")"; sb_cfg="$sb_home/.claude"
+fi
+sb_layers=("$sb_cfg/settings.json")
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] && sb_layers+=("$CLAUDE_PROJECT_DIR/.claude/settings.json" "$CLAUDE_PROJECT_DIR/.claude/settings.local.json")
 # THE MANAGED DIRECTORY is fixed, except to this file's own --self-test, which points it at a scratch
 # directory to watch managed precedence fire (review round 17). The INSTALLED copy never honours the
@@ -1062,15 +1091,19 @@ if [ "$sb_on" = 1 ]; then
     for e in ${sb_md[@]+"${sb_md[@]}"}; do
         # `//x` is absolute and `/x` is RELATIVE to its settings file in Claude Code's rule syntax, so
         # a single-slash entry is skipped with the other relative ones (review round 17).
-        case "$e" in "//"*) sb_md_abs+=("/${e#//}") ;; "~") sb_md_abs+=("$home") ;; "~/"*) sb_md_abs+=("$home/${e#\~/}") ;; esac
+        case "$e" in "//"*) sb_md_abs+=("/${e#//}") ;; "~") sb_md_abs+=("$sb_home") ;; "~/"*) sb_md_abs+=("$sb_home/${e#\~/}") ;; esac
     done
     # `~` is the home; a relative entry (".") is the project's, as Claude Code reads it. Then every
     # entry resolved the way the path it is compared with is: physically.
-    sb_abs() { case "$1" in "~") printf '%s\n' "$home" ;; "~/"*) printf '%s\n' "$home/${1#\~/}" ;; /*) printf '%s\n' "$1" ;;
+    sb_abs() { case "$1" in "~") printf '%s\n' "$sb_home" ;; "~/"*) printf '%s\n' "$sb_home/${1#\~/}" ;; /*) printf '%s\n' "$1" ;;
                *) printf '%s\n' "${CLAUDE_PROJECT_DIR:-$cwd}/${1#./}" ;; esac; }
     # Claude Code's own writable places, which the Bash sandbox also grants: the session's cwd and
     # project, the temp roots it hands tools, and ~/.claude/plans, where plan mode writes.
-    sb_w+=("$cwd" "${CLAUDE_PROJECT_DIR:-$cwd}" "${TMPDIR:-/tmp}" "/tmp/claude" "/tmp/claude-$UID" "~/.claude/plans")
+    # TMPDIR only where a temp root can be: a settings `env` set it to `/`, and every path became a write
+    # root (review round 31).
+    sb_w+=("$cwd" "${CLAUDE_PROJECT_DIR:-$cwd}" "/tmp/claude" "/tmp/claude-$UID" "~/.claude/plans")
+    sb_tmp="$(realpath -m -- "${TMPDIR:-/tmp}" 2>/dev/null)" || sb_tmp=""
+    case "$sb_tmp" in /tmp|/tmp/*) sb_w+=("$sb_tmp") ;; esac
     sb_resolve() { # sb_resolve <name of array> -- each entry, absolute and physical, in place
         local -n arr="$1"; local e out=()
         for e in "${arr[@]}"; do out+=("$(sb_abs "$e")"); done
