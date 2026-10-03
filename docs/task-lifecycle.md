@@ -969,7 +969,9 @@ Only an `allow` overrides the session's rules, so only an approved line has to b
 the property the tests hold is that one: an approved line runs nothing but `jkb` and harmless
 commands. `cd` is harmless only because `PATH` holds no relative or empty entry, so the directory
 cannot change which `jkb` runs — measured on the container's real `PATH`, eleven entries, all
-absolute. `sort`, `printf`, `sed`, `awk` and `uniq` are deliberately off the list
+absolute. (A first measurement, ten entries, was of the Mac's `PATH`, which a stray `env.PATH` in
+the shared `.claude/settings.local.json` had substituted for the image's; same conclusion, wrong
+`PATH`. That substitution is what a session sees when `jkb` will not resolve by name.) `sort`, `printf`, `sed`, `awk` and `uniq` are deliberately off the list
 (`--compress-program`, `printf -v PATH`, `e`, `system()`, `uniq IN OUT` overwriting a binary).
 
 **Superseded: the forced prompts, 2026-10-02.** The hook used to answer `ask` — on `task land` and
