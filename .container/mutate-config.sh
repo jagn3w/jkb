@@ -1732,23 +1732,7 @@ PYX
 run "run.sh's shebang drops -p" "shebang is not #!/bin/bash -p"
 
 # REVIEW ROUND 22. ...and its PATH filter takes no keep list from the environment.
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-o = 'case "$jkb_keep" in *":$jkb_d:"*)'
-assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, 'case "$jkb_keep:${JKB_RUN_PATH_KEEP:-}:" in *":$jkb_d:"*)', 1))
-PYX
-run "run.sh's PATH filter reads a keep list from the environment again" "reads JKB_RUN_PATH_KEEP from the environment"
 
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-o = 'jkb_p="$(cd -P -- "$jkb_d" 2>/dev/null && pwd -P)"'
-assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, 'jkb_p="$jkb_d"', 1))
-PYX
-run "run.sh's PATH filter compares spellings, not physical paths" "compare physical paths"
 
 seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
 import sys
@@ -1760,23 +1744,7 @@ PYX
 run "lib.sh lets the environment move the kit again" "lets JKB_CONTAINER_KIT_HOME move the kit"
 
 # REVIEW ROUND 23. Every piece of the physical comparison, the env re-exec, and where path-keep lives.
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-o = 'jkb_p="$(printf \'%s\' "$jkb_p" | /usr/bin/tr \'[:upper:]\' \'[:lower:]\')"; '
-assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, '', 1))
-PYX
-run "run.sh's PATH filter stops case-folding entries" "so a home spelled with other case"
 
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-o = 'jkb_r="$(cd -P -- "$jkb_r" 2>/dev/null && pwd -P || printf \'%s\' "$jkb_r")"; '
-assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, '', 1))
-PYX
-run "run.sh's PATH filter stops resolving its roots physically" "so a home spelled with other case"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
@@ -1785,7 +1753,26 @@ o = 'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"
 assert o in s, "mutation target absent"
 open(p, 'w').write(s.replace(o, '', 1))
 PYX
-run "run.sh stops re-executing under an allowlisted environment" "does not re-execute under an allowlisted environment"
+run "run.sh stops re-executing under an allowlisted environment" "does not rebuild its environment"
+
+# REVIEW ROUND 27. run.sh BUILDS its PATH and environment; it takes neither from the launching shell.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'jkb_env=("PATH=$jkb_path" '
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'jkb_path="$jkb_path:$PATH"; jkb_env=("PATH=$jkb_path" ', 1))
+PYX
+run "run.sh appends the inherited PATH to the one it builds" "builds its PATH from the inherited one"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'case "$jkb_n" in HOME|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'case "$jkb_n" in HOME|PATH|', 1))
+PYX
+run "run.sh's environment allowlist keeps the inherited PATH" "names a variable that steers what its children run"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
@@ -1824,14 +1811,6 @@ open(p, 'w').write(s.replace(o, '|', 1))
 PYX
 run "run.sh's environment allowlist drops JKB_RUN_FROM_CHECKOUT" "reads JKB_RUN_FROM_CHECKOUT but its environment allowlist drops it"
 
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-o = ' "$HOME/repos"'
-assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, '', 1))
-PYX
-run "run.sh's PATH filter stops dropping where ~/repos leads" "does not drop where the posture's writable ~/repos leads"
 
 # REVIEW ROUND 26. The sweep's INPUTS must name every JKB_ variable it reads, whatever the operator.
 seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
@@ -1852,16 +1831,6 @@ open(p, 'w').write(s.replace(o, '', 1))
 PYX
 run "run.sh runs an existing custom image without building it" "without building it from the kit"
 
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-lines = s.split("\n")
-hit = [i for i, l in enumerate(lines) if l.startswith('if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ]')]
-assert len(hit) == 1, "mutation target absent"
-del lines[hit[0]]
-open(p, 'w').write("\n".join(lines))
-PYX
-run "run.sh stops dropping agent-writable PATH entries" "does not drop agent-writable PATH entries"
 
 # The transcript archive is one of the roots the allow-list guard protects.
 seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
@@ -1909,14 +1878,6 @@ open(p, 'w').write(s.replace(old, "", 1))
 PYX
 run "run.sh loses its jq wrapper" "run.sh does not define the HOME=/dev/null jq wrapper"
 
-seed; python3 - "$work/t/.container/run.sh" <<'PYX'
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = '|/var/folders|/var/folders/*)'
-assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, ')', 1))
-PYX
-run "run.sh's PATH filter stops dropping the macOS temp root" "does not drop agent-writable PATH entries"
 
 # REVIEW ROUND 14. The Homebrew prefixes run.sh keeps, and allow entries read as the sandbox reads them.
 seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
@@ -2521,7 +2482,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=45
+PINNED_UNSB_APPENDS=37
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

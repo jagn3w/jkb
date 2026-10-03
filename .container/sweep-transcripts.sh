@@ -730,7 +730,13 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
     # TRANSCRIPT_ROOT honours it -- plus the state volume's spelling. AN ARRAY: a config dir under
     # "Application Support" split into fragments that no glob overlapped (review round 6).
     proots=("$(posture_canon "${CLAUDE_CONFIG_DIR:-$home/.claude}/projects")" "$(posture_canon "$home/.claude-state/projects")")
-    layers="$(posture_layer_files "$1")" || return 0
+    # ONLY THE IMAGE'S OWN LAYERS: managed settings and their drop-ins (review round 27, from a structural
+    # review of why the reader kept growing). Reading every user, project, worktree and nested-checkout
+    # layer meant reimplementing where Claude Code finds them and how it resolves each one's relative
+    # rules, and rounds 8 to 26 kept finding layers and spellings it missed. The image owns these files
+    # and ships no transcript rule; a rule a person adds to their own layer no longer re-arms the sweep,
+    # which .container/README.md records. verify.sh still reads every layer for its own checks.
+    layers="$(printf '%s\n' "$1"; for f in "$(dirname "$1")"/managed-settings.d/*.json; do [ -f "$f" ] && printf '%s\n' "$f"; done)"
     # THE PROBES ARE REAL SHAPES, and the real files. Made-up leaves (`-p/x.jsonl`) let a rule that
     # names the actual shape -- `~/.claude/**/agent-*.jsonl`, `*/*/????????-*.jsonl` -- read as
     # matching nothing while Claude Code enumerated every subagent transcript (review round 8). So:
@@ -1773,46 +1779,32 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # settings file. Both readers must agree with Claude Code, not with bash.
     printf '%s\n' "{\"permissions\":{\"deny\":[\"Read(/$work/nohome/.claude/projects/**/*.jsonl)\"]}}" >"$pdir/abs.json"
     eq "the //absolute spelling of a per-file glob enumerates" "$(pe "$pdir/abs.json")" yes
-    # OTHER LAYERS. The managed file is clean in both rows; the rule lives elsewhere.
-    lhome="$work/layerhome"; mkdir -p "$lhome/.claude" "$lhome/repos/r/.claude"
+    # OTHER LAYERS DO NOT RE-ARM THE SWEEP (review round 27): only the image's managed file and its
+    # drop-ins are read. A user's, a project's or a nested checkout's rule that names the transcripts
+    # stands the sweep down all the same, and the README records it.
+    lhome="$work/layerhome"; mkdir -p "$lhome/.claude" "$lhome/repos/r/.claude" "$lhome/repos/org/acme/.claude"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]}}' >"$lhome/.claude/settings.json"
-    eq "a per-file glob in USER settings enumerates though managed is clean" "$(pe "$pdir/hook.json" "$lhome")" yes
-    rm "$lhome/.claude/settings.json"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude-state/projects/**/*.jsonl)"]}}' >"$lhome/repos/r/.claude/settings.local.json"
-    eq "...and in a repo's project settings" "$(pe "$pdir/hook.json" "$lhome")" yes
-    # A RELATIVE ANY-DEPTH SECRET RULE in a user layer names no transcript: `Read(**/.env)` and
-    # `Read(**/*.pem)` answered yes before the plain-name skip and turned the sweep back on, while the
-    # `./**/` spelling of the same rules did not (review round 26). `**/*.jsonl` still does.
-    rhome="$work/relhome"; mkdir -p "$rhome/.claude"
-    for rr in '**/.env' '**/*.pem' './**/*.pem'; do
-        printf '{"permissions":{"deny":["Read(%s)"]}}\n' "$rr" >"$rhome/.claude/settings.json"
-        eq "a user-layer Read($rr) names no transcript" "$(pe "$pdir/hook.json" "$rhome")" no
-    done
-    printf '%s\n' '{"permissions":{"deny":["Read(**/*.jsonl)"]}}' >"$rhome/.claude/settings.json"
-    eq "...while a user-layer Read(**/*.jsonl) does" "$(pe "$pdir/hook.json" "$rhome")" yes
-    rm -f "$rhome/.claude/settings.json"
-    # ...and in a NESTED checkout, which run.sh serves at any depth: one level only stood the sweep
-    # down while ~/repos/org/acme named the transcripts (review round 24).
-    nhome="$work/nesthome"; mkdir -p "$nhome/repos/org/acme/.claude"
-    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]}}' >"$nhome/repos/org/acme/.claude/settings.json"
-    eq "...and in a checkout nested two levels under ~/repos" "$(pe "$pdir/hook.json" "$nhome")" yes
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]}}' >"$lhome/repos/org/acme/.claude/settings.json"
+    eq "a per-file glob in USER, PROJECT or nested settings does not re-arm the sweep" "$(pe "$pdir/hook.json" "$lhome")" no
+    rm -f "$lhome/.claude/settings.json" "$lhome/repos/r/.claude/settings.local.json" "$lhome/repos/org/acme/.claude/settings.json"
+    # THE RULE SEMANTICS, in a managed drop-in, the layer that is read.
     mkdir -p "$pdir/managed-settings.d"
-    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]}}' >"$pdir/managed-settings.d/50-x.json"
-    eq "...and in a managed drop-in" "$(pe "$pdir/hook.json")" yes
+    dro() { printf '{"permissions":{"deny":["%s"]}}\n' "$1" >"$pdir/managed-settings.d/50-x.json"; pe "$pdir/hook.json"; }
+    eq "a per-file glob in a managed drop-in enumerates" "$(dro 'Read(~/.claude/projects/**/*.jsonl)')" yes
+    # A relative any-depth secret rule names no transcript: `Read(**/.env)` answered yes outright and
+    # turned the sweep back on, while its `./**/` spelling did not (review round 26).
+    for rr in '**/.env' '**/*.pem' './**/*.pem'; do
+        eq "a drop-in Read($rr) names no transcript" "$(dro "Read($rr)")" no
+    done
+    eq "...while a drop-in Read(**/*.jsonl) does" "$(dro 'Read(**/*.jsonl)')" yes
+    eq "a relative climb inside a brace group is cannot-tell, so yes" "$(dro 'Read({../..,x}/.claude/projects/**/*.jsonl)')" yes
+    eq "Claude Code's documented example deny list enumerates nothing" "$(printf '%s\n' '{"permissions":{"deny":["Bash(curl:*)","Read(./.env)","Read(./.env.*)","Read(./secrets/**)"]}}' >"$pdir/managed-settings.d/50-x.json"; pe "$pdir/hook.json")" no
+    printf '%s\n' 'not json {' >"$pdir/managed-settings.d/50-x.json"
+    eq "an unparseable drop-in contributes no rules" "$(pe "$pdir/hook.json")" no
     rm -r "$pdir/managed-settings.d"
-    printf '%s\n' 'not json {' >"$lhome/repos/r/.claude/settings.local.json"
-    # A non-managed layer that is not valid JSON contributes no rules -- the reading verify.sh takes.
-    eq "an unparseable PROJECT layer contributes no rules" "$(pe "$pdir/hook.json" "$lhome")" no
     printf '%s\n' 'not json {' >"$pdir/badmanaged.json"
     eq "...but an unparseable MANAGED file is cannot-tell, so yes" "$(pe "$pdir/badmanaged.json")" yes
-    printf '%s\n' '{"permissions":{"deny":["Read(./.env.*)"]}}' >"$lhome/repos/r/.claude/settings.local.json"
-    eq "a project's relative rule is resolved in that project, and enumerates nothing here" "$(pe "$pdir/hook.json" "$lhome")" no
-    rm -f "$lhome/repos/r/.claude/settings.local.json"
-    printf '%s\n' '{"permissions":{"deny":["Bash(curl:*)","Read(./.env)","Read(./.env.*)","Read(./secrets/**)"]}}' >"$lhome/.claude/settings.json"
-    eq "Claude Code's documented example deny list in USER settings enumerates nothing" "$(pe "$pdir/hook.json" "$lhome")" no
-    printf '%s\n' '{"permissions":{"deny":["Read(**/*.jsonl)"]}}' >"$lhome/.claude/settings.json"
-    eq "...but a user-layer relative glob that matches at any depth is cannot-tell, so yes" "$(pe "$pdir/hook.json" "$lhome")" yes
-    rm -f "$lhome/.claude/settings.json"
     printf '%s\n' '{"permissions":{"deny":["Read(~/repos/../.claude/projects/**/*.jsonl)"]}}' >"$pdir/dotdot.json"
     eq "a per-file glob spelled through repos/.. still enumerates" "$(pe "$pdir/dotdot.json")" yes
     # Round 8: ancestor-based rules naming the REAL leaf shapes, which made-up probe leaves missed.
@@ -1863,11 +1855,7 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...and with an empty last one" "$(pe "$pdir/brace3.json")" yes
     printf '%s\n' '{"permissions":{"deny":["Read(~/repos/{..,x}/.claude/projects/**/*.jsonl)"]}}' >"$pdir/brace4.json"
     eq "...and a .. alternative that climbs into the tree" "$(pe "$pdir/brace4.json")" yes
-    # Round 16: a climb hidden in a group, `**/` matching zero directories, and repeated rules.
-    lh3="$work/lhome3"; mkdir -p "$lh3/.claude"
-    printf '%s\n' '{"permissions":{"deny":["Read({../..,x}/.claude/projects/**/*.jsonl)"]}}' >"$lh3/.claude/settings.json"
-    eq "a relative climb inside a brace group in a user layer is cannot-tell, so yes" "$(pe "$pdir/hook.json" "$lh3")" yes
-    rm -f "$lh3/.claude/settings.json"
+    # Round 16: `**/` matching zero directories, and repeated rules.
     printf '%s\n' '{"permissions":{"deny":["Read(~/**/.claude/projects/**/*.jsonl)"]}}' >"$pdir/zerodir.json"
     eq "a ~/**/ rule reaches the tree directly under the home" "$(pe "$pdir/zerodir.json")" yes
     eq "...and covers auto-memory there" \

@@ -295,13 +295,14 @@ same ordering reason, it runs the transcript sweep, which is now a **backstop**.
 posture no deny rule names a transcript (the deny is a hook; see *The transcript deny is a hook*),
 so the sweep stands down and says so. It archives by byte budget only if a settings layer brings
 back a rule that enumerates transcripts. Then the sandbox's deny list would outgrow a single argv,
-and **every** Bash call in **every** session would fail at spawn. The layers it reads are managed and
-its drop-ins, your user settings, and the project settings of every checkout up to three levels under
-`~/repos` (such as `~/repos/org/team/acme`) with its worktrees, plus the checkout it serves
-(`JKB_REPO_ROOT`). Until review round 24 it read only one level, and missed a rule in
-`~/repos/org/acme`. A checkout nested deeper is not read. A relative any-depth rule in a user or
-managed layer, such as `Read(**/.env)`, is judged like `Read(./**/.env)`. Until review round 26
-it answered "yes" outright and turned the sweep back on. *Transcripts are swept by byte
+and **every** Bash call in **every** session would fail at spawn. **It reads only the image's own layers**, managed settings and their drop-ins (review round 27).
+From round 6 it read every layer a session might load: user, project, worktree, then nested
+checkouts and `JKB_REPO_ROOT`. That meant reimplementing where Claude Code finds layers and how it
+resolves each one's relative rules, and rounds 8 to 26 kept finding layers and spellings it missed.
+**What this costs:** a rule you add to your own or a project's settings that enumerates transcripts
+does not re-arm the sweep. The argv then grows until Bash fails at spawn, and the recovery is the
+runbook's. Within the layers it reads, a relative any-depth rule such as `Read(**/.env)` is judged
+like `Read(./**/.env)`. *Transcripts are swept by byte
 budget, not by age*, at the end of this file, has the measurement.
 
 ```sh
@@ -461,36 +462,47 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   `JKB_REPO_ROOT`. A failed mirror stops the start rather than falling back to the checkout.
   `verify.sh` asserts the mirror is root's, carries its marker, is not writable by the container
   user, and is where `verify.sh` itself is running from.
-- **The kit's `run.sh` trusts nothing an agent can write on your `PATH` either** (review rounds 11
-  and 12). It runs as you, and the host posture lets a sandboxed agent write `~/.cargo`, `~/.jkb`,
-  `~/.cache` and the temp roots. `~/.cargo/bin` comes first on `PATH`, so a planted `jq` or `docker`
-  ran at the next start. The shebang is `#!/bin/bash -p` (the `-p` since review round 21, below).
-  The first command restarts `run.sh` under an allowlisted environment (review round 23, below).
-  The next drops every `PATH` entry under your home, `/tmp`, `/private` or `/var/folders`, along
-  with relative ones. Since review round 22 an entry is judged by its **physical, case-folded**
-  path, so `/home//you/.cargo/bin`, or `/USERS/you/...` on APFS, is dropped too. Since review round
-  25 the roots also include every home directory the posture lets agents write (`~/repos`, `~/.jkb`,
-  `~/.cargo`, `~/.cache` and the rest), each resolved where it leads. A `~/repos` linked to
-  `/Volumes/Dev/repos` otherwise left `/Volumes/Dev/repos/tools/bin` on `PATH`. `check-config.sh`
-  requires every such posture entry to be one of the roots. Every `jq` it runs goes
-  through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq` readers build
-  the mount list. **What this costs:** a Docker installed per-user (`~/.docker/bin`, OrbStack's
-  `~/.orbstack/bin`) or a `jq` from `~/.nix-profile` is dropped as well. `run.sh` then names the
-  directory it was in. Keep a directory by adding it, one per line, to
-  `~/.local/share/jkb-container-kit/path-keep`, and only if no agent can write it. That is a file
-  and not an environment variable since review round 22: it was `JKB_RUN_PATH_KEEP`, and a
-  committed `.vscode/settings.json` can set any variable in every VS Code terminal
-  (`terminal.integrated.env`), which kept an agent's `~/.cargo/bin`. The kit home is mode 0700 and
-  `Edit`-denied, so the file is yours. For the same reason `JKB_CONTAINER_KIT_HOME`, which moved the
-  kit, is gone. A terminal that replaces `HOME` itself is out of any script's reach: it also chooses
-  which `~/.local/share/.../run.sh` you start. A directory you keep must be one no
-  agent can write. That takes two things in `scripts/auto-mode-posture.json`: the sandbox
-  `allowWrite` must not cover it, and the permissions must deny `Edit` on it, because the in-process
-  Write tool is not sandboxed. `~/.docker/bin` passes the first test by default and not the second
-  (review round 13). Docker Desktop's credential helper lives in the same directory, so keeping it
-  covers both. The host's own `jkb` lives in `~/.cargo/bin` and is dropped
-  too, so the start-time sweep no longer asks it which sessions are live. It holds sessions by its
-  recency window instead.
+- **The kit's `run.sh` builds its `PATH` and environment; it inherits neither** (review round 27).
+  It runs as you, from a shell an agent may have shaped. The host posture lets a sandboxed agent
+  write `~/.cargo`, which comes first on `PATH`, plus `~/.jkb`, `~/.cache` and the temp roots. A
+  committed `.vscode/settings.json` can set any variable in every VS Code terminal. The shebang is
+  `#!/bin/bash -p`, so `BASH_ENV` and exported functions do not reach that first shell. Its first
+  command re-executes it once under `env -i`, marked by an argument no terminal can add, with:
+  - **a `PATH` it builds:** `/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`, then
+    each directory listed, one per line, in `~/.local/share/jkb-container-kit/path-keep`. Homebrew's
+    prefixes are user-owned, so the posture denies `Edit` on them. The kit home is mode 0700 and
+    `Edit`-denied, so the keep file is yours.
+  - **an allowlist of names:** `HOME`, the terminal and locale names, `USER`/`LOGNAME`,
+    `DOCKER_HOST`/`DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`,
+    and on a Linux desktop `DISPLAY`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`. The two Docker names
+    choose a daemon, not code to run. A non-default image is always built from the kit, so
+    `JKB_CONTAINER_IMAGE` names a tag and never chooses what runs. `DBUS_SESSION_BUS_ADDRESS` stays
+    out, because a `unixexec:` address runs a program.
+
+  Every `jq` goes through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq`
+  readers build the mount list. **Why it is built, not filtered.** From review round 11 to round 26
+  `run.sh` filtered what it inherited, and each round found the next way in:
+  - a planted `~/.cargo/bin/jq` (round 11);
+  - a keep list set through the environment (22);
+  - a `//` or other-case spelling of the home (22, 23);
+  - `DOCKER_CONFIG` and `TAR_OPTIONS` reaching children (23);
+  - a dropped override (24);
+  - a symlinked writable directory (25);
+  - an exported function `compgen -e` cannot see (26).
+
+  **What this costs:** a Docker installed per-user (`~/.docker/bin`, OrbStack's `~/.orbstack/bin`) or
+  a `jq` from `~/.nix-profile` is not found until its directory is in `path-keep`. `run.sh` names the
+  directory, because the shell's own `PATH` travels as `JKB_USER_PATH`, which only that message
+  reads. Keep a directory only if no agent can write it. That takes two things in
+  `scripts/auto-mode-posture.json`: the sandbox `allowWrite` must not cover it, and the permissions
+  must deny `Edit` on it, because the in-process Write tool is not sandboxed. `~/.docker/bin` passes
+  the first test by default and not the second (review round 13). Docker Desktop's credential helper
+  lives in the same directory, so keeping it covers both. A Docker setting you set only in your
+  shell (`DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`) is dropped; put it in a Docker context. A terminal
+  that replaces `HOME` itself is out of any script's reach: it also chooses which
+  `~/.local/share/.../run.sh` you start. The host's own `jkb` lives in `~/.cargo/bin`, so the
+  start-time sweep does not ask it which sessions are live; it holds sessions by its recency window
+  instead.
 - **What else run.sh trusts is out of reach too** (review rounds 14 and 15). The posture denies
   `Edit` on the Homebrew prefixes run.sh keeps on `PATH` (`/opt/homebrew`, `/usr/local`), on
   `/Applications`, where `/usr/local/bin`'s `docker` and `code` links point, and on `~/.docker`, whose
@@ -518,29 +530,10 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   so the denies cost nothing. `check-config.sh` requires every one. Whether Claude Code's own
   protected list already covered any of them was not measured; the deny makes the answer
   irrelevant.
-- **`run.sh` takes nothing from the shell that launches it.** One line in `~/.zshenv`,
-  `export BASH_ENV=/tmp/x.sh`, would have run in `run.sh` before its `PATH` filter, because
-  `#!/bin/bash` sources `BASH_ENV`. Round 21 closed that in `run.sh` itself: its shebang is now
-  `#!/bin/bash -p`, which ignores `BASH_ENV` and exported functions, so a terminal whose environment
-  was set some other way (a VS Code `terminal.integrated.env`, direnv) cannot steer it either.
-  `-p` covers only `run.sh`'s own shell. Its children read their own variables: `DOCKER_CONFIG`
-  names the CLI plugins `docker` runs, and `TAR_OPTIONS` can carry `--checkpoint-action=exec`. So
-  since review round 23, `run.sh` restarts itself under `env -i` with only an allowlist. Since
-  review round 26 it always restarts, once, marked by an argument no terminal can add. Deciding by
-  what `compgen -e` lists missed an exported function (`BASH_FUNC_x%%`), which then reached every
-  bash child. The allowlist is `HOME`, `PATH`, the locale and terminal names,
-  `USER`/`LOGNAME`, `DOCKER_HOST`/`DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, and
-  `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`, and on a Linux desktop `DISPLAY`, `WAYLAND_DISPLAY`
-  and `XDG_RUNTIME_DIR`, without which `--open` reaches no display or running VS Code (review round
-  25). `DBUS_SESSION_BUS_ADDRESS` stays out, because a `unixexec:` address runs a program. The
-  container names arrived in review round 24: round 23
-  dropped them, so `run.sh` acted on `jkb-dev` while the reaper looked for the override. A
-  non-default image is always built from the kit, so `JKB_CONTAINER_IMAGE` names a tag and never
-  chooses what runs. The two Docker names are trusted on purpose: they choose a daemon, not code to
-  run. `check-config.sh` refuses an allowlist that names a variable which steers what a child runs,
-  and one that drops a `JKB_` variable `run.sh` reads. **What this costs:** a variable you rely on
-  for Docker and set only in your shell (`DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`) is dropped. Put
-  it in a Docker context instead.
+- **`run.sh` takes nothing from the shell that launches it.** That is the built environment above.
+  The steps that led there: `-p` against `BASH_ENV` in rc files (round 21), an `env -i` allowlist for
+  its children (23), the documented overrides kept (24), an unconditional restart (26), and a
+  constructed `PATH` in place of the filter (27).
 - **A hard link swapped in during `--install-kit` is a residual** (review round 23). The copy is
   checked for links and special files, and the source is checked both before and after the copy.
   A hard link made just before `cp` reaches a file and removed before the second check is still
@@ -1543,60 +1536,28 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
 - **Denies still win.** A permissions `Read(...)` deny or a `sandbox.credentials.files` deny is
   checked before the allow lists. Round 16 found an MCP server reading `~/.cargo/credentials.toml`
   because `~/.cargo` is in `allowWrite`.
-- **Ambiguous path forms are refused, not resolved** (the user's choice after review round 18). In an
-  MCP or unknown tool call, a path-shaped string with a `..` segment or a `~name/` prefix is refused
-  outright. Resolving those meant guessing how an unknown server treats them: whether it normalises
-  before opening, whether it expands `~name`. Rounds 16 to 18 each found a spelling the guess missed,
-  such as a climb padded past `PATH_MAX`, or `~sync/../`. Only a string that is a path as a whole,
-  with no whitespace, is refused for `..`, so prose with a markdown link `](../../x.md)` passes. A
-  climb in a string with a space in it is still resolved and judged, and on **both** readings: where
-  the kernel lands after following links, and where a server that normalises first lands. Judged on
-  the first alone, `l m/../../../.ssh/id_rsa`, with `l m` a link two deep, climbed only to `~/repos`
-  (review round 20). A `~name/` is refused only when the name is account-shaped, so jkb's own
-  `~"term" ns:a/b` query passes (review round 19). Such a string's home reading is a guess; its literal
-  reading, a directory named `~...` in the server's cwd, is judged in full, because a cwd link named
-  `~+` reached `~/.ssh` while both readings were guesses (round 20). There is no length rule. An
-  over-long string first has its `.` and empty segments collapsed, before any form is refused and
-  keeping a leading `./`: collapsed later, padding stripped the `./` off `./~t/` (round 20). If it
-  then fits under `PATH_MAX` it is judged in full, links included. Round 19 found a cwd link padded
-  with `./` that was followed by no check at all.
-- **Round 21 closed the rest of the guessing, by the user's choice ("option 2").** Rounds 16 to 21
-  each found the next spelling a free-text guess missed, and round 21 found three more, one of them
-  caused by round 20's fix. So:
-  - **A string still over `PATH_MAX` with a `..` in it is refused.** Round 20 resolved it the way a
-    normalising server would, and a cwd link followed by a padded climb reached a transcript, because
-    the kernel follows the link first. Resolving it either way is a guess about the server.
-  - **Whitespace around a path, and a path on a line of its own, are judged as the path.** Each line
-    of a string with whitespace is trimmed, and if what is left is one token it is judged as its own
-    candidate, under the same caps. A string judged only whole let ` /h/.ssh/id_rsa` (a leading space)
-    pass as a relative name, a second line pass unexamined, and 5000 trailing spaces hide a
-    credential behind the over-long rule.
-  - **More than 20000 lines in one call are refused**, before any is trimmed, so the per-line work
-    has a bound.
-  - **A string holding a NUL is refused** (review round 24). No path holds one, a trimming server
-    strips it, and no regex class can trim it.
-  - **A line that is only slashes, or a bare `~`, is prose** (review round 25). Judged as a path it
-    was the root or the home, an ancestor of the tree, and a quoted Rust doc comment (`///`) refused
-    the whole call. A whole string that is `/` or `~` is still judged, and so is a padded one-line
-    string (`~ `): applied to every token, the exemption let `~ ` through as prose while a trimming
-    server walks the home (review round 26).
-  - **Object keys are candidates too** (review round 26). A path-keyed map such as
-    `{"files": {"/h/.ssh/id_rsa": {...}}}` reached a server unjudged.
-
-  What this costs, measured against the hook on 2026-10-03: a description listing files one per line
-  now has each line judged, two checks apiece (the cwd and the home), and the description itself is
-  one more candidate, so 15 relative paths on their own lines pass and 16 meet the existing per-call
-  cap of 32 checks and are refused. Round 20's hook passed 40 and more, judging the description whole. Over-long prose holding a climbing relative link
-  (`](../../x.md)`) is refused; under 4096 bytes it still passes.
-- **Only the home-base guess is spared.** An unknown tool's relative free text is read from each base
-  it might be resolved against: the session cwd, the project dir and the home. The cwd and project
-  readings are judged in full, because that is where a server resolves a relative path. jkb's
-  `ingest_path` opens one from the project root, and round 16's version, which spared every base,
-  let `../../.ssh/id_rsa` through (review round 17). Only the home reading is a guess no server
-  makes. It is held to the transcript rule and not to the boundary, so `tasks/inbox`, a URL or a
-  plain word is not refused as a home path. Absolute, `~/` and over-long strings are judged too, the
-  last on their lexical form. A read of a directory that holds a denied entry is refused, so a
-  walker cannot be handed `~/.cargo`.
+- **MCP and unknown tools: a field table, not a free-text scanner** (the user's choice after review
+  round 26, on a structural review of why the rounds had not converged). Each tool the hook does not
+  already judge by its fields is looked up in a table in `deny-transcripts.sh`. A listed tool's path
+  fields are judged as Read's `file_path` is: jkb's `ingest_path` `source`; `ingest_url`'s `source`
+  when it is a `file:` URL, which its headless browser loads from disk; Artifact's file fields;
+  ArtifactData's `file_path`; Workflow's `scriptPath`. A relative one is judged from the session cwd
+  and from the project dir, where jkb's server starts. A tool listed as pathless (jkb's other tools,
+  WebFetch, the task and cron tools and the like) is let through. **Any other tool is refused, MCP
+  or built-in,** with a reason naming the table. Adding one is a table line and a rebuild, as
+  editing the allowlist already is.
+  - **What it replaced, and why.** From review round 6 the hook judged every string an unknown tool
+    carried that could be a path, from every base a server might use. Rounds 16 to 26 spent most of
+    their findings there. Each round found another reading some server might take of free text: a
+    `..` or `~name/` form (rounds 18 to 20), padding past `PATH_MAX` (17 to 21), whitespace and line
+    breaks (21 to 23), a NUL (24), object keys (26). The user's choices to refuse ambiguous forms
+    (round 18) and to stop guessing (round 21, "option 2") narrowed it, but the trim class itself
+    was still a guess about which runtimes trim. Several of those rounds' must-fixes were caused by
+    the previous round's fix. A table cannot be wrong about what an unlisted server does, because it
+    does not let one run. The scanner, its six per-call budgets and about 350 lines went with it.
+  - **What it costs.** An MCP server or built-in tool the table does not name is refused until it is
+    added. That includes connectors such as the claude.ai ones and VS Code's, which a session may
+    offer. jkb's own server needs nothing more: its one path field is in the table.
 - **No sandbox, no boundary.** With the sandbox disabled there is nothing to mirror, and the
   transcript rule still applies. `enabled` takes the word of the highest-precedence layer that sets
   it: managed and its drop-ins, then local, project and user. A layer that is not valid JSON
@@ -1611,8 +1572,11 @@ jkb-dev against its real settings. Bash is still decided first, in 7ms. A tool r
 outside the sandbox's lists is now refused, with a reason naming the list. The deny rules stay, as a
 second layer.
 
-**What it does not cover.** An unknown or MCP tool is judged as a read, the weaker test, because what
-it does with a path is unknown. One that writes to a path the lists only let it read passes. And the
+**What it does not cover.** A listed MCP tool's path field is judged as a read, the weaker test,
+because what the server does with it is not ours to know: jkb's `ingest_path` only reads, and a
+server added to the table that writes to a path the lists only let it read would pass. The same holds
+for Artifact's `out_dir`, where a `read` action saves files: it is judged as a read, so a directory
+under `denyRead` is refused but one the lists only let Bash read is not. And the
 hook is installed only in the container's managed settings. On the host the file tools are still
 held only by the posture's deny rules, and the separate-user task is where that ends.
 
@@ -1692,27 +1656,22 @@ O(files) of argv. What
   container with). So are the built-ins that carry text rather than locations: TodoWrite,
   AskUserQuestion, Agent, Task, ToolSearch, SendMessage, and Skill since review round 24, whose
   `args` is a slash command's free text. The file tools (Read, Edit, MultiEdit since review round 25,
-  Write, NotebookEdit) are judged by their path fields. Any tool whose fields the hook does not know has every string that *could be a
-  path* judged: one holding a `/`, or starting `~` or `.`. Multi-line strings count, because a server that normalises lexically collapses them. A flat cap on all strings
-  refused a long `TodoWrite`. An MCP server resolves relative paths against its own cwd, so for
-  `mcp__*` tools a relative string is judged against the session cwd, `CLAUDE_PROJECT_DIR` and the
-  home. `CLAUDE_CONFIG_DIR`, when set, adds its `projects` tree to the roots.
-- **No input found so far pushes the hook into its timeout**, which fails open. This was claimed
-  outright, as "nothing can", until review round 20 measured 21 s for one 200 KB free-text string.
-  bash's `${x#lit}` and `${x%lit}` are **quadratic when they do not match**, and every prefix test
-  was one. Under a UTF-8 locale a non-matching strip of 1 MB took 907 s, against 7.6 s under `C`.
-  Reading stdin with `read -d ''` and counting slashes with a bracket-class replace were slow too.
-  So the hook pins `LC_ALL=C`, tests prefixes by substring, reads stdin as `$(</dev/stdin)`, counts
-  segments in `jq`, and keeps long strings away from string surgery altogether. Any path field over
-  4096 bytes (`PATH_MAX`) is refused before it is walked. A free-text string still over `PATH_MAX`
-  after collapsing is refused if it holds a `..`, and otherwise only its first 4096 bytes are read,
-  for the transcript rule (round 21; round 20 normalised it, and about 9 MB of such strings across
-  one call approached the timeout). Lines are trimmed in `jq` by two anchored regexes, not a
-  trailing `\s+$`, which is quadratic in a run of spaces, and at most 20000 lines are looked at.
-  Measured in jkb-dev on 2026-10-03: 300 KB strings of five shapes beside a transcript path were each
-  decided in under 160 ms, and the slowest found, 1.5 MB of tab-and-space runs, in 0.7 s. At most 100
-  distinct path-like strings are judged per call. The full measurements and their method are in the
-  script's header.
+  Write, NotebookEdit) are judged by their path fields. Every other tool goes through the field table
+  in *The file tools are held to the sandbox's own boundary*: its listed path fields are judged, a
+  pathless one passes, and an unlisted one is refused (review round 27; from round 3 to 26 every
+  string such a tool carried was judged as a possible path). `CLAUDE_CONFIG_DIR`, when set, adds its
+  `projects` tree to the roots.
+- **A hook that runs out of time refuses** (review round 27). Claude Code kills a hook at its
+  timeout, 10 s here, and then lets the call through. Rounds 9 to 22 answered each slow input with
+  a budget of its own: path-like strings per call, bare words, lines, segments, checks. Round 20
+  found the cost was bash itself: `${x#lit}` and `${x%lit}` are **quadratic when they do not
+  match**, 907 s for 1 MB under a UTF-8 locale. The hook now runs its judging in a child under
+  `timeout -s KILL 8`, and a child that does not finish is a refusal. The free-text budgets went
+  with the scanner. Two remain because they are cheap and exact: a path over 4096 bytes
+  (`PATH_MAX`) is refused before it is walked, and a Glob's brace expansions are capped. The
+  hook still pins `LC_ALL=C` and tests prefixes by substring. The wrapper costs one process: 9 ms
+  for a Bash call (7 ms before), 33 ms for a judged Read, measured over 50 calls in jkb-dev on
+  2026-10-03. A self-test row with a 1 s deadline and a 5 s judge is refused at the deadline.
 - **The hook does not trust `PATH`** (review round 4, the most serious finding in four rounds). It
   runs unsandboxed on every tool call, and the image puts the agent-writable `~/.local/bin` and
   `~/.cargo/bin` first on `PATH`. A `jq` planted there by sandboxed Bash ran outside the sandbox,

@@ -4,116 +4,28 @@
 #   .container/deny-transcripts.sh            # hook mode: tool-call JSON on stdin
 #   .container/deny-transcripts.sh --self-test
 #
-# THE RECORD IS .container/README.md, "The transcript deny is a hook": why this is a hook and not a
-# deny rule (a per-file `Read(...*.jsonl)` glob was half of MAX_ARG_STRLEN in the Bash sandbox's
-# argv, measured; the collapsing `projects/**` swallows auto-memory), and what each review round
-# found. The notes below are the ones someone changing THIS FILE needs beside the code: the
-# invariants, and why each guard is shaped the way it is. The design is not restated here, so the
-# two cannot disagree -- they did once, about multi-line strings.
+# THE RECORD IS .container/README.md ("The transcript deny is a hook" and "The file tools are held to
+# the sandbox's own boundary"): why this is a hook, what each review round found, the measurements.
+# None of that is restated here. These are the invariants someone changing THIS FILE must keep:
 #
-# A glob cannot separate `<slug>/memory/` from `<slug>/<uuid>.jsonl`; they are siblings. A hook
-# can, and costs nothing in argv because it is code rather than a path list: one process per TOOL
-# CALL (the matcher is `.*`) in exchange for O(files) of argv.
-#
-# WHAT STILL COVERS BASH. The sandbox's blanket `denyRead` of `~` already hides this tree from
-# Bash -- observable in one listing, where `~/.claude/todos` is invisible while `~/.claude/projects`
-# was not, because naming a path in a deny rule is what EXPOSES it.
-#
-# THIS HOOK IS THE ONLY FILE-TOOL RULE FOR THE TREE, AND THAT IS DELIBERATE. The first cut kept
-# `Read(~/.claude/projects)` and its .claude-state spelling beside it "as the belt to this brace",
-# on the theory that naming a directory names only the directory. Measured in the rebuilt container
-# (2026-09-30), Claude Code applies a directory rule to its whole subtree: this hook ALLOWED
-# <slug>/memory/MEMORY.md and the permission rule behind it denied it anyway ("File is in a
-# directory that is denied by your permission settings"). Any permissions rule broad enough to
-# cover the transcripts covers memory too -- that is the property that made this a hook in the
-# first place -- so there is no belt to add.
-#
-# FAILS CLOSED, unlike .claude/hooks/block-raw-sqlite.sh, and deliberately. That hook steers an
-# agent away from a better tool, so an error there must not wedge Bash. This one is a
-# confidentiality boundary, so EVERY way of not reaching a verdict is a refusal: a payload jq
-# cannot parse, a missing jq, an unset variable, any crash. An EXIT trap turns anything that ends
-# the script without an explicit allow into exit 2, which Claude Code treats as blocking. The first
-# cut only closed the jq-parse case and said "fails closed" about all of it; with HOME unset,
-# `set -u` aborted at rc=1, which Claude Code reads as a NON-blocking error and lets the call
-# through.
-#
-# THE ONE OPEN EDGE, stated rather than hidden: a hook KILLED for exceeding its timeout is
-# non-blocking in Claude Code, and nothing inside the script can change that. Per call, measured
-# 2026-10-01 in jkb-dev as 50 sequential invocations under `date +%s%N`: 13ms for a Bash call (let
-# through right after the parse) and 50ms for a judged Read, against the 10s budget
-# managed-settings.json gives it. Re-measured after round 8 the same way: 11ms Bash, 29ms Read,
-# 38ms for a Glob whose braces expand to the 64-way cap, 222ms for an MCP call carrying 2000 bare
-# words, each tested on disk, and 270ms for the worst Glob found: 64 expansions of a pattern at the
-# 4096-byte budget (2.8s before the expander skipped finished expansions). Round 12 judges each
-# expansion's own literal prefix: a Glob with 64 short distinct prefixes, every one checked, took
-# 1.05s. That made glob_base's quadratic prefix-building reachable, and 64 distinct ~4KB prefixes
-# then took 30s (round 13). glob_base is linear now, and expansions x pattern bytes is capped. At
-# 32768 a `~`-led 8-way 4KB pattern still took 2.9s, because a `~name` prefix is judged twice
-# (round 14), so the cap is 12288: the slowest Glob under it, `~{a0..a7}/` and 745 segments, takes
-# 0.82s. It refuses `{d0,...,d63}/**/*.rs` (17KB of work), the price of the margin. The MCP arm caps
-# path segments x bases at 12000 (round 14: 100 leaves of 2000 segments reached 10s) AND check()
-# calls at 32 (round 15: 600 calls passed the segment cap and ran 4.6s idle, 20s with 10 busy
-# loops on 10 cores). The slowest call under both, five `~name/` strings from three bases (30
-# calls), takes 0.26s idle and 2.14s with 10 busy loops, measured that way on 2026-10-02. It was ~7ms
-# before five review rounds added guards; the number is re-measured rather than carried, because this
-# hook now runs on EVERY tool call. Round 20 found ONE LONG STRING was enough: a 200KB note beside a
-# transcript path took 21s, because a ${x#lit} that does not match is quadratic (see `under`). After
-# the fix, measured the same way on 2026-10-03: 300KB strings of five shapes decide in under 160ms;
-# after round 21's line trimming, 1.5MB of tab-and-space runs in 0.7s and 19000 padded lines in 0.5s;
-# 7ms Bash, 33ms Read, 64ms for a jkb task_create.
-#
-# PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
-# `~` is the user's home, and a relative path is relative to the SESSION'S cwd (the payload's
-# `.cwd`), not to wherever the harness happened to start this script. Both were missed at first,
-# and the `~` one was confirmed live (2026-10-01): a Read of `~/.claude/projects/<slug>/x.jsonl`
-# went straight past this hook, which had resolved it under its own $PWD, and was stopped only by a
-# permissions rule that a later commit removed.
-#
-# AND AN ANCESTOR OF THE TREE IS DENIED, not only paths inside it. Grep and Glob walk whatever they
-# are rooted at, so `Grep path=~/.claude-state` -- or `path=$HOME`, or no path at all from a home
-# cwd -- read transcripts while naming no transcript. The per-file `.jsonl` deny rules this hook
-# replaced had also been doing that job, as an ignore glob ripgrep honoured, so removing them
-# silently dropped it: the second time in this change that a rule turned out to have a job nobody
-# had written down. A Glob whose PATTERN carries the location (`/home/.../projects/**`,
-# `../../.claude/projects/**`) has its literal prefix checked the same way.
-#
-# AND THE PHYSICAL PATH IS JUDGED, NOT ONLY THE LEXICAL ONE. The file tools run unsandboxed and the
-# kernel follows symlinks, so a path that does not SPELL the tree can still land in it: a symlink
-# an agent makes from sandboxed Bash (`ln -s ~/.claude-state/projects ~/repos/jkb/x` needs no read
-# access to the target), or /proc/self/root/home/... Found by review round 2, reproduced. Every
-# path is now judged twice -- as written, and as `realpath -m` resolves it (symlinks in every
-# existing component, a missing tail kept lexically, which is the kernel's view for a Write too)
-# -- and refused if either says so. /proc/*/{root,cwd,fd,...} and /dev/fd are refused outright:
-# `/proc/self` is the HOOK's process when this resolves it and Claude Code's when the tool does,
-# so no resolution from in here can be trusted for them, and nothing legitimate reads through them.
-#
-# EVERY TOOL REACHES THIS HOOK: the matcher is `.*`. It was an allowlist of file tools, and built-ins
-# it did not name -- Artifact reads a local file and uploads it -- skipped the hook (review round 3).
-# Bash and the built-ins that carry text rather than locations (TodoWrite, AskUserQuestion, Agent,
-# Task, ToolSearch, SendMessage, Skill) are let through first. The file tools (Read, Edit, MultiEdit,
-# Write, NotebookEdit, and Grep and Glob below) are judged by their path fields. A string holding a
-# NUL is refused (cap_deny). Anything else -- MCP tools run unsandboxed, and jkb's own server has an ingest_path
-# -- has every distinct, non-empty string that COULD be a path judged: one holding a `/`, or
-# starting `~` or `.`. A relative one is judged against each distinct base an MCP server might
-# resolve it from: the session cwd, CLAUDE_PROJECT_DIR, the home.
-#
-# BOUNDED, because a timed-out hook FAILS OPEN. At most 100 path-shaped candidates and 2000 bare
-# words (each tested on disk; round 9 timed 20000 at 2s), then refused; a Glob pattern and a path field
-# over PATH_MAX (4096) is refused before it is walked; an over-long free-text string is refused if it
-# holds a `..`, and otherwise only its first 4096 bytes are read, for the transcript rule (see judge).
-# A budget that is hit is a deny naming it (cap_deny). THE MEASUREMENT, kept here and nowhere else: 100 distinct relative
-# strings to an MCP tool, `date +%s%N` around one invocation in jkb-dev on 2026-10-01 -- ~1.0s when
-# the cwd is the project dir (bases deduplicated), 1.4s with three distinct bases. This container
-# has been seen running 5x slow under a saturated VM, and 5x the worst case is still inside 10s.
-#
-# AND THE SANDBOX'S OWN BOUNDARY: when the Claude settings enable the sandbox, every path a tool is
-# handed is also held to the allow lists the sandbox enforces on Bash (`boundary` below; design A,
-# chosen after review round 15). .container/README.md, "The file tools are held to the sandbox's
-# own boundary", has the decision and its cost.
-#
-# WHAT IS RULED OUT AND WHAT IS LEFT OPEN -- hard links, case folding and bind mounts measured as
-# not vectors; the symlink-swap race between this check and the tool's open left open -- is recorded
-# once, in .container/README.md ("The transcript deny is a hook"), and not restated here.
+# - EVERY TOOL REACHES IT (matcher `.*`). Bash and the text-carrying built-ins are let through first;
+#   the file tools are judged by their path fields; every other tool is judged by THE FIELD TABLE at
+#   the bottom -- its listed path fields, or let through as pathless, or REFUSED when it is not listed.
+#   Nothing scans free text: rounds 6 to 26 did, and could not finish (the user's choice, round 27).
+# - IT FAILS CLOSED. An EXIT trap turns every way of not reaching a verdict into exit 2, which blocks;
+#   and the judging runs under a deadline (`timeout -s KILL 8`) whose expiry is a refusal, because
+#   Claude Code lets a call through when it kills a hook at its own 10s timeout.
+# - PATHS ARE RESOLVED AS THE TOOL WILL RESOLVE THEM: `~` is the home, a relative path is relative to
+#   the session's cwd (and, for an MCP server, to the project dir it starts in).
+# - AN ANCESTOR OF THE TREE IS DENIED, not only paths inside it: Grep and Glob walk what they are
+#   rooted at. A Glob's literal prefix, per brace expansion, is judged the same way.
+# - EVERY PATH IS JUDGED TWICE: as written, normalised lexically, and as `realpath -m` resolves it --
+#   the kernel's view, symlinks followed -- and refused if either reading says so. /proc magic links
+#   are refused outright.
+# - THE SANDBOX'S OWN BOUNDARY: with the sandbox enabled, every path a tool is handed is also held to
+#   the allow lists the sandbox enforces on Bash (`boundary`).
+# - AUTO-MEMORY (`<root>/<slug>/memory/`) is the one readable and writable child of the tree, and
+#   saved tool output (`<slug>/<session>/tool-results/`) the one readable one.
 #
 # A FIXED PATH, BEFORE ANYTHING ELSE RUNS, and an absolute shebang in privileged mode. This hook
 # runs UNSANDBOXED on every tool call, and the image puts the agent-writable ~/.local/bin and
@@ -525,7 +437,7 @@ if [ "${1:-}" = --self-test ]; then
     h "with a planted ~/.jq, an Artifact of a transcript is still denied" deny \
       '{"tool_name":"Artifact","cwd":"'"$sh"'/repos/r","tool_input":{"files":{"a":"'"$sh"'/.claude/projects/-s/e.jsonl"}}}' HOME="$sh"
     h "...and an array-valued field still refused" deny \
-      '{"tool_name":"mcp__x__y","cwd":"/tmp","tool_input":{"file_path":["/x","/bin/sh","-c","touch '"$sh"'/PWNED"]}}' HOME="$sh"
+      '{"tool_name":"Read","cwd":"/tmp","tool_input":{"file_path":["/x","/bin/sh","-c","touch '"$sh"'/PWNED"]}}' HOME="$sh"
     if [ -e "$sh/PWNED" ]; then printf '  \033[31mFAIL\033[0m a planted ~/.jq let an array field EXECUTE\n'; fails=$((fails+1))
     else printf '  \033[32mok\033[0m   ...and nothing executed\n'; fi
     rm -f -- "$sh/.jq"
@@ -552,7 +464,7 @@ if [ "${1:-}" = --self-test ]; then
     h "a Glob ~x/ pattern under path= reaches the tree through a link there, and is denied" deny \
       '{"tool_name":"Glob","cwd":"'"$sh"'/repos/r","tool_input":{"path":"'"$sh"'/repos/b","pattern":"~x/-s/*.jsonl"}}' HOME="$sh"
     h "a cwd link named ~sync, an existing account, is denied" deny \
-      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"path":"~sync"}}' HOME="$sh"
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"~sync"}}' HOME="$sh"
     # ...and a NEWLINE in a path is refused: `$( )` drops a trailing one, so a link named "x\n" was
     # judged as "x" and the tool opened the link.
     ln -s "$sh/.claude-state/projects/-s" "$sh/repos/r/nl
@@ -562,7 +474,7 @@ if [ "${1:-}" = --self-test ]; then
     h "a Grep rooted at a link whose name ends in a newline is refused" deny \
       '{"tool_name":"Grep","cwd":"'"$sh"'/repos/r","tool_input":{"path":"nl\n","pattern":"p"}}' HOME="$sh"
     h "an MCP string naming that link is denied" deny \
-      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"path":"./nl\n"}}' HOME="$sh"
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$sh"'/repos/r","tool_input":{"source":"./nl\n"}}' HOME="$sh"
     h "a Glob with a newline is refused" deny \
       '{"tool_name":"Glob","cwd":"'"$sh"'/repos/r","tool_input":{"pattern":"x\n/../../.claude/projects/*"}}' HOME="$sh"
     # REVIEW ROUND 9. `~t/...` read only as a home let the cwd's `~t` link through.
@@ -607,7 +519,7 @@ if [ "${1:-}" = --self-test ]; then
     h "boundary: ...and writable" allow \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.claude/projects/-w/memory/new.md","content":""}}' HOME="$bh"
     h "boundary: an MCP server handed a denied path is refused" deny \
-      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'/.ssh/id"}}' HOME="$bh"
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"'"$bh"'/.ssh/id"}}' HOME="$bh"
     h "boundary: a Grep rooted at the home is refused" deny \
       '{"tool_name":"Grep","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'","pattern":"p"}}' HOME="$bh"
     h "boundary: a Write to the session's TMPDIR is allowed" allow \
@@ -631,113 +543,76 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__jkb__search","cwd":"'"$bh"'/repos/w","tool_input":{"query":"notes"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.cargo/credentials.toml)"]},"sandbox":{"enabled":true,"filesystem":{"denyRead":["~"],"allowWrite":["~/repos","~/.jkb","~/.cargo"]}}}' > "$bh/.claude/settings.json"
     h "round 16: a Read() deny inside an allowWrite tree still refuses an MCP read" deny \
-      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'/.cargo/credentials.toml"}}' HOME="$bh"
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"'"$bh"'/.cargo/credentials.toml"}}' HOME="$bh"
     # REVIEW ROUND 17. Only the HOME-base reading of free text is a guess: a relative climb from the
     # project dir is what jkb's ingest_path opens. A `~name/` string's home reading is judged; a
     # directory holding a must-deny entry is refused to a walker; a padded over-long path still meets
     # the boundary.
     mkdir -p "$bh/.ssh"; : >"$bh/.ssh/id_rsa"
     h "round 17: a relative climb from the project into denyRead is refused to an MCP server" deny \
-      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"../../.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"../../.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 17: ...and into a credential under an allowWrite root" deny \
-      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"path":"../../.cargo/credentials.toml"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    h "round 17: a ~name/ string is judged at the home it names" deny \
-      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"~vscode/.cargo/credentials.toml"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"../../.cargo/credentials.toml"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 17: a ~name/ path is judged at the home it names" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"~vscode/.cargo/credentials.toml"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 17: a walker handed a directory holding a credential is refused" deny \
-      '{"tool_name":"mcp__x__index","cwd":"'"$bh"'/repos/w","tool_input":{"root":"'"$bh"'/.cargo"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    # REVIEW ROUND 18, AND THE USER'S CHOICE AFTER IT: ambiguous path forms in an MCP or unknown tool
-    # call are REFUSED, not resolved. A `..` segment or a `~name/` prefix meant guessing how the server
-    # resolves it, and every round found the next spelling the guess missed.
-    lrel="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{path:(([range(2100)|"./"]|join("")) + "../../.ssh/id_rsa")}}')"
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"'"$bh"'/.cargo"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # Over PATH_MAX a path field is refused before it is walked, however it is padded.
+    lrel="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{source:(([range(2100)|"./"]|join("")) + "../../.ssh/id_rsa")}}')"
     h "round 18: an over-long relative climb is refused" deny "$lrel" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    h "round 18: a ~name/.. string is refused" deny \
-      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"~sync/../home/x/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    h "round 18: a .. segment inside the workspace is refused too -- the form, not the target" deny \
-      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"src/../README.md"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    h "round 18: prose that merely mentions ../ is not a path segment, and is allowed" allow \
-      '{"tool_name":"mcp__jkb__task_create","cwd":"'"$bh"'/repos/w","tool_input":{"title":"t","description":"see ../docs and crates/a.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    # REVIEW ROUND 19. A cwd link padded with `./` past PATH_MAX; jkb's own vector query and prose
-    # with a `~`, a markdown relative link, are not paths; a climb hidden behind a space is still met.
     ln -s "$bh/.ssh" "$bh/repos/w/k"
-    padl="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{path:("k" + ([range(2100)|"/."]|join("")) + "/id_rsa")}}')"
-    h "round 19: a cwd link padded with ./ past PATH_MAX is still followed and judged" deny "$padl" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    h "round 19: jkb's own ~\"term\" ns:a/b query is not a ~name/ path" allow \
+    padl="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{source:("k" + ([range(2100)|"/."]|join("")) + "/id_rsa")}}')"
+    h "round 19: a cwd link padded with ./ past PATH_MAX is refused" deny "$padl" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # Prose in a jkb tool that takes no path is not judged at all.
+    h "round 18: prose in a pathless jkb tool is allowed, ../ and all" allow \
+      '{"tool_name":"mcp__jkb__task_create","cwd":"'"$bh"'/repos/w","tool_input":{"title":"t","description":"see ../docs and crates/a.rs\n///\n~ and \u0000"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 19: jkb's own ~\"term\" ns:a/b query is allowed" allow \
       '{"tool_name":"mcp__jkb__query","cwd":"'"$bh"'/repos/w","tool_input":{"query":"~\"merge conflict\" ns:repos/jkb"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    h "round 19: prose starting ~2h that later names a file is allowed" allow \
-      '{"tool_name":"mcp__jkb__task_create","cwd":"'"$bh"'/repos/w","tool_input":{"title":"t","description":"~2h of work, see crates/a.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    h "round 19: prose with a markdown relative link is allowed" allow \
-      '{"tool_name":"mcp__x__note","cwd":"'"$bh"'/repos/w","tool_input":{"text":"See [the record](../../docs/task-lifecycle.md) for D52."}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    spl="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{path:("a b/" + ([range(2100)|"./"]|join("")) + "../../../.ssh/id_rsa")}}')"
-    h "round 19: an over-long climb with a space in it still meets the boundary" deny "$spl" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    # REVIEW ROUND 20. The literal cwd reading of a `~`-led string is judged in full; a climb after a
-    # link is held to the boundary where a normalising server lands, not only where the kernel does;
-    # padding is collapsed before the form refusals, so it cannot strip a `./` off a `~`.
+    # REVIEW ROUND 20. The literal cwd reading of a `~`-led path is judged in full; a climb after a link
+    # is held to the boundary where a normalising server lands, not only where the kernel does.
     ln -s "$bh/.ssh" "$bh/repos/w/~+"; ln -s "$bh/.ssh" "$bh/repos/w/~t"
     mkdir -p "$bh/repos/w/a/b"; ln -s "$bh/repos/w/a/b" "$bh/repos/w/l m"
     h "round 20: a cwd link named ~+ is followed and judged" deny \
-      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"~+/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"~+/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 20: a climb after a link, behind a space, meets the boundary at its lexical landing" deny \
-      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"l m/../../../.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    padt="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("./~t" + ([range(2100)|"/."]|join("")) + "/id_rsa")}}')"
-    h "round 20: padding does not turn ./~t into ~t" deny "$padt" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    padu="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("file://localhost/h/.claude/projects/-s" + ([range(2100)|"/."]|join("")) + "/e.jsonl")}}')"
-    h "round 20: a padded file://localhost URI is read as its path before it is collapsed" deny "$padu" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
-    # REVIEW ROUND 21, AND THE USER'S CHOICE AFTER IT (option 2): whitespace around a path, a path on a
-    # line of its own, and an over-long climb are ambiguous forms too -- what a server that trims or
-    # splits lines opens is judged, and a long `..` is refused rather than resolved.
-    ln -s "$bh/.claude/projects/-w" "$bh/repos/w/k z"
-    h "round 21: a leading space does not turn a denied absolute path into a relative name" deny \
-      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":" '"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    mline="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/repos/w/a\n" + $h + "/.ssh/id_rsa")}}')"
-    h "round 21: a denied path on a second line is judged as its own path" deny "$mline" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    tpad="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/.ssh/id_rsa" + ([range(5000)|" "]|join("")))}}')"
-    h "round 21: trailing whitespace past PATH_MAX does not hide a denied path" deny "$tpad" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    # REVIEW ROUND 24: a NUL is refused outright -- the trim class cannot hold one, and a trimming
-    # server strips it -- and the Skill tool's args are prose, like an Agent prompt.
-    for nulf in '\u0000%s' '\u0000 %s'; do
-        nj="$(jqh -cn --arg h "$bh" --arg f "$nulf" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("\"" + ($f | sub("%s"; $h + "/.ssh/id_rsa")) + "\"" | fromjson)}}')"
-        h "round 24: a denied path behind '$nulf' is refused" deny "$nj" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    done
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"l m/../../../.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 20: ./~t through a cwd link is denied" deny \
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"'"$bh"'/repos/w","tool_input":{"source":"./~t/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # ingest_url renders a file: URL from disk, so that one form of its source is a path field.
+    h "round 27: ingest_url with a file: URL into denyRead is refused" deny \
+      '{"tool_name":"mcp__jkb__ingest_url","cwd":"'"$bh"'/repos/w","tool_input":{"source":"file://'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: ...while an https URL is not a path" allow \
+      '{"tool_name":"mcp__jkb__ingest_url","cwd":"'"$bh"'/repos/w","tool_input":{"source":"https://example.com/'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 26, AND THE USER'S CHOICE AFTER IT: THE FIELD TABLE. An unlisted tool is refused
+    # whatever it carries, and a listed one is judged on its path fields only.
+    h "round 27: an MCP tool not in the table is refused, with nothing in it that looks like a path" deny \
+      '{"tool_name":"mcp__other__search","cwd":"'"$bh"'/repos/w","tool_input":{"q":"hello"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: ...and so is an unknown built-in" deny \
+      '{"tool_name":"FutureTool","cwd":"'"$bh"'/repos/w","tool_input":{}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: a pathless built-in in the table is allowed" allow \
+      '{"tool_name":"WebFetch","cwd":"'"$bh"'/repos/w","tool_input":{"url":"https://example.com","prompt":"read '"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: Workflow's scriptPath is a path field" deny \
+      '{"tool_name":"Workflow","cwd":"'"$bh"'/repos/w","tool_input":{"scriptPath":"'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: Artifact's {from} source is a path field" deny \
+      '{"tool_name":"Artifact","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/p.html","files":{"k":{"from":"'"$bh"'/.ssh/id_rsa"}}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: ...while another artifact's published file is not a local one" allow \
+      '{"tool_name":"Artifact","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/p.html","files":{"k":{"artifact":"https://claude.ai/artifact/x","path":"'"$bh"'/.ssh/id_rsa"}}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: Artifact's files are judged against its root too" deny \
+      '{"tool_name":"Artifact","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/p.html","root":"'"$bh"'","files":{"k":".ssh/id_rsa"}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    t0=$(date +%s%N)
+    h "round 27: a judge that runs past the deadline is refused, never let through" deny \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/x.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_DEADLINE=1 DT_SELFTEST_SLOW=5
+    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
+    if [ "$t1" -lt 3000 ]; then printf '  \033[32mok\033[0m   ...at the deadline, in %sms\n' "$t1"
+    else printf '  \033[31mFAIL\033[0m ...but it took %sms: the child was not killed at the deadline\n' "$t1"; fails=$((fails+1)); fi
+    h "round 27: ...while the same call under the deadline is allowed" allow \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/x.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 24: a Skill's args are prose, and a ../ in them is not a path" allow \
       '{"tool_name":"Skill","cwd":"'"$bh"'/repos/w","tool_input":{"skill":"review","args":"see\n../docs/x.md\nfor context"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    # REVIEW ROUND 26: the prose exemption is for LINES of a multi-line string; a single-line "~ " is
-    # still the home a trimming server walks. And a path given as an object KEY is judged.
-    for pad in '~ ' ' ~' '/ '; do
-        h "round 26: a padded single-line '$pad' is still judged" deny \
-          '{"tool_name":"mcp__fs__list_dir","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$pad"'"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    done
-    h "round 26: a path given as an object key is judged" deny \
-      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"files":{"'"$bh"'/.ssh/id_rsa":{"encoding":"utf8"}}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    # REVIEW ROUND 25: a line that is only slashes, or a bare ~, is prose (a quoted doc comment), not the
-    # root or the home; and MultiEdit's strings are code, judged by its file_path like Edit's.
-    for pl in 'see:\n/// Foo\n///\n/// Bar' 'a\n//\nb' 'a\n/\nb' 'list:\n  ~\n'; do
-        plj="$(jqh -cn --arg h "$bh" --arg d "$pl" '{tool_name:"mcp__jkb__task_create", cwd:($h + "/repos/w"), tool_input:{title:"t", description:("\"" + $d + "\"" | fromjson)}}')"
-        h "round 25: a description line '$pl' is prose" allow "$plj" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    done
     me="$(jqh -cn --arg h "$bh" '{tool_name:"MultiEdit", cwd:($h + "/repos/w"), tool_input:{file_path:($h + "/repos/w/a.rs"), edits:[{old_string:"x", new_string:"/// doc\n///\nfn a() {}"}]}}')"
     h "round 25: a MultiEdit's code is not free text" allow "$me" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     me="$(jqh -cn --arg h "$bh" '{tool_name:"MultiEdit", cwd:($h + "/repos/w"), tool_input:{file_path:($h + "/.bashrc"), edits:[{old_string:"x", new_string:"y"}]}}')"
     h "round 25: ...while its file_path is still held to the boundary" deny "$me" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    cpad="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/.ssh/id_rsa" + ([range(5000)|"\u0008"]|join("")))}}')"
-    h "round 23: trailing control characters past PATH_MAX do not hide a denied path" deny "$cpad" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    lclimb="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("k z/" + ([range(1000)|"aaaa/"]|join("")) + ([range(1000)|"../"]|join("")) + "../e.jsonl")}}')"
-    h "round 21: an over-long climb behind a space is refused, not resolved" deny "$lclimb" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    mdesc="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__task_create", cwd:($h + "/repos/w"), tool_input:{title:"t", description:"Touches:\ncrates/a.rs\n  crates/b.rs  \n- docs/x.md\nsee ../docs for more"}}')"
-    h "round 21: a description listing workspace files on their own lines is allowed" allow "$mdesc" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    # REVIEW ROUND 22. Every line break a server's splitlines() honours, and the Unicode White_Space a
-    # str.strip() removes, not only ASCII: NBSP, U+3000, `\r`, U+2028 hid a denied path as round 21's
-    # ASCII forms had.
-    # REVIEW ROUND 23: ...and the C0 controls, DEL and U+FEFF, which Python's strip(), JS's trim() and
-    # Java's trim() remove between them.
-    for wsf in '\u00a0%s' '%s\u00a0' '\u3000%s' 'a\r%s' 'a\u2028%s' 'a\u0085%s' 'a\u000b%s' \
-               '\u001f%s' '\ufeff%s' '\u0001%s' '\u0008%s' '\u007f%s' '\u200b%s'; do
-        uj="$(jqh -cn --arg h "$bh" --arg f "$wsf" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($f | sub("%s"; $h + "/.ssh/id_rsa") | fromjson? // ("\"" + . + "\"" | fromjson))}}')"
-        h "round 22: a denied path behind '$wsf' is judged as its own path" deny "$uj" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    done
-    h "round 20: ...and unpadded ./~t is denied as before" deny \
-      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"./~t/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    longp="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + ([range(2100)|"/."]|join("")) + "/.ssh/id_rsa")}}')"
-    h "round 17: an over-long padded path still meets the boundary" deny "$longp" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     mkdir -p "$bh/repos/w/.claude"
     h "round 16: the project's own settings layer is not writable through the boundary" deny \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/.claude/settings.local.json","content":"{}"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
@@ -779,27 +654,21 @@ if [ "${1:-}" = --self-test ]; then
     rm -f -- "$sh.link"
     case "$sh" in */tmp.*) rm -rf -- "$sh" ;; *) printf '  \033[33mnote\033[0m left %s in place: not a mktemp path\n' "$sh" ;; esac
 
-    # ANY TOOL THAT CAN NAME A PATH. MCP tools run unsandboxed; for a tool whose fields this does
-    # not know, every string in its input is judged.
+    # ANY TOOL THAT CAN NAME A PATH. MCP tools run unsandboxed; a listed tool's path fields are judged,
+    # and an unlisted tool is refused (the field table, review round 27).
     h "an MCP tool given a transcript path is denied" deny \
-      '{"tool_name":"mcp__jkb__ingest_path","cwd":"/h/repos/jkb","tool_input":{"path":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
-    h "...however deep in its input the path sits" deny \
-      '{"tool_name":"mcp__x__y","cwd":"/h/repos/jkb","tool_input":{"opts":{"files":["/h/repos/a","~/.claude-state/projects/-s/e.jsonl"]}}}' HOME=/h
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"/h/repos/jkb","tool_input":{"source":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "...or as an ancestor that a server would walk" deny \
-      '{"tool_name":"mcp__x__index","cwd":"/h/repos/jkb","tool_input":{"root":"/h"}}' HOME=/h
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"/h/repos/jkb","tool_input":{"source":"/h"}}' HOME=/h
     h "an MCP tool with ordinary arguments is allowed" allow \
       '{"tool_name":"mcp__jkb__search","cwd":"/h/repos/jkb","tool_input":{"query":"hello world","limit":5}}' HOME=/h
     h "MultiEdit into the tree is denied" deny \
       '{"tool_name":"MultiEdit","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/e.jsonl","edits":[]}}' HOME=/h
     h "a Write whose CONTENT mentions the tree is allowed -- content is not a path" allow \
       '{"tool_name":"Write","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/repos/jkb/notes.md","content":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
-    # Built with jq, not python3: without python3 the payload was empty, the empty-payload refusal
-    # answered, and the row passed without ever reaching the cap. Review round 3.
-    big="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{a:[range(101) | "/h/repos/jkb/f\(.)"]}}')"
-    h "more path-like strings than the cap is a refusal, never a race with the timeout" deny "$big" HOME=/h
     many="$(jqh -cn '{tool_name:"TodoWrite", cwd:"/h/repos/jkb", tool_input:{todos:[range(150) | {content:"do thing \(.)", status:"pending"}]}}')"
     h "a TodoWrite with a long list -- no path-like strings -- is allowed" allow "$many" HOME=/h
-    # EVERY TOOL reaches the hook now; one it does not know is judged by its strings.
+    # EVERY TOOL reaches the hook now; Artifact's path fields are in the table.
     h "an Artifact publish of a transcript is denied" deny \
       '{"tool_name":"Artifact","cwd":"/h/repos/jkb","tool_input":{"action":"publish","file_path":"~/.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "...and through its files map" deny \
@@ -832,21 +701,15 @@ if [ "${1:-}" = --self-test ]; then
     h "40 todos from a home cwd, one with an empty activeForm, are allowed" allow "$todos" HOME=/h
     agent="$(jqh -cn '{tool_name:"Agent", cwd:"/h/repos/jkb", tool_input:{prompt:([range(130) | "Review the change in crates/jkb-core."] | join(" "))}}')"
     h "a 4.6KB Agent prompt with slashes is allowed" allow "$agent" HOME=/h
-    # Over PATH_MAX in an unknown tool's input: prose passes, a chain that collapses into the tree
-    # does not -- judge() normalises it as a server would.
-    prose="$(jqh -cn '{tool_name:"mcp__x__note", cwd:"/h/repos/jkb", tool_input:{text:([range(200) | "see docs/a b.md here"] | join(" "))}}')"
-    h "a 5KB prose string with slashes in an MCP call is allowed" allow "$prose" HOME=/h
-    chain="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("/" + ([range(1500) | "a b/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
-    h "...while a 10KB chain with spaces that collapses into the tree is denied" deny "$chain" HOME=/h
     # REVIEW ROUND 6. Text that starts with `~` is not a home; a file:// URI is its path.
     h "jkb's own vector-search syntax is not a path" allow \
       '{"tool_name":"mcp__jkb__search","cwd":"/h/repos/jkb","tool_input":{"query":"~\"how does sync work\" kind:task"}}' HOME=/h
     h "a ~2h estimate is not a path" allow \
       '{"tool_name":"TaskCreate","cwd":"/h/repos/jkb","tool_input":{"description":"~2h of work"}}' HOME=/h
     h "a file:// URI to a transcript is denied" deny \
-      '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"file:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+      '{"tool_name":"mcp__jkb__ingest_url","cwd":"/h/repos/jkb","tool_input":{"source":"file:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "a percent-escaped file URI is refused, not decoded" deny \
-      '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"file:///h/%2eclaude/projects/-s/e.jsonl"}}' HOME=/h
+      '{"tool_name":"mcp__jkb__ingest_url","cwd":"/h/repos/jkb","tool_input":{"source":"file:///h/%2eclaude/projects/-s/e.jsonl"}}' HOME=/h
     h "a Glob climbing after a wildcard is denied" deny \
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"*/../../../.claude/projects/*/*.jsonl"}}' HOME=/h
     h "a Glob hiding an absolute path in braces is denied" deny \
@@ -859,29 +722,22 @@ if [ "${1:-}" = --self-test ]; then
     fi
     # REVIEW ROUND 7.
     h "an UPPER-CASE FILE:// URI to a transcript is denied" deny \
-      '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"FILE:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
-    lfile="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("file:///" + ([range(1500) | "a/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
+      '{"tool_name":"mcp__jkb__ingest_url","cwd":"/h/repos/jkb","tool_input":{"source":"FILE:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    lfile="$(jqh -cn '{tool_name:"mcp__jkb__ingest_url", cwd:"/h/repos/jkb", tool_input:{source:("file:///" + ([range(1500) | "a/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
     h "a long file:// chain that collapses into the tree is denied" deny "$lfile" HOME=/h
     h "a second brace group hiding an absolute path is denied" deny \
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{,}{/h/.claude/projects/**/*.jsonl,x}"}}' HOME=/h
     h "jkb's one-word vector search ~retry is not a home" allow \
       '{"tool_name":"mcp__jkb__query","cwd":"/h/repos/jkb","tool_input":{"dsl":"~retry"}}' HOME=/h
-    h "a ~2h with no space is not a home either" allow \
-      '{"tool_name":"mcp__x__note","cwd":"/h/repos/jkb","tool_input":{"text":"~2h"}}' HOME=/h
     h "a Glob whose .. is in the literal prefix is allowed" allow \
       '{"tool_name":"Glob","cwd":"/h/repos/jkb/crates","tool_input":{"pattern":"../docs/*.md"}}' HOME=/h
     h "a brace of relative multi-segment paths is allowed" allow \
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{crates/jkb-core,crates/jkb-cli}/**/*.rs"}}' HOME=/h
-    h "free text that starts with file: is text, not a refusal" allow \
-      '{"tool_name":"mcp__x__note","cwd":"/h/repos/jkb","tool_input":{"text":"file: see crates/a.rs"}}' HOME=/h
     h "an ordinary brace pattern is allowed" allow \
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"**/*.{rs,toml}"}}' HOME=/h
     # A bare ~name is a home, as a server applying expanduser would read it.
-    # A MULTI-LINE string a lexically-normalising server would collapse into the tree.
-    h "a multi-line string that collapses into the tree is denied" deny \
-      '{"tool_name":"mcp__x__read","cwd":"/h/repos/jkb","tool_input":{"p":"/h/.claude\n/../.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "a bare ~name root given to an MCP tool is the home, an ancestor" deny \
-      '{"tool_name":"mcp__x__index","cwd":"/h/repos/jkb","tool_input":{"root":"~vscode"}}' HOME=/h
+      '{"tool_name":"mcp__jkb__ingest_path","cwd":"/h/repos/jkb","tool_input":{"source":"~vscode"}}' HOME=/h
     # REVIEW ROUND 8. What a brace group EXPANDS to, not its raw alternatives: a nested group and a
     # `..` composed across a group boundary both passed the per-alternative test.
     h "a nested brace hiding an absolute path is denied" deny \
@@ -896,71 +752,11 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Glob","cwd":"/h/repos/jkb","tool_input":{"pattern":"{src,tests/{unit,e2e}}/**/*.rs"}}' HOME=/h
     blow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(8) | "{a,b,c}"] | join(""))}}')"
     h "a brace product too large to expand is refused, never a race with the timeout" deny "$blow" HOME=/h
-    # REVIEW ROUND 14. The MCP arm had no budget on total work: 99 padding strings of ~4KB and ~2000
-    # segments each pushed a transcript path past the timeout, which fails open.
-    pad="$(jqh -cn '{tool_name:"mcp__jkb__ingest_path", cwd:"/h/repos/jkb", tool_input:{path:"/h/.claude/projects/-s/e.jsonl", pad:[range(99) as $i | ("/a\($i)/" + ([range(2000)|"a/"]|join("")))]}}')"
-    t0=$(date +%s%N)
-    h "an MCP call padded to run past the timeout is refused" deny "$pad" HOME=/h
-    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
-    if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
-    else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
-    # REVIEW ROUND 15. The cost is check() calls, not segments: 100 short `~name/` strings from three
-    # bases passed the segment cap and ran 4.6s idle, 20s under load. Refused on a count, and fast.
-    many="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb/a", tool_input:{p:[range(100) as $i | ("~u\($i)/" + ([range(37)|"a/"]|join("")))]}}')"
-    t0=$(date +%s%N)
-    h "100 ~name strings from three bases are refused on a check count" deny "$many" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
-    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
-    if [ "$t1" -lt 1500 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
-    else printf '  \033[31mFAIL\033[0m ...but it took %sms\n' "$t1"; fails=$((fails+1)); fi
     # REVIEW ROUND 13. 64 long, distinct prefixes made glob_base's per-prefix work run past the
     # timeout, which fails open: refused on a budget before any prefix is walked, and fast.
     slow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:("~/.claude/projects/" + ([range(6)|"{.,./}"]|join("")) + ([range(1960)|"./"]|join("")) + "*/*.jsonl")}}')"
     t0=$(date +%s%N)
     h "64 long distinct Glob prefixes are refused" deny "$slow" HOME=/h
-    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
-    if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
-    else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
-    # REVIEW ROUND 20. A ${x#lit} or ${x%lit} that does NOT match is quadratic in bash: one long free-text
-    # string beside a transcript path ran the hook to 21s, past the timeout, which fails open.
-    for lead in "./" "x/" "/" "~x/" "a b/"; do
-        big="$(jqh -cn --arg l "$lead" '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:($l + ([range(300000)|"e"]|join(""))), p:"/h/.claude/projects/-s/e.jsonl"}}')"
-        t0=$(date +%s%N)
-        h "round 20: a 300KB string led by '$lead' beside a transcript path" deny "$big" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
-        case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
-        if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
-        else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
-    done
-    mlong="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{paths:("/h/.claude/projects/-s/e.jsonl\n" + ([range(1000)|"/h/repos/jkb/a.rs"]|join("\n")))}}')"
-    h "round 20: an over-long multi-line list that starts with a transcript path is still denied" deny "$mlong" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
-    h "round 21: a leading space does not hide a transcript path" deny \
-      '{"tool_name":"mcp__x__read","cwd":"/h/repos/jkb","tool_input":{"p":" /h/.claude/projects/-s/e.jsonl"}}' HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
-    # Trimming is linear: a regex `\s+$` over a long run of spaces is quadratic.
-    for ws in " " "x " " x"; do
-        big="$(jqh -cn --arg w "$ws" '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("a/" + ([range(300000)|$w]|join("")) + "b"), p:"/h/.claude/projects/-s/e.jsonl"}}')"
-        t0=$(date +%s%N)
-        h "round 21: 300KB of '$ws' runs beside a transcript path" deny "$big" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
-        case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
-        if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
-        else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
-    done
-    # REVIEW ROUND 22: a cap is a DENY THAT NAMES IT, not the generic "could not reach a decision".
-    capd="$(jqh -cn '{tool_name:"mcp__jkb__task_create", cwd:"/h/repos/jkb", tool_input:{title:"t", description:("Files:\n" + ([range(16) as $i | "crates/f\($i).rs"]|join("\n")))}}')"
-    capo="$(printf '%s' "$capd" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb "$BASH" "$self" 2>/dev/null)"; caprc=$?
-    case "$caprc:$capo" in
-        0:*'"deny"'*'checks'*) printf '  \033[32mok\033[0m   %s\n' "round 22: a call over the check cap is denied with a reason naming the cap" ;;
-        *) printf '  \033[31mFAIL\033[0m round 22: a call over the check cap is denied with a reason naming the cap\n         rc=%s out=%s\n' "$caprc" "${capo:0:200}"; fails=$((fails+1)) ;;
-    esac
-    manyl="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("a b" + ([range(25000)|"\ne"]|join("")))}}')"
-    h "round 21: more than 20000 lines in one call are refused before any is trimmed" deny "$manyl" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
-    manyl="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("a b" + ([range(19000)|"\n   e   "]|join("")))}}')"
-    t0=$(date +%s%N)
-    h "round 21: ...while 19000 padded lines are trimmed and allowed" allow "$manyl" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
-    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
-    if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
-    else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
-    big="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("see crates/a.rs " + ([range(300000)|"e"]|join("")))}}')"
-    t0=$(date +%s%N)
-    h "round 20: ...and a 300KB note alone is allowed" allow "$big" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
     case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
     if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
     else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
@@ -974,18 +770,11 @@ if [ "${1:-}" = --self-test ]; then
     # also answers a uid (`~5`) and system accounts (`~sync`, home /bin), all denied as $HOME.
     h "jkb's vector search ~sync is not the home of the sync account's tree" allow \
       '{"tool_name":"mcp__jkb__query","cwd":"/h/repos/jkb","tool_input":{"dsl":"~sync"}}' HOME=/h
-    h "a ~5 is not uid 5's home" allow \
-      '{"tool_name":"mcp__x__note","cwd":"/h/repos/jkb","tool_input":{"text":"~5"}}' HOME=/h
     # REVIEW ROUND 9.
     h "a leading brace that never closes is refused, not kept literal" deny \
       '{"tool_name":"Glob","cwd":"/h/repos","tool_input":{"pattern":"x}{{/.,/}./{.,}./.claude/projects/**"}}' HOME=/h
     h "an archived transcript is denied" deny \
       '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude-state/transcript-archive/-s/e.jsonl"}}' HOME=/h
-    words="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{w:[range(2001) | "w\(.)"]}}')"
-    h "more bare words than the cap is a refusal, never a race with the timeout" deny "$words" HOME=/h
-    # 1999 values and the key `w`: object keys are candidates too since review round 26.
-    words="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{w:[range(1999) | "w\(.)"]}}')"
-    h "...while 2000, the key included, is allowed" allow "$words" HOME=/h
     huge="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(3000) | "ab"] | join("") | "{" + . + ",x}")}}')"
     h "a Glob pattern over the byte budget is refused before it is walked" deny "$huge" HOME=/h
 
@@ -1055,25 +844,24 @@ deny() {
     exit 0
 }
 
-# A PER-CALL BUDGET IS A DENY THAT NAMES IT. Each cap below exists because a timed-out hook fails open,
-# and each refused with exit 3, whose reason says only that no decision was reached and the call is
-# "treated as" a transcript read. Since round 21 judges each line, an ordinary jkb task_create listing
-# 16 files hits the check cap, and the agent was never told why or how to get under it (review round
-# 22). exit 3 stays for genuine failures.
-cap_deny() { # cap_deny <leaves|words|lines|segments|checks|glob>
-    local what
-    case "$1" in
-        leaves)   what="more than 100 distinct path-like strings" ;;
-        words)    what="more than 2000 distinct short words, each of which would be looked up on disk" ;;
-        lines)    what="more than 20000 lines across its strings" ;;
-        segments) what="more path segments than the hook can judge in time (12000, counted once per base it resolves them from)" ;;
-        checks)   what="more path checks than the hook can run in time (32: one per string per base, a path on a line of its own counting as a string)" ;;
-        glob)     what="a Glob pattern whose brace expansions are too large to judge in time" ;;
-        nul)      deny "An MCP or unknown tool was handed a string holding a NUL character. No path contains one, and a server that strips it would open a different file from the one judged here; send the string without it." ;;
-        *)        exit 3 ;;
+# A DEADLINE THAT REFUSES (review round 27, from a structural review of why 26 rounds had not
+# converged). Claude Code kills a hook at its timeout -- 10s, managed-settings.json -- and then lets the
+# call through, so every input that could make this slow was a bypass, and rounds 9 to 22 answered
+# each with a budget of its own. Instead the judging runs in a child under `timeout -s KILL`, and a
+# child that does not finish is a refusal. 8s leaves the parent room inside the 10.
+# The self-test shortens the deadline and slows the child, to watch a refusal; both seams are ignored
+# in the installed copy, as DT_SELFTEST_MANAGED_DIR is.
+if [ "${1:-}" != --judge ] && [ "${1:-}" != --sandbox-enabled ]; then
+    dt_deadline=8
+    [ -n "${DT_SELFTEST_DEADLINE:-}" ] && [ "$0" != /usr/local/bin/deny-transcripts.sh ] && dt_deadline="$DT_SELFTEST_DEADLINE"
+    dt_rc=0; /usr/bin/timeout -s KILL "$dt_deadline" /bin/bash -p "$0" --judge || dt_rc=$?
+    case "$dt_rc" in
+        0|2) decided=child; exit "$dt_rc" ;;
+        124|137) deny "The file-tool boundary could not decide this call within its ${dt_deadline}s deadline, so it is refused. A smaller call -- fewer paths, a shorter pattern -- decides in time." ;;
+        *) exit 2 ;;
     esac
-    deny "This call carries $what. The file-tool boundary judges every path-like string it is handed and has a per-call budget, because a hook that runs out of time lets the call through. Split the call, or put fewer paths in it: a list of files in a description can name them in a sentence instead of one per line."
-}
+fi
+[ -n "${DT_SELFTEST_SLOW:-}" ] && [ "$0" != /usr/local/bin/deny-transcripts.sh ] && sleep "$DT_SELFTEST_SLOW"
 
 # BASH, AND THE BUILT-INS THAT TAKE NO PATH, ARE DECIDED FIRST -- before roots, realpath, or anything
 # else that can fail. Bash is the repair tool, and a container broken in some other way must not
@@ -1240,11 +1028,6 @@ sb_under() { # sb_under <path> <entry>... -> rc 0 when <path> is an entry or lie
 # boundary <physical path> -- deny a path the sandbox would not let Bash reach in this tool's mode.
 boundary() {
     [ "$sb_on" = 1 ] || return 0
-    # A GUESSED RELATIVE READING of free text is not a path anyone named: judged against the home it
-    # turned a namespace (`tasks/inbox`), a URL or a word into a home path and refused ordinary MCP
-    # calls (review round 16). The generic arm marks those calls; path fields, absolute strings and
-    # `~/` strings are judged.
-    [ "${sb_guess:-0}" = 1 ] && return 0
     # AUTO-MEMORY IS THE ONE DELIBERATE DIFFERENCE from what Bash may reach: `<root>/<slug>/memory/`
     # is Claude Code's own memory, which its tools must read and write, linked into ~/.jkb or not.
     # Sandboxed Bash cannot see the tree at all. The transcript rule above draws the same line.
@@ -1296,42 +1079,6 @@ boundary() {
 case "$tool" in Write|Edit|MultiEdit|NotebookEdit) sb_mode=write ;; *) sb_mode=read ;; esac
 if [ "$sb_query" = 1 ]; then printf '%s\n' "$sb_on"; decided=allow; exit 0; fi
 
-# `collapse <string>`: `.` and empty segments removed, a leading `./` kept. Each pass is one linear
-# global replace, and each halves a run of `/./`, so a padded string takes a handful of passes.
-collapse() {
-    local lc="$1" ln0
-    while :; do
-        ln0="${#lc}"
-        lc="${lc//\/.\//\/}"; lc="${lc//\/\//\/}"
-        [ "${#lc}" -lt "$ln0" ] || break
-    done
-    [ "${lc: -2}" = /. ] && lc="${lc:0:${#lc}-2}"
-    printf '%s' "$lc"
-}
-
-# `judge <string> <base> <guess 0|1>`: one reading of a free-text string, from one base. Within
-# PATH_MAX it is check()ed as written. Past it no kernel opens it as written:
-# - WITH A `..` SEGMENT it is REFUSED. Resolving it meant choosing between the server that normalises
-#   first and the kernel that follows links first; round 20 judged the first alone, and a cwd link then
-#   a padded climb reached a transcript (review round 21). The user's choice after that round: an
-#   over-long climb is an ambiguous form, like a `..` in a string without whitespace. It also took the
-#   only per-byte walk out of this path, so no total of long strings can reach the timeout.
-# - WITHOUT ONE, collapsed already, it stays past PATH_MAX however a server reads it, so it names
-#   nothing anyone can open, and only the TRANSCRIPT RULE reads its head: verdict() is a prefix test,
-#   so the first 4096 bytes decide it as the whole would, and a long multi-line list led by a
-#   transcript path stays denied. Not check(): the boundary would refuse prose that merely starts with
-#   a home path.
-# <guess> 1 holds the reading to the transcript rule alone (see boundary).
-judge() {
-    local v
-    if [ "${#1}" -le 4096 ]; then sb_guess="$3" check "$1" "$2"; return; fi
-    case "/$1/" in
-        */../*) deny "An MCP or unknown tool was handed a string over 4096 bytes (PATH_MAX) holding a '..' segment. The file-tool boundary refuses that form rather than guess how the server resolves it; pass a path under 4096 bytes, or text without a '..' segment." ;;
-    esac
-    v="$(verdict "${1:0:4096}" "$roots" "$home" "$2")"
-    case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac
-}
-
 check() { # check <path> [base]: deny on deny, return on allow, refuse on anything else
     local base="${2:-$cwd}" v abs raw phys p="$1"
     # A file:// URI IS ITS PATH. Joined onto the cwd as a relative string, `file:///h/.claude/...`
@@ -1374,10 +1121,7 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
     # home; one that does not -- jkb's ingest_path, Rust's fs::read -- opens a directory literally
     # named `~name` in its cwd. Judged as the home alone, a cwd link named `~t` pointing into the
     # tree was allowed (review round 9, reproduced). `./` makes the second reading relative.
-    # The generic arm judges the literal reading ITSELF, from every base, with only the home base a
-    # guess: inherited here, the home reading's guess skipped the boundary for a cwd link `~+`
-    # (review round 20). It sets dt_nolit for that call.
-    case "$1" in "~/"*|"~") ;; "~"?*) [ "${dt_nolit:-0}" = 1 ] || check "./$1" "$base" ;; esac
+    case "$1" in "~/"*|"~") ;; "~"?*) check "./$1" "$base" ;; esac
     return 0
 }
 
@@ -1420,7 +1164,8 @@ case "$tool" in
             # A BUDGET ON THE WORK, before any prefix is walked: 64 distinct ~4KB prefixes ran past
             # the 10s timeout, which fails open (review round 13, measured at 30s). Expansions times
             # pattern bytes; an ordinary pattern is a few hundred.
-            [ $(( ${#brace_out[@]} * ${#pat} )) -le 12288 ] || cap_deny glob
+            [ $(( ${#brace_out[@]} * ${#pat} )) -le 12288 ] \
+                || deny "This Glob pattern's brace expansions are too large to judge in time. Split it into smaller patterns."
             # AN ARRAY of distinct prefixes, never newline-joined text: a newline in an expansion
             # split one prefix into two harmless ones (round 13; newlines are refused above too).
             gbs=()
@@ -1450,207 +1195,52 @@ case "$tool" in
     Read|Edit|MultiEdit|Write|NotebookEdit)
         [ -n "$pth" ] && check "$pth" ;;
     *)
-        # A tool whose fields are not known here: every string it was given that COULD BE A PATH is
-        # judged -- one holding a `/`, or starting `~` or `.` (multi-line strings included, see below),
-        # or a bare word that names an existing entry in a base (round 8, below). Not every
-        # string: with every tool now routed here, a flat cap on all strings refused a TodoWrite or
-        # an AskUserQuestion with a long list. The exception is a cwd that is itself in or above the
-        # tree, where a bare word like `projects` is a path into it; then every string counts.
-        # `strings` filters to strings, so @sh cannot produce an executable word here.
-        # EVERY STRING scanned only where a bare word can reach the tree: a cwd that IS a root's
-        # parent (~/.claude, where `projects` is a root) or lies inside one. It used to be "any
-        # ancestor", which made a home cwd scan everything and refuse a long todo list.
-        scan_all=0
-        while IFS= read -r r; do
-            [ -n "$r" ] || continue
-            if [ "$cwd" = "${r%/*}" ] || [ "$cwd" = "$r" ] || under "$cwd" "$r"; then scan_all=1; fi
-        done <<<"$roots"
-        # UNIQUE, NON-EMPTY candidates: the cap counts distinct strings, and an empty string is never
-        # a location -- judged as one it resolved to the cwd. MULTI-LINE STRINGS ARE JUDGED WHOLE TOO,
-        # on purpose: a server that normalises a path lexically turns `/h/.claude\n/../.claude/projects/x`
-        # into a transcript path, and the lexical verdict here does the same collapse.
-        # ...AND EVERY LINE OF A STRING WITH WHITESPACE IN IT, TRIMMED, when what is left is one token:
-        # a server that trims its argument or reads it as a list of lines opens THAT, and judged only
-        # whole, ` /h/.ssh/id_rsa` was a relative name in the cwd and a second line was never a path
-        # (review round 21). The user's choice after that round: judge what a trimming or line-reading
-        # server opens, as an ambiguous form, rather than guess which one it is. "Whitespace" is the UNION
-        # of what the runtimes trim -- every C0 control (Java's trim(); NUL is refused below, as no
-        # regex class can hold it) and DEL for good measure, Unicode White_Space
-        # (Python's strip()), U+FEFF and U+180E (JS's trim()), U+200B for good measure -- and a line
-        # ends at any break splitlines() honours (rounds 22 and 23: NBSP, \r, U+001F, U+FEFF each hid a
-        # denied path from a narrower set).
-        # A line's token is what precedes its first whitespace, kept only when the rest is whitespace:
-        # two anchored or first-match regexes. `sub("\\s+$")` re-scans a run of spaces from every
-        # position in it, and an explode-and-reverse trim took 3.6s over 150k lines. Per-line work is
-        # still a few microseconds a line, so MORE THAN 20000 LINES in one call is refused, like the
-        # leaf and bare-word caps, before any line is trimmed.
-        # A LINE THAT IS ONLY SLASHES, OR A BARE ~, is prose: a quoted Rust doc comment's `///` was the
-        # root, an ancestor of the tree, and refused the whole call with nothing the caller could
-        # remove (review round 25). A WHOLE string that is `/` or `~` is still judged, and so is a
-        # single-line one padded (`~ `): the exemption is for the LINES of a multi-line string only,
-        # and applied to every token it let `~ ` past as prose while a trimming server walks the home
-        # (review round 26).
-        # One jq run
-        # produces both arrays, and the slash count the segment budget below needs.
-        cands_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
-            def ws: "[\u0001-\u0020\u007f\u0085\u00a0\u1680\u180e\u2000-\u200b\u2028\u2029\u202f\u205f\u3000\ufeff]";
-            def lines: split("\n")[] | split("\r")[] | split("\u000b")[] | split("\f")[] | split("\u001c")[]
-                | split("\u001d")[] | split("\u001e")[] | split("\u0085")[] | split("\u2028")[] | split("\u2029")[];
-            def tok: sub("^" + ws + "+"; "") as $l
-                | ([$l | match(ws).offset] | first) as $o
-                | if $o == null then $l
-                  elif ($l[$o:] | test("^" + ws + "*$")) then $l[:$o]
-                  else empty end;
-            def pathish: $all == "1" or test("^[~.]") or contains("/");
-            # OBJECT KEYS TOO: a path-keyed map ({"files": {"/h/.ssh/id_rsa": {...}}}) reached a server
-            # unjudged while the same path in an array was denied (review round 26).
-            [.tool_input | .. | ((objects | keys[]), strings) | select(. != "")] as $s
-            # A NUL IS REFUSED, not trimmed: no path holds one, the trim class cannot (a regex with a
-            # NUL in it), and a trimming server strips it -- `\u0000/h/.ssh/id_rsa` was a relative name
-            # here and the credential there (review round 24).
-            | if any($s[]; contains("\u0000")) then "dt_cap=nul" else
-            .
-            | [$s[] | select(test(ws + "|[\n\u001c-\u001e]"))] as $w
-            | [$w[] | [lines]] as $wl
-            | if ($wl | map(length) | add // 0) > 20000 then "dt_cap=lines"
-              else ($s + [$wl[] | length as $n | .[] | tok
-                          | select(. != "" and ($n == 1 or (test("^(/+|~)$") | not)))]) as $c
-                | ([$c[] | select(pathish)] | unique) as $leaves
-                | ([$c[] | select(length <= 255 and (pathish | not))] | unique) as $bare
-                | if ($leaves | length) > 100 then "dt_cap=leaves"
-                  elif ($bare | length) > 2000 then "dt_cap=words"
-                  else @sh "leaves=(\($leaves)) bare=(\($bare))" + " segs=\($leaves | map(split("/") | length) | add // 0)" end
-              end end' 2>/dev/null)" || exit 3
-        # ...and every OTHER string short enough to be one name (NAME_MAX), above as `bare`: a bare word
-        # is a path the moment it names something in a base, and a link named `t` there reached the tree
-        # with nothing judged (review round 8, reproduced). Tested on disk below, with no fork per word.
-        leaves=(); bare=(); segs=0; dt_cap=""
-        eval "$cands_sh"
-        [ -z "$dt_cap" ] || cap_deny "$dt_cap"
-        nleaves0="${#leaves[@]}"
-        # An MCP server resolves a relative path against ITS OWN cwd, which is not the session's:
-        # the jkb server starts in the project root. So a relative string is judged against every
-        # base it could plausibly mean. AN ARRAY, iterated quoted: `for b in $bases` split a cwd
-        # with a space into fragments, the real base was never judged, and a relative climb into
-        # the tree was allowed (review round 4, reproduced).
-        bases=("$cwd")
-        if [ "${tool#mcp__}" != "$tool" ]; then
-            # DISTINCT bases only: the session cwd is usually the project dir, and judging every
-            # string twice against one base doubled the worst case for nothing.
-            bases=("$cwd")
-            for b in "${CLAUDE_PROJECT_DIR:-}" "$home"; do
-                [ -n "$b" ] || continue
-                dup=0; for e in "${bases[@]}"; do [ "$e" = "$b" ] && dup=1; done
-                [ "$dup" -eq 0 ] && bases+=("$b")
-            done
+        # THE FIELD TABLE (the user's choice after review round 26, on a structural review of why 26
+        # rounds had not converged). A tool whose path fields are listed has them judged as Read's
+        # file_path is; a tool listed as pathless is let through; ANY OTHER TOOL IS REFUSED, MCP or
+        # built-in. Rounds 6 to 26 judged every string an unknown tool carried as a possible path and
+        # could not finish: each round found another reading of free text -- a whitespace class, a line
+        # break, padding, an object key -- that some server might take. A table cannot be wrong about
+        # what an unlisted server does, because it does not let one run. Adding a tool is one line here
+        # and a rebuild of the image this hook is installed in.
+        case "$tool" in
+            mcp__jkb__ingest_path) dt_fields='.source' ;;
+            # ingest_url renders its URL in a headless browser, which loads a file: URL from disk.
+            mcp__jkb__ingest_url) dt_fields='.source | strings | select(test("^file:"; "i"))' ;;
+            mcp__jkb__search|mcp__jkb__get_context|mcp__jkb__query|mcp__jkb__list_views|mcp__jkb__run_view|\
+            mcp__jkb__task_next|mcp__jkb__task_create|mcp__jkb__task_update) dt_fields='empty' ;;
+            # Artifact publishes local files: its page, its supporting files (a map of published path to
+            # a source path or {from}, or a list of {path}; an {artifact, path} source is another
+            # artifact's published file, not a local one), and asset uploads.
+            Artifact) dt_fields='.file_path, .file_paths[]?, .root, .out_dir,
+                ((.files // empty) | if type == "array" then .[].path?
+                 elif type == "object" then (.[] | if type == "string" then .
+                     elif type == "object" and (has("artifact") | not) then .from? else empty end)
+                 else empty end)' ;;
+            ArtifactData) dt_fields='.file_path' ;;
+            Workflow) dt_fields='.scriptPath' ;;
+            # Pathless built-ins: they carry text, URLs or ids, or run under the kernel sandbox as Bash
+            # does (Monitor, the shell-output tools).
+            WebFetch|WebSearch|Monitor|ScheduleWakeup|CronCreate|CronDelete|CronList|TaskStop|TaskOutput|\
+            ListAgents|EnterPlanMode|ExitPlanMode|ReportFindings|PushNotification|RemoteTrigger|\
+            ArtifactComments|KillShell|BashOutput|TaskCreate|TaskUpdate|TaskList|TaskGet) dt_fields='empty' ;;
+            *) deny "$tool is not in the file-tool boundary's table (the field table in .container/deny-transcripts.sh). An unlisted MCP server or tool cannot be told apart from one that reads any file it is handed, so it is refused. To use it here, add it to that table with its path fields, or as pathless, and rebuild the container." ;;
+        esac
+        dt_paths_sh="$(printf '%s' "$input" | jqh -er "[.tool_input | ($dt_fields) | strings | select(. != \"\")] | @sh \"dt_paths=(\\(.))\"" 2>/dev/null)" || exit 3
+        dt_paths=(); eval "$dt_paths_sh"
+        # Artifact's supporting files are relative to its `root` when one is given.
+        dt_root=""
+        if [ "$tool" = Artifact ]; then
+            dt_root="$(printf '%s' "$input" | jqh -r '.tool_input.root // "" | strings' 2>/dev/null)" || exit 3
+            [ -z "$dt_root" ] || dt_root="$(join_raw "$dt_root" "$home" "$cwd")"
         fi
-        for w in ${bare[@]+"${bare[@]}"}; do
-            for b in "${bases[@]}"; do
-                if [ -n "$b" ] && { [ -e "$b/$w" ] || [ -L "$b/$w" ]; }; then leaves+=("./$w"); break; fi
-            done
-        done
-        [ "${#leaves[@]}" -le 100 ] || cap_deny leaves
-        # A BUDGET ON THE WORK, as the Glob arm has: path segments, times the bases each relative
-        # one is judged from. 100 leaves of ~2000 segments ran a transcript path past the 10s
-        # timeout, which fails open (review round 14, reproduced at 10s; the leaf cap alone allowed
-        # it). Ordinary calls are a few hundred segment-bases.
-        # COUNTED BY jq, where the leaves were found: every bash spelling of "count the slashes" was
-        # slow on one long string -- a bracket-class delete took 2.4s at 300KB, a literal one 2.4s at
-        # 150k slashes (review round 20). A bare word made a leaf is `./word`: two segments.
-        segs=$(( ${segs:-0} + 2 * (${#leaves[@]} - nleaves0) ))
-        [ $(( segs * ${#bases[@]} )) -le 12000 ] || cap_deny segments
-        # ...AND ON THE NUMBER OF check() CALLS, which is what the time goes on: each forks realpath
-        # and walks the path. Under the segment cap, 100 short `~name/` strings from three bases
-        # made 600 calls and ran 4.6s idle, 20s under load (review round 15). An absolute path is
-        # one call, a relative one one per base, a `~name` one two per base (both readings).
-        nchk=0
-        for leaf in ${leaves[@]+"${leaves[@]}"}; do
-            case "$leaf" in
-                /*|"~/"*|"~") nchk=$((nchk + 1)) ;;
-                "~"*) nchk=$((nchk + 2 * ${#bases[@]})) ;;
-                *) nchk=$((nchk + ${#bases[@]})) ;;
-            esac
-        done
-        [ "$nchk" -le 32 ] || cap_deny checks
-        for leaf in ${leaves[@]+"${leaves[@]}"}; do
-            # A free-text string that merely STARTS `file:` is text, not a refusal (round 7); only a
-            # `file:/...` URI is rewritten, by the same helper check() uses. FIRST, before the collapse
-            # below folds `file://localhost/` into `file:/localhost/`, a different path (review round 20).
-            case "$(printf '%s' "${leaf:0:6}" | tr 'A-Z' 'a-z')" in
-                file:/) up="$(uri_path "$leaf")" || exit 3; [ -n "$up" ] && leaf="$up" ;;
-                file:*) continue ;;
-            esac
-            # OVER PATH_MAX, `.` and empty segments are then COLLAPSED -- before the form refusals and
-            # the arms, and keeping a leading `./`. Collapsed after them, padding stripped the `./` off
-            # `./~t/...` and the `~t/` it left skipped the refusal it would have met (review round 20).
-            # A string that then fits is judged in full: a cwd link padded with `./` past PATH_MAX was
-            # followed by no check (round 19).
-            if [ "${#leaf}" -gt 4096 ]; then leaf="$(collapse "$leaf"; printf .)"; leaf="${leaf%.}"; fi
-            # AMBIGUOUS FORMS ARE REFUSED, NOT RESOLVED (the user's choice after review round 18). A
-            # `..` segment or a `~name/` prefix asks this hook to guess how an unknown server will
-            # resolve a path -- normalising first or not, expanding ~name or not -- and rounds 16 to
-            # 18 each found a spelling the guess missed: a climb padded past PATH_MAX, `~sync/../`.
-            # Refusing the form ends that. Prose that merely mentions `../` is not a segment and
-            # passes; a tool that genuinely needs `../x` is told why.
-            # ONLY A STRING THAT IS A PATH AS A WHOLE -- no whitespace -- is refused for a `..`: prose
-            # holding a markdown link `](../../x.md)` was refused as one (review round 19). A climb in a
-            # string with a space in it is still RESOLVED and judged below, on both its physical and its
-            # lexical landing (check), however long it is (judge).
-            case "$leaf" in
-                *[[:space:]]*) ;;
-                *) case "/$leaf/" in
-                       */../*) deny "An MCP or unknown tool was handed a path with a '..' segment. The file-tool boundary refuses that form rather than guess how the server resolves it; pass the path without '..' (an absolute path, or one relative to the workspace)." ;;
-                   esac ;;
-            esac
-            # `~name/` only when the name is ACCOUNT-SHAPED: `[!/]*` ran across spaces and quotes, and
-            # refused jkb's own `~"term" ns:a/b` vector query and `~2h ... crates/a.rs` (round 19).
-            case "$leaf" in
-                "~"[!/]*/*) tn="${leaf#\~}"; tn="${tn%%/*}"
-                            case "$tn" in
-                                *[!A-Za-z0-9._-]*) ;;
-                                *) deny "An MCP or unknown tool was handed a '~name/' path. The file-tool boundary refuses that form rather than guess whether the server expands it; pass an absolute path instead." ;;
-                            esac ;;
-            esac
-            # A SLASHLESS ~word in free text is a home only if that account exists. `~retry` is jkb's
-            # own one-word vector search and `~2h` an estimate; reading them as home directories
-            # refused ordinary calls (round 7). Otherwise it is judged as what a server that does
-            # not expand it opens: a relative name. Skipping it let a link named `~t` reach the tree
-            # (round 8). A path field keeps the over-approximation.
-            case "$leaf" in
-                "~"*/*|"~") ;;
-                # BY NAME, AT ITS REAL HOME: getent also answers a uid (`~5`) and system accounts
-                # (`~sync`, whose home is /bin), and reading every one as $HOME refused jkb's own
-                # `~sync` search (review round 12). An account whose first field is the word is
-                # judged at the home it has; anything else is a relative name.
-                "~"*) ent="$(getent passwd "${leaf#\~}" 2>/dev/null | head -1)"
-                      ent_home="$(printf '%s' "$ent" | cut -d: -f6)"
-                      # BOTH READINGS for an account: its home, and the literal name a server that
-                      # does not expand it opens. Judged at the home alone, a cwd link named `~sync`
-                      # reached the tree (review round 13).
-                      [ "${ent%%:*}" = "${leaf#\~}" ] && [ -n "$ent_home" ] && check "$ent_home"
-                      leaf="./$leaf" ;;
-            esac
-            case "$leaf" in
-                /*|"~/"*|"~") judge "$leaf" "$cwd" 0; continue ;;
-                # A `~`-led string with a `/` that survived the `~name/` refusal above is not an account
-                # path -- its name is not account-shaped, so it is prose like jkb's `~"term" ns:a/b`. Its
-                # HOME reading is a guess, held to the transcript rule alone (round 19); its LITERAL
-                # reading, a name in the server's cwd, is judged below like any relative string. Both
-                # were guesses until review round 20, when a cwd link named `~+` reached ~/.ssh.
-                "~"*/*) dt_nolit=1 judge "$leaf" "$cwd" 1; leaf="./$leaf" ;;
-            esac
-            # A RELATIVE string from every base. ONLY THE HOME-BASE READING is a guess: no server named
-            # the home as its cwd, while the session cwd and project dir are where one resolves a
-            # relative path -- jkb's ingest_path opens it from the project root, and round 16's skip of
-            # every base let `../../.ssh/id_rsa` through (review round 17).
-            for b in "${bases[@]}"; do
-                [ -n "$b" ] || continue
-                if [ "$b" = "$home" ] && [ "$b" != "$cwd" ] && [ "$b" != "${CLAUDE_PROJECT_DIR:-}" ]; then
-                    judge "$leaf" "$b" 1
-                else
-                    judge "$leaf" "$b" 0
-                fi
-            done
+        for p in ${dt_paths[@]+"${dt_paths[@]}"}; do
+            case "$p" in *$'\n'*) deny ;; esac
+            check "$p"
+            # A RELATIVE path is judged from every base the tool may resolve it from: an MCP server
+            # resolves against its OWN cwd, and jkb's starts in the project root.
+            [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ "$CLAUDE_PROJECT_DIR" != "$cwd" ] && check "$p" "$CLAUDE_PROJECT_DIR"
+            [ -z "$dt_root" ] || check "$p" "$dt_root"
         done ;;
 esac
 allow

@@ -28,53 +28,30 @@
 # — including a `jkb task work` session inside one — instead of one container per opened folder.
 set -euo pipefail
 
-# NO PROGRAM FROM A PLACE AN AGENT CAN WRITE. This runs as you, on the host, unsandboxed, and it runs
-# bash, jq, docker, tar and the rest by name. The host auto-mode posture lets a sandboxed agent write
-# ~/.cargo (rustup puts ~/.cargo/bin first on PATH), ~/.jkb, ~/.cache, /tmp and the macOS temp roots,
-# so a planted ~/.cargo/bin/jq or docker ran as you at the next start (review round 11; the
-# kit had moved out of reach and this was the door left). So: an absolute shebang, `#!/usr/bin/env
-# bash` having found bash itself through that PATH, and before anything runs, every PATH entry under
-# $HOME, /tmp or /private, or relative, is dropped. System and Homebrew locations stay, which is
-# where docker and jq live -- Homebrew's are user-owned, so the posture denies Edit on /opt/homebrew
-# and /usr/local for the unsandboxed Write tool (review round 14; check-config.sh holds it); a docker under ~ (~/.docker/bin, ~/.orbstack/bin) has to be linked from
-# one of them. ~/.local/share/jkb-container-kit/path-keep lists directories to keep anyway, one per
-# line, and is safe only for one NO agent can write: outside the posture's sandbox allowWrite AND
-# Edit-denied, since the in-process Write tool is not sandboxed (review round 13 -- ~/.docker/bin
-# passes the first test and not the second unless the posture denies it). The tests' stubs in /tmp
-# use it. A tool the filter hid is named, with the directory it was in, by `need_tool` below (review
-# round 12).
-# AND ITS CHILDREN INHERIT ONLY AN ALLOWLIST (the line before the filter, so the filter runs once, in
-# the clean shell, and need_tool can still name what it dropped): -p keeps BASH_ENV out of this
-# shell, but docker, tar and `code` read their own variables -- DOCKER_CONFIG names the cli-plugins
-# docker runs, TAR_OPTIONS can carry --checkpoint-action=exec -- and a committed terminal.integrated.env
-# sets any of them (review round 23). So run.sh ALWAYS re-executes itself once under `env -i`, marked by
-# an argument no terminal can add (--jkb-clean-env), with only HOME, PATH, the locale and terminal names, USER/LOGNAME,
-# DOCKER_HOST/DOCKER_CONTEXT (a Colima or OrbStack socket, deliberately trusted: they select a daemon,
-# not code to run), JKB_RUN_FROM_CHECKOUT, and JKB_CONTAINER_NAME/JKB_CONTAINER_IMAGE -- documented
-# overrides the reaper and `jkb task work` honour too; dropped, run.sh acted on jkb-dev while they looked
-# for the override (review round 24). A non-default image is therefore always BUILT from the kit's
-# Dockerfile (below), so the override names a tag and never chooses what runs. Plus PWD/SHLVL/_, which
-# bash exports itself and without
-# which the re-exec would never settle. An allowlist, not a denylist: the next variable some tool reads
-# is not on it. ALWAYS, not "when something else is present": that decision read `compgen -e`, which
-# never lists an exported function, so `BASH_FUNC_x%%` beside allowlisted names skipped the re-exec and
-# `bash -p`, which does not import it, still passed it to every bash child (review round 26).
-# On a Linux desktop, DISPLAY, WAYLAND_DISPLAY and XDG_RUNTIME_DIR too, or `--open` could not reach a
-# display or a running VS Code (review round 25): they name a display and a socket directory, not code.
-# DBUS_SESSION_BUS_ADDRESS stays out, because a `unixexec:` address runs a program.
-# AND EVERY WRITABLE DIRECTORY THE POSTURE NAMES IS A DROP ROOT, resolved physically like the rest: a
-# ~/repos linked to /Volumes/Dev/repos put a writable directory on PATH under a name that matched no root
-# (review round 25). check-config requires every ~/ entry of the posture's allowWrite to be listed.
-# NOTHING HERE TAKES ORDERS FROM THE ENVIRONMENT beyond HOME and PATH themselves (review round 22). The
-# keep list was the env var JKB_RUN_PATH_KEEP, and a committed .vscode/settings.json can set any
-# variable in every VS Code terminal: it kept an agent's ~/.cargo/bin. It is now a FILE in the 0700
-# kit home, which the posture Edit-denies. And an entry is dropped when its PHYSICAL, case-folded path
-# is under the home or a temp root, not only its spelling: `/home//you/.cargo/bin` and, on APFS,
-# `/USERS/you/...` passed the textual match. A terminal that replaces HOME itself defeats this and
-# also chooses which `~/.local/share/.../run.sh` you start, so it is out of any script's reach.
+# NOTHING INHERITED STEERS WHAT RUNS. This runs as you, on the host, unsandboxed, and it runs bash, jq,
+# docker, tar and the rest by name, from a shell an agent may have shaped: the posture lets sandboxed
+# agents write ~/.cargo (first on PATH), ~/.jkb, ~/.cache and the temp roots, and a committed
+# .vscode/settings.json can set any variable in every VS Code terminal. Rounds 11 to 26 filtered the
+# inherited PATH and environment and each found the next inlet -- BASH_ENV, exported functions,
+# DOCKER_CONFIG, TAR_OPTIONS, a keep list in the env, a `//` or case spelling, a symlinked root -- so
+# since review round 27 nothing is filtered: run.sh re-executes itself once under `env -i` with a PATH
+# it BUILDS and an allowlist of names it keeps, marked by an argument no terminal can add.
+# - PATH is the system and Homebrew directories, where docker and jq live (Homebrew's are user-owned,
+#   so the posture denies Edit on /opt/homebrew and /usr/local; check-config.sh holds it), then each
+#   directory listed, one per line, in ~/.local/share/jkb-container-kit/path-keep -- a file in the
+#   0700, Edit-denied kit home, for a per-user Docker (~/.docker/bin, ~/.orbstack/bin). List one only
+#   if NO agent can write it. The shell's own PATH travels as JKB_USER_PATH, read by need_tool alone,
+#   to name where a missing tool was.
+# - The names kept: HOME, the terminal and locale, USER/LOGNAME, DOCKER_HOST/DOCKER_CONTEXT (they choose
+#   a daemon, not code to run), JKB_RUN_FROM_CHECKOUT, JKB_CONTAINER_NAME/JKB_CONTAINER_IMAGE (documented
+#   overrides; a non-default image is always built from the kit, below), and on a Linux desktop
+#   DISPLAY, WAYLAND_DISPLAY and XDG_RUNTIME_DIR for `--open`. DBUS_SESSION_BUS_ADDRESS stays out: a
+#   `unixexec:` address runs a program.
+# `#!/bin/bash -p` keeps BASH_ENV and exported functions out of this first shell; `env -i` keeps them
+# out of everything after it. A terminal that replaces HOME itself also chooses which
+# `~/.local/share/.../run.sh` you start, so it is out of any script's reach.
 # Not in --self-test, which check.sh runs and which starts nothing. check-config.sh holds this.
-if [ "${1:-}" = --jkb-clean-env ]; then shift; elif [ "${1:-}" != --self-test ]; then jkb_env=(); for jkb_n in $(compgen -e); do case "$jkb_n" in HOME|PATH|PWD|OLDPWD|SHLVL|_|TERM|COLORTERM|LANG|LC_*|USER|LOGNAME|DOCKER_HOST|DOCKER_CONTEXT|JKB_RUN_FROM_CHECKOUT|JKB_CONTAINER_NAME|JKB_CONTAINER_IMAGE|DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR) jkb_env+=("$jkb_n=${!jkb_n}") ;; esac; done; exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"; fi
-if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=""; JKB_PATH_DROPPED=""; jkb_keep=":"; jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"; if [ -f "$jkb_keepf" ]; then while IFS= read -r jkb_k || [ -n "$jkb_k" ]; do [ -n "$jkb_k" ] && jkb_keep="$jkb_keep$jkb_k:"; done <"$jkb_keepf"; fi; jkb_roots=(); for jkb_r in "$HOME" /tmp /private /var/folders "$HOME/repos" "$HOME/.jkb" "$HOME/.cargo" "$HOME/.rustup" "$HOME/Library/Caches" "$HOME/Library/pnpm" "$HOME/.local/share/pnpm" "$HOME/.cache"; do jkb_r="$(cd -P -- "$jkb_r" 2>/dev/null && pwd -P || printf '%s' "$jkb_r")"; jkb_roots+=("$(printf '%s' "$jkb_r" | /usr/bin/tr '[:upper:]' '[:lower:]')"); done; IFS=: read -r -a jkb_path_in <<<"$PATH"; for jkb_d in ${jkb_path_in[@]+"${jkb_path_in[@]}"}; do case "$jkb_keep" in *":$jkb_d:"*) [ -n "$jkb_d" ] && { jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; continue; } ;; esac; case "$jkb_d" in ""|[!/]*|"$HOME"|"$HOME"/*|/tmp|/tmp/*|/private|/private/*|/var/folders|/var/folders/*) JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue ;; esac; jkb_p="$(cd -P -- "$jkb_d" 2>/dev/null && pwd -P)" || { JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue; }; jkb_p="$(printf '%s' "$jkb_p" | /usr/bin/tr '[:upper:]' '[:lower:]')"; jkb_hit=0; for jkb_r in "${jkb_roots[@]}"; do case "$jkb_p" in "$jkb_r"|"$jkb_r"/*) jkb_hit=1 ;; esac; done; [ "$jkb_hit" -eq 0 ] || { JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue; }; jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; done; PATH="${jkb_path:-/usr/bin:/bin}"; export PATH; fi
+if [ "${1:-}" = --jkb-clean-env ]; then shift; elif [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin; jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"; if [ -f "$jkb_keepf" ]; then while IFS= read -r jkb_k || [ -n "$jkb_k" ]; do case "$jkb_k" in /*) jkb_path="$jkb_path:$jkb_k" ;; esac; done <"$jkb_keepf"; fi; jkb_env=("PATH=$jkb_path" "JKB_USER_PATH=${PATH:-}"); for jkb_n in $(compgen -e); do case "$jkb_n" in HOME|TERM|COLORTERM|LANG|LC_*|USER|LOGNAME|DOCKER_HOST|DOCKER_CONTEXT|JKB_RUN_FROM_CHECKOUT|JKB_CONTAINER_NAME|JKB_CONTAINER_IMAGE|DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR) jkb_env+=("$jkb_n=${!jkb_n}") ;; esac; done; exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"; fi
 # ...and jq with HOME where no file can be: jq sources $HOME/.jq into every program, and the Write
 # tool can create ~/.jq. This file's jq readers build the mount list handed to `docker run`, which
 # README calls the security boundary (review round 12). check-config.sh holds the line in place.
@@ -96,15 +73,15 @@ CTR_REPOS="/home/vscode/repos"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 # need_tool <program> <message> -- the program as a BINARY (`type -P`, never `command -v`, which finds
-# the jq wrapper above), or a refusal. One the PATH filter at the top hid is named with the directory
-# it was in: a per-user Docker in ~/.docker/bin otherwise failed as a bare "docker is not on PATH"
+# the jq wrapper above), or a refusal. One that is only on the launching shell's own PATH is named with
+# its directory: a per-user Docker in ~/.docker/bin otherwise failed as a bare "docker is not on PATH"
 # (review round 12).
 need_tool() {
     type -P "$1" >/dev/null 2>&1 && return 0
     local d hidden=""
-    IFS=: read -r -a need_dropped <<<"${JKB_PATH_DROPPED:-}"
-    for d in ${need_dropped[@]+"${need_dropped[@]}"}; do [ -z "$hidden" ] && [ -x "$d/$1" ] && hidden="$d"; done
-    [ -z "$hidden" ] || die "$1 is in $hidden, which this script drops from PATH: it runs as you, and an agent can plant a program under your home. Keep $hidden only if NO agent can write it: the host posture's sandbox allowWrite must not cover it AND its permissions must deny Edit on it (the in-process Write tool is not sandboxed) -- scripts/auto-mode-posture.json is where both live. Then add it, on a line of its own, to ${jkb_keepf:-path-keep in the kit home} (for Docker Desktop, that directory also holds its credential helper)"
+    IFS=: read -r -a need_user <<<"${JKB_USER_PATH:-}"
+    for d in ${need_user[@]+"${need_user[@]}"}; do [ -z "$hidden" ] && case "$d" in /*) [ -x "$d/$1" ] && hidden="$d" ;; esac; done
+    [ -z "$hidden" ] || die "$1 is in $hidden, which is on your shell's PATH but not on the one this script builds: it runs as you, and an agent can plant a program in a directory it can write. Use $hidden only if NO agent can write it: the host posture's sandbox allowWrite must not cover it AND its permissions must deny Edit on it (the in-process Write tool is not sandboxed) -- scripts/auto-mode-posture.json is where both live. Then add it, on a line of its own, to path-keep in the kit home ($HOME/.local/share/jkb-container-kit/path-keep). For Docker Desktop, that directory also holds its credential helper."
     die "$2"
 }
 
