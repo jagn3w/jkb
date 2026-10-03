@@ -208,7 +208,8 @@ STUB
     # The keep file: run.sh drops PATH entries under /tmp, where this stub lives (see its top).
     mkdir -p "$d/home/.local/share/jkb-container-kit"; printf '%s\n' "$d/bin" > "$d/home/.local/share/jkb-container-kit/path-keep"
     rs_dir="$d"
-    env HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} ${RS_EXTRA_ENV:-} \
+    env ${RS_ENV_I:+-i} HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} ${RS_EXTRA_ENV:-} \
+        ${RS_FUNC:+"BASH_FUNC_jkbx%%=$RS_FUNC"} \
         bash "$script" "$2" >"$d/out" 2>&1
     rs_out="$(cat "$d/out")"
     calls="$(cut -d' ' -f1 "$d/calls" | tr '\n' ' ')"
@@ -410,6 +411,19 @@ case23_a_symlinked_writable_dir_outside_home_is_dropped() {
     case "$h" in */jkb-lnh.*) rm -rf -- "$h" ;; esac; case "$tgt" in */jkb-lnt.*) rm -rf -- "$tgt" ;; esac
 }
 
+# AN EXPORTED FUNCTION is not a variable `compgen -e` lists, so with only allowlisted names beside it
+# run.sh did not re-exec, and `bash -p` passed `BASH_FUNC_x%%` on to every bash child (review round 26,
+# measured on bash 5.2). Launched with a clean environment, so nothing else forces the re-exec.
+case24_an_exported_function_does_not_reach_run_sh_children() {
+    RS_ENV_I=1 RS_FUNC='() { echo PWNED; }' run_sh_with_stub true --stop
+    if [ -s "$rs_dir/child-env" ] && ! grep -q '^BASH_FUNC_' "$rs_dir/child-env"; then
+        ok "an exported function in an otherwise allowlisted environment does not reach run.sh's children"
+    else
+        fail "an exported function in an otherwise allowlisted environment does not reach run.sh's children" \
+            "child env: $(grep -c . "$rs_dir/child-env" 2>/dev/null) lines, BASH_FUNC: $(grep -c '^BASH_FUNC_' "$rs_dir/child-env" 2>/dev/null)"
+    fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -421,5 +435,5 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored \
           case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment \
           case21_run_sh_children_inherit_only_the_allowlist case22_the_container_name_override_survives_the_allowlist \
-          case23_a_symlinked_writable_dir_outside_home_is_dropped
+          case23_a_symlinked_writable_dir_outside_home_is_dropped case24_an_exported_function_does_not_reach_run_sh_children
 finish

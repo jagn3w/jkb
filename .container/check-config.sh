@@ -714,7 +714,7 @@ dc_run_cmds="$(dc_strip_comments "$here/run.sh" | sed '1d' | grep -E '[^[:space:
 # BASH_ENV out of run.sh's own shell, but its children read DOCKER_CONFIG, TAR_OPTIONS and the rest
 # from a launching terminal (review round 23). The allowlist must not name those.
 case "$(sed -n 2p <<<"$dc_run_cmds")" in
-    *'compgen -e'*'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" "$@"'*)
+    *'compgen -e'*'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"'*)
         case "$(sed -n 2p <<<"$dc_run_cmds")" in
             *DOCKER_CONFIG*|*BASH_ENV*|*TAR_OPTIONS*|*LD_*|*DYLD_*|*TMPDIR*|*'|*)'*|*' *)'*'jkb_env+='*) dc_unsb="$dc_unsb run.sh's environment allowlist names a variable that steers what its children run;" ;;
         esac ;;
@@ -1315,8 +1315,10 @@ else
         sweep_inputs="$(grep -oE '^INPUTS="[^"]*"' <<<"$sweep_body" \
             | sed -n '1s/^INPUTS="\(.*\)"/\1/p')"
         sweep_inputs="${sweep_inputs//\$SEAMS/$sweep_seams}"
-        sweep_reads="$(grep -oE '\$\{JKB_[A-Z_]+:-' <<<"$sweep_body" \
-            | sed -E 's/^\$\{([A-Z_]+):-$/\1/' | LC_ALL=C sort -u | tr '\n' ' ')"
+        # EVERY `${JKB_X` READ, whatever its operator: matching only `:-` missed posture_layer_files'
+        # `${JKB_REPO_ROOT:+...}`, so it was in neither list and this stayed green (review round 26).
+        sweep_reads="$(grep -oE '\$\{JKB_[A-Z_]+' <<<"$sweep_body" \
+            | sed -E 's/^\$\{//' | LC_ALL=C sort -u | tr '\n' ' ')"
         sweep_declared="$(printf '%s\n' $sweep_inputs | LC_ALL=C sort -u | tr '\n' ' ')"
         if [ -z "$sweep_reads" ]; then
             sweep_problems="$sweep_problems it reads no \${JKB_…:-} override at all, so the SEAMS declaration can no longer be checked against the code;"

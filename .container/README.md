@@ -299,7 +299,9 @@ and **every** Bash call in **every** session would fail at spawn. The layers it 
 its drop-ins, your user settings, and the project settings of every checkout up to three levels under
 `~/repos` (such as `~/repos/org/team/acme`) with its worktrees, plus the checkout it serves
 (`JKB_REPO_ROOT`). Until review round 24 it read only one level, and missed a rule in
-`~/repos/org/acme`. A checkout nested deeper is not read. *Transcripts are swept by byte
+`~/repos/org/acme`. A checkout nested deeper is not read. A relative any-depth rule in a user or
+managed layer, such as `Read(**/.env)`, is judged like `Read(./**/.env)`. Until review round 26
+it answered "yes" outright and turned the sweep back on. *Transcripts are swept by byte
 budget, not by age*, at the end of this file, has the measurement.
 
 ```sh
@@ -523,8 +525,10 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   was set some other way (a VS Code `terminal.integrated.env`, direnv) cannot steer it either.
   `-p` covers only `run.sh`'s own shell. Its children read their own variables: `DOCKER_CONFIG`
   names the CLI plugins `docker` runs, and `TAR_OPTIONS` can carry `--checkpoint-action=exec`. So
-  since review round 23, `run.sh` restarts itself under `env -i` whenever its environment holds
-  anything outside an allowlist. The allowlist is `HOME`, `PATH`, the locale and terminal names,
+  since review round 23, `run.sh` restarts itself under `env -i` with only an allowlist. Since
+  review round 26 it always restarts, once, marked by an argument no terminal can add. Deciding by
+  what `compgen -e` lists missed an exported function (`BASH_FUNC_x%%`), which then reached every
+  bash child. The allowlist is `HOME`, `PATH`, the locale and terminal names,
   `USER`/`LOGNAME`, `DOCKER_HOST`/`DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, and
   `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`, and on a Linux desktop `DISPLAY`, `WAYLAND_DISPLAY`
   and `XDG_RUNTIME_DIR`, without which `--open` reaches no display or running VS Code (review round
@@ -1573,7 +1577,11 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
     strips it, and no regex class can trim it.
   - **A line that is only slashes, or a bare `~`, is prose** (review round 25). Judged as a path it
     was the root or the home, an ancestor of the tree, and a quoted Rust doc comment (`///`) refused
-    the whole call. A whole string that is `/` or `~` is still judged.
+    the whole call. A whole string that is `/` or `~` is still judged, and so is a padded one-line
+    string (`~ `): applied to every token, the exemption let `~ ` through as prose while a trimming
+    server walks the home (review round 26).
+  - **Object keys are candidates too** (review round 26). A path-keyed map such as
+    `{"files": {"/h/.ssh/id_rsa": {...}}}` reached a server unjudged.
 
   What this costs, measured against the hook on 2026-10-03: a description listing files one per line
   now has each line judged, two checks apiece (the cwd and the home), and the description itself is
@@ -1809,20 +1817,23 @@ tools and its absence is silent:
 
 **The seven `~/repos/**` rules are a known O(worktrees) term, named rather than tolerated.** They
 keep agents from editing a repo's harness configuration, and each `**` sits mid-path, so the
-sandbox enumerates one entry per match on disk. **That enumeration is also their limit, and it is a
-measured residual** (review round 25). The sandbox expands the rules into the files that exist when
-it is built. A worktree made later is not in the list, and neither is a file created later. Measured
-on 2026-10-03 from a session's sandboxed Bash: `[ -w ]` was false on the main checkout's
-`.claude/settings.json` and true on the same file in that session's own `.claude/worktrees/<agent>/`
-checkout. Reviewers measured the same for `.jkb/work/<task>/` and for a new directory under
-`~/repos`. A hook planted there runs unsandboxed in the next session started in that directory. The
-Write tool is still held, because Claude Code matches a permission rule when the tool is called, not
-by enumerating paths. Closing the Bash half means changing what the sandbox protects: a `/**`
-directory rule per harness directory, or worktree `.claude/` directories made read-only. That is
-yours to decide (it is managed settings), so it is recorded here rather than done. Measured on 2026-10-01: 64 paths, 4,246 bytes, from
+sandbox enumerates one entry per match on disk. Measured on 2026-10-01: 64 paths, 4,246 bytes, from
 13 checkouts and worktrees, about 330 bytes each. Small against 131,072, but every task worktree
 adds a set, so it is listed in `check-config.sh` by exact text and a new rule of that shape fails
 until somebody adds it there on purpose.
+
+**That enumeration is also their limit, and it is a measured residual** (review rounds 25 and 26).
+The sandbox expands the rules into the files that exist when it is built, so a worktree made later
+is not in its list, nor is a file created later. Measured on 2026-10-03 from a session in the dev
+container, on a directory `.claude/worktrees/probe/.claude` created after that session started:
+sandboxed Bash wrote `settings.json` there, and the Write tool was refused ("denied by your
+permission settings"), because Claude Code matches a permission rule when the tool is called rather
+than by enumerating paths. The same session's sandboxed Bash could also write its own worktree's
+existing `.claude/settings.json`, while the main checkout's was refused. A hook planted that way runs
+unsandboxed in the next session started in that directory. Closing the Bash half means changing what
+the sandbox protects: a `/**` directory rule per harness directory, or worktree `.claude/`
+directories made read-only. That is yours to decide (it is managed settings), so it is recorded here
+rather than done.
 
 **Bash is covered separately and always was.** The sandbox's blanket `denyRead` of `~` hides this
 tree from Bash regardless; naming a path in a deny rule is in fact what *exposed* it, which is why

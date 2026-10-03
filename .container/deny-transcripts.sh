@@ -700,6 +700,14 @@ if [ "${1:-}" = --self-test ]; then
     done
     h "round 24: a Skill's args are prose, and a ../ in them is not a path" allow \
       '{"tool_name":"Skill","cwd":"'"$bh"'/repos/w","tool_input":{"skill":"review","args":"see\n../docs/x.md\nfor context"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 26: the prose exemption is for LINES of a multi-line string; a single-line "~ " is
+    # still the home a trimming server walks. And a path given as an object KEY is judged.
+    for pad in '~ ' ' ~' '/ '; do
+        h "round 26: a padded single-line '$pad' is still judged" deny \
+          '{"tool_name":"mcp__fs__list_dir","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$pad"'"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    done
+    h "round 26: a path given as an object key is judged" deny \
+      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"files":{"'"$bh"'/.ssh/id_rsa":{"encoding":"utf8"}}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     # REVIEW ROUND 25: a line that is only slashes, or a bare ~, is prose (a quoted doc comment), not the
     # root or the home; and MultiEdit's strings are code, judged by its file_path like Edit's.
     for pl in 'see:\n/// Foo\n///\n/// Bar' 'a\n//\nb' 'a\n/\nb' 'list:\n  ~\n'; do
@@ -975,8 +983,9 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude-state/transcript-archive/-s/e.jsonl"}}' HOME=/h
     words="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{w:[range(2001) | "w\(.)"]}}')"
     h "more bare words than the cap is a refusal, never a race with the timeout" deny "$words" HOME=/h
-    words="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{w:[range(2000) | "w\(.)"]}}')"
-    h "...while 2000 is allowed" allow "$words" HOME=/h
+    # 1999 values and the key `w`: object keys are candidates too since review round 26.
+    words="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{w:[range(1999) | "w\(.)"]}}')"
+    h "...while 2000, the key included, is allowed" allow "$words" HOME=/h
     huge="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:([range(3000) | "ab"] | join("") | "{" + . + ",x}")}}')"
     h "a Glob pattern over the byte budget is refused before it is walked" deny "$huge" HOME=/h
 
@@ -1477,7 +1486,10 @@ case "$tool" in
         # leaf and bare-word caps, before any line is trimmed.
         # A LINE THAT IS ONLY SLASHES, OR A BARE ~, is prose: a quoted Rust doc comment's `///` was the
         # root, an ancestor of the tree, and refused the whole call with nothing the caller could
-        # remove (review round 25). A WHOLE string that is `/` or `~` is still judged.
+        # remove (review round 25). A WHOLE string that is `/` or `~` is still judged, and so is a
+        # single-line one padded (`~ `): the exemption is for the LINES of a multi-line string only,
+        # and applied to every token it let `~ ` past as prose while a trimming server walks the home
+        # (review round 26).
         # One jq run
         # produces both arrays, and the slash count the segment budget below needs.
         cands_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
@@ -1490,16 +1502,19 @@ case "$tool" in
                   elif ($l[$o:] | test("^" + ws + "*$")) then $l[:$o]
                   else empty end;
             def pathish: $all == "1" or test("^[~.]") or contains("/");
-            [.tool_input | .. | strings | select(. != "")] as $s
+            # OBJECT KEYS TOO: a path-keyed map ({"files": {"/h/.ssh/id_rsa": {...}}}) reached a server
+            # unjudged while the same path in an array was denied (review round 26).
+            [.tool_input | .. | ((objects | keys[]), strings) | select(. != "")] as $s
             # A NUL IS REFUSED, not trimmed: no path holds one, the trim class cannot (a regex with a
             # NUL in it), and a trimming server strips it -- `\u0000/h/.ssh/id_rsa` was a relative name
             # here and the credential there (review round 24).
             | if any($s[]; contains("\u0000")) then "dt_cap=nul" else
             .
             | [$s[] | select(test(ws + "|[\n\u001c-\u001e]"))] as $w
-            | [$w[] | lines] as $ls
-            | if ($ls | length) > 20000 then "dt_cap=lines"
-              else ($s + [$ls[] | tok | select(. != "" and (test("^(/+|~)$") | not))]) as $c
+            | [$w[] | [lines]] as $wl
+            | if ($wl | map(length) | add // 0) > 20000 then "dt_cap=lines"
+              else ($s + [$wl[] | length as $n | .[] | tok
+                          | select(. != "" and ($n == 1 or (test("^(/+|~)$") | not)))]) as $c
                 | ([$c[] | select(pathish)] | unique) as $leaves
                 | ([$c[] | select(length <= 255 and (pathish | not))] | unique) as $bare
                 | if ($leaves | length) > 100 then "dt_cap=leaves"

@@ -1781,7 +1781,7 @@ run "run.sh's PATH filter stops resolving its roots physically" "so a home spell
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-o = '[ "$jkb_env_extra" -eq 0 ] || exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" "$@"; '
+o = 'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"; '
 assert o in s, "mutation target absent"
 open(p, 'w').write(s.replace(o, '', 1))
 PYX
@@ -1832,6 +1832,16 @@ assert o in s, "mutation target absent"
 open(p, 'w').write(s.replace(o, '', 1))
 PYX
 run "run.sh's PATH filter stops dropping where ~/repos leads" "does not drop where the posture's writable ~/repos leads"
+
+# REVIEW ROUND 26. The sweep's INPUTS must name every JKB_ variable it reads, whatever the operator.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'INPUTS="$SEAMS JKB_KEEP_SESSIONS JKB_REPO_ROOT"'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'INPUTS="$SEAMS JKB_KEEP_SESSIONS"', 1))
+PYX
+run "the sweep's INPUTS stops naming JKB_REPO_ROOT, which it reads with :+" "INPUTS declares"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys

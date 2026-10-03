@@ -103,7 +103,9 @@ SEAMS="JKB_TRANSCRIPT_ROOT JKB_TRANSCRIPT_ARCHIVE JKB_DENY_BUDGET_BYTES JKB_NOW_
 # sweep, which is false for this one variable. It still needs the rest: check-config compares
 # this list against what the script actually reads, and --self-test neutralises all of it so a
 # developer's exported value cannot reach a row.
-INPUTS="$SEAMS JKB_KEEP_SESSIONS"
+# JKB_REPO_ROOT too: posture_layer_files reads the checkout it names (review round 26 -- left out, an
+# exported value made every posture row read a real checkout's settings).
+INPUTS="$SEAMS JKB_KEEP_SESSIONS JKB_REPO_ROOT"
 
 # MAX_ARG_STRLEN on Linux: 32 pages. Recorded for the reader; the budget below is derived from it.
 ARGV_MAX_BYTES=131072
@@ -720,6 +722,7 @@ $f
 # have stood the sweep down while the argv grew; asking only "does anything expand" would instead
 # be fooled by the seven `Edit(~/repos/**/...)` rules, which expand but name no transcript.
 posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-settings.json> -> rc 0 yes, 1 no
+    local pe_nl=$'\n' pe_key pe_rules_seen=$'\n'
     local f rules rule pat base root layers kind proot home="${HOME:-/home/vscode}" proots e p_last p_comp pe_seen="
 " pe_work=0
     [ -r "$1" ] || return 0
@@ -785,8 +788,16 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
         fi
         while IFS= read -r rule; do
             [ -n "$rule" ] || continue
+            # ONE JUDGEMENT PER DISTINCT RULE IN A DIRECTORY, decided BEFORE any subshell: the probe
+            # walk was deduplicated, but each copy still forked posture_rule_path, dirname and
+            # posture_canon, and 1200 copies of one rule took 5.5s (review round 26). A rule's reading
+            # depends only on its text and the directory of its layer, so that pair is the key.
+            pe_key="${f%/*}"$'\t'"$rule"
+            case "$pe_rules_seen" in *"$pe_nl$pe_key$pe_nl"*) continue ;; esac
+            pe_rules_seen="$pe_rules_seen$pe_key$pe_nl"
+            posture_rules_judged=$((${posture_rules_judged:-0} + 1))
             posture_rule_is_path "$rule" || continue
-            pat="$(posture_rule_path "$rule" "$home" "$(dirname "$f")")"
+            pat="$(posture_rule_path "$rule" "$home" "${f%/*}")"
             posture_rule_expands "$pat" || continue
             # BRACES FIRST, then every expansion resolved and judged on its own: the relative-climb
             # test below ran on the raw rule, so `{../..,x}/.claude/projects/**` hid its climb inside
@@ -807,8 +818,16 @@ posture_enumerates_transcripts() { # posture_enumerates_transcripts <managed-set
                            # `Read(./.env)`, `Read(./secrets/**)`, does none of these; counting every
                            # relative rule as cannot-tell turned the superseded sweep back on (review
                            # round 7). So resolve it from the home and test overlap like any other.
-                           case "/$e/" in */../*|/\*\*/*) return 0 ;; esac
-                           pats+=("$(posture_canon "$home/${e#./}")")
+                           # A climb is cannot-tell. An ANY-DEPTH rule (`**/...`, or `./**/...`, the same
+                           # rule) is rooted at `/` and judged like any other, so the plain-name skip
+                           # and the probes decide it: answering yes outright turned the sweep back on
+                           # for `Read(**/.env)` while `./**/.env` left it off (review round 26).
+                           e="${e#./}"
+                           case "/$e/" in */../*) return 0 ;; esac
+                           case "$e" in
+                               '**'|'**/'*) pats+=("$(posture_canon "/$e")") ;;
+                               *) pats+=("$(posture_canon "$home/$e")") ;;
+                           esac
                        fi ;;
                 esac
             done
@@ -1736,6 +1755,8 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     # rows read their real settings and fail on a correct checkout -- and check.sh stops at the
     # first failing gate. Review round 3. The one row that is ABOUT it sets it for itself.
     unset CLAUDE_CONFIG_DIR
+    # ...nor JKB_REPO_ROOT, whose checkout posture_layer_files reads (review round 26).
+    unset JKB_REPO_ROOT
     pe() { if HOME="${2:-$work/nohome}" posture_enumerates_transcripts "$1"; then echo yes; else echo no; fi; }
     eq "the old per-file globs enumerate transcripts"          "$(pe "$pdir/globs.json")"   yes
     eq "the posture that ships names no transcript"            "$(pe "$pdir/hook.json")"    no
@@ -1759,6 +1780,17 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     rm "$lhome/.claude/settings.json"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude-state/projects/**/*.jsonl)"]}}' >"$lhome/repos/r/.claude/settings.local.json"
     eq "...and in a repo's project settings" "$(pe "$pdir/hook.json" "$lhome")" yes
+    # A RELATIVE ANY-DEPTH SECRET RULE in a user layer names no transcript: `Read(**/.env)` and
+    # `Read(**/*.pem)` answered yes before the plain-name skip and turned the sweep back on, while the
+    # `./**/` spelling of the same rules did not (review round 26). `**/*.jsonl` still does.
+    rhome="$work/relhome"; mkdir -p "$rhome/.claude"
+    for rr in '**/.env' '**/*.pem' './**/*.pem'; do
+        printf '{"permissions":{"deny":["Read(%s)"]}}\n' "$rr" >"$rhome/.claude/settings.json"
+        eq "a user-layer Read($rr) names no transcript" "$(pe "$pdir/hook.json" "$rhome")" no
+    done
+    printf '%s\n' '{"permissions":{"deny":["Read(**/*.jsonl)"]}}' >"$rhome/.claude/settings.json"
+    eq "...while a user-layer Read(**/*.jsonl) does" "$(pe "$pdir/hook.json" "$rhome")" yes
+    rm -f "$rhome/.claude/settings.json"
     # ...and in a NESTED checkout, which run.sh serves at any depth: one level only stood the sweep
     # down while ~/repos/org/acme named the transcripts (review round 24).
     nhome="$work/nesthome"; mkdir -p "$nhome/repos/org/acme/.claude"
@@ -1841,9 +1873,10 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...and covers auto-memory there" \
        "$(posture_rule_covers '/h/**/.claude/projects' /h/.claude/projects/-p/memory/MEMORY.md && echo covered || echo clear)" covered
     jq -n '{permissions:{deny:[range(1200) | "Read(~/.secret*/**/*.key)"]}}' >"$pdir/dups.json" 2>/dev/null
-    dt0=$(date +%s%N); pe "$pdir/dups.json" >/dev/null
-    case "$dt0" in *N) dt1=0 ;; *) dt1=$(( ($(date +%s%N) - dt0) / 1000000 )) ;; esac
-    eq "1200 copies of one rule are judged once, fast" "$([ "$dt1" -lt 3000 ] && echo fast || echo "slow: ${dt1}ms")" fast
+    # COUNTED, not timed: a wall-clock bound passed on one machine and failed at 5.5s in the dev
+    # container, because the cost was per copy (review round 26). The count is the property.
+    posture_rules_judged=0; HOME="$work/nohome" posture_enumerates_transcripts "$pdir/dups.json" >/dev/null || true
+    eq "1200 copies of one rule are judged once" "$posture_rules_judged" 1
     # Round 17: five ordinary secret rules against a few thousand transcripts under a linked tree do
     # not exhaust the budget and switch the sweep on.
     sh4="$work/sechome"; mkdir -p "$sh4/.claude-state/projects/-h-r" "$sh4/.claude"
