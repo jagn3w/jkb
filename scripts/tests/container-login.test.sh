@@ -395,6 +395,21 @@ case22_the_container_name_override_survives_the_allowlist() {
     fi
 }
 
+# A WRITABLE DIRECTORY REACHED THROUGH A LINK is dropped by where it leads: ~/repos linked to a volume
+# outside the home put /Volumes/Dev/repos/tools/bin on PATH under its physical name, which matched no
+# root, and a jq planted there through allowWrite ~/repos ran as you (review round 25).
+case23_a_symlinked_writable_dir_outside_home_is_dropped() {
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h tgt; h="$(mktemp -d "$HOME/.cache/jkb-lnh.XXXXXX")" && tgt="$(mktemp -d "$HOME/.cache/jkb-lnt.XXXXXX")" \
+        || { fail "case23" "no scratch dirs under ~/.cache"; return; }
+    mkdir -p "$tgt/tools/bin"; ln -s "$tgt" "$h/repos"
+    printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$tgt" > "$tgt/tools/bin/jq"; chmod +x "$tgt/tools/bin/jq"
+    env HOME="$h" PATH="$tgt/tools/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
+    if [ ! -e "$tgt/RAN" ]; then ok "a jq planted where a symlinked ~/repos leads, outside the home, does not run"
+    else fail "a jq planted where a symlinked ~/repos leads, outside the home, does not run" "it ran"; fi
+    case "$h" in */jkb-lnh.*) rm -rf -- "$h" ;; esac; case "$tgt" in */jkb-lnt.*) rm -rf -- "$tgt" ;; esac
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -405,5 +420,6 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run \
           case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored \
           case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment \
-          case21_run_sh_children_inherit_only_the_allowlist case22_the_container_name_override_survives_the_allowlist
+          case21_run_sh_children_inherit_only_the_allowlist case22_the_container_name_override_survives_the_allowlist \
+          case23_a_symlinked_writable_dir_outside_home_is_dropped
 finish

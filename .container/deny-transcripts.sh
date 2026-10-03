@@ -90,8 +90,9 @@
 # EVERY TOOL REACHES THIS HOOK: the matcher is `.*`. It was an allowlist of file tools, and built-ins
 # it did not name -- Artifact reads a local file and uploads it -- skipped the hook (review round 3).
 # Bash and the built-ins that carry text rather than locations (TodoWrite, AskUserQuestion, Agent,
-# Task, ToolSearch, SendMessage) are let through first. The six file tools are judged by their
-# path fields. Anything else -- MCP tools run unsandboxed, and jkb's own server has an ingest_path
+# Task, ToolSearch, SendMessage, Skill) are let through first. The file tools (Read, Edit, MultiEdit,
+# Write, NotebookEdit, and Grep and Glob below) are judged by their path fields. A string holding a
+# NUL is refused (cap_deny). Anything else -- MCP tools run unsandboxed, and jkb's own server has an ingest_path
 # -- has every distinct, non-empty string that COULD be a path judged: one holding a `/`, or
 # starting `~` or `.`. A relative one is judged against each distinct base an MCP server might
 # resolve it from: the session cwd, CLAUDE_PROJECT_DIR, the home.
@@ -699,6 +700,16 @@ if [ "${1:-}" = --self-test ]; then
     done
     h "round 24: a Skill's args are prose, and a ../ in them is not a path" allow \
       '{"tool_name":"Skill","cwd":"'"$bh"'/repos/w","tool_input":{"skill":"review","args":"see\n../docs/x.md\nfor context"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 25: a line that is only slashes, or a bare ~, is prose (a quoted doc comment), not the
+    # root or the home; and MultiEdit's strings are code, judged by its file_path like Edit's.
+    for pl in 'see:\n/// Foo\n///\n/// Bar' 'a\n//\nb' 'a\n/\nb' 'list:\n  ~\n'; do
+        plj="$(jqh -cn --arg h "$bh" --arg d "$pl" '{tool_name:"mcp__jkb__task_create", cwd:($h + "/repos/w"), tool_input:{title:"t", description:("\"" + $d + "\"" | fromjson)}}')"
+        h "round 25: a description line '$pl' is prose" allow "$plj" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    done
+    me="$(jqh -cn --arg h "$bh" '{tool_name:"MultiEdit", cwd:($h + "/repos/w"), tool_input:{file_path:($h + "/repos/w/a.rs"), edits:[{old_string:"x", new_string:"/// doc\n///\nfn a() {}"}]}}')"
+    h "round 25: a MultiEdit's code is not free text" allow "$me" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    me="$(jqh -cn --arg h "$bh" '{tool_name:"MultiEdit", cwd:($h + "/repos/w"), tool_input:{file_path:($h + "/.bashrc"), edits:[{old_string:"x", new_string:"y"}]}}')"
+    h "round 25: ...while its file_path is still held to the boundary" deny "$me" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     cpad="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/.ssh/id_rsa" + ([range(5000)|"\u0008"]|join("")))}}')"
     h "round 23: trailing control characters past PATH_MAX do not hide a denied path" deny "$cpad" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     lclimb="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("k z/" + ([range(1000)|"aaaa/"]|join("")) + ([range(1000)|"../"]|join("")) + "../e.jsonl")}}')"
@@ -1425,7 +1436,9 @@ case "$tool" in
                 case "$gb" in /*|"~"*) check "$gb" "$(join_raw "$base" "$home" "$cwd")" ;; *) check "$(join_raw "$base" "$home" "$cwd")/$gb" ;; esac
             done
         fi ;;
-    Read|Edit|Write|NotebookEdit)
+    # MultiEdit too, as sb_mode above already counts it a write tool: left out here, its code was judged
+    # as MCP free text and a `///` doc comment in new_string was refused (review round 25).
+    Read|Edit|MultiEdit|Write|NotebookEdit)
         [ -n "$pth" ] && check "$pth" ;;
     *)
         # A tool whose fields are not known here: every string it was given that COULD BE A PATH is
@@ -1462,6 +1475,9 @@ case "$tool" in
         # position in it, and an explode-and-reverse trim took 3.6s over 150k lines. Per-line work is
         # still a few microseconds a line, so MORE THAN 20000 LINES in one call is refused, like the
         # leaf and bare-word caps, before any line is trimmed.
+        # A LINE THAT IS ONLY SLASHES, OR A BARE ~, is prose: a quoted Rust doc comment's `///` was the
+        # root, an ancestor of the tree, and refused the whole call with nothing the caller could
+        # remove (review round 25). A WHOLE string that is `/` or `~` is still judged.
         # One jq run
         # produces both arrays, and the slash count the segment budget below needs.
         cands_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
@@ -1483,7 +1499,7 @@ case "$tool" in
             | [$s[] | select(test(ws + "|[\n\u001c-\u001e]"))] as $w
             | [$w[] | lines] as $ls
             | if ($ls | length) > 20000 then "dt_cap=lines"
-              else ($s + [$ls[] | tok | select(. != "")]) as $c
+              else ($s + [$ls[] | tok | select(. != "" and (test("^(/+|~)$") | not))]) as $c
                 | ([$c[] | select(pathish)] | unique) as $leaves
                 | ([$c[] | select(length <= 255 and (pathish | not))] | unique) as $bare
                 | if ($leaves | length) > 100 then "dt_cap=leaves"

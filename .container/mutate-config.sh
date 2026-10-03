@@ -1818,6 +1818,24 @@ run "run.sh's environment allowlist drops JKB_CONTAINER_NAME" "reads JKB_CONTAIN
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
+o = '|JKB_RUN_FROM_CHECKOUT|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '|', 1))
+PYX
+run "run.sh's environment allowlist drops JKB_RUN_FROM_CHECKOUT" "reads JKB_RUN_FROM_CHECKOUT but its environment allowlist drops it"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = ' "$HOME/repos"'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "run.sh's PATH filter stops dropping where ~/repos leads" "does not drop where the posture's writable ~/repos leads"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
 o = ' || [ "$IMAGE" != jkb-dev ]'
 assert o in s, "mutation target absent"
 open(p, 'w').write(s.replace(o, '', 1))
@@ -2493,7 +2511,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=43
+PINNED_UNSB_APPENDS=45
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

@@ -466,7 +466,11 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   The first command restarts `run.sh` under an allowlisted environment (review round 23, below).
   The next drops every `PATH` entry under your home, `/tmp`, `/private` or `/var/folders`, along
   with relative ones. Since review round 22 an entry is judged by its **physical, case-folded**
-  path, so `/home//you/.cargo/bin`, or `/USERS/you/...` on APFS, is dropped too. Every `jq` it runs goes
+  path, so `/home//you/.cargo/bin`, or `/USERS/you/...` on APFS, is dropped too. Since review round
+  25 the roots also include every home directory the posture lets agents write (`~/repos`, `~/.jkb`,
+  `~/.cargo`, `~/.cache` and the rest), each resolved where it leads. A `~/repos` linked to
+  `/Volumes/Dev/repos` otherwise left `/Volumes/Dev/repos/tools/bin` on `PATH`. `check-config.sh`
+  requires every such posture entry to be one of the roots. Every `jq` it runs goes
   through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq` readers build
   the mount list. **What this costs:** a Docker installed per-user (`~/.docker/bin`, OrbStack's
   `~/.orbstack/bin`) or a `jq` from `~/.nix-profile` is dropped as well. `run.sh` then names the
@@ -522,7 +526,10 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   since review round 23, `run.sh` restarts itself under `env -i` whenever its environment holds
   anything outside an allowlist. The allowlist is `HOME`, `PATH`, the locale and terminal names,
   `USER`/`LOGNAME`, `DOCKER_HOST`/`DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, and
-  `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`. Those last two arrived in review round 24: round 23
+  `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`, and on a Linux desktop `DISPLAY`, `WAYLAND_DISPLAY`
+  and `XDG_RUNTIME_DIR`, without which `--open` reaches no display or running VS Code (review round
+  25). `DBUS_SESSION_BUS_ADDRESS` stays out, because a `unixexec:` address runs a program. The
+  container names arrived in review round 24: round 23
   dropped them, so `run.sh` acted on `jkb-dev` while the reaper looked for the override. A
   non-default image is always built from the kit, so `JKB_CONTAINER_IMAGE` names a tag and never
   chooses what runs. The two Docker names are trusted on purpose: they choose a daemon, not code to
@@ -1562,6 +1569,11 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
     credential behind the over-long rule.
   - **More than 20000 lines in one call are refused**, before any is trimmed, so the per-line work
     has a bound.
+  - **A string holding a NUL is refused** (review round 24). No path holds one, a trimming server
+    strips it, and no regex class can trim it.
+  - **A line that is only slashes, or a bare `~`, is prose** (review round 25). Judged as a path it
+    was the root or the home, an ancestor of the tree, and a quoted Rust doc comment (`///`) refused
+    the whole call. A whole string that is `/` or `~` is still judged.
 
   What this costs, measured against the hook on 2026-10-03: a description listing files one per line
   now has each line judged, two checks apiece (the cwd and the home), and the description itself is
@@ -1669,7 +1681,10 @@ O(files) of argv. What
 - **Every tool reaches the hook: the matcher is `.*`.** It was an allowlist of file tools, and
   round 3 found built-ins it left out. Artifact reads a local file and uploads it. Bash is let
   through inside the hook (the kernel sandbox confines it, and it is what a person repairs a broken
-  container with). Any tool whose fields the hook does not know has every string that *could be a
+  container with). So are the built-ins that carry text rather than locations: TodoWrite,
+  AskUserQuestion, Agent, Task, ToolSearch, SendMessage, and Skill since review round 24, whose
+  `args` is a slash command's free text. The file tools (Read, Edit, MultiEdit since review round 25,
+  Write, NotebookEdit) are judged by their path fields. Any tool whose fields the hook does not know has every string that *could be a
   path* judged: one holding a `/`, or starting `~` or `.`. Multi-line strings count, because a server that normalises lexically collapses them. A flat cap on all strings
   refused a long `TodoWrite`. An MCP server resolves relative paths against its own cwd, so for
   `mcp__*` tools a relative string is judged against the session cwd, `CLAUDE_PROJECT_DIR` and the
@@ -1794,7 +1809,17 @@ tools and its absence is silent:
 
 **The seven `~/repos/**` rules are a known O(worktrees) term, named rather than tolerated.** They
 keep agents from editing a repo's harness configuration, and each `**` sits mid-path, so the
-sandbox enumerates one entry per match on disk. Measured on 2026-10-01: 64 paths, 4,246 bytes, from
+sandbox enumerates one entry per match on disk. **That enumeration is also their limit, and it is a
+measured residual** (review round 25). The sandbox expands the rules into the files that exist when
+it is built. A worktree made later is not in the list, and neither is a file created later. Measured
+on 2026-10-03 from a session's sandboxed Bash: `[ -w ]` was false on the main checkout's
+`.claude/settings.json` and true on the same file in that session's own `.claude/worktrees/<agent>/`
+checkout. Reviewers measured the same for `.jkb/work/<task>/` and for a new directory under
+`~/repos`. A hook planted there runs unsandboxed in the next session started in that directory. The
+Write tool is still held, because Claude Code matches a permission rule when the tool is called, not
+by enumerating paths. Closing the Bash half means changing what the sandbox protects: a `/**`
+directory rule per harness directory, or worktree `.claude/` directories made read-only. That is
+yours to decide (it is managed settings), so it is recorded here rather than done. Measured on 2026-10-01: 64 paths, 4,246 bytes, from
 13 checkouts and worktrees, about 330 bytes each. Small against 131,072, but every task worktree
 adds a set, so it is listed in `check-config.sh` by exact text and a new rule of that shape fails
 until somebody adds it there on purpose.

@@ -724,7 +724,10 @@ esac
 # JKB_CONTAINER_NAME made run.sh act on jkb-dev while the reaper looked for the override (review round
 # 24). A non-default image must then be built, never run as found.
 dc_allow_line="$(sed -n 2p <<<"$dc_run_cmds")"
-dc_set_here="$(cat "$here/run.sh" "$here/lib.sh" | grep -oE '(^|[ ;(])JKB_[A-Z_]+=' | grep -oE 'JKB_[A-Z_]+' | sort -u)"
+# "Sets itself" means an ASSIGNMENT at the start of a statement in the code, comments stripped: read
+# from the raw files, a comment or an echo naming `JKB_RUN_FROM_CHECKOUT=1` exempted it, and dropping it
+# from the allowlist left this green (review round 25).
+dc_set_here="$({ dc_strip_comments "$here/run.sh"; dc_strip_comments "$here/lib.sh"; } | grep -oE '(^|;)[[:space:]]*(export |local )?JKB_[A-Z_]+=' | grep -oE 'JKB_[A-Z_]+' | sort -u)"
 for dc_v in $(grep -oE '[$][{]?JKB_[A-Z_]+' "$here/run.sh" | tr -d '${' | sort -u); do
     grep -qx -- "$dc_v" <<<"$dc_set_here" && continue
     case "$dc_allow_line" in *"|$dc_v|"*|*"|$dc_v)"*) ;; *) dc_unsb="$dc_unsb run.sh reads $dc_v but its environment allowlist drops it;" ;; esac
@@ -748,6 +751,13 @@ for dc_piece in 'jkb_r="$(cd -P -- "$jkb_r" 2>/dev/null && pwd -P' \
     grep -qF -- "$dc_piece" <<<"$(sed -n 3p <<<"$dc_run_cmds")" \
         || dc_unsb="$dc_unsb run.sh's PATH filter lacks [$dc_piece], so a home spelled with other case or through a link passes;"
 done
+# ...AND EVERY ~/ DIRECTORY THE POSTURE LETS AGENTS WRITE IS ONE OF ITS DROP ROOTS, so one linked
+# outside the home is dropped by where it leads (review round 25).
+while IFS= read -r dc_aw; do
+    case "$dc_aw" in "~/"*) ;; *) continue ;; esac
+    grep -qF -- "\"\$HOME/${dc_aw#\~/}\"" <<<"$(sed -n 3p <<<"$dc_run_cmds")" \
+        || dc_unsb="$dc_unsb run.sh's PATH filter does not drop where the posture's writable $dc_aw leads;"
+done <<<"$(HOME=/dev/null jq -r '.require.sandbox.filesystem.allowWrite[]? // empty' "$here/../scripts/auto-mode-posture.json" 2>/dev/null)"
 grep -q 'JKB_CONTAINER_KIT_HOME' <<<"$(dc_strip_comments "$here/lib.sh")" \
     && dc_unsb="$dc_unsb lib.sh lets JKB_CONTAINER_KIT_HOME move the kit, and a launching terminal sets it;"
 case "$(sed -n 3p <<<"$dc_run_cmds")" in
