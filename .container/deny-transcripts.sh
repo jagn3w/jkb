@@ -604,6 +604,9 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__fs__read_file","cwd":"'"$bh"'/repos/w","tool_input":{"path":"x://id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 28: a claude.ai connector's path field is not a local path" allow \
       '{"tool_name":"mcp__claude_ai_Drive__list","cwd":"'"$bh"'/repos/w","tool_input":{"path":"/"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    ln -s "$bh/.ssh" "$bh/repos/w/https:"
+    h "round 29: an https:// value through a cwd link named https: is judged" deny \
+      '{"tool_name":"mcp__fs__read_file","cwd":"'"$bh"'/repos/w","tool_input":{"path":"https://id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: StructuredOutput passes, whatever its findings name" allow \
       '{"tool_name":"StructuredOutput","cwd":"'"$bh"'/repos/w","tool_input":{"findings":[{"file":"'"$bh"'/.ssh/id_rsa","summary":"x"}]}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: an unknown built-in with no path-named field is allowed" allow \
@@ -642,7 +645,7 @@ if [ "${1:-}" = --self-test ]; then
     h "round 16: the project's own settings layer is not writable through the boundary" deny \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/.claude/settings.local.json","content":"{}"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     printf '%s\n' '{"sandbox":{"enabled":false}}' > "$bh/repos/w/.claude/settings.local.json"
-    h "round 16: a later layer that disables wins over the user's enable, as in Claude Code" allow \
+    h "round 29: a local layer cannot turn the boundary off; only the image's managed layers can" deny \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     rm -f "$bh/repos/w/.claude/settings.local.json"
     # REVIEW ROUND 17: MANAGED WINS for `enabled`, watched failing under the old order.
@@ -661,6 +664,13 @@ if [ "${1:-}" = --self-test ]; then
     sbq="$(cd "$bh/repos/w" && env -u CLAUDE_CONFIG_DIR HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_MANAGED_DIR="$bh/managed" "$BASH" "$dtc" --sandbox-enabled 2>/dev/null)"
     if [ "$sbq" = 1 ]; then printf '  \033[32mok\033[0m   round 17: --sandbox-enabled prints the merged answer (1)\n'
     else printf '  \033[31mFAIL\033[0m round 17: --sandbox-enabled printed [%s]\n' "$sbq"; fails=$((fails+1)); fi
+    # ...and managed may turn it OFF, whatever a local layer says (round 29).
+    printf '%s\n' '{"sandbox":{"enabled":false}}' > "$bh/managed/managed-settings.json"
+    printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/repos/w/.claude/settings.local.json"
+    out="$(printf '%s' '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' \
+           | env -u CLAUDE_CONFIG_DIR HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_MANAGED_DIR="$bh/managed" "$BASH" "$dtc" 2>/dev/null)"
+    case "$out" in *'"permissionDecision":"deny"'*) printf '  \033[31mFAIL\033[0m round 29: managed disabling wins over a local enable\n'; fails=$((fails+1)) ;;
+        *) printf '  \033[32mok\033[0m   round 29: managed disabling wins over a local enable\n' ;; esac
     rm -f "$bh/repos/w/.claude/settings.local.json"; rm -rf "$bh/managed"
     printf '%s\n' '{"sandbox":{"enabled":false,"filesystem":{"denyRead":["~"],"allowWrite":["~/repos"]}}}' > "$bh/.claude/settings.json"
     h "boundary: with the sandbox disabled there is no boundary to mirror" allow \
@@ -985,12 +995,15 @@ sb_layers=("${CLAUDE_CONFIG_DIR:-$home/.claude}/settings.json")
 # override, whatever its environment holds -- a settings `env` must not be able to move it.
 sb_mdir=/etc/claude-code
 [ -n "${DT_SELFTEST_MANAGED_DIR:-}" ] && [ "$0" != /usr/local/bin/deny-transcripts.sh ] && sb_mdir="$DT_SELFTEST_MANAGED_DIR"
+sb_nm_layers=${#sb_layers[@]}
 sb_layers+=("$sb_mdir/managed-settings.json" "$sb_mdir"/managed-settings.d/*.json)
 sb_args=(); sb_names=()
-sb_i=0
+sb_i=0; sb_nm=0; sb_k=0
 for f in "${sb_layers[@]}"; do
+    sb_k=$((sb_k + 1))
     [ -f "$f" ] && [ -r "$f" ] || continue
     sb_args+=(--rawfile "s$sb_i" "$f"); sb_names+=("\$s$sb_i"); sb_i=$((sb_i + 1))
+    [ "$sb_k" -le "$sb_nm_layers" ] && sb_nm=$sb_i
 done
 if [ "$sb_i" -gt 0 ]; then
     # ONE jq, every layer as raw text parsed inside: a file that is not valid JSON contributes nothing,
@@ -998,11 +1011,18 @@ if [ "$sb_i" -gt 0 ]; then
     # in the order read (user, project, local, managed last); the lists are unions, as Claude Code
     # merges arrays across layers.
     sb_names_csv="$(IFS=,; printf '%s' "${sb_names[*]}")"
-    sb_sh="$(jqh -nr "${sb_args[@]}" '
+    # ONLY THE IMAGE'S LAYERS MAY TURN IT OFF (review round 29). Managed settings and their drop-ins have
+    # the last word when they set `enabled`; otherwise any layer may turn the boundary ON and none may
+    # turn it off. A user, project or local layer's `enabled:false` won before, and sandboxed Bash can
+    # CREATE a worktree's settings.local.json, which the ~/repos Edit rules cover only once it exists.
+    # Claude Code itself would still start that session's Bash unsandboxed; pinning `enabled` in the
+    # image's managed settings closes that, and is the user's decision (README).
+    sb_sh="$(jqh -nr --argjson nm "$sb_nm" "${sb_args[@]}" '
         def p: try fromjson catch {};
         def str: if type == "string" then . else empty end;
         [ ('"$sb_names_csv"') | p | .sandbox // {} ] as $l
-        | ([ $l[] | .enabled | select(. != null) ] | last // false) as $on
+        | ([ $l[$nm:][] | .enabled | select(. != null) ] | last) as $mon
+        | (if $mon != null then $mon else ([ $l[:$nm][] | .enabled == true ] | any) end) as $on
         | def dpath: if type == "string" then (capture("^Read\\((?<p>.*)\\)$").p // empty) else empty end;
           @sh "sb_on=\(if $on == true then 1 else 0 end)
                sb_md=(\([ ( [ '"$sb_names_csv"' ] | .[] | p | .permissions.deny[]? | dpath ),
@@ -1254,14 +1274,13 @@ case "$tool" in
             # claude.ai connectors run on claude.ai and open no local file: a `path` there is a repo's or
             # a drive's, and judged here `path:"/"` was an ancestor of the tree (review round 28).
             mcp__claude_ai_*) dt_fields='empty' ;;
-            # Everything else: the path-NAMED fields, at any depth. A value with a web scheme (http, https,
-            # ws, wss) names no local file and is skipped; ANY OTHER `x://...` is judged as the path it
-            # also is, since a server that open()s it reads `x:/...` relative to its cwd -- a link
-            # named `x:` reached the tree when every scheme was skipped (review round 28).
+            # Everything else: the path-NAMED fields, at any depth, EVERY value judged as a path. A URL
+            # is also the relative path a server that open()s it reads (`x:/...` from its cwd): a link
+            # named `x:` reached the tree while schemes were skipped (round 28), and one named `https:`
+            # while web schemes still were (round 29). A real URL resolves to a harmless relative path.
             *) dt_fields='.. | objects | to_entries[]
                 | select(.key | test("^(file_?path|file_?paths|path|paths|file|files|file_?name|dir|directory|root|cwd|source|target|dest|destination|out_?dir|output_?path|input_?path|uri|url)$"; "i"))
-                | .value | (strings, (arrays | .[] | strings))
-                | select(test("^(https?|wss?)://"; "i") | not)' ;;
+                | .value | (strings, (arrays | .[] | strings))' ;;
         esac
         dt_paths_sh="$(printf '%s' "$input" | jqh -er "[.tool_input | ($dt_fields) | strings | select(. != \"\")] | @sh \"dt_paths=(\\(.))\"" 2>/dev/null)" || exit 3
         dt_paths=(); eval "$dt_paths_sh"

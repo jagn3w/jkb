@@ -1713,7 +1713,7 @@ open(p, 'w').write(s.replace(old, 'want_hash="$(fingerprint "$repo" ', 1))
 PYX
 run "the fingerprint strips a different root from the one the arguments came from" "do not both use"
 
-# REVIEW ROUND 11. run.sh runs as you on the host: an absolute shebang and the PATH filter.
+# REVIEW ROUND 11. run.sh runs as you on the host: an absolute shebang (and, since round 27, a built PATH).
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -1731,7 +1731,7 @@ open(p, 'w').write("#!/bin/bash\n" + s[len("#!/bin/bash -p\n"):])
 PYX
 run "run.sh's shebang drops -p" "shebang is not #!/bin/bash -p"
 
-# REVIEW ROUND 22. ...and its PATH filter takes no keep list from the environment.
+# REVIEW ROUND 22. ...and its PATH takes no keep list from the environment.
 
 
 seed; python3 - "$work/t/.container/lib.sh" <<'PYX'

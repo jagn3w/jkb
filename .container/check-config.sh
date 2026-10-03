@@ -896,14 +896,14 @@ while IFS= read -r dc_src; do
 done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(.mounts // [])[] | split(",")[] | select(startswith("source=")) | ltrimstr("source=")' 2>/dev/null)"
 [ "$dc_kit_nsrc" -gt 0 ] || dc_kit_where="$dc_kit_where container.json's mount sources could not be read, so whether a bind holds it is unchecked;"
 # ...AND run.sh READS ITS PATH KEEP LIST FROM THIS SAME HOME. It spells the location itself, because
-# the filter runs before lib.sh is sourced, so a move of DC_KIT_HOME that left it behind would have run.sh
+# its first command runs before lib.sh is sourced, so a move of DC_KIT_HOME that left it behind would have run.sh
 # trust a file that is neither made 0700 nor Edit-denied, with every check here green (review round 23).
 dc_keepf="$(sed -n 's/.*jkb_keepf="\([^"]*\)".*/\1/p' "$here/run.sh" | head -1)"
 dc_keepf="${dc_keepf//\$HOME//kit-home-probe}"
 [ -n "$dc_keepf" ] && [ "${dc_keepf%/*}" = "$dc_kit_home" ] \
     || dc_kit_where="$dc_kit_where run.sh reads its PATH keep list from [${dc_keepf:-nothing found}], not from the kit home [$dc_kit_home];"
-# ...AND THE PATH run.sh KEEPS. Its filter drops everything under the home and the temp roots and
-# keeps the system and Homebrew prefixes, where docker and jq live. Homebrew's are owned by the user,
+# ...AND THE PATH run.sh BUILDS: path-keep's entries, then the system and Homebrew prefixes, where docker
+# and jq live. Homebrew's are owned by the user,
 # so the in-process Write tool, which no sandbox confines, could replace a jq there that run.sh then
 # runs as the user (review round 14). The posture denies Edit on both.
 # ~/.cargo/env too, a FILE: every login shell rustup set up sources it, unsandboxed, while the posture

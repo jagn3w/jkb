@@ -502,7 +502,11 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   must deny `Edit` on it, because the in-process Write tool is not sandboxed. `~/.docker/bin` passes
   the first test by default and not the second (review round 13). Docker Desktop's credential helper
   lives in the same directory, so keeping it covers both. A Docker setting you set only in your
-  shell (`DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`) is dropped; put it in a Docker context. A terminal
+  shell (`DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`) is dropped; put it in a Docker context. And when VS
+  Code is not already running, `run.sh --open` starts it with the same environment. That editor then
+  lives without `SSH_AUTH_SOCK`, DBus, proxy variables or `TMPDIR`: no ssh agent for `git push`,
+  no keyring, no extension installs behind a proxy. Open VS Code yourself first, and `--open` only
+  attaches (review round 29). A terminal
   that replaces `HOME` itself is out of any script's reach: it also chooses which
   `~/.local/share/.../run.sh` you start. The host's own `jkb` lives in `~/.cargo/bin`, so the
   start-time sweep does not ask it which sessions are live; it holds sessions by its recency window
@@ -1567,21 +1571,31 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
   - **What it costs.** A local MCP server that takes a path under a field name not on the list
     (`location`, say) is not judged. A tool whose path field matters belongs in the table, which is
     one line and a rebuild; jkb's own server is there.
-- **No sandbox, no boundary.** With the sandbox disabled there is nothing to mirror, and the
-  transcript rule still applies. `enabled` takes the word of the highest-precedence layer that sets
-  it: managed and its drop-ins, then local, project and user. A layer that is not valid JSON
-  contributes nothing, as Claude Code skips it. **The layers it reads are never writable through it.**
-  The first version claimed no agent could turn the boundary off. For a project outside `~/repos`
-  the cwd is writable, though, and a Write of its `.claude/settings.local.json` could have done it
-  (review round 16). Every layer file is now refused to the write tools. The deny rules cover the
-  `~/repos` ones as before.
+- **No sandbox, no boundary, and only the image can say no.** With the sandbox disabled there is
+  nothing to mirror, and the transcript rule still applies. If managed settings or their drop-ins
+  set `enabled`, theirs is the word. Otherwise any layer may turn the boundary **on**, and no user,
+  project or local layer may turn it off (review round 29). A layer that is not valid JSON
+  contributes nothing, as Claude Code skips it. **The layers it reads are never writable through
+  it**: every layer file is refused to the write tools (review round 16, after a Write of a
+  project's `.claude/settings.local.json` outside `~/repos` could have switched the boundary off).
+  - **Why only the image.** Round 29 measured that sandboxed Bash can **create** a worktree's
+    `.claude/settings.local.json`. The `~/repos/**` Edit rules cover only files that exist when the
+    sandbox is built (see *The seven `~/repos/**` rules*). A planted `{"sandbox":{"enabled":false}}`
+    was honoured by this hook.
+  - **What it does not close: the user's decision.** Claude Code reads the same planted file and
+    starts that session's Bash unsandboxed. The image's managed settings do not set
+    `sandbox.enabled`. Pinning it there, with `allowUnsandboxedCommands: false`, closes the Bash
+    half. That changes the managed settings, so it is left to the user.
 
 **What it costs.** A judged Read went from about 29ms to 58ms per call, measured over 30 calls in
 jkb-dev against its real settings. Bash is still decided first, in 7ms. A tool reading or writing
 outside the sandbox's lists is now refused, with a reason naming the list. The deny rules stay, as a
 second layer.
 
-**What it does not cover.** A listed MCP tool's path field is judged as a read, the weaker test,
+**What it does not cover.** A server is told apart by its name alone: a local MCP server named
+`claude_ai_...` would be taken for a claude.ai connector and its path fields not judged. A local
+server is named in `.mcp.json` or user settings, which agents cannot write in place, so this needs
+the user to add one by that name. A listed MCP tool's path field is judged as a read, the weaker test,
 because what the server does with it is not ours to know: jkb's `ingest_path` only reads, and a
 server added to the table that writes to a path the lists only let it read would pass. The same holds
 for Artifact's `out_dir`, where a `read` action saves files: it is judged as a read, so a directory
