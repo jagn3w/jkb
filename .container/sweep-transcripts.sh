@@ -9,8 +9,9 @@
 # this file was written against, in which the sandbox enumerated every transcript. That stopped
 # being true when the transcript deny moved into a hook (.container/deny-transcripts.sh) and out of
 # permissions.deny: no rule names a transcript now, and on such a posture this script stands down
-# and says so -- see posture_enumerates_transcripts, which asks every settings layer. It still
-# sweeps the day an enumerating rule comes back, anywhere. .container/README.md has the record.
+# and says so -- see posture_enumerates_transcripts, which asks the image's own layers (managed
+# settings and their drop-ins; since review round 27, not the user's or a project's). It still sweeps
+# the day an enumerating rule comes back there. .container/README.md has the record.
 #
 # THE FAILURE, MEASURED IN THIS CONTAINER ON 2026-09-28. Claude Code's Bash sandbox profile
 # enumerates every session transcript INDIVIDUALLY into its read-`denyOnly` list, and hands that
@@ -2011,7 +2012,7 @@ case "${1:-}" in
         # this is a quiet tick there, and it contains no "does not exist", so verify.sh reads it
         # as a measured, healthy pass rather than an unmeasured one.
         if ! posture_enumerates_transcripts "$MANAGED_SETTINGS"; then
-            printf 'transcript sweep: no settings layer (managed %s, its drop-ins, the user'"'"'s, or any repo'"'"'s) names a transcript by path, so they cost the Bash sandbox argv nothing — nothing to archive\n' \
+            printf 'transcript sweep: neither managed %s nor its drop-ins names a transcript by path, so they cost the Bash sandbox argv nothing — nothing to archive (user and project settings are not read: a rule there that names transcripts is not caught; see .container/README.md)\n' \
                 "$MANAGED_SETTINGS"
             exit 0
         fi

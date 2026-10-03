@@ -1832,8 +1832,9 @@ file tools — the self-test proves the script decides correctly, not that the h
 **The sweep's projection did not fall, and that is not a contradiction.** It never read the deny
 list; it modelled it from the file count, so it went on reporting ~69,000 bytes of a list that no
 longer existed, and verify.sh read that as over budget. The sweep now asks, before it budgets
-anything, whether any settings layer — managed, drop-ins, user, or any repo's project settings —
-carries a rule that is enumerated per match *and* covers a transcript. Both halves: the first
+anything, whether a settings layer carries a rule that is enumerated per match *and* covers a
+transcript. Since review round 27 the layers asked are managed settings and their drop-ins only;
+user and project layers were asked before that (see *It reads only the image's own layers*). Both halves: the first
 version asked only about rules under `projects/`, which missed `Read(~/.claude/**/*.jsonl)`, and
 "does anything expand" alone would be fooled by the `~/repos/**` rules, which expand but name no
 transcript. See the next section.

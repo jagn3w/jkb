@@ -276,8 +276,8 @@ case15_a_kit_whose_checkout_is_gone_still_stops() {
 # NO PROGRAM FROM A PLACE AN AGENT CAN WRITE: a jq planted first on PATH, in ~/.cargo/bin, does not
 # run when run.sh does (review round 11 -- the host posture lets a sandboxed agent write ~/.cargo).
 case16_a_program_planted_on_path_under_home_does_not_run() {
-    # OUTSIDE THE TEMP ROOTS: under /tmp the filter's /tmp arm drops the entry, so the case could not
-    # fail with the "$HOME" arm removed (review round 18). The real ~/.cache is writable here and on CI.
+    # OUTSIDE THE TEMP ROOTS (review round 18): the case fails if run.sh goes back to inheriting PATH,
+    # wherever the planted directory is. The real ~/.cache is writable here and on CI.
     mkdir -p "$HOME/.cache" 2>/dev/null
     local h; h="$(mktemp -d "$HOME/.cache/jkb-plant.XXXXXX")" || { fail "case16" "no scratch home under ~/.cache"; return; }
     mkdir -p "$h/.cargo/bin"
@@ -289,19 +289,19 @@ case16_a_program_planted_on_path_under_home_does_not_run() {
     case "$h" in */jkb-plant.*) rm -rf -- "$h" ;; esac
 }
 
-# A TOOL THE FILTER HID IS NAMED, with where it was and the way to keep it: a per-user Docker in
-# ~/.docker/bin failed as a bare "docker is not on PATH" (review round 12). Skipped where a docker
-# outside the home would be found anyway.
+# A TOOL ONLY ON THE SHELL'S OWN PATH IS NAMED, with where it was and the way to keep it: a per-user
+# Docker in ~/.docker/bin failed as a bare "docker is not on PATH" (review round 12). Skipped where a
+# docker in run.sh's fixed directories would be found anyway.
 case17_a_tool_the_path_filter_hid_is_named() {
-    if type -P docker >/dev/null 2>&1; then skip "case17: a docker outside the home is on PATH here, so the filter hides nothing"; return 0; fi
+    if type -P docker >/dev/null 2>&1; then skip "case17: a docker is on a system PATH here, so nothing is missing"; return 0; fi
     mkdir -p "$HOME/.cache" 2>/dev/null
     local h out; h="$(mktemp -d "$HOME/.cache/jkb-hid.XXXXXX")" || { fail "case17" "no scratch home under ~/.cache"; return; }
     mkdir -p "$h/.docker/bin"; printf '#!/bin/sh\nexit 0\n' > "$h/.docker/bin/docker"; chmod +x "$h/.docker/bin/docker"
     ln -s "$(dirname "$repo_root")" "$h/repos"
     out="$(env HOME="$h" PATH="$h/.docker/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" 2>&1)"
     if grep -qF "docker is in $h/.docker/bin" <<<"$out" && grep -qF "jkb-container-kit/path-keep" <<<"$out"; then
-        ok "a docker the PATH filter hid is named with its directory and how to keep it"
-    else fail "a docker the PATH filter hid is named with its directory and how to keep it" "out: $(tail -3 <<<"$out")"; fi
+        ok "a docker only on the shell's PATH is named with its directory and how to keep it"
+    else fail "a docker only on the shell's PATH is named with its directory and how to keep it" "out: $(tail -3 <<<"$out")"; fi
     case "$h" in */jkb-hid.*) rm -rf -- "$h" ;; esac
 }
 
@@ -344,10 +344,10 @@ case19_run_sh_ignores_bash_env_and_exported_functions() {
     fi
 }
 
-# THE PATH FILTER TAKES NO ORDERS FROM THE ENVIRONMENT: a launching terminal's env (a committed
-# terminal.integrated.env) set JKB_RUN_PATH_KEEP to ~/.cargo/bin, or spelled a home entry `<parent>//<user>`,
-# which the textual match missed, and a planted jq ran as you (review round 22). The keep list is a
-# file under the 0700 kit home, and entries are compared by physical, case-folded path.
+# run.sh'S PATH TAKES NO ORDERS FROM THE ENVIRONMENT: a launching terminal's env (a committed
+# terminal.integrated.env) set JKB_RUN_PATH_KEEP to ~/.cargo/bin, or spelled a home entry
+# `<parent>//<user>`, and a planted jq ran as you (review round 22). The keep list is a file under the
+# 0700 kit home, and since round 27 PATH is built rather than filtered; this fails if either regresses.
 case20_the_path_filter_ignores_the_environment() {
     mkdir -p "$HOME/.cache" 2>/dev/null
     local h form ran=""; h="$(mktemp -d "$HOME/.cache/jkb-env.XXXXXX")" || { fail "case20" "no scratch home under ~/.cache"; return; }

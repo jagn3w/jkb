@@ -595,7 +595,8 @@ else
     dc_dl="$(sed -n 's/^    dt_deadline=\([0-9][0-9]*\)$/\1/p' "$here/deny-transcripts.sh" | head -1)"
     if [ "$dc_match" != "$(posture_hook_matcher)" ]; then
         bad "the transcript hook's matcher is [$dc_match], not [$(posture_hook_matcher)] — any tool it does not match never reaches the hook, and can read or upload another session's transcript"
-    elif [ -z "$dc_tmo" ] || [ -z "$dc_dl" ] || [ "$dc_dl" -ge "$dc_tmo" ]; then
+    # An INTEGER timeout, or `[ -ge ]` errors, the elif is skipped and this reads as fine (round 28).
+    elif ! [[ "$dc_tmo" =~ ^[0-9]+$ ]] || [ -z "$dc_dl" ] || [ "$dc_dl" -ge "$dc_tmo" ]; then
         bad "the transcript hook's own deadline [${dc_dl:-not found}s] does not end before its managed timeout [${dc_tmo:-not set}s] — Claude Code would kill it first and let the call through"
     else
         ok "the transcript deny is a wired, root-owned hook that every tool call reaches"
@@ -909,7 +910,7 @@ dc_keepf="${dc_keepf//\$HOME//kit-home-probe}"
 # lets sandboxed agents write ~/.cargo for builds (review round 15). One Edit rule is both the Write
 # tool's deny and, merged by Claude Code, the sandbox's denyWrite.
 # ...AND EVERY OTHER FILE THAT BECOMES CODE LATER, outside every sandbox: the shell startup files (one
-# `export BASH_ENV=...` in ~/.zshenv runs in run.sh before its PATH filter), git's global config and
+# `export BASH_ENV=...` in ~/.zshenv ran in run.sh before it rebuilt its environment), git's global config and
 # hooks, ssh's config, and the per-user autostart directories (review round 20) -- and VS Code's user
 # settings and extensions, whose terminal.integrated.env and extension code run in your next terminal
 # or window (review round 24). Only the user edits these, so denying them costs nothing.

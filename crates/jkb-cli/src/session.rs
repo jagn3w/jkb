@@ -470,7 +470,8 @@ fn gate_place_with(
     let refuse = |why: &str| {
         anyhow::anyhow!(
             "the gate runs the candidate's own code, which was written in the dev container, so it \
-             runs there (design D52.12) — but {why}. Start it (.container/run.sh), or land with \
+             runs there (design D52.12) — but {why}. Start it from the installed kit \
+             (~/.local/share/jkb-container-kit/kit/.container/run.sh), or land with \
              --gate-on-host to run it here, recorded on the task."
         )
     };

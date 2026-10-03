@@ -599,6 +599,11 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"file:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "round 27: ...while an https url field is not a path" allow \
       '{"tool_name":"mcp__x__fetch","cwd":"'"$bh"'/repos/w","tool_input":{"url":"https://example.com'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    ln -s "$bh/.ssh" "$bh/repos/w/x:"
+    h "round 28: an unlisted tool's x:// path through a cwd link named x: is judged" deny \
+      '{"tool_name":"mcp__fs__read_file","cwd":"'"$bh"'/repos/w","tool_input":{"path":"x://id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 28: a claude.ai connector's path field is not a local path" allow \
+      '{"tool_name":"mcp__claude_ai_Drive__list","cwd":"'"$bh"'/repos/w","tool_input":{"path":"/"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: StructuredOutput passes, whatever its findings name" allow \
       '{"tool_name":"StructuredOutput","cwd":"'"$bh"'/repos/w","tool_input":{"findings":[{"file":"'"$bh"'/.ssh/id_rsa","summary":"x"}]}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: an unknown built-in with no path-named field is allowed" allow \
@@ -1246,12 +1251,17 @@ case "$tool" in
             ListAgents|EnterPlanMode|ExitPlanMode|ReportFindings|PushNotification|RemoteTrigger|\
             ArtifactComments|KillShell|BashOutput|TaskCreate|TaskUpdate|TaskList|TaskGet|StructuredOutput|\
             ExitWorktree) dt_fields='empty' ;;
-            # Everything else: the path-NAMED fields, at any depth. A URL in one is a path only when it is
-            # a file: URL; https://... names no local file.
+            # claude.ai connectors run on claude.ai and open no local file: a `path` there is a repo's or
+            # a drive's, and judged here `path:"/"` was an ancestor of the tree (review round 28).
+            mcp__claude_ai_*) dt_fields='empty' ;;
+            # Everything else: the path-NAMED fields, at any depth. A value with a web scheme (http, https,
+            # ws, wss) names no local file and is skipped; ANY OTHER `x://...` is judged as the path it
+            # also is, since a server that open()s it reads `x:/...` relative to its cwd -- a link
+            # named `x:` reached the tree when every scheme was skipped (review round 28).
             *) dt_fields='.. | objects | to_entries[]
                 | select(.key | test("^(file_?path|file_?paths|path|paths|file|files|file_?name|dir|directory|root|cwd|source|target|dest|destination|out_?dir|output_?path|input_?path|uri|url)$"; "i"))
                 | .value | (strings, (arrays | .[] | strings))
-                | select((test("^[A-Za-z][A-Za-z0-9+.-]*://") | not) or test("^file:"; "i"))' ;;
+                | select(test("^(https?|wss?)://"; "i") | not)' ;;
         esac
         dt_paths_sh="$(printf '%s' "$input" | jqh -er "[.tool_input | ($dt_fields) | strings | select(. != \"\")] | @sh \"dt_paths=(\\(.))\"" 2>/dev/null)" || exit 3
         dt_paths=(); eval "$dt_paths_sh"

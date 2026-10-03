@@ -1231,8 +1231,8 @@ sweep_keep=""
 sweep_ok=yes
 if [ "$state" = running ]; then
     sweep_ok=no
-    # On the host `jkb` lives in ~/.cargo/bin, which the PATH filter at the top drops: an agent can
-    # write it, so this no longer runs it, and the sweep holds sessions by its recency window and
+    # On the host `jkb` lives in ~/.cargo/bin, which is not on the PATH run.sh builds at the top: an
+    # agent can write it, so this no longer runs it, and the sweep holds sessions by its recency window and
     # floor instead (the arm below says so). A jkb on a system PATH is still asked.
     if command -v jkb >/dev/null 2>&1; then
         if sweep_ids="$(jkb notify sessions --live-ids 2>/dev/null)"; then

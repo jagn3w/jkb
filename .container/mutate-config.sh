@@ -2063,6 +2063,15 @@ run "the hook's managed timeout drops under its deadline" "does not end before i
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
+o = '"command": "/usr/local/bin/deny-transcripts.sh", "timeout": 10'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '"command": "/usr/local/bin/deny-transcripts.sh", "timeout": 7.5', 1))
+PYX
+run "the hook's managed timeout is a fraction under its deadline" "does not end before its managed timeout"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('"permissions": {', '"permissions_moved": {', 1))
 PYX
 run "the deny rules cannot be read" "examined nothing"
