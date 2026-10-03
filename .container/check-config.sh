@@ -700,13 +700,16 @@ for dc_s in sweep-transcripts verify; do
         *) dc_unsb="$dc_unsb run.sh does not start $dc_s.sh with /bin/bash from the kit mirror;" ;;
     esac
 done
-# run.sh ITSELF runs as you on the host, and finds bash, jq and docker by name: an absolute shebang,
+# run.sh ITSELF runs as you on the host, and finds bash, jq and docker by name: an absolute shebang
+# in privileged mode,
 # and as its first command after `set`, the filter dropping every PATH entry an agent can write
 # (under $HOME, /tmp, /private). A planted ~/.cargo/bin/jq ran as you at the next start without it
 # (review round 11).
 dc_run_cmds="$(dc_strip_comments "$here/run.sh" | sed '1d' | grep -E '[^[:space:]]' | head -2)"
-[ "$(head -1 "$here/run.sh")" = '#!/bin/bash' ] \
-    || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash, so bash itself is found through PATH;"
+# PRIVILEGED MODE TOO, as the hook has: without -p, bash runs the launching terminal's BASH_ENV and
+# imports its exported functions, before any of this file runs (review round 21).
+[ "$(head -1 "$here/run.sh")" = '#!/bin/bash -p' ] \
+    || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash -p, so bash itself is found through PATH, or runs the launching terminal's BASH_ENV and exported functions;"
 case "$(sed -n 2p <<<"$dc_run_cmds")" in
     *'"$HOME"/*'*'/tmp/*'*'/private/*'*'/var/folders/*'*'PATH="${jkb_path:-/usr/bin:/bin}"; export PATH'*) ;;
     *) dc_unsb="$dc_unsb run.sh does not drop agent-writable PATH entries as its first command after set;" ;;
@@ -873,8 +876,8 @@ done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(
 # `export BASH_ENV=...` in ~/.zshenv runs in run.sh before its PATH filter), git's global config and
 # hooks, ssh's config, and the per-user autostart directories (review round 20). Only the user edits
 # these, so denying them costs nothing.
-for dc_inlet in '~/.cargo/env' '~/.zshenv' '~/.zprofile' '~/.zshrc' '~/.zlogin' '~/.bashrc' \
-                '~/.bash_profile' '~/.bash_login' '~/.profile' '~/.gitconfig' '~/.config/git/**' \
+for dc_inlet in '~/.cargo/env' '~/.zshenv' '~/.zprofile' '~/.zshrc' '~/.zlogin' '~/.zlogout' '~/.bashrc' \
+                '~/.bash_profile' '~/.bash_login' '~/.profile' '~/.bash_logout' '~/.gitconfig' '~/.config/git/**' \
                 '~/.ssh/**' '~/Library/LaunchAgents/**' '~/.config/systemd/user/**' '~/.config/autostart/**'; do
     HOME=/dev/null jq -e --arg r "Edit($dc_inlet)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
         || dc_kit_where="$dc_kit_where the posture has no Edit($dc_inlet) deny, so an agent can plant code that runs later as you, unsandboxed;"

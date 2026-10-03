@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 # Start the jkb container from .container/container.json, then ATTACH VS Code to it.
 #
 #   ./.container/run.sh                 build if needed, start, run the lifecycle, say how to attach

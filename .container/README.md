@@ -487,12 +487,15 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   from its own `PATH`; your shells do not.
 - **Every file that becomes code later is `Edit`-denied too** (review round 20). `~/.cargo/env` was
   one case of a wider class. The others are the shell startup files (`~/.zshenv`, `~/.zprofile`,
-  `~/.zshrc`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`), git's
+  `~/.zshrc`, `~/.zlogin`, `~/.zlogout`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`,
+  `~/.profile`, `~/.bash_logout`; the two logout files arrived in review round 21), git's
   global config (`~/.gitconfig`, `~/.config/git/**`, which can name a hooks directory), `~/.ssh/**`
   (a `ProxyCommand` runs), and the per-user autostart directories (`~/Library/LaunchAgents`,
   `~/.config/systemd/user`, `~/.config/autostart`). One line in `~/.zshenv`,
   `export BASH_ENV=/tmp/x.sh`, would have run in `run.sh` before its `PATH` filter, because
-  `#!/bin/bash` sources `BASH_ENV`. Only you edit these files, so the denies cost nothing.
+  `#!/bin/bash` sources `BASH_ENV`. Round 21 closed that in `run.sh` itself: its shebang is now
+  `#!/bin/bash -p`, which ignores `BASH_ENV` and exported functions, so a terminal whose environment
+  was set some other way (a VS Code `terminal.integrated.env`, direnv) cannot steer it either. Only you edit these files, so the denies cost nothing.
   `check-config.sh` requires every one. Whether Claude Code's own protected list already covered any
   of them was not measured; the deny makes the answer irrelevant.
 - **The checkout's `run.sh` refuses** to start or stop anything and names the kit. That protects the
@@ -1505,6 +1508,25 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
   keeping a leading `./`: collapsed later, padding stripped the `./` off `./~t/` (round 20). If it
   then fits under `PATH_MAX` it is judged in full, links included. Round 19 found a cwd link padded
   with `./` that was followed by no check at all.
+- **Round 21 closed the rest of the guessing, by the user's choice ("option 2").** Rounds 16 to 21
+  each found the next spelling a free-text guess missed, and round 21 found three more, one of them
+  caused by round 20's fix. So:
+  - **A string still over `PATH_MAX` with a `..` in it is refused.** Round 20 resolved it the way a
+    normalising server would, and a cwd link followed by a padded climb reached a transcript, because
+    the kernel follows the link first. Resolving it either way is a guess about the server.
+  - **Whitespace around a path, and a path on a line of its own, are judged as the path.** Each line
+    of a string with whitespace is trimmed, and if what is left is one token it is judged as its own
+    candidate, under the same caps. A string judged only whole let ` /h/.ssh/id_rsa` (a leading space)
+    pass as a relative name, a second line pass unexamined, and 5000 trailing spaces hide a
+    credential behind the over-long rule.
+  - **More than 20000 lines in one call are refused**, before any is trimmed, so the per-line work
+    has a bound.
+
+  What this costs, measured against the hook on 2026-10-03: a description listing files one per line
+  now has each line judged, two checks apiece (the cwd and the home), and the description itself is
+  one more candidate, so 15 relative paths on their own lines pass and 16 meet the existing per-call
+  cap of 32 checks and are refused. Round 20's hook passed 40 and more, judging the description whole. Over-long prose holding a climbing relative link
+  (`](../../x.md)`) is refused; under 4096 bytes it still passes.
 - **Only the home-base guess is spared.** An unknown tool's relative free text is read from each base
   it might be resolved against: the session cwd, the project dir and the home. The cwd and project
   readings are judged in full, because that is where a server resolves a relative path. jkb's
@@ -1619,11 +1641,14 @@ O(files) of argv. What
   So the hook pins `LC_ALL=C`, tests prefixes by substring, reads stdin as `$(</dev/stdin)`, counts
   segments in `jq`, and keeps long strings away from string surgery altogether. Any path field over
   4096 bytes (`PATH_MAX`) is refused before it is walked. A free-text string still over `PATH_MAX`
-  after collapsing is normalised first, which is linear, and skipped if it is still too long to open,
-  so the slow strips never see it. Measured in jkb-dev on 2026-10-03: 300 KB strings of five shapes
-  beside a transcript path were each decided in under 140 ms, and the slowest found, 1.5 MB of prose
-  whose `..` must be resolved, took 1.7 s. At most 100 distinct path-like strings are judged per
-  call. The full measurements and their method are in the script's header.
+  after collapsing is refused if it holds a `..`, and otherwise only its first 4096 bytes are read,
+  for the transcript rule (round 21; round 20 normalised it, and about 9 MB of such strings across
+  one call approached the timeout). Lines are trimmed in `jq` by two anchored regexes, not a
+  trailing `\s+$`, which is quadratic in a run of spaces, and at most 20000 lines are looked at.
+  Measured in jkb-dev on 2026-10-03: 300 KB strings of five shapes beside a transcript path were each
+  decided in under 160 ms, and the slowest found, 1.5 MB of tab-and-space runs, in 0.7 s. At most 100
+  distinct path-like strings are judged per call. The full measurements and their method are in the
+  script's header.
 - **The hook does not trust `PATH`** (review round 4, the most serious finding in four rounds). It
   runs unsandboxed on every tool call, and the image puts the agent-writable `~/.local/bin` and
   `~/.cargo/bin` first on `PATH`. A `jq` planted there by sandboxed Bash ran outside the sandbox,

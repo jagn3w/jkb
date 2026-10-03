@@ -58,8 +58,9 @@
 # before five review rounds added guards; the number is re-measured rather than carried, because this
 # hook now runs on EVERY tool call. Round 20 found ONE LONG STRING was enough: a 200KB note beside a
 # transcript path took 21s, because a ${x#lit} that does not match is quadratic (see `under`). After
-# the fix, measured the same way on 2026-10-03: 300KB strings of five shapes decide in under 140ms,
-# 1.5MB of prose with a `..` to resolve in 1.7s; 7ms Bash, 33ms Read, 64ms for a jkb task_create.
+# the fix, measured the same way on 2026-10-03: 300KB strings of five shapes decide in under 160ms;
+# after round 21's line trimming, 1.5MB of tab-and-space runs in 0.7s and 19000 padded lines in 0.5s;
+# 7ms Bash, 33ms Read, 64ms for a jkb task_create.
 #
 # PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
 # `~` is the user's home, and a relative path is relative to the SESSION'S cwd (the payload's
@@ -679,6 +680,20 @@ if [ "${1:-}" = --self-test ]; then
     h "round 20: padding does not turn ./~t into ~t" deny "$padt" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     padu="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("file://localhost/h/.claude/projects/-s" + ([range(2100)|"/."]|join("")) + "/e.jsonl")}}')"
     h "round 20: a padded file://localhost URI is read as its path before it is collapsed" deny "$padu" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    # REVIEW ROUND 21, AND THE USER'S CHOICE AFTER IT (option 2): whitespace around a path, a path on a
+    # line of its own, and an over-long climb are ambiguous forms too -- what a server that trims or
+    # splits lines opens is judged, and a long `..` is refused rather than resolved.
+    ln -s "$bh/.claude/projects/-w" "$bh/repos/w/k z"
+    h "round 21: a leading space does not turn a denied absolute path into a relative name" deny \
+      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":" '"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    mline="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/repos/w/a\n" + $h + "/.ssh/id_rsa")}}')"
+    h "round 21: a denied path on a second line is judged as its own path" deny "$mline" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    tpad="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/.ssh/id_rsa" + ([range(5000)|" "]|join("")))}}')"
+    h "round 21: trailing whitespace past PATH_MAX does not hide a denied path" deny "$tpad" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    lclimb="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("k z/" + ([range(1000)|"aaaa/"]|join("")) + ([range(1000)|"../"]|join("")) + "../e.jsonl")}}')"
+    h "round 21: an over-long climb behind a space is refused, not resolved" deny "$lclimb" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    mdesc="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__task_create", cwd:($h + "/repos/w"), tool_input:{title:"t", description:"Touches:\ncrates/a.rs\n  crates/b.rs  \n- docs/x.md\nsee ../docs for more"}}')"
+    h "round 21: a description listing workspace files on their own lines is allowed" allow "$mdesc" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 20: ...and unpadded ./~t is denied as before" deny \
       '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"./~t/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     longp="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + ([range(2100)|"/."]|join("")) + "/.ssh/id_rsa")}}')"
@@ -877,6 +892,25 @@ if [ "${1:-}" = --self-test ]; then
     done
     mlong="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{paths:("/h/.claude/projects/-s/e.jsonl\n" + ([range(1000)|"/h/repos/jkb/a.rs"]|join("\n")))}}')"
     h "round 20: an over-long multi-line list that starts with a transcript path is still denied" deny "$mlong" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    h "round 21: a leading space does not hide a transcript path" deny \
+      '{"tool_name":"mcp__x__read","cwd":"/h/repos/jkb","tool_input":{"p":" /h/.claude/projects/-s/e.jsonl"}}' HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    # Trimming is linear: a regex `\s+$` over a long run of spaces is quadratic.
+    for ws in " " "x " " x"; do
+        big="$(jqh -cn --arg w "$ws" '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("a/" + ([range(300000)|$w]|join("")) + "b"), p:"/h/.claude/projects/-s/e.jsonl"}}')"
+        t0=$(date +%s%N)
+        h "round 21: 300KB of '$ws' runs beside a transcript path" deny "$big" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+        case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
+        if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
+        else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
+    done
+    manyl="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("a b" + ([range(25000)|"\ne"]|join("")))}}')"
+    h "round 21: more than 20000 lines in one call are refused before any is trimmed" deny "$manyl" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    manyl="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("a b" + ([range(19000)|"\n   e   "]|join("")))}}')"
+    t0=$(date +%s%N)
+    h "round 21: ...while 19000 padded lines are trimmed and allowed" allow "$manyl" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
+    if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
+    else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
     big="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("see crates/a.rs " + ([range(300000)|"e"]|join("")))}}')"
     t0=$(date +%s%N)
     h "round 20: ...and a 300KB note alone is allowed" allow "$big" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
@@ -1206,28 +1240,26 @@ collapse() {
 }
 
 # `judge <string> <base> <guess 0|1>`: one reading of a free-text string, from one base. Within
-# PATH_MAX it is check()ed as written. Past it no kernel opens it as written, and a server that
-# normalises it opens what normalise() makes of it -- so THAT is checked, and when even that is past
-# PATH_MAX the string names nothing anyone can open. normalise() is linear; the verdict's string
-# surgery on a 300KB string was not, and ran the hook past its timeout, which fails open (review
-# round 20). <guess> 1 holds the reading to the transcript rule alone (see boundary).
+# PATH_MAX it is check()ed as written. Past it no kernel opens it as written:
+# - WITH A `..` SEGMENT it is REFUSED. Resolving it meant choosing between the server that normalises
+#   first and the kernel that follows links first; round 20 judged the first alone, and a cwd link then
+#   a padded climb reached a transcript (review round 21). The user's choice after that round: an
+#   over-long climb is an ambiguous form, like a `..` in a string without whitespace. It also took the
+#   only per-byte walk out of this path, so no total of long strings can reach the timeout.
+# - WITHOUT ONE, collapsed already, it stays past PATH_MAX however a server reads it, so it names
+#   nothing anyone can open, and only the TRANSCRIPT RULE reads its head: verdict() is a prefix test,
+#   so the first 4096 bytes decide it as the whole would, and a long multi-line list led by a
+#   transcript path stays denied. Not check(): the boundary would refuse prose that merely starts with
+#   a home path.
+# <guess> 1 holds the reading to the transcript rule alone (see boundary).
 judge() {
-    local n v
+    local v
     if [ "${#1}" -le 4096 ]; then sb_guess="$3" check "$1" "$2"; return; fi
-    # Collapsed already, so only a `..` can make it shorter; without one it stays past PATH_MAX, and
-    # normalise()'s pipe read -- a byte at a time, ~0.5s a MB -- is skipped. THE TRANSCRIPT RULE STILL
-    # READS ITS HEAD: verdict() is a prefix test, so with no `..` the first 4096 bytes decide it as the
-    # whole would, and a long multi-line list led by a transcript path stays denied, as it was when an
-    # over-long string got the lexical verdict whole. Not check(): the boundary would refuse prose
-    # that merely starts with a home path, and no server can open this string as a path.
     case "/$1/" in
-        */../*) ;;
-        *) v="$(verdict "${1:0:4096}" "$roots" "$home" "$2")"
-           case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac ;;
+        */../*) deny "An MCP or unknown tool was handed a string over 4096 bytes (PATH_MAX) holding a '..' segment. The file-tool boundary refuses that form rather than guess how the server resolves it; pass a path under 4096 bytes, or text without a '..' segment." ;;
     esac
-    n="$(resolve "$1" "$home" "$2")"
-    [ "${#n}" -le 4096 ] || return 0
-    sb_guess="$3" check "$n"
+    v="$(verdict "${1:0:4096}" "$roots" "$home" "$2")"
+    case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac
 }
 
 check() { # check <path> [base]: deny on deny, return on allow, refuse on anything else
@@ -1362,28 +1394,42 @@ case "$tool" in
             if [ "$cwd" = "${r%/*}" ] || [ "$cwd" = "$r" ] || under "$cwd" "$r"; then scan_all=1; fi
         done <<<"$roots"
         # UNIQUE, NON-EMPTY candidates: the cap counts distinct strings, and an empty string is never
-        # a location -- judged as one it resolved to the cwd. MULTI-LINE STRINGS ARE JUDGED TOO, on
-        # purpose: a server that normalises a path lexically turns `/h/.claude\n/../.claude/projects/x`
+        # a location -- judged as one it resolved to the cwd. MULTI-LINE STRINGS ARE JUDGED WHOLE TOO,
+        # on purpose: a server that normalises a path lexically turns `/h/.claude\n/../.claude/projects/x`
         # into a transcript path, and the lexical verdict here does the same collapse.
-        leaves_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
-            [.tool_input | .. | strings
-             | select(. != "")
-             | select($all == "1" or test("^[~.]") or contains("/"))]
-            | unique
-            | if length > 100 then error("too many")
-              else @sh "leaves=(\(.))" + " segs=\(map(split("/") | length) | add // 0)" end' 2>/dev/null)" || exit 3
-        # ...and every OTHER string short enough to be one name (NAME_MAX): a bare word is a path
-        # the moment it names something in a base, and a link named `t` there reached the tree with
-        # nothing judged (review round 8, reproduced). Tested on disk below, with no fork per word.
-        bare_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
-            [.tool_input | .. | strings
-             | select(. != "" and length <= 255)
-             | select(($all == "1" or test("^[~.]") or contains("/")) | not)]
-            | unique
-            | if length > 2000 then error("too many") else @sh "bare=(\(.))" end' 2>/dev/null)" || exit 3
+        # ...AND EVERY LINE OF A STRING WITH WHITESPACE IN IT, TRIMMED, when what is left is one token:
+        # a server that trims its argument or reads it as a list of lines opens THAT, and judged only
+        # whole, ` /h/.ssh/id_rsa` was a relative name in the cwd and a second line was never a path
+        # (review round 21). The user's choice after that round: judge what a trimming or line-reading
+        # server opens, as an ambiguous form, rather than guess which one it is.
+        # A line's token is what precedes its first whitespace, kept only when the rest is whitespace:
+        # two anchored or first-match regexes. `sub("\\s+$")` re-scans a run of spaces from every
+        # position in it, and an explode-and-reverse trim took 3.6s over 150k lines. Per-line work is
+        # still a few microseconds a line, so MORE THAN 20000 LINES in one call is refused, like the
+        # leaf and bare-word caps, before any line is trimmed.
+        # One jq run
+        # produces both arrays, and the slash count the segment budget below needs.
+        cands_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
+            def ws: "[ \t\r\f\u000b]";
+            def tok: sub("^" + ws + "+"; "") as $l
+                | ([$l | match(ws).offset] | first) as $o
+                | if $o == null then $l
+                  elif ($l[$o:] | test("^" + ws + "*$")) then $l[:$o]
+                  else empty end;
+            def pathish: $all == "1" or test("^[~.]") or contains("/");
+            [.tool_input | .. | strings | select(. != "")] as $s
+            | [$s[] | select(test("\\s"))] as $w
+            | if ([$w[] | split("\n") | length] | add // 0) > 20000 then error("too many lines") else . end
+            | ($s + [$w[] | split("\n")[] | tok | select(. != "")]) as $c
+            | ([$c[] | select(pathish)] | unique) as $leaves
+            | ([$c[] | select(length <= 255 and (pathish | not))] | unique) as $bare
+            | if ($leaves | length) > 100 or ($bare | length) > 2000 then error("too many")
+              else @sh "leaves=(\($leaves)) bare=(\($bare))" + " segs=\($leaves | map(split("/") | length) | add // 0)" end' 2>/dev/null)" || exit 3
+        # ...and every OTHER string short enough to be one name (NAME_MAX), above as `bare`: a bare word
+        # is a path the moment it names something in a base, and a link named `t` there reached the tree
+        # with nothing judged (review round 8, reproduced). Tested on disk below, with no fork per word.
         leaves=(); bare=(); segs=0
-        eval "$leaves_sh"
-        eval "$bare_sh"
+        eval "$cands_sh"
         nleaves0="${#leaves[@]}"
         # An MCP server resolves a relative path against ITS OWN cwd, which is not the session's:
         # the jkb server starts in the project root. So a relative string is judged against every

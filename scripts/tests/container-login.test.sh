@@ -318,6 +318,25 @@ case18_a_planted_kit_marker_is_ignored() {
     fi
 }
 
+# run.sh RUNS AS YOU, UNSANDBOXED, from whatever terminal launches it, so it must not run that
+# terminal's BASH_ENV or the functions it exports: a committed .vscode/settings.json can set either for
+# every VS Code terminal, and a planted `cd` or `docker` function is called before any check (review
+# round 21, measured: `#!/bin/bash` ran both, `#!/bin/bash -p` neither). EXECUTED directly, so the
+# shebang is what is tested; every other case runs `bash run.sh`, which bypasses it.
+case19_run_sh_ignores_bash_env_and_exported_functions() {
+    local d="$work/be-$RANDOM"
+    mkdir -p "$d/home"
+    printf ': > "%s/RAN-BASH_ENV"\n' "$d" > "$d/env.sh"
+    env HOME="$d/home" BASH_ENV="$d/env.sh" "BASH_FUNC_cd%%=() { : > \"$d/RAN-cd\"; builtin cd \"\$@\"; }" \
+        "$repo_root/.container/run.sh" --kit-path >"$d/out" 2>&1
+    if [ ! -e "$d/RAN-BASH_ENV" ] && [ ! -e "$d/RAN-cd" ] && grep -q 'jkb-container-kit' "$d/out"; then
+        ok "run.sh runs neither a BASH_ENV script nor an exported function from the terminal that launches it"
+    else
+        fail "run.sh runs neither a BASH_ENV script nor an exported function from the terminal that launches it" \
+            "ran: $(ls "$d" | grep '^RAN-' | tr '\n' ' ') out: $(head -c 200 "$d/out")"
+    fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -326,5 +345,6 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case11_run_sh_carries_the_login_before_stop_and_rm case12_run_sh_starts_a_stopped_container_to_carry_it \
           case13_the_checkouts_run_sh_refuses_without_the_override case14_the_kits_run_sh_stops_and_sources_the_mirror \
           case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run \
-          case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored
+          case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored \
+          case19_run_sh_ignores_bash_env_and_exported_functions
 finish

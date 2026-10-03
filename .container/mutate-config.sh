@@ -1717,10 +1717,19 @@ run "the fingerprint strips a different root from the one the arguments came fro
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-assert s.startswith("#!/bin/bash\n"), "mutation target absent"
-open(p, 'w').write("#!/usr/bin/env bash\n" + s[len("#!/bin/bash\n"):])
+assert s.startswith("#!/bin/bash -p\n"), "mutation target absent"
+open(p, 'w').write("#!/usr/bin/env bash\n" + s[len("#!/bin/bash -p\n"):])
 PYX
-run "run.sh's shebang goes back to env" "shebang is not #!/bin/bash"
+run "run.sh's shebang goes back to env" "shebang is not #!/bin/bash -p"
+
+# REVIEW ROUND 21. ...and privileged mode, or the launching terminal's BASH_ENV runs first.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert s.startswith("#!/bin/bash -p\n"), "mutation target absent"
+open(p, 'w').write("#!/bin/bash\n" + s[len("#!/bin/bash -p\n"):])
+PYX
+run "run.sh's shebang drops -p" "shebang is not #!/bin/bash -p"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
@@ -1845,6 +1854,14 @@ d["require"]["permissions"]["deny"].remove("Edit(~/.zshenv)")
 json.dump(d, open(p, "w"), indent=2)
 PYX
 run "the posture stops denying Edit on ~/.zshenv" "no Edit(~/.zshenv) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.zlogout)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on ~/.zlogout" "no Edit(~/.zlogout) deny"
 
 seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
 import json, sys
