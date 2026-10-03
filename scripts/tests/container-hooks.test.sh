@@ -872,6 +872,22 @@ case36_the_checkout_a_kit_script_serves() {
     fi
 }
 
+# THE INSTALLED HOOK'S SELF-TEST PASSES. verify.sh runs it from /usr/local/bin, where the hook trusts the
+# passwd home and not $HOME, so its scratch-home rows failed and verify skipped every probe after it
+# (review round 33). DT_SELFTEST_AS_INSTALLED stands in for the installed path; the self-test must then
+# re-run itself from a copy and pass. Skipped where the hook-mode rows cannot run (no GNU realpath/jq).
+case37_the_installed_hooks_self_test_passes() {
+    local out rc=0
+    # The ACCOUNT's home, not this harness's scratch one under /tmp: the self-test makes its scratch homes
+    # under $HOME/.cache, and inside a temp root every write is allowed, so its deny rows would mean nothing.
+    out="$(HOME="$(getent passwd "$(id -u)" | cut -d: -f6)" DT_SELFTEST_AS_INSTALLED=1 bash "$repo_root/.container/deny-transcripts.sh" --self-test 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ] && [[ "$out" == *"self-test passed"* ]]; then
+        ok "the hook's self-test passes when run as the installed copy"
+    else
+        fail "the hook's self-test passes when run as the installed copy" "rc=$rc: $(grep -c FAIL <<<"$out") FAIL lines: $(grep -A1 FAIL <<<"$out" | head -6 | tr "\n" " ")"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -907,5 +923,5 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case33_an_older_flat_kit_is_removed \
           case34_a_link_that_appears_during_the_copy_is_refused \
           case35_a_hard_link_in_the_checkout_is_refused \
-          case35b_a_hard_link_made_during_the_copy_is_refused case36_the_checkout_a_kit_script_serves
+          case35b_a_hard_link_made_during_the_copy_is_refused case36_the_checkout_a_kit_script_serves case37_the_installed_hooks_self_test_passes
 finish

@@ -442,8 +442,9 @@ git rev-parse --verify --quiet ORIG_HEAD >/dev/null 2>&1 || range="HEAD^..HEAD"
 changed="$(git diff --name-only "$range" 2>/dev/null)"
 
 # --- 1. setup.sh, only when it would actually change something -----------------------
-# setup.sh installs the binary (crates/), the extension (ui/), the service (scripts/) and the
-# notifier (macos/) — a stale notifier is silent, since a broken one posts nothing.
+# setup.sh installs the binary (crates/), the extension (ui/), the service (scripts/), the
+# notifier (macos/) — a stale notifier is silent, since a broken one posts nothing — and the dev
+# container kit (.container/, and the scripts/ files dc_kit_paths names).
 # A pull touching only openspec/ or docs cannot affect any of them, and a full cargo
 # install is ~1-2 minutes we should not spend on every pull.
 if [ "${skip_setup:-0}" = 1 ]; then

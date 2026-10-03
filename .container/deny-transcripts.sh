@@ -276,6 +276,15 @@ verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
 }
 
 if [ "${1:-}" = --self-test ]; then
+    # THE SELF-TEST RUNS AS A COPY. Its rows drive this file against scratch homes, which the installed
+    # copy -- trusting the passwd home, not $HOME, since round 31 -- does not honour, so verify.sh's run
+    # of the INSTALLED self-test failed 26 rows and skipped every probe after it (review round 33). Run as
+    # installed, or asked to behave so, it re-executes from a scratch copy, which keeps every row honest.
+    if [ "$dt_installed" = 1 ] || [ -n "${DT_SELFTEST_AS_INSTALLED:-}" ]; then
+        dt_copy_dir="$(mktemp -d)" && cp "$0" "$dt_copy_dir/deny-transcripts.sh" \
+            && chmod +x "$dt_copy_dir/deny-transcripts.sh" || { echo "could not copy the hook to run its self-test" >&2; exit 1; }
+        exec /usr/bin/env -u DT_SELFTEST_AS_INSTALLED /bin/bash -p "$dt_copy_dir/deny-transcripts.sh" --self-test
+    fi
     fails=0
     R="/h/.claude/projects
 /h/.claude-state/projects"
@@ -692,9 +701,21 @@ if [ "${1:-}" = --self-test ]; then
                 case "$(ai "$aim" "HOME=$bh/forged2")" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 32: installed, a forged home linked into ~/.claude is no memory exception\n' ;;
                     *) printf '  \033[31mFAIL\033[0m round 32: installed, a forged home linked into ~/.claude made it writable as memory\n'; fails=$((fails+1)) ;; esac
                 case "$(ai "$aiw" "CLAUDE_PROJECT_DIR=/")" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 32: a CLAUDE_PROJECT_DIR of / is not a write root\n' ;;
-                    *) printf '  \033[31mFAIL\033[0m round 32: a CLAUDE_PROJECT_DIR of / made every path writable\n'; fails=$((fails+1)) ;; esac ;;
+                    *) printf '  \033[31mFAIL\033[0m round 32: a CLAUDE_PROJECT_DIR of / made every path writable\n'; fails=$((fails+1)) ;; esac
+                # ...nor one inside the home that is no ancestor of the cwd (round 33: only the inside-home
+                # half of the bound was held by a row).
+                aic2='{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$acct3"'/.claude/CLAUDE.md","content":""}}'
+                case "$(ai "$aic2" "CLAUDE_PROJECT_DIR=$acct3/.claude")" in *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 33: a CLAUDE_PROJECT_DIR inside the home but not above the cwd is not a write root\n' ;;
+                    *) printf '  \033[31mFAIL\033[0m round 33: a CLAUDE_PROJECT_DIR that is no ancestor of the cwd became a write root\n'; fails=$((fails+1)) ;; esac ;;
             *) printf '  \033[31mFAIL\033[0m round 31: with the sandbox enabled by a scratch managed layer, /opt was still writable\n'; fails=$((fails+1)) ;;
         esac
+        # A relative entry resolves against the VALIDATED project dir: against the raw one,
+        # CLAUDE_PROJECT_DIR=/ turned a trusted layer's `etc` into /etc (round 33).
+        mkdir -p "$bh/aimgd2"; printf '%s\n' '{"sandbox":{"enabled":true,"filesystem":{"allowWrite":["etc"]}}}' > "$bh/aimgd2/managed-settings.json"
+        aie='{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"/etc/evil","content":""}}'
+        case "$(printf '%s' "$aie" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR DT_SELFTEST_AS_INSTALLED=1 DT_SELFTEST_MANAGED_DIR="$bh/aimgd2" CLAUDE_PROJECT_DIR=/ "$BASH" "$aic" 2>/dev/null)" in
+            *'"permissionDecision":"deny"'*) printf '  \033[32mok\033[0m   round 33: a relative allowWrite entry is not resolved against a forged project dir\n' ;;
+            *) printf '  \033[31mFAIL\033[0m round 33: a relative allowWrite entry resolved against CLAUDE_PROJECT_DIR=/\n'; fails=$((fails+1)) ;; esac
     else
         printf '  \033[33mskip\033[0m round 31/32: no passwd entry for this uid, so the installed home cannot be exercised\n'
     fi
@@ -1124,7 +1145,7 @@ if [ "$sb_on" = 1 ]; then
     # `~` is the home; a relative entry (".") is the project's, as Claude Code reads it. Then every
     # entry resolved the way the path it is compared with is: physically.
     sb_abs() { case "$1" in "~") printf '%s\n' "$sb_home" ;; "~/"*) printf '%s\n' "$sb_home/${1#\~/}" ;; /*) printf '%s\n' "$1" ;;
-               *) printf '%s\n' "${CLAUDE_PROJECT_DIR:-$cwd}/${1#./}" ;; esac; }
+               *) printf '%s\n' "${sb_proj:-$cwd}/${1#./}" ;; esac; }
     # Claude Code's own writable places, which the Bash sandbox also grants: the session's cwd and
     # project, the temp roots it hands tools, and ~/.claude/plans, where plan mode writes.
     # TMPDIR only where a temp root can be: a settings `env` set it to `/`, and every path became a write
@@ -1133,12 +1154,16 @@ if [ "$sb_on" = 1 ]; then
     # CLAUDE_PROJECT_DIR only where a project can be: the cwd or an ancestor of it, strictly inside the
     # home. Whether a settings `env` can override the value Claude Code hands its hooks is unmeasured,
     # and set to `/` every path became a write root (review round 32), as TMPDIR's did in round 31.
+    # The VALIDATED project dir is also the base a relative list entry (`.`, `etc`) resolves against:
+    # resolved against the raw variable, CLAUDE_PROJECT_DIR=/ turned a trusted layer's `etc` into /etc
+    # (review round 33). The raw value may still add a denial, never a location.
+    sb_proj="$cwd"
     if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
         sb_pd="$(realpath -m -- "$CLAUDE_PROJECT_DIR" 2>/dev/null)" || sb_pd=""
         sb_cw="$(realpath -m -- "$cwd" 2>/dev/null)" || sb_cw=""
         if [ -n "$sb_pd" ] && under "$sb_pd" "$(realpath -m -- "$sb_home" 2>/dev/null)" \
            && { [ "$sb_pd" = "$sb_cw" ] || under "$sb_cw" "$sb_pd"; }; then
-            sb_w+=("$sb_pd")
+            sb_w+=("$sb_pd"); sb_proj="$sb_pd"
         fi
     fi
     sb_tmp="$(realpath -m -- "${TMPDIR:-/tmp}" 2>/dev/null)" || sb_tmp=""
