@@ -439,7 +439,8 @@ transcript_resolve() { # transcript_resolve <path> -> physical path
 # not sweeping when it was costs every Bash call in the container. The rule it looks for -- one
 # enumerated per match that also covers a transcript -- is a shape check-config.sh refuses in the
 # managed file, so on a correctly built image this answers "no", and would answer "yes" again the
-# day someone brought such a rule back, in ANY settings layer, not only the managed one.
+# day someone brought such a rule back in the managed file or a drop-in -- the only layers the sweep
+# reads since review round 27; a user's or project's rule does not re-arm it (README).
 # ---- THE DENY-RULE READER, DEFINED ONCE, HERE ---------------------------------------------------
 # check-config.sh (static) and verify.sh (runtime) load these functions FROM THIS FILE by name rather
 # than carrying copies. They live here because this is the one script that cannot source anything:
@@ -683,10 +684,10 @@ posture_rule_expands() { # posture_rule_expands <path pattern> -> rc 0 expands p
     return 0
 }
 
-# Every settings file whose permissions.deny reaches the sandbox profile Claude Code builds:
-# managed, its drop-ins, the user's, and every repo's project settings (a session can start in any
-# of them, worktrees included). OVER-APPROXIMATES on purpose -- one enumerating rule anywhere is
-# enough to matter. Files that do not exist are normal and skipped.
+# Every settings file a session here may load: managed, its drop-ins, the user's, and every repo's
+# project settings (a session can start in any of them, worktrees included). verify.sh's list, for its
+# auto-memory and settings-env checks; the SWEEP's decision reads only managed and its drop-ins since
+# review round 27 (posture_enumerates_transcripts). Files that do not exist are normal and skipped.
 # CHECKOUTS UP TO THREE LEVELS UNDER ~/repos (`~/repos/org/team/acme`), each with its worktrees, and
 # JKB_REPO_ROOT's own: run.sh serves a checkout at any depth, and reading one level only missed a
 # transcript-naming rule in ~/repos/org/acme, so the sweep stood down while the argv grew (review round
@@ -1754,8 +1755,9 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects)","Read(~/.claude-state/projects)"]}}' >"$pdir/baredir.json"
     printf '%s\n' '{"hooks":{}}' >"$pdir/nodeny.json"
     printf '%s\n' 'not json {' >"$pdir/broken.json"
-    # HERMETIC HOME. posture_layer_files reads $HOME's settings and every repo's, so a row run
-    # against the developer's own HOME would be decided by their machine. `pe` runs in an empty
+    # HERMETIC HOME. The probes walk $HOME's transcript tree, and CLAUDE_CONFIG_DIR and the managed
+    # drop-ins sit beside it, so a row run against the developer's own HOME would be decided by their
+    # machine. `pe` runs in an empty
     # one unless a row hands it another.
     mkdir -p "$work/nohome"
     # NOT INHERITED: the predicate honours CLAUDE_CONFIG_DIR, so a developer who exports it made six

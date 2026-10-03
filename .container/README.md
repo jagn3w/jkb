@@ -199,7 +199,7 @@ rule relaxed and every other restriction kept, and it has to be in the kernel be
 can use it:
 
 ```sh
-sudo apparmor_parser -r -W .container/apparmor-jkb-dev
+sudo apparmor_parser -r -W ~/.local/share/jkb-container-kit/kit/.container/apparmor-jkb-dev
 ```
 
 **Nothing installs it under `/etc/apparmor.d`, so this does not survive a reboot.** Run it again
@@ -306,10 +306,11 @@ like `Read(./**/.env)`. *Transcripts are swept by byte
 budget, not by age*, at the end of this file, has the measurement.
 
 ```sh
-./.container/run.sh --build     # rebuild the image (needed after a Dockerfile or extension change)
-./.container/run.sh --stop      # stop it; volumes and image survive
-./.container/run.sh --rm        # remove it, so the next run redoes first-run setup
-./.container/run.sh --dry-run   # print the docker command instead of running it
+kit=~/.local/share/jkb-container-kit/kit/.container/run.sh
+$kit --build     # rebuild the image (needed after a Dockerfile or extension change)
+$kit --stop      # stop it; volumes and image survive
+$kit --rm        # remove it, so the next run redoes first-run setup
+$kit --dry-run   # print the docker command instead of running it
 ```
 
 ### It is not a Dev Containers config, and the file is not called `devcontainer.json`
@@ -476,7 +477,7 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
     the posture denies `Edit` on them. The kit home is mode 0700 and `Edit`-denied.
   - **an allowlist of names:** `HOME`, the terminal and locale names, `USER`/`LOGNAME`,
     `DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`, and on a
-    Linux desktop `DISPLAY`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`. `DOCKER_CONTEXT`'s endpoints
+    Linux desktop `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `XAUTHORITY` (the X cookie Electron needs on X11). `DOCKER_CONTEXT`'s endpoints
     live in the `Edit`-denied `~/.docker`. `DOCKER_HOST` is not kept (review round 27): a terminal
     could point it at a fake daemon that collects registry credentials on a pull. A Colima or
     OrbStack daemon is reached through its Docker context. A non-default image is always built from the kit, so
@@ -1101,7 +1102,7 @@ forwards the Vite port to the Mac. No port publishing and no permission change i
   - The reaping assertion **fails on every container created before it existed**, which is correct
     and is the point: the fix is an image change, and nothing else observes a running container —
     `run.sh` without `--build` finds the argument hash and the image id both matching and starts
-    the old one. Recreate: `./.container/run.sh --rm && ./.container/run.sh --build`.
+    the old one. Recreate: `$kit --rm && $kit --build`, with `$kit` the kit's run.sh (*Using it*).
   - It **refuses to run inside Claude Code's own sandbox**, which wraps a Bash tool call in
     `bwrap --unshare-pid --proc /proc`. In there `/proc/1` and `/proc/self/mountinfo` are bwrap's,
     so both the reaping and mount-boundary assertions would describe the wrong subject — and the
@@ -1463,7 +1464,7 @@ also with them hidden from `PATH`, did not fire it. So the mechanism is inferred
 Every fallback is now inside its substitution, and statuses are read by `ipset_rc`, which takes them
 in an `&&`/`||` list inside the subshell.
 
-Changing any of this takes a **rebuild** (`./.container/run.sh --rm && ./.container/run.sh --build`):
+Changing any of this takes a **rebuild** (`$kit --rm && $kit --build`, with `$kit` the kit's run.sh):
 the firewall, its library and the posture snapshot are installed into the image and read at create.
 
 ## A session worktree is an ordinary folder in here
@@ -1574,7 +1575,10 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
 - **No sandbox, no boundary, and only the image can say no.** With the sandbox disabled there is
   nothing to mirror, and the transcript rule still applies. If managed settings or their drop-ins
   set `enabled`, theirs is the word. Otherwise any layer may turn the boundary **on**, and no user,
-  project or local layer may turn it off (review round 29). A layer that is not valid JSON
+  project or local layer may turn it off (review round 29). **Nor may a project or local layer widen
+  it** (review round 30). `allowWrite` and `allowRead` are taken from managed and user settings
+  only, which agents cannot write. A planted local `allowWrite: ["/"]` let every path through.
+  Those layers still narrow it, through their denies and `denyRead`. A layer that is not valid JSON
   contributes nothing, as Claude Code skips it. **The layers it reads are never writable through
   it**: every layer file is refused to the write tools (review round 16, after a Write of a
   project's `.claude/settings.local.json` outside `~/repos` could have switched the boundary off).

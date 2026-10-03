@@ -1306,7 +1306,7 @@ case "$aa_profile" in
     "")            note "AppArmor mediates on this host, but this process's profile label could not be read — nothing was established about what is confining the container" ;;
     unconfined)    bad "AppArmor is not confining this container (unconfined) — the container ships a profile that keeps every docker-default restriction except \`mount\`; running unconfined discards all of them" ;;
     docker-default)
-                   bad "AppArmor is applying docker-default, which denies \`mount\` — bubblewrap cannot start under it, so the nested sandbox is not running. Load the container's profile: sudo apparmor_parser -r -W .container/apparmor-jkb-dev" ;;
+                   bad "AppArmor is applying docker-default, which denies \`mount\` — bubblewrap cannot start under it, so the nested sandbox is not running. Load the container's profile from the kit, which agents cannot write: sudo apparmor_parser -r -W ~/.local/share/jkb-container-kit/kit/.container/apparmor-jkb-dev" ;;
     "$aa_want")
         # THE POLICY, NOT THE LABEL -- a name is a label, and a profile called jkb-dev that had
         # been edited into permitting everything would pass a name check.

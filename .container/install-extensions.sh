@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Install this container's VS Code extensions. RUNS INSIDE THE CONTAINER.
 #
-#   ./.container/install-extensions.sh
+#   /usr/local/lib/jkb-container/.container/install-extensions.sh     # from the repo
+#
+# The ROOT-OWNED mirror's copy, not the checkout's, which agents can write.
 #
 # WHY IT IS ITS OWN SCRIPT, AND WHEN YOU RUN IT BY HAND. VS Code installs its server into the
 # container when you ATTACH — which is after `run.sh` has finished, because attaching is something

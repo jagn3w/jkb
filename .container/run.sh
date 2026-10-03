@@ -47,13 +47,13 @@ set -euo pipefail
 #   the Edit-denied ~/.docker; DOCKER_HOST is NOT kept, since a terminal could point it at a fake daemon
 #   that collects registry credentials on a pull -- review round 27), JKB_RUN_FROM_CHECKOUT, JKB_CONTAINER_NAME/JKB_CONTAINER_IMAGE (documented
 #   overrides; a non-default image is always built from the kit, below), and on a Linux desktop
-#   DISPLAY, WAYLAND_DISPLAY and XDG_RUNTIME_DIR for `--open`. DBUS_SESSION_BUS_ADDRESS stays out: a
+#   DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR and XAUTHORITY (an X cookie, round 30) for `--open`. DBUS_SESSION_BUS_ADDRESS stays out: a
 #   `unixexec:` address runs a program.
 # `#!/bin/bash -p` keeps BASH_ENV and exported functions out of this first shell; `env -i` keeps them
 # out of everything after it. A terminal that replaces HOME itself also chooses which
 # `~/.local/share/.../run.sh` you start, so it is out of any script's reach.
 # Not in --self-test, which check.sh runs and which starts nothing. check-config.sh holds this.
-if [ "${1:-}" = --jkb-clean-env ]; then shift; elif [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin; jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"; jkb_kp=""; if [ -f "$jkb_keepf" ]; then while IFS= read -r jkb_k || [ -n "$jkb_k" ]; do case "$jkb_k" in /*) jkb_kp="$jkb_kp$jkb_k:" ;; esac; done <"$jkb_keepf"; fi; jkb_path="$jkb_kp$jkb_path"; jkb_env=("PATH=$jkb_path" "JKB_USER_PATH=${PATH:-}"); for jkb_n in $(compgen -e); do case "$jkb_n" in HOME|TERM|COLORTERM|LANG|LC_*|USER|LOGNAME|DOCKER_CONTEXT|JKB_RUN_FROM_CHECKOUT|JKB_CONTAINER_NAME|JKB_CONTAINER_IMAGE|DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR) jkb_env+=("$jkb_n=${!jkb_n}") ;; esac; done; exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"; fi
+if [ "${1:-}" = --jkb-clean-env ]; then shift; elif [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin; jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"; jkb_kp=""; if [ -f "$jkb_keepf" ]; then while IFS= read -r jkb_k || [ -n "$jkb_k" ]; do case "$jkb_k" in /*) jkb_kp="$jkb_kp$jkb_k:" ;; esac; done <"$jkb_keepf"; fi; jkb_path="$jkb_kp$jkb_path"; jkb_env=("PATH=$jkb_path" "JKB_USER_PATH=${PATH:-}"); for jkb_n in $(compgen -e); do case "$jkb_n" in HOME|TERM|COLORTERM|LANG|LC_*|USER|LOGNAME|DOCKER_CONTEXT|JKB_RUN_FROM_CHECKOUT|JKB_CONTAINER_NAME|JKB_CONTAINER_IMAGE|DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|XAUTHORITY) jkb_env+=("$jkb_n=${!jkb_n}") ;; esac; done; exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"; fi
 # ...and jq with HOME where no file can be: jq sources $HOME/.jq into every program, and the Write
 # tool can create ~/.jq. This file's jq readers build the mount list handed to `docker run`, which
 # README calls the security boundary (review round 12). check-config.sh holds the line in place.

@@ -648,6 +648,17 @@ if [ "${1:-}" = --self-test ]; then
     h "round 29: a local layer cannot turn the boundary off; only the image's managed layers can" deny \
       '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     rm -f "$bh/repos/w/.claude/settings.local.json"
+    # REVIEW ROUND 30: ...nor widen it. A planted local allowWrite/allowRead of "/" let every path through.
+    printf '%s\n' '{"sandbox":{"filesystem":{"allowWrite":["/"],"allowRead":["/"]}}}' > "$bh/repos/w/.claude/settings.local.json"
+    h "round 30: a local layer cannot widen the boundary's allow lists" deny \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 30: ...for reads either" deny \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/repos/w/secret/**)"]}}' > "$bh/repos/w/.claude/settings.local.json"
+    mkdir -p "$bh/repos/w/secret"; : > "$bh/repos/w/secret/k"
+    h "round 30: ...while its Read() deny still narrows it" deny \
+      '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/secret/k"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    rm -f "$bh/repos/w/.claude/settings.local.json"
     # REVIEW ROUND 17: MANAGED WINS for `enabled`, watched failing under the old order.
     mkdir -p "$bh/managed"
     printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/managed/managed-settings.json"
@@ -982,8 +993,11 @@ eval "$assign"
 # path, as the kernel sandbox judges it, so auto-memory reached through its ~/.claude/projects link
 # into ~/.jkb is readable, and a link in ~/repos pointing at ~/.ssh is not.
 # Mirrored only when the merged settings ENABLE the sandbox; with no sandbox there is no boundary to
-# mirror, and the transcript rule above still applies. An agent cannot turn it off: every layer read
-# here is write-denied to the sandbox and Edit-denied to the tools.
+# mirror, and the transcript rule above still applies. An agent cannot turn it off or widen it: only
+# managed settings may switch it off, and the allow lists come from managed and user settings, which
+# are write-denied and Edit-denied. A project's or worktree's own layers -- which sandboxed Bash can
+# CREATE in a new worktree -- may narrow it (denies, denyRead) and turn it on, never more (review
+# rounds 29 and 30).
 sb_on=0; sb_w=(); sb_r=(); sb_dr=(); sb_md=()
 # IN PRECEDENCE ORDER, lowest first, because `enabled` takes the last layer's word: user, project,
 # local, then managed and its drop-ins, which win in Claude Code. Managed came first, so a lower
@@ -998,18 +1012,25 @@ sb_mdir=/etc/claude-code
 sb_nm_layers=${#sb_layers[@]}
 sb_layers+=("$sb_mdir/managed-settings.json" "$sb_mdir"/managed-settings.d/*.json)
 sb_args=(); sb_names=()
-sb_i=0; sb_nm=0; sb_k=0
+sb_i=0; sb_nm=0; sb_k=0; sb_untrusted=""; sb_sep=""
 for f in "${sb_layers[@]}"; do
     sb_k=$((sb_k + 1))
     [ -f "$f" ] && [ -r "$f" ] || continue
+    # THE PROJECT AND LOCAL LAYERS are files under the workspace, which sandboxed Bash can CREATE in a
+    # new worktree (round 29). They may narrow the boundary, never widen it (below).
+    if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && { [ "$sb_k" -eq 2 ] || [ "$sb_k" -eq 3 ]; }; then
+        sb_untrusted="$sb_untrusted$sb_sep$sb_i"; sb_sep=,
+    fi
     sb_args+=(--rawfile "s$sb_i" "$f"); sb_names+=("\$s$sb_i"); sb_i=$((sb_i + 1))
     [ "$sb_k" -le "$sb_nm_layers" ] && sb_nm=$sb_i
 done
+sb_untrusted="[$sb_untrusted]"
 if [ "$sb_i" -gt 0 ]; then
     # ONE jq, every layer as raw text parsed inside: a file that is not valid JSON contributes nothing,
     # as Claude Code skips it, instead of failing the whole read. `enabled` is the last layer's word
     # in the order read (user, project, local, managed last); the lists are unions, as Claude Code
-    # merges arrays across layers.
+    # merges arrays across layers -- except that allowWrite and allowRead skip the project and local
+    # layers ($ut): a planted local allowWrite of "/" let every path through (review round 30).
     sb_names_csv="$(IFS=,; printf '%s' "${sb_names[*]}")"
     # ONLY THE IMAGE'S LAYERS MAY TURN IT OFF (review round 29). Managed settings and their drop-ins have
     # the last word when they set `enabled`; otherwise any layer may turn the boundary ON and none may
@@ -1017,7 +1038,7 @@ if [ "$sb_i" -gt 0 ]; then
     # CREATE a worktree's settings.local.json, which the ~/repos Edit rules cover only once it exists.
     # Claude Code itself would still start that session's Bash unsandboxed; pinning `enabled` in the
     # image's managed settings closes that, and is the user's decision (README).
-    sb_sh="$(jqh -nr --argjson nm "$sb_nm" "${sb_args[@]}" '
+    sb_sh="$(jqh -nr --argjson nm "$sb_nm" --argjson ut "$sb_untrusted" "${sb_args[@]}" '
         def p: try fromjson catch {};
         def str: if type == "string" then . else empty end;
         [ ('"$sb_names_csv"') | p | .sandbox // {} ] as $l
@@ -1027,8 +1048,8 @@ if [ "$sb_i" -gt 0 ]; then
           @sh "sb_on=\(if $on == true then 1 else 0 end)
                sb_md=(\([ ( [ '"$sb_names_csv"' ] | .[] | p | .permissions.deny[]? | dpath ),
                            ( $l[] | .credentials.files[]? | select(.mode == "deny") | .path | str ) ] | unique))
-               sb_w=(\([ $l[] | .filesystem.allowWrite[]? | str ] | unique))
-               sb_r=(\([ $l[] | .filesystem.allowRead[]? | str ] | unique))
+               sb_w=(\([ $l | to_entries[] | select(.key as $k | $ut | index($k) | not) | .value.filesystem.allowWrite[]? | str ] | unique))
+               sb_r=(\([ $l | to_entries[] | select(.key as $k | $ut | index($k) | not) | .value.filesystem.allowRead[]? | str ] | unique))
                sb_dr=(\([ $l[] | .filesystem.denyRead[]? | str ] | unique))"' 2>/dev/null)" || exit 3
     eval "$sb_sh"
 fi

@@ -24,7 +24,8 @@ conventions every session is expected to know.
   fourth `skipped` state, because every `skipped` line in the summary names a flag
   (`--no-service`), and that would be false here. Two steps are exceptions: `--link-memory` is valid in the container and
   is honoured, and the VS Code extension has a container counterpart (the explorer
-  `.container/install-extensions.sh` builds), which the exit names instead of calling it the host's. Pinned by
+  `.container/install-extensions.sh` builds, run from the root-owned mirror
+  `/usr/local/lib/jkb-container/.container/`), which the exit names instead of calling it the host's. Pinned by
   `scripts/tests/container-hooks.test.sh`, which runs `setup.sh` with stub `cargo` and `jkb`, and
   asserts `jkb` was asked nothing but its version. That case runs a **copy** of `setup.sh` in a
   scratch repository, with every service manager stubbed. Watching it fail means deleting the very
