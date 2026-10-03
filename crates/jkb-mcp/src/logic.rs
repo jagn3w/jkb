@@ -312,7 +312,7 @@ pub fn task_next(tools: &Tools, args: &QueryArgs) -> Result<Answer> {
 /// Returns an error if the namespace is malformed, the source can't be read or rendered, or capture
 /// fails.
 pub fn ingest(tools: &Tools, args: &IngestArgs, kind: SourceKind) -> Result<Answer> {
-    let is_url = args.source.starts_with("http://") || args.source.starts_with("https://");
+    let is_url = jkb_ingest::is_url(&args.source);
     match (kind, is_url) {
         (SourceKind::Path, true) => {
             return Err(Error::Source(

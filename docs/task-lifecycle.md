@@ -933,65 +933,82 @@ types and the generic ones map to nothing; and **a `PreToolUse` can be followed 
 (a permission refusal after the hook ran), so tickets are also released at `SubagentStop` and
 `SessionEnd`, with a 10-minute backstop.
 
-**What the hook approves, and what it declines to answer.** The hook returns `allow` only for one
-plain `jkb` invocation — the command word literally `jkb`, with no path component — that cannot run
-a shell command, and is not `task land`, which runs the gate. That is what a `Bash(jkb:*)` rule
-would approve, with every request it makes held to the ticket's role. It returns `ask` for a
-command that may be `task land` or `task gate` (which stores the command the next land runs, out
-of that land's prompt), for a line it cannot model, and for a line where anything but `jkb` and a
-short allowlist runs (below). For the rest — every command `jkb` itself or allowlisted — it
-returns **no `permissionDecision` at all**, and the session's own rules and prompt judge the call
-against the
-command as the model wrote it, not the rewritten one carrying `export JKB_ATTEST=…` — measured, see
-below — exactly as they did before this hook existed. A command the classifier cannot model is asked,
-because `land` cannot be ruled out of it — and that includes a redirect or a comment, so `jkb …
-2>&1` prompts. Deferring redirects was tried and reverted in the same series: review round 6
-measured a redirect operator spelled with `&` or `|` (`jkb task 2>&1 land x`) split as a command
-separator, and a quote inside a comment or a here-doc body opening a quote that bash never saw,
-each deferring a `land` bash runs. Doing it safely needs redirects, here-docs and comments lexed as
-bash lexes them.
+**What the hook decides: it never asks.** The hook mints the ticket and approves or stays out of
+the way; it never forces a prompt. What a ticketed `jkb` may DO is the daemon's RBAC, held against
+the ticket on every request. Three answers:
 
-**A ticket goes only where nothing but `jkb` can use it.** The ticket is `export`ed for the whole
-line, so every child of the command inherits it. A line is deferred only when every command in it
-is `jkb` itself — by that exact command word, resolved on `PATH` — or one of a short `HARMLESS`
-allowlist (`cd`, `true`, `false`, `:`, `echo`, `cat`, `head`, `tail`, `wc`, `uniq`, `grep`, `jq`)
-that cannot run other code or repoint `jkb`. Anything else on the line is asked, with the ticket
-minted so an approved line still works; a line that only *mentions* jkb, as a harmless command's
-argument, is skipped. `cd` is on the list only because `PATH` holds no relative or empty entry, so
-the directory cannot change which `jkb` runs — measured on the container's real `PATH`, eleven
-entries, all absolute. (A first measurement, ten entries, was of the Mac's `PATH`, which a stray
-`env.PATH` in the shared `.claude/settings.local.json` had substituted for the image's; same
-conclusion, wrong `PATH`. That substitution is what a session sees when `jkb` will not resolve by
-name.) `sort`,
-`printf`, `sed` and `awk` are deliberately off it (`--compress-program`, `printf -v PATH`, `e`,
-`system()`).
+- **`allow`** for a line whose every command is `jkb` itself — the command word literally `jkb` —
+  or one of a short `HARMLESS` allowlist (`cd`, `true`, `false`, `:`, `echo` — shell builtins with
+  no path to run other code, read or write a file, or repoint `jkb`). So `jkb task show x` and
+  `cd repo && jkb workflow next` never prompt, in any mode. No reader is on the list, by the user's
+  decision (2026-10-02): with `cat`, `grep`, `head`, `tail`, `wc` and `jq` on it, `jkb ls; cat
+  ~/repos/other/.env` was approved and read a file past any rule the person had for reads. So
+  `jkb … | jq .status` is deferred — under the auto posture still unprompted, under stricter rules
+  theirs. The same decision covers `jkb` itself where it reads a file the caller *names* and sends
+  the daemon only the text — `jkb ingest <path>` (a URL is rendered, and stays approved), `jkb mcp`
+  (its `ingest_path` tool), `jkb task review file --from <file>` (from `-` stays approved). RBAC
+  judges the op, never which file fed it, so `jkb ingest ~/repos/other/.env` approved would read
+  past a read rule exactly as `cat` did; the container sees every project under `~/repos`. An
+  inline gate is deferred for the same reason and more: `jkb task land x --gate '<cmd>'` runs a
+  command the caller wrote with `sh -c`, so `--gate 'cat ~/repos/other/.env'` is `cat` again
+  (review round 2 of this change). `jkb task land x` with the gate the host stored stays approved.
+  Which commands these are is `remote::beyond_rbac`, an exhaustive match beside `remote::support`,
+  asked of the words as `jkb`'s own clap parser reads them; words that parser refuses are deferred
+  too, except help and the version, which it reports as errors but which read nothing.
+- **no `permissionDecision`** for any other line that mentions `jkb`: one that also runs something
+  else (`jkb ls && git status`), one the classifier cannot model (a redirect, `$`, a glob, a bare
+  tilde), one that reaches `jkb` by a path, a prefix or a wrapper (`~/.cargo/bin/jkb`, `FOO=1 jkb`,
+  `sh -c "jkb …"`). The line is ticketed and the session's own rules judge it, against the command as
+  the model wrote it, not the rewritten one carrying `export JKB_ATTEST=…` (measured, below) —
+  approving it would approve the rest of the line past whatever rule the person set for that.
+- **nothing at all**, no ticket either, for a line that only *mentions* jkb as a harmless command's
+  argument (`echo jkb`). A reader's mention (`grep -rn jkb src`) is now deferred and ticketed, since a
+  reader is not on the list; the unused ticket costs nothing.
 
-**Superseded twice on the way there.** Round 7 found a ticket inherited by a `jkb` the model never
-saw run — `sh -c "jkb task land x"`, `… | xargs jkb task`, `env -S "…"` — each deferred, each a
-ticketed `land` unprompted. The answer then was to model which `jkb` is *visible* (command position,
-after assignments and argv-preserving wrappers) and treat the rest as hidden. Round 8 measured that
-answer unsound: whether a hidden `jkb` exists cannot be read off the text — a glob inside quotes
-(`sh -c '~/.cargo/bin/jk? task land x'`), a script file, `make`, `jkb ls | ./evil.sh`, `LD_PRELOAD=`
-or `PATH=` in front of the `jkb`, `hash -p`, `printf -v PATH` each ran or repointed one out of sight.
-Naming the dangerous cases kept falling short; naming the safe ones does not. Pinned by
-`run_through_bash_a_hidden_jkb_never_inherits_a_ticket_for_a_land`, whose oracle puts a fake `jkb`
-*program* on `PATH` as well as the shell function — the function alone is invisible to a child shell
-and to `xargs`, which is why no earlier test could see any of this — and by `HARMLESS` being pinned
-as a literal list, since growing it is the dangerous direction.
+Only an `allow` overrides the session's rules, so only an approved line has to be understood, and
+the property the tests hold is that one: an approved line runs nothing but `jkb` and harmless
+commands. `cd` is harmless only because `PATH` holds no relative or empty entry, so the directory
+cannot change which `jkb` runs — measured on the container's real `PATH`, eleven entries, all
+absolute. (A first measurement, ten entries, was of the Mac's `PATH`, which a stray `env.PATH` in
+the shared `.claude/settings.local.json` had substituted for the image's; same conclusion, wrong
+`PATH`. That substitution is what a session sees when `jkb` will not resolve by name.) `sort`, `printf`, `sed`, `awk` and `uniq` are deliberately off the list
+(`--compress-program`, `printf -v PATH`, `e`, `system()`, `uniq IN OUT` overwriting a binary).
 
-**Why `land` alone keeps the prompt.** `land` runs the repository's gate through `sh -c` with a
-command the *caller* supplies (`--gate`), so it is arbitrary execution wearing a `jkb` spelling.
-Deferring it would let that ride in under a `Bash(jkb:*)` allow rule — a rule whose author said
-"jkb commands are fine", not "any shell command spelled as a jkb command is fine". That is the one
-case where the hook's `ask` was the only thing in the way; `may_land` in the daemon decides *who*
-may land, not *what* their gate runs. Two consequences follow. A command whose words cannot be
-modelled at all is asked rather than deferred, because `land` cannot be ruled out in it — and the
-sharpest instance is a bare tilde: `jkb --json task ~ task:x --gate '…'` mentions no `land`, yet
-under `HOME=land` bash passes `task land … --gate …`. And a command *list* is judged command by
-command, so `cd repo && jkb workflow next` is understood as two commands, neither a `land`, and
-needs no prompt, while `jkb task add 'ok' && jkb task land x` is asked on its second command.
+**Superseded: the forced prompts, 2026-10-02.** The hook used to answer `ask` — on `task land` and
+`task gate`, on lines it could not model, and on lines where a `jkb` might run out of sight — and a
+`PreToolUse` `ask` overrides an allow rule, so a mechanism meant to be invisible kept putting
+prompts in front of the person, including on commands that only mentioned the repo's path
+(`cd /home/vscode/repos/jkb && … 2>&1`, which an unmodellable-line rule asked). The user's rule
+reversed it: the ticket is authorization, and RBAC decides. Each prompt was standing in for
+something already covered. *Who* may land is `may_land`, asked before the graft moves the
+target, the gate runs or the session is archived (`task.land_check`) — though not before every
+side effect: the `.git/info/exclude` entry, the land lease and adopting the target from its remote
+come first. *What* a landing's gate runs is `sh -c` inside the same Bash sandbox as every
+agent command, so it reaches nothing the agent could not reach itself — and the default gate is a
+repo script the agent can edit anyway, so a prompt on `--gate` guarded nothing. (That held against
+a *prompt*, not against an *approval*: "nothing the agent could not reach itself" is the sandbox's
+reach, the very bar the reader decision rejected, so an inline `--gate` is now deferred to the
+person's rules — never asked — as recorded above.) A stored gate cannot
+be set from the container at all (`remote.rs` refuses it); `--gate-on-host` needs `task.ran_on_host`,
+operator-only. And `main` changes only through a PR, whose CI is the verification that counts — the
+in-sandbox gate is a fast pre-check a session can weaken only for itself. A ticket inherited by
+another program on the line can do only what its role may.
 
-**Superseded: `ask` for anything that is not one plain invocation.** That was the whole of the
+**The earlier answers, kept for the diagnosis.** Before that reversal, `land` kept a prompt because
+`--gate` runs a caller-supplied command and `may_land` decides who lands, not what the gate runs;
+the reversal answers that with the sandbox and CI rather than a prompt. Round 7 found a ticket
+inherited by a `jkb` the model never saw run — `sh -c "jkb task land x"`, `… | xargs jkb task`,
+`env -S "…"` — and round 8 measured that whether such a `jkb` exists cannot be read off the text (a
+glob inside quotes, a script file, `make`, `jkb ls | ./evil.sh`, `LD_PRELOAD=`/`PATH=` prefixes,
+`hash -p`, `printf -v PATH`); naming the dangerous cases kept falling short, naming the safe ones did
+not, which is why the approval rule is an allowlist. Those lines are now deferred rather than asked,
+and the bash-backed tests still run them — 
+`run_through_bash_a_line_that_runs_jkb_out_of_sight_is_never_approved`, whose oracle puts a fake `jkb` *program* on `PATH` as well as the shell function,
+and `run_through_bash_a_redirect_comment_or_heredoc_is_never_approved` for round 6's shapes — to
+hold that none of them is ever approved. `HARMLESS` is pinned as a literal list, since growing it is
+the dangerous direction.
+
+**Superseded, twice: `ask` for anything that is not one plain invocation.** That was the whole of the
 over-prompting, and it was a design error rather than a tuning problem. A `PreToolUse` `ask`
 *overrides* an allow rule, so adding attestation quietly took a decision that belonged to the
 user's settings and made it more conservatively than they had: every `cd repo && jkb …` and
@@ -1001,8 +1018,9 @@ user's settings and made it more conservatively than they had: every `cd repo &&
 the ticket. It was first applied to every non-plain line, on the reasoning that it "costs nothing
 on the security axis" because a ticket is an authorization fact rather than a permission grant.
 Rounds 7 and 8 refuted that: the ticket is exported for the whole line, so any other program on it
-inherits the authorization, and `jkb ls && rm -rf …` — the very example above — is asked again
-for that reason.
+inherits the authorization, and `jkb ls && rm -rf …` — the very example above — was asked again
+for that reason, until the 2026-10-02 reversal above: it is now deferred, ticketed, with RBAC
+bounding what the inherited ticket may do.
 
 The rewrite still goes out for every ticketed class, because that is how the ticket reaches `jkb`
 and it is a genuine per-tool-call secret: **each Bash tool call runs in its own PID namespace**
@@ -1018,7 +1036,7 @@ either answer.
 
 *`updatedInput` is applied with no `permissionDecision`.* `cd /tmp && ~/.cargo/bin/jkb role
 whoami` — a two-command list, deferred at the time, for which the hook then emitted no decision
-(under the allowlist that followed, a path to `jkb` is asked; the mechanism measured still holds) —
+(a path to `jkb` was later asked, and is now deferred again; the mechanism measured holds) —
 arrived with `JKB_ATTEST` set, and the daemon answered `coordinator` rather than `Unauthorized`.
 The schema had marked the field optional, but that was read out of the installed bundle; this is
 the observation. Had it gone the other way, every deferred call would have lost its ticket.
@@ -1028,13 +1046,14 @@ jkb role whoami` ran with **no** permission prompt, where the old hook forced on
 here had been that the rules match the rewritten command (`export JKB_ATTEST=…; cd … && jkb …`), in
 which case the `export` part would match no rule and prompt anyway. The deny-rule probe
 (`Bash(export:*)` in `permissions.deny`, then one deferred call) produced an approval prompt rather
-than a refusal, so the rules see the original text. That is also why the prefix spellings matter:
-a `Bash(jkb:*)` rule is matched against the text the model wrote, which is why `land` is located
-wherever the `jkb` word sits rather than only at index 0.
+than a refusal, so the rules see the original text: a `Bash(jkb:*)` rule is matched against the
+text the model wrote. (That once mattered for locating `land` behind a prefix; the classifier no
+longer looks for `land` at all.)
 
 A trap met while measuring, worth keeping: a probe that itself contains `$` — `echo
-${JKB_ATTEST:+present}` — is asked by design, because a command this cannot model cannot be
-cleared of `land`. It looked like the fix failing and was the guard working.
+${JKB_ATTEST:+present}` — was asked by design at the time, because a command the classifier cannot
+model could not be cleared of `land`. It looked like the fix failing and was the guard working.
+(It is now deferred: an unmodellable line is simply not approved.)
 
 **Rollback**: `JKB_ATTEST_DECISION=ask` forces the prompt on every ticketed class
 with no rebuild — the hook binary is pinned and root-owned, so a rollback that needs one is not a
@@ -1050,11 +1069,15 @@ so `jkb query 'status!=done'` and `jkb task add 'Fix it !p1 #area=hook'` were as
 `PreToolUse` `ask` overrides an allow rule, anyone with `Bash(jkb:*)` newly saw a prompt on the most
 ordinary calls there are. The rule now turns on whether the shell would read a character as syntax:
 
-- `$`, a backtick and a backslash are refused **anywhere**, quoted or not. They are what the word
+- `$`, a backtick and a backslash keep a line from being approved **anywhere**, quoted or not
+  (they were "refused" when this was written; such a line is now deferred). They are what the word
   reader cannot model — the first two substitute inside double quotes, the third escapes the quoting
   itself — so with any of them present its output is not a model of anything.
-- Every other metacharacter (`; & | < > ( ) { } # ! * ? [ ]` and a line break) is refused only when
-  it appears **bare**. Inside either kind of quote the shell passes it through as text.
+- Every other metacharacter matters only when it appears **bare**; inside either kind of quote the
+  shell passes it through as text. Bare, the separators `; & |` and a line break SPLIT the line into
+  commands, each judged on its own; `< > ( ) { } # * ? [ ]` leave nothing the classifier can model,
+  and `!` and a carriage return are read as word breaks — a line carrying any of these is not
+  approved (it was "refused" when this was written; it is now deferred).
 - A `~` is in neither list, because it has no quoted spelling that still expands. A word holding an
   unquoted `~` anywhere is accepted only when it also carries a `/`, so that whatever the tilde
   expands to, the `/` survives. "Anywhere" is load-bearing: bash expands a tilde after an
