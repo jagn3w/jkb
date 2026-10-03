@@ -562,9 +562,21 @@ $(dc_kit_paths)
 EOF
     # ...AND THE COPY IS CHECKED, not only the source: the source check runs before the copy, and a
     # link the agent made between the two landed in the kit (review round 14, reproduced in 6 of 40
-    # runs with a toggling link). Nothing but this function writes $new, so this answer holds.
+    # runs with a toggling link). Nothing but this function writes $new, so this answer holds -- FOR
+    # SYMLINKS AND SPECIAL FILES. A HARD LINK IT CANNOT SEE: cp writes a fresh file with one link
+    # whatever it read (review round 23). So the SOURCE is checked again after the copy, which catches
+    # a hard link still in place; one made before cp reached the file and removed before this second
+    # look is not caught. That residual needs a lost race AND a hard link to a host secret, which the
+    # container cannot make (above) and which is unmeasured on the macOS host; .container/README.md
+    # records it.
     odd="$(dc_unsafe_entries "$new")"
     [ -z "$odd" ] || { echo "dc_install_kit: refusing: the copy holds something that is not a regular file or a directory (it appeared in the checkout during the copy): $odd" >&2; rm -rf "$new"; return 1; }
+    while IFS= read -r p; do
+        odd="$(dc_unsafe_entries "$src/$p")"
+        [ -z "$odd" ] || { echo "dc_install_kit: refusing: $p changed during the copy and now holds a link, a special file or a second hard link: $odd" >&2; rm -rf "$new"; return 1; }
+    done <<EOF
+$(dc_kit_paths)
+EOF
     printf 'checkout=%s\n' "$src" > "$new/$DC_KIT_MARKER" || { rm -rf "$new"; return 1; }
     chmod -R go-w "$new" && chmod 0755 "$new" || { rm -rf "$new"; return 1; }
     old=""

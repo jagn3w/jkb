@@ -143,6 +143,21 @@ is_linked_worktree() {
     [ "$(_real_dir "$gd")" != "$(_real_dir "$cd")" ]
 }
 
+# kit_decision <repo_root> — whether setup.sh may refresh the shared dev container kit from here:
+# `install` in a main checkout, `worktree` in a linked one, `undecided` when git would not say (an old
+# git without --path-format, a safe.directory refusal, a lock). setup.sh's `&& is_linked_worktree` read
+# that third answer as "main checkout" and refreshed the kit from what may be a task branch (review
+# round 23) -- so the three answers are spelled out here, in the callee, where no caller can fold two.
+kit_decision() {
+    local rc=0
+    is_linked_worktree "$1" || rc=$?
+    case "$rc" in
+        0) printf 'worktree\n' ;;
+        1) printf 'install\n' ;;
+        *) printf 'undecided\n' ;;
+    esac
+}
+
 # main_checkout_of <repo_root> — the MAIN checkout of the repository <repo_root> is in: itself when
 # it is not a linked worktree, else the first entry `git worktree list` gives. Taking the common
 # dir's parent named a --separate-git-dir checkout's git-dir parent instead (review round 17). setup.sh decides with is_linked_worktree and uses this
@@ -1671,6 +1686,7 @@ render_setup_summary() {
                     unchanged) printf '  • container:  the kit already matched this checkout; start it from %s/.container/run.sh\n' "$detail" ;;
                     skipped)   printf '  • container:  kit skipped (--no-kit)\n' ;;
                     worktree)  printf '  • container:  kit left alone: this is a linked worktree, and the kit follows the main checkout\n' ;;
+                    undecided) printf '  • container:  kit left alone: git would not say whether this is a linked worktree (see the warnings above)\n' ;;
                     failed)    printf '  • container:  kit NOT installed; see the warnings above\n' ;;
                     *)         warn "unrecognised kit state: $line" ;;
                 esac ;;

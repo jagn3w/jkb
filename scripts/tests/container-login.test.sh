@@ -179,11 +179,15 @@ run_sh_with_stub() { # run_sh_with_stub <state> <flag> -> sets $calls (one docke
     local d="$work/rs-$RANDOM"; mkdir -p "$d/bin" "$d/home"
     rs_home="$d/home"
     ln -s "$(dirname "$repo_root")" "$d/home/repos"
-    cat > "$d/bin/docker" <<'STUB'
+    # PATHS BAKED IN, not read from the environment: run.sh re-executes itself under `env -i` with an
+    # allowlist (review round 23), so a STUB_LOG in the env would never reach the stub. It also records
+    # the environment it was run with, so a case can ask what run.sh's children inherit.
+    cat > "$d/bin/docker" <<STUB
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "$STUB_LOG"
-case "$1" in
-    inspect) [ "$STUB_STATE" = missing ] && exit 1; printf '%s\n' "$STUB_STATE" ;;
+printf '%s\\n' "\$*" >> "$d/calls"
+env >> "$d/child-env"
+case "\$1" in
+    inspect) [ "$1" = missing ] && exit 1; printf '%s\\n' "$1" ;;
 esac
 exit 0
 STUB
@@ -203,7 +207,8 @@ STUB
     [ -z "${RS_KIT:-}" ] || script="$d/home/.local/share/jkb-container-kit/kit/.container/run.sh"
     # The keep file: run.sh drops PATH entries under /tmp, where this stub lives (see its top).
     mkdir -p "$d/home/.local/share/jkb-container-kit"; printf '%s\n' "$d/bin" > "$d/home/.local/share/jkb-container-kit/path-keep"
-    env HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" STUB_LOG="$d/calls" STUB_STATE="$1" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} \
+    rs_dir="$d"
+    env HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} ${RS_EXTRA_ENV:-} \
         bash "$script" "$2" >"$d/out" 2>&1
     rs_out="$(cat "$d/out")"
     calls="$(cut -d' ' -f1 "$d/calls" | tr '\n' ' ')"
@@ -362,6 +367,22 @@ case20_the_path_filter_ignores_the_environment() {
     case "$h" in */jkb-env.*) rm -rf -- "$h" ;; esac
 }
 
+# run.sh's CHILDREN INHERIT NOTHING FROM THE LAUNCHING TERMINAL beyond an allowlist: -p kept run.sh's
+# own shell from BASH_ENV, but docker, tar and `code` still got DOCKER_CONFIG (whose cli-plugins
+# docker runs), TAR_OPTIONS (checkpoint-action=exec) and BASH_ENV from a committed
+# terminal.integrated.env (review round 23).
+case21_run_sh_children_inherit_only_the_allowlist() {
+    RS_EXTRA_ENV="BASH_ENV=/tmp/x.sh DOCKER_CONFIG=/tmp/d TAR_OPTIONS=--checkpoint=1 JKB_PLANTED=1" run_sh_with_stub true --stop
+    local leaked
+    leaked="$(grep -E '^(BASH_ENV|DOCKER_CONFIG|TAR_OPTIONS|JKB_PLANTED)=' "$rs_dir/child-env" 2>/dev/null | cut -d= -f1 | sort -u | tr '\n' ' ')"
+    if [ -s "$rs_dir/child-env" ] && [ -z "$leaked" ] && grep -q '^HOME=' "$rs_dir/child-env"; then
+        ok "run.sh's children get the allowlisted environment (HOME kept) and none of BASH_ENV, DOCKER_CONFIG, TAR_OPTIONS or an unknown variable"
+    else
+        fail "run.sh's children get the allowlisted environment (HOME kept) and none of BASH_ENV, DOCKER_CONFIG, TAR_OPTIONS or an unknown variable" \
+            "leaked: [$leaked] child-env lines: $(wc -l < "$rs_dir/child-env" 2>/dev/null)"
+    fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -371,5 +392,6 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case13_the_checkouts_run_sh_refuses_without_the_override case14_the_kits_run_sh_stops_and_sources_the_mirror \
           case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run \
           case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored \
-          case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment
+          case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment \
+          case21_run_sh_children_inherit_only_the_allowlist
 finish

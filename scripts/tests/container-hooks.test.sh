@@ -829,6 +829,27 @@ case35_a_hard_link_in_the_checkout_is_refused() {
     fi
 }
 
+# A HARD LINK MADE DURING THE COPY: cp writes a fresh one-link file, so the copy check cannot see it,
+# and only checking the source again after the copy can (review round 23). The stub cp plants the hard
+# link in the SOURCE once it has copied, as a toggling agent would.
+case35b_a_hard_link_made_during_the_copy_is_refused() {
+    local d="$work/hlr-$RANDOM" co kit p err rc=0 realcp
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts" "$d/host" "$d/bin"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    printf 'HOST SECRET\n' > "$d/host/key"
+    ln "$d/host/key" "$d/probe" 2>/dev/null || { skip "case35b: cannot make a hard link here"; return 0; }
+    realcp="$(type -P cp)"
+    printf '#!/bin/sh\n"%s" "$@" || exit\nln "%s" "%s/.container/k-raced" 2>/dev/null\nexit 0\n' "$realcp" "$d/host/key" "$co" > "$d/bin/cp"
+    chmod +x "$d/bin/cp"
+    err="$(PATH="$d/bin:$PATH" dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'changed during the copy' <<<"$err" && [ ! -e "$kit" ]; then
+        ok "a hard link that appears in the checkout during the copy is refused, and no kit is installed"
+    else
+        fail "a hard link that appears in the checkout during the copy is refused, and no kit is installed" "rc=$rc err=$err"
+    fi
+}
+
 # ONE derivation of the checkout a kit script serves, for setup.sh, verify.sh and
 # install-extensions.sh (review round 18): JKB_REPO_ROOT, else the checkout you stand in when running
 # from the mirror, else the script's own checkout.
@@ -886,5 +907,5 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case33_an_older_flat_kit_is_removed \
           case34_a_link_that_appears_during_the_copy_is_refused \
           case35_a_hard_link_in_the_checkout_is_refused \
-          case36_the_checkout_a_kit_script_serves
+          case35b_a_hard_link_made_during_the_copy_is_refused case36_the_checkout_a_kit_script_serves
 finish

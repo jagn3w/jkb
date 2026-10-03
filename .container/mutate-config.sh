@@ -1759,6 +1759,52 @@ open(p, 'w').write(s.replace(old, 'DC_KIT_HOME="${JKB_CONTAINER_KIT_HOME:-$HOME/
 PYX
 run "lib.sh lets the environment move the kit again" "lets JKB_CONTAINER_KIT_HOME move the kit"
 
+# REVIEW ROUND 23. Every piece of the physical comparison, the env re-exec, and where path-keep lives.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'jkb_p="$(printf \'%s\' "$jkb_p" | /usr/bin/tr \'[:upper:]\' \'[:lower:]\')"; '
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "run.sh's PATH filter stops case-folding entries" "so a home spelled with other case"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'jkb_r="$(cd -P -- "$jkb_r" 2>/dev/null && pwd -P || printf \'%s\' "$jkb_r")"; '
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "run.sh's PATH filter stops resolving its roots physically" "so a home spelled with other case"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '[ "$jkb_env_extra" -eq 0 ] || exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" "$@"; '
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "run.sh stops re-executing under an allowlisted environment" "does not re-execute under an allowlisted environment"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '|DOCKER_HOST|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '|DOCKER_CONFIG|DOCKER_HOST|', 1))
+PYX
+run "run.sh's environment allowlist lets DOCKER_CONFIG through" "names a variable that steers what its children run"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'jkb_keepf="$HOME/.config/jkb/path-keep"', 1))
+PYX
+run "run.sh reads its PATH keep list from outside the kit home" "not from the kit home"
+
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -2420,7 +2466,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=33
+PINNED_UNSB_APPENDS=39
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

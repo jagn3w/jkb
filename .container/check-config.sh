@@ -702,27 +702,46 @@ for dc_s in sweep-transcripts verify; do
 done
 # run.sh ITSELF runs as you on the host, and finds bash, jq and docker by name: an absolute shebang
 # in privileged mode,
-# and as its first command after `set`, the filter dropping every PATH entry an agent can write
+# and, right after the allowlist re-exec below, the filter dropping every PATH entry an agent can write
 # (under $HOME, /tmp, /private). A planted ~/.cargo/bin/jq ran as you at the next start without it
 # (review round 11).
-dc_run_cmds="$(dc_strip_comments "$here/run.sh" | sed '1d' | grep -E '[^[:space:]]' | head -2)"
+dc_run_cmds="$(dc_strip_comments "$here/run.sh" | sed '1d' | grep -E '[^[:space:]]' | head -3)"
 # PRIVILEGED MODE TOO, as the hook has: without -p, bash runs the launching terminal's BASH_ENV and
 # imports its exported functions, before any of this file runs (review round 21).
 [ "$(head -1 "$here/run.sh")" = '#!/bin/bash -p' ] \
     || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash -p, so bash itself is found through PATH, or runs the launching terminal's BASH_ENV and exported functions;"
+# ...AFTER RE-EXECUTING UNDER AN ALLOWLISTED ENVIRONMENT, as the command before the filter: -p keeps
+# BASH_ENV out of run.sh's own shell, but its children read DOCKER_CONFIG, TAR_OPTIONS and the rest
+# from a launching terminal (review round 23). The allowlist must not name those.
+case "$(sed -n 2p <<<"$dc_run_cmds")" in
+    *'compgen -e'*'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" "$@"'*)
+        case "$(sed -n 2p <<<"$dc_run_cmds")" in
+            *DOCKER_CONFIG*|*BASH_ENV*|*TAR_OPTIONS*|*LD_*|*DYLD_*|*TMPDIR*|*'|*)'*|*' *)'*'jkb_env+='*) dc_unsb="$dc_unsb run.sh's environment allowlist names a variable that steers what its children run;" ;;
+        esac ;;
+    *) dc_unsb="$dc_unsb run.sh does not re-execute under an allowlisted environment (env -i) before its PATH filter, so its children inherit the launching terminal's DOCKER_CONFIG, TAR_OPTIONS and BASH_ENV;" ;;
+esac
 # ...TAKING NO ORDERS FROM THE ENVIRONMENT: the keep list is a file in the kit home, and an entry is
 # judged by its physical path, since a terminal's env (a committed terminal.integrated.env) set the old
 # JKB_RUN_PATH_KEEP, and a `//` spelling passed the textual match (review round 22).
-case "$(sed -n 2p <<<"$dc_run_cmds")" in
+case "$(sed -n 3p <<<"$dc_run_cmds")" in
     *JKB_RUN_PATH_KEEP*) dc_unsb="$dc_unsb run.sh's PATH filter reads JKB_RUN_PATH_KEEP from the environment, which a launching terminal sets;" ;;
     *'jkb-container-kit/path-keep'*'jkb_p="$(cd -P -- "$jkb_d" 2>/dev/null && pwd -P)"'*) ;;
     *) dc_unsb="$dc_unsb run.sh's PATH filter does not read its keep list from the kit home's path-keep file and compare physical paths;" ;;
 esac
+# ...EVERY PIECE of the physical comparison, each of which alone reopens a spelling: the roots resolved
+# with cd -P, and both sides case-folded (`/USERS/you/...` on APFS). Deleting either passed every gate
+# (review round 23).
+for dc_piece in 'jkb_r="$(cd -P -- "$jkb_r" 2>/dev/null && pwd -P' \
+                'jkb_roots+=("$(printf '"'"'%s'"'"' "$jkb_r" | /usr/bin/tr '"'"'[:upper:]'"'"' '"'"'[:lower:]'"'"')")' \
+                'jkb_p="$(printf '"'"'%s'"'"' "$jkb_p" | /usr/bin/tr '"'"'[:upper:]'"'"' '"'"'[:lower:]'"'"')"'; do
+    grep -qF -- "$dc_piece" <<<"$(sed -n 3p <<<"$dc_run_cmds")" \
+        || dc_unsb="$dc_unsb run.sh's PATH filter lacks [$dc_piece], so a home spelled with other case or through a link passes;"
+done
 grep -q 'JKB_CONTAINER_KIT_HOME' <<<"$(dc_strip_comments "$here/lib.sh")" \
     && dc_unsb="$dc_unsb lib.sh lets JKB_CONTAINER_KIT_HOME move the kit, and a launching terminal sets it;"
-case "$(sed -n 2p <<<"$dc_run_cmds")" in
+case "$(sed -n 3p <<<"$dc_run_cmds")" in
     *'"$HOME"/*'*'/tmp/*'*'/private/*'*'/var/folders/*'*'PATH="${jkb_path:-/usr/bin:/bin}"; export PATH'*) ;;
-    *) dc_unsb="$dc_unsb run.sh does not drop agent-writable PATH entries as its first command after set;" ;;
+    *) dc_unsb="$dc_unsb run.sh does not drop agent-writable PATH entries as its first command after set and the env re-exec;" ;;
 esac
 # EVERY EXEC IN run.sh, not the two above: round 7 fixed the sweep and verify.sh and left seven
 # others -- `bash -c` for the login, `bash -lc` for the reap, `sh`, `sudo` -- resolving through the
@@ -875,6 +894,13 @@ while IFS= read -r dc_src; do
     fi
 done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(.mounts // [])[] | split(",")[] | select(startswith("source=")) | ltrimstr("source=")' 2>/dev/null)"
 [ "$dc_kit_nsrc" -gt 0 ] || dc_kit_where="$dc_kit_where container.json's mount sources could not be read, so whether a bind holds it is unchecked;"
+# ...AND run.sh READS ITS PATH KEEP LIST FROM THIS SAME HOME. It spells the location itself, because
+# the filter runs before lib.sh is sourced, so a move of DC_KIT_HOME that left it behind would have run.sh
+# trust a file that is neither made 0700 nor Edit-denied, with every check here green (review round 23).
+dc_keepf="$(sed -n 's/.*jkb_keepf="\([^"]*\)".*/\1/p' "$here/run.sh" | head -1)"
+dc_keepf="${dc_keepf//\$HOME//kit-home-probe}"
+[ -n "$dc_keepf" ] && [ "${dc_keepf%/*}" = "$dc_kit_home" ] \
+    || dc_kit_where="$dc_kit_where run.sh reads its PATH keep list from [${dc_keepf:-nothing found}], not from the kit home [$dc_kit_home];"
 # ...AND THE PATH run.sh KEEPS. Its filter drops everything under the home and the temp roots and
 # keeps the system and Homebrew prefixes, where docker and jq live. Homebrew's are owned by the user,
 # so the in-process Write tool, which no sandbox confines, could replace a jq there that run.sh then

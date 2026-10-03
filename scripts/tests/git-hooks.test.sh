@@ -2698,6 +2698,15 @@ case_kit_linked() {
     else
         fail "kit: linked worktree" "main=$r1 worktree=$r2 separate=$r3 (want 1 0 1) sep-main=$sm"
     fi
+    # ...and the THIRD answer is its own: outside any repository git will not say, and setup.sh read
+    # that as "main checkout" and refreshed the shared kit (review round 23).
+    local k1 k2 k3
+    k1="$(kit_decision "$main")"; k2="$(kit_decision "$wt")"; k3="$(kit_decision "$work")"
+    if [ "$k1:$k2:$k3" = install:worktree:undecided ]; then
+        ok "kit_decision: install in the main checkout, worktree in a linked one, undecided where git will not say"
+    else
+        fail "kit: kit_decision" "main=$k1 worktree=$k2 outside=$k3 (want install worktree undecided)"
+    fi
 }
 
 run_cases case_kit_main case_kit_linked case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m

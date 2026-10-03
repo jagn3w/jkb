@@ -1481,6 +1481,7 @@ case15() {
         'kit=unchanged /h/.local/share/jkb-container-kit/kit|already matched this checkout'
         'kit=skipped /h/k|kit skipped (--no-kit)'
         'kit=worktree /h/k|kit left alone: this is a linked worktree'
+        'kit=undecided /h/k|git would not say whether this is a linked worktree'
         'kit=failed /h/k|kit NOT installed'
     )
     for entry in "${table[@]}"; do

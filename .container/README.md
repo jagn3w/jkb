@@ -459,7 +459,8 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   and 12). It runs as you, and the host posture lets a sandboxed agent write `~/.cargo`, `~/.jkb`,
   `~/.cache` and the temp roots. `~/.cargo/bin` comes first on `PATH`, so a planted `jq` or `docker`
   ran at the next start. The shebang is `#!/bin/bash -p` (the `-p` since review round 21, below), and
-  the first command drops every `PATH` entry under your home, `/tmp`, `/private` or `/var/folders`,
+  the first command after it restarts `run.sh` under an allowlisted environment (review round 23,
+  below) drops every `PATH` entry under your home, `/tmp`, `/private` or `/var/folders`,
   along with relative ones. Since review round 22 an entry is judged by its **physical, case-folded**
   path, so `/home//you/.cargo/bin`, or `/USERS/you/...` on APFS, is dropped too. Every `jq` it runs goes
   through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq` readers build
@@ -504,9 +505,24 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   `export BASH_ENV=/tmp/x.sh`, would have run in `run.sh` before its `PATH` filter, because
   `#!/bin/bash` sources `BASH_ENV`. Round 21 closed that in `run.sh` itself: its shebang is now
   `#!/bin/bash -p`, which ignores `BASH_ENV` and exported functions, so a terminal whose environment
-  was set some other way (a VS Code `terminal.integrated.env`, direnv) cannot steer it either. Only you edit these files, so the denies cost nothing.
+  was set some other way (a VS Code `terminal.integrated.env`, direnv) cannot steer it either.
+  `-p` covers only `run.sh`'s own shell. Its children read their own variables: `DOCKER_CONFIG`
+  names the CLI plugins `docker` runs, and `TAR_OPTIONS` can carry `--checkpoint-action=exec`. So
+  since review round 23, `run.sh` restarts itself under `env -i` whenever its environment holds
+  anything outside an allowlist. The allowlist is `HOME`, `PATH`, the locale and terminal names,
+  `USER`/`LOGNAME`, `DOCKER_HOST`/`DOCKER_CONTEXT` and `JKB_RUN_FROM_CHECKOUT`. The two Docker
+  names are trusted on purpose: they choose a daemon, not code to run. `check-config.sh` refuses
+  an allowlist that names a variable which steers what a child runs. **What this costs:** a
+  variable you rely on for Docker and set only in your shell (`DOCKER_CERT_PATH`,
+  `DOCKER_TLS_VERIFY`) is dropped. Put it in a Docker context instead. Only you edit these files, so the denies cost nothing.
   `check-config.sh` requires every one. Whether Claude Code's own protected list already covered any
   of them was not measured; the deny makes the answer irrelevant.
+- **A hard link swapped in during `--install-kit` is a residual** (review round 23). The copy is
+  checked for links and special files, and the source is checked both before and after the copy.
+  A hard link made just before `cp` reaches a file and removed before the second check is still
+  copied, because `cp` writes a fresh file with one link. Exploiting that needs a lost race and a
+  hard link to a host secret. Inside the container the sandbox cannot see such a file, so `ln`
+  fails. On the macOS host this is unmeasured.
 - **The checkout's `run.sh` refuses** to start or stop anything and names the kit. That protects the
   habit, not the file: an agent can edit that refusal out. What protects you is that you start the
   kit's `run.sh`.
@@ -517,7 +533,10 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   as well, so a pull that touches code refreshes it through `post-merge`. A pull that touches only
   `.container/` does not trigger `post-merge`, and leaves the kit stale until you run
   `--install-kit`. A pull is already the point where you review what an agent changed (*Git runs
-  the host's hooks* above).
+  the host's hooks* above). `setup.sh` refreshes only from the main checkout. A linked worktree is a
+  task branch and is left alone (review round 10). So is a checkout where git will not say which it
+  is, for example an old git or a safe.directory refusal: that case once read as "main checkout"
+  (review round 23, `kit_decision` in `scripts/lib.sh`).
 
 **Held by** `check-config.sh`. Every `docker exec` in `run.sh` and `lib.sh` names an absolute program
 and pins `PATH`, and none runs a `.container/` path outside `"$DC_CTR_KIT"`. Every script that

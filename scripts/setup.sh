@@ -225,13 +225,17 @@ fi
 # ONE KIT, FROM THE MAIN CHECKOUT. A linked worktree is a task branch: post-merge fires there on a
 # `git merge main`, and refreshing from it pointed the shared kit at an unlanded branch, then at a
 # directory `jkb task land` deleted (review round 10). Whether this is a linked worktree is
-# is_linked_worktree's answer (--git-dir against --git-common-dir); main_checkout_of only names the
-# main checkout in the message.
+# kit_decision's answer (is_linked_worktree's three: yes, no, git would not say); main_checkout_of
+# only names the main checkout in the message.
 kit_main="$(main_checkout_of "$repo_root" 2>/dev/null)" || kit_main=""
-if [ "$do_kit" -eq 1 ] && is_linked_worktree "$repo_root"; then
+kit_how=skip; [ "$do_kit" -eq 1 ] && kit_how="$(kit_decision "$repo_root")"
+if [ "$kit_how" = worktree ]; then
   kit_state=worktree
   warn "not refreshing the dev container kit from a linked worktree; it follows the main checkout ($kit_main)"
-elif [ "$do_kit" -eq 1 ]; then
+elif [ "$kit_how" = undecided ]; then
+  kit_state=undecided
+  warn "not refreshing the dev container kit: git would not say whether $repo_root is a linked worktree, and refreshing from a task branch points the shared kit at unlanded code. Run .container/run.sh --install-kit from the main checkout."
+elif [ "$kit_how" = install ]; then
   say "dev container kit (what the container is started from)"
   if kit_out="$("$repo_root/.container/run.sh" --install-kit 2>&1)"; then
     printf '%s\n' "$kit_out"

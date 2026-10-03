@@ -691,6 +691,8 @@ if [ "${1:-}" = --self-test ]; then
     h "round 21: a denied path on a second line is judged as its own path" deny "$mline" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     tpad="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/.ssh/id_rsa" + ([range(5000)|" "]|join("")))}}')"
     h "round 21: trailing whitespace past PATH_MAX does not hide a denied path" deny "$tpad" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    cpad="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/.ssh/id_rsa" + ([range(5000)|"\u0008"]|join("")))}}')"
+    h "round 23: trailing control characters past PATH_MAX do not hide a denied path" deny "$cpad" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     lclimb="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("k z/" + ([range(1000)|"aaaa/"]|join("")) + ([range(1000)|"../"]|join("")) + "../e.jsonl")}}')"
     h "round 21: an over-long climb behind a space is refused, not resolved" deny "$lclimb" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     mdesc="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__task_create", cwd:($h + "/repos/w"), tool_input:{title:"t", description:"Touches:\ncrates/a.rs\n  crates/b.rs  \n- docs/x.md\nsee ../docs for more"}}')"
@@ -698,7 +700,10 @@ if [ "${1:-}" = --self-test ]; then
     # REVIEW ROUND 22. Every line break a server's splitlines() honours, and the Unicode White_Space a
     # str.strip() removes, not only ASCII: NBSP, U+3000, `\r`, U+2028 hid a denied path as round 21's
     # ASCII forms had.
-    for wsf in '\u00a0%s' '%s\u00a0' '\u3000%s' 'a\r%s' 'a\u2028%s' 'a\u0085%s' 'a\u000b%s'; do
+    # REVIEW ROUND 23: ...and the C0 controls, DEL and U+FEFF, which Python's strip(), JS's trim() and
+    # Java's trim() remove between them.
+    for wsf in '\u00a0%s' '%s\u00a0' '\u3000%s' 'a\r%s' 'a\u2028%s' 'a\u0085%s' 'a\u000b%s' \
+               '\u001f%s' '\ufeff%s' '\u0001%s' '\u0008%s' '\u007f%s' '\u200b%s'; do
         uj="$(jqh -cn --arg h "$bh" --arg f "$wsf" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($f | sub("%s"; $h + "/.ssh/id_rsa") | fromjson? // ("\"" + . + "\"" | fromjson))}}')"
         h "round 22: a denied path behind '$wsf' is judged as its own path" deny "$uj" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     done
@@ -1435,7 +1440,11 @@ case "$tool" in
         # a server that trims its argument or reads it as a list of lines opens THAT, and judged only
         # whole, ` /h/.ssh/id_rsa` was a relative name in the cwd and a second line was never a path
         # (review round 21). The user's choice after that round: judge what a trimming or line-reading
-        # server opens, as an ambiguous form, rather than guess which one it is.
+        # server opens, as an ambiguous form, rather than guess which one it is. "Whitespace" is the UNION
+        # of what the runtimes trim -- every C0 control and DEL (Java's trim()), Unicode White_Space
+        # (Python's strip()), U+FEFF and U+180E (JS's trim()), U+200B for good measure -- and a line
+        # ends at any break splitlines() honours (rounds 22 and 23: NBSP, \r, U+001F, U+FEFF each hid a
+        # denied path from a narrower set).
         # A line's token is what precedes its first whitespace, kept only when the rest is whitespace:
         # two anchored or first-match regexes. `sub("\\s+$")` re-scans a run of spaces from every
         # position in it, and an explode-and-reverse trim took 3.6s over 150k lines. Per-line work is
@@ -1444,7 +1453,7 @@ case "$tool" in
         # One jq run
         # produces both arrays, and the slash count the segment budget below needs.
         cands_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
-            def ws: "[ \t\r\f\u000b\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]";
+            def ws: "[\u0001-\u0020\u007f\u0085\u00a0\u1680\u180e\u2000-\u200b\u2028\u2029\u202f\u205f\u3000\ufeff]";
             def lines: split("\n")[] | split("\r")[] | split("\u000b")[] | split("\f")[] | split("\u001c")[]
                 | split("\u001d")[] | split("\u001e")[] | split("\u0085")[] | split("\u2028")[] | split("\u2029")[];
             def tok: sub("^" + ws + "+"; "") as $l
