@@ -530,8 +530,9 @@ if [ "$SELF_TEST" = yes ]; then
     if [ "$se_got" = "$se/a.json	PATH" ]; then printf '  \033[32mok\033[0m   %s\n' "a settings env.PATH is named with its file; other keys, other files, unparseable and missing files are not"
     else printf '  \033[31mFAIL\033[0m settings_env_shadows\n         got: [%s]\n' "$se_got"; st_fail=$((st_fail+1)); fi
     se_names="$(. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$(dirname "$0")/container.json")"
-    if grep -qx PATH <<<"$se_names" && grep -qx JKB_REMOTE <<<"$se_names" && grep -qx JKB_NS_MARKER <<<"$se_names"; then
-        printf '  \033[32mok\033[0m   %s\n' "the protected names come from the Dockerfile's ENV and containerEnv: PATH, JKB_NS_MARKER, JKB_REMOTE among them"
+    if grep -qx PATH <<<"$se_names" && grep -qx JKB_REMOTE <<<"$se_names" && grep -qx JKB_NS_MARKER <<<"$se_names" \
+       && grep -qx HOME <<<"$se_names" && grep -qx TMPDIR <<<"$se_names" && grep -qx CLAUDE_CONFIG_DIR <<<"$se_names" && grep -qx CLAUDE_PROJECT_DIR <<<"$se_names"; then
+        printf '  \033[32mok\033[0m   %s\n' "the protected names come from the Dockerfile's ENV and containerEnv (PATH, JKB_NS_MARKER, JKB_REMOTE among them), plus the floor the hook reads: HOME, TMPDIR, CLAUDE_CONFIG_DIR, CLAUDE_PROJECT_DIR"
     else printf '  \033[31mFAIL\033[0m dc_protected_env derived [%s]\n' "$(tr '\n' ' ' <<<"$se_names")"; st_fail=$((st_fail+1)); fi
     printf '{bad' > "$se/bad.json"
     if ! (. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$se/bad.json") >/dev/null 2>&1 \
@@ -1799,11 +1800,15 @@ fi
 # fix a hit -- those files are write-denied to it -- so the failure names the file and the key for a
 # person. This cannot ask a SESSION's PATH (it runs through docker exec, with the image's); a session
 # whose PATH arrives by another route is not caught here.
-if ! envp_names="$(dc_protected_env "$here_dc/Dockerfile" "$DC" 2>&1)"; then
+# ...and ONLY WITH THE LAYER LIST IN HAND: without posture_layer_files (the sweep's reader failed to
+# load) it checked no file and still printed ok (review round 22).
+if ! declare -F posture_layer_files >/dev/null; then
+    bad "the settings-layer reader (posture_layer_files, from sweep-transcripts.sh) is not loaded, so whether a Claude settings file replaces the container's environment is unchecked"
+elif ! envp_names="$(dc_protected_env "$here_dc/Dockerfile" "$DC" 2>&1)"; then
     bad "the environment names the container sets could not be derived ($envp_names), so whether a Claude settings file replaces one is unchecked"
 else
     envp_files=()
-    while IFS= read -r envp_f; do [ -n "$envp_f" ] && envp_files+=("$envp_f"); done <<<"$(posture_layer_files "$mem_managed" 2>/dev/null)"
+    while IFS= read -r envp_f; do [ -n "$envp_f" ] && envp_files+=("$envp_f"); done <<<"$(posture_layer_files "$mem_managed")"
     envp_hits="$(settings_env_shadows "$envp_names" ${envp_files[@]+"${envp_files[@]}"})"
     if [ -n "$envp_hits" ]; then
         bad "a Claude settings file sets an environment variable the container itself sets, and every session here gets the file's value instead: $(printf '%s' "$envp_hits" | awk -F'\t' '{printf "%s in %s; ", $2, $1}')remove that key from the file -- the agent cannot, it is write-denied to it. A repo's .claude/settings*.json is SHARED with the host; if the host needs the value, set it in the host's own ~/.claude/settings.json, which this container does not load"

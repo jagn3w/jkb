@@ -107,7 +107,8 @@ dc_container_env() { # dc_container_env <container.json> <repo-root>  -> one KEY
 # the checkout the host shares: an `env.PATH` written for the Mac replaced the image's PATH in every
 # container session, so `jkb` stopped resolving by name and the attest hook, which approves only the
 # bare `jkb` word, asked about every call (2026-10-02, measured by another session). verify.sh and
-# check-config.sh refuse a settings `env` that names one of these. Refuses (rc 1) when either file
+# check-config.sh refuse a settings `env` that names one of these, or one of the floor of names the
+# transcript hook reads its boundary from (HOME, TMPDIR, CLAUDE_CONFIG_DIR, CLAUDE_PROJECT_DIR). Refuses (rc 1) when either file
 # yields nothing, so a broken parse is not read as "nothing to protect".
 dc_protected_env() { # dc_protected_env <Dockerfile> <container.json>
     local names
@@ -128,7 +129,10 @@ dc_protected_env() { # dc_protected_env <Dockerfile> <container.json>
     local ce
     ce="$(dc_strip "$2" | jq -r '(.containerEnv // {}) | keys[]' 2>/dev/null)" \
         || { echo "dc_protected_env: $2 does not parse, so its containerEnv names could not be derived" >&2; return 1; }
-    names="$(printf '%s\n%s\n' "$names" "$ce" | grep -v '^$' | sort -u)"
+    # ...AND A FLOOR the image never declares, because the transcript hook and the sweep take their
+    # boundary from these: a settings env.TMPDIR=$HOME made the home a temp root in the write allow
+    # list, and env.CLAUDE_CONFIG_DIR moved the transcript tree the hook guards (review round 22).
+    names="$(printf '%s\n%s\nHOME\nTMPDIR\nCLAUDE_CONFIG_DIR\nCLAUDE_PROJECT_DIR\n' "$names" "$ce" | grep -v '^$' | sort -u)"
     grep -qx PATH <<<"$names" || { echo "dc_protected_env: no ENV PATH found in $1, so the protected names could not be derived" >&2; return 1; }
     printf '%s\n' "$names"
 }
@@ -487,7 +491,9 @@ JKB_SETUP_MARKER="/home/vscode/.jkb-container-setup-complete"
 # posture's Edit deny and check-config's reach test cover. Staged in ${TMPDIR:-/tmp} or beside the
 # kit, a same-uid agent could swap the archive in the window before root extracted it, and become the
 # mirror that runs unsandboxed in the container (review round 11).
-DC_KIT_HOME="${JKB_CONTAINER_KIT_HOME:-$HOME/.local/share/jkb-container-kit}"
+# NOT OVERRIDABLE FROM THE ENVIRONMENT: JKB_CONTAINER_KIT_HOME let a launching terminal's env (a committed
+# terminal.integrated.env) choose where --install-kit put the kit (review round 22). Nothing set it.
+DC_KIT_HOME="$HOME/.local/share/jkb-container-kit"
 DC_KIT_DIR="$DC_KIT_HOME/kit"
 DC_CTR_KIT=/usr/local/lib/jkb-container
 DC_KIT_MARKER=".jkb-container-kit"

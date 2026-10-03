@@ -1698,9 +1698,9 @@ run "the posture stops denying Edit on the kit" "so the in-process file tools ca
 seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '$HOME/.local/share/jkb-container-kit}'
+old = 'DC_KIT_HOME="$HOME/.local/share/jkb-container-kit"'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, '$HOME/.jkb/container-kit}', 1))
+open(p, 'w').write(s.replace(old, 'DC_KIT_HOME="$HOME/.jkb/container-kit"', 1))
 PYX
 run "the kit moves back under ~/.jkb" "covers ~/.jkb/container-kit"
 
@@ -1730,6 +1730,34 @@ assert s.startswith("#!/bin/bash -p\n"), "mutation target absent"
 open(p, 'w').write("#!/bin/bash\n" + s[len("#!/bin/bash -p\n"):])
 PYX
 run "run.sh's shebang drops -p" "shebang is not #!/bin/bash -p"
+
+# REVIEW ROUND 22. ...and its PATH filter takes no keep list from the environment.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'case "$jkb_keep" in *":$jkb_d:"*)'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'case "$jkb_keep:${JKB_RUN_PATH_KEEP:-}:" in *":$jkb_d:"*)', 1))
+PYX
+run "run.sh's PATH filter reads a keep list from the environment again" "reads JKB_RUN_PATH_KEEP from the environment"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'jkb_p="$(cd -P -- "$jkb_d" 2>/dev/null && pwd -P)"'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'jkb_p="$jkb_d"', 1))
+PYX
+run "run.sh's PATH filter compares spellings, not physical paths" "compare physical paths"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'DC_KIT_HOME="$HOME/.local/share/jkb-container-kit"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'DC_KIT_HOME="${JKB_CONTAINER_KIT_HOME:-$HOME/.local/share/jkb-container-kit}"', 1))
+PYX
+run "lib.sh lets the environment move the kit again" "lets JKB_CONTAINER_KIT_HOME move the kit"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
@@ -2392,7 +2420,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=27
+PINNED_UNSB_APPENDS=33
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

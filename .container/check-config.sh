@@ -710,6 +710,16 @@ dc_run_cmds="$(dc_strip_comments "$here/run.sh" | sed '1d' | grep -E '[^[:space:
 # imports its exported functions, before any of this file runs (review round 21).
 [ "$(head -1 "$here/run.sh")" = '#!/bin/bash -p' ] \
     || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash -p, so bash itself is found through PATH, or runs the launching terminal's BASH_ENV and exported functions;"
+# ...TAKING NO ORDERS FROM THE ENVIRONMENT: the keep list is a file in the kit home, and an entry is
+# judged by its physical path, since a terminal's env (a committed terminal.integrated.env) set the old
+# JKB_RUN_PATH_KEEP, and a `//` spelling passed the textual match (review round 22).
+case "$(sed -n 2p <<<"$dc_run_cmds")" in
+    *JKB_RUN_PATH_KEEP*) dc_unsb="$dc_unsb run.sh's PATH filter reads JKB_RUN_PATH_KEEP from the environment, which a launching terminal sets;" ;;
+    *'jkb-container-kit/path-keep'*'jkb_p="$(cd -P -- "$jkb_d" 2>/dev/null && pwd -P)"'*) ;;
+    *) dc_unsb="$dc_unsb run.sh's PATH filter does not read its keep list from the kit home's path-keep file and compare physical paths;" ;;
+esac
+grep -q 'JKB_CONTAINER_KIT_HOME' <<<"$(dc_strip_comments "$here/lib.sh")" \
+    && dc_unsb="$dc_unsb lib.sh lets JKB_CONTAINER_KIT_HOME move the kit, and a launching terminal sets it;"
 case "$(sed -n 2p <<<"$dc_run_cmds")" in
     *'"$HOME"/*'*'/tmp/*'*'/private/*'*'/var/folders/*'*'PATH="${jkb_path:-/usr/bin:/bin}"; export PATH'*) ;;
     *) dc_unsb="$dc_unsb run.sh does not drop agent-writable PATH entries as its first command after set;" ;;

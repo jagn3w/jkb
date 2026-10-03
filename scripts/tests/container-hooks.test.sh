@@ -239,7 +239,9 @@ remote_setup() { # remote_setup <0|1> [setup.sh flags...]
     printf '#!/bin/sh\necho "jkb $*" >> "%s"\necho "jkb 0.0.0-stub"\n' "$d/calls" > "$d/cargo/bin/jkb"
     # The stub cargo "installs" by appending to the jkb stub when asked to change it, which is what
     # a rebuild from changed sources does to the binary's bytes.
-    if [ "$changes" = 1 ]; then
+    if [ -n "${RS_OFFLINE_FAILS:-}" ]; then
+        printf '#!/bin/sh\necho "cargo $*" >> "%s"\ncase "$*" in *--offline*) exit 101 ;; esac\necho "# rebuilt" >> "%s"\n' "$d/calls" "$d/cargo/bin/jkb" > "$d/cargo/bin/cargo"
+    elif [ "$changes" = 1 ]; then
         printf '#!/bin/sh\necho "cargo $*" >> "%s"\necho "# rebuilt" >> "%s"\n' "$d/calls" "$d/cargo/bin/jkb" > "$d/cargo/bin/cargo"
     else
         printf '#!/bin/sh\necho "cargo $*" >> "%s"\n' "$d/calls" > "$d/cargo/bin/cargo"
@@ -262,9 +264,21 @@ remote_setup() { # remote_setup <0|1> [setup.sh flags...]
 # installed, hooks written into this checkout). So it runs a COPY of setup.sh in a scratch repo, with
 # --no-extension --no-service, and with every service manager and installer it could reach on PATH
 # as a stub that fails and logs. Mutated, it can only write under $d.
+# OFFLINE FIRST IN HERE, online only if that fails: the egress firewall blocks index.crates.io, so
+# the post-merge rebuild failed while every dependency was cached (2026-10-03); a cold cache at first
+# create still needs the network.
+case6b_setup_sh_in_remote_mode_falls_back_online_when_offline_fails() {
+    RS_OFFLINE_FAILS=1 remote_setup 1
+    if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --offline --path crates/jkb-cli --locked --force;cargo install --path crates/jkb-cli --locked --force;"* ]]; then
+        ok "setup.sh with JKB_REMOTE builds offline first, and online only when that fails"
+    else
+        fail "setup.sh with JKB_REMOTE builds offline first, and online only when that fails" "rc=$rc calls=$calls"
+    fi
+}
+
 case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops() {
     remote_setup 1
-    if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --path crates/jkb-cli --locked --force;"* ]] \
+    if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --offline --path crates/jkb-cli --locked --force;"* ]] \
        && [ "$(grep -c '^jkb ' "$d/calls")" = "$(grep -c '^jkb --version$' "$d/calls")" ] \
        && [[ "$out" == *"remote mode"* ]] && [[ "$out" != *"installing git hooks"* ]] \
        && [[ "$out" == *"this jkb changed"* ]] && [[ "$out" == *".container/install-extensions.sh"* ]]; then
@@ -842,7 +856,7 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case3_a_re_mirror_replaces_rather_than_merges \
           case4_a_directory_it_did_not_make_is_left_alone \
           case5_the_host_step_reads_the_global_value \
-          case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops \
+          case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops case6b_setup_sh_in_remote_mode_falls_back_online_when_offline_fails \
           case7_a_trailing_slash_mirrors_and_re_mirrors \
           case8_a_hooks_path_inside_a_bind_is_left_to_the_bind \
           case9_a_forged_marker_is_refused \

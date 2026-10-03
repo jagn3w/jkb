@@ -458,13 +458,22 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
 - **The kit's `run.sh` trusts nothing an agent can write on your `PATH` either** (review rounds 11
   and 12). It runs as you, and the host posture lets a sandboxed agent write `~/.cargo`, `~/.jkb`,
   `~/.cache` and the temp roots. `~/.cargo/bin` comes first on `PATH`, so a planted `jq` or `docker`
-  ran at the next start. The shebang is `#!/bin/bash`, and the first command drops every `PATH`
-  entry under your home, `/tmp` or `/private`, along with relative ones. Every `jq` it runs goes
+  ran at the next start. The shebang is `#!/bin/bash -p` (the `-p` since review round 21, below), and
+  the first command drops every `PATH` entry under your home, `/tmp`, `/private` or `/var/folders`,
+  along with relative ones. Since review round 22 an entry is judged by its **physical, case-folded**
+  path, so `/home//you/.cargo/bin`, or `/USERS/you/...` on APFS, is dropped too. Every `jq` it runs goes
   through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq` readers build
   the mount list. **What this costs:** a Docker installed per-user (`~/.docker/bin`, OrbStack's
   `~/.orbstack/bin`) or a `jq` from `~/.nix-profile` is dropped as well. `run.sh` then names the
-  directory it was in. Keep a directory with `JKB_RUN_PATH_KEEP=<dir>[:<dir>...]` only if no
-  agent can write it. That takes two things in `scripts/auto-mode-posture.json`: the sandbox
+  directory it was in. Keep a directory by adding it, one per line, to
+  `~/.local/share/jkb-container-kit/path-keep`, and only if no agent can write it. That is a file
+  and not an environment variable since review round 22: it was `JKB_RUN_PATH_KEEP`, and a
+  committed `.vscode/settings.json` can set any variable in every VS Code terminal
+  (`terminal.integrated.env`), which kept an agent's `~/.cargo/bin`. The kit home is mode 0700 and
+  `Edit`-denied, so the file is yours. For the same reason `JKB_CONTAINER_KIT_HOME`, which moved the
+  kit, is gone. A terminal that replaces `HOME` itself is out of any script's reach: it also chooses
+  which `~/.local/share/.../run.sh` you start. A directory you keep must be one no
+  agent can write. That takes two things in `scripts/auto-mode-posture.json`: the sandbox
   `allowWrite` must not cover it, and the permissions must deny `Edit` on it, because the in-process
   Write tool is not sandboxed. `~/.docker/bin` passes the first test by default and not the second
   (review round 13). Docker Desktop's credential helper lives in the same directory, so keeping it

@@ -37,13 +37,21 @@ set -euo pipefail
 # $HOME, /tmp or /private, or relative, is dropped. System and Homebrew locations stay, which is
 # where docker and jq live -- Homebrew's are user-owned, so the posture denies Edit on /opt/homebrew
 # and /usr/local for the unsandboxed Write tool (review round 14; check-config.sh holds it); a docker under ~ (~/.docker/bin, ~/.orbstack/bin) has to be linked from
-# one of them. JKB_RUN_PATH_KEEP is a colon-separated list of directories to keep anyway, and is safe
-# only for one NO agent can write: outside the posture's sandbox allowWrite AND Edit-denied, since the
-# in-process Write tool is not sandboxed (review round 13 -- ~/.docker/bin passes the first test and
-# not the second unless the posture denies it). The tests' stubs in /tmp use it. A tool the filter
-# hid is named, with the directory it was in, by `need_tool` below (review round 12).
+# one of them. ~/.local/share/jkb-container-kit/path-keep lists directories to keep anyway, one per
+# line, and is safe only for one NO agent can write: outside the posture's sandbox allowWrite AND
+# Edit-denied, since the in-process Write tool is not sandboxed (review round 13 -- ~/.docker/bin
+# passes the first test and not the second unless the posture denies it). The tests' stubs in /tmp
+# use it. A tool the filter hid is named, with the directory it was in, by `need_tool` below (review
+# round 12).
+# NOTHING HERE TAKES ORDERS FROM THE ENVIRONMENT beyond HOME and PATH themselves (review round 22). The
+# keep list was the env var JKB_RUN_PATH_KEEP, and a committed .vscode/settings.json can set any
+# variable in every VS Code terminal: it kept an agent's ~/.cargo/bin. It is now a FILE in the 0700
+# kit home, which the posture Edit-denies. And an entry is dropped when its PHYSICAL, case-folded path
+# is under the home or a temp root, not only its spelling: `/home//you/.cargo/bin` and, on APFS,
+# `/USERS/you/...` passed the textual match. A terminal that replaces HOME itself defeats this and
+# also chooses which `~/.local/share/.../run.sh` you start, so it is out of any script's reach.
 # Not in --self-test, which check.sh runs and which starts nothing. check-config.sh holds this.
-if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=""; JKB_PATH_DROPPED=""; IFS=: read -r -a jkb_path_in <<<"$PATH"; for jkb_d in ${jkb_path_in[@]+"${jkb_path_in[@]}"}; do case ":${JKB_RUN_PATH_KEEP:-}:" in *":$jkb_d:"*) [ -n "$jkb_d" ] && { jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; continue; } ;; esac; case "$jkb_d" in ""|[!/]*|"$HOME"|"$HOME"/*|/tmp|/tmp/*|/private|/private/*|/var/folders|/var/folders/*) JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue ;; esac; jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; done; PATH="${jkb_path:-/usr/bin:/bin}"; export PATH; fi
+if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=""; JKB_PATH_DROPPED=""; jkb_keep=":"; jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"; if [ -f "$jkb_keepf" ]; then while IFS= read -r jkb_k || [ -n "$jkb_k" ]; do [ -n "$jkb_k" ] && jkb_keep="$jkb_keep$jkb_k:"; done <"$jkb_keepf"; fi; jkb_roots=(); for jkb_r in "$HOME" /tmp /private /var/folders; do jkb_r="$(cd -P -- "$jkb_r" 2>/dev/null && pwd -P || printf '%s' "$jkb_r")"; jkb_roots+=("$(printf '%s' "$jkb_r" | /usr/bin/tr '[:upper:]' '[:lower:]')"); done; IFS=: read -r -a jkb_path_in <<<"$PATH"; for jkb_d in ${jkb_path_in[@]+"${jkb_path_in[@]}"}; do case "$jkb_keep" in *":$jkb_d:"*) [ -n "$jkb_d" ] && { jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; continue; } ;; esac; case "$jkb_d" in ""|[!/]*|"$HOME"|"$HOME"/*|/tmp|/tmp/*|/private|/private/*|/var/folders|/var/folders/*) JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue ;; esac; jkb_p="$(cd -P -- "$jkb_d" 2>/dev/null && pwd -P)" || { JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue; }; jkb_p="$(printf '%s' "$jkb_p" | /usr/bin/tr '[:upper:]' '[:lower:]')"; jkb_hit=0; for jkb_r in "${jkb_roots[@]}"; do case "$jkb_p" in "$jkb_r"|"$jkb_r"/*) jkb_hit=1 ;; esac; done; [ "$jkb_hit" -eq 0 ] || { JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue; }; jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; done; PATH="${jkb_path:-/usr/bin:/bin}"; export PATH; fi
 # ...and jq with HOME where no file can be: jq sources $HOME/.jq into every program, and the Write
 # tool can create ~/.jq. This file's jq readers build the mount list handed to `docker run`, which
 # README calls the security boundary (review round 12). check-config.sh holds the line in place.
@@ -73,7 +81,7 @@ need_tool() {
     local d hidden=""
     IFS=: read -r -a need_dropped <<<"${JKB_PATH_DROPPED:-}"
     for d in ${need_dropped[@]+"${need_dropped[@]}"}; do [ -z "$hidden" ] && [ -x "$d/$1" ] && hidden="$d"; done
-    [ -z "$hidden" ] || die "$1 is in $hidden, which this script drops from PATH: it runs as you, and an agent can plant a program under your home. Keep $hidden only if NO agent can write it: the host posture's sandbox allowWrite must not cover it AND its permissions must deny Edit on it (the in-process Write tool is not sandboxed) -- scripts/auto-mode-posture.json is where both live. Then: JKB_RUN_PATH_KEEP=$hidden (for Docker Desktop, that directory also holds its credential helper)"
+    [ -z "$hidden" ] || die "$1 is in $hidden, which this script drops from PATH: it runs as you, and an agent can plant a program under your home. Keep $hidden only if NO agent can write it: the host posture's sandbox allowWrite must not cover it AND its permissions must deny Edit on it (the in-process Write tool is not sandboxed) -- scripts/auto-mode-posture.json is where both live. Then add it, on a line of its own, to ~/.local/share/jkb-container-kit/path-keep (for Docker Desktop, that directory also holds its credential helper)"
     die "$2"
 }
 
@@ -1196,7 +1204,11 @@ esac
 say "container kit"
 kit_src="$KIT_ROOT"; kit_stage=""
 if [ -z "$kit_src" ]; then
-    kit_stage="$(mktemp -d)"
+    # STAGED UNDER THE 0700 KIT HOME, not $TMPDIR, which sandboxed agents write: a file swapped for a
+    # link between the check below and the dereferencing mirror would carry its target in (review
+    # round 22). The same rule dc_install_kit and dc_mirror_hooks follow.
+    mkdir -p "$DC_KIT_HOME" && chmod 700 "$DC_KIT_HOME" || die "could not make $DC_KIT_HOME to stage the kit in"
+    kit_stage="$(mktemp -d "$DC_KIT_HOME/stage.XXXXXX")" || die "could not make a staging directory under $DC_KIT_HOME"
     dc_install_kit "$repo" "$kit_stage/kit" >/dev/null || die "could not stage the kit from $repo"
     kit_src="$kit_stage/kit"
 fi

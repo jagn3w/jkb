@@ -89,7 +89,16 @@ fi
 # on cksum itself would apply.
 jkb_before="$({ cksum < "${CARGO_HOME:-$HOME/.cargo}/bin/jkb"; } 2>/dev/null || true)"
 # --force so a re-run always refreshes from the current checkout; --locked for reproducibility.
-(cd "$repo_root" && cargo install --path crates/jkb-cli --locked --force)
+# IN THE CONTAINER (JKB_REMOTE set), --offline FIRST: the egress firewall blocks index.crates.io, so
+# the post-merge rebuild failed refreshing the index while every dependency sat in the registry
+# cache (2026-10-03, reported by another session). Online only if offline fails -- a cold cache at
+# first create, before the firewall is up.
+if [ -n "${JKB_REMOTE:-}" ]; then
+  (cd "$repo_root" && { cargo install --offline --path crates/jkb-cli --locked --force \
+      || cargo install --path crates/jkb-cli --locked --force; })
+else
+  (cd "$repo_root" && cargo install --path crates/jkb-cli --locked --force)
+fi
 
 # The binary lands in $CARGO_HOME/bin; make sure that's reachable for the rest of this run.
 cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"

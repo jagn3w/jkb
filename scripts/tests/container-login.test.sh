@@ -201,8 +201,9 @@ STUB
     [ -z "${RS_GONE:-}" ] || rm -rf "$kit_src"
     local script="$repo_root/.container/run.sh"
     [ -z "${RS_KIT:-}" ] || script="$d/home/.local/share/jkb-container-kit/kit/.container/run.sh"
-    # JKB_RUN_PATH_KEEP: run.sh drops PATH entries under /tmp, where this stub lives (see its top).
-    env HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" JKB_RUN_PATH_KEEP="$d/bin" STUB_LOG="$d/calls" STUB_STATE="$1" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} \
+    # The keep file: run.sh drops PATH entries under /tmp, where this stub lives (see its top).
+    mkdir -p "$d/home/.local/share/jkb-container-kit"; printf '%s\n' "$d/bin" > "$d/home/.local/share/jkb-container-kit/path-keep"
+    env HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" STUB_LOG="$d/calls" STUB_STATE="$1" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} \
         bash "$script" "$2" >"$d/out" 2>&1
     rs_out="$(cat "$d/out")"
     calls="$(cut -d' ' -f1 "$d/calls" | tr '\n' ' ')"
@@ -292,7 +293,7 @@ case17_a_tool_the_path_filter_hid_is_named() {
     mkdir -p "$h/.docker/bin"; printf '#!/bin/sh\nexit 0\n' > "$h/.docker/bin/docker"; chmod +x "$h/.docker/bin/docker"
     ln -s "$(dirname "$repo_root")" "$h/repos"
     out="$(env HOME="$h" PATH="$h/.docker/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" 2>&1)"
-    if grep -qF "docker is in $h/.docker/bin" <<<"$out" && grep -qF "JKB_RUN_PATH_KEEP=$h/.docker/bin" <<<"$out"; then
+    if grep -qF "docker is in $h/.docker/bin" <<<"$out" && grep -qF "jkb-container-kit/path-keep" <<<"$out"; then
         ok "a docker the PATH filter hid is named with its directory and how to keep it"
     else fail "a docker the PATH filter hid is named with its directory and how to keep it" "out: $(tail -3 <<<"$out")"; fi
     case "$h" in */jkb-hid.*) rm -rf -- "$h" ;; esac
@@ -337,6 +338,30 @@ case19_run_sh_ignores_bash_env_and_exported_functions() {
     fi
 }
 
+# THE PATH FILTER TAKES NO ORDERS FROM THE ENVIRONMENT: a launching terminal's env (a committed
+# terminal.integrated.env) set JKB_RUN_PATH_KEEP to ~/.cargo/bin, or spelled a home entry `<parent>//<user>`,
+# which the textual match missed, and a planted jq ran as you (review round 22). The keep list is a
+# file under the 0700 kit home, and entries are compared by physical, case-folded path.
+case20_the_path_filter_ignores_the_environment() {
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h form ran=""; h="$(mktemp -d "$HOME/.cache/jkb-env.XXXXXX")" || { fail "case20" "no scratch home under ~/.cache"; return; }
+    mkdir -p "$h/.cargo/bin"
+    printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$h" > "$h/.cargo/bin/jq"; chmod +x "$h/.cargo/bin/jq"
+    for form in keep slashes; do
+        rm -f "$h/RAN"
+        case "$form" in
+            keep)    env HOME="$h" PATH="$h/.cargo/bin:$PATH" JKB_RUN_PATH_KEEP="$h/.cargo/bin" JKB_RUN_FROM_CHECKOUT=1 \
+                         bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1 ;;
+            slashes) env HOME="$h" PATH="$(dirname "$h")//$(basename "$h")/.cargo/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 \
+                         bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1 ;;
+        esac
+        [ -e "$h/RAN" ] && ran="$ran $form"
+    done
+    if [ -z "$ran" ]; then ok "a keep list in the environment, and a // spelling of the home, put no planted jq back on run.sh's PATH"
+    else fail "a keep list in the environment, and a // spelling of the home, put no planted jq back on run.sh's PATH" "ran under:$ran"; fi
+    case "$h" in */jkb-env.*) rm -rf -- "$h" ;; esac
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -346,5 +371,5 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case13_the_checkouts_run_sh_refuses_without_the_override case14_the_kits_run_sh_stops_and_sources_the_mirror \
           case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run \
           case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored \
-          case19_run_sh_ignores_bash_env_and_exported_functions
+          case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment
 finish

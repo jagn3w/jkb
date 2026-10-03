@@ -98,8 +98,9 @@
 #
 # BOUNDED, because a timed-out hook FAILS OPEN. At most 100 path-shaped candidates and 2000 bare
 # words (each tested on disk; round 9 timed 20000 at 2s), then refused; a Glob pattern and a path field
-# over PATH_MAX (4096) is refused before it is walked, and an over-long free-text string is judged on
-# its linear normalisation, or skipped when even that cannot be opened (see judge). THE MEASUREMENT, kept here and nowhere else: 100 distinct relative
+# over PATH_MAX (4096) is refused before it is walked; an over-long free-text string is refused if it
+# holds a `..`, and otherwise only its first 4096 bytes are read, for the transcript rule (see judge).
+# A budget that is hit is a deny naming it (cap_deny). THE MEASUREMENT, kept here and nowhere else: 100 distinct relative
 # strings to an MCP tool, `date +%s%N` around one invocation in jkb-dev on 2026-10-01 -- ~1.0s when
 # the cwd is the project dir (bases deduplicated), 1.4s with three distinct bases. This container
 # has been seen running 5x slow under a saturated VM, and 5x the worst case is still inside 10s.
@@ -694,6 +695,13 @@ if [ "${1:-}" = --self-test ]; then
     h "round 21: an over-long climb behind a space is refused, not resolved" deny "$lclimb" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     mdesc="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__task_create", cwd:($h + "/repos/w"), tool_input:{title:"t", description:"Touches:\ncrates/a.rs\n  crates/b.rs  \n- docs/x.md\nsee ../docs for more"}}')"
     h "round 21: a description listing workspace files on their own lines is allowed" allow "$mdesc" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 22. Every line break a server's splitlines() honours, and the Unicode White_Space a
+    # str.strip() removes, not only ASCII: NBSP, U+3000, `\r`, U+2028 hid a denied path as round 21's
+    # ASCII forms had.
+    for wsf in '\u00a0%s' '%s\u00a0' '\u3000%s' 'a\r%s' 'a\u2028%s' 'a\u0085%s' 'a\u000b%s'; do
+        uj="$(jqh -cn --arg h "$bh" --arg f "$wsf" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($f | sub("%s"; $h + "/.ssh/id_rsa") | fromjson? // ("\"" + . + "\"" | fromjson))}}')"
+        h "round 22: a denied path behind '$wsf' is judged as its own path" deny "$uj" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    done
     h "round 20: ...and unpadded ./~t is denied as before" deny \
       '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"./~t/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     longp="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + ([range(2100)|"/."]|join("")) + "/.ssh/id_rsa")}}')"
@@ -903,6 +911,13 @@ if [ "${1:-}" = --self-test ]; then
         if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
         else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
     done
+    # REVIEW ROUND 22: a cap is a DENY THAT NAMES IT, not the generic "could not reach a decision".
+    capd="$(jqh -cn '{tool_name:"mcp__jkb__task_create", cwd:"/h/repos/jkb", tool_input:{title:"t", description:("Files:\n" + ([range(16) as $i | "crates/f\($i).rs"]|join("\n")))}}')"
+    capo="$(printf '%s' "$capd" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb "$BASH" "$self" 2>/dev/null)"; caprc=$?
+    case "$caprc:$capo" in
+        0:*'"deny"'*'checks'*) printf '  \033[32mok\033[0m   %s\n' "round 22: a call over the check cap is denied with a reason naming the cap" ;;
+        *) printf '  \033[31mFAIL\033[0m round 22: a call over the check cap is denied with a reason naming the cap\n         rc=%s out=%s\n' "$caprc" "${capo:0:200}"; fails=$((fails+1)) ;;
+    esac
     manyl="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("a b" + ([range(25000)|"\ne"]|join("")))}}')"
     h "round 21: more than 20000 lines in one call are refused before any is trimmed" deny "$manyl" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
     manyl="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("a b" + ([range(19000)|"\n   e   "]|join("")))}}')"
@@ -1005,6 +1020,25 @@ deny() {
     printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":%s}}\n' \
         '"Session transcripts are not readable, and neither is any directory containing them -- a search rooted there walks into them. They are other agents'"'"' working context, not a source of truth for this repository, and reading them is how one session inherits another'"'"'s mistakes. Auto-memory under <slug>/memory/ IS readable, and ~/.jkb/claude-memory holds the shared store. If you need what another session concluded, read the decision record it left in docs/ or the commit message."'
     exit 0
+}
+
+# A PER-CALL BUDGET IS A DENY THAT NAMES IT. Each cap below exists because a timed-out hook fails open,
+# and each refused with exit 3, whose reason says only that no decision was reached and the call is
+# "treated as" a transcript read. Since round 21 judges each line, an ordinary jkb task_create listing
+# 16 files hits the check cap, and the agent was never told why or how to get under it (review round
+# 22). exit 3 stays for genuine failures.
+cap_deny() { # cap_deny <leaves|words|lines|segments|checks|glob>
+    local what
+    case "$1" in
+        leaves)   what="more than 100 distinct path-like strings" ;;
+        words)    what="more than 2000 distinct short words, each of which would be looked up on disk" ;;
+        lines)    what="more than 20000 lines across its strings" ;;
+        segments) what="more path segments than the hook can judge in time (12000, counted once per base it resolves them from)" ;;
+        checks)   what="more path checks than the hook can run in time (32: one per string per base, a path on a line of its own counting as a string)" ;;
+        glob)     what="a Glob pattern whose brace expansions are too large to judge in time" ;;
+        *)        exit 3 ;;
+    esac
+    deny "This call carries $what. The file-tool boundary judges every path-like string it is handed and has a per-call budget, because a hook that runs out of time lets the call through. Split the call, or put fewer paths in it: a list of files in a description can name them in a sentence instead of one per line."
 }
 
 # BASH, AND THE BUILT-INS THAT TAKE NO PATH, ARE DECIDED FIRST -- before roots, realpath, or anything
@@ -1350,7 +1384,7 @@ case "$tool" in
             # A BUDGET ON THE WORK, before any prefix is walked: 64 distinct ~4KB prefixes ran past
             # the 10s timeout, which fails open (review round 13, measured at 30s). Expansions times
             # pattern bytes; an ordinary pattern is a few hundred.
-            [ $(( ${#brace_out[@]} * ${#pat} )) -le 12288 ] || exit 3
+            [ $(( ${#brace_out[@]} * ${#pat} )) -le 12288 ] || cap_deny glob
             # AN ARRAY of distinct prefixes, never newline-joined text: a newline in an expansion
             # split one prefix into two harmless ones (round 13; newlines are refused above too).
             gbs=()
@@ -1410,7 +1444,9 @@ case "$tool" in
         # One jq run
         # produces both arrays, and the slash count the segment budget below needs.
         cands_sh="$(printf '%s' "$input" | jqh -er --arg all "$scan_all" '
-            def ws: "[ \t\r\f\u000b]";
+            def ws: "[ \t\r\f\u000b\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]";
+            def lines: split("\n")[] | split("\r")[] | split("\u000b")[] | split("\f")[] | split("\u001c")[]
+                | split("\u001d")[] | split("\u001e")[] | split("\u0085")[] | split("\u2028")[] | split("\u2029")[];
             def tok: sub("^" + ws + "+"; "") as $l
                 | ([$l | match(ws).offset] | first) as $o
                 | if $o == null then $l
@@ -1418,18 +1454,22 @@ case "$tool" in
                   else empty end;
             def pathish: $all == "1" or test("^[~.]") or contains("/");
             [.tool_input | .. | strings | select(. != "")] as $s
-            | [$s[] | select(test("\\s"))] as $w
-            | if ([$w[] | split("\n") | length] | add // 0) > 20000 then error("too many lines") else . end
-            | ($s + [$w[] | split("\n")[] | tok | select(. != "")]) as $c
-            | ([$c[] | select(pathish)] | unique) as $leaves
-            | ([$c[] | select(length <= 255 and (pathish | not))] | unique) as $bare
-            | if ($leaves | length) > 100 or ($bare | length) > 2000 then error("too many")
-              else @sh "leaves=(\($leaves)) bare=(\($bare))" + " segs=\($leaves | map(split("/") | length) | add // 0)" end' 2>/dev/null)" || exit 3
+            | [$s[] | select(test(ws + "|[\n\u001c-\u001e]"))] as $w
+            | [$w[] | lines] as $ls
+            | if ($ls | length) > 20000 then "dt_cap=lines"
+              else ($s + [$ls[] | tok | select(. != "")]) as $c
+                | ([$c[] | select(pathish)] | unique) as $leaves
+                | ([$c[] | select(length <= 255 and (pathish | not))] | unique) as $bare
+                | if ($leaves | length) > 100 then "dt_cap=leaves"
+                  elif ($bare | length) > 2000 then "dt_cap=words"
+                  else @sh "leaves=(\($leaves)) bare=(\($bare))" + " segs=\($leaves | map(split("/") | length) | add // 0)" end
+              end' 2>/dev/null)" || exit 3
         # ...and every OTHER string short enough to be one name (NAME_MAX), above as `bare`: a bare word
         # is a path the moment it names something in a base, and a link named `t` there reached the tree
         # with nothing judged (review round 8, reproduced). Tested on disk below, with no fork per word.
-        leaves=(); bare=(); segs=0
+        leaves=(); bare=(); segs=0; dt_cap=""
         eval "$cands_sh"
+        [ -z "$dt_cap" ] || cap_deny "$dt_cap"
         nleaves0="${#leaves[@]}"
         # An MCP server resolves a relative path against ITS OWN cwd, which is not the session's:
         # the jkb server starts in the project root. So a relative string is judged against every
@@ -1452,7 +1492,7 @@ case "$tool" in
                 if [ -n "$b" ] && { [ -e "$b/$w" ] || [ -L "$b/$w" ]; }; then leaves+=("./$w"); break; fi
             done
         done
-        [ "${#leaves[@]}" -le 100 ] || exit 3
+        [ "${#leaves[@]}" -le 100 ] || cap_deny leaves
         # A BUDGET ON THE WORK, as the Glob arm has: path segments, times the bases each relative
         # one is judged from. 100 leaves of ~2000 segments ran a transcript path past the 10s
         # timeout, which fails open (review round 14, reproduced at 10s; the leaf cap alone allowed
@@ -1461,7 +1501,7 @@ case "$tool" in
         # slow on one long string -- a bracket-class delete took 2.4s at 300KB, a literal one 2.4s at
         # 150k slashes (review round 20). A bare word made a leaf is `./word`: two segments.
         segs=$(( ${segs:-0} + 2 * (${#leaves[@]} - nleaves0) ))
-        [ $(( segs * ${#bases[@]} )) -le 12000 ] || exit 3
+        [ $(( segs * ${#bases[@]} )) -le 12000 ] || cap_deny segments
         # ...AND ON THE NUMBER OF check() CALLS, which is what the time goes on: each forks realpath
         # and walks the path. Under the segment cap, 100 short `~name/` strings from three bases
         # made 600 calls and ran 4.6s idle, 20s under load (review round 15). An absolute path is
@@ -1474,7 +1514,7 @@ case "$tool" in
                 *) nchk=$((nchk + ${#bases[@]})) ;;
             esac
         done
-        [ "$nchk" -le 32 ] || exit 3
+        [ "$nchk" -le 32 ] || cap_deny checks
         for leaf in ${leaves[@]+"${leaves[@]}"}; do
             # A free-text string that merely STARTS `file:` is text, not a refusal (round 7); only a
             # `file:/...` URI is rewritten, by the same helper check() uses. FIRST, before the collapse

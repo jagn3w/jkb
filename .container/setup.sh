@@ -76,7 +76,10 @@ say "rust toolchain (pinned by rust-toolchain.toml)"
 }
 
 say "install jkb into the container"
-( cd "$repo" && cargo install --path crates/jkb-cli --locked --force )
+# --offline first, as scripts/setup.sh does in here: the egress firewall blocks index.crates.io, and
+# a warm registry cache needs no index. Online only if that fails (a cold cache at first create).
+( cd "$repo" && { cargo install --offline --path crates/jkb-cli --locked --force \
+      || cargo install --path crates/jkb-cli --locked --force; } )
 command -v jkb >/dev/null || { echo "jkb is not on PATH after install" >&2; exit 1; }
 jkb --version || true
 # The harness hooks run a root-owned copy of this build, not `jkb` from PATH: ~/.cargo/bin is
