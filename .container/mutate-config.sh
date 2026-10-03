@@ -1805,6 +1805,25 @@ open(p, 'w').write(s.replace(o, 'jkb_keepf="$HOME/.config/jkb/path-keep"', 1))
 PYX
 run "run.sh reads its PATH keep list from outside the kit home" "not from the kit home"
 
+# REVIEW ROUND 24. The allowlist keeps the documented overrides, and a custom image is always built.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '|JKB_CONTAINER_NAME|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '|', 1))
+PYX
+run "run.sh's environment allowlist drops JKB_CONTAINER_NAME" "reads JKB_CONTAINER_NAME but its environment allowlist drops it"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = ' || [ "$IMAGE" != jkb-dev ]'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "run.sh runs an existing custom image without building it" "without building it from the kit"
+
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -1936,6 +1955,14 @@ d["require"]["permissions"]["deny"].remove("Edit(~/.zlogout)")
 json.dump(d, open(p, "w"), indent=2)
 PYX
 run "the posture stops denying Edit on ~/.zlogout" "no Edit(~/.zlogout) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/Library/Application Support/Code/User/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on VS Code's macOS user settings" "no Edit(~/Library/Application Support/Code/User/**) deny"
 
 seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
 import json, sys
@@ -2466,7 +2493,7 @@ fi
 # steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
 unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'dc_unsb' | grep -c .)"
-PINNED_UNSB_APPENDS=39
+PINNED_UNSB_APPENDS=43
 if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
     fails=$((fails+1))
     printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"

@@ -684,15 +684,32 @@ posture_rule_expands() { # posture_rule_expands <path pattern> -> rc 0 expands p
 # managed, its drop-ins, the user's, and every repo's project settings (a session can start in any
 # of them, worktrees included). OVER-APPROXIMATES on purpose -- one enumerating rule anywhere is
 # enough to matter. Files that do not exist are normal and skipped.
+# CHECKOUTS UP TO THREE LEVELS UNDER ~/repos (`~/repos/org/team/acme`), each with its worktrees, and
+# JKB_REPO_ROOT's own: run.sh serves a checkout at any depth, and reading one level only missed a
+# transcript-naming rule in ~/repos/org/acme, so the sweep stood down while the argv grew (review round
+# 24). Globs, not `find`: a bounded find over ~/repos took 3s here, walking every worktree's checkout,
+# and this runs several times per start. Deeper nesting is not read; .container/README.md says so.
 posture_layer_files() { # posture_layer_files <managed-settings.json> -> one path per line
-    local f h="${HOME:-/nonexistent}"
+    local f b h="${HOME:-/nonexistent}" seen="
+"
     printf '%s\n' "$1"
     for f in "$(dirname "$1")"/managed-settings.d/*.json \
-             "${CLAUDE_CONFIG_DIR:-$h/.claude}/settings.json" "${CLAUDE_CONFIG_DIR:-$h/.claude}/settings.local.json" \
-             "$h"/repos/*/.claude/settings.json "$h"/repos/*/.claude/settings.local.json \
-             "$h"/repos/*/.claude/worktrees/*/.claude/settings.json "$h"/repos/*/.claude/worktrees/*/.claude/settings.local.json \
-             "$h"/repos/*/.jkb/work/*/.claude/settings.json "$h"/repos/*/.jkb/work/*/.claude/settings.local.json; do
+             "${CLAUDE_CONFIG_DIR:-$h/.claude}/settings.json" "${CLAUDE_CONFIG_DIR:-$h/.claude}/settings.local.json"; do
         [ -f "$f" ] && printf '%s\n' "$f"
+    done
+    for b in ${JKB_REPO_ROOT:+"$JKB_REPO_ROOT"} "$h"/repos/* "$h"/repos/*/* "$h"/repos/*/*/*; do
+        [ -d "$b/.claude" ] || [ -d "$b/.jkb/work" ] || continue
+        for f in "$b"/.claude/settings.json "$b"/.claude/settings.local.json \
+                 "$b"/.claude/worktrees/*/.claude/settings.json "$b"/.claude/worktrees/*/.claude/settings.local.json \
+                 "$b"/.jkb/work/*/.claude/settings.json "$b"/.jkb/work/*/.claude/settings.local.json; do
+            [ -f "$f" ] || continue
+            case "$seen" in *"
+$f
+"*) continue ;; esac
+            seen="$seen$f
+"
+            printf '%s\n' "$f"
+        done
     done
     return 0
 }
@@ -1742,6 +1759,11 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     rm "$lhome/.claude/settings.json"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude-state/projects/**/*.jsonl)"]}}' >"$lhome/repos/r/.claude/settings.local.json"
     eq "...and in a repo's project settings" "$(pe "$pdir/hook.json" "$lhome")" yes
+    # ...and in a NESTED checkout, which run.sh serves at any depth: one level only stood the sweep
+    # down while ~/repos/org/acme named the transcripts (review round 24).
+    nhome="$work/nesthome"; mkdir -p "$nhome/repos/org/acme/.claude"
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]}}' >"$nhome/repos/org/acme/.claude/settings.json"
+    eq "...and in a checkout nested two levels under ~/repos" "$(pe "$pdir/hook.json" "$nhome")" yes
     mkdir -p "$pdir/managed-settings.d"
     printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]}}' >"$pdir/managed-settings.d/50-x.json"
     eq "...and in a managed drop-in" "$(pe "$pdir/hook.json")" yes

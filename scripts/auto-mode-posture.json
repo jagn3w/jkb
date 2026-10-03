@@ -58,7 +58,10 @@
         "Edit(~/.ssh/**)",
         "Edit(~/Library/LaunchAgents/**)",
         "Edit(~/.config/systemd/user/**)",
-        "Edit(~/.config/autostart/**)"
+        "Edit(~/.config/autostart/**)",
+        "Edit(~/Library/Application Support/Code/User/**)",
+        "Edit(~/.config/Code/User/**)",
+        "Edit(~/.vscode/extensions/**)"
       ]
     },
     "sandbox": {

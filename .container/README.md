@@ -295,7 +295,11 @@ same ordering reason, it runs the transcript sweep, which is now a **backstop**.
 posture no deny rule names a transcript (the deny is a hook; see *The transcript deny is a hook*),
 so the sweep stands down and says so. It archives by byte budget only if a settings layer brings
 back a rule that enumerates transcripts. Then the sandbox's deny list would outgrow a single argv,
-and **every** Bash call in **every** session would fail at spawn. *Transcripts are swept by byte
+and **every** Bash call in **every** session would fail at spawn. The layers it reads are managed and
+its drop-ins, your user settings, and the project settings of every checkout up to three levels under
+`~/repos` (such as `~/repos/org/team/acme`) with its worktrees, plus the checkout it serves
+(`JKB_REPO_ROOT`). Until review round 24 it read only one level, and missed a rule in
+`~/repos/org/acme`. A checkout nested deeper is not read. *Transcripts are swept by byte
 budget, not by age*, at the end of this file, has the measurement.
 
 ```sh
@@ -458,10 +462,10 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
 - **The kit's `run.sh` trusts nothing an agent can write on your `PATH` either** (review rounds 11
   and 12). It runs as you, and the host posture lets a sandboxed agent write `~/.cargo`, `~/.jkb`,
   `~/.cache` and the temp roots. `~/.cargo/bin` comes first on `PATH`, so a planted `jq` or `docker`
-  ran at the next start. The shebang is `#!/bin/bash -p` (the `-p` since review round 21, below), and
-  the first command after it restarts `run.sh` under an allowlisted environment (review round 23,
-  below) drops every `PATH` entry under your home, `/tmp`, `/private` or `/var/folders`,
-  along with relative ones. Since review round 22 an entry is judged by its **physical, case-folded**
+  ran at the next start. The shebang is `#!/bin/bash -p` (the `-p` since review round 21, below).
+  The first command restarts `run.sh` under an allowlisted environment (review round 23, below).
+  The next drops every `PATH` entry under your home, `/tmp`, `/private` or `/var/folders`, along
+  with relative ones. Since review round 22 an entry is judged by its **physical, case-folded**
   path, so `/home//you/.cargo/bin`, or `/USERS/you/...` on APFS, is dropped too. Every `jq` it runs goes
   through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq` readers build
   the mount list. **What this costs:** a Docker installed per-user (`~/.docker/bin`, OrbStack's
@@ -500,8 +504,15 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   `~/.zshrc`, `~/.zlogin`, `~/.zlogout`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`,
   `~/.profile`, `~/.bash_logout`; the two logout files arrived in review round 21), git's
   global config (`~/.gitconfig`, `~/.config/git/**`, which can name a hooks directory), `~/.ssh/**`
-  (a `ProxyCommand` runs), and the per-user autostart directories (`~/Library/LaunchAgents`,
-  `~/.config/systemd/user`, `~/.config/autostart`). One line in `~/.zshenv`,
+  (a `ProxyCommand` runs), the per-user autostart directories (`~/Library/LaunchAgents`,
+  `~/.config/systemd/user`, `~/.config/autostart`), and VS Code's user settings and extensions
+  (`~/Library/Application Support/Code/User/**`, `~/.config/Code/User/**`,
+  `~/.vscode/extensions/**`). Those last three arrived in review round 24: a
+  `terminal.integrated.env` in user settings runs in your next terminal. Only you edit these files,
+  so the denies cost nothing. `check-config.sh` requires every one. Whether Claude Code's own
+  protected list already covered any of them was not measured; the deny makes the answer
+  irrelevant.
+- **`run.sh` takes nothing from the shell that launches it.** One line in `~/.zshenv`,
   `export BASH_ENV=/tmp/x.sh`, would have run in `run.sh` before its `PATH` filter, because
   `#!/bin/bash` sources `BASH_ENV`. Round 21 closed that in `run.sh` itself: its shebang is now
   `#!/bin/bash -p`, which ignores `BASH_ENV` and exported functions, so a terminal whose environment
@@ -510,13 +521,15 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   names the CLI plugins `docker` runs, and `TAR_OPTIONS` can carry `--checkpoint-action=exec`. So
   since review round 23, `run.sh` restarts itself under `env -i` whenever its environment holds
   anything outside an allowlist. The allowlist is `HOME`, `PATH`, the locale and terminal names,
-  `USER`/`LOGNAME`, `DOCKER_HOST`/`DOCKER_CONTEXT` and `JKB_RUN_FROM_CHECKOUT`. The two Docker
-  names are trusted on purpose: they choose a daemon, not code to run. `check-config.sh` refuses
-  an allowlist that names a variable which steers what a child runs. **What this costs:** a
-  variable you rely on for Docker and set only in your shell (`DOCKER_CERT_PATH`,
-  `DOCKER_TLS_VERIFY`) is dropped. Put it in a Docker context instead. Only you edit these files, so the denies cost nothing.
-  `check-config.sh` requires every one. Whether Claude Code's own protected list already covered any
-  of them was not measured; the deny makes the answer irrelevant.
+  `USER`/`LOGNAME`, `DOCKER_HOST`/`DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, and
+  `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`. Those last two arrived in review round 24: round 23
+  dropped them, so `run.sh` acted on `jkb-dev` while the reaper looked for the override. A
+  non-default image is always built from the kit, so `JKB_CONTAINER_IMAGE` names a tag and never
+  chooses what runs. The two Docker names are trusted on purpose: they choose a daemon, not code to
+  run. `check-config.sh` refuses an allowlist that names a variable which steers what a child runs,
+  and one that drops a `JKB_` variable `run.sh` reads. **What this costs:** a variable you rely on
+  for Docker and set only in your shell (`DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`) is dropped. Put
+  it in a Docker context instead.
 - **A hard link swapped in during `--install-kit` is a residual** (review round 23). The copy is
   checked for links and special files, and the source is checked both before and after the copy.
   A hard link made just before `cp` reaches a file and removed before the second check is still

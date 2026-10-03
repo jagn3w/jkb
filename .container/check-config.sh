@@ -720,6 +720,17 @@ case "$(sed -n 2p <<<"$dc_run_cmds")" in
         esac ;;
     *) dc_unsb="$dc_unsb run.sh does not re-execute under an allowlisted environment (env -i) before its PATH filter, so its children inherit the launching terminal's DOCKER_CONFIG, TAR_OPTIONS and BASH_ENV;" ;;
 esac
+# ...AND THE ALLOWLIST NAMES EVERY JKB_ VARIABLE run.sh READS that it does not set itself: dropping
+# JKB_CONTAINER_NAME made run.sh act on jkb-dev while the reaper looked for the override (review round
+# 24). A non-default image must then be built, never run as found.
+dc_allow_line="$(sed -n 2p <<<"$dc_run_cmds")"
+dc_set_here="$(cat "$here/run.sh" "$here/lib.sh" | grep -oE '(^|[ ;(])JKB_[A-Z_]+=' | grep -oE 'JKB_[A-Z_]+' | sort -u)"
+for dc_v in $(grep -oE '[$][{]?JKB_[A-Z_]+' "$here/run.sh" | tr -d '${' | sort -u); do
+    grep -qx -- "$dc_v" <<<"$dc_set_here" && continue
+    case "$dc_allow_line" in *"|$dc_v|"*|*"|$dc_v)"*) ;; *) dc_unsb="$dc_unsb run.sh reads $dc_v but its environment allowlist drops it;" ;; esac
+done
+grep -qF '[ "$IMAGE" != jkb-dev ]' <<<"$(dc_strip_comments "$here/run.sh")" \
+    || dc_unsb="$dc_unsb run.sh may run an existing image named by JKB_CONTAINER_IMAGE without building it from the kit;"
 # ...TAKING NO ORDERS FROM THE ENVIRONMENT: the keep list is a file in the kit home, and an entry is
 # judged by its physical path, since a terminal's env (a committed terminal.integrated.env) set the old
 # JKB_RUN_PATH_KEEP, and a `//` spelling passed the textual match (review round 22).
@@ -910,11 +921,13 @@ dc_keepf="${dc_keepf//\$HOME//kit-home-probe}"
 # tool's deny and, merged by Claude Code, the sandbox's denyWrite.
 # ...AND EVERY OTHER FILE THAT BECOMES CODE LATER, outside every sandbox: the shell startup files (one
 # `export BASH_ENV=...` in ~/.zshenv runs in run.sh before its PATH filter), git's global config and
-# hooks, ssh's config, and the per-user autostart directories (review round 20). Only the user edits
-# these, so denying them costs nothing.
+# hooks, ssh's config, and the per-user autostart directories (review round 20) -- and VS Code's user
+# settings and extensions, whose terminal.integrated.env and extension code run in your next terminal
+# or window (review round 24). Only the user edits these, so denying them costs nothing.
 for dc_inlet in '~/.cargo/env' '~/.zshenv' '~/.zprofile' '~/.zshrc' '~/.zlogin' '~/.zlogout' '~/.bashrc' \
                 '~/.bash_profile' '~/.bash_login' '~/.profile' '~/.bash_logout' '~/.gitconfig' '~/.config/git/**' \
-                '~/.ssh/**' '~/Library/LaunchAgents/**' '~/.config/systemd/user/**' '~/.config/autostart/**'; do
+                '~/.ssh/**' '~/Library/LaunchAgents/**' '~/.config/systemd/user/**' '~/.config/autostart/**' \
+                '~/Library/Application Support/Code/User/**' '~/.config/Code/User/**' '~/.vscode/extensions/**'; do
     HOME=/dev/null jq -e --arg r "Edit($dc_inlet)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
         || dc_kit_where="$dc_kit_where the posture has no Edit($dc_inlet) deny, so an agent can plant code that runs later as you, unsandboxed;"
 done

@@ -383,6 +383,18 @@ case21_run_sh_children_inherit_only_the_allowlist() {
     fi
 }
 
+# ...WHILE THE DOCUMENTED OVERRIDES SURVIVE THE RE-EXEC: JKB_CONTAINER_NAME was dropped with the rest, so
+# `--stop` acted on jkb-dev while the reaper and `jkb task work` looked for the override (review round
+# 24). An unknown variable beside it forces the re-exec, as any real terminal's SHELL or TMPDIR does.
+case22_the_container_name_override_survives_the_allowlist() {
+    RS_EXTRA_ENV="JKB_CONTAINER_NAME=jkb-alt JKB_PLANTED=1" run_sh_with_stub true --stop
+    if grep -q 'jkb-alt' "$rs_dir/calls" && ! grep -qw 'jkb-dev' "$rs_dir/calls"; then
+        ok "JKB_CONTAINER_NAME survives run.sh's environment allowlist: --stop acts on the named container"
+    else
+        fail "JKB_CONTAINER_NAME survives run.sh's environment allowlist: --stop acts on the named container" "calls: $(tr '\n' ';' < "$rs_dir/calls")"
+    fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -393,5 +405,5 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run \
           case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored \
           case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment \
-          case21_run_sh_children_inherit_only_the_allowlist
+          case21_run_sh_children_inherit_only_the_allowlist case22_the_container_name_override_survives_the_allowlist
 finish

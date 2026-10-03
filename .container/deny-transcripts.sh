@@ -691,6 +691,14 @@ if [ "${1:-}" = --self-test ]; then
     h "round 21: a denied path on a second line is judged as its own path" deny "$mline" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     tpad="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/.ssh/id_rsa" + ([range(5000)|" "]|join("")))}}')"
     h "round 21: trailing whitespace past PATH_MAX does not hide a denied path" deny "$tpad" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 24: a NUL is refused outright -- the trim class cannot hold one, and a trimming
+    # server strips it -- and the Skill tool's args are prose, like an Agent prompt.
+    for nulf in '\u0000%s' '\u0000 %s'; do
+        nj="$(jqh -cn --arg h "$bh" --arg f "$nulf" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("\"" + ($f | sub("%s"; $h + "/.ssh/id_rsa")) + "\"" | fromjson)}}')"
+        h "round 24: a denied path behind '$nulf' is refused" deny "$nj" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    done
+    h "round 24: a Skill's args are prose, and a ../ in them is not a path" allow \
+      '{"tool_name":"Skill","cwd":"'"$bh"'/repos/w","tool_input":{"skill":"review","args":"see\n../docs/x.md\nfor context"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     cpad="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + "/.ssh/id_rsa" + ([range(5000)|"\u0008"]|join("")))}}')"
     h "round 23: trailing control characters past PATH_MAX do not hide a denied path" deny "$cpad" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     lclimb="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("k z/" + ([range(1000)|"aaaa/"]|join("")) + ([range(1000)|"../"]|join("")) + "../e.jsonl")}}')"
@@ -1041,6 +1049,7 @@ cap_deny() { # cap_deny <leaves|words|lines|segments|checks|glob>
         segments) what="more path segments than the hook can judge in time (12000, counted once per base it resolves them from)" ;;
         checks)   what="more path checks than the hook can run in time (32: one per string per base, a path on a line of its own counting as a string)" ;;
         glob)     what="a Glob pattern whose brace expansions are too large to judge in time" ;;
+        nul)      deny "An MCP or unknown tool was handed a string holding a NUL character. No path contains one, and a server that strips it would open a different file from the one judged here; send the string without it." ;;
         *)        exit 3 ;;
     esac
     deny "This call carries $what. The file-tool boundary judges every path-like string it is handed and has a per-call budget, because a hook that runs out of time lets the call through. Split the call, or put fewer paths in it: a list of files in a description can name them in a sentence instead of one per line."
@@ -1070,7 +1079,9 @@ fi
 command -v jq >/dev/null 2>&1 || exit 3
 tool="$(printf '%s' "$input" | jqh -er '.tool_name | strings' 2>/dev/null)" || exit 3
 case "$tool" in
-    Bash|TodoWrite|AskUserQuestion|Agent|Task|ToolSearch|SendMessage) allow ;;
+    # Skill too (review round 24): its `args` is a slash command's free text, a /review focus that
+    # mentioned `../x` was refused as an MCP path, and the skill it names runs through these same tools.
+    Bash|TodoWrite|AskUserQuestion|Agent|Task|ToolSearch|SendMessage|Skill) allow ;;
 esac
 
 # HOME from the account database when the environment lost it: the roots are derived from it, and
@@ -1441,7 +1452,8 @@ case "$tool" in
         # whole, ` /h/.ssh/id_rsa` was a relative name in the cwd and a second line was never a path
         # (review round 21). The user's choice after that round: judge what a trimming or line-reading
         # server opens, as an ambiguous form, rather than guess which one it is. "Whitespace" is the UNION
-        # of what the runtimes trim -- every C0 control and DEL (Java's trim()), Unicode White_Space
+        # of what the runtimes trim -- every C0 control (Java's trim(); NUL is refused below, as no
+        # regex class can hold it) and DEL for good measure, Unicode White_Space
         # (Python's strip()), U+FEFF and U+180E (JS's trim()), U+200B for good measure -- and a line
         # ends at any break splitlines() honours (rounds 22 and 23: NBSP, \r, U+001F, U+FEFF each hid a
         # denied path from a narrower set).
@@ -1463,6 +1475,11 @@ case "$tool" in
                   else empty end;
             def pathish: $all == "1" or test("^[~.]") or contains("/");
             [.tool_input | .. | strings | select(. != "")] as $s
+            # A NUL IS REFUSED, not trimmed: no path holds one, the trim class cannot (a regex with a
+            # NUL in it), and a trimming server strips it -- `\u0000/h/.ssh/id_rsa` was a relative name
+            # here and the credential there (review round 24).
+            | if any($s[]; contains("\u0000")) then "dt_cap=nul" else
+            .
             | [$s[] | select(test(ws + "|[\n\u001c-\u001e]"))] as $w
             | [$w[] | lines] as $ls
             | if ($ls | length) > 20000 then "dt_cap=lines"
@@ -1472,7 +1489,7 @@ case "$tool" in
                 | if ($leaves | length) > 100 then "dt_cap=leaves"
                   elif ($bare | length) > 2000 then "dt_cap=words"
                   else @sh "leaves=(\($leaves)) bare=(\($bare))" + " segs=\($leaves | map(split("/") | length) | add // 0)" end
-              end' 2>/dev/null)" || exit 3
+              end end' 2>/dev/null)" || exit 3
         # ...and every OTHER string short enough to be one name (NAME_MAX), above as `bare`: a bare word
         # is a path the moment it names something in a base, and a link named `t` there reached the tree
         # with nothing judged (review round 8, reproduced). Tested on disk below, with no fork per word.

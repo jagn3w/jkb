@@ -50,7 +50,11 @@ set -euo pipefail
 # sets any of them (review round 23). So when the environment holds anything else, run.sh re-executes
 # itself under `env -i` with only HOME, PATH, the locale and terminal names, USER/LOGNAME,
 # DOCKER_HOST/DOCKER_CONTEXT (a Colima or OrbStack socket, deliberately trusted: they select a daemon,
-# not code to run) and JKB_RUN_FROM_CHECKOUT, plus PWD/SHLVL/_, which bash exports itself and without
+# not code to run), JKB_RUN_FROM_CHECKOUT, and JKB_CONTAINER_NAME/JKB_CONTAINER_IMAGE -- documented
+# overrides the reaper and `jkb task work` honour too; dropped, run.sh acted on jkb-dev while they looked
+# for the override (review round 24). A non-default image is therefore always BUILT from the kit's
+# Dockerfile (below), so the override names a tag and never chooses what runs. Plus PWD/SHLVL/_, which
+# bash exports itself and without
 # which the re-exec would never settle. An allowlist, not a denylist: the next variable some tool reads
 # is not on it.
 # NOTHING HERE TAKES ORDERS FROM THE ENVIRONMENT beyond HOME and PATH themselves (review round 22). The
@@ -61,7 +65,7 @@ set -euo pipefail
 # `/USERS/you/...` passed the textual match. A terminal that replaces HOME itself defeats this and
 # also chooses which `~/.local/share/.../run.sh` you start, so it is out of any script's reach.
 # Not in --self-test, which check.sh runs and which starts nothing. check-config.sh holds this.
-if [ "${1:-}" != --self-test ]; then jkb_env=(); jkb_env_extra=0; for jkb_n in $(compgen -e); do case "$jkb_n" in HOME|PATH|PWD|OLDPWD|SHLVL|_|TERM|COLORTERM|LANG|LC_*|USER|LOGNAME|DOCKER_HOST|DOCKER_CONTEXT|JKB_RUN_FROM_CHECKOUT) jkb_env+=("$jkb_n=${!jkb_n}") ;; *) jkb_env_extra=1 ;; esac; done; [ "$jkb_env_extra" -eq 0 ] || exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" "$@"; fi
+if [ "${1:-}" != --self-test ]; then jkb_env=(); jkb_env_extra=0; for jkb_n in $(compgen -e); do case "$jkb_n" in HOME|PATH|PWD|OLDPWD|SHLVL|_|TERM|COLORTERM|LANG|LC_*|USER|LOGNAME|DOCKER_HOST|DOCKER_CONTEXT|JKB_RUN_FROM_CHECKOUT|JKB_CONTAINER_NAME|JKB_CONTAINER_IMAGE) jkb_env+=("$jkb_n=${!jkb_n}") ;; *) jkb_env_extra=1 ;; esac; done; [ "$jkb_env_extra" -eq 0 ] || exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" "$@"; fi
 if [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=""; JKB_PATH_DROPPED=""; jkb_keep=":"; jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"; if [ -f "$jkb_keepf" ]; then while IFS= read -r jkb_k || [ -n "$jkb_k" ]; do [ -n "$jkb_k" ] && jkb_keep="$jkb_keep$jkb_k:"; done <"$jkb_keepf"; fi; jkb_roots=(); for jkb_r in "$HOME" /tmp /private /var/folders; do jkb_r="$(cd -P -- "$jkb_r" 2>/dev/null && pwd -P || printf '%s' "$jkb_r")"; jkb_roots+=("$(printf '%s' "$jkb_r" | /usr/bin/tr '[:upper:]' '[:lower:]')"); done; IFS=: read -r -a jkb_path_in <<<"$PATH"; for jkb_d in ${jkb_path_in[@]+"${jkb_path_in[@]}"}; do case "$jkb_keep" in *":$jkb_d:"*) [ -n "$jkb_d" ] && { jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; continue; } ;; esac; case "$jkb_d" in ""|[!/]*|"$HOME"|"$HOME"/*|/tmp|/tmp/*|/private|/private/*|/var/folders|/var/folders/*) JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue ;; esac; jkb_p="$(cd -P -- "$jkb_d" 2>/dev/null && pwd -P)" || { JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue; }; jkb_p="$(printf '%s' "$jkb_p" | /usr/bin/tr '[:upper:]' '[:lower:]')"; jkb_hit=0; for jkb_r in "${jkb_roots[@]}"; do case "$jkb_p" in "$jkb_r"|"$jkb_r"/*) jkb_hit=1 ;; esac; done; [ "$jkb_hit" -eq 0 ] || { JKB_PATH_DROPPED="${JKB_PATH_DROPPED:+$JKB_PATH_DROPPED:}$jkb_d"; continue; }; jkb_path="${jkb_path:+$jkb_path:}$jkb_d"; done; PATH="${jkb_path:-/usr/bin:/bin}"; export PATH; fi
 # ...and jq with HOME where no file can be: jq sources $HOME/.jq into every program, and the Write
 # tool can create ~/.jq. This file's jq readers build the mount list handed to `docker run`, which
@@ -804,7 +808,11 @@ chmod 0700 "$HOME/.jkb-container"
 [ -s "$HOME/.jkb-container/credential" ] \
     || echo "warning: no container credential at ~/.jkb-container/credential — run ./scripts/setup.sh on the host (jkb role rotate-container --write)" >&2
 
-if [ "$BUILD" -eq 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+# A NON-DEFAULT IMAGE NAME IS ALWAYS BUILT: JKB_CONTAINER_IMAGE comes from the environment, and an
+# existing image of that name was run as it was -- any local image, with this container's mounts, the
+# credential among them, and none of its firewall (review round 24). Built from the kit, the override
+# only names the tag; the layer cache makes a rebuild cheap.
+if [ "$BUILD" -eq 1 ] || [ "$IMAGE" != jkb-dev ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     # `name` and `build.dockerfile` are READ here. They were listed as consumed keys while nothing
     # looked at either, so check-config.sh printed "every key in container.json is applied by
     # run.sh" about two declarations that did nothing — and the fix for the next inert key would
