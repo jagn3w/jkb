@@ -468,14 +468,18 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   committed `.vscode/settings.json` can set any variable in every VS Code terminal. The shebang is
   `#!/bin/bash -p`, so `BASH_ENV` and exported functions do not reach that first shell. Its first
   command re-executes it once under `env -i`, marked by an argument no terminal can add, with:
-  - **a `PATH` it builds:** `/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`, then
-    each directory listed, one per line, in `~/.local/share/jkb-container-kit/path-keep`. Homebrew's
-    prefixes are user-owned, so the posture denies `Edit` on them. The kit home is mode 0700 and
-    `Edit`-denied, so the keep file is yours.
+  - **a `PATH` it builds:** each directory listed, one per line, in
+    `~/.local/share/jkb-container-kit/path-keep`, then
+    `/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`. The keep list comes first because
+    it is yours: behind `/usr/bin`, the tests' stub `docker` lost to a real one, and `--rm` would
+    have removed a developer's container (review round 27). Homebrew's prefixes are user-owned, so
+    the posture denies `Edit` on them. The kit home is mode 0700 and `Edit`-denied.
   - **an allowlist of names:** `HOME`, the terminal and locale names, `USER`/`LOGNAME`,
-    `DOCKER_HOST`/`DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`,
-    and on a Linux desktop `DISPLAY`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`. The two Docker names
-    choose a daemon, not code to run. A non-default image is always built from the kit, so
+    `DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`, and on a
+    Linux desktop `DISPLAY`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`. `DOCKER_CONTEXT`'s endpoints
+    live in the `Edit`-denied `~/.docker`. `DOCKER_HOST` is not kept (review round 27): a terminal
+    could point it at a fake daemon that collects registry credentials on a pull. A Colima or
+    OrbStack daemon is reached through its Docker context. A non-default image is always built from the kit, so
     `JKB_CONTAINER_IMAGE` names a tag and never chooses what runs. `DBUS_SESSION_BUS_ADDRESS` stays
     out, because a `unixexec:` address runs a program.
 
@@ -1543,9 +1547,14 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
   when it is a `file:` URL, which its headless browser loads from disk; Artifact's file fields;
   ArtifactData's `file_path`; Workflow's `scriptPath`. A relative one is judged from the session cwd
   and from the project dir, where jkb's server starts. A tool listed as pathless (jkb's other tools,
-  WebFetch, the task and cron tools and the like) is let through. **Any other tool is refused, MCP
-  or built-in,** with a reason naming the table. Adding one is a table line and a rebuild, as
-  editing the allowlist already is.
+  WebFetch, StructuredOutput, the task and cron tools and the like) is let through. **Any other
+  tool, MCP or built-in, has the fields whose names say they are paths judged** (`file_path`,
+  `path`, `paths`, `file`, `dir`, `root`, `source`, `target`, `uri`, `url` and the like, at any depth,
+  as a string or an array; a URL only when it is `file:`), and everything else it carries passes.
+  Round 27 refused unlisted tools outright. That refused StructuredOutput, which every schema agent
+  must call, so `/jkb-review` and the swarm returned nothing in the container. It also refused every
+  connector, though a claude.ai connector cannot open a local file at all. The user chose names
+  over refusal: a field's name is a far smaller guess than its prose.
   - **What it replaced, and why.** From review round 6 the hook judged every string an unknown tool
     carried that could be a path, from every base a server might use. Rounds 16 to 26 spent most of
     their findings there. Each round found another reading some server might take of free text: a
@@ -1555,9 +1564,9 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
     was still a guess about which runtimes trim. Several of those rounds' must-fixes were caused by
     the previous round's fix. A table cannot be wrong about what an unlisted server does, because it
     does not let one run. The scanner, its six per-call budgets and about 350 lines went with it.
-  - **What it costs.** An MCP server or built-in tool the table does not name is refused until it is
-    added. That includes connectors such as the claude.ai ones and VS Code's, which a session may
-    offer. jkb's own server needs nothing more: its one path field is in the table.
+  - **What it costs.** A local MCP server that takes a path under a field name not on the list
+    (`location`, say) is not judged. A tool whose path field matters belongs in the table, which is
+    one line and a rebuild; jkb's own server is there.
 - **No sandbox, no boundary.** With the sandbox disabled there is nothing to mirror, and the
   transcript rule still applies. `enabled` takes the word of the highest-precedence layer that sets
   it: managed and its drop-ins, then local, project and user. A layer that is not valid JSON
@@ -1658,8 +1667,8 @@ O(files) of argv. What
   `args` is a slash command's free text. The file tools (Read, Edit, MultiEdit since review round 25,
   Write, NotebookEdit) are judged by their path fields. Every other tool goes through the field table
   in *The file tools are held to the sandbox's own boundary*: its listed path fields are judged, a
-  pathless one passes, and an unlisted one is refused (review round 27; from round 3 to 26 every
-  string such a tool carried was judged as a possible path). `CLAUDE_CONFIG_DIR`, when set, adds its
+  pathless one passes, and an unlisted one has its path-NAMED fields judged (review round 27; from
+  round 3 to 26 every string such a tool carried was judged as a possible path). `CLAUDE_CONFIG_DIR`, when set, adds its
   `projects` tree to the roots.
 - **A hook that runs out of time refuses** (review round 27). Claude Code kills a hook at its
   timeout, 10 s here, and then lets the call through. Rounds 9 to 22 answered each slow input with

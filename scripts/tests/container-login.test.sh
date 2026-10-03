@@ -205,7 +205,7 @@ STUB
     [ -z "${RS_GONE:-}" ] || rm -rf "$kit_src"
     local script="$repo_root/.container/run.sh"
     [ -z "${RS_KIT:-}" ] || script="$d/home/.local/share/jkb-container-kit/kit/.container/run.sh"
-    # The keep file: run.sh drops PATH entries under /tmp, where this stub lives (see its top).
+    # The keep file: run.sh builds its PATH from fixed directories, and the stub's goes first through it.
     mkdir -p "$d/home/.local/share/jkb-container-kit"; printf '%s\n' "$d/bin" > "$d/home/.local/share/jkb-container-kit/path-keep"
     rs_dir="$d"
     env ${RS_ENV_I:+-i} HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} ${RS_EXTRA_ENV:-} \
@@ -424,6 +424,19 @@ case24_an_exported_function_does_not_reach_run_sh_children() {
     fi
 }
 
+# A DIRECTORY IN path-keep COMES BEFORE THE SYSTEM ONES: the keep list is yours, and the tests' stubs are
+# kept through it. Behind /usr/bin, a machine with docker installed ran the REAL docker in the stubbed
+# cases -- and `--rm` removed the developer's jkb-dev (review round 27). A recording `dirname`, which
+# run.sh calls first, shows whose copy it found without needing docker at all.
+case25_path_keep_precedes_the_system_dirs() {
+    local d="$work/kp-$RANDOM"; mkdir -p "$d/home/.local/share/jkb-container-kit" "$d/bin"
+    printf '#!/bin/sh\n: > "%s/RAN-dirname"\nexec /usr/bin/dirname "$@"\n' "$d" > "$d/bin/dirname"; chmod +x "$d/bin/dirname"
+    printf '%s\n' "$d/bin" > "$d/home/.local/share/jkb-container-kit/path-keep"
+    env HOME="$d/home" PATH="/usr/bin:/bin" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
+    if [ -e "$d/RAN-dirname" ]; then ok "a directory in path-keep comes before the system directories on run.sh's PATH"
+    else fail "a directory in path-keep comes before the system directories on run.sh's PATH" "the system dirname ran"; fi
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
@@ -435,5 +448,6 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored \
           case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment \
           case21_run_sh_children_inherit_only_the_allowlist case22_the_container_name_override_survives_the_allowlist \
-          case23_a_symlinked_writable_dir_outside_home_is_dropped case24_an_exported_function_does_not_reach_run_sh_children
+          case23_a_symlinked_writable_dir_outside_home_is_dropped case24_an_exported_function_does_not_reach_run_sh_children \
+          case25_path_keep_precedes_the_system_dirs
 finish

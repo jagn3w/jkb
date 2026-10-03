@@ -131,8 +131,9 @@ if [ -n "${JKB_REMOTE:-}" ]; then
   echo "  • skipped: KB scaffold, services, git hooks, notification topic, notifier. The machine"
   echo "    serving the knowledge base owns them; run setup.sh there. In the dev container,"
   echo "    .container/run.sh mirrors that machine's git hooks."
+  # The ROOT-OWNED mirror's copy, as verify.sh and the README name it: the checkout's is agent-writable.
   echo "  • the container's explorer extension is not rebuilt: after a pull that touches ui/, run"
-  echo "    .container/install-extensions.sh from an attached terminal."
+  echo "    /usr/local/lib/jkb-container/.container/install-extensions.sh from an attached terminal."
   # SAID WHEN THE BINARY CHANGED, because nothing else will say it: this rebuilt the client, not
   # the host's jkb or its `jkb serve`, and there is no version handshake between them. The checkout
   # is SHARED (the container mounts ~/repos), so a `git pull` on the host then finds nothing to

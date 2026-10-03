@@ -588,8 +588,15 @@ else
     # and a substring check on that list had already let `Edit` hide inside `NotebookEdit`
     # (round 1). One shape now, from one shared definition, compared exactly.
     dc_match="$(jq -r --arg h "$dc_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$here/managed-settings.json" 2>/dev/null)"
+    # ...AND ITS OWN DEADLINE ENDS BEFORE CLAUDE CODE'S TIMEOUT: the hook refuses a call it could not
+    # judge in dt_deadline seconds, but Claude Code kills it at the managed timeout and then lets the
+    # call through -- so a timeout at or under the deadline fails open (review round 27).
+    dc_tmo="$(jq -r --arg h "$dc_hook" '[.hooks.PreToolUse[]? | .hooks[]? | select(.command == $h) | .timeout] | first // empty' "$here/managed-settings.json" 2>/dev/null)"
+    dc_dl="$(sed -n 's/^    dt_deadline=\([0-9][0-9]*\)$/\1/p' "$here/deny-transcripts.sh" | head -1)"
     if [ "$dc_match" != "$(posture_hook_matcher)" ]; then
         bad "the transcript hook's matcher is [$dc_match], not [$(posture_hook_matcher)] — any tool it does not match never reaches the hook, and can read or upload another session's transcript"
+    elif [ -z "$dc_tmo" ] || [ -z "$dc_dl" ] || [ "$dc_dl" -ge "$dc_tmo" ]; then
+        bad "the transcript hook's own deadline [${dc_dl:-not found}s] does not end before its managed timeout [${dc_tmo:-not set}s] — Claude Code would kill it first and let the call through"
     else
         ok "the transcript deny is a wired, root-owned hook that every tool call reaches"
     fi
@@ -721,7 +728,7 @@ case "$dc_run_env" in
     *'jkb_path="$PATH'*|*'jkb_path=$PATH'*|*'jkb_path="${PATH'*|*'jkb_path=${PATH'*|*':$PATH'*|*':${PATH'*) dc_unsb="$dc_unsb run.sh builds its PATH from the inherited one;" ;;
 esac
 case "$dc_run_env" in
-    *'in PATH|'*|*'|PATH|'*|*'|PATH)'*|*DOCKER_CONFIG*|*BASH_ENV*|*TAR_OPTIONS*|*LD_*|*DYLD_*|*TMPDIR*|*'|*)'*) dc_unsb="$dc_unsb run.sh's environment allowlist names a variable that steers what its children run;" ;;
+    *'in PATH|'*|*'|PATH|'*|*'|PATH)'*|*DOCKER_CONFIG*|*DOCKER_HOST*|*BASH_ENV*|*TAR_OPTIONS*|*LD_*|*DYLD_*|*TMPDIR*|*'|*)'*) dc_unsb="$dc_unsb run.sh's environment allowlist names a variable that steers what its children run;" ;;
 esac
 # ...AND THE ALLOWLIST NAMES EVERY JKB_ VARIABLE run.sh READS that it does not set itself: dropping
 # JKB_CONTAINER_NAME made run.sh act on jkb-dev while the reaper looked for the override (review round

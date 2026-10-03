@@ -10,8 +10,9 @@
 #
 # - EVERY TOOL REACHES IT (matcher `.*`). Bash and the text-carrying built-ins are let through first;
 #   the file tools are judged by their path fields; every other tool is judged by THE FIELD TABLE at
-#   the bottom -- its listed path fields, or let through as pathless, or REFUSED when it is not listed.
-#   Nothing scans free text: rounds 6 to 26 did, and could not finish (the user's choice, round 27).
+#   the bottom -- its listed path fields, or let through as pathless, or, when it is not listed, the
+#   fields whose NAMES say they are paths. Nothing scans free text: rounds 6 to 26 did, and could not
+#   finish (the user's choices after rounds 26 and 27).
 # - IT FAILS CLOSED. An EXIT trap turns every way of not reaching a verdict into exit 2, which blocks;
 #   and the judging runs under a deadline (`timeout -s KILL 8`) whose expiry is a refusal, because
 #   Claude Code lets a call through when it kills a hook at its own 10s timeout.
@@ -583,12 +584,27 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__jkb__ingest_url","cwd":"'"$bh"'/repos/w","tool_input":{"source":"file://'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: ...while an https URL is not a path" allow \
       '{"tool_name":"mcp__jkb__ingest_url","cwd":"'"$bh"'/repos/w","tool_input":{"source":"https://example.com/'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    # REVIEW ROUND 26, AND THE USER'S CHOICE AFTER IT: THE FIELD TABLE. An unlisted tool is refused
-    # whatever it carries, and a listed one is judged on its path fields only.
-    h "round 27: an MCP tool not in the table is refused, with nothing in it that looks like a path" deny \
-      '{"tool_name":"mcp__other__search","cwd":"'"$bh"'/repos/w","tool_input":{"q":"hello"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
-    h "round 27: ...and so is an unknown built-in" deny \
-      '{"tool_name":"FutureTool","cwd":"'"$bh"'/repos/w","tool_input":{}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 26, AND THE USER'S CHOICE AFTER IT: THE FIELD TABLE. A listed tool is judged on its
+    # path fields only.
+    # THE USER'S CHOICE AFTER ROUND 27: an unlisted tool is NOT refused. Its fields whose NAMES say they
+    # are paths are judged; everything else passes. Refusing it broke StructuredOutput, which every
+    # schema agent must call, and every connector.
+    h "round 27: an unlisted MCP tool with no path-named field is allowed" allow \
+      '{"tool_name":"mcp__claude_ai_Docs__batch","cwd":"'"$bh"'/repos/w","tool_input":{"q":"see '"$bh"'/.ssh/id_rsa","text":"../../x"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: ...while its path-named field is judged" deny \
+      '{"tool_name":"mcp__fs__read_file","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: ...however deep, and in an array" deny \
+      '{"tool_name":"mcp__fs__read_many","cwd":"'"$bh"'/repos/w","tool_input":{"opts":{"paths":["'"$bh"'/repos/w/a","'"$bh"'/.ssh/id_rsa"]}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: ...and a file: URL in a uri field" deny \
+      '{"tool_name":"mcp__x__open","cwd":"/h/repos/jkb","tool_input":{"uri":"file:///h/.claude/projects/-s/e.jsonl"}}' HOME=/h
+    h "round 27: ...while an https url field is not a path" allow \
+      '{"tool_name":"mcp__x__fetch","cwd":"'"$bh"'/repos/w","tool_input":{"url":"https://example.com'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: StructuredOutput passes, whatever its findings name" allow \
+      '{"tool_name":"StructuredOutput","cwd":"'"$bh"'/repos/w","tool_input":{"findings":[{"file":"'"$bh"'/.ssh/id_rsa","summary":"x"}]}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: an unknown built-in with no path-named field is allowed" allow \
+      '{"tool_name":"FutureTool","cwd":"'"$bh"'/repos/w","tool_input":{"note":"'"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 27: EnterWorktree's path is judged" deny \
+      '{"tool_name":"EnterWorktree","cwd":"'"$bh"'/repos/w","tool_input":{"path":"'"$bh"'/.ssh"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: a pathless built-in in the table is allowed" allow \
       '{"tool_name":"WebFetch","cwd":"'"$bh"'/repos/w","tool_input":{"url":"https://example.com","prompt":"read '"$bh"'/.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: Workflow's scriptPath is a path field" deny \
@@ -599,6 +615,9 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"Artifact","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/p.html","files":{"k":{"artifact":"https://claude.ai/artifact/x","path":"'"$bh"'/.ssh/id_rsa"}}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     h "round 27: Artifact's files are judged against its root too" deny \
       '{"tool_name":"Artifact","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/p.html","root":"'"$bh"'","files":{"k":".ssh/id_rsa"}}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # FROM A COPY: the installed hook ignores both test seams by its own path, so run from there (as
+    # verify.sh runs it) these rows failed and verify.sh reported the hook broken (review round 27).
+    dlc="$bh/dt-deadline.sh"; cp "$self" "$dlc" && chmod +x "$dlc"; dself="$self"; self="$dlc"
     t0=$(date +%s%N)
     h "round 27: a judge that runs past the deadline is refused, never let through" deny \
       '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/x.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w" DT_SELFTEST_DEADLINE=1 DT_SELFTEST_SLOW=5
@@ -607,6 +626,7 @@ if [ "${1:-}" = --self-test ]; then
     else printf '  \033[31mFAIL\033[0m ...but it took %sms: the child was not killed at the deadline\n' "$t1"; fails=$((fails+1)); fi
     h "round 27: ...while the same call under the deadline is allowed" allow \
       '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/x.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    self="$dself"
     h "round 24: a Skill's args are prose, and a ../ in them is not a path" allow \
       '{"tool_name":"Skill","cwd":"'"$bh"'/repos/w","tool_input":{"skill":"review","args":"see\n../docs/x.md\nfor context"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     me="$(jqh -cn --arg h "$bh" '{tool_name:"MultiEdit", cwd:($h + "/repos/w"), tool_input:{file_path:($h + "/repos/w/a.rs"), edits:[{old_string:"x", new_string:"/// doc\n///\nfn a() {}"}]}}')"
@@ -655,7 +675,7 @@ if [ "${1:-}" = --self-test ]; then
     case "$sh" in */tmp.*) rm -rf -- "$sh" ;; *) printf '  \033[33mnote\033[0m left %s in place: not a mktemp path\n' "$sh" ;; esac
 
     # ANY TOOL THAT CAN NAME A PATH. MCP tools run unsandboxed; a listed tool's path fields are judged,
-    # and an unlisted tool is refused (the field table, review round 27).
+    # and an unlisted tool's path-named fields (the field table, review round 27).
     h "an MCP tool given a transcript path is denied" deny \
       '{"tool_name":"mcp__jkb__ingest_path","cwd":"/h/repos/jkb","tool_input":{"source":"/h/.claude/projects/-s/e.jsonl"}}' HOME=/h
     h "...or as an ancestor that a server would walk" deny \
@@ -1195,14 +1215,15 @@ case "$tool" in
     Read|Edit|MultiEdit|Write|NotebookEdit)
         [ -n "$pth" ] && check "$pth" ;;
     *)
-        # THE FIELD TABLE (the user's choice after review round 26, on a structural review of why 26
-        # rounds had not converged). A tool whose path fields are listed has them judged as Read's
-        # file_path is; a tool listed as pathless is let through; ANY OTHER TOOL IS REFUSED, MCP or
-        # built-in. Rounds 6 to 26 judged every string an unknown tool carried as a possible path and
-        # could not finish: each round found another reading of free text -- a whitespace class, a line
-        # break, padding, an object key -- that some server might take. A table cannot be wrong about
-        # what an unlisted server does, because it does not let one run. Adding a tool is one line here
-        # and a rebuild of the image this hook is installed in.
+        # THE FIELD TABLE (the user's choices after review rounds 26 and 27, on a structural review of
+        # why 26 rounds had not converged). A listed tool has its listed path fields judged as Read's
+        # file_path is, and a tool listed as pathless is let through. ANY OTHER TOOL has the fields
+        # whose NAMES say they are paths judged (file_path, path, paths, file, dir, root, source, uri,
+        # ... -- at any depth, string or array), and everything else it carries passes. Rounds 6 to 26
+        # judged every string an unknown tool carried as a possible path and could not finish: each
+        # round found another reading of free text. A field's name is a much smaller guess than its
+        # prose. Refusing unlisted tools outright (round 27) refused StructuredOutput, which every
+        # schema agent must call, and every connector, which cannot open a local file at all.
         case "$tool" in
             mcp__jkb__ingest_path) dt_fields='.source' ;;
             # ingest_url renders its URL in a headless browser, which loads a file: URL from disk.
@@ -1223,8 +1244,14 @@ case "$tool" in
             # does (Monitor, the shell-output tools).
             WebFetch|WebSearch|Monitor|ScheduleWakeup|CronCreate|CronDelete|CronList|TaskStop|TaskOutput|\
             ListAgents|EnterPlanMode|ExitPlanMode|ReportFindings|PushNotification|RemoteTrigger|\
-            ArtifactComments|KillShell|BashOutput|TaskCreate|TaskUpdate|TaskList|TaskGet) dt_fields='empty' ;;
-            *) deny "$tool is not in the file-tool boundary's table (the field table in .container/deny-transcripts.sh). An unlisted MCP server or tool cannot be told apart from one that reads any file it is handed, so it is refused. To use it here, add it to that table with its path fields, or as pathless, and rebuild the container." ;;
+            ArtifactComments|KillShell|BashOutput|TaskCreate|TaskUpdate|TaskList|TaskGet|StructuredOutput|\
+            ExitWorktree) dt_fields='empty' ;;
+            # Everything else: the path-NAMED fields, at any depth. A URL in one is a path only when it is
+            # a file: URL; https://... names no local file.
+            *) dt_fields='.. | objects | to_entries[]
+                | select(.key | test("^(file_?path|file_?paths|path|paths|file|files|file_?name|dir|directory|root|cwd|source|target|dest|destination|out_?dir|output_?path|input_?path|uri|url)$"; "i"))
+                | .value | (strings, (arrays | .[] | strings))
+                | select((test("^[A-Za-z][A-Za-z0-9+.-]*://") | not) or test("^file:"; "i"))' ;;
         esac
         dt_paths_sh="$(printf '%s' "$input" | jqh -er "[.tool_input | ($dt_fields) | strings | select(. != \"\")] | @sh \"dt_paths=(\\(.))\"" 2>/dev/null)" || exit 3
         dt_paths=(); eval "$dt_paths_sh"

@@ -1777,9 +1777,18 @@ run "run.sh's environment allowlist keeps the inherited PATH" "names a variable 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-o = '|DOCKER_HOST|'
+o = '|DOCKER_CONTEXT|'
 assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, '|DOCKER_CONFIG|DOCKER_HOST|', 1))
+open(p, 'w').write(s.replace(o, '|DOCKER_HOST|DOCKER_CONTEXT|', 1))
+PYX
+run "run.sh's environment allowlist keeps DOCKER_HOST again" "names a variable that steers what its children run"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '|DOCKER_CONTEXT|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '|DOCKER_CONFIG|DOCKER_CONTEXT|', 1))
 PYX
 run "run.sh's environment allowlist lets DOCKER_CONFIG through" "names a variable that steers what its children run"
 
@@ -2040,6 +2049,16 @@ p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('"matcher": ".*"', '"matcher": "mcp__.*"', 1))
 PYX
 run "the hook matcher covers MCP tools only" "transcript hook's matcher is [mcp__.*]"
+
+# REVIEW ROUND 27. The hook's deadline must end before Claude Code's timeout kills it.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '"command": "/usr/local/bin/deny-transcripts.sh", "timeout": 10'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '"command": "/usr/local/bin/deny-transcripts.sh", "timeout": 5', 1))
+PYX
+run "the hook's managed timeout drops under its deadline" "does not end before its managed timeout"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
@@ -2436,7 +2455,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=118
+PINNED_BAD_SITES=119
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
