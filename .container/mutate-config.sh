@@ -1838,6 +1838,22 @@ json.dump(d, open(p, "w"), indent=2)
 PYX
 run "the posture stops denying Edit on ~/.cargo/env" "no Edit(~/.cargo/env) deny"
 
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.zshenv)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on ~/.zshenv" "no Edit(~/.zshenv) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.config/git/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on git's global config directory" "no Edit(~/.config/git/**) deny"
+
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()

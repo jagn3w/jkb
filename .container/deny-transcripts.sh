@@ -54,8 +54,12 @@
 # path segments x bases at 12000 (round 14: 100 leaves of 2000 segments reached 10s) AND check()
 # calls at 32 (round 15: 600 calls passed the segment cap and ran 4.6s idle, 20s with 10 busy
 # loops on 10 cores). The slowest call under both, five `~name/` strings from three bases (30
-# calls), takes 0.26s idle and 2.14s with 10 busy loops, measured that way on 2026-10-02. It was ~7ms before five review rounds added guards; the number is
-# re-measured rather than carried, because this hook now runs on EVERY tool call.
+# calls), takes 0.26s idle and 2.14s with 10 busy loops, measured that way on 2026-10-02. It was ~7ms
+# before five review rounds added guards; the number is re-measured rather than carried, because this
+# hook now runs on EVERY tool call. Round 20 found ONE LONG STRING was enough: a 200KB note beside a
+# transcript path took 21s, because a ${x#lit} that does not match is quadratic (see `under`). After
+# the fix, measured the same way on 2026-10-03: 300KB strings of five shapes decide in under 140ms,
+# 1.5MB of prose with a `..` to resolve in 1.7s; 7ms Bash, 33ms Read, 64ms for a jkb task_create.
 #
 # PATHS ARE RESOLVED THE WAY THE TOOL WILL RESOLVE THEM, not the way this process would. A leading
 # `~` is the user's home, and a relative path is relative to the SESSION'S cwd (the payload's
@@ -93,8 +97,8 @@
 #
 # BOUNDED, because a timed-out hook FAILS OPEN. At most 100 path-shaped candidates and 2000 bare
 # words (each tested on disk; round 9 timed 20000 at 2s), then refused; a Glob pattern and a path field
-# over PATH_MAX (4096) is refused before it is walked, and an over-long free-text string gets the
-# linear lexical verdict alone. THE MEASUREMENT, kept here and nowhere else: 100 distinct relative
+# over PATH_MAX (4096) is refused before it is walked, and an over-long free-text string is judged on
+# its linear normalisation, or skipped when even that cannot be opened (see judge). THE MEASUREMENT, kept here and nowhere else: 100 distinct relative
 # strings to an MCP tool, `date +%s%N` around one invocation in jkb-dev on 2026-10-01 -- ~1.0s when
 # the cwd is the project dir (bases deduplicated), 1.4s with three distinct bases. This container
 # has been seen running 5x slow under a saturated VM, and 5x the worst case is still inside 10s.
@@ -117,6 +121,11 @@
 # other two ways to put code in front of this script.
 PATH=/usr/bin:/bin
 export PATH
+# BYTES, NOT CHARACTERS: under a UTF-8 locale every ${x#lit} that does not match re-decodes the string
+# per candidate length, and one 1MB string took 907s against 7.6s under C (review round 20, measured
+# in jkb-dev). It also makes ${#x} count bytes, which is what PATH_MAX counts.
+LC_ALL=C
+export LC_ALL
 set -uo pipefail
 
 # EVERY jq CALL GOES THROUGH HERE, with HOME pointed where no file can be. jq SOURCES $HOME/.jq into
@@ -209,8 +218,8 @@ through_magic() { # through_magic <absolute un-normalised path> -> rc 0 if it pa
     return 1
 }
 
-# A file: URI AS THE PATH IT NAMES, for every caller -- check() and the over-PATH_MAX branch both,
-# since round 7 found the long branch skipping a rewrite that lived in check() alone. The scheme is
+# A file: URI AS THE PATH IT NAMES, for every caller -- check() and the generic arm both, since round
+# 7 found an over-PATH_MAX branch skipping a rewrite that lived in check() alone. The scheme is
 # compared CASE-INSENSITIVELY: `FILE:///h/.claude/...` is the same URI under RFC 3986, and a
 # lowercase-only match let it through. Prints the path, or nothing if the string is not a file URI;
 # returns 1 for a file URI it will not judge (percent-escapes: a second parser of the same string
@@ -302,8 +311,12 @@ brace_expand() { # brace_expand <pattern>
 # `case "$root/" in "${p%/}"/*)`, and for p=/ -- where the quoted part is EMPTY -- it did not match
 # `/h/.claude/projects/` on bash 5.2.21, while the literal pattern `/*` did. Reproduced in a fresh
 # shell; the dot after a slash is part of it. Whatever bash's matcher is doing there, a
-# confidentiality check must not depend on it, so "starts with" is `${x#"$prefix"} != $x`, which
-# compares bytes and nothing else.
+# confidentiality check must not depend on it, so "starts with" compares bytes and nothing else: a
+# SUBSTRING, `${x:0:${#prefix}}` = $prefix. It was `${x#"$prefix"} != $x` until review round 20 found
+# that a strip which does not match is quadratic in bash, and over a long string ran the hook past the
+# timeout, which fails open. `under <path> <dir>`: is <path> strictly inside <dir>?
+under() { [ "${1:0:${#2}+1}" = "$2/" ]; }
+
 verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
     local p roots="$2" root rel rest anc
     # PROCFS MAGIC LINKS: a path through them is resolved in whichever process opens it, so it is
@@ -313,12 +326,12 @@ verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
     while IFS= read -r root; do
         [ -n "$root" ] || continue
         # INSIDE the tree: the root itself, or anything under root/.
-        if [ "$p" = "$root" ] || [ "${p#"$root"/}" != "$p" ]; then
+        if [ "$p" = "$root" ] || under "$p" "$root"; then
             # Auto-memory is the one child of a slug that is not a transcript. EXACTLY one slug
             # deep: `<slug>/memory/...`. A `case` `*` crosses `/`, so the first cut's
             # `"$root"/*/memory/*` matched a directory called memory at ANY depth --
             # `<slug>/<uuid>/subagents/memory/a.jsonl` was readable and writable.
-            rel="${p#"$root"}"; rel="${rel#/}"
+            rel="${p:${#root}}"; rel="${rel#/}"
             case "$rel" in
                 */*) rest="${rel#*/}"
                      case "$rest" in memory|memory/*) printf 'allow\n'; return ;; esac
@@ -334,8 +347,8 @@ verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
             printf 'deny\n'; return
         fi
         # An ANCESTOR of the tree: anything rooted here walks into it. For p=/ this is "/".
-        anc="${p%/}/"
-        if [ "${root#"$anc"}" != "$root" ]; then printf 'deny\n'; return; fi
+        anc="$p"; [ "${anc: -1}" = / ] && anc="${anc:0:${#anc}-1}"; anc="$anc/"
+        if [ "${root:0:${#anc}}" = "$anc" ]; then printf 'deny\n'; return; fi
     done <<<"$roots"
     printf 'allow\n'
 }
@@ -653,6 +666,21 @@ if [ "${1:-}" = --self-test ]; then
       '{"tool_name":"mcp__x__note","cwd":"'"$bh"'/repos/w","tool_input":{"text":"See [the record](../../docs/task-lifecycle.md) for D52."}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     spl="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__jkb__ingest_path", cwd:($h + "/repos/w"), tool_input:{path:("a b/" + ([range(2100)|"./"]|join("")) + "../../../.ssh/id_rsa")}}')"
     h "round 19: an over-long climb with a space in it still meets the boundary" deny "$spl" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    # REVIEW ROUND 20. The literal cwd reading of a `~`-led string is judged in full; a climb after a
+    # link is held to the boundary where a normalising server lands, not only where the kernel does;
+    # padding is collapsed before the form refusals, so it cannot strip a `./` off a `~`.
+    ln -s "$bh/.ssh" "$bh/repos/w/~+"; ln -s "$bh/.ssh" "$bh/repos/w/~t"
+    mkdir -p "$bh/repos/w/a/b"; ln -s "$bh/repos/w/a/b" "$bh/repos/w/l m"
+    h "round 20: a cwd link named ~+ is followed and judged" deny \
+      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"~+/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    h "round 20: a climb after a link, behind a space, meets the boundary at its lexical landing" deny \
+      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"l m/../../../.ssh/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    padt="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:("./~t" + ([range(2100)|"/."]|join("")) + "/id_rsa")}}')"
+    h "round 20: padding does not turn ./~t into ~t" deny "$padt" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    padu="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("file://localhost/h/.claude/projects/-s" + ([range(2100)|"/."]|join("")) + "/e.jsonl")}}')"
+    h "round 20: a padded file://localhost URI is read as its path before it is collapsed" deny "$padu" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    h "round 20: ...and unpadded ./~t is denied as before" deny \
+      '{"tool_name":"mcp__x__read","cwd":"'"$bh"'/repos/w","tool_input":{"p":"./~t/id_rsa"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     longp="$(jqh -cn --arg h "$bh" '{tool_name:"mcp__x__read", cwd:($h + "/repos/w"), tool_input:{p:($h + ([range(2100)|"/."]|join("")) + "/.ssh/id_rsa")}}')"
     h "round 17: an over-long padded path still meets the boundary" deny "$longp" HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
     mkdir -p "$bh/repos/w/.claude"
@@ -750,7 +778,7 @@ if [ "${1:-}" = --self-test ]; then
     agent="$(jqh -cn '{tool_name:"Agent", cwd:"/h/repos/jkb", tool_input:{prompt:([range(130) | "Review the change in crates/jkb-core."] | join(" "))}}')"
     h "a 4.6KB Agent prompt with slashes is allowed" allow "$agent" HOME=/h
     # Over PATH_MAX in an unknown tool's input: prose passes, a chain that collapses into the tree
-    # does not -- the lexical verdict does the collapse a server would.
+    # does not -- judge() normalises it as a server would.
     prose="$(jqh -cn '{tool_name:"mcp__x__note", cwd:"/h/repos/jkb", tool_input:{text:([range(200) | "see docs/a b.md here"] | join(" "))}}')"
     h "a 5KB prose string with slashes in an MCP call is allowed" allow "$prose" HOME=/h
     chain="$(jqh -cn '{tool_name:"mcp__x__read", cwd:"/h/repos/jkb", tool_input:{p:("/" + ([range(1500) | "a b/.."] | join("/")) + "/h/.claude/projects/-s/e.jsonl")}}')"
@@ -834,6 +862,24 @@ if [ "${1:-}" = --self-test ]; then
     slow="$(jqh -cn '{tool_name:"Glob", cwd:"/h/repos/jkb", tool_input:{pattern:("~/.claude/projects/" + ([range(6)|"{.,./}"]|join("")) + ([range(1960)|"./"]|join("")) + "*/*.jsonl")}}')"
     t0=$(date +%s%N)
     h "64 long distinct Glob prefixes are refused" deny "$slow" HOME=/h
+    case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
+    if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
+    else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
+    # REVIEW ROUND 20. A ${x#lit} or ${x%lit} that does NOT match is quadratic in bash: one long free-text
+    # string beside a transcript path ran the hook to 21s, past the timeout, which fails open.
+    for lead in "./" "x/" "/" "~x/" "a b/"; do
+        big="$(jqh -cn --arg l "$lead" '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:($l + ([range(300000)|"e"]|join(""))), p:"/h/.claude/projects/-s/e.jsonl"}}')"
+        t0=$(date +%s%N)
+        h "round 20: a 300KB string led by '$lead' beside a transcript path" deny "$big" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+        case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
+        if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
+        else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
+    done
+    mlong="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{paths:("/h/.claude/projects/-s/e.jsonl\n" + ([range(1000)|"/h/repos/jkb/a.rs"]|join("\n")))}}')"
+    h "round 20: an over-long multi-line list that starts with a transcript path is still denied" deny "$mlong" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
+    big="$(jqh -cn '{tool_name:"mcp__x__y", cwd:"/h/repos/jkb", tool_input:{note:("see crates/a.rs " + ([range(300000)|"e"]|join("")))}}')"
+    t0=$(date +%s%N)
+    h "round 20: ...and a 300KB note alone is allowed" allow "$big" HOME=/h CLAUDE_PROJECT_DIR=/h/repos/jkb
     case "$t0" in *N) t1=0 ;; *) t1=$(( ($(date +%s%N) - t0) / 1000000 )) ;; esac
     if [ "$t1" -lt 2000 ]; then printf '  \033[32mok\033[0m   ...in %sms\n' "$t1"
     else printf '  \033[31mFAIL\033[0m ...but it took %sms, near enough the timeout to fail open\n' "$t1"; fails=$((fails+1)); fi
@@ -935,8 +981,9 @@ deny() {
 # paths refused ordinary calls once every tool reached this hook: 40 todos from a home cwd, an empty
 # activeForm read as "the home, an ancestor of the tree", a 4.6KB Agent prompt over the byte budget
 # (review round 4, all reproduced). A subagent's own tool calls reach this hook in their own right.
-# Read with the builtin, not `cat`: every tool call pays for this hook now, so a fork saved here is
-# saved on every Bash call.
+# Read without `cat`: every tool call pays for this hook now, so a fork saved here is saved on every
+# Bash call. `$(</dev/stdin)`, not `read -d ''`, which reads a pipe a byte at a time: 1s for a 300KB
+# payload, before any judging (review round 20). The trailing newlines it drops are not JSON.
 # `--sandbox-enabled` asks this hook's own merged answer (1 or 0) for the cwd, so verify.sh does not
 # keep a second copy of the layer-precedence rule (review round 17). It runs the same path as a tool
 # call, with a synthetic payload, and prints instead of deciding.
@@ -945,7 +992,7 @@ if [ "${1:-}" = --sandbox-enabled ]; then
     sb_query=1
     input="$(printf '{"tool_name":"__sandbox_query__","cwd":%s,"tool_input":{}}' "$(printf '%s' "$PWD" | HOME=/dev/null jq -Rs .)")"
 else
-    IFS= read -r -d '' input || true
+    input="$(</dev/stdin)"
 fi
 command -v jq >/dev/null 2>&1 || exit 3
 tool="$(printf '%s' "$input" | jqh -er '.tool_name | strings' 2>/dev/null)" || exit 3
@@ -1082,7 +1129,7 @@ sb_under() { # sb_under <path> <entry>... -> rc 0 when <path> is an entry or lie
     for e in "$@"; do
         [ -n "$e" ] || continue
         [ "$e" = / ] && return 0
-        [ "$p" = "$e" ] || [ "${p#"${e%/}"/}" != "$p" ] && return 0
+        [ "$p" = "$e" ] || under "$p" "${e%/}" && return 0
     done
     return 1
 }
@@ -1108,7 +1155,7 @@ boundary() {
         # inside it (review round 17). The entry's literal base is compared, so a glob errs to refuse.
         if [ "$sb_mode" = read ]; then
             local eb="${e%%[\*\?\[\{]*}"; eb="${eb%/}"
-            [ -n "$eb" ] && [ "${eb#"${1%/}"/}" != "$eb" ] \
+            [ -n "$eb" ] && under "$eb" "${1%/}" \
                 && deny "$1 holds $eb, which the Claude settings deny reading, and a tool rooted here would read it."
         fi
     done
@@ -1122,7 +1169,8 @@ boundary() {
     fi
     while IFS= read -r r; do
         [ -n "$r" ] || continue
-        rest="${1#"$r"/}"; [ "$rest" != "$1" ] || continue
+        under "$1" "$r" || continue
+        rest="${1:${#r}+1}"
         rest="${rest#*/}"
         [ "$rest" = memory ] || [ "${rest#memory/}" != "$rest" ] && return 0
         # Saved tool output, which Claude Code asks the agent to Read, is a read-only exception.
@@ -1143,6 +1191,44 @@ boundary() {
 # is judged as a read, the weaker test, since what an unknown tool does with a path is unknown.
 case "$tool" in Write|Edit|MultiEdit|NotebookEdit) sb_mode=write ;; *) sb_mode=read ;; esac
 if [ "$sb_query" = 1 ]; then printf '%s\n' "$sb_on"; decided=allow; exit 0; fi
+
+# `collapse <string>`: `.` and empty segments removed, a leading `./` kept. Each pass is one linear
+# global replace, and each halves a run of `/./`, so a padded string takes a handful of passes.
+collapse() {
+    local lc="$1" ln0
+    while :; do
+        ln0="${#lc}"
+        lc="${lc//\/.\//\/}"; lc="${lc//\/\//\/}"
+        [ "${#lc}" -lt "$ln0" ] || break
+    done
+    [ "${lc: -2}" = /. ] && lc="${lc:0:${#lc}-2}"
+    printf '%s' "$lc"
+}
+
+# `judge <string> <base> <guess 0|1>`: one reading of a free-text string, from one base. Within
+# PATH_MAX it is check()ed as written. Past it no kernel opens it as written, and a server that
+# normalises it opens what normalise() makes of it -- so THAT is checked, and when even that is past
+# PATH_MAX the string names nothing anyone can open. normalise() is linear; the verdict's string
+# surgery on a 300KB string was not, and ran the hook past its timeout, which fails open (review
+# round 20). <guess> 1 holds the reading to the transcript rule alone (see boundary).
+judge() {
+    local n v
+    if [ "${#1}" -le 4096 ]; then sb_guess="$3" check "$1" "$2"; return; fi
+    # Collapsed already, so only a `..` can make it shorter; without one it stays past PATH_MAX, and
+    # normalise()'s pipe read -- a byte at a time, ~0.5s a MB -- is skipped. THE TRANSCRIPT RULE STILL
+    # READS ITS HEAD: verdict() is a prefix test, so with no `..` the first 4096 bytes decide it as the
+    # whole would, and a long multi-line list led by a transcript path stays denied, as it was when an
+    # over-long string got the lexical verdict whole. Not check(): the boundary would refuse prose
+    # that merely starts with a home path, and no server can open this string as a path.
+    case "/$1/" in
+        */../*) ;;
+        *) v="$(verdict "${1:0:4096}" "$roots" "$home" "$2")"
+           case "$v" in deny) deny ;; allow) return 0 ;; *) exit 3 ;; esac ;;
+    esac
+    n="$(resolve "$1" "$home" "$2")"
+    [ "${#n}" -le 4096 ] || return 0
+    sb_guess="$3" check "$n"
+}
 
 check() { # check <path> [base]: deny on deny, return on allow, refuse on anything else
     local base="${2:-$cwd}" v abs raw phys p="$1"
@@ -1172,8 +1258,12 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
     phys="$(realpath -m -- "$raw" 2>/dev/null && printf .)" || exit 3
     phys="${phys%.}"; phys="${phys%$'\n'}"
     [ -n "$phys" ] || exit 3
-    # The sandbox's boundary, on the path the kernel would open.
+    # The sandbox's boundary, on the path the kernel would open -- AND on the lexical one, which is
+    # what a server that normalises first (path.resolve, normpath) opens: `l m/../../../.ssh/x` with
+    # `l m` a link two deep climbs, physically, only to ~/repos, while a normalising server opens
+    # ~/.ssh/x (review round 20). Refusing on either reading errs the safe way.
     boundary "$phys"
+    [ "$abs" = "$phys" ] || boundary "$abs"
     if [ "$phys" != "$abs" ]; then
         v="$(verdict "$phys" "$roots" "$home" "$base")"
         case "$v" in deny) deny ;; allow) ;; *) exit 3 ;; esac
@@ -1182,7 +1272,10 @@ check() { # check <path> [base]: deny on deny, return on allow, refuse on anythi
     # home; one that does not -- jkb's ingest_path, Rust's fs::read -- opens a directory literally
     # named `~name` in its cwd. Judged as the home alone, a cwd link named `~t` pointing into the
     # tree was allowed (review round 9, reproduced). `./` makes the second reading relative.
-    case "$1" in "~/"*|"~") ;; "~"?*) check "./$1" "$base" ;; esac
+    # The generic arm judges the literal reading ITSELF, from every base, with only the home base a
+    # guess: inherited here, the home reading's guess skipped the boundary for a cwd link `~+`
+    # (review round 20). It sets dt_nolit for that call.
+    case "$1" in "~/"*|"~") ;; "~"?*) [ "${dt_nolit:-0}" = 1 ] || check "./$1" "$base" ;; esac
     return 0
 }
 
@@ -1266,7 +1359,7 @@ case "$tool" in
         scan_all=0
         while IFS= read -r r; do
             [ -n "$r" ] || continue
-            if [ "$cwd" = "${r%/*}" ] || [ "$cwd" = "$r" ] || [ "${cwd#"$r"/}" != "$cwd" ]; then scan_all=1; fi
+            if [ "$cwd" = "${r%/*}" ] || [ "$cwd" = "$r" ] || under "$cwd" "$r"; then scan_all=1; fi
         done <<<"$roots"
         # UNIQUE, NON-EMPTY candidates: the cap counts distinct strings, and an empty string is never
         # a location -- judged as one it resolved to the cwd. MULTI-LINE STRINGS ARE JUDGED TOO, on
@@ -1277,7 +1370,8 @@ case "$tool" in
              | select(. != "")
              | select($all == "1" or test("^[~.]") or contains("/"))]
             | unique
-            | if length > 100 then error("too many") else @sh "leaves=(\(.))" end' 2>/dev/null)" || exit 3
+            | if length > 100 then error("too many")
+              else @sh "leaves=(\(.))" + " segs=\(map(split("/") | length) | add // 0)" end' 2>/dev/null)" || exit 3
         # ...and every OTHER string short enough to be one name (NAME_MAX): a bare word is a path
         # the moment it names something in a base, and a link named `t` there reached the tree with
         # nothing judged (review round 8, reproduced). Tested on disk below, with no fork per word.
@@ -1287,9 +1381,10 @@ case "$tool" in
              | select(($all == "1" or test("^[~.]") or contains("/")) | not)]
             | unique
             | if length > 2000 then error("too many") else @sh "bare=(\(.))" end' 2>/dev/null)" || exit 3
-        leaves=(); bare=()
+        leaves=(); bare=(); segs=0
         eval "$leaves_sh"
         eval "$bare_sh"
+        nleaves0="${#leaves[@]}"
         # An MCP server resolves a relative path against ITS OWN cwd, which is not the session's:
         # the jkb server starts in the project root. So a relative string is judged against every
         # base it could plausibly mean. AN ARRAY, iterated quoted: `for b in $bases` split a cwd
@@ -1316,8 +1411,10 @@ case "$tool" in
         # one is judged from. 100 leaves of ~2000 segments ran a transcript path past the 10s
         # timeout, which fails open (review round 14, reproduced at 10s; the leaf cap alone allowed
         # it). Ordinary calls are a few hundred segment-bases.
-        segs=0
-        for leaf in ${leaves[@]+"${leaves[@]}"}; do sl="${leaf//[^\/]/}"; segs=$((segs + ${#sl} + 1)); done
+        # COUNTED BY jq, where the leaves were found: every bash spelling of "count the slashes" was
+        # slow on one long string -- a bracket-class delete took 2.4s at 300KB, a literal one 2.4s at
+        # 150k slashes (review round 20). A bare word made a leaf is `./word`: two segments.
+        segs=$(( ${segs:-0} + 2 * (${#leaves[@]} - nleaves0) ))
         [ $(( segs * ${#bases[@]} )) -le 12000 ] || exit 3
         # ...AND ON THE NUMBER OF check() CALLS, which is what the time goes on: each forks realpath
         # and walks the path. Under the segment cap, 100 short `~name/` strings from three bases
@@ -1333,6 +1430,19 @@ case "$tool" in
         done
         [ "$nchk" -le 32 ] || exit 3
         for leaf in ${leaves[@]+"${leaves[@]}"}; do
+            # A free-text string that merely STARTS `file:` is text, not a refusal (round 7); only a
+            # `file:/...` URI is rewritten, by the same helper check() uses. FIRST, before the collapse
+            # below folds `file://localhost/` into `file:/localhost/`, a different path (review round 20).
+            case "$(printf '%s' "${leaf:0:6}" | tr 'A-Z' 'a-z')" in
+                file:/) up="$(uri_path "$leaf")" || exit 3; [ -n "$up" ] && leaf="$up" ;;
+                file:*) continue ;;
+            esac
+            # OVER PATH_MAX, `.` and empty segments are then COLLAPSED -- before the form refusals and
+            # the arms, and keeping a leading `./`. Collapsed after them, padding stripped the `./` off
+            # `./~t/...` and the `~t/` it left skipped the refusal it would have met (review round 20).
+            # A string that then fits is judged in full: a cwd link padded with `./` past PATH_MAX was
+            # followed by no check (round 19).
+            if [ "${#leaf}" -gt 4096 ]; then leaf="$(collapse "$leaf"; printf .)"; leaf="${leaf%.}"; fi
             # AMBIGUOUS FORMS ARE REFUSED, NOT RESOLVED (the user's choice after review round 18). A
             # `..` segment or a `~name/` prefix asks this hook to guess how an unknown server will
             # resolve a path -- normalising first or not, expanding ~name or not -- and rounds 16 to
@@ -1341,7 +1451,8 @@ case "$tool" in
             # passes; a tool that genuinely needs `../x` is told why.
             # ONLY A STRING THAT IS A PATH AS A WHOLE -- no whitespace -- is refused for a `..`: prose
             # holding a markdown link `](../../x.md)` was refused as one (review round 19). A climb in a
-            # string with a space in it is still RESOLVED and judged below, the long branch included.
+            # string with a space in it is still RESOLVED and judged below, on both its physical and its
+            # lexical landing (check), however long it is (judge).
             case "$leaf" in
                 *[[:space:]]*) ;;
                 *) case "/$leaf/" in
@@ -1376,71 +1487,27 @@ case "$tool" in
                       [ "${ent%%:*}" = "${leaf#\~}" ] && [ -n "$ent_home" ] && check "$ent_home"
                       leaf="./$leaf" ;;
             esac
-            # A free-text string that merely STARTS `file:` is text, not a refusal (round 7); only a
-            # `file:/...` URI is rewritten, and the same helper serves the long branch below.
-            case "$(printf '%s' "${leaf:0:6}" | tr 'A-Z' 'a-z')" in
-                file:/) up="$(uri_path "$leaf")" || exit 3; [ -n "$up" ] && leaf="$up" ;;
-                file:*) continue ;;
-            esac
-            # OVER PATH_MAX, `.` and empty segments are COLLAPSED first -- exact, since a `..` in a
-            # path-shaped string is refused above -- and a string that then fits is judged in full: a
-            # cwd link padded with `./` past PATH_MAX was followed by no check (review round 19).
-            if [ "${#leaf}" -gt 4096 ]; then
-                lc="$leaf"
-                while :; do
-                    ln0="${#lc}"
-                    lc="${lc//\/.\//\/}"; lc="${lc//\/\//\/}"
-                    case "$lc" in ./*) lc="${lc#./}" ;; esac
-                    [ "${#lc}" -lt "$ln0" ] || break
-                done
-                case "$lc" in */.) lc="${lc%/.}" ;; esac
-                [ "${#lc}" -le 4096 ] && leaf="$lc"
-            fi
-            # Still over PATH_MAX: prose, or a chain no kernel opens unnormalised. It gets the lexical
-            # verdict -- linear, and the collapse a server would do is the collapse it mirrors.
-            if [ "${#leaf}" -gt 4096 ]; then
-                for b in "${bases[@]}"; do
-                    [ -n "$b" ] || continue
-                    v="$(verdict "$leaf" "$roots" "$home" "$b")"
-                    case "$v" in deny) deny ;; allow) ;; *) exit 3 ;; esac
-                done
-                # ...and an absolute or `~/` one meets the boundary on its lexical form: padded past
-                # PATH_MAX with `./` it skipped every allow-list check, and a normalising server would
-                # open ~/.ssh (review round 17).
-                case "$leaf" in
-                    /*|"~/"*|"~") boundary "$(resolve "$leaf" "$home" "$cwd")" ;;
-                    # ...and a relative one from each base a server resolves it from -- not the home,
-                    # the guess -- so a climb hidden behind a space still meets it (round 19).
-                    *) for b in "${bases[@]}"; do
-                           [ -n "$b" ] || continue
-                           [ "$b" = "$home" ] && [ "$b" != "$cwd" ] && [ "$b" != "${CLAUDE_PROJECT_DIR:-}" ] && continue
-                           boundary "$(resolve "$leaf" "$home" "$b")"
-                       done ;;
-                esac
-                continue
-            fi
             case "$leaf" in
-                /*|"~/"*|"~") check "$leaf" ;;
-                # Both readings of `~name...` (check does the second), from every base. The relative
-                # ones are guesses, held to the transcript rule but not to the boundary.
-                # ONLY THE HOME-BASE READING is a guess: no server named the home as its cwd, while the
-                # session cwd and project dir are where one resolves a relative path -- jkb's
-                # ingest_path opens it from the project root, and round 16's skip of every base let
-                # `../../.ssh/id_rsa` through (review round 17). The home reading of a `~name/` string
-                # comes from the cwd base's call, unmarked, so it is judged too.
+                /*|"~/"*|"~") judge "$leaf" "$cwd" 0; continue ;;
                 # A `~`-led string with a `/` that survived the `~name/` refusal above is not an account
-                # path -- its name is not account-shaped, so it is prose like jkb's `~"term" ns:a/b` --
-                # and every reading of it is a guess, held to the transcript rule alone (round 19).
-                "~"*/*) for b in "${bases[@]}"; do [ -n "$b" ] && sb_guess=1 check "$leaf" "$b"; done ;;
-                "~"*|*) for b in "${bases[@]}"; do
-                            [ -n "$b" ] || continue
-                            if [ "$b" = "$home" ] && [ "$b" != "$cwd" ] && [ "$b" != "${CLAUDE_PROJECT_DIR:-}" ]; then
-                                sb_guess=1 check "$leaf" "$b"
-                            else
-                                check "$leaf" "$b"
-                            fi
-                        done ;;
+                # path -- its name is not account-shaped, so it is prose like jkb's `~"term" ns:a/b`. Its
+                # HOME reading is a guess, held to the transcript rule alone (round 19); its LITERAL
+                # reading, a name in the server's cwd, is judged below like any relative string. Both
+                # were guesses until review round 20, when a cwd link named `~+` reached ~/.ssh.
+                "~"*/*) dt_nolit=1 judge "$leaf" "$cwd" 1; leaf="./$leaf" ;;
             esac
+            # A RELATIVE string from every base. ONLY THE HOME-BASE READING is a guess: no server named
+            # the home as its cwd, while the session cwd and project dir are where one resolves a
+            # relative path -- jkb's ingest_path opens it from the project root, and round 16's skip of
+            # every base let `../../.ssh/id_rsa` through (review round 17).
+            for b in "${bases[@]}"; do
+                [ -n "$b" ] || continue
+                if [ "$b" = "$home" ] && [ "$b" != "$cwd" ] && [ "$b" != "${CLAUDE_PROJECT_DIR:-}" ]; then
+                    judge "$leaf" "$b" 1
+                else
+                    judge "$leaf" "$b" 0
+                fi
+            done
         done ;;
 esac
 allow

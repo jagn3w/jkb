@@ -133,6 +133,20 @@ dc_protected_env() { # dc_protected_env <Dockerfile> <container.json>
     printf '%s\n' "$names"
 }
 
+# Which settings files set an `env` key the container itself sets, one `<file>\t<KEY>` per line.
+# <names> is dc_protected_env's list. ONE copy, here, for verify.sh's runtime check and check-config's
+# review-time one (review round 20: check-config had re-spelt it inline). A file that is not valid JSON is skipped, as Claude Code skips
+# it; its key is not in force.
+settings_env_shadows() { # settings_env_shadows <names, one per line> <settings file>...
+    local names="$1" f k; shift
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        while IFS= read -r k; do
+            [ -n "$k" ] && grep -qxF -- "$k" <<<"$names" && printf '%s\t%s\n' "$f" "$k"
+        done <<<"$(HOME=/dev/null jq -r '(.env // {}) | keys[]?' "$f" 2>/dev/null)"
+    done
+}
+
 # READ A REFUSING PRODUCER THROUGH `$( )`, NEVER THROUGH `< <( )`. `dc_subst`, `dc_run_args`,
 # `dc_container_env` and run.sh's `docker_args` all REFUSE — that is the whole point of the unset-${localEnv:…} error
 # above — and bash discards a process substitution's exit status, so a refusal inside one kills

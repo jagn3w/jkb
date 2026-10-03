@@ -869,8 +869,16 @@ done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(
 # ~/.cargo/env too, a FILE: every login shell rustup set up sources it, unsandboxed, while the posture
 # lets sandboxed agents write ~/.cargo for builds (review round 15). One Edit rule is both the Write
 # tool's deny and, merged by Claude Code, the sandbox's denyWrite.
-HOME=/dev/null jq -e '.require.permissions.deny | index("Edit(~/.cargo/env)")' "$dc_posture" >/dev/null 2>&1 \
-    || dc_kit_where="$dc_kit_where the posture has no Edit(~/.cargo/env) deny, so an agent can plant code every login shell sources;"
+# ...AND EVERY OTHER FILE THAT BECOMES CODE LATER, outside every sandbox: the shell startup files (one
+# `export BASH_ENV=...` in ~/.zshenv runs in run.sh before its PATH filter), git's global config and
+# hooks, ssh's config, and the per-user autostart directories (review round 20). Only the user edits
+# these, so denying them costs nothing.
+for dc_inlet in '~/.cargo/env' '~/.zshenv' '~/.zprofile' '~/.zshrc' '~/.zlogin' '~/.bashrc' \
+                '~/.bash_profile' '~/.bash_login' '~/.profile' '~/.gitconfig' '~/.config/git/**' \
+                '~/.ssh/**' '~/Library/LaunchAgents/**' '~/.config/systemd/user/**' '~/.config/autostart/**'; do
+    HOME=/dev/null jq -e --arg r "Edit($dc_inlet)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
+        || dc_kit_where="$dc_kit_where the posture has no Edit($dc_inlet) deny, so an agent can plant code that runs later as you, unsandboxed;"
+done
 for dc_pfx in //opt/homebrew //usr/local //Applications '~/.docker'; do
     HOME=/dev/null jq -e --arg r "Edit($dc_pfx/**)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
         || dc_kit_where="$dc_kit_where the posture has no Edit($dc_pfx/**) deny, so the Write tool can replace a program run.sh runs from there;"
@@ -878,7 +886,7 @@ done
 if [ -n "$dc_kit_where" ]; then
     bad "an agent can write the container kit ($dc_kit_tilde), which runs outside every sandbox:$dc_kit_where"
 else
-    ok "no agent can write the container kit ($dc_kit_tilde) or the Homebrew prefixes run.sh keeps on PATH: no container bind, posture allowWrite or missing Edit deny reaches them"
+    ok "no agent can write the container kit ($dc_kit_tilde), the Homebrew prefixes run.sh keeps on PATH, or a shell, git, ssh or autostart file: no container bind, posture allowWrite or missing Edit deny reaches them"
 fi
 
 # THE FINGERPRINT STRIPS THE ROOT THE ARGUMENTS WERE ASSEMBLED FROM. run.sh assembled from the kit
@@ -899,15 +907,9 @@ fi
 if ! dc_envp_names="$(dc_protected_env "$here/Dockerfile" "$here/container.json" 2>&1)"; then
     bad "the environment names the container sets could not be derived ($dc_envp_names), so whether the repo's Claude settings replace one is unchecked"
 else
-    dc_envp_hit=""
-    for dc_sf in "$here/../.claude/settings.json"; do
-        [ -f "$dc_sf" ] || continue
-        while IFS= read -r dc_k; do
-            [ -n "$dc_k" ] && grep -qxF -- "$dc_k" <<<"$dc_envp_names" && dc_envp_hit="$dc_envp_hit $dc_k"
-        done <<<"$(HOME=/dev/null jq -r '(.env // {}) | keys[]?' "$dc_sf" 2>/dev/null)"
-    done
+    dc_envp_hit="$(settings_env_shadows "$dc_envp_names" "$here/../.claude/settings.json" | cut -f2 | tr '\n' ' ')"
     if [ -n "$dc_envp_hit" ]; then
-        bad "the repo's .claude/settings.json sets env that the container itself sets ($dc_envp_hit ), so every container session gets the file's value instead of the image's — a PATH written for one machine breaks jkb's resolution on the other"
+        bad "the repo's .claude/settings.json sets env that the container itself sets ( $dc_envp_hit), so every container session gets the file's value instead of the image's — a PATH written for one machine breaks jkb's resolution on the other"
     else
         ok "the repo's committed Claude settings replace none of the $(grep -c . <<<"$dc_envp_names") environment names the container sets"
     fi

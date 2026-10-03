@@ -2672,8 +2672,9 @@ refuses is still code 2" \
 }
 
 # --- the dev container kit follows the MAIN checkout ----------------------------------------
-# setup.sh refreshes the kit only where main_checkout_of answers with the tree it runs in, so a
-# linked worktree (a task branch) cannot repoint the shared kit (review round 10).
+# setup.sh refreshes the kit only where is_linked_worktree says the tree is NOT a linked worktree,
+# so a task branch cannot repoint the shared kit (review round 10); main_checkout_of only names the
+# main checkout in the message it prints instead. case_kit_linked pins the decision.
 case_kit_main() {
     local m w main_real
     main_real="$(cd "$main" && pwd -P)"

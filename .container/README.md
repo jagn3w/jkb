@@ -485,6 +485,16 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   because denying it breaks every sandboxed `cargo install`. That includes the container's
   `post-merge` rebuild of `jkb`, which runs inside an agent's sandbox. `run.sh` drops `~/.cargo/bin`
   from its own `PATH`; your shells do not.
+- **Every file that becomes code later is `Edit`-denied too** (review round 20). `~/.cargo/env` was
+  one case of a wider class. The others are the shell startup files (`~/.zshenv`, `~/.zprofile`,
+  `~/.zshrc`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`), git's
+  global config (`~/.gitconfig`, `~/.config/git/**`, which can name a hooks directory), `~/.ssh/**`
+  (a `ProxyCommand` runs), and the per-user autostart directories (`~/Library/LaunchAgents`,
+  `~/.config/systemd/user`, `~/.config/autostart`). One line in `~/.zshenv`,
+  `export BASH_ENV=/tmp/x.sh`, would have run in `run.sh` before its `PATH` filter, because
+  `#!/bin/bash` sources `BASH_ENV`. Only you edit these files, so the denies cost nothing.
+  `check-config.sh` requires every one. Whether Claude Code's own protected list already covered any
+  of them was not measured; the deny makes the answer irrelevant.
 - **The checkout's `run.sh` refuses** to start or stop anything and names the kit. That protects the
   habit, not the file: an agent can edit that refusal out. What protects you is that you start the
   kit's `run.sh`.
@@ -1484,11 +1494,17 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
   before opening, whether it expands `~name`. Rounds 16 to 18 each found a spelling the guess missed,
   such as a climb padded past `PATH_MAX`, or `~sync/../`. Only a string that is a path as a whole,
   with no whitespace, is refused for `..`, so prose with a markdown link `](../../x.md)` passes. A
-  climb in a string with a space in it is still resolved and judged. A `~name/` is refused only when
-  the name is account-shaped, so jkb's own `~"term" ns:a/b` query passes (review round 19). There is
-  no length rule. An over-long string has its `.` and empty segments collapsed, which is exact once
-  `..` is refused. If it then fits under `PATH_MAX` it is judged in full, links included. Round 19
-  found a cwd link padded with `./` that was followed by no check at all.
+  climb in a string with a space in it is still resolved and judged, and on **both** readings: where
+  the kernel lands after following links, and where a server that normalises first lands. Judged on
+  the first alone, `l m/../../../.ssh/id_rsa`, with `l m` a link two deep, climbed only to `~/repos`
+  (review round 20). A `~name/` is refused only when the name is account-shaped, so jkb's own
+  `~"term" ns:a/b` query passes (review round 19). Such a string's home reading is a guess; its literal
+  reading, a directory named `~...` in the server's cwd, is judged in full, because a cwd link named
+  `~+` reached `~/.ssh` while both readings were guesses (round 20). There is no length rule. An
+  over-long string first has its `.` and empty segments collapsed, before any form is refused and
+  keeping a leading `./`: collapsed later, padding stripped the `./` off `./~t/` (round 20). If it
+  then fits under `PATH_MAX` it is judged in full, links included. Round 19 found a cwd link padded
+  with `./` that was followed by no check at all.
 - **Only the home-base guess is spared.** An unknown tool's relative free text is read from each base
   it might be resolved against: the session cwd, the project dir and the home. The cwd and project
   readings are judged in full, because that is where a server resolves a relative path. jkb's
@@ -1595,12 +1611,19 @@ O(files) of argv. What
   refused a long `TodoWrite`. An MCP server resolves relative paths against its own cwd, so for
   `mcp__*` tools a relative string is judged against the session cwd, `CLAUDE_PROJECT_DIR` and the
   home. `CLAUDE_CONFIG_DIR`, when set, adds its `projects` tree to the roots.
-- **Nothing can push the hook into its timeout**, which fails open. Any path string over 4096 bytes
-  (`PATH_MAX`) is refused before it is walked; a 24 KB `a/..` chain took up to 15 s against the
-  10 s budget before, and is refused in milliseconds now. The magic-link walk is linear, with no
-  subshell per segment, so an over-long free-text string can be judged lexically instead of
-  refused. At most 100 distinct path-like strings are judged per call; what that costs is
-  measured once, with its method, in the script's header.
+- **No input found so far pushes the hook into its timeout**, which fails open. This was claimed
+  outright, as "nothing can", until review round 20 measured 21 s for one 200 KB free-text string.
+  bash's `${x#lit}` and `${x%lit}` are **quadratic when they do not match**, and every prefix test
+  was one. Under a UTF-8 locale a non-matching strip of 1 MB took 907 s, against 7.6 s under `C`.
+  Reading stdin with `read -d ''` and counting slashes with a bracket-class replace were slow too.
+  So the hook pins `LC_ALL=C`, tests prefixes by substring, reads stdin as `$(</dev/stdin)`, counts
+  segments in `jq`, and keeps long strings away from string surgery altogether. Any path field over
+  4096 bytes (`PATH_MAX`) is refused before it is walked. A free-text string still over `PATH_MAX`
+  after collapsing is normalised first, which is linear, and skipped if it is still too long to open,
+  so the slow strips never see it. Measured in jkb-dev on 2026-10-03: 300 KB strings of five shapes
+  beside a transcript path were each decided in under 140 ms, and the slowest found, 1.5 MB of prose
+  whose `..` must be resolved, took 1.7 s. At most 100 distinct path-like strings are judged per
+  call. The full measurements and their method are in the script's header.
 - **The hook does not trust `PATH`** (review round 4, the most serious finding in four rounds). It
   runs unsandboxed on every tool call, and the image puts the agent-writable `~/.local/bin` and
   `~/.cargo/bin` first on `PATH`. A `jq` planted there by sandboxed Bash ran outside the sandbox,

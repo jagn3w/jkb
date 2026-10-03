@@ -322,19 +322,6 @@ kit_mirror_problems() { # kit_mirror_problems <dir> <root-uid> <marker> <self-ki
     printf '%s' "$out"
 }
 
-# Which settings files set an `env` key the container itself sets, one `<file>\t<KEY>` per line.
-# <names> is dc_protected_env's list. A file that is not valid JSON is skipped, as Claude Code skips
-# it; its key is not in force.
-settings_env_shadows() { # settings_env_shadows <names, one per line> <settings file>...
-    local names="$1" f k; shift
-    for f in "$@"; do
-        [ -f "$f" ] || continue
-        while IFS= read -r k; do
-            [ -n "$k" ] && grep -qxF -- "$k" <<<"$names" && printf '%s\t%s\n' "$f" "$k"
-        done <<<"$(HOME=/dev/null jq -r '(.env // {}) | keys[]?' "$f" 2>/dev/null)"
-    done
-}
-
 reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
     [ -n "$1" ] || { printf 'pid1-unreadable'; return; }
     # A container at its --pids-limit fails exactly here -- which is the SYMPTOM of a PID 1 that
@@ -539,7 +526,7 @@ if [ "$SELF_TEST" = yes ]; then
     printf '%s\n' '{"env":{"PATH":"/Users/me/.cargo/bin:/usr/bin","FOO":"1"}}' >"$se/a.json"
     printf '%s\n' '{"env":{"FOO":"1"},"permissions":{}}' >"$se/b.json"
     printf '%s\n' 'not json {' >"$se/c.json"
-    se_got="$(settings_env_shadows "$(printf 'PATH\nJKB_REMOTE\n')" "$se/a.json" "$se/b.json" "$se/c.json" "$se/missing.json")"
+    se_got="$(. "$(dirname "$0")/lib.sh" && settings_env_shadows "$(printf 'PATH\nJKB_REMOTE\n')" "$se/a.json" "$se/b.json" "$se/c.json" "$se/missing.json")"
     if [ "$se_got" = "$se/a.json	PATH" ]; then printf '  \033[32mok\033[0m   %s\n' "a settings env.PATH is named with its file; other keys, other files, unparseable and missing files are not"
     else printf '  \033[31mFAIL\033[0m settings_env_shadows\n         got: [%s]\n' "$se_got"; st_fail=$((st_fail+1)); fi
     se_names="$(. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$(dirname "$0")/container.json")"
