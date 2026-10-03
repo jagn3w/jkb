@@ -276,15 +276,16 @@ verdict() { # verdict <path> <roots> <home> <cwd> -> allow|deny
 }
 
 if [ "${1:-}" = --self-test ]; then
-    # THE SELF-TEST RUNS AS A COPY. Its rows drive this file against scratch homes, which the installed
-    # copy -- trusting the passwd home, not $HOME, since round 31 -- does not honour, so verify.sh's run
-    # of the INSTALLED self-test failed 26 rows and skipped every probe after it (review round 33). Run as
-    # installed, or asked to behave so, it re-executes from a scratch copy, which keeps every row honest.
-    if [ "$dt_installed" = 1 ] || [ -n "${DT_SELFTEST_AS_INSTALLED:-}" ]; then
-        dt_copy_dir="$(mktemp -d)" && cp "$0" "$dt_copy_dir/deny-transcripts.sh" \
-            && chmod +x "$dt_copy_dir/deny-transcripts.sh" || { echo "could not copy the hook to run its self-test" >&2; exit 1; }
-        exec /usr/bin/env -u DT_SELFTEST_AS_INSTALLED /bin/bash -p "$dt_copy_dir/deny-transcripts.sh" --self-test
+    # THE INSTALLED COPY DOES NOT RUN IT. The self-test executes copies of this file staged in /tmp and
+    # ~/.cache, which sandboxed agents write, and run from here -- unsandboxed, as verify.sh did -- a
+    # swapped copy runs outside the sandbox (review round 34; round 33 had made the installed run
+    # re-execute from such a copy). Run the checkout's copy instead, as check.sh and CI do.
+    if [ "$dt_installed" = 1 ]; then
+        echo "the installed hook does not run its self-test: it executes copies of itself from directories agents write. Run the checkout's .container/deny-transcripts.sh --self-test instead." >&2
+        exit 1
     fi
+    # Asked to behave as installed, the self-test's own rows still need their scratch homes honoured.
+    unset DT_SELFTEST_AS_INSTALLED
     fails=0
     R="/h/.claude/projects
 /h/.claude-state/projects"

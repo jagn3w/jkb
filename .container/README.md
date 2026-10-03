@@ -507,9 +507,14 @@ you would then run it (review round 10). `check-config.sh` holds all three condi
   Code is not already running, `run.sh --open` starts it with the same environment. That editor then
   lives without `SSH_AUTH_SOCK`, DBus, proxy variables or `TMPDIR`: no ssh agent for `git push`,
   no keyring, no extension installs behind a proxy. Open VS Code yourself first, and `--open` only
-  attaches (review round 29). A terminal
-  that replaces `HOME` itself is out of any script's reach: it also chooses which
-  `~/.local/share/.../run.sh` you start. The host's own `jkb` lives in `~/.cargo/bin`, so the
+  attaches (review round 29). **`HOME` is built too**, from your passwd entry (review round 34). A
+  terminal that set `HOME` chose the `path-keep` this reads, and so put an agent's directory first
+  on `PATH`, even with the kit started by its absolute path. That had been recorded as out of reach,
+  on the theory that a forged `HOME` also chooses which `~/...` run.sh you start, which is true only
+  of `~`. The tests pass a scratch home as an argument, `--test-home <dir>`, which a terminal's
+  environment cannot add. `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are dropped
+  with the rest, so a `core.hooksPath` kept only in an XDG git config is not seen when run.sh copies
+  the host's hooks; keep it in `~/.gitconfig`. The host's own `jkb` lives in `~/.cargo/bin`, so the
   start-time sweep does not ask it which sessions are live; it holds sessions by its recency window
   instead.
 - **What else run.sh trusts is out of reach too** (review rounds 14 and 15). The posture denies
@@ -1807,10 +1812,13 @@ tools and its absence is silent:
   third form of this check: a substring test let `Edit` hide inside `NotebookEdit` (round 1), a
   whole-token list let unlisted built-ins such as Artifact skip the hook (round 3), and only
   "every tool" has neither hole. Don't reintroduce a token list.
-- `verify.sh` (runtime): the installed hook exists, is root-owned and not writable by `vscode`,
-  passes its own self-test in the container, and, asked of the installed copy under **both**
+- `verify.sh` (runtime): the installed hook exists, is root-owned and not writable by `vscode`, and,
+  asked of the installed copy under **both**
   spellings of the tree, denies a transcript and allows auto-memory. It probed one spelling at
-  first, so a hook that lost its `~/.claude-state` root still passed. The memory check reads
+  first, so a hook that lost its `~/.claude-state` root still passed. It does **not** run the hook's
+  self-test (review round 34): verify runs unsandboxed, and the self-test executes copies of the hook
+  staged in `/tmp` and `~/.cache`, which agents write, so a swapped copy would run outside the
+  sandbox. The installed copy refuses `--self-test`; the checkout's runs in `check.sh` and CI. The memory check reads
   **every** settings layer (managed, drop-ins, user, every repo's project settings), not only the
   managed file.
 

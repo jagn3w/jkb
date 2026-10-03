@@ -872,19 +872,19 @@ case36_the_checkout_a_kit_script_serves() {
     fi
 }
 
-# THE INSTALLED HOOK'S SELF-TEST PASSES. verify.sh runs it from /usr/local/bin, where the hook trusts the
-# passwd home and not $HOME, so its scratch-home rows failed and verify skipped every probe after it
-# (review round 33). DT_SELFTEST_AS_INSTALLED stands in for the installed path; the self-test must then
-# re-run itself from a copy and pass. Skipped where the hook-mode rows cannot run (no GNU realpath/jq).
+# THE SELF-TEST IS NOT CHANGED BY "BEHAVE AS INSTALLED". Round 33 found its scratch-home rows failing when
+# the self-test ran as installed; since round 34 the installed copy refuses --self-test outright (verify
+# no longer runs it, unsandboxed, over copies agents can swap), and DT_SELFTEST_AS_INSTALLED is dropped
+# for the self-test's own rows. This holds that the self-test passes with it set.
 case37_the_installed_hooks_self_test_passes() {
     local out rc=0
     # The ACCOUNT's home, not this harness's scratch one under /tmp: the self-test makes its scratch homes
     # under $HOME/.cache, and inside a temp root every write is allowed, so its deny rows would mean nothing.
     out="$(HOME="$(getent passwd "$(id -u)" | cut -d: -f6)" DT_SELFTEST_AS_INSTALLED=1 bash "$repo_root/.container/deny-transcripts.sh" --self-test 2>&1)" || rc=$?
     if [ "$rc" -eq 0 ] && [[ "$out" == *"self-test passed"* ]]; then
-        ok "the hook's self-test passes when run as the installed copy"
+        ok "the hook's self-test passes with DT_SELFTEST_AS_INSTALLED set"
     else
-        fail "the hook's self-test passes when run as the installed copy" "rc=$rc: $(grep -c FAIL <<<"$out") FAIL lines: $(grep -A1 FAIL <<<"$out" | head -6 | tr "\n" " ")"
+        fail "the hook's self-test passes with DT_SELFTEST_AS_INSTALLED set" "rc=$rc: $(grep -c FAIL <<<"$out") FAIL lines: $(grep -A1 FAIL <<<"$out" | head -6 | tr "\n" " ")"
     fi
 }
 

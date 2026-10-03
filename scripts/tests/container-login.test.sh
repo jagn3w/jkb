@@ -210,7 +210,7 @@ STUB
     rs_dir="$d"
     env ${RS_ENV_I:+-i} HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} ${RS_EXTRA_ENV:-} \
         ${RS_FUNC:+"BASH_FUNC_jkbx%%=$RS_FUNC"} \
-        bash "$script" "$2" >"$d/out" 2>&1
+        bash "$script" --test-home "$d/home" "$2" >"$d/out" 2>&1
     rs_out="$(cat "$d/out")"
     calls="$(cut -d' ' -f1 "$d/calls" | tr '\n' ' ')"
     execs="$(grep '^exec ' "$d/calls" || true)"
@@ -282,7 +282,7 @@ case16_a_program_planted_on_path_under_home_does_not_run() {
     local h; h="$(mktemp -d "$HOME/.cache/jkb-plant.XXXXXX")" || { fail "case16" "no scratch home under ~/.cache"; return; }
     mkdir -p "$h/.cargo/bin"
     printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$h" > "$h/.cargo/bin/jq"; chmod +x "$h/.cargo/bin/jq"
-    env HOME="$h" PATH="$h/.cargo/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
+    env HOME="$h" PATH="$h/.cargo/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --test-home "$h" --print-args >/dev/null 2>&1
     local rc=$?
     if [ ! -e "$h/RAN" ] && [ "$rc" -eq 0 ]; then ok "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one"
     else fail "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one" "rc=$rc ran=$([ -e "$h/RAN" ] && echo yes || echo no)"; fi
@@ -298,7 +298,7 @@ case17_a_tool_the_path_filter_hid_is_named() {
     local h out; h="$(mktemp -d "$HOME/.cache/jkb-hid.XXXXXX")" || { fail "case17" "no scratch home under ~/.cache"; return; }
     mkdir -p "$h/.docker/bin"; printf '#!/bin/sh\nexit 0\n' > "$h/.docker/bin/docker"; chmod +x "$h/.docker/bin/docker"
     ln -s "$(dirname "$repo_root")" "$h/repos"
-    out="$(env HOME="$h" PATH="$h/.docker/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" 2>&1)"
+    out="$(env HOME="$h" PATH="$h/.docker/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --test-home "$h" 2>&1)"
     if grep -qF "docker is in $h/.docker/bin" <<<"$out" && grep -qF "jkb-container-kit/path-keep" <<<"$out"; then
         ok "a docker only on the shell's PATH is named with its directory and how to keep it"
     else fail "a docker only on the shell's PATH is named with its directory and how to keep it" "out: $(tail -3 <<<"$out")"; fi
@@ -316,7 +316,7 @@ case18_a_planted_kit_marker_is_ignored() {
     done
     co="$d/co"; evil="$d/evil"; echo '# EVIL' >> "$evil/.container/run.sh"
     printf 'checkout=%s\n' "$evil" > "$co/.jkb-container-kit"
-    env HOME="$d/home" bash "$co/.container/run.sh" --install-kit >/dev/null 2>&1
+    env HOME="$d/home" bash "$co/.container/run.sh" --test-home "$d/home" --install-kit >/dev/null 2>&1
     kit="$d/home/.local/share/jkb-container-kit/kit"
     if [ "$(sed -n 's/^checkout=//p' "$kit/.jkb-container-kit" 2>/dev/null)" = "$(cd "$co" && pwd -P)" ] && ! grep -q '# EVIL' "$kit/.container/run.sh"; then
         ok "a kit marker planted in a checkout is ignored: --install-kit copies the checkout itself"
@@ -335,7 +335,7 @@ case19_run_sh_ignores_bash_env_and_exported_functions() {
     mkdir -p "$d/home"
     printf ': > "%s/RAN-BASH_ENV"\n' "$d" > "$d/env.sh"
     env HOME="$d/home" BASH_ENV="$d/env.sh" "BASH_FUNC_cd%%=() { : > \"$d/RAN-cd\"; builtin cd \"\$@\"; }" \
-        "$repo_root/.container/run.sh" --kit-path >"$d/out" 2>&1
+        "$repo_root/.container/run.sh" --test-home "$d/home" --kit-path >"$d/out" 2>&1
     if [ ! -e "$d/RAN-BASH_ENV" ] && [ ! -e "$d/RAN-cd" ] && grep -q 'jkb-container-kit' "$d/out"; then
         ok "run.sh runs neither a BASH_ENV script nor an exported function from the terminal that launches it"
     else
@@ -357,9 +357,9 @@ case20_the_path_filter_ignores_the_environment() {
         rm -f "$h/RAN"
         case "$form" in
             keep)    env HOME="$h" PATH="$h/.cargo/bin:$PATH" JKB_RUN_PATH_KEEP="$h/.cargo/bin" JKB_RUN_FROM_CHECKOUT=1 \
-                         bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1 ;;
+                         bash "$repo_root/.container/run.sh" --test-home "$h" --print-args >/dev/null 2>&1 ;;
             slashes) env HOME="$h" PATH="$(dirname "$h")//$(basename "$h")/.cargo/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 \
-                         bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1 ;;
+                         bash "$repo_root/.container/run.sh" --test-home "$h" --print-args >/dev/null 2>&1 ;;
         esac
         [ -e "$h/RAN" ] && ran="$ran $form"
     done
@@ -405,7 +405,7 @@ case23_a_symlinked_writable_dir_outside_home_is_dropped() {
         || { fail "case23" "no scratch dirs under ~/.cache"; return; }
     mkdir -p "$tgt/tools/bin"; ln -s "$tgt" "$h/repos"
     printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$tgt" > "$tgt/tools/bin/jq"; chmod +x "$tgt/tools/bin/jq"
-    env HOME="$h" PATH="$tgt/tools/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
+    env HOME="$h" PATH="$tgt/tools/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --test-home "$h" --print-args >/dev/null 2>&1
     if [ ! -e "$tgt/RAN" ]; then ok "a jq planted where a symlinked ~/repos leads, outside the home, does not run"
     else fail "a jq planted where a symlinked ~/repos leads, outside the home, does not run" "it ran"; fi
     case "$h" in */jkb-lnh.*) rm -rf -- "$h" ;; esac; case "$tgt" in */jkb-lnt.*) rm -rf -- "$tgt" ;; esac
@@ -432,9 +432,24 @@ case25_path_keep_precedes_the_system_dirs() {
     local d="$work/kp-$RANDOM"; mkdir -p "$d/home/.local/share/jkb-container-kit" "$d/bin"
     printf '#!/bin/sh\n: > "%s/RAN-dirname"\nexec /usr/bin/dirname "$@"\n' "$d" > "$d/bin/dirname"; chmod +x "$d/bin/dirname"
     printf '%s\n' "$d/bin" > "$d/home/.local/share/jkb-container-kit/path-keep"
-    env HOME="$d/home" PATH="/usr/bin:/bin" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
+    env HOME="$d/home" PATH="/usr/bin:/bin" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --test-home "$d/home" --print-args >/dev/null 2>&1
     if [ -e "$d/RAN-dirname" ]; then ok "a directory in path-keep comes before the system directories on run.sh's PATH"
     else fail "a directory in path-keep comes before the system directories on run.sh's PATH" "the system dirname ran"; fi
+}
+
+# run.sh's HOME IS THE ACCOUNT'S: a terminal that set HOME chose the path-keep it read, and an agent's
+# directory went first on its PATH even with the kit started by its absolute path (review round 34). A
+# forged HOME with a path-keep naming a recording `dirname` must not have it run.
+case26_a_forged_home_does_not_choose_path_keep() {
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h; h="$(mktemp -d "$HOME/.cache/jkb-fh.XXXXXX")" || { fail "case26" "no scratch dir under ~/.cache"; return; }
+    mkdir -p "$h/.local/share/jkb-container-kit" "$h/bin"
+    printf '#!/bin/sh\n: > "%s/RAN-dirname"\nexec /usr/bin/dirname "$@"\n' "$h" > "$h/bin/dirname"; chmod +x "$h/bin/dirname"
+    printf '%s\n' "$h/bin" > "$h/.local/share/jkb-container-kit/path-keep"
+    env HOME="$h" PATH="/usr/bin:/bin" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1
+    if [ ! -e "$h/RAN-dirname" ]; then ok "a forged HOME does not choose run.sh's path-keep: its home is the account's"
+    else fail "a forged HOME does not choose run.sh's path-keep: its home is the account's" "the forged path-keep's dirname ran"; fi
+    case "$h" in */jkb-fh.*) rm -rf -- "$h" ;; esac
 }
 
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
@@ -449,5 +464,5 @@ run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_da
           case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment \
           case21_run_sh_children_inherit_only_the_allowlist case22_the_container_name_override_survives_the_allowlist \
           case23_a_symlinked_writable_dir_outside_home_is_dropped case24_an_exported_function_does_not_reach_run_sh_children \
-          case25_path_keep_precedes_the_system_dirs
+          case25_path_keep_precedes_the_system_dirs case26_a_forged_home_does_not_choose_path_keep
 finish

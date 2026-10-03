@@ -1759,18 +1759,18 @@ run "run.sh stops re-executing under an allowlisted environment" "does not rebui
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-o = 'jkb_env=("PATH=$jkb_path" '
+o = 'jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" '
 assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, 'jkb_path="$jkb_path:$PATH"; jkb_env=("PATH=$jkb_path" ', 1))
+open(p, 'w').write(s.replace(o, 'jkb_path="$jkb_path:$PATH"; jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" ', 1))
 PYX
 run "run.sh appends the inherited PATH to the one it builds" "builds its PATH from the inherited one"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-o = 'case "$jkb_n" in HOME|'
+o = 'case "$jkb_n" in TERM|'
 assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, 'case "$jkb_n" in HOME|PATH|', 1))
+open(p, 'w').write(s.replace(o, 'case "$jkb_n" in PATH|TERM|', 1))
 PYX
 run "run.sh's environment allowlist keeps the inherited PATH" "names a variable that steers what its children run"
 
@@ -1782,6 +1782,25 @@ assert o in s, "mutation target absent"
 open(p, 'w').write(s.replace(o, '|DOCKER_HOST|DOCKER_CONTEXT|', 1))
 PYX
 run "run.sh's environment allowlist keeps DOCKER_HOST again" "names a variable that steers what its children run"
+
+# REVIEW ROUND 34. run.sh's HOME is the account's, built, never inherited.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'case "$jkb_n" in TERM|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'case "$jkb_n" in HOME|TERM|', 1))
+PYX
+run "run.sh's environment allowlist keeps the inherited HOME again" "names a variable that steers what its children run"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'eval "jkb_home=~$jkb_u"'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'jkb_home="$HOME"', 1))
+PYX
+run "run.sh takes its home from the environment again" "does not rebuild its environment"
 
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
@@ -1795,9 +1814,9 @@ run "run.sh's environment allowlist lets DOCKER_CONFIG through" "names a variabl
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-o = 'jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"'
+o = 'jkb_keepf="$jkb_home/.local/share/jkb-container-kit/path-keep"'
 assert o in s, "mutation target absent"
-open(p, 'w').write(s.replace(o, 'jkb_keepf="$HOME/.config/jkb/path-keep"', 1))
+open(p, 'w').write(s.replace(o, 'jkb_keepf="$jkb_home/.config/jkb/path-keep"', 1))
 PYX
 run "run.sh reads its PATH keep list from outside the kit home" "not from the kit home"
 

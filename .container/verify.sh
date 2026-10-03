@@ -1828,8 +1828,10 @@ if [ ! -x "$mem_hook" ]; then
     bad "$mem_hook is missing or not executable, so nothing stops a file tool reading another session's transcript — rebuild the image"
 elif [ "$(stat -c '%U' "$mem_hook" 2>/dev/null)" != root ] || [ -w "$mem_hook" ]; then
     bad "$mem_hook is not root-owned-and-read-only to this user — the hook that confines the agent is writable by it"
-elif ! "$mem_hook" --self-test >/dev/null 2>&1; then
-    bad "$mem_hook fails its own self-test in this container — the transcript deny is wired but not working"
+# NOT ITS SELF-TEST: this runs unsandboxed, and the self-test executes copies of the hook staged in
+# /tmp and ~/.cache, which sandboxed agents write -- a swapped copy would run outside the sandbox
+# (review round 34). The checkout's self-test runs in check.sh and CI; here the INSTALLED copy is
+# probed directly, below, under every spelling of the tree.
 else
     # ASKED OF THE INSTALLED COPY, not of a fixture, and under EVERY spelling of the tree. This
     # probed ~/.claude/projects alone, so a hook that had lost its ~/.claude-state/projects root

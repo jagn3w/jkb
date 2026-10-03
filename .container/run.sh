@@ -50,10 +50,15 @@ set -euo pipefail
 #   DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR and XAUTHORITY (an X cookie, round 30) for `--open`. DBUS_SESSION_BUS_ADDRESS stays out: a
 #   `unixexec:` address runs a program.
 # `#!/bin/bash -p` keeps BASH_ENV and exported functions out of this first shell; `env -i` keeps them
-# out of everything after it. A terminal that replaces HOME itself also chooses which
-# `~/.local/share/.../run.sh` you start, so it is out of any script's reach.
+# out of everything after it.
+# HOME TOO IS BUILT, from the passwd entry (`~user`, getpwnam, on macOS as on Linux), not inherited: a
+# terminal that set HOME chose the path-keep this reads, and so put an agent's directory first on PATH,
+# even when you started the kit by its absolute path (review round 34; it had been recorded as out of
+# reach, on the theory that a forged HOME also chooses which `~/...` run.sh you start -- true only for
+# `~`). The tests give a scratch home as an ARGUMENT, `--test-home <dir>` first, which a terminal's
+# environment cannot add.
 # Not in --self-test, which check.sh runs and which starts nothing. check-config.sh holds this.
-if [ "${1:-}" = --jkb-clean-env ]; then shift; elif [ "${1:-}" != --self-test ]; then [ -n "${HOME:-}" ] || { echo "run.sh: HOME is not set" >&2; exit 1; }; jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin; jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"; jkb_kp=""; if [ -f "$jkb_keepf" ]; then while IFS= read -r jkb_k || [ -n "$jkb_k" ]; do case "$jkb_k" in /*) jkb_kp="$jkb_kp$jkb_k:" ;; esac; done <"$jkb_keepf"; fi; jkb_path="$jkb_kp$jkb_path"; jkb_env=("PATH=$jkb_path" "JKB_USER_PATH=${PATH:-}"); for jkb_n in $(compgen -e); do case "$jkb_n" in HOME|TERM|COLORTERM|LANG|LC_*|USER|LOGNAME|DOCKER_CONTEXT|JKB_RUN_FROM_CHECKOUT|JKB_CONTAINER_NAME|JKB_CONTAINER_IMAGE|DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|XAUTHORITY) jkb_env+=("$jkb_n=${!jkb_n}") ;; esac; done; exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"; fi
+if [ "${1:-}" = --jkb-clean-env ]; then shift; elif [ "${1:-}" != --self-test ]; then if [ "${1:-}" = --test-home ]; then jkb_home="${2:-}"; shift 2 || exit 1; else jkb_u="$(/usr/bin/id -un)"; case "$jkb_u" in ""|*[!A-Za-z0-9._-]*) echo "run.sh: cannot read your account name" >&2; exit 1 ;; esac; eval "jkb_home=~$jkb_u"; fi; case "$jkb_home" in /*) ;; *) echo "run.sh: cannot find your home directory" >&2; exit 1 ;; esac; jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin; jkb_keepf="$jkb_home/.local/share/jkb-container-kit/path-keep"; jkb_kp=""; if [ -f "$jkb_keepf" ]; then while IFS= read -r jkb_k || [ -n "$jkb_k" ]; do case "$jkb_k" in /*) jkb_kp="$jkb_kp$jkb_k:" ;; esac; done <"$jkb_keepf"; fi; jkb_path="$jkb_kp$jkb_path"; jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" "JKB_USER_PATH=${PATH:-}"); for jkb_n in $(compgen -e); do case "$jkb_n" in TERM|COLORTERM|LANG|LC_*|USER|LOGNAME|DOCKER_CONTEXT|JKB_RUN_FROM_CHECKOUT|JKB_CONTAINER_NAME|JKB_CONTAINER_IMAGE|DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|XAUTHORITY) jkb_env+=("$jkb_n=${!jkb_n}") ;; esac; done; exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"; fi
 # ...and jq with HOME where no file can be: jq sources $HOME/.jq into every program, and the Write
 # tool can create ~/.jq. This file's jq readers build the mount list handed to `docker run`, which
 # README calls the security boundary (review round 12). check-config.sh holds the line in place.

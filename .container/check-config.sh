@@ -725,7 +725,7 @@ dc_run_env="$(sed -n 2p <<<"$dc_run_cmds")"
 [ "$(head -1 "$here/run.sh")" = '#!/bin/bash -p' ] \
     || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash -p, so bash itself is found through PATH, or runs the launching terminal's BASH_ENV and exported functions;"
 case "$dc_run_env" in
-    *'jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin;'*'jkb_keepf="$HOME/.local/share/jkb-container-kit/path-keep"'*'jkb_env=("PATH=$jkb_path" '*'compgen -e'*'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"'*) ;;
+    *'eval "jkb_home=~$jkb_u"'*'jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin;'*'jkb_keepf="$jkb_home/.local/share/jkb-container-kit/path-keep"'*'jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" '*'compgen -e'*'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"'*) ;;
     *) dc_unsb="$dc_unsb run.sh does not rebuild its environment as its first command (env -i, a PATH built from fixed directories and path-keep, an allowlist), so it runs with what the launching terminal gave it;" ;;
 esac
 # The built PATH takes nothing from the inherited one, which travels only as JKB_USER_PATH for need_tool's
@@ -734,7 +734,7 @@ case "$dc_run_env" in
     *'jkb_path="$PATH'*|*'jkb_path=$PATH'*|*'jkb_path="${PATH'*|*'jkb_path=${PATH'*|*':$PATH'*|*':${PATH'*) dc_unsb="$dc_unsb run.sh builds its PATH from the inherited one;" ;;
 esac
 case "$dc_run_env" in
-    *'in PATH|'*|*'|PATH|'*|*'|PATH)'*|*DOCKER_CONFIG*|*DOCKER_HOST*|*BASH_ENV*|*TAR_OPTIONS*|*LD_*|*DYLD_*|*TMPDIR*|*'|*)'*) dc_unsb="$dc_unsb run.sh's environment allowlist names a variable that steers what its children run;" ;;
+    *'in PATH|'*|*'|PATH|'*|*'|PATH)'*|*'in HOME|'*|*'|HOME|'*|*'|HOME)'*|*DOCKER_CONFIG*|*DOCKER_HOST*|*BASH_ENV*|*TAR_OPTIONS*|*LD_*|*DYLD_*|*TMPDIR*|*'|*)'*) dc_unsb="$dc_unsb run.sh's environment allowlist names a variable that steers what its children run;" ;;
 esac
 # ...AND THE ALLOWLIST NAMES EVERY JKB_ VARIABLE run.sh READS that it does not set itself: dropping
 # JKB_CONTAINER_NAME made run.sh act on jkb-dev while the reaper looked for the override (review round
@@ -904,7 +904,7 @@ done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(
 # its first command runs before lib.sh is sourced, so a move of DC_KIT_HOME that left it behind would have run.sh
 # trust a file that is neither made 0700 nor Edit-denied, with every check here green (review round 23).
 dc_keepf="$(sed -n 's/.*jkb_keepf="\([^"]*\)".*/\1/p' "$here/run.sh" | head -1)"
-dc_keepf="${dc_keepf//\$HOME//kit-home-probe}"
+dc_keepf="${dc_keepf//\$jkb_home//kit-home-probe}"
 [ -n "$dc_keepf" ] && [ "${dc_keepf%/*}" = "$dc_kit_home" ] \
     || dc_kit_where="$dc_kit_where run.sh reads its PATH keep list from [${dc_keepf:-nothing found}], not from the kit home [$dc_kit_home];"
 # ...AND THE PATH run.sh BUILDS: path-keep's entries, then the system and Homebrew prefixes, where docker
