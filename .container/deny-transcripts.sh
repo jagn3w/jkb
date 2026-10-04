@@ -720,6 +720,16 @@ if [ "${1:-}" = --self-test ]; then
     else
         printf '  \033[33mskip\033[0m round 31/32: no passwd entry for this uid, so the installed home cannot be exercised\n'
     fi
+    # A LAYER THAT PARSES BUT HAS A WRONGLY TYPED FIELD contributes nothing, as one that does not parse
+    # does: `{"permissions":"x"}` crashed the merge, and every non-Bash call was refused (review round 36).
+    for badl in '{"permissions":"x"}' '{"sandbox":"x"}' '{"sandbox":{"filesystem":5}}' '{"sandbox":{"credentials":{"files":"x"}}}' '[1,2]'; do
+        printf '%s\n' "$badl" > "$bh/repos/w/.claude/settings.local.json"
+        h "round 36: a local layer of $badl contributes nothing, and an ordinary Read passes" allow \
+          '{"tool_name":"Read","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/repos/w/a.rs"}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    done
+    h "round 36: ...and the boundary still holds around it" deny \
+      '{"tool_name":"Write","cwd":"'"$bh"'/repos/w","tool_input":{"file_path":"'"$bh"'/.bashrc","content":""}}' HOME="$bh" CLAUDE_PROJECT_DIR="$bh/repos/w"
+    rm -f "$bh/repos/w/.claude/settings.local.json"
     # REVIEW ROUND 17: MANAGED WINS for `enabled`, watched failing under the old order.
     mkdir -p "$bh/managed"
     printf '%s\n' '{"sandbox":{"enabled":true}}' > "$bh/managed/managed-settings.json"
@@ -1118,18 +1128,23 @@ if [ "$sb_i" -gt 0 ]; then
     # Claude Code itself would still start that session's Bash unsandboxed; pinning `enabled` in the
     # image's managed settings closes that, and is the user's decision (README).
     sb_sh="$(jqh -nr --argjson nm "$sb_nm" --argjson ut "$sb_untrusted" "${sb_args[@]}" '
-        def p: try fromjson catch {};
+        # EVERY PART COERCED TO ITS TYPE: a layer that parses but holds a wrongly typed field
+        # (`{"permissions":"x"}`) crashed this, and the hook refused every non-Bash call, blaming
+        # transcripts (review round 36). Now such a part contributes nothing, as an unparseable layer does.
+        def obj: if type == "object" then . else {} end;
+        def arr: if type == "array" then . else [] end;
+        def p: (try fromjson catch {}) | obj;
         def str: if type == "string" then . else empty end;
-        [ ('"$sb_names_csv"') | p | .sandbox // {} ] as $l
+        [ ('"$sb_names_csv"') | p | .sandbox | obj ] as $l
         | ([ $l[$nm:][] | .enabled | select(. != null) ] | last) as $mon
         | (if $mon != null then $mon else ([ $l[:$nm][] | .enabled == true ] | any) end) as $on
         | def dpath: if type == "string" then (capture("^Read\\((?<p>.*)\\)$").p // empty) else empty end;
           @sh "sb_on=\(if $on == true then 1 else 0 end)
-               sb_md=(\([ ( [ '"$sb_names_csv"' ] | .[] | p | .permissions.deny[]? | dpath ),
-                           ( $l[] | .credentials.files[]? | select(.mode == "deny") | .path | str ) ] | unique))
-               sb_w=(\([ $l | to_entries[] | select(.key as $k | $ut | index($k) | not) | .value.filesystem.allowWrite[]? | str ] | unique))
-               sb_r=(\([ $l | to_entries[] | select(.key as $k | $ut | index($k) | not) | .value.filesystem.allowRead[]? | str ] | unique))
-               sb_dr=(\([ $l[] | .filesystem.denyRead[]? | str ] | unique))"' 2>/dev/null)" || exit 3
+               sb_md=(\([ ( [ '"$sb_names_csv"' ] | .[] | p | .permissions | obj | .deny | arr | .[] | dpath ),
+                           ( $l[] | .credentials | obj | .files | arr | .[] | obj | select(.mode == "deny") | .path | str ) ] | unique))
+               sb_w=(\([ $l | to_entries[] | select(.key as $k | $ut | index($k) | not) | .value.filesystem | obj | .allowWrite | arr | .[] | str ] | unique))
+               sb_r=(\([ $l | to_entries[] | select(.key as $k | $ut | index($k) | not) | .value.filesystem | obj | .allowRead | arr | .[] | str ] | unique))
+               sb_dr=(\([ $l[] | .filesystem | obj | .denyRead | arr | .[] | str ] | unique))"' 2>/dev/null)" || exit 3
     eval "$sb_sh"
 fi
 if [ "$sb_on" = 1 ]; then

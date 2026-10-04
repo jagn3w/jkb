@@ -607,6 +607,18 @@ else
         ok "the transcript deny is a wired, root-owned hook that every tool call reaches"
     fi
 fi
+# THE SANDBOX IS PINNED ON IN THE IMAGE'S MANAGED SETTINGS (the user's decision after review round 36).
+# Managed settings outrank every other layer, and without the pin a worktree's own settings.local.json
+# -- which sandboxed Bash can create in a new worktree -- could set enabled:false, and Claude Code would
+# start that session's Bash unsandboxed. allowUnsandboxedCommands:false removes the per-command escape.
+# The host posture (scripts/auto-mode-posture.json) requires the same two on the Mac.
+if [ "$(jq -r '.sandbox.enabled' "$here/managed-settings.json" 2>/dev/null)" = true ] \
+   && [ "$(jq -r '.sandbox.allowUnsandboxedCommands' "$here/managed-settings.json" 2>/dev/null)" = false ]; then
+    ok "the image's managed settings pin the sandbox on (enabled, no unsandboxed commands), so no lower settings layer can switch it off"
+else
+    bad "the image's managed settings do not pin sandbox.enabled:true and allowUnsandboxedCommands:false — a worktree's own settings.local.json, which sandboxed Bash can create, could switch the sandbox off for the next session there"
+fi
+
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers
 # base ships /etc/sudoers.d/vscode = `NOPASSWD:ALL`, under which the agent can flush the firewall,
 # delete the allowlist snapshot or rewrite the root-owned script. verify.sh asks sudo itself at

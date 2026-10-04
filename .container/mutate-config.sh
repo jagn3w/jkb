@@ -2108,6 +2108,25 @@ open(p, 'w').write(s.replace(o, 'DT_INSTALLED_PATH=/usr/local/lib/deny-transcrip
 PYX
 run "the hook's DT_INSTALLED_PATH drifts from the managed command" "DT_INSTALLED_PATH is not the managed hook command"
 
+# The sandbox is pinned on in managed settings (the user's decision after review round 36).
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '"sandbox": { "enabled": true, "allowUnsandboxedCommands": false },'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "the managed settings stop pinning the sandbox" "do not pin sandbox.enabled:true"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '"allowUnsandboxedCommands": false'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '"allowUnsandboxedCommands": true', 1))
+PYX
+run "the managed settings allow unsandboxed commands" "do not pin sandbox.enabled:true"
+
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -2503,7 +2522,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=120
+PINNED_BAD_SITES=121
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

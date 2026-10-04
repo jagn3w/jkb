@@ -1592,10 +1592,15 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
     `.claude/settings.local.json`. The `~/repos/**` Edit rules cover only files that exist when the
     sandbox is built (see *The seven `~/repos/**` rules*). A planted `{"sandbox":{"enabled":false}}`
     was honoured by this hook.
-  - **What it does not close: the user's decision.** Claude Code reads the same planted file and
-    starts that session's Bash unsandboxed. The image's managed settings do not set
-    `sandbox.enabled`. Pinning it there, with `allowUnsandboxedCommands: false`, closes the Bash
-    half. That changes the managed settings, so it is left to the user.
+  - **The Bash half is closed in managed settings** (the user's decision after review round 36).
+    Claude Code read the same planted file and started that session's Bash unsandboxed, because the
+    image's managed settings did not set `sandbox.enabled`. They now pin
+    `"sandbox": { "enabled": true, "allowUnsandboxedCommands": false }`, as the host posture already
+    does. Managed settings outrank every layer, so no worktree file can switch the sandbox off, and
+    `check-config.sh` holds both keys.
+  - **A layer that parses but is wrongly typed contributes nothing** (review round 36), as an
+    unparseable one does. `{"permissions":"x"}` crashed the merge, and the hook refused every
+    non-Bash call for the session with a message about transcripts.
 
 **What it costs.** A judged Read went from about 29ms to 58ms per call, measured over 30 calls in
 jkb-dev against its real settings. Bash is still decided first, in 7ms. A tool reading or writing

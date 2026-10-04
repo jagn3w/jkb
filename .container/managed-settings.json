@@ -1,4 +1,5 @@
 {
+  "sandbox": { "enabled": true, "allowUnsandboxedCommands": false },
   "permissions": {
     "deny": [
       "Read(~/.jkb-container/**)",
