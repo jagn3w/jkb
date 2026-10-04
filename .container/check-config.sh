@@ -612,7 +612,9 @@ fi
 # Linux opening /dev/stdin (or /dev/fd/0, /proc/self/fd/0) on a socket fails with ENXIO. macOS opens it
 # fine, so container-hooks.test.sh's socket row cannot fail on the Mac -- this is the Mac-side guard.
 # The scripts are the ones managed-settings.json runs from /usr/local/bin, each checked as the copy in
-# here; comments are stripped, so the rule can still be explained in prose.
+# here; comments are stripped, so the rule can still be explained in prose. Any mention in code counts,
+# including one as data (a self-test path, a case pattern): spell such a string another way, e.g.
+# "/dev/""stdin", rather than teach the guard to tell an open from a mention (review round 40).
 dc_stdin_hooks=()
 while IFS= read -r dc_c; do
     case "$dc_c" in /usr/local/bin/*) [ -f "$here/${dc_c#/usr/local/bin/}" ] && dc_stdin_hooks+=("${dc_c#/usr/local/bin/}") ;; esac

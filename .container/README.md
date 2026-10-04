@@ -1145,6 +1145,17 @@ forwards the Vite port to the Mac. No port publishing and no permission change i
 
 ## What is still not established
 
+**Superseded 2026-10-04: the nested sandbox does engage for a tool call in here.** The first
+authenticated session on the pinned image showed it from Bash itself. `verify.sh` refused because
+it was in namespaces other than the container's. `/proc/self/mountinfo` showed a tmpfs over
+`/home/vscode`, which is how bubblewrap implements the posture's `denyRead: ["~"]`. A write to
+`~/.claude/settings.json` failed with `EROFS`, and one to `~/repos` persisted. See *The Bash half
+is closed in managed settings*. The planned probe below, `auto-mode.sh sandboxed`, said **NOT
+CONFINED** in that same session, and that was wrong. Its canary writes to `$HOME`, and on Linux
+that home is the sandbox's own tmpfs, so the write succeeds and is discarded. Under this posture
+the probe cannot tell confined from unconfined on Linux; that is a backlog task. The original
+entry follows.
+
 That the **nested** sandbox engages for a tool call *in here*. `bwrap` working is the mechanism,
 not the product, and the obvious credential-free probe does not discriminate: with
 `failIfUnavailable: true` in a stock container — where `bwrap` provably cannot run — Claude Code
@@ -1760,10 +1771,11 @@ O(files) of argv. What
   stdin). That costs one more process per call, not re-measured. `container-hooks.test.sh` case 39
   runs the hook with stdin as one end of a `socketpair()` and requires a decision for a deny and an
   allow. That row skips on the Mac, which lacks the hook's GNU tools and could not fail it anyway.
-  **The Mac-side guard is `check-config.sh`**, which refuses any hook named in
-  `managed-settings.json` whose code (comments stripped) names `/dev/stdin`, `/dev/fd/0` or
-  `/proc/*/fd/0`. It was watched failing on each of the three spellings put back, and
-  `mutate-config.sh` pins it.
+  **The Mac-side guard is `check-config.sh`**. It refuses any shell hook that `managed-settings.json`
+  runs from `/usr/local/bin` with a copy in `.container/` (today, `deny-transcripts.sh`) whose code
+  (comments stripped) names `/dev/stdin`, `/dev/fd/0` or `/proc/*/fd/0`. `mutate-config.sh` pins
+  each spelling. The `jkb attest hook` and `jkb workflow next --stop-hook` hooks are the Rust
+  binary, which reads fd 0 through `std::io::stdin`, so the guard does not look at them.
 - **The hook does not trust `PATH`** (review round 4, the most serious finding in four rounds). It
   runs unsandboxed on every tool call, and the image puts the agent-writable `~/.local/bin` and
   `~/.cargo/bin` first on `PATH`. A `jq` planted there by sandboxed Bash ran outside the sandbox,
