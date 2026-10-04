@@ -611,9 +611,9 @@ fi
 # Managed settings outrank every other layer, and without the pin a worktree's own settings.local.json
 # -- which sandboxed Bash can create in a new worktree -- could set enabled:false, and Claude Code would
 # start that session's Bash unsandboxed. allowUnsandboxedCommands:false removes the per-command escape, and
-# failIfUnavailable:true makes Claude Code refuse to start rather than run Bash unconfined when the
-# sandbox cannot come up (the user's decision after review round 38).
-# The host posture (scripts/auto-mode-posture.json) requires the same two on the Mac.
+# failIfUnavailable:true makes Bash error, rather than run unconfined, when the sandbox cannot come up
+# (measured: README, "`/proc` has to be unmasked"; the user's decision after review round 38).
+# The host posture (scripts/auto-mode-posture.json) requires the same three on the Mac.
 if [ "$(jq -r '.sandbox.enabled' "$here/managed-settings.json" 2>/dev/null)" = true ] \
    && [ "$(jq -r '.sandbox.failIfUnavailable' "$here/managed-settings.json" 2>/dev/null)" = true ] \
    && [ "$(jq -r '.sandbox.allowUnsandboxedCommands' "$here/managed-settings.json" 2>/dev/null)" = false ]; then

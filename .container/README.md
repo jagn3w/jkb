@@ -1599,14 +1599,16 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
     as the host posture already does. Managed settings outrank every layer, so no worktree file can
     switch the sandbox off. `failIfUnavailable` was added after review round 38: without it, a
     sandbox that cannot start (bubblewrap missing or refused by the runtime) leaves Bash running
-    unconfined with only a warning; with it, Claude Code refuses to start. `check-config.sh` holds
+    unconfined; with it, each Bash command errors instead. That is measured: it is how the missing
+    `systempaths=unconfined` flag showed up (see *`/proc` has to be unmasked*). Startup is not
+    refused, because the sandbox is checked lazily (*What is still not established*). `check-config.sh` holds
     all three keys in the repo, and `verify.sh` holds them in the running image.
     **It takes a rebuild** (`$kit --rm && $kit --build`): the managed settings are baked into the
     image, and a container on an older one keeps no pin. Verify names the rebuild when the pin is
     missing (review round 37).
     **Not yet measured**, because no image with the pin had been built when it was written: that a
     planted local `enabled:false` then leaves Bash sandboxed, and that a managed `sandbox` object
-    holding only these two keys **merges** with the user layer's `filesystem` lists rather than
+    holding only these three keys **merges** with the user layer's `filesystem` lists rather than
     replacing them. Check both after the first rebuild. In a session, `touch ~/x` must fail and
     `touch ~/repos/x` must succeed. Then record the result here.
   - **A layer that parses but is wrongly typed contributes nothing** (review round 36), as an
