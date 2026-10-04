@@ -1595,9 +1595,12 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
   - **The Bash half is closed in managed settings** (the user's decision after review round 36).
     Claude Code read the same planted file and started that session's Bash unsandboxed, because the
     image's managed settings did not set `sandbox.enabled`. They now pin
-    `"sandbox": { "enabled": true, "allowUnsandboxedCommands": false }`, as the host posture already
-    does. Managed settings outrank every layer, so no worktree file can switch the sandbox off.
-    `check-config.sh` holds both keys in the repo, and `verify.sh` holds them in the running image.
+    `"sandbox": { "enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false }`,
+    as the host posture already does. Managed settings outrank every layer, so no worktree file can
+    switch the sandbox off. `failIfUnavailable` was added after review round 38: without it, a
+    sandbox that cannot start (bubblewrap missing or refused by the runtime) leaves Bash running
+    unconfined with only a warning; with it, Claude Code refuses to start. `check-config.sh` holds
+    all three keys in the repo, and `verify.sh` holds them in the running image.
     **It takes a rebuild** (`$kit --rm && $kit --build`): the managed settings are baked into the
     image, and a container on an older one keeps no pin. Verify names the rebuild when the pin is
     missing (review round 37).

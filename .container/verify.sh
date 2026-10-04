@@ -1877,8 +1877,9 @@ else
     # 36). A container still on an older image has no pin, so a worktree's own settings.local.json can
     # switch Bash's sandbox off, and nothing said so (round 37). The remedy is a rebuild.
     [ "$(HOME=/dev/null jq -r '.sandbox.enabled' "$mem_managed" 2>/dev/null)" = true ] \
+      && [ "$(HOME=/dev/null jq -r '.sandbox.failIfUnavailable' "$mem_managed" 2>/dev/null)" = true ] \
       && [ "$(HOME=/dev/null jq -r '.sandbox.allowUnsandboxedCommands' "$mem_managed" 2>/dev/null)" = false ] \
-      || mem_hook_wrong="$mem_hook_wrong $mem_managed does not pin sandbox.enabled:true and allowUnsandboxedCommands:false, so a worktree's own settings file can switch Bash's sandbox off -- this image predates the pin; rebuild it (run.sh --rm, then run.sh --build);"
+      || mem_hook_wrong="$mem_hook_wrong $mem_managed does not pin sandbox.enabled:true, failIfUnavailable:true and allowUnsandboxedCommands:false, so a worktree's own settings file can switch Bash's sandbox off -- this image predates the pin; rebuild it (run.sh --rm, then run.sh --build);"
     case "$mem_sb" in
         0) mem_hook_wrong="$mem_hook_wrong it says the sandbox is disabled, though the image's managed settings pin it on, so the file tools are not held to its boundary;" ;;
         1) ;;
