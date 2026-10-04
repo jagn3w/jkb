@@ -888,6 +888,21 @@ case37_the_installed_hooks_self_test_passes() {
     fi
 }
 
+# THE SELF-TEST DOES NOT DEPEND ON THE MACHINE'S MANAGED SETTINGS. Two rows read /etc/claude-code, and
+# once the image pinned the sandbox there they flipped, turning the gate red on every rebuilt image
+# (review round 37). Run with the REPO's managed settings as the managed layer -- what a rebuilt image
+# carries -- the self-test must still pass.
+case38_the_self_test_passes_under_the_pinned_managed_settings() {
+    local d="$work/pinmgd-$RANDOM" out rc=0
+    mkdir -p "$d"; cp "$repo_root/.container/managed-settings.json" "$d/"
+    out="$(HOME="$(getent passwd "$(id -u)" | cut -d: -f6)" DT_SELFTEST_MANAGED_DIR="$d" bash "$repo_root/.container/deny-transcripts.sh" --self-test 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ] && [[ "$out" == *"self-test passed"* ]]; then
+        ok "the hook's self-test passes with the image's pinned managed settings in force"
+    else
+        fail "the hook's self-test passes with the image's pinned managed settings in force" "rc=$rc: $(grep -A1 FAIL <<<"$out" | head -4 | tr '\n' ' ')"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -923,5 +938,5 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case33_an_older_flat_kit_is_removed \
           case34_a_link_that_appears_during_the_copy_is_refused \
           case35_a_hard_link_in_the_checkout_is_refused \
-          case35b_a_hard_link_made_during_the_copy_is_refused case36_the_checkout_a_kit_script_serves case37_the_installed_hooks_self_test_passes
+          case35b_a_hard_link_made_during_the_copy_is_refused case36_the_checkout_a_kit_script_serves case37_the_installed_hooks_self_test_passes case38_the_self_test_passes_under_the_pinned_managed_settings
 finish

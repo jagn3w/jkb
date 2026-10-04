@@ -1596,8 +1596,16 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
     Claude Code read the same planted file and started that session's Bash unsandboxed, because the
     image's managed settings did not set `sandbox.enabled`. They now pin
     `"sandbox": { "enabled": true, "allowUnsandboxedCommands": false }`, as the host posture already
-    does. Managed settings outrank every layer, so no worktree file can switch the sandbox off, and
-    `check-config.sh` holds both keys.
+    does. Managed settings outrank every layer, so no worktree file can switch the sandbox off.
+    `check-config.sh` holds both keys in the repo, and `verify.sh` holds them in the running image.
+    **It takes a rebuild** (`$kit --rm && $kit --build`): the managed settings are baked into the
+    image, and a container on an older one keeps no pin. Verify names the rebuild when the pin is
+    missing (review round 37).
+    **Not yet measured**, because no image with the pin had been built when it was written: that a
+    planted local `enabled:false` then leaves Bash sandboxed, and that a managed `sandbox` object
+    holding only these two keys **merges** with the user layer's `filesystem` lists rather than
+    replacing them. Check both after the first rebuild. In a session, `touch ~/x` must fail and
+    `touch ~/repos/x` must succeed. Then record the result here.
   - **A layer that parses but is wrongly typed contributes nothing** (review round 36), as an
     unparseable one does. `{"permissions":"x"}` crashed the merge, and the hook refused every
     non-Bash call for the session with a message about transcripts.

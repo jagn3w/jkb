@@ -561,14 +561,20 @@ posture_hook_matcher() {
 # carries the blanket `~`, which keeps Bash out of the home -- memory included, and rightly -- but
 # says nothing about whether the Read tool can reach MEMORY.md. Read as one list, `~` looked like a
 # rule swallowing auto-memory.
+# EACH PART COERCED TO ITS TYPE, as the hook does: one mistyped part (`denyRead: [5]`) made jq exit
+# non-zero, the whole layer was skipped, and an enumerating rule beside it stood the sweep down (review
+# round 37). A file that is not JSON, or whose top level is not an object, still fails -- callers read
+# that as "does not parse", and for the managed file as "cannot tell".
 posture_deny_rules() { # posture_deny_rules <json file> [jq path to the settings object] [all|perm] -> one rule per line
+    local pre='def obj: if type == "object" then . else {} end; def arr: if type == "array" then . else [] end;
+               '"${2:-.}"' | if type == "object" then . else error("not a settings object") end'
     case "${3:-all}" in
-        perm) HOME=/dev/null jq -r "${2:-.}"' | .permissions.deny[]?' "$1" ;;
+        perm) HOME=/dev/null jq -r "$pre"' | .permissions | obj | .deny | arr | .[] | strings' "$1" ;;
         # denyWrite too: it is enumerated per match exactly as denyRead is (review round 5), and
         # wrapped as an Edit rule, which is what a write-side deny means to the reader.
-        *)    HOME=/dev/null jq -r "${2:-.}"' | (.permissions.deny[]?),
-                  (.sandbox.filesystem.denyRead[]?  | if startswith("/") then "Read(/\(.))" else "Read(\(.))" end),
-                  (.sandbox.filesystem.denyWrite[]? | if startswith("/") then "Edit(/\(.))" else "Edit(\(.))" end)' "$1" ;;
+        *)    HOME=/dev/null jq -r "$pre"' | (.permissions | obj | .deny | arr | .[] | strings),
+                  (.sandbox | obj | .filesystem | obj | .denyRead  | arr | .[] | strings | if startswith("/") then "Read(/\(.))" else "Read(\(.))" end),
+                  (.sandbox | obj | .filesystem | obj | .denyWrite | arr | .[] | strings | if startswith("/") then "Edit(/\(.))" else "Edit(\(.))" end)' "$1" ;;
     esac
 }
 
@@ -1803,6 +1809,8 @@ if [ "${1:-}" = "--self-test" ] && [ "$#" -eq 1 ]; then
     eq "...while a drop-in Read(**/*.jsonl) does" "$(dro 'Read(**/*.jsonl)')" yes
     eq "a relative climb inside a brace group is cannot-tell, so yes" "$(dro 'Read({../..,x}/.claude/projects/**/*.jsonl)')" yes
     eq "Claude Code's documented example deny list enumerates nothing" "$(printf '%s\n' '{"permissions":{"deny":["Bash(curl:*)","Read(./.env)","Read(./.env.*)","Read(./secrets/**)"]}}' >"$pdir/managed-settings.d/50-x.json"; pe "$pdir/hook.json")" no
+    printf '%s\n' '{"permissions":{"deny":["Read(~/.claude/projects/**/*.jsonl)"]},"sandbox":{"filesystem":{"denyRead":[5]}}}' >"$pdir/managed-settings.d/50-x.json"
+    eq "a drop-in with one mistyped denyRead entry still counts its enumerating rule (round 37)" "$(pe "$pdir/hook.json")" yes
     printf '%s\n' 'not json {' >"$pdir/managed-settings.d/50-x.json"
     eq "an unparseable drop-in contributes no rules" "$(pe "$pdir/hook.json")" no
     rm -r "$pdir/managed-settings.d"

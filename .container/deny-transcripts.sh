@@ -366,7 +366,15 @@ if [ "${1:-}" = --self-test ]; then
         local label="$1" want="$2" in="$3" out rc=0; shift 3
         # The session's own CLAUDE_PROJECT_DIR and CLAUDE_CONFIG_DIR are not inherited: they would
         # point the boundary at this machine's real settings. A row that is about them sets them.
-        out="$(printf '%s' "$in" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR "$@" "$BASH" "$self" 2>/dev/null)" || rc=$?
+        # NOR THE REAL MANAGED SETTINGS: every row gets an empty scratch managed directory unless it
+        # names its own. Rows that read /etc/claude-code flipped once the image pinned the sandbox
+        # there, and the gate went red on every rebuilt image (review round 37).
+        # AFTER the row's own arguments, which may be env OPTIONS (`-u HOME`), and only when the row
+        # names no managed directory of its own.
+        [ -n "${dt_nomgd:-}" ] || dt_nomgd="$(mktemp -d)" || { printf '  \033[31mFAIL\033[0m mktemp -d failed\n'; exit 1; }
+        local mgd=("DT_SELFTEST_MANAGED_DIR=$dt_nomgd")
+        case " $* " in *" DT_SELFTEST_MANAGED_DIR="*) mgd=() ;; esac
+        out="$(printf '%s' "$in" | env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR "$@" ${mgd[@]+"${mgd[@]}"} "$BASH" "$self" 2>/dev/null)" || rc=$?
         local got=allow
         case "$out" in *'"permissionDecision":"deny"'*) got=deny ;; esac
         [ "$rc" -eq 2 ] && got=deny

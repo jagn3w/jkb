@@ -1873,9 +1873,14 @@ else
     # container's user settings enable the sandbox, the regression that would skip exactly the
     # probe below (review round 18).
     mem_sb="$(cd "$mem_repo" 2>/dev/null && CLAUDE_PROJECT_DIR="$mem_repo" "$mem_hook" --sandbox-enabled 2>/dev/null)"
+    # ...AND THE IMAGE PINS THE SANDBOX ON in its managed settings (the user's decision after review round
+    # 36). A container still on an older image has no pin, so a worktree's own settings.local.json can
+    # switch Bash's sandbox off, and nothing said so (round 37). The remedy is a rebuild.
+    [ "$(HOME=/dev/null jq -r '.sandbox.enabled' "$mem_managed" 2>/dev/null)" = true ] \
+      && [ "$(HOME=/dev/null jq -r '.sandbox.allowUnsandboxedCommands' "$mem_managed" 2>/dev/null)" = false ] \
+      || mem_hook_wrong="$mem_hook_wrong $mem_managed does not pin sandbox.enabled:true and allowUnsandboxedCommands:false, so a worktree's own settings file can switch Bash's sandbox off -- this image predates the pin; rebuild it (run.sh --rm, then run.sh --build);"
     case "$mem_sb" in
-        0) [ "$(HOME=/dev/null jq -r '.sandbox.enabled // false' "$HOME/.claude/settings.json" 2>/dev/null)" = true ] \
-               && mem_hook_wrong="$mem_hook_wrong it says the sandbox is disabled while this container's user settings enable it, so the file tools are not held to its boundary;" ;;
+        0) mem_hook_wrong="$mem_hook_wrong it says the sandbox is disabled, though the image's managed settings pin it on, so the file tools are not held to its boundary;" ;;
         1) ;;
         *) mem_hook_wrong="$mem_hook_wrong it did not answer --sandbox-enabled with 0 or 1 ([$mem_sb]) -- an image older than the boundary; rebuild it;" ;;
     esac
