@@ -43,7 +43,8 @@ dc_strip_comments() { sed 's/[[:space:]]#.*$//; s/^#.*$//' "$1"; }
 # saying there is no verify.sh statement -- and the cheapest repair for the second is to delete the
 # ordering branch that keeps the sweep from being disabled by an unrelated assertion.
 dc_stmt_line() { # dc_stmt_line <stripped run.sh> <script basename regex> -> line number, or nothing
-    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+bash[[:space:]]+\.container/$2" \
+    # FROM THE KIT MIRROR: a statement running the checkout's copy is not the statement this asks for.
+    grep -nE "^[[:space:]]*(in_container|docker exec)([[:space:]]+[^[:space:]]+)*[[:space:]]+(/usr)?(/bin/)?bash[[:space:]]+\"\\\$DC_CTR_KIT/\.container/$2" \
         <<<"$1" | sed -n '1s/^\([0-9]*\):.*/\1/p'
 }
 
@@ -437,11 +438,190 @@ fi
 hook_cmds="$(jq -r '.hooks[][].hooks[].command' "$here/managed-settings.json" 2>/dev/null)"
 if [ -z "$hook_cmds" ]; then
     bad "no hook commands could be read from managed-settings.json — the check that they run the pinned binary examined nothing"
-elif grep -qv '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds"; then
-    bad "a managed hook does not run /usr/local/lib/jkb-hook/jkb — one found on PATH is replaceable from the sandbox: $(grep -m1 -v '^/usr/local/lib/jkb-hook/jkb ' <<<"$hook_cmds")"
+elif grep -qvE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.sh$)' <<<"$hook_cmds"; then
+    # TWO PINNED PATHS, NOT A RELAXED PATTERN. The rule is "absolute, root-owned, and not writable
+    # from inside the sandbox", and both satisfy it: the Dockerfile installs each --chown=root:root
+    # and the sandbox's allowOnly write list reaches neither. deny-transcripts.sh joined the list
+    # when the transcript deny moved out of permissions.deny and into a hook, because a
+    # `Read(...*.jsonl)` glob is named per-matching-file in the bubblewrap argv and blew it. A
+    # THIRD entry here should be suspicious: each one is a program that runs outside the sandbox
+    # with the container credential readable.
+    bad "a managed hook runs neither pinned root-owned program — one found on PATH is replaceable from the sandbox: $(grep -m1 -vE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.sh$)' <<<"$hook_cmds")"
 else
-    ok "every managed hook runs the pinned, root-owned jkb"
+    ok "every managed hook runs one of the two pinned, root-owned programs (jkb, deny-transcripts.sh)"
 fi
+# THE TWO THINGS A DENY RULE OVER THE TRANSCRIPT TREE CAN BREAK, and they pull in OPPOSITE
+# directions. This is one check because treating either alone produces the other's failure.
+#
+#   ARGV. Claude Code compiles `permissions.deny` into the bubblewrap argv for the Bash sandbox.
+#   A rule ending in a directory wildcard COLLAPSES -- `Read(~/.ssh/**)` becomes the single path
+#   `~/.ssh`, as it does for ~/.aws, ~/Documents, ~/.pki and ~/.jkb-container. A rule ending in a
+#   FILE pattern cannot: the sandbox names every match and binds /dev/null over each, so the argv
+#   grows by one path per file on disk. Measured 2026-09-30, after a sweep had already run: the
+#   two transcript rules expanded to 206 paths, 33,819 bytes per spelling, 67,638 across both,
+#   against a MAX_ARG_STRLEN of 131,072 Linux does not let you raise -- 52% of the ceiling. Past
+#   it EVERY Bash call in the container dies at spawn with E2BIG, including `:`, with nothing in
+#   the message naming transcripts.
+#
+#   MEMORY. Claude Code keeps auto-memory at ~/.claude/projects/<slug>/memory/. That location is
+#   not ours to choose, `scripts/link-claude-memory.sh` exists to put the link there, and
+#   verify.sh FAILS when it is missing. A subtree rule over `projects/**` covers it -- and denied
+#   memory does not error, it goes QUIET: MEMORY.md stops arriving in context, which reads like an
+#   agent that forgot rather than a broken container.
+#
+# SO NO GLOB CAN BE THE TRANSCRIPT DENY, and that is a finding, not an oversight. `projects/**`
+# collapses the argv to ~50 bytes and swallows auto-memory (verify.sh's memory_shadow rows caught it
+# on both spellings); a bare `projects` does the same, because Claude Code applies a directory rule
+# to its subtree (measured in a rebuilt container); and the per-file `**/*.jsonl` that spares memory
+# is the O(files) term this whole check exists to refuse. So the transcript deny is a PreToolUse
+# hook, .container/deny-transcripts.sh, and no rule here names the tree at all. The only named
+# exceptions below are the `~/repos/**` Edit rules, which are a different, measured term. (This
+# paragraph said the transcript rules "MUST end in a file pattern" and were the exception -- true
+# of the design the branch tried first, and false of the one it shipped. Review round 2.)
+# THE ONE DENY-RULE READER, loaded from sweep-transcripts.sh by name -- not a copy. This block used
+# to parse rules itself (sed, `~` only) while verify.sh parsed them with jq and the sweep a third
+# way, and each was wrong differently: this one missed Claude Code's absolute `//path` spelling, so
+# `Read(//home/vscode/.claude/projects)` -- the exact bare-directory rule that silently drops
+# MEMORY.md -- passed as clear. A rename in the sweep makes these calls "command not found" and the
+# checks below fail loudly, which is the direction a shared definition must fail in.
+# EVERY posture_* FUNCTION, by one pattern -- not a hand-kept list of names. The list form missed
+# posture_canon when posture_rule_path began calling it: posture_rule_path then printed nothing, an
+# empty pattern "covered" everything, and every rule read as swallowing auto-memory. Loud that time;
+# the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
+eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$here/sweep-transcripts.sh")"
+dc_reader_ok=0
+declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_rule_expands posture_rule_base posture_hook_matcher posture_transcript_roots >/dev/null && dc_reader_ok=1
+# BOTH DENY LISTS, FROM BOTH FILES, through the one emitter: the image's managed settings, and the
+# posture's `require` block that auto-mode writes into user settings. Each line is
+# "<settings-dir><TAB><rule>", because a one-slash permission rule is relative to the file it is in.
+# This read permissions.deny from the managed file alone, so a per-file transcript glob in
+# sandbox.filesystem.denyRead -- which reaches the same argv -- passed (review round 4, reproduced).
+dc_deny_raw=""
+if [ "$dc_reader_ok" = 1 ]; then
+    # "<settings-dir><TAB><list><TAB><rule>": `perm` lines govern the file tools, `argv` lines are
+    # everything that reaches bubblewrap. The memory arm reads `perm`; the expansion arm reads `argv`.
+    # The tab is printf's, so the separator is visible in the source.
+    dc_tab="$(printf '\t')"
+    dc_deny_raw="$( { posture_deny_rules "$here/managed-settings.json" . perm | sed "s|^|/etc/claude-code${dc_tab}perm${dc_tab}|"
+                     posture_deny_rules "$posture" .require perm | sed "s|^|/home/vscode/.claude${dc_tab}perm${dc_tab}|"
+                     posture_deny_rules "$here/managed-settings.json" . all | sed "s|^|/etc/claude-code${dc_tab}argv${dc_tab}|"
+                     posture_deny_rules "$posture" .require all | sed "s|^|/home/vscode/.claude${dc_tab}argv${dc_tab}|"; } 2>/dev/null)"
+fi
+if [ "$dc_reader_ok" != 1 ]; then
+    bad "the deny-rule reader could not be loaded from sweep-transcripts.sh, so nothing below can say whether a rule blows the argv or swallows auto-memory"
+# THE MANAGED FILE'S OWN RULES, not the merged list: once the posture's rules joined it, the merged
+# list was never empty, and an unreadable managed-settings.json passed in silence. The mutation
+# harness caught that the same round it was introduced.
+elif ! grep -q "^/etc/claude-code$(printf '\t')perm$(printf '\t')" <<<"$dc_deny_raw"; then
+    bad "no permissions.deny rules could be read from managed-settings.json — the checks that none of them blows the argv or swallows auto-memory examined nothing"
+else
+    # Rules are read as the INSTALLED file reads them: home is the container's, and a single
+    # leading `/` is relative to /etc/claude-code, where the image puts this file -- not $HOME,
+    # which on CI is the runner's.
+    # THE KNOWN EXPANDERS, named rather than tolerated by shape. These predate this guard and
+    # keep agents from editing a repo's harness configuration; each `**` sits MID-PATH, so the
+    # sandbox enumerates one argv entry per match on disk -- and every task worktree adds a set.
+    # That is an O(worktrees) term, bounded by how many worktrees exist, measured in
+    # .container/README.md. A new rule of this shape fails until it is added here, deliberately.
+    dc_known_expanders='Edit(~/repos/**/.claude/settings.json)
+Edit(~/repos/**/.claude/settings.local.json)
+Edit(~/repos/**/.claude/hooks/**)
+Edit(~/repos/**/.claude/agents/**)
+Edit(~/repos/**/.claude/skills/**)
+Edit(~/repos/**/.claude/workflows/**)
+Edit(~/repos/**/.mcp.json)'
+    dc_mem_hit=""; dc_expanding=""
+    while IFS=$'\t' read -r dc_dir dc_list dc_rule; do
+        [ -n "$dc_rule" ] || continue
+        # Only FILE rules have paths: `Bash(curl:*)` fed through path semantics read as an expander.
+        posture_rule_is_path "$dc_rule" || continue
+        # No relative base: the managed file and the posture are not project layers, so a relative
+        # rule in either meets a session's cwd -- a repo -- and covers no absolute path (round 9,
+        # which reversed round 8's home reading here; verify.sh's memory arm reads it the same way).
+        dc_pat="$(posture_rule_path "$dc_rule" /home/vscode "$dc_dir")"
+        # 1. Nothing may cover auto-memory, with Claude Code's subtree semantics. Two spellings of
+        #    the tree, one synthetic slug: no rule names a slug, so a probe answers for every repo.
+        [ "$dc_list" = perm ] && for dc_probe in /home/vscode/.claude/projects/-probe-repo/memory/MEMORY.md \
+                        /home/vscode/.claude-state/projects/-probe-repo/memory/MEMORY.md; do
+            posture_rule_covers "$dc_pat" "$dc_probe" && { dc_mem_hit="$dc_mem_hit $dc_rule"; break; }
+        done
+        # 2. Nothing may be enumerated per match unless it is a named, measured exception.
+        if [ "$dc_list" = argv ] && posture_rule_expands "$dc_pat" && ! grep -qxF -- "$dc_rule" <<<"$dc_known_expanders"; then
+            dc_expanding="$dc_expanding $dc_rule"
+        fi
+    done <<<"$dc_deny_raw"
+    if [ -n "$dc_mem_hit" ]; then
+        bad "a deny rule covers ~/.claude/projects/<slug>/memory, so MEMORY.md stops reaching context with no error anywhere:$dc_mem_hit
+       Auto-memory's location is Claude Code's, not ours, and verify.sh FAILS when it is not
+       linked there — so a subtree rule over the transcript tree cannot also be the argv fix."
+    elif [ -n "$dc_expanding" ]; then
+        bad "a deny rule is enumerated per match — a file pattern at the end, or a ** mid-path — so the Bash sandbox must name every matching path and the argv grows with the tree until every Bash call in the container dies at spawn:$dc_expanding
+       Only two shapes collapse to one argv entry: no wildcard, or a single trailing \`/**\` on a
+       literal prefix. If it has to spare a sibling the way the transcript deny spares auto-memory,
+       a glob cannot express that — make it a PreToolUse hook, as .container/deny-transcripts.sh
+       is. .container/README.md carries the measurements."
+    else
+        ok "no deny rule (managed, or in the posture) swallows auto-memory, and none is enumerated per match beyond the $(grep -c . <<<"$dc_known_expanders") named ~/repos/** rules"
+    fi
+fi
+
+# AND THE HOOK THAT REPLACED THEM MUST ACTUALLY BE WIRED. With the globs gone, deny-transcripts.sh
+# is the ONLY thing stopping a file tool reading another session's transcript -- there is no
+# permissions rule for the tree at all, because any rule broad enough to cover the transcripts
+# covers auto-memory too (the memory arm above refuses it). Deleting the hook entry, or the COPY that installs
+# it, leaves every gate here green and the confidentiality boundary simply absent. Three things
+# have to hold together, so all three are asked: it is referenced, it is installed, and it is
+# installed root-owned (a hook the sandbox can rewrite is a hook the agent controls).
+dc_hook=/usr/local/bin/deny-transcripts.sh
+if ! jq -e --arg h "$dc_hook" '[.hooks.PreToolUse[]?.hooks[]?.command] | index($h)' \
+        "$here/managed-settings.json" >/dev/null 2>&1; then
+    bad "managed-settings.json no longer runs $dc_hook as a PreToolUse hook — with the transcript globs gone, nothing else keeps a file tool out of another session's transcript"
+# STRIPPED AND ANCHORED: a raw grep matched `# COPY --chown=root:root deny-transcripts.sh ...` and
+# passed an image that ships without the hook. Review round 2.
+elif ! stripped_matches "$here/Dockerfile" "^COPY --chown=root:root deny-transcripts\.sh ${dc_hook//./\\.}([[:space:]]|\$)"; then
+    bad "the Dockerfile does not install deny-transcripts.sh root-owned at $dc_hook — the hook managed-settings.json names is either missing or writable by the agent it confines"
+elif [ ! -f "$here/deny-transcripts.sh" ]; then
+    bad "there is no .container/deny-transcripts.sh to install, so the transcript deny does not exist"
+else
+    # THE MATCHER MUST BE EVERY TOOL. An allowlist of file tools let built-ins it did not name --
+    # Artifact, which reads a local file and uploads it -- skip the hook entirely (review round 3),
+    # and a substring check on that list had already let `Edit` hide inside `NotebookEdit`
+    # (round 1). One shape now, from one shared definition, compared exactly.
+    dc_match="$(jq -r --arg h "$dc_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$here/managed-settings.json" 2>/dev/null)"
+    # ...AND ITS OWN DEADLINE ENDS BEFORE CLAUDE CODE'S TIMEOUT: the hook refuses a call it could not
+    # judge in dt_deadline seconds, but Claude Code kills it at the managed timeout and then lets the
+    # call through -- so a timeout at or under the deadline fails open (review round 27).
+    dc_tmo="$(jq -r --arg h "$dc_hook" '[.hooks.PreToolUse[]? | .hooks[]? | select(.command == $h) | .timeout] | first // empty' "$here/managed-settings.json" 2>/dev/null)"
+    dc_dl="$(sed -n 's/^    dt_deadline=\([0-9][0-9]*\)$/\1/p' "$here/deny-transcripts.sh" | head -1)"
+    if [ "$dc_match" != "$(posture_hook_matcher)" ]; then
+        bad "the transcript hook's matcher is [$dc_match], not [$(posture_hook_matcher)] — any tool it does not match never reaches the hook, and can read or upload another session's transcript"
+    # An INTEGER timeout, or `[ -ge ]` errors, the elif is skipped and this reads as fine (round 28).
+    elif ! [[ "$dc_tmo" =~ ^[0-9]+$ ]] || [ -z "$dc_dl" ] || [ "$dc_dl" -ge "$dc_tmo" ]; then
+        bad "the transcript hook's own deadline [${dc_dl:-not found}s] does not end before its managed timeout [${dc_tmo:-not set}s] — Claude Code would kill it first and let the call through"
+    # ...AND IT KNOWS WHERE IT IS INSTALLED: the hook trusts its environment and its test seams only when
+    # it is NOT at DT_INSTALLED_PATH, so a hook command elsewhere would run the live hook in test mode
+    # (review round 32).
+    elif [ "$(sed -n 's/^DT_INSTALLED_PATH=\(.*\)$/\1/p' "$here/deny-transcripts.sh" | head -1)" != "$dc_hook" ]; then
+        bad "the transcript hook's DT_INSTALLED_PATH is not the managed hook command [$dc_hook] — the live hook would take itself for a test copy, trusting its environment and its self-test seams"
+    else
+        ok "the transcript deny is a wired, root-owned hook that every tool call reaches"
+    fi
+fi
+# THE SANDBOX IS PINNED ON IN THE IMAGE'S MANAGED SETTINGS (the user's decision after review round 36).
+# Managed settings outrank every other layer, and without the pin a worktree's own settings.local.json
+# -- which sandboxed Bash can create in a new worktree -- could set enabled:false, and Claude Code would
+# start that session's Bash unsandboxed. allowUnsandboxedCommands:false removes the per-command escape, and
+# failIfUnavailable:true makes Bash error, rather than run unconfined, when the sandbox cannot come up
+# (measured: README, "`/proc` has to be unmasked"; the user's decision after review round 38).
+# The host posture (scripts/auto-mode-posture.json) requires the same three on the Mac.
+if [ "$(jq -r '.sandbox.enabled' "$here/managed-settings.json" 2>/dev/null)" = true ] \
+   && [ "$(jq -r '.sandbox.failIfUnavailable' "$here/managed-settings.json" 2>/dev/null)" = true ] \
+   && [ "$(jq -r '.sandbox.allowUnsandboxedCommands' "$here/managed-settings.json" 2>/dev/null)" = false ]; then
+    ok "the image's managed settings pin the sandbox on (enabled, fail if unavailable, no unsandboxed commands), so no lower settings layer can switch it off"
+else
+    bad "the image's managed settings do not pin sandbox.enabled:true, failIfUnavailable:true and allowUnsandboxedCommands:false — a worktree's own settings.local.json, which sandboxed Bash can create, could switch the sandbox off for the next session there"
+fi
+
 # ...and that grant is decorative unless the base image's blanket one is gone. The devcontainers
 # base ships /etc/sudoers.d/vscode = `NOPASSWD:ALL`, under which the agent can flush the firewall,
 # delete the allowlist snapshot or rewrite the root-owned script. verify.sh asks sudo itself at
@@ -450,6 +630,413 @@ if grep -qF 'rm -f /etc/sudoers.d/vscode' "$here/Dockerfile"; then
     ok "the base image's blanket NOPASSWD:ALL grant is removed"
 else
     bad "the Dockerfile no longer removes /etc/sudoers.d/vscode — the agent can sudo anything, and every root-ownership guard here is bypassable"
+fi
+
+# AND THE SANDBOX'S OWN ALLOW LISTS MUST STAY CLEAR OF THE TREE. With no deny rule naming the
+# transcripts any more, the one thing keeping SANDBOXED BASH out of them is the blanket `denyRead`
+# of `~` -- which an allowRead or allowWrite entry carves back. The per-file `.jsonl` denies used to
+# bind /dev/null over each transcript whatever the allow lists said; now an entry widened to
+# `~/.claude` would expose every transcript to `cat`, with every other guard still green. Review
+# round 3, filed as aggravated: the gap is old, this branch removed what was covering it. Compared in
+# `~` space with the shared canonicaliser, both directions: an entry containing a root, or inside one.
+# GATED ON THE LOADER'S RESULT, which reported its own failure above: without posture_canon this
+# block would read every entry as empty and pass on nothing.
+# ABSOLUTE ENTRIES COUNT TOO. Compared in `~` space alone, `/home/vscode/.claude` passed as clear
+# (review round 4, reproduced). The posture applies on the host AND in the container, so an entry
+# under any home -- /home/<user>/..., /Users/<user>/..., /root/... -- is mapped into `~` space, and
+# `/`, `/home`, `/Users` are ancestors of every home.
+# AN ALLOW ENTRY IN `~` SPACE, as the sandbox reads it: canonicalised, cut to its literal base (the
+# sandbox collapses `~/.claude/**` to `~/.claude`), and with an absolute path under any home mapped to
+# `~`. ONE helper for both allow guards: the kit's guard compared raw strings, so `~/.local/**` or
+# `/Users/<u>/.local/share` read as not covering the kit (review round 14).
+dc_tilde_base() { # dc_tilde_base <allow entry> -> its literal base in ~ space
+    local a
+    a="$(posture_rule_base "$(posture_canon "$1")")"
+    case "$a" in
+        /home/*/*|/Users/*/*) a="~/${a#/*/*/}" ;;
+        /root/*)              a="~/${a#/root/}" ;;
+        /home/*|/Users/*|/root|/home|/Users|/) a="~" ;;
+    esac
+    printf '%s\n' "$a"
+}
+dc_allow_hit=""
+if [ "$dc_reader_ok" = 1 ]; then
+    while IFS= read -r dc_a; do
+        [ -n "$dc_a" ] || continue
+        # A GLOB ENTRY IS ITS LITERAL BASE: the sandbox collapses `~/.claude/**` to `~/.claude`, and
+        # compared as a string it passed as clear while opening every transcript (review round 6).
+        dc_a="$(dc_tilde_base "$dc_a")"
+        for dc_root in $(posture_transcript_roots); do
+            if [ "$dc_a" = "$dc_root" ] || [ "${dc_root#"$dc_a"/}" != "$dc_root" ] || [ "${dc_a#"$dc_root"/}" != "$dc_a" ] || [ "$dc_a" = "~" ]; then
+                dc_allow_hit="$dc_allow_hit $dc_a"; break
+            fi
+        done
+    # FROM BOTH FILES, as the deny arm reads both: allow arrays MERGE across settings layers, so an
+    # entry in managed-settings.json opens the tree exactly as one in the posture does. This read
+    # the posture alone (review round 5).
+    done <<<"$( { jq -r '.sandbox.filesystem | (.allowRead[]?, .allowWrite[]?)' "$here/managed-settings.json"
+                 jq -r '.require.sandbox.filesystem | (.allowRead[]?, .allowWrite[]?)' "$posture"; } 2>/dev/null)"
+    if [ -n "$dc_allow_hit" ]; then
+        bad "a sandbox allowRead/allowWrite entry reaches the transcript tree, so sandboxed Bash can read or write other sessions' transcripts — nothing else stands in the way now that no deny rule names them:$dc_allow_hit"
+    else
+        ok "no sandbox allowRead/allowWrite entry reaches the transcript tree"
+    fi
+fi
+
+# THE HOOK MUST NOT TRUST PATH. It runs UNSANDBOXED on every tool call, and the image puts the
+# agent-writable ~/.local/bin and ~/.cargo/bin first on PATH, so a `jq` or a `bash` planted there ran
+# outside the sandbox with the container credential readable (review round 4, measured; the guards
+# above certified the hook "not replaceable" because they looked only at the script file). Required:
+# an absolute shebang -- `#!/usr/bin/env bash` finds bash itself through PATH -- and PATH fixed to
+# system directories before the first command the script runs.
+dc_shebang="$(head -1 "$here/deny-transcripts.sh")"
+dc_first_cmd="$(dc_strip_comments "$here/deny-transcripts.sh" | sed '1d' | grep -m1 -E '[^[:space:]]')"
+# `-p` REQUIRED, not merely an absolute bash: privileged mode is what makes bash ignore BASH_ENV
+# and functions exported through the environment, and a plain `#!/bin/bash` passed every gate here
+# while losing both (review round 7). The self-test also plants a BASH_ENV and watches it not run.
+case "$dc_shebang" in
+    '#!/bin/bash -p'|'#!/bin/bash -p '*|'#!/usr/bin/bash -p'|'#!/usr/bin/bash -p '*)
+        if [ "$dc_first_cmd" != "PATH=/usr/bin:/bin" ]; then
+            bad "deny-transcripts.sh does not fix PATH before it runs anything (its first command is [$dc_first_cmd]) — it runs unsandboxed, and ~/.cargo/bin and ~/.local/bin, which the sandbox can write, come first on the image's PATH"
+        else
+            ok "the transcript hook has an absolute shebang and fixes PATH before running anything"
+        fi ;;
+    *) bad "deny-transcripts.sh's shebang is [$dc_shebang], not an absolute bash in privileged mode (\`#!/bin/bash -p\`) — an env shebang finds bash through a PATH the sandbox can write to, and without -p bash runs BASH_ENV and imported functions, all unsandboxed" ;;
+esac
+
+# THE SWEEP RUNS UNSANDBOXED TOO, and the same rule holds for it: the reaper pipes it into
+# `docker exec`, run.sh runs it at start, and the image's PATH begins with directories the sandbox
+# can write. Round 7 found a planted `jq` there running on the next reaper tick. Required: the
+# sweep pins PATH as its first command, and every place that starts it -- or verify.sh, which also runs
+# unsandboxed -- names `/bin/bash` by absolute path rather than letting docker exec look it up.
+dc_unsb=""
+# HERE-STRINGS, NEVER `producer | grep -q`: the note above dc_stmt_line is why. The first cut of
+# this guard piped twice into grep -q, which is the race that once failed only on CI.
+# THE FIRST COMMAND, not "somewhere in the real-run arm": the pin sat in that arm and the top-level
+# `date` and `stat` ran a planted program before it (review round 8).
+dc_sweep_first="$(dc_strip_comments "$here/sweep-transcripts.sh" | sed '1d' | grep -m1 -E '[^[:space:]]')"
+[ "$dc_sweep_first" = '[ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }' ] \
+    || dc_unsb="$dc_unsb the sweep's first command does not pin PATH (it is [$dc_sweep_first]);"
+grep -qF -- '"/bin/bash", "-s"' "$here/../crates/jkb-cli/src/transcripts.rs" \
+    || dc_unsb="$dc_unsb the reaper's docker exec does not name /bin/bash;"
+dc_run_stripped="$(dc_strip_comments "$here/run.sh")"
+for dc_s in sweep-transcripts verify; do
+    dc_ln="$(dc_stmt_line "$dc_run_stripped" "$dc_s\\.sh")"
+    dc_line=""; [ -n "$dc_ln" ] && dc_line="$(sed -n "${dc_ln}p" <<<"$dc_run_stripped")"
+    case "$dc_line" in
+        *'/bin/bash "$DC_CTR_KIT/.container/'"$dc_s"'.sh"'*) ;;
+        *) dc_unsb="$dc_unsb run.sh does not start $dc_s.sh with /bin/bash from the kit mirror;" ;;
+    esac
+done
+# run.sh ITSELF runs as you on the host, and finds bash, jq and docker by name, from a shell an agent
+# may have shaped. Since review round 27 it FILTERS NOTHING: its first command after `set` re-executes
+# it under `env -i` with a PATH it builds from fixed directories and the kit home's path-keep file, and
+# an allowlist of names. Rounds 11 to 26 filtered the inherited PATH and environment and each found the
+# next inlet; these checks hold the construction, not a filter.
+dc_run_cmds="$(dc_strip_comments "$here/run.sh" | sed '1d' | grep -E '[^[:space:]]' | head -2)"
+dc_run_env="$(sed -n 2p <<<"$dc_run_cmds")"
+# PRIVILEGED MODE, as the hook has: without -p, bash runs the launching terminal's BASH_ENV and imports
+# its exported functions before any of this file runs (review round 21).
+[ "$(head -1 "$here/run.sh")" = '#!/bin/bash -p' ] \
+    || dc_unsb="$dc_unsb run.sh's shebang is not #!/bin/bash -p, so bash itself is found through PATH, or runs the launching terminal's BASH_ENV and exported functions;"
+case "$dc_run_env" in
+    *'jkb_home="$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)"'*'jkb_path=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin;'*'jkb_keepf="$jkb_home/.local/share/jkb-container-kit/path-keep"'*'jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" '*'compgen -e'*'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"'*) ;;
+    *) dc_unsb="$dc_unsb run.sh does not rebuild its environment as its first command (env -i, a PATH built from fixed directories and path-keep, an allowlist), so it runs with what the launching terminal gave it;" ;;
+esac
+# The built PATH takes nothing from the inherited one, which travels only as JKB_USER_PATH for need_tool's
+# message; and the allowlist names neither PATH nor a variable that steers what a child runs.
+case "$dc_run_env" in
+    *'jkb_path="$PATH'*|*'jkb_path=$PATH'*|*'jkb_path="${PATH'*|*'jkb_path=${PATH'*|*':$PATH'*|*':${PATH'*) dc_unsb="$dc_unsb run.sh builds its PATH from the inherited one;" ;;
+esac
+case "$dc_run_env" in
+    *'in PATH|'*|*'|PATH|'*|*'|PATH)'*|*'in HOME|'*|*'|HOME|'*|*'|HOME)'*|*DOCKER_CONFIG*|*DOCKER_HOST*|*BASH_ENV*|*TAR_OPTIONS*|*LD_*|*DYLD_*|*TMPDIR*|*'|*)'*) dc_unsb="$dc_unsb run.sh's environment allowlist names a variable that steers what its children run;" ;;
+esac
+# ...AND THE ALLOWLIST NAMES EVERY JKB_ VARIABLE run.sh READS that it does not set itself: dropping
+# JKB_CONTAINER_NAME made run.sh act on jkb-dev while the reaper looked for the override (review round
+# 24). "Sets itself" is a statement-start assignment in the code (a comment or an echo exempted
+# JKB_RUN_FROM_CHECKOUT, round 25), or a name the re-exec puts in its own environment.
+dc_set_here="$({ dc_strip_comments "$here/run.sh"; dc_strip_comments "$here/lib.sh"; } | grep -oE '(^|;)[[:space:]]*(export |local )?JKB_[A-Z_]+=' | grep -oE 'JKB_[A-Z_]+'; grep -oE '"JKB_[A-Z_]+=' <<<"$dc_run_env" | tr -d '"=')"
+for dc_v in $(grep -oE '[$][{]?JKB_[A-Z_]+' "$here/run.sh" | tr -d '${' | sort -u); do
+    grep -qx -- "$dc_v" <<<"$dc_set_here" && continue
+    case "$dc_run_env" in *"|$dc_v|"*|*"|$dc_v)"*) ;; *) dc_unsb="$dc_unsb run.sh reads $dc_v but its environment allowlist drops it;" ;; esac
+done
+grep -qF '[ "$IMAGE" != jkb-dev ]' <<<"$(dc_strip_comments "$here/run.sh")" \
+    || dc_unsb="$dc_unsb run.sh may run an existing image named by JKB_CONTAINER_IMAGE without building it from the kit;"
+# THE INSTALLED HOOK REFUSES ITS SELF-TEST, before the self-test stages any copy: run unsandboxed, its
+# copies in agent-writable /tmp and ~/.cache could be swapped and run outside the sandbox (review
+# rounds 34 and 35; nothing held the refusal).
+dc_st="$(dc_strip_comments "$here/deny-transcripts.sh" | sed -n '/^if \[ "\${1:-}" = --self-test \]; then/,/mktemp/p')"
+grep -qF 'if [ "$dt_installed" = 1 ]; then' <<<"$dc_st" && grep -qF 'exit 1' <<<"$dc_st" \
+    || dc_unsb="$dc_unsb the installed transcript hook does not refuse --self-test before staging copies, which run unsandboxed from agent-writable directories;"
+grep -q 'JKB_CONTAINER_KIT_HOME' <<<"$(dc_strip_comments "$here/lib.sh")" \
+    && dc_unsb="$dc_unsb lib.sh lets JKB_CONTAINER_KIT_HOME move the kit, and a launching terminal sets it;"
+# EVERY EXEC IN run.sh, not the two above: round 7 fixed the sweep and verify.sh and left seven
+# others -- `bash -c` for the login, `bash -lc` for the reap, `sh`, `sudo` -- resolving through the
+# same PATH (review round 8). Each `docker exec`/`in_container` statement must name its program
+# absolutely, and pin PATH with `-e PATH=/usr/bin:/bin` unless the program is one that answers for
+# its own: the sweep (pins as its first command), setup.sh (runs the toolchain by design, once),
+# verify.sh (task verify-sh-runs-unsandboxed-with--18da6e4b5d893488), or sudo (secure_path).
+# EVERY OCCURRENCE IS ACCOUNTED FOR, never skipped: a statement whose container or program the scan
+# cannot resolve is a failure, so `in_container --user root "${NAME}" bash` cannot be added unseen
+# (review round 9: the scan skipped anything not spelled `"$NAME"`, and the floor cannot see an
+# addition). The only two occurrences that are not a statement are named: in_container's own
+# `docker exec "$@"`, and the `"docker exec $*"` it prints when the container has died.
+# run.sh AND lib.sh, whose hook mirror runs four execs -- one of them `sh -c` as root, which found
+# `sh` on the agent-writable PATH until review round 8's self-review. lib.sh's container token is
+# `"$name"` and its docker `"$docker"`. Each line is tagged with its file, so a failure says which.
+# AND NOTHING FROM THE CHECKOUT: a `.container/` path in an exec that is not under "$DC_CTR_KIT" is
+# the checkout's copy, which the agent writes (the kit's whole point; lib.sh's DC_KIT_DIR).
+dc_exec_awk='
+    {
+        n = split($0, t, /[[:space:]]+/)
+        l = $0; gsub(/"\$DC_CTR_KIT\/\.container\//, "", l); ck = (l ~ /\.container\//) ? 1 : 0
+        for (i = 1; i <= n; i++) {
+            if (t[i] ~ /(^|[("])in_container$/ || (t[i] == "exec" && i > 1 && t[i-1] ~ /docker"?$/)) {
+                if (t[i] == "exec" && t[i-1] == "\"docker") continue
+                j = i + 1; pin = 0
+                while (j <= n && t[j] ~ /^-/) {
+                    if ((t[j] == "-e" || t[j] == "--env") && t[j+1] == "PATH=/usr/bin:/bin") pin = 1
+                    if (t[j] == "--env=PATH=/usr/bin:/bin") pin = 1
+                    if (t[j] ~ /^(-e|-w|-u|--env|--workdir|--user)$/) j += 2; else j++
+                }
+                if (t[j] == "\"$@\"") continue
+                if ((t[j] != "\"$NAME\"" && t[j] != "\"$name\"") || t[j+1] == "") { print F ":" NR "\tUNRESOLVED\t" t[j] "\t" t[j+1] "\t" ck; continue }
+                print F ":" NR "\t" pin "\t" t[j+1] "\t" t[j+2] "\t" ck
+            }
+        }
+    }'
+dc_execs="$(awk -v F=run.sh "$dc_exec_awk" <<<"$dc_run_stripped"; awk -v F=lib.sh "$dc_exec_awk" <<<"$(dc_strip_comments "$here/lib.sh")")"
+dc_nexec=0; dc_nlib=0
+while IFS=$'\t' read -r dc_ln dc_pin dc_prog dc_arg dc_ck; do
+    [ -n "$dc_ln" ] || continue
+    dc_nexec=$((dc_nexec + 1))
+    case "$dc_ln" in lib.sh:*) dc_nlib=$((dc_nlib + 1)) ;; esac
+    [ "$dc_ck" = 1 ] && dc_unsb="$dc_unsb $dc_ln runs a script from the checkout's .container/, not from \"\$DC_CTR_KIT\";"
+    if [ "$dc_pin" = UNRESOLVED ]; then
+        dc_unsb="$dc_unsb $dc_ln has a container exec the scan cannot read (container [$dc_prog], program [$dc_arg]) -- spell it \`\"\$NAME\" /absolute/program\`;"
+        continue
+    fi
+    case "$dc_prog" in
+        /*) ;;
+        *) dc_unsb="$dc_unsb $dc_ln starts [$dc_prog] by PATH lookup;"; continue ;;
+    esac
+    [ "$dc_pin" = 1 ] && continue
+    case "$dc_prog $dc_arg" in
+        '/bin/bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"'|'/bin/bash "$DC_CTR_KIT/.container/setup.sh"'|'/bin/bash "$DC_CTR_KIT/.container/verify.sh"'|"/usr/bin/sudo "*) ;;
+        *) dc_unsb="$dc_unsb $dc_ln runs [$dc_prog $dc_arg] without -e PATH=/usr/bin:/bin;" ;;
+    esac
+done <<<"$dc_execs"
+# ~/.jq AS WELL AS PATH: jq sources $HOME/.jq into every program it runs, and the sandbox writes
+# $HOME. The sweep and verify.sh each define ONE wrapper that runs jq with HOME=/dev/null, as their
+# first mention of jq, so every call -- lib.sh's included, which round 9 found a per-call scan of
+# these files could not see -- goes through it. Bypassing it takes `command jq` or an absolute
+# `/usr/bin/jq`, and either is refused outside the wrapper line itself.
+dc_jq_wrap='jq() { HOME=/dev/null command jq "$@"; }'
+# run.sh too: its jq readers build the mount list handed to `docker run` (review round 12).
+for dc_f in sweep-transcripts verify run; do
+    dc_jq_text="$(dc_strip_comments "$here/$dc_f.sh")"
+    dc_jq_first="$(grep -m1 -E '(^|[^A-Za-z0-9_.-])jq([^A-Za-z0-9_.-]|$)' <<<"$dc_jq_text")"
+    [ "$dc_jq_first" = "$dc_jq_wrap" ] \
+        || dc_unsb="$dc_unsb $dc_f.sh does not define the HOME=/dev/null jq wrapper before its first jq (first mention: [$dc_jq_first]), so an agent-written ~/.jq is sourced into its jq;"
+    dc_jq_bypass="$(grep -vxF -- "$dc_jq_wrap" <<<"$dc_jq_text" | grep -cE 'command jq|/jq([[:space:]]|$)')"
+    [ "$dc_jq_bypass" -eq 0 ] \
+        || dc_unsb="$dc_unsb $dc_f.sh calls jq around its wrapper ($dc_jq_bypass time(s), by \`command jq\` or an absolute path);"
+done
+# A FLOOR, so a parser that stops matching reads as a failure and not as "nothing to check".
+[ "$dc_nexec" -ge 13 ] && [ "$dc_nlib" -eq 4 ] \
+    || dc_unsb="$dc_unsb only $dc_nexec container exec(s) found in run.sh and lib.sh ($dc_nlib in lib.sh), where there are nine and four -- the scan has stopped seeing them;"
+if [ -n "$dc_unsb" ]; then
+    bad "an unsandboxed script can be steered through PATH:$dc_unsb a program planted in ~/.cargo/bin would run outside the sandbox with the container credential readable"
+else
+    ok "the sweep pins PATH, and the reaper and run.sh start the unsandboxed scripts with /bin/bash"
+fi
+
+# THE KIT HOLDS EVERYTHING ITS SCRIPTS RUN. setup.sh and verify.sh run from the root-owned kit mirror
+# and execute scripts from `scripts/` beside it; one that is not in lib.sh's dc_kit_paths would be
+# missing from the mirror, and one reached through the CHECKOUT ($repo, $mem_repo) is the agent's
+# copy, which is what the kit exists to stop (review round 8's self-review: verify.sh ran the
+# checkout's link-claude-memory.sh and auto-mode.sh on every start). setup.sh's `cargo install` and
+# the extension build are the named exception: they BUILD the checkout, which is their job.
+dc_kit_list="$(bash -c '. "$1" && dc_kit_paths' _ "$here/lib.sh" 2>/dev/null)"
+dc_kit_bad=""
+[ -n "$dc_kit_list" ] || dc_kit_bad=" lib.sh's dc_kit_paths printed nothing;"
+for dc_f in setup verify install-extensions; do
+    dc_t="$(dc_strip_comments "$here/$dc_f.sh")"
+    while IFS= read -r dc_ref; do
+        [ -n "$dc_ref" ] || continue
+        grep -qxF -- "scripts/$dc_ref" <<<"$dc_kit_list" || dc_kit_bad="$dc_kit_bad $dc_f.sh runs scripts/$dc_ref, which the kit does not carry;"
+    done <<<"$(grep -oE '\$(kit|kit_dc)/scripts/[A-Za-z0-9._-]+' <<<"$dc_t" | sed 's,.*/scripts/,,' | sort -u)"
+    # The one named exception: the extension's builder, run on the checkout it builds.
+    dc_ck="$(grep -nE '\$\{?(repo|mem_repo)\}?/(scripts|\.container)/' <<<"$dc_t" \
+        | grep -vF '"$repo/scripts/install-extension.sh" --build-in' | head -3 | tr '\n' ' ')"
+    [ -z "$dc_ck" ] || dc_kit_bad="$dc_kit_bad $dc_f.sh reaches the checkout's scripts ($dc_ck);"
+done
+if [ -n "$dc_kit_bad" ]; then
+    bad "the container kit does not hold what its scripts run:$dc_kit_bad what runs unsandboxed must come from the kit, never from the checkout the agent can write"
+else
+    ok "setup.sh, verify.sh and install-extensions.sh run scripts only from the kit, and the kit carries each one"
+fi
+
+# NO AGENT CAN WRITE THE KIT. It is what runs outside every sandbox, so it must be out of reach of
+# the container (no bind reaches it), of sandboxed Bash on the host (no posture allowWrite covers
+# it), and of the in-process file tools (a posture Edit deny names it). It sat under ~/.jkb first,
+# which the posture's allowWrite grants, so any sandboxed host agent could rewrite the kit's run.sh
+# (review round 10). The default comes from lib.sh with HOME pinned, in ~ space like the posture.
+# The kit's HOME, not only the kit: the staging copies and the mirror's archive live under it too.
+dc_kit_home="$(env -u JKB_CONTAINER_KIT_HOME HOME=/kit-home-probe bash -c '. "$1" && printf "%s" "$DC_KIT_HOME"' _ "$here/lib.sh" 2>/dev/null)"
+dc_kit_tilde="~${dc_kit_home#/kit-home-probe}"
+dc_kit_where=""
+case "$dc_kit_home" in /kit-home-probe/?*) ;; *) dc_kit_where=" lib.sh's DC_KIT_HOME [$dc_kit_home] is not under the home;" ;; esac
+dc_posture="$here/../scripts/auto-mode-posture.json"
+# ONE REACH TEST over every place run.sh's trust rests on: the kit, the Homebrew prefixes it keeps
+# on PATH, the directories /usr/local/bin's links point into, and ~/.docker, whose CLI plugins
+# `docker info` runs. An allowWrite entry that is any of them, or an ancestor, lets sandboxed Bash
+# plant code there; the Homebrew arm checked only the Edit deny (review round 15).
+dc_protected="$dc_kit_tilde
+/opt/homebrew
+/usr/local
+/Applications
+~/.docker"
+while IFS= read -r dc_aw; do
+    [ -n "$dc_aw" ] || continue
+    dc_aw="$(dc_tilde_base "$dc_aw")"
+    while IFS= read -r dc_pp; do
+        case "$dc_pp:$dc_aw" in "~"*":~"|*":/") dc_kit_where="$dc_kit_where the posture's allowWrite entry [$dc_aw] covers $dc_pp;"; continue ;; esac
+        if [ "$dc_pp" = "$dc_aw" ] || [ "${dc_pp#"$dc_aw"/}" != "$dc_pp" ]; then
+            dc_kit_where="$dc_kit_where the posture's allowWrite entry [$dc_aw] covers $dc_pp;"
+        fi
+    done <<<"$dc_protected"
+done <<<"$(HOME=/dev/null jq -r '.require.sandbox.filesystem.allowWrite[]? // empty' "$dc_posture" 2>/dev/null)"
+HOME=/dev/null jq -e --arg r "Edit($dc_kit_tilde/**)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
+    || dc_kit_where="$dc_kit_where the posture has no Edit($dc_kit_tilde/**) deny, so the in-process file tools can write it;"
+dc_kit_nsrc=0
+while IFS= read -r dc_src; do
+    [ -n "$dc_src" ] || continue
+    dc_kit_nsrc=$((dc_kit_nsrc + 1))
+    # A named volume reaches no host path; only a ${localEnv:HOME} bind can hold the kit.
+    case "$dc_src" in '${localEnv:HOME}'*) ;; *) continue ;; esac
+    dc_src="~${dc_src#\$\{localEnv:HOME\}}"; dc_src="${dc_src%/}"
+    if [ "$dc_kit_tilde" = "$dc_src" ] || [ "${dc_kit_tilde#"$dc_src"/}" != "$dc_kit_tilde" ]; then
+        dc_kit_where="$dc_kit_where container.json binds [$dc_src], which holds it;"
+    fi
+done <<<"$(dc_strip "$here/container.json" 2>/dev/null | HOME=/dev/null jq -r '(.mounts // [])[] | split(",")[] | select(startswith("source=")) | ltrimstr("source=")' 2>/dev/null)"
+[ "$dc_kit_nsrc" -gt 0 ] || dc_kit_where="$dc_kit_where container.json's mount sources could not be read, so whether a bind holds it is unchecked;"
+# ...AND run.sh READS ITS PATH KEEP LIST FROM THIS SAME HOME. It spells the location itself, because
+# its first command runs before lib.sh is sourced, so a move of DC_KIT_HOME that left it behind would have run.sh
+# trust a file that is neither made 0700 nor Edit-denied, with every check here green (review round 23).
+dc_keepf="$(sed -n 's/.*jkb_keepf="\([^"]*\)".*/\1/p' "$here/run.sh" | head -1)"
+dc_keepf="${dc_keepf//\$jkb_home//kit-home-probe}"
+[ -n "$dc_keepf" ] && [ "${dc_keepf%/*}" = "$dc_kit_home" ] \
+    || dc_kit_where="$dc_kit_where run.sh reads its PATH keep list from [${dc_keepf:-nothing found}], not from the kit home [$dc_kit_home];"
+# ...AND THE PATH run.sh BUILDS: path-keep's entries, then the system and Homebrew prefixes, where docker
+# and jq live. Homebrew's are owned by the user,
+# so the in-process Write tool, which no sandbox confines, could replace a jq there that run.sh then
+# runs as the user (review round 14). The posture denies Edit on both.
+# ~/.cargo/env too, a FILE: every login shell rustup set up sources it, unsandboxed, while the posture
+# lets sandboxed agents write ~/.cargo for builds (review round 15). One Edit rule is both the Write
+# tool's deny and, merged by Claude Code, the sandbox's denyWrite.
+# ...AND EVERY OTHER FILE THAT BECOMES CODE LATER, outside every sandbox: the shell startup files (one
+# `export BASH_ENV=...` in ~/.zshenv ran in run.sh before it rebuilt its environment), git's global config and
+# hooks, ssh's config, and the per-user autostart directories (review round 20) -- and VS Code's user
+# settings and extensions, whose terminal.integrated.env and extension code run in your next terminal
+# or window (review round 24). Only the user edits these, so denying them costs nothing.
+for dc_inlet in '~/.cargo/env' '~/.zshenv' '~/.zprofile' '~/.zshrc' '~/.zlogin' '~/.zlogout' '~/.bashrc' \
+                '~/.bash_profile' '~/.bash_login' '~/.profile' '~/.bash_logout' '~/.gitconfig' '~/.config/git/**' \
+                '~/.ssh/**' '~/Library/LaunchAgents/**' '~/.config/systemd/user/**' '~/.config/autostart/**' \
+                '~/Library/Application Support/Code/User/**' '~/.config/Code/User/**' '~/.vscode/extensions/**'; do
+    HOME=/dev/null jq -e --arg r "Edit($dc_inlet)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
+        || dc_kit_where="$dc_kit_where the posture has no Edit($dc_inlet) deny, so an agent can plant code that runs later as you, unsandboxed;"
+done
+for dc_pfx in //opt/homebrew //usr/local //Applications '~/.docker'; do
+    HOME=/dev/null jq -e --arg r "Edit($dc_pfx/**)" '.require.permissions.deny | index($r)' "$dc_posture" >/dev/null 2>&1 \
+        || dc_kit_where="$dc_kit_where the posture has no Edit($dc_pfx/**) deny, so the Write tool can replace a program run.sh runs from there;"
+done
+if [ -n "$dc_kit_where" ]; then
+    bad "an agent can write the container kit ($dc_kit_tilde), which runs outside every sandbox:$dc_kit_where"
+else
+    ok "no agent can write the container kit ($dc_kit_tilde), the Homebrew prefixes run.sh keeps on PATH, or a shell, git, ssh or autostart file: no container bind, posture allowWrite or missing Edit deny reaches them"
+fi
+
+# THE FINGERPRINT STRIPS THE ROOT THE ARGUMENTS WERE ASSEMBLED FROM. run.sh assembled from the kit
+# and fingerprinted with the checkout, so the kit's seccomp path entered the hash and every existing
+# container read as stale, with `--rm` as the advice (review round 10). The self-test proves the
+# function; this holds the two call sites to one root.
+if stripped_matches "$here/run.sh" '^ARGS_OUT="\$\(assembled_args "\$args_root"\)"' \
+   && stripped_matches "$here/run.sh" '^want_hash="\$\(fingerprint "\$args_root" '; then
+    ok "run.sh fingerprints the container with the same root it assembles the arguments from"
+else
+    bad "run.sh's live fingerprint and its assembly do not both use \$args_root — a root the fingerprint does not strip enters the hash, and every existing container reads as created from a different container.json"
+fi
+
+# THE REPO'S OWN SETTINGS DO NOT REPLACE THE CONTAINER'S ENVIRONMENT. Claude Code puts a settings
+# file's `env` into every session, over the image's ENV, and .claude/settings.json is committed and
+# shared with the host. verify.sh checks every layer a container session loads, settings.local.json
+# included; this holds the committed file at review time, before any container sees it.
+if ! dc_envp_names="$(dc_protected_env "$here/Dockerfile" "$here/container.json" 2>&1)"; then
+    bad "the environment names the container sets could not be derived ($dc_envp_names), so whether the repo's Claude settings replace one is unchecked"
+else
+    dc_envp_hit="$(settings_env_shadows "$dc_envp_names" "$here/../.claude/settings.json" | cut -f2 | tr '\n' ' ')"
+    if [ -n "$dc_envp_hit" ]; then
+        bad "the repo's .claude/settings.json sets env that the container itself sets ( $dc_envp_hit), so every container session gets the file's value instead of the image's — a PATH written for one machine breaks jkb's resolution on the other"
+    else
+        ok "the repo's committed Claude settings replace none of the $(grep -c . <<<"$dc_envp_names") environment names the container sets"
+    fi
+fi
+
+# run.sh CHECKS THE KIT BEFORE IT MIRRORS IT. The mirror's tar dereferences, so a link in the kit
+# would put its target in the container; dc_install_kit refuses one in the copy it makes, and run.sh
+# holds the line for a kit made any other way. No test drives run.sh to that step, so this holds the
+# call in place, ahead of the mirror (review round 15: deleting it left everything green).
+dc_kit_chk="$(grep -n 'kit_odd="$(dc_unsafe_entries "$kit_src")"' <<<"$dc_run_stripped" | head -1 | cut -d: -f1)"
+dc_kit_mir="$(grep -n 'dc_mirror_hooks "$kit_src" "$DC_CTR_KIT"' <<<"$dc_run_stripped" | head -1 | cut -d: -f1)"
+if [ -n "$dc_kit_chk" ] && [ -n "$dc_kit_mir" ] && [ "$dc_kit_chk" -lt "$dc_kit_mir" ] \
+   && grep -qF '[ -z "$kit_odd" ] || die' <<<"$dc_run_stripped"; then
+    ok "run.sh refuses to mirror a kit holding a link, a special file or a hard link, before it mirrors one"
+else
+    bad "run.sh does not check the kit with dc_unsafe_entries, and refuse, before dc_mirror_hooks copies it into the container — a link in the kit would carry its target's bytes in"
+fi
+
+# ONE DERIVATION OF THE SERVED CHECKOUT. setup.sh, verify.sh and install-extensions.sh each spelled
+# it, and two took the kit mirror for the checkout when run there (review round 18); each now calls
+# lib.sh's dc_repo_root, and none spells `${JKB_REPO_ROOT:-` itself (review round 19: nothing held it).
+dc_rr_bad=""
+for dc_f in setup verify install-extensions; do
+    dc_t="$(dc_strip_comments "$here/$dc_f.sh")"
+    grep -q 'dc_repo_root "' <<<"$dc_t" || dc_rr_bad="$dc_rr_bad $dc_f.sh does not call dc_repo_root;"
+    # A DEFAULT naming a directory is a derivation; `${JKB_REPO_ROOT:-}` only asks whether run.sh set it.
+    grep -qE '\$\{JKB_REPO_ROOT:-[^}]' <<<"$dc_t" && dc_rr_bad="$dc_rr_bad $dc_f.sh derives the checkout itself;"
+done
+if [ -n "$dc_rr_bad" ]; then
+    bad "the served checkout is derived outside lib.sh's dc_repo_root:$dc_rr_bad run from the kit mirror, such a script takes the mirror itself for the checkout"
+else
+    ok "setup.sh, verify.sh and install-extensions.sh derive the checkout through dc_repo_root alone"
+fi
+
+# THE HOOK AND THE SWEEP MUST AGREE ON WHERE THE TREE IS. The hook cannot load the shared reader --
+# it is installed alone, root-owned, at /usr/local/bin -- so its roots are its own, and they drifted:
+# it ignored CLAUDE_CONFIG_DIR while the sweep honoured it, leaving the real tree unguarded whenever
+# that is set (review round 3). Held together by name here, on comment-stripped text: each must
+# derive a root from CLAUDE_CONFIG_DIR and name both spellings.
+dc_hook_roots="$(dc_strip_comments "$here/deny-transcripts.sh" | sed -n '/^root_list=()/,/^done/p')"
+dc_sweep_roots="$(dc_strip_comments "$here/sweep-transcripts.sh" | grep -E '^[[:space:]]*proots=')"
+dc_roots_missing=""
+for dc_need in 'CLAUDE_CONFIG_DIR' '.claude-state/projects'; do
+    grep -qF -- "$dc_need" <<<"$dc_hook_roots"  || dc_roots_missing="$dc_roots_missing hook:$dc_need"
+    grep -qF -- "$dc_need" <<<"$dc_sweep_roots" || dc_roots_missing="$dc_roots_missing sweep:$dc_need"
+done
+# EVERY ROOT IN THE SHARED LIST is named by the hook, the archive included (review rounds 9 and 11).
+for dc_need in $(posture_transcript_roots 2>/dev/null); do
+    grep -qF -- "${dc_need#\~/}" <<<"$dc_hook_roots" || dc_roots_missing="$dc_roots_missing hook:${dc_need#\~/}"
+done
+[ -n "$(posture_transcript_roots 2>/dev/null)" ] || dc_roots_missing="$dc_roots_missing (the shared root list printed nothing)"
+grep -qE '^TRANSCRIPT_ARCHIVE=.*/\.claude-state/transcript-archive' <<<"$(dc_strip_comments "$here/sweep-transcripts.sh")" \
+    || dc_roots_missing="$dc_roots_missing sweep:TRANSCRIPT_ARCHIVE"
+if [ -z "$dc_hook_roots" ] || [ -z "$dc_sweep_roots" ]; then
+    bad "the transcript roots could not be found in deny-transcripts.sh and sweep-transcripts.sh, so whether they agree is unchecked"
+elif [ -n "$dc_roots_missing" ]; then
+    bad "the hook and the sweep disagree about where the transcript tree is — missing:$dc_roots_missing; a tree one of them does not know is guarded by the other alone, or by neither"
+else
+    ok "the hook and the sweep derive the transcript tree from the same spellings, CLAUDE_CONFIG_DIR included"
 fi
 if grep -qF 'takes no arguments' "$here/egress-status.sh"; then
     ok "egress-status.sh refuses arguments"
@@ -734,8 +1321,10 @@ else
         sweep_inputs="$(grep -oE '^INPUTS="[^"]*"' <<<"$sweep_body" \
             | sed -n '1s/^INPUTS="\(.*\)"/\1/p')"
         sweep_inputs="${sweep_inputs//\$SEAMS/$sweep_seams}"
-        sweep_reads="$(grep -oE '\$\{JKB_[A-Z_]+:-' <<<"$sweep_body" \
-            | sed -E 's/^\$\{([A-Z_]+):-$/\1/' | LC_ALL=C sort -u | tr '\n' ' ')"
+        # EVERY `${JKB_X` READ, whatever its operator: matching only `:-` missed posture_layer_files'
+        # `${JKB_REPO_ROOT:+...}`, so it was in neither list and this stayed green (review round 26).
+        sweep_reads="$(grep -oE '\$\{JKB_[A-Z_]+' <<<"$sweep_body" \
+            | sed -E 's/^\$\{//' | LC_ALL=C sort -u | tr '\n' ' ')"
         sweep_declared="$(printf '%s\n' $sweep_inputs | LC_ALL=C sort -u | tr '\n' ' ')"
         if [ -z "$sweep_reads" ]; then
             sweep_problems="$sweep_problems it reads no \${JKB_…:-} override at all, so the SEAMS declaration can no longer be checked against the code;"
@@ -818,7 +1407,7 @@ else
     # require and no path to agree about, so the guard that compared two paths is gone with them.
     grep -qF -- 'include_str!("../../../.container/sweep-transcripts.sh")' <<<"$ctr_rs" \
         || sweep_problems="$sweep_problems the reaper no longer embeds the sweep, so it runs something other than the script this repository tests;"
-    grep -qF -- '"exec", "-i", "-e", &keep, name, "bash", "-s"' <<<"$ctr_rs" \
+    grep -qF -- '"exec", "-i", "-e", &keep, name, "/bin/bash", "-s"' <<<"$ctr_rs" \
         || sweep_problems="$sweep_problems the reaper no longer feeds the sweep in on stdin, so it depends on a copy inside the container that an already-running one does not have;"
 fi
 

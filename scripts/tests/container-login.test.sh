@@ -172,22 +172,48 @@ case10_a_failed_move_is_recorded_and_then_cleared() {
 # run.sh's --stop and --rm, against a stub `docker` that logs its calls. HOME/repos points at this
 # checkout's parent so run.sh's container_path resolves as it does on a real host.
 # STUB_STATE is what `docker inspect` answers: true, false, or missing (no such container).
-run_sh_with_stub() { # run_sh_with_stub <state> <flag> -> sets $calls (one docker call per line)
+# THE CHECKOUT'S run.sh REFUSES to start or stop anything unless JKB_RUN_FROM_CHECKOUT=1 (lib.sh's
+# DC_KIT_DIR says why), so these cases set it -- RS_SCRIPT and RS_ENV let the kit cases below run
+# the KIT's run.sh, or the checkout's without the override, through the same stub.
+run_sh_with_stub() { # run_sh_with_stub <state> <flag> -> sets $calls (one docker call per line) and $execs
     local d="$work/rs-$RANDOM"; mkdir -p "$d/bin" "$d/home"
+    rs_home="$d/home"
     ln -s "$(dirname "$repo_root")" "$d/home/repos"
-    cat > "$d/bin/docker" <<'STUB'
+    # PATHS BAKED IN, not read from the environment: run.sh re-executes itself under `env -i` with an
+    # allowlist (review round 23), so a STUB_LOG in the env would never reach the stub. It also records
+    # the environment it was run with, so a case can ask what run.sh's children inherit.
+    cat > "$d/bin/docker" <<STUB
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "$STUB_LOG"
-case "$1" in
-    inspect) [ "$STUB_STATE" = missing ] && exit 1; printf '%s\n' "$STUB_STATE" ;;
+printf '%s\\n' "\$*" >> "$d/calls"
+env >> "$d/child-env"
+case "\$1" in
+    inspect) [ "$1" = missing ] && exit 1; printf '%s\\n' "$1" ;;
 esac
 exit 0
 STUB
     chmod +x "$d/bin/docker"
     : > "$d/calls"
-    HOME="$d/home" PATH="$d/bin:$PATH" STUB_LOG="$d/calls" STUB_STATE="$1" \
-        bash "$repo_root/.container/run.sh" "$2" >/dev/null 2>&1
+    # RS_GONE: install from a scratch copy of the checkout and delete it before running, as
+    # `jkb task land` deletes a worktree a kit could have been installed from.
+    local kit_src="$repo_root" p
+    if [ -n "${RS_GONE:-}" ]; then
+        kit_src="$d/gone-checkout"; mkdir -p "$kit_src/scripts"
+        cp -R "$repo_root/.container" "$kit_src/.container"
+        for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$kit_src/scripts/$p"; done
+    fi
+    [ -z "${RS_KIT:-}" ] || bash -c '. "$1/.container/lib.sh" && dc_install_kit "$1" "$2"' _ "$kit_src" "$d/home/.local/share/jkb-container-kit/kit" >/dev/null 2>&1
+    [ -z "${RS_GONE:-}" ] || rm -rf "$kit_src"
+    local script="$repo_root/.container/run.sh"
+    [ -z "${RS_KIT:-}" ] || script="$d/home/.local/share/jkb-container-kit/kit/.container/run.sh"
+    # The keep file: run.sh builds its PATH from fixed directories, and the stub's goes first through it.
+    mkdir -p "$d/home/.local/share/jkb-container-kit"; printf '%s\n' "$d/bin" > "$d/home/.local/share/jkb-container-kit/path-keep"
+    rs_dir="$d"
+    env ${RS_ENV_I:+-i} HOME="$d/home" PATH="${RS_PATH_PREFIX:+$RS_PATH_PREFIX:}$d/bin:$PATH" ${RS_ENV:-JKB_RUN_FROM_CHECKOUT=1} ${RS_EXTRA_ENV:-} \
+        ${RS_FUNC:+"BASH_FUNC_jkbx%%=$RS_FUNC"} \
+        bash "$script" --test-home "$d/home" "$2" >"$d/out" 2>&1
+    rs_out="$(cat "$d/out")"
     calls="$(cut -d' ' -f1 "$d/calls" | tr '\n' ' ')"
+    execs="$(grep '^exec ' "$d/calls" || true)"
 }
 
 case11_run_sh_carries_the_login_before_stop_and_rm() {
@@ -215,10 +241,230 @@ case12_run_sh_starts_a_stopped_container_to_carry_it() {
     else fail "run.sh --rm with no container carries nothing and still removes" "calls: $calls"; fi
 }
 
+# THE KIT. From a checkout, run.sh starts and stops nothing without the developer's override, and
+# runs no docker command at all; it names the kit's run.sh instead (review round 8's self-review:
+# the checkout's run.sh is a file the agent can write, and it ran as you).
+case13_the_checkouts_run_sh_refuses_without_the_override() {
+    RS_ENV=JKB_RUN_FROM_CHECKOUT=0 run_sh_with_stub true --stop
+    if [ -z "$calls" ] && grep -q 'installed kit' <<<"$rs_out"; then ok "the checkout's run.sh --stop refuses, runs no docker command, and names the kit"
+    else fail "the checkout's run.sh --stop refuses, runs no docker command, and names the kit" "calls: $calls out: $rs_out"; fi
+}
+
+# From the kit, with no override, it stops -- and the login step sources lib.sh from the root-owned
+# mirror, never from the checkout.
+case14_the_kits_run_sh_stops_and_sources_the_mirror() {
+    RS_KIT=1 RS_ENV=JKB_RUN_FROM_CHECKOUT=0 run_sh_with_stub true --stop
+    if [ "$calls" = "inspect exec stop " ] && grep -qF '/usr/local/lib/jkb-container/.container/lib.sh' <<<"$execs" \
+       && ! grep -qE "(^| |')\.container/lib\.sh" <<<"$execs"; then
+        ok "the kit's run.sh --stop carries the login from the mirror's lib.sh, then stops"
+    else fail "the kit's run.sh --stop carries the login from the mirror's lib.sh, then stops" "calls: $calls execs: $execs out: $rs_out"; fi
+}
+
+# A KIT WHOSE CHECKOUT IS GONE still stops and removes its container; only a start or an install
+# needs the checkout (review round 10: it died before reading its arguments, --stop included).
+case15_a_kit_whose_checkout_is_gone_still_stops() {
+    RS_KIT=1 RS_GONE=1 RS_ENV=JKB_RUN_FROM_CHECKOUT=0 run_sh_with_stub true --stop
+    local stop_calls="$calls" stop_out="$rs_out"
+    RS_KIT=1 RS_GONE=1 RS_ENV=JKB_RUN_FROM_CHECKOUT=0 run_sh_with_stub true --dry-run
+    if [ "$stop_calls" = "stop " ] && grep -q 'is gone' <<<"$stop_out" && grep -q 'no longer exists' <<<"$rs_out"; then
+        ok "a kit whose checkout is gone still stops its container, saying so, and refuses a start"
+    else
+        fail "a kit whose checkout is gone still stops its container, saying so, and refuses a start" "stop calls: $stop_calls stop out: $stop_out start out: $rs_out"
+    fi
+}
+
+# NO PROGRAM FROM A PLACE AN AGENT CAN WRITE: a jq planted first on PATH, in ~/.cargo/bin, does not
+# run when run.sh does (review round 11 -- the host posture lets a sandboxed agent write ~/.cargo).
+case16_a_program_planted_on_path_under_home_does_not_run() {
+    # OUTSIDE THE TEMP ROOTS (review round 18): the case fails if run.sh goes back to inheriting PATH,
+    # wherever the planted directory is. The real ~/.cache is writable here and on CI.
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h; h="$(mktemp -d "$HOME/.cache/jkb-plant.XXXXXX")" || { fail "case16" "no scratch home under ~/.cache"; return; }
+    mkdir -p "$h/.cargo/bin"
+    printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$h" > "$h/.cargo/bin/jq"; chmod +x "$h/.cargo/bin/jq"
+    env HOME="$h" PATH="$h/.cargo/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --test-home "$h" --print-args >/dev/null 2>&1
+    local rc=$?
+    if [ ! -e "$h/RAN" ] && [ "$rc" -eq 0 ]; then ok "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one"
+    else fail "a jq planted in ~/.cargo/bin, first on PATH, does not run; run.sh uses the system one" "rc=$rc ran=$([ -e "$h/RAN" ] && echo yes || echo no)"; fi
+    case "$h" in */jkb-plant.*) rm -rf -- "$h" ;; esac
+}
+
+# A TOOL ONLY ON THE SHELL'S OWN PATH IS NAMED, with where it was and the way to keep it: a per-user
+# Docker in ~/.docker/bin failed as a bare "docker is not on PATH" (review round 12). Skipped where a
+# docker in run.sh's fixed directories would be found anyway.
+case17_a_tool_the_path_filter_hid_is_named() {
+    if type -P docker >/dev/null 2>&1; then skip "case17: a docker is on a system PATH here, so nothing is missing"; return 0; fi
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h out; h="$(mktemp -d "$HOME/.cache/jkb-hid.XXXXXX")" || { fail "case17" "no scratch home under ~/.cache"; return; }
+    mkdir -p "$h/.docker/bin"; printf '#!/bin/sh\nexit 0\n' > "$h/.docker/bin/docker"; chmod +x "$h/.docker/bin/docker"
+    ln -s "$(dirname "$repo_root")" "$h/repos"
+    out="$(env HOME="$h" PATH="$h/.docker/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --test-home "$h" 2>&1)"
+    if grep -qF "docker is in $h/.docker/bin" <<<"$out" && grep -qF "jkb-container-kit/path-keep" <<<"$out"; then
+        ok "a docker only on the shell's PATH is named with its directory and how to keep it"
+    else fail "a docker only on the shell's PATH is named with its directory and how to keep it" "out: $(tail -3 <<<"$out")"; fi
+    case "$h" in */jkb-hid.*) rm -rf -- "$h" ;; esac
+}
+
+# A MARKER PLANTED IN A CHECKOUT does not make its run.sh the kit, so --install-kit copies the
+# checkout itself, never the directory the marker names (review round 16).
+case18_a_planted_kit_marker_is_ignored() {
+    local d="$work/mk-$RANDOM" co evil p kit
+    mkdir -p "$d/home"
+    for co in "$d/co" "$d/evil"; do
+        mkdir -p "$co/scripts"; cp -R "$repo_root/.container" "$co/.container"
+        for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    done
+    co="$d/co"; evil="$d/evil"; echo '# EVIL' >> "$evil/.container/run.sh"
+    printf 'checkout=%s\n' "$evil" > "$co/.jkb-container-kit"
+    env HOME="$d/home" bash "$co/.container/run.sh" --test-home "$d/home" --install-kit >/dev/null 2>&1
+    kit="$d/home/.local/share/jkb-container-kit/kit"
+    if [ "$(sed -n 's/^checkout=//p' "$kit/.jkb-container-kit" 2>/dev/null)" = "$(cd "$co" && pwd -P)" ] && ! grep -q '# EVIL' "$kit/.container/run.sh"; then
+        ok "a kit marker planted in a checkout is ignored: --install-kit copies the checkout itself"
+    else
+        fail "a kit marker planted in a checkout is ignored: --install-kit copies the checkout itself" "marker: $(cat "$kit/.jkb-container-kit" 2>&1)"
+    fi
+}
+
+# run.sh RUNS AS YOU, UNSANDBOXED, from whatever terminal launches it, so it must not run that
+# terminal's BASH_ENV or the functions it exports: a committed .vscode/settings.json can set either for
+# every VS Code terminal, and a planted `cd` or `docker` function is called before any check (review
+# round 21, measured: `#!/bin/bash` ran both, `#!/bin/bash -p` neither). EXECUTED directly, so the
+# shebang is what is tested; every other case runs `bash run.sh`, which bypasses it.
+case19_run_sh_ignores_bash_env_and_exported_functions() {
+    local d="$work/be-$RANDOM"
+    mkdir -p "$d/home"
+    printf ': > "%s/RAN-BASH_ENV"\n' "$d" > "$d/env.sh"
+    env HOME="$d/home" BASH_ENV="$d/env.sh" "BASH_FUNC_cd%%=() { : > \"$d/RAN-cd\"; builtin cd \"\$@\"; }" \
+        "$repo_root/.container/run.sh" --test-home "$d/home" --kit-path >"$d/out" 2>&1
+    if [ ! -e "$d/RAN-BASH_ENV" ] && [ ! -e "$d/RAN-cd" ] && grep -q 'jkb-container-kit' "$d/out"; then
+        ok "run.sh runs neither a BASH_ENV script nor an exported function from the terminal that launches it"
+    else
+        fail "run.sh runs neither a BASH_ENV script nor an exported function from the terminal that launches it" \
+            "ran: $(ls "$d" | grep '^RAN-' | tr '\n' ' ') out: $(head -c 200 "$d/out")"
+    fi
+}
+
+# run.sh'S PATH TAKES NO ORDERS FROM THE ENVIRONMENT: a launching terminal's env (a committed
+# terminal.integrated.env) set JKB_RUN_PATH_KEEP to ~/.cargo/bin, or spelled a home entry
+# `<parent>//<user>`, and a planted jq ran as you (review round 22). The keep list is a file under the
+# 0700 kit home, and since round 27 PATH is built rather than filtered; this fails if either regresses.
+case20_the_path_filter_ignores_the_environment() {
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h form ran=""; h="$(mktemp -d "$HOME/.cache/jkb-env.XXXXXX")" || { fail "case20" "no scratch home under ~/.cache"; return; }
+    mkdir -p "$h/.cargo/bin"
+    printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$h" > "$h/.cargo/bin/jq"; chmod +x "$h/.cargo/bin/jq"
+    for form in keep slashes; do
+        rm -f "$h/RAN"
+        case "$form" in
+            keep)    env HOME="$h" PATH="$h/.cargo/bin:$PATH" JKB_RUN_PATH_KEEP="$h/.cargo/bin" JKB_RUN_FROM_CHECKOUT=1 \
+                         bash "$repo_root/.container/run.sh" --test-home "$h" --print-args >/dev/null 2>&1 ;;
+            slashes) env HOME="$h" PATH="$(dirname "$h")//$(basename "$h")/.cargo/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 \
+                         bash "$repo_root/.container/run.sh" --test-home "$h" --print-args >/dev/null 2>&1 ;;
+        esac
+        [ -e "$h/RAN" ] && ran="$ran $form"
+    done
+    if [ -z "$ran" ]; then ok "a keep list in the environment, and a // spelling of the home, put no planted jq back on run.sh's PATH"
+    else fail "a keep list in the environment, and a // spelling of the home, put no planted jq back on run.sh's PATH" "ran under:$ran"; fi
+    case "$h" in */jkb-env.*) rm -rf -- "$h" ;; esac
+}
+
+# run.sh's CHILDREN INHERIT NOTHING FROM THE LAUNCHING TERMINAL beyond an allowlist: -p kept run.sh's
+# own shell from BASH_ENV, but docker, tar and `code` still got DOCKER_CONFIG (whose cli-plugins
+# docker runs), TAR_OPTIONS (checkpoint-action=exec) and BASH_ENV from a committed
+# terminal.integrated.env (review round 23).
+case21_run_sh_children_inherit_only_the_allowlist() {
+    RS_EXTRA_ENV="BASH_ENV=/tmp/x.sh DOCKER_CONFIG=/tmp/d TAR_OPTIONS=--checkpoint=1 JKB_PLANTED=1" run_sh_with_stub true --stop
+    local leaked
+    leaked="$(grep -E '^(BASH_ENV|DOCKER_CONFIG|TAR_OPTIONS|JKB_PLANTED)=' "$rs_dir/child-env" 2>/dev/null | cut -d= -f1 | sort -u | tr '\n' ' ')"
+    if [ -s "$rs_dir/child-env" ] && [ -z "$leaked" ] && grep -q '^HOME=' "$rs_dir/child-env"; then
+        ok "run.sh's children get the allowlisted environment (HOME kept) and none of BASH_ENV, DOCKER_CONFIG, TAR_OPTIONS or an unknown variable"
+    else
+        fail "run.sh's children get the allowlisted environment (HOME kept) and none of BASH_ENV, DOCKER_CONFIG, TAR_OPTIONS or an unknown variable" \
+            "leaked: [$leaked] child-env lines: $(wc -l < "$rs_dir/child-env" 2>/dev/null)"
+    fi
+}
+
+# ...WHILE THE DOCUMENTED OVERRIDES SURVIVE THE RE-EXEC: JKB_CONTAINER_NAME was dropped with the rest, so
+# `--stop` acted on jkb-dev while the reaper and `jkb task work` looked for the override (review round
+# 24). An unknown variable beside it forces the re-exec, as any real terminal's SHELL or TMPDIR does.
+case22_the_container_name_override_survives_the_allowlist() {
+    RS_EXTRA_ENV="JKB_CONTAINER_NAME=jkb-alt JKB_PLANTED=1" run_sh_with_stub true --stop
+    if grep -q 'jkb-alt' "$rs_dir/calls" && ! grep -qw 'jkb-dev' "$rs_dir/calls"; then
+        ok "JKB_CONTAINER_NAME survives run.sh's environment allowlist: --stop acts on the named container"
+    else
+        fail "JKB_CONTAINER_NAME survives run.sh's environment allowlist: --stop acts on the named container" "calls: $(tr '\n' ';' < "$rs_dir/calls")"
+    fi
+}
+
+# A WRITABLE DIRECTORY REACHED THROUGH A LINK is dropped by where it leads: ~/repos linked to a volume
+# outside the home put /Volumes/Dev/repos/tools/bin on PATH under its physical name, which matched no
+# root, and a jq planted there through allowWrite ~/repos ran as you (review round 25).
+case23_a_symlinked_writable_dir_outside_home_is_dropped() {
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h tgt; h="$(mktemp -d "$HOME/.cache/jkb-lnh.XXXXXX")" && tgt="$(mktemp -d "$HOME/.cache/jkb-lnt.XXXXXX")" \
+        || { fail "case23" "no scratch dirs under ~/.cache"; return; }
+    mkdir -p "$tgt/tools/bin"; ln -s "$tgt" "$h/repos"
+    printf '#!/bin/sh\n: > "%s/RAN"\nexit 0\n' "$tgt" > "$tgt/tools/bin/jq"; chmod +x "$tgt/tools/bin/jq"
+    env HOME="$h" PATH="$tgt/tools/bin:$PATH" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --test-home "$h" --print-args >/dev/null 2>&1
+    if [ ! -e "$tgt/RAN" ]; then ok "a jq planted where a symlinked ~/repos leads, outside the home, does not run"
+    else fail "a jq planted where a symlinked ~/repos leads, outside the home, does not run" "it ran"; fi
+    case "$h" in */jkb-lnh.*) rm -rf -- "$h" ;; esac; case "$tgt" in */jkb-lnt.*) rm -rf -- "$tgt" ;; esac
+}
+
+# AN EXPORTED FUNCTION is not a variable `compgen -e` lists, so with only allowlisted names beside it
+# run.sh did not re-exec, and `bash -p` passed `BASH_FUNC_x%%` on to every bash child (review round 26,
+# measured on bash 5.2). Launched with a clean environment, so nothing else forces the re-exec.
+case24_an_exported_function_does_not_reach_run_sh_children() {
+    RS_ENV_I=1 RS_FUNC='() { echo PWNED; }' run_sh_with_stub true --stop
+    if [ -s "$rs_dir/child-env" ] && ! grep -q '^BASH_FUNC_' "$rs_dir/child-env"; then
+        ok "an exported function in an otherwise allowlisted environment does not reach run.sh's children"
+    else
+        fail "an exported function in an otherwise allowlisted environment does not reach run.sh's children" \
+            "child env: $(grep -c . "$rs_dir/child-env" 2>/dev/null) lines, BASH_FUNC: $(grep -c '^BASH_FUNC_' "$rs_dir/child-env" 2>/dev/null)"
+    fi
+}
+
+# A DIRECTORY IN path-keep COMES BEFORE THE SYSTEM ONES: the keep list is yours, and the tests' stubs are
+# kept through it. Behind /usr/bin, a machine with docker installed ran the REAL docker in the stubbed
+# cases -- and `--rm` removed the developer's jkb-dev (review round 27). A recording `dirname`, which
+# run.sh calls first, shows whose copy it found without needing docker at all.
+case25_path_keep_precedes_the_system_dirs() {
+    local d="$work/kp-$RANDOM"; mkdir -p "$d/home/.local/share/jkb-container-kit" "$d/bin"
+    printf '#!/bin/sh\n: > "%s/RAN-dirname"\nexec /usr/bin/dirname "$@"\n' "$d" > "$d/bin/dirname"; chmod +x "$d/bin/dirname"
+    printf '%s\n' "$d/bin" > "$d/home/.local/share/jkb-container-kit/path-keep"
+    env HOME="$d/home" PATH="/usr/bin:/bin" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --test-home "$d/home" --print-args >/dev/null 2>&1
+    if [ -e "$d/RAN-dirname" ]; then ok "a directory in path-keep comes before the system directories on run.sh's PATH"
+    else fail "a directory in path-keep comes before the system directories on run.sh's PATH" "the system dirname ran"; fi
+}
+
+# run.sh's HOME IS THE ACCOUNT'S: a terminal that set HOME chose the path-keep it read, and an agent's
+# directory went first on its PATH even with the kit started by its absolute path (review round 34). A
+# forged HOME with a path-keep naming a recording `dirname` must not have it run.
+case26_a_forged_home_does_not_choose_path_keep() {
+    mkdir -p "$HOME/.cache" 2>/dev/null
+    local h; h="$(mktemp -d "$HOME/.cache/jkb-fh.XXXXXX")" || { fail "case26" "no scratch dir under ~/.cache"; return; }
+    mkdir -p "$h/.local/share/jkb-container-kit" "$h/bin"
+    printf '#!/bin/sh\n: > "%s/RAN-dirname"\nexec /usr/bin/dirname "$@"\n' "$h" > "$h/bin/dirname"; chmod +x "$h/bin/dirname"
+    printf '%s\n' "$h/bin" > "$h/.local/share/jkb-container-kit/path-keep"
+    # ...and GOT PAST the home lookup: exiting at it would also keep the stub from running (round 35).
+    local rc=0
+    env HOME="$h" PATH="/usr/bin:/bin" JKB_RUN_FROM_CHECKOUT=1 bash "$repo_root/.container/run.sh" --print-args >/dev/null 2>&1 || rc=$?
+    if [ ! -e "$h/RAN-dirname" ] && [ "$rc" -eq 0 ]; then ok "a forged HOME does not choose run.sh's path-keep: its home is the account's"
+    else fail "a forged HOME does not choose run.sh's path-keep: its home is the account's" "the forged path-keep's dirname ran"; fi
+    case "$h" in */jkb-fh.*) rm -rf -- "$h" ;; esac
+}
+
 run_cases case1_the_login_files_are_the_two_known_pairs case2_fresh_home_gets_dangling_links \
           case3_a_replaced_link_is_carried_into_the_volume case4_the_account_state_file_is_carried_too \
           case5_a_healthy_link_is_left_alone case6_a_link_elsewhere_is_repointed \
           case7_a_directory_is_refused_not_masked case8_dc_link_state_carries_the_login \
           case9_at_setup_the_volume_copy_wins_over_an_image_file case10_a_failed_move_is_recorded_and_then_cleared \
-          case11_run_sh_carries_the_login_before_stop_and_rm case12_run_sh_starts_a_stopped_container_to_carry_it
+          case11_run_sh_carries_the_login_before_stop_and_rm case12_run_sh_starts_a_stopped_container_to_carry_it \
+          case13_the_checkouts_run_sh_refuses_without_the_override case14_the_kits_run_sh_stops_and_sources_the_mirror \
+          case15_a_kit_whose_checkout_is_gone_still_stops case16_a_program_planted_on_path_under_home_does_not_run \
+          case17_a_tool_the_path_filter_hid_is_named case18_a_planted_kit_marker_is_ignored \
+          case19_run_sh_ignores_bash_env_and_exported_functions case20_the_path_filter_ignores_the_environment \
+          case21_run_sh_children_inherit_only_the_allowlist case22_the_container_name_override_survives_the_allowlist \
+          case23_a_symlinked_writable_dir_outside_home_is_dropped case24_an_exported_function_does_not_reach_run_sh_children \
+          case25_path_keep_precedes_the_system_dirs case26_a_forged_home_does_not_choose_path_keep
 finish

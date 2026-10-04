@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Install this container's VS Code extensions. RUNS INSIDE THE CONTAINER.
 #
-#   ./.container/install-extensions.sh
+#   /usr/local/lib/jkb-container/.container/install-extensions.sh     # from the repo
+#
+# The ROOT-OWNED mirror's copy, not the checkout's, which agents can write.
 #
 # WHY IT IS ITS OWN SCRIPT, AND WHEN YOU RUN IT BY HAND. VS Code installs its server into the
 # container when you ATTACH — which is after `run.sh` has finished, because attaching is something
@@ -18,11 +20,15 @@
 # Idempotent — `--force` reinstalls and the explorer rebuilds — so running it again is safe and is
 # what you do after changing `ui/vscode` or the pinned extension list.
 set -euo pipefail
+# The caller's repository selection, dropped before the one git call below: an exported GIT_WORK_TREE
+# outranks the cwd and would name a different checkout to build.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 here="$(cd "$(dirname "$0")" && pwd)"
-repo="$(cd "$here/.." && pwd)"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 # shellcheck source=/dev/null
 . "$here/lib.sh"
+# The checkout whose extension is built: lib.sh's dc_repo_root, shared with setup.sh and verify.sh.
+repo="$(dc_repo_root "$(cd "$here/.." && pwd)")"
 
 say "vs code extensions"
 code_server="$(ls -d "$HOME"/.vscode-server/bin/*/bin/code-server 2>/dev/null | head -1 || true)"
@@ -61,7 +67,7 @@ while read -r ext; do
     "$code_server" --server-data-dir "$HOME/.vscode-server" \
                    --install-extension "$vsix" --force >/dev/null
     echo "  installed $id@$version from disk"
-done <<<"$(dc_extensions "$repo/.container/container.json")"
+done <<<"$(dc_extensions "$here/container.json")"
 
 # ...and the one this repo BUILDS. The jkb explorer is not on the marketplace, so it is not in the
 # list above and fetch-extensions.sh cannot stage it — which is why the side panel was missing from
@@ -78,6 +84,11 @@ if [ -f "$repo/ui/vscode/package.json" ]; then
     # native binary differs per platform and pnpm links only the current one, so building here
     # would break the HOST's `./scripts/check.sh`, which runs `pnpm run build` with no install in
     # front of it. See the flag's comment in that script.
+    # FROM THE CHECKOUT, deliberately, and the one place this script runs checkout code: it BUILDS
+    # ui/ from the checkout (pnpm runs its package scripts), so the builder is part of what is
+    # built. setup.sh's call rarely reaches here (no VS Code server on a first start); it usually
+    # runs when you invoke this by hand after attaching. .container/README.md records it with cargo
+    # install, as a residual.
     "$repo/scripts/install-extension.sh" --build-in "$HOME/.jkb-ui-build"
 fi
 

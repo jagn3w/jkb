@@ -11,11 +11,14 @@
 #      core.hooksPath is set globally (which replaces .git/hooks), a chainer there too
 #   6. builds + installs the notifier behind sticky Claude Code notifications, and reports
 #      the two things it cannot do for you: the one-time Allow, and the Alerts style
+#   7. installs or refreshes the dev container's KIT (~/.local/share/jkb-container-kit), the copy of
+#      .container/ and the scripts it runs that the container is started from, so nothing the
+#      agent's sandbox can write in the checkout runs outside it (.container/README.md)
 #
 # With JKB_REMOTE set (the dev container) only step 1 runs: the rest belongs to the machine
 # that serves the knowledge base.
 #
-# Flags: --no-extension, --no-service, --no-scaffold, --link-memory, --db <path>, -h/--help.
+# Flags: --no-extension, --no-service, --no-scaffold, --no-kit, --link-memory, --db <path>, -h/--help.
 #
 # --link-memory is opt-in, and deliberately not the default: it writes symlinks under
 # ~/.claude/projects so the dev container and the host share one auto-memory store, and this
@@ -32,6 +35,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 do_extension=1
 do_service=1
 do_scaffold=1
+do_kit=1
 link_memory=0
 # One state word per section, rendered at the end by `render_setup_summary` in lib.sh. Each
 # means what actually happened, not what was attempted: `watcher=running` is set to `failed`
@@ -43,6 +47,7 @@ scaffold_state=created
 extension_state=installed
 watcher_state=running
 serve_state=unchecked
+kit_state=installed
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -50,6 +55,7 @@ while [ "$#" -gt 0 ]; do
     --no-extension) do_extension=0 ;;
     --no-service) do_service=0 ;;
     --no-scaffold) do_scaffold=0 ;;
+    --no-kit) do_kit=0 ;;
     --link-memory) link_memory=1 ;;
     --db) shift; db="$1" ;;
     -h|--help)
@@ -83,7 +89,16 @@ fi
 # on cksum itself would apply.
 jkb_before="$({ cksum < "${CARGO_HOME:-$HOME/.cargo}/bin/jkb"; } 2>/dev/null || true)"
 # --force so a re-run always refreshes from the current checkout; --locked for reproducibility.
-(cd "$repo_root" && cargo install --path crates/jkb-cli --locked --force)
+# IN THE CONTAINER (JKB_REMOTE set), --offline FIRST: the egress firewall blocks index.crates.io, so
+# the post-merge rebuild failed refreshing the index while every dependency sat in the registry
+# cache (2026-10-03, reported by another session). Online only if offline fails -- a cold cache at
+# first create, before the firewall is up.
+if [ -n "${JKB_REMOTE:-}" ]; then
+  (cd "$repo_root" && { cargo install --offline --path crates/jkb-cli --locked --force \
+      || cargo install --path crates/jkb-cli --locked --force; })
+else
+  (cd "$repo_root" && cargo install --path crates/jkb-cli --locked --force)
+fi
 
 # The binary lands in $CARGO_HOME/bin; make sure that's reachable for the rest of this run.
 cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
@@ -116,8 +131,9 @@ if [ -n "${JKB_REMOTE:-}" ]; then
   echo "  • skipped: KB scaffold, services, git hooks, notification topic, notifier. The machine"
   echo "    serving the knowledge base owns them; run setup.sh there. In the dev container,"
   echo "    .container/run.sh mirrors that machine's git hooks."
+  # The ROOT-OWNED mirror's copy, as verify.sh and the README name it: the checkout's is agent-writable.
   echo "  • the container's explorer extension is not rebuilt: after a pull that touches ui/, run"
-  echo "    .container/install-extensions.sh from an attached terminal."
+  echo "    /usr/local/lib/jkb-container/.container/install-extensions.sh from the repo, in an attached terminal."
   # SAID WHEN THE BINARY CHANGED, because nothing else will say it: this rebuilt the client, not
   # the host's jkb or its `jkb serve`, and there is no version handshake between them. The checkout
   # is SHARED (the container mounts ~/repos), so a `git pull` on the host then finds nothing to
@@ -199,6 +215,40 @@ setup_roles() {
 say "roles: the container credential and the worker agent types"
 if setup_roles; then :; else
   warn "could not set up roles — the dev container cannot reach jkb serve without its credential (re-run, or: jkb role rotate-container --write)."
+fi
+
+# --- the dev container's kit ------------------------------------------------
+# A pull is where you review what an agent changed, and this script runs after one (post-merge), so
+# this is where the kit is refreshed: it COPIES .container/ and the scripts it runs out of the
+# checkout, which agents can write, into the kit's home under ~/.local/share, which none can
+# (.container/lib.sh's DC_KIT_HOME says where and why). The kit's run.sh is then
+# what starts the container. Wrapped like the steps around it: a failure here must not end the run.
+# ONE KIT, FROM THE MAIN CHECKOUT. A linked worktree is a task branch: post-merge fires there on a
+# `git merge main`, and refreshing from it pointed the shared kit at an unlanded branch, then at a
+# directory `jkb task land` deleted (review round 10). Whether this is a linked worktree is
+# kit_decision's answer (is_linked_worktree's three: yes, no, git would not say); main_checkout_of
+# only names the main checkout in the message.
+kit_main="$(main_checkout_of "$repo_root" 2>/dev/null)" || kit_main=""
+kit_how=skip; [ "$do_kit" -eq 1 ] && kit_how="$(kit_decision "$repo_root")"
+if [ "$kit_how" = worktree ]; then
+  kit_state=worktree
+  warn "not refreshing the dev container kit from a linked worktree; it follows the main checkout ($kit_main)"
+elif [ "$kit_how" = undecided ]; then
+  kit_state=undecided
+  warn "not refreshing the dev container kit: git would not say whether $repo_root is a linked worktree, and refreshing from a task branch points the shared kit at unlanded code. Run .container/run.sh --install-kit from the main checkout."
+elif [ "$kit_how" = install ]; then
+  say "dev container kit (what the container is started from)"
+  if kit_out="$("$repo_root/.container/run.sh" --install-kit 2>&1)"; then
+    printf '%s\n' "$kit_out"
+    case "$kit_out" in *"already matches"*) kit_state=unchanged ;; *) kit_state=installed ;; esac
+  else
+    printf '%s\n' "$kit_out" >&2
+    kit_state=failed
+    warn "could not install the dev container kit — continuing."
+  fi
+else
+  kit_state=skipped
+  warn "skipping the dev container kit (--no-kit)"
 fi
 
 # --- 3. VS Code extension ----------------------------------------------------
@@ -339,6 +389,7 @@ render_setup_summary < <(
   printf 'extension=%s\n' "$extension_state"
   printf 'watcher=%s\n' "$watcher_state"
   printf 'serve=%s\n' "$serve_state"
+  printf 'kit=%s %s\n' "$kit_state" "$("$repo_root/.container/run.sh" --kit-path 2>/dev/null || echo '(unknown)')"
   printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
   printf 'notifier=%s %s\n' "$notifier_state" "${notifier_pid:-}"
 )

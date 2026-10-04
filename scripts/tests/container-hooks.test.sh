@@ -18,6 +18,9 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 
 new_workdir
 isolate_git "$work/home"
+# lib.sh computed the kit's home from the REAL HOME when it was sourced above; the mirror stages its
+# archive there, so it is pointed into the scratch home before any case runs.
+DC_KIT_HOME="$HOME/.local/share/jkb-container-kit"; DC_KIT_DIR="$DC_KIT_HOME/kit"
 
 # A stub `docker` for `exec`. Every absolute path argument is re-rooted under $CTR_ROOT, so "the
 # container" is a scratch directory. `-u root` runs the script with three tools shimmed to behave
@@ -78,17 +81,24 @@ SHIM
     cat > "$stub_dir/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 [ "$1" = exec ] || { echo "stub docker: only exec" >&2; exit 2; }
-shift; user=vscode
+shift; user=vscode; pinned=no
 while [ $# -gt 0 ]; do
     case "$1" in
         -i) shift ;;
         -u) user="$2"; shift 2 ;;
+        -e) [ "$2" = PATH=/usr/bin:/bin ] && pinned=yes; shift 2 ;;
         *)  break ;;
     esac
 done
 shift   # the container name
-printf '%s %s\n' "$user" "$1" >> "$DOCKER_LOG"
-args=()
+# Logged by the program's NAME, so the cases read `root sh` whether it was spelled `sh` or `/bin/sh`;
+# how it was spelled, and whether PATH was pinned, go to a second log a case asserts on.
+printf '%s %s\n' "$user" "${1##*/}" >> "$DOCKER_LOG"
+printf '%s %s pinned=%s\n' "$user" "$1" "$pinned" >> "$DOCKER_LOG.exec"
+# THE PROGRAM IS NOT RE-ROOTED: it is the container's /bin/sh, which the scratch root does not hold.
+# Every other absolute argument names a place to act on, and is.
+prog="$1"; shift
+args=("$prog")
 for a in "$@"; do case "$a" in /*) args+=("$CTR_ROOT$a") ;; *) args+=("$a") ;; esac; done
 # TMPDIR inside the scratch root, so the root step's staging directory is on the same filesystem
 # as its target and a move keeps inodes, as it does in the container (/tmp there).
@@ -97,7 +107,7 @@ exec "${args[@]}"
 STUB
     chmod +x "$stub_dir/bin/docker"
     export CTR_ROOT="$stub_dir/root" ROOT_SHIM="$stub_dir/shim" DOCKER_LOG="$stub_dir/log" TAR_LOG="$stub_dir/tar-log"
-    : > "$DOCKER_LOG"
+    : > "$DOCKER_LOG"; : > "$DOCKER_LOG.exec"
     docker_cmd="$stub_dir/bin/docker"
 }
 
@@ -229,7 +239,9 @@ remote_setup() { # remote_setup <0|1> [setup.sh flags...]
     printf '#!/bin/sh\necho "jkb $*" >> "%s"\necho "jkb 0.0.0-stub"\n' "$d/calls" > "$d/cargo/bin/jkb"
     # The stub cargo "installs" by appending to the jkb stub when asked to change it, which is what
     # a rebuild from changed sources does to the binary's bytes.
-    if [ "$changes" = 1 ]; then
+    if [ -n "${RS_OFFLINE_FAILS:-}" ]; then
+        printf '#!/bin/sh\necho "cargo $*" >> "%s"\ncase "$*" in *--offline*) exit 101 ;; esac\necho "# rebuilt" >> "%s"\n' "$d/calls" "$d/cargo/bin/jkb" > "$d/cargo/bin/cargo"
+    elif [ "$changes" = 1 ]; then
         printf '#!/bin/sh\necho "cargo $*" >> "%s"\necho "# rebuilt" >> "%s"\n' "$d/calls" "$d/cargo/bin/jkb" > "$d/cargo/bin/cargo"
     else
         printf '#!/bin/sh\necho "cargo $*" >> "%s"\n' "$d/calls" > "$d/cargo/bin/cargo"
@@ -252,9 +264,21 @@ remote_setup() { # remote_setup <0|1> [setup.sh flags...]
 # installed, hooks written into this checkout). So it runs a COPY of setup.sh in a scratch repo, with
 # --no-extension --no-service, and with every service manager and installer it could reach on PATH
 # as a stub that fails and logs. Mutated, it can only write under $d.
+# OFFLINE FIRST IN HERE, online only if that fails: the egress firewall blocks index.crates.io, so
+# the post-merge rebuild failed while every dependency was cached (2026-10-03); a cold cache at first
+# create still needs the network.
+case6b_setup_sh_in_remote_mode_falls_back_online_when_offline_fails() {
+    RS_OFFLINE_FAILS=1 remote_setup 1
+    if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --offline --path crates/jkb-cli --locked --force;cargo install --path crates/jkb-cli --locked --force;"* ]]; then
+        ok "setup.sh with JKB_REMOTE builds offline first, and online only when that fails"
+    else
+        fail "setup.sh with JKB_REMOTE builds offline first, and online only when that fails" "rc=$rc calls=$calls"
+    fi
+}
+
 case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops() {
     remote_setup 1
-    if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --path crates/jkb-cli --locked --force;"* ]] \
+    if [ "$rc" -eq 0 ] && [[ "$calls" == "cargo install --offline --path crates/jkb-cli --locked --force;"* ]] \
        && [ "$(grep -c '^jkb ' "$d/calls")" = "$(grep -c '^jkb --version$' "$d/calls")" ] \
        && [[ "$out" == *"remote mode"* ]] && [[ "$out" != *"installing git hooks"* ]] \
        && [[ "$out" == *"this jkb changed"* ]] && [[ "$out" == *".container/install-extensions.sh"* ]]; then
@@ -636,12 +660,255 @@ case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale() {
     fi
 }
 
+# EVERY EXEC NAMES ITS PROGRAM ABSOLUTELY AND PINS PATH. The image's PATH begins with directories the
+# sandbox writes and docker exec hands it to `-u root` too: a planted ~/.cargo/bin/sh ran as root in
+# the copy's root step on every start (review round 8's self-review).
+case28_every_exec_names_its_program_and_pins_path() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local cfg="$HOME/.gitconfig" bad_lines
+    # A ~/ path, so the copy lands under /home/vscode and the user-side mkdir runs too: four execs.
+    mkdir -p "$HOME/.config/git/hooks"; cp "$src/commit-msg" "$HOME/.config/git/hooks/"
+    rm -f "$cfg"; git config --file "$cfg" core.hooksPath "~/.config/git/hooks"
+    GIT_CONFIG_GLOBAL="$cfg" dc_mirror_host_hooks ctr "$repo_root/.container/container.json" "$docker_cmd" >/dev/null 2>&1
+    bad_lines="$(grep -v '^[a-z]* /[^ ]* pinned=yes$' "$DOCKER_LOG.exec")"
+    if [ "$(grep -c . "$DOCKER_LOG.exec")" -eq 4 ] && [ -z "$bad_lines" ]; then
+        ok "every docker exec of the hooks step names an absolute program and pins PATH (mkdir, the copy, the config, the record)"
+    else
+        fail "every docker exec of the hooks step names an absolute program and pins PATH (mkdir, the copy, the config, the record)" "execs: $(tr '\n' ';' < "$DOCKER_LOG.exec")"
+    fi
+}
+
+# THE KIT: what run.sh, the sweep, setup.sh and verify.sh run from instead of the agent-writable
+# checkout. Installed whole or not at all, recording where it came from.
+case29_the_kit_installs_whole_and_records_its_checkout() {
+    local d="$work/kit-$RANDOM" co kit got p missing=""
+    co="$d/checkout"; kit="$d/home/.local/share/jkb-container-kit/kit"
+    mkdir -p "$co/scripts"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    dc_install_kit "$co" "$kit" >/dev/null 2>&1 || { fail "the kit installs whole and records its checkout" "install failed"; return; }
+    while IFS= read -r p; do [ -e "$kit/$p" ] || missing="$missing $p"; done <<<"$(dc_kit_paths)"
+    got="$(dc_kit_checkout "$kit")"
+    [ -z "$missing" ] && [ "$got" = "$(cd "$co" && pwd -P)" ] && [ -z "$(find "$kit" -perm -o+w ! -type l)" ] \
+        || { fail "the kit installs whole and records its checkout" "missing:$missing checkout=$got"; return; }
+    # A re-install REPLACES: a file gone from the checkout is gone from the kit, nothing left beside it.
+    : > "$kit/.container/stale-file"
+    echo '# changed' >> "$co/.container/run.sh"
+    dc_install_kit "$co" "$kit" >/dev/null 2>&1
+    [ ! -e "$kit/.container/stale-file" ] && [ "$(tail -1 "$kit/.container/run.sh")" = '# changed' ] \
+        && [ -z "$(ls -d "$kit".new.* "$kit".old.* 2>/dev/null)" ] \
+        || { fail "the kit installs whole and records its checkout" "a re-install did not replace cleanly: $(ls -a "$kit/.container" | tr '\n' ' ') $(ls -d "$kit".* 2>/dev/null)"; return; }
+    # A checkout missing a kit path is refused, and the kit is left as it was.
+    rm "$co/scripts/auto-mode.sh"
+    if ! dc_install_kit "$co" "$kit" >/dev/null 2>&1 && [ -e "$kit/scripts/auto-mode.sh" ]; then
+        ok "the kit installs whole, records its checkout, replaces on re-install, and refuses a checkout missing a path"
+    else
+        fail "the kit installs whole and records its checkout" "an incomplete checkout was installed, or the old kit was lost"
+    fi
+}
+
+case30_the_kit_says_which_paths_the_checkout_has_changed() {
+    local d="$work/stale-$RANDOM" co kit p
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    dc_install_kit "$co" "$kit" >/dev/null 2>&1
+    local before after
+    before="$(dc_kit_stale "$kit" "$co")"
+    echo '# agent edit' >> "$co/scripts/auto-mode.sh"
+    after="$(dc_kit_stale "$kit" "$co")"
+    local files; files="$(dc_kit_changes "$kit" "$co")"
+    # ...and a new subdirectory is listed FILE BY FILE, a file that became a directory is seen, and a
+    # path missing from the old kit is listed (review round 18).
+    mkdir -p "$co/.container/sub"; : >"$co/.container/sub/a"; : >"$co/.container/sub/b"
+    rm "$co/.container/run.sh"; mkdir "$co/.container/run.sh"; : >"$co/.container/run.sh/x"
+    rm -f "$kit/scripts/lib.sh"
+    local more; more="$(dc_kit_changes "$kit" "$co" | sort | tr '\n' ';')"
+    # ...and under the caller's own options, `set -euo pipefail`, with a kit path missing on one side.
+    # A PLAIN STATEMENT, not the left of `&&`: `set -e` is suspended for anything there, the whole
+    # function body included, which is how this row first passed against the broken version.
+    local strict; strict="$(set -euo pipefail; dc_kit_changes "$kit" "$co" >/dev/null; echo survived)"
+    if [ -z "$before" ] && [ "$after" = scripts/auto-mode.sh ] && [ "$files" = scripts/auto-mode.sh ] \
+       && [ "$more" = ".container/run.sh (removed);.container/run.sh/x (new);.container/sub/a (new);.container/sub/b (new);scripts/auto-mode.sh;scripts/lib.sh (new);" ] \
+       && [ "$strict" = survived ]; then
+        ok "the kit names exactly the paths the checkout has changed since it was installed"
+    else
+        fail "the kit names exactly the paths the checkout has changed since it was installed" "before=[$before] after=[$after] files=[$files] more=[$more] strict=[$strict]"
+    fi
+}
+
+# A SYMLINK IN THE CHECKOUT IS REFUSED, never followed: copied with -L, a link the agent planted in an
+# untracked corner of .container/ put a HOST file into the kit, which every start mirrored into the
+# container (review round 10, reproduced).
+case31_a_planted_symlink_is_refused_not_followed() {
+    local d="$work/link-$RANDOM" co kit p err rc=0
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts" "$d/host"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    dc_install_kit "$co" "$kit" >/dev/null 2>&1
+    printf 'HOST SECRET\n' > "$d/host/id_ed25519"
+    mkdir -p "$co/.container/.jkb"; ln -s "$d/host/id_ed25519" "$co/.container/.jkb/k"
+    err="$(dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'not a plain file' <<<"$err" && [ ! -e "$kit/.container/.jkb/k" ] \
+       && ! grep -rqs 'HOST SECRET' "$kit"; then
+        ok "a symlink planted in the checkout is refused, named, and nothing it points at reaches the kit"
+    else
+        fail "a symlink planted in the checkout is refused, named, and nothing it points at reaches the kit" "rc=$rc err=$err"
+    fi
+}
+
+# THE ARCHIVE IS STAGED WHERE NO AGENT CAN WRITE, never in $TMPDIR: an agent could swap it there in
+# the window before root extracted it in the container (review round 11). With TMPDIR read-only the
+# mirror still succeeds, and the kit's home is the user's alone.
+case32_the_mirror_stages_nothing_in_tmpdir() {
+    need_gnu || return 0
+    make_stub; host_hooks
+    local ro="$work/ro-tmp-$RANDOM" out rc mode
+    mkdir -p "$ro"; chmod a-w "$ro"
+    out="$(TMPDIR="$ro" dc_mirror_hooks "$src" /home/vscode/.config/git/hooks ctr "$docker_cmd" 2>&1)"; rc=$?
+    mode="$(stat -c '%a' "$DC_KIT_HOME" 2>/dev/null || stat -f '%Lp' "$DC_KIT_HOME")"
+    chmod u+w "$ro"
+    if [ "$rc" -eq 0 ] && [ -z "$(ls -A "$ro")" ] && [ "$mode" = 700 ] && [ -z "$(ls -A "$DC_KIT_HOME" | grep '^stage\.')" ]; then
+        ok "the mirror stages its archive under the kit's home (0700), never in TMPDIR, and leaves nothing behind"
+    else
+        fail "the mirror stages its archive under the kit's home (0700), never in TMPDIR, and leaves nothing behind" "rc=$rc mode=$mode out=$out"
+    fi
+}
+
+# A KIT IN ROUND 10'S FLAT LAYOUT, left directly in the kit's home, is removed by the next install:
+# its run.sh had no PATH filter, and its --install-kit moved the whole home aside (review round 12).
+case33_an_older_flat_kit_is_removed() {
+    local d="$work/flat-$RANDOM" co home p
+    co="$d/checkout"; home="$d/home/.local/share/jkb-container-kit"; mkdir -p "$co/scripts" "$home"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    cp -R "$repo_root/.container" "$home/.container"; mkdir -p "$home/scripts"; printf 'checkout=%s\n' "$co" > "$home/$DC_KIT_MARKER"
+    dc_install_kit "$co" "$home/kit" >/dev/null 2>&1
+    if [ -f "$home/kit/.container/run.sh" ] && [ ! -e "$home/.container" ] && [ ! -e "$home/scripts" ] && [ ! -e "$home/$DC_KIT_MARKER" ]; then
+        ok "an older kit left directly in the kit's home is removed, and the new one is in kit/"
+    else
+        fail "an older kit left directly in the kit's home is removed, and the new one is in kit/" "$(ls -a "$home" | tr '\n' ' ')"
+    fi
+}
+
+# A LINK THAT APPEARS DURING THE COPY is refused too: the source check ran before the copy, and a
+# link made in between landed in the kit (review round 14). A `cp` that plants one after copying
+# reproduces that race on every run.
+case34_a_link_that_appears_during_the_copy_is_refused() {
+    local d="$work/race-$RANDOM" co kit p err rc=0 realcp
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts" "$d/bin" "$d/host"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    printf 'HOST SECRET\n' > "$d/host/key"
+    realcp="$(command -v cp)"
+    printf '#!/bin/sh\n"%s" "$@" || exit\neval "last=\\${$#}"\n[ -d "$last" ] && ln -s "%s" "$last/zz-raced" 2>/dev/null\nexit 0\n' "$realcp" "$d/host/key" > "$d/bin/cp"
+    chmod +x "$d/bin/cp"
+    err="$(PATH="$d/bin:$PATH" dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'appeared in the checkout during the copy' <<<"$err" && [ ! -e "$kit" ]; then
+        ok "a link that appears during the copy is refused, and no kit is installed"
+    else
+        fail "a link that appears during the copy is refused, and no kit is installed" "rc=$rc err=$err kit=$(ls -a "$kit" 2>&1 | tr '\n' ' ')"
+    fi
+}
+
+# A HARD LINK is refused as a symlink is: it passes a type test and copies the linked file's bytes
+# (review round 15).
+case35_a_hard_link_in_the_checkout_is_refused() {
+    local d="$work/hl-$RANDOM" co kit p err rc=0
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts" "$d/host"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    printf 'HOST SECRET\n' > "$d/host/key"
+    ln "$d/host/key" "$co/.container/k" 2>/dev/null || { skip "case35: cannot make a hard link here"; return 0; }
+    err="$(dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'second hard link' <<<"$err" && [ ! -e "$kit" ]; then
+        ok "a hard link in the checkout is refused, and nothing it points at reaches the kit"
+    else
+        fail "a hard link in the checkout is refused, and nothing it points at reaches the kit" "rc=$rc err=$err"
+    fi
+}
+
+# A HARD LINK MADE DURING THE COPY: cp writes a fresh one-link file, so the copy check cannot see it,
+# and only checking the source again after the copy can (review round 23). The stub cp plants the hard
+# link in the SOURCE once it has copied, as a toggling agent would.
+case35b_a_hard_link_made_during_the_copy_is_refused() {
+    local d="$work/hlr-$RANDOM" co kit p err rc=0 realcp
+    co="$d/checkout"; kit="$d/kit"; mkdir -p "$co/scripts" "$d/host" "$d/bin"
+    cp -R "$repo_root/.container" "$co/.container"
+    for p in lib.sh link-claude-memory.sh auto-mode.sh auto-mode-posture.json; do cp "$repo_root/scripts/$p" "$co/scripts/$p"; done
+    printf 'HOST SECRET\n' > "$d/host/key"
+    ln "$d/host/key" "$d/probe" 2>/dev/null || { skip "case35b: cannot make a hard link here"; return 0; }
+    realcp="$(type -P cp)"
+    printf '#!/bin/sh\n"%s" "$@" || exit\nln "%s" "%s/.container/k-raced" 2>/dev/null\nexit 0\n' "$realcp" "$d/host/key" "$co" > "$d/bin/cp"
+    chmod +x "$d/bin/cp"
+    err="$(PATH="$d/bin:$PATH" dc_install_kit "$co" "$kit" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'changed during the copy' <<<"$err" && [ ! -e "$kit" ]; then
+        ok "a hard link that appears in the checkout during the copy is refused, and no kit is installed"
+    else
+        fail "a hard link that appears in the checkout during the copy is refused, and no kit is installed" "rc=$rc err=$err"
+    fi
+}
+
+# ONE derivation of the checkout a kit script serves, for setup.sh, verify.sh and
+# install-extensions.sh (review round 18): JKB_REPO_ROOT, else the checkout you stand in when running
+# from the mirror, else the script's own checkout.
+case36_the_checkout_a_kit_script_serves() {
+    local d="$work/rr-$RANDOM" a b c
+    mkdir -p "$d/mirror" "$d/co"; git -C "$d/co" init -q 2>/dev/null; mkdir -p "$d/co/sub"
+    a="$(JKB_REPO_ROOT=/x/y dc_repo_root "$d/mirror")"
+    b="$(cd "$d/co/sub" && DC_CTR_KIT="$(cd "$d/mirror" && pwd -P)" dc_repo_root "$d/mirror")"
+    c="$(dc_repo_root "$d/co")"
+    # ...an exported GIT_WORK_TREE does not redirect the mirror arm, and outside any repository it
+    # falls back to the directory you stand in (review round 19).
+    local e f; mkdir -p "$d/plain" "$d/other"; git -C "$d/other" init -q 2>/dev/null
+    e="$(cd "$d/co/sub" && GIT_WORK_TREE="$d/other" GIT_DIR="$d/other/.git" DC_CTR_KIT="$(cd "$d/mirror" && pwd -P)" dc_repo_root "$d/mirror")"
+    f="$(cd "$d/plain" && DC_CTR_KIT="$(cd "$d/mirror" && pwd -P)" dc_repo_root "$d/mirror")"
+    if [ "$a" = /x/y ] && [ "$b" = "$(cd "$d/co" && pwd -P)" ] && [ "$c" = "$d/co" ] \
+       && [ "$e" = "$(cd "$d/co" && pwd -P)" ] && [ "$f" = "$(cd "$d/plain" && pwd -P)" ]; then
+        ok "dc_repo_root: JKB_REPO_ROOT first, the checkout you stand in from the mirror, else the script's own"
+    else
+        fail "dc_repo_root: JKB_REPO_ROOT first, the checkout you stand in from the mirror, else the script's own" "a=$a b=$b c=$c e=$e f=$f"
+    fi
+}
+
+# THE SELF-TEST IS NOT CHANGED BY "BEHAVE AS INSTALLED". Round 33 found its scratch-home rows failing when
+# the self-test ran as installed; since round 34 the installed copy refuses --self-test outright (verify
+# no longer runs it, unsandboxed, over copies agents can swap), and DT_SELFTEST_AS_INSTALLED is dropped
+# for the self-test's own rows. This holds that the self-test passes with it set.
+case37_the_installed_hooks_self_test_passes() {
+    local out rc=0
+    # The ACCOUNT's home, not this harness's scratch one under /tmp: the self-test makes its scratch homes
+    # under $HOME/.cache, and inside a temp root every write is allowed, so its deny rows would mean nothing.
+    out="$(HOME="$(getent passwd "$(id -u)" | cut -d: -f6)" DT_SELFTEST_AS_INSTALLED=1 bash "$repo_root/.container/deny-transcripts.sh" --self-test 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ] && [[ "$out" == *"self-test passed"* ]]; then
+        ok "the hook's self-test passes with DT_SELFTEST_AS_INSTALLED set"
+    else
+        fail "the hook's self-test passes with DT_SELFTEST_AS_INSTALLED set" "rc=$rc: $(grep -c FAIL <<<"$out") FAIL lines: $(grep -A1 FAIL <<<"$out" | head -6 | tr "\n" " ")"
+    fi
+}
+
+# THE SELF-TEST DOES NOT DEPEND ON THE MACHINE'S MANAGED SETTINGS. Two rows read /etc/claude-code, and
+# once the image pinned the sandbox there they flipped, turning the gate red on every rebuilt image
+# (review round 37). Run with the REPO's managed settings as the managed layer -- what a rebuilt image
+# carries -- the self-test must still pass.
+case38_the_self_test_passes_under_the_pinned_managed_settings() {
+    local d="$work/pinmgd-$RANDOM" out rc=0
+    mkdir -p "$d"; cp "$repo_root/.container/managed-settings.json" "$d/"
+    out="$(HOME="$(getent passwd "$(id -u)" | cut -d: -f6)" DT_SELFTEST_MANAGED_DIR="$d" bash "$repo_root/.container/deny-transcripts.sh" --self-test 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ] && [[ "$out" == *"self-test passed"* ]]; then
+        ok "the hook's self-test passes with the image's pinned managed settings in force"
+    else
+        fail "the hook's self-test passes with the image's pinned managed settings in force" "rc=$rc: $(grep -A1 FAIL <<<"$out" | head -4 | tr '\n' ' ')"
+    fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
           case4_a_directory_it_did_not_make_is_left_alone \
           case5_the_host_step_reads_the_global_value \
-          case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops \
+          case6_setup_sh_in_remote_mode_rebuilds_the_binary_and_stops case6b_setup_sh_in_remote_mode_falls_back_online_when_offline_fails \
           case7_a_trailing_slash_mirrors_and_re_mirrors \
           case8_a_hooks_path_inside_a_bind_is_left_to_the_bind \
           case9_a_forged_marker_is_refused \
@@ -662,5 +929,14 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case24_an_unreadable_host_config_keeps_the_container_key \
           case25_a_failed_config_write_is_recorded_as_failed \
           case26_a_hooks_path_inside_a_volume_is_not_mirrored \
-          case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale
+          case27_setup_sh_in_remote_mode_says_when_the_installed_hook_is_stale \
+          case28_every_exec_names_its_program_and_pins_path \
+          case29_the_kit_installs_whole_and_records_its_checkout \
+          case30_the_kit_says_which_paths_the_checkout_has_changed \
+          case31_a_planted_symlink_is_refused_not_followed \
+          case32_the_mirror_stages_nothing_in_tmpdir \
+          case33_an_older_flat_kit_is_removed \
+          case34_a_link_that_appears_during_the_copy_is_refused \
+          case35_a_hard_link_in_the_checkout_is_refused \
+          case35b_a_hard_link_made_during_the_copy_is_refused case36_the_checkout_a_kit_script_serves case37_the_installed_hooks_self_test_passes case38_the_self_test_passes_under_the_pinned_managed_settings
 finish

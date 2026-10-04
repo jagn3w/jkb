@@ -181,8 +181,15 @@ Needs a container runtime on the host (Docker Desktop, OrbStack, colima, or Appl
 which macOS does not ship.
 
 ```sh
-./.container/run.sh             # build if needed, start, firewall, setup, verify
+./.container/run.sh --install-kit      # once, and after reviewing a change to .container/ or scripts/
+~/.local/share/jkb-container-kit/kit/.container/run.sh # build if needed, start, firewall, setup, verify
 ```
+
+**Start it from the kit, not from the checkout** (see *Everything unsandboxed runs from the kit*
+below). `scripts/setup.sh` installs and refreshes the kit too. The checkout's `run.sh` refuses to
+start or stop anything. Its `--self-test`, `--print-args`, `--dry-run` and `--install-kit` still
+work, and `JKB_RUN_FROM_CHECKOUT=1` lets it start the container while you iterate on this directory.
+Every `run.sh` below means the kit's.
 
 ### On an AppArmor host, the profile must be loaded — and a reboot unloads it
 
@@ -192,7 +199,7 @@ rule relaxed and every other restriction kept, and it has to be in the kernel be
 can use it:
 
 ```sh
-sudo apparmor_parser -r -W .container/apparmor-jkb-dev
+sudo apparmor_parser -r -W ~/.local/share/jkb-container-kit/kit/.container/apparmor-jkb-dev
 ```
 
 **Nothing installs it under `/etc/apparmor.d`, so this does not survive a reboot.** Run it again
@@ -213,7 +220,7 @@ into the container when you *attach*, which is after `run.sh` has finished — s
 to install into and says so. From a terminal in the attached window:
 
 ```sh
-./.container/install-extensions.sh     # marketplace extensions from disk, the jkb explorer, machine settings
+/usr/local/lib/jkb-container/.container/install-extensions.sh  # from the repo: marketplace extensions, the jkb explorer, machine settings
 ```
 
 The same script merges `vscode-machine-settings.json` into the server's **Machine** settings, which
@@ -284,15 +291,26 @@ interrupted first run used to leave setup unreachable for the container's whole 
 sweeps deferred worktree archives — the container's job, because a session cannot archive its own
 checkout and the host's reaper cannot see `/home/vscode/...` paths — and it does that *before*
 verifying, so a failing assertion about something else cannot disable it. Beside it, and for the
-same ordering reason, it sweeps session transcripts by byte budget: without that, the sandbox's
-deny list outgrows a single argv and **every** Bash call in **every** session fails at spawn. See
-*Transcripts are swept by byte budget, not by age* at the end of this file for the measurement.
+same ordering reason, it runs the transcript sweep, which is now a **backstop**. On the shipped
+posture no deny rule names a transcript (the deny is a hook; see *The transcript deny is a hook*),
+so the sweep stands down and says so. It archives by byte budget only if a settings layer brings
+back a rule that enumerates transcripts. Then the sandbox's deny list would outgrow a single argv,
+and **every** Bash call in **every** session would fail at spawn. **It reads only the image's own layers**, managed settings and their drop-ins (review round 27).
+From round 6 it read every layer a session might load: user, project, worktree, then nested
+checkouts and `JKB_REPO_ROOT`. That meant reimplementing where Claude Code finds layers and how it
+resolves each one's relative rules, and rounds 8 to 26 kept finding layers and spellings it missed.
+**What this costs:** a rule you add to your own or a project's settings that enumerates transcripts
+does not re-arm the sweep. The argv then grows until Bash fails at spawn, and the recovery is the
+runbook's. Within the layers it reads, a relative any-depth rule such as `Read(**/.env)` is judged
+like `Read(./**/.env)`. *Transcripts are swept by byte
+budget, not by age*, at the end of this file, has the measurement.
 
 ```sh
-./.container/run.sh --build     # rebuild the image (needed after a Dockerfile or extension change)
-./.container/run.sh --stop      # stop it; volumes and image survive
-./.container/run.sh --rm        # remove it, so the next run redoes first-run setup
-./.container/run.sh --dry-run   # print the docker command instead of running it
+kit=~/.local/share/jkb-container-kit/kit/.container/run.sh
+$kit --build     # rebuild the image (needed after a Dockerfile or extension change)
+$kit --stop      # stop it; volumes and image survive
+$kit --rm        # remove it, so the next run redoes first-run setup
+$kit --dry-run   # print the docker command instead of running it
 ```
 
 ### It is not a Dev Containers config, and the file is not called `devcontainer.json`
@@ -398,6 +416,210 @@ derivation, because a rename dropping `publisher` from `ui/vscode/package.json` 
 make that assertion silently check one fewer extension — the invisible-again failure. Both steps
 are skipped where the repo builds no extension of its own, since this container is meant to serve
 any repo under `~/repos`.
+
+## Everything unsandboxed runs from the kit
+
+**The failure, found in review round 8's self-review.** The sandbox can write the checkout (probed:
+`touch .container/x` succeeds from sandboxed Bash), and every script that runs *outside* the sandbox
+ran from it:
+
+- on the host, `run.sh` and the `lib.sh` it sources, as you, on every start;
+- in the container, through `docker exec`, the sweep, `setup.sh`, `verify.sh`, `lib.sh` for the
+  login step, and the `scripts/link-claude-memory.sh` and `scripts/auto-mode.sh` that `verify.sh`
+  executes on every start, all with the container credential readable.
+
+Editing one of them was as good as planting a binary on `PATH`, which rounds 4 to 8 had closed one
+door at a time. Read-only binds over those files would have been the speed bump the git-config
+binds above are documented as, because renaming the directory around a bind gets past it.
+
+**What runs now.** One list, `dc_kit_paths` in `lib.sh`, names `.container/` and the four files
+under `scripts/` that those scripts run or read. `run.sh --install-kit` copies them to
+`~/.local/share/jkb-container-kit/kit` (`DC_KIT_DIR`), whole or not at all, and records the
+checkout they came from.
+It copies and runs nothing, and it copies only regular files and directories. It dereferenced
+symlinks at first, so a link the agent planted in an untracked corner of `.container/` copied a host
+file (an SSH key, in the reproduction) into the kit, and every start then mirrored it world-readable
+into the container (review round 10). A symlink or special file anywhere under the kit's paths is now
+a refusal that names it.
+
+**Where the kit lives is chosen so that no agent can write it**: `~/.local/share/jkb-container-kit`
+(`DC_KIT_HOME`). The kit is `kit/` inside it. The copies `--install-kit` stages and swaps through
+are there too, and so is the archive the mirror builds before root extracts it in the container.
+That archive used to be staged in `$TMPDIR`, which an agent can write, so a same-uid agent could
+swap it in the window before extraction and become the root-owned mirror (review round 11).
+That path is outside every container bind. It is also outside the host auto-mode posture's
+`allowWrite`, and that posture denies `Edit` on it for the in-process tools the Bash sandbox does not
+confine. The first location, `~/.jkb/container-kit`, satisfied only the first condition. The posture
+lets every sandboxed host agent write `~/.jkb`, so a host agent could rewrite the kit's `run.sh`, and
+you would then run it (review round 10). `check-config.sh` holds all three conditions.
+
+- **On the host**, the kit's `run.sh` starts the container. Its `repo` is the recorded checkout, the
+  one the container is for. Every file it runs or hands docker comes from the kit: `lib.sh`,
+  `container.json`, the Dockerfile and build context, and the seccomp profile, which docker reads
+  from `${localWorkspaceFolder}`, now the kit's root.
+- **In the container**, every start mirrors the kit to `/usr/local/lib/jkb-container`
+  (`DC_CTR_KIT`), root-owned, through the same root step that copies the host's git hooks. The sweep,
+  `setup.sh`, the login step and `verify.sh` run from there, and learn the checkout from
+  `JKB_REPO_ROOT`. A failed mirror stops the start rather than falling back to the checkout.
+  `verify.sh` asserts the mirror is root's, carries its marker, is not writable by the container
+  user, and is where `verify.sh` itself is running from.
+- **The kit's `run.sh` builds its `PATH` and environment; it inherits neither** (review round 27).
+  It runs as you, from a shell an agent may have shaped. The host posture lets a sandboxed agent
+  write `~/.cargo`, which comes first on `PATH`, plus `~/.jkb`, `~/.cache` and the temp roots. A
+  committed `.vscode/settings.json` can set any variable in every VS Code terminal. The shebang is
+  `#!/bin/bash -p`, so `BASH_ENV` and exported functions do not reach that first shell. Its first
+  command re-executes it once under `env -i`, marked by an argument no terminal can add, with:
+  - **a `PATH` it builds:** each directory listed, one per line, in
+    `~/.local/share/jkb-container-kit/path-keep`, then
+    `/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`. The keep list comes first because
+    it is yours: behind `/usr/bin`, the tests' stub `docker` lost to a real one, and `--rm` would
+    have removed a developer's container (review round 27). Homebrew's prefixes are user-owned, so
+    the posture denies `Edit` on them. The kit home is mode 0700 and `Edit`-denied.
+  - **an allowlist of names:** the terminal and locale names (`HOME` is built, below), `USER`/`LOGNAME`,
+    `DOCKER_CONTEXT`, `JKB_RUN_FROM_CHECKOUT`, `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`, and on a
+    Linux desktop `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `XAUTHORITY` (the X cookie Electron needs on X11). `DOCKER_CONTEXT`'s endpoints
+    live in the `Edit`-denied `~/.docker`. `DOCKER_HOST` is not kept (review round 27): a terminal
+    could point it at a fake daemon that collects registry credentials on a pull. A Colima or
+    OrbStack daemon is reached through its Docker context. A non-default image is always built from the kit, so
+    `JKB_CONTAINER_IMAGE` names a tag and never chooses what runs. `DBUS_SESSION_BUS_ADDRESS` stays
+    out, because a `unixexec:` address runs a program.
+
+  Every `jq` goes through a `HOME=/dev/null` wrapper, because `~/.jq` is writable too and those `jq`
+  readers build the mount list. **Why it is built, not filtered.** From review round 11 to round 26
+  `run.sh` filtered what it inherited, and each round found the next way in:
+  - a planted `~/.cargo/bin/jq` (round 11);
+  - a keep list set through the environment (22);
+  - a `//` or other-case spelling of the home (22, 23);
+  - `DOCKER_CONFIG` and `TAR_OPTIONS` reaching children (23);
+  - a dropped override (24);
+  - a symlinked writable directory (25);
+  - an exported function `compgen -e` cannot see (26).
+
+  **What this costs:** a Docker installed per-user (`~/.docker/bin`, OrbStack's `~/.orbstack/bin`) or
+  a `jq` from `~/.nix-profile` is not found until its directory is in `path-keep`. `run.sh` names the
+  directory, because the shell's own `PATH` travels as `JKB_USER_PATH`, which only that message
+  reads. Keep a directory only if no agent can write it. That takes two things in
+  `scripts/auto-mode-posture.json`: the sandbox `allowWrite` must not cover it, and the permissions
+  must deny `Edit` on it, because the in-process Write tool is not sandboxed. `~/.docker/bin` passes
+  the first test by default and not the second (review round 13). Docker Desktop's credential helper
+  lives in the same directory, so keeping it covers both. A Docker setting you set only in your
+  shell (`DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`) is dropped; put it in a Docker context. And when VS
+  Code is not already running, `run.sh --open` starts it with the same environment. That editor then
+  lives without `SSH_AUTH_SOCK`, DBus, proxy variables or `TMPDIR`: no ssh agent for `git push`,
+  no keyring, no extension installs behind a proxy. Open VS Code yourself first, and `--open` only
+  attaches (review round 29). **`HOME` is built too**, from your passwd entry (review round 34). A
+  terminal that set `HOME` chose the `path-keep` this reads, and so put an agent's directory first
+  on `PATH`, even with the kit started by its absolute path. That had been recorded as out of reach,
+  on the theory that a forged `HOME` also chooses which `~/...` run.sh you start, which is true only
+  of `~`. The tests pass a scratch home as an argument, `--test-home <dir>`, which a terminal's
+  environment cannot add. `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are dropped
+  with the rest, so a `core.hooksPath` kept only in an XDG git config is not seen when run.sh copies
+  the host's hooks; keep it in `~/.gitconfig`. The host's own `jkb` lives in `~/.cargo/bin`, so the
+  start-time sweep does not ask it which sessions are live; it holds sessions by its recency window
+  instead.
+- **What else run.sh trusts is out of reach too** (review rounds 14 and 15). The posture denies
+  `Edit` on the Homebrew prefixes run.sh keeps on `PATH` (`/opt/homebrew`, `/usr/local`), on
+  `/Applications`, where `/usr/local/bin`'s `docker` and `code` links point, and on `~/.docker`, whose
+  CLI plugins `docker info` runs. `check-config.sh` holds every one of those denies, and refuses an
+  `allowWrite` that covers any of them. Claude Code merges an `Edit` deny into the sandbox's
+  `denyWrite`, so each one rule covers both the Write tool and sandboxed Bash.
+- **`~/.cargo` is half closed, and the open half is a decision.** The posture lets sandboxed agents
+  write `~/.cargo` for builds. Every login shell rustup set up sources `~/.cargo/env`, and
+  `~/.cargo/bin` leads your `PATH`, so a planted file there runs as you in your next terminal, not
+  only in `run.sh`. That predates this branch (review round 15). `~/.cargo/env` is now
+  `Edit`-denied, which costs nothing: only rustup's installer writes it. **`~/.cargo/bin` is not**,
+  because denying it breaks every sandboxed `cargo install`. That includes the container's
+  `post-merge` rebuild of `jkb`, which runs inside an agent's sandbox. `run.sh` drops `~/.cargo/bin`
+  from its own `PATH`; your shells do not.
+- **Every file that becomes code later is `Edit`-denied too** (review round 20). `~/.cargo/env` was
+  one case of a wider class. The others are the shell startup files (`~/.zshenv`, `~/.zprofile`,
+  `~/.zshrc`, `~/.zlogin`, `~/.zlogout`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`,
+  `~/.profile`, `~/.bash_logout`; the two logout files arrived in review round 21), git's
+  global config (`~/.gitconfig`, `~/.config/git/**`, which can name a hooks directory), `~/.ssh/**`
+  (a `ProxyCommand` runs), the per-user autostart directories (`~/Library/LaunchAgents`,
+  `~/.config/systemd/user`, `~/.config/autostart`), and VS Code's user settings and extensions
+  (`~/Library/Application Support/Code/User/**`, `~/.config/Code/User/**`,
+  `~/.vscode/extensions/**`). Those last three arrived in review round 24: a
+  `terminal.integrated.env` in user settings runs in your next terminal. Only you edit these files,
+  so the denies cost nothing. `check-config.sh` requires every one. Whether Claude Code's own
+  protected list already covered any of them was not measured; the deny makes the answer
+  irrelevant.
+- **`run.sh` takes nothing from the shell that launches it.** That is the built environment above.
+  The steps that led there: `-p` against `BASH_ENV` in rc files (round 21), an `env -i` allowlist for
+  its children (23), the documented overrides kept (24), an unconditional restart (26), and a
+  constructed `PATH` in place of the filter (27).
+- **A hard link swapped in during `--install-kit` is a residual** (review round 23). The copy is
+  checked for links and special files, and the source is checked both before and after the copy.
+  A hard link made just before `cp` reaches a file and removed before the second check is still
+  copied, because `cp` writes a fresh file with one link. Exploiting that needs a lost race and a
+  hard link to a host secret. Inside the container the sandbox cannot see such a file, so `ln`
+  fails. On the macOS host this is unmeasured.
+- **The checkout's `run.sh` refuses** to start or stop anything and names the kit. That protects the
+  habit, not the file: an agent can edit that refusal out. What protects you is that you start the
+  kit's `run.sh`.
+- **A stale kit is reported, not followed.** On every start the kit's `run.sh` names any kit path the
+  checkout has changed since install, and keeps using the kit. Taking a change is
+  `run.sh --install-kit`, which lists every file it copies as it copies them. That listing is a
+  record, not a gate: review the checkout's changes before running it. `scripts/setup.sh` refreshes the kit
+  as well, so a pull that touches code or `.container/` refreshes it through `post-merge` (`.container/`
+  joined the trigger in review round 31; before, such a pull left the kit stale). A pull is already the point where you review what an agent changed (*Git runs
+  the host's hooks* above). `setup.sh` refreshes only from the main checkout. A linked worktree is a
+  task branch and is left alone (review round 10). So is a checkout where git will not say which it
+  is, for example an old git or a safe.directory refusal: that case once read as "main checkout"
+  (review round 23, `kit_decision` in `scripts/lib.sh`).
+
+**Held by** `check-config.sh`. Every `docker exec` in `run.sh` and `lib.sh` names an absolute program
+and pins `PATH`, and none runs a `.container/` path outside `"$DC_CTR_KIT"`. Every script that
+`setup.sh`, `verify.sh` and `install-extensions.sh` run from `scripts/` is in `dc_kit_paths`, and none
+reaches the checkout's `scripts/` or `.container/`. A mutation exists for each.
+`scripts/tests/container-hooks.test.sh` covers the installer, the stale report and the pinned execs.
+`scripts/tests/container-login.test.sh` covers the checkout's refusal and the kit's `--stop`, which
+sources the mirror's `lib.sh`.
+
+**Residuals, stated.**
+
+- *Building the checkout runs checkout code.* `setup.sh` runs `cargo install` on the checkout,
+  unsandboxed in the container, once per container. `install-extensions.sh` runs
+  `scripts/install-extension.sh` from the checkout, which builds `ui/` through pnpm. That build rarely
+  happens from `setup.sh`, whose call finds no VS Code server on a first start. It usually happens
+  when you run the mirror's `install-extensions.sh` by hand after attaching, as `verify.sh` advises,
+  and then it builds the checkout you are standing in. Building is what these steps are for, and it
+  is the same exposure as the host's `post-merge` build (*Git runs the host's hooks*). The
+  mitigation is the same too: review what you build.
+- *The kit is trusted at install.* The first `--install-kit`, and every `setup.sh` run, copy whatever
+  the checkout holds at that moment.
+- *`verify.sh` still inherits the image's `PATH`* for the toolchain it checks
+  (`task:verify-sh-runs-unsandboxed-with--18da6e4b5d893488`). Its own code now comes from the kit.
+
+## A Claude settings `env` does not replace the container's environment
+
+**The failure, measured by another session on 2026-10-02.** Claude sessions in here were getting the
+Mac's `PATH` (`/Users/<user>/.cargo/bin`, `/System/Cryptexes/...`) instead of the image's, so `jkb`
+did not resolve by name. The cause was an `"env": {"PATH": ...}` block in the repo's
+`.claude/settings.local.json`. Claude Code puts a settings file's `env` into every session's
+environment, over the image's `ENV`, and that file is in the checkout the host shares. A value
+written for the Mac therefore replaced the container's in every container session. Deleting the
+block restored the image's `PATH`, 11 absolute entries. It is not only an inconvenience: the attest
+hook approves only the bare `jkb` command word, so a `PATH` that hides `jkb` means agents type
+`~/.cargo/bin/jkb`, and every call prompts. This is also the explanation the Dockerfile's "a session
+can inherit a PATH that never saw this image's ENV" note lacked, corrected there in place.
+
+**Held by** `dc_protected_env` in `lib.sh`, which derives every name the container sets from the
+Dockerfile's `ENV` lines and `containerEnv`, `PATH` among them, and refuses if it cannot find
+`ENV PATH`.
+
+- `verify.sh` fails when any settings layer a session in here loads sets one of those names in
+  `env`. The layers are managed, drop-ins, the user's settings, and every repo's and worktree's
+  `.claude/settings*.json`. The failure names the file and the key for a person, because the agent
+  cannot fix it: those files are write-denied to it. It also says that a repo's file is shared with
+  the host, and that a host-only value belongs in the host's own `~/.claude/settings.json`, which
+  this container does not load.
+- `check-config.sh` holds the repo's committed `.claude/settings.json` to the same rule at review
+  time.
+
+**What it cannot see.** `verify.sh` runs through `docker exec`, with the image's environment, so it
+cannot ask a *session's* `PATH`. A `PATH` replaced by some route other than a settings file is not
+caught here. The Ruby and PostgreSQL links into `/usr/local/bin` stay for that reason.
 
 ## The mount list is the security boundary
 
@@ -545,11 +767,13 @@ and `mutate-verify.sh` carry a mutation for each.
 **The harness's own rules are managed settings baked into the image**
 (`/etc/claude-code/managed-settings.json`, from `managed-settings.json` here, root-owned): the
 attestation hook (`jkb attest hook`, which tells `jkb serve` which agent made each `jkb` call),
-the workflow Stop hook (which holds only a session launched with `JKB_DRIVE`), and deny rules keeping the model's in-process tools — which the Bash
-sandbox does not confine — away from the credential, from session transcripts (a live tool call's
-ticket is written there; `*.jsonl` only, so auto-memory stays readable, and workflow journals do
-not), and from the files that configure the harness (a hook, agent definition or MCP server it
-could add would run unsandboxed).
+the workflow Stop hook (which holds only a session launched with `JKB_DRIVE`), the transcript
+hook `deny-transcripts.sh`, which keeps every tool out of other sessions' transcripts (a live tool
+call's ticket is written there) while leaving auto-memory readable, and deny rules keeping the
+model's in-process tools — which the Bash sandbox does not confine — away from the credential and
+from the files that configure the harness (a hook, agent definition or MCP server it could add
+would run unsandboxed). Why the transcript guard is a hook and not a `*.jsonl` deny rule is in "The
+transcript deny is a hook" below.
 
 **The hooks run a pinned, root-owned `jkb`** — `/usr/local/lib/jkb-hook/jkb`, never `jkb` from
 PATH. They run outside the sandbox with the credential readable, and `~/.cargo/bin` is writable from
@@ -890,7 +1114,7 @@ forwards the Vite port to the Mac. No port publishing and no permission change i
   - The reaping assertion **fails on every container created before it existed**, which is correct
     and is the point: the fix is an image change, and nothing else observes a running container —
     `run.sh` without `--build` finds the argument hash and the image id both matching and starts
-    the old one. Recreate: `./.container/run.sh --rm && ./.container/run.sh --build`.
+    the old one. Recreate: `$kit --rm && $kit --build`, with `$kit` the kit's run.sh (*Using it*).
   - It **refuses to run inside Claude Code's own sandbox**, which wraps a Bash tool call in
     `bwrap --unshare-pid --proc /proc`. In there `/proc/1` and `/proc/self/mountinfo` are bwrap's,
     so both the reaping and mount-boundary assertions would describe the wrong subject — and the
@@ -901,8 +1125,13 @@ forwards the Vite port to the Mac. No port publishing and no permission change i
   `allowRead` entry, so it fails with `Operation not permitted`. That is the posture working: an
   unattended agent that can talk to Docker can mount `/` into a container and is root on the host.
   Allowlisting it to make the harness runnable would trade the boundary for convenience.
-- `mutate-verify.sh` — needs a Docker host. Breaks each property in turn and asserts `verify.sh`
-  fails naming it. A guard nobody has watched fail is not a guard.
+- `mutate-verify.sh` — needs a Docker host. Breaks the properties it carries cases for in turn,
+  and asserts `verify.sh` fails naming each one. A guard nobody has watched fail is not a guard.
+  **Not every guard has a case.** Its container is started without `run.sh`, so it has no kit
+  mirror, and this branch's live checks have none: the kit mirror, the installed transcript hook and
+  its matcher, and the auto-memory shadow. Those verdicts are driven instead by `verify.sh
+  --self-test` from injected facts (`kit_mirror_problems`, `memory_shadow`). Cases for them are open
+  work (review round 10).
 - `mutate-verify.sh --control` — **the one way to ask "is this container healthy" from outside**.
   One healthy run, printed verbatim, using the same flags and the same preamble every mutation
   runs against. Do not hand-roll the `docker run`: it needs the seccomp profile, `NET_ADMIN`, both
@@ -1247,7 +1476,7 @@ also with them hidden from `PATH`, did not fire it. So the mechanism is inferred
 Every fallback is now inside its substitution, and statuses are read by `ipset_rc`, which takes them
 in an `&&`/`||` list inside the subshell.
 
-Changing any of this takes a **rebuild** (`./.container/run.sh --rm && ./.container/run.sh --build`):
+Changing any of this takes a **rebuild** (`$kit --rm && $kit --build`, with `$kit` the kit's run.sh):
 the firewall, its library and the posture snapshot are installed into the image and read at create.
 
 ## A session worktree is an ordinary folder in here
@@ -1300,7 +1529,389 @@ deliberately not pruned — `git clean -X` deletes exactly the regenerable files
 gitignored `.env`, and unrequested deletion is what this whole mechanism exists to avoid. Shorten
 `--retain-days` if size matters more than the safety net.
 
+## The file tools are held to the sandbox's own boundary (design A)
+
+**Why.** Claude Code's file tools (Read, Write, Edit, Grep, Glob, Artifact) and every MCP server run
+in its own process, outside the Bash sandbox. They were held only by permission deny rules, which
+list what is forbidden. Rounds 13 to 15 of the review on `jkb/argv-root-fix` kept adding the place
+nobody had thought of: `~/.docker`, `/Applications`, `~/.cargo/env`. Reviewing the security model
+after round 15, the user chose to hold the file tools to the same allow lists the sandbox enforces
+on Bash. One list, two enforcers. The longer-term fix, a separate Unix user for agents, is filed as
+`task:separate-unix-user-for-agents-ke-18dabb26d2f5dca8`.
+
+**What it does.** `deny-transcripts.sh`, which every tool call already reaches, reads the sandbox
+settings from the same layers Claude Code merges: managed and its drop-ins, the user's settings, and
+the project's `settings.json` and `settings.local.json`. When they enable the sandbox, every path a
+tool is handed is judged on its physical path, as the kernel sandbox judges it:
+
+- **A write** (Write, Edit, MultiEdit, NotebookEdit) must land under an `allowWrite` entry. Claude
+  Code's own writable places are added: the session's cwd and project, the temp roots, and
+  `~/.claude/plans`, where plan mode writes.
+- **Anything else** (Read, Grep, Glob, MCP servers, unknown tools) is judged as a read. It must not
+  land under `denyRead` unless `allowRead` or `allowWrite` covers it.
+- **Two deliberate differences from what Bash may reach, both Claude Code's own.** Auto-memory,
+  `<root>/<slug>/memory/`, is readable and writable, linked into `~/.jkb` or not. Saved tool output,
+  `<root>/<slug>/<session>/tool-results/`, is readable: Claude Code writes output too large to show
+  inline there and tells the agent to Read it. That exception arrived in review round 16, after this
+  branch had made such output unreadable. The transcript rule draws the same two lines.
+- **Denies still win.** A permissions `Read(...)` deny or a `sandbox.credentials.files` deny is
+  checked before the allow lists. Round 16 found an MCP server reading `~/.cargo/credentials.toml`
+  because `~/.cargo` is in `allowWrite`.
+- **MCP and unknown tools: a field table, not a free-text scanner** (the user's choice after review
+  round 26, on a structural review of why the rounds had not converged). Each tool the hook does not
+  already judge by its fields is looked up in a table in `deny-transcripts.sh`. A listed tool's path
+  fields are judged as Read's `file_path` is: jkb's `ingest_path` `source`; `ingest_url`'s `source`
+  when it is a `file:` URL, which its headless browser loads from disk; Artifact's file fields;
+  ArtifactData's `file_path`; Workflow's `scriptPath`. A relative one is judged from the session cwd
+  and from the project dir, where jkb's server starts. A tool listed as pathless (jkb's other tools,
+  WebFetch, StructuredOutput, the task and cron tools and the like) is let through. **Any other
+  tool, MCP or built-in, has the fields whose names say they are paths judged** (`file_path`,
+  `path`, `paths`, `file`, `dir`, `root`, `source`, `target`, `uri`, `url` and the like, at any depth,
+  as a string or an array, every value judged as a path, a URL included: a link named `x:` (round
+  28) or `https:` (round 29) in the cwd is what a server that open()s the value reads), and
+  everything else it carries passes.
+  Round 27 refused unlisted tools outright. That refused StructuredOutput, which every schema agent
+  must call, so `/jkb-review` and the swarm returned nothing in the container. It also refused every
+  connector, though a claude.ai connector cannot open a local file at all. The user chose names
+  over refusal: a field's name is a far smaller guess than its prose.
+  - **What it replaced, and why.** From review round 6 the hook judged every string an unknown tool
+    carried that could be a path, from every base a server might use. Rounds 16 to 26 spent most of
+    their findings there. Each round found another reading some server might take of free text: a
+    `..` or `~name/` form (rounds 18 to 20), padding past `PATH_MAX` (17 to 21), whitespace and line
+    breaks (21 to 23), a NUL (24), object keys (26). The user's choices to refuse ambiguous forms
+    (round 18) and to stop guessing (round 21, "option 2") narrowed it, but the trim class itself
+    was still a guess about which runtimes trim. Several of those rounds' must-fixes were caused by
+    the previous round's fix. A table cannot be wrong about what an unlisted server does, because it
+    does not let one run. The scanner, its six per-call budgets and about 350 lines went with it.
+  - **What it costs.** A local MCP server that takes a path under a field name not on the list
+    (`location`, say) is not judged. A tool whose path field matters belongs in the table, which is
+    one line and a rebuild; jkb's own server is there.
+- **No sandbox, no boundary, and only the image can say no.** With the sandbox disabled there is
+  nothing to mirror, and the transcript rule still applies. If managed settings or their drop-ins
+  set `enabled`, theirs is the word. Otherwise any layer may turn the boundary **on**, and no user,
+  project or local layer may turn it off (review round 29). **Nor may a project or local layer widen
+  it** (review round 30). `allowWrite` and `allowRead` are taken from managed and user settings
+  only, which agents cannot write. A planted local `allowWrite: ["/"]` let every path through.
+  Those layers still narrow it, through their denies and `denyRead`. A layer that is not valid JSON
+  contributes nothing, as Claude Code skips it. **The layers it reads are never writable through
+  it**: every layer file is refused to the write tools (review round 16, after a Write of a
+  project's `.claude/settings.local.json` outside `~/repos` could have switched the boundary off).
+  - **Why only the image.** Round 29 measured that sandboxed Bash can **create** a worktree's
+    `.claude/settings.local.json`. The `~/repos/**` Edit rules cover only files that exist when the
+    sandbox is built (see *The seven `~/repos/**` rules*). A planted `{"sandbox":{"enabled":false}}`
+    was honoured by this hook.
+  - **The Bash half is closed in managed settings** (the user's decision after review round 36).
+    Claude Code read the same planted file and started that session's Bash unsandboxed, because the
+    image's managed settings did not set `sandbox.enabled`. They now pin
+    `"sandbox": { "enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false }`,
+    as the host posture already does. Managed settings outrank every layer, so no worktree file can
+    switch the sandbox off. `failIfUnavailable` was added after review round 38: without it, a
+    sandbox that cannot start (bubblewrap missing or refused by the runtime) leaves Bash running
+    unconfined; with it, each Bash command errors instead. That is measured: it is how the missing
+    `systempaths=unconfined` flag showed up (see *`/proc` has to be unmasked*). Startup is not
+    refused, because the sandbox is checked lazily (*What is still not established*). `check-config.sh` holds
+    all three keys in the repo, and `verify.sh` holds them in the running image.
+    **It takes a rebuild** (`$kit --rm && $kit --build`): the managed settings are baked into the
+    image, and a container on an older one keeps no pin. Verify names the rebuild when the pin is
+    missing (review round 37).
+    **Not yet measured**, because no image with the pin had been built when it was written: that a
+    planted local `enabled:false` then leaves Bash sandboxed, and that a managed `sandbox` object
+    holding only these three keys **merges** with the user layer's `filesystem` lists rather than
+    replacing them. Check both after the first rebuild. In a session, `touch ~/x` must fail and
+    `touch ~/repos/x` must succeed. Then record the result here.
+  - **A layer that parses but is wrongly typed contributes nothing** (review round 36), as an
+    unparseable one does. `{"permissions":"x"}` crashed the merge, and the hook refused every
+    non-Bash call for the session with a message about transcripts.
+
+**What it costs.** A judged Read went from about 29ms to 58ms per call, measured over 30 calls in
+jkb-dev against its real settings. Bash is still decided first, in 7ms. A tool reading or writing
+outside the sandbox's lists is now refused, with a reason naming the list. The deny rules stay, as a
+second layer.
+
+**What it does not cover.** A server is told apart by its name alone: a local MCP server named
+`claude_ai_...` would be taken for a claude.ai connector and its path fields not judged. A local
+server is named in `.mcp.json` or user settings, which agents cannot write in place, so this needs
+the user to add one by that name. A listed MCP tool's path field is judged as a read, the weaker test,
+because what the server does with it is not ours to know: jkb's `ingest_path` only reads, and a
+server added to the table that writes to a path the lists only let it read would pass. The same holds
+for Artifact's `out_dir`, where a `read` action saves files: it is judged as a read, so a directory
+under `denyRead` is refused but one the lists only let Bash read is not. And the
+hook is installed only in the container's managed settings. On the host the file tools are still
+held only by the posture's deny rules, and the separate-user task is where that ends.
+
+**The boundary's locations come from the account, not the environment** (review rounds 31 and 32). A
+settings layer's `env` reaches the hook's environment, and a project or local layer is one sandboxed
+Bash can create. Its `HOME` or `CLAUDE_CONFIG_DIR` pointed the trusted user layer at an agent's file.
+A forged home whose `.claude/projects` linked to `~/.claude` made all of it a writable "memory"
+directory. `TMPDIR=/` or `CLAUDE_PROJECT_DIR=/` made every path a write root. The installed hook
+therefore takes the user layer, `~` in its lists, and the roots of its memory and tool-output
+exceptions from the passwd home. It takes `TMPDIR` as a write root only under `/tmp`, and
+`CLAUDE_PROJECT_DIR` only when it is the cwd or an ancestor of it, strictly inside the home. The
+transcript rule still adds every spelling of the tree as a root, because there a root only denies.
+Whether a settings `env` can override the `CLAUDE_PROJECT_DIR` Claude Code hands its hooks is not
+measured; the bound makes the answer irrelevant.
+
+**Held by** the boundary rows in the hook's self-test, which run against a scratch home outside
+the temp roots, because `/tmp` is writable to the sandbox and would pass every write. Five of them
+were watched failing with the boundary call removed. `verify.sh` probes the installed hook: with the
+sandbox enabled, a Write to the home must be refused and one in the workspace allowed.
+
+## The transcript deny is a hook, so the sandbox argv is O(1)
+
+Two `permissions.deny` globs used to cost more than half the argv budget every Bash call in this
+container gets. They are now one PreToolUse hook, `.container/deny-transcripts.sh`, and the sweep
+below went from the defence to a backstop: on the posture that ships it stands down and archives
+nothing, and it runs again only if a rule that enumerates transcripts comes back in the managed settings
+or a drop-in, the only layers it reads (see *It reads only the image's own layers*).
+
+**Why a glob was the wrong instrument.** Claude Code compiles `permissions.deny` into the
+bubblewrap argv for the Bash sandbox. A rule ending in a directory wildcard *collapses* to one
+entry — `Read(~/.ssh/**)` becomes `~/.ssh`, and eight rules in the live profile do exactly that.
+A rule ending in a **file pattern** cannot: the sandbox names every match and binds `/dev/null`
+over each, so the argv grows by one path per file on disk.
+
+**Measured 2026-09-30 in `jkb-dev`, after a sweep had already run:**
+
+| | |
+|---|---|
+| `.jsonl` files under `~/.claude/projects` | 206 |
+| path text, one spelling | 33,819 bytes |
+| both spellings (`.claude` and `.claude-state` are one tree) | 67,638 bytes |
+| `MAX_ARG_STRLEN` (Linux, 32 pages, not tunable) | 131,072 bytes |
+| **share of the ceiling spent by two rules** | **52%** |
+| after: a hook, and no rule naming the tree | 0 bytes for the tree |
+
+Past the ceiling *every* Bash tool call fails at spawn with `E2BIG` — not the one that overflowed,
+all of them, including `:` — with nothing in the message naming transcripts.
+
+**The obvious fix is a trap, and it was committed before it was caught.**
+`Read(~/.claude/projects/**)` collapses beautifully and also covers
+`~/.claude/projects/<slug>/memory`, which is where Claude Code keeps auto-memory. That location is
+not ours to choose: `scripts/link-claude-memory.sh` exists to put the link there and verify.sh
+**fails** when it is missing. Denied memory does not error — `MEMORY.md` stops arriving in context,
+which reads like an agent that forgot rather than a broken container. `memory` and `<uuid>.jsonl`
+are siblings, so **no glob separates them**; that is a property of Claude Code's layout, not
+something this repo can rule its way out of.
+
+**A hook can, and costs no argv, because it is code rather than a path list.** The trade is one
+process per tool call, since the matcher is `.*` (the timing is recorded once, in the script's header), in exchange for
+O(files) of argv. What
+`deny-transcripts.sh` decides, and each clause is there because the first cut got it wrong:
+
+- **Paths are resolved the way the tool resolves them.** A leading `~` is the home, and a relative
+  path is relative to the *session's* cwd (the payload's `.cwd`), not the hook's own. Confirmed
+  live on 2026-10-01: a `Read` of `~/.claude/projects/<slug>/x.jsonl` went straight past the first
+  cut, which had resolved it under its own `$PWD`, and was stopped only by a permissions rule that
+  a later commit removed. The two commits were unsafe apart.
+- **An ancestor of the tree is denied**, not only paths inside it. `Grep path=~/.claude-state`, or
+  `path=$HOME`, or a search with no path from a home cwd, reads transcripts while naming none. The
+  per-file `.jsonl` rules this hook replaced had been doing that job as an ignore glob ripgrep
+  honoured, so removing them silently dropped it. A `Glob` whose pattern carries the location
+  (`/home/…/projects/**`, `../../.claude/projects/*`) has its literal prefix checked the same way.
+- **Memory is exactly one slug deep**: `<slug>/memory/…`. A `case` `*` crosses `/`, so the first
+  cut exempted a directory called `memory` at any depth.
+- **Paths are split with `read -a`, never an unquoted expansion.** `for seg in $p` also does
+  pathname expansion, so a `*` segment became the names of files in the hook's cwd. A hook that
+  rewrites the path it is judging into an unrelated one can be steered past itself.
+- **The physical path is judged too** (review rounds 2 and 3). The file tools run unsandboxed and
+  the kernel follows symlinks, so a symlink an agent makes from sandboxed Bash, or
+  `/proc/self/root/…`, landed in the tree without spelling it. Every path is judged as written *and*
+  as `realpath -m` resolves it, and it is resolved **from the un-normalised join**: resolving the
+  lexically collapsed path let `l2/..` through (with `l2` linked into the tree), because the
+  collapse removed the link before the kernel could follow it. The roots are resolved too, so a
+  `HOME` that passes through a symlink still names the tree. Procfs magic links and `/dev/fd` are
+  refused outright and before normalising, because `/proc/self` names a different process for the
+  hook than for the tool.
+- **Every tool reaches the hook: the matcher is `.*`.** It was an allowlist of file tools, and
+  round 3 found built-ins it left out. Artifact reads a local file and uploads it. Bash is let
+  through inside the hook (the kernel sandbox confines it, and it is what a person repairs a broken
+  container with). So are the built-ins that carry text rather than locations: TodoWrite,
+  AskUserQuestion, Agent, Task, ToolSearch, SendMessage, and Skill since review round 24, whose
+  `args` is a slash command's free text. The file tools (Read, Edit, MultiEdit since review round 25,
+  Write, NotebookEdit) are judged by their path fields. Every other tool goes through the field table
+  in *The file tools are held to the sandbox's own boundary*: its listed path fields are judged, a
+  pathless one passes, and an unlisted one has its path-NAMED fields judged (review round 27; from
+  round 3 to 26 every string such a tool carried was judged as a possible path). `CLAUDE_CONFIG_DIR`, when set, adds its
+  `projects` tree to the roots.
+- **A hook that runs out of time refuses** (review round 27). Claude Code kills a hook at its
+  timeout, 10 s here, and then lets the call through. Rounds 9 to 22 answered each slow input with
+  a budget of its own: path-like strings per call, bare words, lines, segments, checks. Round 20
+  found the cost was bash itself: `${x#lit}` and `${x%lit}` are **quadratic when they do not
+  match**, 907 s for 1 MB under a UTF-8 locale. The hook now runs its judging in a child under
+  `timeout -s KILL 8`, and a child that does not finish is a refusal. The free-text budgets went
+  with the scanner. Two remain because they are cheap and exact: a path over 4096 bytes
+  (`PATH_MAX`) is refused before it is walked, and a Glob's brace expansions are capped. The
+  hook still pins `LC_ALL=C` and tests prefixes by substring. The wrapper costs one process: 9 ms
+  for a Bash call (7 ms before), 33 ms for a judged Read, measured over 50 calls in jkb-dev on
+  2026-10-03. A self-test row with a 1 s deadline and a 5 s judge is refused at the deadline.
+- **The hook does not trust `PATH`** (review round 4, the most serious finding in four rounds). It
+  runs unsandboxed on every tool call, and the image puts the agent-writable `~/.local/bin` and
+  `~/.cargo/bin` first on `PATH`. A `jq` planted there by sandboxed Bash ran outside the sandbox,
+  with the container credential readable. Shown against the previous hook: it ran planted `bash`,
+  `jq` and `realpath`. The shebang is now `#!/bin/bash -p`, where privileged mode ignores
+  `BASH_ENV` and exported functions, and `PATH` is fixed to `/usr/bin:/bin` before the first
+  command. `check-config.sh` requires both, and the self-test plants a fake of every program the
+  hook calls and executes it directly. **Round 5 found the same class through another door:** `jq`
+  sources `$HOME/.jq` into every program, and the Write tool can create `~/.jq`. A planted
+  `def unique: [];` turned a deny into an allow, and `def error(m): .;` let `eval` run an
+  array-valued field as a command. Shown against the previous hook: it reported *deny* and had
+  *already executed* the command. Every `jq` call now goes through one wrapper with
+  `HOME=/dev/null`. The hook's other programs load nothing from the home. The general rule, written
+  here so it gets applied next time: **anything an unsandboxed process loads automatically from an
+  agent-writable place is a way into it.** Round 7 applied it beyond the hook. The *sweep* runs
+  unsandboxed too, when the reaper pipes it into `docker exec`, and it looked up `jq` (and, before this
+  branch, `bash` and `find`) through a `PATH` that starts with `~/.cargo/bin`. Its real run now
+  pins `PATH`, its `jq` runs with `HOME=/dev/null`, and the reaper and `run.sh` start it, and
+  `verify.sh`, with `/bin/bash` by absolute path. **Round 8 found round 7's application partial,
+  three ways.** The pin sat in the real-run arm, so the sweep's top-level `date` and `stat` ran a
+  planted program first (reproduced; the pin is now the first command, and a self-test row plants
+  eleven programs and runs the sweep through `/bin/bash`). Seven other execs in `run.sh` still
+  named `bash`, `sh` or `sudo` bare, among them the login step and the reap, which ran
+  `bash -lc 'jkb task reap'` and so found both `bash` and `jkb` on `PATH`. Every exec there now
+  names its program by absolute path and pins `PATH` with `-e PATH=/usr/bin:/bin`, the reap runs the
+  root-owned pinned `jkb`, and `check-config.sh` scans every exec in the file, not two of them. The
+  exceptions are named in that scan: the sweep pins its own `PATH`, `sudo` replaces it with
+  `secure_path`, `verify.sh` is the open item below, and `setup.sh` runs the toolchain in
+  `~/.cargo` by design, once, before its marker exists. And nothing checked the `HOME=/dev/null`
+  prefix this paragraph said `check-config.sh` held; it now requires it on every `jq` in the sweep's
+  real run and in `verify.sh`, where one memory-matcher read lacked it.
+  **Two older problems in the same class came up in that round's self-review, and both are fixed
+  here.** `lib.sh`'s hook mirror ran `docker exec -u root ... sh -c`, so a planted `~/.cargo/bin/sh`
+  ran *as root* on every start. Its four execs now name absolute programs and pin `PATH`, and the
+  exec scan covers `lib.sh` as well as `run.sh`. More fundamentally, every unsandboxed script was
+  loaded from the checkout, which the sandbox writes, so editing one was as good as planting a
+  binary. They run from a kit now, described in *Everything unsandboxed runs from the kit* above.
+  **Still open, and older than this branch:** `verify.sh` runs unsandboxed with that same `PATH`, and
+  it has to. It checks the installed toolchain, so it runs the `jkb` in `~/.cargo/bin`, which the
+  sandbox can write. Its one call this branch added, `jkb notify sessions --live-ids`, now uses the
+  root-owned pinned binary at `/usr/local/lib/jkb-hook/jkb`. The rest is filed as its own work.
+- **Built-ins that carry text are let through, along with Bash, before anything that can fail.**
+  With every tool reaching a hook that fails closed, judging a todo list's or a subagent prompt's
+  strings as paths refused ordinary calls: 40 todos from a home cwd, an empty field read as "the
+  home", a 4.6 KB Agent prompt (all reproduced). Bash is decided right after the parse, so a
+  container broken in some other way still has its repair tool.
+- **Considered and not vectors**, measured: hard links (sandboxed Bash cannot see the tree, and
+  `~/repos` is a different filesystem from the state volume, so `ln` would be `EXDEV`); case
+  folding (`~/repos` is case-insensitive, but the tree is not, and a case-variant symlink is
+  resolved by the kernel inside `realpath`); bind mounts (an unprivileged namespace changes only
+  the agent's own view). **One residual is left open and written down**: a race in which a
+  background process repoints a symlink between the hook's check and the tool's open. Closing it
+  would mean refusing every symlink in a writable directory.
+- **Prefix tests are string surgery, not `case` patterns.** `case "$root/" in "${p%/}"/*)` with
+  `p=/` did not match `/h/.claude/projects/` on bash 5.2.21, so `/` read as "not an ancestor".
+
+Its self-test runs in `./scripts/check.sh`, in CI, and inside the container from verify.sh. It includes program-level rows that run the
+hook exactly as Claude Code does, JSON on stdin and a verdict on stdout or exit 2, because the
+fail-closed contract is about how the script *exits*, which no call to a function can show.
+
+**It fails closed**, unlike `.claude/hooks/block-raw-sqlite.sh`, which fails open on purpose (that
+one steers an agent to a better tool, so an error must not wedge Bash). This one is a
+confidentiality boundary, so every way of not reaching a verdict is a refusal: an unparseable
+payload, a missing `jq`, an unset variable, any crash. An EXIT trap turns anything that ends the
+script without an explicit allow into exit 2, which Claude Code treats as blocking. The first cut
+only closed the jq-parse case: with `HOME` unset, `set -u` aborted at rc 1, which Claude Code reads
+as non-blocking, and the call went through. **One edge stays open, and it is the harness's:** a
+hook killed for exceeding its timeout is non-blocking, and nothing inside the script changes that.
+It answers well inside its 10s budget; the script's header has the measurement.
+
+**What holds it in place**, because the hook is the only thing denying transcripts to the file
+tools and its absence is silent:
+
+- **One deny-rule reader**, defined in `sweep-transcripts.sh` (the one script that cannot source
+  anything; the reaper pipes it in over `bash -s`) and loaded by name into `check-config.sh` and
+  `verify.sh`. Three files used to parse rules three ways, and each was wrong differently: one
+  missed Claude Code's absolute `//path` spelling, one only looked at rules containing `projects/`,
+  one passed a mid-path `**`. A rename now makes both loaders fail loudly. **One question is unmeasured, and the reader errs the
+  safe way on it:** whether Claude Code's permission and sandbox matching expands `{a,b}`. A `case`
+  pattern does not, so `Read(~/.claude/{projects,x}/**/*.jsonl)` read as one literal directory, and
+  matched nothing (review round 13). A brace now counts as a wildcard: the rule's base stops before
+  it, and it covers everything under that base. A brace rule over the tree therefore turns the sweep
+  on, fails `check-config.sh`'s argv guard, and fails `verify.sh`'s memory check. If matching is
+  measured not to expand braces, that is a false alarm to correct here.
+- `check-config.sh` also holds what the hook cannot load: no sandbox `allowRead`/`allowWrite`
+  entry may reach the transcript tree, because with no deny rule naming it that entry is the only
+  thing between sandboxed Bash and the transcripts; and the hook's roots and the sweep's must both
+  name `CLAUDE_CONFIG_DIR` and both spellings, because the hook is installed alone and keeps its own.
+- `check-config.sh` (static): no rule may cover the memory path, with Claude Code's subtree
+  semantics; nothing may be enumerated per match (a file pattern at the end, or a `**` mid-path)
+  except the seven named `~/repos/**` rules below; and the hook must be referenced, installed by the
+  Dockerfile `--chown=root:root`, and its matcher must **equal** `.*`, every tool. That's the
+  third form of this check: a substring test let `Edit` hide inside `NotebookEdit` (round 1), a
+  whole-token list let unlisted built-ins such as Artifact skip the hook (round 3), and only
+  "every tool" has neither hole. Don't reintroduce a token list.
+- `verify.sh` (runtime): the installed hook exists, is root-owned and not writable by `vscode`, and,
+  asked of the installed copy under **both**
+  spellings of the tree, denies a transcript and allows auto-memory. It probed one spelling at
+  first, so a hook that lost its `~/.claude-state` root still passed. It does **not** run the hook's
+  self-test (review round 34): verify runs unsandboxed, and the self-test executes copies of the hook
+  staged in `/tmp` and `~/.cache`, which agents write, so a swapped copy would run outside the
+  sandbox. The installed copy refuses `--self-test`; the checkout's runs in `check.sh` and CI. The memory check reads
+  **every** settings layer (managed, drop-ins, user, every repo's project settings), not only the
+  managed file.
+
+**The seven `~/repos/**` rules are a known O(worktrees) term, named rather than tolerated.** They
+keep agents from editing a repo's harness configuration, and each `**` sits mid-path, so the
+sandbox enumerates one entry per match on disk. Measured on 2026-10-01: 64 paths, 4,246 bytes, from
+13 checkouts and worktrees, about 330 bytes each. Small against 131,072, but every task worktree
+adds a set, so it is listed in `check-config.sh` by exact text and a new rule of that shape fails
+until somebody adds it there on purpose.
+
+**That enumeration is also their limit, and it is a measured residual** (review rounds 25 and 26).
+The sandbox expands the rules into the files that exist when it is built, so a worktree made later
+is not in its list, nor is a file created later. Measured on 2026-10-03 from a session in the dev
+container, on a directory `.claude/worktrees/probe/.claude` created after that session started:
+sandboxed Bash wrote `settings.json` there, and the Write tool was refused ("denied by your
+permission settings"), because Claude Code matches a permission rule when the tool is called rather
+than by enumerating paths. The same session's sandboxed Bash could also write its own worktree's
+existing `.claude/settings.json`, while the main checkout's was refused. A hook planted that way runs
+unsandboxed in the next session started in that directory. Closing the Bash half means changing what
+the sandbox protects: a `/**` directory rule per harness directory, or worktree `.claude/`
+directories made read-only. That is yours to decide (it is managed settings), so it is recorded here
+rather than done.
+
+**Bash is covered separately and always was.** The sandbox's blanket `denyRead` of `~` hides this
+tree from Bash regardless; naming a path in a deny rule is in fact what *exposed* it, which is why
+`~/.claude/todos` was invisible while `~/.claude/projects` was not.
+
+**There is no permissions rule for the tree, and a second trap is why.** The first cut kept
+`Read(~/.claude/projects)` and its `.claude-state` spelling beside the hook, as a belt to its
+brace, on the theory that a rule naming a directory names only the directory. The smoke test in the
+rebuilt container disproved it on the first try: a `Read` of a transcript was refused *by the
+hook*, quoting its reason text — and a `Read` of `<slug>/memory/MEMORY.md`, which the hook had
+allowed, was refused anyway, with `File is in a directory that is denied by your permission
+settings`. **Claude Code applies a directory rule to its whole subtree.** Any permissions rule broad
+enough to cover the transcripts therefore covers memory, which is the same property that made this
+a hook in the first place. So there is no belt to add.
+
+The guards had the same wrong belief. `memory_shadow` and the `check-config.sh` memory arm matched
+the bare pattern only (bash `case` semantics), so both read the belt rules as clear. They now match
+`$pat` **and** `$pat/*`, and turned red on exactly those two rules before they were removed.
+
+**Measured in the rebuilt container, 2026-09-30.** A session cannot see bubblewrap's own command
+line (it is PID 2 in the sandbox's namespace), but it can see the deny list Claude Code hands it:
+before the change that list carried the transcripts one by one and ended `"... and 439 more"`;
+after, it carried no transcript at all — only the two bare-directory rules this section goes on to
+remove, one entry each. In the same container, a `Read` of a transcript was refused by the hook with
+its reason text, which is the only evidence that Claude Code honours this hook's `deny` for the
+file tools — the self-test proves the script decides correctly, not that the harness obeys it.
+
+**The sweep's projection did not fall, and that is not a contradiction.** It never read the deny
+list; it modelled it from the file count, so it went on reporting ~69,000 bytes of a list that no
+longer existed, and verify.sh read that as over budget. The sweep now asks, before it budgets
+anything, whether a settings layer carries a rule that is enumerated per match *and* covers a
+transcript. Since review round 27 the layers asked are managed settings and their drop-ins only;
+user and project layers were asked before that (see *It reads only the image's own layers*). Both halves: the first
+version asked only about rules under `projects/`, which missed `Read(~/.claude/**/*.jsonl)`, and
+"does anything expand" alone would be fooled by the `~/repos/**` rules, which expand but name no
+transcript. See the next section.
+
 ## Transcripts are swept by byte budget, not by age
+
+*Superseded as the defence on 2026-09-30, kept as the backstop.* Everything below describes the
+posture the sweep was written against, when the sandbox enumerated every transcript. On the posture
+that ships, no rule names a transcript, and the sweep stands down and archives nothing. It runs again
+only if the managed settings or a drop-in brings back a rule that enumerates transcripts. The section above, on the
+hook, is the current design.
 
 Every Bash tool call in every container session failed at spawn with `E2BIG`. Not degraded —
 total, from the first call, in a container that had worked the week before, with nothing in the
@@ -1642,7 +2253,12 @@ tree's copy of the script. It feeds the sweep to `docker exec -i … bash -s` on
 > the four older scripts. Only a rebuilt image carries a new file, nothing forces a rebuild, so
 > `bash` would have exited 127 — the trigger dead on every live container, reported once into
 > `reap.log` and deduped for ever, with every gate green. Embedding removes the second copy instead
-> of guarding it: no drift, no rebuild, no path for two files to agree about.
+> of guarding it: no drift, no rebuild, no path for two files to agree about. **Since the kit there
+> are two copies again:** `run.sh` and `verify.sh` run the kit mirror's sweep, and the reaper runs the
+> one compiled into `jkb`. They differ only when the binary and the kit come from different
+> checkouts, such as `setup.sh` run in a linked worktree, which builds that branch's `jkb` and leaves
+> the kit on main. That is accepted for a backstop that stands down on the shipped posture
+> (review round 11; `transcripts.rs`'s module docs say why the reaper does not exec the mirror's copy).
 
 The container's **name** must agree across the two files that spell it, and it is **silent when
 wrong**: a reaper poking a name nothing creates reports nothing for ever — the same end state as
@@ -1715,8 +2331,10 @@ The fix removes the possibility rather than guarding it, which is this directory
 script is embedded in the `jkb` binary with `include_str!` (the crate already reaches out of itself
 this way for `.claude/commands/*.md`) and fed to `docker exec -i … bash -s` on **stdin**. There is
 then no copy in the image to drift, no rebuild to require, and no path for two files to agree about —
-the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was built from. It is written
-from a thread, because the script is 74KB against a 64KB pipe buffer and `bash -s` executes as it
+the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was built from. (The kit's
+mirror is a second copy now; see the superseded note above.) It is written
+from a thread, because the script is well over a 64KB pipe buffer (`wc -c` it; it was 74KB when
+this was written, and a dated figure here went stale within a day) and `bash -s` executes as it
 reads: a blocking write from the main thread deadlocks the moment the child pauses to run a `find`.
 
 Two things the same round caught about the tick itself. It had **no timeout**, and it runs *before*

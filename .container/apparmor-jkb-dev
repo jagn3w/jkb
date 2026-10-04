@@ -37,7 +37,9 @@
 # by being reachable only inside the user namespace, and noted as the next tightening.
 #
 # LOADING IT IS A HOST ACTION and needs root, so a container cannot do it for itself:
-#     sudo apparmor_parser -r -W .container/apparmor-jkb-dev
+#     sudo apparmor_parser -r -W ~/.local/share/jkb-container-kit/kit/.container/apparmor-jkb-dev
+#   -- the KIT's copy, which agents cannot write; root loading the checkout's would load policy an agent
+#   could have edited (review round 30).
 # run.sh checks it is loaded and refuses with that command rather than falling back to
 # docker-default, which would start a container whose nested sandbox silently does not work --
 # the state this whole change exists to end.

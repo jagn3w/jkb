@@ -1,10 +1,9 @@
 {
+  "sandbox": { "enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false },
   "permissions": {
     "deny": [
       "Read(~/.jkb-container/**)",
       "Read(~/.jkb-container)",
-      "Read(~/.claude/projects/**/*.jsonl)",
-      "Read(~/.claude-state/projects/**/*.jsonl)",
       "Edit(~/repos/**/.claude/settings.json)",
       "Edit(~/repos/**/.claude/settings.local.json)",
       "Edit(~/repos/**/.claude/hooks/**)",
@@ -19,7 +18,8 @@
   },
   "hooks": {
     "PreToolUse": [
-      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] },
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "/usr/local/bin/deny-transcripts.sh", "timeout": 10 }] }
     ],
     "PostToolUse": [
       { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }

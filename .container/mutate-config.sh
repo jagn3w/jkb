@@ -42,6 +42,10 @@ seed() {
     # has none — so without this the mutation below could not be watched failing.
     mkdir -p "$work/t/ui/vscode"
     cp "$repo/ui/vscode/package.json" "$work/t/ui/vscode/"
+    # ...and the repo's committed Claude settings, whose `env` check-config.sh holds to the names the
+    # container sets.
+    mkdir -p "$work/t/.claude"
+    cp "$repo/.claude/settings.json" "$work/t/.claude/"
     # ...and jkb-daemon's DEFAULT_ADDR, which check-config.sh holds the firewall's daemon port to.
     mkdir -p "$work/t/crates/jkb-daemon/src"
     cp "$repo/crates/jkb-daemon/src/lib.rs" "$work/t/crates/jkb-daemon/src/"
@@ -428,9 +432,9 @@ run "a transcript that raced away is counted as a failure again" "counts a trans
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'bash .container/sweep-transcripts.sh || true'
+old = 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh" || true'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'JKB_DENY_BUDGET_BYTES=99999999 bash .container/sweep-transcripts.sh || true', 1))
+open(p, 'w').write(s.replace(old, 'JKB_DENY_BUDGET_BYTES=99999999 bash "$DC_CTR_KIT/.container/sweep-transcripts.sh" || true', 1))
 PYX
 run "run.sh wires the self-test budget seam into the container" "sets JKB_DENY_BUDGET_BYTES"
 
@@ -585,9 +589,9 @@ run "the reaper stops embedding the sweep" "no longer embeds the sweep"
 seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = '"exec", "-i", "-e", &keep, name, "bash", "-s"'
+old = '"exec", "-i", "-e", &keep, name, "/bin/bash", "-s"'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, '"exec", name, "bash", "/usr/local/bin/sweep-transcripts.sh"', 1))
+open(p, 'w').write(s.replace(old, '"exec", name, "/bin/bash", "/usr/local/bin/sweep-transcripts.sh"', 1))
 PYX
 run "the reaper goes back to a path inside the container" "no longer feeds the sweep in on stdin"
 
@@ -736,9 +740,9 @@ run "the sweep gains a success exit with no phrase behind it" "success exits, pi
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -w "$ctr_repo" "$NAME" bash .container/verify.sh'
+old = 'in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/verify.sh"'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" bash .container/verify.sh', 1))
+open(p, 'w').write(s.replace(old, 'in_container -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/verify.sh"', 1))
 PYX
 run "verify.sh measures a different tree from the one the sweep acted on" "verify.sh is measured without the live-session list"
 
@@ -834,9 +838,9 @@ run "the irreducible measure is renamed, so the guard reads nothing" "no transcr
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'bash .container/verify.sh'
+old = 'bash "$DC_CTR_KIT/.container/verify.sh"'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'bash .container/verify-renamed.sh', 1))
+open(p, 'w').write(s.replace(old, 'bash "$DC_CTR_KIT/.container/verify-renamed.sh"', 1))
 PYX
 run "run.sh has no verify statement to order the sweep against" "no verify.sh statement to order it against"
 
@@ -892,7 +896,7 @@ seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
 lines = s.split('\n')
-hit = [i for i, l in enumerate(lines) if 'bash .container/sweep-transcripts.sh' in l and not l.lstrip().startswith('#')]
+hit = [i for i, l in enumerate(lines) if 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"' in l and not l.lstrip().startswith('#')]
 assert len(hit) == 1, "mutation target absent"
 del lines[hit[0]]
 open(p, 'w').write('\n'.join(lines))
@@ -907,7 +911,7 @@ def only(needle):
     hit = [i for i, l in enumerate(lines) if needle in l and not l.lstrip().startswith('#')]
     assert len(hit) == 1, "mutation target absent"
     return hit[0]
-sweep, verify = only('bash .container/sweep-transcripts.sh'), only('bash .container/verify.sh')
+sweep, verify = only('bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"'), only('bash "$DC_CTR_KIT/.container/verify.sh"')
 assert sweep < verify, "mutation target absent"
 line = lines.pop(sweep)
 lines.insert(verify, line)
@@ -923,9 +927,9 @@ run "the sweep moves after the verify, where a failing assertion disables it" "A
 seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys
 p = sys.argv[1]; s = open(p).read()
-old = 'bash .container/sweep-transcripts.sh || true'
+old = 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh" || true'
 assert old in s, "mutation target absent"
-open(p, 'w').write(s.replace(old, 'bash .container/sweep-transcripts.sh', 1))
+open(p, 'w').write(s.replace(old, 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"', 1))
 PYX
 run "the sweep invocation stops being non-fatal" "does not append \`|| true\` to it"
 
@@ -1255,7 +1259,7 @@ seed; python3 - "$work/t/.container/run.sh" <<'PYX'
 import sys, re
 p = sys.argv[1]; s = open(p).read()
 out = [l for l in s.split("\n")
-       if not re.match(r'^\s*(in_container|docker exec).*bash \.container/verify\.sh', l)]
+       if not re.match(r'^\s*(in_container|docker exec).*bash "\$DC_CTR_KIT/\.container/verify\.sh"', l)]
 assert len(out) < len(s.split("\n")), "no verify invocation line to delete"
 open(p, 'w').write("\n".join(out))
 PYX
@@ -1298,7 +1302,7 @@ import sys
 p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('"/usr/local/lib/jkb-hook/jkb workflow next --stop-hook"', '"jkb workflow next --stop-hook"', 1))
 PYX
-run "a managed hook runs jkb found on PATH" "does not run /usr/local/lib/jkb-hook/jkb"
+run "a managed hook runs jkb found on PATH" "runs neither pinned root-owned program"
 
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
@@ -1306,6 +1310,838 @@ p = sys.argv[1]; s = open(p).read()
 open(p, 'w').write(s.replace('"hooks": {', '"hooks_moved": {', 1))
 PYX
 run "the managed hooks cannot be read" "no hook commands could be read"
+
+# THE TRANSCRIPT DENY (2026-09-30), which is a HOOK because a glob cannot be both cheap and
+# correct here. A `Read(...*.jsonl)` glob is named per-matching-file in the bubblewrap argv (206
+# files = 52% of MAX_ARG_STRLEN, and past it every Bash call dies at spawn); the collapsing
+# `projects/**` form is cheap and swallows auto-memory, which fails SILENTLY. Both dead ends are
+# pinned below alongside the wiring of the hook that replaced them, because with the globs gone
+# the hook is the only thing left holding the boundary.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["hooks"]["PreToolUse"] = [h for h in d["hooks"]["PreToolUse"] if "deny-transcripts.sh" not in json.dumps(h)]
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the transcript hook is unwired" "no longer runs /usr/local/bin/deny-transcripts.sh"
+
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("COPY --chown=root:root deny-transcripts.sh /usr/local/bin/deny-transcripts.sh\n", "", 1))
+PYX
+run "the transcript hook is not installed" "does not install deny-transcripts.sh root-owned"
+
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("COPY --chown=root:root deny-transcripts.sh", "COPY deny-transcripts.sh", 1))
+PYX
+run "the transcript hook is installed agent-writable" "does not install deny-transcripts.sh root-owned"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+for h in d["hooks"]["PreToolUse"]:
+    if "deny-transcripts.sh" in json.dumps(h): h["matcher"] = "Read"
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the hook misses the tools that can also read" "transcript hook's matcher is [Read]"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects/**/*.jsonl)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a per-file deny glob comes back" "is enumerated per match"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the collapsing shape swallows auto-memory" "covers ~/.claude/projects/<slug>/memory"
+
+# THE BARE-DIRECTORY BELT, which is the shape that actually shipped and broke memory in a real
+# container -- and which the memory arm passed until it matched `$pat/*` as well as `$pat`.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a bare directory rule covers auto-memory's subtree" "covers ~/.claude/projects/<slug>/memory"
+
+# THE REVIEW ROUND'S ROWS (2026-10-01): each one a guard the first cut had and could not fire.
+# `Edit` is a substring of `NotebookEdit`, so a substring matcher check passed a matcher without Edit.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"matcher": ".*"', '"matcher": "Read|Edit|Write|Grep|Glob"', 1))
+PYX
+run "the hook matcher is narrowed back to an allowlist" "transcript hook's matcher is [Read|Edit|Write|Grep|Glob]"
+
+# Claude Code's absolute spelling of the bare-directory rule that drops MEMORY.md.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(//home/vscode/.claude/projects)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a //absolute bare-directory rule covers auto-memory" "covers ~/.claude/projects/<slug>/memory"
+
+# A mid-path ** with a literal tail is enumerated per match; only the seven named rules may be.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/repos/**/.env)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a new mid-path ** rule outside the named seven" "is enumerated per match"
+
+# The hook file itself gone from the tree the Dockerfile copies.
+seed; rm -f "$work/t/.container/deny-transcripts.sh"
+run "the transcript hook file is missing" "there is no .container/deny-transcripts.sh"
+
+# The shared reader renamed in the sweep: both loaders must fail loudly, not pass on nothing.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("posture_rule_covers() {", "posture_rule_covers_renamed() {", 1))
+PYX
+run "the shared deny-rule reader cannot be loaded" "could not be loaded from sweep-transcripts.sh"
+
+# REVIEW ROUND 2. The .claude-state spelling of the memory probe had never been made to fail: every
+# row used ~/.claude/projects, and deleting the second probe left all of them CAUGHT.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude-state/projects/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a subtree rule over the .claude-state spelling covers auto-memory" "covers ~/.claude/projects/<slug>/memory"
+
+# The bare-directory rule with a trailing slash: canonicalised, it is the same rule.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["permissions"]["deny"].append("Read(~/.claude/projects/)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a bare-directory rule with a trailing slash covers auto-memory" "covers ~/.claude/projects/<slug>/memory"
+
+# A commented-out COPY ships an image without the hook; a raw grep passed it.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("COPY --chown=root:root deny-transcripts.sh", "# COPY --chown=root:root deny-transcripts.sh", 1))
+PYX
+run "the hook's COPY is commented out" "does not install deny-transcripts.sh root-owned"
+
+# REVIEW ROUND 3. With no deny rule naming the tree, an allow entry reaching it opens it to Bash.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowRead"].append("~/.claude")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a sandbox allowRead entry widened to ~/.claude" "reaches the transcript tree"
+
+# The hook's roots lose CLAUDE_CONFIG_DIR: the sweep still honours it, the hook does not.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/projects"}', '', 1))
+PYX
+run "the hook forgets CLAUDE_CONFIG_DIR" "disagree about where the transcript tree is"
+
+# A helper the reader uses goes missing: the load guard must fail, not the reader pass on nothing.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("posture_hook_matcher() {", "posture_hook_matcher_renamed() {", 1))
+PYX
+run "the shared matcher definition is renamed" "could not be loaded from sweep-transcripts.sh"
+
+# REVIEW ROUND 4. The unsandboxed hook must not trust PATH: an env shebang, or no PATH reset.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("#!/bin/bash -p\n", "#!/usr/bin/env bash\n", 1))
+PYX
+run "the hook's shebang goes back to env" "not an absolute bash"
+
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("PATH=/usr/bin:/bin\nexport PATH\n", "", 1))
+PYX
+run "the hook stops fixing PATH" "does not fix PATH before it runs anything"
+
+# REVIEW ROUND 7. Losing `-p` alone keeps the shebang absolute and lets BASH_ENV in.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace("#!/bin/bash -p\n", "#!/bin/bash\n", 1))
+PYX
+run "the hook's shebang loses -p" "not an absolute bash in privileged mode"
+
+# The sweep's PATH pin, and the absolute bash at each place an unsandboxed script is started.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('[ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }\n', "", 1))
+PYX
+run "the sweep stops pinning PATH" "the sweep's first command does not pin PATH"
+
+# REVIEW ROUND 8. The pin back in the real-run arm: still present, and too late for date and stat.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace('[ "${1:-}" = --self-test ] || { PATH=/usr/bin:/bin; export PATH; }\n', "", 1)
+open(p, 'w').write(s.replace('    ""|--dry-run)\n', '    ""|--dry-run)\n        PATH=/usr/bin:/bin\n        export PATH\n', 1))
+PYX
+run "the sweep's PATH pin moves back into the real-run arm" "the sweep's first command does not pin PATH"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('/bin/bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"', 'bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"', 1))
+PYX
+run "run.sh starts the sweep with a bare bash" "run.sh does not start sweep-transcripts.sh with /bin/bash"
+
+# REVIEW ROUND 8. Every exec in run.sh, not only the sweep's and verify's.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container -e PATH=/usr/bin:/bin -w "$ctr_repo" "$NAME" /usr/local/lib/jkb-hook/jkb task reap || true'
+assert old in s
+open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" bash -lc \'jkb task reap || true\' || true', 1))
+PYX
+run "the reap goes back to a login bash found on PATH" "by PATH lookup"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container -e PATH=/usr/bin:/bin -w "$ctr_repo" "$NAME" /bin/bash -c'
+assert old in s
+open(p, 'w').write(s.replace(old, 'in_container -w "$ctr_repo" "$NAME" /bin/bash -c', 1))
+PYX
+run "the login step stops pinning PATH for what its shell runs" "without -e PATH=/usr/bin:/bin"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'in_container "$NAME" /usr/bin/sudo -n'
+assert old in s
+open(p, 'w').write(s.replace(old, 'in_container "${NAME}" sudo -n', 1))
+PYX
+run "an exec spelled so the scan cannot see it" "has a container exec the scan cannot read"
+
+# The two exec branches round 7 added and left unmutated.
+seed; python3 - "$work/t/crates/jkb-cli/src/transcripts.rs" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"exec", "-i", "-e", &keep, name, "/bin/bash", "-s"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"exec", "-i", "-e", &keep, name, "bash", "-s"', 1))
+PYX
+run "the reaper's docker exec finds bash on PATH" "the reaper's docker exec does not name /bin/bash"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('/bin/bash "$DC_CTR_KIT/.container/verify.sh"', 'bash "$DC_CTR_KIT/.container/verify.sh"', 1))
+PYX
+run "run.sh starts verify.sh with a bare bash" "run.sh does not start verify.sh with /bin/bash"
+
+# REVIEW ROUNDS 8-9. ~/.jq: one HOME=/dev/null wrapper per unsandboxed script, never bypassed.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'jq() { HOME=/dev/null command jq "$@"; }\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "the sweep loses its jq wrapper" "does not define the HOME=/dev/null jq wrapper"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'jq() { HOME=/dev/null command jq "$@"; }\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "verify.sh loses its jq wrapper" "does not define the HOME=/dev/null jq wrapper"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'mem_match="$(HOME=/dev/null jq -r'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'mem_match="$(command jq -r', 1))
+PYX
+run "verify.sh calls jq around its wrapper" "calls jq around its wrapper"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "perm) HOME=/dev/null jq -r"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "perm) /usr/bin/jq -r", 1))
+PYX
+run "the sweep names jq by absolute path" "calls jq around its wrapper"
+
+# REVIEW ROUND 9. An ADDED exec the scan cannot read is a failure, not a skip.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'say "login state"\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, old + 'in_container --user root "$CONTAINER" bash -c true\n', 1))
+PYX
+run "an exec added with a container the scan cannot read" "has a container exec the scan cannot read"
+
+# The archive is a root of the hook's.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '/.claude-state/transcript-archive"'
+assert s.count(old) == 3, "mutation target absent"
+open(p, 'w').write(s.replace(old, '/.claude-state/elsewhere"'))
+PYX
+run "the hook forgets the transcript archive" "hook:.claude-state/transcript-archive"
+
+# THE KIT (review round 8's self-review). What runs unsandboxed comes from the kit, never the checkout.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '/bin/bash "$DC_CTR_KIT/.container/setup.sh"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '/bin/bash .container/setup.sh', 1))
+PYX
+run "run.sh runs setup.sh from the checkout again" "runs a script from the checkout's .container/"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = """/bin/bash -c '. "$1" && dc_persist_login' _ "$DC_CTR_KIT/.container/lib.sh" \\\n    || say"""
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, """/bin/bash -c '. .container/lib.sh && dc_persist_login' \\\n    || say""", 1))
+PYX
+run "the login step sources the checkout's lib.sh again" "runs a script from the checkout's .container/"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"$docker" exec -i -u root -e PATH=/usr/bin:/bin "$name" /bin/sh -c \''
+assert s.count(old) == 2, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"$docker" exec -i -u root "$name" sh -c \'', 1))
+PYX
+run "the hook mirror's root step finds sh on PATH again" "starts [sh] by PATH lookup"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"$docker" exec -e PATH=/usr/bin:/bin "$name" /bin/mkdir -p'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"$docker" exec "$name" /bin/mkdir -p', 1))
+PYX
+run "the hook mirror's mkdir stops pinning PATH" "without -e PATH=/usr/bin:/bin"
+
+seed; python3 - "$work/t/.container/verify.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'if "$kit_dc/scripts/auto-mode.sh" check'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'if "$mem_repo/scripts/auto-mode.sh" check', 1))
+PYX
+run "verify.sh runs the checkout's auto-mode.sh again" "reaches the checkout's scripts"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ' scripts/auto-mode.sh scripts/auto-mode-posture.json'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, ' scripts/auto-mode-posture.json', 1))
+PYX
+run "the kit stops carrying a script verify.sh runs" "which the kit does not carry"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    printf '%s\\n' .container scripts/lib.sh"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "    : printf '%s\\n' .container scripts/lib.sh", 1))
+PYX
+run "the kit list prints nothing" "dc_kit_paths printed nothing"
+
+# REVIEW ROUND 10. No agent can write the kit, and the fingerprint strips the root it was assembled from.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowWrite"].append("~/.local/share")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture lets sandboxed Bash write over the kit" "covers ~/.local/share/jkb-container-kit"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.local/share/jkb-container-kit/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on the kit" "so the in-process file tools can write it"
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'DC_KIT_HOME="$HOME/.local/share/jkb-container-kit"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'DC_KIT_HOME="$HOME/.jkb/container-kit"', 1))
+PYX
+run "the kit moves back under ~/.jkb" "covers ~/.jkb/container-kit"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'want_hash="$(fingerprint "$args_root" '
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'want_hash="$(fingerprint "$repo" ', 1))
+PYX
+run "the fingerprint strips a different root from the one the arguments came from" "do not both use"
+
+# REVIEW ROUND 11. run.sh runs as you on the host: an absolute shebang (and, since round 27, a built PATH).
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert s.startswith("#!/bin/bash -p\n"), "mutation target absent"
+open(p, 'w').write("#!/usr/bin/env bash\n" + s[len("#!/bin/bash -p\n"):])
+PYX
+run "run.sh's shebang goes back to env" "shebang is not #!/bin/bash -p"
+
+# REVIEW ROUND 21. ...and privileged mode, or the launching terminal's BASH_ENV runs first.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+assert s.startswith("#!/bin/bash -p\n"), "mutation target absent"
+open(p, 'w').write("#!/bin/bash\n" + s[len("#!/bin/bash -p\n"):])
+PYX
+run "run.sh's shebang drops -p" "shebang is not #!/bin/bash -p"
+
+# REVIEW ROUND 22. ...and its PATH takes no keep list from the environment.
+
+
+seed; python3 - "$work/t/.container/lib.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'DC_KIT_HOME="$HOME/.local/share/jkb-container-kit"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'DC_KIT_HOME="${JKB_CONTAINER_KIT_HOME:-$HOME/.local/share/jkb-container-kit}"', 1))
+PYX
+run "lib.sh lets the environment move the kit again" "lets JKB_CONTAINER_KIT_HOME move the kit"
+
+# REVIEW ROUND 23. Every piece of the physical comparison, the env re-exec, and where path-keep lives.
+
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'exec /usr/bin/env -i "${jkb_env[@]}" /bin/bash -p "$0" --jkb-clean-env "$@"; '
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "run.sh stops re-executing under an allowlisted environment" "does not rebuild its environment"
+
+# REVIEW ROUND 27. run.sh BUILDS its PATH and environment; it takes neither from the launching shell.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" '
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'jkb_path="$jkb_path:$PATH"; jkb_env=("HOME=$jkb_home" "PATH=$jkb_path" ', 1))
+PYX
+run "run.sh appends the inherited PATH to the one it builds" "builds its PATH from the inherited one"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'case "$jkb_n" in TERM|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'case "$jkb_n" in PATH|TERM|', 1))
+PYX
+run "run.sh's environment allowlist keeps the inherited PATH" "names a variable that steers what its children run"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '|DOCKER_CONTEXT|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '|DOCKER_HOST|DOCKER_CONTEXT|', 1))
+PYX
+run "run.sh's environment allowlist keeps DOCKER_HOST again" "names a variable that steers what its children run"
+
+# REVIEW ROUND 34. run.sh's HOME is the account's, built, never inherited.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'case "$jkb_n" in TERM|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'case "$jkb_n" in HOME|TERM|', 1))
+PYX
+run "run.sh's environment allowlist keeps the inherited HOME again" "names a variable that steers what its children run"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'jkb_home="$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)"'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'jkb_home="$HOME"', 1))
+PYX
+run "run.sh takes its home from the environment again" "does not rebuild its environment"
+
+# REVIEW ROUND 35. The installed hook refuses --self-test before staging any copy.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '    if [ "$dt_installed" = 1 ]; then\n        echo "the installed hook does not run its self-test'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '    if false; then\n        echo "the installed hook does not run its self-test', 1))
+PYX
+run "the installed hook runs its self-test again" "does not refuse --self-test before staging copies"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '|DOCKER_CONTEXT|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '|DOCKER_CONFIG|DOCKER_CONTEXT|', 1))
+PYX
+run "run.sh's environment allowlist lets DOCKER_CONFIG through" "names a variable that steers what its children run"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'jkb_keepf="$jkb_home/.local/share/jkb-container-kit/path-keep"'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'jkb_keepf="$jkb_home/.config/jkb/path-keep"', 1))
+PYX
+run "run.sh reads its PATH keep list from outside the kit home" "not from the kit home"
+
+# REVIEW ROUND 24. The allowlist keeps the documented overrides, and a custom image is always built.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '|JKB_CONTAINER_NAME|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '|', 1))
+PYX
+run "run.sh's environment allowlist drops JKB_CONTAINER_NAME" "reads JKB_CONTAINER_NAME but its environment allowlist drops it"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '|JKB_RUN_FROM_CHECKOUT|'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '|', 1))
+PYX
+run "run.sh's environment allowlist drops JKB_RUN_FROM_CHECKOUT" "reads JKB_RUN_FROM_CHECKOUT but its environment allowlist drops it"
+
+
+# REVIEW ROUND 26. The sweep's INPUTS must name every JKB_ variable it reads, whatever the operator.
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'INPUTS="$SEAMS JKB_KEEP_SESSIONS JKB_REPO_ROOT"'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'INPUTS="$SEAMS JKB_KEEP_SESSIONS"', 1))
+PYX
+run "the sweep's INPUTS stops naming JKB_REPO_ROOT, which it reads with :+" "INPUTS declares"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = ' || [ "$IMAGE" != jkb-dev ]'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "run.sh runs an existing custom image without building it" "without building it from the kit"
+
+
+# The transcript archive is one of the roots the allow-list guard protects.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowRead"].append("~/.claude-state/transcript-archive")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "an allowRead entry over the transcript archive" "reaches the transcript tree"
+
+seed; python3 - "$work/t/.container/sweep-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '"~/.claude-state/transcript-archive"\n}'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, '"~/.claude-state/transcript-archive" "~/.claude-state/elsewhere"\n}', 1))
+PYX
+run "the shared root list names a root the hook does not" "hook:.claude-state/elsewhere"
+
+# A Claude settings `env` must not replace what the container sets (2026-10-02: a Mac PATH did).
+seed; python3 - "$work/t/.claude/settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("env", {})["PATH"] = "/Users/me/.cargo/bin:/usr/bin:/bin"
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the repo's settings set env.PATH" "sets env that the container itself sets"
+
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "ENV PATH=/home/vscode/.local/bin:/home/vscode/.cargo/bin:$PATH\n"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "the image's ENV PATH can no longer be found" "environment names the container sets could not be derived"
+
+# REVIEW ROUND 12. run.sh's jq wrapper, and the macOS temp root in its PATH filter.
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'jq() { HOME=/dev/null command jq "$@"; }\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "run.sh loses its jq wrapper" "run.sh does not define the HOME=/dev/null jq wrapper"
+
+
+# REVIEW ROUND 14. The Homebrew prefixes run.sh keeps, and allow entries read as the sandbox reads them.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(//usr/local/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on /usr/local" "no Edit(//usr/local/**) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowWrite"].append("~/.local/**")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a glob allowWrite entry over the kit" "covers ~/.local/share/jkb-container-kit"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowWrite"].append("/Users/someone/.local/share")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "an absolute allowWrite entry over the kit" "covers ~/.local/share/jkb-container-kit"
+
+# REVIEW ROUND 15. Every place run.sh's trust rests on, and the kit checked before it is mirrored.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowWrite"].append("/opt/homebrew")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "an allowWrite entry over /opt/homebrew" "covers /opt/homebrew"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(//opt/homebrew/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on /opt/homebrew" "no Edit(//opt/homebrew/**) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.cargo/env)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on ~/.cargo/env" "no Edit(~/.cargo/env) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.zshenv)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on ~/.zshenv" "no Edit(~/.zshenv) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.zlogout)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on ~/.zlogout" "no Edit(~/.zlogout) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/Library/Application Support/Code/User/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on VS Code's macOS user settings" "no Edit(~/Library/Application Support/Code/User/**) deny"
+
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["permissions"]["deny"].remove("Edit(~/.config/git/**)")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the posture stops denying Edit on git's global config directory" "no Edit(~/.config/git/**) deny"
+
+seed; python3 - "$work/t/.container/run.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'kit_odd="$(dc_unsafe_entries "$kit_src")"\n'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'kit_odd=""\n', 1))
+PYX
+run "run.sh stops checking the kit before mirroring it" "does not check the kit with dc_unsafe_entries"
+
+# REVIEW ROUND 19. The served checkout through dc_repo_root alone.
+seed; python3 - "$work/t/.container/setup.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'repo="$(dc_repo_root "$kit")"'
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, 'repo="${JKB_REPO_ROOT:-$kit}"', 1))
+PYX
+run "setup.sh derives the checkout itself again" "derives the checkout itself"
+
+# A per-file transcript glob in sandbox.filesystem.denyRead reaches the same argv.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("sandbox", {}).setdefault("filesystem", {}).setdefault("denyRead", []).append("~/.claude/projects/**/*.jsonl")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a per-file glob in sandbox.filesystem.denyRead" "is enumerated per match"
+
+# An ABSOLUTE allow entry under a home reaches the tree as surely as a ~ one.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowRead"].append("/home/vscode/.claude")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "an absolute allowRead entry over ~/.claude" "reaches the transcript tree"
+
+# The roots extraction reads nothing: the agreement check must say so, not pass.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('\nroot_list=()\n', '\nroot_list_moved=()\n', 1))
+PYX
+run "the hook's roots can no longer be found" "transcript roots could not be found"
+
+# REVIEW ROUND 5. Allow arrays merge across layers: an entry in the MANAGED file opens the tree too.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("sandbox", {}).setdefault("filesystem", {}).setdefault("allowRead", []).append("~/.claude")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a managed allowRead entry over ~/.claude" "reaches the transcript tree"
+
+# denyWrite is enumerated per match, as denyRead is.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("sandbox", {}).setdefault("filesystem", {}).setdefault("denyWrite", []).append("~/.claude/projects/**/*.jsonl")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a per-file glob in sandbox.filesystem.denyWrite" "is enumerated per match"
+
+# REVIEW ROUND 6. An allow entry spelled as a glob is its literal base: `~/.claude/**` opens the tree.
+seed; python3 - "$work/t/scripts/auto-mode-posture.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["require"]["sandbox"]["filesystem"]["allowRead"].append("~/.claude/**")
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "a sandbox allowRead glob over ~/.claude" "reaches the transcript tree"
+
+# MCP tools run unsandboxed and take paths; a matcher without them leaves every one unguarded.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"matcher": ".*"', '"matcher": "mcp__.*"', 1))
+PYX
+run "the hook matcher covers MCP tools only" "transcript hook's matcher is [mcp__.*]"
+
+# REVIEW ROUND 27. The hook's deadline must end before Claude Code's timeout kills it.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '"command": "/usr/local/bin/deny-transcripts.sh", "timeout": 10'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '"command": "/usr/local/bin/deny-transcripts.sh", "timeout": 5', 1))
+PYX
+run "the hook's managed timeout drops under its deadline" "does not end before its managed timeout"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '"command": "/usr/local/bin/deny-transcripts.sh", "timeout": 10'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '"command": "/usr/local/bin/deny-transcripts.sh", "timeout": 7.5', 1))
+PYX
+run "the hook's managed timeout is a fraction under its deadline" "does not end before its managed timeout"
+
+# REVIEW ROUND 32. The hook's own idea of its install path must be the managed hook command.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = 'DT_INSTALLED_PATH=/usr/local/bin/deny-transcripts.sh'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, 'DT_INSTALLED_PATH=/usr/local/lib/deny-transcripts.sh', 1))
+PYX
+run "the hook's DT_INSTALLED_PATH drifts from the managed command" "DT_INSTALLED_PATH is not the managed hook command"
+
+# The sandbox is pinned on in managed settings (the user's decision after review round 36).
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '"sandbox": { "enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false },'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "the managed settings stop pinning the sandbox" "do not pin sandbox.enabled:true"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '"allowUnsandboxedCommands": false'
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '"allowUnsandboxedCommands": true', 1))
+PYX
+run "the managed settings allow unsandboxed commands" "do not pin sandbox.enabled:true"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '"failIfUnavailable": true, '
+assert o in s, "mutation target absent"
+open(p, 'w').write(s.replace(o, '', 1))
+PYX
+run "the managed settings stop failing when the sandbox is unavailable" "do not pin sandbox.enabled:true"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('"permissions": {', '"permissions_moved": {', 1))
+PYX
+run "the deny rules cannot be read" "examined nothing"
 
 # The two self-test lists (D51.9): drop one from each side in turn.
 seed; python3 - "$work/t/scripts/check.sh" <<'PYX'
@@ -1591,11 +2427,11 @@ PS='< <'
 seed; python3 - "$work/t/.container/run.sh" "$PS" <<'PYX'
 import sys
 p, ps = sys.argv[1], sys.argv[2]; s = open(p).read()
-old = ('ARGS_OUT="$(assembled_args "$repo")" || die "container.json could not be read; '
+old = ('ARGS_OUT="$(assembled_args "$args_root")" || die "container.json could not be read; '
        'refusing to start a container from a partial declaration"\n'
        'while IFS= read -r line; do ARGS+=("$line"); done <<<"$ARGS_OUT"')
 assert old in s, "mutation target absent"
-new = 'while IFS= read -r line; do ARGS+=("$line"); done %s(assembled_args "$repo")' % ps
+new = 'while IFS= read -r line; do ARGS+=("$line"); done %s(assembled_args "$args_root")' % ps
 open(p, 'w').write(s.replace(old, new, 1))
 PYX
 run "run.sh reads its assembly through a process substitution again" "which discards its refusal"
@@ -1695,7 +2531,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=97
+PINNED_BAD_SITES=121
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
@@ -1735,6 +2571,19 @@ else
     # file says must be watched failing. Claiming more than was established, printed by the harness
     # that exists to catch exactly that.
     printf '  %s mentions of sweep_problems behind the sweep guard, count pinned so a new branch must be decided about\n' "$sweep_appends"
+fi
+
+# THE SAME, FOR THE UNSANDBOXED-EXEC GUARD. dc_unsb gathers every way an unsandboxed script can be
+# steered through PATH and emits once, and round 8 found two of its round-7 branches unmutated.
+unsb_appends="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
+    | grep -o 'dc_unsb' | grep -c .)"
+PINNED_UNSB_APPENDS=39
+if [ "$unsb_appends" -ne "$PINNED_UNSB_APPENDS" ]; then
+    fails=$((fails+1))
+    printf '  the exec guard mentions dc_unsb %s time(s), pinned at %s.\n' "$unsb_appends" "$PINNED_UNSB_APPENDS"
+    echo "  They all emit through one \`bad \"\`; add a mutation for the new branch and update PINNED_UNSB_APPENDS."
+else
+    printf '  %s mentions of dc_unsb behind the exec guard, count pinned so a new branch must be decided about\n' "$unsb_appends"
 fi
 
 echo

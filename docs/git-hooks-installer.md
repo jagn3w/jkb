@@ -9,7 +9,9 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the
 conventions every session is expected to know.
 
 - **`scripts/hooks/post-merge`** (installed by `setup.sh`) runs `setup.sh` when the pull
-  touched `crates/`/`ui/`/`scripts/`/`Cargo.*`, then `jkb task close-merged`. It never fails
+  touched `crates/`/`ui/`/`scripts/`/`macos/`/`.container/`/`Cargo.*` (`.container/` so the dev
+  container kit, which `setup.sh` refreshes, follows a pull; see `.container/README.md`), then
+  `jkb task close-merged`. It never fails
   the merge. **Install wrinkle:** `core.hooksPath` set globally *replaces* `.git/hooks`, so
   `setup.sh` also writes a global chainer — without it the repo hook is silently dead.
 - **In the dev container, `setup.sh` rebuilds the binary and stops** (`JKB_REMOTE` set). Once the
@@ -24,7 +26,8 @@ conventions every session is expected to know.
   fourth `skipped` state, because every `skipped` line in the summary names a flag
   (`--no-service`), and that would be false here. Two steps are exceptions: `--link-memory` is valid in the container and
   is honoured, and the VS Code extension has a container counterpart (the explorer
-  `.container/install-extensions.sh` builds), which the exit names instead of calling it the host's. Pinned by
+  `.container/install-extensions.sh` builds, run from the root-owned mirror
+  `/usr/local/lib/jkb-container/.container/`), which the exit names instead of calling it the host's. Pinned by
   `scripts/tests/container-hooks.test.sh`, which runs `setup.sh` with stub `cargo` and `jkb`, and
   asserts `jkb` was asked nothing but its version. That case runs a **copy** of `setup.sh` in a
   scratch repository, with every service manager stubbed. Watching it fail means deleting the very

@@ -1,5 +1,10 @@
 //! Telling the dev container to bound its own Bash-sandbox deny list.
 //!
+//! *Superseded as the defence on 2026-09-30, kept as the backstop:* the transcript deny moved into a
+//! hook (`.container/deny-transcripts.sh`), so on the posture that ships no rule enumerates a
+//! transcript and the sweep stands down. What follows is the posture it was written against;
+//! `.container/README.md` has the record.
+//!
 //! **Why this lives on the host.** Claude Code's Bash sandbox enumerates every session transcript
 //! into one argv, Linux caps one argument at `MAX_ARG_STRLEN`, and a dev container over that limit
 //! fails *every* Bash tool call at spawn with `E2BIG` — total, from the first call, with nothing in
@@ -20,9 +25,15 @@
 //! which **no already-running container has**, because only a rebuilt image carries it and nothing
 //! forces a rebuild. On every live container that exec would have exited 127, been reported once
 //! into `reap.log`, and deduped for ever, with every gate green. So the script is embedded in this
-//! binary at compile time and fed to `bash -s` on stdin. There is then no second copy to drift, no
-//! rebuild to require, and no path to agree about: the reaper runs exactly the sweep the `jkb` that
-//! `setup.sh` installed was built from.
+//! binary at compile time and fed to `bash -s` on stdin. There is then no rebuild to require and no
+//! path to agree about: the reaper runs exactly the sweep the `jkb` that `setup.sh` installed was
+//! built from. **It is one of two copies now.** Since the container kit, `run.sh`'s start sweep and
+//! `verify.sh` run the kit mirror's copy (`.container/README.md`, "Everything unsandboxed runs from
+//! the kit"). They agree when the binary and the kit come from one checkout, and differ when
+//! `setup.sh` runs in a linked worktree: it builds that branch's `jkb` and leaves the kit on the main
+//! checkout. Accepted, not closed: the sweep is a backstop that stands down on the shipped posture,
+//! and making this exec the mirror's copy would leave the stdin writer below pushing the embedded
+//! one at a child that never reads it.
 //!
 //! **It is never fatal, and silent unless something is wrong.** A host with no Docker, or no such
 //! container, or a stopped one, is the ordinary case for anyone not using the dev container and says
@@ -271,8 +282,12 @@ pub fn sweep_with(name: &str, live: &[String], run: Runner<'_>) -> Sweep {
     // Passed as ONE environment variable rather than arguments: `docker exec -e` leaves the script's
     // own argument dispatch alone, and an id list is data, not a flag.
     let keep = format!("{KEEP_SESSIONS_VAR}={}", live.join(" "));
+    // `/bin/bash` BY ABSOLUTE PATH. `docker exec` resolves a bare `bash` through the container's
+    // PATH, which the image starts with the sandbox-writable ~/.cargo/bin and ~/.local/bin -- and
+    // this runs UNSANDBOXED, so a planted `bash` there would run with the container credential
+    // readable (review round 7). The script pins its own PATH on its first real-run line.
     let Some((ok, out, err)) = run(
-        &["exec", "-i", "-e", &keep, name, "bash", "-s"],
+        &["exec", "-i", "-e", &keep, name, "/bin/bash", "-s"],
         Some(SWEEP_SCRIPT),
     ) else {
         // NOT `Absent`. The probe just answered, so Docker is there and the container is running —
@@ -334,7 +349,8 @@ pub fn sweep_dev_container(name: &str, live: &[String]) -> Sweep {
         // EVERY PIPE GETS A THREAD, and all three for the same reason: a pipe nobody is moving
         // blocks whoever is on the other end of it.
         //
-        // The WRITER, because the script is larger than a pipe buffer (74KB against 64KB) and
+        // The WRITER, because the script is well over a 64KB pipe buffer (`wc -c` it; a dated
+        // figure here went stale within a day) and
         // `bash -s` executes as it reads, so a blocking write from here deadlocks the moment the
         // child pauses to run a `find`. The handle is moved in, so the pipe closes when the thread
         // ends and `bash` sees EOF.
@@ -629,7 +645,7 @@ mod tests {
                 "-e",
                 "JKB_KEEP_SESSIONS=",
                 "jkb-dev",
-                "bash",
+                "/bin/bash",
                 "-s"
             ]
         );
@@ -659,7 +675,7 @@ mod tests {
                 "-e",
                 "JKB_KEEP_SESSIONS=aaaa-1111 bbbb-2222",
                 "jkb-dev",
-                "bash",
+                "/bin/bash",
                 "-s"
             ],
             "space-separated, in one variable, as the sweep splits them"

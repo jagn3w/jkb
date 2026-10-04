@@ -66,6 +66,15 @@ RUN apt-get update -qq \
 #    host's, while every other image ENV, JKB_NS_MARKER included, did arrive), and /usr/local/bin
 #    is on every PATH, that one included. Only the named executables are linked; a project's own
 #    come from `bundle exec` or its binstubs.
+#    CAUSE FOUND 2026-10-02, corrected here rather than rewritten: this was recorded as unexplained
+#    harness behaviour, and it was not. The repo's .claude/settings.local.json carried an
+#    `"env": {"PATH": "/Users/<user>/.cargo/bin:..."}` block written for the Mac. Claude Code puts
+#    settings `env` into every session, and that file is in the checkout the host shares, so the
+#    Mac's PATH replaced this image's in container sessions. Only PATH was replaced because only PATH
+#    was in that block, which is why every other ENV arrived. Deleting the block restored the
+#    image's PATH (measured by another session). verify.sh and check-config.sh now refuse a settings
+#    `env` that names any variable this image or containerEnv sets. The linking still stands: it
+#    costs nothing and survives a PATH replaced by any other route.
 #
 # The distro's `postgresql` would create a root-managed `main` cluster that nothing here can start
 # (starting a service needs root), so it is suppressed and each user runs their own with pg_ctl.
@@ -177,12 +186,18 @@ RUN mkdir -p "$(dirname "$JKB_NS_MARKER")" && chown vscode:vscode "$(dirname "$J
 # THE HARNESS'S OWN RULES, WHERE THE MODEL CANNOT REACH THEM (design D52.9, P1). Claude Code reads
 # managed settings from this root-owned path, and nothing a session writes can override them. They
 # add, for every session in this container: the attestation hook that tells jkb serve which agent
-# made each `jkb` call, the workflow Stop hook, and deny rules keeping the model's in-process tools
-# (which the Bash sandbox does not confine) away from the container credential, from session
-# transcripts (a live tool call's ticket is written there), and from the files that configure the
-# harness itself — a hook, an agent definition or an MCP server it could add would run unsandboxed.
+# made each `jkb` call, the workflow Stop hook, the transcript hook below (which keeps every tool
+# away from other sessions' transcripts -- a live tool call's ticket is written there), and deny
+# rules keeping the model's in-process tools (which the Bash sandbox does not confine) away from
+# the container credential and from the files that configure the harness itself -- a hook, an
+# agent definition or an MCP server it could add would run unsandboxed.
 COPY --chown=root:root managed-settings.json /etc/claude-code/managed-settings.json
 RUN chmod 0644 /etc/claude-code/managed-settings.json
+# The transcript deny is a HOOK, not a permissions rule; .container/README.md ("The transcript deny
+# is a hook") has why and the measurements. Root-owned and 0755 for the same reason
+# pin-jkb-hook.sh is: it is the thing that confines the agent, so the agent must not rewrite it.
+COPY --chown=root:root deny-transcripts.sh /usr/local/bin/deny-transcripts.sh
+RUN chmod 0755 /usr/local/bin/deny-transcripts.sh
 # The binary the managed hooks run, root-owned, where nothing in the sandbox can replace it (D52.9):
 # pin-jkb-hook.sh copies setup's build there, run through sudo — which a sandboxed tool call cannot.
 COPY --chown=root:root pin-jkb-hook.sh /usr/local/bin/pin-jkb-hook.sh

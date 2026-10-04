@@ -175,6 +175,7 @@ else
 # entrypoint now boots on: it reads the live chains, so unlike the record it was reading before, it
 # cannot describe a network that no longer exists.
 "$(dirname "$0")/../.container/egress-lib.sh" --self-test
+"$(dirname "$0")/../.container/deny-transcripts.sh" --self-test
 "$(dirname "$0")/../.container/egress-status.sh" --self-test
 
 # ...and verify.sh's exclusion list. The rest of verify.sh needs a container, but RUNTIME_OWNED is
@@ -212,12 +213,23 @@ else
     echo "   (skipped: python3 not installed; CI runs this gate)"
 fi
 
-# ...and the transcript sweep's budget arithmetic. It is what keeps the Bash sandbox's deny list
-# inside one argv (MAX_ARG_STRLEN = 131072 bytes), and getting it wrong is either a container where
-# no Bash call works or a sweep that archives the session it is running in. Pure — records in,
+# ...and the transcript sweep's budget arithmetic. The sweep is now the BACKSTOP, not the defence:
+# .container/deny-transcripts.sh keeps transcripts out of the deny list, and the sweep stands down
+# unless the managed settings or a drop-in bring back a rule that enumerates them, in which case its budget is what
+# keeps the Bash sandbox's deny list inside one argv (MAX_ARG_STRLEN = 131072 bytes). Getting that
+# wrong is a container where no Bash call works, or a sweep that archives a live session. Pure — records in,
 # paths out — and its filesystem half runs against a scratch tree, so no container and no Docker.
-# Outside the jq group deliberately: it reads no container.json.
-"$(dirname "$0")/../.container/sweep-transcripts.sh" --self-test
+# GUARDED ON jq, not in the jq group (it reads no container.json): its posture rows read settings
+# files through jq, and unguarded, a machine without jq failed eleven of them, stopped this script
+# under set -e, and skipped every gate below (review round 10). A named skip, as for python3 above.
+# IN /usr/bin OR /bin, not anywhere on PATH: the self-test's program rows run the sweep with its
+# real-run PATH pin (/usr/bin:/bin), so a Homebrew or nix jq passed a `command -v` gate and then
+# five rows failed (review round 11).
+if [ -x /usr/bin/jq ] || [ -x /bin/jq ]; then
+    "$(dirname "$0")/../.container/sweep-transcripts.sh" --self-test
+else
+    echo "   (skipped: no jq in /usr/bin or /bin, where the sweep's pinned PATH looks; CI runs this gate)"
+fi
 
 # The host/container auto-memory link. Its slug rule is a guess about Claude Code's own private
 # path encoding and its migration step is the only thing here that can lose a file, so both are

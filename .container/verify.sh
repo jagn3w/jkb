@@ -7,6 +7,12 @@
 # but not on one that no longer contains what it should). Each assertion below fails for exactly
 # one such edit.
 set -uo pipefail
+# EVERY jq HERE RUNS WITH HOME WHERE NO FILE CAN BE, the lib.sh functions this script calls
+# included: jq sources $HOME/.jq into every program, and the agent can write $HOME. One wrapper,
+# so no call site has to remember a prefix -- round 8 required the prefix per call and round 9
+# found lib.sh's calls, which no per-call scan of this file could see. check-config.sh requires
+# this line to be the file's first mention of jq.
+jq() { HOME=/dev/null command jq "$@"; }
 
 # The egress verdict path, its `key=value` parser and the verdict-state vocabulary come from here.
 # This script runs from the checkout (`./.container/verify.sh`), which carries egress-lib.sh beside
@@ -247,6 +253,75 @@ ns_verdict() { # ns_verdict <recorded-pid> <recorded-mnt> <observed-pid> <observ
     printf 'ours'
 }
 
+# WHETHER A DENY RULE SWALLOWS AUTO-MEMORY -- a pure function, because the two halves it compares
+# are decided in different files by people solving different problems, and nothing else looks at
+# both. `link-claude-memory.sh` MUST put the link at ~/.claude/projects/<slug>/memory: that is
+# where Claude Code reads memory from, it is not negotiable, and the block further down this file
+# treats "not linked" as FATAL. The pressure on that same tree comes from the other side: keeping
+# one session out of another's transcripts, which is deny-transcripts.sh's job now and was a deny
+# rule's before it. Any rule someone writes to cover transcripts covers memory as well, and
+# NOTHING SAYS SO: memory does not error when it is denied, it
+# goes quiet -- MEMORY.md simply stops arriving in context, which reads like an agent that forgot
+# rather than like a broken container.
+#
+# THE SHAPES ARE ONE CHARACTER APART, which is the whole reason this is checked and not reasoned
+# about. `projects/**/*.jsonl` cannot match `<slug>/memory/MEMORY.md` -- it must end in .jsonl.
+# `projects/**` matches it. The second form is the one that keeps the sandbox argv O(1) (see
+# check-config.sh and the README section on the deny list), so the pressure to write it is real
+# and will recur.
+#
+# Bash's `case` lets `*` cross `/`, so `**` and `*` behave the same here, which over-reports rather
+# than misses. What it does NOT model is spelling, and it once missed for exactly that reason: the
+# claim here used to be "never miss one", and `Read(~/.claude/projects/)` (trailing slash) missed
+# until the shared reader learned to canonicalise. Spellings it knows: `~/`, `//`, a single leading
+# `/` (relative to the settings file), trailing and repeated slashes. A cwd-relative rule cannot be
+# resolved statically and matches nothing absolute.
+#
+# A RULE COVERS ITS SUBTREE, which is Claude Code's semantics and not bash's -- hence `$pat/*` beside
+# `$pat`. This matched the bare pattern only, so `Read(~/.claude/projects)` -- an exact-path rule
+# added as "the belt to the hook's brace" on the theory that naming a directory names only the
+# directory -- read as clear. Measured in the rebuilt container on 2026-09-30, it is not: a Read of
+# <slug>/memory/MEMORY.md came back "File is in a directory that is denied by your permission
+# settings" while the hook in front of it had ALLOWED the same path. The guard shared the exact
+# wrong belief it existed to catch, which is the one way a guard cannot fail.
+# THE ONE DENY-RULE READER, loaded from sweep-transcripts.sh by name (it is this file's sibling,
+# which the transcript-budget check below already relies on). This used to match with its own `case`
+# and parse rules with its own jq+sed, which missed Claude Code's `//path` spelling exactly as
+# check-config.sh's copy did -- the same defect in two places, needing two fixes. One definition now.
+# EVERY posture_* FUNCTION, by one pattern -- not a hand-kept list of names. The list form missed
+# posture_canon when posture_rule_path began calling it: posture_rule_path then printed nothing, an
+# empty pattern "covered" everything, and every rule read as swallowing auto-memory. Loud that time;
+# the same miss elsewhere could be quiet. The `declare -F` guard below names what this file USES.
+eval "$(sed -n '/^posture_[a-z_]*() {/,/^}/p' "$(dirname "$0")/sweep-transcripts.sh")"
+memory_shadow() { # memory_shadow <memory path> <deny paths, one per line> -> clear|shadowed:<pattern>
+    local mem="$1" pat
+    while IFS= read -r pat; do
+        [ -n "$pat" ] || continue
+        posture_rule_covers "$pat" "$mem" && { printf 'shadowed:%s\n' "$pat"; return; }
+    done <<<"$2"
+    printf 'clear\n'
+}
+
+# What is wrong with the container kit's mirror, one clause per problem, or nothing. A FUNCTION so
+# --self-test drives every arm: mutate-verify.sh runs against a bare image with no mirror, where only
+# the "not started by run.sh" note is reachable (review round 10). <root-uid> is the uid that must own
+# it -- 0, and the self-test passes its own; <self-kit> is the kit this verify.sh runs from, and
+# <launched> is non-empty when run.sh started it, which is when it must be the mirror.
+kit_mirror_problems() { # kit_mirror_problems <dir> <root-uid> <marker> <self-kit> <launched>
+    local d="$1" p out=""
+    if [ ! -d "$d" ]; then
+        printf '%s does not exist -- run.sh mirrors it in on every start;' "$d"; return
+    fi
+    [ -L "$d" ] && out="$out it is a symlink;"
+    [ "$(stat -c %u "$d" 2>/dev/null || stat -f %u "$d" 2>/dev/null)" = "$2" ] || out="$out it is not owned by uid $2;"
+    [ -f "$d/$3" ] || out="$out it carries no $3;"
+    for p in "$d" "$d/.container" "$d/.container/verify.sh" "$d/.container/lib.sh" "$d/scripts"; do
+        [ -w "$p" ] && out="$out $p is writable by $(id -un);"
+    done
+    [ -n "$5" ] && [ "$4" != "$d" ] && out="$out this verify.sh runs from $4, not from the mirror;"
+    printf '%s' "$out"
+}
+
 reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <final-state>
     [ -n "$1" ] || { printf 'pid1-unreadable'; return; }
     # A container at its --pids-limit fails exactly here -- which is the SYMPTOM of a PID 1 that
@@ -423,6 +498,105 @@ if [ "$SELF_TEST" = yes ]; then
              /home/vscode/repos /home/vscode/.jkb /host; do
         st "$p" checked
     done
+
+    echo "==> verify.sh self-test: the container kit's mirror"
+    km="$(mktemp -d)"; mkdir -p "$km/kit/.container" "$km/kit/scripts"
+    : >"$km/kit/.container/verify.sh"; : >"$km/kit/.container/lib.sh"; : >"$km/kit/.jkb-host-mirror"
+    kmu="$(id -u)"
+    kmr() { # kmr <label> <got> <want: "" for clean, or a fragment>
+        if { [ -z "$3" ] && [ -z "$2" ]; } || { [ -n "$3" ] && [ "${2#*"$3"}" != "$2" ]; }; then
+            printf '  \033[32mok\033[0m   %s\n' "$1"
+        else printf '  \033[31mFAIL\033[0m %s\n         got: [%s]\n' "$1" "$2"; st_fail=$((st_fail+1)); fi
+    }
+    kmr "a writable mirror is refused" "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror "$km/kit" x)" "is writable by"
+    chmod -R a-w "$km/kit"
+    kmr "a root-owned, read-only, marked mirror that verify.sh runs from is clean" \
+        "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror "$km/kit" x)" ""
+    kmr "...owned by anyone else, it is refused" "$(kit_mirror_problems "$km/kit" 99999 .jkb-host-mirror "$km/kit" x)" "not owned by uid 99999"
+    kmr "...without its marker, it is refused" "$(kit_mirror_problems "$km/kit" "$kmu" .no-such-marker "$km/kit" x)" "carries no .no-such-marker"
+    kmr "...started by run.sh from somewhere else, it is refused" \
+        "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror /home/vscode/repos/jkb x)" "not from the mirror"
+    kmr "...but run by hand from a checkout, where it is" \
+        "$(kit_mirror_problems "$km/kit" "$kmu" .jkb-host-mirror /home/vscode/repos/jkb "")" ""
+    kmr "a missing mirror is named" "$(kit_mirror_problems "$km/none" "$kmu" .jkb-host-mirror "$km/kit" x)" "does not exist"
+    chmod -R u+w "$km"; rm -rf "$km"
+
+    echo "==> verify.sh self-test: a settings env that replaces the container's own"
+    se="$(mktemp -d)"
+    printf '%s\n' '{"env":{"PATH":"/Users/me/.cargo/bin:/usr/bin","FOO":"1"}}' >"$se/a.json"
+    printf '%s\n' '{"env":{"FOO":"1"},"permissions":{}}' >"$se/b.json"
+    printf '%s\n' 'not json {' >"$se/c.json"
+    se_got="$(. "$(dirname "$0")/lib.sh" && settings_env_shadows "$(printf 'PATH\nJKB_REMOTE\n')" "$se/a.json" "$se/b.json" "$se/c.json" "$se/missing.json")"
+    if [ "$se_got" = "$se/a.json	PATH" ]; then printf '  \033[32mok\033[0m   %s\n' "a settings env.PATH is named with its file; other keys, other files, unparseable and missing files are not"
+    else printf '  \033[31mFAIL\033[0m settings_env_shadows\n         got: [%s]\n' "$se_got"; st_fail=$((st_fail+1)); fi
+    se_names="$(. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$(dirname "$0")/container.json")"
+    if grep -qx PATH <<<"$se_names" && grep -qx JKB_REMOTE <<<"$se_names" && grep -qx JKB_NS_MARKER <<<"$se_names" \
+       && grep -qx HOME <<<"$se_names" && grep -qx TMPDIR <<<"$se_names" && grep -qx CLAUDE_CONFIG_DIR <<<"$se_names" && grep -qx CLAUDE_PROJECT_DIR <<<"$se_names"; then
+        printf '  \033[32mok\033[0m   %s\n' "the protected names come from the Dockerfile's ENV and containerEnv (PATH, JKB_NS_MARKER, JKB_REMOTE among them), plus the floor the hook reads: HOME, TMPDIR, CLAUDE_CONFIG_DIR, CLAUDE_PROJECT_DIR"
+    else printf '  \033[31mFAIL\033[0m dc_protected_env derived [%s]\n' "$(tr '\n' ' ' <<<"$se_names")"; st_fail=$((st_fail+1)); fi
+    printf '{bad' > "$se/bad.json"
+    if ! (. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$se/bad.json") >/dev/null 2>&1 \
+       && ! (. "$(dirname "$0")/lib.sh" && dc_protected_env "$(dirname "$0")/Dockerfile" "$se/missing.json") >/dev/null 2>&1; then
+        printf '  \033[32mok\033[0m   %s\n' "dc_protected_env refuses a container.json that does not parse, and one that is missing"
+    else printf '  \033[31mFAIL\033[0m dc_protected_env answered for an unparseable or missing container.json\n'; st_fail=$((st_fail+1)); fi
+    rm -rf "$se"
+
+    echo "==> verify.sh self-test: does a deny rule swallow auto-memory"
+    # Literal inputs on both sides, so this needs no container and no Claude Code. The point of
+    # the rows is the PAIR: the same memory path against the two rule shapes, one of which is the
+    # shape the argv budget pushes everyone towards.
+    MEMP=/home/vscode/.claude/projects/-home-vscode-repos-jkb/memory/MEMORY.md
+    ms() { # ms <label> <memory path> <deny paths> <want prefix>
+        got="$(memory_shadow "$2" "$3")"
+        case "$got" in
+            "$4"*) printf '  \033[32mok\033[0m   %s\n' "$1" ;;
+            *) printf '  \033[31mFAIL\033[0m %s\n         got:  %s\n         want: %s...\n' "$1" "$got" "$4"; st_fail=$((st_fail+1)) ;;
+        esac
+    }
+    ms "the .jsonl rule cannot reach memory — it must end in .jsonl" \
+       "$MEMP" '/home/vscode/.claude/projects/**/*.jsonl' clear
+    ms "the subtree rule DOES reach memory, which is the trap" \
+       "$MEMP" '/home/vscode/.claude/projects/**' shadowed
+    ms "...and it is caught whichever spelling of the tree is used" \
+       "/home/vscode/.claude-state/projects/-home-vscode-repos-jkb/memory/MEMORY.md" \
+       '/home/vscode/.claude-state/projects/**' shadowed
+    # THE SHAPE THAT ACTUALLY SHIPPED AND BROKE: a bare directory, no wildcard at all. Claude Code
+    # applies it to the whole subtree -- measured, not inferred: in the rebuilt container this
+    # rule denied a Read of <slug>/memory/MEMORY.md that the hook had allowed. This row read
+    # `clear` until the matcher learned `$pat/*`.
+    ms "a bare directory rule covers its subtree, memory included" \
+       "$MEMP" '/home/vscode/.claude/projects' shadowed
+    ms "...but a bare rule on a SIBLING directory does not" \
+       "$MEMP" '/home/vscode/.claude/projects-archive' clear
+    # Claude Code's ABSOLUTE spelling is `//path`; the pattern is what the shared reader makes of the
+    # RULE. Both old copies rewrote `~` and nothing else, so this exact rule read as clear.
+    ms "a //absolute bare-directory rule covers memory too" \
+       "$MEMP" "$(posture_rule_path 'Read(//home/vscode/.claude/projects)' /home/vscode /etc/claude-code)" shadowed
+    ms "a rule about another tree leaves memory alone" \
+       "$MEMP" '/home/vscode/repos/**/*.env' clear
+    # REVIEW ROUND 8. A RELATIVE rule, resolved against its layer's base by the shared reader.
+    ms "a project's relative rule climbing into the tree covers memory" "$MEMP" \
+       "$(posture_rule_path 'Read(../../.claude/projects)' /home/vscode /home/vscode/repos/jkb/.claude \
+           "$(posture_layer_base /home/vscode/repos/jkb/.claude/settings.local.json /etc/claude-code/managed-settings.json /home/vscode)")" shadowed
+    # ...and only a project layer's: elsewhere a relative rule meets a session's cwd, a repo here, and
+    # the arm passes no base (round 9), which is what these two rows hand the reader.
+    ms "a user layer's relative rule, given no base, does not read as covering memory" "$MEMP" \
+       "$(posture_rule_path 'Read(.claude/projects)' /home/vscode /home/vscode/.claude "")" clear
+    ms "...nor does a user layer's Edit(**/*.md)" "$MEMP" \
+       "$(posture_rule_path 'Edit(**/*.md)' /home/vscode /home/vscode/.claude "")" clear
+    lk="$(CLAUDE_CONFIG_DIR='' posture_layer_kind /home/vscode/.claude/settings.json /etc/claude-code/managed-settings.json /home/vscode)"
+    if [ "$lk" = user ]; then printf '  \033[32mok\033[0m   %s\n' "the arm's layer test reads user settings as a user layer, not a project"
+    else printf '  \033[31mFAIL\033[0m the arm'"'"'s layer test read user settings as [%s]\n' "$lk"; st_fail=$((st_fail+1)); fi
+    ms "...while Claude Code's documented ./.env example stays clear" "$MEMP" \
+       "$(posture_rule_path 'Read(./.env)' /home/vscode /home/vscode/repos/jkb/.claude \
+           "$(posture_layer_base /home/vscode/repos/jkb/.claude/settings.local.json /etc/claude-code/managed-settings.json /home/vscode)")" clear
+    # The scan must read EVERY rule, not just the first: a shadowing rule added below a harmless
+    # one is the realistic way this arrives.
+    ms "a shadowing rule is found when it is not the first" "$MEMP" \
+       '/home/vscode/.ssh
+/home/vscode/repos/**/*.env
+/home/vscode/.claude/projects/**' shadowed
+    ms "no rules at all is clear, not an error" "$MEMP" "" clear
 
     echo "==> verify.sh self-test: the transcript-budget verdict"
     # THE DECISION run.sh READS. Both codes refuse a window — its gate tests `verify_rc -ne 0` — and what
@@ -658,14 +832,14 @@ transcript sweep: 90000 deny bytes are projected and none of them can be archive
     echo "==> verify.sh self-test: machine settings (merge and missing)"
     mt="$(mktemp -d)"; shipped="$(dirname "$0")/vscode-machine-settings.json"
     printf '{"files.exclude":{"**/target":true},"search.followSymlinks":false}\n' > "$mt/want"
-    mm() { dc_merge_machine_settings "$@" | jq -cS .; }
+    mm() { dc_merge_machine_settings "$@" | HOME=/dev/null jq -cS .; }
     ms() { dc_machine_settings_missing "$@" | tr '\n' ' '; }
     # The shipped file is what every other case stands in for, so an empty or broken one must not
     # leave them passing: `{}` would make assertion 8 print `ok` having checked nothing.
     st2 "the shipped settings are a non-empty object" \
-        "$(jq -e 'type == "object" and length > 0' "$shipped" 2>/dev/null)" true
+        "$(HOME=/dev/null jq -e 'type == "object" and length > 0' "$shipped" 2>/dev/null)" true
     st2 "no file yet: the merge is exactly what we want" \
-        "$(mm "$mt/none" "$mt/want")" "$(jq -cS . "$mt/want")"
+        "$(mm "$mt/none" "$mt/want")" "$(HOME=/dev/null jq -cS . "$mt/want")"
     st2 "no file yet: every key is missing" "$(ms "$mt/none" "$mt/want")" "files.exclude search.followSymlinks "
     : > "$mt/empty"
     st2 "an empty file reads as no settings" "$(ms "$mt/empty" "$mt/want")" "files.exclude search.followSymlinks "
@@ -711,7 +885,7 @@ if [ ! -r /proc/self/mountinfo ]; then
     echo "  /proc/self/mountinfo is not readable here, so the mount boundary — the assertion this" >&2
     echo "  file exists for — could not be checked at all." >&2
     echo >&2
-    echo "  In VS Code:  ./.container/run.sh, attach to the container, then run this" >&2
+    echo "  In VS Code:  ~/.local/share/jkb-container-kit/kit/.container/run.sh, attach to the container, then run this" >&2
     echo "  With Docker: ./.container/mutate-verify.sh --control   (one healthy run)" >&2
     echo "               ./.container/mutate-verify.sh             (every guard, watched failing)" >&2
     echo >&2
@@ -760,7 +934,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "  The fresh procfs is why /proc/1 and the mount table are not this container's."
             echo
             echo "  Run it from a plain terminal in the attached container, or from the host:"
-            echo "    ./.container/run.sh                       (runs this for you, via docker exec)"
+            echo "    ~/.local/share/jkb-container-kit/kit/.container/run.sh                       (runs this for you, via docker exec)"
             echo "    ./.container/mutate-verify.sh --control   (one healthy run)"
         } >&2
         exit 2
@@ -774,7 +948,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "  one of:"
             echo "    * the container was started with --entrypoint, bypassing entrypoint.sh;"
             echo "    * its start did not finish (check \`docker logs\`);"
-            echo "    * the image predates the marker — rebuild: ./.container/run.sh --rm && ./.container/run.sh --build"
+            echo "    * the image predates the marker — rebuild: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build"
             echo
             echo "  On an ordinary Linux host there is no marker either, and that is the honest"
             echo "  answer: this script asserts what a CONTAINER is and has no subject here."
@@ -792,7 +966,7 @@ case "$(ns_verdict "$rec_pid" "$rec_mnt" "$obs_pid" "$obs_mnt")" in
             echo "    docker stats --no-stream <name>   # PIDS = the counter --pids-limit bounds"
             echo
             echo "  If that is near the limit, recreate it:"
-            echo "    ./.container/run.sh --rm && ./.container/run.sh --build"
+            echo "    ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build"
         } >&2
         exit 2
         ;;
@@ -901,7 +1075,7 @@ fi
 
 case "$(reaper_verdict "$pid1_argv" "$orphan" "$adopted" "$final")" in
     reaped)     ok  "PID 1 reaps the orphans it adopts (PID 1 is: $pid1_argv)" ;;
-    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
+    not-reaped) bad "PID 1 does not reap: an orphan it adopted is still a zombie (PID 1 is: $pid1_argv) — so every orphan becomes one and ordinary use spends the --pids-limit. This container predates the tini handover; recreate it: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build" ;;
     fork-failed)      bad "could not establish whether PID 1 reaps: the fork for the test orphan failed, which is how a container at its --pids-limit fails — the end state of a PID 1 that does not reap (PID 1 is: $pid1_argv)" ;;
     pid1-unreadable)  bad "could not establish whether PID 1 reaps: $PROC/1/cmdline could not be read, so nothing here observed what PID 1 even is" ;;
     proc-unreadable)  bad "could not establish whether PID 1 reaps: this process's own $PROC entry is unreadable, so an absent orphan would say nothing about reaping" ;;
@@ -1132,7 +1306,7 @@ case "$aa_profile" in
     "")            note "AppArmor mediates on this host, but this process's profile label could not be read — nothing was established about what is confining the container" ;;
     unconfined)    bad "AppArmor is not confining this container (unconfined) — the container ships a profile that keeps every docker-default restriction except \`mount\`; running unconfined discards all of them" ;;
     docker-default)
-                   bad "AppArmor is applying docker-default, which denies \`mount\` — bubblewrap cannot start under it, so the nested sandbox is not running. Load the container's profile: sudo apparmor_parser -r -W .container/apparmor-jkb-dev" ;;
+                   bad "AppArmor is applying docker-default, which denies \`mount\` — bubblewrap cannot start under it, so the nested sandbox is not running. Load the container's profile from the kit, which agents cannot write: sudo apparmor_parser -r -W ~/.local/share/jkb-container-kit/kit/.container/apparmor-jkb-dev" ;;
     "$aa_want")
         # THE POLICY, NOT THE LABEL -- a name is a label, and a profile called jkb-dev that had
         # been edited into permitting everything would pass a name check.
@@ -1195,12 +1369,29 @@ esac
 # the gate that reviews the boundary and the check that enforces it cannot read it differently.
 here_dc="$(cd "$(dirname "$0")" && pwd)"
 DC="$here_dc/container.json"
-# The checkout being verified: the one this script is in. Every assertion below that used to name
-# /home/vscode/repos/jkb reads this instead — with all of ~/repos mounted, that literal is a
-# statement about whichever repo happens to sit there, which is not necessarily this one.
-mem_repo="$(cd "$here_dc/.." && pwd)"
+# The checkout being verified: the one run.sh names in JKB_REPO_ROOT, since this script runs from
+# the root-owned kit mirror rather than from the checkout (lib.sh's DC_KIT_DIR); run by hand from a
+# checkout, the one it is in. Every assertion below that used to name /home/vscode/repos/jkb reads
+# this instead. `kit_dc` is where the scripts this RUNS come from: the kit, never the checkout.
+kit_dc="$(cd "$here_dc/.." && pwd)"
 # shellcheck source=/dev/null
 . "$here_dc/lib.sh"
+mem_repo="$(dc_repo_root "$kit_dc")"
+
+# THE KIT MIRROR IS ROOT'S, and this script runs from it. Everything run.sh starts in here runs
+# unsandboxed and comes from $DC_CTR_KIT; a mirror the container user could write would put the
+# agent's code back in that position, which is the whole of what the kit closed.
+kit_wrong="$(kit_mirror_problems "$DC_CTR_KIT" 0 "$DC_HOOKS_MIRROR_MARKER" "$kit_dc" "${JKB_REPO_ROOT:-}")"
+# A FAILURE WHEN run.sh STARTED THIS (it names JKB_REPO_ROOT, and it mirrors the kit first). Run by
+# hand, or by mutate-verify.sh against a bare image no run.sh ever touched, a missing mirror is a
+# note: nothing in that container was started from it.
+if [ -n "$kit_wrong" ] && [ -z "${JKB_REPO_ROOT:-}" ] && [ ! -d "$DC_CTR_KIT" ]; then
+    note "no container kit at $DC_CTR_KIT -- this verify.sh was not started by run.sh, which mirrors one in first"
+elif [ -n "$kit_wrong" ]; then
+    bad "the container kit is not what runs unsandboxed in here:$kit_wrong rerun the kit's run.sh"
+else
+    ok "the container kit at $DC_CTR_KIT is root-owned and not writable here$([ -n "${JKB_REPO_ROOT:-}" ] && echo ", and this verify.sh runs from it")"
+fi
 EXPECTED="$(dc_mount_targets "$DC")"
 # RUNTIME_OWNED — the exclusion list — is defined at the top of this file, above the
 # inside-the-container refusal, so `--self-test` can exercise it on a host with no Docker.
@@ -1441,7 +1632,7 @@ fi
 # consumed once reported — which is what makes the documented remedy actually clear it.
 mem_key="$(basename "$mem_repo")"
 mem_status_file=/home/vscode/.claude-state/memory-status
-mem_live="$("$mem_repo/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
+mem_live="$("$kit_dc/scripts/link-claude-memory.sh" --status "$mem_repo" 2>/dev/null)"
 mem_recorded="$(awk -v k="$mem_key" '$1 == k { print $2 }' "$mem_status_file" 2>/dev/null | tail -1)"
 # The two states ONLY THE RUN can know, so only the record can carry them. `exposed` because the
 # repair clears its own alarm; `error` because it means the run stopped part-way — a migration that
@@ -1508,6 +1699,220 @@ case "$mem_state" in
     *)
         bad "scripts/link-claude-memory.sh --status answered '$mem_state', which this check does not recognise" ;;
 esac
+
+# ...AND NOTHING IN THE POSTURE MAY SWALLOW THE PLACE THE BLOCK ABOVE INSISTS ON. The two are
+# decided in different files: the block above FAILS unless memory is linked at
+# ~/.claude/projects/<slug>/memory, and keeping sessions out of each other's transcripts pushes
+# rules onto that same tree (the posture carries none now; deny-transcripts.sh holds that line). A
+# rule written for the second reason covers the first, and the failure has no symptom -- denied memory does not error, MEMORY.md just stops
+# arriving, which reads as an agent that forgot. Checked here rather than reasoned about, because
+# the two rule shapes are one character apart and the argv budget actively pushes towards the
+# dangerous one (see the README's deny-list section).
+#
+# READ FROM THE POSTURE IN FORCE, not from the repo's copy: this runs inside the container, so
+# /etc/claude-code is what Claude Code actually loaded. A repo file that disagrees with it is a
+# different failure, and check-config.sh owns that one.
+mem_managed=/etc/claude-code/managed-settings.json
+# THE SHARED READER MUST HAVE LOADED. If a function it uses were missing, posture_rule_covers would
+# be "command not found", memory_shadow would answer `clear`, and this whole block would pass on
+# nothing -- the quiet direction. check-config.sh guards its own load the same way.
+if ! declare -F posture_canon posture_deny_rules posture_rule_is_path posture_rule_path posture_rule_covers posture_layer_files posture_layer_kind posture_layer_base posture_hook_matcher posture_transcript_roots >/dev/null; then
+    bad "the deny-rule reader could not be loaded from sweep-transcripts.sh beside this script, so whether any settings layer swallows auto-memory, or whether the hook is wired, is unchecked"
+elif [ ! -f "$mem_managed" ]; then
+    bad "there are no managed settings at $mem_managed, so nothing here establishes that the posture leaves auto-memory readable"
+else
+    # EVERY LAYER, read the way Claude Code reads it: managed, its drop-ins, the user's settings and
+    # every repo's. A memory-swallowing rule in a project's settings.local.json breaks memory exactly
+    # as one in the image would, and this used to read the managed file alone.
+    mem_deny=""; mem_unread=""; mem_skipped=""; mem_where=""
+    while IFS= read -r mem_f; do
+        mem_rules="$(posture_deny_rules "$mem_f" . perm 2>/dev/null)" || {
+            # The MANAGED file unreadable is fatal: it is the posture, and nothing else holds the line.
+            # Any other layer that will not parse is one Claude Code skips as well, so a rule in it is
+            # not in force -- and refusing the whole container over a trailing comma in an unrelated
+            # repo's settings.local.json is the wrong cost (review round 5). Named, not hidden.
+            if [ "$mem_f" = "$mem_managed" ]; then mem_unread="$mem_unread $mem_f"; else mem_skipped="$mem_skipped $mem_f"; fi
+            continue; }
+        # A PROJECT layer's relative rule is resolved against that project, by the shared reader:
+        # read as written it covered nothing here while Claude Code resolved it into the tree
+        # (review round 8). Any other layer's relative rule is left as written, which covers no
+        # absolute path. It meets whatever cwd a session starts in -- a repo, in this container --
+        # and resolving it from the home made `Edit(**/*.md)` in user settings refuse the whole
+        # container over a reading Claude Code would not take (round 9). The sweep, which only has
+        # to err towards sweeping, keeps the home reading.
+        mem_base=""
+        [ "$(posture_layer_kind "$mem_f" "$mem_managed" "$HOME")" = project ] \
+            && mem_base="$(posture_layer_base "$mem_f" "$mem_managed" "$HOME")"
+        while IFS= read -r mem_r; do
+            [ -n "$mem_r" ] || continue
+            posture_rule_is_path "$mem_r" || continue
+            mem_p="$(posture_rule_path "$mem_r" "$HOME" "$(dirname "$mem_f")" "$mem_base")"
+            mem_deny="$mem_deny$mem_p
+"
+            # Remembered with its LAYER, so the failure can say which file to edit.
+            mem_where="$mem_where$mem_p	$mem_r in $mem_f
+"
+        done <<<"$mem_rules"
+    done <<<"$(posture_layer_files "$mem_managed")"
+    # A SYNTHETIC SLUG, deliberately. The question is whether the TREE is covered, and no rule
+    # names a slug; a probe path is therefore faithful for every repo at once and saves this file
+    # from carrying a second copy of the linker's slugify -- two spellings of one rule being the
+    # defect this record keeps rediscovering. A rule that did name one slug is caught by the live
+    # scan below instead.
+    mem_shadowed=""
+    for mem_root in "$HOME/.claude/projects" "$HOME/.claude-state/projects"; do
+        mem_probe="$mem_root/-probe-repo/memory/MEMORY.md"
+        mem_v="$(memory_shadow "$mem_probe" "$mem_deny")"
+        case "$mem_v" in shadowed:*) mem_shadowed="$mem_shadowed ${mem_v#shadowed:}" ;; esac
+    done
+    # And every link that actually exists, which is what catches a slug-specific rule.
+    for mem_link in "$HOME"/.claude/projects/*/memory "$HOME"/.claude-state/projects/*/memory; do
+        [ -e "$mem_link" ] || [ -L "$mem_link" ] || continue
+        mem_v="$(memory_shadow "$mem_link/MEMORY.md" "$mem_deny")"
+        case "$mem_v" in shadowed:*) mem_shadowed="$mem_shadowed ${mem_v#shadowed:}" ;; esac
+    done
+    if [ -n "$mem_unread" ]; then
+        bad "a settings layer could not be parsed, so whether it swallows auto-memory is unknown:$mem_unread"
+    elif [ -z "$mem_deny" ]; then
+        bad "no permissions.deny rules could be read from any settings layer — the check that none of them swallows auto-memory examined nothing"
+    elif [ -n "$mem_shadowed" ]; then
+        # FATAL. The container runs, every other check passes, and memory silently stops working
+        # -- which is the exact failure profile this file exists to convert into a sentence.
+        mem_src="$(printf '%s' "$mem_shadowed" | tr ' ' '\n' | sort -u | while IFS= read -r q; do
+            [ -n "$q" ] && awk -F'\t' -v q="$q" '$1 == q { print "         " $2 }' <<<"$mem_where"; done | sort -u)"
+        bad "a deny rule covers the auto-memory location, so MEMORY.md will stop reaching context with no error anywhere:
+$mem_src
+       REMOVE it. Auto-memory has to live at ~/.claude/projects/<slug>/memory — Claude Code decides
+       that — and transcripts are already kept from the file tools by
+       /usr/local/bin/deny-transcripts.sh, which can tell memory from a transcript and costs no
+       argv. Do not narrow it to the transcripts as a per-file glob instead: that is the O(files)
+       rule check-config.sh refuses, for blowing the Bash sandbox argv."
+    else
+        ok "no deny rule in any settings layer covers the auto-memory location${mem_skipped:+ (skipped, unparseable, as Claude Code skips them:$mem_skipped)}"
+    fi
+fi
+
+# NO SETTINGS FILE REPLACES THE CONTAINER'S OWN ENVIRONMENT. Claude Code puts a settings file's `env`
+# into every session, over the image's ENV and containerEnv, and a repo's .claude/settings*.json is
+# in the checkout the HOST shares. An `env.PATH` written for the Mac in settings.local.json replaced
+# the image's PATH in every container session: `jkb` stopped resolving by name, and the attest hook,
+# which approves only the bare `jkb` word, then asked about every call (2026-10-02). The agent cannot
+# fix a hit -- those files are write-denied to it -- so the failure names the file and the key for a
+# person. This cannot ask a SESSION's PATH (it runs through docker exec, with the image's); a session
+# whose PATH arrives by another route is not caught here.
+# ...and ONLY WITH THE LAYER LIST IN HAND: without posture_layer_files (the sweep's reader failed to
+# load) it checked no file and still printed ok (review round 22).
+if ! declare -F posture_layer_files >/dev/null; then
+    bad "the settings-layer reader (posture_layer_files, from sweep-transcripts.sh) is not loaded, so whether a Claude settings file replaces the container's environment is unchecked"
+elif ! envp_names="$(dc_protected_env "$here_dc/Dockerfile" "$DC" 2>&1)"; then
+    bad "the environment names the container sets could not be derived ($envp_names), so whether a Claude settings file replaces one is unchecked"
+else
+    envp_files=()
+    while IFS= read -r envp_f; do [ -n "$envp_f" ] && envp_files+=("$envp_f"); done <<<"$(posture_layer_files "$mem_managed")"
+    envp_hits="$(settings_env_shadows "$envp_names" ${envp_files[@]+"${envp_files[@]}"})"
+    if [ -n "$envp_hits" ]; then
+        bad "a Claude settings file sets an environment variable the container itself sets, and every session here gets the file's value instead: $(printf '%s' "$envp_hits" | awk -F'\t' '{printf "%s in %s; ", $2, $1}')remove that key from the file -- the agent cannot, it is write-denied to it. A repo's .claude/settings*.json is SHARED with the host; if the host needs the value, set it in the host's own ~/.claude/settings.json, which this container does not load"
+    else
+        ok "no Claude settings file a session here loads replaces an environment variable the container sets ($(grep -c . <<<"$envp_names") names, PATH among them)"
+    fi
+fi
+
+# ...AND THE HOOK THAT NOW CARRIES THE TRANSCRIPT DENY IS PRESENT AND ROOT-OWNED. check-config.sh
+# asks whether the repo WIRES it; this asks whether the running container HAS it, which is a
+# different question and the one that matters after a rebuild from a stale image or a hand-edited
+# /etc/claude-code. With the per-file globs gone (they cost 52% of MAX_ARG_STRLEN in argv), this
+# script is the only thing keeping a file tool out of another session's transcript, and its
+# absence is silent: every tool call simply succeeds.
+mem_hook=/usr/local/bin/deny-transcripts.sh
+if [ ! -x "$mem_hook" ]; then
+    bad "$mem_hook is missing or not executable, so nothing stops a file tool reading another session's transcript — rebuild the image"
+elif [ "$(stat -c '%U' "$mem_hook" 2>/dev/null)" != root ] || [ -w "$mem_hook" ]; then
+    bad "$mem_hook is not root-owned-and-read-only to this user — the hook that confines the agent is writable by it"
+# NOT ITS SELF-TEST: this runs unsandboxed, and the self-test executes copies of the hook staged in
+# /tmp and ~/.cache, which sandboxed agents write -- a swapped copy would run outside the sandbox
+# (review round 34). The checkout's self-test runs in check.sh and CI; here the INSTALLED copy is
+# probed directly, below, under every spelling of the tree.
+else
+    # ASKED OF THE INSTALLED COPY, not of a fixture, and under EVERY spelling of the tree. This
+    # probed ~/.claude/projects alone, so a hook that had lost its ~/.claude-state/projects root
+    # still passed here while that whole spelling was readable. The spellings are THIS file's own
+    # list -- what the hook is required to cover -- not the hook's, so a hook that drops one cannot
+    # agree with itself. Verdict by exit too: rc 2 is the hook refusing, and anything else non-zero
+    # would let the call through.
+    mem_probe_hook() { # mem_probe_hook <path> -> deny|allow|broken
+        local out rc=0
+        out="$(printf '{"tool_name":"Read","cwd":"%s","tool_input":{"file_path":"%s"}}' "$HOME" "$1" | "$mem_hook" 2>/dev/null)" || rc=$?
+        case "$rc:$out" in
+            0:*'"permissionDecision":"deny"'*|2:*) echo deny ;;
+            0:*) echo allow ;;
+            *) echo broken ;;
+        esac
+    }
+    mem_hook_wrong=""
+    # EVERY ROOT in the shared list, the archive included (review round 11: this probed the two
+    # spellings of the tree, so a hook that lost the archive root passed). Auto-memory lives only
+    # under the tree, so only those two are asked about it.
+    for mem_root in $(posture_transcript_roots); do
+        mem_root="$HOME/${mem_root#\~/}"
+        [ "$(mem_probe_hook "$mem_root/-probe/x.jsonl")" = deny ] \
+            || mem_hook_wrong="$mem_hook_wrong a transcript under $mem_root is NOT denied;"
+        case "$mem_root" in */projects)
+            [ "$(mem_probe_hook "$mem_root/-probe/memory/MEMORY.md")" = allow ] \
+                || mem_hook_wrong="$mem_hook_wrong auto-memory under $mem_root is NOT allowed;" ;;
+        esac
+    done
+    [ -n "$(posture_transcript_roots 2>/dev/null)" ] \
+        || mem_hook_wrong="$mem_hook_wrong the shared root list could not be loaded, so no root was probed;"
+    # ...AND IT HOLDS THE FILE TOOLS TO THE SANDBOX'S BOUNDARY (design A, after review round 15): with
+    # the sandbox enabled in this container's settings, a Write outside every allowWrite path -- the
+    # home itself -- is refused, and one inside the workspace is not.
+    # ASKED OF THE HOOK, which merges the layers in Claude Code's precedence: reading the user layer
+    # here was a second copy of that rule, wrong whenever managed or local set `enabled` (round 17).
+    # ...BUT THE HOOK DOES NOT GET TO DECIDE WHETHER IT IS TESTED: an answer other than 0 or 1 (an
+    # image whose hook predates the query prints nothing) is a finding, and so is a 0 while this
+    # container's user settings enable the sandbox, the regression that would skip exactly the
+    # probe below (review round 18).
+    mem_sb="$(cd "$mem_repo" 2>/dev/null && CLAUDE_PROJECT_DIR="$mem_repo" "$mem_hook" --sandbox-enabled 2>/dev/null)"
+    # ...AND THE IMAGE PINS THE SANDBOX ON in its managed settings (the user's decision after review round
+    # 36). A container still on an older image has no pin, so a worktree's own settings.local.json can
+    # switch Bash's sandbox off, and nothing said so (round 37). The remedy is a rebuild.
+    [ "$(HOME=/dev/null jq -r '.sandbox.enabled' "$mem_managed" 2>/dev/null)" = true ] \
+      && [ "$(HOME=/dev/null jq -r '.sandbox.failIfUnavailable' "$mem_managed" 2>/dev/null)" = true ] \
+      && [ "$(HOME=/dev/null jq -r '.sandbox.allowUnsandboxedCommands' "$mem_managed" 2>/dev/null)" = false ] \
+      || mem_hook_wrong="$mem_hook_wrong $mem_managed does not pin sandbox.enabled:true, failIfUnavailable:true and allowUnsandboxedCommands:false, so a worktree's own settings file can switch Bash's sandbox off -- this image predates the pin; rebuild it (run.sh --rm, then run.sh --build);"
+    case "$mem_sb" in
+        0) mem_hook_wrong="$mem_hook_wrong it says the sandbox is disabled, though the image's managed settings pin it on, so the file tools are not held to its boundary;" ;;
+        1) ;;
+        *) mem_hook_wrong="$mem_hook_wrong it did not answer --sandbox-enabled with 0 or 1 ([$mem_sb]) -- an image older than the boundary; rebuild it;" ;;
+    esac
+    if [ "$mem_sb" = 1 ]; then
+        mem_probe_write() { # mem_probe_write <path> -> deny|allow|broken
+            local out rc=0
+            out="$(printf '{"tool_name":"Write","cwd":"%s","tool_input":{"file_path":"%s","content":""}}' "$mem_repo" "$1" \
+                   | CLAUDE_PROJECT_DIR="$mem_repo" "$mem_hook" 2>/dev/null)" || rc=$?
+            case "$rc:$out" in 0:*'"permissionDecision":"deny"'*|2:*) echo deny ;; 0:*) echo allow ;; *) echo broken ;; esac
+        }
+        [ "$(mem_probe_write "$HOME/.jkb-boundary-probe")" = deny ] \
+            || mem_hook_wrong="$mem_hook_wrong a Write to the home, outside every allowWrite path, is NOT refused;"
+        [ "$(mem_probe_write "$mem_repo/.jkb-boundary-probe")" = allow ] \
+            || mem_hook_wrong="$mem_hook_wrong a Write inside the workspace is refused;"
+    fi
+    # ...AND THE INSTALLED SETTINGS MUST ACTUALLY RUN IT. A present, correct hook that no PreToolUse
+    # entry names guards nothing, and every probe above still passes -- the stale-image and
+    # hand-edited /etc/claude-code cases this block exists for. The matcher must EQUAL the shared
+    # definition (`.*`, every tool) -- a token list let unlisted built-ins such as Artifact skip it.
+    mem_match="$(HOME=/dev/null jq -r --arg h "$mem_hook" '.hooks.PreToolUse[]? | select([.hooks[]?.command] | index($h)) | .matcher' "$mem_managed" 2>/dev/null)"
+    if [ -z "$mem_match" ]; then
+        mem_hook_wrong="$mem_hook_wrong the installed $mem_managed has no PreToolUse entry running it;"
+    elif [ "$mem_match" != "$(posture_hook_matcher)" ]; then
+        mem_hook_wrong="$mem_hook_wrong its installed matcher is [$mem_match], not [$(posture_hook_matcher)], so a tool it does not match never reaches it;"
+    fi
+    if [ -n "$mem_hook_wrong" ]; then
+        bad "the installed transcript hook is present but wrong:$mem_hook_wrong"
+    else
+        ok "the transcript hook is installed root-owned and reached by every tool call, denies a transcript under every root (archive included) and allows auto-memory"
+    fi
+fi
 
 # 3e. Git runs the hooks the host runs. VS Code copies the host's ~/.gitconfig in on attach, so a
 #     global core.hooksPath names a host directory; run.sh mirrors it (lib.sh's
@@ -1800,7 +2205,7 @@ case "$eg_daemon" in
     unresolved) $dm_bad "${daemon_at%:*} did not resolve when the firewall was raised, so no address is open for jkb serve on the host — re-run init-firewall.sh; on Linux add --add-host=${daemon_at%:*}:host-gateway" ;;
     absent)     $dm_bad "the firewall has no rule for jkb serve on the host ($daemon_at), so this container cannot reach the knowledge base" ;;
     wide)       $dm_bad "the host's address is in the egress allowlist, which opens EVERY port on the host's loopback to this container — jkb serve must be reached through its port-only rule alone" ;;
-    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ./.container/run.sh --rm && ./.container/run.sh --build" ;;
+    *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build" ;;
 esac
 
 # ...and what actually answers. The token is read from the ~/.jkb bind, where the host's daemon
@@ -1845,7 +2250,7 @@ else
             if [ -z "$jkb_remote_at" ] || ! command -v jkb >/dev/null 2>&1; then
                 :   # asserted above: remote mode unset fails there, no jkb is a note there
             elif [ "$jkb_remote_at" != "$daemon_at" ]; then
-                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ./.container/run.sh --rm && ./.container/run.sh --build"
+                $dm_bad "JKB_REMOTE (${JKB_REMOTE}) is not the address this image's firewall opens ($daemon_at) — the checkout and the image disagree; rebuild the image: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build"
             else
                 if jkb_answer="$(env -u JKB_DB jkb --json mq topic ls 2>&1)"; then
                     ok "the installed jkb reaches jkb serve through JKB_REMOTE"
@@ -1860,7 +2265,7 @@ fi
 
 # 6. The inner posture. `check` is the drift rule from D48; here it also proves the posture
 #    survived being installed into a fresh container HOME.
-if "$mem_repo/scripts/auto-mode.sh" check >/dev/null 2>&1; then
+if "$kit_dc/scripts/auto-mode.sh" check >/dev/null 2>&1; then
     ok "Claude Code posture is intact"
 else
     bad "Claude Code posture is NOT intact (scripts/auto-mode.sh check)"
@@ -1898,7 +2303,7 @@ else
     # not on the marketplace. It was absent from every container ever built precisely because
     # nothing declared it, so nothing checked it. Appended rather than checked separately so the
     # one matcher the self-test exercises covers it too.
-    if local_ext="$(dc_local_extension "$(cd "$here_dc/.." && pwd)")"; then
+    if local_ext="$(dc_local_extension "$mem_repo")"; then
         declared="$declared"$'\n'"$local_ext"
     fi
     missing="$(missing_extensions "$declared" "$installed")"
@@ -1909,11 +2314,11 @@ else
         # Nothing at all has been installed into this server, which is what attaching leaves behind
         # — not a broken install. The remedy is a command, and it is the command that exists for it.
         echo "  note this VS Code server has no extensions yet — attaching does not install them."
-        echo "       Run  ./.container/install-extensions.sh  from a terminal in the attached window."
+        echo "       Run  /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo)  from a terminal in the attached window."
     else
         bad "declared extensions are not installed:$missing — $present other(s) are, so this is not the
-       never-installed state. Run ./.container/install-extensions.sh from an attached terminal; if it
-       reports one was not staged into the image, rebuild: ./.container/run.sh --rm && ./.container/run.sh --build"
+       never-installed state. Run /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo) from an attached terminal; if it
+       reports one was not staged into the image, rebuild: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build"
     fi
 fi
 
@@ -1931,10 +2336,10 @@ if [ -n "$code_server" ]; then
         ok "VS Code machine settings carry vscode-machine-settings.json"
     elif [ ! -s "$machine_settings" ]; then
         echo "  note this VS Code server has no machine settings yet — attaching does not write them."
-        echo "       Run  ./.container/install-extensions.sh  from a terminal in the attached window."
+        echo "       Run  /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo)  from a terminal in the attached window."
     else
         bad "VS Code machine settings are missing or override: $(printf '%s' "$unset_keys" | tr '\n' ' ')— run
-       ./.container/install-extensions.sh from an attached terminal, then Developer: Reload Window"
+       /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo) from an attached terminal, then Developer: Reload Window"
     fi
 fi
 
@@ -1979,7 +2384,10 @@ if [ -f "$sweep_sh" ]; then
     sweep_keep_note=""
     if [ -n "${JKB_KEEP_SESSIONS+set}" ]; then
         : # supplied by our caller, and authoritative even when empty
-    elif sweep_live="$(jkb notify sessions --live-ids 2>/dev/null)"; then
+    # THE PINNED, ROOT-OWNED jkb, not whatever is first on PATH: this runs unsandboxed, and the jkb
+    # on PATH lives in ~/.cargo/bin, which the sandbox can write (review round 7). The pinned copy is
+    # the one the harness hooks run, for the same reason.
+    elif sweep_live="$(/usr/local/lib/jkb-hook/jkb notify sessions --live-ids 2>/dev/null)"; then
         JKB_KEEP_SESSIONS="$(printf '%s' "$sweep_live" | tr '\n' ' ')"
         export JKB_KEEP_SESSIONS
     else
@@ -2007,9 +2415,10 @@ if [ -f "$sweep_sh" ]; then
         # A SWEEP THAT FOUND NO TREE IS NOT A MEASURED PASS. It exits 0 for "nothing to sweep", and
         # the arm above printed `ok the transcript deny list fits in one argv` over a budget nobody
         # measured — the exact rule the sweep's own header states and that broke: a sweep that
-        # cannot find its subject must not look successful. Reachable whenever
-        # `$CLAUDE_BASE/projects` is missing: a second config dir, or a `dc_link_state` that failed
-        # and which run.sh deliberately tolerates and defers to this file.
+        # cannot find its subject must not look successful. Reachable when `$CLAUDE_BASE/projects`
+        # is missing AND a settings layer enumerates transcripts: on the shipped posture the sweep
+        # stands down before it looks for the tree, and a missing default link is caught instead
+        # by the ~/.claude/projects link check earlier in this file (review round 12).
         #
         # "DOES NOT EXIST" ONLY, and not "no transcripts". A root that exists and is EMPTY has been
         # measured: the deny list is zero bytes and Bash can spawn — which is every freshly created

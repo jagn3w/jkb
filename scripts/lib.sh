@@ -131,6 +131,55 @@ git_hooks_dir() {
     printf '%s\n' "$(_real_dir "$common")/hooks"
 }
 
+# is_linked_worktree <repo_root> — rc 0 when <repo_root> is a LINKED worktree (`git worktree add`),
+# rc 1 for a main checkout, and rc 2 outside a repository. Decided by --git-dir against
+# --git-common-dir, which differ only in a linked worktree. Taking the common dir's parent as the
+# main checkout misread a `--separate-git-dir` clone as a linked worktree, so setup.sh never
+# installed the kit there (review round 15).
+is_linked_worktree() {
+    local gd cd
+    gd="$(_git -C "$1" rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 2
+    cd="$(_git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 2
+    [ "$(_real_dir "$gd")" != "$(_real_dir "$cd")" ]
+}
+
+# kit_decision <repo_root> — whether setup.sh may refresh the shared dev container kit from here:
+# `install` in a main checkout, `worktree` in a linked one, `undecided` when git would not say (an old
+# git without --path-format, a safe.directory refusal, a lock). setup.sh's `&& is_linked_worktree` read
+# that third answer as "main checkout" and refreshed the kit from what may be a task branch (review
+# round 23) -- so the three answers are spelled out here, in the callee, where no caller can fold two.
+kit_decision() {
+    local rc=0
+    is_linked_worktree "$1" || rc=$?
+    case "$rc" in
+        0) printf 'worktree\n' ;;
+        1) printf 'install\n' ;;
+        *) printf 'undecided\n' ;;
+    esac
+}
+
+# main_checkout_of <repo_root> — the MAIN checkout of the repository <repo_root> is in: itself when
+# it is not a linked worktree, else the first entry `git worktree list` gives. Taking the common
+# dir's parent named a --separate-git-dir checkout's git-dir parent instead (review round 17). setup.sh decides with is_linked_worktree and uses this
+# only to name the main checkout in its message.
+main_checkout_of() {
+    local m rc=0
+    is_linked_worktree "$1" || rc=$?
+    case "$rc" in
+        # Not a linked worktree: it IS the main checkout. Its toplevel, not `worktree list`, which
+        # names the git dir itself for a --separate-git-dir checkout (measured on git 2.51.1).
+        1) m="$(_git -C "$1" rev-parse --show-toplevel 2>/dev/null)" ;;
+        # A linked worktree: git's own answer, the first `worktree list` entry. For a worktree of a
+        # --separate-git-dir checkout that answer is the git dir, and there is no better one: git
+        # records no path for that main checkout, neither in the list nor as core.worktree
+        # (measured on git 2.51.1, review round 18). setup.sh only names it in a message.
+        0) m="$(_git -C "$1" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" ;;
+        *) return 1 ;;
+    esac
+    [ -n "$m" ] || return 1
+    _real_dir "$m"
+}
+
 # _real_dir <path> — a directory's physical path, or the path itself when it does not exist.
 # Two spellings of one directory (a trailing slash, a symlink, a `..`) must compare equal.
 _real_dir() {
@@ -1630,6 +1679,16 @@ render_setup_summary() {
                     undecided) printf '  • jkb serve:  listening; could not confirm it serves (see the warnings above)\n' ;;
                     failed)    printf '  • jkb serve:  NOT up; its log is serve.log beside the database (macOS) or journalctl --user -u com.jkb.serve (Linux)\n' ;;
                     *)         warn "unrecognised serve state: $line" ;;
+                esac ;;
+            kit=*)
+                case "$state" in
+                    installed) printf '  • container:  start the dev container from the kit: %s/.container/run.sh\n' "$detail" ;;
+                    unchanged) printf '  • container:  the kit already matched this checkout; start it from %s/.container/run.sh\n' "$detail" ;;
+                    skipped)   printf '  • container:  kit skipped (--no-kit)\n' ;;
+                    worktree)  printf '  • container:  kit left alone: this is a linked worktree, and the kit follows the main checkout\n' ;;
+                    undecided) printf '  • container:  kit left alone: git would not say whether this is a linked worktree (see the warnings above)\n' ;;
+                    failed)    printf '  • container:  kit NOT installed; see the warnings above\n' ;;
+                    *)         warn "unrecognised kit state: $line" ;;
                 esac ;;
             topic=*)
                 case "$state" in

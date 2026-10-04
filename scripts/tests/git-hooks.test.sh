@@ -1533,6 +1533,26 @@ case10k() {
 #
 # So this drives an actual merge and reads what the hook actually prints. Three layouts, and the
 # middle one is the harm: without the guard an unrelated repository's setup.sh executes.
+# A MERGE THAT TOUCHES ONLY .container/ RUNS setup.sh, which refreshes the dev container kit from it:
+# left out of the trigger, such a pull left the kit stale (review round 31).
+case10n() {
+    local r="$work/pm-container" hook out
+    hook="$(cd "$(dirname "$0")/../.." && pwd)/scripts/hooks/post-merge"
+    mkdir -p "$r/scripts"; git_q init -q "$r" >/dev/null 2>&1
+    printf 'seed\n' >"$r/seed"
+    printf '%s\n' '#!/bin/sh' 'echo "SETUP-RAN"' >"$r/scripts/setup.sh"; chmod +x "$r/scripts/setup.sh"
+    git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm seed >/dev/null
+    mkdir -p "$r/.container"; printf 'x\n' >"$r/.container/run.sh"
+    git_q -C "$r" add -A >/dev/null; git_q -C "$r" commit -qm container >/dev/null
+    git_q -C "$r" branch -q feature 2>/dev/null; git_q -C "$r" reset -q --hard HEAD~1
+    cp "$hook" "$r/.git/hooks/post-merge"; chmod +x "$r/.git/hooks/post-merge"
+    out="$(git_q -C "$r" merge --no-edit feature 2>&1)"
+    case "$out" in
+        *"running setup.sh"*"SETUP-RAN"*) ok "a merge touching only .container/ runs setup.sh, which refreshes the kit" ;;
+        *) fail "post-merge: .container/" "unexpected: $(printf '%s' "$out" | tr '\n' '|')" ;;
+    esac
+}
+
 case10l() {
     local d="$work/hookenv" hook out
     hook="$(cd "$(dirname "$0")/../.." && pwd)/scripts/hooks/post-merge"
@@ -2671,6 +2691,44 @@ refuses is still code 2" \
     git_q config --global user.name "Test"
 }
 
-run_cases case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m
+# --- the dev container kit follows the MAIN checkout ----------------------------------------
+# setup.sh refreshes the kit only where is_linked_worktree says the tree is NOT a linked worktree,
+# so a task branch cannot repoint the shared kit (review round 10); main_checkout_of only names the
+# main checkout in the message it prints instead. case_kit_linked pins the decision.
+case_kit_main() {
+    local m w main_real
+    main_real="$(cd "$main" && pwd -P)"
+    m="$(main_checkout_of "$main")"; w="$(main_checkout_of "$wt")"
+    if [ "$m" = "$main_real" ] && [ "$w" = "$main_real" ] && ! main_checkout_of "$work" >/dev/null 2>&1; then
+        ok "main_checkout_of answers the main checkout from both it and its linked worktree, and fails outside a repository"
+    else
+        fail "kit: main checkout" "main=$m worktree=$w want=$main_real"
+    fi
+}
+
+case_kit_linked() {
+    local sep="$work/sep-$RANDOM" r1=9 r2=9 r3=9
+    git_q init -q --separate-git-dir "$sep.git" "$sep" >/dev/null 2>&1
+    is_linked_worktree "$main"; r1=$?
+    is_linked_worktree "$wt"; r2=$?
+    is_linked_worktree "$sep"; r3=$?
+    local sm; sm="$(main_checkout_of "$sep")"
+    if [ "$r1$r2$r3" = 101 ] && [ "$sm" = "$(cd "$sep" && pwd -P)" ]; then
+        ok "is_linked_worktree: main checkout no, linked worktree yes, a --separate-git-dir checkout no"
+    else
+        fail "kit: linked worktree" "main=$r1 worktree=$r2 separate=$r3 (want 1 0 1) sep-main=$sm"
+    fi
+    # ...and the THIRD answer is its own: outside any repository git will not say, and setup.sh read
+    # that as "main checkout" and refreshed the shared kit (review round 23).
+    local k1 k2 k3
+    k1="$(kit_decision "$main")"; k2="$(kit_decision "$wt")"; k3="$(kit_decision "$work")"
+    if [ "$k1:$k2:$k3" = install:worktree:undecided ]; then
+        ok "kit_decision: install in the main checkout, worktree in a linked one, undecided where git will not say"
+    else
+        fail "kit: kit_decision" "main=$k1 worktree=$k2 outside=$k3 (want install worktree undecided)"
+    fi
+}
+
+run_cases case_kit_main case_kit_linked case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m case10n
 
 finish

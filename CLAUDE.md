@@ -132,8 +132,12 @@ implementation checklist and the **source of truth for what's done**.
 - **Fresh-machine setup:** `./scripts/setup.sh` is the one-shot, idempotent installer —
   `cargo install`s the `jkb` binary, scaffolds the standard KB roots via `jkb ns mk repos
   tasks media references memory`, builds+installs the VS Code extension (`install-extension.sh`),
-  and installs+activates the file-sync watcher service (launchd/systemd). Flags:
-  `--no-extension`/`--no-service`/`--no-scaffold`/`--db`. `jkb ns mk <path>…` creates namespaces
+  installs+activates the file-sync watcher service (launchd/systemd), and installs the dev container's
+  **kit** (`~/.local/share/jkb-container-kit/kit`, via `.container/run.sh --install-kit`). Start the
+  container with `~/.local/share/jkb-container-kit/kit/.container/run.sh` (`run.sh --kit-path` prints
+  the kit's directory), never with the checkout's `run.sh`, which refuses: everything that runs outside the agent's
+  sandbox comes from the kit (`.container/README.md`, "Everything unsandboxed runs from the kit").
+  Flags: `--no-extension`/`--no-service`/`--no-scaffold`/`--no-kit`/`--db`. `jkb ns mk <path>…` creates namespaces
   idempotently (the only way to make an empty namespace; others arise from placements/mounts).
 - Per-task status (with `[~]` partials and inline notes) is in
   `openspec/changes/jkb-v1-foundation/tasks.md` (v1) and
