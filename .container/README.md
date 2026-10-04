@@ -1744,6 +1744,20 @@ O(files) of argv. What
   hook still pins `LC_ALL=C` and tests prefixes by substring. The wrapper costs one process: 9 ms
   for a Bash call (7 ms before), 33 ms for a judged Read, measured over 50 calls in jkb-dev on
   2026-10-03. A self-test row with a 1 s deadline and a 5 s judge is refused at the deadline.
+- **The hook reads its input from fd 0, never by path** (2026-10-04). The `--judge` child read it as
+  `$(</dev/stdin)`, to save `cat`'s fork. In the rebuilt image that refused **every** tool call with
+  `line 1010: /dev/stdin: No such device or address` and *could not reach a decision (exit 3)*.
+  Claude Code hands hook input over a socket. On Linux `/dev/stdin` is a link into
+  `/proc/self/fd`, and opening a socket through it fails with `ENXIO`. macOS opens it fine. Every
+  self-test row fed the hook through a pipe, which opens either way, so nothing saw it. The child
+  now reads `$(cat)`, which calls `read(2)` on the descriptor it inherits (the parent never touches
+  stdin). That costs one more process per call, not re-measured. `container-hooks.test.sh` case 39
+  runs the hook with stdin as one end of a `socketpair()` and requires a decision for a deny and an
+  allow. That row skips on the Mac, which lacks the hook's GNU tools and could not fail it anyway.
+  **The Mac-side guard is `check-config.sh`**, which refuses any hook named in
+  `managed-settings.json` whose code (comments stripped) names `/dev/stdin`, `/dev/fd/0` or
+  `/proc/*/fd/0`. It was watched failing on each of the three spellings put back, and
+  `mutate-config.sh` pins it.
 - **The hook does not trust `PATH`** (review round 4, the most serious finding in four rounds). It
   runs unsandboxed on every tool call, and the image puts the agent-writable `~/.local/bin` and
   `~/.cargo/bin` first on `PATH`. A `jq` planted there by sandboxed Bash ran outside the sandbox,
