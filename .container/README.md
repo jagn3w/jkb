@@ -1614,11 +1614,17 @@ tool is handed is judged on its physical path, as the kernel sandbox judges it:
     **It takes a rebuild** (`$kit --rm && $kit --build`): the managed settings are baked into the
     image, and a container on an older one keeps no pin. Verify names the rebuild when the pin is
     missing (review round 37).
-    **Not yet measured**, because no image with the pin had been built when it was written: that a
-    planted local `enabled:false` then leaves Bash sandboxed, and that a managed `sandbox` object
-    holding only these three keys **merges** with the user layer's `filesystem` lists rather than
-    replacing them. Check both after the first rebuild. In a session, `touch ~/x` must fail and
-    `touch ~/repos/x` must succeed. Then record the result here.
+    **The merge is measured** (2026-10-04, first session on the pinned image). A managed `sandbox`
+    object holding only these three keys **merges** with the user layer's `filesystem` lists:
+    sandboxed Bash writing `~/repos/.pin-probe` persisted, while `~/.claude/settings.json` was
+    `Read-only file system`, and `/etc` too. The probe planned here, "`touch ~/x` must fail", was
+    the wrong one. `touch ~/x` **succeeds**, because the user layer denies reading `/home/vscode`,
+    so the sandbox mounts an empty tmpfs over the home and binds the allowed paths back
+    (`/proc/self/mountinfo`: `/home/vscode ... tmpfs`). The file was gone in the next command and
+    never reached the real home. The right probe is that a home write does not survive into the
+    next command. **Still not measured:** that a planted worktree `settings.local.json` holding
+    `enabled:false` leaves the next session's Bash sandboxed. Managed precedence says it does, but
+    checking it needs a new session started in such a worktree.
   - **A layer that parses but is wrongly typed contributes nothing** (review round 36), as an
     unparseable one does. `{"permissions":"x"}` crashed the merge, and the hook refused every
     non-Bash call for the session with a message about transcripts.
