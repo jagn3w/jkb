@@ -903,6 +903,46 @@ case38_the_self_test_passes_under_the_pinned_managed_settings() {
     fi
 }
 
+# THE HOOK DECIDES WHEN ITS STDIN IS A SOCKET. Claude Code hands hook input over a socket in the
+# container, and the hook read it as `$(</dev/stdin)`: on Linux opening /dev/stdin on a socket fails
+# with ENXIO, so the judge exited 3 and EVERY tool call was refused. Every other row feeds a pipe,
+# which opens fine, so none saw it. Here stdin is one end of a socketpair; both a deny (a transcript
+# Read) and an allow (Bash) must come back as decisions, not the could-not-decide refusal.
+# ONLY LINUX CAN FAIL THIS: macOS opens /dev/stdin on a socket without complaint. The Mac-side guard
+# is check-config.sh refusing any hook that names /dev/stdin, /dev/fd/0 or /proc/self/fd/0.
+case39_the_hook_decides_when_stdin_is_a_socket() {
+    # The hook's own pinned PATH, as its self-test probes it: without GNU realpath -m, jq and timeout
+    # there, every call is the refusal, and this row would fail -- or pass -- for the wrong reason.
+    if ! PATH=/usr/bin:/bin realpath -m / >/dev/null 2>&1 || ! PATH=/usr/bin:/bin type -P jq >/dev/null 2>&1 \
+       || [ ! -x /usr/bin/timeout ]; then
+        skip "${FUNCNAME[0]}: no GNU realpath -m, jq or timeout in /usr/bin:/bin here, so the hook cannot run (the container and Linux CI have them)"
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || { skip "${FUNCNAME[0]}: no python3 to make a socket with"; return 0; }
+    local mgd="$work/sockmgd-$RANDOM" out
+    mkdir -p "$mgd"
+    # rc, stdout and stderr of one run, the payload written into one end of the pair and that end
+    # closed before the hook starts, so the hook sees the whole input and then EOF.
+    sock_run() {
+        env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR HOME=/h DT_SELFTEST_MANAGED_DIR="$mgd" python3 - "$repo_root/.container/deny-transcripts.sh" "$1" <<'PY'
+import socket, subprocess, sys
+a, b = socket.socketpair()
+a.sendall(sys.argv[2].encode()); a.close()
+p = subprocess.run([sys.argv[1]], stdin=b, capture_output=True)
+b.close()
+sys.stdout.write("rc=%d out=%s err=%s" % (p.returncode, p.stdout.decode().strip(), p.stderr.decode().strip()))
+PY
+    }
+    out="$(sock_run '{"tool_name":"Read","cwd":"/h/repos/jkb","tool_input":{"file_path":"/h/.claude/projects/-s/e.jsonl"}}')"
+    case "$out" in
+        'rc=0 out='*'"permissionDecision":"deny"'*' err=') ok "with stdin a socket, a transcript Read is still decided: denied" ;;
+        *) fail "with stdin a socket, a transcript Read is still decided: denied" "$out" ;;
+    esac
+    out="$(sock_run '{"tool_name":"Bash","cwd":"/h","tool_input":{"command":"ls"}}')"
+    if [ "$out" = 'rc=0 out= err=' ]; then ok "with stdin a socket, a Bash call is still decided: allowed"
+    else fail "with stdin a socket, a Bash call is still decided: allowed" "$out"; fi
+}
+
 run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case2_a_mirror_arrives_runnable_marked_and_root_side \
           case3_a_re_mirror_replaces_rather_than_merges \
@@ -938,5 +978,5 @@ run_cases case1_the_container_path_is_what_git_in_there_resolves \
           case33_an_older_flat_kit_is_removed \
           case34_a_link_that_appears_during_the_copy_is_refused \
           case35_a_hard_link_in_the_checkout_is_refused \
-          case35b_a_hard_link_made_during_the_copy_is_refused case36_the_checkout_a_kit_script_serves case37_the_installed_hooks_self_test_passes case38_the_self_test_passes_under_the_pinned_managed_settings
+          case35b_a_hard_link_made_during_the_copy_is_refused case36_the_checkout_a_kit_script_serves case37_the_installed_hooks_self_test_passes case38_the_self_test_passes_under_the_pinned_managed_settings case39_the_hook_decides_when_stdin_is_a_socket
 finish

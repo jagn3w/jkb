@@ -996,9 +996,15 @@ fi
 # paths refused ordinary calls once every tool reached this hook: 40 todos from a home cwd, an empty
 # activeForm read as "the home, an ancestor of the tree", a 4.6KB Agent prompt over the byte budget
 # (review round 4, all reproduced). A subagent's own tool calls reach this hook in their own right.
-# Read without `cat`: every tool call pays for this hook now, so a fork saved here is saved on every
-# Bash call. `$(</dev/stdin)`, not `read -d ''`, which reads a pipe a byte at a time: 1s for a 300KB
-# payload, before any judging (review round 20). The trailing newlines it drops are not JSON.
+# STDIN IS READ FROM THE DESCRIPTOR, NEVER BY PATH. This was `$(</dev/stdin)`, to save `cat`'s fork,
+# and it refused EVERY tool call in the container: Claude Code hands hook input over a socket, and on
+# Linux opening /dev/stdin -- a link into /proc/self/fd -- fails with ENXIO on a socket ("No such
+# device or address"), so the judge exited 3. macOS opens it fine and the self-tests fed a pipe, so
+# nothing caught it; check-config.sh now refuses any hook naming /dev/stdin, /dev/fd/0 or
+# /proc/self/fd/0. `cat` reads fd 0 with read(2), which works on a pipe, a file or a socket. Not
+# `read -d ''`, which reads a pipe a byte at a time: 1s for a 300KB payload (review round 20). Only
+# this --judge child reads: the parent never touches stdin, so the child inherits it unread. The
+# trailing newlines `$(...)` drops are not JSON.
 # `--sandbox-enabled` asks this hook's own merged answer (1 or 0) for the cwd, so verify.sh does not
 # keep a second copy of the layer-precedence rule (review round 17). It runs the same path as a tool
 # call, with a synthetic payload, and prints instead of deciding.
@@ -1007,7 +1013,7 @@ if [ "${1:-}" = --sandbox-enabled ]; then
     sb_query=1
     input="$(printf '{"tool_name":"__sandbox_query__","cwd":%s,"tool_input":{}}' "$(printf '%s' "$PWD" | HOME=/dev/null jq -Rs .)")"
 else
-    input="$(</dev/stdin)"
+    input="$(cat)"
 fi
 command -v jq >/dev/null 2>&1 || exit 3
 tool="$(printf '%s' "$input" | jqh -er '.tool_name | strings' 2>/dev/null)" || exit 3

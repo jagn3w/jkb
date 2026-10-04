@@ -2108,6 +2108,22 @@ open(p, 'w').write(s.replace(o, 'DT_INSTALLED_PATH=/usr/local/lib/deny-transcrip
 PYX
 run "the hook's DT_INSTALLED_PATH drifts from the managed command" "DT_INSTALLED_PATH is not the managed hook command"
 
+# The hook reads stdin by path again: the exact line that refused every tool call in the rebuilt
+# image (ENXIO on a socket). The guard is the Mac-side half; container-hooks.test.sh's socket row
+# is the Linux one.
+seed; python3 - "$work/t/.container/deny-transcripts.sh" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '    input="$(cat)"\n'
+assert s.count(o) == 1, "mutation target absent"
+open(p, 'w').write(s.replace(o, '    input="$(</dev/stdin)"\n', 1))
+PYX
+run "the hook opens its stdin by path again" "a hook opens its stdin by path"
+
+# ...and the guard pinned against examining nothing: with no hook script to read, it says so.
+seed; rm -f "$work/t/.container/deny-transcripts.sh"
+run "no hook script is found to check for stdin by path" "whether a hook opens stdin by path is unchecked"
+
 # The sandbox is pinned on in managed settings (the user's decision after review round 36).
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
 import sys
@@ -2531,7 +2547,7 @@ echo "==> coverage"
 # mutation while the harness printed a coverage number over it.
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=121
+PINNED_BAD_SITES=123
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

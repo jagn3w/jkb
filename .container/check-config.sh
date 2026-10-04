@@ -607,6 +607,30 @@ else
         ok "the transcript deny is a wired, root-owned hook that every tool call reaches"
     fi
 fi
+# A HOOK READS STDIN FROM THE DESCRIPTOR, NEVER BY PATH. deny-transcripts.sh read `$(</dev/stdin)`, and
+# in the rebuilt image it refused EVERY tool call: Claude Code hands hook input over a socket, and on
+# Linux opening /dev/stdin (or /dev/fd/0, /proc/self/fd/0) on a socket fails with ENXIO. macOS opens it
+# fine, so container-hooks.test.sh's socket row cannot fail on the Mac -- this is the Mac-side guard.
+# The scripts are the ones managed-settings.json runs from /usr/local/bin, each checked as the copy in
+# here; comments are stripped, so the rule can still be explained in prose.
+dc_stdin_hooks=()
+while IFS= read -r dc_c; do
+    case "$dc_c" in /usr/local/bin/*) [ -f "$here/${dc_c#/usr/local/bin/}" ] && dc_stdin_hooks+=("${dc_c#/usr/local/bin/}") ;; esac
+done <<<"$hook_cmds"
+dc_stdin_by_path=""
+if [ "${#dc_stdin_hooks[@]}" -gt 0 ]; then
+    for dc_s in "${dc_stdin_hooks[@]}"; do
+        grep -qE '/dev/stdin|/dev/fd/0|/proc/[^/[:space:]]+/fd/0' <<<"$(dc_strip_comments "$here/$dc_s")" \
+            && dc_stdin_by_path="$dc_stdin_by_path $dc_s"
+    done
+fi
+if [ "${#dc_stdin_hooks[@]}" -eq 0 ]; then
+    bad "no hook script in here could be found from managed-settings.json's /usr/local/bin commands, so whether a hook opens stdin by path is unchecked"
+elif [ -n "$dc_stdin_by_path" ]; then
+    bad "a hook opens its stdin by path (/dev/stdin, /dev/fd/0 or /proc/*/fd/0):$dc_stdin_by_path — Claude Code hands hook input over a socket, which Linux refuses to open that way (ENXIO), so the hook fails and refuses every call; read it with \`cat\`"
+else
+    ok "no hook opens its stdin by path (${dc_stdin_hooks[*]})"
+fi
 # THE SANDBOX IS PINNED ON IN THE IMAGE'S MANAGED SETTINGS (the user's decision after review round 36).
 # Managed settings outrank every other layer, and without the pin a worktree's own settings.local.json
 # -- which sandboxed Bash can create in a new worktree -- could set enabled:false, and Claude Code would
