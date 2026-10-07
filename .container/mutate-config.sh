@@ -2120,6 +2120,19 @@ open(p, 'w').write(s.replace(o, '    input="$(</dev/stdin)"\n', 1))
 PYX
 run "the hook opens its stdin by path again" "a hook opens its stdin by path"
 
+# ...and each of the guard's other two spellings, so narrowing its pattern to /dev/stdin is caught
+# (review round 40).
+for alt in '/dev/fd/0' '/proc/self/fd/0'; do
+seed; python3 - "$work/t/.container/deny-transcripts.sh" "$alt" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+o = '    input="$(cat)"\n'
+assert s.count(o) == 1, "mutation target absent"
+open(p, 'w').write(s.replace(o, '    input="$(<' + sys.argv[2] + ')"\n', 1))
+PYX
+run "the hook opens its stdin as $alt" "a hook opens its stdin by path"
+done
+
 # ...and the guard pinned against examining nothing: with no hook script to read, it says so.
 seed; rm -f "$work/t/.container/deny-transcripts.sh"
 run "no hook script is found to check for stdin by path" "whether a hook opens stdin by path is unchecked"
