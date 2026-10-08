@@ -800,7 +800,8 @@ grep -q 'JKB_CONTAINER_KIT_HOME' <<<"$(dc_strip_comments "$here/lib.sh")" \
 # others -- `bash -c` for the login, `bash -lc` for the reap, `sh`, `sudo` -- resolving through the
 # same PATH (review round 8). Each `docker exec`/`in_container` statement must name its program
 # absolutely, and pin PATH with `-e PATH=/usr/bin:/bin` unless the program is one that answers for
-# its own: the sweep (pins as its first command), setup.sh (runs the toolchain by design, once),
+# its own: the sweep (pins as its first command), setup.sh (runs the toolchain by design, once) and
+# install-extensions.sh (builds the explorer with it; setup.sh runs it too),
 # verify.sh (task verify-sh-runs-unsandboxed-with--18da6e4b5d893488), or sudo (secure_path).
 # EVERY OCCURRENCE IS ACCOUNTED FOR, never skipped: a statement whose container or program the scan
 # cannot resolve is a failure, so `in_container --user root "${NAME}" bash` cannot be added unseen
@@ -849,6 +850,9 @@ while IFS=$'\t' read -r dc_ln dc_pin dc_prog dc_arg dc_ck; do
     [ "$dc_pin" = 1 ] && continue
     case "$dc_prog $dc_arg" in
         '/bin/bash "$DC_CTR_KIT/.container/sweep-transcripts.sh"'|'/bin/bash "$DC_CTR_KIT/.container/setup.sh"'|'/bin/bash "$DC_CTR_KIT/.container/verify.sh"'|"/usr/bin/sudo "*) ;;
+        # install-extensions.sh builds the explorer with the toolchain, as setup.sh does (and setup.sh
+        # runs it); `run.sh --install-extensions` starts it the way its header says to by hand (D53.8).
+        '/bin/bash "$DC_CTR_KIT/.container/install-extensions.sh"') ;;
         *) dc_unsb="$dc_unsb $dc_ln runs [$dc_prog $dc_arg] without -e PATH=/usr/bin:/bin;" ;;
     esac
 done <<<"$dc_execs"

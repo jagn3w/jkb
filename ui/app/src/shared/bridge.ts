@@ -6,7 +6,17 @@
 // token, the HTTP client and the PTYs stay in main. A capability the renderer needs is added here,
 // in the preload and in main's handlers together; nothing reaches the renderer any other way.
 
-import type { DesignAnnouncement, Hello, OpRequest, OpResponse, Outcome, PromptAnnouncement } from "@jkb/core";
+import type {
+  ContainerAction,
+  ContainerResult,
+  ContainerStatus,
+  DesignAnnouncement,
+  Hello,
+  OpRequest,
+  OpResponse,
+  Outcome,
+  PromptAnnouncement,
+} from "@jkb/core";
 
 import type { TerminalEvent, TerminalInfo, TerminalResult, TerminalRoots, TerminalSpec } from "./terminal";
 
@@ -25,6 +35,8 @@ export const BRIDGE_CHANNELS = {
   designUnsubscribe: "jkb:design:unsubscribe",
   /** main → renderer: a design topic's update, gap or error. */
   designEvent: "jkb:design:event",
+  containerStatus: "jkb:container:status",
+  containerSpec: "jkb:container:spec",
 } as const;
 
 /** What the renderer may know about where it runs. Nothing secret: no token, no token path. */
@@ -78,6 +90,20 @@ export interface DesignBridge {
   onEvent(listener: (event: DesignFeedEvent) => void): () => void;
 }
 
+/**
+ * `window.jkb.container`: the dev container, through the installed kit's `run.sh` (D53.8). Main
+ * finds the kit and checks it; the renderer only names what it wants done.
+ */
+export interface ContainerBridge {
+  /** `run.sh --status`: what the container is, its image's labels and its drift. */
+  status(): Promise<ContainerResult<ContainerStatus>>;
+  /**
+   * The host terminal that runs `action` (the kit's `run.sh` with that action's one flag), for the
+   * renderer to open in the integrated terminal so its output streams there.
+   */
+  spec(action: ContainerAction): Promise<ContainerResult<TerminalSpec>>;
+}
+
 /** `window.jkb`: everything the renderer can ask of the main process. */
 export interface JkbBridge {
   /** `GET /v1/hello`: whether the daemon is reachable, and which schema and ops it serves. */
@@ -90,4 +116,6 @@ export interface JkbBridge {
   readonly terminal: TerminalBridge;
   /** Live design updates. */
   readonly design: DesignBridge;
+  /** The dev container, through the kit. */
+  readonly container: ContainerBridge;
 }

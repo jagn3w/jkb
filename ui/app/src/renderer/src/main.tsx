@@ -8,6 +8,7 @@ import "./styles/design.css";
 import "./styles/plan.css";
 import "./styles/prompts.css";
 import "./styles/workflows.css";
+import "./styles/container.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";

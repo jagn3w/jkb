@@ -578,6 +578,14 @@ EOF
 $(dc_kit_paths)
 EOF
     printf 'checkout=%s\n' "$src" > "$new/$DC_KIT_MARKER" || { rm -rf "$new"; return 1; }
+    # ...AND THE COMMIT AND BRANCH IT STOOD ON, which the image is labelled with when it is built from
+    # this kit (D53.8). The checkout's HEAD at the copy: an uncommitted edit to a kit path rides along
+    # in the copy and is not in that commit, which .container/README.md states beside the labels.
+    local src_head
+    if src_head="$(dc_git_head "$src")"; then
+        printf 'commit=%s\nbranch=%s\n' "${src_head%%$'\t'*}" "${src_head#*$'\t'}" >> "$new/$DC_KIT_MARKER" \
+            || { rm -rf "$new"; return 1; }
+    fi
     chmod -R go-w "$new" && chmod 0755 "$new" || { rm -rf "$new"; return 1; }
     old=""
     if [ -e "$kit" ] || [ -L "$kit" ]; then
@@ -608,6 +616,71 @@ dc_kit_checkout() { # dc_kit_checkout <kit dir>
     c="$(sed -n 's/^checkout=//p' "$1/$DC_KIT_MARKER" 2>/dev/null | head -1)"
     [ -n "$c" ] || return 1
     printf '%s\n' "$c"
+}
+
+# THE COMMIT AND BRANCH A CHECKOUT STANDS ON, READ FROM ITS FILES -- NEVER BY RUNNING GIT (D53.8).
+# The image's `jkb.source-commit`/`jkb.source-branch` labels come from here, and this runs on the host,
+# unsandboxed, against a checkout the agent can write: git there reads the repository's own config,
+# whose `core.fsmonitor` is a program git runs. Every other host-side git call in this directory runs
+# from `/` for the same reason (dc_global_hooks_path). So HEAD is read as git stores it: `.git` is the
+# directory, or a `gitdir:` file for a worktree; a worktree's branches live in its `commondir`; a
+# branch is a loose ref or a `packed-refs` line. A reftable repository, a symbolic ref that is not a
+# branch, or anything that does not end in a full hex object name is rc 1 -- "unknown", never a guess.
+# Prints `<commit>\t<branch>`, the branch empty when HEAD is detached.
+dc_git_head() { # dc_git_head <checkout>
+    local root="$1" gd common head ref sha="" branch="" c
+    if [ -d "$root/.git" ]; then gd="$root/.git"
+    elif [ -f "$root/.git" ]; then
+        gd="$(sed -n 's/^gitdir: //p' "$root/.git" 2>/dev/null | head -1)"
+        case "$gd" in "") return 1 ;; /*) ;; *) gd="$root/$gd" ;; esac
+    else return 1
+    fi
+    common="$gd"
+    if [ -f "$gd/commondir" ]; then
+        c="$(head -1 "$gd/commondir" 2>/dev/null)"
+        case "$c" in "") ;; /*) common="$c" ;; *) common="$gd/$c" ;; esac
+    fi
+    head="$(head -1 "$gd/HEAD" 2>/dev/null)"
+    case "$head" in
+        "ref: refs/heads/"*)
+            ref="${head#ref: }"; branch="${ref#refs/heads/}"
+            if [ -f "$common/$ref" ]; then sha="$(head -1 "$common/$ref" 2>/dev/null)"
+            elif [ -f "$common/packed-refs" ]; then
+                sha="$(awk -v r="$ref" '$2 == r { print $1; exit }' "$common/packed-refs" 2>/dev/null)"
+            fi ;;
+        "ref: "*) return 1 ;;
+        *) sha="$head" ;;
+    esac
+    case "$sha" in ""|*[!0-9a-f]*) return 1 ;; esac
+    [ "${#sha}" -eq 40 ] || [ "${#sha}" -eq 64 ] || return 1
+    # A branch name goes into the kit marker (one line per field) and a docker label: git refuses
+    # whitespace and control characters in a ref name, so one that has them was not written by git.
+    case "$branch" in *[[:space:][:cntrl:]]*) return 1 ;; esac
+    printf '%s\t%s\n' "$sha" "$branch"
+}
+
+# dc_kit_source <kit dir> -> `<commit>\t<branch>` the kit was copied from, as dc_install_kit recorded
+# them, or rc 1 when it recorded none (a kit installed before it did, or from a checkout whose HEAD
+# could not be read).
+dc_kit_source() { # dc_kit_source <kit dir>
+    local commit branch
+    commit="$(sed -n 's/^commit=//p' "$1/$DC_KIT_MARKER" 2>/dev/null | head -1)"
+    branch="$(sed -n 's/^branch=//p' "$1/$DC_KIT_MARKER" 2>/dev/null | head -1)"
+    [ -n "$commit" ] || return 1
+    printf '%s\t%s\n' "$commit" "$branch"
+}
+
+# dc_source_labels [<commit>\t<branch>] -> the `jkb.source-commit`/`jkb.source-branch` label values,
+# `<commit>\t<branch>`: a detached HEAD (empty branch) is `(detached)`, and no source at all is
+# `unknown` for both. The ONE place that mapping is written: build_image labels with it and the tests
+# expect what it says, so a detached CI checkout cannot make the two disagree.
+dc_source_labels() { # dc_source_labels [<commit>\t<branch>]
+    local commit=unknown branch=unknown
+    if [ -n "${1:-}" ]; then
+        commit="${1%%$'\t'*}"; branch="${1#*$'\t'}"
+        [ -n "$branch" ] || branch="(detached)"
+    fi
+    printf '%s\t%s\n' "$commit" "$branch"
 }
 
 # dc_kit_changes <kit dir> <checkout> -> every FILE that differs between the kit and the checkout,

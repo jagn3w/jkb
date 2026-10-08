@@ -8,6 +8,14 @@
 #   ./.container/run.sh --rm            stop AND remove it, so the next run redoes setup
 #                                    (both move a login written since the start into the state
 #                                    volume first; see lib.sh's dc_persist_login)
+#   ./.container/run.sh --verify        check the RUNNING container again (verify.sh, from a fresh
+#                                    kit mirror); never builds, creates or starts one
+#   ./.container/run.sh --install-extensions
+#                                    run install-extensions.sh in the RUNNING container, from the mirror
+#   ./.container/run.sh --status        what the container is, as one JSON object: the image's labels
+#                                    (jkb.built-at, jkb.source-commit, jkb.source-branch), the
+#                                    container's state and its drift from this declaration. Read by
+#                                    the Code Factory app's Container tab (docs/code-factory.md, D53.8)
 #   ./.container/run.sh --dry-run       print the docker command instead of running it
 #   ./.container/run.sh --consumed-keys list the container.json keys this tooling reads
 #   ./.container/run.sh --print-args [--posture] [<repo-root>]
@@ -242,6 +250,34 @@ config_hash() { # config_hash <config> <repo-root>
     out="$(docker_args "$1" "$2")" || die "container.json could not be read; refusing to fingerprint half a declaration"
     while IFS= read -r l; do a+=("$l"); done <<<"$out"
     fingerprint "$2" ${a[@]+"${a[@]}"}
+}
+
+# DRIFT: the two ways an existing container differs from what a start would make it (D53.8). ONE
+# answer for the start path, which refuses on either, and for --status, which reports them: two
+# copies of the comparison could call the same container current in one place and stale in the other.
+# A container created before the args-hash label existed reads `<no value>` -- unrecorded, which the
+# start path refuses as it refuses `differs`.
+args_drift() { # args_drift <the container's jkb.args-hash> <this declaration's> -> same|differs|unrecorded
+    case "$1" in
+        ""|"<no value>") printf 'unrecorded' ;;
+        "$2")            printf 'same' ;;
+        *)               printf 'differs' ;;
+    esac
+}
+image_drift() { # image_drift <the container's image id> <the image tag's id> -> same|differs|unknown
+    if [ -z "$1" ] || [ -z "$2" ]; then printf 'unknown'
+    elif [ "$1" = "$2" ]; then printf 'same'
+    else printf 'differs'; fi
+}
+
+# WHAT AN IMAGE IS, LESS WHEN IT WAS STAMPED (D53.8): its layers by content (RootFS's diff ids), its
+# platform, and its configuration without `jkb.built-at` -- and without the two fields the classic
+# builder fills per build step, the parent image (`Image`) and the build container's id (`Hostname`),
+# neither of which says anything about what runs. Two images with the same answer run the same
+# thing; build_image keeps the tag when a build produced the same answer. One canonical line, or
+# nothing for input that is not `docker image inspect` output.
+image_content() { # image_content <docker image inspect JSON>
+    jq -cS '.[0] // empty | {RootFS, Os, Architecture, Variant, Config: ((.Config // {}) | del(.Image, .Hostname) | .Labels = ((.Labels // {}) | del(.["jkb.built-at"])))}' <<<"$1" 2>/dev/null
 }
 
 # TWO HALVES, ONE EMITTER (D54.1). Every flag is emitted at exactly one place here, and a caller
@@ -608,6 +644,37 @@ true    /usr/bin/tini\x20--\x20sleep\x20infinity   settled
 true    /sbin/docker-init\x20--\x20/usr/local/bin/entrypoint.sh\x20sleep\x20infinity   waiting
 TABLE
 
+    echo "==> run.sh self-test: drift, one answer for the start and for --status"
+    eq "a container stamped with this declaration's hash is the same" "$(args_drift abc abc)" "same"
+    eq "...one stamped with another hash differs" "$(args_drift abc def)" "differs"
+    eq "...one with no stamp is unrecorded, never the same" "$(args_drift '<no value>' def)" "unrecorded"
+    eq "...and so is an empty read, even against an empty hash" "$(args_drift '' '')" "unrecorded"
+    eq "a container on the tag's image is the same" "$(image_drift sha256:a sha256:a)" "same"
+    eq "...on another build differs" "$(image_drift sha256:a sha256:b)" "differs"
+    eq "...and with either id missing it is unknown, not the same" "$(image_drift '' sha256:a)" "unknown"
+
+    echo "==> run.sh self-test: an image, less when it was stamped"
+    ic_base='{"Id":"sha256:1","RootFS":{"Type":"layers","Layers":["sha256:l1","sha256:l2"]},"Os":"linux","Architecture":"arm64","Config":{"Hostname":"h1","Image":"sha256:p1","Env":["A=1"],"Entrypoint":["/e"],"Labels":{"jkb.source-commit":"c1","jkb.source-branch":"main","jkb.built-at":"2026-01-01T00:00:00Z"}}}'
+    ic_of() { image_content "[$(jq -c "$1" <<<"$ic_base")]"; }
+    ic_same="$(ic_of '.')"
+    eq "the projection reads docker's inspect output at all" "$([ -n "$ic_same" ] && echo read || echo nothing)" "read"
+    eq "a restamp -- another id, parent, build host and built-at -- is the same content" \
+       "$([ "$(ic_of '.Id="sha256:2" | .Config.Hostname="h2" | .Config.Image="sha256:p2" | .Config.Labels["jkb.built-at"]="2026-02-02T00:00:00Z"')" = "$ic_same" ] && echo same || echo differs)" "same"
+    eq "...and so is one with no built-at at all (the unstamped first build)" \
+       "$([ "$(ic_of 'del(.Config.Labels["jkb.built-at"])')" = "$ic_same" ] && echo same || echo differs)" "same"
+    eq "another layer is another image" \
+       "$([ "$(ic_of '.RootFS.Layers[1]="sha256:l3"')" = "$ic_same" ] && echo same || echo differs)" "differs"
+    eq "...as is another entrypoint" \
+       "$([ "$(ic_of '.Config.Entrypoint=["/f"]')" = "$ic_same" ] && echo same || echo differs)" "differs"
+    eq "...another environment" \
+       "$([ "$(ic_of '.Config.Env=["A=2"]')" = "$ic_same" ] && echo same || echo differs)" "differs"
+    eq "...another platform" \
+       "$([ "$(ic_of '.Architecture="amd64"')" = "$ic_same" ] && echo same || echo differs)" "differs"
+    eq "...and another source commit, which the label claims" \
+       "$([ "$(ic_of '.Config.Labels["jkb.source-commit"]="c2"')" = "$ic_same" ] && echo same || echo differs)" "differs"
+    eq "input that is not inspect output reads as nothing, which build_image never calls the same" \
+       "$(image_content 'not json')$(image_content '[]')" ""
+
     echo
     [ "$fails" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$fails"; exit 1; }
     printf '\033[32mrun.sh self-test passed\033[0m\n'
@@ -660,9 +727,17 @@ require_kit() {
 }
 
 BUILD=0 DRY=0 OPEN=0 open_path=""
+# WHAT THIS RUN IS FOR: `start` (build if needed, start, set up, verify), or one of the three modes the
+# Code Factory app's Container tab drives (D53.8). The modes go through the same assembly and, for
+# verify and install-extensions, the same start path -- the drift checks, the settle, the kit mirror --
+# stopping where their job ends, so there is one route to each exec rather than a second copy of it.
+MODE=start
 while [ $# -gt 0 ]; do
     case "$1" in
         --build)         BUILD=1; shift ;;
+        --verify)        MODE=verify; shift ;;
+        --install-extensions) MODE=install-extensions; shift ;;
+        --status)        MODE=status; shift ;;
         --dry-run)       DRY=1; shift ;;
         --open)          OPEN=1; shift; case "${1:-}" in -*|"") ;; *) open_path="$1"; shift ;; esac ;;
         --consumed-keys) consumed_keys; exit 0 ;;
@@ -730,6 +805,11 @@ while [ $# -gt 0 ]; do
         *)               die "unknown argument '$1' (see the header of $0)" ;;
     esac
 done
+# A MODE IS ALONE: `--verify --build` would read as "rebuild, then verify", and a mode never builds,
+# creates or starts anything -- so it is refused rather than half-honoured.
+if [ "$MODE" != start ] && { [ "$BUILD" -eq 1 ] || [ "$OPEN" -eq 1 ] || [ "$DRY" -eq 1 ]; }; then
+    die "--$MODE takes no other flag (not --build, --open or --dry-run)"
+fi
 
 kit_need_checkout
 need_tool jq "jq is required to read $CONFIG"
@@ -791,7 +871,70 @@ if [ -n "$KIT_ROOT" ]; then
 fi
 
 need_tool docker "docker is not on PATH"
+
+# --status: WHAT THE CONTAINER IS, as one JSON object on stdout (D53.8), for the Code Factory app's
+# Container tab. Read-only: it inspects and changes nothing. Its drift is args_drift and image_drift,
+# the start path's own answers, against the want_hash this run just derived -- so the tab says
+# "stale" exactly when a start would refuse. A daemon that cannot be reached is an answer
+# (`"docker": "unreachable"`), not an error: Docker Desktop not running yet is the commonest state.
+print_status() {
+    local reach=reachable img="[]" ctr="[]" cimg="[]" cid="" have="" disk_id="" args="" image=""
+    if docker info >/dev/null 2>&1; then
+        img="$(docker image inspect "$IMAGE" 2>/dev/null)" || img="[]"
+        ctr="$(docker container inspect "$NAME" 2>/dev/null)" || ctr="[]"
+    else
+        reach=unreachable
+    fi
+    # Anything that is not an array of objects is read as "none", never handed to --argjson raw.
+    jq -e 'type == "array"' >/dev/null 2>&1 <<<"$img" || img="[]"
+    jq -e 'type == "array"' >/dev/null 2>&1 <<<"$ctr" || ctr="[]"
+    cid="$(jq -r '.[0].Image // empty' <<<"$ctr" 2>/dev/null)" || cid=""
+    if [ -n "$cid" ]; then
+        cimg="$(docker image inspect "$cid" 2>/dev/null)" || cimg="[]"
+        jq -e 'type == "array"' >/dev/null 2>&1 <<<"$cimg" || cimg="[]"
+    fi
+    disk_id="$(jq -r '.[0].Id // empty' <<<"$img" 2>/dev/null)" || disk_id=""
+    if [ "$(jq -r 'length' <<<"$ctr" 2>/dev/null)" != 0 ]; then
+        have="$(jq -r '.[0].Config.Labels["jkb.args-hash"] // empty' <<<"$ctr" 2>/dev/null)" || have=""
+        args="$(args_drift "$have" "$want_hash")"
+        image="$(image_drift "$cid" "$disk_id")"
+    fi
+    jq -n --arg docker "$reach" --arg name "$NAME" --arg image "$IMAGE" --arg kit "$KIT_ROOT" \
+          --arg checkout "$repo" --arg kit_changed "${kit_changed:-}" --arg want "$want_hash" \
+          --arg args "$args" --arg image_drift "$image" \
+          --argjson img "$img" --argjson ctr "$ctr" --argjson cimg "$cimg" '
+        def opt: if . == "" then null else . end;
+        def stamp: if . == null then null else {
+            id: .Id, created: .Created,
+            built_at: (.Config.Labels["jkb.built-at"] // null),
+            source_commit: (.Config.Labels["jkb.source-commit"] // null),
+            source_branch: (.Config.Labels["jkb.source-branch"] // null)
+        } end;
+        {
+            schema: 1, docker: $docker, name: $name, image: $image,
+            kit: ($kit | opt), checkout: ($checkout | opt),
+            kit_changed: ($kit_changed | split("\n") | map(select(. != ""))),
+            want_args_hash: $want,
+            image_on_disk: ($img[0] | stamp),
+            container: (if ($ctr | length) == 0 then null else {
+                state: $ctr[0].State.Status,
+                image_id: $ctr[0].Image,
+                args_hash: ($ctr[0].Config.Labels["jkb.args-hash"] // null),
+                image: ($cimg[0] | stamp)
+            } end),
+            drift: {args: ($args | opt), image: ($image_drift | opt)}
+        }'
+}
+if [ "$MODE" = status ]; then print_status; exit 0; fi
+
 docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
+
+# --verify AND --install-extensions ACT ON A RUNNING CONTAINER, never make one: a button that checks
+# the container must not be the one that builds or creates it. Asked here, before the build below.
+if [ "$MODE" != start ] \
+   && [ "$(docker container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" != true ]; then
+    die "$NAME is not running, and --$MODE acts on a running container only. Start it first: $0"
+fi
 
 # The narrowed ~/.jkb binds and the credential's directory must exist on the host: a bind whose source
 # is missing is a hard error (D52.8). The credential itself is written by `jkb role rotate-container
@@ -805,13 +948,60 @@ chmod 0700 "$HOME/.jkb-container"
 # existing image of that name was run as it was -- any local image, with this container's mounts, the
 # credential among them, and none of its firewall (review round 24). Built from the kit, the override
 # only names the tag; the layer cache makes a rebuild cheap.
-if [ "$BUILD" -eq 1 ] || [ "$IMAGE" != jkb-dev ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+#
+# THE BUILD IS STAMPED (D53.8). The image carries where it came from and when, as labels the Code
+# Factory app's Container tab shows (`--status`):
+#   jkb.source-commit, jkb.source-branch  the commit and branch the kit was copied from (lib.sh's
+#                                         dc_kit_source), or the checkout's own HEAD when this runs
+#                                         from it; `unknown` when neither was recorded;
+#   jkb.built-at                          when THIS CONTENT was first built, UTC.
+# A label is part of an image's configuration, so a time that changed on every build would give every
+# `--build` -- and every start with JKB_CONTAINER_IMAGE set, which always builds -- a new image id, and
+# the image check below would then refuse every existing container as "running an older build". So the
+# build is two steps. The first does the work, its output streamed, with no time on it, and writes the
+# id it produced to a file in the kit home (which no agent can write: the file decides whether the tag
+# moves). If the image the tag holds now is that content less its stamp (image_content), the tag stays,
+# and so does its time. Otherwise the second build -- every layer cached, so quick -- adds the time and
+# moves the tag. A planted image under a non-default name passes only by BEING that content: the
+# comparison is of layer digests and configuration, not of a label anyone can write.
+build_image() {
+    local df src labels commit branch idf built new_json have_json new_content now
+    df="$here/$(dc_dockerfile "$CONFIG")"
+    if [ -n "$KIT_ROOT" ]; then src="$(dc_kit_source "$KIT_ROOT")" || src=""
+    else src="$(dc_git_head "$repo")" || src=""; fi
+    labels="$(dc_source_labels "$src")"
+    commit="${labels%%$'\t'*}"; branch="${labels#*$'\t'}"
+    if [ -z "$src" ]; then
+        echo "note: no source commit is recorded for this build, so it is labelled 'unknown'${KIT_ROOT:+ -- a kit installed before the labels existed records none; reinstall it: $KIT_ROOT/.container/run.sh --install-kit}" >&2
+    fi
+    mkdir -p "$DC_KIT_HOME" && chmod 700 "$DC_KIT_HOME" || die "could not make $DC_KIT_HOME to hold the build's image id"
+    idf="$(mktemp "$DC_KIT_HOME/iid.XXXXXX")" || die "could not make a file under $DC_KIT_HOME for the build's image id"
+    if ! docker build --iidfile "$idf" --label "jkb.source-commit=$commit" --label "jkb.source-branch=$branch" \
+            -f "$df" "$here"; then
+        rm -f "$idf"; die "the image did not build"
+    fi
+    built="$(cat "$idf")"; rm -f "$idf"
+    new_json="$(docker image inspect "$built" 2>/dev/null)" || die "docker built $built but cannot inspect it"
+    new_content="$(image_content "$new_json")"
+    [ -n "$new_content" ] || die "could not read what docker built ($built)"
+    have_json="$(docker image inspect "$IMAGE" 2>/dev/null)" || have_json=""
+    if [ -n "$have_json" ] && [ "$(image_content "$have_json")" = "$new_content" ]; then
+        say "$IMAGE is unchanged by this build: it keeps its jkb.built-at"
+        return 0
+    fi
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    say "stamp $IMAGE (jkb.built-at=$now, jkb.source-commit=$commit, jkb.source-branch=$branch)"
+    docker build -q -t "$IMAGE" --label "jkb.source-commit=$commit" --label "jkb.source-branch=$branch" \
+        --label "jkb.built-at=$now" -f "$df" "$here" >/dev/null || die "the image built but could not be stamped"
+}
+if [ "$MODE" = start ] \
+   && { [ "$BUILD" -eq 1 ] || [ "$IMAGE" != jkb-dev ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; }; then
     # `name` and `build.dockerfile` are READ here. They were listed as consumed keys while nothing
     # looked at either, so check-config.sh printed "every key in container.json is applied by
     # run.sh" about two declarations that did nothing — and the fix for the next inert key would
     # have been to add it to the list, which silences the check rather than satisfying it.
     say "build $IMAGE — $(dc_name "$CONFIG")"
-    docker build -t "$IMAGE" -f "$here/$(dc_dockerfile "$CONFIG")" "$here"
+    build_image
 fi
 
 state="$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || true)"
@@ -882,10 +1072,11 @@ case "$state" in
         # wrong, refusing costs one command and accepting runs a container built to a
         # specification nobody can see any more.
         have="$(docker inspect -f '{{index .Config.Labels "jkb.args-hash"}}' "$NAME" 2>/dev/null || true)"
-        if [ "$have" != "$want_hash" ]; then
-            case "$have" in
-                ""|"<no value>") reason="$NAME carries no record of what it was created from" ;;
-                *)               reason="$NAME was created from a different container.json or seccomp profile" ;;
+        drift="$(args_drift "$have" "$want_hash")"
+        if [ "$drift" != same ]; then
+            case "$drift" in
+                unrecorded) reason="$NAME carries no record of what it was created from" ;;
+                *)          reason="$NAME was created from a different container.json or seccomp profile" ;;
             esac
             die "$reason.
   \`docker start\` reuses the configuration a container was BUILT with, so starting it would give
@@ -903,7 +1094,7 @@ case "$state" in
         # user had just followed.
         want_image="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
         have_image="$(docker inspect -f '{{.Image}}' "$NAME" 2>/dev/null || true)"
-        if [ -n "$want_image" ] && [ -n "$have_image" ] && [ "$have_image" != "$want_image" ]; then
+        if [ "$(image_drift "$have_image" "$want_image")" = differs ]; then
             die "$NAME is running an older build of $IMAGE than the one on disk.
   A container keeps the image it was created from, so the new one does not reach it by starting.
 
@@ -1233,6 +1424,16 @@ kit_rc=0; dc_mirror_hooks "$kit_src" "$DC_CTR_KIT" "$NAME" docker "the container
 [ -z "$kit_stage" ] || rm -rf "$kit_stage"
 [ "$kit_rc" -eq 0 ] || die "could not install the container kit at $DC_CTR_KIT in $NAME -- the sweep, setup.sh and verify.sh run only from there, never from the checkout the agent can write"
 
+# --install-extensions ENDS HERE: the mirror it runs from was just refreshed from the kit, which is the
+# whole of what it needs from the start path. The script itself says when there is no VS Code server
+# to install into yet. Its PATH is the image's, not pinned: it builds the explorer with the toolchain,
+# as setup.sh does, and is the same run its own header tells you to start by hand from an attached
+# terminal -- from the mirror, never the checkout. check-config.sh names it beside setup.sh.
+if [ "$MODE" = install-extensions ]; then
+    in_container -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/install-extensions.sh"
+    exit 0
+fi
+
 sweep_keep=""
 sweep_ok=yes
 if [ "$state" = running ]; then
@@ -1261,7 +1462,11 @@ fi
 # replaces it (round 8: the round-7 fix covered two of nine). check-config.sh holds all of them.
 in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/sweep-transcripts.sh" || true
 
-if [ "$setup_done" -eq 0 ]; then
+if [ "$setup_done" -eq 0 ] && [ "$MODE" = verify ]; then
+    # Setup is the start's job, and the slow one: a check does not run it. verify.sh reports what an
+    # unfinished setup left missing.
+    say "first-run setup has not completed — --verify does not run it; start the container to finish it: $0"
+elif [ "$setup_done" -eq 0 ]; then
     [ "$fresh" -eq 1 ] || say "setup did not complete last time — re-running it"
     say "first-run setup (this is the slow one — toolchain, jkb, extensions)"
     in_container -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/setup.sh"
@@ -1306,6 +1511,13 @@ verify_rc=0
 # scripts: 120 subagent transcripts under one live session, 40 archivable, budget 30000 —
 # `beyond` with the list, `over` without it.
 in_container -e "JKB_KEEP_SESSIONS=$sweep_keep" -e "JKB_REPO_ROOT=$ctr_repo" -w "$ctr_repo" "$NAME" /bin/bash "$DC_CTR_KIT/.container/verify.sh" || verify_rc=$?
+
+# --verify ENDS HERE, with verify's own exit code: the attach instructions below are the start's.
+if [ "$MODE" = verify ]; then
+    if [ "$verify_rc" -eq 0 ]; then say "$NAME verified"
+    else printf '\n\033[31mverify.sh reported problems (exit %s)\033[0m — the failing lines above say what to do.\n' "$verify_rc" >&2; fi
+    exit "$verify_rc"
+fi
 
 say "attached VS Code windows"
 cat <<EOF

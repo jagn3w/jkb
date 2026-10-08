@@ -132,6 +132,20 @@ test("the Workflows tab says why it has no agents when the daemon is unreachable
   assert.equal(await pane.getByRole("combobox", { name: "Workflow" }).isDisabled(), true);
 });
 
+// The Container tab (D53.8): a button per kit run.sh flag, and an answer from the kit -- on a CI
+// runner there is none, so it says how to install one. The kit is found under the ACCOUNT's home,
+// not the smoke's HOME, so on a machine with a kit this reads that kit's (read-only) --status. What
+// main runs and refuses is pinned by container.test.mjs; run.sh's side by
+// scripts/tests/container-status.test.sh.
+test("the Container tab offers the kit's buttons and says what the kit answered", { skip }, async () => {
+  await page.getByRole("tab", { name: "Container", exact: true }).click();
+  const pane = page.locator("#pane-container");
+  for (const label of ["Build", "Verify", "Install extensions", "Stop", "Remove"]) {
+    await pane.getByRole("button", { name: label, exact: true }).waitFor();
+  }
+  await pane.locator(".container-error, .container-findings").first().waitFor();
+});
+
 // The integrated terminal (D53.10). A new terminal is a container terminal, labelled so; the
 // toggle moves it to the host, where it is a real shell. The container side is not exercised here
 // (no dev container in CI): what it runs is pinned by terminal.test.mjs.

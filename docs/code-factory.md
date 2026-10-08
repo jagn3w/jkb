@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane) and 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane), 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not) and 8 (the Container tab) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -470,6 +470,35 @@ the integrated terminal. The tab shows what the container is: build time, source
 branch, image, args-hash drift. Build time/commit/branch do not exist yet: the build stamps them
 as image labels (`jkb.built-at`, `jkb.source-commit`, `jkb.source-branch`), recorded in
 `.container/README.md` where the container's own decisions live.
+
+**As built (subtask 8).** The run.sh side — `--verify`, `--install-extensions` and `--status`, the labels
+and why `jkb.built-at` does not change the image id — is recorded in `.container/README.md` ("The
+buttons over the kit, and the image's own record of where it came from"), and pinned by
+`scripts/tests/container-status.test.sh` and `run.sh --self-test`. In the app: `@jkb/core`'s
+`container.ts` (the buttons as data, each one flag; `--status` parsed; what the tab says about each
+standing; which button can act), main's `src/main/container.ts` (`ContainerKit`: find the kit, check
+it, read `--status`, build each button's terminal spec), `window.jkb.container` on the bridge, and
+`tabs/ContainerTab.tsx`. What was decided past the text above:
+
+- **The renderer names an action; main picks the program and its flag.** `container.spec(action)`
+  refuses anything that is not one of the five actions (a flag, a path, an object), and answers a
+  **host** terminal spec — `[<kit>/.container/run.sh, <flag>]`, from the account's home — that the tab
+  opens in the integrated terminal's drawer, so the output streams there and the drawer's restart and
+  close work on it as on any terminal. When that terminal ends, the tab reads `--status` again.
+- **The kit is found where `lib.sh` puts it, and asked to agree.** `DC_KIT_DIR` is under the
+  *account's* home (the passwd entry, which is what `run.sh` builds its own HOME from), not `$HOME`,
+  which a launching terminal can set; and the kit's own `run.sh --kit-path` must name that same
+  directory before its `--status` or any button runs. No kit is an answer that says how to install one.
+- **The tab's words are `run.sh`'s.** Drift is read from `--status` (`args_drift`/`image_drift`), never
+  recomputed, and each finding carries the remedy `run.sh` itself prints (*Remove it, then Build*). A
+  button that cannot act on the container as it stands is disabled with the reason in its title
+  (Verify, Install extensions and Stop need it running; Remove needs one to exist); with no status at
+  all every button is offered and `run.sh` decides. Stop and Remove ask first.
+- **Re-read on demand**, like the Workflows tab: the refresh button and the end of a button's run.
+  Nothing announces a change to a container, and D53.1 rules out a poll loop.
+- *Unmeasured, stated:* the Electron smoke for the tab needs the binary the sandbox cannot download,
+  and on a machine with a kit it reads that kit's (read-only) `--status`, since the kit is found under
+  the account's home and not the smoke's.
 
 ## D53.9 — Sessions tab and the needs-input dot
 

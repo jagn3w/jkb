@@ -17,6 +17,7 @@ import type * as NodePty from "node-pty";
 
 import { BRIDGE_CHANNELS, type AppInfo } from "../shared/bridge";
 import type { TerminalResult, TerminalRoots } from "../shared/terminal";
+import { ContainerKit, machineKit } from "./container";
 import { DaemonClient } from "./daemon";
 import { DesignFeeds } from "./designFeeds";
 import { TerminalHost, machineEnvironment, type SpawnPty } from "./terminals";
@@ -67,6 +68,19 @@ const terminals = new TerminalHost(
     if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.terminalEvent, event);
   },
 );
+
+/**
+ * The installed container kit (D53.8), under the ACCOUNT's home — the passwd entry, which is what
+ * `run.sh` builds its own HOME from — rather than `$HOME`, which a launching terminal can set.
+ */
+function accountHome(): string {
+  try {
+    return userInfo().homedir || homedir();
+  } catch {
+    return homedir();
+  }
+}
+const containerKit = new ContainerKit(machineKit(accountHome(), process.env));
 
 /** Live design updates, one long-poll per open design shared by every window showing it (D53.4). */
 const designFeeds = new DesignFeeds(
@@ -162,6 +176,17 @@ function registerBridge(): void {
   });
   ipcMain.on(BRIDGE_CHANNELS.designUnsubscribe, (event, topic: unknown) => {
     if (isTrusted(event)) designFeeds.unsubscribe(event.sender.id, topic);
+  });
+
+  // The dev container, through the kit's run.sh (D53.8). The renderer names an action; main finds
+  // the kit, checks it, and builds the terminal spec that runs the action's one flag.
+  ipcMain.handle(BRIDGE_CHANNELS.containerStatus, (event) => {
+    assertTrusted(event);
+    return containerKit.status();
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.containerSpec, (event, action: unknown) => {
+    assertTrusted(event);
+    return containerKit.spec(action);
   });
 }
 

@@ -311,7 +311,61 @@ $kit --build     # rebuild the image (needed after a Dockerfile or extension cha
 $kit --stop      # stop it; volumes and image survive
 $kit --rm        # remove it, so the next run redoes first-run setup
 $kit --dry-run   # print the docker command instead of running it
+$kit --verify               # check the RUNNING container again; builds, creates and starts nothing
+$kit --install-extensions   # run install-extensions.sh in the running container, from the mirror
+$kit --status               # what the container is, as one JSON object (the app's Container tab)
 ```
+
+### The buttons over the kit, and the image's own record of where it came from (D53.8)
+
+The Code Factory app's Container tab (`docs/code-factory.md`, D53.8) is buttons over these flags,
+run from the kit and never the checkout, with the output in its integrated terminal. Three of them
+were added for it, and each goes through the start path rather than beside it:
+
+- **`--verify` and `--install-extensions` act on a running container only.** A container that is not
+  running is refused before the build, so the button that checks the container can never be the one
+  that builds or creates it — even under `JKB_CONTAINER_IMAGE`, which a start always builds. Both then
+  take the start path's own route: the drift checks (a stale container is refused with the same
+  `--rm && run.sh` advice), the settle, the firewall re-raise, and the kit mirror refreshed from the
+  kit. `--install-extensions` stops there and runs `install-extensions.sh` from the mirror, with the
+  image's PATH as `setup.sh` runs it (it builds the explorer with the toolchain; `check-config.sh`
+  names it beside `setup.sh`). `--verify` runs the sweep, the login, the hooks and the reap as a start
+  does — not first-run setup, which is the start's job and which `verify.sh` reports as missing —
+  then the one verify statement, and exits with its code. One route, because `check-config.sh` and
+  `mutate-config.sh` pin the sweep-before-verify order and the keep list on the *first* verify
+  statement in `run.sh`: a second copy for the mode would have been the one they read.
+- **`--status` changes nothing.** It prints the image tag's labels, the container's state and its own
+  image's labels, the declaration's args-hash, and the two drifts as `args_drift` and `image_drift`
+  answer them — the functions the start path refuses on, so the tab calls a container stale exactly
+  when a start would refuse it. A daemon that cannot be reached is an answer (`"docker":
+  "unreachable"`), not an error.
+- **The build stamps the image** with `jkb.source-commit` and `jkb.source-branch` — the commit and
+  branch the kit was copied from, recorded in the kit's marker by `--install-kit`, or the checkout's
+  own HEAD under `JKB_RUN_FROM_CHECKOUT=1` — and `jkb.built-at`, UTC. **Read from git's files, never
+  by running git** (`lib.sh`'s `dc_git_head`): this is the host, unsandboxed, and git in a checkout
+  reads that repository's config, whose `core.fsmonitor` is a program it runs. A reftable repository,
+  an unborn branch or anything that is not a full hex object name is `unknown`, never a guess.
+  *Stated, not measured:* the commit is HEAD at the copy, so an uncommitted edit to a kit path rides
+  in the kit without being in that commit; `--status`'s `kit_changed` shows a checkout that has moved
+  since, not a kit that was dirty when copied.
+- **`jkb.built-at` is when the content was first built, not when `--build` last ran.** A label is part
+  of an image's configuration, so a time that changed every build would give every `--build` — and
+  every start under `JKB_CONTAINER_IMAGE` — a new image id, and the image check would then refuse
+  every existing container as running an older build. So the build is two steps: the work, with no
+  time on it, writing its id to a file in the kit home (an agent writing that file would choose
+  whether the tag moves); then, only when that content differs from what the tag holds — layer
+  digests, platform and configuration less `jkb.built-at` and the classic builder's per-step
+  `Image`/`Hostname` (`image_content`) — a second, fully cached build that adds the time and moves the
+  tag. A planted image under a non-default name passes only by being that content. The source labels
+  *are* content, deliberately: a kit reinstalled at a new commit with an unchanged Dockerfile builds a
+  new image id, because the image now claims a different commit — so under `JKB_CONTAINER_IMAGE`,
+  where every start builds, the existing container is refused as an older build and must be
+  recreated, rather than running under an image whose label names a commit it was not built from. A
+  detached HEAD (a pull request's CI checkout) is labelled `(detached)` and no source `unknown`, both
+  mapped once by `lib.sh`'s `dc_source_labels`. *Unmeasured here:*
+  the agent sandbox has no Docker, so `--iidfile`, the cached second build and the inspect fields are
+  pinned against a stub (`scripts/tests/container-status.test.sh`) and the projection by
+  `run.sh --self-test`, not observed on BuildKit or the classic builder.
 
 ### It is not a Dev Containers config, and the file is not called `devcontainer.json`
 

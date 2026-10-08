@@ -87,6 +87,10 @@ test("the shell renders every tab and pane, with only the active pane shown", as
         open: () => assert.fail("terminal.open during render"),
         onEvent: () => assert.fail("terminal.onEvent during render"),
       },
+      container: {
+        status: () => assert.fail("container.status during render"),
+        spec: () => assert.fail("container.spec during render"),
+      },
     },
     innerHeight: 800,
     localStorage: { getItem: () => "container", setItem: () => {} },
@@ -117,6 +121,12 @@ test("the shell renders every tab and pane, with only the active pane shown", as
     assert.match(html, /<select(?=[^>]*aria-label="Workflow")(?=[^>]*disabled)/, "the workflow picker waits for the agents");
     assert.match(html, /<select(?=[^>]*aria-label="Strategy")(?=[^>]*disabled)/, "the strategy picker waits for the strategies");
     assert.match(html, /Loading agents…/);
+    // The Container tab (D53.8): a button per kit run.sh flag, and the status asked for from an
+    // effect, never during render.
+    for (const action of ["build", "verify", "install-extensions", "stop", "remove"]) {
+      assert.match(html, new RegExp(`<button[^>]*data-action="${action}"`), `the ${action} button`);
+    }
+    assert.match(html, /Asking the kit(?:&#x27;|')s run\.sh…/);
   } finally {
     delete globalThis.window;
   }

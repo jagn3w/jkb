@@ -39,6 +39,10 @@ const bridge: JkbBridge = {
       };
     },
   },
+  container: {
+    status: () => ipcRenderer.invoke(BRIDGE_CHANNELS.containerStatus),
+    spec: (action) => ipcRenderer.invoke(BRIDGE_CHANNELS.containerSpec, action),
+  },
 };
 
 contextBridge.exposeInMainWorld("jkb", bridge);
