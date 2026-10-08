@@ -1422,22 +1422,37 @@ under `~/.jkb` on a device other than `/`'s (today `~/.jkb/logs`, virtiofs). "A 
 And Claude Code's bubblewrap sandbox re-binds every allowed path, so `~/.jkb` *is* a mount point
 under it, but on `/`'s own overlay device (0:54, against virtiofs's 0:45, measured in
 `/proc/self/mountinfo`). Read as the host's share, that failed case11 on trunk, and
-`merge-queue.sh` then ejected every candidate. So a process with remote mode switched off and `--db ~/.jkb/jkb.db` (or no `--db` at all), gets a
-refusal instead of the host's database — **once the installed `jkb` carries the refusal**: a binary built before it opens
-the host's database from in here (a review measured exactly that), so `setup.sh` must have rebuilt it,
-and `verify.sh` asks the installed binary to open a probe on the bind and requires the refusal.
-`db::open` also refuses any `file:` string: the bundled SQLite is compiled with `-DSQLITE_USE_URI`,
-and `--db file:/home/vscode/.jkb/jkb.db` opened the host's database past a guard that judged a
-relative path — measured, it listed the host's namespaces and touched its `-shm` before this fix. Measured in the container: `jkb --db ~/.jkb/refusal-probe/jkb.db ns ls` exits 1
-naming the FUSE bind and creates no database file (the CLI's `create_dir_all` of the parent still runs
-first, leaving an empty directory).
+`merge-queue.sh` then ejected every candidate. Case11 is gated on the namespace record the
+entrypoint writes (`$JKB_NS_MARKER`, the evidence `verify.sh` uses), because a different device is
+necessary for a share but not sufficient: a Linux host whose `/home` is its own partition re-binds
+`~/.jkb` on `/home`'s device, local all the same. Inside the container a share is required (none
+fails, never skips). Outside it the assertion skips.
+
+The refusal is exercised on a share that exists: `verify.sh` asks the installed binary to open a
+probe under `~/.jkb/logs` and requires the refusal, **once the installed `jkb` carries it** — a
+binary built before it opened the host's database from in here (a review measured exactly that),
+so `setup.sh` must have rebuilt it. `db::open` also refuses any `file:` string: the bundled SQLite
+is compiled with `-DSQLITE_USE_URI`, and `--db file:/home/vscode/.jkb/jkb.db` opened the host's
+database past a guard that judged a relative path — measured, it listed the host's namespaces and
+touched its `-shm` before this fix.
+
+*Superseded by the D52.8 narrowing (above, "Only what the container uses of `~/.jkb`"):* "a
+process with remote mode switched off and `--db ~/.jkb/jkb.db` (or no `--db` at all) gets a refusal
+instead of the host's database", and the measurement "`jkb --db ~/.jkb/refusal-probe/jkb.db ns ls`
+exits 1 naming the FUSE bind". Both were true while the whole of `~/.jkb` was bound in. Since
+D52.8, `~/.jkb` is an image directory: the host's database is not in the container to be refused,
+and a `--db` there is a container-local file that the guard rightly allows (remote mode still
+refuses `--db` before anything opens).
 
 **Residual, stated.** The guard covers jkb and `jkb_sqlite`. Any *other* SQLite client run in the
 container — `python3 -c 'import sqlite3; sqlite3.connect(".../.jkb/jkb.db")'`, a hand-typed database
 shell — is not jkb and is not refused; `.claude/hooks/block-raw-sqlite.sh` matches only the shell,
-only for agent tool calls, and fails open. What would close that for good is the container not
-seeing the host's database file at all; the bind still carries it, because `~/.jkb` holds the token
-and the other shared state (`openspec/changes/jkb-message-queue/design-r3.md`).
+only for agent tool calls, and fails open. What closes that for good is the container not seeing
+the host's database file at all, and since D52.8 it does not: only `~/.jkb/{logs,claude-memory}`
+are bound. What remains is a database someone creates on one of those two shares, which jkb and
+`jkb_sqlite` refuse and another client would not. *Superseded:* "the bind still carries it, because
+`~/.jkb` holds the token and the other shared state" (`openspec/changes/jkb-message-queue/design-r3.md`),
+true until D52.8 moved the token out and stopped binding `~/.jkb`.
 
 ## The one opening to the host: `jkb serve` on port 7117
 

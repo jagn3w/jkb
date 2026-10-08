@@ -1603,6 +1603,11 @@ _shell_shared_magics() {
 # case11 on trunk and made merge-queue.sh eject every candidate. A re-bind of the root filesystem
 # onto itself shares nothing with another kernel; a different device is the one thing a share from
 # another kernel must have.
+#
+# Necessary, not sufficient: on a Linux host whose /home is its own partition, a re-bind of ~/.jkb
+# reports /home's device, local all the same. So the caller asks this only inside the dev
+# container, where every non-root device under ~/.jkb is a share by construction (the mount list
+# is the boundary), and skips everywhere else.
 _jkb_host_share() {
     awk -v want="$1" '
         $5 == "/" { root = $3 }
@@ -1723,7 +1728,12 @@ it — another process closing its last connection made every open beside it ref
     # The REAL home, not $HOME: the harness points HOME at a scratch directory, which is how this
     # assertion first skipped inside the very container it exists for.
     real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
-    if [ -n "$real_home" ] && share="$(_jkb_host_share "$real_home/.jkb")"; then
+    # Inside the dev container, by the evidence verify.sh uses: the namespace record its entrypoint
+    # writes. There the share is REQUIRED; a container with none under ~/.jkb has a mount list this
+    # assertion no longer describes, and skipping would be the silent pass it exists to prevent.
+    if [ ! -s "${JKB_NS_MARKER:-}" ]; then
+        skip "live bind refusal (not inside the dev container)"
+    elif [ -n "$real_home" ] && share="$(_jkb_host_share "$real_home/.jkb")"; then
         refuse_shared_db "$share/jkb.db" 2>/dev/null; rc=$?
         [ "$rc" = 3 ] && ok "inside the container, a database on the host's share ($share) is refused" \
             || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for $share/jkb.db \
@@ -1734,7 +1744,8 @@ it — another process closing its last connection made every open beside it ref
             || fail "shared-db: dangling link allowed" "refuse_shared_db returned $rc for a dangling \
 link into $share — SQLite would create the database at the link's target"
     else
-        skip "live bind refusal (nothing under ~/.jkb is shared from another device here)"
+        fail "shared-db: no live share" "inside the dev container, nothing under ${real_home:-<no home>}/.jkb \
+is on a device other than /'s — the mount list changed and this assertion no longer exercises a share"
     fi
 }
 
