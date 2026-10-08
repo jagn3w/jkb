@@ -1,5 +1,6 @@
 //! *Play* (D53.6) as terminal specs: a Claude session in the container started with the prompt
-//! `design.prompt` built — the text `jkb design prompt play|task` prints.
+//! `design.prompt` built — the text `jkb design prompt play|task` prints — and recorded as one of the
+//! design's prompts before it starts (`launch.ts`).
 //
 // Pure, so the commands they run are pinned by a test. As with *Discuss*, the prompt is never
 // assembled here, and everything that varies is a positional parameter, never spliced into the
@@ -9,17 +10,9 @@ import { decodeWorkPrompt, playPins } from "@jkb/core";
 import type { OpRequest, OpResponse, Outcome, PlanTask, WorkPrompt } from "@jkb/core";
 
 import type { TerminalRoots, TerminalSpec } from "../../../shared/terminal";
-import { DISCUSS_SCRIPT, repoDir } from "./discuss";
+import { launchSpec } from "./launch";
 
-/**
- * *Play* on a task: `jkb task work` opens (or resumes) the task's own worktree and claims it, and
- * Claude starts there. `jq` reads the worktree from the JSON answer (it is in the image), skipping
- * any line that is not JSON — `task work` prints a note before its answer when it cancels a pending
- * removal. A refusal, or an answer naming no worktree, stops the script before Claude starts, its
- * message left on the terminal (`pipefail`: `jkb`'s own failure, not only `jq`'s).
- */
-export const PLAY_TASK_SCRIPT =
-  'set -euo pipefail; dir=$(jkb --json task work "$1" | jq -Rer \'fromjson? | objects | .worktree | strings\'); cd "$dir"; exec claude --session-id "$2" "$3"';
+export { PLAY_TASK_SCRIPT } from "./launch";
 
 /** One op through the bridge. */
 export type Op = (request: OpRequest) => Promise<Outcome<OpResponse>>;
@@ -46,29 +39,38 @@ export async function pinThenPrompt(
   return decodeWorkPrompt(await op(prompt));
 }
 
-function titled(label: string, title: string): string {
-  const t = `${label} · ${title}`;
-  return t.length > 200 ? `${t.slice(0, 199)}…` : t;
-}
-
 /** The terminal a plan's *Play* opens: Claude in the design's repo, with the plan's prompt. */
-export function playPlanSpec(prompt: WorkPrompt, repo: string, roots: TerminalRoots, sessionUuid: string): TerminalSpec {
-  return {
-    target: "container",
-    cwd: repoDir(roots, repo),
-    argv: ["/bin/bash", "-lc", DISCUSS_SCRIPT, "claude", sessionUuid, prompt.prompt],
-    title: titled("Play", prompt.title),
+export function playPlanSpec(
+  prompt: WorkPrompt,
+  design: string,
+  repo: string,
+  roots: TerminalRoots,
+  sessionUuid: string,
+): TerminalSpec {
+  return launchSpec(
+    { design, launch: "play", subject: prompt.uid, label: "Play", title: prompt.title, prompt: prompt.prompt },
+    repo,
+    roots,
     sessionUuid,
-  };
+  );
 }
 
-/** The terminal a task's *Play* opens: its session worktree, then Claude in it with the task's prompt. */
-export function playTaskSpec(prompt: WorkPrompt, repo: string, roots: TerminalRoots, sessionUuid: string): TerminalSpec {
-  return {
-    target: "container",
-    cwd: repoDir(roots, repo),
-    argv: ["/bin/bash", "-lc", PLAY_TASK_SCRIPT, "play", prompt.uid, sessionUuid, prompt.prompt],
-    title: titled("Play", prompt.title),
+/**
+ * The terminal a task's *Play* opens: its session worktree (`jkb task work`), then Claude in it with
+ * the task's prompt. `design` is the design whose Tasks pane played it: a session the Design tab
+ * starts is always one of its design's prompts, whatever the task's own place.
+ */
+export function playTaskSpec(
+  prompt: WorkPrompt,
+  design: string,
+  repo: string,
+  roots: TerminalRoots,
+  sessionUuid: string,
+): TerminalSpec {
+  return launchSpec(
+    { design, launch: "task", subject: prompt.uid, label: "Play", title: prompt.title, prompt: prompt.prompt },
+    repo,
+    roots,
     sessionUuid,
-  };
+  );
 }

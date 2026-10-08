@@ -5013,3 +5013,88 @@ fn a_plan_is_built_and_played_through_the_cli() {
         .stdout(predicate::str::contains(format!("jkb task work {task}")))
         .stdout(predicate::str::contains(&plan_uid));
 }
+
+/// Design prompts (D53.6) through the CLI: the *New prompt* text, a launch recording its session
+/// from the directory it runs in, and the listing with the command that resumes it.
+#[test]
+fn a_session_is_recorded_from_where_it_starts_and_listed_with_its_resume() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let created = jkb(&db)
+        .args(["--json", "design", "create", "Factory", "--repo", "jkb"])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    let uid = serde_json::from_slice::<serde_json::Value>(&created.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    jkb(&db)
+        .args(["design", "prompt", "new", &uid, "Tighten", "the", "intro"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("jkb design cat {uid}")))
+        .stdout(predicate::str::contains("Tighten the intro"));
+    assert_cmd::Command::from_std(jkb(&db))
+        .args(["design", "prompt", "new", &uid, "-"])
+        .write_stdin("from stdin")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("from stdin"));
+
+    jkb(&db)
+        .args(["design", "prompt", "ls", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no prompts)"));
+    // No --cwd: the record names the directory the launch runs in, where `claude --resume` must.
+    let session = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    let cwd = dir.path().join("it's here");
+    std::fs::create_dir(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    jkb(&db)
+        .current_dir(&cwd)
+        .args([
+            "design",
+            "prompt",
+            "record",
+            &uid,
+            "--session",
+            session,
+            "--launch",
+            "new",
+            "--subject",
+            "",
+            "--title",
+            "New · Tighten the intro",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("prompt:{session}")));
+    let quoted = format!("'{}'", cwd.display().to_string().replace('\'', r"'\''"));
+    jkb(&db)
+        .args(["design", "prompt", "ls", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[new]  New · Tighten the intro"))
+        .stdout(predicate::str::contains(format!(
+            "resume: cd {quoted} && claude --resume {session}"
+        )));
+    jkb(&db)
+        .args([
+            "design",
+            "prompt",
+            "record",
+            &uid,
+            "--session",
+            "nope",
+            "--launch",
+            "new",
+            "--title",
+            "t",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a session uuid"));
+}

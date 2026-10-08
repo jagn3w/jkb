@@ -517,3 +517,138 @@ fn play_prompts_name_the_plan_and_the_strategy_its_work_runs_under() {
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "a step is not a task: {e:?}");
 }
+
+const SESSION: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+fn recorded(r: Response) -> crate::designs::prompts::DesignPrompt {
+    match r {
+        Response::DesignPromptRecorded { prompt, .. } => *prompt,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A launch records its session before Claude starts — a designer's write, which the container's
+/// coordinator credential holds and an implementer does not — and the Prompts pane lists them in
+/// the wire shape `@jkb/core`'s `decodeDesignPrompts` reads (`ui/core/src/prompts.ts`).
+#[test]
+fn a_launch_records_its_session_and_the_design_lists_it() {
+    let Staged { kb, uid, task, .. } = staged();
+    let ask_again = |cwd: &str| {
+        json!({ "op": "design.prompt_record", "uid": uid, "session": SESSION, "cwd": cwd,
+                "launch": "task", "title": "x" })
+    };
+    let ask = json!({ "op": "design.prompt_record", "uid": uid, "session": SESSION,
+                      "cwd": "/home/vscode/repos/jkb/.jkb/work/build", "launch": "task",
+                      "subject": task, "title": "Play · Build the scaffold" });
+    let e = call(&kb.as_role("implementer"), ask.clone()).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+    let wire = serde_json::to_value(ok(&kb.as_role("coordinator"), ask)).unwrap();
+    assert_eq!(wire["result"], "design_prompt_recorded");
+    for key in [
+        "uid",
+        "design",
+        "session",
+        "cwd",
+        "launch",
+        "subject",
+        "title",
+        "created_at",
+    ] {
+        assert!(wire["prompt"].get(key).is_some(), "{key}: {wire}");
+    }
+    assert_eq!(wire["prompt"]["uid"], format!("prompt:{SESSION}"));
+    assert_eq!(wire["prompt"]["launch"], "task");
+    assert_eq!(wire["wrote"], true);
+    let again = ok(&kb.op, ask_again("/home/vscode/repos/jkb/.jkb/work/build"));
+    assert!(
+        !again.announces_a_send(),
+        "the same place again wrote nothing, so wakes no poller"
+    );
+
+    // The same session again, from the other side of the toggle: the same prompt, moved.
+    let moved = ok(&kb.op, ask_again("/Users/me/repos/jkb"));
+    assert!(moved.announces_a_send(), "a move is announced");
+    let moved = recorded(moved);
+    assert_eq!(moved.cwd, "/Users/me/repos/jkb");
+    assert_eq!(moved.subject.as_deref(), Some(task.as_str()));
+
+    let wire =
+        serde_json::to_value(ok(&kb.op, json!({ "op": "design.prompts", "uid": uid }))).unwrap();
+    assert_eq!(wire["result"], "design_prompts");
+    assert_eq!(wire["uid"], json!(uid));
+    assert_eq!(wire["prompts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(wire["prompts"][0]["session"], SESSION);
+    // Anyone who reads may list them.
+    assert!(matches!(
+        ok(
+            &kb.as_role("implementer"),
+            json!({ "op": "design.prompts", "uid": uid })
+        ),
+        Response::DesignPrompts { .. }
+    ));
+
+    let e = call(
+        &kb.op,
+        json!({ "op": "design.prompt_record", "uid": uid, "session": SESSION, "cwd": "/r",
+                "launch": "resume", "title": "x" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    let e = call(
+        &kb.op,
+        json!({ "op": "design.prompts", "uid": "design:nope" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+}
+
+/// *New prompt* starts a session with the operator's words, fenced, after how to read the design.
+#[test]
+fn a_new_prompt_carries_the_operators_words_and_how_to_read_the_design() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "x");
+    let new = |text: &str| match ok(
+        &kb.op,
+        json!({ "op": "design.prompt", "ask": { "kind": "new", "uid": uid, "text": text } }),
+    ) {
+        Response::DesignNewPrompt { prompt } => *prompt,
+        other => panic!("{other:?}"),
+    };
+    let p = new("  Tighten the ```intro``` please.\n");
+    assert_eq!(p.kind, "new");
+    assert_eq!(p.uid, uid);
+    assert_eq!(p.title, "Factory");
+    for needle in [
+        format!("jkb design cat {uid}"),
+        format!("jkb design plan ls {uid}"),
+        "\n````\nTighten the ```intro``` please.\n````\n".to_owned(),
+    ] {
+        assert!(p.prompt.contains(&needle), "{needle}: {}", p.prompt);
+    }
+    let blank = new("");
+    assert!(
+        blank.prompt.contains("has not said what they want yet"),
+        "{}",
+        blank.prompt
+    );
+    let wire = serde_json::to_value(ok(
+        &kb.op,
+        json!({ "op": "design.prompt", "ask": { "kind": "new", "uid": uid } }),
+    ))
+    .unwrap();
+    assert_eq!(wire["result"], "design_new_prompt");
+
+    let long = "x".repeat(crate::designs::prompts::MAX_NEW_PROMPT_BYTES + 1);
+    let e = call(
+        &kb.op,
+        json!({ "op": "design.prompt", "ask": { "kind": "new", "uid": uid, "text": long } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    let e = call(
+        &kb.op,
+        json!({ "op": "design.prompt", "ask": { "kind": "new", "uid": "design:nope" } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+}

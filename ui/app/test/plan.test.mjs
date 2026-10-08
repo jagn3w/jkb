@@ -28,7 +28,7 @@ const src = path.join(here, "..", "src");
 const { pinThenPrompt, playPlanSpec, playTaskSpec, PLAY_TASK_SCRIPT } = await load(
   path.join(src, "renderer", "src", "design", "play.ts"),
 );
-const { DISCUSS_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "discuss.ts"));
+const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const { parseSpec } = await load(path.join(src, "shared", "terminal.ts"));
 
 const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostHome: "/Users/me" };
@@ -122,64 +122,81 @@ test("a Play left on the default pins no defaulting task; an explicit pick of th
 
 test("a plan's Play runs Claude in the design's repo with the prompt as one argument", () => {
   const prompt = workPrompt();
-  const spec = playPlanSpec(prompt, "jkb", ROOTS, UUID);
+  const spec = playPlanSpec(prompt, "design:d", "jkb", ROOTS, UUID);
   assert.deepEqual(spec, {
     target: "container",
     cwd: "/home/vscode/repos/jkb",
-    argv: ["/bin/bash", "-lc", DISCUSS_SCRIPT, "claude", UUID, prompt.prompt],
+    // Recorded as the design's prompt, on the plan, before Claude starts.
+    argv: ["/bin/bash", "-lc", LAUNCH_SCRIPT, "claude", "design:d", UUID, "play", "plan:x", "Play · First cut", prompt.prompt],
     title: "Play · First cut",
     sessionUuid: UUID,
   });
   assert.equal(parseSpec(spec).ok, true, "main accepts it");
-  assert.equal(playPlanSpec({ ...prompt, title: "t".repeat(400) }, "jkb", ROOTS, UUID).title.length, 200);
+  assert.equal(playPlanSpec({ ...prompt, title: "t".repeat(400) }, "design:d", "jkb", ROOTS, UUID).title.length, 200);
 });
 
 test("a task's Play opens its worktree with `jkb task work`, then Claude there", () => {
-  const prompt = workPrompt({ kind: "task", uid: "task:a", title: "Build it" });
-  const spec = playTaskSpec(prompt, "jkb", ROOTS, UUID);
-  assert.deepEqual(spec.argv, ["/bin/bash", "-lc", PLAY_TASK_SCRIPT, "play", "task:a", UUID, prompt.prompt]);
+  // A task under no design still records under the design whose pane played it.
+  const prompt = workPrompt({ kind: "task", uid: "task:a", title: "Build it", design: null });
+  const spec = playTaskSpec(prompt, "design:d", "jkb", ROOTS, UUID);
+  assert.deepEqual(spec.argv, ["/bin/bash", "-lc", PLAY_TASK_SCRIPT, "claude", "design:d", UUID, "task", "task:a", "Play · Build it", prompt.prompt]);
   assert.equal(spec.cwd, "/home/vscode/repos/jkb");
   assert.equal(spec.sessionUuid, UUID);
   assert.equal(parseSpec(spec).ok, true, "main accepts it");
   assert.ok(!PLAY_TASK_SCRIPT.includes(prompt.prompt));
 });
 
-/** A directory of stand-in programs: `jkb` answering `task work`, `claude` reporting what it got. */
+/**
+ * A directory of stand-in programs: `jkb` answering `task work` with `jkbBody` and logging a
+ * `design prompt record` call (its cwd and arguments) to `record.log`; `claude` reporting what it got.
+ */
 function stand_ins(jkbBody) {
   const bin = fs.mkdtempSync(path.join(work, "bin-"));
   const wt = fs.mkdtempSync(path.join(work, "wt dir-"));
-  fs.writeFileSync(path.join(bin, "jkb"), `#!/bin/bash\n${jkbBody.replaceAll("$WT", wt)}\n`, { mode: 0o755 });
+  const log = path.join(bin, "record.log");
+  const jkb = [
+    "#!/bin/bash",
+    `if [ "$1 $2 $3" = "design prompt record" ]; then printf '%s|' "$PWD" "$@" >> '${log}'; exit 0; fi`,
+    jkbBody.replaceAll("$WT", wt),
+  ].join("\n");
+  fs.writeFileSync(path.join(bin, "jkb"), `${jkb}\n`, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, "claude"), `#!/bin/bash\nprintf '%s|' "$PWD" "$@"\n`, { mode: 0o755 });
-  return { bin, wt };
+  return { bin, wt, recorded: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "") };
 }
 
 const hasJq = spawnSync("/bin/sh", ["-c", "command -v jq"]).status === 0;
 
 test("the task script runs Claude in the worktree `jkb task work` answered, its arguments untouched", { skip: !hasJq && "jq is not installed here (the image has it)" }, () => {
-  const { bin, wt } = stand_ins(
+  const { bin, wt, recorded } = stand_ins(
     // The note `task work` prints before its answer when it cancels a pending removal.
     `[ "$1 $2 $3 $4" = "--json task work task:a" ] || { echo "unexpected: $*" >&2; exit 9; }\necho "cancelled the pending removal of $WT"\nprintf '{"uid":"task:a","worktree":"%s"}\\n' "$WT"`,
   );
   const nasty = "it's $(echo pwned) `x` \"q\" $HOME";
-  const out = execFileSync("/bin/bash", ["-c", PLAY_TASK_SCRIPT, "play", "task:a", UUID, nasty], {
+  const out = execFileSync("/bin/bash", ["-c", PLAY_TASK_SCRIPT, "claude", "design:d", UUID, "task", "task:a", "Play · it", nasty], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
   });
   assert.equal(out, `${wt}|--session-id|${UUID}|${nasty}|`);
+  // Recorded from the worktree, before Claude started there.
+  assert.equal(
+    recorded(),
+    `${wt}|design|prompt|record|design:d|--session|${UUID}|--launch|task|--subject|task:a|--title|Play · it|`,
+  );
 });
 
 test("a refused `jkb task work` stops the script before Claude starts", { skip: !hasJq && "jq is not installed here (the image has it)" }, () => {
-  const { bin } = stand_ins('echo "task:a is claimed by someone else" >&2; exit 1');
-  const r = spawnSync("/bin/bash", ["-c", PLAY_TASK_SCRIPT, "play", "task:a", UUID, "p"], {
+  const { bin, recorded } = stand_ins('echo "task:a is claimed by someone else" >&2; exit 1');
+  const r = spawnSync("/bin/bash", ["-c", PLAY_TASK_SCRIPT, "claude", "design:d", UUID, "task", "task:a", "t", "p"], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
   });
   assert.notEqual(r.status, 0);
   assert.equal(r.stdout, "", "claude never ran");
   assert.match(r.stderr, /claimed by someone else/);
+  assert.equal(recorded(), "", "nothing recorded for a session that never started");
   // An answer that names no worktree stops it too, rather than starting Claude wherever it stands.
   const { bin: odd } = stand_ins('echo \'{"uid":"task:a"}\'');
-  const r2 = spawnSync("/bin/bash", ["-c", PLAY_TASK_SCRIPT, "play", "task:a", UUID, "p"], {
+  const r2 = spawnSync("/bin/bash", ["-c", PLAY_TASK_SCRIPT, "claude", "design:d", UUID, "task", "task:a", "t", "p"], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${odd}:${process.env.PATH}` },
   });

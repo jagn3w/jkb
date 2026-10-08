@@ -5,6 +5,7 @@ import { decodeDesignPrompt, decodeDesigns, designOps, designRepos, repoOf, SPAN
 import { DocumentEditor } from "../design/DocumentEditor";
 import { discussSpec } from "../design/discuss";
 import { PlanColumn } from "../design/PlanColumn";
+import { PromptsPane } from "../design/PromptsPane";
 import { DesignSession, type SyncStatus } from "../design/session";
 import { useTerminals } from "../terminal/TerminalProvider";
 
@@ -76,7 +77,8 @@ function bridgeOf(): ConstructorParameters<typeof DesignSession>[0] {
  * The Design tab (D53.4–6): pick a repo and one of its designs, and edit it live. The Document pane
  * is the design's CRDT text in CodeMirror, synced with jkb as it is typed, coloured by span state;
  * selecting text offers *Discuss*, which opens Claude beside it. Beside it, the Execution Plan and
- * Tasks panes: the design's plans, their steps and tasks, and *Play*.
+ * Tasks panes — the design's plans, their steps and tasks, and *Play* — and the Prompts pane: every
+ * Claude session that worked the design, resumable, and *New prompt*.
  */
 export function DesignTab(): React.JSX.Element {
   const terminals = useTerminals();
@@ -241,7 +243,9 @@ export function DesignTab(): React.JSX.Element {
               )}
             </div>
             {activeRepo !== undefined && (
-              <PlanColumn key={design.uid} design={design.uid} repo={activeRepo} onNotice={setNotice} />
+              <PlanColumn key={design.uid} design={design.uid} repo={activeRepo} onNotice={setNotice}>
+                <PromptsPane design={design} repo={activeRepo} onNotice={setNotice} />
+              </PlanColumn>
             )}
           </div>
         )}

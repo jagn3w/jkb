@@ -44,7 +44,8 @@ async function load(entry) {
 const src = path.join(here, "..", "src");
 const { DesignFeeds, DESIGN_GROUP } = await load(path.join(src, "main", "designFeeds.ts"));
 const { DesignSession } = await load(path.join(src, "renderer", "src", "design", "session.ts"));
-const { discussSpec, repoDir, DISCUSS_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "discuss.ts"));
+const { discussSpec, repoDir } = await load(path.join(src, "renderer", "src", "design", "discuss.ts"));
+const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const Y = require("yjs");
 
 const TOPIC = "design/design.factory-1";
@@ -115,20 +116,24 @@ test("a feed joins the app's group, then delivers each update to every window ho
         { seq: 7, kind: "update", payload: { design: "design:factory-1", seq: 3, update: "AA==" } },
         { seq: 8, kind: "other", payload: {} },
         { seq: 9, kind: "update", payload: { design: "design:factory-1", seq: 4, update: null } },
+        { seq: 10, kind: "prompt", payload: { design: "design:factory-1", prompt: "prompt:p" } },
+        { seq: 11, kind: "prompt", payload: { design: "design:factory-1" } },
       ],
     }),
   );
   await until(() => daemon.calls.some((c) => c.request.op === "mq.ack"), "the ack");
   assert.deepEqual(
-    heard.map((h) => [h.owner, h.event.kind, h.event.seq, h.event.update]),
+    heard.map((h) => [h.owner, h.event.kind, h.event.seq ?? h.event.prompt, h.event.update]),
     [
       [1, "update", 3, "AA=="],
       [2, "update", 3, "AA=="],
       [1, "update", 4, null],
       [2, "update", 4, null],
+      [1, "prompt", "prompt:p", undefined],
+      [2, "prompt", "prompt:p", undefined],
     ],
   );
-  assert.equal(daemon.calls.find((c) => c.request.op === "mq.ack").request.seq, 9, "acked through the last message");
+  assert.equal(daemon.calls.find((c) => c.request.op === "mq.ack").request.seq, 11, "acked through the last message");
   assert.equal(daemon.calls.filter((c) => c.request.op === "mq.group_create").length, 1, "one feed per topic");
 
   // The feed ends when its last window goes: after the held poll answers, nothing more is asked.
@@ -409,21 +414,13 @@ test("Discuss runs Claude in the design's repo with the prompt as one argument, 
   assert.deepEqual(spec, {
     target: "container",
     cwd: "/home/vscode/repos/jkb",
-    argv: ["/bin/bash", "-lc", DISCUSS_SCRIPT, "claude", uuid, prompt.prompt],
+    // Recorded as one of the design's prompts (no subject: the design itself), then Claude.
+    argv: ["/bin/bash", "-lc", LAUNCH_SCRIPT, "claude", "design:x", uuid, "discuss", "", "Discuss · Code Factory", prompt.prompt],
     title: "Discuss · Code Factory",
     sessionUuid: uuid,
   });
-  assert.ok(!DISCUSS_SCRIPT.includes(prompt.prompt));
+  assert.ok(!LAUNCH_SCRIPT.includes(prompt.prompt));
   assert.equal(repoDir(ROOTS, ".."), "/home/vscode/repos", "a repo name that is not one directory stays at the root");
   assert.equal(repoDir(ROOTS, "a/b"), "/home/vscode/repos");
   assert.equal(discussSpec({ ...prompt, title: "t".repeat(400) }, "jkb", ROOTS, uuid).title.length, 200);
-});
-
-test("the script passes its arguments through bash untouched", async () => {
-  const { execFileSync } = await import("node:child_process");
-  const nasty = "it's $(echo pwned) `x` \"q\" $HOME";
-  const out = execFileSync("/bin/bash", ["-c", DISCUSS_SCRIPT.replace("exec claude", "printf '%s|%s|%s'"), "claude", "id", nasty], {
-    encoding: "utf8",
-  });
-  assert.equal(out, `--session-id|id|${nasty}`);
 });

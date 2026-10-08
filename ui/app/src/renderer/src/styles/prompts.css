@@ -1,0 +1,78 @@
+/* The Design tab's Prompts pane (D53.6): the sessions that worked a design, and New prompt. */
+
+.prompts-pane {
+  border-top: var(--hairline-width) solid var(--hairline-strong);
+}
+
+.prompt-new {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+}
+
+.prompt-new textarea {
+  box-sizing: border-box;
+  width: 100%;
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--ink);
+  background: var(--bg);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  padding: var(--space-1) var(--space-2);
+  resize: vertical;
+}
+
+.prompt-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.prompt-row {
+  padding: var(--space-1) 0;
+  border-bottom: var(--hairline-width) solid var(--hairline);
+}
+
+.prompt-row:last-child {
+  border-bottom: 0;
+}
+
+.prompt-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.prompt-launch {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--ink-muted);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  padding: 0 var(--space-1);
+  white-space: nowrap;
+}
+
+.prompt-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-meta {
+  font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-meta time {
+  font-family: var(--font-mono);
+}

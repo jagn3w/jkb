@@ -11,7 +11,14 @@
 // No Electron import: the feeds are given the op call and a delivery callback, so they are tested
 // with a stand-in daemon.
 
-import { isDesignTopic, parseAnnouncement, type OpRequest, type OpResponse, type Outcome } from "@jkb/core";
+import {
+  isDesignTopic,
+  parseAnnouncement,
+  parsePromptAnnouncement,
+  type OpRequest,
+  type OpResponse,
+  type Outcome,
+} from "@jkb/core";
 
 import type { DesignFeedEvent } from "../shared/bridge";
 
@@ -194,6 +201,8 @@ export class DesignFeeds {
         if (typeof seq === "number") last = seq;
         const announced = kind === "update" ? parseAnnouncement(payload) : undefined;
         if (announced !== undefined) this.#emit(feed, { topic, kind: "update", ...announced });
+        const prompt = kind === "prompt" ? parsePromptAnnouncement(payload) : undefined;
+        if (prompt !== undefined) this.#emit(feed, { topic, kind: "prompt", ...prompt });
       }
       if (last !== undefined) {
         // A failed ack only means the same messages come again, and merging them twice is a no-op.

@@ -469,6 +469,17 @@ fn samples() -> Vec<Request> {
                 end: 1,
             },
         },
+        Request::DesignPromptRecord {
+            uid: "design:x".into(),
+            session: "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
+            cwd: "/r".into(),
+            launch: "new".into(),
+            subject: None,
+            title: "t".into(),
+        },
+        Request::DesignPrompts {
+            uid: "design:x".into(),
+        },
         Request::DesignCompact {
             uid: "design:x".into(),
         },
@@ -1592,6 +1603,7 @@ const READS: &[&str] = &[
     "design.plan",
     "design.plans",
     "design.prompt",
+    "design.prompts",
 ];
 
 #[test]

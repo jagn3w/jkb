@@ -1030,3 +1030,183 @@ fn undoing_a_plan_takes_back_the_plan_and_its_steps() {
         .unwrap()
         .is_none());
 }
+
+const SESSION: &str = "0F8FAD5B-D9CB-469F-A165-70867728950E";
+
+fn ask(design: &str, session: &str, cwd: &str) -> prompts::NewPrompt {
+    prompts::NewPrompt {
+        design: design.to_owned(),
+        session: session.to_owned(),
+        cwd: cwd.to_owned(),
+        launch: Launch::Discuss,
+        subject: None,
+        title: "Discuss · Code Factory".to_owned(),
+    }
+}
+
+fn record(db: &Db, a: prompts::NewPrompt) -> Result<PromptRecord> {
+    db.write_txn("t", move |c, m| prompts::record(c, m, &a))
+        .map(|r| r.prompt)
+}
+
+fn wrote(db: &Db, a: prompts::NewPrompt) -> bool {
+    db.write_txn("t", move |c, m| prompts::record(c, m, &a))
+        .unwrap()
+        .wrote
+}
+
+fn prompts_of(db: &Db, design: &str) -> Vec<PromptRecord> {
+    let design = design.to_owned();
+    db.read(move |c| prompts::list(c, &design)).unwrap()
+}
+
+#[test]
+fn a_prompt_is_recorded_under_its_design_by_its_session_uuid() {
+    let db = db();
+    let uid = create(&db, "x");
+    let p = record(&db, ask(&uid, SESSION, "/repos/jkb")).unwrap();
+    let session = SESSION.to_ascii_lowercase();
+    assert_eq!(p.uid, format!("prompt:{session}"));
+    assert_eq!(p.session, session, "stored as claude --resume takes it");
+    assert_eq!(p.design, uid);
+    assert_eq!(p.cwd, "/repos/jkb");
+    assert_eq!(p.launch, Launch::Discuss);
+    assert_eq!(p.subject, None);
+    assert_eq!(p.title, "Discuss · Code Factory");
+    let prompt_uid = p.uid.clone();
+    let id = db
+        .read(move |c| item::id_for_uid(c, &prompt_uid))
+        .unwrap()
+        .unwrap();
+    let design_uid = uid.clone();
+    let design_item = db.read(move |c| design_id(c, &design_uid)).unwrap();
+    assert_eq!(
+        db.read(move |c| containment::parent(c, id)).unwrap(),
+        Some(design_item),
+        "contained by its design (n:1)"
+    );
+    assert_eq!(prompts_of(&db, &uid), vec![p.clone()]);
+
+    // Announced on the design's topic, after the update its body was written by.
+    let name = topic(&uid);
+    let msgs = db
+        .read(move |c| crate::mq::tail(c, &name, 10, crate::mq::now_ms()))
+        .unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].kind, "update");
+    assert_eq!(msgs[1].kind, "prompt");
+    assert_eq!(msgs[1].payload["design"], uid.as_str());
+    assert_eq!(msgs[1].payload["prompt"], p.uid.as_str());
+    // Recording it again from the same place writes nothing, so announces nothing.
+    assert!(!wrote(&db, ask(&uid, SESSION, "/repos/jkb")));
+    let name = topic(&uid);
+    assert_eq!(
+        db.read(move |c| crate::mq::tail(c, &name, 10, crate::mq::now_ms()))
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_session_is_one_prompt_and_rerecording_it_moves_only_its_cwd() {
+    let db = db();
+    let uid = create(&db, "x");
+    assert!(wrote(&db, ask(&uid, SESSION, "/repos/jkb")));
+    let first = record(&db, ask(&uid, SESSION, "/repos/jkb")).unwrap();
+    let mut again = ask(&uid, &SESSION.to_ascii_lowercase(), "/Users/me/repos/jkb");
+    again.title = "Something else".to_owned();
+    let moved = record(&db, again).unwrap();
+    assert_eq!(moved.uid, first.uid);
+    assert_eq!(moved.cwd, "/Users/me/repos/jkb");
+    assert_eq!(moved.title, first.title, "the first launch named it");
+    assert_eq!(prompts_of(&db, &uid).len(), 1);
+    undo_last(&db);
+    assert_eq!(
+        prompts_of(&db, &uid)[0].cwd,
+        "/repos/jkb",
+        "the move is undone"
+    );
+
+    let other = create(&db, "y");
+    let err = record(&db, ask(&other, SESSION, "/repos/jkb")).unwrap_err();
+    assert!(
+        err.to_string().contains("already recorded for design"),
+        "{err}"
+    );
+    assert!(prompts_of(&db, &other).is_empty());
+}
+
+#[test]
+fn a_prompt_refuses_what_resume_could_not_use() {
+    let db = db();
+    let uid = create(&db, "x");
+    for (session, cwd, title, why) in [
+        ("not-a-uuid", "/r", "t", "not a session uuid"),
+        (
+            "0f8fad5b-d9cb-469f-a165-70867728950",
+            "/r",
+            "t",
+            "not a session uuid",
+        ),
+        (
+            "0f8fad5b-d9cb-469f-a165-70867728950g",
+            "/r",
+            "t",
+            "not a session uuid",
+        ),
+        (SESSION, "repos/jkb", "t", "absolute path"),
+        (SESSION, "/r\0x", "t", "absolute path"),
+        (SESSION, "/r", "  \n", "needs a title"),
+    ] {
+        let mut a = ask(&uid, session, cwd);
+        a.title = title.to_owned();
+        let err = record(&db, a).unwrap_err();
+        assert!(err.to_string().contains(why), "{session} {cwd:?}: {err}");
+    }
+    let mut a = ask(&uid, SESSION, "/r");
+    a.subject = Some("task:nope".to_owned());
+    assert!(record(&db, a)
+        .unwrap_err()
+        .to_string()
+        .contains("task:nope"));
+    assert!(record(&db, ask("design:nope", SESSION, "/r")).is_err());
+    assert!(Launch::parse("bogus")
+        .unwrap_err()
+        .to_string()
+        .contains("bogus"));
+    assert!(
+        prompts_of(&db, &uid).is_empty(),
+        "nothing refused was written"
+    );
+
+    let plan = new_plan(&db, &uid, &["a"]).unwrap();
+    let mut a = ask(&uid, SESSION, "/r");
+    a.launch = Launch::Play;
+    a.subject = Some(plan.uid.clone());
+    a.title = format!("{}\nsecond line", "é".repeat(300));
+    let p = record(&db, a).unwrap();
+    assert_eq!(p.launch, Launch::Play);
+    assert_eq!(p.subject.as_deref(), Some(plan.uid.as_str()));
+    assert_eq!(p.title.chars().count(), prompts::MAX_TITLE_CHARS);
+    assert!(p.title.ends_with('…') && !p.title.contains('\n'));
+}
+
+#[test]
+fn prompts_list_newest_first_and_undo_takes_one_back() {
+    let db = db();
+    let uid = create(&db, "x");
+    let a = record(&db, ask(&uid, SESSION, "/r")).unwrap();
+    let b = record(&db, ask(&uid, "11111111-2222-3333-4444-555555555555", "/r")).unwrap();
+    // A plan contained by the same design is not one of its prompts.
+    new_plan(&db, &uid, &["a"]).unwrap();
+    assert_eq!(prompts_of(&db, &uid), vec![b.clone(), a.clone()]);
+    undo_last(&db); // the plan
+    undo_last(&db); // b
+    assert_eq!(prompts_of(&db, &uid), vec![a]);
+    let gone = b.uid;
+    assert!(db
+        .read(move |c| item::id_for_uid(c, &gone))
+        .unwrap()
+        .is_none());
+}

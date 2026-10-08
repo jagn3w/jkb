@@ -606,6 +606,42 @@ enum DesignPromptCmd {
         /// The task.
         uid: String,
     },
+    /// A *New prompt*: a session on a design started with your own words, after how to read and
+    /// edit the design. What the app's *New prompt* starts Claude with.
+    New {
+        /// The design.
+        uid: String,
+        /// What to ask (`-` reads stdin); omitted, Claude reads the design and asks you.
+        text: Vec<String>,
+    },
+    /// Record the Claude Code session a launch is about to start, BEFORE it starts: one prompt per
+    /// session, contained by its design, so the Prompts pane can resume it. Recording a session
+    /// again moves its cwd.
+    Record {
+        /// The design.
+        uid: String,
+        /// The pre-minted session uuid the launch passes to `claude --session-id`.
+        #[arg(long)]
+        session: String,
+        /// Where the session starts — where `claude --resume` must run (this directory when
+        /// omitted).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// What starts it: `discuss`, `play`, `task` or `new`.
+        #[arg(long)]
+        launch: String,
+        /// The plan or task it is started on.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Its title, as the Prompts pane lists it.
+        #[arg(long)]
+        title: String,
+    },
+    /// A design's recorded prompts, newest first, each with the command that resumes it.
+    Ls {
+        /// The design.
+        uid: String,
+    },
 }
 
 #[derive(Subcommand)]

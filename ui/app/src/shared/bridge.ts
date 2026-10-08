@@ -6,7 +6,7 @@
 // token, the HTTP client and the PTYs stay in main. A capability the renderer needs is added here,
 // in the preload and in main's handlers together; nothing reaches the renderer any other way.
 
-import type { DesignAnnouncement, Hello, OpRequest, OpResponse, Outcome } from "@jkb/core";
+import type { DesignAnnouncement, Hello, OpRequest, OpResponse, Outcome, PromptAnnouncement } from "@jkb/core";
 
 import type { TerminalEvent, TerminalInfo, TerminalResult, TerminalRoots, TerminalSpec } from "./terminal";
 
@@ -57,9 +57,11 @@ export interface TerminalBridge {
  * - `gap`: updates may have been missed; re-read the state.
  * - `error`: the feed cannot reach the daemon and is retrying; informational.
  * - `live`: the feed is back after an `error`; nothing was missed (its place was kept).
+ * - `prompt`: a launch recorded (or moved) one of the design's prompts; re-read the Prompts pane (D53.6).
  */
 export type DesignFeedEvent =
   | ({ readonly topic: string; readonly kind: "update" } & DesignAnnouncement)
+  | ({ readonly topic: string; readonly kind: "prompt" } & PromptAnnouncement)
   | { readonly topic: string; readonly kind: "gap"; readonly message: string }
   | { readonly topic: string; readonly kind: "error"; readonly message: string }
   | { readonly topic: string; readonly kind: "live" };

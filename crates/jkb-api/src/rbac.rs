@@ -224,7 +224,8 @@ impl Request {
             | Self::DesignSpans { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
-            | Self::DesignPrompt { .. } => OpPermission::Read,
+            | Self::DesignPrompt { .. }
+            | Self::DesignPrompts { .. } => OpPermission::Read,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -280,7 +281,8 @@ impl Request {
             | Self::DesignSpan { .. }
             | Self::DesignStage { .. }
             | Self::DesignPlanCreate { .. }
-            | Self::DesignPlanStep { .. } => OpPermission::Design,
+            | Self::DesignPlanStep { .. }
+            | Self::DesignPromptRecord { .. } => OpPermission::Design,
             Self::DesignApprove { .. } => OpPermission::DesignApprove,
             Self::AttestMint { .. } | Self::AttestRelease { .. } => OpPermission::Attest,
             // Waiving the review gate is the operator's escape hatch, whoever the strategy lets land.
@@ -363,6 +365,7 @@ impl Request {
             | Self::DesignStage { .. }
             | Self::DesignPlanCreate { .. }
             | Self::DesignPlanStep { .. }
+            | Self::DesignPromptRecord { .. }
             | Self::DesignCompact { .. } => Target::Shared,
             // Held by their own callee: a filing writes only a namespace nobody holds, and becomes
             // a task's round only when recorded; recording holds a scoped caller to its task
@@ -417,6 +420,7 @@ impl Request {
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
+            | Self::DesignPrompts { .. }
             | Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }

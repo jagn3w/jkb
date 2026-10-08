@@ -24,6 +24,7 @@
 pub mod crdt;
 mod discuss;
 pub mod plan;
+pub mod prompts;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -39,6 +40,7 @@ use crate::{containment, edge, item, ns, placement, Error, Result};
 use crdt::{Crdt, Piece, PieceKind};
 pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 pub use plan::{PlanTask, PlanView, Plans, StepView, TaskPlace, PLAN_KIND};
+pub use prompts::{Launch, NewPrompt, PromptRecord, Recorded, PROMPT_KIND};
 use yrs::Text as _;
 
 /// The item kind of a design.
@@ -593,17 +595,36 @@ fn ensure_topic(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<String
 /// commutative, so at-least-once is enough). Best effort by design — the table is the truth, and a
 /// full or oversized queue costs a subscriber a re-read, never the write.
 fn publish(conn: &Connection, meta: &WriteMeta, uid: &str, seq: i64, update: &[u8]) -> Result<()> {
+    let inline = (update.len() <= INLINE_UPDATE_MAX).then(|| STANDARD.encode(update));
+    announce(
+        conn,
+        meta,
+        uid,
+        "update",
+        json!({ "design": uid, "seq": seq, "update": inline }),
+    )
+}
+
+/// Put a `kind` message on `design/<uid>` — an `update`, or a `prompt` recorded (D53.6) — best
+/// effort, as [`publish`] says: a full or oversized queue costs a subscriber a re-read, never the
+/// write.
+fn announce(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    kind: &str,
+    payload: Value,
+) -> Result<()> {
     let name = ensure_topic(conn, meta, uid)?;
     let now = mq::now_ms();
-    let inline = (update.len() <= INLINE_UPDATE_MAX).then(|| STANDARD.encode(update));
     let sent = mq::send(
         conn,
         meta,
         &name,
         &Draft {
             key: uid.to_owned(),
-            kind: "update".to_owned(),
-            payload: json!({ "design": uid, "seq": seq, "update": inline }),
+            kind: kind.to_owned(),
+            payload,
             ttl_ms: None,
             producer: "design".to_owned(),
         },

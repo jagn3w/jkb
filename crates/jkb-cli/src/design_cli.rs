@@ -234,6 +234,138 @@ fn plan_cmd(ops: &Ops<'_>, what: DesignPlanCmd) -> Result<()> {
     Ok(())
 }
 
+/// `s` as one shell word: itself when nothing in it is special, else single-quoted.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':'));
+    if plain {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Print a prompt's text, or the whole answer under `--json`.
+fn print_prompt<T: serde::Serialize>(ops: &Ops<'_>, answer: &T, text: &str) -> Result<()> {
+    if ops.json {
+        println!("{}", serde_json::to_string_pretty(answer)?);
+    } else {
+        print!("{text}");
+    }
+    Ok(())
+}
+
+/// `jkb design prompt record` (D53.6): the launch's own record of the session it is about to
+/// start, its cwd the directory it runs in unless named.
+fn record_prompt(ops: &Ops<'_>, request: Request) -> Result<()> {
+    match ops.call(request)? {
+        Response::DesignPromptRecorded { prompt, .. } => {
+            if ops.json {
+                println!("{}", serde_json::to_string_pretty(&prompt)?);
+            } else {
+                println!("{}  {}  {}", prompt.uid, prompt.launch, prompt.cwd);
+            }
+            Ok(())
+        }
+        other => unexpected("design.prompt_record", &other),
+    }
+}
+
+/// `jkb design prompt ls` (D53.6): a design's prompts, newest first, each with how to resume it.
+fn list_prompts(ops: &Ops<'_>, uid: String) -> Result<()> {
+    let (uid, prompts) = match ops.call(Request::DesignPrompts { uid })? {
+        Response::DesignPrompts { uid, prompts } => (uid, prompts),
+        other => return unexpected("design.prompts", &other),
+    };
+    if ops.json {
+        let listing = serde_json::json!({ "uid": uid, "prompts": prompts });
+        println!("{}", serde_json::to_string_pretty(&listing)?);
+        return Ok(());
+    }
+    if prompts.is_empty() {
+        println!("(no prompts)");
+    }
+    for p in &prompts {
+        let subject = p
+            .subject
+            .as_deref()
+            .map(|s| format!("  on {s}"))
+            .unwrap_or_default();
+        println!(
+            "{}  [{}]  {}{subject}  {}",
+            p.created_at, p.launch, p.title, p.uid
+        );
+        println!(
+            "    resume: cd {} && claude --resume {}",
+            shell_word(&p.cwd),
+            p.session
+        );
+    }
+    Ok(())
+}
+
+/// `jkb design prompt …`: build a prompt a session starts with, record a session, or list them.
+fn prompt_cmd(ops: &Ops<'_>, what: DesignPromptCmd) -> Result<()> {
+    let ask = match what {
+        DesignPromptCmd::Record {
+            uid,
+            session,
+            cwd,
+            launch,
+            subject,
+            title,
+        } => {
+            let cwd = match cwd {
+                Some(c) => c,
+                None => std::env::current_dir()
+                    .context("reading the current directory")?
+                    .to_str()
+                    .context("the current directory is not UTF-8")?
+                    .to_owned(),
+            };
+            return record_prompt(
+                ops,
+                Request::DesignPromptRecord {
+                    uid,
+                    session,
+                    cwd,
+                    launch,
+                    // A launch script passes an empty subject for a session on the design itself.
+                    subject: subject.filter(|s| !s.trim().is_empty()),
+                    title,
+                },
+            );
+        }
+        DesignPromptCmd::Ls { uid } => return list_prompts(ops, uid),
+        DesignPromptCmd::Discuss { uid, range, base } => {
+            let (start, end) = parse_range(&range)?;
+            PromptAsk::Discuss {
+                uid,
+                base,
+                start,
+                end,
+            }
+        }
+        DesignPromptCmd::Play { plan, strategy } => PromptAsk::Play { plan, strategy },
+        DesignPromptCmd::Task { uid } => PromptAsk::Task { uid },
+        DesignPromptCmd::New { uid, text } => {
+            let text = if text.len() == 1 && text[0] == "-" {
+                text_arg("-".to_owned())?
+            } else {
+                text.join(" ")
+            };
+            PromptAsk::New { uid, text }
+        }
+    };
+    match ops.call(Request::DesignPrompt { ask })? {
+        Response::DesignPrompt { prompt } => print_prompt(ops, &prompt, &prompt.prompt),
+        Response::DesignWorkPrompt { prompt } => print_prompt(ops, &prompt, &prompt.prompt),
+        Response::DesignNewPrompt { prompt } => print_prompt(ops, &prompt, &prompt.prompt),
+        other => unexpected("design.prompt", &other),
+    }
+}
+
 /// `jkb design …`.
 ///
 /// # Errors
@@ -405,40 +537,7 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             let w = written(ops, "design.apply", Request::DesignApply { uid, update })?;
             print_written(ops, &w)
         }
-        DesignCmd::Prompt { what } => {
-            let ask = match what {
-                DesignPromptCmd::Discuss { uid, range, base } => {
-                    let (start, end) = parse_range(&range)?;
-                    PromptAsk::Discuss {
-                        uid,
-                        base,
-                        start,
-                        end,
-                    }
-                }
-                DesignPromptCmd::Play { plan, strategy } => PromptAsk::Play { plan, strategy },
-                DesignPromptCmd::Task { uid } => PromptAsk::Task { uid },
-            };
-            match ops.call(Request::DesignPrompt { ask })? {
-                Response::DesignPrompt { prompt } => {
-                    if ops.json {
-                        println!("{}", serde_json::to_string_pretty(&prompt)?);
-                    } else {
-                        print!("{}", prompt.prompt);
-                    }
-                    Ok(())
-                }
-                Response::DesignWorkPrompt { prompt } => {
-                    if ops.json {
-                        println!("{}", serde_json::to_string_pretty(&prompt)?);
-                    } else {
-                        print!("{}", prompt.prompt);
-                    }
-                    Ok(())
-                }
-                other => unexpected("design.prompt", &other),
-            }
-        }
+        DesignCmd::Prompt { what } => prompt_cmd(ops, what),
         DesignCmd::Plan { what } => plan_cmd(ops, what),
         DesignCmd::Compact { uid } => {
             match ops.call(Request::DesignCompact { uid: uid.clone() })? {

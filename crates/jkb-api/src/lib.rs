@@ -860,6 +860,30 @@ pub enum Request {
         /// Which prompt, over what.
         ask: designs::PromptAsk,
     },
+    /// Record the Claude Code session a launch is about to start on a design, before it starts
+    /// ([`designs::prompts::record`]).
+    #[serde(rename = "design.prompt_record")]
+    DesignPromptRecord {
+        /// The design.
+        uid: String,
+        /// The pre-minted session uuid (`claude --session-id`).
+        session: String,
+        /// The absolute directory the session starts in, where it is resumed.
+        cwd: String,
+        /// What started it: `discuss`, `play`, `task` or `new`.
+        launch: String,
+        /// The plan or task it is started on.
+        #[serde(default)]
+        subject: Option<String>,
+        /// Its title.
+        title: String,
+    },
+    /// A design's recorded prompts, newest first ([`designs::prompts::list`]).
+    #[serde(rename = "design.prompts")]
+    DesignPrompts {
+        /// The design.
+        uid: String,
+    },
     /// Fold a design's updates into its snapshot (operator; [`jkb_core::design::compact`]).
     #[serde(rename = "design.compact")]
     DesignCompact {
@@ -1451,6 +1475,8 @@ impl Request {
         "design.plan",
         "design.plans",
         "design.prompt",
+        "design.prompt_record",
+        "design.prompts",
         "design.compact",
         "attest.mint",
         "attest.release",
@@ -1575,6 +1601,8 @@ impl Request {
             Self::DesignPlan { .. } => "design.plan",
             Self::DesignPlans { .. } => "design.plans",
             Self::DesignPrompt { .. } => "design.prompt",
+            Self::DesignPromptRecord { .. } => "design.prompt_record",
+            Self::DesignPrompts { .. } => "design.prompts",
             Self::DesignCompact { .. } => "design.compact",
             Self::AttestMint { .. } => "attest.mint",
             Self::AttestRelease { .. } => "attest.release",
@@ -1657,7 +1685,8 @@ impl Request {
             | Self::DesignSpans { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
-            | Self::DesignPrompt { .. } => true,
+            | Self::DesignPrompt { .. }
+            | Self::DesignPrompts { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -1737,6 +1766,7 @@ impl Request {
             | Self::DesignStage { .. }
             | Self::DesignPlanCreate { .. }
             | Self::DesignPlanStep { .. }
+            | Self::DesignPromptRecord { .. }
             | Self::DesignCompact { .. } => false,
         }
     }
@@ -2274,6 +2304,26 @@ pub enum Response {
         /// The prompt and what it was built from.
         prompt: Box<designs::plans::WorkPrompt>,
     },
+    /// A `design.prompt` for *New prompt*.
+    DesignNewPrompt {
+        /// The prompt and what it was built from.
+        prompt: Box<designs::prompts::NewPrompt>,
+    },
+    /// A `design.prompt_record`.
+    DesignPromptRecorded {
+        /// The prompt as recorded.
+        prompt: Box<designs::prompts::DesignPrompt>,
+        /// Whether anything was written — and so announced on the design's topic. A session
+        /// recorded again from where it already was writes nothing.
+        wrote: bool,
+    },
+    /// A `design.prompts`.
+    DesignPrompts {
+        /// The design.
+        uid: String,
+        /// Its prompts, newest first.
+        prompts: Vec<designs::prompts::DesignPrompt>,
+    },
     /// A `design.plan`, `design.plan_create` or `design.plan_step`.
     DesignPlan {
         /// The plan after it.
@@ -2384,6 +2434,9 @@ impl Response {
             | Self::DesignSpan { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignWorkPrompt { .. }
+            | Self::DesignNewPrompt { .. }
+            | Self::DesignPromptRecorded { .. }
+            | Self::DesignPrompts { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
@@ -2405,6 +2458,8 @@ impl Response {
             // Every stored design update is announced on `design/<uid>` (D53.4).
             Self::DesignWritten { written } => written.seq.is_some(),
             Self::DesignCreated { design } => design.seq > 0,
+            // A recorded prompt is announced on its design's topic (D53.6), when it wrote.
+            Self::DesignPromptRecorded { wrote, .. } => *wrote,
             Self::Created { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
@@ -2485,6 +2540,8 @@ impl Response {
             | Self::DesignSpan { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignWorkPrompt { .. }
+            | Self::DesignNewPrompt { .. }
+            | Self::DesignPrompts { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
@@ -3697,7 +3754,44 @@ impl LocalBackend {
                     designs::PromptAnswer::Work(prompt) => Response::DesignWorkPrompt {
                         prompt: Box::new(prompt),
                     },
+                    designs::PromptAnswer::New(prompt) => Response::DesignNewPrompt {
+                        prompt: Box::new(prompt),
+                    },
                 }
+            }
+            Request::DesignPromptRecord {
+                uid,
+                session,
+                cwd,
+                launch,
+                subject,
+                title,
+            } => {
+                let (prompt, wrote) = db.write_txn_with(actor, move |c, m| {
+                    designs::prompts::record(
+                        c,
+                        m,
+                        designs::prompts::RecordAsk {
+                            uid,
+                            session,
+                            cwd,
+                            launch,
+                            subject,
+                            title,
+                        },
+                    )
+                })?;
+                Response::DesignPromptRecorded {
+                    prompt: Box::new(prompt),
+                    wrote,
+                }
+            }
+            Request::DesignPrompts { uid } => {
+                let prompts = db.read_with({
+                    let uid = uid.clone();
+                    move |c| designs::prompts::list(c, &uid)
+                })?;
+                Response::DesignPrompts { uid, prompts }
             }
             Request::DesignCompact { uid } => {
                 let done = db.write_txn_with(actor, move |c, m| {

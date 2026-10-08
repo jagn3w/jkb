@@ -120,18 +120,22 @@ function PlanCard({
 /**
  * The Design tab's right-hand column (D53.6): the Execution Plan pane — the design's live plans,
  * their steps, staged spans and tasks, with *Play* — the history drawer of archived plans, and the
- * Tasks pane for the task selected. Every read and write is an op; the strategy picker chooses what
- * a *Play* pins its tasks to before Claude starts — only when the operator picked one: left on "each
- * task's own", nothing is pinned and unpinned tasks keep following the default.
+ * Tasks pane for the task selected, then any panes the tab puts below (the Prompts pane). Every
+ * read and write is an op; the strategy picker chooses what a *Play* pins its tasks to before Claude
+ * starts — only when the operator picked one: left on "each task's own", nothing is pinned and
+ * unpinned tasks keep following the default.
  */
 export function PlanColumn({
   design,
   repo,
   onNotice,
+  children,
 }: {
   readonly design: string;
   readonly repo: string;
   readonly onNotice: (message: string) => void;
+  /** Panes below the Tasks pane in the same column (the Prompts pane). */
+  readonly children?: React.ReactNode;
 }): React.JSX.Element {
   const terminals = useTerminals();
   const [listing, setListing] = useState<Listing>({ kind: "loading" });
@@ -183,14 +187,14 @@ export function PlanColumn({
           onNotice(answer.error.message);
           return;
         }
-        const spec = (what === "plan" ? playPlanSpec : playTaskSpec)(answer.value, repo, roots, crypto.randomUUID());
+        const spec = (what === "plan" ? playPlanSpec : playTaskSpec)(answer.value, design, repo, roots, crypto.randomUUID());
         terminals.open(spec, "drawer");
       } finally {
         setBusy(false);
         void load();
       }
     },
-    [terminals, strategy, repo, onNotice, load],
+    [terminals, strategy, design, repo, onNotice, load],
   );
 
   return (
@@ -288,6 +292,7 @@ export function PlanColumn({
         onChanged={() => void load()}
         onNotice={onNotice}
       />
+      {children}
     </aside>
   );
 }

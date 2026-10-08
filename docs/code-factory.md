@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane) and 5 (execution plans and the Tasks pane) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane) and 6 (the Prompts pane) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -252,6 +252,8 @@ the Yjs peer, `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `disc
   design's repo under the repos mount, the session uuid minted by the app and passed as the terminal's
   `sessionUuid` too. The login shell finds `claude` on the login `PATH` (a `docker exec` has the
   image's environment); the prompt is a positional parameter, never spliced into the script.
+  *Extended by subtask 6:* the script now records the session as one of the design's prompts before
+  it becomes Claude, the one launch script every launch shares (D53.6, `launch.ts`).
 - **Every design has its topic from creation.** `mq.group_create` refuses a topic that does not exist,
   and a design created with no text had none until its first update, so the app could not subscribe
   to it. `design::create` now creates it; publishing still does too, for a design made before.
@@ -342,6 +344,44 @@ text above:
   here — a claim is a session's, taken by `task work`.
 - **Plans are re-read on demand** (a design switch, the refresh button, after a Play or an edit), not
   live: no topic carries task or plan changes yet, and D53.1 rules out a poll loop.
+
+**As built (subtask 6, the Prompts pane).** The engine is `crates/jkb-core/src/design/prompts.rs`; the
+ops `design.prompt_record` (a designer's write) and `design.prompts` (a read), and the *New prompt*
+prompt (`design.prompt` `{kind: "new", uid, text}`), are `crates/jkb-api/src/designs/prompts.rs`;
+`jkb design prompt record|ls|new` is the CLI. In the app, `@jkb/core`'s `prompts.ts` (the shapes, the
+requests), and `src/renderer/src/design/` `launch.ts` (every launch and resume as a terminal spec) and
+`PromptsPane.tsx`, below the Tasks pane. What was decided past the text above:
+
+- **A prompt's uid is its session's: `prompt:<uuid>`.** "One per session" is then the uniqueness of a
+  uid, not a rule every caller must remember. Recording the same session again is the same prompt:
+  nothing is written when it is recorded from where it already was, and its cwd moves when it is not
+  (the terminal's toggle restarts the program on the other side, which runs the launch again from
+  there). Recording it under another design is refused. The item's content is its title; the design,
+  session, cwd, launch (`discuss`/`play`/`task`/`new`) and subject (the plan or task a *Play* named)
+  are its metadata. Session ids are stored lowercase, as `claude --resume` takes them.
+- **The launch records, not the app, and it records where Claude starts.** Every launch the Design tab
+  makes — *Discuss*, a plan's *Play*, a task's *Play*, *New prompt* — runs one script:
+  `jkb design prompt record <design> --session <uuid> …` then `exec claude --session-id <uuid>`. The
+  record takes the directory it runs in (no `--cwd`), so the cwd a resume needs is the one the session
+  really has. That is what makes a task's *Play* recordable at all: its worktree is known only after
+  `jkb task work` answers inside the container, and the script records from there. A record refused
+  (the daemon unreachable, an unknown design) stops the script before Claude starts, so no session
+  exists without its prompt. The container's credential is a coordinator grant, which holds `design`;
+  an implementer's does not.
+- **Resume is `claude --resume <uuid>` in the recorded cwd, in the container**, opened with the session
+  id as the terminal's `sessionUuid`, so resuming a session whose terminal is still open shows that
+  terminal. A session the toggle moved to the host recorded a host path; the resume carries it back
+  through the repos mount, and the toggle takes it to the host again. *Unmeasured, stated:* the
+  container's and the host's Claude session stores are separate, so a session started on the host
+  resumes only on the host.
+- **The pane is live through the design's topic.** A record that wrote something is announced on
+  `design/<uid>` as a `prompt` message (the editor's feed already holds that topic, and ignores the
+  kind); main forwards it, and the pane re-reads its list — on that, a `gap`, a design switch or its
+  refresh button. `design.prompt_record`'s answer carries `wrote`, so a repeat that wrote nothing wakes
+  no poller (`announces_a_send`).
+- ***New prompt* is an op first** (D53.1): the text is the operator's, fenced, after how Claude reads
+  and edits the design; empty, Claude reads the design and asks. At most 16 KiB: it is an argument of
+  the program it starts. Its record is titled by the request's first line.
 
 ## D53.7 — Workflows tab: agent templates move into jkb
 

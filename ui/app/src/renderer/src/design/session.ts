@@ -194,6 +194,9 @@ export class DesignSession {
         this.feedProblem = event.message;
         this.#changed();
         return;
+      case "prompt":
+        // The Prompts pane's, not the document's.
+        return;
     }
   }
 

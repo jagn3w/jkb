@@ -6,6 +6,7 @@ import "./styles/app.css";
 import "./styles/terminal.css";
 import "./styles/design.css";
 import "./styles/plan.css";
+import "./styles/prompts.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";

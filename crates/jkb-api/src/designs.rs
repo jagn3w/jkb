@@ -16,6 +16,7 @@ use crate::rbac::Principal;
 use crate::{ApiError, ErrorCode};
 
 pub mod plans;
+pub mod prompts;
 
 fn invalid(why: impl Into<String>) -> ApiError {
     ApiError::with_code(ErrorCode::Invalid, why)
@@ -398,7 +399,8 @@ pub fn stage(
 }
 
 /// What prompt a `design.prompt` builds (D53.5–6): *Discuss* a selection (answered as a
-/// [`Prompt`]), or *Play* a plan or a task (answered as a [`WorkPrompt`]).
+/// [`Prompt`]), *Play* a plan or a task (answered as a [`WorkPrompt`]), or a *New prompt* with the
+/// operator's own words (answered as a [`prompts::NewPrompt`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PromptAsk {
@@ -415,6 +417,14 @@ pub enum PromptAsk {
     Task {
         /// The task.
         uid: String,
+    },
+    /// A new session on a design, started with the operator's own words.
+    New {
+        /// The design.
+        uid: String,
+        /// What the operator asks; empty when they will say it in the session.
+        #[serde(default)]
+        text: String,
     },
     /// Discuss a selection of a design's text with Claude.
     Discuss {
@@ -456,7 +466,7 @@ pub struct Prompt {
 }
 
 /// The longest run of backticks in `s`, so a code fence around it can be one longer.
-fn longest_backtick_run(s: &str) -> usize {
+pub(crate) fn longest_backtick_run(s: &str) -> usize {
     s.split(|c| c != '`').map(str::len).max().unwrap_or(0)
 }
 
@@ -534,13 +544,15 @@ fn discuss_prompt(d: &design::Discussion) -> String {
     p
 }
 
-/// What a `design.prompt` answers: a *Discuss* prompt, or a *Play* one.
+/// What a `design.prompt` answers: a *Discuss* prompt, a *Play* one, or a *New prompt*.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptAnswer {
     /// `discuss`.
     Discuss(Prompt),
     /// `play` or `task`.
     Work(plans::WorkPrompt),
+    /// `new`.
+    New(prompts::NewPrompt),
 }
 
 /// `design.prompt`.
@@ -573,6 +585,7 @@ pub fn prompt(conn: &Connection, ask: &PromptAsk) -> Result<PromptAnswer, ApiErr
             plans::play_prompt(conn, plan, strategy.as_deref()).map(PromptAnswer::Work)
         }
         PromptAsk::Task { uid } => plans::task_prompt(conn, uid).map(PromptAnswer::Work),
+        PromptAsk::New { uid, text } => prompts::new_prompt(conn, uid, text).map(PromptAnswer::New),
     }
 }
 
