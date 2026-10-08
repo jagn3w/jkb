@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model) and 4 (the Document pane) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane) and 5 (execution plans and the Tasks pane) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -298,6 +298,50 @@ The cardinality the operator gave: **prompts (n:1) design (1:n) spans (1:n) exec
   app **pre-mints the session uuid** and launches `claude --session-id <uuid>`, so the link is
   recorded before the session exists rather than reconstructed from hooks afterwards. Resuming is
   `claude --resume <uuid>` in the prompt's recorded cwd.
+
+**As built (subtask 5, plans and the Tasks pane).** The engine is `crates/jkb-core/src/design/plan.rs`;
+the ops `design.plan_create`/`plan_step`/`plan`/`plans` and the *Play* prompts are
+`crates/jkb-api/src/designs/plans.rs`; `jkb design plan ls|create|step|show` and `jkb design prompt
+play|task` are the CLI. In the app, `@jkb/core`'s `plan.ts` (the shapes, the requests, the archive
+split, which tasks a Play pins), and `src/renderer/src/design/` `PlanColumn.tsx` (the Execution Plan
+pane and history drawer), `TaskPane.tsx` and `play.ts` (the terminal specs). What was decided past the
+text above:
+
+- **Nothing about a plan is stored that the graph says.** A plan is contained by its design, its steps
+  by the plan (containment position is their order), a step's tasks by the step (`jkb task add …
+  --under <step>`, the ordinary subtask path, so the step is the task's parent the way a parent task
+  is). **Archived is derived on every read**: a plan with at least one task, every task under it at
+  any depth `done` or `cancelled`. A plan with no tasks is a draft, not finished work — the vacuous
+  truth IMPLEMENTED also refuses — and a reopened task brings its plan back with no write.
+- **`design.plans` takes `all`**, as `jkb ls` does for terminal tasks; the listing says how many
+  archived plans it left out. The app always asks for all and splits them itself, so the drawer is
+  one read with the pane.
+- **The strategy is pinned before the work starts, by the app, as the operator.** A strategy (D52) is
+  pinned per task (`workflow.set`, operator-only), so *Play* with a strategy pins each open task of the
+  plan that does not already run it, one at a time, stopping at the first refusal so nothing starts
+  under a half-applied choice; a task already on it is left alone, since a pin writes a row of its
+  history. **Only an explicit pick pins.** The picker starts on "each task's own" (naming the default)
+  and a *Play* left there pins nothing and sends no strategy: an unpinned task reports
+  `default:<name>` while the default is listed as bare `<name>`, so treating the shown default as a
+  choice once pinned every unpinned task on every Play, freezing it off any later change of the
+  default (caught in review). An explicit pick that equals the default does pin those tasks — that
+  freeze is what choosing asks for — and the decision is one pure helper, `playPins`, that the
+  terminal and the Tasks pane's "Play pins it to" hint both use. With no pick, the prompt says no
+  strategy was chosen rather than claiming the operator chose the default. The prompt names the
+  strategy chosen and each task's own (`default:<name>` when unpinned),
+  and tells Claude that a task it adds runs the default until the operator pins it — an agent cannot
+  pin, by D52's rule. A definition is listed as `name@version` and pinned by `name` (its newest).
+- **A task's *Play* is `jkb task work` in the container, then Claude in the worktree it answers.** The
+  script reads the worktree from `--json` with `jq` (in the image), skipping lines that are not JSON
+  (`task work` prints a note first when it cancels a pending removal); a refusal or an answer with no
+  worktree stops it before Claude starts. The prompt (`design.prompt` `{kind: "task"}`) carries the
+  task, its design, plan and step, the spans that step stages, and the strategy it runs — read after
+  the pin, so it is the one its gates will use.
+- **The Tasks pane is `task.show` and `task.edit`**: status, claim holder, strategy and transitions
+  shown; the task's text edited in place (replace) or a note appended. Claims are shown, not changed
+  here — a claim is a session's, taken by `task work`.
+- **Plans are re-read on demand** (a design switch, the refresh button, after a Play or an edit), not
+  live: no topic carries task or plan changes yet, and D53.1 rules out a poll loop.
 
 ## D53.7 — Workflows tab: agent templates move into jkb
 

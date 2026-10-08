@@ -23,6 +23,7 @@
 
 pub mod crdt;
 mod discuss;
+pub mod plan;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -37,6 +38,7 @@ use crate::store::WriteMeta;
 use crate::{containment, edge, item, ns, placement, Error, Result};
 use crdt::{Crdt, Piece, PieceKind};
 pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
+pub use plan::{PlanTask, PlanView, Plans, StepView, TaskPlace, PLAN_KIND};
 use yrs::Text as _;
 
 /// The item kind of a design.

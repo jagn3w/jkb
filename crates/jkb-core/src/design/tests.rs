@@ -826,3 +826,207 @@ fn a_discussion_names_the_spans_its_range_touches_with_their_states() {
     assert_eq!(d.spans[0].reviewer, Reviewer::Claude);
     assert!(discuss(&db, &uid, None, 0, 5).unwrap().spans.is_empty());
 }
+
+// ---- execution plans (D53.6) ---------------------------------------------------------------
+
+fn new_plan(db: &Db, design: &str, steps: &[&str]) -> Result<plan::PlanView> {
+    let design = design.to_owned();
+    let steps: Vec<String> = steps.iter().map(|s| (*s).to_owned()).collect();
+    db.write_txn("t", move |c, m| {
+        plan::create(c, m, &design, "Ship it", &steps)
+    })
+}
+
+fn plans_of(db: &Db, design: &str, all: bool) -> plan::Plans {
+    let design = design.to_owned();
+    db.read(move |c| plan::list(c, &design, all)).unwrap()
+}
+
+fn step_id(db: &Db, uid: &str) -> ItemId {
+    let uid = uid.to_owned();
+    db.read(move |c| item::id_for_uid(c, &uid))
+        .unwrap()
+        .unwrap()
+}
+
+fn set_status(db: &Db, t: ItemId, status: TaskStatus) {
+    db.write_txn("t", move |c, m| task::set_status(c, m, t, status))
+        .unwrap();
+}
+
+#[test]
+fn a_plan_is_contained_by_its_design_with_its_steps_in_order() {
+    let db = db();
+    let uid = create(&db, "Build it.");
+    let p = new_plan(&db, &uid, &["scaffold", " database ", "frontend"]).unwrap();
+    assert!(p.uid.starts_with("plan:ship-it-"), "{}", p.uid);
+    assert_eq!(p.design, uid);
+    assert_eq!(p.title, "Ship it");
+    let texts: Vec<&str> = p.steps.iter().map(|s| s.text.as_str()).collect();
+    assert_eq!(texts, ["scaffold", "database", "frontend"]);
+    assert!(
+        !p.archived,
+        "a plan with no tasks is a draft, not finished work"
+    );
+    let plan_uid = p.uid.clone();
+    let p = db
+        .write_txn("t", move |c, m| plan::add_step(c, m, &plan_uid, "deploy"))
+        .unwrap();
+    assert_eq!(p.steps.len(), 4);
+    assert_eq!(p.steps[3].text, "deploy");
+    assert_eq!(plans_of(&db, &uid, false).plans, vec![p]);
+}
+
+#[test]
+fn a_plan_refuses_what_is_not_a_design_and_empty_steps() {
+    let db = db();
+    let uid = create(&db, "x");
+    let e = new_plan(&db, "design:nope", &["a"]).unwrap_err();
+    assert!(e.to_string().contains("no design"), "{e}");
+    let e = new_plan(&db, &uid, &["a", "  "]).unwrap_err();
+    assert!(e.to_string().contains("needs some text"), "{e}");
+    let many: Vec<&str> = std::iter::repeat_n("s", plan::MAX_STEPS + 1).collect();
+    assert!(new_plan(&db, &uid, &many).is_err());
+    let p = new_plan(&db, &uid, &["a"]).unwrap();
+    let step = p.steps[0].uid.clone();
+    let e = db
+        .write_txn("t", move |c, m| plan::add_step(c, m, &step, "b"))
+        .unwrap_err();
+    assert!(e.to_string().contains("not a plan"), "{e}");
+    assert_eq!(
+        plans_of(&db, &uid, true).plans.len(),
+        1,
+        "the refused plans wrote nothing"
+    );
+}
+
+/// Archived is derived on every read: every task under the plan terminal (and at least one), and
+/// a reopened task brings the plan back with no write to it.
+#[test]
+fn a_plan_whose_tasks_are_all_terminal_is_archived_and_hidden_unless_asked() {
+    let db = db();
+    let uid = create(&db, "x");
+    let p = new_plan(&db, &uid, &["one", "two"]).unwrap();
+    let (s1, s2) = (step_id(&db, &p.steps[0].uid), step_id(&db, &p.steps[1].uid));
+    let parent = task_under(&db, s1, "task:a");
+    let child = task_under(&db, parent, "task:b");
+    let other = task_under(&db, s2, "task:c");
+    let listed = plans_of(&db, &uid, false);
+    let tasks: Vec<(&str, u32)> = listed.plans[0]
+        .tasks()
+        .map(|t| (t.uid.as_str(), t.depth))
+        .collect();
+    assert_eq!(tasks, [("task:a", 0), ("task:b", 1), ("task:c", 0)]);
+    let t = &listed.plans[0].steps[0].tasks[0];
+    assert_eq!(t.status.as_deref(), Some("open"));
+    assert!(t.strategy.starts_with("default:"), "{}", t.strategy);
+    assert_eq!(t.claimed_by, None);
+
+    set_status(&db, parent, TaskStatus::Done);
+    set_status(&db, other, TaskStatus::Cancelled);
+    assert!(
+        !plans_of(&db, &uid, false).plans[0].archived,
+        "a nested task is open"
+    );
+    set_status(&db, child, TaskStatus::Done);
+    let hidden = plans_of(&db, &uid, false);
+    assert!(hidden.plans.is_empty());
+    assert_eq!(hidden.hidden, 1);
+    let all = plans_of(&db, &uid, true);
+    assert_eq!(all.hidden, 0);
+    assert!(all.plans[0].archived);
+    let shown = p.uid.clone();
+    assert!(db.read(move |c| plan::show(c, &shown)).unwrap().archived);
+    set_status(&db, child, TaskStatus::Open);
+    assert!(!plans_of(&db, &uid, false).plans[0].archived);
+}
+
+#[test]
+fn a_task_lists_its_claim_holder() {
+    let db = db();
+    let uid = create(&db, "x");
+    let p = new_plan(&db, &uid, &["one"]).unwrap();
+    let t = task_under(&db, step_id(&db, &p.steps[0].uid), "task:a");
+    db.write_txn("t", move |c, m| crate::claim::claim(c, m, t, "agent-1"))
+        .unwrap();
+    let listed = plans_of(&db, &uid, false);
+    assert_eq!(
+        listed.plans[0].steps[0].tasks[0].claimed_by.as_deref(),
+        Some("agent-1")
+    );
+}
+
+#[test]
+fn a_step_lists_the_spans_staged_into_it_and_a_task_knows_its_place() {
+    let db = db();
+    let uid = create(&db, "Scaffold the app. Then the database.");
+    let p = new_plan(&db, &uid, &["scaffold", "database"]).unwrap();
+    let sp = span(&db, &uid, "Scaffold the app.", Reviewer::Operator).unwrap();
+    approve_as(&db, &sp, Approver::Operator).unwrap();
+    stage_into(&db, &sp, &p.steps[0].uid).unwrap();
+    let shown = plans_of(&db, &uid, false).plans.remove(0);
+    let staged: Vec<&str> = shown.steps[0]
+        .spans
+        .iter()
+        .map(|s| s.uid.as_str())
+        .collect();
+    assert_eq!(staged, [sp.as_str()]);
+    assert!(shown.steps[1].spans.is_empty());
+
+    let step = step_id(&db, &p.steps[0].uid);
+    let parent = task_under(&db, step, "task:p");
+    let child = task_under(&db, parent, "task:q");
+    let place = db
+        .read(move |c| plan::place_of(c, child))
+        .unwrap()
+        .expect("under a design");
+    assert_eq!(place.design.0, uid);
+    assert_eq!(
+        place.plan.as_ref().map(|p| p.0.as_str()),
+        Some(p.uid.as_str())
+    );
+    assert_eq!(place.step.as_ref().map(|s| s.1.as_str()), Some("scaffold"));
+    assert_eq!(place.spans.len(), 1);
+
+    // A one-off: directly under the design, listed beside the plans, with no step.
+    let u = uid.clone();
+    let d = db.read(move |c| design_id(c, &u)).unwrap();
+    let one_off = task_under(&db, d, "task:one-off");
+    assert_eq!(
+        plans_of(&db, &uid, false)
+            .tasks
+            .iter()
+            .map(|t| t.uid.as_str())
+            .collect::<Vec<_>>(),
+        ["task:one-off"]
+    );
+    let place = db
+        .read(move |c| plan::place_of(c, one_off))
+        .unwrap()
+        .unwrap();
+    assert!(place.plan.is_none() && place.step.is_none());
+    // A task under no design has no place.
+    let loose = db
+        .write_txn("t", |c, m| {
+            task::create(c, m, &task::NewTask::new("task:loose", "x"))
+        })
+        .unwrap();
+    assert!(db
+        .read(move |c| plan::place_of(c, loose))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn undoing_a_plan_takes_back_the_plan_and_its_steps() {
+    let db = db();
+    let uid = create(&db, "x");
+    let p = new_plan(&db, &uid, &["a", "b"]).unwrap();
+    undo_last(&db);
+    assert!(plans_of(&db, &uid, true).plans.is_empty());
+    let step = p.steps[0].uid.clone();
+    assert!(db
+        .read(move |c| item::id_for_uid(c, &step))
+        .unwrap()
+        .is_none());
+}

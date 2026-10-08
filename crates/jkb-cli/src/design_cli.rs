@@ -7,11 +7,12 @@
 //! over anything written since.
 
 use anyhow::{bail, Context as _, Result};
+use jkb_api::designs::plans::{Plan, PlanTask};
 use jkb_api::designs::{DesignDoc, EditAsk, PromptAsk, Span, Written};
 use jkb_api::{Request, Response};
 
 use crate::ops_cli::{unexpected, Ops};
-use crate::{DesignCmd, DesignPromptCmd};
+use crate::{DesignCmd, DesignPlanCmd, DesignPromptCmd};
 
 /// The text `value` names: itself, or stdin for `-`.
 fn text_arg(value: String) -> Result<String> {
@@ -131,6 +132,104 @@ fn print_doc(ops: &Ops<'_>, d: &DesignDoc, plain: bool) -> Result<()> {
         println!("version: {}", d.version);
         println!();
         println!("{}", d.marked);
+    }
+    Ok(())
+}
+
+fn plan_answer(ops: &Ops<'_>, op: &str, request: Request) -> Result<Plan> {
+    match ops.call(request)? {
+        Response::DesignPlan { plan } => Ok(*plan),
+        other => unexpected(op, &other),
+    }
+}
+
+fn print_task(t: &PlanTask, indent: &str) {
+    let depth = "  ".repeat(usize::try_from(t.depth).unwrap_or(0));
+    let claim = t
+        .claimed_by
+        .as_deref()
+        .map(|c| format!("  claimed_by={c}"))
+        .unwrap_or_default();
+    println!(
+        "{indent}{depth}[{}] {}  {}  strategy={}{claim}",
+        t.status.as_deref().unwrap_or("?"),
+        t.uid,
+        t.title,
+        t.strategy
+    );
+}
+
+fn print_plan(p: &Plan) {
+    let archived = if p.archived { "  (archived)" } else { "" };
+    println!("{}  {}{archived}", p.uid, p.title);
+    for (n, step) in p.steps.iter().enumerate() {
+        println!("  {}. {}  {}", n + 1, step.text, step.uid);
+        for s in &step.spans {
+            println!("       stages {} {}", s.uid, s.state);
+        }
+        for t in &step.tasks {
+            print_task(t, "       ");
+        }
+    }
+}
+
+/// `jkb design plan …` (D53.6).
+fn plan_cmd(ops: &Ops<'_>, what: DesignPlanCmd) -> Result<()> {
+    let plan = match what {
+        DesignPlanCmd::Ls { uid, all } => {
+            let list = match ops.call(Request::DesignPlans { uid, all })? {
+                Response::DesignPlans { list } => list,
+                other => return unexpected("design.plans", &other),
+            };
+            if ops.json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
+            if list.plans.is_empty() {
+                println!("(no plans)");
+            }
+            for p in &list.plans {
+                print_plan(p);
+            }
+            if list.hidden > 0 {
+                println!(
+                    "({} archived plan(s) not shown — every task done or cancelled; --all lists them)",
+                    list.hidden
+                );
+            }
+            if !list.tasks.is_empty() {
+                println!("one-off tasks:");
+                for t in &list.tasks {
+                    print_task(t, "  ");
+                }
+            }
+            return Ok(());
+        }
+        DesignPlanCmd::Create { uid, title, steps } => plan_answer(
+            ops,
+            "design.plan_create",
+            Request::DesignPlanCreate {
+                uid,
+                title: title.join(" "),
+                steps,
+            },
+        )?,
+        DesignPlanCmd::Step { plan, text } => plan_answer(
+            ops,
+            "design.plan_step",
+            Request::DesignPlanStep {
+                plan,
+                text: text.join(" "),
+            },
+        )?,
+        DesignPlanCmd::Show { plan } => {
+            plan_answer(ops, "design.plan", Request::DesignPlan { plan })?
+        }
+    };
+    if ops.json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        print_plan(&plan);
     }
     Ok(())
 }
@@ -306,15 +405,19 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             let w = written(ops, "design.apply", Request::DesignApply { uid, update })?;
             print_written(ops, &w)
         }
-        DesignCmd::Prompt {
-            what: DesignPromptCmd::Discuss { uid, range, base },
-        } => {
-            let (start, end) = parse_range(&range)?;
-            let ask = PromptAsk::Discuss {
-                uid,
-                base,
-                start,
-                end,
+        DesignCmd::Prompt { what } => {
+            let ask = match what {
+                DesignPromptCmd::Discuss { uid, range, base } => {
+                    let (start, end) = parse_range(&range)?;
+                    PromptAsk::Discuss {
+                        uid,
+                        base,
+                        start,
+                        end,
+                    }
+                }
+                DesignPromptCmd::Play { plan, strategy } => PromptAsk::Play { plan, strategy },
+                DesignPromptCmd::Task { uid } => PromptAsk::Task { uid },
             };
             match ops.call(Request::DesignPrompt { ask })? {
                 Response::DesignPrompt { prompt } => {
@@ -325,9 +428,18 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
                     }
                     Ok(())
                 }
+                Response::DesignWorkPrompt { prompt } => {
+                    if ops.json {
+                        println!("{}", serde_json::to_string_pretty(&prompt)?);
+                    } else {
+                        print!("{}", prompt.prompt);
+                    }
+                    Ok(())
+                }
                 other => unexpected("design.prompt", &other),
             }
         }
+        DesignCmd::Plan { what } => plan_cmd(ops, what),
         DesignCmd::Compact { uid } => {
             match ops.call(Request::DesignCompact { uid: uid.clone() })? {
                 Response::DesignCompacted { through, removed } => {

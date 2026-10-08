@@ -445,6 +445,22 @@ fn samples() -> Vec<Request> {
             span: "span:x".into(),
             step: "step:x".into(),
         },
+        Request::DesignPlanCreate {
+            uid: "design:x".into(),
+            title: "t".into(),
+            steps: vec!["s".into()],
+        },
+        Request::DesignPlanStep {
+            plan: "plan:x".into(),
+            text: "s".into(),
+        },
+        Request::DesignPlan {
+            plan: "plan:x".into(),
+        },
+        Request::DesignPlans {
+            uid: "design:x".into(),
+            all: false,
+        },
         Request::DesignPrompt {
             ask: crate::designs::PromptAsk::Discuss {
                 uid: "design:x".into(),
@@ -1573,6 +1589,8 @@ const READS: &[&str] = &[
     "design.cat",
     "design.state",
     "design.spans",
+    "design.plan",
+    "design.plans",
     "design.prompt",
 ];
 

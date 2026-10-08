@@ -1,0 +1,282 @@
+/* The Design tab's Execution Plan and Tasks panes (D53.6). Colour is meaning only: a staged span
+ * carries its state's accent, a failed or cancelled task is muted, nothing else is coloured. */
+
+.design-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+  height: 100%;
+  min-height: 0;
+}
+
+.design-document {
+  min-height: 0;
+  overflow: auto;
+}
+
+.plan-column {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  border-left: var(--hairline-width) solid var(--hairline);
+  font-size: var(--text-md);
+}
+
+.pane-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: var(--hairline-width) solid var(--hairline);
+  min-width: 0;
+}
+
+.pane-bar h2 {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-bar .spacer {
+  flex: 1;
+}
+
+.pane-bar .picker select {
+  max-width: 150px;
+}
+
+.pane-body {
+  padding: var(--space-2) var(--space-3);
+}
+
+.plan-hint {
+  margin: var(--space-1) 0;
+  font-size: var(--text-sm);
+}
+
+.plan-hint code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  word-break: break-all;
+}
+
+.plan-card {
+  padding: var(--space-2) 0;
+  border-bottom: var(--hairline-width) solid var(--hairline);
+}
+
+.plan-card:last-child {
+  border-bottom: 0;
+}
+
+.plan-card[data-archived="true"] {
+  color: var(--ink-muted);
+}
+
+.plan-card > header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.plan-card h3 {
+  flex: 1;
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+
+.play-button {
+  color: var(--ink);
+}
+
+.plan-steps {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-4);
+}
+
+.plan-steps > li {
+  margin-bottom: var(--space-2);
+}
+
+.step-text {
+  font-weight: 500;
+}
+
+.step-spans {
+  list-style: none;
+  margin: var(--space-1) 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.step-spans li {
+  font-size: var(--text-sm);
+  color: var(--ink-muted);
+  border-left: 3px solid var(--span-accent, var(--hairline-strong));
+  padding-left: var(--space-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-spans [data-state="PROPOSED"] { --span-accent: var(--accent-proposed); }
+.step-spans [data-state="APPROVED"] { --span-accent: var(--accent-approved); }
+.step-spans [data-state="STAGED"] { --span-accent: var(--accent-staged); }
+.step-spans [data-state="IMPLEMENTED"] { --span-accent: var(--accent-implemented); }
+
+.plan-tasks {
+  list-style: none;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+}
+
+.plan-task {
+  appearance: none;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--ink);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius);
+  padding: 2px var(--space-2);
+  cursor: pointer;
+}
+
+.plan-task:hover {
+  background: var(--surface-hover);
+}
+
+.plan-task[aria-pressed="true"] {
+  background: var(--surface-active);
+}
+
+.task-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-status {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
+.task-status[data-status="done"],
+.task-status[data-status="cancelled"] {
+  color: var(--ink-faint);
+}
+
+.task-claim {
+  font-size: var(--text-xs);
+  color: var(--ink-muted);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  padding: 0 var(--space-1);
+}
+
+.history {
+  margin-top: auto;
+  padding: var(--space-2) var(--space-3);
+  border-top: var(--hairline-width) solid var(--hairline);
+}
+
+.history-drawer {
+  margin-top: var(--space-2);
+  max-height: 40vh;
+  overflow: auto;
+}
+
+.task-pane {
+  border-top: var(--hairline-width) solid var(--hairline-strong);
+}
+
+.task-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px var(--space-3);
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.task-facts dt {
+  color: var(--ink-muted);
+}
+
+.task-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-facts code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.task-notes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--ink-muted);
+}
+
+.task-notes textarea,
+.task-append input {
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--ink);
+  background: var(--bg);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  padding: var(--space-1) var(--space-2);
+}
+
+.task-notes textarea {
+  font-family: var(--font-mono);
+  resize: vertical;
+}
+
+.task-actions,
+.task-append {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.task-append input {
+  flex: 1;
+  min-width: 0;
+}
+
+.task-subhead {
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.task-transitions {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-size: var(--text-sm);
+}
+
+.task-transitions time {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--ink-muted);
+}

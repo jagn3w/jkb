@@ -533,6 +533,49 @@ enum DesignCmd {
         #[command(subcommand)]
         what: DesignPromptCmd,
     },
+    /// Execution plans: a design's ordered steps, the spans staged into them, and their tasks.
+    Plan {
+        #[command(subcommand)]
+        what: DesignPlanCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesignPlanCmd {
+    /// A design's execution plans and its one-off tasks. A plan whose tasks are all done or
+    /// cancelled is archived, and listed only with `--all`.
+    Ls {
+        /// The design.
+        uid: String,
+        /// Archived plans too.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Create an execution plan under a design, with its steps in order.
+    Create {
+        /// The design.
+        uid: String,
+        /// The plan's title.
+        #[arg(num_args = 1.., required = true)]
+        title: Vec<String>,
+        /// A step, in order (repeat): a coarse stage such as `scaffold` or `deploy`.
+        #[arg(long = "step")]
+        steps: Vec<String>,
+    },
+    /// Append a step to a plan. Stage approved spans into it with `jkb design stage`, and add its
+    /// tasks with `jkb task add … --under <step>`.
+    Step {
+        /// The plan.
+        plan: String,
+        /// What the step is.
+        #[arg(num_args = 1.., required = true)]
+        text: Vec<String>,
+    },
+    /// One plan: its steps, the spans each stages, and their tasks.
+    Show {
+        /// The plan.
+        plan: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -548,6 +591,20 @@ enum DesignPromptCmd {
         /// The version token the selection was made in (the current version when omitted).
         #[arg(long)]
         base: Option<String>,
+    },
+    /// *Play* an execution plan: the plan, its steps, their tasks, the spans they stage, and the
+    /// workflow strategy the work runs under. What the app's *Play* starts Claude with.
+    Play {
+        /// The plan.
+        plan: String,
+        /// The workflow strategy chosen for the plan's tasks (the default when omitted).
+        #[arg(long)]
+        strategy: Option<String>,
+    },
+    /// *Play* one task: what it is, where it sits in its design, and the strategy it runs.
+    Task {
+        /// The task.
+        uid: String,
     },
 }
 

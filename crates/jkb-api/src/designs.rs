@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::rbac::Principal;
 use crate::{ApiError, ErrorCode};
 
+pub mod plans;
+
 fn invalid(why: impl Into<String>) -> ApiError {
     ApiError::with_code(ErrorCode::Invalid, why)
 }
@@ -395,11 +397,25 @@ pub fn stage(
     Ok(design::stage(conn, meta, span, step)?.into())
 }
 
-/// What prompt a `design.prompt` builds (D53.5–6). Only *Discuss* today; *Play* on a plan is the
-/// execution-plan subtask's.
+/// What prompt a `design.prompt` builds (D53.5–6): *Discuss* a selection (answered as a
+/// [`Prompt`]), or *Play* a plan or a task (answered as a [`WorkPrompt`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PromptAsk {
+    /// *Play* an execution plan: its steps, their tasks, the spans they stage, and the strategy
+    /// the work runs under.
+    Play {
+        /// The plan.
+        plan: String,
+        /// The workflow strategy the operator chose for the plan's tasks; the default when omitted.
+        #[serde(default)]
+        strategy: Option<String>,
+    },
+    /// *Play* one task: what it is, where it sits in its design, and the strategy it runs.
+    Task {
+        /// The task.
+        uid: String,
+    },
     /// Discuss a selection of a design's text with Claude.
     Discuss {
         /// The design.
@@ -518,11 +534,20 @@ fn discuss_prompt(d: &design::Discussion) -> String {
     p
 }
 
+/// What a `design.prompt` answers: a *Discuss* prompt, or a *Play* one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptAnswer {
+    /// `discuss`.
+    Discuss(Prompt),
+    /// `play` or `task`.
+    Work(plans::WorkPrompt),
+}
+
 /// `design.prompt`.
 ///
 /// # Errors
-/// The engine's refusal of the selection.
-pub fn prompt(conn: &Connection, ask: &PromptAsk) -> Result<Prompt, ApiError> {
+/// The engine's refusal of the selection, or an unknown plan, task or strategy.
+pub fn prompt(conn: &Connection, ask: &PromptAsk) -> Result<PromptAnswer, ApiError> {
     match ask {
         PromptAsk::Discuss {
             uid,
@@ -531,7 +556,7 @@ pub fn prompt(conn: &Connection, ask: &PromptAsk) -> Result<Prompt, ApiError> {
             end,
         } => {
             let d = design::discussion(conn, uid, base.as_deref(), *start, *end)?;
-            Ok(Prompt {
+            Ok(PromptAnswer::Discuss(Prompt {
                 kind: "discuss".to_owned(),
                 prompt: discuss_prompt(&d),
                 uid: d.uid,
@@ -542,8 +567,12 @@ pub fn prompt(conn: &Connection, ask: &PromptAsk) -> Result<Prompt, ApiError> {
                 quote: d.quote,
                 occurrence: d.occurrence,
                 spans: d.spans.into_iter().map(|s| s.uid).collect(),
-            })
+            }))
         }
+        PromptAsk::Play { plan, strategy } => {
+            plans::play_prompt(conn, plan, strategy.as_deref()).map(PromptAnswer::Work)
+        }
+        PromptAsk::Task { uid } => plans::task_prompt(conn, uid).map(PromptAnswer::Work),
     }
 }
 

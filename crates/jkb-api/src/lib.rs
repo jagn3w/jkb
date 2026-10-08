@@ -818,7 +818,43 @@ pub enum Request {
         /// The plan step.
         step: String,
     },
-    /// A prompt for a Claude session over a design: *Discuss* a selection ([`designs::prompt`]).
+    /// Create an execution plan under a design, with its steps in order
+    /// ([`designs::plans::create`]).
+    #[serde(rename = "design.plan_create")]
+    DesignPlanCreate {
+        /// The design.
+        uid: String,
+        /// The plan's title.
+        title: String,
+        /// Its steps, in order.
+        #[serde(default)]
+        steps: Vec<String>,
+    },
+    /// Append a step to an execution plan ([`designs::plans::add_step`]).
+    #[serde(rename = "design.plan_step")]
+    DesignPlanStep {
+        /// The plan.
+        plan: String,
+        /// What the step is.
+        text: String,
+    },
+    /// One execution plan: its steps, their tasks and staged spans ([`designs::plans::show`]).
+    #[serde(rename = "design.plan")]
+    DesignPlan {
+        /// The plan.
+        plan: String,
+    },
+    /// A design's execution plans and one-off tasks ([`designs::plans::list`]).
+    #[serde(rename = "design.plans")]
+    DesignPlans {
+        /// The design.
+        uid: String,
+        /// Include archived plans (every task terminal).
+        #[serde(default)]
+        all: bool,
+    },
+    /// A prompt for a Claude session over a design: *Discuss* a selection, or *Play* a plan or a
+    /// task ([`designs::prompt`]).
     #[serde(rename = "design.prompt")]
     DesignPrompt {
         /// Which prompt, over what.
@@ -1410,6 +1446,10 @@ impl Request {
         "design.span",
         "design.approve",
         "design.stage",
+        "design.plan_create",
+        "design.plan_step",
+        "design.plan",
+        "design.plans",
         "design.prompt",
         "design.compact",
         "attest.mint",
@@ -1530,6 +1570,10 @@ impl Request {
             Self::DesignSpan { .. } => "design.span",
             Self::DesignApprove { .. } => "design.approve",
             Self::DesignStage { .. } => "design.stage",
+            Self::DesignPlanCreate { .. } => "design.plan_create",
+            Self::DesignPlanStep { .. } => "design.plan_step",
+            Self::DesignPlan { .. } => "design.plan",
+            Self::DesignPlans { .. } => "design.plans",
             Self::DesignPrompt { .. } => "design.prompt",
             Self::DesignCompact { .. } => "design.compact",
             Self::AttestMint { .. } => "attest.mint",
@@ -1611,6 +1655,8 @@ impl Request {
             | Self::DesignCat { .. }
             | Self::DesignState { .. }
             | Self::DesignSpans { .. }
+            | Self::DesignPlan { .. }
+            | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -1689,6 +1735,8 @@ impl Request {
             | Self::DesignSpan { .. }
             | Self::DesignApprove { .. }
             | Self::DesignStage { .. }
+            | Self::DesignPlanCreate { .. }
+            | Self::DesignPlanStep { .. }
             | Self::DesignCompact { .. } => false,
         }
     }
@@ -2216,10 +2264,25 @@ pub enum Response {
         /// The span after it.
         span: Box<designs::Span>,
     },
-    /// A `design.prompt`.
+    /// A `design.prompt` for *Discuss*.
     DesignPrompt {
         /// The prompt and what it was built from.
         prompt: Box<designs::Prompt>,
+    },
+    /// A `design.prompt` for *Play* (a plan or a task).
+    DesignWorkPrompt {
+        /// The prompt and what it was built from.
+        prompt: Box<designs::plans::WorkPrompt>,
+    },
+    /// A `design.plan`, `design.plan_create` or `design.plan_step`.
+    DesignPlan {
+        /// The plan after it.
+        plan: Box<designs::plans::Plan>,
+    },
+    /// A `design.plans`.
+    DesignPlans {
+        /// The design's plans and one-off tasks.
+        list: Box<designs::plans::PlanList>,
     },
     /// A `design.compact`.
     DesignCompacted {
@@ -2320,6 +2383,9 @@ impl Response {
             | Self::DesignWritten { .. }
             | Self::DesignSpan { .. }
             | Self::DesignPrompt { .. }
+            | Self::DesignWorkPrompt { .. }
+            | Self::DesignPlan { .. }
+            | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
@@ -2418,6 +2484,9 @@ impl Response {
             | Self::DesignSpans { .. }
             | Self::DesignSpan { .. }
             | Self::DesignPrompt { .. }
+            | Self::DesignWorkPrompt { .. }
+            | Self::DesignPlan { .. }
+            | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
@@ -3604,9 +3673,32 @@ impl LocalBackend {
                     db.write_txn_with(actor, move |c, m| designs::stage(c, m, &span, &step))?,
                 ),
             },
-            Request::DesignPrompt { ask } => Response::DesignPrompt {
-                prompt: Box::new(db.read_with(move |c| designs::prompt(c, &ask))?),
+            Request::DesignPlanCreate { uid, title, steps } => Response::DesignPlan {
+                plan: Box::new(db.write_txn_with(actor, move |c, m| {
+                    designs::plans::create(c, m, &uid, &title, &steps)
+                })?),
             },
+            Request::DesignPlanStep { plan, text } => Response::DesignPlan {
+                plan: Box::new(db.write_txn_with(actor, move |c, m| {
+                    designs::plans::add_step(c, m, &plan, &text)
+                })?),
+            },
+            Request::DesignPlan { plan } => Response::DesignPlan {
+                plan: Box::new(db.read_with(move |c| designs::plans::show(c, &plan))?),
+            },
+            Request::DesignPlans { uid, all } => Response::DesignPlans {
+                list: Box::new(db.read_with(move |c| designs::plans::list(c, &uid, all))?),
+            },
+            Request::DesignPrompt { ask } => {
+                match db.read_with(move |c| designs::prompt(c, &ask))? {
+                    designs::PromptAnswer::Discuss(prompt) => Response::DesignPrompt {
+                        prompt: Box::new(prompt),
+                    },
+                    designs::PromptAnswer::Work(prompt) => Response::DesignWorkPrompt {
+                        prompt: Box::new(prompt),
+                    },
+                }
+            }
             Request::DesignCompact { uid } => {
                 let done = db.write_txn_with(actor, move |c, m| {
                     jkb_core::design::compact(c, m, &uid).map_err(ApiError::from)

@@ -4913,3 +4913,103 @@ fn a_design_is_edited_by_quote_against_the_version_read() {
         .failure()
         .stderr(predicate::str::contains("<start>..<end>"));
 }
+
+/// Execution plans (D53.6) through the CLI: a plan with steps, a span staged into a step, a task
+/// under it, and the *Play* prompts the app starts Claude with.
+#[test]
+fn a_plan_is_built_and_played_through_the_cli() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = jkb(&db).arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let uid = json(&[
+        "design",
+        "create",
+        "Factory",
+        "--repo",
+        "jkb",
+        "--body",
+        "Scaffold the app.",
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let plan = json(&[
+        "design", "plan", "create", &uid, "First", "cut", "--step", "scaffold", "--step", "deploy",
+    ]);
+    let plan_uid = plan["uid"].as_str().unwrap().to_owned();
+    assert_eq!(plan["title"], "First cut");
+    let step = plan["steps"][0]["uid"].as_str().unwrap().to_owned();
+    jkb(&db)
+        .args(["design", "plan", "step", &plan_uid, "watch", "it"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("3. watch it"));
+
+    let version = json(&["design", "cat", &uid])["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let span = json(&[
+        "design",
+        "span",
+        &uid,
+        "--base",
+        &version,
+        "--find",
+        "Scaffold the app.",
+    ])["span"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    jkb(&db)
+        .args(["design", "approve", &span])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "stage", &span, &step])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("STAGED"));
+    let task = json(&[
+        "task",
+        "add",
+        "Build the scaffold",
+        "--under",
+        &step,
+        "--managed",
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    jkb(&db)
+        .args(["design", "plan", "ls", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("stages {span} STAGED")))
+        .stdout(predicate::str::contains(format!("[open] {task}")));
+    jkb(&db)
+        .args([
+            "design",
+            "prompt",
+            "play",
+            &plan_uid,
+            "--strategy",
+            "coordinated",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workflow strategy: coordinated"))
+        .stdout(predicate::str::contains(&task))
+        .stdout(predicate::str::contains(&span));
+    jkb(&db)
+        .args(["design", "prompt", "task", &task])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("jkb task work {task}")))
+        .stdout(predicate::str::contains(&plan_uid));
+}

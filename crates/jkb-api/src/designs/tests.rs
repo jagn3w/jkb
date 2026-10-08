@@ -268,6 +268,11 @@ fn a_discuss_prompt_names_the_selection_as_the_edit_that_reaches_it() {
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
     // An unknown kind is a bad request, not a guess.
     assert!(serde_json::from_value::<crate::Request>(
+        json!({ "op": "design.prompt", "ask": { "kind": "summarize", "uid": uid } })
+    )
+    .is_err());
+    // …and so is a known kind with another kind's fields.
+    assert!(serde_json::from_value::<crate::Request>(
         json!({ "op": "design.prompt", "ask": { "kind": "play", "uid": uid } })
     )
     .is_err());
@@ -287,4 +292,228 @@ fn a_discussed_passage_with_backticks_is_fenced_by_a_longer_run() {
         "{}",
         prompt.prompt
     );
+}
+
+// ---- execution plans and *Play* (D53.6) --------------------------------------------------------
+
+fn plan_of(r: Response) -> crate::designs::plans::Plan {
+    match r {
+        Response::DesignPlan { plan } => *plan,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn plans_of(b: &LocalBackend, uid: &str) -> crate::designs::plans::PlanList {
+    match ok(b, json!({ "op": "design.plans", "uid": uid })) {
+        Response::DesignPlans { list } => *list,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // every call site builds its ask inline
+fn work_prompt(b: &LocalBackend, ask: Value) -> crate::designs::plans::WorkPrompt {
+    match ok(b, json!({ "op": "design.prompt", "ask": ask })) {
+        Response::DesignWorkPrompt { prompt } => *prompt,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A design with a plan whose first step stages an approved span and holds one task.
+struct Staged {
+    kb: Kb,
+    uid: String,
+    plan: String,
+    step: String,
+    span: String,
+    task: String,
+}
+
+/// A plan is a designer's write (not an implementer's); its steps take spans and tasks.
+fn staged() -> Staged {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "Scaffold the app. Ship it.");
+    let ask = json!({ "op": "design.plan_create", "uid": uid, "title": "First cut",
+                      "steps": ["scaffold", "deploy"] });
+    let e = call(&kb.as_role("implementer"), ask.clone()).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+    let plan = plan_of(ok(&kb.as_role("designer"), ask));
+    assert_eq!(plan.design, uid);
+    assert_eq!(plan.steps.len(), 2);
+    let step = plan.steps[0].uid.clone();
+    let plan = plan_of(ok(
+        &kb.op,
+        json!({ "op": "design.plan_step", "plan": plan.uid, "text": "monitor" }),
+    ));
+    assert_eq!(plan.steps[2].text, "monitor");
+
+    let read = cat(&kb.op, &uid);
+    let span = written(ok(
+        &kb.op,
+        json!({ "op": "design.span", "uid": uid, "base": read.version, "find": "Scaffold the app." }),
+    ))
+    .span
+    .unwrap();
+    ok(&kb.op, json!({ "op": "design.approve", "span": span }));
+    ok(
+        &kb.op,
+        json!({ "op": "design.stage", "span": span, "step": step }),
+    );
+    let task = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "Build the scaffold", "under": step, "managed": true }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    Staged {
+        kb,
+        uid,
+        plan: plan.uid,
+        step,
+        span,
+        task,
+    }
+}
+
+/// The listing carries each step's staged spans and tasks, in the wire shape the app decodes.
+#[test]
+fn a_plan_lists_its_steps_spans_and_tasks() {
+    let Staged {
+        kb,
+        uid,
+        plan,
+        span,
+        task,
+        ..
+    } = staged();
+    // The wire shape `@jkb/core`'s `decodePlanList` and `decodeWorkPrompt` read (`ui/core/src/plan.ts`).
+    let wire =
+        serde_json::to_value(ok(&kb.op, json!({ "op": "design.plans", "uid": uid }))).unwrap();
+    assert_eq!(wire["result"], "design_plans");
+    let wire_task = &wire["list"]["plans"][0]["steps"][0]["tasks"][0];
+    for key in [
+        "uid",
+        "title",
+        "status",
+        "priority",
+        "depth",
+        "claimed_by",
+        "strategy",
+    ] {
+        assert!(wire_task.get(key).is_some(), "{key}: {wire_task}");
+    }
+    let wire = serde_json::to_value(ok(
+        &kb.op,
+        json!({ "op": "design.prompt", "ask": { "kind": "task", "uid": task } }),
+    ))
+    .unwrap();
+    assert_eq!(wire["result"], "design_work_prompt");
+    assert_eq!(wire["prompt"]["kind"], "task");
+
+    let listed = plans_of(&kb.op, &uid);
+    assert_eq!(listed.hidden, 0);
+    assert!(
+        listed.tasks.is_empty(),
+        "the task is the step's, not a one-off"
+    );
+    let shown = &listed.plans[0];
+    assert_eq!(shown.uid, plan);
+    assert_eq!(shown.steps[0].spans[0].uid, span);
+    assert_eq!(shown.steps[0].spans[0].state, "STAGED");
+    assert_eq!(shown.steps[0].tasks[0].uid, task);
+    assert_eq!(shown.steps[0].tasks[0].strategy, "default:design-reviewed");
+    assert_eq!(
+        plan_of(ok(
+            &kb.op,
+            json!({ "op": "design.plan", "plan": shown.uid })
+        )),
+        *shown
+    );
+}
+
+/// *Play* names the plan, its steps, spans and tasks and the strategy the work runs under; a task's
+/// own *Play* names where it sits and the strategy it runs.
+#[test]
+fn play_prompts_name_the_plan_and_the_strategy_its_work_runs_under() {
+    let Staged {
+        kb,
+        uid,
+        plan,
+        step,
+        span,
+        task,
+    } = staged();
+    let prompt = work_prompt(
+        &kb.op,
+        json!({ "kind": "play", "plan": plan, "strategy": "coordinated" }),
+    );
+    assert_eq!(prompt.kind, "play");
+    assert_eq!(prompt.strategy, "coordinated");
+    assert_eq!(prompt.design.as_deref(), Some(uid.as_str()));
+    for needle in [
+        plan.as_str(),
+        step.as_str(),
+        span.as_str(),
+        task.as_str(),
+        "Workflow strategy: coordinated",
+        "\"Scaffold the app.\"",
+        "Tasks: none yet.",
+        "jkb task add",
+        "--under <step uid>",
+    ] {
+        assert!(
+            prompt.prompt.contains(needle),
+            "{needle}: {}",
+            prompt.prompt
+        );
+    }
+    let e = call(
+        &kb.op,
+        json!({ "op": "design.prompt", "ask": { "kind": "play", "plan": plan, "strategy": "lax" } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+
+    // With no strategy chosen the prompt claims no choice: each task runs its own.
+    let unchosen = work_prompt(&kb.op, json!({ "kind": "play", "plan": plan }));
+    assert_eq!(unchosen.strategy, "design-reviewed");
+    assert!(
+        unchosen.prompt.contains("no choice for this plan"),
+        "{}",
+        unchosen.prompt
+    );
+    assert!(
+        !unchosen.prompt.contains("The operator chose it"),
+        "{}",
+        unchosen.prompt
+    );
+
+    // The strategy a task's *Play* names is the one it runs: pinned by the operator.
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.set", "uid": task, "strategy": "autonomous" }),
+    );
+    let one = work_prompt(&kb.op, json!({ "kind": "task", "uid": task }));
+    assert_eq!(one.kind, "task");
+    assert_eq!(one.strategy, "autonomous");
+    for needle in [
+        task.as_str(),
+        uid.as_str(),
+        step.as_str(),
+        span.as_str(),
+        "jkb task work",
+        "Workflow strategy: autonomous",
+    ] {
+        assert!(one.prompt.contains(needle), "{needle}: {}", one.prompt);
+    }
+    assert_eq!(
+        plans_of(&kb.op, &uid).plans[0].steps[0].tasks[0].strategy,
+        "autonomous"
+    );
+    let e = call(
+        &kb.op,
+        json!({ "op": "design.prompt", "ask": { "kind": "task", "uid": step } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "a step is not a task: {e:?}");
 }

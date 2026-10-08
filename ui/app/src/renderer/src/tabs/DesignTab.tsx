@@ -4,6 +4,7 @@ import { decodeDesignPrompt, decodeDesigns, designOps, designRepos, repoOf, SPAN
 
 import { DocumentEditor } from "../design/DocumentEditor";
 import { discussSpec } from "../design/discuss";
+import { PlanColumn } from "../design/PlanColumn";
 import { DesignSession, type SyncStatus } from "../design/session";
 import { useTerminals } from "../terminal/TerminalProvider";
 
@@ -72,9 +73,10 @@ function bridgeOf(): ConstructorParameters<typeof DesignSession>[0] {
 }
 
 /**
- * The Design tab (D53.4–5): pick a repo and one of its designs, and edit it live. The Document pane
+ * The Design tab (D53.4–6): pick a repo and one of its designs, and edit it live. The Document pane
  * is the design's CRDT text in CodeMirror, synced with jkb as it is typed, coloured by span state;
- * selecting text offers *Discuss*, which opens Claude beside it.
+ * selecting text offers *Discuss*, which opens Claude beside it. Beside it, the Execution Plan and
+ * Tasks panes: the design's plans, their steps and tasks, and *Play*.
  */
 export function DesignTab(): React.JSX.Element {
   const terminals = useTerminals();
@@ -229,10 +231,19 @@ export function DesignTab(): React.JSX.Element {
               Create one with <code>jkb design create &lt;title&gt; --repo &lt;repo&gt;</code>, then Refresh.
             </p>
           </div>
-        ) : session === undefined ? (
-          <p className="design-empty muted">Opening…</p>
         ) : (
-          <DocumentEditor key={design.uid} session={session} onDiscuss={(f, t, shown) => void onDiscuss(f, t, shown)} />
+          <div className="design-split">
+            <div className="design-document">
+              {session === undefined ? (
+                <p className="design-empty muted">Opening…</p>
+              ) : (
+                <DocumentEditor key={design.uid} session={session} onDiscuss={(f, t, shown) => void onDiscuss(f, t, shown)} />
+              )}
+            </div>
+            {activeRepo !== undefined && (
+              <PlanColumn key={design.uid} design={design.uid} repo={activeRepo} onNotice={setNotice} />
+            )}
+          </div>
         )}
       </div>
     </div>
