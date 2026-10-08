@@ -57,6 +57,11 @@
   --radius: 4px;
   --hairline-width: 1px;
   --topbar-height: 40px;
+  --drawer-bar-height: 30px;
+
+  /* The integrated terminal: the page's own ground, so a terminal reads as part of the app. */
+  --terminal-bg: #ffffff;
+  --terminal-selection: #d3d3d1;
 
   /* Motion. */
   --motion: 150ms;
@@ -88,6 +93,9 @@
     --accent-implemented-soft: #17301f;
     --alert: #f26464;
     --alert-soft: #3d1c1c;
+
+    --terminal-bg: #191919;
+    --terminal-selection: #3f3f3f;
   }
 }
 

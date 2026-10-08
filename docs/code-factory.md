@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtask 1 (the scaffold) is built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold) and 2 (the terminal) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -247,6 +247,52 @@ One React component used by every tab: a collapsible bottom drawer (and a popove
   command runs.
 - A terminal is created from a **spec** (`{target, cwd, argv, title, sessionUuid?}`) built by the
   caller from CLI output; the component has no knowledge of Claude or jkb.
+
+**As built (subtask 2).** The contract is `src/shared/terminal.ts` (the spec, its validator
+`parseSpec`, `retarget`, the events); main's half is `src/main/terminals.ts` (`TerminalHost`: the
+PTYs, the command each spec runs); the renderer's is `src/renderer/src/terminal/` (a reducer for
+what is open where, one xterm instance per terminal that outlives its view, the drawer, the
+popover, and `useTerminals()` — `open(spec, "drawer" | "popover")` is what a tab calls). The drawer
+folds with Ctrl+` and is resized by its top edge; its height is a per-window convenience.
+
+- **A container terminal is `docker exec -i -t -e TERM=… -w <cwd> <container> <argv>`**, with
+  `/bin/bash -l` (absolute, as the kit names every program it execs) when the spec has no argv. The
+  container is `$JKB_CONTAINER_NAME`, default `jkb-dev`: the variable `run.sh` reads. A name that is
+  not one (`--privileged`) is refused rather than handed to docker as a flag. `docker` itself is
+  looked for at fixed absolute paths, never on `PATH`: a GUI app's `PATH` is not the shell's.
+- **Main trusts nothing the renderer sends.** `parseSpec` refuses unknown fields (there is no `env`
+  to smuggle in), relative or NUL-bearing paths, and oversized argv; sizes and writes are bounded. A
+  terminal belongs to the window that opened it: only that window can write to it, resize it or
+  close it, and it is killed when that window closes or reloads. The PTYs never cross the bridge,
+  only their output does.
+- **The toggle restarts the program on the other side.** A process cannot move between the
+  container and the host, so switching ends it (after asking, while it runs) and starts the spec
+  again there. The cwd crosses through the repos mount (`HOST_REPOS` ⇄ `CTR_REPOS` in `run.sh`), the
+  one directory both sides see; outside it, the target's default. The badge on the tab says where
+  it runs, and a host badge is drawn inverted so it cannot be read as the quiet default.
+- **A second open with the same `sessionUuid` shows the terminal already running it**, so a
+  double-clicked *Play* or *Discuss* does not start a second Claude on one session.
+
+What it cost to learn:
+
+- **The CSP allows inline styles now.** xterm.js 6.0.0 writes its theme and cell size into `<style>`
+  elements it creates at run time, and true-colour cells through `setAttribute("style", …)` (both
+  read in its `lib/xterm.js`); it takes no nonce. `style-src` therefore has `'unsafe-inline'`.
+  Scripts are still `'self'` only, and with connect, image and font sources closed to the network an
+  injected style has nowhere to send anything.
+- **xterm measures its cell once, when it opens.** It does not watch `document.fonts`, so a terminal
+  opened before JetBrains Mono loads keeps the fallback font's metrics. The session opens xterm only
+  after `document.fonts.load` resolves.
+- **Output is gathered for 4 ms before it crosses.** Measured in `test/terminal.test.mjs`: 2000 lines
+  from a real PTY arrive in 2–3 messages, and in 469 when each PTY read is sent as it comes.
+- **`node-pty` builds from source on Linux**, with node-gyp, which fetches Node's headers from
+  nodejs.org. The agent sandbox cannot reach it; `npm_config_nodedir=/usr` builds against the local
+  headers instead (measured: node-pty 1.1.0 on linux-arm64, Node 22). It is a Node-API module, so
+  that one build is what the tests load in Node. Loading it in Electron is exercised by the
+  Electron smoke, which needs the binary the sandbox cannot download; it runs in CI.
+- **Unmeasured here, stated:** what Docker does to the process inside the container when the
+  `docker exec` client is killed (no Docker in the agent sandbox), and the macOS `spawn-helper` path
+  of node-pty (no Mac). Packaging the native module (`asarUnpack`) belongs to subtask 10.
 
 ## Subtasks, in landing order
 

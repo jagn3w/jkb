@@ -10,6 +10,11 @@ packages:
 # - electron: its install script downloads the Electron binary from GitHub releases. Where GitHub
 #   is unreachable (the agent sandbox) set ELECTRON_SKIP_BINARY_DOWNLOAD=1: type-check and bundle
 #   need no binary, and the app's Electron smoke test skips and says why (D53.2).
+# - node-pty: the app's terminal PTYs (D53.10). A native module: its install script uses a
+#   prebuilt binary where node-pty ships one (macOS, Windows) and otherwise compiles with
+#   node-gyp, which downloads Node's headers from nodejs.org. Where that is unreachable (the agent
+#   sandbox) install with `npm_config_nodedir=/usr` to compile against the local headers. It is a
+#   Node-API module, so the one build loads in Node (the tests) and in Electron (the app) alike.
 #
 # Both spellings are kept deliberately: pnpm 11 reads `allowBuilds`, pnpm 10 reads
 # `onlyBuiltDependencies`, and a mismatch is not a warning — the install fails with
@@ -17,7 +22,9 @@ packages:
 allowBuilds:
   esbuild: true
   electron: true
+  node-pty: true
 
 onlyBuiltDependencies:
   - esbuild
   - electron
+  - node-pty

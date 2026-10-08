@@ -1,4 +1,5 @@
-/* The shell: a top bar with the four tabs and the daemon's status, and one pane below it. */
+/* The shell: a top bar with the four tabs and the daemon's status, one pane below it, and the
+ * terminal drawer under that (terminal.css). */
 
 *,
 *::before,
@@ -35,8 +36,9 @@ pre {
 }
 
 .shell {
+  position: relative;
   display: grid;
-  grid-template-rows: var(--topbar-height) 1fr;
+  grid-template-rows: var(--topbar-height) minmax(0, 1fr) auto;
   height: 100%;
 }
 

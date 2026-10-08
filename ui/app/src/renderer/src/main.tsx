@@ -1,7 +1,9 @@
 import "@fontsource-variable/inter";
 import "@fontsource-variable/jetbrains-mono";
 import "./styles/tokens.css";
+import "@xterm/xterm/css/xterm.css";
 import "./styles/app.css";
+import "./styles/terminal.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";

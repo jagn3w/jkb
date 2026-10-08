@@ -1,0 +1,223 @@
+/* The integrated terminal (D53.10): the bottom drawer, its tabs, and the popover. */
+
+.terminal-drawer {
+  position: relative;
+  border-top: var(--hairline-width) solid var(--hairline);
+  background: var(--bg);
+  min-width: 0;
+}
+
+.drawer-resize {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: ns-resize;
+  z-index: 1;
+}
+
+.drawer-bar,
+.popover-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--drawer-bar-height);
+  padding: 0 var(--space-2);
+  min-width: 0;
+  font-size: var(--text-sm);
+}
+
+.drawer-toggle,
+.terminal-action,
+.terminal-close,
+.target-toggle button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  font: inherit;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.drawer-toggle:hover,
+.terminal-action:hover:not(:disabled),
+.terminal-close:hover,
+.target-toggle button:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.drawer-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.drawer-toggle .chevron {
+  width: 10px;
+  color: var(--ink-muted);
+}
+
+.drawer-toggle .count {
+  color: var(--ink-muted);
+  font-weight: 400;
+}
+
+.terminal-action:disabled,
+.target-toggle button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.terminal-tabs {
+  display: flex;
+  gap: var(--space-1);
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.terminal-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 1px var(--space-1) 1px var(--space-2);
+  border-radius: var(--radius);
+  color: var(--ink-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 280px;
+}
+
+.terminal-tab:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.terminal-tab[aria-selected="true"] {
+  background: var(--surface-active);
+  color: var(--ink);
+}
+
+.terminal-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.terminal-close {
+  padding: 0 var(--space-1);
+  line-height: 1.2;
+}
+
+/*
+ * Where a terminal runs. Not a span state, so not an accent: the container is the quiet default
+ * and the host is drawn inverted, so a host terminal cannot be mistaken for a container one.
+ */
+.target-badge {
+  font-size: var(--text-xs);
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 3px;
+  border: var(--hairline-width) solid var(--hairline-strong);
+  color: var(--ink-muted);
+}
+
+.target-badge[data-target="host"] {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+.terminal-status {
+  font-size: var(--text-xs);
+  color: var(--ink-faint);
+}
+
+.terminal-status[data-failed] {
+  color: var(--alert);
+}
+
+.target-toggle {
+  display: inline-flex;
+  border: var(--hairline-width) solid var(--hairline);
+  border-radius: var(--radius);
+  padding: 1px;
+}
+
+.target-toggle button {
+  padding: 0 var(--space-2);
+}
+
+.target-toggle button[aria-pressed="true"] {
+  background: var(--surface-active);
+  color: var(--ink);
+  cursor: default;
+}
+
+.drawer-body {
+  position: relative;
+  border-top: var(--hairline-width) solid var(--hairline);
+}
+
+.drawer-body[hidden] {
+  display: none;
+}
+
+.drawer-empty {
+  margin: 0;
+  padding: var(--space-3);
+}
+
+.terminal-panel {
+  position: absolute;
+  inset: 0;
+}
+
+.terminal-panel[hidden] {
+  display: none;
+}
+
+.terminal-view,
+.terminal-host {
+  width: 100%;
+  height: 100%;
+}
+
+.terminal-view {
+  padding: var(--space-1) 0 0 var(--space-2);
+  background: var(--terminal-bg);
+}
+
+.terminal-popover {
+  position: absolute;
+  right: var(--space-4);
+  bottom: calc(var(--drawer-bar-height) + var(--space-4));
+  width: min(720px, calc(100% - 2 * var(--space-4)));
+  height: min(440px, calc(100% - var(--topbar-height) - var(--drawer-bar-height) - 2 * var(--space-4)));
+  display: grid;
+  grid-template-rows: var(--drawer-bar-height) minmax(0, 1fr);
+  background: var(--bg);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  z-index: 10;
+}
+
+.popover-bar {
+  border-bottom: var(--hairline-width) solid var(--hairline);
+}
+
+.popover-bar .spacer {
+  flex: 1;
+}
+
+.popover-body {
+  min-height: 0;
+}

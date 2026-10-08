@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKe
 
 import { DaemonStatus } from "./DaemonStatus";
 import { DEFAULT_TAB, TABS, isTabId, tabForKey, type TabId } from "./tabs";
+import { TerminalDrawer } from "./terminal/TerminalDrawer";
+import { TerminalPopover } from "./terminal/TerminalPopover";
+import { TerminalProvider } from "./terminal/TerminalProvider";
 import { ContainerTab } from "./tabs/ContainerTab";
 import { DesignTab } from "./tabs/DesignTab";
 import { SessionsTab } from "./tabs/SessionsTab";
@@ -67,52 +70,56 @@ export function App(): React.JSX.Element {
   };
 
   return (
-    <div className="shell">
-      <header className="topbar">
-        <span className="wordmark">Code Factory</span>
-        <div className="tablist" role="tablist" aria-label="Sections" onKeyDown={onTabKey}>
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              ref={(el) => {
-                if (el) tabRefs.current.set(t.id, el);
-                else tabRefs.current.delete(t.id);
-              }}
-              type="button"
-              role="tab"
-              id={`tab-${t.id}`}
-              className="tab"
-              aria-selected={active === t.id}
-              aria-controls={`pane-${t.id}`}
-              tabIndex={active === t.id ? 0 : -1}
-              onClick={() => select(t.id, false)}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-        <DaemonStatus />
-      </header>
-      <main className="panes">
-        {TABS.map((t) => {
-          const Pane = PANES[t.id];
-          // Every pane stays mounted and only the active one is shown, so a pane keeps its state
-          // (an open document, a scrolled list) across tab switches.
-          return (
-            <section
-              key={t.id}
-              id={`pane-${t.id}`}
-              className="pane"
-              role="tabpanel"
-              aria-labelledby={`tab-${t.id}`}
-              data-tab={t.id}
-              hidden={active !== t.id}
-            >
-              <Pane />
-            </section>
-          );
-        })}
-      </main>
-    </div>
+    <TerminalProvider>
+      <div className="shell">
+        <header className="topbar">
+          <span className="wordmark">Code Factory</span>
+          <div className="tablist" role="tablist" aria-label="Sections" onKeyDown={onTabKey}>
+            {TABS.map((t) => (
+              <button
+                key={t.id}
+                ref={(el) => {
+                  if (el) tabRefs.current.set(t.id, el);
+                  else tabRefs.current.delete(t.id);
+                }}
+                type="button"
+                role="tab"
+                id={`tab-${t.id}`}
+                className="tab"
+                aria-selected={active === t.id}
+                aria-controls={`pane-${t.id}`}
+                tabIndex={active === t.id ? 0 : -1}
+                onClick={() => select(t.id, false)}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <DaemonStatus />
+        </header>
+        <main className="panes">
+          {TABS.map((t) => {
+            const Pane = PANES[t.id];
+            // Every pane stays mounted and only the active one is shown, so a pane keeps its state
+            // (an open document, a scrolled list) across tab switches.
+            return (
+              <section
+                key={t.id}
+                id={`pane-${t.id}`}
+                className="pane"
+                role="tabpanel"
+                aria-labelledby={`tab-${t.id}`}
+                data-tab={t.id}
+                hidden={active !== t.id}
+              >
+                <Pane />
+              </section>
+            );
+          })}
+        </main>
+        <TerminalDrawer />
+        <TerminalPopover />
+      </div>
+    </TerminalProvider>
   );
 }

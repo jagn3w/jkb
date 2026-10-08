@@ -83,7 +83,12 @@ test("the shell renders every tab and pane, with only the active pane shown", as
       hello: () => assert.fail("hello during render"),
       op: () => assert.fail("op during render"),
       info: () => assert.fail("info during render"),
+      terminal: {
+        open: () => assert.fail("terminal.open during render"),
+        onEvent: () => assert.fail("terminal.onEvent during render"),
+      },
     },
+    innerHeight: 800,
     localStorage: { getItem: () => "container", setItem: () => {} },
   };
   try {
@@ -96,6 +101,12 @@ test("the shell renders every tab and pane, with only the active pane shown", as
     assert.match(html, /id="pane-container"(?![^>]*hidden)[^>]*>/, "its pane is shown");
     assert.match(html, /id="pane-design"[^>]*hidden/, "the others are hidden");
     assert.match(html, /data-state="checking"/, "the daemon's status starts unknown");
+    // The terminal drawer (D53.10): present and folded, with nothing to start a terminal in until
+    // main has said where terminals run.
+    assert.match(html, /class="drawer-toggle"[^>]*aria-expanded="false"/, "the drawer starts folded");
+    assert.match(html, /id="terminal-drawer-body"[^>]*hidden/, "its body is hidden");
+    assert.match(html, /aria-label="New terminal"[^>]*disabled/, "no new terminal before the roots are known");
+    assert.doesNotMatch(html, /terminal-popover/, "no popover");
   } finally {
     delete globalThis.window;
   }

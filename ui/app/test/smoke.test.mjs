@@ -86,7 +86,7 @@ test("the renderer has no Node, only the bridge", { skip }, async () => {
     process: typeof globalThis.process,
     bridge: Object.keys(window.jkb).sort(),
   }));
-  assert.deepEqual(globals, { require: "undefined", process: "undefined", bridge: ["hello", "info", "op"] });
+  assert.deepEqual(globals, { require: "undefined", process: "undefined", bridge: ["hello", "info", "op", "terminal"] });
 });
 
 test("the daemon's status is shown, and an absent daemon reads unreachable", { skip }, async () => {
@@ -102,11 +102,42 @@ for (const [id, label] of [
   ["sessions", "Sessions"],
 ]) {
   test(`the ${label} tab opens its pane`, { skip }, async () => {
-    await page.getByRole("tab", { name: label }).click();
+    const tab = page.getByRole("tab", { name: label, exact: true });
+    await tab.click();
     const pane = page.locator(`#pane-${id}`);
     await pane.waitFor({ state: "visible" });
-    assert.equal(await page.getByRole("tab", { name: label }).getAttribute("aria-selected"), "true");
+    assert.equal(await tab.getAttribute("aria-selected"), "true");
     assert.equal(await pane.getByRole("heading", { level: 1 }).innerText(), label);
-    assert.equal(await page.locator('[role="tabpanel"]:visible').count(), 1, "only one pane is shown");
+    assert.equal(await page.locator('.panes > [role="tabpanel"]:visible').count(), 1, "only one pane is shown");
   });
 }
+
+// The integrated terminal (D53.10). A new terminal is a container terminal, labelled so; the
+// toggle moves it to the host, where it is a real shell. The container side is not exercised here
+// (no dev container in CI): what it runs is pinned by terminal.test.mjs.
+test("the terminal opens in the container by default, and the toggle runs it on the host", { skip }, async () => {
+  page.on("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: "New terminal" }).click();
+  const tab = page.locator(".terminal-tab").first();
+  await tab.waitFor();
+  assert.equal(await tab.locator(".target-badge").innerText(), "container");
+  assert.equal(await page.locator(".drawer-toggle").getAttribute("aria-expanded"), "true");
+
+  await page.getByRole("group", { name: "Where this terminal runs" }).getByRole("button", { name: "Host" }).click();
+  await tab.locator('.target-badge[data-target="host"]').waitFor();
+  assert.equal(await tab.locator(".target-badge").innerText(), "host");
+
+  const screen = page.locator("#terminal-drawer-body .terminal-panel:not([hidden]) .xterm");
+  await screen.click();
+  await page.keyboard.type("echo jkb-$((40 + 2))");
+  await page.keyboard.press("Enter");
+  await page.locator(".xterm-rows", { hasText: "jkb-42" }).waitFor({ timeout: 15_000 });
+
+  await page.keyboard.press("Control+Backquote");
+  assert.equal(await page.locator(".drawer-toggle").getAttribute("aria-expanded"), "false", "Ctrl+` folds it");
+  await page.keyboard.press("Control+Backquote");
+  assert.equal(await page.locator(".drawer-toggle").getAttribute("aria-expanded"), "true", "and opens it");
+
+  await tab.getByRole("button", { name: /^Close / }).click();
+  assert.equal(await page.locator(".terminal-tab").count(), 0);
+});

@@ -1,0 +1,58 @@
+//! The small pieces the drawer and the popover share: where a terminal runs, how it stands, and
+//! the toggle that moves it between the container and the host.
+
+import { TERMINAL_TARGETS, targetLabel, type TerminalTarget } from "../../../shared/terminal";
+import { statusLabel, type TerminalEntry } from "./state";
+import { useTerminals } from "./TerminalProvider";
+
+/** Where the terminal's commands run, on its tab, so it is never ambiguous (D53.10). */
+export function TargetBadge({ target }: { readonly target: TerminalTarget }): React.JSX.Element {
+  return (
+    <span className="target-badge" data-target={target} title={target === "host" ? "Runs on this machine, outside the container" : "Runs in the dev container"}>
+      {targetLabel(target)}
+    </span>
+  );
+}
+
+export function StatusNote({ entry }: { readonly entry: TerminalEntry }): React.JSX.Element | null {
+  const label = statusLabel(entry.status);
+  if (label === "") return null;
+  const failed = entry.status.kind === "failed" || (entry.status.kind === "exited" && entry.status.exitCode !== 0);
+  return (
+    <span className="terminal-status" data-failed={failed || undefined} title={entry.status.kind === "failed" ? entry.status.error : undefined}>
+      {label}
+    </span>
+  );
+}
+
+/** Container | Host, for one terminal. Choosing the other side starts its program again there. */
+export function TargetToggle({ entry }: { readonly entry: TerminalEntry }): React.JSX.Element {
+  const { retarget, roots } = useTerminals();
+  return (
+    <div className="target-toggle" role="group" aria-label="Where this terminal runs">
+      {TERMINAL_TARGETS.map((t) => (
+        <button
+          key={t}
+          type="button"
+          aria-pressed={entry.spec.target === t}
+          disabled={roots === undefined}
+          onClick={() => retarget(entry.key, t)}
+          title={entry.spec.target === t ? `Running on the ${targetLabel(t)}` : `Run on the ${targetLabel(t)} instead`}
+        >
+          {t === "container" ? "Container" : "Host"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Restart, shown once the program has ended. */
+export function RestartButton({ entry }: { readonly entry: TerminalEntry }): React.JSX.Element | null {
+  const { restart } = useTerminals();
+  if (entry.status.kind !== "exited" && entry.status.kind !== "failed") return null;
+  return (
+    <button type="button" className="terminal-action" onClick={() => restart(entry.key)}>
+      Restart
+    </button>
+  );
+}

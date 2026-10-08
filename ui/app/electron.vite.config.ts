@@ -13,7 +13,12 @@ import type { Plugin } from "vite";
 const CSP = [
   "default-src 'none'",
   "script-src 'self'",
-  "style-src 'self'",
+  // 'unsafe-inline' for styles only, for the terminal (D53.10). xterm.js 6.0.0 draws its theme and
+  // cell sizes into <style> elements it creates at run time, and a true-colour cell through
+  // `setAttribute("style", …)` (read in its lib/xterm.js); it has no nonce option. Without this the
+  // terminal renders unstyled and colourless. Scripts stay 'self' only, and with connect, image and
+  // font sources closed to the network an injected style has nowhere to send anything.
+  "style-src 'self' 'unsafe-inline'",
   "font-src 'self' data:",
   "img-src 'self' data:",
   "connect-src 'none'",

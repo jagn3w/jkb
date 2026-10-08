@@ -14,7 +14,7 @@ database directly. Anything the UI does, the terminal can do (design D31).
 | **`core/`** (`@jkb/core`) | Portable TypeScript — **no `vscode`, no Node APIs**. The `JkbClient` transport interface (`client.ts`), domain models (`model.ts`: `NodeRef` / `TreeChild` / `NodeDetails` / `MutationIntent`), the node-kind **registry** (`registry.ts`), row colour policy (`decoration.ts`), detail HTML rendering (`details.ts`), per-folder count formatting (`summary.ts`), and the staging/In-Flight row shapes and labels (`staging.ts`). Reused verbatim by any host. |
 | **`vscode/`** (`jkb-explorer`) | The VS Code extension: `cliClient.ts` (spawns `jkb --json` — the only Node-specific transport), `tree.ts` (the Explorer `TreeDataProvider`), `inflight.ts` (the In Flight `TreeDataProvider`), `detailsPanel.ts` (the Webview details host), `decorations.ts` (row colours/badges), `claude.ts` (starting a session in the Claude Code extension), and `extension.ts` (command wiring). |
 
-| **`app/`** (`@jkb/app`) | **Code Factory**, the jkb desktop app (Electron + React, built by electron-vite; design record [docs/code-factory.md](../docs/code-factory.md), D53). `src/main` holds the window, the bridge's handlers and `daemon.ts` — the `jkb serve` HTTP client and the only holder of the daemon's token; `src/preload` builds `window.jkb` from `src/shared/bridge.ts`, the typed contract; `src/renderer` is the React shell (the four tabs, design tokens in `styles/tokens.css`). The renderer has no Node and reaches jkb only through the bridge. |
+| **`app/`** (`@jkb/app`) | **Code Factory**, the jkb desktop app (Electron + React, built by electron-vite; design record [docs/code-factory.md](../docs/code-factory.md), D53). `src/main` holds the window, the bridge's handlers and `daemon.ts` — the `jkb serve` HTTP client and the only holder of the daemon's token; `src/preload` builds `window.jkb` from `src/shared/bridge.ts`, the typed contract; `src/renderer` is the React shell (the four tabs, design tokens in `styles/tokens.css`) and the integrated terminal (`src/renderer/src/terminal/`: xterm.js, drawer and popover; its PTYs are `node-pty` in `src/main/terminals.ts`, D53.10). The renderer has no Node and reaches jkb only through the bridge. |
 
 `@jkb/core`'s `daemon.ts` is the `jkb serve` wire protocol as data (where the daemon and its
 token are, the op/response/error shapes, reply decoding), shared by every adapter that speaks
@@ -58,8 +58,13 @@ CLI's remote mode uses. Start the daemon first (`jkb serve`).
 
 `pnpm install` downloads the Electron binary from GitHub releases. Where that is unreachable (the
 agent sandbox) install with `ELECTRON_SKIP_BINARY_DOWNLOAD=1`: type-check and bundle need no
-binary, and the Electron smoke (`app/test/smoke.test.mjs`, one test per tab) skips and says why.
-On Linux it also needs a display (`xvfb-run`), as in CI.
+binary, and the Electron smoke (`app/test/smoke.test.mjs`, one test per tab and one for the
+terminal) skips and says why. On Linux it also needs a display (`xvfb-run`), as in CI.
+
+The terminal's `node-pty` compiles on Linux with node-gyp, which downloads Node's headers from
+nodejs.org; where that is unreachable add `npm_config_nodedir=/usr` to the install. A container
+terminal enters `$JKB_CONTAINER_NAME` (default `jkb-dev`, as `.container/run.sh`); Ctrl+` folds
+the drawer.
 
 ## Run the extension
 
