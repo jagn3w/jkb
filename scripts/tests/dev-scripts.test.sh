@@ -1589,15 +1589,32 @@ _shell_shared_magics() {
         | grep -oE '^[[:space:]]+[0-9a-f]+\)' | tr -d ' )' | sort
 }
 
-# In the dev container, the host's ~/.jkb is a BIND MOUNT — a mount point in this mount namespace.
-# The live refusal is required there whatever the mount reports; keying it on the known FUSE magic
-# skipped it on exactly the backend the magic list did not know about.
-_jkb_is_a_bind_here() {
-    awk -v want="$1" '$5 == want { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo 2>/dev/null
+# _jkb_host_share <dir> — print the mount point of a filesystem shared INTO <dir> from elsewhere:
+# <dir> itself or any mount beneath it, on a device other than `/`'s. The live refusal is required
+# there whatever the mount reports; keying it on the known FUSE magic skipped it on exactly the
+# backend the magic list did not know about, so the device is the discriminator, never the magic.
+#
+# "A mount point at <dir>" was the test, and it held only while the container bound the host's whole
+# ~/.jkb. Two things broke it. The mount list narrowed to ~/.jkb/{logs,claude-memory}, so ~/.jkb
+# stopped being a share and the assertion stopped checking one. And Claude Code's bubblewrap sandbox
+# re-binds every allowed path into its own namespace: measured in the dev container,
+# /proc/self/mountinfo lists /home/vscode/.jkb as a mount on device 0:54 — the device `/` is on —
+# while the real shares are virtiofs on 0:45. Read as the host's share, that local overlay failed
+# case11 on trunk and made merge-queue.sh eject every candidate. A re-bind of the root filesystem
+# onto itself shares nothing with another kernel; a different device is the one thing a share from
+# another kernel must have.
+_jkb_host_share() {
+    awk -v want="$1" '
+        $5 == "/" { root = $3 }
+        $5 == want || index($5, want "/") == 1 { dev[++n] = $3; at[n] = $5 }
+        END {
+            for (i = 1; i <= n; i++) if (dev[i] != root) { print at[i]; exit 0 }
+            exit 1
+        }' /proc/self/mountinfo 2>/dev/null
 }
 
 case11() {
-    local sites rust shell odd m probe_dir rc=0 real_home calls
+    local sites rust shell odd m probe_dir rc=0 real_home share calls
     sites="$(_bare_sqlite_sites "$repo_root")"
     calls="$(_wrapper_calls)"
     if [ "$calls" != 1 ]; then
@@ -1706,18 +1723,18 @@ it — another process closing its last connection made every open beside it ref
     # The REAL home, not $HOME: the harness points HOME at a scratch directory, which is how this
     # assertion first skipped inside the very container it exists for.
     real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
-    if [ -n "$real_home" ] && _jkb_is_a_bind_here "$real_home/.jkb"; then
-        refuse_shared_db "$real_home/.jkb/jkb.db" 2>/dev/null; rc=$?
-        [ "$rc" = 3 ] && ok "inside the container, the host's ~/.jkb/jkb.db is refused" \
-            || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for the ~/.jkb bind \
-(fs magic $(stat -f -c %t "$real_home/.jkb" 2>/dev/null)) — a shared mount the magic list does not know"
-        ln -s "$real_home/.jkb/refusal-probe-missing.db" "$probe_dir/dangling.db"
+    if [ -n "$real_home" ] && share="$(_jkb_host_share "$real_home/.jkb")"; then
+        refuse_shared_db "$share/jkb.db" 2>/dev/null; rc=$?
+        [ "$rc" = 3 ] && ok "inside the container, a database on the host's share ($share) is refused" \
+            || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for $share/jkb.db \
+(fs magic $(stat -f -c %t "$share" 2>/dev/null)) — a shared mount the magic list does not know"
+        ln -s "$share/refusal-probe-missing.db" "$probe_dir/dangling.db"
         refuse_shared_db "$probe_dir/dangling.db" 2>/dev/null; rc=$?
-        [ "$rc" = 3 ] && ok "a dangling link from a local directory into the bind is refused" \
+        [ "$rc" = 3 ] && ok "a dangling link from a local directory into the share is refused" \
             || fail "shared-db: dangling link allowed" "refuse_shared_db returned $rc for a dangling \
-link into ~/.jkb — SQLite would create the database at the link's target"
+link into $share — SQLite would create the database at the link's target"
     else
-        skip "live bind refusal (~/.jkb is not a bind mount here)"
+        skip "live bind refusal (nothing under ~/.jkb is shared from another device here)"
     fi
 }
 

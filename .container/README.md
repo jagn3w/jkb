@@ -1415,8 +1415,14 @@ refused as "cannot tell what filesystem" (met by a CLI test under a parallel run
 Rust and the shell copy skip it, each pinned by a test). Every script's database read goes
 through `jkb_sqlite` in
 `scripts/lib.sh`, which applies the same magic set — `scripts/tests/dev-scripts.test.sh` case11 fails
-on a bare call, on the two sets drifting, and inside the container on the live bind not being
-refused. So a process with remote mode switched off and `--db ~/.jkb/jkb.db` (or no `--db` at all), gets a
+on a bare call, on the two sets drifting, and inside the container on a live share not being
+refused. The live share is found by device, not by being a mount point: the first mount at or
+under `~/.jkb` on a device other than `/`'s (today `~/.jkb/logs`, virtiofs). "A mount point at
+`~/.jkb`" stopped meaning a share twice over. The mount list narrowed to `~/.jkb/{logs,claude-memory}`.
+And Claude Code's bubblewrap sandbox re-binds every allowed path, so `~/.jkb` *is* a mount point
+under it, but on `/`'s own overlay device (0:54, against virtiofs's 0:45, measured in
+`/proc/self/mountinfo`). Read as the host's share, that failed case11 on trunk, and
+`merge-queue.sh` then ejected every candidate. So a process with remote mode switched off and `--db ~/.jkb/jkb.db` (or no `--db` at all), gets a
 refusal instead of the host's database — **once the installed `jkb` carries the refusal**: a binary built before it opens
 the host's database from in here (a review measured exactly that), so `setup.sh` must have rebuilt it,
 and `verify.sh` asks the installed binary to open a probe on the bind and requires the refusal.
