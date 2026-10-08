@@ -934,6 +934,13 @@ pub enum Request {
         /// The design.
         uid: String,
     },
+    /// The prompt a Claude Code session was recorded with, if any — the link from a session back to
+    /// the design it worked ([`designs::prompts::of_session`], D53.9).
+    #[serde(rename = "design.prompt_of")]
+    DesignPromptOf {
+        /// The session id.
+        session: String,
+    },
     /// Fold a design's updates into its snapshot (operator; [`jkb_core::design::compact`]).
     #[serde(rename = "design.compact")]
     DesignCompact {
@@ -1169,6 +1176,12 @@ pub struct NotifySession {
     pub instance: String,
     /// When the record was last written (Unix ms).
     pub updated_at: i64,
+    /// Where the notification stands: `awaiting_user` (no tool named — the idle prompt, and the
+    /// Code Factory's needs-input dot, D53.9) or `awaiting_tool` (a permission prompt naming
+    /// `tool`). Derived by [`notify::SessionRecord::state`], never by a reader. Empty from a daemon
+    /// that predates it.
+    #[serde(default)]
+    pub state: String,
 }
 
 /// One process's hold on a Claude Code session, as `session.list` reports it.
@@ -1532,6 +1545,7 @@ impl Request {
         "design.prompt",
         "design.prompt_record",
         "design.prompts",
+        "design.prompt_of",
         "design.compact",
         "attest.mint",
         "attest.release",
@@ -1663,6 +1677,7 @@ impl Request {
             Self::DesignPrompt { .. } => "design.prompt",
             Self::DesignPromptRecord { .. } => "design.prompt_record",
             Self::DesignPrompts { .. } => "design.prompts",
+            Self::DesignPromptOf { .. } => "design.prompt_of",
             Self::DesignCompact { .. } => "design.compact",
             Self::AttestMint { .. } => "attest.mint",
             Self::AttestRelease { .. } => "attest.release",
@@ -1749,7 +1764,8 @@ impl Request {
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
-            | Self::DesignPrompts { .. } => true,
+            | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -2411,6 +2427,14 @@ pub enum Response {
         /// Its prompts, newest first.
         prompts: Vec<designs::prompts::DesignPrompt>,
     },
+    /// A `design.prompt_of`.
+    DesignPromptOf {
+        /// The session asked about.
+        session: String,
+        /// The prompt it was recorded with; absent when no launch recorded it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<Box<designs::prompts::DesignPrompt>>,
+    },
     /// A `design.plan`, `design.plan_create` or `design.plan_step`.
     DesignPlan {
         /// The plan after it.
@@ -2527,6 +2551,7 @@ impl Response {
             | Self::DesignNewPrompt { .. }
             | Self::DesignPromptRecorded { .. }
             | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
@@ -2635,6 +2660,7 @@ impl Response {
             | Self::DesignWorkPrompt { .. }
             | Self::DesignNewPrompt { .. }
             | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
@@ -3187,6 +3213,7 @@ impl LocalBackend {
                     .read(notify::open_sessions)?
                     .into_iter()
                     .map(|r| NotifySession {
+                        state: r.state().as_str().to_owned(),
                         session: r.session,
                         tool: r.tool,
                         owner: r.owner,
@@ -3928,6 +3955,16 @@ impl LocalBackend {
                     move |c| designs::prompts::list(c, &uid)
                 })?;
                 Response::DesignPrompts { uid, prompts }
+            }
+            Request::DesignPromptOf { session } => {
+                let prompt = db.read_with({
+                    let session = session.clone();
+                    move |c| designs::prompts::of_session(c, &session)
+                })?;
+                Response::DesignPromptOf {
+                    session,
+                    prompt: prompt.map(Box::new),
+                }
             }
             Request::DesignCompact { uid } => {
                 let done = db.write_txn_with(actor, move |c, m| {

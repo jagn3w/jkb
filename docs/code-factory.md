@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane), 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not) and 8 (the Container tab) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane), 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not), 8 (the Container tab) and 9 (the Sessions tab) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -510,6 +510,53 @@ it, read `--status`, build each button's terminal spec), `window.jkb.container` 
   live app-owned sessions (uuid, cwd, target); after the rebuild it relaunches each as
   `claude --resume <uuid>` in its terminal. Sessions the app did not start (another editor) can be
   viewed and resumed, not re-attached — the app does not own their process.
+
+**As built (subtask 9).** `@jkb/core`'s `sessions.ts` (the registry and the records decoded and
+joined, the dot's rule, the `claude/notify` messages, and the pure halves of *Jump to context*); main's
+`topicFeeds.ts` (the one long-poll loop, now shared: `designFeeds.ts` and `notifyFeed.ts` are its two
+kinds), `notifyFeed.ts` and `gitPlace.ts`; `window.jkb.notify` and `window.jkb.sessions` on the bridge;
+the renderer's `sessions/` (`watch.ts`, the provider every tab reads the dot from, the registry reads,
+`reattach.ts`) and `tabs/SessionsTab.tsx`. What was decided past the text above:
+
+- **The state is derived once, in Rust, and carried.** `notify.open_sessions` gained `state`
+  (`notify::SessionRecord::state`, the machine's own `state_of`), so the app never re-decides
+  "tool empty means awaiting the user". The dot is `awaiting_user` only: a permission prompt
+  (`awaiting_tool`) is shown as *awaiting permission: Bash* on its row, without the dot, as the decision
+  says. A daemon that predates the field gives no dot rather than a guessed one.
+- **The feed says when, the records say what.** A message on `claude/notify` only means a session's
+  record moved; the window re-reads `notify.open_sessions`, joined after the feed is, with reads that
+  overlap coalesced into one more — so a post and its withdrawal arriving together, twice, or out of
+  order cost a re-read and never leave a stale dot. One feed for the window, from the shell down, so
+  the dot is right on every tab. Without the topic (`no_such_topic`: setup never ran) the records are
+  still read on demand, and the tab says why the dot will not move by itself.
+- **Jump to context is two lookups.** The design prompt is a new read op, `design.prompt_of {session}`
+  (`jkb design prompt of <session>`), since a prompt's uid is its session's: *Open design* moves to the
+  Design tab with that design open (the shell's `navigation.ts`). The worktree is read by **main from
+  git's files** — the `.git` file's `gitdir:` line, then `HEAD` — never by running git: the app runs
+  unsandboxed on the host, and a repo under the repos mount is writable from the container. Only paths
+  under the repos mount are looked at (either side's spelling), the walk stops at the first `.git` and
+  never leaves the mount, a `gitdir` pointing outside it is refused, links are not followed, and only
+  the place (root, repo key = the root's basename as `gitrepo::key` derives it, branch) crosses back.
+  The repo key and branch then go to `task.by_branch`.
+- **Re-attach follows the terminal, not a guess.** Build, Stop and Remove record before their run starts
+  every terminal the app opened with a `sessionUuid`, on the container, still running; where each
+  session *runs* comes from the registry (`session.list`'s cwd), not the terminal's spec — a task's
+  *Play* moves into its worktree after the terminal opens, and `claude --resume` finds a session by its
+  directory. When the run ends and `--status` says the container is running, each recorded terminal that
+  ended is relaunched in place with `claude --resume` (a closed one gets a new terminal; one still
+  running was not torn down and is left alone). After a Stop or a Remove the record waits for the next
+  run that leaves the container running, with *Re-attach now* and *Forget* on the Container tab. The
+  record is the window's memory only: what the app owns ends with the app.
+- **Read on demand, otherwise.** The registry is re-read on Refresh, the *Ended too* toggle and every
+  notification change; nothing announces a session starting or ending, and D53.1 rules out a poll loop.
+  The preview is the session's facts and context (and a task's text on *Show task*), not its
+  transcript, which lives in Claude Code's own store and is not jkb's to serve.
+- *Residual, stated:* while the app is closed its group still exists and holds what it has not read
+  unreapable, until the queue removes it as idle (7 days) — the same exposure a stopped notifier's group
+  has ([notifications.md](notifications.md)). The queue has no op to drop a group, so the app cannot
+  leave on quit.
+- *Unmeasured here, stated:* the Electron smoke for the tab (no binary in the sandbox), and a rebuild
+  re-attaching against a real container (no Docker in the sandbox): `reattach.ts`'s plan is what is pinned.
 
 ## D53.10 — The integrated terminal
 

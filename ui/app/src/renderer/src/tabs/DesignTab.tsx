@@ -7,6 +7,7 @@ import { discussSpec } from "../design/discuss";
 import { PlanColumn } from "../design/PlanColumn";
 import { PromptsPane } from "../design/PromptsPane";
 import { DesignSession, type SyncStatus } from "../design/session";
+import { useNavigation } from "../navigation";
 import { useTerminals } from "../terminal/TerminalProvider";
 
 /** The last repo and design, per-window conveniences (D53.1): the only state the tab keeps itself. */
@@ -100,6 +101,31 @@ export function DesignTab(): React.JSX.Element {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // A design another tab asked for (*Jump to context*, D53.9): opened once the listing has it. A
+  // design newer than the listing is read again once, then said to be missing.
+  const { designRequest } = useNavigation();
+  const [handled, setHandled] = useState<{ readonly seq: number; readonly reloaded: boolean }>({ seq: 0, reloaded: false });
+  useEffect(() => {
+    if (designRequest === undefined || designRequest.seq === handled.seq || listing.kind === "loading") return;
+    const found = listing.kind === "loaded" ? listing.designs.find((d) => d.uid === designRequest.uid) : undefined;
+    if (found !== undefined) {
+      const r = repoOf(found.namespace);
+      if (r !== undefined) {
+        setRepo(r);
+        remember(LAST_REPO_KEY, r);
+      }
+      setUid(found.uid);
+      remember(LAST_DESIGN_KEY, found.uid);
+      setHandled({ seq: designRequest.seq, reloaded: false });
+    } else if (!handled.reloaded) {
+      setHandled({ seq: handled.seq, reloaded: true });
+      void load();
+    } else {
+      setNotice(`${designRequest.uid} is not a design this daemon lists.`);
+      setHandled({ seq: designRequest.seq, reloaded: false });
+    }
+  }, [designRequest, handled, listing, load]);
 
   const designs = listing.kind === "loaded" ? listing.designs : [];
   const repos = useMemo(() => designRepos(designs), [designs]);

@@ -10,6 +10,8 @@ import {
   type ImageStamp,
 } from "@jkb/core";
 
+import { liveCwds, loadHolders } from "../sessions/data";
+import { mergeRecords, reattachPlan, recordAttached, tearsDown, type Attached } from "../sessions/reattach";
 import { useTerminals } from "../terminal/TerminalProvider";
 
 type Loaded =
@@ -77,11 +79,13 @@ export function ContainerTab(): React.JSX.Element {
   const [running, setRunning] = useState<{ readonly key: number; readonly action: ContainerAction } | undefined>(undefined);
   const live = useRef(true);
 
-  const load = useCallback(async () => {
+  /** Read `--status`; resolves to what it said (`undefined` when it could not be read). */
+  const load = useCallback(async (): Promise<ContainerStatus | undefined> => {
     setStatus((s) => (s.kind === "loaded" ? s : { kind: "loading" }));
     const answer = await window.jkb.container.status();
-    if (!live.current) return;
+    if (!live.current) return undefined;
     setStatus(answer.ok ? { kind: "loaded", value: answer.value } : { kind: "failed", message: answer.error });
+    return answer.ok ? answer.value : undefined;
   }, []);
 
   useEffect(() => {
@@ -95,11 +99,33 @@ export function ContainerTab(): React.JSX.Element {
   // A button's run has ended (or its terminal was closed): read what it left.
   const entry = running === undefined ? undefined : terminals.state.entries.find((e) => e.key === running.key);
   const ended = running !== undefined && (entry === undefined || entry.status.kind === "exited" || entry.status.kind === "failed");
+  // Re-attach (D53.9): the app's own container sessions, recorded before a teardown, relaunched as
+  // `claude --resume` in their terminals once the container runs again — after the run that tore it
+  // down, or a later one (a Stop, then a Build), or on demand. Asked when a run ends, not on every
+  // render, with the record and the terminals as they stand then (refs, so a closure is never stale).
+  const [attached, setAttached] = useState<readonly Attached[]>([]);
+  const attachedRef = useRef(attached);
+  attachedRef.current = attached;
+  const terminalsRef = useRef(terminals);
+  terminalsRef.current = terminals;
+  const reattach = useCallback((now: ContainerStatus | undefined): void => {
+    const t = terminalsRef.current;
+    const recorded = attachedRef.current;
+    if (recorded.length === 0 || t.roots === undefined) return;
+    const plan = reattachPlan(recorded, t.state.entries, now?.container?.state === "running", t.roots);
+    if (plan === undefined) return;
+    for (const step of plan) {
+      if (step.kind === "relaunch" && !t.relaunch(step.key, step.spec)) t.open(step.spec, "drawer");
+      else if (step.kind === "open") t.open(step.spec, "drawer");
+    }
+    setAttached([]);
+  }, []);
+
   useEffect(() => {
     if (!ended) return;
     setRunning(undefined);
-    void load();
-  }, [ended, load]);
+    void load().then(reattach);
+  }, [ended, load, reattach]);
 
   const run = async (action: ContainerAction): Promise<void> => {
     const spec = CONTAINER_ACTIONS.find((a) => a.id === action);
@@ -110,6 +136,14 @@ export function ContainerTab(): React.JSX.Element {
     if (!answer.ok) {
       setNotice(answer.error);
       return;
+    }
+    if (tearsDown(action)) {
+      // Recorded before the run starts: where each session really runs is the registry's word (a
+      // task's Play moves into its worktree after its terminal opened), read now while it is live.
+      const holders = await loadHolders((r) => window.jkb.op(r), false);
+      const cwds = holders.ok ? liveCwds(holders.value.holders) : new Map<string, string>();
+      const recorded = recordAttached(terminalsRef.current.state.entries, (s) => cwds.get(s));
+      setAttached((older) => mergeRecords(older, recorded));
     }
     setRunning({ key: terminals.open(answer.value, "drawer"), action });
   };
@@ -154,6 +188,19 @@ export function ContainerTab(): React.JSX.Element {
           <span className="spacer" />
           <button type="button" className="bar-button" onClick={() => setNotice(undefined)} aria-label="Dismiss">
             ×
+          </button>
+        </p>
+      )}
+      {attached.length > 0 && running === undefined && (
+        <p className="design-notice" role="status" data-kind="reattach">
+          {attached.length === 1 ? "1 session" : `${attached.length} sessions`} this app ran in the container will be
+          resumed in {attached.length === 1 ? "its terminal" : "their terminals"} when the container runs again.
+          <span className="spacer" />
+          <button type="button" className="bar-button" onClick={() => void load().then(reattach)} disabled={status.kind === "loading"}>
+            Re-attach now
+          </button>
+          <button type="button" className="bar-button" onClick={() => setAttached([])}>
+            Forget
           </button>
         </p>
       )}

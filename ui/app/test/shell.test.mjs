@@ -91,6 +91,13 @@ test("the shell renders every tab and pane, with only the active pane shown", as
         status: () => assert.fail("container.status during render"),
         spec: () => assert.fail("container.spec during render"),
       },
+      notify: {
+        subscribe: () => assert.fail("notify.subscribe during render"),
+        onEvent: () => assert.fail("notify.onEvent during render"),
+      },
+      sessions: {
+        place: () => assert.fail("sessions.place during render"),
+      },
     },
     innerHeight: 800,
     localStorage: { getItem: () => "container", setItem: () => {} },
@@ -127,6 +134,11 @@ test("the shell renders every tab and pane, with only the active pane shown", as
       assert.match(html, new RegExp(`<button[^>]*data-action="${action}"`), `the ${action} button`);
     }
     assert.match(html, /Asking the kit(?:&#x27;|')s run\.sh…/);
+    // The Sessions tab (D53.9): the registry and the needs-input feed are asked for from effects,
+    // never during render, and there is no dot before a record says there is one.
+    assert.match(html, /Loading sessions…/);
+    assert.doesNotMatch(html, /needs-dot/, "no dot before the records are read");
+    assert.doesNotMatch(html, /id="tab-sessions"[^>]*aria-describedby/);
   } finally {
     delete globalThis.window;
   }

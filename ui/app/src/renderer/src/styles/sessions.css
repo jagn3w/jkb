@@ -1,0 +1,197 @@
+/* The Sessions tab (D53.9) and the needs-input dot. The dot is the app's one alert colour: a session
+ * waiting on the operator. Everything else here is ink. */
+
+.needs-dot {
+  display: inline-block;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--alert);
+  vertical-align: middle;
+}
+
+.tab .needs-dot {
+  margin-left: var(--space-1);
+  margin-bottom: 2px;
+}
+
+.sessions-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.sessions-tab .picker input {
+  margin: 0;
+}
+
+.sessions-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) minmax(0, 3fr);
+}
+
+.sessions-list {
+  min-height: 0;
+  overflow: auto;
+  border-right: var(--hairline-width) solid var(--hairline);
+}
+
+.sessions-list ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-row {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "mark dir id"
+    ". meta meta";
+  align-items: center;
+  gap: 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: var(--hairline-width) solid var(--hairline);
+  cursor: pointer;
+  font-size: var(--text-md);
+}
+
+.session-row:hover {
+  background: var(--surface-hover);
+}
+
+.session-row[aria-selected="true"] {
+  background: var(--surface-active);
+}
+
+.session-row[data-live="false"] .session-dir {
+  color: var(--ink-muted);
+}
+
+.session-mark {
+  grid-area: mark;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink);
+}
+
+.live-dot[data-live="false"] {
+  background: transparent;
+  border: var(--hairline-width) solid var(--ink-faint);
+}
+
+.session-dir {
+  grid-area: dir;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-id {
+  grid-area: id;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--ink-muted);
+}
+
+.session-meta {
+  grid-area: meta;
+  display: flex;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.needs-text {
+  color: var(--alert);
+}
+
+.session-badge {
+  padding: 0 var(--space-1);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  font-size: var(--text-xs);
+}
+
+.sessions-preview {
+  min-height: 0;
+  overflow: auto;
+}
+
+.session-preview .pane-bar h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-preview .pane-body {
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-md);
+}
+
+.session-preview h3 {
+  margin: var(--space-4) 0 var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink-muted);
+}
+
+.session-preview dd[data-needs="true"] {
+  color: var(--alert);
+}
+
+.session-preview code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.session-context {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.session-tasks {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-tasks li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+}
+
+.session-task {
+  margin-top: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: var(--hairline-width) solid var(--hairline);
+}
+
+.session-task-text {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--ink-muted);
+}

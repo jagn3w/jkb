@@ -36,6 +36,11 @@ export interface TerminalsApi {
   toggleDrawer(): void;
   /** Run the terminal's spec again (after it exited, say). */
   restart(key: number): void;
+  /**
+   * Run `spec` in the terminal `key` from now on (a session re-attached after a container rebuild,
+   * D53.9). `false` when that terminal is gone.
+   */
+  relaunch(key: number, spec: TerminalSpec): boolean;
   /** Move the terminal to the other target: its program starts again there. */
   retarget(key: number, target: TerminalTarget): void;
   session(key: number): TerminalSession | undefined;
@@ -135,6 +140,14 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
     void session.start(entry.spec);
   }, []);
 
+  const relaunch = useCallback((key: number, spec: TerminalSpec): boolean => {
+    const session = sessions.current.get(key);
+    if (session === undefined || !stateRef.current.entries.some((e) => e.key === key)) return false;
+    dispatch({ type: "restart", key, spec });
+    void session.start(spec);
+    return true;
+  }, []);
+
   const retarget = useCallback(
     (key: number, target: TerminalTarget): void => {
       const entry = stateRef.current.entries.find((e) => e.key === key);
@@ -177,10 +190,11 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
       setDrawer: (o) => dispatch({ type: "drawer", open: o }),
       toggleDrawer,
       restart,
+      relaunch,
       retarget,
       session: (key) => sessions.current.get(key),
     }),
-    [state, roots, open, openShell, close, toggleDrawer, restart, retarget],
+    [state, roots, open, openShell, close, toggleDrawer, restart, relaunch, retarget],
   );
 
   return <TerminalsContext.Provider value={api}>{children}</TerminalsContext.Provider>;

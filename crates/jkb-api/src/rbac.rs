@@ -228,7 +228,8 @@ impl Request {
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
-            | Self::DesignPrompts { .. } => OpPermission::Read,
+            | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. } => OpPermission::Read,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -433,6 +434,7 @@ impl Request {
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. }
             | Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }

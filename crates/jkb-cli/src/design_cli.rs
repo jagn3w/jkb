@@ -305,6 +305,31 @@ fn list_prompts(ops: &Ops<'_>, uid: String) -> Result<()> {
     Ok(())
 }
 
+/// `jkb design prompt of` (D53.9): the prompt a session was recorded with, which names its design.
+fn prompt_of(ops: &Ops<'_>, session: String) -> Result<()> {
+    let (session, prompt) = match ops.call(Request::DesignPromptOf { session })? {
+        Response::DesignPromptOf { session, prompt } => (session, prompt),
+        other => return unexpected("design.prompt_of", &other),
+    };
+    if ops.json {
+        let answer = serde_json::json!({ "session": session, "prompt": prompt });
+        println!("{}", serde_json::to_string_pretty(&answer)?);
+        return Ok(());
+    }
+    match prompt {
+        None => println!("(none)"),
+        Some(p) => {
+            println!("{}  [{}]  {}  {}", p.design, p.launch, p.title, p.uid);
+            println!(
+                "    resume: cd {} && claude --resume {}",
+                shell_word(&p.cwd),
+                p.session
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `jkb design prompt …`: build a prompt a session starts with, record a session, or list them.
 fn prompt_cmd(ops: &Ops<'_>, what: DesignPromptCmd) -> Result<()> {
     let ask = match what {
@@ -338,6 +363,7 @@ fn prompt_cmd(ops: &Ops<'_>, what: DesignPromptCmd) -> Result<()> {
             );
         }
         DesignPromptCmd::Ls { uid } => return list_prompts(ops, uid),
+        DesignPromptCmd::Of { session } => return prompt_of(ops, session),
         DesignPromptCmd::Discuss { uid, range, base } => {
             let (start, end) = parse_range(&range)?;
             PromptAsk::Discuss {

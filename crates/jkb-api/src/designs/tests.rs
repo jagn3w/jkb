@@ -600,6 +600,27 @@ fn a_launch_records_its_session_and_the_design_lists_it() {
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+
+    // A session resolves back to its design (the Sessions tab's *Jump to context*, D53.9), in the
+    // wire shape `@jkb/core`'s `decodeSessionPrompt` reads (`ui/core/src/sessions.ts`); a session no
+    // launch recorded answers without a prompt, to anyone who reads.
+    let wire = serde_json::to_value(ok(
+        &kb.as_role("implementer"),
+        json!({ "op": "design.prompt_of", "session": SESSION.to_ascii_uppercase() }),
+    ))
+    .unwrap();
+    assert_eq!(wire["result"], "design_prompt_of");
+    assert_eq!(wire["prompt"]["design"], json!(uid));
+    assert_eq!(wire["prompt"]["cwd"], "/Users/me/repos/jkb");
+    let wire = serde_json::to_value(ok(
+        &kb.op,
+        json!({ "op": "design.prompt_of", "session": "abc" }),
+    ))
+    .unwrap();
+    assert_eq!(
+        wire,
+        json!({ "result": "design_prompt_of", "session": "abc" })
+    );
 }
 
 /// *New prompt* starts a session with the operator's words, fenced, after how to read the design.

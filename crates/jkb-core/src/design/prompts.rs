@@ -297,6 +297,20 @@ fn recorded(conn: &Connection, meta: &WriteMeta, design: &str, uid: &str) -> Res
     })
 }
 
+/// The prompt a Claude Code session was recorded with, if it was one a launch recorded: the link
+/// from a session back to the design it worked (the Code Factory's *Jump to context*, D53.9).
+/// `None` for a session no launch recorded — one started outside the app, or with an id that is
+/// not a uuid, which no launch can have recorded.
+///
+/// # Errors
+/// An item named like a prompt that is not one, unreadable metadata, or a database error.
+pub fn of_session(conn: &Connection, session: &str) -> Result<Option<PromptRecord>> {
+    let Ok(session) = session_id(session) else {
+        return Ok(None);
+    };
+    Ok(existing(conn, &uid_for(&session))?.map(|(_, _, record)| record))
+}
+
 /// A design's prompts, newest first.
 ///
 /// # Errors

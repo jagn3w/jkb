@@ -643,6 +643,12 @@ enum DesignPromptCmd {
         /// The design.
         uid: String,
     },
+    /// The prompt a Claude Code session was recorded with — the design it worked — or nothing
+    /// (exit 0, `(none)`) when no launch recorded it.
+    Of {
+        /// The session id.
+        session: String,
+    },
 }
 
 #[derive(Subcommand)]

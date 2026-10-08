@@ -42,6 +42,8 @@ export interface NewPrompt {
 export const promptOps = {
   /** A design's prompts, newest first. */
   list: (uid: string) => ({ op: "design.prompts", uid }),
+  /** The prompt a Claude Code session was recorded with, if any (D53.9). */
+  of: (session: string) => ({ op: "design.prompt_of", session }),
   /** The prompt a *New prompt* starts its session with: the operator's `text`, after the design's how-to. */
   newPrompt: (uid: string, text: string) => ({ op: "design.prompt", ask: { kind: "new", uid, text } }),
 } as const;
@@ -77,6 +79,21 @@ export function decodeDesignPrompts(o: Outcome<OpResponse>): Outcome<readonly De
     return failed("internal", "jkb serve did not answer with a well-formed `design_prompts`");
   }
   return { ok: true, value: prompts.map((p) => ({ ...p, subject: p.subject ?? null })) };
+}
+
+/**
+ * `design.prompt_of`'s answer: the prompt a session was recorded with — the design it worked — or
+ * `null` when no launch recorded it (a session started outside the app). D53.9's *Jump to context*.
+ */
+export function decodeSessionPrompt(o: Outcome<OpResponse>): Outcome<DesignPromptRecord | null> {
+  if (!o.ok) return o;
+  if (o.value.result !== "design_prompt_of") {
+    return failed("internal", "jkb serve did not answer with a well-formed `design_prompt_of`");
+  }
+  const p = o.value["prompt"];
+  if (p === undefined || p === null) return { ok: true, value: null };
+  if (!isRecord(p)) return failed("internal", "jkb serve did not answer with a well-formed `design_prompt_of`");
+  return { ok: true, value: { ...p, subject: p.subject ?? null } };
 }
 
 /** `design.prompt`'s answer to a *New prompt*. */

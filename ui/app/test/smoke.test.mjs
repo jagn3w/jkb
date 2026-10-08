@@ -132,6 +132,17 @@ test("the Workflows tab says why it has no agents when the daemon is unreachable
   assert.equal(await pane.getByRole("combobox", { name: "Workflow" }).isDisabled(), true);
 });
 
+// The Sessions tab (D53.9): with no daemon there is no registry to list and no notification to dot,
+// and the pane says why. The join, the dot's rule, the claude/notify feed, the git-file reader and
+// re-attach are pinned by sessions.test.mjs (app and core); the ops by the jkb-api tests.
+test("the Sessions tab says why it lists nothing when the daemon is unreachable", { skip }, async () => {
+  await page.getByRole("tab", { name: "Sessions", exact: true }).click();
+  const pane = page.locator("#pane-sessions");
+  await pane.locator(".plan-hint", { hasText: "Cannot list sessions" }).waitFor();
+  await pane.locator(".design-notice", { hasText: "claude/notify" }).first().waitFor();
+  assert.equal(await page.locator(".tab .needs-dot").count(), 0, "no dot without a record of one");
+});
+
 // The Container tab (D53.8): a button per kit run.sh flag, and an answer from the kit -- on a CI
 // runner there is none, so it says how to install one. The kit is found under the ACCOUNT's home,
 // not the smoke's HOME, so on a machine with a kit this reads that kit's (read-only) --status. What

@@ -149,6 +149,15 @@ export function retarget(spec: TerminalSpec, target: TerminalTarget, roots: Term
   return { ...spec, target, cwd };
 }
 
+/**
+ * `path` in the host's filesystem: a container path under the repos mount is carried to the host's
+ * side of it; a path already under the host's repos directory is kept; anything else is `undefined`,
+ * since neither side can say where it is on the other.
+ */
+export function hostPathOf(path: string, roots: TerminalRoots): string | undefined {
+  return rebase(path, roots.containerRepos, roots.hostRepos) ?? rebase(path, roots.hostRepos, roots.hostRepos);
+}
+
 /** How a target is named on a terminal's tab, so it is never ambiguous where a command runs. */
 export function targetLabel(target: TerminalTarget): string {
   return target === "container" ? "container" : "host";

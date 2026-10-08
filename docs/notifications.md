@@ -61,14 +61,20 @@ failure lasts. Each run restarts once however many of its end signals arrive.
 **A topic nobody reads is not written to.** A message no group consumes is never reapable, so a topic
 with no groups fills to its 10,000-message cap and then refuses every hook call. On a machine with no
 notifier that is the topic's whole life. So the machine still moves the record but sends only while
-`claude/notify` has a group — and the only group is the notifier's (`macos-notifier`, created from
-now by its `jkb mq subscribe`), so only a Mac running the agent receives anything. `scripts/setup.sh`
+`claude/notify` has a group. There are two consumers: the notifier's (`macos-notifier`, created from
+now by its `jkb mq subscribe`), and the Code Factory app's own `code-factory` group, which feeds its
+needs-input dot while the app is open (D53.9, [code-factory.md](code-factory.md)) — so a Mac running the
+agent, or any machine with the app open, has its posts and withdrawals sent; with neither, nothing is.
+A closed app's group is an abandoned consumer like a stopped notifier's: what it has not read cannot be
+reaped until the queue removes it as idle (7 days), and there is no op to drop a group on quit — the
+residual is recorded under D53.9. `scripts/setup.sh`
 creates the topic on every platform, because a producer never creates one. On macOS it reports only
 what it checked (`report_notifier` in `scripts/lib.sh`): the agent has a running process (a PID from
 `launchctl list`, not merely "loaded", which a crash-looping agent also is) and the topic has a consumer
 group — the question the daemon asks. That is deliberately not "notifications are shown": a group
-outlives its consumer by 7 idle days, and a running notifier can have a failing subscription (its
-`notifier.log` says). What it rules out is the two states setup once reported as healthy — an
+outlives its consumer by 7 idle days, a running notifier can have a failing subscription (its
+`notifier.log` says), and the group found may be the Code Factory app's rather than the notifier's.
+What it rules out is the two states setup once reported as healthy — an
 authorized bundle with no agent, and an agent loaded but not running (both stage-5 reviews). A group
 list that cannot be read is `undecided`, never "no group". `--no-service` leaves the agent off.
 

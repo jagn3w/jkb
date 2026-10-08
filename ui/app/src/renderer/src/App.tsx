@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { DaemonStatus } from "./DaemonStatus";
+import { NavigationContext, type DesignRequest, type Navigation } from "./navigation";
+import { NeedsInputProvider, useNeedsInput } from "./sessions/NeedsInputProvider";
 import { DEFAULT_TAB, TABS, isTabId, tabForKey, type TabId } from "./tabs";
 import { TerminalDrawer } from "./terminal/TerminalDrawer";
 import { TerminalPopover } from "./terminal/TerminalPopover";
@@ -38,7 +40,33 @@ const PANES: Record<TabId, () => React.JSX.Element> = {
 };
 
 export function App(): React.JSX.Element {
+  return (
+    <TerminalProvider>
+      <NeedsInputProvider>
+        <Shell />
+      </NeedsInputProvider>
+    </TerminalProvider>
+  );
+}
+
+/** The id of a tab's dot, which describes the tab (its name stays the tab's label). */
+const dotId = (tab: TabId): string => `tab-${tab}-needs`;
+
+/**
+ * The red dot on the Sessions tab: sessions whose notification awaits the operator (D53.9). Hidden
+ * from the tab's name, so the tab is still called "Sessions", and read as its description instead.
+ */
+function TabDot({ tab }: { readonly tab: TabId }): React.JSX.Element | null {
+  const { needing } = useNeedsInput();
+  if (tab !== "sessions" || needing.size === 0) return null;
+  const said = needing.size === 1 ? "1 session needs input" : `${needing.size} sessions need input`;
+  return <span id={dotId(tab)} className="needs-dot" aria-hidden="true" aria-label={said} title={said} />;
+}
+
+function Shell(): React.JSX.Element {
   const [active, setActive] = useState<TabId>(loadLastTab);
+  const [designRequest, setDesignRequest] = useState<DesignRequest | undefined>(undefined);
+  const { needing } = useNeedsInput();
   const tabRefs = useRef(new Map<TabId, HTMLButtonElement>());
 
   const select = useCallback((tab: TabId, focus: boolean) => {
@@ -46,6 +74,18 @@ export function App(): React.JSX.Element {
     saveLastTab(tab);
     if (focus) tabRefs.current.get(tab)?.focus();
   }, []);
+
+  const navigation = useMemo<Navigation>(
+    () => ({
+      goTo: (tab) => select(tab, false),
+      openDesign: (uid) => {
+        setDesignRequest((r) => ({ uid, seq: (r?.seq ?? 0) + 1 }));
+        select("design", false);
+      },
+      designRequest,
+    }),
+    [select, designRequest],
+  );
 
   // Cmd/Ctrl+1…4 from anywhere in the window.
   useEffect(() => {
@@ -70,7 +110,7 @@ export function App(): React.JSX.Element {
   };
 
   return (
-    <TerminalProvider>
+    <NavigationContext.Provider value={navigation}>
       <div className="shell">
         <header className="topbar">
           <span className="wordmark">Code Factory</span>
@@ -88,10 +128,12 @@ export function App(): React.JSX.Element {
                 className="tab"
                 aria-selected={active === t.id}
                 aria-controls={`pane-${t.id}`}
+                aria-describedby={t.id === "sessions" && needing.size > 0 ? dotId(t.id) : undefined}
                 tabIndex={active === t.id ? 0 : -1}
                 onClick={() => select(t.id, false)}
               >
                 {t.label}
+                <TabDot tab={t.id} />
               </button>
             ))}
           </div>
@@ -120,6 +162,6 @@ export function App(): React.JSX.Element {
         <TerminalDrawer />
         <TerminalPopover />
       </div>
-    </TerminalProvider>
+    </NavigationContext.Provider>
   );
 }

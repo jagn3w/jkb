@@ -1109,6 +1109,27 @@ fn a_prompt_is_recorded_under_its_design_by_its_session_uuid() {
 }
 
 #[test]
+fn a_session_resolves_to_the_prompt_it_was_recorded_with() {
+    let db = db();
+    let uid = create(&db, "x");
+    let of = |session: &'static str| db.read(move |c| prompts::of_session(c, session)).unwrap();
+    assert_eq!(of(SESSION), None, "nothing recorded yet");
+    let p = record(&db, ask(&uid, SESSION, "/repos/jkb")).unwrap();
+    assert_eq!(
+        of(SESSION),
+        Some(p.clone()),
+        "found from any case of the uuid"
+    );
+    assert_eq!(of("0f8fad5b-d9cb-469f-a165-70867728950e"), Some(p));
+    assert_eq!(
+        of("not-a-uuid"),
+        None,
+        "a session no launch could have recorded is no prompt, not an error"
+    );
+    assert_eq!(of("00000000-0000-0000-0000-000000000000"), None);
+}
+
+#[test]
 fn a_session_is_one_prompt_and_rerecording_it_moves_only_its_cwd() {
     let db = db();
     let uid = create(&db, "x");

@@ -503,6 +503,9 @@ fn samples() -> Vec<Request> {
         Request::DesignPrompts {
             uid: "design:x".into(),
         },
+        Request::DesignPromptOf {
+            session: "s".into(),
+        },
         Request::DesignCompact {
             uid: "design:x".into(),
         },
@@ -1630,6 +1633,7 @@ const READS: &[&str] = &[
     "design.plans",
     "design.prompt",
     "design.prompts",
+    "design.prompt_of",
 ];
 
 #[test]

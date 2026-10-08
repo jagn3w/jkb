@@ -20,6 +20,8 @@ import type { TerminalResult, TerminalRoots } from "../shared/terminal";
 import { ContainerKit, machineKit } from "./container";
 import { DaemonClient } from "./daemon";
 import { DesignFeeds } from "./designFeeds";
+import { gitPlace } from "./gitPlace";
+import { NotifyFeed } from "./notifyFeed";
 import { TerminalHost, machineEnvironment, type SpawnPty } from "./terminals";
 
 /** Set by `electron-vite dev` to the renderer's dev server; never honoured by a packaged app. */
@@ -90,6 +92,21 @@ const designFeeds = new DesignFeeds(
     if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.designEvent, event);
   },
 );
+
+/** The needs-input feed: the app's own consumer group on `claude/notify`, one for every window (D53.9). */
+const notifyFeed = new NotifyFeed(
+  (request, options) => daemon.op(request, options),
+  (owner, event) => {
+    const contents = webContents.fromId(owner);
+    if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.notifyEvent, event);
+  },
+);
+
+/** Every feed a window can hold, ended together when it closes or reloads. */
+function closeFeeds(owner?: number): void {
+  designFeeds.closeAll(owner);
+  notifyFeed.closeAll(owner);
+}
 
 /** The windows this process created: the only senders the bridge answers. */
 const windows = new Set<number>();
@@ -188,6 +205,20 @@ function registerBridge(): void {
     assertTrusted(event);
     return containerKit.spec(action);
   });
+
+  // The Sessions tab (D53.9): the needs-input feed — `claude/notify` and nothing else, with the
+  // app's one group — and where a session's directory is, read from git's files.
+  ipcMain.handle(BRIDGE_CHANNELS.notifySubscribe, (event) => {
+    assertTrusted(event);
+    return notifyFeed.join(event.sender.id);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.notifyUnsubscribe, (event) => {
+    if (isTrusted(event)) notifyFeed.leave(event.sender.id);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.sessionsPlace, (event, cwd: unknown) => {
+    assertTrusted(event);
+    return gitPlace(cwd, terminalRoots);
+  });
 }
 
 function createWindow(): void {
@@ -214,19 +245,19 @@ function createWindow(): void {
   win.on("closed", () => {
     windows.delete(id);
     terminals.closeAll(id);
-    designFeeds.closeAll(id);
+    closeFeeds(id);
   });
   // A reload starts a renderer that knows none of the old page's terminals: end them rather than
   // leave processes nobody can see or type into.
   win.webContents.on("did-start-navigation", (details) => {
     if (details.isMainFrame && !details.isSameDocument) {
       terminals.closeAll(id);
-      designFeeds.closeAll(id);
+      closeFeeds(id);
     }
   });
   win.webContents.on("render-process-gone", () => {
     terminals.closeAll(id);
-    designFeeds.closeAll(id);
+    closeFeeds(id);
   });
   win.once("ready-to-show", () => win.show());
 
@@ -257,7 +288,7 @@ void app.whenReady().then(() => {
 
 app.on("will-quit", () => {
   terminals.closeAll();
-  designFeeds.closeAll();
+  closeFeeds();
 });
 
 app.on("window-all-closed", () => {

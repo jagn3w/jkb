@@ -110,6 +110,15 @@ pub fn list(conn: &Connection, uid: &str) -> Result<Vec<DesignPrompt>, ApiError>
         .collect())
 }
 
+/// `design.prompt_of`: the prompt a session was recorded with, or `None` when no launch recorded
+/// it (D53.9).
+///
+/// # Errors
+/// A database error, or a record that cannot be read.
+pub fn of_session(conn: &Connection, session: &str) -> Result<Option<DesignPrompt>, ApiError> {
+    Ok(prompts::of_session(conn, session)?.map(DesignPrompt::from))
+}
+
 /// A *New prompt*'s prompt, and what it was built from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewPrompt {

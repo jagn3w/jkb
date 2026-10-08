@@ -11,6 +11,7 @@ import type {
   ContainerResult,
   ContainerStatus,
   DesignAnnouncement,
+  GitPlace,
   Hello,
   OpRequest,
   OpResponse,
@@ -37,6 +38,11 @@ export const BRIDGE_CHANNELS = {
   designEvent: "jkb:design:event",
   containerStatus: "jkb:container:status",
   containerSpec: "jkb:container:spec",
+  notifySubscribe: "jkb:notify:subscribe",
+  notifyUnsubscribe: "jkb:notify:unsubscribe",
+  /** main → renderer: a session's notification moved, or the feed's standing changed. */
+  notifyEvent: "jkb:notify:event",
+  sessionsPlace: "jkb:sessions:place",
 } as const;
 
 /** What the renderer may know about where it runs. Nothing secret: no token, no token path. */
@@ -104,6 +110,38 @@ export interface ContainerBridge {
   spec(action: ContainerAction): Promise<ContainerResult<TerminalSpec>>;
 }
 
+/**
+ * What main tells a window about `claude/notify` (D53.9).
+ * - `changed`: a session's notification was posted or withdrawn; re-read `notify.open_sessions`.
+ * - `gap`, `error`, `live`: the feed's standing, as for a design topic.
+ */
+export type NotifyFeedEvent =
+  | { readonly topic: string; readonly kind: "changed"; readonly session: string }
+  | { readonly topic: string; readonly kind: "gap"; readonly message: string }
+  | { readonly topic: string; readonly kind: "error"; readonly message: string }
+  | { readonly topic: string; readonly kind: "live" };
+
+/** `window.jkb.notify`: the needs-input feed, the app's own consumer group on `claude/notify` (D53.9). */
+export interface NotifyBridge {
+  /**
+   * Hear `claude/notify`. Resolves once main's group is on the topic: read the records after that,
+   * and no change falls between the read and the feed.
+   */
+  subscribe(): Promise<Outcome<null>>;
+  unsubscribe(): void;
+  /** Hear every notify event for this window. Returns the unsubscribe. */
+  onEvent(listener: (event: NotifyFeedEvent) => void): () => void;
+}
+
+/** `window.jkb.sessions`: what the Sessions tab needs of the host beyond the op set (D53.9). */
+export interface SessionsBridge {
+  /**
+   * The checkout a session's working directory is in — its root (on the host), repo key and branch —
+   * read from git's files by main. Only directories under the repos mount are looked at.
+   */
+  place(cwd: string): Promise<TerminalResult<GitPlace>>;
+}
+
 /** `window.jkb`: everything the renderer can ask of the main process. */
 export interface JkbBridge {
   /** `GET /v1/hello`: whether the daemon is reachable, and which schema and ops it serves. */
@@ -118,4 +156,8 @@ export interface JkbBridge {
   readonly design: DesignBridge;
   /** The dev container, through the kit. */
   readonly container: ContainerBridge;
+  /** The needs-input feed. */
+  readonly notify: NotifyBridge;
+  /** Where sessions run. */
+  readonly sessions: SessionsBridge;
 }

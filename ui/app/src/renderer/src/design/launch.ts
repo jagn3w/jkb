@@ -47,7 +47,8 @@ export function repoDir(roots: TerminalRoots, repo: string): string {
   return safe ? `${roots.containerRepos.replace(/\/+$/, "")}/${repo}` : roots.containerRepos;
 }
 
-function titled(label: string, title: string): string {
+/** `<label> · <title>`, cut to the terminal's title limit. */
+export function titled(label: string, title: string): string {
   const t = `${label} · ${title}`;
   return t.length > 200 ? `${t.slice(0, 199)}…` : t;
 }
@@ -98,15 +99,27 @@ function under(path: string, root: string): boolean {
  * by the terminal's toggle recorded a host path, which is carried back through the repos mount.
  */
 export function resumeSpec(prompt: DesignPromptRecord, roots: TerminalRoots): TerminalSpec {
-  const hostOnly = !under(prompt.cwd, roots.containerRepos) && under(prompt.cwd, roots.hostRepos);
+  return sessionResumeSpec({ session: prompt.session, cwd: prompt.cwd, title: titled("Resume", prompt.title) }, roots);
+}
+
+/**
+ * `claude --resume <session>` in the container, in `cwd` — carried back through the repos mount when
+ * it is a host path — titled `title`. What every resume runs: a recorded prompt's (above), a session
+ * the Sessions tab lists, and a terminal re-attached after a rebuild (D53.9).
+ */
+export function sessionResumeSpec(
+  ask: { readonly session: string; readonly cwd: string; readonly title: string },
+  roots: TerminalRoots,
+): TerminalSpec {
+  const hostOnly = !under(ask.cwd, roots.containerRepos) && under(ask.cwd, roots.hostRepos);
   const cwd = hostOnly
-    ? roots.containerRepos.replace(/\/+$/, "") + prompt.cwd.slice(roots.hostRepos.replace(/\/+$/, "").length)
-    : prompt.cwd;
+    ? roots.containerRepos.replace(/\/+$/, "") + ask.cwd.slice(roots.hostRepos.replace(/\/+$/, "").length)
+    : ask.cwd;
   return {
     target: "container",
     cwd,
-    argv: ["/bin/bash", "-lc", RESUME_SCRIPT, "claude", prompt.session],
-    title: titled("Resume", prompt.title),
-    sessionUuid: prompt.session,
+    argv: ["/bin/bash", "-lc", RESUME_SCRIPT, "claude", ask.session],
+    title: ask.title,
+    sessionUuid: ask.session,
   };
 }
