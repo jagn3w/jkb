@@ -4,6 +4,7 @@ import "./styles/tokens.css";
 import "@xterm/xterm/css/xterm.css";
 import "./styles/app.css";
 import "./styles/terminal.css";
+import "./styles/design.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";

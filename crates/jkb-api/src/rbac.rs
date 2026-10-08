@@ -221,7 +221,8 @@ impl Request {
             | Self::DesignList { .. }
             | Self::DesignCat { .. }
             | Self::DesignState { .. }
-            | Self::DesignSpans { .. } => OpPermission::Read,
+            | Self::DesignSpans { .. }
+            | Self::DesignPrompt { .. } => OpPermission::Read,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -407,6 +408,7 @@ impl Request {
             | Self::DesignCat { .. }
             | Self::DesignState { .. }
             | Self::DesignSpans { .. }
+            | Self::DesignPrompt { .. }
             | Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }

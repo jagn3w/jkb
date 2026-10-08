@@ -206,3 +206,85 @@ fn a_span_is_approved_only_by_the_reviewer_it_names() {
         other => panic!("{other:?}"),
     }
 }
+
+#[allow(clippy::needless_pass_by_value)] // every call site builds its ask inline
+fn prompt_of(b: &LocalBackend, ask: Value) -> crate::designs::Prompt {
+    match ok(b, json!({ "op": "design.prompt", "ask": ask })) {
+        Response::DesignPrompt { prompt } => *prompt,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// *Discuss* (D53.5): the app sends the selection as offsets into the version it showed, and the
+/// prompt names it the way Claude edits — the quote, its occurrence and that version's token — so
+/// the edit the prompt describes lands on the selected words even after a later edit.
+#[test]
+fn a_discuss_prompt_names_the_selection_as_the_edit_that_reaches_it() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "one cat, two cat");
+    let read = cat(&kb.op, &uid);
+    written(ok(
+        &kb.op,
+        json!({ "op": "design.edit", "uid": uid, "base": read.version,
+                "edit": { "how": "insert_after", "find": "one", "text": " small" } }),
+    ));
+    let designer = kb.as_role("designer");
+    let prompt = prompt_of(
+        &designer,
+        json!({ "kind": "discuss", "uid": uid, "base": read.version, "start": 13, "end": 16 }),
+    );
+    assert_eq!(prompt.kind, "discuss");
+    assert_eq!(prompt.quote, "cat");
+    assert_eq!(prompt.occurrence, Some(2));
+    assert_eq!(prompt.version, read.version);
+    for needle in [
+        format!("jkb design cat {uid}"),
+        format!(
+            "--base {} --find <the passage above> --occurrence 2",
+            read.version
+        ),
+        "```\ncat\n```".to_owned(),
+        "occurrence 2".to_owned(),
+        "PROPOSED".to_owned(),
+    ] {
+        assert!(
+            prompt.prompt.contains(&needle),
+            "{needle:?} not in:\n{}",
+            prompt.prompt
+        );
+    }
+    written(ok(
+        &kb.op,
+        json!({ "op": "design.edit", "uid": uid, "base": prompt.version,
+                "edit": { "how": "replace", "find": prompt.quote, "occurrence": prompt.occurrence, "with": "dog" } }),
+    ));
+    assert_eq!(cat(&kb.op, &uid).text, "one small cat, two dog");
+    // A selection the version cannot hold is the engine's refusal, as `invalid`.
+    let e = call(
+        &kb.op,
+        json!({ "op": "design.prompt", "ask": { "kind": "discuss", "uid": uid, "start": 5, "end": 500 } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    // An unknown kind is a bad request, not a guess.
+    assert!(serde_json::from_value::<crate::Request>(
+        json!({ "op": "design.prompt", "ask": { "kind": "play", "uid": uid } })
+    )
+    .is_err());
+}
+
+/// A quote holding backticks is fenced by a longer run, so the passage cannot close its own fence.
+#[test]
+fn a_discussed_passage_with_backticks_is_fenced_by_a_longer_run() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "run ```cargo``` now");
+    let prompt = prompt_of(
+        &kb.op,
+        json!({ "kind": "discuss", "uid": uid, "start": 4, "end": 15 }),
+    );
+    assert!(
+        prompt.prompt.contains("````\n```cargo```\n````"),
+        "{}",
+        prompt.prompt
+    );
+}

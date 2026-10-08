@@ -4898,4 +4898,18 @@ fn a_design_is_edited_by_quote_against_the_version_read() {
         .assert()
         .success()
         .stdout(predicate::str::contains("APPROVED"));
+    // *Discuss* (D53.5): the prompt the app starts Claude with is this command's output.
+    jkb(&db)
+        .args(["design", "prompt", "discuss", &uid, "--range", "0..7"])
+        .args(["--base", &base])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("```\nThe app\n```"))
+        .stdout(predicate::str::contains(format!("--base {base}")))
+        .stdout(predicate::str::contains(format!("jkb design cat {uid}")));
+    jkb(&db)
+        .args(["design", "prompt", "discuss", &uid, "--range", "7"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<start>..<end>"));
 }

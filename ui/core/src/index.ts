@@ -8,3 +8,4 @@ export * from "./summary.js";
 export * from "./staging.js";
 export * from "./details.js";
 export * from "./daemon.js";
+export * from "./design.js";

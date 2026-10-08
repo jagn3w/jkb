@@ -721,3 +721,108 @@ fn a_revert_restores_deleted_text_beside_text_written_after_it() {
     assert_eq!(other.text(), doc.text());
     assert!(!revert.is_empty());
 }
+
+/// A subscriber joins a design's topic before anything is written to it, so the topic exists from
+/// the design's creation — even one created with no text, whose first update comes later.
+#[test]
+fn a_design_has_its_topic_from_creation_even_with_no_text() {
+    let db = db();
+    let uid = create(&db, "");
+    let name = topic(&uid);
+    let n = name.clone();
+    db.write_txn("t", move |c, m| {
+        mq::group_create(c, m, &n, "app", mq::Start::FromNow, mq::now_ms())
+    })
+    .unwrap();
+    let peer = Crdt::new();
+    let ((), update) = peer
+        .change(|txn, body, _| {
+            body.insert(txn, 0, "first words");
+            Ok(())
+        })
+        .unwrap();
+    let (u, bytes) = (uid.clone(), update.unwrap());
+    let w = db
+        .write_txn("t", move |c, m| apply(c, m, &u, &bytes))
+        .unwrap();
+    assert_eq!(w.seq, Some(1));
+    let msgs = db
+        .read(move |c| mq::tail(c, &name, 10, mq::now_ms()))
+        .unwrap();
+    assert_eq!(msgs.len(), 1);
+}
+
+fn discuss(db: &Db, uid: &str, base: Option<String>, start: u32, end: u32) -> Result<Discussion> {
+    let u = uid.to_owned();
+    db.read(move |c| discussion(c, &u, base.as_deref(), start, end))
+}
+
+#[test]
+fn a_discussion_resolves_its_range_in_the_version_read_into_the_quote_an_edit_names() {
+    let db = db();
+    let uid = create(&db, "the cat and the cat");
+    let base = token(&db, &uid);
+    // Written after the selection was made: the range still means what the editor showed.
+    edit_at(&db, &uid, &base, insert_after("and", " a dog")).unwrap();
+    let d = discuss(&db, &uid, Some(base.clone()), 16, 19).unwrap();
+    assert_eq!(d.quote, "cat");
+    assert_eq!((d.occurrence, d.occurrences), (Some(2), 2));
+    assert_eq!(d.version.token(), base);
+    assert_eq!(d.title, "Code Factory");
+    // What the prompt tells Claude to run lands on exactly those words, merged over the later edit.
+    edit_at(
+        &db,
+        &uid,
+        &base,
+        Edit::Replace {
+            find: d.quote,
+            occurrence: d.occurrence,
+            with: "bird".to_owned(),
+        },
+    )
+    .unwrap();
+    assert_eq!(text(&db, &uid), "the cat and a dog the bird");
+    // A quote that occurs once needs no occurrence; no base reads the current version.
+    let d = discuss(&db, &uid, None, 12, 17).unwrap();
+    assert_eq!(
+        (d.quote.as_str(), d.occurrence, d.occurrences),
+        ("a dog", None, 1)
+    );
+}
+
+#[test]
+fn a_discussion_is_refused_for_a_range_no_quote_could_name() {
+    let db = db();
+    let uid = create(&db, "aaa 🦀 end");
+    let refused = |start, end, why: &str| {
+        let e = discuss(&db, &uid, None, start, end).unwrap_err();
+        assert!(e.to_string().contains(why), "{start}..{end}: {e}");
+    };
+    refused(2, 2, "empty");
+    refused(3, 99, "past the end");
+    // The crab is two UTF-16 units: a range ending between them splits it.
+    refused(4, 5, "splits a character");
+    // "aa" at 1 overlaps the match at 0, so `--find aa` could never reach it.
+    refused(1, 3, "overlaps an earlier occurrence");
+    let d = discuss(&db, &uid, None, 4, 6).unwrap();
+    assert_eq!(d.quote, "🦀");
+    // A version this design never reached.
+    let future = format!("9{}", token(&db, &uid));
+    let e = discuss(&db, &uid, Some(future), 0, 1).unwrap_err();
+    assert!(e.to_string().contains("not a version"), "{e}");
+}
+
+#[test]
+fn a_discussion_names_the_spans_its_range_touches_with_their_states() {
+    let db = db();
+    let uid = create(&db, "alpha beta gamma");
+    let beta = span(&db, &uid, "beta", Reviewer::Claude).unwrap();
+    approve_as(&db, &beta, Approver::Operator).unwrap();
+    let d = discuss(&db, &uid, None, 3, 8).unwrap();
+    assert_eq!(d.quote, "ha be");
+    assert_eq!(d.spans.len(), 1);
+    assert_eq!(d.spans[0].uid, beta);
+    assert_eq!(d.spans[0].state, SpanState::Approved);
+    assert_eq!(d.spans[0].reviewer, Reviewer::Claude);
+    assert!(discuss(&db, &uid, None, 0, 5).unwrap().spans.is_empty());
+}

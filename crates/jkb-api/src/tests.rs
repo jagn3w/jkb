@@ -445,6 +445,14 @@ fn samples() -> Vec<Request> {
             span: "span:x".into(),
             step: "step:x".into(),
         },
+        Request::DesignPrompt {
+            ask: crate::designs::PromptAsk::Discuss {
+                uid: "design:x".into(),
+                base: None,
+                start: 0,
+                end: 1,
+            },
+        },
         Request::DesignCompact {
             uid: "design:x".into(),
         },
@@ -1565,6 +1573,7 @@ const READS: &[&str] = &[
     "design.cat",
     "design.state",
     "design.spans",
+    "design.prompt",
 ];
 
 #[test]

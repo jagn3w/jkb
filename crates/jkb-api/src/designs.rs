@@ -395,6 +395,158 @@ pub fn stage(
     Ok(design::stage(conn, meta, span, step)?.into())
 }
 
+/// What prompt a `design.prompt` builds (D53.5–6). Only *Discuss* today; *Play* on a plan is the
+/// execution-plan subtask's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PromptAsk {
+    /// Discuss a selection of a design's text with Claude.
+    Discuss {
+        /// The design.
+        uid: String,
+        /// The version token the selection was made in; the current version when omitted.
+        #[serde(default)]
+        base: Option<String>,
+        /// UTF-16 start of the selection.
+        start: u32,
+        /// UTF-16 end.
+        end: u32,
+    },
+}
+
+/// A prompt for a Claude session, and what it was built from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Prompt {
+    /// `discuss`.
+    pub kind: String,
+    /// The design.
+    pub uid: String,
+    /// Its title.
+    pub title: String,
+    /// The version the selection was resolved in.
+    pub version: String,
+    /// UTF-16 start.
+    pub start: u32,
+    /// UTF-16 end.
+    pub end: u32,
+    /// The selected text, as an edit quotes it.
+    pub quote: String,
+    /// Which match of the quote the selection is, from 1, when it occurs more than once.
+    pub occurrence: Option<usize>,
+    /// The spans the selection touches.
+    pub spans: Vec<String>,
+    /// The prompt itself: what the session is started with.
+    pub prompt: String,
+}
+
+/// The longest run of backticks in `s`, so a code fence around it can be one longer.
+fn longest_backtick_run(s: &str) -> usize {
+    s.split(|c| c != '`').map(str::len).max().unwrap_or(0)
+}
+
+/// The *Discuss* prompt: the design, the version read, the selection as the quote an edit names it
+/// by, the spans it touches, and how to read and edit the design through the CLI.
+fn discuss_prompt(d: &design::Discussion) -> String {
+    use std::fmt::Write as _;
+    let version = d.version.token();
+    let fence = "`".repeat(longest_backtick_run(&d.quote).max(2) + 1);
+    let mut p = String::new();
+    let _ = writeln!(
+        p,
+        "The operator selected a passage of the design \"{}\" ({}) in Code Factory and wants to \
+         discuss it with you.",
+        d.title, d.uid
+    );
+    let _ = writeln!(p);
+    let _ = writeln!(
+        p,
+        "The passage (UTF-16 {}..{} of version {version}):",
+        d.start, d.end
+    );
+    let _ = writeln!(p, "{fence}\n{}\n{fence}", d.quote);
+    match d.occurrence {
+        Some(k) => {
+            let _ = writeln!(
+                p,
+                "That text occurs {} times in the version read; the selection is occurrence {k}.",
+                d.occurrences
+            );
+        }
+        None => {
+            let _ = writeln!(p, "That text occurs once in the version read.");
+        }
+    }
+    if d.spans.is_empty() {
+        let _ = writeln!(
+            p,
+            "It is covered by no span, so it reads as PROPOSED (D53.5)."
+        );
+    } else {
+        let _ = writeln!(p, "It touches these spans (D53.5):");
+        for s in &d.spans {
+            let _ = writeln!(
+                p,
+                "- {} {} (its reviewer: {})",
+                s.uid,
+                s.state.as_str(),
+                s.reviewer.as_str()
+            );
+        }
+    }
+    let _ = writeln!(p);
+    let _ = writeln!(
+        p,
+        "Read the whole design first: `jkb design cat {}` prints it with span markers and a \
+         version token. Discuss the passage with the operator; change nothing until they ask you \
+         to.",
+        d.uid
+    );
+    let occurrence = d
+        .occurrence
+        .map(|k| format!(" --occurrence {k}"))
+        .unwrap_or_default();
+    let _ = writeln!(
+        p,
+        "When they do, edit through the CLI against the version you read — your edit merges with \
+         anything written since, and the quote is matched in that version, never the latest: \
+         `jkb design edit {} --base <token> --find <quote>{occurrence} --replace <text>` (or \
+         `--insert-after <quote> --text <text>`). This passage, at version {version}, is \
+         `--base {version} --find <the passage above>{occurrence}`. Editing approved text makes it \
+         PROPOSED again until it is re-approved.",
+        d.uid
+    );
+    p
+}
+
+/// `design.prompt`.
+///
+/// # Errors
+/// The engine's refusal of the selection.
+pub fn prompt(conn: &Connection, ask: &PromptAsk) -> Result<Prompt, ApiError> {
+    match ask {
+        PromptAsk::Discuss {
+            uid,
+            base,
+            start,
+            end,
+        } => {
+            let d = design::discussion(conn, uid, base.as_deref(), *start, *end)?;
+            Ok(Prompt {
+                kind: "discuss".to_owned(),
+                prompt: discuss_prompt(&d),
+                uid: d.uid,
+                title: d.title,
+                version: d.version.token(),
+                start: d.start,
+                end: d.end,
+                quote: d.quote,
+                occurrence: d.occurrence,
+                spans: d.spans.into_iter().map(|s| s.uid).collect(),
+            })
+        }
+    }
+}
+
 /// `design.spans`.
 ///
 /// # Errors

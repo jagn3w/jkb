@@ -528,6 +528,27 @@ enum DesignCmd {
         /// The design.
         uid: String,
     },
+    /// Print the prompt a Claude session over a design is started with.
+    Prompt {
+        #[command(subcommand)]
+        what: DesignPromptCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesignPromptCmd {
+    /// Discuss a selection: the design, the version read, and the selected text as the quote (and
+    /// occurrence) an edit names it by. What the app's *Discuss* starts Claude with.
+    Discuss {
+        /// The design.
+        uid: String,
+        /// The selection, as UTF-16 offsets `<start>..<end>` into the text at `--base`.
+        #[arg(long)]
+        range: String,
+        /// The version token the selection was made in (the current version when omitted).
+        #[arg(long)]
+        base: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

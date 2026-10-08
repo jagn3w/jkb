@@ -22,6 +22,7 @@
 //! and IMPLEMENTED (every task under those steps `done`) are read from the graph, never stored.
 
 pub mod crdt;
+mod discuss;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -35,6 +36,7 @@ use crate::mq::{self, Draft, QueueError, TopicSpec};
 use crate::store::WriteMeta;
 use crate::{containment, edge, item, ns, placement, Error, Result};
 use crdt::{Crdt, Piece, PieceKind};
+pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 use yrs::Text as _;
 
 /// The item kind of a design.
@@ -390,6 +392,7 @@ pub fn create(
     )?;
     let home = ns::ensure(conn, &path)?;
     placement::place(conn, meta, id, home, PlacementRole::Primary, 0)?;
+    ensure_topic(conn, meta, &uid)?;
     let mut seq = 0;
     if !body.is_empty() {
         let doc = Crdt::new();
@@ -569,20 +572,27 @@ fn append_row(
     Ok(seq)
 }
 
-/// Announce an update on `design/<uid>`: subscribers merge it (updates are idempotent and
-/// commutative, so at-least-once is enough). Best effort by design — the table is the truth, and a
-/// full or oversized queue costs a subscriber a re-read, never the write.
-fn publish(conn: &Connection, meta: &WriteMeta, uid: &str, seq: i64, update: &[u8]) -> Result<()> {
+/// Make sure the design's live-update topic exists, and answer its name. Every design has one from
+/// its creation, so a subscriber can join it before the first update (`mq.group_create` refuses a
+/// topic that does not exist); [`publish`] calls it too, for a design made before that was so.
+fn ensure_topic(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<String> {
     let name = topic(uid);
     let spec = TopicSpec {
         default_ttl_ms: Some(TOPIC_TTL_MS),
         ..TopicSpec::default()
     };
-    let now = mq::now_ms();
-    match mq::topic_create(conn, meta, &name, &spec, now) {
-        Ok(_) | Err(Error::Queue(QueueError::TopicConflict(_))) => {}
-        Err(e) => return Err(e),
+    match mq::topic_create(conn, meta, &name, &spec, mq::now_ms()) {
+        Ok(_) | Err(Error::Queue(QueueError::TopicConflict(_))) => Ok(name),
+        Err(e) => Err(e),
     }
+}
+
+/// Announce an update on `design/<uid>`: subscribers merge it (updates are idempotent and
+/// commutative, so at-least-once is enough). Best effort by design — the table is the truth, and a
+/// full or oversized queue costs a subscriber a re-read, never the write.
+fn publish(conn: &Connection, meta: &WriteMeta, uid: &str, seq: i64, update: &[u8]) -> Result<()> {
+    let name = ensure_topic(conn, meta, uid)?;
+    let now = mq::now_ms();
     let inline = (update.len() <= INLINE_UPDATE_MAX).then(|| STANDARD.encode(update));
     let sent = mq::send(
         conn,

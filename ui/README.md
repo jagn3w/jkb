@@ -61,6 +61,10 @@ agent sandbox) install with `ELECTRON_SKIP_BINARY_DOWNLOAD=1`: type-check and bu
 binary, and the Electron smoke (`app/test/smoke.test.mjs`, one test per tab and one for the
 terminal) skips and says why. On Linux it also needs a display (`xvfb-run`), as in CI.
 
+The Design tab's Document pane (D53.4–5) edits a design's Yjs text live. `app/test/yjs-wire.test.mjs`
+measures the editor's `yjs` against jkb's `yrs` with a real `jkb`: set `JKB_BIN` to one built from
+this tree (`scripts/check.sh` does); without it the test skips and says so.
+
 The terminal's `node-pty` compiles on Linux with node-gyp, which downloads Node's headers from
 nodejs.org; where that is unreachable add `npm_config_nodedir=/usr` to the install. A container
 terminal enters `$JKB_CONTAINER_NAME` (default `jkb-dev`, as `.container/run.sh`); Ctrl+` folds

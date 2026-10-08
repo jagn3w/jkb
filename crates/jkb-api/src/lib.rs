@@ -818,6 +818,12 @@ pub enum Request {
         /// The plan step.
         step: String,
     },
+    /// A prompt for a Claude session over a design: *Discuss* a selection ([`designs::prompt`]).
+    #[serde(rename = "design.prompt")]
+    DesignPrompt {
+        /// Which prompt, over what.
+        ask: designs::PromptAsk,
+    },
     /// Fold a design's updates into its snapshot (operator; [`jkb_core::design::compact`]).
     #[serde(rename = "design.compact")]
     DesignCompact {
@@ -1404,6 +1410,7 @@ impl Request {
         "design.span",
         "design.approve",
         "design.stage",
+        "design.prompt",
         "design.compact",
         "attest.mint",
         "attest.release",
@@ -1523,6 +1530,7 @@ impl Request {
             Self::DesignSpan { .. } => "design.span",
             Self::DesignApprove { .. } => "design.approve",
             Self::DesignStage { .. } => "design.stage",
+            Self::DesignPrompt { .. } => "design.prompt",
             Self::DesignCompact { .. } => "design.compact",
             Self::AttestMint { .. } => "attest.mint",
             Self::AttestRelease { .. } => "attest.release",
@@ -1602,7 +1610,8 @@ impl Request {
             | Self::DesignList { .. }
             | Self::DesignCat { .. }
             | Self::DesignState { .. }
-            | Self::DesignSpans { .. } => true,
+            | Self::DesignSpans { .. }
+            | Self::DesignPrompt { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -2207,6 +2216,11 @@ pub enum Response {
         /// The span after it.
         span: Box<designs::Span>,
     },
+    /// A `design.prompt`.
+    DesignPrompt {
+        /// The prompt and what it was built from.
+        prompt: Box<designs::Prompt>,
+    },
     /// A `design.compact`.
     DesignCompacted {
         /// The snapshot covers every update through this seq.
@@ -2305,6 +2319,7 @@ impl Response {
             | Self::DesignSpans { .. }
             | Self::DesignWritten { .. }
             | Self::DesignSpan { .. }
+            | Self::DesignPrompt { .. }
             | Self::DesignCompacted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
@@ -2402,6 +2417,7 @@ impl Response {
             | Self::DesignUpdate { .. }
             | Self::DesignSpans { .. }
             | Self::DesignSpan { .. }
+            | Self::DesignPrompt { .. }
             | Self::DesignCompacted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
@@ -3587,6 +3603,9 @@ impl LocalBackend {
                 span: Box::new(
                     db.write_txn_with(actor, move |c, m| designs::stage(c, m, &span, &step))?,
                 ),
+            },
+            Request::DesignPrompt { ask } => Response::DesignPrompt {
+                prompt: Box::new(db.read_with(move |c| designs::prompt(c, &ask))?),
             },
             Request::DesignCompact { uid } => {
                 let done = db.write_txn_with(actor, move |c, m| {

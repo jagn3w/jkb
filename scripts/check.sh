@@ -107,6 +107,10 @@ esac
 if command -v pnpm >/dev/null 2>&1; then
     # `test` after `build`: the tests bundle their own module, so they do not need dist — but
     # a type error is the cheaper failure to read, so it is the one reported first.
+    # JKB_BIN: the jkb built above, against which the app's yjs-wire test measures the editor's
+    # Yjs updates (D53.4). Where the build left none it skips, saying so.
+    JKB_BIN="${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/.." && pwd)/target}/debug/jkb"
+    export JKB_BIN
     (cd "$(dirname "$0")/../ui" && pnpm run build && pnpm run test)
 else
     echo "   (skipped: pnpm not found — install it, or set PNPM_HOME; CI runs this gate)"

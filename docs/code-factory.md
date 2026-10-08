@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold), 2 (the terminal) and 3 (the design data model) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model) and 4 (the Document pane) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -224,9 +224,56 @@ to learn, and what was decided past the text above:
   queue costs a subscriber a `design.state` re-read, never the write.
 - **A design cannot be removed** (`item::remove`, even with `--force`): its updates are not in the
   delete's snapshot, so `jkb undo` would bring back a design with no text.
-- **Unmeasured here, stated:** byte compatibility with the app's JavaScript `yjs`. The tests write
-  updates with `yrs` playing the editor; `yrs` is the Yjs authors' port and claims v1 wire
-  compatibility, and subtask 4's editor is the first thing to exercise it against `yjs` itself.
+- ~~**Unmeasured here, stated:** byte compatibility with the app's JavaScript `yjs`.~~ *Measured in
+  subtask 4* (below): `ui/app/test/yjs-wire.test.mjs` drives a real `jkb` with `yjs` 13.6.33 as the
+  editor — jkb's state loaded, an editor update merged after a two-unit character, a CLI edit merged
+  back from `design.state --since`, and a span's anchors (`yrs` `StickyIndex` v1 bytes) resolved by
+  `Y.decodeRelativePosition` to the offsets jkb reports. It held at the first run; no adapter needed.
+
+**As built (subtask 4, the Document pane).** `@jkb/core`'s `design.ts` (the answers' shapes and
+decoders, base64, the live-update message, and `stateRuns` — the span-state derivation the editor
+draws), the app's `src/main/designFeeds.ts` (the live feeds), `src/renderer/src/design/` (`session.ts`
+the Yjs peer, `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `discuss.ts`) and
+`tabs/DesignTab.tsx` (the repo and design pickers). What was decided past the text above:
+
+- ***Discuss* is an op first** (D53.1): `design.prompt` with `{kind: "discuss", uid, base, start,
+  end}` and `jkb design prompt discuss <uid> --range <start>..<end> [--base <token>]`, the same answer
+  both ways. The selection crosses as UTF-16 offsets into the version the editor showed, and the engine
+  (`design/discuss.rs`) turns it into what Claude edits by: the quote, which match of it the selection
+  is (`--occurrence`), and the spans it touches. A selection no quote could name — one starting inside
+  an earlier match of itself, or splitting a surrogate pair — is refused, never widened. The app only
+  carries the prompt text; it builds none of it.
+- **The offsets are sent with the version whose text is the screen's.** The pane waits for every
+  local edit to be saved, re-reads with `design.cat`, and sends that version only if its text is the
+  text the selection was made in; otherwise it asks for the selection again. Sending the latest version
+  with offsets taken from an older screen is the read-latest mistake D53.4 rejected, in the other
+  direction.
+- **A *Discuss* is `bash -lc 'exec claude --session-id "$1" "$2"'`** in the container, in the
+  design's repo under the repos mount, the session uuid minted by the app and passed as the terminal's
+  `sessionUuid` too. The login shell finds `claude` on the login `PATH` (a `docker exec` has the
+  image's environment); the prompt is a positional parameter, never spliced into the script.
+- **Every design has its topic from creation.** `mq.group_create` refuses a topic that does not exist,
+  and a design created with no text had none until its first update, so the app could not subscribe
+  to it. `design::create` now creates it; publishing still does too, for a design made before.
+- **One consumer group, `code-factory`, one long-poll per open design, in main.** A per-launch group
+  would leave a group per launch on every topic, each holding messages until the queue's idle removal
+  (7 days) — at the topic's cap that refuses the announcement of every later edit. Windows showing the
+  same design share the feed. The window subscribes *then* loads (`design.state` since its own state
+  vector), so nothing falls between the two. A group the queue removed is rejoined and the window told
+  `gap`; an update too large to announce inline, or one whose dependencies never arrived (Yjs keeps it
+  pending), is completed the same way. Two app instances would share the group and split its messages:
+  not a case the app guards today (one instance per machine).
+- **Span states are drawn only from an answer that describes the screen.** `design.cat`'s text is
+  compared with the document's; an answer read while an edit was in flight is dropped for the next.
+  Between answers the drawing moves with the text. Text in a span is tinted with its state; text no
+  span covers reads PROPOSED but is marked only by an amber bar in the margin (a line's bar is its
+  least advanced state), so a fresh draft is not a page of amber; words removed from an approved span
+  show struck through where they were.
+- **A refused `design.apply` stops the session** (the editor turns read-only and says why) rather than
+  retrying; an unreachable or busy daemon is retried with backoff and the edits kept, in order, merged
+  into one update per call.
+- **`@codemirror/language` is held at 6.12.4** (a workspace `overrides` entry): 6.13.0, published the
+  day before, imports `@codemirror/streamparser` without declaring it, and the renderer did not bundle.
 
 ## D53.6 — Execution plans, tasks and prompts are items and edges
 

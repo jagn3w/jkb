@@ -7,11 +7,11 @@
 //! over anything written since.
 
 use anyhow::{bail, Context as _, Result};
-use jkb_api::designs::{DesignDoc, EditAsk, Span, Written};
+use jkb_api::designs::{DesignDoc, EditAsk, PromptAsk, Span, Written};
 use jkb_api::{Request, Response};
 
 use crate::ops_cli::{unexpected, Ops};
-use crate::DesignCmd;
+use crate::{DesignCmd, DesignPromptCmd};
 
 /// The text `value` names: itself, or stdin for `-`.
 fn text_arg(value: String) -> Result<String> {
@@ -106,6 +106,19 @@ fn print_span(ops: &Ops<'_>, s: &Span) -> Result<()> {
         println!("  {:?}", s.text);
     }
     Ok(())
+}
+
+/// `<start>..<end>`, UTF-16 offsets.
+fn parse_range(range: &str) -> Result<(u32, u32)> {
+    let (start, end) = range
+        .split_once("..")
+        .with_context(|| format!("--range {range:?}: expected <start>..<end>"))?;
+    let num = |s: &str| {
+        s.trim()
+            .parse::<u32>()
+            .with_context(|| format!("--range {range:?}: {s:?} is not an offset"))
+    };
+    Ok((num(start)?, num(end)?))
 }
 
 fn print_doc(ops: &Ops<'_>, d: &DesignDoc, plain: bool) -> Result<()> {
@@ -293,6 +306,28 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             let w = written(ops, "design.apply", Request::DesignApply { uid, update })?;
             print_written(ops, &w)
         }
+        DesignCmd::Prompt {
+            what: DesignPromptCmd::Discuss { uid, range, base },
+        } => {
+            let (start, end) = parse_range(&range)?;
+            let ask = PromptAsk::Discuss {
+                uid,
+                base,
+                start,
+                end,
+            };
+            match ops.call(Request::DesignPrompt { ask })? {
+                Response::DesignPrompt { prompt } => {
+                    if ops.json {
+                        println!("{}", serde_json::to_string_pretty(&prompt)?);
+                    } else {
+                        print!("{}", prompt.prompt);
+                    }
+                    Ok(())
+                }
+                other => unexpected("design.prompt", &other),
+            }
+        }
         DesignCmd::Compact { uid } => {
             match ops.call(Request::DesignCompact { uid: uid.clone() })? {
                 Response::DesignCompacted { through, removed } => {
@@ -308,6 +343,20 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
                 }
                 other => unexpected("design.compact", &other),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range;
+
+    #[test]
+    fn a_range_is_two_utf16_offsets() {
+        assert_eq!(parse_range("3..8").unwrap(), (3, 8));
+        assert_eq!(parse_range(" 0 .. 12 ").unwrap(), (0, 12));
+        for bad in ["3", "3..", "..8", "a..b", "-1..2", "3-8"] {
+            assert!(parse_range(bad).is_err(), "{bad}");
         }
     }
 }

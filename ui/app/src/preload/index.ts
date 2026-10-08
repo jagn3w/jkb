@@ -6,7 +6,7 @@
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
 
-import { BRIDGE_CHANNELS, type JkbBridge } from "../shared/bridge";
+import { BRIDGE_CHANNELS, type DesignFeedEvent, type JkbBridge } from "../shared/bridge";
 import type { TerminalEvent } from "../shared/terminal";
 
 const bridge: JkbBridge = {
@@ -25,6 +25,17 @@ const bridge: JkbBridge = {
       ipcRenderer.on(BRIDGE_CHANNELS.terminalEvent, handler);
       return () => {
         ipcRenderer.removeListener(BRIDGE_CHANNELS.terminalEvent, handler);
+      };
+    },
+  },
+  design: {
+    subscribe: (topic) => ipcRenderer.invoke(BRIDGE_CHANNELS.designSubscribe, topic),
+    unsubscribe: (topic) => ipcRenderer.send(BRIDGE_CHANNELS.designUnsubscribe, topic),
+    onEvent: (listener) => {
+      const handler = (_event: IpcRendererEvent, payload: DesignFeedEvent): void => listener(payload);
+      ipcRenderer.on(BRIDGE_CHANNELS.designEvent, handler);
+      return () => {
+        ipcRenderer.removeListener(BRIDGE_CHANNELS.designEvent, handler);
       };
     },
   },

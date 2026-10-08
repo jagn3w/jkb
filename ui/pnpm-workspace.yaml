@@ -28,3 +28,9 @@ onlyBuiltDependencies:
   - esbuild
   - electron
   - node-pty
+
+# @codemirror/language 6.13.0 (published 2026-10-07) imports @codemirror/streamparser without
+# declaring it, so the app (D53.4) does not bundle with it; 6.13.1 declares it but was a day old.
+# Every copy is held at the last 6.12 release, as the app pins it, so lang-markdown resolves the same.
+overrides:
+  "@codemirror/language": 6.12.4

@@ -18,6 +18,7 @@ import type * as NodePty from "node-pty";
 import { BRIDGE_CHANNELS, type AppInfo } from "../shared/bridge";
 import type { TerminalResult, TerminalRoots } from "../shared/terminal";
 import { DaemonClient } from "./daemon";
+import { DesignFeeds } from "./designFeeds";
 import { TerminalHost, machineEnvironment, type SpawnPty } from "./terminals";
 
 /** Set by `electron-vite dev` to the renderer's dev server; never honoured by a packaged app. */
@@ -64,6 +65,15 @@ const terminals = new TerminalHost(
   (owner, event) => {
     const contents = webContents.fromId(owner);
     if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.terminalEvent, event);
+  },
+);
+
+/** Live design updates, one long-poll per open design shared by every window showing it (D53.4). */
+const designFeeds = new DesignFeeds(
+  (request, options) => daemon.op(request, options),
+  (owner, event) => {
+    const contents = webContents.fromId(owner);
+    if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.designEvent, event);
   },
 );
 
@@ -143,6 +153,16 @@ function registerBridge(): void {
   ipcMain.on(BRIDGE_CHANNELS.terminalClose, (event, id: unknown) => {
     if (isTrusted(event)) terminals.close(event.sender.id, id);
   });
+
+  // Live design updates. Only a design's own topic is subscribed to (`isDesignTopic`, checked in
+  // the feeds), with the app's one consumer group.
+  ipcMain.handle(BRIDGE_CHANNELS.designSubscribe, (event, topic: unknown) => {
+    assertTrusted(event);
+    return designFeeds.subscribe(event.sender.id, topic);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.designUnsubscribe, (event, topic: unknown) => {
+    if (isTrusted(event)) designFeeds.unsubscribe(event.sender.id, topic);
+  });
 }
 
 function createWindow(): void {
@@ -169,13 +189,20 @@ function createWindow(): void {
   win.on("closed", () => {
     windows.delete(id);
     terminals.closeAll(id);
+    designFeeds.closeAll(id);
   });
   // A reload starts a renderer that knows none of the old page's terminals: end them rather than
   // leave processes nobody can see or type into.
   win.webContents.on("did-start-navigation", (details) => {
-    if (details.isMainFrame && !details.isSameDocument) terminals.closeAll(id);
+    if (details.isMainFrame && !details.isSameDocument) {
+      terminals.closeAll(id);
+      designFeeds.closeAll(id);
+    }
   });
-  win.webContents.on("render-process-gone", () => terminals.closeAll(id));
+  win.webContents.on("render-process-gone", () => {
+    terminals.closeAll(id);
+    designFeeds.closeAll(id);
+  });
   win.once("ready-to-show", () => win.show());
 
   // The app is one page. Links never open in it or in a new window.
@@ -203,7 +230,10 @@ void app.whenReady().then(() => {
   });
 });
 
-app.on("will-quit", () => terminals.closeAll());
+app.on("will-quit", () => {
+  terminals.closeAll();
+  designFeeds.closeAll();
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

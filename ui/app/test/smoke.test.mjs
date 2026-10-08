@@ -86,7 +86,7 @@ test("the renderer has no Node, only the bridge", { skip }, async () => {
     process: typeof globalThis.process,
     bridge: Object.keys(window.jkb).sort(),
   }));
-  assert.deepEqual(globals, { require: "undefined", process: "undefined", bridge: ["hello", "info", "op", "terminal"] });
+  assert.deepEqual(globals, { require: "undefined", process: "undefined", bridge: ["design", "hello", "info", "op", "terminal"] });
 });
 
 test("the daemon's status is shown, and an absent daemon reads unreachable", { skip }, async () => {
@@ -111,6 +111,16 @@ for (const [id, label] of [
     assert.equal(await page.locator('.panes > [role="tabpanel"]:visible').count(), 1, "only one pane is shown");
   });
 }
+
+// The Design tab (D53.4): with no daemon there are no designs to list, and the pane says why rather
+// than showing an empty editor. Editing, live sync and Discuss against a real jkb are pinned by
+// design.test.mjs and yjs-wire.test.mjs.
+test("the Design tab says why it has no designs when the daemon is unreachable", { skip }, async () => {
+  await page.getByRole("tab", { name: "Design", exact: true }).click();
+  const pane = page.locator("#pane-design");
+  await pane.locator(".design-empty", { hasText: "Cannot list designs" }).waitFor();
+  assert.equal(await pane.getByRole("combobox", { name: "Repo" }).isDisabled(), true);
+});
 
 // The integrated terminal (D53.10). A new terminal is a container terminal, labelled so; the
 // toggle moves it to the host, where it is a real shell. The container side is not exercised here
