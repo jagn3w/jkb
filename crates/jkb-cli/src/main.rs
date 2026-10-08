@@ -9,6 +9,7 @@
 mod archive;
 mod atomic;
 mod commands;
+mod design_cli;
 mod doctor;
 mod git_audit;
 mod gitrepo;
@@ -368,6 +369,12 @@ enum Command {
         #[command(subcommand)]
         cmd: InvCmd,
     },
+    /// Design documents (D53.4): CRDT text you edit by quote against the version you read, with
+    /// spans that are approved, staged and implemented. Start with `jkb design cat <uid>`.
+    Design {
+        #[command(subcommand)]
+        cmd: DesignCmd,
+    },
     /// The content-addressed blob archive. File sync stores the bytes of every version it
     /// settles and blobs are never deleted, so this is a complete history of every synced
     /// file — the recovery path when a sync has written a wrong version over your work.
@@ -399,6 +406,127 @@ enum BlobCmd {
     Cat {
         /// The blake3 hash (a unique prefix is enough).
         hash: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesignCmd {
+    /// List the designs (the ambient repo's, or `--repo`'s; `--all` for every repo's).
+    Ls {
+        /// Only this repo's designs (`designs/<repo>`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Every repo's designs.
+        #[arg(long, conflicts_with = "repo")]
+        all: bool,
+    },
+    /// Create a design under `designs/<repo>` (the ambient repo unless `--repo`).
+    Create {
+        /// Its title.
+        #[arg(num_args = 1.., required = true)]
+        title: Vec<String>,
+        /// The repo it designs.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Its first text.
+        #[arg(long, conflicts_with = "stdin")]
+        body: Option<String>,
+        /// Read its first text from stdin.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Print a design's text with span markers (`⟦<span> STATE⟧ … ⟦/<span>⟧`) and the version
+    /// token an edit takes as `--base`. Quote text without the markers.
+    Cat {
+        /// The design.
+        uid: String,
+        /// The text alone: no markers, no header.
+        #[arg(long)]
+        plain: bool,
+    },
+    /// Edit by quote. The quote is matched in the version `--base` names (the token `jkb design
+    /// cat` printed), and the edit merges with everything written since; it is refused only
+    /// when the quoted text was deleted since, or the base predates a compaction.
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["find", "insert_after", "span"])))]
+    Edit {
+        /// The design.
+        uid: String,
+        /// The version token you read the quote at.
+        #[arg(long)]
+        base: String,
+        /// Replace this quote's text with `--replace`.
+        #[arg(long, requires = "replace")]
+        find: Option<String>,
+        /// Insert `--text` right after this quote.
+        #[arg(long, requires = "text")]
+        insert_after: Option<String>,
+        /// Replace this span's whole text with `--replace`; the span then covers it.
+        #[arg(long, requires = "replace")]
+        span: Option<String>,
+        /// Which match of the quote, from 1, when it occurs more than once.
+        #[arg(long)]
+        occurrence: Option<usize>,
+        /// The new text (empty with `--find` deletes the quote). `-` reads it from stdin.
+        #[arg(long, allow_hyphen_values = true)]
+        replace: Option<String>,
+        /// The text `--insert-after` inserts. `-` reads it from stdin.
+        #[arg(long, allow_hyphen_values = true)]
+        text: Option<String>,
+    },
+    /// Make a span over a quote (matched in `--base`), to be approved by `--reviewer`.
+    Span {
+        /// The design.
+        uid: String,
+        /// The version token you read the quote at.
+        #[arg(long)]
+        base: String,
+        /// The quote the span covers.
+        #[arg(long)]
+        find: String,
+        /// Which match, from 1.
+        #[arg(long)]
+        occurrence: Option<usize>,
+        /// Who approves it: `operator` (default) or `claude`.
+        #[arg(long, default_value = "operator")]
+        reviewer: String,
+    },
+    /// A design's spans and their states: PROPOSED, APPROVED, STAGED, IMPLEMENTED.
+    Spans {
+        /// The design.
+        uid: String,
+    },
+    /// Approve a span — as the reviewer it names.
+    Approve {
+        /// The span.
+        span: String,
+    },
+    /// Stage an approved span into an execution plan's step.
+    Stage {
+        /// The span.
+        span: String,
+        /// The plan step.
+        step: String,
+    },
+    /// What a peer at `--since` (a base64 state vector) lacks, as one base64 Yjs update.
+    State {
+        /// The design.
+        uid: String,
+        /// The peer's state vector, base64; omitted for the whole document.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Merge a Yjs v1 update (base64) — what the editor sends.
+    Apply {
+        /// The design.
+        uid: String,
+        /// The update, base64; `-` reads it from stdin.
+        update: String,
+    },
+    /// Fold a design's updates into one snapshot (operator). Versions read before it can no
+    /// longer be edited against.
+    Compact {
+        /// The design.
+        uid: String,
     },
 }
 
@@ -1369,7 +1497,8 @@ fn run(cli: Cli) -> Result<()> {
         | Command::Related { .. }
         | Command::Blob { .. }
         | Command::History { .. }
-        | Command::Inv { .. } => {
+        | Command::Inv { .. }
+        | Command::Design { .. } => {
             anyhow::bail!("internal: a command served as an op missed ops_cli's dispatch")
         }
         Command::Commands { cmd } => match cmd {

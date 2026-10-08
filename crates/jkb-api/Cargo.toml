@@ -10,6 +10,8 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# Design updates and state vectors cross the wire as base64 (D53.4).
+base64 = "0.22.1"
 jkb-core = { version = "0.1.0", path = "../jkb-core" }
 jkb-fsm = { version = "0.1.0", path = "../jkb-fsm" }
 jkb-rbac = { version = "0.1.0", path = "../jkb-rbac" }
@@ -26,3 +28,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# A peer editor in the design tests, writing updates as the app's `yjs` does.
+yrs = "0.28.0"

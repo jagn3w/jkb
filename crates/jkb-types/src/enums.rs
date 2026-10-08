@@ -83,6 +83,9 @@ pub enum EdgeType {
     ExplainsFailure,
     /// The source informs the destination's strategy (an obstruction informing a route).
     Informs,
+    /// The source (an approved design span) is staged into the destination (an execution plan's
+    /// step) — design D53.5/D53.6. A span with one is STAGED; the state is derived from the edge.
+    Stages,
 }
 
 /// How an item is placed within a namespace.
@@ -402,6 +405,7 @@ impl EdgeType {
         Self::EquivalentInStrengthTo,
         Self::ExplainsFailure,
         Self::Informs,
+        Self::Stages,
     ];
 
     /// The `snake_case` string stored in the database (matches the serde form).
@@ -431,6 +435,7 @@ impl EdgeType {
             Self::EquivalentInStrengthTo => "equivalent_in_strength_to",
             Self::ExplainsFailure => "explains_failure",
             Self::Informs => "informs",
+            Self::Stages => "stages",
         }
     }
 

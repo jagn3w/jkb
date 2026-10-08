@@ -17,6 +17,7 @@ pub mod blob;
 pub mod claim;
 pub mod claude_session;
 pub mod containment;
+pub mod design;
 pub mod dsl;
 pub mod edge;
 pub mod host;

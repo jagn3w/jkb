@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold) and 2 (the terminal) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal) and 3 (the design data model) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -176,6 +176,57 @@ Each piece of design text is in exactly one state:
   Claude session whose prompt carries the design uid and the selected span's anchors
   (`jkb design prompt discuss <uid> --range …` builds it — the prompt is CLI output, not app
   string-building).
+
+**As built (subtask 3, D53.4–5).** The engine is `crates/jkb-core/src/design/` (`mod.rs`: storage, the
+edit, spans and their states; `crdt.rs`: the pure `yrs` half), migration `V024__designs.sql`, the ops
+`design.list`/`create`/`cat`/`state`/`spans`/`apply`/`edit`/`span`/`approve`/`stage`/`compact` in
+`crates/jkb-api/src/designs.rs`, and `jkb design …` in `crates/jkb-cli/src/design_cli.rs`. What it cost
+to learn, and what was decided past the text above:
+
+- **The version token is `<seq>.<state vector>`, not the state vector alone.** A state vector says
+  which inserts a peer has seen but nothing about deletions, so the text Claude read cannot be rebuilt
+  from one. The document at a version is the compaction plus every update with `seq` at or below the
+  token's; the state vector rides along so a token cannot be replayed against another design (it must
+  match what that seq rebuilds to) and so an editor can ask `design.state --since` for what it lacks.
+- **Offsets are UTF-16.** `yrs` defaults to byte offsets while a string item's clock counts UTF-16
+  units, so a sticky index after a multi-byte character resolved to the wrong place. Every document is
+  built with `OffsetKind::Utf16`, as Yjs counts; pinned by an edit and a span after `🦀` and `ï`
+  (measured: with `OffsetKind::Bytes` that test fails).
+- **`design_updates.id` is AUTOINCREMENT.** A compaction deletes rows and the changelog names an update
+  by its id; with a plain rowid the next update was handed the compacted row's id, and `jkb undo` of the
+  compacted update reverted the newer one (measured: the compaction test did exactly that, and
+  `an_update_id_is_never_reused_after_a_compaction` fails again with the keyword removed). The
+  `items.id` lesson (V010), again.
+- **Undo is `InsertInverse::ForwardUpdate`** (`undo::Inverse::DesignRevert`): the `UndoManager` seeded
+  with the one stack item the update is, run over the current document with garbage collection off so a
+  deleted run can be put back beside text written after it. The appended row is not itself
+  changelogged — the `undo` marker is its record, and undoing an undo is not something `undo` does. A
+  compaction is logged as bookkeeping (`BOOKKEEPING`), so a bare `jkb undo` reaches past it; an update
+  it folded away is refused by name, never reverted on a guess.
+- **APPROVED is recorded on the span's item, not in the CRDT**: `metadata.approval` holds a Yjs snapshot
+  (state vector + deletions) of the document at the approval, and the reviewer the span names is on the
+  item too. Any editor can write the document, so a reviewer stored there could be rewritten by any peer.
+  Which words are still the approved ones is derived by diffing the text against that snapshot: words
+  written inside the span since read PROPOSED, the rest keep the span's state, and words deleted from it
+  are reported as a zero-width removed piece. A span with any of either is `demoted` and reads PROPOSED
+  as a whole until re-approved; `jkb design edit` names the spans it demoted.
+- **Anchors**: the start sticks to the span's first character and the end to its last, so text typed at
+  either edge stays outside and only an insertion strictly inside splits the span. Spans may not
+  overlap — each piece of text is in exactly one state.
+- **Who approves**: a span naming `operator` is the operator's alone; one naming `claude` is approved by
+  a Claude principal (recorded by its label) or the operator, who holds every permission. RBAC adds
+  `design` (coordinator, designer) and `design_approve` (those and the reviewer); compaction is the
+  operator's; a design write is no one task's (`Target::Shared`).
+- **IMPLEMENTED needs at least one task** under the span's steps (containment, any depth), all `done`:
+  a step with no tasks has implemented nothing, so vacuous truth is refused.
+- **Live updates** go to topic `design/<uid>` with the uid's `:` spelled `.` (not a topic character),
+  payload `{design, seq, update}` with the update inline up to 32 KiB. Best effort: a full or oversized
+  queue costs a subscriber a `design.state` re-read, never the write.
+- **A design cannot be removed** (`item::remove`, even with `--force`): its updates are not in the
+  delete's snapshot, so `jkb undo` would bring back a design with no text.
+- **Unmeasured here, stated:** byte compatibility with the app's JavaScript `yjs`. The tests write
+  updates with `yrs` playing the editor; `yrs` is the Yjs authors' port and claims v1 wire
+  compatibility, and subtask 4's editor is the first thing to exercise it against `yjs` itself.
 
 ## D53.6 — Execution plans, tasks and prompts are items and edges
 

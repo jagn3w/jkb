@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod claims;
+pub mod designs;
 pub mod health;
 pub mod ingest;
 pub mod inv;
@@ -730,6 +731,99 @@ pub enum Request {
     /// The presets and definitions ([`rbac::strategies`]).
     #[serde(rename = "workflow.strategies")]
     WorkflowStrategies {},
+    /// The designs, or one repo's ([`designs::list`]).
+    #[serde(rename = "design.list")]
+    DesignList {
+        /// Only this repo's (`designs/<repo>`).
+        #[serde(default)]
+        repo: Option<String>,
+    },
+    /// Create a design under `designs/<repo>` ([`designs::create`]).
+    #[serde(rename = "design.create")]
+    DesignCreate {
+        /// The repo it designs.
+        repo: String,
+        /// Its title.
+        title: String,
+        /// Its first text.
+        #[serde(default)]
+        body: String,
+    },
+    /// A design's text, spans and version token ([`designs::cat`]).
+    #[serde(rename = "design.cat")]
+    DesignCat {
+        /// The design.
+        uid: String,
+    },
+    /// What a peer lacks, as one Yjs update ([`designs::state`]).
+    #[serde(rename = "design.state")]
+    DesignState {
+        /// The design.
+        uid: String,
+        /// The peer's state vector, base64; omitted for the whole document.
+        #[serde(default)]
+        since: Option<String>,
+    },
+    /// A design's spans and their derived states ([`designs::spans`]).
+    #[serde(rename = "design.spans")]
+    DesignSpans {
+        /// The design.
+        uid: String,
+    },
+    /// Merge an editor's Yjs v1 update ([`designs::apply`]).
+    #[serde(rename = "design.apply")]
+    DesignApply {
+        /// The design.
+        uid: String,
+        /// The update, base64.
+        update: String,
+    },
+    /// Edit by quote, resolved against the version read ([`designs::edit`]).
+    #[serde(rename = "design.edit")]
+    DesignEdit {
+        /// The design.
+        uid: String,
+        /// The version token the quote was read at.
+        base: String,
+        /// What to do.
+        edit: designs::EditAsk,
+    },
+    /// Make a span over a quote, resolved against the version read ([`designs::span`]).
+    #[serde(rename = "design.span")]
+    DesignSpan {
+        /// The design.
+        uid: String,
+        /// The version token the quote was read at.
+        base: String,
+        /// The quote.
+        find: String,
+        /// Which match, from 1.
+        #[serde(default)]
+        occurrence: Option<usize>,
+        /// Who approves it: `operator` (the default) or `claude`.
+        #[serde(default)]
+        reviewer: Option<String>,
+    },
+    /// Approve a span, as the reviewer it names ([`designs::approve`]).
+    #[serde(rename = "design.approve")]
+    DesignApprove {
+        /// The span.
+        span: String,
+    },
+    /// Stage an approved span into a plan step ([`designs::stage`]).
+    #[serde(rename = "design.stage")]
+    DesignStage {
+        /// The span.
+        span: String,
+        /// The plan step.
+        step: String,
+    },
+    /// Fold a design's updates into its snapshot (operator; [`jkb_core::design::compact`]).
+    #[serde(rename = "design.compact")]
+    DesignCompact {
+        /// The design.
+        uid: String,
+    },
     /// Mint a harness attestation ticket for one tool call (the container credential only;
     /// [`rbac::mint_ticket`]).
     #[serde(rename = "attest.mint")]
@@ -1300,6 +1394,17 @@ impl Request {
         "workflow.set",
         "workflow.define",
         "workflow.strategies",
+        "design.list",
+        "design.create",
+        "design.cat",
+        "design.state",
+        "design.spans",
+        "design.apply",
+        "design.edit",
+        "design.span",
+        "design.approve",
+        "design.stage",
+        "design.compact",
         "attest.mint",
         "attest.release",
         "task.claims",
@@ -1408,6 +1513,17 @@ impl Request {
             Self::WorkflowSet { .. } => "workflow.set",
             Self::WorkflowDefine { .. } => "workflow.define",
             Self::WorkflowStrategies {} => "workflow.strategies",
+            Self::DesignList { .. } => "design.list",
+            Self::DesignCreate { .. } => "design.create",
+            Self::DesignCat { .. } => "design.cat",
+            Self::DesignState { .. } => "design.state",
+            Self::DesignSpans { .. } => "design.spans",
+            Self::DesignApply { .. } => "design.apply",
+            Self::DesignEdit { .. } => "design.edit",
+            Self::DesignSpan { .. } => "design.span",
+            Self::DesignApprove { .. } => "design.approve",
+            Self::DesignStage { .. } => "design.stage",
+            Self::DesignCompact { .. } => "design.compact",
             Self::AttestMint { .. } => "attest.mint",
             Self::AttestRelease { .. } => "attest.release",
             Self::TaskClaims { .. } => "task.claims",
@@ -1482,7 +1598,11 @@ impl Request {
             | Self::RoleList { .. }
             | Self::RoleWhoami {}
             | Self::WorkflowShow { .. }
-            | Self::WorkflowStrategies {} => true,
+            | Self::WorkflowStrategies {}
+            | Self::DesignList { .. }
+            | Self::DesignCat { .. }
+            | Self::DesignState { .. }
+            | Self::DesignSpans { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -1553,7 +1673,14 @@ impl Request {
             | Self::InvWrite(_)
             | Self::TaskPrRecord { .. }
             | Self::TaskCloseMerged { .. }
-            | Self::NsMv { .. } => false,
+            | Self::NsMv { .. }
+            | Self::DesignCreate { .. }
+            | Self::DesignApply { .. }
+            | Self::DesignEdit { .. }
+            | Self::DesignSpan { .. }
+            | Self::DesignApprove { .. }
+            | Self::DesignStage { .. }
+            | Self::DesignCompact { .. } => false,
         }
     }
 }
@@ -2041,6 +2168,52 @@ pub enum Response {
         /// How many.
         count: usize,
     },
+    /// A `design.list`.
+    Designs {
+        /// The designs, by uid.
+        designs: Vec<designs::Design>,
+    },
+    /// A `design.create`.
+    DesignCreated {
+        /// The new design.
+        design: designs::Design,
+    },
+    /// A `design.cat`.
+    DesignText {
+        /// The design at its current version.
+        design: Box<designs::DesignDoc>,
+    },
+    /// A `design.state`.
+    DesignUpdate {
+        /// What the peer lacks, as one Yjs v1 update, base64.
+        update: String,
+        /// The version it brings the peer to.
+        version: String,
+        /// That version's seq.
+        seq: i64,
+    },
+    /// A `design.spans`.
+    DesignSpans {
+        /// The spans, in text order.
+        spans: Vec<designs::Span>,
+    },
+    /// A `design.apply`, `design.edit` or `design.span`.
+    DesignWritten {
+        /// What it did.
+        written: designs::Written,
+    },
+    /// A `design.approve` or `design.stage`.
+    DesignSpan {
+        /// The span after it.
+        span: Box<designs::Span>,
+    },
+    /// A `design.compact`.
+    DesignCompacted {
+        /// The snapshot covers every update through this seq.
+        through: i64,
+        /// How many update rows it replaced.
+        removed: usize,
+    },
 }
 
 impl Response {
@@ -2125,6 +2298,14 @@ impl Response {
             | Self::Defined { .. }
             | Self::Ticket { .. }
             | Self::TicketsReleased { .. }
+            | Self::Designs { .. }
+            | Self::DesignCreated { .. }
+            | Self::DesignText { .. }
+            | Self::DesignUpdate { .. }
+            | Self::DesignSpans { .. }
+            | Self::DesignWritten { .. }
+            | Self::DesignSpan { .. }
+            | Self::DesignCompacted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -2140,6 +2321,9 @@ impl Response {
         match self {
             Self::Sent { .. } => true,
             Self::Notified { sent, .. } => *sent > 0,
+            // Every stored design update is announced on `design/<uid>` (D53.4).
+            Self::DesignWritten { written } => written.seq.is_some(),
+            Self::DesignCreated { design } => design.seq > 0,
             Self::Created { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
@@ -2213,6 +2397,12 @@ impl Response {
             | Self::Defined { .. }
             | Self::Ticket { .. }
             | Self::TicketsReleased { .. }
+            | Self::Designs { .. }
+            | Self::DesignText { .. }
+            | Self::DesignUpdate { .. }
+            | Self::DesignSpans { .. }
+            | Self::DesignSpan { .. }
+            | Self::DesignCompacted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -3334,6 +3524,77 @@ impl LocalBackend {
                 Response::Strategies {
                     strategies,
                     default,
+                }
+            }
+            Request::DesignList { repo } => Response::Designs {
+                designs: db.read_with(move |c| designs::list(c, repo.as_deref()))?,
+            },
+            Request::DesignCreate { repo, title, body } => Response::DesignCreated {
+                design: db.write_txn_with(actor, move |c, m| {
+                    designs::create(c, m, &repo, &title, &body)
+                })?,
+            },
+            Request::DesignCat { uid } => Response::DesignText {
+                design: Box::new(db.read_with(move |c| designs::cat(c, &uid))?),
+            },
+            Request::DesignState { uid, since } => {
+                let (update, version) =
+                    db.read_with(move |c| designs::state(c, &uid, since.as_deref()))?;
+                Response::DesignUpdate {
+                    update,
+                    seq: version.seq,
+                    version: version.token(),
+                }
+            }
+            Request::DesignSpans { uid } => Response::DesignSpans {
+                spans: db.read_with(move |c| designs::spans(c, &uid))?,
+            },
+            Request::DesignApply { uid, update } => Response::DesignWritten {
+                written: db
+                    .write_txn_with(actor, move |c, m| designs::apply(c, m, &uid, &update))?,
+            },
+            Request::DesignEdit { uid, base, edit } => Response::DesignWritten {
+                written: db
+                    .write_txn_with(actor, move |c, m| designs::edit(c, m, &uid, &base, edit))?,
+            },
+            Request::DesignSpan {
+                uid,
+                base,
+                find,
+                occurrence,
+                reviewer,
+            } => {
+                let ask = designs::SpanAsk {
+                    uid,
+                    base,
+                    find,
+                    occurrence,
+                    reviewer,
+                };
+                Response::DesignWritten {
+                    written: db.write_txn_with(actor, move |c, m| designs::span(c, m, &ask))?,
+                }
+            }
+            Request::DesignApprove { span } => {
+                let who = principal.clone();
+                Response::DesignSpan {
+                    span: Box::new(
+                        db.write_txn_with(actor, move |c, m| designs::approve(c, m, &span, &who))?,
+                    ),
+                }
+            }
+            Request::DesignStage { span, step } => Response::DesignSpan {
+                span: Box::new(
+                    db.write_txn_with(actor, move |c, m| designs::stage(c, m, &span, &step))?,
+                ),
+            },
+            Request::DesignCompact { uid } => {
+                let done = db.write_txn_with(actor, move |c, m| {
+                    jkb_core::design::compact(c, m, &uid).map_err(ApiError::from)
+                })?;
+                Response::DesignCompacted {
+                    through: done.through,
+                    removed: done.removed,
                 }
             }
             Request::AttestMint {

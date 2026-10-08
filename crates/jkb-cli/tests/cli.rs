@@ -4806,3 +4806,96 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
     }));
     assert!(!whoami(&sub).status.success(), "released at SubagentStop");
 }
+
+/// The design edit loop an agent runs (D53.4): `cat` for the text and its version token, `edit` by
+/// quote against that token — merged over an edit made since — then a span approved and demoted.
+#[test]
+fn a_design_is_edited_by_quote_against_the_version_read() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args([
+            "--json", "design", "create", "Code", "Factory", "--repo", "jkb",
+        ])
+        .args(["--body", "The app reads the database. It writes nothing."])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uid = created["uid"].as_str().unwrap().to_owned();
+    let version = || -> String {
+        let out = jkb(&db)
+            .args(["--json", "design", "cat", &uid])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        doc["version"].as_str().unwrap().to_owned()
+    };
+    let base = version();
+    jkb(&db)
+        .args(["design", "edit", &uid, "--base", &base])
+        .args(["--insert-after", "The app", "--text", " (desktop)"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "edit", &uid, "--base", &base])
+        .args(["--find", "writes nothing", "--replace", "writes via ops"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update 3"));
+    jkb(&db)
+        .args(["design", "cat", &uid, "--plain"])
+        .assert()
+        .success()
+        .stdout("The app (desktop) reads the database. It writes via ops.");
+    // A quote that is not in the version read is refused, never guessed at.
+    jkb(&db)
+        .args(["design", "edit", &uid, "--base", &base])
+        .args(["--find", "(desktop)", "--replace", "x"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not in the version you read"));
+
+    let out = jkb(&db)
+        .args(["--json", "design", "span", &uid, "--base", &version()])
+        .args(["--find", "It writes via ops."])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let span = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["span"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    jkb(&db)
+        .args(["design", "approve", &span])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("APPROVED"));
+    jkb(&db)
+        .args(["design", "cat", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "⟦{span} APPROVED⟧It writes via ops.⟦/{span}⟧"
+        )));
+    jkb(&db)
+        .args(["design", "edit", &uid, "--base", &version()])
+        .args(["--insert-after", "writes ", "--text", "only "])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("demoted: {span}")));
+    // `jkb undo` reverts the edit as a forward update: the approved words are back, so the span reads
+    // APPROVED again, with nothing re-approved.
+    jkb(&db).args(["undo"]).assert().success();
+    jkb(&db)
+        .args(["design", "cat", &uid, "--plain"])
+        .assert()
+        .success()
+        .stdout("The app (desktop) reads the database. It writes via ops.");
+    jkb(&db)
+        .args(["design", "spans", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("APPROVED"));
+}

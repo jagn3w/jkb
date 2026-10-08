@@ -163,6 +163,10 @@ entities! {
     Ingestions => "ingestions",
     Containment => "containment",
     SyncState => "sync_state",
+    /// A design document's CRDT updates (design D53.4), keyed by the update row's `id`.
+    DesignUpdates => "design_updates",
+    /// A design's compaction — bookkeeping: the document it stores is the one its updates made.
+    DesignSnapshots => "design_snapshots",
     /// `undo` markers, whose `entity_id` is the reverted transaction's id.
     Changelog => "changelog",
 }
@@ -197,6 +201,14 @@ pub(crate) enum InsertInverse {
     ///    would compile, ship, and fail at some user's `jkb undo` with "bad entity id" instead of
     ///    on that author's first write.
     Never,
+    /// Append a **new** row that reverts the inserted one, and delete nothing (design D53.4).
+    ///
+    /// For an append-only CRDT log, whose rows every peer that merged them still holds: deleting one
+    /// would make the table disagree with every open editor, and the next update one of them sends
+    /// would bring the deleted content straight back. The inverse is a forward update instead — the
+    /// Yjs `UndoManager` construction, in `design::revert_update` — keyed by the reverted row's
+    /// `id`, which is AUTOINCREMENT so a compaction's deletions never hand it to another update.
+    ForwardUpdate,
 }
 
 impl Entity {
@@ -225,9 +237,14 @@ impl Entity {
             | Self::Mounts
             | Self::Ingestions
             | Self::Containment => InsertInverse::DeleteRow,
+            Self::DesignUpdates => InsertInverse::ForwardUpdate,
             // Keyed by a uri, a transaction id and a content hash respectively, so a rowid
             // delete would address some other row; none is ever logged with op `insert`.
-            Self::SyncState | Self::Changelog | Self::Blobs => InsertInverse::Never,
+            // A compaction is logged as an update, as bookkeeping (`undo::BOOKKEEPING`): it changes
+            // no document, only how one is stored.
+            Self::SyncState | Self::Changelog | Self::Blobs | Self::DesignSnapshots => {
+                InsertInverse::Never
+            }
         }
     }
 }

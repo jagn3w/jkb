@@ -695,6 +695,17 @@ fn memory_reason(conn: &Connection, item: ItemId) -> Result<Option<String>> {
 pub fn remove(conn: &Connection, meta: &WriteMeta, item: ItemId, force: bool) -> Result<Removed> {
     let before = snapshot(conn, item)?;
 
+    // Not even with `force`: the snapshot above is what `jkb undo` restores, and a design's
+    // document — its CRDT updates — is not in it. Deleting would report an undoable delete and then
+    // bring back a design with no text.
+    if crate::design::holds_document(conn, item)? {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "refusing to delete {item}: it is a design, and its document (the updates in \
+             `design_updates`) is not part of what `jkb undo` restores, so the delete could not be \
+             taken back"
+        ))));
+    }
+
     if !force {
         if let Some(reason) = memory_reason(conn, item)? {
             return Err(Error::Types(TypeError::Validation(format!(

@@ -402,6 +402,52 @@ fn samples() -> Vec<Request> {
             spec: json!({ "graph": "direct" }),
         },
         Request::WorkflowStrategies {},
+        Request::DesignList { repo: None },
+        Request::DesignCreate {
+            repo: "jkb".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+        Request::DesignCat {
+            uid: "design:x".into(),
+        },
+        Request::DesignState {
+            uid: "design:x".into(),
+            since: None,
+        },
+        Request::DesignSpans {
+            uid: "design:x".into(),
+        },
+        Request::DesignApply {
+            uid: "design:x".into(),
+            update: String::new(),
+        },
+        Request::DesignEdit {
+            uid: "design:x".into(),
+            base: "0.".into(),
+            edit: crate::designs::EditAsk::InsertAfter {
+                find: "a".into(),
+                occurrence: None,
+                text: "b".into(),
+            },
+        },
+        Request::DesignSpan {
+            uid: "design:x".into(),
+            base: "0.".into(),
+            find: "a".into(),
+            occurrence: None,
+            reviewer: None,
+        },
+        Request::DesignApprove {
+            span: "span:x".into(),
+        },
+        Request::DesignStage {
+            span: "span:x".into(),
+            step: "step:x".into(),
+        },
+        Request::DesignCompact {
+            uid: "design:x".into(),
+        },
         Request::AttestMint {
             session: "s".into(),
             agent_id: None,
@@ -1515,6 +1561,10 @@ const READS: &[&str] = &[
     "role.whoami",
     "workflow.show",
     "workflow.strategies",
+    "design.list",
+    "design.cat",
+    "design.state",
+    "design.spans",
 ];
 
 #[test]
@@ -1918,7 +1968,14 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
     for request in samples() {
         let mut wire = serde_json::to_value(&request).unwrap();
         let names_an_item = request.op().starts_with("task.") || wire.get("uid").is_some();
-        if !names_an_item || request.is_agent_read() || MANY_TASK_WRITES.contains(&request.op()) {
+        // A design write names a design (`uid`) but writes only its update log and its spans' items,
+        // none of which is placed anywhere a sync exports from — and it refuses any other item kind.
+        let design_write = request.op().starts_with("design.");
+        if !names_an_item
+            || design_write
+            || request.is_agent_read()
+            || MANY_TASK_WRITES.contains(&request.op())
+        {
             continue;
         }
         if wire.get("uid").is_some() {

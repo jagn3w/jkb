@@ -125,6 +125,9 @@ enum Inverse {
     ReinsertRow,
     /// Delete the inserted row by `rowid`.
     DeleteRow,
+    /// Append a design update that reverts the one inserted ([`crate::design::revert_update`]) —
+    /// the [`InsertInverse::ForwardUpdate`] answer. Nothing is deleted.
+    DesignRevert,
 }
 
 /// The generic inverse driven by a before-state made of column values, if this entry has one —
@@ -511,6 +514,12 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     ),
     (Op::Delete, Some(Entity::Edges), Inverse::ReinsertRow),
     (Op::Delete, Some(Entity::Namespaces), Inverse::ReinsertRow),
+    // A design update is reverted by a newer update, never by deleting the row (D53.4).
+    (
+        Op::Insert,
+        Some(Entity::DesignUpdates),
+        Inverse::DesignRevert,
+    ),
     // Any table whose inserts delete by rowid; an insert into anything else is uninvertible, not
     // deleted on a guess. The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so
     // a table-specific `insert` inverse placed after it would never be reached.
@@ -550,6 +559,8 @@ fn is_work(op: &str, table: &str) -> bool {
 /// copy. Two spellings of one rule is the shape this whole module is a correction of.
 const BOOKKEEPING: &[(Op, Entity)] = &[
     (Op::Update, Entity::SyncState),
+    // A compaction rewrites how a design is stored, not what it says.
+    (Op::Update, Entity::DesignSnapshots),
     (Op::Undo, Entity::Changelog),
 ];
 
@@ -588,6 +599,7 @@ fn inverse_for(op: &str, table: &str) -> Option<Inverse> {
 /// before-state.
 fn invert_entry(
     conn: &Connection,
+    meta: &WriteMeta,
     op: &str,
     table: &str,
     entity_id: &str,
@@ -658,6 +670,10 @@ fn invert_entry(
         }
         Inverse::SyncStateRow => {
             rows += revert_sync_state(conn, entity_id, snapshot("sync journal before-state")?)?;
+        }
+        // A forward update, appended: the reverted row stays, as every peer that merged it has it.
+        Inverse::DesignRevert => {
+            rows += crate::design::revert_update(conn, meta, rowid()?)?;
         }
         // A mount edit is inverted by putting the previous configuration back. `jkb mount
         // create` doubles as the update command, so without this the generic insert
@@ -886,9 +902,19 @@ fn blocker(
             | Inverse::EdgeWeight
             | Inverse::MountConfig
             | Inverse::ContainmentRow
+            | Inverse::DesignRevert
     ) && entity_id.parse::<i64>().is_err()
     {
         return Some(format!("its changelog key `{entity_id}` is not a row id"));
+    }
+    if inverse == Inverse::DesignRevert {
+        if let Some(why) = entity_id
+            .parse::<i64>()
+            .ok()
+            .and_then(|row| crate::design::unrevertable(conn, row).transpose())
+        {
+            return Some(why.unwrap_or_else(|e| e.to_string()));
+        }
     }
     None
 }
@@ -1127,7 +1153,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
 
     let mut reverted = 0;
     for (op, table, entity_id, before) in entries {
-        match invert_entry(conn, &op, &table, &entity_id, before.as_deref()) {
+        match invert_entry(conn, meta, &op, &table, &entity_id, before.as_deref()) {
             Ok(rows) => reverted += rows,
             Err(e) => {
                 let why = format!("reversing `{op}` on `{table}` failed: {e}");
