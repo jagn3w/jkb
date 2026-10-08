@@ -184,8 +184,14 @@ kill "$RECLAIMER_PID" 2>/dev/null; rm -f "$RUN_OWNER_FILE"
 ```
 
 When the workflow finishes, relay its result: which task uids **completed** (landed on the
-feature branch and marked `done`), which it **gave up** on (retry-capped), how many groups
-and passes it ran, and the merge-queue **landed/eject** counts. Each completed task was
+feature branch and marked `done`), which it **gave up** on (retry-capped), which **stalled**
+(`stalled_tasks`, with each `merge_queue.stalls[].why`: these need a person and nothing will
+retry them), how many groups and passes it ran, and the merge-queue **landed/eject** counts.
+A stall that reads "landed … but not closed in jkb" means the code IS on the feature branch but
+jkb refused or held the landing record, usually because the task's strategy does not let the
+coordinator land. The operator settles it with `jkb task landed <branch> --onto <feature
+branch>`, which needs that `swarm-task/*` branch, so keep it until then. Or pin a strategy whose
+`lands` toggle includes the coordinator before the next run. Each completed task was
 closed **`done`** in jkb by the merge queue's `jkb task landed` (`observed_landed`) once its
 group's branch landed — which also unblocked its dependents; a file-backed task's checkbox
 follows on the host's next sync. Nothing in the swarm runs `jkb task set --status done`, and jkb
@@ -201,6 +207,7 @@ Then tell the user how to finish:
 - When satisfied, merge/PR the feature branch normally: `git switch "$BASE" && git merge "$INTEG"`
   (or open a PR from `$INTEG`). It looks like any other feature branch.
 - Clean up: `git worktree remove .swarm/integration`, `git worktree prune`, and delete the
-  local `swarm-task/*` branches (`git branch -D`); do **not** push them.
+  local `swarm-task/*` branches (`git branch -D`), **except** those of stalled groups until the
+  operator has recorded their landing. Do **not** push them.
 - If a prior run crashed and left claims, `jkb doctor` reports orphaned claims and
   `jkb doctor --fix` clears them (owner-existence reclaim, D27.2).

@@ -1229,7 +1229,7 @@ way). Update the host before, or with, the container.
 the swarm lands on its own runs under a strategy whose `lands` toggle includes the coordinator
 (`jkb workflow set <uid> autonomous`, or a defined one), or the operator lands it.
 
-**Only a landing closes a swarm task, and nobody but the operator closes an `open` one.** The
+**The swarm closes a task only by landing it, and only the operator moves an `open` task straight to `done`.** The
 swarm's merge queue closes a landed group itself (`jkb task landed`, `observed_landed`). Behind it
 the workflow ran a second, `haiku`-model agent told to "mark every task in the group done" with a
 free `jkb task set --status done`. Measured on 2026-10-08, twice in one chain: each time that
@@ -1237,12 +1237,22 @@ agent ran after the queue had already closed its group, and it set the NEXT task
 done`, an `override`, 42 s and 75 s after the landing). The swarm then started that task's
 dependents on work that did not exist. A later implementer caught the second one only because a
 note on its task told it to stop and say `BLOCKED:`. Two changes, one per layer:
-`task-swarm.js`'s step after a landing now only *checks* that its tasks are `done` and reports a
-group that landed but did not close as stalled. And `rbac::authorize` refuses a non-operator
-`task.set --status done` on an `open` task, because closing work nobody started is the operator's.
-That rule lives in the callee: the prompt that broke it was one of several that hand an agent a
-status command. Narrow on purpose: `in_progress`/`needs_review -> done` (the session that worked
-it, `/next-task`) and every other status stay as they were.
+`task-swarm.js`'s step after a landing now only *checks* the group's tasks, and reports the ones
+that did not close as stalled, with the remedy. Under the default `design-reviewed` strategy, where
+only the operator lands, that is every group: the queue's `jkb task landed` is refused and only
+prints a note. The old agent's `task set --status done` had been quietly closing them past that
+rule. And `rbac::authorize` refuses a non-operator `task.set --status done` on an `open` task,
+because closing work nobody started is the operator's. That rule lives in the callee: the prompt
+that broke it was one of several that hand an agent a status command.
+
+**What the guard does not cover, stated.** It refuses one move, a single `open -> done`. A caller
+holding the status permission can still close an `in_progress` or `needs_review` task. That is
+how `/next-task` finishes its own work, and nothing yet ties a `done` to whoever started the task.
+It can also step a task `open -> in_progress -> done` in two calls. The guard stops an agent
+closing the wrong task by accident, which is what happened; it does not stop one set on closing
+it. And the operator is admitted before any of this runs, so a swarm launched on the host, where
+agents act as the operator, relies on the workflow change alone. The swarm in this incident ran in
+the container under the coordinator grant, so both layers would have held.
 
 **Rejected, and why.**
 

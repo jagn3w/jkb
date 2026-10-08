@@ -173,6 +173,23 @@ function classifyMerge(code) {
   }
 }
 
+// The post-landing check's answer: which of the group's tasks are NOT done, by uid, so a group that
+// closed in part credits the part that closed.
+const CLOSED = {
+  type: 'object',
+  properties: {
+    not_done: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { uid: { type: 'string' }, status: { type: 'string' } },
+        required: ['uid', 'status'],
+      },
+    },
+  },
+  required: ['not_done'],
+}
+
 const ACK = {
   type: 'object',
   properties: { ok: { type: 'boolean' }, detail: { type: 'string' } },
@@ -275,7 +292,7 @@ function closedCheckPrompt(group) {
 
 Run EXACTLY: ${shows}
 
-Change NOTHING. Do not set any status, edit, claim, release, sync or touch git; run no command but the ones above, and run nothing against any other task. Return ok=true if every one of these tasks has status "done"; otherwise ok=false with detail listing each uid that is not done and its status.`
+Change NOTHING. Do not set any status, edit, claim, release, sync or touch git; run no command but the ones above, and run nothing against any other task. Return not_done: one {uid, status} for each of these tasks whose status is not "done" (an empty list when all are done).`
 }
 
 function claimPrompt(group, verb) {
@@ -478,21 +495,35 @@ async function processGroup(group) {
         const closed = await agent(closedCheckPrompt(group), {
           label: `closed?:${label}`,
           phase: 'Merge',
-          schema: ACK,
+          schema: CLOSED,
           model: 'haiku',
         })
-        if (!closed || !closed.ok) {
-          // Landed but not closed: the queue printed a "could not record the landing" note (open
-          // subtasks, most often). Nothing here may close it, so a person is told, and its
-          // dependents stay held, which is right while it is not done.
+        // No answer is not "all closed": every task is then reported unclosed, never assumed done.
+        const notDone = closed && Array.isArray(closed.not_done)
+          ? closed.not_done
+          : group.tasks.map((t) => ({ uid: t.uid, status: 'unknown (the check returned nothing)' }))
+        const unclosed = new Set(notDone.map((n) => n.uid))
+        group.tasks.filter((t) => !unclosed.has(t.uid)).forEach((t) => landed.push(t.uid))
+        if (unclosed.size) {
+          // Landed but not closed. The code IS on the integration branch; jkb refused or held the
+          // landing record for these tasks, and merge-queue.sh still exits 0 for that (it is not the
+          // branch's fault). The usual cause: the task's strategy does not let the coordinator land
+          // (the default `design-reviewed` lands only for the operator), so `jkb task landed` was
+          // refused. Or a task still has open subtasks, so the landing was held. Nothing here may
+          // close it, so it is a stall for a person, with the remedy named. Dependents stay held,
+          // which is right while it is not done.
           stats.stall++
-          const why = `landed but not closed in jkb — ${(closed && closed.detail) || 'the check returned nothing'}`
+          const which = notDone.map((n) => `${n.uid} (${n.status})`).join(', ')
+          const why =
+            `landed on ${INTEGRATION} but not closed in jkb: ${which}. Its strategy may not let the ` +
+            `coordinator land, or it has open subtasks. The operator records it with ` +
+            `\`jkb task landed ${branch} --onto ${INTEGRATION}\` (keep the branch until then), or ` +
+            `pins a strategy whose lands toggle includes the coordinator before the next run`
           log(`group ${label}: ${why} · ${merge.detail}`)
           stalled.push({ group: label, branch, exit: merge.exit, why, detail: merge.detail })
-          group.tasks.forEach((t) => stalledUids.push(t.uid))
+          notDone.forEach((n) => stalledUids.push(n.uid))
           return
         }
-        group.tasks.forEach((t) => landed.push(t.uid))
         log(`group ${label}: landed → done · ${merge.detail}`)
         return
       }

@@ -956,7 +956,6 @@ pub fn authorize(
         // Nothing to scope against; the op itself answers `not_found`.
         return Ok(Admit::Run);
     };
-    closing_unstarted(conn, target, request, reference)?;
     if permission == OpPermission::Land {
         let current = wf::current(conn, target)?;
         if let Decision::Deny(no) = current.spec.may_land(&principal.roles) {
@@ -988,14 +987,21 @@ pub fn authorize(
                     principal.label
                 )));
             }
+            closing_unstarted(conn, target, request, reference)?;
             Ok(Admit::Run)
         }
-        (None, Some((session, agent))) => Ok(Admit::BindThenRun {
-            session: session.to_owned(),
-            agent_id: agent.to_owned(),
-            task: target,
-        }),
-        (None, None) => Ok(Admit::Run),
+        (None, Some((session, agent))) => {
+            closing_unstarted(conn, target, request, reference)?;
+            Ok(Admit::BindThenRun {
+                session: session.to_owned(),
+                agent_id: agent.to_owned(),
+                task: target,
+            })
+        }
+        (None, None) => {
+            closing_unstarted(conn, target, request, reference)?;
+            Ok(Admit::Run)
+        }
     }
 }
 

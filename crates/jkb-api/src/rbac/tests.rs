@@ -1015,6 +1015,16 @@ fn an_open_task_is_not_closed_by_anyone_but_the_operator() {
         json!({ "op": "task.set", "uid": worked, "status": "done" }),
     );
 
+    // Out of scope is refused as out of scope, not sent off to start a task it may not touch.
+    let mine = add(&kb.op, "mine");
+    let elsewhere = add(&kb.op, "elsewhere, never started");
+    let (_, scoped) = grant(&kb.op, "coordinator", Some(&mine), "scoped");
+    let e = refused(
+        &kb.as_token(&scoped),
+        json!({ "op": "task.set", "uid": elsewhere, "status": "done" }),
+    );
+    assert!(e.message.contains("scoped to another task"), "{e:?}");
+
     let operator_closes = add(&kb.op, "operator closes");
     ok(
         &kb.op,
