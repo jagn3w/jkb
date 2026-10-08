@@ -316,8 +316,17 @@ jobs:
       - name: build (type-checks)
         run: pnpm run build
 
-      # The adapter's tests. They bundle the module under test themselves (with `vscode`
+      # The packages' tests. The adapter's bundle the module under test themselves (with `vscode`
       # stubbed), so they need no VS Code and no dist — but they do need a node new enough
       # for `node --test`, which is why this job pins one rather than taking the runner's.
+      #
+      # The app's Electron smoke (ui/app/test/smoke.test.mjs) launches the built app, so it needs
+      # a display — xvfb-run gives it one — and Chromium's sandbox, which Ubuntu 24.04's AppArmor
+      # denies unprivileged user namespaces by default. The sysctl lifts that one restriction on
+      # this throwaway runner, rather than launching Electron with --no-sandbox: the renderer
+      # sandbox is the boundary the smoke exists to exercise (D53.1). Without a display the smoke
+      # skips and says so, which here would be a skip passing for green.
+      - name: allow Chromium's sandbox (Ubuntu 24.04 AppArmor)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: test
-        run: pnpm run test
+        run: xvfb-run -a pnpm run test

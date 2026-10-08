@@ -1,0 +1,98 @@
+/*
+ * Design tokens (docs/code-factory.md, D53.2 "Visual language").
+ *
+ * Black and white, dense and quiet. Light and dark are both first class and come from this one
+ * set of custom properties: a component names a token, never a colour. 1px hairlines instead of
+ * shadows; motion only where it explains a change of state, and never longer than --motion.
+ *
+ * Colour carries meaning only. The accents are the span-state set plus one alert, and nothing
+ * else in the app is coloured:
+ *   PROPOSED amber · APPROVED blue · STAGED violet · IMPLEMENTED green · needs input/failure red
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces and ink. */
+  --bg: #ffffff;
+  --surface: #f7f7f5;
+  --surface-hover: #efefed;
+  --surface-active: #e9e9e7;
+  --ink: #191919;
+  --ink-muted: #6b6b6b;
+  --ink-faint: #a3a3a3;
+  --hairline: #e9e9e7;
+  --hairline-strong: #d3d3d1;
+  --focus: #191919;
+
+  /* Meaning: the span states (D53.5) and the alert. Each has a soft fill for backgrounds. */
+  --accent-proposed: #b7791f;
+  --accent-proposed-soft: #fbf3db;
+  --accent-approved: #2563eb;
+  --accent-approved-soft: #e6eefc;
+  --accent-staged: #7c3aed;
+  --accent-staged-soft: #efe8fd;
+  --accent-implemented: #15803d;
+  --accent-implemented-soft: #e3f4e8;
+  --alert: #dc2626;
+  --alert-soft: #fde8e8;
+
+  /* Type. Inter for UI, JetBrains Mono for code and terminals; both bundled, never fetched. */
+  --font-ui: "Inter Variable", Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 15px;
+  --text-xl: 22px;
+  --leading: 1.5;
+
+  /* Space and shape. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --radius: 4px;
+  --hairline-width: 1px;
+  --topbar-height: 40px;
+
+  /* Motion. */
+  --motion: 150ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --bg: #191919;
+    --surface: #202020;
+    --surface-hover: #2a2a2a;
+    --surface-active: #303030;
+    --ink: #e6e6e5;
+    --ink-muted: #9b9b9b;
+    --ink-faint: #5f5f5f;
+    --hairline: #2f2f2f;
+    --hairline-strong: #3f3f3f;
+    --focus: #e6e6e5;
+
+    --accent-proposed: #e0a43a;
+    --accent-proposed-soft: #3a2f17;
+    --accent-approved: #6b9bf5;
+    --accent-approved-soft: #1c2840;
+    --accent-staged: #a98bf5;
+    --accent-staged-soft: #2a2140;
+    --accent-implemented: #4fbf77;
+    --accent-implemented-soft: #17301f;
+    --alert: #f26464;
+    --alert-soft: #3d1c1c;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion: 0ms;
+  }
+}

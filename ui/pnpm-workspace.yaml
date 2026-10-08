@@ -1,16 +1,23 @@
 packages:
   - core
   - vscode
+  - app
 
-# esbuild's install script fetches its platform binary; without it the VS Code adapter
-# cannot bundle. pnpm blocks dependency build scripts by default (supply-chain defence) and
-# esbuild is the only one allowed here.
+# Dependency install scripts pnpm may run. pnpm blocks them by default (supply-chain defence),
+# and these are the only ones allowed here:
+# - esbuild: its install script fetches its platform binary; without it nothing bundles (the VS
+#   Code adapter, and electron-vite/Vite under the app).
+# - electron: its install script downloads the Electron binary from GitHub releases. Where GitHub
+#   is unreachable (the agent sandbox) set ELECTRON_SKIP_BINARY_DOWNLOAD=1: type-check and bundle
+#   need no binary, and the app's Electron smoke test skips and says why (D53.2).
 #
 # Both spellings are kept deliberately: pnpm 11 reads `allowBuilds`, pnpm 10 reads
 # `onlyBuiltDependencies`, and a mismatch is not a warning — the install fails with
 # ERR_PNPM_IGNORED_BUILDS. Carrying both means either version installs cleanly.
 allowBuilds:
   esbuild: true
+  electron: true
 
 onlyBuiltDependencies:
   - esbuild
+  - electron

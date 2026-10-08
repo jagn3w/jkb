@@ -14,8 +14,12 @@ database directly. Anything the UI does, the terminal can do (design D31).
 | **`core/`** (`@jkb/core`) | Portable TypeScript — **no `vscode`, no Node APIs**. The `JkbClient` transport interface (`client.ts`), domain models (`model.ts`: `NodeRef` / `TreeChild` / `NodeDetails` / `MutationIntent`), the node-kind **registry** (`registry.ts`), row colour policy (`decoration.ts`), detail HTML rendering (`details.ts`), per-folder count formatting (`summary.ts`), and the staging/In-Flight row shapes and labels (`staging.ts`). Reused verbatim by any host. |
 | **`vscode/`** (`jkb-explorer`) | The VS Code extension: `cliClient.ts` (spawns `jkb --json` — the only Node-specific transport), `tree.ts` (the Explorer `TreeDataProvider`), `inflight.ts` (the In Flight `TreeDataProvider`), `detailsPanel.ts` (the Webview details host), `decorations.ts` (row colours/badges), `claude.ts` (starting a session in the Claude Code extension), and `extension.ts` (command wiring). |
 
-A future web app is a third package that reuses `@jkb/core` with an HTTP-backed `JkbClient`
-— no rewrite of the models, registry, staging labels, or rendering.
+| **`app/`** (`@jkb/app`) | **Code Factory**, the jkb desktop app (Electron + React, built by electron-vite; design record [docs/code-factory.md](../docs/code-factory.md), D53). `src/main` holds the window, the bridge's handlers and `daemon.ts` — the `jkb serve` HTTP client and the only holder of the daemon's token; `src/preload` builds `window.jkb` from `src/shared/bridge.ts`, the typed contract; `src/renderer` is the React shell (the four tabs, design tokens in `styles/tokens.css`). The renderer has no Node and reaches jkb only through the bridge. |
+
+`@jkb/core`'s `daemon.ts` is the `jkb serve` wire protocol as data (where the daemon and its
+token are, the op/response/error shapes, reply decoding), shared by every adapter that speaks
+HTTP to the daemon. A future web app is another package that reuses `@jkb/core` the same way —
+no rewrite of the models, registry, staging labels, or rendering.
 
 ## Develop
 
@@ -37,6 +41,25 @@ no framework and no new dependency. A test bundles the module it covers with esb
 here for the extension bundle), aliasing `vscode` to a stub, so it needs neither a running
 VS Code nor `dist/`. That suits glue over an API we do not own: what it pins is our half —
 which command is asked for, with which arguments, and the state kept between two windows.
+
+`@jkb/core`'s tests (`core/test`) run against its emitted `dist/`, so `build` precedes `test`.
+
+## The desktop app (`app/`)
+
+```sh
+pnpm --filter @jkb/app run build   # type-check main/preload and renderer, then bundle to out/
+pnpm --filter @jkb/app run test    # client against a real HTTP server, tab shell, Electron smoke
+pnpm --filter @jkb/app run start   # run the built app (needs the Electron binary)
+```
+
+It talks to `jkb serve` at `$JKB_REMOTE` (default `127.0.0.1:7117`) with the token at
+`$JKB_REMOTE_TOKEN_FILE` (default `~/.jkb/daemon/<port>/token`) — the same variables and paths the
+CLI's remote mode uses. Start the daemon first (`jkb serve`).
+
+`pnpm install` downloads the Electron binary from GitHub releases. Where that is unreachable (the
+agent sandbox) install with `ELECTRON_SKIP_BINARY_DOWNLOAD=1`: type-check and bundle need no
+binary, and the Electron smoke (`app/test/smoke.test.mjs`, one test per tab) skips and says why.
+On Linux it also needs a display (`xvfb-run`), as in CI.
 
 ## Run the extension
 

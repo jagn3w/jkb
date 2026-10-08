@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided, not yet built.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtask 1 (the scaffold) is built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -52,6 +52,34 @@ Chromium is the stack VS Code itself ships; the Tauri equivalent (portable-pty +
   download (GitHub releases) may not be. Type-check and bundle need no binary
   (`ELECTRON_SKIP_BINARY_DOWNLOAD=1`); the Electron smoke tests are skipped with a stated reason
   when the binary is absent, never reported green.
+
+**As built (subtask 1).** `ui/app` is laid out as `src/main` (the window, the bridge's handlers,
+`daemon.ts` — the `jkb serve` client), `src/preload` (builds `window.jkb`), `src/shared/bridge.ts`
+(the typed contract both sides compile against) and `src/renderer` (React). The wire format —
+daemon URL and token path rules, op/response/error shapes, reply decoding — is `@jkb/core`'s
+`daemon.ts`, mirroring `crates/jkb-cli/src/remote.rs` and `crates/jkb-api`. What it cost to learn:
+
+- **The preload must be CommonJS.** A sandboxed preload cannot be an ES module, and electron-vite
+  emits ESM when the package says `"type": "module"`, so `@jkb/app` does not; `@jkb/core` is
+  bundled into main and the preload (`externalizeDeps.exclude`), never required at run time.
+- **The CSP is added at build time only.** `script-src 'self'; connect-src 'none'` is right for the
+  built page — every request goes through the bridge — but refuses the dev server's inline
+  React-refresh preamble, so `electron.vite.config.ts` injects it into the built `index.html`.
+- **`require("electron")` downloads the binary when it is missing** (measured on electron 44.5:
+  its `index.js` spawns `install.js` on a miss), so the smoke finds the binary through `path.txt`
+  itself and skips without touching the network.
+- **The daemon token is read `O_NOFOLLOW`** and must be a small regular file holding one word:
+  `~/.jkb` is writable from the dev container, and a planted link would have the app send
+  whatever it points at as a header. The CLI's reader follows links; the app is the first host
+  client that holds the root token in a long-lived GUI process, so it is the stricter one.
+- **pnpm 11 holds back releases younger than its minimum release age**, and `pnpm add` answered by
+  adding an exemption to `pnpm-workspace.yaml`. The exemption was removed and slightly older
+  versions pinned instead (electron 44.5.1, playwright-core 1.63.0): the gate is a supply-chain
+  defence, not an obstacle.
+- **CI runs the smoke under `xvfb-run`** with Ubuntu 24.04's AppArmor userns restriction lifted,
+  rather than with `--no-sandbox` — the renderer sandbox is what the smoke is there to exercise.
+  Not yet observed green on a runner when this was written; the agent sandbox has no Electron
+  binary and no display, so there the smoke skips, saying so.
 
 ### Visual language
 

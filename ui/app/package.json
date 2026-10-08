@@ -1,0 +1,33 @@
+{
+  "name": "@jkb/app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Code Factory, the jkb desktop app (Electron): a client of jkb serve's op set, never a backend (design D53).",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "build": "pnpm run typecheck && electron-vite build",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "dev": "electron-vite dev",
+    "start": "electron-vite preview",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "@jkb/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^44.5.1",
+    "electron-vite": "^5.0.0",
+    "esbuild": "^0.25.12",
+    "playwright-core": "^1.63.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.7"
+  }
+}
