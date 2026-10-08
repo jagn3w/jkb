@@ -25,9 +25,25 @@ FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 # what this directory did for /run/jkb-egress-verdict once egress-lib.sh single-sourced it.
 ENV JKB_REAPER=/usr/bin/tini
 
+# LINK WITH LLD, NOT GNU ld. Measured 2026-10-01 in this container on arm64, touching
+# crates/jkb-cli/tests/sessions.rs and rebuilding `cargo test -p jkb-cli --test sessions --no-run`,
+# four alternating runs per linker, best of each: GNU ld 21.2s wall / 7.8s CPU, lld 14.9s wall /
+# 6.4s CPU. Taken with two other Claude sessions running, so CPU time is the more reliable figure.
+# The lld measured was the toolchain's rust-lld 22.1.2 through its gcc-ld shim; what ships is
+# Ubuntu's `lld`, because the shim's path names the toolchain version and an ENV pointing at it
+# would break silently at the next rust-toolchain.toml bump. Both triples, because this image is
+# built for amd64 too and a flag for the other triple applies to nothing, silently (on x86_64,
+# rustc already defaults to its own lld; this makes the container say so rather than rely on it).
+# The flag and the package are here together, beside the build-time check below, because a flag
+# whose linker is absent fails every link in the container. verify.sh asserts the RESULT — a binary
+# cargo links in here carries LLD's .comment stamp — because RUSTFLAGS in a session overrides
+# these per-target flags and quietly reverts to GNU ld.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+
 RUN apt-get update -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        bubblewrap socat ripgrep jq tini \
+        bubblewrap socat ripgrep jq tini lld \
         build-essential pkg-config libssl-dev ca-certificates curl git \
         iptables ipset dnsutils \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
@@ -37,6 +53,10 @@ RUN apt-get update -qq \
     # start at all, with the cause one exec deep -- so it fails the BUILD instead, the way the
     # sudoers `visudo -c` check does.
     && test -x "$JKB_REAPER" \
+    # ...and the same for the linker the CARGO_TARGET_*_RUSTFLAGS above name: gcc's -fuse-ld=lld
+    # looks for `ld.lld` on PATH, so a package that stops providing it fails the build here rather
+    # than every link in the container.
+    && ld.lld --version \
     && rm -rf /var/lib/apt/lists/*
 
 # --- sibling-repo toolchain: Ruby + PostgreSQL (for ~/repos/contextual-translate) ----------------

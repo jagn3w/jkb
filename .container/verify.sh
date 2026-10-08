@@ -123,6 +123,20 @@ missing_extensions() { # missing_extensions <declared, one per line> <installed,
     printf '%s' "$out"
 }
 
+# WHICH LINKER PRODUCED A BINARY, from the probe build's exit code and `readelf -p .comment`.
+# Pure for assertion 9's sake: its `other` arm is the one a correctly built container never
+# reaches, so only --self-test can show it firing. lld stamps `Linker: LLD <ver>`, and Ubuntu's
+# build `Linker: Ubuntu LLD <ver>`; GNU ld writes no Linker line at all, so its absence is `other`.
+linker_verdict() { # linker_verdict <build rc> <.comment text> -> lld | other | unbuilt
+    [ "$1" -eq 0 ] || { echo unbuilt; return; }
+    # `LLD` as a whole word after `Linker:` — `(.* )?` makes the preceding character a space.
+    if grep -qE 'Linker:(.* )?LLD ' <<<"$2"; then
+        echo lld
+    else
+        echo other
+    fi
+}
+
 # WHAT AN ORPHAN'S FATE MEANS. Pure, taking its observations as arguments, for the reason
 # settle_step is (D52.4): the arm that matters most here is the one no healthy container can
 # reach, and a decision reachable only by running a container is a decision nothing in the gate
@@ -864,6 +878,19 @@ transcript sweep: 90000 deny bytes are projected and none of them can be archive
     st2 "a non-object file is refused" \
         "$(dc_merge_machine_settings "$mt/array" "$mt/want" >/dev/null 2>&1; echo $?)" 1
     rm -rf "$mt"
+
+    echo "==> verify.sh self-test: linker_verdict"
+    # Real .comment shapes: rust-lld (measured 2026-10-01 in jkb-dev), Ubuntu's lld, and a GNU-ld
+    # binary, which carries GCC's stamp and no Linker line.
+    gcc_line='  [     0]  GCC: (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0'
+    st2 "rust-lld's stamp is lld" \
+        "$(linker_verdict 0 '  [     0]  Linker: LLD 22.1.2 (/checkout/src/llvm-project/llvm 1cb4e38)')" lld
+    st2 "Ubuntu's lld stamp is lld" \
+        "$(linker_verdict 0 "$(printf '%s\n  [    2b]  Linker: Ubuntu LLD 18.1.3\n' "$gcc_line")")" lld
+    st2 "GNU ld — a GCC stamp and no Linker line — is other" "$(linker_verdict 0 "$gcc_line")" other
+    st2 "no .comment at all is other, not lld"                "$(linker_verdict 0 '')" other
+    st2 "a word merely ending in LLD is not lld"              "$(linker_verdict 0 '  [ 0]  Linker: XLLD 1.0')" other
+    st2 "a failed build is unbuilt, whatever the stamp says"  "$(linker_verdict 101 '  [ 0]  Linker: LLD 22.1.2')" unbuilt
 
     echo
     [ "$st_fail" -eq 0 ] || { printf '\033[31m%d failed\033[0m\n' "$st_fail"; exit 1; }
@@ -2341,6 +2368,41 @@ if [ -n "$code_server" ]; then
         bad "VS Code machine settings are missing or override: $(printf '%s' "$unset_keys" | tr '\n' ' ')— run
        /usr/local/lib/jkb-container/.container/install-extensions.sh (from the repo) from an attached terminal, then Developer: Reload Window"
     fi
+fi
+
+# 9. Cargo links with lld (the Dockerfile's CARGO_TARGET_*_RUSTFLAGS; measurement and reasons
+#    there). Asserted on a LINKED BINARY rather than on the environment, because the ways this
+#    fails are all silent: a RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS export overrides the per-target
+#    flags and cargo quietly links with GNU ld, and an image built without the ENV does the same.
+#    The binary's .comment section says which linker actually ran. A probe crate with no
+#    dependencies, built offline into its own target dir so it touches neither the network nor the
+#    shared target volume, under the pinned toolchain (rust-toolchain.toml copied in) with
+#    auto-install off, so a container whose toolchain is not installed yet skips instead of
+#    reaching for the network the firewall refuses.
+lld_repo="$(cd "$here_dc/.." && pwd)"
+if ! command -v cargo >/dev/null 2>&1 || ! command -v readelf >/dev/null 2>&1; then
+    echo "  skip no cargo or readelf here — the linker was not checked"
+elif ! (cd "$lld_repo" && RUSTUP_AUTO_INSTALL=0 rustc --version) >/dev/null 2>&1; then
+    echo "  skip the pinned Rust toolchain is not installed yet — the linker was not checked"
+else
+    lld_probe="$(mktemp -d)"
+    mkdir -p "$lld_probe/src"
+    printf '[package]\nname = "lldprobe"\nversion = "0.0.0"\nedition = "2021"\n' > "$lld_probe/Cargo.toml"
+    printf 'fn main() {}\n' > "$lld_probe/src/main.rs"
+    cp "$lld_repo/rust-toolchain.toml" "$lld_probe/"
+    lld_rc=0
+    lld_err="$(cd "$lld_probe" && RUSTUP_AUTO_INSTALL=0 CARGO_TARGET_DIR="$lld_probe/target" \
+               cargo build --offline -q 2>&1)" || lld_rc=$?
+    lld_comment="$(readelf -p .comment "$lld_probe/target/debug/lldprobe" 2>/dev/null || true)"
+    case "$(linker_verdict "$lld_rc" "$lld_comment")" in
+        lld)     ok "cargo links with lld ($(printf '%s\n' "$lld_comment" | grep -o 'Linker:.*' | head -1 | cut -c1-40))" ;;
+        other)   bad "cargo linked the probe crate WITHOUT lld — check for RUSTFLAGS / CARGO_ENCODED_RUSTFLAGS
+       overriding CARGO_TARGET_*_RUSTFLAGS, or an image built before the Dockerfile set them
+       (rebuild: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build)" ;;
+        *)       bad "the probe crate did not build, so no link here works either:
+       $(printf '%s' "$lld_err" | tail -3)" ;;
+    esac
+    rm -rf "$lld_probe"
 fi
 
 # THE DENY LIST STILL FITS IN ONE ARGV. This is the container's health report, and it said nothing
