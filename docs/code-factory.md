@@ -107,11 +107,22 @@ wire-compatible), so the CLI and the app edit the same document with no translat
 - **Live co-editing:** the app applies a local edit as `design.apply` (the update bytes,
   base64); the daemon appends it and publishes on topic `design/<uid>`; every subscriber merges.
   Updates are idempotent and commutative, so at-least-once delivery is enough.
-- **Claude edits through the CLI, by anchor, never by raw offset:**
-  `jkb design cat <uid>` prints the text with span markers; `jkb design edit <uid> --find
-  <quote> [--occurrence n] --replace <text>` / `--insert-after <quote>` / `--span <id>
-  --replace`. The CLI resolves the anchor to a position inside one transaction, so a concurrent
-  edit cannot slide it. An ambiguous or missing quote is refused, never guessed.
+- **Claude edits through the CLI against the version it read, and the CRDT merges.**
+  `jkb design cat <uid>` prints the text with span markers **and a version token** (the Yjs state
+  vector it was read at). `jkb design edit <uid> --base <token> --find <quote> [--occurrence n]
+  --replace <text>` / `--insert-after <quote>` / `--span <id> --replace` resolves the quote **in
+  the base snapshot**, converts it to Yjs item ids, and builds the update against that snapshot.
+  Appending it merges with everything written since, the same way two app peers merge. Both
+  edits survive, even inside one paragraph. Refused only where no merge exists: the targeted
+  text was deleted after the base, or the base predates the last compaction (re-read and retry).
+  An ambiguous or missing quote *in the base* is refused, never guessed.
+- **Quotes are addressing, not concurrency control.** A model copies a quote exactly and counts
+  offsets badly, so quotes are how Claude names text. They are matched in the version Claude
+  saw, never the latest one. *Superseded first draft:* "resolve the anchor against the current
+  document inside one transaction". That is read-latest-then-write, a lock in all but name, and
+  it threw away the CRDT's one guarantee. An edit to text the operator had just touched was
+  refused, or it landed on words Claude had never read. Caught by the operator in design review,
+  before any code.
 - **Editor:** CodeMirror 6 + `y-codemirror.next` over the same `Y.Text`, styled as live preview
   (headings, lists, code rendered in place, Notion-like). Text-first because Claude's CLI edits
   are text, and CodeMirror's decoration model is how span states are drawn.
