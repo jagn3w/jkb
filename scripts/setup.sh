@@ -14,11 +14,15 @@
 #   7. installs or refreshes the dev container's KIT (~/.local/share/jkb-container-kit), the copy of
 #      .container/ and the scripts it runs that the container is started from, so nothing the
 #      agent's sandbox can write in the checkout runs outside it (.container/README.md)
+#   8. builds + installs Code Factory, the desktop app, from a host-side clean clone of origin/main
+#      (~/.local/share/jkb-app/src), never from this checkout: it runs unsandboxed on the host
+#      (docs/code-factory.md, D53.3). Skipped when the installed copy is already main's tip.
 #
 # With JKB_REMOTE set (the dev container) only step 1 runs: the rest belongs to the machine
 # that serves the knowledge base.
 #
-# Flags: --no-extension, --no-service, --no-scaffold, --no-kit, --link-memory, --db <path>, -h/--help.
+# Flags: --no-extension, --no-service, --no-scaffold, --no-kit, --no-app, --link-memory, --db <path>,
+# -h/--help.
 #
 # --link-memory is opt-in, and deliberately not the default: it writes symlinks under
 # ~/.claude/projects so the dev container and the host share one auto-memory store, and this
@@ -36,6 +40,7 @@ do_extension=1
 do_service=1
 do_scaffold=1
 do_kit=1
+do_app=1
 link_memory=0
 # One state word per section, rendered at the end by `render_setup_summary` in lib.sh. Each
 # means what actually happened, not what was attempted: `watcher=running` is set to `failed`
@@ -48,6 +53,8 @@ extension_state=installed
 watcher_state=running
 serve_state=unchecked
 kit_state=installed
+app_state=skipped
+app_home="$HOME/.local/share/jkb-app"
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -56,6 +63,7 @@ while [ "$#" -gt 0 ]; do
     --no-service) do_service=0 ;;
     --no-scaffold) do_scaffold=0 ;;
     --no-kit) do_kit=0 ;;
+    --no-app) do_app=0 ;;
     --link-memory) link_memory=1 ;;
     --db) shift; db="$1" ;;
     -h|--help)
@@ -251,6 +259,18 @@ else
   warn "skipping the dev container kit (--no-kit)"
 fi
 
+# --- Code Factory, the desktop app (D53.3) ------------------------------------
+# NOT built from this checkout, which agents can write: the app runs unsandboxed on the host. The
+# clean clone under ~/.local/share/jkb-app is moved to origin/main and THE CLONE'S build-app.sh
+# builds and installs it (lib.sh's install_app). Wrapped like every step after the binary.
+if [ "$do_app" -eq 1 ]; then
+  say "Code Factory desktop app (built from origin/main, not from this checkout)"
+  install_app "$repo_root" "$app_home"
+  if [ "$app_state" = failed ]; then warn "could not install Code Factory — continuing."; fi
+else
+  warn "skipping the Code Factory app (--no-app)"
+fi
+
 # --- 3. VS Code extension ----------------------------------------------------
 if [ "$do_extension" -eq 1 ]; then
   say "build + install VS Code extension"
@@ -390,6 +410,7 @@ render_setup_summary < <(
   printf 'watcher=%s\n' "$watcher_state"
   printf 'serve=%s\n' "$serve_state"
   printf 'kit=%s %s\n' "$kit_state" "$("$repo_root/.container/run.sh" --kit-path 2>/dev/null || echo '(unknown)')"
+  printf 'app=%s %s\n' "$app_state" "$(app_default_dest "$(uname -s)" "$HOME" "$app_home")"
   printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
   printf 'notifier=%s %s\n' "$notifier_state" "${notifier_pid:-}"
 )

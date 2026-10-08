@@ -1690,6 +1690,15 @@ render_setup_summary() {
                     failed)    printf '  • container:  kit NOT installed; see the warnings above\n' ;;
                     *)         warn "unrecognised kit state: $line" ;;
                 esac ;;
+            app=*)
+                case "$state" in
+                    installed)  printf '  • app:        Code Factory installed at %s; it updates itself (jkb ▸ Update from main…)\n' "$detail" ;;
+                    unchanged)  printf '  • app:        Code Factory at %s is already main'"'"'s tip\n' "$detail" ;;
+                    no-builder) printf '  • app:        NOT installed: origin/main has no scripts/build-app.sh yet\n' ;;
+                    skipped)    printf '  • app:        skipped (--no-app)\n' ;;
+                    failed)     printf '  • app:        NOT installed; see the warnings above (an installed copy is unchanged)\n' ;;
+                    *)          warn "unrecognised app state: $line" ;;
+                esac ;;
             topic=*)
                 case "$state" in
                     ready)    printf '  • topic:      %s ready\n' "$detail" ;;
@@ -2076,4 +2085,179 @@ EOF
         return 1
     fi
     echo "   $n shell file(s) parse"
+}
+
+# --- Code Factory: the installed copy (docs/code-factory.md, D53.3) -------------------------------
+# The desktop app runs unsandboxed on the host and opens host terminals, so it is never run from a
+# checkout an agent can write. It is built from a CLEAN CLONE of origin/main under the account's
+# ~/.local/share/jkb-app (which the dev container does not mount), by that clone's own
+# scripts/build-app.sh, and copied into place. setup.sh calls `app_clone_refresh` and then the
+# clone's builder; the app's *Update from main…* moves the clone itself (ui/app/src/main/update.ts)
+# and runs the same builder. Here rather than inline for the reason every setup.sh section moved
+# here: scripts/tests/app-install.test.sh drives these against real repositories.
+
+# The ref an install takes, and the refspec that fetches main into it. ui/core/src/update.ts names
+# the same two (UPDATE_REF, UPDATE_REFSPEC) for the app's side.
+APP_UPDATE_REF=refs/remotes/origin/main
+APP_UPDATE_REFSPEC="+refs/heads/main:$APP_UPDATE_REF"
+
+# app_installed_commit <app-home> — the commit build-app.sh stamped as installed, or nothing.
+app_installed_commit() {
+    local line
+    [ -f "$1/installed" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            commit=*) printf '%s\n' "${line#commit=}"; return 0 ;;
+        esac
+    done <"$1/installed"
+}
+
+# app_clone_refresh <checkout> <src> — make <src> a clone of <checkout>'s origin, moved to the tip
+# of origin/main with nothing else in its tree. Creates the clone on first use, from the URL of the
+# checkout's `origin`; after that the clone's own `origin` is what it fetches, so nothing a checkout
+# says later redirects it. Returns non-zero, saying why on stderr, when it cannot.
+#
+# GIT_TERMINAL_PROMPT=0: the post-merge hook runs setup.sh, and a credential prompt there would hang
+# the pull rather than fail it.
+app_clone_refresh() {
+    local checkout="$1" src="$2" url
+    if [ ! -e "$src/.git" ]; then
+        if ! url="$(_git -C "$checkout" config --get remote.origin.url)" || [ -z "$url" ]; then
+            warn "$checkout has no origin remote to clone the app's source from"
+            return 1
+        fi
+        # Not over a directory that holds something else: that is not ours to replace.
+        if [ -e "$src" ] && [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
+            warn "$src exists and is not a git clone; move it aside and re-run"
+            return 1
+        fi
+        if ! mkdir -p "$(dirname "$src")" \
+           || ! GIT_TERMINAL_PROMPT=0 _git clone --quiet --no-checkout "$url" "$src"; then
+            warn "could not clone $url into $src"
+            return 1
+        fi
+    fi
+    if ! GIT_TERMINAL_PROMPT=0 _git -C "$src" fetch --quiet --no-tags origin "$APP_UPDATE_REFSPEC"; then
+        warn "could not fetch main into $src"
+        return 1
+    fi
+    if ! _git -C "$src" checkout --quiet --detach --force "$APP_UPDATE_REF" \
+       || ! _git -C "$src" clean -ffdq; then
+        warn "could not move $src to origin/main"
+        return 1
+    fi
+}
+
+# app_clone_check <src> — whether <src> is exactly origin/main: HEAD at its tip, and no tracked
+# change or untracked file (ignored ones — node_modules, build output — are allowed). What
+# build-app.sh refuses to build anything else on. Says why on stderr.
+app_clone_check() {
+    local src="$1" head tip dirty
+    if ! head="$(_git -C "$src" rev-parse --verify --quiet HEAD)" \
+       || ! tip="$(_git -C "$src" rev-parse --verify --quiet "$APP_UPDATE_REF^{commit}")"; then
+        warn "$src has no HEAD or no origin/main"
+        return 1
+    fi
+    if [ "$head" != "$tip" ]; then
+        warn "$src is at ${head:0:12}, not origin/main (${tip:0:12}); the app is built from main and nothing else"
+        return 1
+    fi
+    if ! dirty="$(_git -C "$src" status --porcelain --untracked-files=all)"; then
+        warn "git could not say whether $src is clean"
+        return 1
+    fi
+    if [ -n "$dirty" ]; then
+        warn "$src has changes that are not on main:"
+        printf '%s\n' "$dirty" | sed -n '1,10p' >&2
+        return 1
+    fi
+}
+
+# app_built_product <dist> <uname -s> — the one packaged app electron-builder left in <dist>:
+# `mac*/Code Factory.app` on macOS (mac, mac-arm64, …), `linux*-unpacked` elsewhere. Fails unless
+# there is exactly one, so a stale product of another architecture is never the one installed.
+app_built_product() {
+    local dist="$1" os="$2" found="" n=0 p
+    for p in "$dist"/mac*/"Code Factory.app" "$dist"/linux*-unpacked; do
+        [ -d "$p" ] || continue
+        case "$os:$p" in
+            Darwin:*.app|Linux:*-unpacked) found="$p"; n=$((n + 1)) ;;
+        esac
+    done
+    if [ "$n" -ne 1 ]; then
+        warn "expected one packaged app in $dist for $os, found $n"
+        return 1
+    fi
+    printf '%s\n' "$found"
+}
+
+# app_default_dest <uname -s> <home> <app-home> — where the installed app goes: ~/Applications on
+# macOS, <app-home>/app elsewhere.
+app_default_dest() {
+    case "$1" in
+        Darwin) printf '%s\n' "$2/Applications/Code Factory.app" ;;
+        *)      printf '%s\n' "$3/app" ;;
+    esac
+}
+
+# install_app <checkout> <app-home> — setup.sh's app step: move the clone to origin/main, then run
+# THE CLONE'S build-app.sh (never <checkout>'s). Reports, so it returns 0 and sets `app_state`:
+#   installed   built and installed origin/main's tip now
+#   unchanged   that tip is already installed (stamped, and the app is where it was put)
+#   no-builder  origin/main has no scripts/build-app.sh yet: it predates the installed copy
+#   failed      anything else, said on stderr; an installed app is left as it was
+# The unchanged arm is what keeps this cheap: setup.sh runs after every pull that touches ui/.
+install_app() {
+    local checkout="$1" app_home="$2" src tip
+    src="$app_home/src"
+    app_state=failed
+    app_clone_refresh "$checkout" "$src" || return 0
+    tip="$(_git -C "$src" rev-parse --verify --quiet HEAD)" || return 0
+    if [ "$(app_installed_commit "$app_home")" = "$tip" ] \
+       && [ -d "$(app_default_dest "$(uname -s)" "$HOME" "$app_home")" ]; then
+        app_state=unchanged
+        return 0
+    fi
+    if [ ! -f "$src/scripts/build-app.sh" ]; then
+        app_state=no-builder
+        return 0
+    fi
+    if /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home"; then
+        app_state=installed
+    fi
+    return 0
+}
+
+# app_swap <built> <dest> <previous> — install the directory <built> at <dest>.
+#
+# Copied beside <dest> first, so a failed copy leaves the installed app as it was; then the
+# installed one is MOVED to <previous> (replacing an older one there) and the copy renamed into
+# place. Moved rather than deleted because the app being replaced is usually the one running the
+# update: its files stay where it can still read them until it relaunches, and <previous> is the
+# one-step rollback. If the final rename fails, the old app is moved back.
+app_swap() {
+    local built="$1" dest="$2" prev="$3" new
+    if [ ! -d "$built" ]; then
+        warn "nothing to install: $built is not a directory"
+        return 1
+    fi
+    new="$dest.new.$$"
+    if ! mkdir -p "$(dirname "$dest")" || ! rm -rf "$new" || ! cp -pR "$built" "$new"; then
+        rm -rf "$new"
+        warn "could not copy $built beside $dest"
+        return 1
+    fi
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        if ! rm -rf "$prev" || ! mkdir -p "$(dirname "$prev")" || ! mv "$dest" "$prev"; then
+            rm -rf "$new"
+            warn "could not move the installed app at $dest aside"
+            return 1
+        fi
+    fi
+    if ! mv "$new" "$dest"; then
+        { [ -e "$prev" ] && mv "$prev" "$dest"; } || :
+        rm -rf "$new"
+        warn "could not move the new app into $dest"
+        return 1
+    fi
 }

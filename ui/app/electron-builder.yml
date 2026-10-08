@@ -1,0 +1,33 @@
+# The installed copy (D53.3): `pnpm run package`, run by scripts/build-app.sh from the app's clean
+# clone of origin/main, never from a checkout. `--dir` only: the result is copied into place on this
+# machine, so there is no installer, no dmg/AppImage download, and no signing.
+appId: dev.jkb.code-factory
+productName: Code Factory
+directories:
+  output: dist
+# The bundle electron-vite emitted, and the manifest. @jkb/core and the renderer's libraries are
+# bundled into out/ (devDependencies); node-pty is the one runtime dependency, and comes along as one.
+files:
+  - out/**
+  - package.json
+# node-pty is a native module with a helper executable (spawn-helper on macOS): neither can run from
+# inside an asar archive.
+asarUnpack:
+  - "**/node_modules/node-pty/**"
+# node-pty is a Node-API module, so the build pnpm made loads in Electron as it is (docs/code-factory.md,
+# D53.10). A rebuild would fetch Electron's headers for nothing.
+npmRebuild: false
+mac:
+  target: dir
+  category: public.app-category.developer-tools
+  # Built and run on the same machine; nothing is distributed, so nothing is signed for distribution.
+  # AD-HOC, not unsigned: renaming the bundle invalidates Electron's own signature, and Apple silicon
+  # kills an executable whose signature is invalid. `"-"` is electron-builder's ad-hoc identity (its
+  # schema, 26.17); `null` would skip signing. Hardened runtime off, because with it library
+  # validation rejects the Electron framework signed by another team (the same schema says so).
+  identity: "-"
+  hardenedRuntime: false
+linux:
+  target: dir
+  executableName: code-factory
+  category: Development

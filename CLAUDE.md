@@ -137,7 +137,10 @@ implementation checklist and the **source of truth for what's done**.
   container with `~/.local/share/jkb-container-kit/kit/.container/run.sh` (`run.sh --kit-path` prints
   the kit's directory), never with the checkout's `run.sh`, which refuses: everything that runs outside the agent's
   sandbox comes from the kit (`.container/README.md`, "Everything unsandboxed runs from the kit").
-  Flags: `--no-extension`/`--no-service`/`--no-scaffold`/`--no-kit`/`--db`. `jkb ns mk <path>…` creates namespaces
+  The same rule installs the Code Factory app: built by a clean clone of `origin/main`
+  (`~/.local/share/jkb-app/src`, its own `scripts/build-app.sh`), never this checkout, and updated from
+  its menu (docs/code-factory.md, D53.3).
+  Flags: `--no-extension`/`--no-service`/`--no-scaffold`/`--no-kit`/`--no-app`/`--db`. `jkb ns mk <path>…` creates namespaces
   idempotently (the only way to make an empty namespace; others arise from placements/mounts).
 - Per-task status (with `[~]` partials and inline notes) is in
   `openspec/changes/jkb-v1-foundation/tasks.md` (v1) and

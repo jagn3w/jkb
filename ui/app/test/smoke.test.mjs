@@ -9,6 +9,7 @@
 // own), so it never talks to the operator's real `jkb serve` and the status reads unreachable.
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import { createRequire } from "node:module";
@@ -69,7 +70,8 @@ before(async () => {
   app = await electron.launch({
     executablePath: binary,
     args: [appDir],
-    env: { ...process.env, HOME: home, JKB_REMOTE: `127.0.0.1:${port}`, JKB_REMOTE_TOKEN_FILE: "", ELECTRON_RENDERER_URL: "" },
+    // JKB_APP_FROM_CHECKOUT: this is the checkout's build, which refuses to start without it (D53.3).
+    env: { ...process.env, HOME: home, JKB_REMOTE: `127.0.0.1:${port}`, JKB_REMOTE_TOKEN_FILE: "", ELECTRON_RENDERER_URL: "", JKB_APP_FROM_CHECKOUT: "1" },
   });
   page = await app.firstWindow();
   await page.waitForSelector('[role="tablist"]');
@@ -78,6 +80,17 @@ before(async () => {
 after(async () => {
   await app?.close();
   if (home !== undefined) fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The installed copy is what runs (D53.3): the checkout's build, started without the opt-in, says
+// why and exits before it opens a window.
+test("run from a checkout without JKB_APP_FROM_CHECKOUT=1, the app refuses to start", { skip }, () => {
+  const env = { ...process.env, HOME: home, ELECTRON_RENDERER_URL: "" };
+  delete env.JKB_APP_FROM_CHECKOUT;
+  const r = spawnSync(binary, [appDir], { env, encoding: "utf8", timeout: 30_000 });
+  assert.equal(r.status, 1, `exit ${r.status}, signal ${r.signal}; stderr: ${r.stderr}`);
+  assert.match(r.stderr, /running from a checkout/);
+  assert.match(r.stderr, /JKB_APP_FROM_CHECKOUT=1/);
 });
 
 test("the renderer has no Node, only the bridge", { skip }, async () => {

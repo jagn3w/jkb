@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane), 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not), 8 (the Container tab) and 9 (the Sessions tab) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane), 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not), 8 (the Container tab), 9 (the Sessions tab) and 10 (the installed copy and Update from main) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -113,6 +113,61 @@ runs from an agent-writable checkout.**
 - Running from a checkout (`pnpm --filter @jkb/app dev`) refuses unless
   `JKB_APP_FROM_CHECKOUT=1` — the same opt-in `run.sh` uses — so it is a deliberate developer
   act, never the default.
+
+**As built (subtask 10).** Four pieces, one rule: what is installed is built by the clone's own
+code, at `origin/main`, and a checkout never gets a say.
+
+- **`scripts/lib.sh`** holds the shell half, so `scripts/tests/app-install.test.sh` drives it against
+  real repositories: `app_clone_refresh` (clone from the checkout's `origin` on first use only — after
+  that the clone's own `origin` is fetched, so a checkout cannot redirect it later; fetch
+  `+refs/heads/main:refs/remotes/origin/main`; detach there with `--force`; `git clean -ffd`, which
+  keeps ignored build state such as `node_modules`), `app_clone_check` (HEAD is `origin/main`'s tip and
+  nothing is changed or untracked), `app_swap`, and `install_app`, setup.sh's step. setup.sh runs it
+  after the kit (`--no-app` skips it); it is `unchanged`, and builds nothing, when the stamp already
+  names `main`'s tip and the app is where it was put — setup.sh runs after every pull touching `ui/`.
+- **`scripts/build-app.sh`**, run only as the clone's copy, refuses unless its own repository *is*
+  `<app-home>/src` and `app_clone_check` passes, so a checkout's or worktree's copy builds nothing.
+  Then `pnpm install --frozen-lockfile`, `pnpm --filter "@jkb/app..." run build` (each package
+  type-checks before it emits), `pnpm --filter @jkb/app run package` (`electron-builder --dir`,
+  `ui/app/electron-builder.yml`), the swap, and last the stamp `<app-home>/installed` (`commit=<sha>`),
+  which is what the update counts from. On Linux it writes a desktop entry.
+- **Where things go:** `~/.local/share/jkb-app/{src,installed,update.log,previous}`; the app at
+  `~/Applications/Code Factory.app` (macOS) or `~/.local/share/jkb-app/app/code-factory` (Linux).
+- **The swap moves, never deletes, the running app.** The copy is made beside the destination first
+  (a failed copy changes nothing), the installed app is moved to `previous/` — the update is usually
+  run *by* that app, which keeps reading its files until it relaunches, and it is the one-step
+  rollback — and the copy renamed in. A failed rename moves the old one back.
+- **In the app**, `src/main/update.ts` (`AppUpdater`) and `@jkb/core`'s `update.ts` (paths, the stamp,
+  the commit log, the confirmation's words, `checkoutRefusal`). *jkb ▸ Update from main…* (on macOS
+  the second menu, after the app menu Apple names after the app) fetches, shows
+  `installed..origin/main` with its commits — saying so when the installed commit is not an ancestor,
+  i.e. `main` was rewritten — and on a yes checks that `origin/main` is still the commit it showed,
+  moves the clone there, cleans it, runs the clone's `build-app.sh`, requires the stamp to name that
+  commit, then `app.relaunch()` and `app.quit()` (so `will-quit` ends the terminals and feeds). A
+  failure says the installed app is unchanged and leaves the builder's output in `update.log`. Git and
+  the builder run with Electron's variables and git's repository selection stripped from the
+  environment, so a launching shell's `GIT_DIR` cannot point the fetch elsewhere.
+- **The refusal is in main**, before any window: not `app.isPackaged` and not
+  `JKB_APP_FROM_CHECKOUT=1` prints why and exits 1. One check covers `dev`, `start` and any other way
+  of running `out/` from a checkout; the Electron smoke sets the variable, and has a case that the
+  build refuses without it.
+- **Packaging decisions** (`electron-builder.yml`): `asarUnpack` for `node-pty` (a native module and,
+  on macOS, an executable `spawn-helper`, neither of which runs from inside an asar); `npmRebuild:
+  false`, because node-pty is Node-API and the build pnpm made loads in Electron as it is (D53.10);
+  `@jkb/core` moved to `devDependencies`, since it is bundled into `out/` and node-pty is then the
+  only runtime dependency the packager collects. macOS signs **ad-hoc** (`identity: "-"`, hardened
+  runtime off): renaming the bundle invalidates Electron's signature, and Apple silicon kills an
+  executable whose signature is invalid; with hardened runtime on, library validation would reject
+  the Electron framework signed by another team (electron-builder 26.17's own schema says both).
+  `electron-winstaller`, which arrives with electron-builder, has its install script denied by name
+  (`pnpm-workspace.yaml`): it serves Windows installers only, and pnpm 11 fails an install on a
+  script that is neither allowed nor denied.
+- *Measured here:* `electron-builder --dir` with this config, against a stand-in Electron
+  distribution (`electronDist`; the real one is a GitHub download the sandbox cannot reach), found
+  node-pty through pnpm and left it — `build/Release/pty.node` included — under
+  `resources/app.asar.unpacked`. *Unmeasured, stated:* a real package and launch on macOS and Linux
+  (the Electron download), the relaunch after a swap, and on Linux whether Chromium's sandbox starts
+  under Ubuntu 24.04's AppArmor user-namespace restriction outside CI, where it is lifted (D53.2).
 
 ## D53.4 — Designs are CRDT documents stored in jkb
 
@@ -613,7 +668,7 @@ What it cost to learn:
   Electron smoke, which needs the binary the sandbox cannot download; it runs in CI.
 - **Unmeasured here, stated:** what Docker does to the process inside the container when the
   `docker exec` client is killed (no Docker in the agent sandbox), and the macOS `spawn-helper` path
-  of node-pty (no Mac). Packaging the native module (`asarUnpack`) belongs to subtask 10.
+  of node-pty (no Mac). Packaging the native module (`asarUnpack`) is subtask 10's (D53.3, as built).
 
 ## Subtasks, in landing order
 

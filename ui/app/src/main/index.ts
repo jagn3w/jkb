@@ -6,13 +6,40 @@
 // a window this process created, showing the app's own page. The daemon's token is read and held
 // here and never crosses; so are the integrated terminal's PTYs (`terminals.ts`), whose output is
 // the only thing about them that does.
+//
+// It runs from the installed copy (D53.3): a packaged app, built from a host-side clean clone of
+// `origin/main` and updated from the menu (*jkb ▸ Update from main…*, `update.ts`). Run from a
+// checkout, it refuses unless `JKB_APP_FROM_CHECKOUT=1` says that is deliberate.
 
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { REMOTE_VAR, TOKEN_FILE_VAR, daemonUrl, failed, portOf, tokenPath, type OpRequest } from "@jkb/core";
-import { BrowserWindow, app, ipcMain, nativeTheme, webContents, type IpcMainEvent, type IpcMainInvokeEvent } from "electron";
+import {
+  REMOTE_VAR,
+  TOKEN_FILE_VAR,
+  checkoutRefusal,
+  daemonUrl,
+  failed,
+  portOf,
+  tokenPath,
+  updateSummary,
+  type OpRequest,
+} from "@jkb/core";
+import {
+  BrowserWindow,
+  Menu,
+  app,
+  dialog,
+  ipcMain,
+  nativeTheme,
+  webContents,
+  type IpcMainEvent,
+  type IpcMainInvokeEvent,
+  type MenuItemConstructorOptions,
+  type MessageBoxOptions,
+  type MessageBoxReturnValue,
+} from "electron";
 import type * as NodePty from "node-pty";
 
 import { BRIDGE_CHANNELS, type AppInfo } from "../shared/bridge";
@@ -23,6 +50,10 @@ import { DesignFeeds } from "./designFeeds";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
 import { TerminalHost, machineEnvironment, type SpawnPty } from "./terminals";
+import { AppUpdater, machineRunner } from "./update";
+
+/** Why this process may not run — it is a checkout, and nobody said that was deliberate — or `undefined`. */
+const refusal = checkoutRefusal(app.isPackaged, process.env);
 
 /** Set by `electron-vite dev` to the renderer's dev server; never honoured by a packaged app. */
 const DEV_RENDERER_URL = (!app.isPackaged && process.env["ELECTRON_RENDERER_URL"]?.trim()) || undefined;
@@ -83,6 +114,9 @@ function accountHome(): string {
   }
 }
 const containerKit = new ContainerKit(machineKit(accountHome(), process.env));
+
+/** The installed copy's clean clone and its builder, under the same account home as the kit (D53.3). */
+const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), process.env));
 
 /** Live design updates, one long-poll per open design shared by every window showing it (D53.4). */
 const designFeeds = new DesignFeeds(
@@ -273,18 +307,108 @@ function createWindow(): void {
   }
 }
 
+/** A message box, over the focused window when there is one. */
+function messageBox(options: MessageBoxOptions): Promise<MessageBoxReturnValue> {
+  const win = BrowserWindow.getFocusedWindow();
+  return win === null ? dialog.showMessageBox(options) : dialog.showMessageBox(win, options);
+}
+
+/** Every window's progress bar: indeterminate while `busy`, cleared otherwise. */
+function showBusy(busy: boolean): void {
+  for (const win of BrowserWindow.getAllWindows()) win.setProgressBar(busy ? 2 : -1);
+}
+
+/**
+ * *jkb ▸ Update from main…*: fetch `main` into the clean clone, show the commits it would take,
+ * and on a yes build exactly that commit, swap it in and relaunch (D53.3).
+ */
+async function updateFromMain(): Promise<void> {
+  if (!app.isPackaged) {
+    await messageBox({
+      type: "info",
+      message: "Update from main is for the installed copy",
+      detail:
+        "This app is running from a checkout (JKB_APP_FROM_CHECKOUT=1). Update the checkout with git; the installed copy updates itself from main.",
+    });
+    return;
+  }
+  if (updater.busy) {
+    await messageBox({ type: "info", message: "An update is already building." });
+    return;
+  }
+  showBusy(true);
+  const plan = await updater.plan();
+  showBusy(false);
+  if (!plan.ok) {
+    await messageBox({ type: "error", message: "Could not check main for an update", detail: plan.error });
+    return;
+  }
+  const summary = updateSummary(plan.value);
+  if (summary === undefined) {
+    await messageBox({ type: "info", message: "Code Factory is up to date with main", detail: `Installed: ${plan.value.target.slice(0, 12)}` });
+    return;
+  }
+  const { response } = await messageBox({
+    type: "question",
+    buttons: ["Update and Relaunch", "Cancel"],
+    defaultId: 0,
+    cancelId: 1,
+    message: summary.message,
+    detail: summary.detail,
+  });
+  if (response !== 0) return;
+  showBusy(true);
+  const done = await updater.apply(plan.value.target);
+  showBusy(false);
+  if (!done.ok) {
+    await messageBox({ type: "error", message: "The update did not install", detail: done.error });
+    return;
+  }
+  // Swapped in under the same path, so relaunching starts the new build. `quit`, not `exit`, so
+  // `will-quit` ends the terminals and feeds as on any quit.
+  app.relaunch();
+  app.quit();
+}
+
+/** The application menu: the platform's standard menus, plus *jkb* with *Update from main…*. */
+function installMenu(): void {
+  const mac = process.platform === "darwin";
+  const jkb: MenuItemConstructorOptions = {
+    label: "jkb",
+    submenu: [
+      { label: "Update from main…", click: () => void updateFromMain() },
+      // On macOS Quit is in the app menu; elsewhere this is the first menu, and it goes here.
+      ...(mac ? [] : [{ type: "separator" as const }, { role: "quit" as const }]),
+    ],
+  };
+  const template: MenuItemConstructorOptions[] = [
+    ...(mac ? [{ role: "appMenu" as const }] : []),
+    jkb,
+    { role: "editMenu" },
+    { role: "viewMenu" },
+    { role: "windowMenu" },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 // Nothing may be granted to a page by asking: no camera, notifications, clipboard reads, ….
 app.on("web-contents-created", (_event, contents) => {
   contents.session.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
 });
 
-void app.whenReady().then(() => {
-  registerBridge();
-  createWindow();
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+if (refusal !== undefined) {
+  process.stderr.write(`code-factory: ${refusal}\n`);
+  app.exit(1);
+} else {
+  void app.whenReady().then(() => {
+    installMenu();
+    registerBridge();
+    createWindow();
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
-});
+}
 
 app.on("will-quit", () => {
   terminals.closeAll();

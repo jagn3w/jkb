@@ -49,8 +49,15 @@ which command is asked for, with which arguments, and the state kept between two
 ```sh
 pnpm --filter @jkb/app run build   # type-check main/preload and renderer, then bundle to out/
 pnpm --filter @jkb/app run test    # client against a real HTTP server, tab shell, Electron smoke
-pnpm --filter @jkb/app run start   # run the built app (needs the Electron binary)
+JKB_APP_FROM_CHECKOUT=1 pnpm --filter @jkb/app run start   # run the built app (needs the Electron binary)
 ```
+
+The app you use is the **installed copy** (D53.3): `scripts/setup.sh` builds it from a clean clone of
+`origin/main` under `~/.local/share/jkb-app/src` with that clone's `scripts/build-app.sh`, and the app
+updates itself from its menu (*jkb ▸ Update from main…*). Run from this checkout (`dev`, `start`), it
+refuses to start unless `JKB_APP_FROM_CHECKOUT=1` says that is deliberate: it runs unsandboxed on the
+host, and an agent can write this checkout. `pnpm --filter @jkb/app run package` is the packaging
+step (`electron-builder --dir`, `app/electron-builder.yml`); `build-app.sh` is what runs it.
 
 It talks to `jkb serve` at `$JKB_REMOTE` (default `127.0.0.1:7117`) with the token at
 `$JKB_REMOTE_TOKEN_FILE` (default `~/.jkb/daemon/<port>/token`) — the same variables and paths the

@@ -15,6 +15,9 @@ packages:
 #   node-gyp, which downloads Node's headers from nodejs.org. Where that is unreachable (the agent
 #   sandbox) install with `npm_config_nodedir=/usr` to compile against the local headers. It is a
 #   Node-API module, so the one build loads in Node (the tests) and in Electron (the app) alike.
+# - electron-winstaller is DENIED: it arrives with electron-builder (the installed copy, D53.3) and
+#   its script only serves Windows installers, which jkb does not build. Denied by name because
+#   pnpm 11 fails the install on a build script that is neither allowed nor denied.
 #
 # Both spellings are kept deliberately: pnpm 11 reads `allowBuilds`, pnpm 10 reads
 # `onlyBuiltDependencies`, and a mismatch is not a warning — the install fails with
@@ -23,11 +26,15 @@ allowBuilds:
   esbuild: true
   electron: true
   node-pty: true
+  electron-winstaller: false
 
 onlyBuiltDependencies:
   - esbuild
   - electron
   - node-pty
+
+ignoredBuiltDependencies:
+  - electron-winstaller
 
 # @codemirror/language 6.13.0 (published 2026-10-07) imports @codemirror/streamparser without
 # declaring it, so the app (D53.4) does not bundle with it; 6.13.1 declares it but was a day old.
