@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane) and 6 (the Prompts pane) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane) and 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -398,6 +398,69 @@ edits them needs them as data.
   from the table, never redrawn by hand.
 - *Contribute to jkb* exports a template to the repo's packaged-templates file on a new branch
   and opens a PR — run in the container, as every git write is.
+
+**Scope split (operator decision, 2026-10-08).** An agent cannot write `.claude/` in its own worktree
+(the harness keeps it read-only), so subtask 7 is two: **7a** builds everything below and edits nothing
+under `.claude/`; **7b**, host-only, rewires `.claude/workflows/*.js` to read their prompts with `jkb
+workflow agent show`. Until 7b lands the scripts still carry their own copies, and an operator copy
+saved in the tab is not yet what they run.
+
+**As built (subtask 7a).** The engine is `crates/jkb-core/src/workflow/agents.rs` with the packaged
+templates in `agents.json` beside it and the operator's copies in `workflow_agents` (V025); the ops
+`workflow.agents`/`agent` (reads), `workflow.agent_copy`/`agent_set` (the operator's) and
+`workflow.graph` (a read) are `crates/jkb-api/src/workflows.rs`; `jkb workflow agent
+list|show|copy|set|export` (`crates/jkb-cli/src/agent_cli.rs`) and `jkb workflow show --graph` are the
+CLI; `jkb_fsm::Machine::table()` is the table as data. In the app, `@jkb/core`'s `workflows.ts` (the
+shapes, the requests, what a save sends, both layouts) and `src/renderer/src/workflows/`
+(`AgentGraphView`, `AgentPanel`, `LifecyclePane`, `contribute.ts`). What was decided past the text above:
+
+- **Packaged templates are compiled in, not rows — "seeded" as the strategy presets are.** The file
+  `crates/jkb-core/src/workflow/agents.json` is `include_str!`'d and served beside the stored copies as
+  read-only rows, exactly as `PRESETS` sit beside `workflow_strategies`. Writing them into the table at
+  open was rejected: the reader connection is `query_only`, a newer jkb's packaged text would need a
+  migration (or a write on every open) to reach an existing database, and a row is something an
+  `UPDATE` can edit — a compiled-in template cannot be edited in place by anything. The file is the one
+  a contribution changes, so "the file and the tab cannot disagree" holds by construction.
+- **A copy under a packaged name overrides it.** `workflow.agent <name>` answers the newest operator
+  copy, else the packaged template — so once 7b lands, a script asking for `swarm-implementer` runs the
+  operator's text. A copy under *another* packaged name is refused (it would silently replace that
+  agent with an unrelated prompt); under a new name it is the operator's own template. Copies are
+  versioned and append-only like strategy definitions, and not changelogged for the same reason.
+  Reverting is `copy <name> --packaged`, a new version holding the packaged text — nothing is deleted.
+  A copy records `packaged:<name>@<v>` it was taken from, so the listing says when the packaged
+  template has moved on since (`behind_packaged`).
+- **The templates were copied out of the scripts, not rewritten.** Each prompt function's template
+  literal became a template whose `${…}` interpolations are `{{placeholders}}`; a conditional block
+  (`${reviewHint ? … : ''}`) is one placeholder the script fills with the block it computes. The code
+  review's shared contract is a **fragment** (`review-preamble`, included as `{{preamble}}`, not drawn
+  as an agent); each lens and each skeptic angle is a template of its own, its question copied in.
+  The file stores each prompt as an array of lines, so a contribution's pull request diffs line by line;
+  a test holds the file to the canonical form `export` writes, so the diff is only the change.
+- **Placeholders are checked when saved and when filled.** `{{name}}` of `a-z0-9_`; an unclosed `{{` or
+  a malformed name is refused at save. Filling (`show --var k=v`, the op's `vars`) refuses a placeholder
+  with no value and a value with no placeholder, so a script and a template that have drifted apart
+  fail loudly rather than run a prompt with a hole in it.
+- **Permissions are two halves, both shown.** The role's jkb op classes (`OP_GRANTS`, enforced by
+  `jkb serve`) come with every template; the template's own `permissions` — where it runs (`none` /
+  `worktree`), its model (none: the session's), the most it may change (`nothing`/`kb`/`git`/`code`) —
+  are what the script enforces, read from the `agent()` options the scripts pass today. Stored with
+  `deny_unknown_fields`: a permission a newer jkb added is refused by an older one, never dropped.
+- **The agent graph is drawn from the hand-offs, per workflow.** Each template names the agents it
+  hands its result to (`hands_off_to`); the tab lays a workflow's agents out by distance from those
+  nothing hands to, and an arrow running back (review → implementer) bends below. The strategy picker
+  drives the Lifecycle pane, which marks the states where the selected agent's role acts next — the
+  agents' place in that strategy.
+- **The Lifecycle pane is the table.** `workflow.graph` answers the strategy's workflow machine — each
+  state with who acts next (`next_actor`), each transition with the roles the strategy's permission
+  table lets fire it — and the task lifecycle machine, both from `Machine::table()`. Self-loops and
+  overrides are listed under the picture rather than drawn (every live state has an override), and the
+  list under it is every row.
+- **Contribute runs in a fresh worktree off `origin/main`**, under the checkout's `.jkb/work/`: export
+  the saved copy, commit only `agents.json`, push, `gh pr create`, remove the worktree. Never the
+  operator's checkout, so neither their branch nor their uncommitted work rides along. Pinned against a
+  real git repository with a local `origin` and stand-in `jkb`/`gh` (`ui/app/test/workflows.test.mjs`).
+  *Unmeasured, stated:* the push and the pull request need the container's git credential and `gh`
+  login, which the sandbox has neither of.
 
 ## D53.8 — Container tab: buttons over the kit, never over the checkout
 

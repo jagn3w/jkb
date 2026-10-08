@@ -5098,3 +5098,143 @@ fn a_session_is_recorded_from_where_it_starts_and_listed_with_its_resume() {
         .failure()
         .stderr(predicate::str::contains("not a session uuid"));
 }
+
+/// `jkb workflow agent` (D53.7): a script reads a packaged template filled in; the operator copies
+/// and edits it, which the same read then answers; `export` writes it into a packaged-templates file
+/// as its next version.
+#[test]
+fn workflow_agent_copy_set_show_and_export() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let listed = jkb(&db)
+        .args(["--json", "workflow", "agent", "list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert!(v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["name"] == "swarm-status" && a["source"] == "packaged"));
+
+    // A placeholder left empty is refused rather than run with a hole in the prompt.
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "show",
+            "swarm-status",
+            "--var",
+            "status=open",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no value for"));
+
+    jkb(&db)
+        .args(["workflow", "agent", "copy", "swarm-status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("as swarm-status v1"));
+    let template = dir.path().join("t.md");
+    std::fs::write(&template, "Set {{status}} on {{commands}}.").unwrap();
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "set",
+            "swarm-status",
+            "--template-file",
+        ])
+        .arg(&template)
+        .args(["--model", "session"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("swarm-status is now v2"));
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "show",
+            "swarm-status",
+            "--var",
+            "status=open",
+            "--var",
+            "commands=x",
+        ])
+        .assert()
+        .success()
+        .stdout("Set open on x.");
+
+    // Export into a copy of the packaged file: that entry moves to its next version.
+    let file = dir.path().join("agents.json");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../jkb-core/src/workflow/agents.json"),
+        &file,
+    )
+    .unwrap();
+    jkb(&db)
+        .args(["workflow", "agent", "export", "swarm-status", "--file"])
+        .arg(&file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("swarm-status packaged as v2"));
+    let text: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let entry = text["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "swarm-status")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        entry["template"],
+        serde_json::json!(["Set {{status}} on {{commands}}."])
+    );
+    assert_eq!(entry["permissions"]["model"], serde_json::Value::Null);
+}
+
+/// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or
+/// the default; without `--graph` a task is required.
+#[test]
+fn workflow_show_graph_prints_the_machines() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args([
+            "--json",
+            "workflow",
+            "show",
+            "--graph",
+            "--strategy",
+            "coordinated",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["strategy"], "coordinated");
+    assert!(v["workflow"]["transitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["event"] == "approve_design"
+            && t["roles"] == serde_json::json!(["operator", "coordinator"])));
+    assert!(!v["lifecycle"]["states"].as_array().unwrap().is_empty());
+    jkb(&db)
+        .args(["workflow", "show", "--graph"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("strategy:  design-reviewed"));
+    jkb(&db)
+        .args(["workflow", "show"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--graph"));
+}

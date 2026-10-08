@@ -81,10 +81,19 @@ pub enum RoleCmd {
 
 #[derive(Subcommand)]
 pub enum WorkflowCmd {
-    /// A task's workflow: phase, strategy, who acts next, what the caller may do, history.
+    /// A task's workflow: phase, strategy, who acts next, what the caller may do, history. With
+    /// `--graph`, the machines instead: the strategy's workflow graph (who may fire each event) and
+    /// the task lifecycle, from the compiled tables — the task's own strategy, `--strategy`'s, or the
+    /// default.
     Show {
-        /// The task.
-        uid: String,
+        /// The task; with `--graph` it may be left out.
+        uid: Option<String>,
+        /// Print the machines as data rather than the task's standing.
+        #[arg(long)]
+        graph: bool,
+        /// With `--graph` and no task: this strategy's machines rather than the default's.
+        #[arg(long, requires = "graph", conflicts_with = "uid")]
+        strategy: Option<String>,
     },
     /// Who acts next on a task, and the one thing to do.
     Next {
@@ -148,6 +157,12 @@ pub enum WorkflowCmd {
     Dot {
         /// reviewed-design or direct.
         graph: String,
+    },
+    /// The agent templates the workflow scripts give their agents (design D53.7): packaged ones
+    /// (read-only) and the operator's copies, which override a packaged template of their name.
+    Agent {
+        #[command(subcommand)]
+        cmd: crate::agent_cli::AgentCmd,
     },
 }
 
@@ -361,7 +376,15 @@ fn roles_list(s: &str) -> Vec<String> {
 #[allow(clippy::too_many_lines)] // one arm per verb
 pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()> {
     match cmd {
-        WorkflowCmd::Show { uid } => {
+        WorkflowCmd::Show {
+            uid,
+            graph: true,
+            strategy,
+        } => show_graph(b, uid, strategy, json_out),
+        WorkflowCmd::Show { uid: None, .. } => {
+            bail!("name a task, or pass --graph to print the machines")
+        }
+        WorkflowCmd::Show { uid: Some(uid), .. } => {
             let w = show(b, uid)?;
             print(json_out, &json!(w), || {
                 println!("task:      {}", w.uid);
@@ -505,6 +528,7 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
             );
             Ok(())
         }
+        WorkflowCmd::Agent { cmd } => crate::agent_cli::run(b, cmd, json_out),
         WorkflowCmd::Dot { graph } => {
             let g = jkb_core::workflow::GraphId::parse(&graph)
                 .with_context(|| format!("no graph `{graph}` (reviewed-design, direct)"))?;
@@ -512,6 +536,48 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
             Ok(())
         }
     }
+}
+
+fn show_graph(
+    b: &dyn Backend,
+    uid: Option<String>,
+    strategy: Option<String>,
+    json_out: bool,
+) -> Result<()> {
+    let r = call(b, Request::WorkflowGraph { uid, strategy })?;
+    let Response::WorkflowGraph { graph } = r else {
+        return unexpected("workflow.graph", &r);
+    };
+    print(json_out, &json!(graph), || {
+        println!("strategy:  {} ({})", graph.strategy, graph.graph);
+        if let Some(task) = &graph.task {
+            println!(
+                "task:      {task} — phase {}, status {}",
+                graph.phase.as_deref().unwrap_or("-"),
+                graph.status.as_deref().unwrap_or("-")
+            );
+        }
+        for (title, m) in [
+            ("workflow", &graph.workflow),
+            ("lifecycle", &graph.lifecycle),
+        ] {
+            println!("\n{title}:");
+            for t in &m.transitions {
+                let by = if t.reconciled {
+                    "observed".to_owned()
+                } else {
+                    t.roles.join(", ")
+                };
+                println!(
+                    "  {:<16} {:<20} -> {:<16} {by}",
+                    t.from,
+                    t.event,
+                    t.to.as_deref().unwrap_or("(stated)")
+                );
+            }
+        }
+    });
+    Ok(())
 }
 
 fn strategies(b: &dyn Backend) -> Result<(Vec<jkb_api::rbac::StrategyInfo>, String)> {

@@ -218,6 +218,9 @@ impl Request {
             | Self::RoleBind { .. }
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents {}
+            | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
             | Self::DesignCat { .. }
             | Self::DesignState { .. }
@@ -297,6 +300,10 @@ impl Request {
             | Self::RoleRotateContainer { .. }
             | Self::WorkflowSet { .. }
             | Self::WorkflowDefine { .. }
+            // The packaged templates are read-only to everyone; the copies the workflow scripts read
+            // instead are the operator's, as choosing a strategy is.
+            | Self::WorkflowAgentCopy { .. }
+            | Self::WorkflowAgentSet { .. }
             | Self::DesignCompact { .. } => OpPermission::Admin,
         }
     }
@@ -356,6 +363,8 @@ impl Request {
             | Self::RoleMap { .. }
             | Self::RoleRotateContainer { .. }
             | Self::WorkflowDefine { .. }
+            | Self::WorkflowAgentCopy { .. }
+            | Self::WorkflowAgentSet { .. }
             // A design is no one task's.
             | Self::DesignCreate { .. }
             | Self::DesignApply { .. }
@@ -413,6 +422,9 @@ impl Request {
             | Self::RoleWhoami {}
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents {}
+            | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
             | Self::DesignCat { .. }
             | Self::DesignState { .. }

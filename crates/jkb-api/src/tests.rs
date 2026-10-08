@@ -402,6 +402,29 @@ fn samples() -> Vec<Request> {
             spec: json!({ "graph": "direct" }),
         },
         Request::WorkflowStrategies {},
+        Request::WorkflowGraph {
+            uid: None,
+            strategy: Some("autonomous".into()),
+        },
+        Request::WorkflowAgents {},
+        Request::WorkflowAgent {
+            name: "swarm-implementer".into(),
+            packaged: false,
+            version: None,
+            vars: None,
+        },
+        Request::WorkflowAgentCopy {
+            from: "swarm-implementer".into(),
+            packaged: false,
+            as_name: None,
+        },
+        Request::WorkflowAgentSet {
+            name: "swarm-implementer".into(),
+            edit: crate::workflows::AgentEdit {
+                describe: Some("d".into()),
+                ..crate::workflows::AgentEdit::default()
+            },
+        },
         Request::DesignList { repo: None },
         Request::DesignCreate {
             repo: "jkb".into(),
@@ -1596,6 +1619,9 @@ const READS: &[&str] = &[
     "role.whoami",
     "workflow.show",
     "workflow.strategies",
+    "workflow.graph",
+    "workflow.agents",
+    "workflow.agent",
     "design.list",
     "design.cat",
     "design.state",

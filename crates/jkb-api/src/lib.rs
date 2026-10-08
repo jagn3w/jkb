@@ -44,6 +44,7 @@ pub mod review;
 pub mod sessions;
 pub mod staging;
 pub mod tasks;
+pub mod workflows;
 
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -731,6 +732,55 @@ pub enum Request {
     /// The presets and definitions ([`rbac::strategies`]).
     #[serde(rename = "workflow.strategies")]
     WorkflowStrategies {},
+    /// A strategy's workflow machine and the task lifecycle machine, as data
+    /// ([`workflows::graph`]): a task's own strategy, a named one, or the default.
+    #[serde(rename = "workflow.graph")]
+    WorkflowGraph {
+        /// The task whose strategy to draw.
+        #[serde(default)]
+        uid: Option<String>,
+        /// The strategy to draw.
+        #[serde(default)]
+        strategy: Option<String>,
+    },
+    /// Every agent template, each as the one in effect ([`workflows::list`]).
+    #[serde(rename = "workflow.agents")]
+    WorkflowAgents {},
+    /// One agent template, optionally filled in ([`workflows::show`]).
+    #[serde(rename = "workflow.agent")]
+    WorkflowAgent {
+        /// Its name.
+        name: String,
+        /// The packaged template, whatever overrides it.
+        #[serde(default)]
+        packaged: bool,
+        /// This version of the operator copy.
+        #[serde(default)]
+        version: Option<i64>,
+        /// Fill its placeholders with these values: every one, and nothing else.
+        #[serde(default)]
+        vars: Option<std::collections::BTreeMap<String, String>>,
+    },
+    /// Copy a template into an operator copy (operator; [`workflows::copy`]).
+    #[serde(rename = "workflow.agent_copy")]
+    WorkflowAgentCopy {
+        /// The template to copy.
+        from: String,
+        /// Copy the packaged text even when a copy overrides it.
+        #[serde(default)]
+        packaged: bool,
+        /// The copy's name; by default `from`, which then overrides the packaged template.
+        #[serde(default, rename = "as")]
+        as_name: Option<String>,
+    },
+    /// Edit an operator copy (operator; [`workflows::set`]).
+    #[serde(rename = "workflow.agent_set")]
+    WorkflowAgentSet {
+        /// The copy.
+        name: String,
+        /// What changes.
+        edit: workflows::AgentEdit,
+    },
     /// The designs, or one repo's ([`designs::list`]).
     #[serde(rename = "design.list")]
     DesignList {
@@ -1460,6 +1510,11 @@ impl Request {
         "workflow.set",
         "workflow.define",
         "workflow.strategies",
+        "workflow.graph",
+        "workflow.agents",
+        "workflow.agent",
+        "workflow.agent_copy",
+        "workflow.agent_set",
         "design.list",
         "design.create",
         "design.cat",
@@ -1586,6 +1641,11 @@ impl Request {
             Self::WorkflowSet { .. } => "workflow.set",
             Self::WorkflowDefine { .. } => "workflow.define",
             Self::WorkflowStrategies {} => "workflow.strategies",
+            Self::WorkflowGraph { .. } => "workflow.graph",
+            Self::WorkflowAgents {} => "workflow.agents",
+            Self::WorkflowAgent { .. } => "workflow.agent",
+            Self::WorkflowAgentCopy { .. } => "workflow.agent_copy",
+            Self::WorkflowAgentSet { .. } => "workflow.agent_set",
             Self::DesignList { .. } => "design.list",
             Self::DesignCreate { .. } => "design.create",
             Self::DesignCat { .. } => "design.cat",
@@ -1679,6 +1739,9 @@ impl Request {
             | Self::RoleWhoami {}
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents {}
+            | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
             | Self::DesignCat { .. }
             | Self::DesignState { .. }
@@ -1747,6 +1810,8 @@ impl Request {
             | Self::WorkflowObserve { .. }
             | Self::WorkflowSet { .. }
             | Self::WorkflowDefine { .. }
+            | Self::WorkflowAgentCopy { .. }
+            | Self::WorkflowAgentSet { .. }
             // In memory: no database at all, so the writer is as good as anywhere.
             | Self::AttestMint { .. }
             | Self::AttestRelease { .. }
@@ -2245,6 +2310,28 @@ pub enum Response {
         /// The new version.
         version: i64,
     },
+    /// A `workflow.graph`.
+    WorkflowGraph {
+        /// The machines.
+        graph: Box<workflows::GraphView>,
+    },
+    /// A `workflow.agents`.
+    WorkflowAgents {
+        /// Every template, as the one in effect.
+        agents: Vec<workflows::AgentView>,
+    },
+    /// A `workflow.agent`, `workflow.agent_copy` or `workflow.agent_set`.
+    WorkflowAgent {
+        /// The template.
+        agent: Box<workflows::AgentView>,
+        /// Its prompt filled in, when values were given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rendered: Option<String>,
+        /// Whether anything was written (a copy always writes; an edit that changes nothing does
+        /// not). `false` for a read.
+        #[serde(default)]
+        wrote: bool,
+    },
     /// An `attest.mint`.
     Ticket {
         /// The ticket.
@@ -2423,6 +2510,9 @@ impl Response {
             | Self::WorkflowMoved { .. }
             | Self::Strategies { .. }
             | Self::Defined { .. }
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents { .. }
+            | Self::WorkflowAgent { .. }
             | Self::Ticket { .. }
             | Self::TicketsReleased { .. }
             | Self::Designs { .. }
@@ -2531,6 +2621,9 @@ impl Response {
             | Self::WorkflowMoved { .. }
             | Self::Strategies { .. }
             | Self::Defined { .. }
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents { .. }
+            | Self::WorkflowAgent { .. }
             | Self::Ticket { .. }
             | Self::TicketsReleased { .. }
             | Self::Designs { .. }
@@ -3666,6 +3759,49 @@ impl LocalBackend {
                 Response::Strategies {
                     strategies,
                     default,
+                }
+            }
+            Request::WorkflowGraph { uid, strategy } => Response::WorkflowGraph {
+                graph: Box::new(db.read_with(move |c| {
+                    workflows::graph(c, uid.as_deref(), strategy.as_deref())
+                })?),
+            },
+            Request::WorkflowAgents {} => Response::WorkflowAgents {
+                agents: db.read_with(workflows::list)?,
+            },
+            Request::WorkflowAgent {
+                name,
+                packaged,
+                version,
+                vars,
+            } => {
+                let (agent, rendered) = db.read_with(move |c| {
+                    workflows::show(c, &name, packaged, version, vars.as_ref())
+                })?;
+                Response::WorkflowAgent {
+                    agent: Box::new(agent),
+                    rendered,
+                    wrote: false,
+                }
+            }
+            Request::WorkflowAgentCopy {
+                from,
+                packaged,
+                as_name,
+            } => Response::WorkflowAgent {
+                agent: Box::new(db.write_txn_with(actor, move |c, m| {
+                    workflows::copy(c, m, &from, packaged, as_name.as_deref())
+                })?),
+                rendered: None,
+                wrote: true,
+            },
+            Request::WorkflowAgentSet { name, edit } => {
+                let (agent, wrote) =
+                    db.write_txn_with(actor, move |c, m| workflows::set(c, m, &name, edit))?;
+                Response::WorkflowAgent {
+                    agent: Box::new(agent),
+                    rendered: None,
+                    wrote,
                 }
             }
             Request::DesignList { repo } => Response::Designs {

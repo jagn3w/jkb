@@ -11,3 +11,4 @@ export * from "./daemon.js";
 export * from "./design.js";
 export * from "./plan.js";
 export * from "./prompts.js";
+export * from "./workflows.js";

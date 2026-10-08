@@ -112,6 +112,11 @@ test("the shell renders every tab and pane, with only the active pane shown", as
     assert.match(html, /<select(?=[^>]*aria-label="Repo")(?=[^>]*disabled)/, "the repo picker waits for the listing");
     assert.match(html, /<select(?=[^>]*aria-label="Design")(?=[^>]*disabled)/, "so does the design picker");
     assert.match(html, /Loading designs…/);
+    // The Workflows tab (D53.7): its pickers wait for the agents and strategies, asked for from
+    // effects, never during render.
+    assert.match(html, /<select(?=[^>]*aria-label="Workflow")(?=[^>]*disabled)/, "the workflow picker waits for the agents");
+    assert.match(html, /<select(?=[^>]*aria-label="Strategy")(?=[^>]*disabled)/, "the strategy picker waits for the strategies");
+    assert.match(html, /Loading agents…/);
   } finally {
     delete globalThis.window;
   }

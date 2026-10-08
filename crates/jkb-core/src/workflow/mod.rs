@@ -15,6 +15,7 @@
 //! **This module is pure**, like [`crate::lifecycle`]: guards read [`WorkflowFacts`], which
 //! [`store::observe`] gathers, so every rule is exercisable from a literal.
 
+pub mod agents;
 pub mod store;
 pub mod strategy;
 

@@ -122,6 +122,16 @@ test("the Design tab says why it has no designs when the daemon is unreachable",
   assert.equal(await pane.getByRole("combobox", { name: "Repo" }).isDisabled(), true);
 });
 
+// The Workflows tab (D53.7): with no daemon there are no templates to draw, and the pane says why.
+// The graph, the side panel's save and the lifecycle against a real jkb are pinned by the CLI and
+// API tests over the same ops; Contribute's script by workflows.test.mjs.
+test("the Workflows tab says why it has no agents when the daemon is unreachable", { skip }, async () => {
+  await page.getByRole("tab", { name: "Workflows", exact: true }).click();
+  const pane = page.locator("#pane-workflows");
+  await pane.locator(".plan-hint", { hasText: "Cannot list agent templates" }).waitFor();
+  assert.equal(await pane.getByRole("combobox", { name: "Workflow" }).isDisabled(), true);
+});
+
 // The integrated terminal (D53.10). A new terminal is a container terminal, labelled so; the
 // toggle moves it to the host, where it is a real shell. The container side is not exercised here
 // (no dev container in CI): what it runs is pinned by terminal.test.mjs.

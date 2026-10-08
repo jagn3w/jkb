@@ -6,6 +6,7 @@
 //! Read/task/query commands default their namespace scope to the mount covering the
 //! current directory (design D19), overridable with `--global`.
 
+mod agent_cli;
 mod archive;
 mod atomic;
 mod commands;
