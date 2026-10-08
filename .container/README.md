@@ -1363,8 +1363,10 @@ invalidates every cached unit.
 
 ## The container never opens the knowledge base — measured, not assumed
 
-`~/.jkb` is still bind-mounted (auto-memory, worktree archives, logs, the daemon's token), but no
-process in here opens `jkb.db`. Since the cutover (tasks S6.5) the container is in **remote mode**:
+Only `~/.jkb/{logs,claude-memory}` are bind-mounted, and no process in here opens `jkb.db`. (*Superseded
+by D52.8:* "`~/.jkb` is still bind-mounted (auto-memory, worktree archives, logs, the daemon's
+token)". The whole directory, the host's database and the root token among it, was bound until
+D52.8 narrowed the mount list; see "Only what the container uses of `~/.jkb`".) Since the cutover (tasks S6.5) the container is in **remote mode**:
 `JKB_REMOTE=host.docker.internal:7117` (`containerEnv`), so every `jkb` command reaches the host's
 knowledge base through `jkb serve` (next section) or is refused, and there is no database of the
 container's own. Before the cutover there was one — `JKB_DB` on a `jkb-kb-local` volume, empty at
@@ -1417,19 +1419,25 @@ through `jkb_sqlite` in
 `scripts/lib.sh`, which applies the same magic set — `scripts/tests/dev-scripts.test.sh` case11 fails
 on a bare call, on the two sets drifting, and inside the container on a live share not being
 refused. The live share is found by device, not by being a mount point: the first mount at or
-under `~/.jkb` on a device other than `/`'s (today `~/.jkb/logs`, virtiofs). "A mount point at
+under `~/.jkb` whose visible entry is on a device other than `/`'s (measured: `~/.jkb/logs`,
+virtiofs, the mount case11 reports). "A mount point at
 `~/.jkb`" stopped meaning a share twice over. The mount list narrowed to `~/.jkb/{logs,claude-memory}`.
 And Claude Code's bubblewrap sandbox re-binds every allowed path, so `~/.jkb` *is* a mount point
 under it, but on `/`'s own overlay device (0:54, against virtiofs's 0:45, measured in
 `/proc/self/mountinfo`). Read as the host's share, that failed case11 on trunk, and
-`merge-queue.sh` then ejected every candidate. Case11 is gated on the namespace record the
-entrypoint writes (`$JKB_NS_MARKER`, the evidence `verify.sh` uses), because a different device is
-necessary for a share but not sufficient: a Linux host whose `/home` is its own partition re-binds
-`~/.jkb` on `/home`'s device, local all the same. Inside the container a share is required (none
-fails, never skips). Outside it the assertion skips.
+`merge-queue.sh` then ejected every candidate. A different device is necessary for a share, not
+sufficient, so case11 applies `verify.sh`'s rule to what it finds, and the two cannot disagree. The
+assertion runs only inside the dev container (`$JKB_NS_MARKER` set; set with no record fails, as
+in `verify.sh`). It requires a candidate there (none fails), and it requires the refusal only when
+`shared_fs_kind` names the candidate's filesystem as one shared with another kernel. Otherwise it
+skips, printing the magic, because on a native Linux Docker host the bind is same-kernel ext4,
+where opening is correct and refusing would be the bug. The cost is that a cross-kernel backend
+the list does not know skips too. The printed magic is how it gets noticed, and the drift checks
+keep the shell list and `shared_fs.rs` equal.
 
 The refusal is exercised on a share that exists: `verify.sh` asks the installed binary to open a
-probe under `~/.jkb/logs` and requires the refusal, **once the installed `jkb` carries it** — a
+probe under `~/.jkb/logs` and, when that bind is a shared filesystem by the same `shared_fs_kind`
+test, requires the refusal, **once the installed `jkb` carries it** — a
 binary built before it opened the host's database from in here (a review measured exactly that),
 so `setup.sh` must have rebuilt it. `db::open` also refuses any `file:` string: the bundled SQLite
 is compiled with `-DSQLITE_USE_URI`, and `--db file:/home/vscode/.jkb/jkb.db` opened the host's

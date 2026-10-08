@@ -1589,37 +1589,38 @@ _shell_shared_magics() {
         | grep -oE '^[[:space:]]+[0-9a-f]+\)' | tr -d ' )' | sort
 }
 
-# _jkb_host_share <dir> — print the mount point of a filesystem shared INTO <dir> from elsewhere:
-# <dir> itself or any mount beneath it, on a device other than `/`'s. The live refusal is required
-# there whatever the mount reports; keying it on the known FUSE magic skipped it on exactly the
-# backend the magic list did not know about, so the device is the discriminator, never the magic.
+# _jkb_host_share <dir> [mountinfo] — print the mount point of a filesystem shared INTO <dir> from
+# elsewhere: <dir> itself or any mount beneath it whose VISIBLE entry is on a device other than `/`'s.
+# Visible = the last entry for that mount point; a later mount on the same path shadows an earlier
+# one, and the bubblewrap sandbox stacks exactly such entries.
 #
 # "A mount point at <dir>" was the test, and it held only while the container bound the host's whole
-# ~/.jkb. Two things broke it. The mount list narrowed to ~/.jkb/{logs,claude-memory}, so ~/.jkb
-# stopped being a share and the assertion stopped checking one. And Claude Code's bubblewrap sandbox
-# re-binds every allowed path into its own namespace: measured in the dev container,
+# ~/.jkb. Two things broke it. The mount list narrowed to ~/.jkb/{logs,claude-memory} (D52.8), so
+# ~/.jkb stopped being a share and the assertion stopped checking one. And Claude Code's bubblewrap
+# sandbox re-binds every allowed path into its own namespace: measured in the dev container,
 # /proc/self/mountinfo lists /home/vscode/.jkb as a mount on device 0:54 — the device `/` is on —
 # while the real shares are virtiofs on 0:45. Read as the host's share, that local overlay failed
-# case11 on trunk and made merge-queue.sh eject every candidate. A re-bind of the root filesystem
-# onto itself shares nothing with another kernel; a different device is the one thing a share from
-# another kernel must have.
+# case11 on trunk and made merge-queue.sh eject every candidate.
 #
-# Necessary, not sufficient: on a Linux host whose /home is its own partition, a re-bind of ~/.jkb
-# reports /home's device, local all the same. So the caller asks this only inside the dev
-# container, where every non-root device under ~/.jkb is a share by construction (the mount list
-# is the boundary), and skips everywhere else.
+# A different device is necessary for a share, not sufficient (a Linux host's separate /home has
+# its own device too). So this only FINDS the candidate, only inside the dev container, and case11
+# then asks lib.sh's shared_fs_kind whether it is a filesystem shared with another kernel — the one
+# rule verify.sh applies to the same bind.
 _jkb_host_share() {
     awk -v want="$1" '
         $5 == "/" { root = $3 }
-        $5 == want || index($5, want "/") == 1 { dev[++n] = $3; at[n] = $5 }
+        $5 == want || index($5, want "/") == 1 {
+            if (!($5 in last)) order[++n] = $5
+            last[$5] = $3
+        }
         END {
-            for (i = 1; i <= n; i++) if (dev[i] != root) { print at[i]; exit 0 }
+            for (i = 1; i <= n; i++) if (last[order[i]] != root) { print order[i]; exit 0 }
             exit 1
-        }' /proc/self/mountinfo 2>/dev/null
+        }' "${2:-/proc/self/mountinfo}" 2>/dev/null
 }
 
 case11() {
-    local sites rust shell odd m probe_dir rc=0 real_home share calls
+    local sites rust shell odd m probe_dir rc=0 real_home share kind calls
     sites="$(_bare_sqlite_sites "$repo_root")"
     calls="$(_wrapper_calls)"
     if [ "$calls" != 1 ]; then
@@ -1728,14 +1729,44 @@ it — another process closing its last connection made every open beside it ref
     # The REAL home, not $HOME: the harness points HOME at a scratch directory, which is how this
     # assertion first skipped inside the very container it exists for.
     real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
-    # Inside the dev container, by the evidence verify.sh uses: the namespace record its entrypoint
-    # writes. There the share is REQUIRED; a container with none under ~/.jkb has a mount list this
-    # assertion no longer describes, and skipping would be the silent pass it exists to prevent.
-    if [ ! -s "${JKB_NS_MARKER:-}" ]; then
+    # The share finder's three mountinfo shapes, pinned everywhere rather than only where a real
+    # sandbox stacks them: the root re-bind does not count, a share beneath it does unless a later
+    # root-device mount shadows it, and a sibling sharing the prefix (~/.jkb-container) is not under it.
+    mkdir -p "$work/mi"
+    printf '%s\n' '1 0 0:54 / / rw - overlay o rw' '2 1 0:54 /h/.jkb /h/.jkb rw - overlay o rw' \
+        '3 1 0:45 /s /h/.jkb-container ro - virtiofs v rw' > "$work/mi/rebind"
+    { cat "$work/mi/rebind"; echo '4 2 0:45 /s/logs /h/.jkb/logs rw - virtiofs v rw'; } > "$work/mi/share"
+    { cat "$work/mi/share"; echo '5 4 0:54 /h/x /h/.jkb/logs rw - overlay o rw'; } > "$work/mi/shadowed"
+    if ! _jkb_host_share /h/.jkb "$work/mi/rebind" >/dev/null \
+        && [ "$(_jkb_host_share /h/.jkb "$work/mi/share")" = /h/.jkb/logs ] \
+        && ! _jkb_host_share /h/.jkb "$work/mi/shadowed" >/dev/null; then
+        ok "the share finder skips the root re-bind, the prefix sibling and a shadowed share, and finds a share"
+    else
+        fail "shared-db: share finder" "_jkb_host_share misread a mountinfo fixture under $work/mi \
+(rebind: $(_jkb_host_share /h/.jkb "$work/mi/rebind"); share: $(_jkb_host_share /h/.jkb "$work/mi/share"); \
+shadowed: $(_jkb_host_share /h/.jkb "$work/mi/shadowed"))"
+    fi
+
+    # Inside the dev container, by the evidence verify.sh uses: the image sets JKB_NS_MARKER and the
+    # entrypoint writes the record. A set variable with no record is a container started past its
+    # entrypoint, which verify.sh fails too; reading it as "not a container" would skip the
+    # assertion exactly where it runs.
+    if [ -z "${JKB_NS_MARKER:-}" ]; then
         skip "live bind refusal (not inside the dev container)"
-    elif [ -n "$real_home" ] && share="$(_jkb_host_share "$real_home/.jkb")"; then
+    elif [ ! -s "$JKB_NS_MARKER" ]; then
+        fail "shared-db: no namespace record" "JKB_NS_MARKER=$JKB_NS_MARKER is set but holds no record — \
+the container was started past its entrypoint, so this cannot tell what it is running inside"
+    elif ! share="$(_jkb_host_share "${real_home:-/nonexistent}/.jkb")"; then
+        fail "shared-db: no live share" "inside the dev container, nothing under ${real_home:-<no home>}/.jkb \
+is on a device other than /'s — the mount list changed and this assertion no longer exercises a share"
+    elif ! kind="$(shared_fs_kind "$(stat -f -c %t "$share" 2>/dev/null)")" || [ -z "$kind" ]; then
+        # verify.sh's rule, for the same reason: on a native Linux Docker host the bind is
+        # same-kernel ext4, where opening is correct and refusing would be the bug. The magic is
+        # printed, so a cross-kernel backend the list does not know shows up here, not nowhere.
+        skip "live bind refusal ($share is magic $(stat -f -c %t "$share" 2>/dev/null), not a filesystem shared with another kernel)"
+    else
         refuse_shared_db "$share/jkb.db" 2>/dev/null; rc=$?
-        [ "$rc" = 3 ] && ok "inside the container, a database on the host's share ($share) is refused" \
+        [ "$rc" = 3 ] && ok "inside the container, a database on the host's $kind share ($share) is refused" \
             || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for $share/jkb.db \
 (fs magic $(stat -f -c %t "$share" 2>/dev/null)) — a shared mount the magic list does not know"
         ln -s "$share/refusal-probe-missing.db" "$probe_dir/dangling.db"
@@ -1743,9 +1774,6 @@ it — another process closing its last connection made every open beside it ref
         [ "$rc" = 3 ] && ok "a dangling link from a local directory into the share is refused" \
             || fail "shared-db: dangling link allowed" "refuse_shared_db returned $rc for a dangling \
 link into $share — SQLite would create the database at the link's target"
-    else
-        fail "shared-db: no live share" "inside the dev container, nothing under ${real_home:-<no home>}/.jkb \
-is on a device other than /'s — the mount list changed and this assertion no longer exercises a share"
     fi
 }
 
