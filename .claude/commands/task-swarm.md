@@ -186,9 +186,11 @@ kill "$RECLAIMER_PID" 2>/dev/null; rm -f "$RUN_OWNER_FILE"
 When the workflow finishes, relay its result: which task uids **completed** (landed on the
 feature branch and marked `done`), which it **gave up** on (retry-capped), how many groups
 and passes it ran, and the merge-queue **landed/eject** counts. Each completed task was
-marked **`done`** in jkb (file-backed tasks got a `- [x]` + sync; managed tasks via
-`jkb task set … --status done`) once its group's branch landed — which also unblocked its
-dependents. Nothing about the swarm reached git: commits are ordinary professional
+closed **`done`** in jkb by the merge queue's `jkb task landed` (`observed_landed`) once its
+group's branch landed — which also unblocked its dependents; a file-backed task's checkbox
+follows on the host's next sync. Nothing in the swarm runs `jkb task set --status done`, and jkb
+refuses a non-operator `done` on an `open` task: a group that landed but did not close is
+reported **stalled** ("landed but not closed in jkb") for you to settle, never closed by an agent. Nothing about the swarm reached git: commits are ordinary professional
 messages, history is linear, and no `swarm-task/*` branch entered it.
 
 Then tell the user how to finish:

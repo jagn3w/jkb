@@ -975,3 +975,49 @@ fn a_grant_no_longer_grantable_is_marked_in_the_full_listing() {
         .filter(|g| g.id != id)
         .all(|g| g.grantable));
 }
+
+/// Closing a task nobody started is the operator's: a swarm's "mark the group done" agent set the
+/// next, still-`open` task in a chain `done` twice on 2026-10-08, and the swarm started its
+/// dependents on work that did not exist. Started work still closes, and the operator still may.
+#[test]
+fn an_open_task_is_not_closed_by_anyone_but_the_operator() {
+    let kb = Kb::new();
+    let (_, token) = grant(&kb.op, "coordinator", None, "coord");
+    let c = kb.as_token(&token);
+
+    let never_started = add(&kb.op, "never started");
+    let e = refused(
+        &c,
+        json!({ "op": "task.set", "uid": never_started, "status": "done" }),
+    );
+    assert!(e.message.contains("is `open`"), "{e:?}");
+    match ok(&kb.op, json!({ "op": "task.show", "uid": never_started })) {
+        Response::Task { task, .. } => assert_eq!(task.item.status.as_deref(), Some("open")),
+        other => panic!("{other:?}"),
+    }
+    // Everything else about an open task is still the coordinator's.
+    ok(
+        &c,
+        json!({ "op": "task.set", "uid": never_started, "priority": 2 }),
+    );
+    ok(
+        &c,
+        json!({ "op": "task.set", "uid": never_started, "status": "cancelled" }),
+    );
+
+    let worked = add(&kb.op, "worked");
+    ok(
+        &c,
+        json!({ "op": "task.set", "uid": worked, "status": "in_progress" }),
+    );
+    ok(
+        &c,
+        json!({ "op": "task.set", "uid": worked, "status": "done" }),
+    );
+
+    let operator_closes = add(&kb.op, "operator closes");
+    ok(
+        &kb.op,
+        json!({ "op": "task.set", "uid": operator_closes, "status": "done" }),
+    );
+}

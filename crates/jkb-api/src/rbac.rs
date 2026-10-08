@@ -956,6 +956,7 @@ pub fn authorize(
         // Nothing to scope against; the op itself answers `not_found`.
         return Ok(Admit::Run);
     };
+    closing_unstarted(conn, target, request, reference)?;
     if permission == OpPermission::Land {
         let current = wf::current(conn, target)?;
         if let Decision::Deny(no) = current.spec.may_land(&principal.roles) {
@@ -996,6 +997,46 @@ pub fn authorize(
         }),
         (None, None) => Ok(Admit::Run),
     }
+}
+
+/// Refuse a non-operator `task.set --status done` on an `open` task; the operator returned earlier.
+///
+/// # Errors
+/// [`ErrorCode::Forbidden`] for that write; a database error.
+///
+/// Closing a task nobody started is the operator's. A task's work closes it — its landing
+/// (`task.landed`, `observed_landed`) or the session that started it — and an `open` task has had
+/// neither, so a `done` here is a claim with nothing behind it that unblocks every dependent at
+/// once. That is what a swarm's "mark the group done" agent did twice on 2026-10-08: each time,
+/// after the merge queue had already closed its group, it set the NEXT task in the chain `done`,
+/// and the swarm then started that task's dependents on work that did not exist. In the callee,
+/// because a rule each agent prompt must remember is the defect.
+fn closing_unstarted(
+    conn: &Connection,
+    target: ItemId,
+    request: &Request,
+    reference: &str,
+) -> Result<(), ApiError> {
+    let op = request.op();
+    if let Request::TaskSet {
+        status: Some(status),
+        ..
+    } = request
+    {
+        let now = jkb_core::item::get(conn, target)?.and_then(|m| m.status);
+        if status == jkb_types::TaskStatus::Done.as_str()
+            && now.as_deref() == Some(jkb_types::TaskStatus::Open.as_str())
+        {
+            return Err(forbidden(format!(
+                "`{op}` refused: {reference} is `open` — nobody has started it, so `done` would \
+                 close work that never happened and release its dependents. A task closes when its \
+                 work lands (the merge queue's `jkb task landed`) or when the session that started \
+                 it finishes; to close it anyway, the operator runs `jkb task set {reference} \
+                 --status done` on the host, or `--status cancelled` if it will not be done"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `request` lands `task` exactly as its live landing already records — a workflow parked at

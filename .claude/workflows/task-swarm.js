@@ -261,29 +261,21 @@ The script rebases ${branch} onto the current ${INTEGRATION} tip, runs the gate,
 Run it ONCE and return {exit, detail}: \`exit\` is the script's exit status verbatim, \`detail\` is its last line of output. Do not map the code to a meaning — this workflow does that, and the script's own header is where the meanings are written down. Do not touch the main copy at ${REPO}.`
 }
 
-function completePrompt(group) {
-  const fileBacked = group.tasks.filter((t) => t.source_file)
-  const managed = group.tasks.filter((t) => !t.source_file)
-  const parts = []
-  if (managed.length) {
-    parts.push(
-      `Managed tasks (set status done via the CLI — no git artifact): ${managed
-        .map((t) => `\`${JKB}${DB} task set ${t.uid} --status done\``)
-        .join(' ; ')}`,
-    )
-  }
-  if (fileBacked.length) {
-    parts.push(
-      `File-backed tasks: set the checkbox to "- [x]" on the line ending \`^<frag>\` in each source file, then \`${JKB}${DB} sync\` so the KB status becomes done:\n${fileBacked
-        .map((t) => `    - ${t.source_file}  (\`^${fragOf(t.uid)}\`)`)
-        .join('\n')}`,
-    )
-  }
-  return `A swarm work-group's branch has LANDED on the feature branch ${INTEGRATION}. Mark EVERY task in the group DONE in jkb — landing is what completes them, and \`done\` unblocks their dependents (design D27.6/D27.7). Work in the MAIN copy at ${REPO}. Status is KB-local only — write NOTHING to git here.
+// The merge queue's `jkb task landed` is what closes a landed group (`observed_landed`), so this step
+// CHECKS and writes nothing. It used to be a "mark every task in the group done" agent handed a free
+// `jkb task set --status done`. On 2026-10-08 it ran twice after the queue had already closed its
+// group, and each time it set the NEXT task in the chain `done` (open -> done, an `override`, 42 s
+// and 75 s after the landing). The swarm then started that task's dependents on work that did not
+// exist. jkb now refuses a non-operator `done` on an `open` task (rbac.rs), and this step no longer
+// holds the command at all. A file-backed task's checkbox follows its KB status on the host's next
+// sync, as every other status change does.
+function closedCheckPrompt(group) {
+  const shows = group.tasks.map((t) => `${JKB}${DB} task show ${t.uid} --json`).join(' ; ')
+  return `Mechanical READ-ONLY check — the merge queue has landed this work-group's branch on ${INTEGRATION} and recorded the landing, which closes its tasks. Confirm that it did. Work in the main copy at ${REPO}.
 
-${parts.join('\n\n')}
+Run EXACTLY: ${shows}
 
-Return ok=true with a one-line confirmation. Do not fabricate changes.`
+Change NOTHING. Do not set any status, edit, claim, release, sync or touch git; run no command but the ones above, and run nothing against any other task. Return ok=true if every one of these tasks has status "done"; otherwise ok=false with detail listing each uid that is not done and its status.`
 }
 
 function claimPrompt(group, verb) {
@@ -373,7 +365,7 @@ This clears claims left by CRASHED PRIOR runs (owner pid gone) before the first 
 // ---------------------------------------------------------------------------
 log(`swarm start · scope ${scopeExpr} · integration ${INTEGRATION} (${INTEGRATION_WT}) · owner ${OWNER}`)
 
-const landed = [] // uids of completed (landed + marked done) tasks
+const landed = [] // uids of completed tasks: landed, and closed by that landing
 const gaveUp = [] // uids the swarm exhausted RETRY_CAP on
 // Groups whose merge could neither land nor be blamed on the branch. Reported in the run summary
 // rather than swallowed, because nothing downstream will ever retry them on its own.
@@ -483,7 +475,23 @@ async function processGroup(group) {
       const verdict = classifyMerge(merge.exit)
       if (verdict.outcome === 'landed') {
         stats.land++
-        await agent(completePrompt(group), { label: `done:${label}`, phase: 'Merge', schema: ACK, model: 'haiku' })
+        const closed = await agent(closedCheckPrompt(group), {
+          label: `closed?:${label}`,
+          phase: 'Merge',
+          schema: ACK,
+          model: 'haiku',
+        })
+        if (!closed || !closed.ok) {
+          // Landed but not closed: the queue printed a "could not record the landing" note (open
+          // subtasks, most often). Nothing here may close it, so a person is told, and its
+          // dependents stay held, which is right while it is not done.
+          stats.stall++
+          const why = `landed but not closed in jkb — ${(closed && closed.detail) || 'the check returned nothing'}`
+          log(`group ${label}: ${why} · ${merge.detail}`)
+          stalled.push({ group: label, branch, exit: merge.exit, why, detail: merge.detail })
+          group.tasks.forEach((t) => stalledUids.push(t.uid))
+          return
+        }
         group.tasks.forEach((t) => landed.push(t.uid))
         log(`group ${label}: landed → done · ${merge.detail}`)
         return
@@ -619,7 +627,7 @@ return {
   integration_branch: INTEGRATION,
   passes: round,
   groups: stats.groups,
-  // Landed on the feature branch and marked done in jkb; dependents unblocked.
+  // Landed on the feature branch and closed in jkb by that landing; dependents unblocked.
   completed: landed,
   gave_up: gaveUp,
   // NAMED, not just counted. The stall count reached `stats` and the log, but the uids did not
