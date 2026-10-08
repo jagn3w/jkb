@@ -1,7 +1,7 @@
 export const meta = {
   name: 'jkb-task-swarm',
   description:
-    'SCHEDULER groups overlapping ready jkb tasks into work-groups; one IMPLEMENTER builds each group on a clean branch; a fresh REVIEWER checks the whole group; a deterministic merge queue (no agent) rebase/fast-forwards approved branches into one feature branch and marks the group done. Pipelined (no per-round barrier), claim-guarded, looping as dependents unblock.',
+    'SCHEDULER groups overlapping ready jkb tasks into work-groups; one IMPLEMENTER builds each group on a clean branch; a fresh REVIEWER checks the whole group; a deterministic merge queue (no agent) rebase/fast-forwards approved branches into one feature branch and records the landing, which closes the group when its strategy lets the coordinator land. Pipelined (no per-round barrier), claim-guarded, looping as dependents unblock.',
   whenToUse:
     'Launched by the /jkb-task-swarm command after it scouts the jkb task set and creates the integration branch + worktree.',
   phases: [
@@ -143,6 +143,22 @@ const MERGE = {
 // The one place that reads the contract merge-queue.sh's header declares. An UNKNOWN code stalls
 // rather than falling through to any of the three actions — a fifth code added later must reach a
 // human, not be silently sorted into the nearest bucket, which is exactly how the fourth arrived.
+// unclosedTasks(group, answer) -> [{uid, status}] for each group task the post-landing check did
+// NOT show as closed. Closed means: that task's own entry, under its full uid, says exactly `done`.
+// Anything else — no answer, a missing entry, a short uid, an error — is unclosed, never assumed
+// done: assuming it is how a landed-but-unclosed task would be reported complete and its dependents
+// started on work that does not exist. Top-level and pure so dev-scripts.test.sh case12 can run it.
+function unclosedTasks(group, answer) {
+  const said = new Map(
+    (answer && Array.isArray(answer.tasks) ? answer.tasks : [])
+      .filter((e) => e && typeof e.uid === 'string')
+      .map((e) => [e.uid, String(e.status)]),
+  )
+  return group.tasks
+    .filter((t) => said.get(t.uid) !== 'done')
+    .map((t) => ({ uid: t.uid, status: said.get(t.uid) || "unknown (not in the check's answer)" }))
+}
+
 function classifyMerge(code) {
   switch (code) {
     case 0:
@@ -284,9 +300,9 @@ Run it ONCE and return {exit, detail}: \`exit\` is the script's exit status verb
 // `jkb task set --status done`. On 2026-10-08 it ran twice after the queue had already closed its
 // group, and each time it set the NEXT task in the chain `done` (open -> done, an `override`, 42 s
 // and 75 s after the landing). The swarm then started that task's dependents on work that did not
-// exist. jkb now refuses a non-operator `done` on an `open` task (rbac.rs), and this step no longer
-// holds the command at all. A file-backed task's checkbox follows its KB status on the host's next
-// sync, as every other status change does.
+// exist. This step no longer holds the command at all, and nothing in jkb yet refuses it (see
+// docs/task-lifecycle.md, "The swarm closes a task only by landing it"). A file-backed task's
+// checkbox follows its KB status on the host's next sync, as every other status change does.
 function closedCheckPrompt(group) {
   const shows = group.tasks.map((t) => `${JKB}${DB} task show ${t.uid} --json`).join(' ; ')
   return `Mechanical READ-ONLY check — the merge queue has landed this work-group's branch on ${INTEGRATION} and recorded the landing, which closes its tasks. Confirm that it did. Work in the main copy at ${REPO}.
@@ -499,17 +515,9 @@ async function processGroup(group) {
           schema: CLOSED,
           model: 'haiku',
         })
-        // Closed means: this task's own entry, under its full uid, says exactly `done`. Anything
-        // else — no answer, a missing entry, a short uid, an error — is unclosed, never assumed done.
-        const said = new Map(
-          (closed && Array.isArray(closed.tasks) ? closed.tasks : [])
-            .filter((e) => e && typeof e.uid === 'string')
-            .map((e) => [e.uid, String(e.status)]),
-        )
-        const notDone = group.tasks
-          .filter((t) => said.get(t.uid) !== 'done')
-          .map((t) => ({ uid: t.uid, status: said.get(t.uid) || 'unknown (not in the check\'s answer)' }))
-        group.tasks.filter((t) => said.get(t.uid) === 'done').forEach((t) => landed.push(t.uid))
+        const notDone = unclosedTasks(group, closed)
+        const unclosed = new Set(notDone.map((n) => n.uid))
+        group.tasks.filter((t) => !unclosed.has(t.uid)).forEach((t) => landed.push(t.uid))
         if (notDone.length) {
           // Landed but not closed. The code IS on the integration branch; jkb refused or held the
           // landing record for these tasks, and merge-queue.sh still exits 0 for that (it is not the

@@ -1780,6 +1780,42 @@ link into $share — SQLite would create the database at the link's target"
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10 case11
+# The swarm's post-landing check (task-swarm.js unclosedTasks). The merge queue's landing record is
+# what closes a task; the workflow only checks. On 2026-10-08 an agent that "marked the group done"
+# instead closed the NEXT, unstarted task twice, so the check's one job is never to call unclosed
+# work closed. Every answer but "each task's own full-uid entry says done" must name the task.
+_unclosed_src() {
+    sed -n '/^function unclosedTasks(/,/^}/p' "$repo_root/.claude/workflows/task-swarm.js"
+}
+
+case12() {
+    local src out
+    src="$(_unclosed_src)"
+    if [ -z "$src" ]; then
+        fail "closed-check: premise" "did NOT find unclosedTasks in task-swarm.js — the cases below would pass vacuously"
+        return
+    fi
+    out="$(node -e "$src
+const g = { tasks: [{ uid: 'task:a-1' }, { uid: 'task:b-2' }] }
+const cases = [
+  ['no answer', null, 'task:a-1,task:b-2'],
+  ['empty answer', { tasks: [] }, 'task:a-1,task:b-2'],
+  ['a short uid', { tasks: [{ uid: 'a-1', status: 'done' }, { uid: 'task:b-2', status: 'done' }] }, 'task:a-1'],
+  ['an error', { tasks: [{ uid: 'task:a-1', status: 'unknown: bad_request' }, { uid: 'task:b-2', status: 'done' }] }, 'task:a-1'],
+  ['one not done', { tasks: [{ uid: 'task:a-1', status: 'done' }, { uid: 'task:b-2', status: 'needs_review' }] }, 'task:b-2'],
+  ['all done', { tasks: [{ uid: 'task:a-1', status: 'done' }, { uid: 'task:b-2', status: 'done' }] }, ''],
+]
+for (const [name, answer, want] of cases) {
+  const got = unclosedTasks(g, answer).map((n) => n.uid).join(',')
+  if (got !== want) console.log(name + ': got [' + got + '], want [' + want + ']')
+}" 2>&1)"
+    if [ -z "$out" ]; then
+        ok "the post-landing check names every task not shown done under its full uid, and passes only all-done"
+    else
+        fail "closed-check: verdicts" "$out"
+    fi
+}
+
+run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10 case11 case12
 
 finish

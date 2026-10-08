@@ -57,16 +57,6 @@ The `snippet` is truncated — get the whole task before acting:
 
 ## 4. Do the work
 
-First take the task, so it is yours and visibly started:
-
-```sh
-jkb task claim <uid>     # claims it and starts it (open -> in_progress), atomically
-```
-
-A claim refused because someone else holds it means another session is on it: stop and report
-that, and do not work it. Closing a task that was never started is the operator's alone (jkb
-refuses a non-operator `done` on an `open` task), so this step is also what lets step 5 close it.
-
 Carry out what the task describes, fully and following repo conventions in `CLAUDE.md`
 (no `unsafe` beyond the one allowed site, no `unwrap`/`expect` outside tests, parameterized
 SQL, changelog on mutations, `thiserror` in libs). Make the actual code/content change —
@@ -80,8 +70,7 @@ calling it done:
 ```
 
 If the task is ambiguous or turns out to be wrong/obsolete, stop and report what you found
-rather than forcing a change, and give the task back with `jkb task release <uid>` so it is not
-left claimed.
+rather than forcing a change.
 
 ## 5. Mark it done
 
