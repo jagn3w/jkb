@@ -1768,7 +1768,7 @@ is on a device other than /'s — the mount list changed and this assertion no l
         refuse_shared_db "$share/jkb.db" 2>/dev/null; rc=$?
         [ "$rc" = 3 ] && ok "inside the container, a database on the host's $kind share ($share) is refused" \
             || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for $share/jkb.db \
-(fs magic $(stat -f -c %t "$share" 2>/dev/null)) — a shared mount the magic list does not know"
+although shared_fs_kind names $share $kind — the refusal itself is broken, not the magic list"
         ln -s "$share/refusal-probe-missing.db" "$probe_dir/dangling.db"
         refuse_shared_db "$probe_dir/dangling.db" 2>/dev/null; rc=$?
         [ "$rc" = 3 ] && ok "a dangling link from a local directory into the share is refused" \

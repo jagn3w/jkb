@@ -2235,8 +2235,9 @@ case "$eg_daemon" in
     *)          $dm_bad "could not establish the firewall's opening for jkb serve on the host (daemon=${eg_daemon:-<none>}) — egress-status.sh did not report it; an image built before the opening existed does not, so rebuild: ~/.local/share/jkb-container-kit/kit/.container/run.sh --rm && ~/.local/share/jkb-container-kit/kit/.container/run.sh --build" ;;
 esac
 
-# ...and what actually answers. The token is read from the ~/.jkb bind, where the host's daemon
-# writes it, which is also what the container's `jkb` in remote mode will read — so this is the
+# ...and what actually answers. The token is the container credential from the read-only
+# ~/.jkb-container bind (D52.8; ~/.jkb holds no token), which is also what the container's `jkb` in
+# remote mode will read — so this is the
 # whole path a client takes, not just the port. `--noproxy '*'`: this runs outside the nested
 # sandbox, and a proxy variable in the environment would test the proxy instead of the rule.
 # The header goes through a file descriptor so the token is never in this process's argv.

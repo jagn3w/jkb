@@ -1450,15 +1450,19 @@ instead of the host's database", and the measurement "`jkb --db ~/.jkb/refusal-p
 exits 1 naming the FUSE bind". Both were true while the whole of `~/.jkb` was bound in. Since
 D52.8, `~/.jkb` is an image directory: the host's database is not in the container to be refused,
 and a `--db` there is a container-local file that the guard rightly allows (remote mode still
-refuses `--db` before anything opens).
+refuses `--db` before anything opens). Measured 2026-10-08 in a D52.8 container: `stat -f ~/.jkb`
+reports overlayfs (magic `794c7630`, the device `/` is on), and `refuse_shared_db
+~/.jkb/refusal-probe-r3/jkb.db` returns 0 without creating anything; `verify.sh` separately
+asserts the host's `jkb.db`, `-wal`, `daemon/` and `backups/` are absent.
 
 **Residual, stated.** The guard covers jkb and `jkb_sqlite`. Any *other* SQLite client run in the
 container — `python3 -c 'import sqlite3; sqlite3.connect(".../.jkb/jkb.db")'`, a hand-typed database
 shell — is not jkb and is not refused; `.claude/hooks/block-raw-sqlite.sh` matches only the shell,
 only for agent tool calls, and fails open. What closes that for good is the container not seeing
 the host's database file at all, and since D52.8 it does not: only `~/.jkb/{logs,claude-memory}`
-are bound. What remains is a database someone creates on one of those two shares, which jkb and
-`jkb_sqlite` refuse and another client would not. *Superseded:* "the bind still carries it, because
+are bound. What remains, for the host's knowledge base, is nothing. For any other database, it is
+one created on a read-write share — those two, and the repository binds, which are virtiofs too —
+and opened from both kernels at once, which jkb and `jkb_sqlite` refuse and another client would not. *Superseded:* "the bind still carries it, because
 `~/.jkb` holds the token and the other shared state" (`openspec/changes/jkb-message-queue/design-r3.md`),
 true until D52.8 moved the token out and stopped binding `~/.jkb`.
 
@@ -1505,7 +1509,9 @@ variable's name to `remote.rs`'s `REMOTE_VAR`, and `mutate-config.sh` drifts and
 it needs a rebuild, like the rest of `containerEnv`. See [docs/notifications.md](../docs/notifications.md).
 
 **What `verify.sh` asks.** The kernel's answer above, at the address the *image* names; then the
-daemon's own answer (`/v1/hello` with the token from the `~/.jkb` bind — the path remote mode takes).
+daemon's own answer (`/v1/hello` with the container credential from the read-only `~/.jkb-container`
+bind, `$JKB_REMOTE_TOKEN_FILE` overriding — the path remote mode takes). *Superseded by D52.8:* "the
+token from the `~/.jkb` bind"; `~/.jkb` holds no token since D52.8 moved the credential out.
 A missing token is a **failure**, since the container depends on the daemon for every command
 (tasks S6.5) — unless `JKB_VERIFY_NO_DAEMON=1` says none is expected, which `mutate-verify.sh` sets
 because its scratch `~/.jkb` has no daemon (a CI runner would too); it is a note then, and a mutation
