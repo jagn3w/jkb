@@ -978,7 +978,7 @@ pub fn authorize(
             )));
         }
     }
-    match (principal.scope, principal.attested_agent()) {
+    let admit = match (principal.scope, principal.attested_agent()) {
         (Some(scope), _) => {
             if !roles::in_scope(conn, scope, target)? {
                 return Err(forbidden(format!(
@@ -987,22 +987,18 @@ pub fn authorize(
                     principal.label
                 )));
             }
-            closing_unstarted(conn, target, request, reference)?;
-            Ok(Admit::Run)
+            Admit::Run
         }
-        (None, Some((session, agent))) => {
-            closing_unstarted(conn, target, request, reference)?;
-            Ok(Admit::BindThenRun {
-                session: session.to_owned(),
-                agent_id: agent.to_owned(),
-                task: target,
-            })
-        }
-        (None, None) => {
-            closing_unstarted(conn, target, request, reference)?;
-            Ok(Admit::Run)
-        }
-    }
+        (None, Some((session, agent))) => Admit::BindThenRun {
+            session: session.to_owned(),
+            agent_id: agent.to_owned(),
+            task: target,
+        },
+        (None, None) => Admit::Run,
+    };
+    // Once, after scope and before any admit, so no arm (and no arm added later) can skip it.
+    closing_unstarted(conn, target, request, reference)?;
+    Ok(admit)
 }
 
 /// Refuse a non-operator `task.set --status done` on an `open` task; the operator returned earlier.

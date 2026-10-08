@@ -173,12 +173,13 @@ function classifyMerge(code) {
   }
 }
 
-// The post-landing check's answer: which of the group's tasks are NOT done, by uid, so a group that
-// closed in part credits the part that closed.
+// The post-landing check's answer: EVERY task in the group with its status, by full uid. A task is
+// closed only when its own entry says exactly `done`; a missing, shortened or unexpected uid counts
+// as unclosed, so a partial or failed answer can never report unclosed work as completed.
 const CLOSED = {
   type: 'object',
   properties: {
-    not_done: {
+    tasks: {
       type: 'array',
       items: {
         type: 'object',
@@ -187,7 +188,7 @@ const CLOSED = {
       },
     },
   },
-  required: ['not_done'],
+  required: ['tasks'],
 }
 
 const ACK = {
@@ -292,7 +293,7 @@ function closedCheckPrompt(group) {
 
 Run EXACTLY: ${shows}
 
-Change NOTHING. Do not set any status, edit, claim, release, sync or touch git; run no command but the ones above, and run nothing against any other task. Return not_done: one {uid, status} for each of these tasks whose status is not "done" (an empty list when all are done).`
+Change NOTHING. Do not set any status, edit, claim, release, sync or touch git; run no command but the ones above, and run nothing against any other task. Return tasks: one {uid, status} for EACH of these tasks, with the uid exactly as written above (the full uid) and the status exactly as \`task show\` reports it. If a command fails, return that task with status "unknown: <the error>".`
 }
 
 function claimPrompt(group, verb) {
@@ -498,13 +499,18 @@ async function processGroup(group) {
           schema: CLOSED,
           model: 'haiku',
         })
-        // No answer is not "all closed": every task is then reported unclosed, never assumed done.
-        const notDone = closed && Array.isArray(closed.not_done)
-          ? closed.not_done
-          : group.tasks.map((t) => ({ uid: t.uid, status: 'unknown (the check returned nothing)' }))
-        const unclosed = new Set(notDone.map((n) => n.uid))
-        group.tasks.filter((t) => !unclosed.has(t.uid)).forEach((t) => landed.push(t.uid))
-        if (unclosed.size) {
+        // Closed means: this task's own entry, under its full uid, says exactly `done`. Anything
+        // else — no answer, a missing entry, a short uid, an error — is unclosed, never assumed done.
+        const said = new Map(
+          (closed && Array.isArray(closed.tasks) ? closed.tasks : [])
+            .filter((e) => e && typeof e.uid === 'string')
+            .map((e) => [e.uid, String(e.status)]),
+        )
+        const notDone = group.tasks
+          .filter((t) => said.get(t.uid) !== 'done')
+          .map((t) => ({ uid: t.uid, status: said.get(t.uid) || 'unknown (not in the check\'s answer)' }))
+        group.tasks.filter((t) => said.get(t.uid) === 'done').forEach((t) => landed.push(t.uid))
+        if (notDone.length) {
           // Landed but not closed. The code IS on the integration branch; jkb refused or held the
           // landing record for these tasks, and merge-queue.sh still exits 0 for that (it is not the
           // branch's fault). The usual cause: the task's strategy does not let the coordinator land
@@ -650,7 +656,7 @@ log(
 // groups stalled read exactly like a run in which nothing went wrong.
 if (stalled.length) {
   log(`** ${stalled.length} group(s) STALLED and need a person — nothing will pick them up:`)
-  for (const st of stalled) log(`   ${st.group} (${st.branch}) exit ${st.exit}: ${st.detail}`)
+  for (const st of stalled) log(`   ${st.group} (${st.branch}) exit ${st.exit}: ${st.why} · ${st.detail}`)
 }
 
 return {

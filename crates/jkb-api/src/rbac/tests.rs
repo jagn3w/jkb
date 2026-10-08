@@ -1005,6 +1005,17 @@ fn an_open_task_is_not_closed_by_anyone_but_the_operator() {
         json!({ "op": "task.set", "uid": never_started, "status": "cancelled" }),
     );
 
+    // /next-task's sequence: claim (which starts it), work, close.
+    let next_task = add(&kb.op, "next-task's");
+    ok(
+        &c,
+        json!({ "op": "task.claim", "uid": next_task, "owner": "session:next-task" }),
+    );
+    ok(
+        &c,
+        json!({ "op": "task.set", "uid": next_task, "status": "done" }),
+    );
+
     let worked = add(&kb.op, "worked");
     ok(
         &c,
@@ -1024,6 +1035,12 @@ fn an_open_task_is_not_closed_by_anyone_but_the_operator() {
         json!({ "op": "task.set", "uid": elsewhere, "status": "done" }),
     );
     assert!(e.message.contains("scoped to another task"), "{e:?}");
+    // ...and in scope, a scoped grant is held to the same rule as an unscoped one.
+    let e = refused(
+        &kb.as_token(&scoped),
+        json!({ "op": "task.set", "uid": mine, "status": "done" }),
+    );
+    assert!(e.message.contains("is `open`"), "{e:?}");
 
     let operator_closes = add(&kb.op, "operator closes");
     ok(

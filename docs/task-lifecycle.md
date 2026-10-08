@@ -1245,10 +1245,16 @@ rule. And `rbac::authorize` refuses a non-operator `task.set --status done` on a
 because closing work nobody started is the operator's. That rule lives in the callee: the prompt
 that broke it was one of several that hand an agent a status command.
 
-**What the guard does not cover, stated.** It refuses one move, a single `open -> done`. A caller
-holding the status permission can still close an `in_progress` or `needs_review` task. That is
-how `/next-task` finishes its own work, and nothing yet ties a `done` to whoever started the task.
-It can also step a task `open -> in_progress -> done` in two calls. The guard stops an agent
+**What the guard does not cover, stated.** It refuses one move, a single `open -> done` through
+`task.set`. A caller holding the status permission can still close an `in_progress` or
+`needs_review` task, and nothing yet ties a `done` to whoever started the task. That is also how
+`/next-task` finishes its own work: it now runs `jkb task claim <uid>` (claim and start, at once)
+before working, because it used to close a task it never started. Review round 2 caught that the
+first draft of this paragraph claimed otherwise; the test pins claim-then-close. A caller can
+also step a task `open -> in_progress -> done` in two calls. And a **file-backed** task closes
+by its checkbox: an agent flips `[ ]` to `[x]`, and the host's sync applies it through
+`task::set_status_str_from_file`, which never passes `authorize`. So a container agent that can
+write a tasks file can still close an `open` task that way. The guard stops an agent
 closing the wrong task by accident, which is what happened; it does not stop one set on closing
 it. And the operator is admitted before any of this runs, so a swarm launched on the host, where
 agents act as the operator, relies on the workflow change alone. The swarm in this incident ran in
