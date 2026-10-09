@@ -784,6 +784,12 @@ pub(crate) fn op_error(e: ApiError, remote: bool, op: &str) -> anyhow::Error {
                  machine running `jkb serve` (./scripts/setup.sh there) and try again"
             )
         }
+        // A replace whose `--expected` base no longer holds: nothing was written.
+        ErrorCode::Stale => anyhow::anyhow!(
+            "{} (stale: it changed since you read it). Read it again, redo the edit against what it \
+             says now, and pass that as --expected",
+            e.message
+        ),
         _ => anyhow::Error::msg(e.message),
     }
 }

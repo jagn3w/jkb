@@ -164,7 +164,16 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             text,
             stdin,
             append,
-        } => edit(ops, &uid, &text, stdin, append),
+            expected,
+            expected_file,
+        } => edit(
+            ops,
+            &uid,
+            &text,
+            stdin,
+            append,
+            crate::item_cli::expected_base(expected, expected_file.as_deref())?,
+        ),
         TaskCmd::Tag { cmd } => {
             let (uid, facet_value, mode) = match cmd {
                 TaskTagCmd::Add { uid, facet_value } => (uid, facet_value, TagMode::Add),
@@ -339,7 +348,14 @@ fn add(
     Ok(())
 }
 
-fn edit(ops: &Ops<'_>, uid: &str, text: &[String], stdin: bool, append: bool) -> Result<()> {
+fn edit(
+    ops: &Ops<'_>,
+    uid: &str,
+    text: &[String],
+    stdin: bool,
+    append: bool,
+    expected: Option<String>,
+) -> Result<()> {
     let text = if stdin {
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
@@ -354,7 +370,7 @@ fn edit(ops: &Ops<'_>, uid: &str, text: &[String], stdin: bool, append: bool) ->
         uid: uid.to_owned(),
         text,
         append,
-        expected: None,
+        expected,
     })? {
         Response::Edited { file_backed } => file_backed,
         other => return unexpected("task.edit", &other),

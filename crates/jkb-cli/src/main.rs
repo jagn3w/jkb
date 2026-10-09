@@ -909,6 +909,13 @@ enum ItemCmd {
         /// Append to the existing content (blank-line separated) instead of replacing.
         #[arg(long)]
         append: bool,
+        /// Replace only while the content is still exactly this — what you read before editing.
+        /// Refused as stale (exit non-zero, nothing written) if it changed since.
+        #[arg(long, conflicts_with = "append", allow_hyphen_values = true)]
+        expected: Option<String>,
+        /// `--expected`, read from this file (its bytes exactly).
+        #[arg(long, conflicts_with_all = ["append", "expected"])]
+        expected_file: Option<PathBuf>,
     },
 }
 
@@ -1070,6 +1077,13 @@ enum TaskCmd {
         /// Append to the existing content (blank-line separated) instead of replacing.
         #[arg(long)]
         append: bool,
+        /// Replace only while the content is still exactly this — what you read before editing.
+        /// Refused as stale (exit non-zero, nothing written) if it changed since.
+        #[arg(long, conflicts_with = "append", allow_hyphen_values = true)]
+        expected: Option<String>,
+        /// `--expected`, read from this file (its bytes exactly).
+        #[arg(long, conflicts_with_all = ["append", "expected"])]
+        expected_file: Option<PathBuf>,
     },
     /// Add or remove a `facet=value` tag on a task.
     Tag {

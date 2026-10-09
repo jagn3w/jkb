@@ -403,10 +403,12 @@ text above:
   is). **Archived is derived on every read**: a plan with at least one task, every task its steps
   list (at any depth below a step) `done` or `cancelled`. A plan with no tasks is a draft, not
   finished work — the vacuous truth IMPLEMENTED also refuses — and a reopened task brings its plan
-  back with no write. Archived and the listing are **one walk**: archived once counted every task
-  contained anywhere under the plan while the listing reached only tasks under a step, so a task put
-  directly under the plan held it open forever and showed nowhere (caught in review).
-  `task::add_subtask` now refuses a plan or a span as a task's parent, so no op can put one there.
+  back with no write. Archived and the listing are **one walk**, from the steps: archived once
+  counted every task contained anywhere under the plan while the listing reached only tasks under a
+  step, so a task put directly under the plan held it open forever and showed nowhere (caught in
+  review). What prevents such a task is the guard, not the walk: `task::add_subtask` refuses a plan
+  or a span as a task's parent, so no op can put one there. One written before the guard (only by a
+  pre-merge build of this change) is neither listed nor counted.
 - **`design.plans` takes `all`**, as `jkb ls` does for terminal tasks; the listing says how many
   archived plans it left out. The app always asks for all and splits them itself, so the drawer is
   one read with the pane.
@@ -446,7 +448,8 @@ text above:
   `stale` (a new error code) when the text is no longer that — a Save once silently erased a note
   the Play session appended while the draft was open (caught in review). The pane keeps the draft,
   shows the task's text as it now is, and offers to discard the draft or keep it over that text; an
-  append takes no base, since it loses nothing.
+  append takes no base, since it loses nothing. The CLI has the same guard: `jkb task edit` and `jkb
+  item edit` take `--expected <text>` or `--expected-file <path>`, and exit non-zero on `stale`.
 - **Plans are re-read on demand** (a design switch, the refresh button, after a Play or an edit), not
   live: no topic carries task or plan changes yet, and D53.1 rules out a poll loop.
 

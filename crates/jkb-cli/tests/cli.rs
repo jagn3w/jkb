@@ -5238,3 +5238,57 @@ fn workflow_show_graph_prints_the_machines() {
         .failure()
         .stderr(predicate::str::contains("--graph"));
 }
+
+/// `jkb task edit` and `jkb item edit` take the base a replace was made against (`--expected`, or
+/// `--expected-file`): a note appended since makes it stale, and the replace exits non-zero having
+/// written nothing.
+#[test]
+fn an_edit_with_a_stale_expected_base_is_refused_and_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "Build it"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uid = v["uid"].as_str().unwrap().to_owned();
+    let content = || {
+        let shown = jkb(&db)
+            .args(["--json", "task", "show", &uid])
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+        v["content"].as_str().unwrap().to_owned()
+    };
+    let read = content();
+    jkb(&db)
+        .args(["task", "edit", &uid, "--append", "blocked on X"])
+        .assert()
+        .success();
+    let noted = content();
+    for cmd in ["task", "item"] {
+        jkb(&db)
+            .args([cmd, "edit", &uid, "Build it well", "--expected", &read])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("stale"));
+        assert_eq!(content(), noted, "`{cmd} edit` wrote nothing");
+    }
+    let base = dir.path().join("base.txt");
+    std::fs::write(&base, &noted).unwrap();
+    jkb(&db)
+        .args(["item", "edit", &uid, "Build it well", "--expected-file"])
+        .arg(&base)
+        .assert()
+        .success();
+    assert_eq!(content(), "Build it well");
+    jkb(&db)
+        .args(["task", "edit", &uid, "Again", "--expected", "Build it well"])
+        .assert()
+        .success();
+    assert_eq!(content(), "Again");
+    jkb(&db)
+        .args(["task", "edit", &uid, "--append", "x", "--expected", "Again"])
+        .assert()
+        .failure();
+}

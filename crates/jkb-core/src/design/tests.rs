@@ -941,8 +941,9 @@ fn a_plan_whose_tasks_are_all_terminal_is_archived_and_hidden_unless_asked() {
     assert!(!plans_of(&db, &uid, false).plans[0].archived);
 }
 
-/// Archived and the listing are one walk: a task the steps do not reach (here contained by the
-/// plan itself, which `task::add_subtask` now refuses) neither holds the plan open unseen nor shows.
+/// Archived and the listing are one walk: a task the steps do not reach (here contained by the plan
+/// itself, which `task::add_subtask` refuses — this test writes the row directly) is neither listed
+/// nor counted.
 #[test]
 fn archived_is_judged_on_exactly_the_tasks_the_plan_lists() {
     let db = db();

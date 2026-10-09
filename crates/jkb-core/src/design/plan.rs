@@ -287,9 +287,10 @@ fn view(
             tasks,
         });
     }
-    // Archived is judged on exactly the tasks the view lists — one walk — so a task the listing
-    // cannot show (one contained by the plan itself, say) can neither hold the plan open unseen nor
-    // be silently left out of a plan called finished. `task::add_subtask` refuses such a parent.
+    // Archived is judged on exactly the tasks the view lists — one walk, from the steps. What keeps
+    // a task out of reach of both is `task::add_subtask`, which refuses a plan or a span as a
+    // parent; the walk does not. A task contained by a plan itself (only a pre-guard build of this
+    // change could write one) is neither listed nor counted, so it does not hold the plan open.
     let mut count = 0usize;
     let mut open = 0usize;
     for t in steps.iter().flat_map(|s: &StepView| s.tasks.iter()) {

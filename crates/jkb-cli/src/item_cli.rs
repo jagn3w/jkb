@@ -96,7 +96,16 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: ItemCmd) -> Result<()> {
             text,
             stdin,
             append,
-        } => edit(ops, &uid, &text, stdin, append),
+            expected,
+            expected_file,
+        } => edit(
+            ops,
+            &uid,
+            &text,
+            stdin,
+            append,
+            crate::item_cli::expected_base(expected, expected_file.as_deref())?,
+        ),
     }
 }
 
@@ -171,9 +180,30 @@ fn rm(ops: &Ops<'_>, uid: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// The base a replace names (`--expected`, or `--expected-file` read exactly): `task.edit` writes
+/// only while the content is still this, and is refused as `stale` otherwise.
+///
+/// # Errors
+/// An unreadable `--expected-file`.
+pub(crate) fn expected_base(text: Option<String>, file: Option<&Path>) -> Result<Option<String>> {
+    match file {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading --expected-file {}", path.display()))
+            .map(Some),
+        None => Ok(text),
+    }
+}
+
 /// `jkb item edit` — through `task.edit`, whose edit rule (`item::edit_content`) is the one for any
 /// item: an item in a tasks.md appends with one newline and refuses a line that would end its body.
-fn edit(ops: &Ops<'_>, uid: &str, text: &[String], stdin: bool, append: bool) -> Result<()> {
+fn edit(
+    ops: &Ops<'_>,
+    uid: &str,
+    text: &[String],
+    stdin: bool,
+    append: bool,
+    expected: Option<String>,
+) -> Result<()> {
     let new_text = if stdin {
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
@@ -192,7 +222,7 @@ fn edit(ops: &Ops<'_>, uid: &str, text: &[String], stdin: bool, append: bool) ->
         uid: uid.to_owned(),
         text: new_text,
         append,
-        expected: None,
+        expected,
     })? {
         Response::Edited { file_backed } => file_backed,
         other => return unexpected("task.edit", &other),

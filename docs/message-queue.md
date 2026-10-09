@@ -80,7 +80,7 @@ routinely built from different checkouts.
 | `task.why` | `uid` | `history` {`entries`} (budgeted) |
 | `task.add` | `text`, `home?`, `under?`, `backlog?`, `global_backlog?`, `sync?`, `managed?`, `cwd?`, `client_home?`, `literal?` (the text is the title, no modifiers read), `priority?`, `due?`, `also?` (a reference placement) | `added` {`id`, `uid`, `home`, `binding`}, or `needs_global_backlog_assent` |
 | `task.set` | `uid`, `status?`, `priority?`, `due?` | `applied` |
-| `task.edit` | `uid` (any item's), `text`, `append?` | `edited` {`file_backed`} — the result is capped at 256 KiB for a task, and for any item a client of `jkb serve` edits |
+| `task.edit` | `uid` (any item's), `text`, `append?`, `expected?` | `edited` {`file_backed`} — the result is capped at 256 KiB for a task, and for any item a client of `jkb serve` edits. `expected` is a replace's base, the content the edit was made against: refused as `stale` when the content is no longer exactly that, and refused (`invalid`) together with `append` |
 | `task.tag` | `uid`, `facet_value`, `mode` (`add`\|`set`\|`rm`) | `applied` |
 | `task.depend` / `task.undepend` | `uid`, `dep` | `applied` |
 | `task.place` | `uid`, `ns`, `home?` | `applied` |
@@ -413,7 +413,8 @@ route this backend does not serve), `forbidden` (a write whose host-side effect 
 cause — see the task-mutate set), `ack_beyond_end`, `corrupt_payload` (with `seq`, so a consumer can ack past
 it), `bad_request`, `busy` (transient — retry: another writer held the database lock past the busy
 timeout, or, over HTTP, the daemon is at a concurrency limit or the group already has a long-poll in
-progress), `internal`, and `schema_newer` — a newer `jkb` migrated the database, so this build must
+progress), `stale` (HTTP 409: a `task.edit` replace whose `expected` base no longer holds — nothing
+was written; re-read and retry), `internal`, and `schema_newer` — a newer `jkb` migrated the database, so this build must
 not write to it. That one means different things by where it comes from: **in-process**, this process
 is too old and only a newer binary helps (exit, and let a supervisor start one); **from `jkb serve`**,
 the daemon is too old and `setup.sh` restarts it on the newer binary, so waiting helps. Over HTTP two
