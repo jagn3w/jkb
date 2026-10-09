@@ -4808,7 +4808,8 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
 }
 
 /// A quote beginning with `-` (a Markdown list item) is a value, not a flag, in every quote option
-/// (`--find`, `--insert-after`, `design span --find`), spelled with or without `=`.
+/// (`--find`, `--insert-after`, `design span --find`), in the separated spelling — the one that
+/// needs `allow_hyphen_values` (`--find=- x` parses without it).
 #[test]
 fn a_quote_that_begins_with_a_dash_is_a_value() {
     let dir = TempDir::new().unwrap();
@@ -4841,7 +4842,7 @@ fn a_quote_that_begins_with_a_dash_is_a_value() {
         .success();
     jkb(&db)
         .args(["design", "span", &list_uid, "--base", &list_version()])
-        .args(["--find=- uno"])
+        .args(["--find", "- uno"])
         .assert()
         .success();
     jkb(&db)

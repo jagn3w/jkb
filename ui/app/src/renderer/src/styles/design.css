@@ -113,7 +113,8 @@
   color: var(--ink-muted);
 }
 
-.design-notice[data-kind="failed"] {
+.design-notice[data-kind="failed"],
+.design-notice[data-kind="lost"] {
   color: var(--alert);
   background: var(--alert-soft);
 }

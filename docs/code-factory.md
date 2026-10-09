@@ -322,6 +322,11 @@ to learn, and what was decided past the text above:
   *Corrected in review:* CI's `ui` job has no `jkb`, so the test skipped there on every run and passed
   green. It now runs in the `check` job against the `jkb` that job builds, and `scripts/check.sh`
   runs it too; both set `JKB_REQUIRE_WIRE`, under which a missing binary fails instead of skipping.
+  `ui/app/test/wire-required.test.mjs` pins that flag: with a missing `JKB_BIN` it exits non-zero
+  with the flag set and skips without it. `check.sh` locates its built `jkb` once, from `cargo
+  metadata`, and hands it on as `JKB_CHECK_BIN`, a name only the gate sets. In CI the shell tests now
+  run after the build with that variable and `JKB_REQUIRE_BUILT_JKB`. Run before the build,
+  `notify-hook.test.sh`'s `jkb notify events` cross-check found no binary and skipped green.
 
 **As built (subtask 4, the Document pane).** `@jkb/core`'s `design.ts` (the answers' shapes and
 decoders, base64, the live-update message, and `stateRuns` — the span-state derivation the editor
@@ -346,10 +351,13 @@ the Yjs peer, `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `disc
 - **The quote is also given as a JSON string**, and a passage with whitespace or a line break at an
   edge says so. A fence cannot show those, but the quote and its occurrence count them: copying the
   visible `foo` of a selected `foo\n` matched a third time and edited the wrong line. Such a passage
-  names bash's `$'…'` quoting, the shell spelling that passes a real line break. `--find`,
+  names bash's `$'…'` quoting, the shell spelling that passes a real line break, and says that an
+  apostrophe inside it is written `\'`. JSON leaves `'` bare, so a transcribed quote would end early. `--find`,
   `--insert-after` and `design span --find` take values beginning with `-` (`allow_hyphen_values`),
   because a Markdown list item is a common quote. Both prompts that teach an edit (*Discuss* and
-  *New prompt*) build it from one string, `designs::edit_usage`, so the two cannot drift apart.
+  *New prompt*) build it from one string, `designs::edit_usage`, so the two cannot drift apart. That
+  string carries both the spelling and the rule to quote enough context to be unique in the version
+  read.
 - **The offsets are sent with the version whose text is the screen's.** The pane waits for every
   local edit to be saved, re-reads with `design.cat`, and sends that version only if its text is the
   text the selection was made in; otherwise it asks for the selection again. Every other reason
@@ -415,9 +423,13 @@ the Yjs peer, `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `disc
   every design. Making the overlap impossible was simpler than counting it (found in review, round
   2; pinned by `a design reopened while its old pane's edits are unsent reuses the session, and
   stays live`). A detached session also ends every wait on it: a *Discuss* pending there resolves
-  as `closed`. Its resend retries are bounded (10 by default). A refusal or a give-up while
-  detached is reported as a notice naming the design, since no pane showed its status. Leaving a
-  design with unsent edits says they are still being saved. A Refresh keeps the designs it already
+  as `closed`, and that is said as a notice naming the design. Its resend retries are bounded (10 by
+  default). A refusal or a give-up while detached is reported as a notice naming the design, since
+  no pane showed its status. Leaving a design with unsent edits says they are still being saved; that
+  notice is withdrawn once they land or the design is shown again. **These notices are the
+  registry's own list, each kept until dismissed**, not the tab's single notice slot. Every
+  *Discuss* clears that slot, so an unread report of lost edits was erased by the next click (found
+  in review, round 3). A Refresh keeps the designs it already
   has while it loads and when it fails: emptying the list for a moment detached the open design.
 - **`@codemirror/language` is held at 6.12.4** (a workspace `overrides` entry): 6.13.0, published the
   day before, imports `@codemirror/streamparser` without declaring it, and the renderer did not bundle.

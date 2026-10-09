@@ -29,12 +29,6 @@ jobs:
       - name: shell syntax
         run: bash -c '. scripts/lib.sh; check_shell_syntax "$PWD"'
 
-      # setup.sh's installs are not reachable from a Rust test, and one of them replaces the
-      # very hook that runs it. No `-e` guard on the glob, unlike check.sh: here, finding no
-      # tests is a failure.
-      - name: shell tests
-        run: for t in scripts/tests/*.test.sh; do bash "$t"; done
-
       # The workspace pulls heavy transitive deps (fastembed/ONNX, headless_chrome,
       # rav1e/image) and builds them twice (default + --features fastembed) plus a
       # --all-features cargo-deny graph, which overflows the runner's ~14 GB free disk
@@ -84,6 +78,18 @@ jobs:
 
       - name: test (fastembed)
         run: cargo test --all --features fastembed
+
+      # setup.sh's installs are not reachable from a Rust test, and one of them replaces the
+      # very hook that runs it. No `-e` guard on the glob, unlike check.sh: here, finding no
+      # tests is a failure. AFTER the tests, which build target/debug/jkb: notify-hook.test.sh
+      # cross-checks the hook against `jkb notify events`, and run before any build it found no
+      # binary and skipped that check green on every run. JKB_REQUIRE_BUILT_JKB makes a missing
+      # binary a failure, as in check.sh.
+      - name: shell tests
+        env:
+          JKB_CHECK_BIN: ${{ github.workspace }}/target/debug/jkb
+          JKB_REQUIRE_BUILT_JKB: "1"
+        run: for t in scripts/tests/*.test.sh; do bash "$t"; done
 
       # The editor's `yjs` against jkb's `yrs`, byte for byte (D53.4): ui/app/test/yjs-wire.test.mjs
       # drives a real jkb. It runs HERE, against the jkb the tests above built, rather than in the

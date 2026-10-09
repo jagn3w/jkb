@@ -461,8 +461,7 @@ function registryOver(jkb, options = quick) {
     },
   };
   const registry = new SessionRegistry(bridge, options);
-  const notices = [];
-  registry.onNotice((n) => notices.push(n.message));
+  const notices = () => registry.notices.map((n) => n.message);
   const attach = () => {
     const s = registry.attach({ uid: "d", topic: TOPIC, title: "Code Factory" });
     opened.push(s);
@@ -492,10 +491,11 @@ test("a design reopened while its old pane's edits are unsent reuses the session
   first.text.insert(3, " typed");
   await until(() => first.status.kind === "retrying", "the retry");
   registry.detach(first);
-  assert.deepEqual(notices, ["Edits to Code Factory are still being saved in the background."]);
+  assert.deepEqual(notices(), ["Edits to Code Factory are still being saved in the background."]);
 
   const again = attach();
   assert.equal(again, first, "one session per design: the pane reattaches to the one still sending");
+  assert.deepEqual(notices(), [], "shown again, its own status says how saving goes");
   daemon.back();
   await until(() => bodyOf(jkb.table) === "abc typed", "the old pane's edits, sent");
   await until(() => again.status.kind === "live", "Saved");
@@ -512,7 +512,7 @@ test("a design reopened while its old pane's edits are unsent reuses the session
 test("a detached session sends what it holds, then is disposed and leaves the feed", async () => {
   const jkb = standInJkb("abc");
   // No span re-read to wake the registry: the drained outbox alone must.
-  const { registry, feed, attach } = registryOver(jkb, { ...quick, spansDelayMs: 60_000 });
+  const { registry, feed, notices, attach } = registryOver(jkb, { ...quick, spansDelayMs: 60_000 });
   const s = attach();
   await until(() => s.status.kind === "live", "the load");
   const daemon = downUntilBack(jkb);
@@ -520,10 +520,12 @@ test("a detached session sends what it holds, then is disposed and leaves the fe
   await until(() => s.status.kind === "retrying", "the retry");
   registry.detach(s);
   assert.equal(registry.session("d"), s, "kept while it holds edits");
+  assert.equal(notices().length, 1);
   daemon.back();
   await until(() => bodyOf(jkb.table) === "abc typed while away", "the held edit, sent after the pane left");
   await until(() => registry.session("d") === undefined, "the dispose once sent");
   assert.ok(s.doc.isDestroyed);
+  assert.deepEqual(notices(), [], "\"still being saved\" is withdrawn once saved");
   assert.equal(feed.unsubscribed, 1);
 });
 
@@ -540,7 +542,7 @@ test("a detached session's refused edit is reported naming the design, and its r
   r1.registry.detach(s);
   answer = err("invalid", "the update does not apply");
   await until(() => r1.registry.session("d") === undefined, "the dispose");
-  assert.equal(r1.notices.at(-1), "Edits to Code Factory were not saved: invalid: the update does not apply");
+  assert.deepEqual(r1.notices(), ["Edits to Code Factory were not saved: invalid: the update does not apply"]);
 
   // A daemon that never answers: a detached session gives up after its retries, and says so.
   const gone = standInJkb("abc");
@@ -552,7 +554,41 @@ test("a detached session's refused edit is reported naming the design, and its r
   await until(() => t.status.kind === "retrying", "the retry");
   r2.registry.detach(t);
   await until(() => r2.registry.session("d") === undefined, "the give-up");
-  assert.match(r2.notices.at(-1), /^Edits to Code Factory were not saved: not saved after 3 retries/);
+  assert.match(r2.notices().at(-1), /^Edits to Code Factory were not saved: not saved after 3 retries/);
+});
+
+test("a report of lost edits stays until it is dismissed, whatever is said after it", async () => {
+  const jkb = standInJkb("abc");
+  const { registry, notices, attach } = registryOver(jkb);
+  const s = attach();
+  await until(() => s.status.kind === "live", "the load");
+  const realOp = jkb.bridge.op;
+  jkb.bridge.op = async (request) => (request.op === "design.apply" ? err("unavailable", "down") : realOp(request));
+  s.text.insert(3, "d");
+  await until(() => s.status.kind === "retrying", "the retry");
+  registry.detach(s);
+  jkb.bridge.op = async (request) => (request.op === "design.apply" ? err("invalid", "no") : realOp(request));
+  await until(() => registry.session("d") === undefined, "the refusal");
+  // Later notices — another design's, a Discuss not started — and a design reopened do not erase it.
+  registry.notify("other", "closed", "A Discuss of Other was not started.");
+  jkb.bridge.op = realOp;
+  const t = attach();
+  await until(() => t.status.kind === "live", "the fresh load");
+  assert.deepEqual(notices(), ["Edits to Code Factory were not saved: invalid: no", "A Discuss of Other was not started."]);
+  registry.notify("other", "closed", "A Discuss of Other was not started.");
+  assert.equal(notices().length, 2, "the same notice is not repeated");
+  // The reopened design is left with edits unsent, then they land: only "still being saved" goes.
+  const daemon = downUntilBack(jkb);
+  t.text.insert(0, "x");
+  await until(() => t.status.kind === "retrying", "the retry");
+  registry.detach(t);
+  assert.equal(notices().length, 3);
+  daemon.back();
+  await until(() => registry.session("d") === undefined, "the save");
+  assert.deepEqual(notices(), ["Edits to Code Factory were not saved: invalid: no", "A Discuss of Other was not started."]);
+  const lost = registry.notices[0];
+  registry.dismiss(lost.id);
+  assert.deepEqual(notices(), ["A Discuss of Other was not started."]);
 });
 
 test("a Discuss waiting on a design the pane has left resolves as closed", async () => {

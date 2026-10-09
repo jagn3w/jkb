@@ -12,13 +12,22 @@
 // is disposed once nothing is unsent, or once it stops; a stop while no pane showed it is reported as
 // a notice naming the design, since nobody saw its status.
 //
+// Notices are the registry's own list, kept until each is dismissed — not the tab's one notice slot,
+// which every *Discuss* clears: an unread report that edits were lost must not be erased by the next
+// click. "Still being saved" is withdrawn by itself once the edits land or the design is shown again.
+//
 // No React and no `window`: the bridge is passed in, so this is tested with a stand-in daemon.
 
 import { DesignSession, type DesignSessionOptions, type SessionBridge } from "./session";
 
-/** What the registry tells the tab, about a design no pane may be showing. */
+/**
+ * What the registry tells the tab, about a design no pane may be showing: its edits are still being
+ * saved (withdrawn when they are), they were not saved, or a *Discuss* of it was not started.
+ */
 export interface RegistryNotice {
+  readonly id: number;
   readonly uid: string;
+  readonly kind: "saving" | "lost" | "closed";
   readonly message: string;
 }
 
@@ -40,9 +49,9 @@ export class SessionRegistry {
   readonly #bridge: SessionBridge;
   readonly #options: DesignSessionOptions;
   readonly #entries = new Map<string, Entry>();
-  readonly #listeners = new Set<(notice: RegistryNotice) => void>();
-  /** Notices raised while no tab was listening, delivered to the next listener. */
-  #queued: RegistryNotice[] = [];
+  readonly #listeners = new Set<() => void>();
+  #notices: readonly RegistryNotice[] = [];
+  #nextNotice = 1;
 
   constructor(bridge: SessionBridge, options: DesignSessionOptions = {}) {
     this.#bridge = bridge;
@@ -56,6 +65,8 @@ export class SessionRegistry {
       entry.views += 1;
       entry.title = design.title;
       entry.session.setAttached(true);
+      // Shown again: its status says how saving goes.
+      this.#withdraw(design.uid, "saving");
       return entry.session;
     }
     // A stopped session sends nothing more ("reopen the design"): reopening is a fresh one.
@@ -79,17 +90,33 @@ export class SessionRegistry {
       this.#dispose(session.uid, entry);
       return;
     }
-    if (session.unsent) this.#notify({ uid: session.uid, message: `Edits to ${entry.title} are still being saved in the background.` });
+    if (session.unsent) this.notify(session.uid, "saving", `Edits to ${entry.title} are still being saved in the background.`);
     this.#settle(session.uid);
   }
 
-  /** Hear notices; those raised while nobody listened arrive at once. Returns the unsubscribe. */
-  onNotice(listener: (notice: RegistryNotice) => void): () => void {
+  /** The notices not yet dismissed, oldest first. */
+  get notices(): readonly RegistryNotice[] {
+    return this.#notices;
+  }
+
+  /** Hear every change to the notices. Returns the unsubscribe. */
+  onNotices(listener: () => void): () => void {
     this.#listeners.add(listener);
-    const queued = this.#queued;
-    this.#queued = [];
-    for (const n of queued) listener(n);
     return () => this.#listeners.delete(listener);
+  }
+
+  /** Add a notice about `uid`; one of the same kind and words is not repeated. */
+  notify(uid: string, kind: RegistryNotice["kind"], message: string): void {
+    if (this.#notices.some((n) => n.uid === uid && n.kind === kind && n.message === message)) return;
+    this.#notices = [...this.#notices, { id: this.#nextNotice++, uid, kind, message }];
+    this.#noticesChanged();
+  }
+
+  dismiss(id: number): void {
+    const kept = this.#notices.filter((n) => n.id !== id);
+    if (kept.length === this.#notices.length) return;
+    this.#notices = kept;
+    this.#noticesChanged();
   }
 
   /** The open session of `uid`, if any (shown or still sending). */
@@ -102,11 +129,24 @@ export class SessionRegistry {
     if (entry === undefined || entry.views > 0) return;
     const { session } = entry;
     if (session.status.kind === "failed") {
-      this.#notify({ uid, message: `Edits to ${entry.title} were not saved: ${session.status.message}` });
+      this.#withdraw(uid, "saving");
+      this.notify(uid, "lost", `Edits to ${entry.title} were not saved: ${session.status.message}`);
       this.#dispose(uid, entry);
     } else if (!session.unsent) {
+      this.#withdraw(uid, "saving");
       this.#dispose(uid, entry);
     }
+  }
+
+  #withdraw(uid: string, kind: RegistryNotice["kind"]): void {
+    const kept = this.#notices.filter((n) => n.uid !== uid || n.kind !== kind);
+    if (kept.length === this.#notices.length) return;
+    this.#notices = kept;
+    this.#noticesChanged();
+  }
+
+  #noticesChanged(): void {
+    for (const l of this.#listeners) l();
   }
 
   #dispose(uid: string, entry: Entry): void {
@@ -115,8 +155,4 @@ export class SessionRegistry {
     entry.session.dispose();
   }
 
-  #notify(notice: RegistryNotice): void {
-    if (this.#listeners.size === 0) this.#queued.push(notice);
-    for (const l of this.#listeners) l(notice);
-  }
 }

@@ -7,7 +7,7 @@ import { discussSpec, exclusive } from "../design/discuss";
 import { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading, type Listing } from "../design/listing";
 import { PlanColumn } from "../design/PlanColumn";
 import { PromptsPane } from "../design/PromptsPane";
-import { SessionRegistry } from "../design/registry";
+import { SessionRegistry, type RegistryNotice } from "../design/registry";
 import type { DesignSession, SessionBridge, SyncStatus } from "../design/session";
 import { useNavigation } from "../navigation";
 import { useTerminals } from "../terminal/TerminalProvider";
@@ -147,9 +147,15 @@ export function DesignTab(): React.JSX.Element {
   // under this one's name.
   const session = opened !== undefined && opened.uid === design?.uid ? opened : undefined;
 
-  // What the registry says about designs the pane has left — still saving, or not saved — whichever
-  // way the pane left them (a picker, *Jump to context*, the tab closing).
-  useEffect(() => registryOf().onNotice((n) => setNotice(n.message)), []);
+  // What the registry says about designs the pane has left — still saving, not saved, a *Discuss*
+  // not started — whichever way the pane left them (a picker, *Jump to context*, the tab closing).
+  // Its own list, each kept until dismissed: never the one `notice` slot every *Discuss* clears.
+  const [designNotices, setDesignNotices] = useState<readonly RegistryNotice[]>(() => registryOf().notices);
+  useEffect(() => {
+    const reg = registryOf();
+    setDesignNotices(reg.notices);
+    return reg.onNotices(() => setDesignNotices(reg.notices));
+  }, []);
 
   const pickRepo = (next: string): void => {
     setRepo(next);
@@ -177,6 +183,13 @@ export function DesignTab(): React.JSX.Element {
       const why = settled.why;
       switch (why.kind) {
         case "closed":
+          // The pane left the design while its edits were still being saved: said once, in the
+          // design's own notices, so it is there whichever design is shown now.
+          registryOf().notify(
+            design.uid,
+            "closed",
+            `A Discuss of ${design.title} was not started: the design was left before its edits were saved. Select the text again.`,
+          );
           return;
         case "failed":
           setNotice(`${why.message} — reopen the design to discuss it.`);
@@ -273,6 +286,14 @@ export function DesignTab(): React.JSX.Element {
           </button>
         </p>
       )}
+      {designNotices.map((n) => (
+        <p key={n.id} className="design-notice" role={n.kind === "lost" ? "alert" : "status"} data-kind={n.kind}>
+          {n.message}
+          <button type="button" className="bar-button" onClick={() => registryOf().dismiss(n.id)} aria-label="Dismiss">
+            ×
+          </button>
+        </p>
+      ))}
       {session?.status.kind === "failed" && (
         <p className="design-notice" role="alert" data-kind="failed">
           {session.status.message} — nothing more is saved until the design is reopened.

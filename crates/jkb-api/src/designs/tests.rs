@@ -345,13 +345,6 @@ fn a_discuss_prompt_names_the_selection_as_the_edit_that_reaches_it() {
         "{}",
         prompt.prompt
     );
-    assert!(
-        !prompt
-            .prompt
-            .contains("<token> --find=<quote> --occurrence"),
-        "{}",
-        prompt.prompt
-    );
     written(ok(
         &kb.op,
         json!({ "op": "design.edit", "uid": uid, "base": prompt.version,
@@ -394,6 +387,7 @@ fn a_discussed_passage_with_an_edge_line_break_is_quoted_exactly() {
         "Exactly, as a JSON string: \"foo\\n\"",
         "begins or ends with whitespace or a line break",
         "--find=$'foo\\n'",
+        "an apostrophe is written `\\'`",
     ] {
         assert!(
             prompt.prompt.contains(needle),
@@ -779,6 +773,7 @@ fn a_new_prompt_carries_the_operators_words_and_how_to_read_the_design() {
         "\n````\nTighten the ```intro``` please.\n````\n".to_owned(),
         // The one spelling of an edit every prompt teaches (`edit_usage`), the same as Discuss's.
         format!("jkb design edit {uid} --base <token> --find=<quote> --replace=<text>"),
+        "Quote enough of the surrounding text that the quote occurs once".to_owned(),
     ] {
         assert!(p.prompt.contains(&needle), "{needle}: {}", p.prompt);
     }

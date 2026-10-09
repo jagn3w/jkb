@@ -582,11 +582,13 @@ pub(crate) fn longest_backtick_run(s: &str) -> usize {
 }
 
 /// How Claude edits a design's text, as every prompt that teaches it says it (*Discuss*, *New
-/// prompt*): one spelling, so the prompts cannot drift apart on a CLI rule.
+/// prompt*): one spelling and one uniqueness rule, so the prompts cannot drift apart on either.
+/// Whole sentences, ending in a full stop.
 pub(crate) fn edit_usage(uid: &str) -> String {
     format!(
         "`jkb design edit {uid} --base <token> --find=<quote> --replace=<text>` (or \
-         `--insert-after=<quote> --text=<text>`)"
+         `--insert-after=<quote> --text=<text>`). Quote enough of the surrounding text that the \
+         quote occurs once in the version you read."
     )
 }
 
@@ -619,8 +621,8 @@ fn discuss_prompt(d: &design::Discussion) -> String {
             p,
             "It begins or ends with whitespace or a line break, which the block above does not \
              show: quote it as the JSON string has it. In bash, `$'…'` quoting passes a line break \
-             as `\\n` (e.g. `--find=$'foo\\n'`); a plain `'…'` or `\"…\"` passes the two \
-             characters."
+             as `\\n` (e.g. `--find=$'foo\\n'`), where a plain `'…'` or `\"…\"` passes the two \
+             characters; inside `$'…'` an apostrophe is written `\\'` and a backslash `\\\\`."
         );
     }
     match d.occurrence {
@@ -664,8 +666,7 @@ fn discuss_prompt(d: &design::Discussion) -> String {
         p,
         "When they do, edit through the CLI against a version you read — your edit merges with \
          anything written since, and the quote is matched in that version, never the latest: \
-         {}. Against a version you read yourself, quote enough of the surrounding text that it \
-         occurs once there.",
+         {}",
         edit_usage(&d.uid)
     );
     // The occurrence counts matches in the version the selection was made in, and in no other: it
