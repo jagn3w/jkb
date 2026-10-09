@@ -5,6 +5,7 @@ import {
   defaultCwd,
   retarget as retargetSpec,
   targetLabel,
+  type TerminalEnd,
   type TerminalRoots,
   type TerminalSpec,
   type TerminalTarget,
@@ -44,6 +45,8 @@ export interface TerminalsApi {
   relaunch(key: number, spec: TerminalSpec): boolean;
   /** Move the terminal to the other target: its program starts again there. */
   retarget(key: number, target: TerminalTarget): void;
+  /** Forget a closed tab whose program may still be running (`TerminalsState.orphans`). */
+  dismissOrphan(key: number): void;
   session(key: number): TerminalSession | undefined;
 }
 
@@ -68,6 +71,8 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
   const sessions = useRef(new Map<number, TerminalSession>());
   const router = useRef<TerminalEventRouter | undefined>(undefined);
   const nextKey = useRef(1);
+  /** The end of each closed tab's program, kept while it is an orphan, for a new tab of its session to wait on. */
+  const orphanEnds = useRef(new Map<number, Promise<TerminalEnd | undefined>>());
 
   // The bridge is reached only from effects and handlers, never during render.
   useEffect(() => {
@@ -106,7 +111,7 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
 
   const open = useCallback((spec: TerminalSpec, placement: Placement = "drawer"): number => {
     const plan = planOpen(stateRef.current, spec);
-    if (plan.kind !== "new") {
+    if (plan.kind === "show" || plan.kind === "relaunch") {
       const { key } = plan.entry;
       const session = sessions.current.get(key);
       if (plan.kind === "relaunch" && session !== undefined) {
@@ -122,6 +127,15 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
     const key = nextKey.current++;
     const session = new TerminalSession(r, (status) => dispatch({ type: "status", key, status }));
     sessions.current.set(key, session);
+    if (plan.kind === "afterOrphan") {
+      // A closed tab of this session may still be running: the new one waits for that end, and
+      // does not start if it is unconfirmed (its Restart is the override).
+      const { orphan } = plan;
+      const unconfirmed: TerminalEnd = { target: orphan.spec.target, confirmed: false, detail: orphan.detail ?? "its end was not confirmed" };
+      session.inherit(orphanEnds.current.get(orphan.key) ?? Promise.resolve(unconfirmed));
+      orphanEnds.current.delete(orphan.key);
+      dispatch({ type: "dropOrphan", key: orphan.key });
+    }
     dispatch({ type: "open", key, spec, placement });
     void session.start(spec);
     return key;
@@ -137,9 +151,24 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
   );
 
   const close = useCallback((key: number): void => {
-    sessions.current.get(key)?.dispose();
+    const session = sessions.current.get(key);
     sessions.current.delete(key);
+    // The tab goes now; its program's end is awaited, and an unconfirmed one outlives the tab as an
+    // orphan (shown in the drawer, and waited on by a later open of the same session).
     dispatch({ type: "close", key });
+    if (session === undefined) return;
+    const end = session.dispose();
+    orphanEnds.current.set(key, end);
+    void end.then((e) => {
+      const confirmed = e === undefined || e.confirmed;
+      if (confirmed) orphanEnds.current.delete(key);
+      dispatch({ type: "orphanEnded", key, confirmed, detail: e?.detail ?? "" });
+    });
+  }, []);
+
+  const dismissOrphan = useCallback((key: number): void => {
+    orphanEnds.current.delete(key);
+    dispatch({ type: "dropOrphan", key });
   }, []);
 
   const restart = useCallback((key: number): void => {
@@ -147,7 +176,8 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
     const session = sessions.current.get(key);
     if (entry === undefined || session === undefined) return;
     dispatch({ type: "restart", key, spec: entry.spec });
-    void session.start(entry.spec);
+    // The person's explicit act: it starts even beside a program that may still be running.
+    void session.start(entry.spec, { override: true });
   }, []);
 
   const relaunch = useCallback((key: number, spec: TerminalSpec): boolean => {
@@ -168,7 +198,7 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
         dispatch({ type: "restart", key, spec });
         session.term.write(`\r\n\x1b[2m— moving to the ${targetLabel(target)}, in ${spec.cwd} —\x1b[22m\r\n`);
         // The program on the other side starts only once the one here is seen to have ended.
-        void session.start(spec, { requireEnded: true });
+        void session.start(spec);
       };
       if (target !== "host") return move();
       // A move to the host is always confirmed, showing exactly what runs and where. A program is
@@ -219,9 +249,10 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
       restart,
       relaunch,
       retarget,
+      dismissOrphan,
       session: (key) => sessions.current.get(key),
     }),
-    [state, roots, open, openShell, close, toggleDrawer, restart, relaunch, retarget],
+    [state, roots, open, openShell, close, toggleDrawer, restart, relaunch, retarget, dismissOrphan],
   );
 
   return <TerminalsContext.Provider value={api}>{children}</TerminalsContext.Provider>;

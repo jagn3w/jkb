@@ -70,7 +70,16 @@ export interface TerminalEnvironment {
   run(file: string, args: readonly string[], timeoutMs: number): Promise<{ code: number | null; output: string }>;
   /** Where, inside the container, each container terminal's process is recorded. */
   readonly containerRunDir: string;
+  /** Whether process `pid` (a PTY's child) still exists. */
+  processAlive(pid: number): boolean;
 }
+
+/**
+ * How often a paused PTY's program is checked for having exited. node-pty 1.1.0 waits at most
+ * 200 ms (`DESTROY_SOCKET_TIMEOUT_MS` in its `unixTerminal.js`) after its child exits for the
+ * socket to drain, then destroys it with whatever is unread; a socket left paused never drains.
+ */
+export const PAUSED_EXIT_CHECK_MS = 50;
 
 /** `TerminalEnvironment.containerRunDir` on a real machine: the container's own tmp. */
 export const CONTAINER_RUN_DIR = "/tmp/jkb-terminals";
@@ -208,9 +217,42 @@ export function needsHostConfirmation(spec: TerminalSpec): boolean {
 export interface HostPrompt {
   readonly argv: readonly string[];
   readonly cwd: string;
-  /** `argv` as a shell would read it (`formatArgv`). */
-  readonly command: string;
-  readonly title: string;
+  /** What the dialog says (`hostPromptText`): every part made visible and bounded. */
+  readonly message: string;
+  readonly detail: string;
+}
+
+/** The most of any one part (title, command, cwd) the confirmation dialog shows. */
+export const PROMPT_PART_CHARS = 600;
+
+/**
+ * Characters that would make the dialog misstate what runs: C0/C1 controls and DEL (a newline
+ * pushes the payload below what is read), line and paragraph separators, bidi controls (U+202E
+ * shows text reversed) and zero-width characters.
+ */
+const HIDDEN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/gu;
+
+/**
+ * `text` as the dialog shows it: every hidden or layout-changing character written as a visible
+ * `\u{…}` escape (`\n` and `\t` by name), and at most `max` characters, the rest counted. For
+ * display only: what runs is the argv itself.
+ */
+export function visible(text: string, max: number = PROMPT_PART_CHARS): string {
+  const shown = text.replace(HIDDEN, (c) => {
+    if (c === "\n") return "\\n";
+    if (c === "\t") return "\\t";
+    return `\\u{${(c.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}}`;
+  });
+  const chars = [...shown];
+  return chars.length <= max ? shown : `${chars.slice(0, max).join("")}… (${chars.length - max} more characters not shown)`;
+}
+
+/** What main's confirmation dialog says for a host program: its exact argv and cwd, made visible. */
+export function hostPromptText(spec: TerminalSpec): { message: string; detail: string } {
+  return {
+    message: `Run "${visible(spec.title, 80)}" on the host, outside the container?`,
+    detail: `It runs as you, with everything your account can reach.\n\nProgram: ${visible(formatArgv(spec.argv))}\nIn: ${visible(spec.cwd)}`,
+  };
 }
 
 /**
@@ -280,6 +322,15 @@ export function machineEnvironment(roots: TerminalRoots, env: Readonly<Record<st
     },
     run: runToEnd(env),
     containerRunDir: CONTAINER_RUN_DIR,
+    processAlive: (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (e) {
+        // EPERM: it exists, as someone else's.
+        return (e as { code?: unknown }).code === "EPERM";
+      }
+    },
   };
 }
 
@@ -309,6 +360,10 @@ interface Running {
   /** Characters sent and not yet acknowledged as drawn (flow control). */
   unacked: number;
   paused: boolean;
+  /** While paused: the check for the program having exited (`PAUSED_EXIT_CHECK_MS`). */
+  exitCheck: ReturnType<typeof setInterval> | undefined;
+  /** The program has exited: whatever is left is read through, never paused for again. */
+  draining: boolean;
 }
 
 /**
@@ -367,7 +422,7 @@ export class TerminalHost {
     if (!needsHostConfirmation(spec) || this.isApproved(owner, spec)) return { ok: true, value: true };
     let yes: boolean;
     try {
-      yes = await this.askHost(owner, { argv: spec.argv, cwd: spec.cwd, command: formatArgv(spec.argv), title: spec.title });
+      yes = await this.askHost(owner, { argv: spec.argv, cwd: spec.cwd, ...hostPromptText(spec) });
     } catch (e) {
       return { ok: false, error: `could not ask: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -416,6 +471,8 @@ export class TerminalHost {
       timer: undefined,
       unacked: 0,
       paused: false,
+      exitCheck: undefined,
+      draining: false,
     };
     this.running.set(id, entry);
     pty.onData((data) => {
@@ -424,6 +481,7 @@ export class TerminalHost {
       else entry.timer ??= setTimeout(() => this.flush(entry), FLUSH_MS);
     });
     pty.onExit(({ exitCode, signal }) => {
+      this.unpause(entry);
       this.flush(entry);
       this.running.delete(id);
       markExited();
@@ -441,13 +499,21 @@ export class TerminalHost {
     entry.unacked += data.length;
     // Past the high watermark the PTY is not read until the renderer catches up: the program
     // blocks on a full buffer instead of growing the IPC queue and xterm's write buffer.
-    if (!entry.paused && entry.unacked > FLOW.high && this.running.has(entry.info.id)) {
+    if (!entry.paused && !entry.draining && entry.unacked > FLOW.high && this.running.has(entry.info.id)) {
       entry.paused = true;
       try {
         entry.pty.pause();
       } catch {
         // Exited: nothing to pause.
       }
+      // A program that exits while its output is unread would lose that output to node-pty's
+      // 200 ms destroy timer: once it is gone, the rest is read through, acknowledged or not.
+      entry.exitCheck = setInterval(() => {
+        if (this.environment.processAlive(entry.pty.pid)) return;
+        entry.draining = true;
+        this.unpause(entry);
+      }, PAUSED_EXIT_CHECK_MS);
+      entry.exitCheck.unref?.();
     }
     this.emit(entry.owner, { id: entry.info.id, kind: "data", data });
   }
@@ -457,15 +523,20 @@ export class TerminalHost {
     const entry = this.owned(owner, id);
     if (entry === undefined || !Number.isInteger(chars) || (chars as number) < 1 || (chars as number) > MAX_ACK_CHARS) return false;
     entry.unacked = Math.max(0, entry.unacked - (chars as number));
-    if (entry.paused && entry.unacked < FLOW.low) {
-      entry.paused = false;
-      try {
-        entry.pty.resume();
-      } catch {
-        // Exited: nothing to resume.
-      }
-    }
+    if (entry.paused && entry.unacked < FLOW.low) this.unpause(entry);
     return true;
+  }
+
+  private unpause(entry: Running): void {
+    if (entry.exitCheck !== undefined) clearInterval(entry.exitCheck);
+    entry.exitCheck = undefined;
+    if (!entry.paused) return;
+    entry.paused = false;
+    try {
+      entry.pty.resume();
+    } catch {
+      // Gone: nothing to resume.
+    }
   }
 
   /** Whether main has stopped reading terminal `id` until its output is drawn (for tests). */
@@ -550,6 +621,8 @@ export class TerminalHost {
     for (const entry of [...this.running.values()]) {
       if (owner !== undefined && entry.owner !== owner) continue;
       if (entry.timer !== undefined) clearTimeout(entry.timer);
+      if (entry.exitCheck !== undefined) clearInterval(entry.exitCheck);
+      entry.exitCheck = undefined;
       this.running.delete(entry.info.id);
       void this.end(entry);
     }

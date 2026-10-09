@@ -728,16 +728,31 @@ folds with Ctrl+` and is resized by its top edge; its height is a per-window con
   its jobs), TERM after 2 s and KILL after 4 s, and exits 0 only once the recorded process is gone.
   `close` answers a `TerminalEnd { target, confirmed, detail }`: `confirmed` is true only for that
   exit 0 (or, on the host, the program's own exit after its hangup). The UI says "ended" only then;
-  otherwise it writes the end command's failure and "it may still be running". The toggle starts the
-  program on the other side only after a confirmed end (`requireEnded`), so an unconfirmed end of a
-  `claude --resume <uuid>` cannot leave two writers on one session; *Restart* then runs it anyway,
-  as a deliberate second act. A window's close or reload, and quit, send the ends without waiting.
+  otherwise it writes the end command's failure and "it may still be running".
+  **No start goes ahead beside a program that may still run (review s2-r2).** Each terminal keeps an
+  `EndRecord` (`terminal/ending.ts`): every end is recorded as it is SENT, and every start — the
+  toggle, a re-toggle that sent nothing itself, a *Resume* reaching the tab through `planOpen` —
+  waits for all of them and does not start while any came back unconfirmed. The tab then reads
+  `failed` with `mayBeRunning` ("may still run"), which `planOpen` shows rather than relaunches; only
+  *Restart* (`override`) runs it anyway, as a deliberate act, and clears the record. Closing a tab
+  with × awaits its end too: the tab goes at once, but a program that was running is kept as an
+  **orphan** (`TerminalsState.orphans`) until its end is known — forgotten if confirmed; if not,
+  shown in the drawer (which opens for it) with a *Dismiss*. An open of the same `sessionUuid`
+  meanwhile gets a new tab that inherits the orphan's end and waits on it like any other
+  (`afterOrphan`), so a Resume after × cannot start a second `claude --resume` beside a survivor.
+  A window's close or reload, and quit, send the ends without waiting: the renderer that would
+  record them is gone.
   A program that exits on its own leaves its record file in the container's `/tmp` (one line, gone
   when the container restarts).
 - **A program on the host runs only on main's own confirmation.** `TerminalHost.open` refuses a
   host spec with a non-empty argv unless that window confirmed exactly that `(cwd, argv)` through
   `confirmHost`, which shows main's native dialog with the argv (shell-quoted, `formatArgv`) and the
-  cwd; the renderer cannot answer it. A yes lasts for the window until it closes or reloads, so
+  cwd; the renderer cannot answer it. What the dialog shows is made visible and bounded
+  (`hostPromptText`/`visible`): C0/C1 controls, line and paragraph separators, bidi controls and
+  zero-width characters are written as `\n`, `\t` or `\u{…}`, and each of title, command and cwd
+  is cut at `PROMPT_PART_CHARS` (600; the title at 80) with the rest counted — so a renderer cannot
+  push the payload below the visible text with newlines or reverse it with U+202E. Only the shown
+  text is escaped; the argv that runs is the one confirmed. A yes lasts for the window until it closes or reloads, so
   *Restart* does not ask again. The one exception is a spec main built itself from its own constants
   (the Container tab's `run.sh <flag>`, D53.8), approved as main hands it out. The toggle always
   confirms a move to the host: a program through that dialog, the login shell (which runs nothing
@@ -749,10 +764,13 @@ folds with Ctrl+` and is resized by its top edge; its height is a per-window con
   profile builds — a Dock-launched app's own PATH is launchd's `/usr/bin:/bin:/usr/sbin:/sbin`,
   without `~/.local/bin`. Chosen over requiring an absolute `argv[0]`, which would make the toggle
   refuse every container spec (they name programs bare, for the container's PATH). The quoting is
-  single quotes with `'\''`, total for POSIX shells; a login shell outside that family (fish, whose
-  single quotes treat `\` differently) is not trusted with the words, and `/bin/sh -l` runs them.
-  Pinned in `test/terminal.test.mjs` against a real `/bin/sh -l` whose profile alone puts the program
-  on PATH, with `'`, spaces, `$`, a trailing `\`, `*` and an empty word.
+  single quotes with `'\''`; a word is left bare only when made of characters none of the accepted
+  shells expands — not `=`, which zsh (macOS's default login shell) expands at a word's start
+  (`=ls` is `/usr/bin/ls`, `=x` is an error; review s2-r2). A login shell outside that family (fish,
+  whose single quotes treat `\` differently) is not trusted with the words, and `/bin/sh -l` runs
+  them. Pinned in `test/terminal.test.mjs` against each real login shell present (`/bin/sh`, `bash`,
+  `zsh`; all three on the linux-arm64 dev container), whose profile alone puts the program on PATH,
+  with `'`, spaces, `$`, a trailing `\`, `*`, an empty word, `=x`, `=ls`, `~` and `a=b`.
 - **Main trusts nothing the renderer sends.** `parseSpec` refuses unknown fields (there is no `env`
   to smuggle in), relative or NUL-bearing paths, and oversized argv; sizes and writes are bounded. A
   terminal belongs to the window that opened it: only that window can write to it, resize it or
@@ -782,6 +800,21 @@ folds with Ctrl+` and is resized by its top edge; its height is a per-window con
   acknowledges output it held for an unclaimed terminal and had to drop. Measured in
   `test/terminal.test.mjs`: a real `yes` stops within the watermark plus one flush while
   unacknowledged, sends nothing more for 300 ms, and resumes on the ack.
+  **A paused PTY is read through once its program exits (review s2-r2).** node-pty 1.1.0 waits at
+  most 200 ms after its child exits for the socket to drain (`DESTROY_SOCKET_TIMEOUT_MS`,
+  `lib/unixTerminal.js`), then destroys it with whatever is unread, and only then reports the exit;
+  a paused socket never drains, so the end of a burst was lost whenever the ack came late. While
+  paused, main checks every `PAUSED_EXIT_CHECK_MS` (50) whether the program's process still exists,
+  and once it does not, resumes and never pauses that terminal again. Measured: a program that
+  writes past the watermark, waits for the pause, writes a 2 000-character tail and exits with no
+  acknowledgement at all now delivers every character (it lost the whole tail with the check
+  removed); an ack arriving after the exit is refused as for nothing. **The cost, computed, not
+  measured in Electron:** a hidden or minimized window's renderer is throttled (Chromium's
+  `backgroundThrottling`, left on), so its write callbacks — and so the acks — slow down, and a
+  terminal in a background window is held to roughly the watermark per acknowledgement round. A
+  long build in a hidden window runs slower than it would unthrottled; it does not lose output, and
+  nothing the person has not seen piles up in the renderer. Turning `backgroundThrottling` off
+  would lift the cap at the price of a busy hidden renderer; not chosen.
 - **Pastes are chunked below `MAX_WRITE_CHARS` without splitting a surrogate pair** (`chunkWrite`),
   which would otherwise reach the PTY as two U+FFFD.
 - **The 16 ANSI colours are design tokens** (`--terminal-ansi-*`, a light and a dark value each, read

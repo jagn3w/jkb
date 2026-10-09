@@ -94,8 +94,10 @@ async function askHost(owner: number, prompt: HostPrompt): Promise<boolean> {
     cancelId: 0,
     noLink: true,
     title: "Run on the host?",
-    message: `Run "${prompt.title}" on the host, outside the container?`,
-    detail: `It runs as you, with everything your account can reach.\n\nProgram: ${prompt.command}\nIn: ${prompt.cwd}`,
+    // Made visible and bounded by `hostPromptText`: a renderer's newlines or bidi controls cannot
+    // make this misstate what runs.
+    message: prompt.message,
+    detail: prompt.detail,
   };
   const answer = win === null ? await dialog.showMessageBox(options) : await dialog.showMessageBox(win, options);
   return answer.response === 1;

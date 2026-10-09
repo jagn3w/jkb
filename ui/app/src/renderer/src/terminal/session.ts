@@ -10,6 +10,7 @@ import { Terminal, type ITheme } from "@xterm/xterm";
 import { FLOW, chunkWrite, type TerminalEnd, type TerminalEvent, type TerminalSpec } from "../../../shared/terminal";
 import type { TerminalEventRouter } from "./router";
 import type { TerminalStatus } from "./state";
+import { EndRecord, mayStartAfter } from "./ending";
 import { themeFrom } from "./theme";
 
 /** The terminal's colours, from the design tokens, so it follows the app's light and dark. */
@@ -47,6 +48,8 @@ export class TerminalSession {
   private ptyTarget: TerminalSpec["target"] = "container";
   private generation = 0;
   private disposed = false;
+  /** Every end this terminal sent (or inherited from a closed tab of the same session). */
+  private readonly ends = new EndRecord();
   /** Drawn output not yet acknowledged to main, and the PTY it came from. */
   private drawn = { id: -1, chars: 0 };
 
@@ -135,11 +138,12 @@ export class TerminalSession {
   /**
    * Start (or start again) the program `spec` names, ending the one running first. A program on the
    * host runs only once main's own dialog confirmed it (`confirmHost`; it does not ask again for one
-   * already confirmed in this window). With `requireEnded` (the target toggle), a container program
-   * that could not be confirmed ended keeps the new one from starting: two programs on one session
-   * is worse than none.
+   * already confirmed in this window). Every start waits for every end this terminal has sent —
+   * including one a superseded start sent, or one inherited from a closed tab — and does not start
+   * while any of them is unconfirmed: two programs on one session is worse than none. Only
+   * `override` (an explicit Restart) starts anyway.
    */
-  async start(spec: TerminalSpec, options: { readonly requireEnded?: boolean } = {}): Promise<void> {
+  async start(spec: TerminalSpec, options: { readonly override?: boolean } = {}): Promise<void> {
     const generation = ++this.generation;
     this.onStatus({ kind: "starting" });
     if (spec.target === "host" && spec.argv.length > 0) {
@@ -157,17 +161,18 @@ export class TerminalSession {
         return;
       }
     }
-    const ended = await this.stop();
+    const own = this.stop();
+    const ended = await this.ends.settled();
+    const mine = await own;
     if (this.disposed || generation !== this.generation) return;
-    if (ended !== undefined) {
-      this.writeNote(`[${ended.detail}]`);
-      if (options.requireEnded === true && !ended.confirmed) {
-        const why = `not started on the ${spec.target}: ${ended.detail}. Restart runs it anyway.`;
-        this.writeNote(why);
-        this.onStatus({ kind: "failed", error: why });
-        return;
-      }
+    if (mine !== undefined) this.writeNote(`[${mine.detail}]`);
+    if (!mayStartAfter(ended, options.override === true)) {
+      const why = `not started on the ${spec.target}: an earlier program here may still be running (${ended?.detail ?? "unknown"}). Restart runs it anyway.`;
+      this.writeNote(why);
+      this.onStatus({ kind: "failed", error: why, mayBeRunning: true });
+      return;
     }
+    if (options.override === true) this.ends.clear();
     this.fit();
     let result;
     try {
@@ -213,24 +218,36 @@ export class TerminalSession {
    * End the running program, if any, without disposing the screen: what main saw of its ending, or
    * `undefined` when nothing was running.
    */
-  private async stop(): Promise<TerminalEnd | undefined> {
-    if (this.ptyId === undefined) return undefined;
+  private stop(): Promise<TerminalEnd | undefined> {
+    if (this.ptyId === undefined) return Promise.resolve(undefined);
     const id = this.ptyId;
+    const target = this.ptyTarget;
     this.ptyId = undefined;
     this.router.retire(id);
-    try {
-      const result = await window.jkb.terminal.close(id);
-      // Gone already (it exited as it was closed): its exit was the ending.
-      return result.ok ? result.value : undefined;
-    } catch (e) {
-      return { target: this.ptyTarget, confirmed: false, detail: `could not end it: ${e instanceof Error ? e.message : String(e)}` };
-    }
+    // Recorded before it is awaited, so a start that comes meanwhile waits for it too.
+    return this.ends.record(
+      window.jkb.terminal.close(id).then(
+        // Gone already (it exited as it was closed): its exit was the ending.
+        (result) => (result.ok ? result.value : undefined),
+        (e: unknown): TerminalEnd => ({ target, confirmed: false, detail: `could not end it: ${e instanceof Error ? e.message : String(e)}` }),
+      ),
+    );
   }
 
-  dispose(): void {
+  /** Wait for `end` (a closed tab's, of the same session) before anything here starts. */
+  inherit(end: Promise<TerminalEnd | undefined>): void {
+    void this.ends.record(end);
+  }
+
+  /**
+   * Dispose of the screen and end the program: every end this terminal sent, settled — an
+   * unconfirmed one if any was — for the caller to keep after the tab is gone.
+   */
+  dispose(): Promise<TerminalEnd | undefined> {
     this.disposed = true;
     void this.stop();
     this.term.dispose();
     this.host.remove();
+    return this.ends.settled();
   }
 }

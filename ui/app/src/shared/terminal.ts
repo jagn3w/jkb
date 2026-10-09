@@ -219,11 +219,13 @@ export function hostPathOf(path: string, roots: TerminalRoots): string | undefin
 }
 
 /**
- * `arg` quoted for a POSIX shell: single quotes, with each `'` closed, escaped and reopened. Total
- * (every string, including newlines, comes back as itself) and the only quoting the terminal does.
+ * `arg` quoted for a POSIX shell (and zsh): single quotes, with each `'` closed, escaped and reopened.
+ * Total (every string, including newlines, comes back as itself) and the only quoting the terminal
+ * does. A word is left bare only when it is made of characters no shell in `POSIX_SHELLS` expands.
  */
 export function shellQuote(arg: string): string {
-  return /^[A-Za-z0-9_\/.,:=@%+-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`;
+  // No `=` among the bare characters: zsh expands a word starting with one (`=ls` is `/usr/bin/ls`).
+  return /^[A-Za-z0-9_\/.,:@%+-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
 /** `argv` as one line a person can read and a POSIX shell would run as the same words. */

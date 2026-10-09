@@ -81,7 +81,8 @@ app's own environment: an app launched from the Dock or Finder does not see what
 exports, so for a non-default name run `launchctl setenv JKB_CONTAINER_NAME <name>` and relaunch
 the app (or start it from that shell). The *New terminal* button's tooltip names the container it
 enters. Closing a container terminal also ends its program inside the container with a second
-`docker exec` (D53.10); a program is run on the host only after the app's own dialog shows you its
+`docker exec` (D53.10); when that cannot be confirmed the terminal says the program may still be
+running, and nothing new starts beside it until you press Restart. A program is run on the host only after the app's own dialog shows you its
 exact command and directory. Ctrl+` folds the drawer.
 
 ## Run the extension

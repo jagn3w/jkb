@@ -142,6 +142,16 @@ export function TerminalDrawer(): React.JSX.Element {
         )}
       </div>
       <div id="terminal-drawer-body" className="drawer-body" hidden={!state.drawerOpen} style={{ height }}>
+        {state.orphans
+          .filter((o) => o.detail !== undefined)
+          .map((o) => (
+            <p key={o.key} className="terminal-orphan" role="status">
+              <strong>{o.spec.title}</strong> ({o.spec.target}) was closed but may still be running: {o.detail}
+              <button type="button" className="terminal-action" onClick={() => terminals.dismissOrphan(o.key)}>
+                Dismiss
+              </button>
+            </p>
+          ))}
         {entries.length === 0 && (
           <p className="drawer-empty muted">No terminals open. + starts a shell in the container.</p>
         )}
