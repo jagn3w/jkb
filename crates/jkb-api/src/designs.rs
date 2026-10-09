@@ -601,16 +601,27 @@ fn discuss_prompt(d: &design::Discussion) -> String {
         d.start, d.end
     );
     let _ = writeln!(p, "{fence}\n{}\n{fence}", d.quote);
+    // The block cannot show whitespace or a line break at the passage's edges, and the quote and its
+    // occurrence count them: the exact quote is given as a JSON string too, and an edge said aloud.
+    let exact = serde_json::to_string(&d.quote).unwrap_or_default();
+    let _ = writeln!(p, "Exactly, as a JSON string: {exact}");
+    if d.quote.trim() != d.quote {
+        let _ = writeln!(
+            p,
+            "It begins or ends with whitespace or a line break, which the block above does not \
+             show: quote it as the JSON string has it."
+        );
+    }
     match d.occurrence {
         Some(k) => {
             let _ = writeln!(
                 p,
-                "That text occurs {} times in the version read; the selection is occurrence {k}.",
+                "In version {version} that text occurs {} times; the selection is occurrence {k}.",
                 d.occurrences
             );
         }
         None => {
-            let _ = writeln!(p, "That text occurs once in the version read.");
+            let _ = writeln!(p, "In version {version} that text occurs once.");
         }
     }
     if d.spans.is_empty() {
@@ -638,19 +649,30 @@ fn discuss_prompt(d: &design::Discussion) -> String {
          to.",
         d.uid
     );
-    let occurrence = d
-        .occurrence
-        .map(|k| format!(" --occurrence {k}"))
-        .unwrap_or_default();
     let _ = writeln!(
         p,
-        "When they do, edit through the CLI against the version you read — your edit merges with \
+        "When they do, edit through the CLI against a version you read — your edit merges with \
          anything written since, and the quote is matched in that version, never the latest: \
-         `jkb design edit {} --base <token> --find <quote>{occurrence} --replace <text>` (or \
-         `--insert-after <quote> --text <text>`). This passage, at version {version}, is \
-         `--base {version} --find <the passage above>{occurrence}`. Editing approved text makes it \
-         PROPOSED again until it is re-approved.",
-        d.uid
+         `jkb design edit {uid} --base <token> --find=<quote> --replace=<text>` (or \
+         `--insert-after=<quote> --text=<text>`). Spell each quote with `=`: one beginning \
+         with `-`, as a list item does, is otherwise read as a flag. Against a version you read \
+         yourself, quote enough of the surrounding text that it occurs once there.",
+        uid = d.uid
+    );
+    // The occurrence counts matches in the version the selection was made in, and in no other: it
+    // is given only beside that version's token, never as part of a command with another one.
+    let pinned = match d.occurrence {
+        Some(k) => format!(
+            " --occurrence {k}`. That occurrence holds only with `--base {version}`; never pair it \
+             with a newer token"
+        ),
+        None => "`".to_owned(),
+    };
+    let _ = writeln!(
+        p,
+        "This passage, in the version it was selected in, is `--base {version} --find=<the \
+         passage above>{pinned}. Editing approved text makes it PROPOSED again until it is \
+         re-approved."
     );
     p
 }

@@ -1,11 +1,11 @@
 //! One open design in the renderer (D53.4): a Yjs document kept in step with jkb.
 //
 // The table in jkb is the truth; this document is a peer of it, like any other editor. Local edits
-// leave as `design.apply` (the update bytes, base64), in order, one call at a time; updates other
-// peers write — the CLI's `jkb design edit`, another window — arrive on the design's topic through
-// main and are merged. Anything the feed could not carry (an update too large to announce, a gap,
-// a merge waiting on something it never saw) is fetched with `design.state` from this document's
-// own state vector, so the answer is exactly what it lacks.
+// leave as `design.apply` (the update bytes, base64), in order, one call at a time. What other peers
+// write — the CLI's `jkb design edit`, another window — is announced on the design's topic, and each
+// announcement is only a hint: the session fetches with `design.state` from this document's own state
+// vector, so what it merges is exactly what it lacks, read from the table. The bytes an announcement
+// carries are never merged: anyone who may send to the queue could put any bytes there (D53.4).
 //
 // Span states come from `design.cat`, whose text is compared with this document's before its spans
 // are drawn: an answer read while an edit was in flight describes other text, and is dropped for the
@@ -56,6 +56,47 @@ export const REMOTE = Symbol("jkb");
 /** Codes that mean "try again later", as opposed to a refusal. */
 const TRANSIENT = new Set(["unavailable", "busy", "internal", "unknown"]);
 
+/** Why there is no settled version to send a *Discuss* with. */
+export type Unsettled =
+  /** The session stopped (a refused edit or design): nothing it shows can be named. */
+  | { readonly kind: "failed"; readonly message: string }
+  /** The session was closed while waiting. */
+  | { readonly kind: "closed" }
+  /** `design.cat` could not be read. */
+  | { readonly kind: "unread"; readonly message: string }
+  /** The text changed while the selection was being sent: an edit from elsewhere arrived. */
+  | { readonly kind: "moved" };
+
+/** A `design.cat` read: the answer kept, or why none was. */
+type SpansRead = { readonly kept: true } | { readonly kept: false; readonly unread?: string };
+
+/** One retried call's timer and backoff. Each call that retries has its own, so one never cancels another's. */
+class Retry {
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  #backoff: number;
+  constructor(
+    readonly min: number,
+    readonly max: number,
+  ) {
+    this.#backoff = min;
+  }
+  schedule(again: () => void): void {
+    clearTimeout(this.#timer);
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      again();
+    }, this.#backoff);
+    this.#backoff = Math.min(this.#backoff * 2, this.max);
+  }
+  reset(): void {
+    this.#backoff = this.min;
+  }
+  cancel(): void {
+    clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+}
+
 export interface DesignSessionOptions {
   /** How long after a change the spans are re-read. */
   readonly spansDelayMs?: number;
@@ -79,15 +120,18 @@ export class DesignSession {
   readonly #uid: string;
   readonly #topic: string;
   readonly #spansDelay: number;
-  readonly #minBackoff: number;
-  readonly #maxBackoff: number;
   readonly #listeners = new Set<() => void>();
   #outbox: Uint8Array[] = [];
   #sending = false;
   #pulling: Promise<void> | undefined;
   #pullAgain = false;
-  #backoff: number;
-  #retryTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Whether a load has merged: until then the document is empty, not the design. */
+  #loaded = false;
+  /** The feed could not be joined because the design has no topic yet: joined again later. */
+  #joinLater = false;
+  readonly #flushRetry: Retry;
+  readonly #pullRetry: Retry;
+  readonly #joinRetry: Retry;
   #spansTimer: ReturnType<typeof setTimeout> | undefined;
   #unlisten: (() => void) | undefined;
   #idle: (() => void)[] = [];
@@ -98,9 +142,11 @@ export class DesignSession {
     this.#uid = uid;
     this.#topic = topic;
     this.#spansDelay = options.spansDelayMs ?? 250;
-    this.#minBackoff = options.minBackoffMs ?? 500;
-    this.#maxBackoff = options.maxBackoffMs ?? 30_000;
-    this.#backoff = this.#minBackoff;
+    const min = options.minBackoffMs ?? 500;
+    const max = options.maxBackoffMs ?? 30_000;
+    this.#flushRetry = new Retry(min, max);
+    this.#pullRetry = new Retry(min, max);
+    this.#joinRetry = new Retry(min, max);
     // Garbage collection off, as the engine's documents: a deleted run stays addressable, which an
     // undo of it (a forward update from jkb) relies on.
     this.doc = new Y.Doc({ gc: false });
@@ -115,6 +161,20 @@ export class DesignSession {
 
   get uid(): string {
     return this.#uid;
+  }
+
+  /**
+   * Whether the editor may take typing: only once a load has merged, and never after a refusal.
+   * Text typed into the empty document before the load would be sent as a real edit, and land at
+   * one end of the design's text.
+   */
+  get editable(): boolean {
+    return this.#loaded && this.status.kind !== "failed";
+  }
+
+  /** Whether local edits are waiting to be sent (or one is in flight). */
+  get unsent(): boolean {
+    return this.#outbox.length > 0 || this.#sending;
   }
 
   /** Hear every change of status or spans. Returns the unsubscribe. */
@@ -139,15 +199,50 @@ export class DesignSession {
    */
   async open(): Promise<void> {
     this.#unlisten = this.#bridge.onEvent((event) => this.#onEvent(event));
-    const joined = await this.#bridge.subscribe(this.#topic);
+    await this.#join();
     if (this.#disposed) return;
-    if (!joined.ok) {
-      // Without the feed the document would silently stop hearing other editors: say so, and
-      // keep what can still work (load and save) working.
-      this.feedProblem = `live updates unavailable: ${joined.error.message}`;
-      this.#changed();
-    }
     await this.pull();
+  }
+
+  /**
+   * Join the design's topic. A design made before every design had a topic from creation has none
+   * until its first update, and the join is refused with `no_such_topic`: it is tried again — on a
+   * timer, and as soon as this session's own edit has created the topic — and the design re-read
+   * once joined, for whatever was written while it was not.
+   */
+  async #join(): Promise<boolean> {
+    this.#joinRetry.cancel();
+    const joined = await this.#bridge.subscribe(this.#topic);
+    if (this.#disposed) return false;
+    if (joined.ok) {
+      if (this.#joinLater) {
+        this.#joinLater = false;
+        this.feedProblem = undefined;
+        this.#changed();
+      }
+      return true;
+    }
+    // Without the feed the document would silently stop hearing other editors: say so, and keep
+    // what can still work (load and save) working.
+    this.feedProblem = `live updates unavailable: ${joined.error.message}`;
+    this.#joinLater = joined.error.code === "no_such_topic";
+    if (this.#joinLater) this.#joinRetry.schedule(() => void this.#rejoin());
+    this.#changed();
+    return false;
+  }
+
+  async #rejoin(): Promise<void> {
+    if (await this.#join()) await this.pull();
+  }
+
+  /**
+   * Close the session once its edits are sent: a pane that stops showing a design must not drop
+   * what was typed into it. It is disposed at once when nothing is waiting, or when the session has
+   * stopped (a refused edit is never sent).
+   */
+  close(): void {
+    this.#listeners.clear();
+    void this.idle().then(() => this.dispose());
   }
 
   dispose(): void {
@@ -155,7 +250,9 @@ export class DesignSession {
     this.#disposed = true;
     this.#unlisten?.();
     this.#bridge.unsubscribe(this.#topic);
-    clearTimeout(this.#retryTimer);
+    this.#flushRetry.cancel();
+    this.#pullRetry.cancel();
+    this.#joinRetry.cancel();
     clearTimeout(this.#spansTimer);
     this.#listeners.clear();
     for (const w of this.#idle) w();
@@ -170,16 +267,8 @@ export class DesignSession {
           this.feedProblem = undefined;
           this.#changed();
         }
-        const bytes = event.update === null ? undefined : fromBase64(event.update);
-        if (bytes === undefined) {
-          void this.pull();
-          return;
-        }
-        this.#merge(bytes);
-        // A merge waiting on an update this document never got (the feed lost one) is completed
-        // from the table.
-        if (this.#hasPending()) void this.pull();
-        else this.#scheduleSpans();
+        // A hint, never the bytes to merge: what the table holds is fetched (see the header).
+        void this.pull();
         return;
       }
       case "gap":
@@ -208,10 +297,6 @@ export class DesignSession {
     }
   }
 
-  #hasPending(): boolean {
-    return this.doc.store.pendingStructs !== null || this.doc.store.pendingDs !== null;
-  }
-
   /** Fetch what this document lacks (`design.state` since its state vector) and merge it. */
   pull(): Promise<void> {
     if (this.#pulling !== undefined) {
@@ -225,7 +310,7 @@ export class DesignSession {
         const answer = decodeDesignUpdate(await this.#bridge.op(designOps.state(this.#uid, since)));
         if (this.#disposed) return;
         if (!answer.ok) {
-          this.#trouble(answer.error, () => void this.pull());
+          this.#trouble(answer.error, this.#pullRetry, () => void this.pull());
           return;
         }
         const bytes = fromBase64(answer.value.update);
@@ -235,9 +320,15 @@ export class DesignSession {
         }
         this.#merge(bytes);
       } while (this.#pullAgain && !this.#disposed);
+      if (this.#disposed) return;
+      this.#pullRetry.reset();
+      this.#pullRetry.cancel();
+      this.#loaded = true;
       if (this.status.kind === "connecting" || this.status.kind === "retrying") {
-        this.#backoff = this.#minBackoff;
-        this.#setStatus(this.#outbox.length > 0 ? { kind: "saving" } : { kind: "live" });
+        // An edit waiting on its own retry is still unsent: "saving" until that one is sent.
+        this.#setStatus(this.unsent ? { kind: "saving" } : { kind: "live" });
+      } else {
+        this.#changed();
       }
       this.#scheduleSpans();
     };
@@ -263,10 +354,14 @@ export class DesignSession {
         if (!answer.ok) {
           // Not sent: back at the head of the queue, ahead of anything written since.
           this.#outbox = [...batch, ...this.#outbox];
-          this.#trouble(answer.error, () => void this.#flush());
+          this.#trouble(answer.error, this.#flushRetry, () => void this.#flush());
           return;
         }
-        this.#backoff = this.#minBackoff;
+        // Sent: a resend still scheduled from an earlier failure has nothing left to do.
+        this.#flushRetry.reset();
+        this.#flushRetry.cancel();
+        // This session's edit has created a topic the design lacked: join it now.
+        if (this.#joinLater) void this.#rejoin();
       }
       this.#setStatus({ kind: "live" });
       this.#scheduleSpans();
@@ -277,15 +372,13 @@ export class DesignSession {
   }
 
   /** A failed call: retried later when it may pass, the session stopped when it never will. */
-  #trouble(error: ApiError, again: () => void): void {
+  #trouble(error: ApiError, retry: Retry, again: () => void): void {
     if (!TRANSIENT.has(error.code)) {
       this.#fail(`${error.code}: ${error.message}`);
       return;
     }
     this.#setStatus({ kind: "retrying", message: error.message });
-    clearTimeout(this.#retryTimer);
-    this.#retryTimer = setTimeout(again, this.#backoff);
-    this.#backoff = Math.min(this.#backoff * 2, this.#maxBackoff);
+    retry.schedule(again);
   }
 
   #fail(message: string): void {
@@ -311,17 +404,22 @@ export class DesignSession {
    * whether it was kept.
    */
   async refreshSpans(): Promise<boolean> {
+    return (await this.#readSpans()).kept;
+  }
+
+  async #readSpans(): Promise<SpansRead> {
     const answer = decodeDesignDoc(await this.#bridge.op(designOps.cat(this.#uid)));
-    if (this.#disposed || !answer.ok) return false;
-    if (answer.value.text !== this.text.toString()) return false;
+    if (this.#disposed) return { kept: false };
+    if (!answer.ok) return { kept: false, unread: answer.error.message };
+    if (answer.value.text !== this.text.toString()) return { kept: false };
     this.current = answer.value;
     this.#changed();
-    return true;
+    return { kept: true };
   }
 
   /** Resolves when every local edit has been sent (or the session has stopped). */
   idle(): Promise<void> {
-    if ((this.#outbox.length === 0 && !this.#sending) || this.#disposed || this.status.kind === "failed") {
+    if (!this.unsent || this.#disposed || this.status.kind === "failed") {
       return Promise.resolve();
     }
     return new Promise((resolve) => this.#idle.push(resolve));
@@ -329,11 +427,19 @@ export class DesignSession {
 
   /**
    * The version whose text is exactly what this document shows: every edit sent, then read back.
-   * `undefined` while the text is still moving (an edit from elsewhere arrived in between).
+   * Otherwise why there is none — the session stopped or closed, the read failed, or the text moved
+   * (an edit from elsewhere arrived in between) — each its own reason, so each is said as it is.
    */
-  async settledVersion(): Promise<DesignDoc | undefined> {
+  async settledVersion(): Promise<{ readonly ok: true; readonly doc: DesignDoc } | { readonly ok: false; readonly why: Unsettled }> {
     await this.idle();
-    if (this.#disposed || this.status.kind === "failed") return undefined;
-    return (await this.refreshSpans()) ? this.current : undefined;
+    const stopped = (): Unsettled | undefined =>
+      this.#disposed ? { kind: "closed" } : this.status.kind === "failed" ? { kind: "failed", message: this.status.message } : undefined;
+    const before = stopped();
+    if (before !== undefined) return { ok: false, why: before };
+    const read = await this.#readSpans();
+    const after = stopped();
+    if (after !== undefined) return { ok: false, why: after };
+    if (read.kept && this.current !== undefined) return { ok: true, doc: this.current };
+    return { ok: false, why: read.kept || read.unread === undefined ? { kind: "moved" } : { kind: "unread", message: read.unread } };
   }
 }

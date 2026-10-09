@@ -25,3 +25,21 @@ export function discussSpec(prompt: DesignPrompt, repo: string, roots: TerminalR
     sessionUuid,
   );
 }
+
+/**
+ * `run`, one at a time: a call made while the last is still pending is ignored, not queued. A
+ * *Discuss* waits for every edit to be saved and the design read back — seconds, or as long as the
+ * daemon is away — and a second click in that window would start a second Claude on one selection.
+ */
+export function exclusive<A extends unknown[]>(run: (...args: A) => Promise<void>): (...args: A) => Promise<void> {
+  let pending = false;
+  return async (...args: A): Promise<void> => {
+    if (pending) return;
+    pending = true;
+    try {
+      await run(...args);
+    } finally {
+      pending = false;
+    }
+  };
+}

@@ -115,10 +115,14 @@ esac
 if command -v pnpm >/dev/null 2>&1; then
     # `test` after `build`: the tests bundle their own module, so they do not need dist — but
     # a type error is the cheaper failure to read, so it is the one reported first.
-    # JKB_BIN: the jkb built above, against which the app's yjs-wire test measures the editor's
-    # Yjs updates (D53.4). Where the build left none it skips, saying so.
-    JKB_BIN="${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/.." && pwd)/target}/debug/jkb"
-    export JKB_BIN
+    # JKB_BIN: the jkb built above (`build jkb`), against which the app's yjs-wire test measures
+    # the editor's Yjs updates (D53.4). This gate always builds one, so the test is REQUIRED here
+    # (JKB_REQUIRE_WIRE): a missing binary fails rather than skipping green. The target directory is
+    # cargo's own answer, so a `build.target-dir` in a cargo config is followed too.
+    target_dir="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+    JKB_BIN="${target_dir:-${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/.." && pwd)/target}}/debug/jkb"
+    JKB_REQUIRE_WIRE=1
+    export JKB_BIN JKB_REQUIRE_WIRE
     (cd "$(dirname "$0")/../ui" && pnpm run build && pnpm run test)
 else
     echo "   (skipped: pnpm not found — install it, or set PNPM_HOME; CI runs this gate)"

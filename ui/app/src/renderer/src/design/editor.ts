@@ -7,7 +7,15 @@
 
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxTree } from "@codemirror/language";
-import { RangeSetBuilder, StateEffect, StateField, type EditorState, type Extension, type Range } from "@codemirror/state";
+import {
+  RangeSetBuilder,
+  StateEffect,
+  StateField,
+  type ChangeDesc,
+  type EditorState,
+  type Extension,
+  type Range,
+} from "@codemirror/state";
 import {
   Decoration,
   EditorView,
@@ -191,15 +199,42 @@ function draw(map: StateMap, length: number): Drawn {
   return { marks: marks.finish(), removed: removed.finish() };
 }
 
+/**
+ * The drawn states moved through `changes`, between two `design.cat` answers. A mark maps over text
+ * inserted strictly inside it — CodeMirror widens a range around an insertion — which would tint new
+ * words with the state of the words around them. New words are PROPOSED (D53.5), so every inserted
+ * range is cut out of the marks it landed in and drawn PROPOSED, as text no span covers, until the
+ * next answer redraws.
+ */
+export function mapStates(marks: DecorationSet, changes: ChangeDesc): DecorationSet {
+  const mapped = marks.map(changes);
+  const inserted: (readonly [number, number])[] = [];
+  changes.iterChangedRanges((_fromA, _toA, fromB, toB) => {
+    if (toB > fromB) inserted.push([fromB, toB]);
+  });
+  if (inserted.length === 0) return mapped;
+  const out: Range<Decoration>[] = [];
+  for (const it = mapped.iter(); it.value !== null; it.next()) {
+    let from = it.from;
+    for (const [a, b] of inserted) {
+      if (b <= from || a >= it.to) continue;
+      if (a > from) out.push(it.value.range(from, a));
+      from = b;
+    }
+    if (it.to > from) out.push(it.value.range(from, it.to));
+  }
+  for (const [a, b] of inserted) out.push(MARKS.PROPOSED.free.range(a, b));
+  return Decoration.set(out, true);
+}
+
 const drawnStates = StateField.define<Drawn>({
   create: () => ({ marks: Decoration.none, removed: Decoration.none }),
   update(value, tr) {
     for (const e of tr.effects) {
       if (e.is(setStateMap)) return draw(e.value, tr.newDoc.length);
     }
-    // Between answers, the drawing moves with the text; new words fall outside every mark (the
-    // engine's anchors put an edge insertion outside the span too), and the next answer redraws.
-    return tr.docChanged ? { marks: value.marks.map(tr.changes), removed: value.removed.map(tr.changes) } : value;
+    // Between answers, the drawing moves with the text, and what is typed reads PROPOSED.
+    return tr.docChanged ? { marks: mapStates(value.marks, tr.changes), removed: value.removed.map(tr.changes) } : value;
   },
   provide: (f) => [
     EditorView.decorations.from(f, (d) => d.marks),
@@ -257,12 +292,13 @@ export const spanStates: Extension = [
 
 /**
  * *Discuss* on a selection (D53.5): a small button over the selected text, which hands the range
- * (UTF-16 offsets, as the editor and Yjs count) to `onDiscuss`.
+ * (UTF-16 offsets, as the editor and Yjs count) to `onDiscuss`. Not offered while `enabled()` is
+ * false — before the design has loaded, and once its session has stopped.
  */
-export function discussOnSelection(onDiscuss: (from: number, to: number) => void): Extension {
+export function discussOnSelection(onDiscuss: (from: number, to: number) => void, enabled: () => boolean = () => true): Extension {
   const tooltip = (state: EditorState): Tooltip | null => {
     const sel = state.selection.main;
-    if (sel.empty) return null;
+    if (sel.empty || !enabled()) return null;
     return {
       pos: sel.from,
       above: true,
@@ -283,7 +319,8 @@ export function discussOnSelection(onDiscuss: (from: number, to: number) => void
   };
   return StateField.define<Tooltip | null>({
     create: tooltip,
-    update: (value, tr) => (tr.docChanged || tr.selection !== undefined ? tooltip(tr.state) : value),
+    // Re-read on a reconfigure too: that is how the pane says the session stopped or loaded.
+    update: (value, tr) => (tr.docChanged || tr.selection !== undefined || tr.reconfigured ? tooltip(tr.state) : value),
     provide: (f) => showTooltip.from(f),
   });
 }

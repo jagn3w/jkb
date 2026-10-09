@@ -85,6 +85,28 @@ jobs:
       - name: test (fastembed)
         run: cargo test --all --features fastembed
 
+      # The editor's `yjs` against jkb's `yrs`, byte for byte (D53.4): ui/app/test/yjs-wire.test.mjs
+      # drives a real jkb. It runs HERE, against the jkb the tests above built, rather than in the
+      # `ui` job, which has no Rust toolchain — there it skipped on every run and passed green.
+      # JKB_REQUIRE_WIRE turns a missing binary into a failure, so this step cannot skip.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: yjs ↔ yrs wire (against the jkb built above)
+        working-directory: ui
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          JKB_BIN: ${{ github.workspace }}/target/debug/jkb
+          JKB_REQUIRE_WIRE: "1"
+        run: |
+          pnpm install --frozen-lockfile
+          node --test app/test/yjs-wire.test.mjs
+
       # The auto-mode posture's tests (design D48). Hermetic and seconds-long: no Rust, no
       # session, no network — they only exercise the JSON merge/subset logic against a temp
       # CLAUDE_CONFIG_DIR. `check.sh` skips them when jq is missing; the runner always has jq,
@@ -328,6 +350,9 @@ jobs:
       # the smoke skips and says so; JKB_REQUIRE_ELECTRON_SMOKE=1 turns that skip into a failure
       # here, so a runner that lost either cannot pass green having run none of it
       # (ui/app/test/smoke-required.test.mjs pins that the flag does).
+      #
+      # yjs-wire.test.mjs skips here (no jkb in this job, so no JKB_BIN): it runs, required, in the
+      # `check` job against the jkb that job builds.
       - name: allow Chromium's sandbox (Ubuntu 24.04 AppArmor)
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: test

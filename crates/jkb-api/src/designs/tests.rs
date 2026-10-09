@@ -323,11 +323,12 @@ fn a_discuss_prompt_names_the_selection_as_the_edit_that_reaches_it() {
     for needle in [
         format!("jkb design cat {uid}"),
         format!(
-            "--base {} --find <the passage above> --occurrence 2",
-            read.version
+            "--base {} --find=<the passage above> --occurrence 2`. That occurrence holds only \
+             with `--base {}`",
+            read.version, read.version
         ),
         "```\ncat\n```".to_owned(),
-        "occurrence 2".to_owned(),
+        "Exactly, as a JSON string: \"cat\"".to_owned(),
         "PROPOSED".to_owned(),
     ] {
         assert!(
@@ -336,6 +337,21 @@ fn a_discuss_prompt_names_the_selection_as_the_edit_that_reaches_it() {
             prompt.prompt
         );
     }
+    // The occurrence counts matches in the version selected in, so it is never offered beside
+    // another token: a re-read version may hold a new earlier match, and the pairing would edit it.
+    assert_eq!(
+        prompt.prompt.matches("--occurrence").count(),
+        1,
+        "{}",
+        prompt.prompt
+    );
+    assert!(
+        !prompt
+            .prompt
+            .contains("<token> --find=<quote> --occurrence"),
+        "{}",
+        prompt.prompt
+    );
     written(ok(
         &kb.op,
         json!({ "op": "design.edit", "uid": uid, "base": prompt.version,
@@ -359,6 +375,37 @@ fn a_discuss_prompt_names_the_selection_as_the_edit_that_reaches_it() {
         json!({ "op": "design.prompt", "ask": { "kind": "play", "uid": uid } })
     )
     .is_err());
+}
+
+/// A passage with a line break at its edge: the fence cannot show it, but the quote and its
+/// occurrence count it, so the prompt gives the exact quote as a JSON string and says so — copying
+/// the visible `foo` would match three times, and occurrence 2 of those is the middle line.
+#[test]
+fn a_discussed_passage_with_an_edge_line_break_is_quoted_exactly() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "foo bar\nfoo\nfoo\n");
+    let prompt = prompt_of(
+        &kb.op,
+        json!({ "kind": "discuss", "uid": uid, "start": 12, "end": 16 }),
+    );
+    assert_eq!(prompt.quote, "foo\n");
+    assert_eq!(prompt.occurrence, Some(2));
+    for needle in [
+        "Exactly, as a JSON string: \"foo\\n\"",
+        "begins or ends with whitespace or a line break",
+    ] {
+        assert!(
+            prompt.prompt.contains(needle),
+            "{needle:?} not in:\n{}",
+            prompt.prompt
+        );
+    }
+    // A passage with no edge whitespace says nothing of it.
+    let plain = prompt_of(
+        &kb.op,
+        json!({ "kind": "discuss", "uid": uid, "start": 4, "end": 7 }),
+    );
+    assert!(!plain.prompt.contains("begins or ends"), "{}", plain.prompt);
 }
 
 /// A quote holding backticks is fenced by a longer run, so the passage cannot close its own fence.

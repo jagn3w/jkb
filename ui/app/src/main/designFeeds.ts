@@ -16,7 +16,11 @@ export type DesignFeedsOptions = FeedOptions;
 
 type DesignMessageEvent = Exclude<DesignFeedEvent, FeedStatusEvent>;
 
-/** Design topics: an `update` merges, a `prompt` re-reads the Prompts pane (D53.6). */
+/**
+ * Design topics: an `update` tells the session to fetch what it lacks with `design.state` — a hint,
+ * whose bytes are never merged, since any sender may write to the queue (D53.4) — and a `prompt`
+ * re-reads the Prompts pane (D53.6).
+ */
 const DESIGN_FEED: FeedKind<DesignMessageEvent> = {
   accepts: isDesignTopic,
   refusal: "not a design topic",

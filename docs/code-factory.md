@@ -221,8 +221,10 @@ wire-compatible), so the CLI and the app edit the same document with no translat
   `yrs`), never a row deletion: deleting history from a CRDT corrupts every peer that already
   merged it.
 - **Live co-editing:** the app applies a local edit as `design.apply` (the update bytes,
-  base64); the daemon appends it and publishes on topic `design/<uid>`; every subscriber merges.
-  Updates are idempotent and commutative, so at-least-once delivery is enough.
+  base64); the daemon appends it and publishes on topic `design/<uid>`; every subscriber fetches
+  what it lacks from the table (`design.state` since its state vector) and merges that — the
+  announcement is a hint, never the bytes merged (subtask 4, below). Updates are idempotent and
+  commutative, so at-least-once delivery is enough.
 - **Claude edits through the CLI against the version it read, and the CRDT merges.**
   `jkb design cat <uid>` prints the text with span markers **and a version token** (the Yjs state
   vector it was read at). `jkb design edit <uid> --base <token> --find <quote> [--occurrence n]
@@ -317,6 +319,9 @@ to learn, and what was decided past the text above:
   editor — jkb's state loaded, an editor update merged after a two-unit character, a CLI edit merged
   back from `design.state --since`, and a span's anchors (`yrs` `StickyIndex` v1 bytes) resolved by
   `Y.decodeRelativePosition` to the offsets jkb reports. It held at the first run; no adapter needed.
+  *Corrected in review:* CI's `ui` job has no `jkb`, so the test skipped there on every run and passed
+  green. It now runs in the `check` job against the `jkb` that job builds, and `scripts/check.sh`
+  runs it too; both set `JKB_REQUIRE_WIRE`, under which a missing binary fails instead of skipping.
 
 **As built (subtask 4, the Document pane).** `@jkb/core`'s `design.ts` (the answers' shapes and
 decoders, base64, the live-update message, and `stateRuns` — the span-state derivation the editor
@@ -331,9 +336,25 @@ the Yjs peer, `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `disc
   is (`--occurrence`), and the spans it touches. A selection no quote could name — one starting inside
   an earlier match of itself, or splitting a surrogate pair — is refused, never widened. The app only
   carries the prompt text; it builds none of it.
+- **The occurrence is given only beside its own version's token.** It counts matches in the version
+  the selection was made in, and the prompt also tells Claude to re-read with `jkb design cat`. A
+  generic `--base <token> --find <quote> --occurrence k` line invited pairing that count with a newer
+  token, where an earlier match inserted since makes the same count name other words, and the edit
+  succeeds silently. The generic line now carries no occurrence and says to quote enough context to
+  be unique in a version Claude read itself. The concrete line `--base V --find=… --occurrence k`
+  says the count holds only with `V`. *Found in review.*
+- **The quote is also given as a JSON string**, and a passage with whitespace or a line break at an
+  edge says so. A fence cannot show those, but the quote and its occurrence count them: copying the
+  visible `foo` of a selected `foo\n` matched a third time and edited the wrong line. Values are
+  spelled `--find=<quote>`, because a quote starting with `-` (a Markdown list item) otherwise parses
+  as a flag.
 - **The offsets are sent with the version whose text is the screen's.** The pane waits for every
   local edit to be saved, re-reads with `design.cat`, and sends that version only if its text is the
-  text the selection was made in; otherwise it asks for the selection again. Sending the latest version
+  text the selection was made in; otherwise it asks for the selection again. Every other reason
+  is reported as itself: a stopped session (where *Discuss* is not offered at all), a failed read, or
+  a closed pane. It is never reported as "the text changed". One *Discuss* runs at a time, and a
+  second click while one waits is ignored. Each click mints a session uuid, so the terminal's dedupe
+  could not catch a double click. Sending the latest version
   with offsets taken from an older screen is the read-latest mistake D53.4 rejected, in the other
   direction.
 - **A *Discuss* is `bash -lc 'exec claude --session-id "$1" "$2"'`** in the container, in the
@@ -350,18 +371,40 @@ the Yjs peer, `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `disc
   (7 days) — at the topic's cap that refuses the announcement of every later edit. Windows showing the
   same design share the feed. The window subscribes *then* loads (`design.state` since its own state
   vector), so nothing falls between the two. A group the queue removed is rejoined and the window told
-  `gap`; an update too large to announce inline, or one whose dependencies never arrived (Yjs keeps it
-  pending), is completed the same way. Two app instances would share the group and split its messages:
+  `gap`.
+- **An announcement is a hint; its bytes are never merged.** On each `update` the session fetches
+  `design.state` since its own state vector, so everything it merges comes from the table. `mq.send`
+  is open at Hook permission with a sender-chosen kind and producer. Merging the inline bytes let any
+  token that may send to the queue put text into every open editor that the table does not hold,
+  stop the editor with bytes that do not decode, or reuse a real client's clock so that client's
+  genuine update was dropped. Reads are coalesced (a pull asked for during a pull runs once more).
+  The inline update is still published for other consumers. *Found in review.*
+- **A design with no topic is joined later.** A design created before every design got its topic
+  at creation answers the join with `no_such_topic`. The session retries the join on a backoff, and
+  also right after its own first saved edit, which creates the topic. Once joined, it re-reads. Two app instances would share the group and split its messages:
   not a case the app guards today (one instance per machine).
 - **Span states are drawn only from an answer that describes the screen.** `design.cat`'s text is
   compared with the document's; an answer read while an edit was in flight is dropped for the next.
-  Between answers the drawing moves with the text. Text in a span is tinted with its state; text no
+  Between answers the drawing moves with the text. Text typed between answers is cut out of any mark it
+  landed in and reads PROPOSED until the next answer. CodeMirror widens a mark over an insertion
+  strictly inside it, and new words showed the APPROVED tint until a matching answer arrived; during
+  steady typing, or while the daemon was away, that never happened. Text in a span is tinted with its state; text no
   span covers reads PROPOSED but is marked only by an amber bar in the margin (a line's bar is its
   least advanced state), so a fresh draft is not a page of amber; words removed from an approved span
   show struck through where they were.
 - **A refused `design.apply` stops the session** (the editor turns read-only and says why) rather than
   retrying; an unreachable or busy daemon is retried with backoff and the edits kept, in order, merged
-  into one update per call.
+  into one update per call. **The send and the read each have their own retry.** With a shared timer,
+  a failed `design.state` cancelled the pending resend of a failed edit. The edit was never sent,
+  the status stayed "Saving…", and every *Discuss* waited forever (found in review, reproduced by
+  `a failed pull does not cancel a failed edit's retry`).
+- **The editor is read-only until the first load has merged.** Text typed into the empty document
+  before the load was sent as a real edit, and landed at one end of the design's text.
+- **Edits outlive the pane that held them.** A session the pane stops showing is *closed*, not
+  disposed: it sends what it still holds, then disposes itself (a stopped session holds nothing it
+  will send). Switching design or repo says that edits are still being saved. A Refresh keeps the
+  designs it already has while it loads and when it fails. Emptying the list for a moment closed the
+  open design and, before `close`, dropped its unsent edits.
 - **`@codemirror/language` is held at 6.12.4** (a workspace `overrides` entry): 6.13.0, published the
   day before, imports `@codemirror/streamparser` without declaring it, and the renderer did not bundle.
 

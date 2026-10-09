@@ -31,7 +31,8 @@ export function DocumentEditor({
     if (parent === null) return undefined;
     const undo = new Y.UndoManager(session.text);
     const editable = new Compartment();
-    const writable = (): boolean => session.status.kind !== "failed";
+    // Read-only until the first load has merged, and after a refusal (`DesignSession.editable`).
+    const writable = (): boolean => session.editable;
     const view = new EditorView({
       parent,
       state: EditorState.create({
@@ -40,7 +41,7 @@ export function DocumentEditor({
           keymap.of([...yUndoManagerKeymap, indentWithTab, ...defaultKeymap]),
           livePreview,
           spanStates,
-          discussOnSelection((from, to) => discuss.current(from, to, view.state.doc.toString())),
+          discussOnSelection((from, to) => discuss.current(from, to, view.state.doc.toString()), writable),
           yCollab(session.text, null, { undoManager: undo }),
           editable.of([EditorView.editable.of(writable()), EditorState.readOnly.of(!writable())]),
           EditorView.contentAttributes.of({ "aria-label": "Design document", spellcheck: "true" }),

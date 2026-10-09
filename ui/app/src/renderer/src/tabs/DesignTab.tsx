@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { decodeDesignPrompt, decodeDesigns, designOps, designRepos, repoOf, SPAN_STATES, type Design } from "@jkb/core";
 
 import { DocumentEditor } from "../design/DocumentEditor";
-import { discussSpec } from "../design/discuss";
+import { discussSpec, exclusive } from "../design/discuss";
+import { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading, type Listing } from "../design/listing";
 import { PlanColumn } from "../design/PlanColumn";
 import { PromptsPane } from "../design/PromptsPane";
 import { DesignSession, type SyncStatus } from "../design/session";
@@ -31,11 +32,6 @@ function remember(key: string, value: string | undefined): void {
   }
 }
 
-type Listing =
-  | { readonly kind: "loading" }
-  | { readonly kind: "loaded"; readonly designs: readonly Design[] }
-  | { readonly kind: "failed"; readonly message: string };
-
 const STATUS_LABEL: Record<SyncStatus["kind"], string> = {
   connecting: "Loading…",
   live: "Saved",
@@ -44,7 +40,10 @@ const STATUS_LABEL: Record<SyncStatus["kind"], string> = {
   failed: "Stopped",
 };
 
-/** The open design's session, re-rendered on every change of status or spans. */
+/**
+ * The open design's session, re-rendered on every change of status or spans. A session the pane
+ * stops showing is closed, not disposed: it sends what it still holds first (`DesignSession.close`).
+ */
 function useSession(design: Design | undefined): DesignSession | undefined {
   const [session, setSession] = useState<DesignSession | undefined>(undefined);
   const [, bump] = useState(0);
@@ -59,7 +58,7 @@ function useSession(design: Design | undefined): DesignSession | undefined {
     void s.open();
     return () => {
       off();
-      s.dispose();
+      s.close();
     };
   }, [design?.uid, design?.topic]);
   return session;
@@ -83,18 +82,18 @@ function bridgeOf(): ConstructorParameters<typeof DesignSession>[0] {
  */
 export function DesignTab(): React.JSX.Element {
   const terminals = useTerminals();
-  const [listing, setListing] = useState<Listing>({ kind: "loading" });
+  const [listing, setListing] = useState<Listing>(INITIAL_LISTING);
   const [repo, setRepo] = useState<string | undefined>(() => remembered(LAST_REPO_KEY));
   const [uid, setUid] = useState<string | undefined>(() => remembered(LAST_DESIGN_KEY));
   const [notice, setNotice] = useState<string | undefined>(undefined);
 
   const load = useCallback(async () => {
-    setListing({ kind: "loading" });
+    setListing(listingLoading);
     try {
       const answer = decodeDesigns(await window.jkb.op(designOps.list()));
-      setListing(answer.ok ? { kind: "loaded", designs: answer.value } : { kind: "failed", message: answer.error.message });
+      setListing((prev) => (answer.ok ? listingLoaded(answer.value) : listingFailed(prev, answer.error.message)));
     } catch (e) {
-      setListing({ kind: "failed", message: e instanceof Error ? e.message : String(e) });
+      setListing((prev) => listingFailed(prev, e instanceof Error ? e.message : String(e)));
     }
   }, []);
 
@@ -107,8 +106,8 @@ export function DesignTab(): React.JSX.Element {
   const { designRequest } = useNavigation();
   const [handled, setHandled] = useState<{ readonly seq: number; readonly reloaded: boolean }>({ seq: 0, reloaded: false });
   useEffect(() => {
-    if (designRequest === undefined || designRequest.seq === handled.seq || listing.kind === "loading") return;
-    const found = listing.kind === "loaded" ? listing.designs.find((d) => d.uid === designRequest.uid) : undefined;
+    if (designRequest === undefined || designRequest.seq === handled.seq || listing.loading) return;
+    const found = listing.designs?.find((d) => d.uid === designRequest.uid);
     if (found !== undefined) {
       const r = repoOf(found.namespace);
       if (r !== undefined) {
@@ -127,7 +126,7 @@ export function DesignTab(): React.JSX.Element {
     }
   }, [designRequest, handled, listing, load]);
 
-  const designs = listing.kind === "loaded" ? listing.designs : [];
+  const designs = useMemo(() => listing.designs ?? [], [listing.designs]);
   const repos = useMemo(() => designRepos(designs), [designs]);
   const activeRepo = repo !== undefined && repos.includes(repo) ? repo : repos[0];
   const inRepo = useMemo(() => designs.filter((d) => repoOf(d.namespace) === activeRepo), [designs, activeRepo]);
@@ -137,42 +136,66 @@ export function DesignTab(): React.JSX.Element {
   // under this one's name.
   const session = opened !== undefined && opened.uid === design?.uid ? opened : undefined;
 
+  // Switching away from a design with edits not yet sent: they are sent in the background
+  // (`useSession` closes the session, it does not drop it), and the operator is told so.
+  const leaving = (): void => {
+    if (session?.unsent === true) setNotice(`Edits to ${design?.title ?? "the design"} are still being saved in the background.`);
+  };
   const pickRepo = (next: string): void => {
+    leaving();
     setRepo(next);
     remember(LAST_REPO_KEY, next);
     setUid(undefined);
     remember(LAST_DESIGN_KEY, undefined);
   };
   const pickDesign = (next: string): void => {
+    leaving();
     setUid(next);
     remember(LAST_DESIGN_KEY, next);
   };
 
-  const onDiscuss = useCallback(
-    async (from: number, to: number, shown: string): Promise<void> => {
-      if (session === undefined || design === undefined || activeRepo === undefined) return;
-      setNotice(undefined);
-      const roots = terminals.roots;
-      if (roots === undefined) {
-        setNotice("The terminal is not ready yet.");
-        return;
+  const discuss = async (from: number, to: number, shown: string): Promise<void> => {
+    if (session === undefined || design === undefined || activeRepo === undefined) return;
+    setNotice(undefined);
+    const roots = terminals.roots;
+    if (roots === undefined) {
+      setNotice("The terminal is not ready yet.");
+      return;
+    }
+    // The selection is offsets into the text on screen; it is sent with the version whose text is
+    // exactly that, once every edit has been saved.
+    const settled = await session.settledVersion();
+    if (!settled.ok) {
+      const why = settled.why;
+      switch (why.kind) {
+        case "closed":
+          return;
+        case "failed":
+          setNotice(`${why.message} — reopen the design to discuss it.`);
+          return;
+        case "unread":
+          setNotice(`Cannot read the design: ${why.message}`);
+          return;
+        case "moved":
+          break;
       }
-      // The selection is offsets into the text on screen; it is sent with the version whose text is
-      // exactly that, once every edit has been saved.
-      const settled = await session.settledVersion();
-      if (settled === undefined || settled.text !== shown) {
-        setNotice("The text changed while the selection was being sent — select it again.");
-        return;
-      }
-      const answer = decodeDesignPrompt(await window.jkb.op(designOps.discuss(design.uid, settled.version, from, to)));
-      if (!answer.ok) {
-        setNotice(answer.error.message);
-        return;
-      }
-      terminals.open(discussSpec(answer.value, activeRepo, roots, crypto.randomUUID()), "popover");
-    },
-    [session, design, activeRepo, terminals],
-  );
+    }
+    if (!settled.ok || settled.doc.text !== shown) {
+      setNotice("The text changed while the selection was being sent — select it again.");
+      return;
+    }
+    const answer = decodeDesignPrompt(await window.jkb.op(designOps.discuss(design.uid, settled.doc.version, from, to)));
+    if (!answer.ok) {
+      setNotice(answer.error.message);
+      return;
+    }
+    terminals.open(discussSpec(answer.value, activeRepo, roots, crypto.randomUUID()), "popover");
+  };
+  // One *Discuss* at a time, across re-renders: the latest closure runs, the guard is the one made
+  // on mount.
+  const latestDiscuss = useRef(discuss);
+  latestDiscuss.current = discuss;
+  const onDiscuss = useMemo(() => exclusive((from: number, to: number, shown: string) => latestDiscuss.current(from, to, shown)), []);
 
   return (
     <div className="design-tab">
@@ -208,7 +231,7 @@ export function DesignTab(): React.JSX.Element {
             ))}
           </select>
         </label>
-        <button type="button" className="bar-button" onClick={() => void load()} disabled={listing.kind === "loading"}>
+        <button type="button" className="bar-button" onClick={() => void load()} disabled={listing.loading}>
           Refresh
         </button>
         <span className="spacer" />
@@ -247,10 +270,15 @@ export function DesignTab(): React.JSX.Element {
           {session.status.message} — nothing more is saved until the design is reopened.
         </p>
       )}
+      {listing.error !== undefined && listing.designs !== undefined && (
+        <p className="design-notice" role="status">
+          Cannot refresh the designs: {listing.error}
+        </p>
+      )}
       <div className="design-body">
-        {listing.kind === "failed" ? (
-          <p className="design-empty">Cannot list designs: {listing.message}</p>
-        ) : listing.kind === "loading" && designs.length === 0 ? (
+        {listing.designs === undefined && listing.error !== undefined ? (
+          <p className="design-empty">Cannot list designs: {listing.error}</p>
+        ) : listing.designs === undefined ? (
           <p className="design-empty muted">Loading designs…</p>
         ) : design === undefined ? (
           <div className="design-empty">

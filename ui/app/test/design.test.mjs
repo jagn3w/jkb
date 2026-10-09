@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import test, { after } from "node:test";
+import test, { after, afterEach } from "node:test";
 
 import * as esbuild from "esbuild";
 
@@ -44,7 +44,8 @@ async function load(entry) {
 const src = path.join(here, "..", "src");
 const { DesignFeeds, DESIGN_GROUP } = await load(path.join(src, "main", "designFeeds.ts"));
 const { DesignSession } = await load(path.join(src, "renderer", "src", "design", "session.ts"));
-const { discussSpec, repoDir } = await load(path.join(src, "renderer", "src", "design", "discuss.ts"));
+const { discussSpec, exclusive, repoDir } = await load(path.join(src, "renderer", "src", "design", "discuss.ts"));
+const { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading } = await load(path.join(src, "renderer", "src", "design", "listing.ts"));
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const Y = require("yjs");
 
@@ -278,11 +279,23 @@ function standInJkb(initial, { spans = [] } = {}) {
 }
 
 const quick = { spansDelayMs: 0, minBackoffMs: 1, maxBackoffMs: 2 };
+
+// Every session a test opens is disposed after it, passed or failed: one left retrying against a
+// stand-in that stays down would keep its timers, and the run, alive forever.
+const opened = [];
+function Session(...args) {
+  const s = new DesignSession(...args);
+  opened.push(s);
+  return s;
+}
+afterEach(() => {
+  for (const s of opened.splice(0)) s.dispose();
+});
 const bodyOf = (doc) => doc.getText("body").toString();
 
 test("a session loads the design, sends local edits as updates, and merges updates from elsewhere", async () => {
   const jkb = standInJkb("hello world");
-  const s = new DesignSession(jkb.bridge, "d", TOPIC, quick);
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
   await s.open();
   assert.equal(s.text.toString(), "hello world");
   assert.equal(s.status.kind, "live");
@@ -294,11 +307,11 @@ test("a session loads the design, sends local edits as updates, and merges updat
   const applies = jkb.asked.filter((r) => r.op === "design.apply");
   assert.ok(applies.length >= 1 && applies.length <= 2, "edits leave in order, merged while one is in flight");
 
-  // The CLI edits: announced inline, merged without asking.
+  // The CLI edits: the announcement is a hint, and what the table holds is fetched.
   const before = jkb.asked.length;
   jkb.writeElsewhere((t) => t.insert(0, "Oh, "));
-  assert.equal(s.text.toString(), "Oh, hello, world!");
-  assert.ok(!jkb.asked.slice(before).some((r) => r.op === "design.state"), "an inline update needs no read");
+  await until(() => s.text.toString() === "Oh, hello, world!", "the announced update");
+  assert.ok(jkb.asked.slice(before).some((r) => r.op === "design.state"), "an announcement is read from the table");
 
   // Too large to announce inline: the session fetches what it lacks.
   jkb.writeElsewhere((t) => t.insert(t.length, " Bye."), { inline: false });
@@ -314,7 +327,7 @@ test("a session loads the design, sends local edits as updates, and merges updat
 
 test("an update built on one the session missed is completed from the table", async () => {
   const jkb = standInJkb("abc");
-  const s = new DesignSession(jkb.bridge, "d", TOPIC, quick);
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
   await s.open();
   jkb.writeElsewhere((t) => t.insert(3, "d"), { announce: false });
   jkb.writeElsewhere((t) => t.insert(4, "e"));
@@ -325,7 +338,7 @@ test("an update built on one the session missed is completed from the table", as
 test("spans are kept only from an answer whose text is the document's, and *Discuss* waits for one", async () => {
   const span = { uid: "span:x", reviewer: "operator", anchored: true, start: 0, end: 5, text: "hello", state: "APPROVED", demoted: false, pieces: [], approved_by: "operator", approved_at: null, steps: [] };
   const jkb = standInJkb("hello world", { spans: [span] });
-  const s = new DesignSession(jkb.bridge, "d", TOPIC, quick);
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
   await s.open();
   await until(() => s.current !== undefined, "the first spans");
   assert.equal(s.current.spans[0].uid, "span:x");
@@ -340,18 +353,173 @@ test("spans are kept only from an answer whose text is the document's, and *Disc
 
   // Settled: every edit sent, and the answer's text is what is shown.
   const jkb2 = standInJkb("one two");
-  const t = new DesignSession(jkb2.bridge, "d", TOPIC, quick);
+  const t = Session(jkb2.bridge, "d", TOPIC, quick);
   await t.open();
   t.text.insert(7, " three");
   const settled = await t.settledVersion();
-  assert.equal(settled.text, "one two three");
-  assert.equal(settled.version.split(".")[0], String(jkb2.seq));
+  assert.ok(settled.ok);
+  assert.equal(settled.doc.text, "one two three");
+  assert.equal(settled.doc.version.split(".")[0], String(jkb2.seq));
   t.dispose();
+});
+
+test("an announcement's bytes are never merged: a forged update cannot put text in the editor", async () => {
+  const jkb = standInJkb("abc");
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
+  await s.open();
+  // Anyone who may send to the queue could announce any bytes, from any client and clock.
+  const forger = new Y.Doc({ gc: false });
+  forger.getText("body").insert(0, "INJECTED ");
+  jkb.emit({ kind: "update", design: "d", seq: 99, update: b64(Y.encodeStateAsUpdate(forger)) });
+  jkb.emit({ kind: "update", design: "d", seq: 100, update: b64(new Uint8Array([255, 1, 2])) });
+  await until(() => jkb.asked.filter((r) => r.op === "design.state").length >= 2, "the re-read");
+  await s.idle();
+  await tick();
+  assert.equal(s.text.toString(), "abc", "the table's text, not the announcement's");
+  assert.notEqual(s.status.kind, "failed", "undecodable bytes in an announcement do not stop the session");
+  s.dispose();
+});
+
+test("why there is no settled version is said as it is: stopped, unread, or moved", async () => {
+  const jkb = standInJkb("abc");
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
+  await s.open();
+  const realOp = jkb.bridge.op;
+  jkb.bridge.op = async (request) => (request.op === "design.cat" ? err("unavailable", "cannot reach jkb serve") : realOp(request));
+  assert.deepEqual(await s.settledVersion(), { ok: false, why: { kind: "unread", message: "cannot reach jkb serve" } });
+  jkb.bridge.op = async (request) => {
+    // Another editor writes between the save and the read-back.
+    if (request.op === "design.cat") jkb.writeElsewhere((t) => t.insert(0, "z"), { announce: false });
+    return realOp(request);
+  };
+  assert.deepEqual(await s.settledVersion(), { ok: false, why: { kind: "moved" } });
+  jkb.bridge.op = async (request) => (request.op === "design.apply" ? err("invalid", "the update does not apply") : realOp(request));
+  s.text.insert(0, "x");
+  await until(() => s.status.kind === "failed", "the refusal");
+  const failed = await s.settledVersion();
+  assert.equal(failed.ok, false);
+  assert.equal(failed.why.kind, "failed");
+  assert.match(failed.why.message, /does not apply/);
+  s.dispose();
+  assert.deepEqual(await s.settledVersion(), { ok: false, why: { kind: "closed" } });
+});
+
+test("a session is not editable until its first load has merged, nor after a refusal", async () => {
+  const jkb = standInJkb("the real text");
+  const realOp = jkb.bridge.op;
+  let down = true;
+  jkb.bridge.op = async (request) => (down && request.op === "design.state" ? err("unavailable", "down") : realOp(request));
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
+  await s.open();
+  assert.equal(s.status.kind, "retrying");
+  assert.equal(s.editable, false, "an empty document before the load is not the design");
+  down = false;
+  await until(() => s.editable, "the load");
+  assert.equal(s.text.toString(), "the real text");
+  jkb.bridge.op = async (request) => (request.op === "design.apply" ? err("invalid", "no") : realOp(request));
+  s.text.insert(0, "x");
+  await until(() => s.status.kind === "failed", "the refusal");
+  assert.equal(s.editable, false);
+  s.dispose();
+});
+
+test("a failed pull does not cancel a failed edit's retry: both are retried, and the edit is sent", async () => {
+  const jkb = standInJkb("abc");
+  const s = Session(jkb.bridge, "d", TOPIC, { spansDelayMs: 0, minBackoffMs: 5, maxBackoffMs: 5 });
+  await s.open();
+  const realOp = jkb.bridge.op;
+  let down = true;
+  jkb.bridge.op = async (request) => (down ? err("unavailable", "down") : realOp(request));
+  s.text.insert(3, "d");
+  await until(() => s.status.kind === "retrying", "the edit's retry");
+  // A gap while the daemon is still down: the pull fails too, and schedules its own retry.
+  jkb.emit({ kind: "gap", message: "lost" });
+  await tick();
+  down = false;
+  await until(() => bodyOf(jkb.table) === "abcd", "the edit, resent");
+  await s.idle();
+  await until(() => s.status.kind === "live", "Saved");
+  s.dispose();
+});
+
+test("closing a session sends what it still holds before disposing it", async () => {
+  const jkb = standInJkb("abc");
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
+  await s.open();
+  const realOp = jkb.bridge.op;
+  let down = true;
+  jkb.bridge.op = async (request) => (down ? err("unavailable", "down") : realOp(request));
+  s.text.insert(3, " typed while away");
+  await until(() => s.status.kind === "retrying", "the retry");
+  assert.equal(s.unsent, true);
+  s.close();
+  await tick();
+  down = false;
+  await until(() => bodyOf(jkb.table) === "abc typed while away", "the held edit, sent after close");
+  await until(() => s.doc.isDestroyed, "the dispose once sent");
+  // Nothing waiting: closed at once.
+  const t = Session(jkb.bridge, "d", TOPIC, quick);
+  await t.open();
+  t.close();
+  await until(() => t.doc.isDestroyed, "the dispose");
+});
+
+test("a design with no topic yet is joined once it has one, and re-read then", async () => {
+  const jkb = standInJkb("");
+  let topicExists = false;
+  const joins = [];
+  jkb.bridge.subscribe = async () => {
+    joins.push(topicExists);
+    return topicExists ? ok(null) : err("no_such_topic", "no topic");
+  };
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
+  await s.open();
+  assert.match(s.feedProblem, /no topic/);
+  // The CLI's first edit creates the topic; this editor never heard it announced.
+  jkb.writeElsewhere((t) => t.insert(0, "first words"), { announce: false });
+  topicExists = true;
+  await until(() => s.feedProblem === undefined, "the join");
+  await until(() => s.text.toString() === "first words", "the re-read after the join");
+  assert.ok(joins.length >= 2);
+  s.dispose();
+});
+
+test("a refresh keeps the designs it has while it loads, and when it fails", () => {
+  const a = { uid: "design:a", title: "A", namespace: "designs/jkb", topic: "design/design.a" };
+  let l = listingLoaded([a]);
+  l = listingLoading(l);
+  assert.deepEqual(l.designs, [a], "loading keeps the list, so the open design stays open");
+  assert.equal(l.loading, true);
+  l = listingFailed(l, "cannot reach jkb serve");
+  assert.deepEqual(l.designs, [a]);
+  assert.equal(l.error, "cannot reach jkb serve");
+  assert.equal(listingLoaded([]).error, undefined);
+  assert.equal(listingFailed(INITIAL_LISTING, "x").designs, undefined, "before any read there is no list to keep");
+});
+
+test("a Discuss is one at a time: a click while one is pending is ignored", async () => {
+  let release;
+  let runs = 0;
+  const run = exclusive(async () => {
+    runs += 1;
+    await new Promise((r) => {
+      release = r;
+    });
+  });
+  const first = run();
+  await run();
+  assert.equal(runs, 1);
+  release();
+  await first;
+  const again = run();
+  assert.equal(runs, 2, "once the first is done, the next runs");
+  release();
+  await again;
 });
 
 test("a refused edit stops the session; an unreachable daemon is retried and the edit kept", async () => {
   const jkb = standInJkb("abc");
-  const s = new DesignSession(jkb.bridge, "d", TOPIC, quick);
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
   await s.open();
   let attempts = 0;
   const realOp = jkb.bridge.op;
@@ -374,7 +542,7 @@ test("a refused edit stops the session; an unreachable daemon is retried and the
 
 test("a feed problem is shown beside the status and cleared when the feed is back", async () => {
   const jkb = standInJkb("abc");
-  const s = new DesignSession(jkb.bridge, "d", TOPIC, quick);
+  const s = Session(jkb.bridge, "d", TOPIC, quick);
   await s.open();
   jkb.emit({ kind: "error", message: "cannot reach jkb serve" });
   assert.equal(s.feedProblem, "cannot reach jkb serve");
@@ -401,6 +569,33 @@ test("a line's margin shows its least advanced state, and a run that only touche
   assert.equal(lineState(marks, 5, 9), "PROPOSED", "a line mixing states shows the least advanced");
   assert.equal(lineState(marks, 10, 14), "IMPLEMENTED");
   assert.equal(lineState(Decoration.none, 0, 4), undefined);
+});
+
+test("typing inside a drawn mark does not widen it: new words read PROPOSED until the next answer", async () => {
+  const { mapStates } = await load(path.join(src, "renderer", "src", "design", "editor.ts"));
+  const { Decoration } = require("@codemirror/view");
+  const { ChangeSet } = require("@codemirror/state");
+  const approved = Decoration.mark({ class: "cm-state cm-state-approved cm-state-span", state: "APPROVED" });
+  const marks = Decoration.set([approved.range(0, 5)]);
+  const runs = (set) => {
+    const out = [];
+    for (const it = set.iter(); it.value !== null; it.next()) out.push([it.from, it.to, it.value.spec.state]);
+    return out;
+  };
+  // "hello" → "heXYZllo": the insert lands strictly inside the approved mark.
+  assert.deepEqual(runs(mapStates(marks, ChangeSet.of({ from: 2, insert: "XYZ" }, 10))), [
+    [0, 2, "APPROVED"],
+    [2, 5, "PROPOSED"],
+    [5, 8, "APPROVED"],
+  ]);
+  // A replacement inside it: the new words are PROPOSED, the rest keep their state.
+  assert.deepEqual(runs(mapStates(marks, ChangeSet.of({ from: 1, to: 3, insert: "AB" }, 10))), [
+    [0, 1, "APPROVED"],
+    [1, 3, "PROPOSED"],
+    [3, 5, "APPROVED"],
+  ]);
+  // A deletion only shrinks it.
+  assert.deepEqual(runs(mapStates(marks, ChangeSet.of({ from: 1, to: 3 }, 10))), [[0, 3, "APPROVED"]]);
 });
 
 // ---- Discuss -------------------------------------------------------------------------------------

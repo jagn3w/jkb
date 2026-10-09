@@ -5,7 +5,9 @@
 //! vector, and a span's anchors read in Yjs at the offsets jkb reports.
 //
 // Needs a `jkb` built from this tree: set JKB_BIN to it (`./scripts/build.sh` puts it in cargo's
-// target directory). Without it the test SKIPS and says so; it is never reported green.
+// target directory). Without it the test SKIPS and says so — unless JKB_REQUIRE_WIRE is set, as
+// `scripts/check.sh` and CI's `check` job set it, where a missing jkb FAILS: a skip there would pass
+// a broken yrs↔yjs wire on a green tick.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -25,7 +27,12 @@ const skip =
     : !fs.existsSync(bin)
       ? `no jkb at ${bin}`
       : undefined;
-if (skip !== undefined) console.log(`# yjs-wire skipped: ${skip}`);
+const required = (process.env.JKB_REQUIRE_WIRE ?? "") !== "";
+if (skip !== undefined && required) {
+  test("the yjs-wire measurement ran", () => assert.fail(`JKB_REQUIRE_WIRE is set, but ${skip}`));
+} else if (skip !== undefined) {
+  console.log(`# yjs-wire skipped: ${skip}`);
+}
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "jkb-app-wire-"));
 after(() => fs.rmSync(work, { recursive: true, force: true }));
