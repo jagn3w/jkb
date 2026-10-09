@@ -32,7 +32,7 @@ const { gitPlace } = await load(path.join(src, "main", "gitPlace.ts"));
 const { NotifyWatch } = await load(path.join(src, "renderer", "src", "sessions", "watch.ts"));
 const { loadHolders, liveCwds, MAX_PAGES } = await load(path.join(src, "renderer", "src", "sessions", "data.ts"));
 const { recordAttached, reattachPlan, mergeRecords, tearsDown } = await load(path.join(src, "renderer", "src", "sessions", "reattach.ts"));
-const { RESUME_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
+const { RESUME_SCRIPT, sessionResumeSpec } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 
 const ok = (value) => ({ ok: true, value });
 const err = (code, message = code) => ({ ok: false, error: { code, message } });
@@ -354,6 +354,21 @@ test("a teardown records the app's live container sessions, where they really ru
     ],
     "a host session survives the container; a shell is no session; an ended one is not live; the registry's directory wins",
   );
+});
+
+test("a resumed session the registry does not know is recorded where the resume moved, not where its terminal started", () => {
+  const resumed = sessionResumeSpec({ session: S1, cwd: "/home/vscode/repos/jkb/.jkb/work/build", title: "Resume · x" }, ROOTS);
+  const atRoot = sessionResumeSpec({ session: S2, cwd: "/home/vscode/repos", title: "Resume · y" }, ROOTS);
+  const outside = sessionResumeSpec({ session: "aaaaaaaa-0000-0000-0000-000000000000", cwd: "/elsewhere", title: "Resume · z" }, ROOTS);
+  assert.equal(resumed.cwd, "/home/vscode/repos", "the terminal starts at the mount's root");
+  const recorded = recordAttached([entry(1, resumed), entry(2, atRoot), entry(3, outside)], () => undefined);
+  assert.deepEqual(
+    recorded.map((a) => a.cwd),
+    ["/home/vscode/repos/jkb/.jkb/work/build", "/home/vscode/repos", "/elsewhere"],
+  );
+  // ... so the rebuild resumes it there again.
+  const plan = reattachPlan(recorded, [], true, ROOTS);
+  assert.deepEqual(plan[0].spec, resumed);
 });
 
 test("after the rebuild each recorded session is resumed in its terminal — and only once the container runs", () => {

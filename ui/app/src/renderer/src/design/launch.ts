@@ -138,3 +138,17 @@ export function sessionResumeSpec(
     sessionUuid: ask.session,
   };
 }
+
+/**
+ * The directory a resume terminal moves into — `sessionResumeSpec`'s inverse — or `undefined` for a
+ * spec that is no resume. A resume's own `cwd` is where it *starts* (the repos mount's root), never
+ * the session's directory, so anything that needs where the session runs asks this.
+ */
+export function resumedDir(spec: TerminalSpec): string | undefined {
+  const [, , script, , , dir] = spec.argv;
+  if (script !== RESUME_SCRIPT || dir === undefined) return undefined;
+  if (dir.startsWith("/")) return dir;
+  const rel = dir.replace(/^\.\/?/, "").replace(/\/+$/, "");
+  const start = spec.cwd.replace(/\/+$/, "");
+  return rel === "" ? spec.cwd : `${start}/${rel}`;
+}

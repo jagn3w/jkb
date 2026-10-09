@@ -1238,7 +1238,7 @@ fn a_prompt_subject_is_the_launchs_kind_and_this_designs() {
     let other = create(&db, "y");
     let plan = new_plan(&db, &uid, &["a"]).unwrap();
     let step = step_id(&db, &plan.steps[0].uid);
-    task_under(&db, step, "task:mine");
+    let mine = task_under(&db, step, "task:mine");
     // A one-off, directly under the design.
     let design_uid = uid.clone();
     let design_item = db.read(move |c| design_id(c, &design_uid)).unwrap();
@@ -1270,12 +1270,35 @@ fn a_prompt_subject_is_the_launchs_kind_and_this_designs() {
         let err = try_record(launch, subject).unwrap_err();
         assert!(err.contains(why), "{launch:?} {subject}: {err}");
     }
+    // A Play and a task's Play are started on something: naming nothing is refused by name.
+    for launch in [Launch::Play, Launch::Task] {
+        for subject in [None, Some("  ")] {
+            let mut a = ask(&uid, SESSION, "/r");
+            a.launch = launch;
+            a.subject = subject.map(str::to_owned);
+            let err = record(&db, a).unwrap_err().to_string();
+            assert!(err.contains("name it with a subject"), "{launch:?}: {err}");
+        }
+    }
     assert!(
         prompts_of(&db, &uid).is_empty(),
         "nothing refused was written"
     );
 
     try_record(Launch::Task, "task:mine").unwrap();
+    // The task then leaves the design: recording the session again (the terminal's toggle) still
+    // moves its cwd, since a re-record writes only that and its subject was checked when first
+    // recorded.
+    db.write_txn("t", move |c, m| {
+        containment::contain(c, m, mine, their_step, 0)
+    })
+    .unwrap();
+    let mut again = ask(&uid, SESSION, "/Users/me/r");
+    again.launch = Launch::Task;
+    again.subject = Some("task:mine".to_owned());
+    let moved = record(&db, again).unwrap();
+    assert_eq!(moved.cwd, "/Users/me/r");
+    assert_eq!(moved.subject.as_deref(), Some("task:mine"));
     for (session, launch, subject) in [
         (
             "11111111-2222-3333-4444-555555555555",

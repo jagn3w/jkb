@@ -446,10 +446,12 @@ requests), and `src/renderer/src/design/` `launch.ts` (every launch and resume a
   (the terminal's toggle restarts the program on the other side, which runs the launch again from
   there). Recording it under another design is refused. The item's content is its title; the design,
   session, cwd, launch (`discuss`/`play`/`task`/`new`) and subject (the plan or task a *Play* named)
-  are its metadata. The subject is checked against the launch: a plan's *Play* names one of this
-  design's plans, a task's *Play* one of its tasks (under a step, or directly under the design), and a
-  *Discuss* or *New prompt* names none — the pane lists the subject under the design, so one from
-  another design, or of another kind, is refused (caught in review). A session id is a **lowercase**
+  are its metadata. The subject is checked against the launch when the session is first recorded: a
+  plan's *Play* must name one of this design's plans, a task's *Play* one of its tasks (under a step,
+  or directly under the design), and a *Discuss* or *New prompt* names none — the pane lists the
+  subject under the design, so a missing one, one from another design, or one of another kind is
+  refused (caught in review). Recording the session again checks no subject: it writes only the cwd,
+  and the plan or task leaving the design since must not stop the toggle from restarting it. A session id is a **lowercase**
   uuid, and another spelling is **refused, not rewritten**: the launch hands Claude the caller's
   spelling, so a record that folded case could name a session other than the one Claude was given.
   *Unmeasured:* whether Claude folds a session id's case — the refusal makes it moot, and the app mints
@@ -476,8 +478,11 @@ requests), and `src/renderer/src/design/` `launch.ts` (every launch and resume a
   runs (caught in review). So a resume's terminal starts at the repos mount's root, which always
   exists on both sides, and the script moves into the recorded directory *relative to it* (the toggle
   rebases the root and the relative path follows); outside the mount it starts at `/` and moves to the
-  absolute path. A directory that is gone ends the script before Claude starts with `jkb: <dir> no
-  longer exists (a task removes its worktree when it lands), so this session cannot be resumed.` It is
+  absolute path. Since a resume's own cwd is no longer the session's directory, re-attach (D53.9),
+  when the registry does not know where a session runs, reads the directory back from the resume's
+  argv (`resumedDir`, `sessionResumeSpec`'s inverse) rather than the spec's cwd. A directory that is
+  gone ends the script before Claude starts with `jkb: <dir> no longer exists (a task removes its
+  worktree when it lands), so this session cannot be resumed.` It is
   **not** resumed in the design's repo instead: Claude finds a session by the directory it ran in
   (*unmeasured, stated*, the same premise D53.9's re-attach rests on), so a resume elsewhere would
   not find it. The pane still offers Resume on every row: whether a container

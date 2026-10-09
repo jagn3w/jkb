@@ -156,27 +156,31 @@ fn contained_by(conn: &Connection, item: ItemId, ancestor: ItemId) -> Result<boo
     Ok(false)
 }
 
-/// `subject` checked against the launch: a *Play* names one of this design's plans, a task's *Play*
-/// one of its tasks (under a step or directly under the design), and a *Discuss* or *New prompt*
-/// nothing — it works the design itself.
+/// `subject` checked against the launch: a *Play* must name one of this design's plans, a task's
+/// *Play* one of its tasks (under a step or directly under the design), and a *Discuss* or *New
+/// prompt* names nothing — it works the design itself.
 fn check_subject(
     conn: &Connection,
     design: ItemId,
     launch: Launch,
     subject: Option<&str>,
 ) -> Result<()> {
-    let Some(s) = subject else {
-        return Ok(());
-    };
-    let (kind, what) = match launch {
-        Launch::Play => (PLAN_KIND, "plan"),
-        Launch::Task => (KIND_TASK, "task"),
-        Launch::Discuss | Launch::New => {
+    let (kind, what) = match (launch, subject) {
+        (Launch::Discuss | Launch::New, None) => return Ok(()),
+        (Launch::Discuss | Launch::New, Some(s)) => {
             return Err(invalid(format!(
                 "a `{}` prompt works the design itself, so it names no subject, not `{s}`",
                 launch.as_str()
             )))
         }
+        (Launch::Play, _) => (PLAN_KIND, "plan"),
+        (Launch::Task, _) => (KIND_TASK, "task"),
+    };
+    let Some(s) = subject else {
+        return Err(invalid(format!(
+            "a `{}` prompt is started on a {what}: name it with a subject",
+            launch.as_str()
+        )));
     };
     let id = item::id_for_uid(conn, s)?.ok_or_else(|| not_found(format!("no {what} `{s}`")))?;
     let found = item::get(conn, id)?.map(|m| m.kind).unwrap_or_default();
@@ -268,11 +272,12 @@ fn existing(conn: &Connection, uid: &str) -> Result<Option<(ItemId, Value, Promp
 
 /// Record the prompt a session is started with, before it starts. Recording a session already
 /// recorded for the same design is that prompt again, its cwd moved to `ask.cwd` (a terminal
-/// restarted on the other target).
+/// restarted on the other target); its launch, subject and title stay as first recorded.
 ///
 /// # Errors
-/// An unknown design, a subject that is not one of the design's plans (for a *Play*) or tasks (for
-/// a task's *Play*) or any subject on a *Discuss* or *New prompt*, a session that is not a lowercase
+/// An unknown design; on a first record, a missing subject or one that is not one of the design's
+/// plans (for a *Play*) or tasks (for a task's *Play*), or any subject on a *Discuss* or *New
+/// prompt*; a session that is not a lowercase
 /// uuid, a relative cwd, an empty title, a session already recorded for another design, or a
 /// database error.
 pub fn record(conn: &Connection, meta: &WriteMeta, ask: &RecordPrompt) -> Result<Recorded> {
@@ -285,8 +290,10 @@ pub fn record(conn: &Connection, meta: &WriteMeta, ask: &RecordPrompt) -> Result
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    check_subject(conn, design, ask.launch, subject)?;
     let uid = uid_for(session);
+    // A session already recorded is that prompt again, and only its cwd can move: its subject was
+    // checked when it was first recorded, and is not checked again — the plan or task may since
+    // have left the design, which must not stop the terminal's toggle from restarting it.
     if let Some((id, mut value, found)) = existing(conn, &uid)? {
         if found.design != ask.design {
             return Err(invalid(format!(
@@ -304,6 +311,7 @@ pub fn record(conn: &Connection, meta: &WriteMeta, ask: &RecordPrompt) -> Result
         set_metadata(conn, meta, id, &value)?;
         return recorded(conn, meta, &ask.design, &uid);
     }
+    check_subject(conn, design, ask.launch, subject)?;
     let id = item::upsert(
         conn,
         meta,

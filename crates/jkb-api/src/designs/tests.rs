@@ -618,7 +618,7 @@ fn a_launch_records_its_session_and_the_design_lists_it() {
     let Staged { kb, uid, task, .. } = staged();
     let ask_again = |cwd: &str| {
         json!({ "op": "design.prompt_record", "uid": uid, "session": SESSION, "cwd": cwd,
-                "launch": "task", "title": "x" })
+                "launch": "task", "subject": task, "title": "x" })
     };
     let ask = json!({ "op": "design.prompt_record", "uid": uid, "session": SESSION,
                       "cwd": "/home/vscode/repos/jkb/.jkb/work/build", "launch": "task",

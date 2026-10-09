@@ -10,7 +10,7 @@
 import type { ContainerAction } from "@jkb/core";
 
 import type { TerminalRoots, TerminalSpec } from "../../../shared/terminal";
-import { sessionResumeSpec } from "../design/launch";
+import { resumedDir, sessionResumeSpec } from "../design/launch";
 import type { TerminalEntry } from "../terminal/state";
 
 /** The Container tab's actions that end the container's processes: rebuild, stop, remove. */
@@ -44,7 +44,8 @@ function isAttached(e: TerminalEntry): e is TerminalEntry & { readonly spec: Ter
 /**
  * The live app-owned sessions, recorded before a teardown. `cwdOf` is where the session really runs —
  * the session registry's directory (a task's *Play* moves into its worktree after the terminal
- * starts, so the spec's directory is not it) — and the terminal's own directory when nothing knows.
+ * starts, so the spec's directory is not it). When the registry does not know: the directory a
+ * resume moves into (its spec starts at the repos mount's root), else the terminal's own directory.
  */
 export function recordAttached(
   entries: readonly TerminalEntry[],
@@ -53,7 +54,7 @@ export function recordAttached(
   return entries.filter(isAttached).map((e) => ({
     key: e.key,
     session: e.spec.sessionUuid,
-    cwd: cwdOf(e.spec.sessionUuid) || e.spec.cwd,
+    cwd: cwdOf(e.spec.sessionUuid) || resumedDir(e.spec) || e.spec.cwd,
     target: "container",
     title: e.spec.title,
   }));
