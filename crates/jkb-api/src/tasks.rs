@@ -521,7 +521,10 @@ fn settle_home(
     server_home: Option<&Path>,
 ) -> Result<bool, ApiError> {
     let invalid = |why: &str| ApiError::with_code(ErrorCode::Invalid, why);
-    let ambient_repo = || crate::kb::ambient(conn, &ask.cwd, &ask.client_home, server_home);
+    // The whole ambient mount namespace (`repos/proj`), not a repo name: a task is homed under
+    // `tasks/<mount>/…` (`tasks/repos/proj/.backlog`), which is what the inbox's D26.3 mirror and
+    // the tests pin. Unlike `jkb design`, which homes by repo name (`designs/proj`).
+    let ambient_mount = || crate::kb::ambient(conn, &ask.cwd, &ask.client_home, server_home);
     if explicit {
         if ask.backlog {
             return Err(invalid(
@@ -531,14 +534,14 @@ fn settle_home(
         }
     } else if ask.backlog {
         let root = task::DEFAULT_ROOT;
-        if let Some(repo) = ambient_repo()? {
-            spec.home = format!("{root}/{repo}/.backlog");
+        if let Some(mount) = ambient_mount()? {
+            spec.home = format!("{root}/{mount}/.backlog");
         } else {
             spec.home = format!("{root}/.backlog");
             return Ok(ask.global_backlog);
         }
-    } else if let Some(repo) = ambient_repo()? {
-        spec.home = format!("{}/{repo}/inbox", task::DEFAULT_ROOT);
+    } else if let Some(mount) = ambient_mount()? {
+        spec.home = format!("{}/{mount}/inbox", task::DEFAULT_ROOT);
         spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
     }
     Ok(true)

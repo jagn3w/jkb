@@ -1160,6 +1160,9 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // The statuses are read **before** the inversion and again after it, so what gets recorded is
     // what actually happened rather than what an entry said it would do.
     let statuses_before = task_statuses(conn, &entries)?;
+    // An approval or a staging is announced on its design's topic when made; its reversal must be
+    // too, or an open editor keeps drawing the span APPROVED or STAGED (D53.5).
+    let spans = crate::design::spans_touched(conn, &entries)?;
 
     let mut reverted = 0;
     for (op, table, entity_id, before) in entries {
@@ -1180,6 +1183,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     }
 
     record_status_restores(conn, meta, &statuses_before)?;
+    crate::design::announce_spans(conn, meta, &spans)?;
 
     changelog::append(
         conn,

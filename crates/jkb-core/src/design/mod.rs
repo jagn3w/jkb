@@ -806,6 +806,24 @@ fn overlaps(doc: &Crdt, items: &[SpanItem]) -> BTreeSet<(String, String)> {
     out
 }
 
+/// Refuse a document in which two spans overlap that did not in `before`. Every writer of a row
+/// that can move an anchor asks it: [`finish`] for the edits and merges, [`revert_update`] for an
+/// undo — which once skipped it, so undoing an anchor-shrinking update laid a span back over a
+/// neighbour added since.
+fn refuse_new_overlaps(
+    doc: &Crdt,
+    items: &[SpanItem],
+    before: &BTreeSet<(String, String)>,
+) -> Result<()> {
+    match overlaps(doc, items).difference(before).next() {
+        Some((a, b)) => Err(invalid(format!(
+            "span {a} would overlap span {b}: each piece of a design is in exactly one state, so \
+             spans do not overlap"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// What [`finish`] compares a write against, read from the document before it. Only spans with an
 /// approval are diffed — the costly part — so a design with none approved pays for none.
 fn before_write(conn: &Connection, design: ItemId, doc: &Crdt) -> Result<Before> {
@@ -828,9 +846,8 @@ fn before_write(conn: &Connection, design: ItemId, doc: &Crdt) -> Result<Before>
 /// The answer to a write that merged `doc`: its version, and the spans it demoted.
 ///
 /// **Spans do not overlap**, however the write reached the document: a pair overlapping now that
-/// did not before refuses the write (the transaction rolls back, row and announcement with it). One
-/// check here, rather than one per writer, because `design.apply` writes the `spans` map as freely
-/// as `design.span` does.
+/// did not before refuses the write (the transaction rolls back, row and announcement with it),
+/// through [`refuse_new_overlaps`] — which [`revert_update`] asks too, for `jkb undo`.
 fn finish(
     conn: &Connection,
     id: ItemId,
@@ -840,12 +857,7 @@ fn finish(
     span: Option<String>,
 ) -> Result<Written> {
     let items = span_items(conn, id)?;
-    if let Some((a, b)) = overlaps(doc, &items).difference(&before.overlaps).next() {
-        return Err(invalid(format!(
-            "span {a} would overlap span {b}: each piece of a design is in exactly one state, so \
-             spans do not overlap"
-        )));
-    }
+    refuse_new_overlaps(doc, &items, &before.overlaps)?;
     let text = doc.text();
     let mut demoted = Vec::new();
     for span in items.iter().filter(|s| before.held.contains(&s.uid)) {
@@ -1075,6 +1087,8 @@ struct SpanItem {
     id: ItemId,
     uid: String,
     metadata: Value,
+    /// The design that contains it.
+    design: ItemId,
 }
 
 impl SpanItem {
@@ -1128,6 +1142,7 @@ fn span_item(conn: &Connection, uid: &str) -> Result<(SpanItem, ItemId, String)>
             id: ItemId::new(id),
             uid: uid.to_owned(),
             metadata,
+            design,
         },
         design,
         design_uid,
@@ -1157,42 +1172,45 @@ fn span_items(conn: &Connection, design: ItemId) -> Result<Vec<SpanItem>> {
                 id: ItemId::new(id),
                 uid,
                 metadata,
+                design,
             })
         })
         .collect()
 }
 
 /// The state a span's approved words are in: APPROVED, or STAGED / IMPLEMENTED from the graph.
-fn approved_state(conn: &Connection, span: ItemId) -> Result<(SpanState, Vec<String>)> {
+///
+/// Only `stages` edges into a step of the span's **own** design count ([`plan::design_of_step`]),
+/// the same rule [`stage`] refuses by: an edge written another way (`jkb inv link <span> stages
+/// <step>`) into another design's plan does not make the span STAGED. IMPLEMENTED needs every
+/// counted step to be implemented ([`plan::StepTasks::implemented`]).
+fn approved_state(
+    conn: &Connection,
+    span: ItemId,
+    design: ItemId,
+) -> Result<(SpanState, Vec<String>)> {
     let mut stmt = conn.prepare_cached(
         "SELECT i.id, i.uid FROM edges e JOIN items i ON i.id = e.dst_item_id
           WHERE e.src_item_id = ?1 AND e.type = ?2 AND i.kind = ?3 ORDER BY i.uid",
     )?;
-    let steps = stmt
+    let edges = stmt
         .query_map(
             params![span.get(), EdgeType::Stages.as_str(), STEP_KIND],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            |r| Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut steps = Vec::new();
+    for (step, uid) in edges {
+        if plan::design_of_step(conn, step, &uid).ok() == Some(design) {
+            steps.push((step, uid));
+        }
+    }
     if steps.is_empty() {
         return Ok((SpanState::Approved, Vec::new()));
     }
-    // Every task contained, at any depth, under each step. IMPLEMENTED needs every step to have at
-    // least one, all `done`: a step with no tasks under it has implemented nothing, and another
-    // step's finished work does not stand in for it.
     let mut implemented = true;
-    let mut stmt = conn.prepare_cached(
-        "WITH RECURSIVE under(id) AS (
-             SELECT child_item_id FROM containment WHERE parent_item_id = ?1
-             UNION
-             SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
-         )
-         SELECT COUNT(*), COALESCE(SUM(i.status IS NOT 'done'), 0)
-           FROM under u JOIN items i ON i.id = u.id WHERE i.kind = 'task'",
-    )?;
     for (step, _) in &steps {
-        let (count, open): (i64, i64) = stmt.query_row([step], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        implemented &= count > 0 && open == 0;
+        implemented &= plan::step_tasks(conn, *step)?.implemented();
     }
     let state = if implemented {
         SpanState::Implemented
@@ -1234,7 +1252,7 @@ fn view(conn: &Connection, span: &SpanItem, doc: &Crdt, text: &str) -> Result<Sp
     };
     let range = doc.range(&span.uid);
     let (start, end) = range.unwrap_or((0, 0));
-    let (words, steps) = approved_state(conn, span.id)?;
+    let (words, steps) = approved_state(conn, span.id, span.design)?;
     let whole = |state| {
         vec![SpanPiece {
             start,
@@ -1447,7 +1465,8 @@ pub fn stage(
 
 /// Tell a design's subscribers a span's state changed (`kind = "span"` on `design/<uid>`): an
 /// approval or a staging writes item metadata and edges, not the document, so no `update` carries
-/// it. Best effort, as [`publish`] is. A task finishing (IMPLEMENTED) is not announced here — it is
+/// it. Best effort, as [`publish`] is; `jkb undo` of either announces through [`announce_spans`]. A
+/// task finishing (IMPLEMENTED) is not announced here — it is
 /// derived from task status, which this module does not write — so a subscriber re-reads
 /// `design.spans` on any message, and on a `gap`.
 fn announce_span(conn: &Connection, meta: &WriteMeta, design: &str, span: &SpanView) -> Result<()> {
@@ -1528,6 +1547,78 @@ fn compact_if_due(conn: &Connection, meta: &WriteMeta, id: ItemId) -> Result<()>
     Ok(())
 }
 
+/// The spans an undo's changelog `entries` touch: a span item's metadata (its approval), or a
+/// `stages` edge out of a span. Read **before** the inversion, while an inserted edge still exists;
+/// [`announce_spans`] tells their designs' subscribers afterwards. Unreadable entries are skipped:
+/// this is bookkeeping around the inversion, never what makes an undo fail.
+///
+/// # Errors
+/// A database error.
+pub(crate) fn spans_touched(
+    conn: &Connection,
+    entries: &[(String, String, String, Option<String>)],
+) -> Result<Vec<ItemId>> {
+    let span_kind = |id: i64| -> Result<bool> {
+        Ok(conn
+            .prepare_cached("SELECT kind FROM items WHERE id = ?1")?
+            .query_row([id], |r| r.get::<_, String>(0))
+            .optional()?
+            .is_some_and(|k| k == SPAN_KIND))
+    };
+    let mut out = Vec::new();
+    for (op, table, entity_id, before) in entries {
+        let src = if table == Entity::Items.as_str() {
+            entity_id.parse::<i64>().ok()
+        } else if table == Entity::Edges.as_str() && op == Op::Delete.as_str() {
+            before
+                .as_deref()
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                .filter(|b| b["type"] == EdgeType::Stages.as_str())
+                .and_then(|b| b["src_item_id"].as_i64())
+        } else if table == Entity::Edges.as_str() {
+            match entity_id.parse::<i64>() {
+                Ok(row) => conn
+                    .prepare_cached("SELECT src_item_id FROM edges WHERE id = ?1 AND type = ?2")?
+                    .query_row(params![row, EdgeType::Stages.as_str()], |r| r.get(0))
+                    .optional()?,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(id) = src {
+            if span_kind(id)? && !out.contains(&ItemId::new(id)) {
+                out.push(ItemId::new(id));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Announce each of `spans`' state now on its design's topic, as [`approve`] and [`stage`] do — what
+/// `jkb undo` calls after reverting an approval or a staging, so an open editor redraws it. A span
+/// gone, or one that no longer reads, is skipped.
+///
+/// # Errors
+/// A database error from the announcement.
+pub(crate) fn announce_spans(conn: &Connection, meta: &WriteMeta, spans: &[ItemId]) -> Result<()> {
+    for id in spans {
+        let uid: Option<String> = conn
+            .prepare_cached("SELECT uid FROM items WHERE id = ?1 AND kind = ?2")?
+            .query_row(params![id.get(), SPAN_KIND], |r| r.get(0))
+            .optional()?;
+        let Some(uid) = uid else { continue };
+        let Ok((span, design, design_uid)) = span_item(conn, &uid) else {
+            continue;
+        };
+        let Ok(now) = span_now(conn, &span, design) else {
+            continue;
+        };
+        announce_span(conn, meta, &design_uid, &now)?;
+    }
+    Ok(())
+}
+
 /// Why the update row `rowid` cannot be reverted, or `None` when it can — `undo`'s pre-flight.
 ///
 /// # Errors
@@ -1563,15 +1654,25 @@ pub(crate) fn revert_update(conn: &Connection, meta: &WriteMeta, rowid: i64) -> 
         .prepare_cached("SELECT uid FROM items WHERE id = ?1")?
         .query_row([design.get()], |r| r.get(0))?;
     let (doc, _) = load(conn, design)?;
+    let items = span_items(conn, design)?;
+    let before = overlaps(&doc, &items);
     let Some(revert) = doc.revert(&bytes)? else {
         return Ok(0);
     };
+    refuse_new_overlaps(&doc, &items, &before).map_err(|e| {
+        invalid(format!(
+            "reverting design update {rowid} would put a span back over another written since \
+             ({e}) — move or remove that span first"
+        ))
+    })?;
     store_row(conn, meta, design, &uid, &revert)?;
     Ok(1)
 }
 
 /// Why `jkb undo` of transaction `txn`'s insert of `item` would lose design history, or `None`:
-/// the item holds document rows another transaction wrote, or a compaction. Undoing the insert
+/// the item holds document rows another transaction wrote, a compaction, or contains items (spans,
+/// plans, prompts, tasks) another transaction put under it — the cascade would orphan them, and a
+/// plan whose design is gone can no longer be resolved. Undoing the insert
 /// deletes the item, and `ON DELETE CASCADE` would take every later update with it — text written
 /// after the create, spans whose metadata names the design, and the rows `jkb undo` of each later
 /// edit needs. `undo`'s pre-flight asks this for every `(insert, items)` entry, so the rule holds
@@ -1580,15 +1681,32 @@ pub(crate) fn revert_update(conn: &Connection, meta: &WriteMeta, rowid: i64) -> 
 /// # Errors
 /// A database error.
 pub(crate) fn undo_would_lose(conn: &Connection, item: ItemId, txn: i64) -> Result<Option<String>> {
-    let (later, compacted): (bool, bool) = conn
+    let kind: Option<String> = conn
+        .prepare_cached("SELECT kind FROM items WHERE id = ?1")?
+        .query_row([item.get()], |r| r.get(0))
+        .optional()?;
+    if kind.as_deref() != Some(KIND) {
+        return Ok(None);
+    }
+    // A child is the transaction's own when the transaction logged containing it; anything else
+    // contained by the design (a span, a plan, a prompt, a one-off task) was written since.
+    let (later, compacted, children): (bool, bool, bool) = conn
         .prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM design_updates WHERE design_id = ?1 AND txn_id <> ?2),
-                    EXISTS (SELECT 1 FROM design_snapshots WHERE design_id = ?1)",
+                    EXISTS (SELECT 1 FROM design_snapshots WHERE design_id = ?1),
+                    EXISTS (SELECT 1 FROM containment c
+                             WHERE c.parent_item_id = ?1
+                               AND NOT EXISTS (SELECT 1 FROM changelog l
+                                                WHERE l.txn_id = ?2 AND l.entity_type = ?3
+                                                  AND l.entity_id = CAST(c.child_item_id AS TEXT)))",
         )?
-        .query_row(params![item.get(), txn], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok((later || compacted).then(|| {
-        "it created a design that has been written since, and deleting the design would take \
-         every later update with it; a design's history is append-only (D53.4), even an undo of \
+        .query_row(
+            params![item.get(), txn, Entity::Containment.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+    Ok((later || compacted || children).then(|| {
+        "it created a design that has been written to or under since, and deleting the design \
+         would take every later update, and every plan, span and prompt under it, with it; a design's history is append-only (D53.4), even an undo of \
          an edit appends, so a design written to after its creation is kept"
             .to_owned()
     }))

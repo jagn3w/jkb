@@ -7,8 +7,9 @@
 //! --under <step>`), or directly under the design for a one-off.
 //!
 //! Nothing here is stored that the graph already says. Which tasks a plan has is containment; which
-//! spans a step implements is the `stages` edges; and **archived** — a plan whose tasks are all
-//! terminal — is derived on every read, so a reopened task brings its plan back without a write.
+//! spans a step implements is the `stages` edges; and **archived** — a plan every one of whose
+//! steps has tasks, all terminal ([`StepTasks::finished`]) — is derived on every read, so a
+//! reopened task brings its plan back without a write.
 
 use rusqlite::{params, Connection};
 
@@ -273,7 +274,11 @@ fn view(
     spans: &[SpanView],
 ) -> Result<PlanView> {
     let mut steps = Vec::new();
+    // Per step, by the same count IMPLEMENTED reads ([`step_tasks`]): every step has tasks, all
+    // terminal. A plan with an empty step is a draft, not finished work.
+    let mut archived = true;
     for (step, step_uid, text) in step_items(conn, plan_item)? {
+        archived &= step_tasks(conn, step)?.finished();
         let mut tasks = Vec::new();
         tasks_under(conn, step, 0, &mut tasks)?;
         steps.push(StepView {
@@ -287,27 +292,75 @@ fn view(
             tasks,
         });
     }
-    // Archived is judged on exactly the tasks the view lists — one walk, from the steps. What keeps
-    // a task out of reach of both is `task::add_subtask`, which refuses a plan or a span as a
-    // parent; the walk does not. A task contained by a plan itself (only a pre-guard build of this
-    // change could write one) is neither listed nor counted, so it does not hold the plan open.
-    let mut count = 0usize;
-    let mut open = 0usize;
-    for t in steps.iter().flat_map(|s: &StepView| s.tasks.iter()) {
-        count += 1;
-        if !TaskStatus::is_terminal_str(t.status.as_deref()) {
-            open += 1;
-        }
-    }
+    // Judged from the steps alone, as the view lists tasks: a task contained by the plan itself (only
+    // a pre-guard build could write one, `task::add_subtask` refuses a plan as a parent) is neither
+    // listed nor counted, so it does not hold the plan open.
+    archived &= !steps.is_empty();
     Ok(PlanView {
         uid,
         title,
         design: design.to_owned(),
-        // A plan with no tasks yet is a draft, not finished work: vacuous truth is refused, as
-        // IMPLEMENTED refuses it.
-        archived: count > 0 && open == 0,
+        archived,
         steps,
     })
+}
+
+/// The tasks contained under a plan step, at any depth: how many, how many are `done`, and how
+/// many are terminal (`done` or `cancelled`). **The one count** behind both a span's IMPLEMENTED
+/// and a plan's `archived`, so the two cannot disagree about what a step holds — they once did, a
+/// plan counting all its tasks at once while IMPLEMENTED counted per step, and a plan with an empty
+/// step was archived while a span staged into that step stayed STAGED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StepTasks {
+    count: i64,
+    done: i64,
+    terminal: i64,
+}
+
+impl StepTasks {
+    /// The step implemented what was staged into it: it has tasks, all `done`. A cancelled task
+    /// implemented nothing, and a step with no tasks implemented nothing (vacuous truth refused).
+    pub(crate) fn implemented(self) -> bool {
+        self.count > 0 && self.done == self.count
+    }
+
+    /// The step's work is over: it has tasks, all terminal. Cancelled counts as over — nothing is
+    /// left to do — which is why this is not [`StepTasks::implemented`].
+    pub(crate) fn finished(self) -> bool {
+        self.count > 0 && self.terminal == self.count
+    }
+}
+
+/// What [`StepTasks`] counts for `step`.
+///
+/// # Errors
+/// A database error.
+pub(crate) fn step_tasks(conn: &Connection, step: ItemId) -> Result<StepTasks> {
+    Ok(conn
+        .prepare_cached(
+            "WITH RECURSIVE under(id) AS (
+                 SELECT child_item_id FROM containment WHERE parent_item_id = ?1
+                 UNION
+                 SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
+             )
+             SELECT COUNT(*), COALESCE(SUM(i.status IS ?2), 0),
+                    COALESCE(SUM(i.status IN (?2, ?3)), 0)
+               FROM under u JOIN items i ON i.id = u.id WHERE i.kind = 'task'",
+        )?
+        .query_row(
+            params![
+                step.get(),
+                TaskStatus::Done.as_str(),
+                TaskStatus::Cancelled.as_str()
+            ],
+            |r| {
+                Ok(StepTasks {
+                    count: r.get(0)?,
+                    done: r.get(1)?,
+                    terminal: r.get(2)?,
+                })
+            },
+        )?)
 }
 
 /// The design a plan step belongs to: its plan's container. What [`super::stage`] holds a span to —

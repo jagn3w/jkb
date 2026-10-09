@@ -1015,7 +1015,8 @@ enum TaskCmd {
     Add {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
-        /// Home the task in the ambient repo's backlog (`tasks/<repo>/.backlog`)
+        /// Home the task in the ambient mount's backlog (`tasks/<mount>/.backlog`, e.g.
+        /// `tasks/repos/jkb/.backlog`)
         /// instead of its inbox. Outside a repo, confirms a global `tasks/.backlog`.
         #[arg(long)]
         backlog: bool,

@@ -1878,3 +1878,168 @@ fn a_span_with_no_width_renders_its_open_marker_before_its_close() {
     edit_at(&db, &uid, &token(&db, &uid), replace("X", "")).unwrap();
     assert_eq!(render(&cat(&db, &uid)), format!("a⟦{s} PROPOSED⟧⟦/{s}⟧b"));
 }
+
+// ---- review round 2 ----------------------------------------------------------------------------
+
+/// The overlap rule holds for `jkb undo` too: reverting an update that shrank a span, after a
+/// neighbour was added in the room it made, would lay the span back over the neighbour.
+#[test]
+fn undoing_an_anchor_shrinking_update_over_a_newer_neighbour_is_refused() {
+    let db = db();
+    let uid = create(&db, "one. two. three.");
+    let a = span(&db, &uid, "one. two.", Reviewer::Operator).unwrap();
+    reanchor(&db, &uid, &a, 0, 4).unwrap();
+    let shrink: i64 = db
+        .read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap();
+    let b = span(&db, &uid, "two.", Reviewer::Operator).unwrap();
+    let e = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, shrink))
+        .unwrap_err();
+    assert!(e.to_string().contains("overlap"), "{e}");
+    let (va, vb) = (view_of(&db, &uid, &a), view_of(&db, &uid, &b));
+    assert!(va.end <= vb.start, "{va:?} {vb:?}");
+}
+
+/// Undoing a design's creation is refused once a later transaction put a plan under it — the
+/// cascade would leave the plan, its steps and their tasks with no design.
+#[test]
+fn undoing_a_designs_creation_is_refused_once_a_plan_was_added_under_it() {
+    let db = db();
+    let uid = create(&db, "");
+    let created: i64 = db
+        .read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap();
+    let p = new_plan(&db, &uid, &["one"]).unwrap();
+    task_under(&db, step_id(&db, &p.steps[0].uid), "task:x");
+    let e = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, created))
+        .unwrap_err();
+    assert!(e.to_string().contains("plan, span and prompt"), "{e}");
+    let shown = p.uid.clone();
+    assert!(db.read(move |c| plan::show(c, &shown)).is_ok());
+}
+
+/// A `stages` edge written around `design.stage` (`jkb inv link <span> stages <step>`) into another
+/// design's plan does not make the span STAGED: the state counts only its own design's steps.
+#[test]
+fn a_stages_edge_into_another_designs_plan_does_not_stage_the_span() {
+    let db = db();
+    let mine = create(&db, "Mine.");
+    let s = span(&db, &mine, "Mine.", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let other = create(&db, "Theirs.");
+    let theirs = new_plan(&db, &other, &["x"]).unwrap();
+    let (span_id, step) = (step_id(&db, &s), step_id(&db, &theirs.steps[0].uid));
+    db.write_txn("t", move |c, m| {
+        edge::link(c, m, span_id, step, EdgeType::Stages, None)
+    })
+    .unwrap();
+    let v = view_of(&db, &mine, &s);
+    assert_eq!(v.state, SpanState::Approved);
+    assert!(v.steps.is_empty(), "{v:?}");
+}
+
+fn span_messages(db: &Db, uid: &str) -> Vec<String> {
+    let name = topic(uid);
+    db.read(move |c| crate::mq::tail(c, &name, 50, crate::mq::now_ms()))
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.kind == "span")
+        .map(|m| m.payload["state"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// `jkb undo` of an approval or a staging is announced like the approval or staging was, so an
+/// open editor does not keep drawing the reverted state.
+#[test]
+fn undoing_an_approval_or_a_staging_is_announced() {
+    let db = db();
+    let uid = create(&db, "Announce me.");
+    let s = span(&db, &uid, "Announce me.", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let plan = new_plan(&db, &uid, &["s"]).unwrap();
+    stage_into(&db, &s, &plan.steps[0].uid).unwrap();
+    undo_last(&db);
+    assert_eq!(view_of(&db, &uid, &s).state, SpanState::Approved);
+    let plan_txn: i64 = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT MAX(txn_id) FROM changelog WHERE entity_type = 'items' AND op = 'update'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    db.write_txn("t", move |c, m| crate::undo::undo(c, m, plan_txn))
+        .unwrap();
+    assert_eq!(view_of(&db, &uid, &s).state, SpanState::Proposed);
+    assert_eq!(
+        span_messages(&db, &uid),
+        ["APPROVED", "STAGED", "APPROVED", "PROPOSED"]
+    );
+}
+
+/// `archived` and IMPLEMENTED read one per-step count: a plan with a step holding no tasks is not
+/// archived, so it is never hidden while a span staged into that step is still STAGED.
+#[test]
+fn a_plan_with_an_empty_step_is_not_archived() {
+    let db = db();
+    let uid = create(&db, "Do both.");
+    let s = span(&db, &uid, "Do both.", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let p = new_plan(&db, &uid, &["one", "two"]).unwrap();
+    stage_into(&db, &s, &p.steps[1].uid).unwrap();
+    let t = task_under(&db, step_id(&db, &p.steps[0].uid), "task:one");
+    set_status(&db, t, TaskStatus::Done);
+    assert_eq!(view_of(&db, &uid, &s).state, SpanState::Staged);
+    assert!(!plans_of(&db, &uid, true).plans[0].archived);
+    let t2 = task_under(&db, step_id(&db, &p.steps[1].uid), "task:two");
+    set_status(&db, t2, TaskStatus::Done);
+    assert_eq!(view_of(&db, &uid, &s).state, SpanState::Implemented);
+    assert!(plans_of(&db, &uid, true).plans[0].archived);
+}
+
+/// Approval over text with surrogate pairs before and inside the span: the attested ids are
+/// counted in UTF-16 units, as a string item's clock is, so an edit outside keeps it APPROVED and
+/// one inside demotes it.
+#[test]
+fn approval_counts_surrogate_pairs_in_utf16_units() {
+    let db = db();
+    // Several items, each with surrogate pairs, before and inside the span: an offset counted in
+    // anything but UTF-16 units lands on the wrong item's ids.
+    let uid = create(&db, "head. Keep Ferris here. tail");
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("head.", " 🦀🦀")).unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("tail", " 🦀")).unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("Keep", " 🦀")).unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), replace("head.", "🦀 head.")).unwrap();
+    assert_eq!(
+        text(&db, &uid),
+        "🦀 head. 🦀🦀 Keep 🦀 Ferris here. tail 🦀"
+    );
+    let s = span(&db, &uid, "Keep 🦀 Ferris here.", Reviewer::Operator).unwrap();
+    let v = approve_as(&db, &s, Approver::Operator).unwrap();
+    assert_eq!(v.state, SpanState::Approved, "{v:?}");
+    assert_eq!(v.text, "Keep 🦀 Ferris here.");
+    edit_at(
+        &db,
+        &uid,
+        &token(&db, &uid),
+        insert_after("🦀 head.", " 🦀🦀"),
+    )
+    .unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("tail 🦀", " 🦀")).unwrap();
+    let v = view_of(&db, &uid, &s);
+    assert_eq!(v.state, SpanState::Approved, "{v:?}");
+    assert_eq!(v.text, "Keep 🦀 Ferris here.");
+    let w = edit_at(&db, &uid, &token(&db, &uid), insert_after("Keep 🦀", "🦀")).unwrap();
+    assert_eq!(w.demoted, vec![s.clone()]);
+    let v = view_of(&db, &uid, &s);
+    let added: Vec<&str> = v
+        .pieces
+        .iter()
+        .filter(|p| p.state == SpanState::Proposed && !p.removed)
+        .map(|p| p.text.as_str())
+        .collect();
+    assert_eq!(added, ["🦀"]);
+}

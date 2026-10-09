@@ -407,7 +407,9 @@ to learn, and what was decided past the text above:
   asked by `undo`'s pre-flight for every `(insert, items)` entry): deleting the item cascades
   (`ON DELETE CASCADE`) every later update away, orphaning its spans and every later edit's undo. While
   only the create's own rows exist it is still undone. Enforced at the one place an item insert is
-  reverted, not by each caller (round 1).
+  reverted, not by each caller (round 1). It counts what is *under* the design as well — a span, a
+  plan, a prompt or a one-off task another transaction contained in it: the cascade took the plan's
+  containment row, and its steps and tasks were left with no design to resolve (round 2).
 - **A write folds old rows into the snapshot as it goes**: past 4096 rows, all but the newest 1024 are
   compacted (`compact_if_due`, from the one logged writer of rows). Every write rebuilds the document
   from its rows on the single writer thread, so one editor applying per keystroke made every write
@@ -442,12 +444,18 @@ to learn, and what was decided past the text above:
   the anchored clause and staged a span that read PROPOSED (round 1).
 - **A span is staged only into a step of its own design's plans** (`plan::design_of_step`): staged into
   another design's plan, its STAGED/IMPLEMENTED derived from tasks no view of its design connects to.
+  `design.stage` refuses one, and the derivation itself (`approved_state`) counts only `stages` edges
+  into the span's own design's steps — the same function — because the generic edge writer (`jkb inv
+  link <span> stages <step>`) writes one without asking (round 2).
 - **Anchors**: the start sticks to the span's first character and the end to its last, so text typed at
   either edge stays outside and only an insertion strictly inside splits the span. Spans may not
-  overlap — each piece of text is in exactly one state. The rule is checked once, after every write
-  (`finish`: a pair overlapping now that did not before refuses the write), because `design.apply`
-  writes the `spans` map as freely as `design.span` does; it was first checked in `add_span` alone
-  (round 1).
+  overlap — each piece of text is in exactly one state. The rule is one function,
+  `refuse_new_overlaps` (a pair overlapping now that did not before refuses the write), asked by every
+  writer of a row that can move an anchor: `finish` for edits, spans and `design.apply` — which writes
+  the `spans` map as freely as `design.span` does; the rule was first checked in `add_span` alone
+  (round 1) — and `revert_update` for `jkb undo`, which skipped it: undoing an update that shrank a
+  span, after a neighbour was added in the room it made, laid the span back over the neighbour, and the
+  pair then sat in every later write's "already overlapping" set for good (round 2).
 - **Who approves**: a span naming `operator` is the operator's alone; one naming `claude` is approved by
   a Claude principal (recorded by its label) or the operator, who holds every permission. RBAC adds
   `design` (coordinator, designer) and `design_approve` (those and the reviewer); compaction is the
@@ -458,13 +466,20 @@ to learn, and what was decided past the text above:
   Shared, that path could never run (round 1; `an_attested_reviewer_subagent_approves_a_span_naming_claude`).
 - **IMPLEMENTED needs every staged step to have at least one task** under it (containment, any depth),
   all `done`: a step with no tasks has implemented nothing, so vacuous truth is refused — per step, not
-  across them, or one step's finished task stood in for an empty second step (round 1).
+  across them, or one step's finished task stood in for an empty second step (round 1). A plan's
+  **archived** reads the same per-step count (`plan::step_tasks`): every step has tasks, all terminal.
+  Counted over the whole plan at once, a plan with an empty step was archived — hidden — while a span
+  staged into that step stayed STAGED (round 2). The two differ only on `cancelled`, deliberately: a
+  cancelled task leaves nothing to do (archived) and implemented nothing (not IMPLEMENTED).
 - **Live updates** go to topic `design/<uid>` with the uid's `:` spelled `.` (not a topic character),
   payload `{design, seq, update}` with the update inline up to 32 KiB. Best effort: a full or oversized
   queue costs a subscriber a `design.state` re-read, never the write. An approval or a staging writes
   no update, so each is announced as `kind = "span"`, `{design, span, state}`, and the editor re-reads
-  the span states on it (round 1). A task finishing (IMPLEMENTED) is not announced: it is task status,
-  which the design engine does not write, and the editor re-reads states after every update and gap.
+  the span states on it (round 1). `jkb undo` of an approval or a staging is announced the same way
+  (`design::spans_touched` before the inversion, `announce_spans` after), or an open editor kept
+  drawing the reverted state (round 2). A task finishing (IMPLEMENTED) is not announced: it is task
+  status, which the design engine does not write, and the editor re-reads states after every update
+  and gap.
 - **A design cannot be removed** (`item::remove`, even with `--force`): its updates are not in the
   delete's snapshot, so `jkb undo` would bring back a design with no text. Nor can its creation be
   undone once anything else wrote to it (above).
@@ -600,8 +615,8 @@ The cardinality the operator gave: **prompts (n:1) design (1:n) spans (1:n) exec
 - **Execution plan** — `kind = 'exec_plan'`, contained by the design; ordered **steps**
   (`kind = 'plan_step'`, natural language, coarse: *scaffold → database → frontend → deploy*).
   A span is staged into a step by a `stages` edge (`jkb design stage <span> <step>`). Several
-  plans may be live at once when work is truly parallel. A plan whose tasks are all terminal is
-  **archived**: hidden from listings unless asked (`--all`, the same rule `jkb ls` uses for
+  plans may be live at once when work is truly parallel. A plan every one of whose steps has tasks,
+  all terminal, is **archived** (D53.5's as-built note: the per-step count IMPLEMENTED reads): hidden from listings unless asked (`--all`, the same rule `jkb ls` uses for
   terminal tasks), shown in a version-history drawer.
 - **Play** on a plan opens a terminal running Claude with the prompt
   `jkb design prompt play <plan>` emits: the plan, its steps, their tasks, the spans they stage,

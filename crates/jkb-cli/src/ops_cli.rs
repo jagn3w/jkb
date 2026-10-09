@@ -394,7 +394,6 @@ impl<'a> Ops<'a> {
         self.ambient_here()
     }
 
-    /// The ambient namespace, `--global` or not — task homing always reflects where you are.
     /// The repo the command runs in: the first segment after `repos/` of the ambient mount, or
     /// `None` outside one — a mount elsewhere (`references/papers`) names no repo. The one
     /// derivation `jkb design` and `jkb inv` share; each once carried its own copy, which took a
@@ -406,6 +405,7 @@ impl<'a> Ops<'a> {
         Ok(self.ambient_here()?.and_then(|mount| repo_of_mount(&mount)))
     }
 
+    /// The ambient namespace, `--global` or not — task homing always reflects where you are.
     pub(crate) fn ambient_here(&self) -> Result<Option<String>> {
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
         let home = std::env::var("HOME").unwrap_or_default();
