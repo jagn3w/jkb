@@ -331,6 +331,9 @@ jobs:
   # locally must not become a skip in CI, or a type error merges on a green tick.
   ui:
     runs-on: ubuntu-latest
+    # Install, build and every package's tests take a few minutes. Bounded so a hung Electron
+    # smoke fails here rather than holding a runner for GitHub's six-hour default.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ui

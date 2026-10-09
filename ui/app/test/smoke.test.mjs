@@ -97,8 +97,28 @@ before(async () => {
   await page.waitForSelector('[role="tablist"]');
 });
 
+// How long the app may take to quit once asked. Its will-quit holds the first quit for at most
+// LEAVE_WAIT_MS (1.5 s) to leave claude/notify, then quits again, so this is generous. Bounded
+// because Playwright's close() waits for the process to exit with no limit of its own: an app that
+// never re-quits would otherwise hold the test file open until CI's job timeout.
+const QUIT_WAIT_MS = 20_000;
+
 after(async () => {
-  await app?.close();
+  if (app !== undefined) {
+    const proc = app.process();
+    let timer;
+    const quit = await Promise.race([
+      app.close().then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), QUIT_WAIT_MS);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (!quit) {
+      proc.kill("SIGKILL");
+      assert.fail(`the app did not quit within ${QUIT_WAIT_MS} ms of being asked to: killed it`);
+    }
+  }
   if (home !== undefined) fs.rmSync(home, { recursive: true, force: true });
 });
 
