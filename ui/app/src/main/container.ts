@@ -8,7 +8,11 @@
 // the sandbox comes from the kit (D53.3, `.container/README.md`). The kit is where lib.sh's
 // `DC_KIT_DIR` puts it — under the ACCOUNT's home, which is also what `run.sh` builds its own HOME
 // from — and its `run.sh --kit-path` must answer that same directory before anything else is run
-// from it. The renderer names an action; main alone turns it into a program and its flag.
+// from it. The renderer names an action and main turns it into the kit's program and its flag, so the
+// tab never spells a path. That is a convenience, not a boundary: the spec goes back to the renderer,
+// which opens it through the generic `terminal.open`, and that accepts any host argv by design
+// (D53.10). The renderer is the app's own page; what keeps the checkout's run.sh from running is that
+// nothing in the app names it, and that run.sh itself refuses to start a container from a checkout.
 
 import { execFile } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
@@ -26,6 +30,7 @@ import {
 } from "@jkb/core";
 
 import type { TerminalSpec } from "../shared/terminal";
+import { hostEnv } from "./terminals";
 
 /** What running a program to completion answered. `code` is null when it was killed (a timeout). */
 export interface RunResult {
@@ -130,7 +135,8 @@ export class ContainerKit {
   /**
    * The terminal a button opens: the kit's `run.sh` with the action's one flag, on the HOST (it
    * drives docker from outside the container), so its output streams into the integrated terminal.
-   * `action` comes from the renderer and is checked here; nothing else of the spec does.
+   * `action` comes from the renderer and is checked here; nothing else of the spec does. A
+   * convenience, not a gate: the renderer opens the spec through `terminal.open`, which takes any argv.
    */
   async spec(action: unknown): Promise<ContainerResult<TerminalSpec>> {
     if (!isContainerAction(action)) return { ok: false, error: `not a container action: ${JSON.stringify(action)}` };
@@ -146,10 +152,9 @@ export class ContainerKit {
 
 /** The real machine. `env` is what `run.sh` is started with; it rebuilds its own from an allowlist. */
 export function machineKit(home: string, env: Readonly<Record<string, string | undefined>>): KitEnvironment {
-  const childEnv: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (v !== undefined && !k.startsWith("ELECTRON_")) childEnv[k] = v;
-  }
+  // The terminal's rule, not a copy of it: --status here and a button's run.sh in the terminal must
+  // resolve JKB_CONTAINER_NAME/IMAGE alike.
+  const childEnv = hostEnv(env);
   return {
     home,
     run: (file, args, timeoutMs) =>

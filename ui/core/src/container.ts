@@ -111,6 +111,11 @@ export interface ContainerStatus {
   readonly checkout: string | null;
   /** The kit's paths that differ from its checkout: what `--install-kit` would take. */
   readonly kitChanged: readonly string[];
+  /**
+   * The command that refreshes the kit, as run.sh writes it (`KIT_REFRESH`: the KIT's run.sh, never
+   * the checkout's, which the agent can rewrite). Shown verbatim; `null` when there is no kit.
+   */
+  readonly kitRefresh: string | null;
   readonly wantArgsHash: string;
   /** What the image tag holds now. */
   readonly imageOnDisk: ImageStamp | null;
@@ -164,7 +169,9 @@ export function parseContainerStatus(text: string): ContainerResult<ContainerSta
   if (!isString(name) || !isString(image) || !isString(want)) return bad("name, image or want_args_hash is missing");
   const kit = optString(v["kit"]);
   const checkout = optString(v["checkout"]);
+  const kitRefresh = optString(v["kit_refresh"]);
   if (kit === undefined || checkout === undefined) return bad("kit or checkout is not a path");
+  if (kitRefresh === undefined) return bad("kit_refresh is not a command");
   const changed = v["kit_changed"];
   if (!Array.isArray(changed) || !changed.every(isString)) return bad("kit_changed is not a list of paths");
   const onDisk = stamp(v["image_on_disk"]);
@@ -196,6 +203,7 @@ export function parseContainerStatus(text: string): ContainerResult<ContainerSta
       kit,
       checkout,
       kitChanged: [...changed],
+      kitRefresh,
       wantArgsHash: want,
       imageOnDisk: onDisk,
       container,
@@ -210,9 +218,21 @@ export interface Finding {
   readonly text: string;
 }
 
+/** The states run.sh's start path takes up again with `docker start` (its `running|exited|created` arm). */
+const RESTARTABLE: readonly string[] = ["exited", "created"];
+
+/** The states `run.sh --stop` acts on: `docker stop` ends a paused or restarting container too. */
+const STOPPABLE: readonly string[] = ["running", "paused", "restarting"];
+
 /**
  * What the tab says about `s`, in order: the container's state, then each way it differs from what a
  * start would make it, each with the remedy `run.sh` itself prints. Pure, so every case is a test row.
+ *
+ * "Build starts it again" is said only where it is true: a stopped container a start would take up,
+ * with no drift the start path refuses (any args drift, an image that differs). A stale one says its
+ * state and lets the stale lines carry the remedy; one in a state the start path has no arm for
+ * (paused, restarting, dead) cannot be started by Build at all -- its `docker run` would collide with
+ * the name -- so it is stale in itself.
  */
 export function findings(s: ContainerStatus): Finding[] {
   if (s.docker === "unreachable") {
@@ -223,8 +243,14 @@ export function findings(s: ContainerStatus): Finding[] {
     out.push({ level: "note", text: `There is no container named ${s.name}. Build creates and starts it.` });
   } else if (s.container.state === "running") {
     out.push({ level: "ok", text: `${s.name} is running.` });
+  } else if (RESTARTABLE.includes(s.container.state)) {
+    const startable = s.drift.args === "same" && s.drift.image !== "differs";
+    out.push({ level: "note", text: `${s.name} is ${s.container.state}.${startable ? " Build starts it again." : ""}` });
   } else {
-    out.push({ level: "note", text: `${s.name} is ${s.container.state}. Build starts it again.` });
+    out.push({
+      level: "stale",
+      text: `${s.name} is ${s.container.state}, a state run.sh does not start a container from. Remove it, then Build.`,
+    });
   }
   if (s.imageOnDisk === null) out.push({ level: "note", text: `There is no ${s.image} image yet. Build makes one.` });
   if (s.drift.args === "differs") {
@@ -247,7 +273,9 @@ export function findings(s: ContainerStatus): Finding[] {
   if (s.kitChanged.length > 0) {
     out.push({
       level: "note",
-      text: `The checkout has changed since the kit was installed (${s.kitChanged.join(", ")}). Review the changes, then reinstall the kit: ${s.checkout ?? "<checkout>"}/.container/run.sh --install-kit`,
+      // run.sh's own command, never one composed here: the remedy is a program the operator runs on
+      // the host by hand, and the checkout's run.sh is the agent's to rewrite (review s8 round 1).
+      text: `The checkout has changed since the kit was installed (${s.kitChanged.join(", ")}). Review the changes, then reinstall the kit${s.kitRefresh === null ? " with the kit's own run.sh --install-kit." : `: ${s.kitRefresh}`}`,
     });
   }
   return out;
@@ -260,14 +288,16 @@ export function findings(s: ContainerStatus): Finding[] {
 export function availability(action: ContainerAction, s: ContainerStatus | undefined): { readonly enabled: boolean; readonly why?: string } {
   if (s === undefined) return { enabled: true };
   if (s.docker === "unreachable") return { enabled: false, why: "the docker daemon is not reachable" };
-  const running = s.container?.state === "running";
+  const state = s.container?.state;
+  const running = state === "running";
   switch (action) {
     case "build":
       return { enabled: true };
     case "verify":
     case "install-extensions":
-    case "stop":
       return running ? { enabled: true } : { enabled: false, why: `${s.name} is not running` };
+    case "stop":
+      return state !== undefined && STOPPABLE.includes(state) ? { enabled: true } : { enabled: false, why: `${s.name} is not running` };
     case "remove":
       return s.container !== null ? { enabled: true } : { enabled: false, why: `there is no container named ${s.name}` };
   }

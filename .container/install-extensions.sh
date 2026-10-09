@@ -14,8 +14,9 @@
 # So on a fresh container `setup.sh` reports that it skipped this, correctly — there was nothing to
 # install into yet. Attach, then run this from a terminal in the attached window.
 #
-# `run.sh` cannot do it for you: it drives Docker from the HOST, and the container deliberately has
-# no Docker in it.
+# Or from the HOST: the kit's `run.sh --install-extensions` (the Code Factory app's Container tab has a
+# button for it) refreshes the mirror and `docker exec`s this copy in the running container. From in
+# here nothing can start it for you -- the container deliberately has no Docker in it.
 #
 # Idempotent — `--force` reinstalls and the explorer rebuilds — so running it again is safe and is
 # what you do after changing `ui/vscode` or the pinned extension list.

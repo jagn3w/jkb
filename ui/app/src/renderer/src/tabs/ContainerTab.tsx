@@ -145,7 +145,11 @@ export function ContainerTab(): React.JSX.Element {
       const recorded = recordAttached(terminalsRef.current.state.entries, (s) => cwds.get(s));
       setAttached((older) => mergeRecords(older, recorded));
     }
-    setRunning({ key: terminals.open(answer.value, "drawer"), action });
+    // Run ONCE: the drawer offers no Restart and no Container/Host toggle for it. A Restart re-ran the
+    // action (a Remove, say) past the confirmation above, with the buttons enabled and no status read
+    // after, and the toggle could move the host-only run.sh into the container (review s8 round 1).
+    // So every run of an action goes through this function, and `running` covers each one.
+    setRunning({ key: terminals.open(answer.value, "drawer", { once: true }), action });
   };
 
   const current = status.kind === "loaded" ? status.value : undefined;

@@ -631,6 +631,17 @@ test("opening a terminal puts it in front and opens the drawer", () => {
   assert.equal(S.statusLabel({ kind: "running" }), "");
 });
 
+test("a terminal opened to run once may not run again; every other may", () => {
+  let s = S.reduce(S.INITIAL_STATE, { type: "open", key: 1, spec: spec({ target: "host", cwd: "/h", argv: ["/k/run.sh", "--rm"] }), placement: "drawer", once: true });
+  s = S.reduce(s, { type: "open", key: 2, spec: spec(), placement: "drawer" });
+  s = S.reduce(s, { type: "status", key: 1, status: { kind: "exited", exitCode: 0 } });
+  assert.equal(S.canRerun(s.entries[0]), false, "the Container tab's run.sh --rm: no Restart, no toggle");
+  assert.equal(S.canRerun(s.entries[1]), true);
+  s = S.reduce(s, { type: "restart", key: 1, spec: s.entries[0].spec });
+  assert.equal(S.canRerun(s.entries[0]), false, "and nothing the reducer does makes it rerunnable");
+  assert.equal("once" in S.reduce(S.INITIAL_STATE, { type: "open", key: 3, spec: spec(), placement: "drawer", once: false }).entries[0], false);
+});
+
 test("closing the front terminal brings its neighbour forward, and the last one folds the drawer", () => {
   let s = S.INITIAL_STATE;
   for (const key of [1, 2, 3]) s = S.reduce(s, { type: "open", key, spec: spec(), placement: "drawer" });

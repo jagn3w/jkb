@@ -2,7 +2,7 @@
 //! D53.10), how it stands, and its Restart.
 
 import { targetLabel, type TerminalTarget } from "../../../shared/terminal";
-import { statusLabel, type TerminalEntry } from "./state";
+import { canRerun, statusLabel, type TerminalEntry } from "./state";
 import { useTerminals } from "./TerminalProvider";
 
 /** Where the terminal's commands run, on its tab, so it is never ambiguous (D53.10). */
@@ -25,10 +25,10 @@ export function StatusNote({ entry }: { readonly entry: TerminalEntry }): React.
   );
 }
 
-/** Restart, shown once the program has ended. */
+/** Restart, shown once the program has ended, for a terminal that may run again. */
 export function RestartButton({ entry }: { readonly entry: TerminalEntry }): React.JSX.Element | null {
   const { restart } = useTerminals();
-  if (entry.status.kind !== "exited" && entry.status.kind !== "failed") return null;
+  if (!canRerun(entry) || (entry.status.kind !== "exited" && entry.status.kind !== "failed")) return null;
   return (
     <button type="button" className="terminal-action" onClick={() => restart(entry.key)}>
       Restart

@@ -18,6 +18,7 @@ const status = (over = {}) =>
     kit: "/home/me/.local/share/jkb-container-kit/kit",
     checkout: "/home/me/repos/jkb",
     kit_changed: [],
+    kit_refresh: "/home/me/.local/share/jkb-container-kit/kit/.container/run.sh --install-kit",
     want_args_hash: "h1",
     image_on_disk: { id: "sha256:a", created: "2026-10-08T10:00:00Z", built_at: "2026-10-08T10:00:01Z", source_commit: SHA, source_branch: "main" },
     container: {
@@ -88,6 +89,7 @@ test("anything else is refused with the reason, never read as a status", () => {
   refused(status({ docker: "maybe" }), /docker/);
   refused(status({ name: 7 }), /name/);
   refused(status({ kit_changed: "a" }), /kit_changed/);
+  refused(status({ kit_refresh: ["run.sh"] }), /kit_refresh/);
   refused(status({ image_on_disk: { created: null } }), /image_on_disk/);
   refused(status({ container: { state: "running" } }), /container/);
   refused(status({ drift: { args: "stale", image: "same" } }), /args drift/);
@@ -116,18 +118,56 @@ test("drift reads as stale, with run.sh's own remedy", () => {
   assert.equal(say({ drift: { args: "same", image: "unknown" } }).length, 1, "an unknown image id is not called stale");
 });
 
-test("no container, a stopped one, no image, a changed checkout and a down daemon each say so", () => {
+test("no container, a stopped one, no image and a down daemon each say so", () => {
   assert.match(say({ container: null, drift: { args: null, image: null } })[0][1], /no container named jkb-dev/);
   assert.match(say({ container: { state: "exited", image_id: "sha256:a", args_hash: "h1", image: null } })[0][1], /is exited/);
   assert.ok(say({ image_on_disk: null }).some(([, t]) => /no jkb-dev image yet/.test(t)));
-  const kit = say({ kit_changed: [".container", "scripts/lib.sh"] });
-  assert.match(kit[1][1], /\.container, scripts\/lib\.sh.*\/home\/me\/repos\/jkb\/\.container\/run\.sh --install-kit/);
   const down = parseContainerStatus(status({ docker: "unreachable" }));
   assert.deepEqual(
     findings(down.value).map((f) => f.level),
     ["stale"],
     "with the daemon down, nothing else is claimed about the container",
   );
+});
+
+test("a stale kit's remedy is run.sh's own command, the KIT's run.sh, never the checkout's", () => {
+  // The checkout's run.sh is the agent's to rewrite, and this line is a program the operator runs on
+  // the host by hand (review s8 round 1: it named the checkout's).
+  const kit = say({ kit_changed: [".container", "scripts/lib.sh"] });
+  assert.equal(
+    kit[1][1],
+    "The checkout has changed since the kit was installed (.container, scripts/lib.sh). Review the changes, then reinstall the kit: /home/me/.local/share/jkb-container-kit/kit/.container/run.sh --install-kit",
+  );
+  assert.doesNotMatch(kit[1][1], /\/home\/me\/repos\/jkb\/\.container/);
+  // Whatever run.sh says is what is shown: the app composes no path of its own.
+  assert.match(say({ kit_changed: [".container"], kit_refresh: "/k/.container/run.sh --install-kit" })[1][1], /: \/k\/\.container\/run\.sh --install-kit$/);
+  const none = say({ kit_changed: [".container"], kit_refresh: null })[1][1];
+  assert.doesNotMatch(none, /\/home\/me\/repos/, "with no command from run.sh, no path is guessed");
+  assert.match(none, /the kit's own run\.sh --install-kit/);
+});
+
+test("Build is said to start a stopped container only where the start path would", () => {
+  const ctr = (state) => ({ state, image_id: "sha256:a", args_hash: "h1", image: null });
+  assert.deepEqual(say({ container: ctr("exited") }), [["note", "jkb-dev is exited. Build starts it again."]]);
+  assert.deepEqual(say({ container: ctr("created"), drift: { args: "same", image: "unknown" } }), [["note", "jkb-dev is created. Build starts it again."]]);
+  // Drift the start path refuses: the state is said plainly, and the stale line carries the remedy.
+  for (const drift of [
+    { args: "differs", image: "same" },
+    { args: "unrecorded", image: "same" },
+    { args: "same", image: "differs" },
+  ]) {
+    const said = say({ container: ctr("exited"), drift });
+    assert.deepEqual(said[0], ["note", "jkb-dev is exited."], JSON.stringify(drift));
+    assert.ok(said.slice(1).some(([level, text]) => level === "stale" && /Remove it, then Build/.test(text)));
+    assert.ok(!said.some(([, text]) => /Build starts it again/.test(text)));
+  }
+  // A state the start path has no arm for: Build would collide with the name.
+  for (const state of ["paused", "restarting", "dead"]) {
+    const said = say({ container: ctr(state) });
+    assert.equal(said[0][0], "stale", state);
+    assert.match(said[0][1], new RegExp(`jkb-dev is ${state}, .*Remove it, then Build`));
+    assert.doesNotMatch(said[0][1], /starts it again/);
+  }
 });
 
 test("a button is offered only where it can act, and with no status every one is", () => {
@@ -151,6 +191,14 @@ test("a button is offered only where it can act, and with no status every one is
     stop: false,
     remove: false,
   });
+  for (const state of ["paused", "restarting"]) {
+    assert.deepEqual(
+      of({ container: { state, image_id: "sha256:a", args_hash: "h1", image: null } }),
+      { build: true, verify: false, "install-extensions": false, stop: true, remove: true },
+      `run.sh --stop acts on a ${state} container, so Stop is offered`,
+    );
+  }
+  assert.equal(of({ container: { state: "dead", image_id: "sha256:a", args_hash: "h1", image: null } }).stop, false);
   assert.deepEqual(Object.values(of({ docker: "unreachable" })), [false, false, false, false, false]);
   assert.match(availability("verify", parseContainerStatus(status({ container: null })).value).why, /not running/);
   assert.ok(CONTAINER_ACTIONS.every((a) => availability(a.id, undefined).enabled), "run.sh decides when the status could not be read");

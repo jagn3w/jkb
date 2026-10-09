@@ -205,14 +205,22 @@ export function commandFor(spec: TerminalSpec, env: TerminalEnvironment, tag: st
 }
 
 /**
- * The environment a terminal's process starts with: main's own, without Electron's variables
- * (`ELECTRON_RUN_AS_NODE` would turn a child Electron into Node), and with the terminal's `TERM`.
+ * The environment any program main starts on the host begins from: main's own, without Electron's
+ * variables (`ELECTRON_RUN_AS_NODE` would turn a child Electron into Node). The one rule, for a
+ * terminal and for the container kit's `run.sh --status` alike, so the two never read different
+ * `JKB_CONTAINER_NAME`s and show one container while acting on another.
  */
-export function terminalEnv(env: Readonly<Record<string, string | undefined>>): Record<string, string> {
+export function hostEnv(env: Readonly<Record<string, string | undefined>>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
     if (v !== undefined && !k.startsWith("ELECTRON_")) out[k] = v;
   }
+  return out;
+}
+
+/** The environment a terminal's process starts with: `hostEnv`, with the terminal's `TERM`. */
+export function terminalEnv(env: Readonly<Record<string, string | undefined>>): Record<string, string> {
+  const out = hostEnv(env);
   out["TERM"] = TERM;
   out["COLORTERM"] = "truecolor";
   return out;

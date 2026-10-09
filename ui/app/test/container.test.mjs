@@ -153,3 +153,15 @@ test("an action the tab does not offer is refused, flags and programs included",
   }
   assert.deepEqual(k.calls(), [], "nothing ran for any of them");
 });
+
+test("the Container tab opens each action's terminal to run once", () => {
+  // The tab is not rendered in these tests, so its one call is read: a Restart in the drawer re-ran
+  // an action (a Remove) past the tab's confirmation, with its buttons enabled and no status read
+  // after, and the Container/Host toggle could move the host-only run.sh into the container.
+  const tab = fs.readFileSync(path.join(src, "renderer", "src", "tabs", "ContainerTab.tsx"), "utf8");
+  const opens = [...tab.matchAll(/terminals\.open\(([^;]*)\)/g)].map((m) => m[1]);
+  assert.ok(opens.length > 0, "the tab opens its action terminals through terminals.open");
+  const actionOpens = opens.filter((a) => a.startsWith("answer.value"));
+  assert.equal(actionOpens.length, 1, `one open runs an action: ${JSON.stringify(opens)}`);
+  assert.match(actionOpens[0], /\{ once: true \}/);
+});

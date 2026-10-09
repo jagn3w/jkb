@@ -640,6 +640,9 @@ dc_git_head() { # dc_git_head <checkout>
         c="$(head -1 "$gd/commondir" 2>/dev/null)"
         case "$c" in "") ;; /*) common="$c" ;; *) common="$gd/$c" ;; esac
     fi
+    # A REGULAR FILE, like every other read here: the agent can write .git (all but config and hooks),
+    # and a FIFO planted as HEAD hung --install-kit and setup.sh on the host, with no message.
+    [ -f "$gd/HEAD" ] || return 1
     head="$(head -1 "$gd/HEAD" 2>/dev/null)"
     case "$head" in
         "ref: refs/heads/"*)

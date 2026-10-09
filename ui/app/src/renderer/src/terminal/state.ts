@@ -28,6 +28,12 @@ export interface TerminalEntry {
   readonly spec: TerminalSpec;
   readonly placement: Placement;
   readonly status: TerminalStatus;
+  /**
+   * Run once, for its caller: no Restart and no target toggle (`canRerun`). The Container tab's
+   * buttons open these: a rerun of `run.sh --rm` would skip the tab's confirmation and its status
+   * read, and the toggle would move the host-only `run.sh` into the container.
+   */
+  readonly once?: boolean;
 }
 
 export interface TerminalsState {
@@ -42,7 +48,7 @@ export interface TerminalsState {
 export const INITIAL_STATE: TerminalsState = { entries: [], active: undefined, popover: undefined, drawerOpen: false };
 
 export type TerminalAction =
-  | { readonly type: "open"; readonly key: number; readonly spec: TerminalSpec; readonly placement: Placement }
+  | { readonly type: "open"; readonly key: number; readonly spec: TerminalSpec; readonly placement: Placement; readonly once?: boolean }
   | { readonly type: "status"; readonly key: number; readonly status: TerminalStatus }
   /** The terminal starts again from `spec` (a Restart, a relaunch, a re-attach). */
   | { readonly type: "restart"; readonly key: number; readonly spec: TerminalSpec }
@@ -59,7 +65,13 @@ function drawerKeys(entries: readonly TerminalEntry[]): number[] {
 export function reduce(state: TerminalsState, action: TerminalAction): TerminalsState {
   switch (action.type) {
     case "open": {
-      const entry: TerminalEntry = { key: action.key, spec: action.spec, placement: action.placement, status: { kind: "starting" } };
+      const entry: TerminalEntry = {
+        key: action.key,
+        spec: action.spec,
+        placement: action.placement,
+        status: { kind: "starting" },
+        ...(action.once === true ? { once: true } : {}),
+      };
       const entries = [...state.entries, entry];
       if (action.placement === "popover") {
         // One popover at a time: the one it replaces moves to the drawer rather than vanishing
@@ -113,6 +125,14 @@ export function reduce(state: TerminalsState, action: TerminalAction): Terminals
     case "toggleDrawer":
       return { ...state, drawerOpen: !state.drawerOpen };
   }
+}
+
+/**
+ * Whether the terminal may run its program again, by Restart, a relaunch or the target toggle: every
+ * terminal but one opened to run once. The provider asks this before each, so no caller can forget.
+ */
+export function canRerun(entry: TerminalEntry): boolean {
+  return entry.once !== true;
 }
 
 /** The open terminal already running `sessionUuid`, so a second open shows it instead of starting another. */

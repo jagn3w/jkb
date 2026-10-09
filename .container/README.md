@@ -322,9 +322,16 @@ The Code Factory app's Container tab (`docs/code-factory.md`, D53.8) is buttons 
 run from the kit and never the checkout, with the output in its integrated terminal. Three of them
 were added for it, and each goes through the start path rather than beside it:
 
+- **One thing per call.** A mode refuses a second mode, and a flag that acts as it is read (`--stop`,
+  `--rm`, `--install-kit`, `--print-args`, …) refuses anything beside it: a second mode used to
+  overwrite the first, and `--status --rm` removed the container it was asked to describe (review s8
+  round 1).
 - **`--verify` and `--install-extensions` act on a running container only.** A container that is not
   running is refused before the build, so the button that checks the container can never be the one
-  that builds or creates it — even under `JKB_CONTAINER_IMAGE`, which a start always builds. Both then
+  that builds or creates it — even under `JKB_CONTAINER_IMAGE`, which a start always builds. That early
+  refusal is the fast one; the one that holds is asked again on the state the dispatch acts on, because
+  the dispatch starts or creates whatever that state says is not running, and a container stopped or
+  removed between the two reads sent the mode into `docker start` or `docker run`. Both then
   take the start path's own route: the drift checks (a stale container is refused with the same
   `--rm && run.sh` advice), the settle, the firewall re-raise, and the kit mirror refreshed from the
   kit. `--install-extensions` stops there and runs `install-extensions.sh` from the mirror, with the
@@ -338,13 +345,20 @@ were added for it, and each goes through the start path rather than beside it:
   image's labels, the declaration's args-hash, and the two drifts as `args_drift` and `image_drift`
   answer them — the functions the start path refuses on, so the tab calls a container stale exactly
   when a start would refuse it. A daemon that cannot be reached is an answer (`"docker":
-  "unreachable"`), not an error.
+  "unreachable"`), not an error. `kit_refresh` is the command that refreshes a stale kit — run.sh's
+  one `KIT_REFRESH`, the **kit's** `run.sh --install-kit`, which the start's note names too — so the
+  app shows run.sh's remedy rather than composing one. It had composed the checkout's path: a command
+  the operator runs on the host by hand, naming a script the agent can rewrite.
 - **The build stamps the image** with `jkb.source-commit` and `jkb.source-branch` — the commit and
   branch the kit was copied from, recorded in the kit's marker by `--install-kit`, or the checkout's
   own HEAD under `JKB_RUN_FROM_CHECKOUT=1` — and `jkb.built-at`, UTC. **Read from git's files, never
   by running git** (`lib.sh`'s `dc_git_head`): this is the host, unsandboxed, and git in a checkout
   reads that repository's config, whose `core.fsmonitor` is a program it runs. A reftable repository,
-  an unborn branch or anything that is not a full hex object name is `unknown`, never a guess.
+  an unborn branch or anything that is not a full hex object name is `unknown`, never a guess, and so is
+  a `HEAD` that is not a regular file (a FIFO planted there hung `--install-kit` on the host). The
+  build's note says which: a kit installed before it recorded a source is told to reinstall, and
+  `--install-kit` no longer calls such a kit current while its checkout has a readable HEAD; a checkout
+  whose HEAD cannot be read is said to be one, since no reinstall would change it.
   *Stated, not measured:* the commit is HEAD at the copy, so an uncommitted edit to a kit path rides
   in the kit without being in that commit; `--status`'s `kit_changed` shows a checkout that has moved
   since, not a kit that was dirty when copied.
@@ -446,8 +460,8 @@ not.
 ship a different build of the extension from the one you install on the host for reasons nobody
 decided. `setup.sh` calls that script too, but on a fresh container it finds no VS Code server and
 correctly does nothing: the server arrives when you **attach**, which is after setup has run. So on
-a new container this is the one step you run by hand, from a terminal in the attached window — see
-*Using it* above. (Under Dev Containers the order was the reverse, which is why it was never a
+a new container this is the one step left: run it from a terminal in the attached window, or from the
+host with the kit's `run.sh --install-extensions` (the Container tab's button) — see *Using it* above. (Under Dev Containers the order was the reverse, which is why it was never a
 separate step.) That script resolves
 `code-server` and its `--server-data-dir` itself when there is no `code` CLI, which is the dev
 container case. It builds from the checkout rather than from a snapshot baked into the image, so
@@ -636,8 +650,10 @@ sources the mirror's `lib.sh`.
   unsandboxed in the container, once per container. `install-extensions.sh` runs
   `scripts/install-extension.sh` from the checkout, which builds `ui/` through pnpm. That build rarely
   happens from `setup.sh`, whose call finds no VS Code server on a first start. It usually happens
-  when you run the mirror's `install-extensions.sh` by hand after attaching, as `verify.sh` advises,
-  and then it builds the checkout you are standing in. Building is what these steps are for, and it
+  after attaching, when you run the mirror's `install-extensions.sh` by hand as `verify.sh` advises,
+  or with one click: the kit's `run.sh --install-extensions`, which the Code Factory app's Container
+  tab offers as a button, execs the same mirror copy in the container. Either way it builds the
+  checkout's `ui/` in the container, as it stands. Building is what these steps are for, and it
   is the same exposure as the host's `post-merge` build (*Git runs the host's hooks*). The
   mitigation is the same too: review what you build.
 - *The kit is trusted at install.* The first `--install-kit`, and every `setup.sh` run, copy whatever

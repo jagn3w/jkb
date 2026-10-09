@@ -710,6 +710,11 @@ if [ -f "$here/../$DC_KIT_MARKER" ] \
         KIT_GONE="${repo:-none}"; repo=""
     fi
 fi
+# THE KIT'S REFRESH, written once: the start's note, the build's note and --status (which the Code
+# Factory app shows verbatim) all name this command, never the checkout's run.sh -- that one is the
+# agent's to rewrite, and the remedy for a stale kit is the one place an operator is told to run
+# something on the host by hand (review s8 round 1: the app had spelled the checkout's path).
+KIT_REFRESH="${KIT_ROOT:+$KIT_ROOT/.container/run.sh --install-kit}"
 kit_need_checkout() {
     [ -z "${KIT_GONE:-}" ] && return 0
     die "the kit at $KIT_ROOT records a checkout that no longer exists ($KIT_GONE) -- reinstall it from one: <checkout>/.container/run.sh --install-kit"
@@ -732,26 +737,42 @@ BUILD=0 DRY=0 OPEN=0 open_path=""
 # verify and install-extensions, the same start path -- the drift checks, the settle, the kit mirror --
 # stopping where their job ends, so there is one route to each exec rather than a second copy of it.
 MODE=start
+# ONE THING PER CALL. A second mode used to overwrite the first (`--verify --install-extensions` skipped
+# verify), and a flag that acts as it is read -- --stop, --rm, --install-kit -- acted on whatever came
+# beside it: `--status --rm` removed the container it was asked to describe (review s8 round 1). So a
+# mode refuses another mode, and an acting flag refuses anything before it and, except --print-args,
+# which reads the rest as its own, anything after it.
+set_mode() { # set_mode <flag>
+    [ "$MODE" = start ] || die "--$MODE and $1 are two modes; run.sh does one thing per call"
+    MODE="${1#--}"
+}
+alone() { # alone <flag> <how many arguments follow it>
+    if [ "$MODE" != start ] || [ "$BUILD" -eq 1 ] || [ "$DRY" -eq 1 ] || [ "$OPEN" -eq 1 ] || [ "$2" -gt 0 ]; then
+        die "$1 takes no other flag; run.sh does one thing per call"
+    fi
+}
 while [ $# -gt 0 ]; do
     case "$1" in
         --build)         BUILD=1; shift ;;
-        --verify)        MODE=verify; shift ;;
-        --install-extensions) MODE=install-extensions; shift ;;
-        --status)        MODE=status; shift ;;
+        --verify|--install-extensions|--status) set_mode "$1"; shift ;;
         --dry-run)       DRY=1; shift ;;
         --open)          OPEN=1; shift; case "${1:-}" in -*|"") ;; *) open_path="$1"; shift ;; esac ;;
-        --consumed-keys) consumed_keys; exit 0 ;;
+        --consumed-keys) alone "$1" $(($# - 1)); consumed_keys; exit 0 ;;
         # Where the kit is: one answer, lib.sh's, for setup.sh's summary and anything else that
         # would otherwise spell the path again.
-        --kit-path)      printf '%s\n' "$DC_KIT_DIR"; exit 0 ;;
+        --kit-path)      alone "$1" $(($# - 1)); printf '%s\n' "$DC_KIT_DIR"; exit 0 ;;
         # COPIES, never runs: dc_install_kit copies the kit's paths from the checkout and executes
         # nothing in it. From the kit, the checkout is the one recorded at install, and what changed
         # since is listed FILE BY FILE as it copies -- a record of what came in, not a gate: review the
         # checkout's changes before running this (round 17 found it naming only `.container`).
-        --install-kit)   kit_need_checkout
+        --install-kit)   alone "$1" $(($# - 1)); kit_need_checkout
                          if [ -f "$DC_KIT_DIR/$DC_KIT_MARKER" ]; then
                              kit_changed="$(dc_kit_stale "$DC_KIT_DIR" "$repo")"
-                             if [ -z "$kit_changed" ] && [ "$(dc_kit_checkout "$DC_KIT_DIR")" = "$(cd "$repo" && pwd -P)" ]; then
+                             # ...AND IT RECORDS A SOURCE, or this checkout has none to give: a kit
+                             # installed before the labels existed matched its checkout file for file,
+                             # so this exited here and the build's "reinstall it" note recurred forever.
+                             if [ -z "$kit_changed" ] && [ "$(dc_kit_checkout "$DC_KIT_DIR")" = "$(cd "$repo" && pwd -P)" ] \
+                                && { dc_kit_source "$DC_KIT_DIR" >/dev/null || ! dc_git_head "$repo" >/dev/null; }; then
                                  echo "the kit at $DC_KIT_DIR already matches $repo"; exit 0
                              fi
                              [ -z "$kit_changed" ] || { echo "copying these files, changed in $repo since the kit was installed:"; dc_kit_changes "$DC_KIT_DIR" "$repo" | sed 's/^/    /'; }
@@ -763,7 +784,7 @@ while [ $# -gt 0 ]; do
         # container and wrong for printing what one would be started with -- CI checks out to
         # /home/runner/work, and mutate-verify.sh's control has to be derivable there.
         # The root is an argument for the same reason: it is the harness's, not this script's.
-        --print-args)    shift
+        --print-args)    alone "$1" 0; shift
                          # PARSED AS A SET, NOT AS A FIXED ORDER, and an unconsumed argument is
                          # refused. This tested `--posture` in the next position ONLY, so the
                          # natural `--print-args <root> --posture` left the mode at `all`, exited
@@ -798,9 +819,9 @@ while [ $# -gt 0 ]; do
                              || die "container.json could not be read; refusing to print a partial declaration"
                          [ -n "$args_out" ] || die "the assembly produced no arguments"
                          printf '%s\n' "$args_out"; exit 0 ;;
-        --stop)          require_kit --stop; need_tool docker "docker is not on PATH"; persist_login
+        --stop)          alone "$1" $(($# - 1)); require_kit --stop; need_tool docker "docker is not on PATH"; persist_login
                          docker stop "$NAME" >/dev/null 2>&1 && echo "stopped $NAME" || echo "$NAME was not running"; exit 0 ;;
-        --rm)            require_kit --rm; need_tool docker "docker is not on PATH"; persist_login
+        --rm)            alone "$1" $(($# - 1)); require_kit --rm; need_tool docker "docker is not on PATH"; persist_login
                          docker rm -f "$NAME" >/dev/null 2>&1 && echo "removed $NAME" || echo "$NAME did not exist"; exit 0 ;;
         *)               die "unknown argument '$1' (see the header of $0)" ;;
     esac
@@ -867,7 +888,7 @@ fi
 require_kit
 if [ -n "$KIT_ROOT" ]; then
     kit_changed="$(dc_kit_stale "$KIT_ROOT" "$repo")"
-    [ -z "$kit_changed" ] || echo "note: the checkout has changed since the kit was installed ($(printf '%s ' $kit_changed)) -- this start uses the kit; to take the changes, review them, then: $KIT_ROOT/.container/run.sh --install-kit" >&2
+    [ -z "$kit_changed" ] || echo "note: the checkout has changed since the kit was installed ($(printf '%s ' $kit_changed)) -- this start uses the kit; to take the changes, review them, then: $KIT_REFRESH" >&2
 fi
 
 need_tool docker "docker is not on PATH"
@@ -875,8 +896,9 @@ need_tool docker "docker is not on PATH"
 # --status: WHAT THE CONTAINER IS, as one JSON object on stdout (D53.8), for the Code Factory app's
 # Container tab. Read-only: it inspects and changes nothing. Its drift is args_drift and image_drift,
 # the start path's own answers, against the want_hash this run just derived -- so the tab says
-# "stale" exactly when a start would refuse. A daemon that cannot be reached is an answer
-# (`"docker": "unreachable"`), not an error: Docker Desktop not running yet is the commonest state.
+# "stale" exactly when a start would refuse. `kit_refresh` is KIT_REFRESH, carried so the app shows
+# run.sh's remedy for a stale kit rather than composing its own. A daemon that cannot be reached is an
+# answer (`"docker": "unreachable"`), not an error: Docker Desktop not running yet is the commonest state.
 print_status() {
     local reach=reachable img="[]" ctr="[]" cimg="[]" cid="" have="" disk_id="" args="" image=""
     if docker info >/dev/null 2>&1; then
@@ -900,7 +922,7 @@ print_status() {
         image="$(image_drift "$cid" "$disk_id")"
     fi
     jq -n --arg docker "$reach" --arg name "$NAME" --arg image "$IMAGE" --arg kit "$KIT_ROOT" \
-          --arg checkout "$repo" --arg kit_changed "${kit_changed:-}" --arg want "$want_hash" \
+          --arg checkout "$repo" --arg kit_changed "${kit_changed:-}" --arg kit_refresh "$KIT_REFRESH" --arg want "$want_hash" \
           --arg args "$args" --arg image_drift "$image" \
           --argjson img "$img" --argjson ctr "$ctr" --argjson cimg "$cimg" '
         def opt: if . == "" then null else . end;
@@ -914,6 +936,7 @@ print_status() {
             schema: 1, docker: $docker, name: $name, image: $image,
             kit: ($kit | opt), checkout: ($checkout | opt),
             kit_changed: ($kit_changed | split("\n") | map(select(. != ""))),
+            kit_refresh: ($kit_refresh | opt),
             want_args_hash: $want,
             image_on_disk: ($img[0] | stamp),
             container: (if ($ctr | length) == 0 then null else {
@@ -971,8 +994,14 @@ build_image() {
     else src="$(dc_git_head "$repo")" || src=""; fi
     labels="$(dc_source_labels "$src")"
     commit="${labels%%$'\t'*}"; branch="${labels#*$'\t'}"
-    if [ -z "$src" ]; then
-        echo "note: no source commit is recorded for this build, so it is labelled 'unknown'${KIT_ROOT:+ -- a kit installed before the labels existed records none; reinstall it: $KIT_ROOT/.container/run.sh --install-kit}" >&2
+    # THE NOTE SAYS WHY, because the remedy differs: a kit installed before the labels existed takes
+    # one from a reinstall, but a checkout whose HEAD dc_git_head cannot read (a reftable repository,
+    # an unborn branch) gives none to any reinstall, and telling the operator to reinstall then sent
+    # them round a loop (review s8 round 1).
+    if [ -z "$src" ] && [ -n "$KIT_ROOT" ] && dc_git_head "$repo" >/dev/null; then
+        echo "note: this kit records no source commit (it was installed before it recorded one, or while the checkout's HEAD could not be read), so this build is labelled 'unknown'; reinstall it to record one: $KIT_REFRESH" >&2
+    elif [ -z "$src" ]; then
+        echo "note: the commit of $repo cannot be read from its files (a reftable repository, an unborn branch, or not a git checkout), so this build is labelled 'unknown'" >&2
     fi
     mkdir -p "$DC_KIT_HOME" && chmod 700 "$DC_KIT_HOME" || die "could not make $DC_KIT_HOME to hold the build's image id"
     idf="$(mktemp "$DC_KIT_HOME/iid.XXXXXX")" || die "could not make a file under $DC_KIT_HOME for the build's image id"
@@ -1006,6 +1035,14 @@ fi
 
 state="$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || true)"
 fresh=0
+# ...AND ASKED AGAIN HERE, on the state the dispatch below acts on. The check above is the fast
+# refusal; this is the one that holds. The two reads are only a few commands apart, but the dispatch
+# starts or creates whatever `$state` says is not running, so a container stopped or removed between
+# them sent --verify into `docker start` or `docker run` -- the button that checks the container making
+# one (review s8 round 1). Only `running` reaches an arm that starts nothing.
+if [ "$MODE" != start ] && [ "$state" != running ]; then
+    die "$NAME is ${state:-gone} now, and --$MODE acts on a running container only. Start it first: $0"
+fi
 
 # CAN DOCKER APPLY THE PROFILE? ASKED ABOVE THE DISPATCH, so it dominates every arm (D45.5).
 #

@@ -22,6 +22,7 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=t GIT
 #   args-hash     its jkb.args-hash label;  ctr-image  its image id
 #   images/<name> `docker image inspect` JSON, by tag or id (`/` and `:` spelled `_`)
 #   down          present = the daemon is unreachable
+#   running-said  the answer to the first .State.Running query only (a container that changes state)
 #   build.json    what a `docker build` produces (its Config.Labels gain the build's --label values)
 # Every call is appended to <dir>/calls, one per line.
 stub_docker() {
@@ -32,7 +33,12 @@ stub_docker() {
 D="$d"
 printf '%s\\n' "\$*" >> "\$D/calls"
 key() { printf '%s' "\$1" | tr '/:' '__'; }
-running() { [ "\$(cat "\$D/state" 2>/dev/null)" = running ] && echo true || echo false; }
+running() {
+    # running-said: what the FIRST .State.Running query answers, then removed -- a container stopped
+    # between run.sh's early check and its dispatch.
+    if [ -f "\$D/running-said" ]; then cat "\$D/running-said"; rm -f "\$D/running-said"; return; fi
+    [ "\$(cat "\$D/state" 2>/dev/null)" = running ] && echo true || echo false
+}
 ctr_json() {
     [ -f "\$D/state" ] || return 1
     /usr/bin/jq -n --arg s "\$(cat "\$D/state")" --arg h "\$(cat "\$D/args-hash" 2>/dev/null)" --arg i "\$(cat "\$D/ctr-image" 2>/dev/null)" \\
@@ -50,6 +56,7 @@ case "\$1" in
         [ "\$1" = container ] && shift
         shift
         [ "\${1:-}" = -f ] && { fmt="\$2"; shift 2; }
+        case "\$fmt" in *State.Running*) [ -f "\$D/running-said" ] && { running; exit 0; } ;; esac
         [ -f "\$D/state" ] || exit 1
         case "\$fmt" in
             "") ctr_json ;;
@@ -350,9 +357,96 @@ case10_a_detached_source_is_labelled_detached() {
     else fail "a kit copied from a detached HEAD builds an image labelled (detached)" "rc=$rc labels: $(jq -c '.[0].Config.Labels' "$d/images/jkb-dev" 2>/dev/null) err=$(tail -3 <<<"$err")"; fi
 }
 
+
+# --------------------------------------------------------------------------------------------
+# Review s8 round 1: one thing per call, the dispatch's own running check, the kit's remedy.
+# --------------------------------------------------------------------------------------------
+
+case11_one_thing_per_call() {
+    local d="$work/s11" combo
+    stub_docker "$d"
+    printf 'running' > "$d/state"
+    for combo in "--status --rm" "--rm --status" "--verify --stop" "--verify --install-extensions" \
+                 "--status --install-kit" "--build --stop" "--stop --build" "--status --print-args"; do
+        : > "$d/calls"
+        # shellcheck disable=SC2086
+        kit_run "$d" $combo
+        if [ "$rc" -ne 0 ] && grep -qE 'takes no other flag|are two modes' <<<"$err" && [ -z "$calls" ] && [ -e "$d/state" ]; then
+            ok "run.sh $combo is refused before docker is asked anything"
+        else fail "run.sh $combo is refused before docker is asked anything" "rc=$rc err=$err calls: $(tr '\n' ';' <<<"$calls")"; fi
+    done
+}
+
+case12_a_container_stopped_mid_run_is_not_started_by_a_mode() {
+    local d="$work/s12" want mode
+    stub_docker "$d"
+    image_json sha256:img '{}' > "$d/images/jkb-dev"
+    kit_run "$d" --status
+    want="$(jq -r '.want_args_hash' <<<"$out")"
+    for mode in --verify --install-extensions; do
+        # Stopped: the early check sees it running, the dispatch sees it exited.
+        printf 'exited' > "$d/state"; printf '%s' "$want" > "$d/args-hash"; printf 'sha256:img' > "$d/ctr-image"
+        printf 'true' > "$d/running-said"; : > "$d/calls"
+        kit_run "$d" "$mode"
+        if [ "$rc" -ne 0 ] && grep -q 'acts on a running container only' <<<"$err" && ! grep -qE '^start( |$)' <<<"$calls"; then
+            ok "run.sh $mode on a container stopped after the early check refuses rather than starting it"
+        else fail "run.sh $mode on a container stopped after the early check refuses rather than starting it" "rc=$rc err=$(tail -2 <<<"$err") calls: $(cut -c1-40 <<<"$calls" | tr '\n' ';')"; fi
+        # Removed: the dispatch sees no container at all.
+        rm -f "$d/state"; printf 'true' > "$d/running-said"; : > "$d/calls"
+        kit_run "$d" "$mode"
+        if [ "$rc" -ne 0 ] && grep -q 'acts on a running container only' <<<"$err" \
+           && ! grep -qE '^run ' <<<"$(grep -v -- '--entrypoint true' <<<"$calls")"; then
+            ok "...and on one removed after it, refuses rather than creating one"
+        else fail "...and on one removed after it, refuses rather than creating one" "rc=$rc err=$(tail -2 <<<"$err") calls: $(cut -c1-40 <<<"$calls" | tr '\n' ';')"; fi
+    done
+}
+
+case13_a_head_that_is_not_a_file_is_unknown_not_a_hang() {
+    local r="$work/repo13" rc13=0
+    mkdir -p "$r/.git/refs/heads"
+    mkfifo "$r/.git/HEAD" || { fail "case13" "mkfifo failed"; return; }
+    timeout 5 bash -c '. "$1/.container/lib.sh"; dc_git_head "$2"' _ "$repo_root" "$r" >/dev/null 2>&1 || rc13=$?
+    if [ "$rc13" -eq 1 ]; then ok "a HEAD that is a FIFO is unknown (rc 1), never read"
+    else fail "a HEAD that is a FIFO is unknown (rc 1), never read" "rc=$rc13 (124 = it hung)"; fi
+}
+
+case14_status_names_the_kits_refresh_never_the_checkouts() {
+    local d="$work/s14" kit
+    stub_docker "$d"
+    kit_run "$d" --status
+    kit="$(jq -r '.kit' <<<"$out")"
+    if [ "$(jq -r '.kit_refresh' <<<"$out")" = "$kit/.container/run.sh --install-kit" ] \
+       && ! grep -qF "$(jq -r '.checkout' <<<"$out")/.container/run.sh" <<<"$(jq -r '.kit_refresh' <<<"$out")"; then
+        ok "--status carries the kit's own refresh command, the kit's run.sh --install-kit"
+    else fail "--status carries the kit's own refresh command, the kit's run.sh --install-kit" "out=$out"; fi
+}
+
+case15_a_kit_with_no_source_takes_one_from_a_reinstall() {
+    local d="$work/s15" kit
+    stub_docker "$d"
+    image_json sha256:base '{}' > "$d/build.json"
+    kit_run "$d" --status >/dev/null
+    kit="$d/home/.local/share/jkb-container-kit/kit"
+    sed -i -e '/^commit=/d' -e '/^branch=/d' "$kit/$DC_KIT_MARKER"
+    kit_run "$d" --build
+    if grep -q 'this kit records no source commit' <<<"$err" && grep -qF "$kit/.container/run.sh --install-kit" <<<"$err"; then
+        ok "a build from a kit with no recorded source says the kit is old, and names the kit's refresh"
+    else fail "a build from a kit with no recorded source says the kit is old, and names the kit's refresh" "err=$(grep note <<<"$err")"; fi
+    kit_run "$d" --install-kit
+    if [ "$rc" -eq 0 ] && ! grep -q 'already matches' <<<"$out" && dc_kit_source "$kit" >/dev/null; then
+        ok "...and --install-kit then reinstalls it, rather than calling it current, so it records one"
+    else fail "...and --install-kit then reinstalls it, rather than calling it current, so it records one" "rc=$rc out=$out err=$err"; fi
+    kit_run "$d" --install-kit
+    if [ "$rc" -eq 0 ] && grep -q 'already matches' <<<"$out"; then ok "...after which it does match"
+    else fail "...after which it does match" "rc=$rc out=$out err=$err"; fi
+}
+
 run_cases case1_dc_git_head_reads_loose_packed_detached_and_worktrees case2_dc_git_head_says_unknown_rather_than_guess \
           case3_the_kit_records_what_it_was_copied_from case4_status_reports_the_image_labels_and_no_container \
           case5_status_drift_is_the_start_paths_answer case6_status_with_the_daemon_down_is_an_answer \
           case7_a_mode_refuses_a_container_that_is_not_running case8_verify_and_install_extensions_on_a_running_container \
-          case9_a_build_is_stamped_with_its_source_and_time case10_a_detached_source_is_labelled_detached
+          case9_a_build_is_stamped_with_its_source_and_time case10_a_detached_source_is_labelled_detached \
+          case11_one_thing_per_call case12_a_container_stopped_mid_run_is_not_started_by_a_mode \
+          case13_a_head_that_is_not_a_file_is_unknown_not_a_hang case14_status_names_the_kits_refresh_never_the_checkouts \
+          case15_a_kit_with_no_source_takes_one_from_a_reinstall
 finish

@@ -708,9 +708,10 @@ shapes, the requests, what a save sends, both layouts) and `src/renderer/src/wor
 Build / verify / stop / remove / install-extensions are the kit's `run.sh` flags, invoked from
 the kit path (`run.sh --kit-path`), never the checkout — the D53.3 rule again. Output streams into
 the integrated terminal. The tab shows what the container is: build time, source commit and
-branch, image, args-hash drift. Build time/commit/branch do not exist yet: the build stamps them
-as image labels (`jkb.built-at`, `jkb.source-commit`, `jkb.source-branch`), recorded in
-`.container/README.md` where the container's own decisions live.
+branch, image, args-hash drift. Build time, commit and branch did not exist when this was decided;
+the build now stamps them as image labels (`jkb.built-at`, `jkb.source-commit`, `jkb.source-branch`) —
+see *As built (subtask 8)* below — recorded in `.container/README.md` where the container's own
+decisions live.
 
 **As built (subtask 8).** The run.sh side — `--verify`, `--install-extensions` and `--status`, the labels
 and why `jkb.built-at` does not change the image id — is recorded in `.container/README.md` ("The
@@ -724,17 +725,34 @@ it, read `--status`, build each button's terminal spec), `window.jkb.container` 
 - **The renderer names an action; main picks the program and its flag.** `container.spec(action)`
   refuses anything that is not one of the five actions (a flag, a path, an object), and answers a
   **host** terminal spec — `[<kit>/.container/run.sh, <flag>]`, from the account's home — that the tab
-  opens in the integrated terminal's drawer, so the output streams there and the drawer's restart and
-  close work on it as on any terminal. When that terminal ends, the tab reads `--status` again.
+  opens in the integrated terminal's drawer, so the output streams there. **A convenience, not a
+  boundary** (corrected, review s8 round 1): the spec goes back to the renderer, which opens it through
+  the generic `terminal.open`, and that accepts any host argv by design (D53.10). What keeps the
+  checkout's `run.sh` from running is that nothing in the app names it and that `run.sh` itself refuses
+  to start a container from a checkout. main's `run.sh --status` and the terminal start from one
+  environment rule (`hostEnv`), so both resolve `JKB_CONTAINER_NAME` alike.
+- **A button's terminal runs once.** It is opened with no Restart and no Container/Host toggle
+  (`canRerun`, asked by the terminal provider before every restart, relaunch and retarget). As first
+  built it was "a terminal like any other", and the drawer's Restart re-ran a finished Remove with no
+  confirmation, with the tab's buttons enabled, and with no `--status` read after; the toggle could move
+  the host-only `run.sh` into the container. So every run of an action goes through the tab's own
+  button — its confirmation, its disabled buttons while it runs, and its `--status` read when it ends.
 - **The kit is found where `lib.sh` puts it, and asked to agree.** `DC_KIT_DIR` is under the
   *account's* home (the passwd entry, which is what `run.sh` builds its own HOME from), not `$HOME`,
   which a launching terminal can set; and the kit's own `run.sh --kit-path` must name that same
   directory before its `--status` or any button runs. No kit is an answer that says how to install one.
 - **The tab's words are `run.sh`'s.** Drift is read from `--status` (`args_drift`/`image_drift`), never
-  recomputed, and each finding carries the remedy `run.sh` itself prints (*Remove it, then Build*). A
+  recomputed, and each finding carries the remedy `run.sh` itself prints (*Remove it, then Build*). The
+  stale-kit remedy is `--status`'s `kit_refresh`, shown verbatim: the **kit's** `run.sh --install-kit`.
+  The tab had composed `<checkout>/.container/run.sh --install-kit` itself — a command the operator
+  pastes into a host terminal, naming a script the agent can rewrite. *Build starts it again* is said
+  only of an exited or created container with no drift the start path refuses; a stale one gets its
+  state and the stale line's remedy, and one paused, restarting or dead (a state the start path has no
+  arm for: its `docker run` would collide with the name) is stale itself, *Remove it, then Build*. A
   button that cannot act on the container as it stands is disabled with the reason in its title
-  (Verify, Install extensions and Stop need it running; Remove needs one to exist); with no status at
-  all every button is offered and `run.sh` decides. Stop and Remove ask first.
+  (Verify and Install extensions need it running; Stop needs it running, paused or restarting, which
+  `docker stop` all ends; Remove needs one to exist); with no status at all every button is offered and
+  `run.sh` decides. Stop and Remove ask first.
 - **Re-read on demand**, like the Workflows tab: the refresh button and the end of a button's run.
   Nothing announces a change to a container, and D53.1 rules out a poll loop.
 - *Unmeasured, stated:* the Electron smoke for the tab needs the binary the sandbox cannot download,

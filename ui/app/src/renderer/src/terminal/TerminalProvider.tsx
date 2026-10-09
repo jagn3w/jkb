@@ -9,7 +9,7 @@ import {
 } from "../../../shared/terminal";
 import { TerminalEventRouter } from "./router";
 import { TerminalSession, themeFromTokens } from "./session";
-import { INITIAL_STATE, planOpen, reduce, type Placement, type TerminalsState } from "./state";
+import { INITIAL_STATE, canRerun, planOpen, reduce, type Placement, type TerminalsState } from "./state";
 
 /**
  * The integrated terminal, as every tab sees it (D53.10). A caller builds a `TerminalSpec` (from
@@ -23,9 +23,10 @@ export interface TerminalsApi {
   /**
    * Open a terminal from `spec`. A spec naming a `sessionUuid` that an open terminal is still
    * running shows that terminal instead of starting a second; one whose program has ended runs
-   * `spec` in that terminal (`planOpen`). Returns the terminal's key.
+   * `spec` in that terminal (`planOpen`). Returns the terminal's key. `once`: it runs its program
+   * this one time, with no Restart (`canRerun`).
    */
-  open(spec: TerminalSpec, placement?: Placement): number;
+  open(spec: TerminalSpec, placement?: Placement, options?: { readonly once?: boolean }): number;
   /** Open the target's login shell in its default directory (the drawer's "+"). */
   openShell(target?: TerminalTarget): void;
   /**
@@ -105,7 +106,7 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
     return () => media.removeEventListener("change", onChange);
   }, []);
 
-  const open = useCallback((spec: TerminalSpec, placement: Placement = "drawer"): number => {
+  const open = useCallback((spec: TerminalSpec, placement: Placement = "drawer", options?: { readonly once?: boolean }): number => {
     const plan = planOpen(stateRef.current, spec);
     if (plan.kind === "show" || plan.kind === "relaunch") {
       const { key } = plan.entry;
@@ -123,7 +124,7 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
     const key = nextKey.current++;
     const session = new TerminalSession(r, (status) => dispatch({ type: "status", key, status }));
     sessions.current.set(key, session);
-    dispatch({ type: "open", key, spec, placement });
+    dispatch({ type: "open", key, spec, placement, once: options?.once === true });
     void session.start(spec);
     return key;
   }, []);
@@ -159,7 +160,7 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
   const restart = useCallback((key: number): void => {
     const entry = stateRef.current.entries.find((e) => e.key === key);
     const session = sessions.current.get(key);
-    if (entry === undefined || session === undefined) return;
+    if (entry === undefined || session === undefined || !canRerun(entry)) return;
     dispatch({ type: "restart", key, spec: entry.spec });
     // The person's explicit act: it starts even beside a program that may still be running.
     void session.start(entry.spec, { override: true });
@@ -167,7 +168,8 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
 
   const relaunch = useCallback((key: number, spec: TerminalSpec): boolean => {
     const session = sessions.current.get(key);
-    if (session === undefined || !stateRef.current.entries.some((e) => e.key === key)) return false;
+    const entry = stateRef.current.entries.find((e) => e.key === key);
+    if (session === undefined || entry === undefined || !canRerun(entry)) return false;
     dispatch({ type: "restart", key, spec });
     void session.start(spec);
     return true;
