@@ -13,9 +13,8 @@
 //!
 //! ## What this does NOT replace
 //! The `parent_of` / `derived_from` edges survive, carrying what a containment row cannot:
-//! [`crate::edge::link`]'s cycle guard, `jkb related` traversal, `derived_from` as the
-//! provenance search reads for `source_document`, and the `tasks` file serializer's
-//! indentation round-trip. [`crate::task::add_subtask`] writes both the edge and the
+//! `jkb related` traversal, `derived_from` as the provenance search reads for
+//! `source_document`, and the `tasks` file serializer's indentation round-trip. [`crate::task::add_subtask`] writes both the edge and the
 //! containment row in one call so they cannot drift; [`contain`] records only the row.
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -30,9 +29,10 @@ use crate::{changelog, Result};
 /// Record that `child` is contained by `parent`, at `position` among its siblings.
 /// Idempotent: re-containing the same pair updates the position.
 ///
-/// Prefer `crate::task::add_subtask`, which also links the `parent_of` edge (and so
-/// inherits its cycle guard). Use this directly only where the relationship edge is already
-/// written, as the ingest pipeline does for chunks.
+/// Prefer `crate::task::add_subtask`, which also links the `parent_of` edge and refuses a
+/// parent that is already inside `child` — this refuses only `child == parent`. Use this
+/// directly only where the relationship edge is already written, as the ingest pipeline does
+/// for chunks.
 ///
 /// # Errors
 /// Returns a validation error if `child` and `parent` are the same item; otherwise an error

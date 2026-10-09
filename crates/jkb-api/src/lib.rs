@@ -432,6 +432,14 @@ pub enum Request {
         #[serde(default)]
         home: bool,
     },
+    /// Move an existing task under another parent: a task or an execution plan's step.
+    #[serde(rename = "task.move")]
+    TaskMove {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The new parent, as a uid or bare slug.
+        under: String,
+    },
     /// Remove a task's mirror placement.
     #[serde(rename = "task.unplace")]
     TaskUnplace {
@@ -1527,6 +1535,7 @@ impl Request {
         "task.depend",
         "task.undepend",
         "task.place",
+        "task.move",
         "task.unplace",
         "task.bind",
         "task.claim",
@@ -1663,6 +1672,7 @@ impl Request {
             Self::TaskDepend { .. } => "task.depend",
             Self::TaskUndepend { .. } => "task.undepend",
             Self::TaskPlace { .. } => "task.place",
+            Self::TaskMove { .. } => "task.move",
             Self::TaskUnplace { .. } => "task.unplace",
             Self::TaskBind { .. } => "task.bind",
             Self::TaskClaim { .. } => "task.claim",
@@ -1844,6 +1854,7 @@ impl Request {
             | Self::TaskDepend { .. }
             | Self::TaskUndepend { .. }
             | Self::TaskPlace { .. }
+            | Self::TaskMove { .. }
             | Self::TaskUnplace { .. }
             | Self::TaskBind { .. }
             | Self::TaskClaim { .. }
@@ -2072,6 +2083,12 @@ pub enum Response {
         /// The task created.
         #[serde(flatten)]
         added: tasks::Added,
+    },
+    /// A `task.move`.
+    TaskMoved {
+        /// What it did.
+        #[serde(flatten)]
+        moved: tasks::Moved,
     },
     /// A `task.unplace`.
     Unplaced {
@@ -2535,6 +2552,7 @@ impl Response {
     /// node cap — asked once by a client rather than remembered in each place it takes one apart.
     /// Exhaustive, so a new answer that can be cut must say.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one arm per answer, like `Request::permission`
     pub const fn truncated(&self) -> bool {
         match self {
             Self::Items { truncated, .. }
@@ -2571,6 +2589,7 @@ impl Response {
             | Self::Content { .. }
             | Self::Applied {}
             | Self::Added { .. }
+            | Self::TaskMoved { .. }
             | Self::Unplaced { .. }
             | Self::Claimed { .. }
             | Self::Released { .. }
@@ -2683,6 +2702,7 @@ impl Response {
             | Self::Versions { .. }
             | Self::Applied {}
             | Self::Added { .. }
+            | Self::TaskMoved { .. }
             | Self::Unplaced { .. }
             | Self::Claimed { .. }
             | Self::Released { .. }
@@ -3593,6 +3613,14 @@ impl LocalBackend {
                     tasks::place(c, m, uid, &ns, home, roots.as_ref(), scope)
                 })?;
                 Response::Applied {}
+            }
+            Request::TaskMove { uid, under } => {
+                let roots = self.file_roots.clone();
+                Response::TaskMoved {
+                    moved: task_write(db, actor, uid, move |c, m, uid| {
+                        tasks::move_under(c, m, uid, &under, roots.as_ref())
+                    })?,
+                }
             }
             Request::TaskUnplace { uid, ns } => {
                 let roots = self.file_roots.clone();

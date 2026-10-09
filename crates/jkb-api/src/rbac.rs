@@ -257,6 +257,7 @@ impl Request {
             | Self::TaskDepend { .. }
             | Self::TaskUndepend { .. }
             | Self::TaskPlace { .. }
+            | Self::TaskMove { .. }
             | Self::TaskUnplace { .. }
             | Self::TaskBind { .. }
             | Self::IngestText(_)
@@ -327,6 +328,7 @@ impl Request {
             | Self::TaskDepend { uid, .. }
             | Self::TaskUndepend { uid, .. }
             | Self::TaskPlace { uid, .. }
+            | Self::TaskMove { uid, .. }
             | Self::TaskUnplace { uid, .. }
             | Self::TaskBind { uid, .. }
             | Self::TaskClaim { uid, .. }

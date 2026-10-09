@@ -1127,6 +1127,17 @@ enum TaskCmd {
         #[arg(long)]
         home: bool,
     },
+    /// Move an existing task under another parent: a task, or an execution plan's step.
+    ///
+    /// Replaces its parent (one transaction; `jkb undo` restores the old one) and leaves its
+    /// placements and binding alone. A task bound to a synced file is refused — edit the file.
+    Move {
+        /// The task uid.
+        uid: String,
+        /// The new parent: a task uid or a plan step uid.
+        #[arg(long)]
+        under: String,
+    },
     /// Remove a task's reference (mirror) placement under a namespace (inverse of `place`).
     Unplace {
         /// The task uid.
@@ -2504,6 +2515,7 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Depend { .. }
         | TaskCmd::Undepend { .. }
         | TaskCmd::Place { .. }
+        | TaskCmd::Move { .. }
         | TaskCmd::Unplace { .. }
         | TaskCmd::Bind { .. }
         | TaskCmd::Claim { .. }

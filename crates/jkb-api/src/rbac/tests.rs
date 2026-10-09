@@ -975,3 +975,34 @@ fn a_grant_no_longer_grantable_is_marked_in_the_full_listing() {
         .filter(|g| g.id != id)
         .all(|g| g.grantable));
 }
+
+/// `task.move` is granted exactly as `task.place` is: the same permission, held to the moved task.
+#[test]
+fn task_move_is_granted_and_scoped_as_task_place_is() {
+    let parse = |r: serde_json::Value| -> crate::Request { serde_json::from_value(r).unwrap() };
+    let place = parse(json!({ "op": "task.place", "uid": "u", "ns": "n" }));
+    let moved = parse(json!({ "op": "task.move", "uid": "u", "under": "p" }));
+    assert_eq!(moved.permission(), place.permission());
+    assert_eq!(moved.target(), place.target());
+
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let b_task = add(&kb.op, "task b");
+    let parent = add(&kb.op, "parent");
+    let (_, token) = grant(&kb.op, "coordinator", Some(&a), "coord");
+    let c = kb.as_token(&token);
+    match ok(&c, json!({ "op": "task.move", "uid": a, "under": parent })) {
+        Response::TaskMoved { moved } => assert!(moved.moved, "{moved:?}"),
+        other => panic!("{other:?}"),
+    }
+    let e = refused(
+        &c,
+        json!({ "op": "task.move", "uid": b_task, "under": parent }),
+    );
+    assert!(e.message.contains("scoped to another task"), "{e:?}");
+    let (_, rev) = grant(&kb.op, "reviewer", Some(&a), "rev-1");
+    refused(
+        &kb.as_token(&rev),
+        json!({ "op": "task.move", "uid": a, "under": b_task }),
+    );
+}

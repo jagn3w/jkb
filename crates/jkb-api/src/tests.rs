@@ -217,6 +217,10 @@ fn samples() -> Vec<Request> {
             ns: "n".into(),
             home: false,
         },
+        Request::TaskMove {
+            uid: "u".into(),
+            under: "p".into(),
+        },
         Request::TaskUnplace {
             uid: "u".into(),
             ns: "n".into(),
@@ -2138,7 +2142,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 28, "every write naming an item was asked");
+    assert_eq!(checked, 29, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {
@@ -2514,6 +2518,14 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
     // Every task write the wire accepts is here; `task.add` checks the task it makes, below.
     let mut covered: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();
     covered.push("task.add");
+    // A file's line is never moved at all: its parent is the file's indentation (`task::move_under`).
+    let e = call(
+        &host,
+        json!({ "op": "task.move", "uid": inside, "under": other }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("edit the file"), "{e:?}");
+    covered.push("task.move");
     covered.sort_unstable();
     covered.dedup();
     let mut task_writes: Vec<&str> = samples()
@@ -3327,4 +3339,52 @@ fn a_task_edit_replace_against_a_stale_base_is_refused_and_writes_nothing() {
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
     assert_eq!(body(), "Again");
+}
+
+#[test]
+fn task_move_reparents_names_the_parent_it_left_and_is_unchanged_when_repeated() {
+    let b = backend();
+    let add = |r: serde_json::Value| match call(&b, r).unwrap() {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let a = add(json!({ "op": "task.add", "text": "a" }));
+    let other = add(json!({ "op": "task.add", "text": "other" }));
+    let child = add(json!({ "op": "task.add", "text": "child", "under": a }));
+    let moved = |under: &str| match call(
+        &b,
+        json!({ "op": "task.move", "uid": child, "under": under }),
+    )
+    .unwrap()
+    {
+        Response::TaskMoved { moved } => moved,
+        other => panic!("{other:?}"),
+    };
+    let m = moved(&other);
+    assert_eq!((m.moved, m.from.as_deref()), (true, Some(a.as_str())));
+    assert_eq!(m.under, other);
+    let m = moved(&other);
+    assert_eq!((m.moved, m.from), (false, None), "already there");
+    let kids = |p: &str| match call(&b, json!({ "op": "task.subtasks", "uid": p })).unwrap() {
+        Response::Children { children, .. } => children
+            .into_iter()
+            .map(|c| c.reference)
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(kids(&other), std::slice::from_ref(&child));
+    assert!(kids(&a).is_empty());
+
+    let e = call(
+        &b,
+        json!({ "op": "task.move", "uid": child, "under": "nope" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+    let e = call(
+        &b,
+        json!({ "op": "task.move", "uid": other, "under": child }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("its own ancestor"), "{e:?}");
 }

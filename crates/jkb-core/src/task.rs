@@ -370,15 +370,17 @@ pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> 
 ///
 /// A parent with any non-terminal child leaves the ready frontier (design D34.3), so this
 /// is how a task too big for one branch is split into the pieces that actually get worked.
-/// Cycle-guarded by [`edge::link`], so a task cannot become its own ancestor.
+/// Cycle-guarded here, so a task cannot become its own ancestor: [`edge::link`] guards only
+/// `depends_on`, and a `parent_of` cycle would make the tree walks that bound their depth silently
+/// drop the loop. New subtasks cannot close one; [`move_under`] can, and is refused through this.
 ///
 /// An execution plan or a design span is never a task's parent (design D53.6): a plan's work is
 /// under its steps, and a plan's listing and its *archived* both walk only from the steps, so a task
 /// contained by the plan itself (or by a span) would be in neither — invisible, never prompted for.
 ///
 /// # Errors
-/// Returns a validation error if the edge would create a cycle, or if `parent` is an execution
-/// plan or a design span; otherwise a database error.
+/// Returns a validation error if `child` is `parent` or one of its ancestors, or if `parent` is an
+/// execution plan or a design span; otherwise a database error.
 pub fn add_subtask(
     conn: &Connection,
     meta: &WriteMeta,
@@ -394,11 +396,131 @@ pub fn add_subtask(
             ))));
         }
     }
-    // The edge records the relationship and refuses a cycle; the containment row records
-    // that the child lives inside the parent. Both here so they cannot drift — this is the
-    // only supported way to make a subtask.
+    if is_ancestor_or_self(conn, child, parent)? {
+        let uid = |id: ItemId| -> Result<String> {
+            Ok(crate::item::get(conn, id)?.map_or_else(|| id.to_string(), |m| m.uid))
+        };
+        let (c, p) = (uid(child)?, uid(parent)?);
+        return Err(Error::Types(TypeError::Validation(if child == parent {
+            format!("`{c}` cannot be its own parent")
+        } else {
+            format!(
+                "`{c}` cannot go under `{p}`: `{p}` is inside `{c}`, so the move would make \
+                 `{c}` its own ancestor"
+            )
+        })));
+    }
+    // The edge records the relationship; the containment row records that the child lives
+    // inside the parent. Both here so they cannot drift — this is the only supported way to
+    // make a subtask.
     edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
     crate::containment::contain(conn, meta, child, parent, 0)
+}
+
+/// Whether `ancestor` is `item` or above it, by containment or by a `parent_of` edge — both,
+/// because a file-synced task's parent is only its edge (the serializer writes no containment).
+/// `UNION` de-duplicates, so a cycle a hand-edited database already holds still ends the walk.
+fn is_ancestor_or_self(conn: &Connection, ancestor: ItemId, item: ItemId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "WITH RECURSIVE up(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT c.parent_item_id FROM containment c JOIN up ON c.child_item_id = up.id
+                 UNION
+                 SELECT e.src_item_id FROM edges e JOIN up ON e.dst_item_id = up.id
+                  WHERE e.type = 'parent_of'
+             )
+             SELECT 1 FROM up WHERE id = ?2 LIMIT 1",
+        )?
+        .query_row(params![item.get(), ancestor.get()], |r| r.get::<_, i64>(0))
+        .optional()?
+        .is_some())
+}
+
+/// What [`move_under`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moved {
+    /// The task was already under that parent; nothing was written.
+    Unchanged,
+    /// The task moved, from its previous parent (`None`: it had none).
+    Moved {
+        /// The parent it left.
+        from: Option<ItemId>,
+    },
+}
+
+/// Move the existing task `child` under `new_parent` — another task, or an execution plan's step.
+///
+/// Its old `parent_of` edge goes through [`edge::unlink`] (journalled, so `jkb undo` restores
+/// it) and the new parent is attached through [`add_subtask`], so the plan/span refusal and the
+/// cycle guard are the ones a new subtask meets. `containment::contain` is an upsert, journalled
+/// as an update of the existing row, so undo puts the old container back (or removes the row the
+/// task never had). Its placements and binding are untouched: a move changes what the task is
+/// part of, not where it is filed.
+///
+/// Refused for a task bound to a synced `file://` line: the tasks serializer owns that task's
+/// parent through the file's indentation, so the next sync would put it back.
+///
+/// # Errors
+/// [`TypeError::NotFound`] when either item is missing; a validation error when `child` is not a
+/// task, is bound to a file, or the move is refused by [`add_subtask`]; otherwise a database error.
+pub fn move_under(
+    conn: &Connection,
+    meta: &WriteMeta,
+    child: ItemId,
+    new_parent: ItemId,
+) -> Result<Moved> {
+    let invalid = |why: String| Error::Types(TypeError::Validation(why));
+    let task = crate::item::get(conn, child)?
+        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {child}"))))?;
+    if task.kind != "task" {
+        return Err(invalid(format!(
+            "`{}` is a {}, not a task: only a task moves under a new parent",
+            task.uid, task.kind
+        )));
+    }
+    if crate::item::get(conn, new_parent)?.is_none() {
+        return Err(Error::Types(TypeError::NotFound(format!(
+            "item {new_parent}"
+        ))));
+    }
+    if let Some(file) = binding::get(conn, child)?
+        .as_ref()
+        .and_then(|b| binding::file_path(&b.uri))
+    {
+        return Err(invalid(format!(
+            "`{}` is a line of {file}, whose indentation is its parent: edit the file to move it \
+             (a move here would be put back by the next sync)",
+            task.uid
+        )));
+    }
+    let edge_parents = parent_edges(conn, child)?;
+    let contained_in = crate::containment::parent(conn, child)?;
+    if contained_in == Some(new_parent) && edge_parents == [new_parent] {
+        return Ok(Moved::Unchanged);
+    }
+    for parent in &edge_parents {
+        edge::unlink(conn, meta, *parent, child, EdgeType::ParentOf)?;
+    }
+    add_subtask(conn, meta, new_parent, child)?;
+    Ok(Moved::Moved {
+        from: contained_in.or_else(|| edge_parents.first().copied()),
+    })
+}
+
+/// The sources of every `parent_of` edge into `child`, in id order.
+fn parent_edges(conn: &Connection, child: ItemId) -> Result<Vec<ItemId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT src_item_id FROM edges WHERE dst_item_id = ?1 AND type = 'parent_of'
+          ORDER BY src_item_id",
+    )?;
+    let rows = stmt.query_map([child.get()], |r| r.get::<_, i64>(0))?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(ItemId::new)
+        .collect())
 }
 
 /// The direct subtasks of `parent`, ordered by priority (asc, nulls last) then uid — the
@@ -1469,5 +1591,216 @@ mod tests {
             .read(move |conn| item::id_for_uid(conn, "task:rn"))
             .unwrap();
         assert_eq!(looked_up, Some(id));
+    }
+
+    // ---- move_under ---------------------------------------------------------------------------
+
+    mod move_under {
+        use jkb_types::{EdgeType, ItemId, SyncMode};
+
+        use super::super::{add_subtask, create, move_under, subtasks, Moved, NewTask};
+        use crate::{binding, containment, design, edge, item, Db};
+
+        struct Fixture {
+            db: Db,
+            plan: String,
+            step: ItemId,
+            span: ItemId,
+            a: ItemId,
+            t: ItemId,
+            loose: ItemId,
+        }
+
+        /// A design with a one-step plan and a span; task `a` with subtask `t`; parentless `loose`.
+        fn fixture() -> Fixture {
+            let db = Db::open_in_memory().unwrap();
+            let (plan, step, span, a, t, loose) = db
+                .write_txn("t", |c, m| {
+                    let d = design::create(c, m, "jkb", "Code Factory", "Build it.")?.uid;
+                    let p = design::plan::create(c, m, &d, "Ship it", &["one".to_owned()])?;
+                    let step = item::id_for_uid(c, &p.steps[0].uid)?.unwrap();
+                    let version = design::read(c, &d)?.version.token();
+                    let span = design::add_span(
+                        c,
+                        m,
+                        &d,
+                        &version,
+                        "Build it.",
+                        None,
+                        design::Reviewer::Operator,
+                    )?
+                    .span
+                    .unwrap();
+                    let span = item::id_for_uid(c, &span)?.unwrap();
+                    let a = create(c, m, &NewTask::new("task:a", "a"))?;
+                    let t = create(c, m, &NewTask::new("task:t", "t"))?;
+                    add_subtask(c, m, a, t)?;
+                    let loose = create(c, m, &NewTask::new("task:loose", "loose"))?;
+                    Ok((p.uid, step, span, a, t, loose))
+                })
+                .unwrap();
+            Fixture {
+                db,
+                plan,
+                step,
+                span,
+                a,
+                t,
+                loose,
+            }
+        }
+
+        fn mv(db: &Db, child: ItemId, parent: ItemId) -> crate::Result<Moved> {
+            db.write_txn("t", move |c, m| move_under(c, m, child, parent))
+        }
+
+        /// `(containment parent, parent_of edge sources)` of `child`.
+        fn parent_of(db: &Db, child: ItemId) -> (Option<ItemId>, Vec<ItemId>) {
+            db.read(move |c| {
+                let mut srcs: Vec<ItemId> = c
+                    .prepare(
+                        "SELECT src_item_id FROM edges WHERE dst_item_id = ?1 AND type = 'parent_of'",
+                    )?
+                    .query_map([child.get()], |r| r.get::<_, i64>(0))?
+                    .map(|r| r.map(ItemId::new))
+                    .collect::<rusqlite::Result<_>>()?;
+                srcs.sort();
+                Ok((containment::parent(c, child)?, srcs))
+            })
+            .unwrap()
+        }
+
+        fn kids(db: &Db, parent: ItemId) -> Vec<String> {
+            db.read(move |c| subtasks(c, parent))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.uid)
+                .collect()
+        }
+
+        fn plan_tasks(db: &Db, plan: &str) -> Vec<String> {
+            let plan = plan.to_owned();
+            db.read(move |c| design::plan::show(c, &plan))
+                .unwrap()
+                .tasks()
+                .map(|t| t.uid.clone())
+                .collect()
+        }
+
+        fn undo(db: &Db) {
+            db.write_txn("t", crate::undo::undo_last).unwrap();
+        }
+
+        #[test]
+        fn a_subtask_moves_from_a_task_to_a_step_and_undo_puts_it_back() {
+            let f = fixture();
+            assert_eq!(
+                mv(&f.db, f.t, f.step).unwrap(),
+                Moved::Moved { from: Some(f.a) }
+            );
+            assert_eq!(parent_of(&f.db, f.t), (Some(f.step), vec![f.step]));
+            assert_eq!(kids(&f.db, f.step), ["task:t"]);
+            assert!(
+                kids(&f.db, f.a).is_empty(),
+                "the old parent no longer lists it"
+            );
+            assert_eq!(plan_tasks(&f.db, &f.plan), ["task:t"]);
+
+            undo(&f.db);
+            assert_eq!(parent_of(&f.db, f.t), (Some(f.a), vec![f.a]));
+            assert_eq!(kids(&f.db, f.a), ["task:t"]);
+            assert!(kids(&f.db, f.step).is_empty());
+        }
+
+        #[test]
+        fn a_parentless_task_moves_under_a_step_and_undo_leaves_it_parentless() {
+            let f = fixture();
+            assert_eq!(
+                mv(&f.db, f.loose, f.step).unwrap(),
+                Moved::Moved { from: None }
+            );
+            assert_eq!(parent_of(&f.db, f.loose), (Some(f.step), vec![f.step]));
+            assert_eq!(plan_tasks(&f.db, &f.plan), ["task:loose"]);
+            undo(&f.db);
+            assert_eq!(parent_of(&f.db, f.loose), (None, vec![]));
+            assert!(plan_tasks(&f.db, &f.plan).is_empty());
+        }
+
+        #[test]
+        fn a_move_to_the_current_parent_is_unchanged_and_writes_nothing() {
+            let f = fixture();
+            let entries = |db: &Db| {
+                db.read(|c| {
+                    Ok(c.query_row("SELECT count(*) FROM changelog", [], |r| r.get::<_, i64>(0))?)
+                })
+                .unwrap()
+            };
+            let before = entries(&f.db);
+            assert_eq!(mv(&f.db, f.t, f.a).unwrap(), Moved::Unchanged);
+            assert_eq!(entries(&f.db), before);
+            assert_eq!(parent_of(&f.db, f.t), (Some(f.a), vec![f.a]));
+        }
+
+        #[test]
+        fn a_move_under_a_plan_or_a_span_is_refused_and_leaves_the_parent() {
+            let f = fixture();
+            let plan =
+                f.db.read({
+                    let plan = f.plan.clone();
+                    move |c| item::id_for_uid(c, &plan)
+                })
+                .unwrap()
+                .unwrap();
+            for parent in [plan, f.span] {
+                let e = mv(&f.db, f.t, parent).unwrap_err();
+                assert!(e.to_string().contains("holds no tasks"), "{e}");
+                assert_eq!(parent_of(&f.db, f.t), (Some(f.a), vec![f.a]));
+            }
+        }
+
+        #[test]
+        fn a_move_that_would_make_a_task_its_own_ancestor_is_refused() {
+            let f = fixture();
+            // Under its own subtask, and under a grandchild reached only by a file's edge.
+            let e = mv(&f.db, f.a, f.t).unwrap_err();
+            assert!(e.to_string().contains("its own ancestor"), "{e}");
+            let (top, sub) = (f.a, f.t);
+            let grand =
+                f.db.write_txn("t", move |c, m| {
+                    let g = create(c, m, &NewTask::new("task:g", "g"))?;
+                    edge::link(c, m, sub, g, EdgeType::ParentOf, None)?;
+                    Ok(g)
+                })
+                .unwrap();
+            let e = mv(&f.db, top, grand).unwrap_err();
+            assert!(e.to_string().contains("`task:g` is inside `task:a`"), "{e}");
+            let e = mv(&f.db, top, top).unwrap_err();
+            assert!(e.to_string().contains("its own parent"), "{e}");
+            assert_eq!(parent_of(&f.db, top), (None, vec![]));
+            assert_eq!(parent_of(&f.db, sub), (Some(top), vec![top]));
+        }
+
+        #[test]
+        fn a_file_bound_task_or_a_non_task_is_refused() {
+            let f = fixture();
+            let t = f.t;
+            f.db.write_txn("t", move |c, m| {
+                binding::set(
+                    c,
+                    m,
+                    t,
+                    "file:///r/tasks.md#t1",
+                    Some(SyncMode::Bidirectional),
+                    None,
+                )
+            })
+            .unwrap();
+            let e = mv(&f.db, t, f.step).unwrap_err();
+            assert!(e.to_string().contains("edit the file"), "{e}");
+            assert_eq!(parent_of(&f.db, t), (Some(f.a), vec![f.a]));
+            // The step is not a task.
+            let e = mv(&f.db, f.step, f.a).unwrap_err();
+            assert!(e.to_string().contains("not a task"), "{e}");
+        }
     }
 }

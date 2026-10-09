@@ -233,6 +233,33 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             report(ops.json, &uid, "placed");
             Ok(())
         }
+        TaskCmd::Move { uid, under } => {
+            let moved = match ops.call(Request::TaskMove {
+                uid: uid.clone(),
+                under,
+            })? {
+                Response::TaskMoved { moved } => moved,
+                other => return unexpected("task.move", &other),
+            };
+            if ops.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "uid": uid,
+                        "moved": moved.moved,
+                        "from": moved.from,
+                        "under": moved.under,
+                    })
+                );
+            } else if !moved.moved {
+                println!("unchanged: {uid} is already under {}", moved.under);
+            } else if let Some(from) = &moved.from {
+                println!("moved {uid} from {from} to {}", moved.under);
+            } else {
+                println!("moved {uid} under {}", moved.under);
+            }
+            Ok(())
+        }
         TaskCmd::Unplace { uid, ns } => {
             let removed = match ops.call(Request::TaskUnplace {
                 uid: uid.clone(),

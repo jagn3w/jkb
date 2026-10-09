@@ -68,6 +68,7 @@ pub const fn handles(command: &Command) -> bool {
                 | TaskCmd::Depend { .. }
                 | TaskCmd::Undepend { .. }
                 | TaskCmd::Place { .. }
+                | TaskCmd::Move { .. }
                 | TaskCmd::Unplace { .. }
                 | TaskCmd::Bind { .. }
                 | TaskCmd::Claim { .. }
