@@ -1049,7 +1049,10 @@ the renderer's `sessions/` (`watch.ts`, the provider every tab reads the dot fro
 - **The app leaves `claude/notify` when it stops reading.** A new op, `mq.group_delete` (CLI:
   `jkb mq group rm <topic> <group>`), removes the app's group when the feed's last window closes
   (macOS keeps a windowless app running) and on quit, which waits up to 1.5 s for it — and for any
-  removal already in flight. As first built the group stayed after every ordinary quit, holding each
+  removal already in flight — then ends the process with `app.exit()`. It first called `app.quit()`
+  again, expecting a second `will-quit`: measured in CI's Electron smoke (Electron 44, Linux), the
+  window and terminals were gone and the main process then sat idle until killed, so the app could
+  not be quit. As first built the group stayed after every ordinary quit, holding each
   later post and withdrawal unreapable; at the topic's cap `send` is refused, so `notify.event` failed
   `queue_full` and the notifier showed nothing. A join waits for a removal still in flight and then
   asks again whether anyone still wants the feed; after quit nothing joins; and a join already in

@@ -473,7 +473,7 @@ app.on("will-quit", (event) => {
   // The staged build goes in once this process — and every other copy — has exited. Started on the
   // first pass, before the notify leave below holds the quit: it is a detached spawn that returns at
   // once, and the step itself waits for this process to exit, so neither delays the other. Once,
-  // because the leave re-quits and this handler runs again. A quit during a build leaves that build
+  // because a second quit during the leave below runs this handler again. A quit during a build leaves that build
   // running (its output goes to update.log, not to this process) to finish staging, and the next
   // start offers whatever is staged and not running (`pendingInstall`). If the build still holds the
   // lock when an install step started here gets to it, the step records 75 and that start says why.
@@ -483,12 +483,19 @@ app.on("will-quit", (event) => {
     if (!started.ok) process.stderr.write(`code-factory: ${started.error}\n`);
   }
   // Once: hold the quit until the app's group is off `claude/notify` (or the wait runs out), then
-  // quit again. A group left there would keep every later notification unreapable until the topic's
-  // cap refuses `notify.event`.
+  // exit. A group left there would keep every later notification unreapable until the topic's cap
+  // refuses `notify.event`.
+  //
+  // EXIT, NOT QUIT. This used to call `app.quit()` again, expecting a second will-quit that this
+  // guard lets through. Measured in CI (Electron 44, Linux, the Electron smoke): the window and
+  // every terminal were gone, and the main process then sat idle until killed — the second
+  // `app.quit()` after a prevented will-quit never ended the process. `app.exit()` ends it at once
+  // without emitting the quit events again, which is all this second pass ever did: the windows
+  // are closed and the cleanup above has run.
   if (leftNotify) return;
   leftNotify = true;
   event.preventDefault();
-  void notifyFeed.leaveAll(LEAVE_WAIT_MS).finally(() => app.quit());
+  void notifyFeed.leaveAll(LEAVE_WAIT_MS).finally(() => app.exit(0));
 });
 
 app.on("window-all-closed", () => {
