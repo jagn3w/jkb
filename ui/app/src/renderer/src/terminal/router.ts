@@ -19,7 +19,14 @@ export class TerminalEventRouter {
   private heldChars = 0;
   private readonly unsubscribe: () => void;
 
-  constructor(subscribe: (listener: (event: TerminalEvent) => void) => () => void) {
+  constructor(
+    subscribe: (listener: (event: TerminalEvent) => void) => () => void,
+    /**
+     * Held output dropped unseen, so its characters can still be acknowledged to main: main counts
+     * them as outstanding, and a terminal whose output was never acknowledged stays paused (`FLOW`).
+     */
+    private readonly onDropped: (id: number, chars: number) => void = () => undefined,
+  ) {
     this.unsubscribe = subscribe((event) => this.deliver(event));
   }
 
@@ -45,7 +52,10 @@ export class TerminalEventRouter {
     for (const [id, list] of this.held) {
       if (this.heldChars <= HELD_LIMIT_CHARS) return;
       this.held.delete(id);
-      for (const e of list) this.heldChars -= e.kind === "data" ? e.data.length : 0;
+      let chars = 0;
+      for (const e of list) chars += e.kind === "data" ? e.data.length : 0;
+      this.heldChars -= chars;
+      if (chars > 0) this.onDropped(id, chars);
     }
   }
 

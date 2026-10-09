@@ -27,7 +27,7 @@ export function TerminalPopover(): React.JSX.Element | null {
           type="button"
           className="terminal-close"
           aria-label={`Close ${entry.spec.title}`}
-          title="Close (ends its program)"
+          title="Close (signals its program to end; in the container, from inside it)"
           onClick={() => terminals.close(entry.key)}
         >
           ×

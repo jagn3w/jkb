@@ -709,23 +709,85 @@ what is open where, one xterm instance per terminal that outlives its view, the 
 popover, and `useTerminals()` — `open(spec, "drawer" | "popover")` is what a tab calls). The drawer
 folds with Ctrl+` and is resized by its top edge; its height is a per-window convenience.
 
-- **A container terminal is `docker exec -i -t -e TERM=… -w <cwd> <container> <argv>`**, with
-  `/bin/bash -l` (absolute, as the kit names every program it execs) when the spec has no argv. The
-  container is `$JKB_CONTAINER_NAME`, default `jkb-dev`: the variable `run.sh` reads. A name that is
-  not one (`--privileged`) is refused rather than handed to docker as a flag. `docker` itself is
-  looked for at fixed absolute paths, never on `PATH`: a GUI app's `PATH` is not the shell's.
+- **A container terminal is `docker exec -i -t -e TERM=… -w <cwd> <container> /bin/sh -c
+  <WRAPPER_SCRIPT> jkb-terminal <record> <argv>`**, with `/bin/bash -l` (absolute, as the kit names
+  every program it execs) when the spec has no argv. The wrapper writes its PID to
+  `/tmp/jkb-terminals/<uuid>.pid` inside the container and `exec`s the program, so the PID is the
+  program's; it refuses to start a program it could not record. The container is
+  `$JKB_CONTAINER_NAME`, default `jkb-dev`: the variable `run.sh` reads, but read from the APP's
+  environment — a Dock- or Finder-launched app does not see shell-rc exports, so a non-default name
+  must be set where the app is launched (`launchctl setenv JKB_CONTAINER_NAME …` on macOS, then
+  relaunch; or start the app from that shell). The *New terminal* button's tooltip names the
+  container it enters, so a mismatch is visible. A name that is not one (`--privileged`) is refused
+  rather than handed to docker as a flag. `docker` itself is looked for at fixed absolute paths,
+  never on `PATH`: a GUI app's `PATH` is not the shell's.
+- **Ending a container program is explicit (review s2-r1).** Closing, restarting or retargeting a
+  container terminal kills the `docker exec` client AND runs a second `docker exec <container>
+  /bin/sh -c <END_SCRIPT> jkb-terminal-end <record>`, which sends the recorded process group SIGHUP
+  (what a closing terminal sends, and what an interactive `bash`, which ignores TERM, passes on to
+  its jobs), TERM after 2 s and KILL after 4 s, and exits 0 only once the recorded process is gone.
+  `close` answers a `TerminalEnd { target, confirmed, detail }`: `confirmed` is true only for that
+  exit 0 (or, on the host, the program's own exit after its hangup). The UI says "ended" only then;
+  otherwise it writes the end command's failure and "it may still be running". The toggle starts the
+  program on the other side only after a confirmed end (`requireEnded`), so an unconfirmed end of a
+  `claude --resume <uuid>` cannot leave two writers on one session; *Restart* then runs it anyway,
+  as a deliberate second act. A window's close or reload, and quit, send the ends without waiting.
+  A program that exits on its own leaves its record file in the container's `/tmp` (one line, gone
+  when the container restarts).
+- **A program on the host runs only on main's own confirmation.** `TerminalHost.open` refuses a
+  host spec with a non-empty argv unless that window confirmed exactly that `(cwd, argv)` through
+  `confirmHost`, which shows main's native dialog with the argv (shell-quoted, `formatArgv`) and the
+  cwd; the renderer cannot answer it. A yes lasts for the window until it closes or reloads, so
+  *Restart* does not ask again. The one exception is a spec main built itself from its own constants
+  (the Container tab's `run.sh <flag>`, D53.8), approved as main hands it out. The toggle always
+  confirms a move to the host: a program through that dialog, the login shell (which runs nothing
+  until typed into) through the page's own confirm showing the cwd. A move to the container does not
+  ask.
+- **A bare program name on the host runs through the login shell.** A host argv whose `argv[0]` is
+  absolute runs as it is; a bare one (`claude`, carried over by the toggle from a container spec)
+  runs as `<$SHELL> -l -c 'exec <argv, POSIX-quoted>'`, so it is found on the PATH the person's
+  profile builds — a Dock-launched app's own PATH is launchd's `/usr/bin:/bin:/usr/sbin:/sbin`,
+  without `~/.local/bin`. Chosen over requiring an absolute `argv[0]`, which would make the toggle
+  refuse every container spec (they name programs bare, for the container's PATH). The quoting is
+  single quotes with `'\''`, total for POSIX shells; a login shell outside that family (fish, whose
+  single quotes treat `\` differently) is not trusted with the words, and `/bin/sh -l` runs them.
+  Pinned in `test/terminal.test.mjs` against a real `/bin/sh -l` whose profile alone puts the program
+  on PATH, with `'`, spaces, `$`, a trailing `\`, `*` and an empty word.
 - **Main trusts nothing the renderer sends.** `parseSpec` refuses unknown fields (there is no `env`
   to smuggle in), relative or NUL-bearing paths, and oversized argv; sizes and writes are bounded. A
   terminal belongs to the window that opened it: only that window can write to it, resize it or
   close it, and it is killed when that window closes or reloads. The PTYs never cross the bridge,
   only their output does.
 - **The toggle restarts the program on the other side.** A process cannot move between the
-  container and the host, so switching ends it (after asking, while it runs) and starts the spec
-  again there. The cwd crosses through the repos mount (`HOST_REPOS` ⇄ `CTR_REPOS` in `run.sh`), the
-  one directory both sides see; outside it, the target's default. The badge on the tab says where
-  it runs, and a host badge is drawn inverted so it cannot be read as the quiet default.
-- **A second open with the same `sessionUuid` shows the terminal already running it**, so a
-  double-clicked *Play* or *Discuss* does not start a second Claude on one session.
+  container and the host, so switching ends it (see above) and starts the spec again there. The cwd
+  crosses through the repos mount (`HOST_REPOS` ⇄ `CTR_REPOS` in `run.sh`), the one directory both
+  sides see; outside it, the target's default. Like `run.sh`'s `container_path`, both spellings of
+  the host root map: `TerminalRoots.hostReposReal` is `~/repos` with its links resolved, once, by
+  main (`machineRoots`), so a cwd from `git rev-parse --show-toplevel` under a symlinked `~/repos`
+  still lands in the repo rather than in `CTR_REPOS`. `containerPathOf` is the one statement of the
+  host → container rule; the Sessions tab's resume (`sessionResumeSpec`) uses it too. The badge on
+  the tab says where it runs, and a host badge is drawn inverted so it cannot be read as the quiet
+  default.
+- **A second open with the same `sessionUuid` shows the terminal while its program is starting or
+  running** (`planOpen`), so a double-clicked *Play* or *Discuss* does not start a second Claude on
+  one session. Once that program has exited or failed, the open runs the NEW spec in the same tab:
+  a *Resume* on a prompt whose launch terminal is still in the drawer, dead, runs `claude --resume`
+  rather than reselecting the corpse (review s6).
+- **Output is flow-controlled.** Main counts the characters it sent a terminal that the renderer has
+  not acknowledged; past `FLOW.high` (100 000) it pauses the PTY (`pty.pause()`), so a `yes` blocks
+  on a full kernel buffer instead of growing the IPC queue and xterm's write buffer until the
+  renderer dies, and below `FLOW.low` (5 000) it resumes. The renderer acknowledges from xterm's
+  write callback — characters actually parsed — in batches of `FLOW.ackBatch` (4 096, below `low`,
+  so a drawn-but-unacknowledged remainder cannot hold a terminal paused), and the event router
+  acknowledges output it held for an unclaimed terminal and had to drop. Measured in
+  `test/terminal.test.mjs`: a real `yes` stops within the watermark plus one flush while
+  unacknowledged, sends nothing more for 300 ms, and resumes on the ack.
+- **Pastes are chunked below `MAX_WRITE_CHARS` without splitting a surrogate pair** (`chunkWrite`),
+  which would otherwise reach the PTY as two U+FFFD.
+- **The 16 ANSI colours are design tokens** (`--terminal-ansi-*`, a light and a dark value each, read
+  by `terminal/theme.ts`). xterm's defaults are for a dark ground; on the light one its white, bright
+  white and yellow vanished. Every light value reads at 3:1 or better on `--terminal-bg`, and every
+  dark one but `black` (conventionally a ground) does on the dark ground; pinned in the test.
 
 What it cost to learn:
 
@@ -745,8 +807,21 @@ What it cost to learn:
   that one build is what the tests load in Node. Loading it in Electron is exercised by the
   Electron smoke, which needs the binary the sandbox cannot download; it runs in CI.
 - **Unmeasured here, stated:** what Docker does to the process inside the container when the
-  `docker exec` client is killed (no Docker in the agent sandbox), and the macOS `spawn-helper` path
-  of node-pty (no Mac). Packaging the native module (`asarUnpack`) is subtask 10's (D53.3, as built).
+  `docker exec` client is killed (no Docker in the agent sandbox; moby#9098 reports it survives).
+  The explicit end does not depend on the answer, but its own premises are unmeasured against real
+  Docker too: that `docker exec -t` starts the program as a session and process-group leader (so the
+  recorded PID names its group), that a second `docker exec` can signal it, and that `/proc` and
+  `sleep 0.1` behave in the image as on Debian. What IS measured is the mechanism, against a stand-in
+  `docker` that runs the program in a new session (`setsid`), the way the real client is a separate
+  process from what it runs: with the end, an interactive `bash` and its background job are gone and
+  the record removed; without it (an end that fails), the program outlives its client and the UI
+  says "may still be running". Until it is measured live, the UI claims an ending only on the end
+  command's success. Also unmeasured: the macOS `spawn-helper` path of node-pty (no Mac). Packaging
+  the native module (`asarUnpack`) is subtask 10's (D53.3, as built).
+- **A pre-existing flake, measured, not fixed:** "output is gathered into few messages" loses the
+  tail of a fast program's output in a few runs (2 of 15 on the unchanged tree, linux-arm64, node-pty
+  1.1.0): node-pty reports the exit and drops what was still in the master's buffer. Delaying the
+  exit by 50 ms did not help (3 of 20), so the data is lost rather than late.
 
 ## Subtasks, in landing order
 

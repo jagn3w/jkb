@@ -29,7 +29,7 @@ const src = path.join(here, "..", "src");
 const { contributeSpec, CONTRIBUTE_SCRIPT, PACKAGED_FILE } = await load(path.join(src, "renderer", "src", "workflows", "contribute.ts"));
 const { parseSpec } = await load(path.join(src, "shared", "terminal.ts"));
 
-const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostHome: "/Users/me" };
+const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostReposReal: "/Users/me/repos", hostHome: "/Users/me" };
 
 test("Contribute opens a container terminal in the jkb checkout, the name a parameter", () => {
   const spec = contributeSpec("swarm-implementer", ROOTS);

@@ -113,7 +113,7 @@ export function TerminalDrawer(): React.JSX.Element {
                 type="button"
                 className="terminal-close"
                 aria-label={`Close ${e.spec.title}`}
-                title="Close (ends its program)"
+                title="Close (signals its program to end; in the container, from inside it)"
                 onClick={(ev) => {
                   ev.stopPropagation();
                   terminals.close(e.key);
@@ -128,7 +128,7 @@ export function TerminalDrawer(): React.JSX.Element {
           type="button"
           className="terminal-action"
           aria-label="New terminal"
-          title="New terminal in the container"
+          title={`New terminal in the container${terminals.roots === undefined ? "" : ` ${terminals.roots.container}`}`}
           disabled={terminals.roots === undefined}
           onClick={() => terminals.openShell()}
         >

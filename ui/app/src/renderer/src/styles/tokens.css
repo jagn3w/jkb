@@ -62,6 +62,27 @@
   /* The integrated terminal: the page's own ground, so a terminal reads as part of the app. */
   --terminal-bg: #ffffff;
   --terminal-selection: #d3d3d1;
+  /*
+   * Its 16 ANSI colours, for a light ground: "white" and the bright set are darkened, since a
+   * program writing bright white or yellow expects a dark ground and would vanish on this one.
+   * Every one reads at 3:1 or better on --terminal-bg (pinned by app/test/terminal.test.mjs).
+   */
+  --terminal-ansi-black: #191919;
+  --terminal-ansi-red: #c42b1c;
+  --terminal-ansi-green: #15803d;
+  --terminal-ansi-yellow: #8a6100;
+  --terminal-ansi-blue: #2563eb;
+  --terminal-ansi-magenta: #a626a4;
+  --terminal-ansi-cyan: #0e7490;
+  --terminal-ansi-white: #6b6b6b;
+  --terminal-ansi-bright-black: #6b6b6b;
+  --terminal-ansi-bright-red: #b91c1c;
+  --terminal-ansi-bright-green: #166534;
+  --terminal-ansi-bright-yellow: #7a5200;
+  --terminal-ansi-bright-blue: #1d4ed8;
+  --terminal-ansi-bright-magenta: #86198f;
+  --terminal-ansi-bright-cyan: #155e75;
+  --terminal-ansi-bright-white: #404040;
 
   /* Motion. */
   --motion: 150ms;
@@ -96,6 +117,22 @@
 
     --terminal-bg: #191919;
     --terminal-selection: #3f3f3f;
+    --terminal-ansi-black: #5f5f5f;
+    --terminal-ansi-red: #f26464;
+    --terminal-ansi-green: #4fbf77;
+    --terminal-ansi-yellow: #e0a43a;
+    --terminal-ansi-blue: #6b9bf5;
+    --terminal-ansi-magenta: #c678dd;
+    --terminal-ansi-cyan: #56b6c2;
+    --terminal-ansi-white: #d4d4d4;
+    --terminal-ansi-bright-black: #8a8a8a;
+    --terminal-ansi-bright-red: #ff7b72;
+    --terminal-ansi-bright-green: #7ee2a8;
+    --terminal-ansi-bright-yellow: #f2cc60;
+    --terminal-ansi-bright-blue: #9cbcff;
+    --terminal-ansi-bright-magenta: #d2a8ff;
+    --terminal-ansi-bright-cyan: #7dd3e0;
+    --terminal-ansi-bright-white: #ffffff;
   }
 }
 

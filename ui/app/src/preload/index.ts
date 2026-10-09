@@ -17,7 +17,9 @@ const bridge: JkbBridge = {
     open: (spec, cols, rows) => ipcRenderer.invoke(BRIDGE_CHANNELS.terminalOpen, spec, cols, rows),
     write: (id, data) => ipcRenderer.send(BRIDGE_CHANNELS.terminalWrite, id, data),
     resize: (id, cols, rows) => ipcRenderer.send(BRIDGE_CHANNELS.terminalResize, id, cols, rows),
-    close: (id) => ipcRenderer.send(BRIDGE_CHANNELS.terminalClose, id),
+    close: (id) => ipcRenderer.invoke(BRIDGE_CHANNELS.terminalClose, id),
+    ack: (id, chars) => ipcRenderer.send(BRIDGE_CHANNELS.terminalAck, id, chars),
+    confirmHost: (spec) => ipcRenderer.invoke(BRIDGE_CHANNELS.terminalConfirmHost, spec),
     onEvent: (listener) => {
       // Only the payload reaches the renderer, never the IPC event (whose `sender` is an
       // `ipcRenderer` that could send on any channel).

@@ -11,7 +11,7 @@ import {
 } from "../../../shared/terminal";
 import { TerminalEventRouter } from "./router";
 import { TerminalSession, themeFromTokens } from "./session";
-import { INITIAL_STATE, findSession, reduce, type Placement, type TerminalsState } from "./state";
+import { INITIAL_STATE, planOpen, reduce, type Placement, type TerminalsState } from "./state";
 
 /**
  * The integrated terminal, as every tab sees it (D53.10). A caller builds a `TerminalSpec` (from
@@ -23,8 +23,9 @@ export interface TerminalsApi {
   /** Where terminals run, once main has said; `undefined` until then. */
   readonly roots: TerminalRoots | undefined;
   /**
-   * Open a terminal from `spec`. A spec naming a `sessionUuid` that an open terminal already
-   * runs shows that terminal instead of starting a second. Returns the terminal's key.
+   * Open a terminal from `spec`. A spec naming a `sessionUuid` that an open terminal is still
+   * running shows that terminal instead of starting a second; one whose program has ended runs
+   * `spec` in that terminal (`planOpen`). Returns the terminal's key.
    */
   open(spec: TerminalSpec, placement?: Placement): number;
   /** Open the target's login shell in its default directory (the drawer's "+"). */
@@ -70,7 +71,10 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
 
   // The bridge is reached only from effects and handlers, never during render.
   useEffect(() => {
-    const r = new TerminalEventRouter((listener) => window.jkb.terminal.onEvent(listener));
+    const r = new TerminalEventRouter(
+      (listener) => window.jkb.terminal.onEvent(listener),
+      (id, chars) => window.jkb.terminal.ack(id, chars),
+    );
     router.current = r;
     let live = true;
     window.jkb.info().then(
@@ -101,11 +105,17 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
   }, []);
 
   const open = useCallback((spec: TerminalSpec, placement: Placement = "drawer"): number => {
-    const existing = findSession(stateRef.current, spec.sessionUuid);
-    if (existing !== undefined) {
-      if (existing.placement === "drawer") dispatch({ type: "select", key: existing.key });
-      sessions.current.get(existing.key)?.focus();
-      return existing.key;
+    const plan = planOpen(stateRef.current, spec);
+    if (plan.kind !== "new") {
+      const { key } = plan.entry;
+      const session = sessions.current.get(key);
+      if (plan.kind === "relaunch" && session !== undefined) {
+        dispatch({ type: "restart", key, spec });
+        void session.start(spec);
+      }
+      if (plan.entry.placement === "drawer") dispatch({ type: "select", key });
+      session?.focus();
+      return key;
     }
     const r = router.current;
     if (r === undefined) throw new Error("the terminal is not ready");
@@ -153,14 +163,31 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
       const entry = stateRef.current.entries.find((e) => e.key === key);
       const session = sessions.current.get(key);
       if (entry === undefined || session === undefined || roots === undefined || entry.spec.target === target) return;
-      const live = entry.status.kind === "running" || entry.status.kind === "starting";
-      if (live && !window.confirm(`Run "${entry.spec.title}" on the ${targetLabel(target)} instead? Its program is ended and started again there.`)) {
+      const spec = retargetSpec(entry.spec, target, roots);
+      const move = (): void => {
+        dispatch({ type: "restart", key, spec });
+        session.term.write(`\r\n\x1b[2m— moving to the ${targetLabel(target)}, in ${spec.cwd} —\x1b[22m\r\n`);
+        // The program on the other side starts only once the one here is seen to have ended.
+        void session.start(spec, { requireEnded: true });
+      };
+      if (target !== "host") return move();
+      // A move to the host is always confirmed, showing exactly what runs and where. A program is
+      // confirmed by main's own dialog (which main also requires before it runs one); the login
+      // shell runs nothing until it is typed into, and is confirmed here.
+      if (spec.argv.length > 0) {
+        void window.jkb.terminal.confirmHost(spec).then(
+          (answer) => {
+            if (answer.ok && answer.value) move();
+            else if (!answer.ok) session.term.write(`\r\n\x1b[2mnot moved: ${answer.error}\x1b[22m\r\n`);
+          },
+          () => undefined,
+        );
         return;
       }
-      const spec = retargetSpec(entry.spec, target, roots);
-      dispatch({ type: "restart", key, spec });
-      session.term.write(`\r\n\x1b[2m— now on the ${targetLabel(target)}, in ${spec.cwd} —\x1b[22m\r\n`);
-      void session.start(spec);
+      const question =
+        `Open a login shell on the host, outside the container?\n\nProgram: your login shell\nIn: ${spec.cwd}` +
+        (entry.status.kind === "running" || entry.status.kind === "starting" ? "\n\nThe program running here is signalled to end first." : "");
+      if (window.confirm(question)) move();
     },
     [roots],
   );

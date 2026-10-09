@@ -27,9 +27,9 @@ async function load(entry) {
 
 const src = path.join(here, "..", "src");
 const { launchSpec, resumeSpec, LAUNCH_SCRIPT, RESUME_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
-const { parseSpec, retarget } = await load(path.join(src, "shared", "terminal.ts"));
+const { parseSpec } = await load(path.join(src, "shared", "terminal.ts"));
 
-const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostHome: "/Users/me" };
+const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostReposReal: "/Users/me/repos", hostHome: "/Users/me" };
 const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
 
 const record = (over = {}) => ({
@@ -73,17 +73,16 @@ test("a recorded session resumes in its recorded cwd, under its own session id",
     sessionUuid: UUID,
   });
   assert.equal(parseSpec(spec).ok, true, "main accepts it");
-  // A session the toggle moved to the host recorded a host path: carried back through the mount.
+  // A session recorded with a host path: carried back through the mount.
   const moved = resumeSpec(record({ cwd: "/Users/me/repos/jkb" }), ROOTS);
   assert.equal(moved.cwd, "/home/vscode/repos");
   assert.equal(moved.argv.at(-1), "./jkb");
-  // ... and the toggle takes the resume to the host again: the mount's root there, the same
-  // relative directory, so it lands where it was recorded.
-  assert.equal(retarget(moved, "host", ROOTS).cwd, "/Users/me/repos");
   assert.equal(resumeSpec(record({ cwd: "/home/vscode/repos" }), ROOTS).argv.at(-1), "./");
   const elsewhere = resumeSpec(record({ cwd: "/elsewhere" }), ROOTS);
   assert.equal(elsewhere.cwd, "/", "outside both mounts: from the root...");
   assert.equal(elsewhere.argv.at(-1), "/elsewhere", "...into the directory as recorded");
+  const linked = { ...ROOTS, hostReposReal: "/Volumes/dev/repos" };
+  assert.equal(resumeSpec(record({ cwd: "/Volumes/dev/repos/jkb" }), linked).argv.at(-1), "./jkb", "a host cwd through the resolved root");
 });
 
 /** Stand-ins: `jkb` logging a record call (or refusing one), `claude` reporting what it got. */

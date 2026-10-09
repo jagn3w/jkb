@@ -40,6 +40,37 @@ export const SPEC_LIMITS = {
 /** The largest single write main accepts. A paste is chunked below this by the renderer. */
 export const MAX_WRITE_CHARS = 64 * 1024;
 
+/**
+ * `data` in pieces of at most `max` UTF-16 units, never splitting a surrogate pair: half of one
+ * crosses the bridge as a lone surrogate and reaches the PTY as U+FFFD.
+ */
+export function chunkWrite(data: string, max: number = MAX_WRITE_CHARS): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < data.length) {
+    let end = Math.min(i + max, data.length);
+    // A high surrogate at the cut belongs with the low one after it.
+    if (end < data.length && end - i > 1) {
+      const last = data.charCodeAt(end - 1);
+      if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+    }
+    out.push(data.slice(i, end));
+    i = end;
+  }
+  return out;
+}
+
+/**
+ * Flow control (D53.10). Main stops reading a terminal's PTY once more than `high` characters it
+ * sent are not yet drawn, and starts again below `low`; the renderer acknowledges what xterm has
+ * drawn in batches of `ackBatch`. `ackBatch` is below `low`, so what is drawn but not yet
+ * acknowledged can never hold a terminal paused.
+ */
+export const FLOW = { high: 100_000, low: 5_000, ackBatch: 4_096 } as const;
+
+/** The largest single acknowledgement main takes: more than it can have outstanding. */
+export const MAX_ACK_CHARS = 16 * 1024 * 1024;
+
 /** The terminal sizes main accepts. */
 export const SIZE_LIMITS = { minCols: 2, maxCols: 1000, minRows: 1, maxRows: 500 } as const;
 
@@ -117,8 +148,14 @@ export interface TerminalRoots {
   readonly container: string;
   /** The repos directory inside the container (`CTR_REPOS` in `.container/run.sh`). */
   readonly containerRepos: string;
-  /** The same directory on the host (`HOST_REPOS`). */
+  /** The same directory on the host (`HOST_REPOS`), as spelled. */
   readonly hostRepos: string;
+  /**
+   * `hostRepos` with its links resolved (`HOST_REPOS_REAL`), or `hostRepos` itself when it is
+   * none. A host path reached through the link (`git rev-parse --show-toplevel` answers this
+   * spelling) is under the mount too, and maps the same way.
+   */
+  readonly hostReposReal: string;
   /** Where a host terminal starts when nothing better is known. */
   readonly hostHome: string;
 }
@@ -135,6 +172,23 @@ function rebase(path: string, from: string, to: string): string | undefined {
   return undefined;
 }
 
+/** Both spellings of the host's repos directory: as spelled, then with its links resolved (`run.sh`'s `container_path`). */
+function hostRoots(roots: TerminalRoots): string[] {
+  return [roots.hostRepos, roots.hostReposReal];
+}
+
+/**
+ * The container's path for a host path under the repos mount, through either spelling of the
+ * host's root; `undefined` outside it.
+ */
+export function containerPathOf(path: string, roots: TerminalRoots): string | undefined {
+  for (const root of hostRoots(roots)) {
+    const mapped = rebase(path, root, roots.containerRepos);
+    if (mapped !== undefined) return mapped;
+  }
+  return undefined;
+}
+
 /**
  * `spec` moved to `target` (the per-terminal toggle). The program and title are kept; the
  * working directory is translated through the repos mount, the one directory both sides see,
@@ -143,19 +197,38 @@ function rebase(path: string, from: string, to: string): string | undefined {
  */
 export function retarget(spec: TerminalSpec, target: TerminalTarget, roots: TerminalRoots): TerminalSpec {
   if (spec.target === target) return spec;
-  const [from, to] =
-    target === "host" ? [roots.containerRepos, roots.hostRepos] : [roots.hostRepos, roots.containerRepos];
-  const cwd = rebase(spec.cwd, from, to) ?? defaultCwd(target, roots);
-  return { ...spec, target, cwd };
+  const mapped =
+    target === "host" ? rebase(spec.cwd, roots.containerRepos, roots.hostRepos) : containerPathOf(spec.cwd, roots);
+  return { ...spec, target, cwd: mapped ?? defaultCwd(target, roots) };
 }
 
 /**
- * `path` in the host's filesystem: a container path under the repos mount is carried to the host's
- * side of it; a path already under the host's repos directory is kept; anything else is `undefined`,
- * since neither side can say where it is on the other.
+ * `path` in the host's filesystem, spelled under `hostRepos`: a container path under the repos
+ * mount is carried to the host's side of it; a path under either spelling of the host's repos
+ * directory is kept (re-spelled under `hostRepos`); anything else is `undefined`, since neither
+ * side can say where it is on the other.
  */
 export function hostPathOf(path: string, roots: TerminalRoots): string | undefined {
-  return rebase(path, roots.containerRepos, roots.hostRepos) ?? rebase(path, roots.hostRepos, roots.hostRepos);
+  const fromContainer = rebase(path, roots.containerRepos, roots.hostRepos);
+  if (fromContainer !== undefined) return fromContainer;
+  for (const root of hostRoots(roots)) {
+    const kept = rebase(path, root, roots.hostRepos);
+    if (kept !== undefined) return kept;
+  }
+  return undefined;
+}
+
+/**
+ * `arg` quoted for a POSIX shell: single quotes, with each `'` closed, escaped and reopened. Total
+ * (every string, including newlines, comes back as itself) and the only quoting the terminal does.
+ */
+export function shellQuote(arg: string): string {
+  return /^[A-Za-z0-9_\/.,:=@%+-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+/** `argv` as one line a person can read and a POSIX shell would run as the same words. */
+export function formatArgv(argv: readonly string[]): string {
+  return argv.map(shellQuote).join(" ");
 }
 
 /** How a target is named on a terminal's tab, so it is never ambiguous where a command runs. */
@@ -168,6 +241,18 @@ export interface TerminalInfo {
   /** Main's id for it; unique for the life of the app. */
   readonly id: number;
   readonly spec: TerminalSpec;
+}
+
+/**
+ * What closing a terminal did to its program (D53.10). `confirmed` is true only when main saw the
+ * program end: a host program's exit, or, for a container program, the in-container end command
+ * reporting that the recorded process group is gone. Ending the `docker exec` client alone is never
+ * taken as ending what it runs. `detail` says what happened, for the screen.
+ */
+export interface TerminalEnd {
+  readonly target: TerminalTarget;
+  readonly confirmed: boolean;
+  readonly detail: string;
 }
 
 /** What main tells the renderer about a terminal it runs. */

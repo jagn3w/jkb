@@ -7,21 +7,15 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal, type ITheme } from "@xterm/xterm";
 
-import { MAX_WRITE_CHARS, type TerminalEvent, type TerminalSpec } from "../../../shared/terminal";
+import { FLOW, chunkWrite, type TerminalEnd, type TerminalEvent, type TerminalSpec } from "../../../shared/terminal";
 import type { TerminalEventRouter } from "./router";
 import type { TerminalStatus } from "./state";
+import { themeFrom } from "./theme";
 
 /** The terminal's colours, from the design tokens, so it follows the app's light and dark. */
 export function themeFromTokens(): ITheme {
   const css = getComputedStyle(document.documentElement);
-  const token = (name: string, fallback: string): string => css.getPropertyValue(name).trim() || fallback;
-  return {
-    background: token("--terminal-bg", "#ffffff"),
-    foreground: token("--ink", "#191919"),
-    cursor: token("--ink", "#191919"),
-    cursorAccent: token("--terminal-bg", "#ffffff"),
-    selectionBackground: token("--terminal-selection", "#d3d3d1"),
-  };
+  return themeFrom((name) => css.getPropertyValue(name));
 }
 
 function monoFont(): string {
@@ -50,8 +44,11 @@ export class TerminalSession {
   private opened = false;
   private opening: Promise<void> | undefined;
   private ptyId: number | undefined;
+  private ptyTarget: TerminalSpec["target"] = "container";
   private generation = 0;
   private disposed = false;
+  /** Drawn output not yet acknowledged to main, and the PTY it came from. */
+  private drawn = { id: -1, chars: 0 };
 
   constructor(
     private readonly router: TerminalEventRouter,
@@ -79,9 +76,21 @@ export class TerminalSession {
 
   private send(data: string): void {
     if (this.ptyId === undefined) return;
-    for (let i = 0; i < data.length; i += MAX_WRITE_CHARS) {
-      window.jkb.terminal.write(this.ptyId, data.slice(i, i + MAX_WRITE_CHARS));
+    for (const chunk of chunkWrite(data)) window.jkb.terminal.write(this.ptyId, chunk);
+  }
+
+  /** xterm drew `chars` of `id`'s output: tell main in batches, so it reads the PTY again (`FLOW`). */
+  private drew(id: number, chars: number): void {
+    if (this.drawn.id !== id) this.drawn = { id, chars: 0 };
+    this.drawn.chars += chars;
+    if (this.drawn.chars >= FLOW.ackBatch) {
+      window.jkb.terminal.ack(id, this.drawn.chars);
+      this.drawn.chars = 0;
     }
+  }
+
+  private writeNote(text: string): void {
+    if (!this.disposed) this.term.write(note(text));
   }
 
   /**
@@ -123,11 +132,42 @@ export class TerminalSession {
     this.term.options.theme = theme;
   }
 
-  /** Start (or start again) the program `spec` names. */
-  async start(spec: TerminalSpec): Promise<void> {
-    this.stop();
+  /**
+   * Start (or start again) the program `spec` names, ending the one running first. A program on the
+   * host runs only once main's own dialog confirmed it (`confirmHost`; it does not ask again for one
+   * already confirmed in this window). With `requireEnded` (the target toggle), a container program
+   * that could not be confirmed ended keeps the new one from starting: two programs on one session
+   * is worse than none.
+   */
+  async start(spec: TerminalSpec, options: { readonly requireEnded?: boolean } = {}): Promise<void> {
     const generation = ++this.generation;
     this.onStatus({ kind: "starting" });
+    if (spec.target === "host" && spec.argv.length > 0) {
+      let confirmed;
+      try {
+        confirmed = await window.jkb.terminal.confirmHost(spec);
+      } catch (e) {
+        confirmed = { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+      }
+      if (this.disposed || generation !== this.generation) return;
+      if (!confirmed.ok || !confirmed.value) {
+        const why = confirmed.ok ? "running it on the host was not confirmed" : confirmed.error;
+        this.writeNote(`not started: ${why}`);
+        this.onStatus({ kind: "failed", error: why });
+        return;
+      }
+    }
+    const ended = await this.stop();
+    if (this.disposed || generation !== this.generation) return;
+    if (ended !== undefined) {
+      this.writeNote(`[${ended.detail}]`);
+      if (options.requireEnded === true && !ended.confirmed) {
+        const why = `not started on the ${spec.target}: ${ended.detail}. Restart runs it anyway.`;
+        this.writeNote(why);
+        this.onStatus({ kind: "failed", error: why });
+        return;
+      }
+    }
     this.fit();
     let result;
     try {
@@ -139,7 +179,7 @@ export class TerminalSession {
       // Closed or restarted while it was starting: end the one that just started.
       if (result.ok) {
         this.router.retire(result.value.id);
-        window.jkb.terminal.close(result.value.id);
+        void window.jkb.terminal.close(result.value.id);
       }
       return;
     }
@@ -150,6 +190,7 @@ export class TerminalSession {
     }
     const id = result.value.id;
     this.ptyId = id;
+    this.ptyTarget = spec.target;
     this.onStatus({ kind: "running" });
     this.router.claim(id, (event) => this.receive(id, event));
     // The size may have changed while the open was in flight.
@@ -159,7 +200,8 @@ export class TerminalSession {
   private receive(id: number, event: TerminalEvent): void {
     if (id !== this.ptyId) return;
     if (event.kind === "data") {
-      this.term.write(event.data);
+      const chars = event.data.length;
+      this.term.write(event.data, () => this.drew(id, chars));
       return;
     }
     this.ptyId = undefined;
@@ -167,18 +209,27 @@ export class TerminalSession {
     this.onStatus({ kind: "exited", exitCode: event.exitCode, ...(event.signal ? { signal: event.signal } : {}) });
   }
 
-  /** End the running program, if any, without disposing the screen. */
-  private stop(): void {
-    if (this.ptyId === undefined) return;
+  /**
+   * End the running program, if any, without disposing the screen: what main saw of its ending, or
+   * `undefined` when nothing was running.
+   */
+  private async stop(): Promise<TerminalEnd | undefined> {
+    if (this.ptyId === undefined) return undefined;
     const id = this.ptyId;
     this.ptyId = undefined;
     this.router.retire(id);
-    window.jkb.terminal.close(id);
+    try {
+      const result = await window.jkb.terminal.close(id);
+      // Gone already (it exited as it was closed): its exit was the ending.
+      return result.ok ? result.value : undefined;
+    } catch (e) {
+      return { target: this.ptyTarget, confirmed: false, detail: `could not end it: ${e instanceof Error ? e.message : String(e)}` };
+    }
   }
 
   dispose(): void {
     this.disposed = true;
-    this.stop();
+    void this.stop();
     this.term.dispose();
     this.host.remove();
   }

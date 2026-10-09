@@ -76,8 +76,13 @@ this tree (`scripts/check.sh` does); without it the test skips and says so.
 
 The terminal's `node-pty` compiles on Linux with node-gyp, which downloads Node's headers from
 nodejs.org; where that is unreachable add `npm_config_nodedir=/usr` to the install. A container
-terminal enters `$JKB_CONTAINER_NAME` (default `jkb-dev`, as `.container/run.sh`); Ctrl+` folds
-the drawer.
+terminal enters `$JKB_CONTAINER_NAME` (default `jkb-dev`, as `.container/run.sh`), read from the
+app's own environment: an app launched from the Dock or Finder does not see what your shell rc
+exports, so for a non-default name run `launchctl setenv JKB_CONTAINER_NAME <name>` and relaunch
+the app (or start it from that shell). The *New terminal* button's tooltip names the container it
+enters. Closing a container terminal also ends its program inside the container with a second
+`docker exec` (D53.10); a program is run on the host only after the app's own dialog shows you its
+exact command and directory. Ctrl+` folds the drawer.
 
 ## Run the extension
 

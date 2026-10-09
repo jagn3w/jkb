@@ -114,6 +114,24 @@ export function findSession(state: TerminalsState, sessionUuid: string | undefin
   return state.entries.find((e) => e.spec.sessionUuid === sessionUuid);
 }
 
+/**
+ * What opening `spec` does (D53.10). A terminal with the same `sessionUuid` that is still starting
+ * or running is shown, so a double-clicked *Play* does not start a second Claude on one session. One
+ * whose program has ended (exited, or failed to start) is started again from `spec` — the new ask
+ * (a *Resume*, say) rather than whatever it first ran — in the same tab. Anything else is new.
+ */
+export type OpenPlan =
+  | { readonly kind: "show"; readonly entry: TerminalEntry }
+  | { readonly kind: "relaunch"; readonly entry: TerminalEntry }
+  | { readonly kind: "new" };
+
+export function planOpen(state: TerminalsState, spec: TerminalSpec): OpenPlan {
+  const entry = findSession(state, spec.sessionUuid);
+  if (entry === undefined) return { kind: "new" };
+  const live = entry.status.kind === "starting" || entry.status.kind === "running";
+  return { kind: live ? "show" : "relaunch", entry };
+}
+
 /** The drawer's terminals, in tab order. */
 export function drawerEntries(state: TerminalsState): TerminalEntry[] {
   return state.entries.filter((e) => e.placement === "drawer");

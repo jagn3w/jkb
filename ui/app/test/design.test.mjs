@@ -405,7 +405,7 @@ test("a line's margin shows its least advanced state, and a run that only touche
 
 // ---- Discuss -------------------------------------------------------------------------------------
 
-const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostHome: "/Users/me" };
+const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostReposReal: "/Users/me/repos", hostHome: "/Users/me" };
 
 test("Discuss runs Claude in the design's repo with the prompt as one argument, never as shell", () => {
   const prompt = { kind: "discuss", uid: "design:x", title: "Code Factory", version: "3.AQ", start: 0, end: 4, quote: "text", occurrence: null, spans: [], prompt: "it's $(rm -rf /) `x` \"q\"" };

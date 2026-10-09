@@ -150,7 +150,7 @@ function repos() {
 
 test("a session's directory resolves to its checkout, repo key and branch, from git's files alone", () => {
   const { root, main, wt } = repos();
-  const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: root, hostHome: "/home/me" };
+  const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: root, hostReposReal: root, hostHome: "/home/me" };
   assert.deepEqual(gitPlace(main, roots), ok({ root: main, repo: "jkb", branch: "main" }));
   assert.deepEqual(gitPlace(path.join(wt, "src"), roots), ok({ root: wt, repo: "build", branch: "task/build-1" }), "a linked worktree, from a subdirectory");
   assert.deepEqual(
@@ -167,7 +167,7 @@ test("a session's directory resolves to its checkout, repo key and branch, from 
 
 test("only the repos directory is looked at, nothing is followed out of it, and no file's contents cross", () => {
   const { root, main, wt } = repos();
-  const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: root, hostHome: "/home/me" };
+  const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: root, hostReposReal: root, hostHome: "/home/me" };
   for (const cwd of ["/etc", `${root}/../`, `${root}/jkb/../../`, "relative/path", 5, undefined]) {
     const r = gitPlace(cwd, roots);
     assert.equal(r.ok, false, String(cwd));
@@ -332,7 +332,7 @@ test("the registry is read a page at a time, to its end or a bound", async () =>
 
 // ---- re-attach after a rebuild -------------------------------------------------------------------
 
-const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostHome: "/Users/me" };
+const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostReposReal: "/Users/me/repos", hostHome: "/Users/me" };
 const entry = (key, spec, status = { kind: "running" }) => ({ key, spec, placement: "drawer", status });
 const claudeSpec = (session, over = {}) => ({ target: "container", cwd: "/home/vscode/repos/jkb", argv: ["/bin/bash", "-lc", "x"], title: `Play · ${session.slice(0, 4)}`, sessionUuid: session, ...over });
 

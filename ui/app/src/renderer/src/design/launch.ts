@@ -13,7 +13,7 @@
 
 import type { DesignPromptRecord, Launch } from "@jkb/core";
 
-import type { TerminalRoots, TerminalSpec } from "../../../shared/terminal";
+import { containerPathOf, type TerminalRoots, type TerminalSpec } from "../../../shared/terminal";
 
 /**
  * Record the prompt, then become Claude. Positional parameters: `$1` design, `$2` session uuid,
@@ -123,12 +123,11 @@ export function sessionResumeSpec(
   roots: TerminalRoots,
 ): TerminalSpec {
   const ctr = roots.containerRepos.replace(/\/+$/, "");
-  const host = roots.hostRepos.replace(/\/+$/, "");
-  const hostOnly = !under(ask.cwd, ctr) && under(ask.cwd, host);
-  const cwd = hostOnly ? ctr + ask.cwd.slice(host.length) : ask.cwd;
-  // Under the repos mount the terminal starts at its root — which exists on both sides, so the
-  // target toggle still carries the resume across — and the script moves into the directory,
-  // relative to it. Elsewhere it starts at `/` and moves to the absolute path.
+  // A host path (through either spelling of the host's repos root, `containerPathOf`) is carried
+  // into the container through the mount.
+  const cwd = under(ask.cwd, ctr) ? ask.cwd : (containerPathOf(ask.cwd, roots) ?? ask.cwd);
+  // Under the repos mount the terminal starts at its root and the script moves into the
+  // directory, relative to it. Elsewhere it starts at `/` and moves to the absolute path.
   const [start, dir] = under(cwd, ctr) ? [roots.containerRepos, `./${cwd.slice(ctr.length + 1)}`] : ["/", cwd];
   return {
     target: "container",

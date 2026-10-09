@@ -4,17 +4,27 @@
 // app. `node-pty` is injected rather than imported, for the same reason.
 //
 // A terminal is made from a spec the renderer sends, validated by `parseSpec` before anything
-// runs. A container terminal is `docker exec -it -w <cwd> <container> <argv>`; a host terminal runs
-// `argv` itself. Every terminal belongs to the window that opened it: only that window can write
-// to it, resize it or close it, it hears only that window's events, and it is killed when that
-// window closes.
+// runs. A container terminal is `docker exec -it -w <cwd> <container> <wrapper> <argv>`, the
+// wrapper recording the program's process group inside the container so that closing it can end it
+// there (`END_SCRIPT`), not only end the docker client; a host terminal runs `argv` itself (a bare
+// program name through the login shell). A host terminal that runs a program needs the person's
+// confirmation, asked by main, before it starts. Every terminal belongs to the window that opened
+// it: only that window can write to it, resize it, acknowledge its output or close it, it hears
+// only that window's events, and it is ended when that window closes.
 
-import { statSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
+import { join } from "node:path";
 
 import {
+  FLOW,
+  MAX_ACK_CHARS,
   MAX_WRITE_CHARS,
+  formatArgv,
   isValidSize,
   parseSpec,
+  type TerminalEnd,
   type TerminalEvent,
   type TerminalInfo,
   type TerminalResult,
@@ -30,6 +40,9 @@ export interface Pty {
   write(data: string): void;
   resize(cols: number, rows: number): void;
   kill(signal?: string): void;
+  /** Stop reading the PTY (its program blocks once the kernel's buffer fills), and start again. */
+  pause(): void;
+  resume(): void;
 }
 
 /** `node-pty`'s `spawn`, narrowed to what this module passes. */
@@ -50,7 +63,55 @@ export interface TerminalEnvironment {
   readonly env: Readonly<Record<string, string | undefined>>;
   /** Whether `path` is a directory on the host. */
   isDirectory(path: string): boolean;
+  /**
+   * Run a short command to completion (the in-container end), with its exit code (`null` when it
+   * was killed or never started) and what it printed.
+   */
+  run(file: string, args: readonly string[], timeoutMs: number): Promise<{ code: number | null; output: string }>;
+  /** Where, inside the container, each container terminal's process is recorded. */
+  readonly containerRunDir: string;
 }
+
+/** `TerminalEnvironment.containerRunDir` on a real machine: the container's own tmp. */
+export const CONTAINER_RUN_DIR = "/tmp/jkb-terminals";
+
+/**
+ * The wrapper every container program runs under: `$1` is the file to record in, the rest is the
+ * program. It records its own PID and then becomes the program (`exec`), so the PID is the
+ * program's. `docker exec -t` starts it as a session (and so a process group) leader, which is what
+ * `END_SCRIPT` signals. If it cannot record, it refuses to run rather than start something closing
+ * could not end.
+ */
+export const WRAPPER_SCRIPT =
+  'mkdir -p "${1%/*}" && printf \'%s\\n\' "$$" >"$1" || { echo "jkb: could not record this terminal in $1; not starting it" >&2; exit 125; }; shift; exec "$@"';
+
+/**
+ * Ends a container program from a second `docker exec`: `$1` is the file the wrapper recorded in.
+ * It sends the recorded process group a hangup — what closing a terminal sends, and what an
+ * interactive shell (which ignores TERM) passes on to its jobs — then TERM after 2 s and KILL after
+ * 4 s, and succeeds only once the recorded process is gone or a zombie (exit 0). 3: nothing
+ * recorded; 4: still running after 5 s.
+ */
+export const END_SCRIPT = [
+  'p=$(cat "$1" 2>/dev/null) || { echo "nothing recorded at $1" >&2; exit 3; }',
+  'case $p in ""|*[!0-9]*) echo "not a process id in $1" >&2; exit 3;; esac',
+  // Gone, or a zombie its parent has not reaped yet (it has ended either way).
+  'running() { kill -0 "$p" 2>/dev/null || return 1; s=$(cat "/proc/$p/stat" 2>/dev/null) || return 0; case ${s##*") "} in Z*) return 1;; esac; return 0; }',
+  'kill -s HUP -- "-$p" 2>/dev/null',
+  "i=0",
+  "while running; do",
+  "  i=$((i+1))",
+  '  [ "$i" -eq 20 ] && kill -s TERM -- "-$p" 2>/dev/null',
+  '  [ "$i" -eq 40 ] && kill -s KILL -- "-$p" 2>/dev/null',
+  '  [ "$i" -gt 50 ] && { echo "process $p is still running" >&2; exit 4; }',
+  "  sleep 0.1",
+  "done",
+  'rm -f "$1"',
+].join("\n");
+
+/** How long main waits for the in-container end, and for a host program to exit after its hangup. */
+export const END_TIMEOUT_MS = 10_000;
+export const HOST_EXIT_WAIT_MS = 3_000;
 
 /** The program a container terminal runs when its spec names none: the image's shell, by absolute path. */
 export const CONTAINER_SHELL: readonly string[] = ["/bin/bash", "-l"];
@@ -74,18 +135,42 @@ export const DOCKER_CANDIDATES: readonly string[] = [
 /** A container name `docker exec` will take as a name, never as a flag. */
 const CONTAINER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
+/** A terminal's tag: names its record in the container. Never a path or a flag. */
+const TAG = /^[A-Za-z0-9-]{1,64}$/;
+
 /** What to spawn for a spec: the program, its arguments, and the directory to start it in. */
 export interface Command {
   readonly file: string;
   readonly args: readonly string[];
   readonly cwd: string;
+  /** For a container program: the second `docker exec` that ends it inside the container. */
+  readonly end?: { readonly file: string; readonly args: readonly string[] };
+}
+
+/** Login shells that take POSIX quoting, so `formatArgv`'s words reach the program unchanged. */
+const POSIX_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh"]);
+
+/**
+ * How a host spec's argv runs. A program named by absolute path runs as it is. A bare name
+ * (`claude`) runs through the login shell — `<shell> -l -c 'exec <argv, quoted>'` — so it is found
+ * on the PATH the person's profile builds: a Dock-launched app's own PATH is launchd's minimal one,
+ * where `~/.local/bin` is not. A login shell that does not take POSIX quoting (fish) is not trusted
+ * to keep the words intact; `/bin/sh -l` runs it instead.
+ */
+export function hostArgv(argv: readonly string[], hostShell: string): { file: string; args: string[] } {
+  const [program, ...rest] = argv;
+  if (program === undefined) return { file: hostShell, args: ["-l"] };
+  if (program.startsWith("/")) return { file: program, args: rest };
+  const shell = POSIX_SHELLS.has(hostShell.slice(hostShell.lastIndexOf("/") + 1)) ? hostShell : "/bin/sh";
+  return { file: shell, args: ["-l", "-c", `exec ${formatArgv(argv)}`] };
 }
 
 /**
  * The command a spec runs. A container spec's `cwd` is the container's and goes to `docker exec
- * -w`; the docker client itself starts in the host's home, which exists.
+ * -w`; the docker client itself starts in the host's home, which exists. `tag` names the
+ * container program's record (`WRAPPER_SCRIPT`), unique per terminal.
  */
-export function commandFor(spec: TerminalSpec, env: TerminalEnvironment): TerminalResult<Command> {
+export function commandFor(spec: TerminalSpec, env: TerminalEnvironment, tag: string): TerminalResult<Command> {
   if (spec.target === "container") {
     const docker = env.docker();
     if (docker === undefined) {
@@ -93,20 +178,39 @@ export function commandFor(spec: TerminalSpec, env: TerminalEnvironment): Termin
     }
     const container = env.roots.container;
     if (!CONTAINER_NAME.test(container)) return { ok: false, error: `not a container name: ${JSON.stringify(container)}` };
+    if (!TAG.test(tag)) return { ok: false, error: `not a terminal tag: ${JSON.stringify(tag)}` };
+    const record = `${env.containerRunDir.replace(/\/+$/, "")}/${tag}.pid`;
     const program = spec.argv.length > 0 ? spec.argv : CONTAINER_SHELL;
     return {
       ok: true,
       value: {
         file: docker,
         // Everything after the container name is the command, never docker's flags.
-        args: ["exec", "-i", "-t", "-e", `TERM=${TERM}`, "-e", "COLORTERM=truecolor", "-w", spec.cwd, container, ...program],
+        args: [
+          "exec", "-i", "-t", "-e", `TERM=${TERM}`, "-e", "COLORTERM=truecolor", "-w", spec.cwd, container,
+          "/bin/sh", "-c", WRAPPER_SCRIPT, "jkb-terminal", record, ...program,
+        ],
         cwd: env.roots.hostHome,
+        end: { file: docker, args: ["exec", container, "/bin/sh", "-c", END_SCRIPT, "jkb-terminal-end", record] },
       },
     };
   }
   if (!env.isDirectory(spec.cwd)) return { ok: false, error: `no such directory on the host: ${spec.cwd}` };
-  const [file, ...args] = spec.argv.length > 0 ? spec.argv : [env.hostShell, "-l"];
-  return { ok: true, value: { file: file ?? env.hostShell, args, cwd: spec.cwd } };
+  return { ok: true, value: { ...hostArgv(spec.argv, env.hostShell), cwd: spec.cwd } };
+}
+
+/** Whether running `spec` needs the person's confirmation first: a program, on the host. */
+export function needsHostConfirmation(spec: TerminalSpec): boolean {
+  return spec.target === "host" && spec.argv.length > 0;
+}
+
+/** What main shows when it asks to run a program on the host: the exact words and where. */
+export interface HostPrompt {
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  /** `argv` as a shell would read it (`formatArgv`). */
+  readonly command: string;
+  readonly title: string;
 }
 
 /**
@@ -121,6 +225,33 @@ export function terminalEnv(env: Readonly<Record<string, string | undefined>>): 
   out["TERM"] = TERM;
   out["COLORTERM"] = "truecolor";
   return out;
+}
+
+/** The container's repos directory (`CTR_REPOS` in `.container/run.sh`). */
+export const CONTAINER_REPOS = "/home/vscode/repos";
+
+/**
+ * Where terminals run on this machine: the container `run.sh` starts (`$JKB_CONTAINER_NAME`, the
+ * variable it reads, default `jkb-dev` — read from the app's OWN environment, which for a
+ * Dock-launched app is not the shell's; ui/README.md says how to set it there) and the repos mount,
+ * the one directory both sides see: `~/repos` as spelled and with its links resolved
+ * (`HOST_REPOS`/`HOST_REPOS_REAL`), so a path reached through either maps into the container.
+ */
+export function machineRoots(home: string, env: Readonly<Record<string, string | undefined>>): TerminalRoots {
+  const hostRepos = join(home, "repos");
+  let hostReposReal = hostRepos;
+  try {
+    hostReposReal = realpathSync(hostRepos);
+  } catch {
+    // Not there yet: only the spelling can name it.
+  }
+  return {
+    container: env["JKB_CONTAINER_NAME"]?.trim() || "jkb-dev",
+    containerRepos: CONTAINER_REPOS,
+    hostRepos,
+    hostReposReal,
+    hostHome: home,
+  };
 }
 
 /** The real machine: docker by `DOCKER_CANDIDATES`, the host shell from `$SHELL`. */
@@ -147,15 +278,37 @@ export function machineEnvironment(roots: TerminalRoots, env: Readonly<Record<st
         return false;
       }
     },
+    run: runToEnd(env),
+    containerRunDir: CONTAINER_RUN_DIR,
   };
+}
+
+/** `TerminalEnvironment.run` with `execFile`, in `env` (without Electron's variables). */
+export function runToEnd(env: Readonly<Record<string, string | undefined>>): TerminalEnvironment["run"] {
+  return (file, args, timeoutMs) =>
+    new Promise((resolve) => {
+      execFile(file, [...args], { env: terminalEnv(env), timeout: timeoutMs, maxBuffer: 64 * 1024 }, (error, stdout, stderr) => {
+        const output = `${stdout}${stderr}`.trim();
+        if (error === null) return resolve({ code: 0, output });
+        const code = (error as { code?: unknown }).code;
+        resolve({ code: typeof code === "number" ? code : null, output: output || error.message });
+      });
+    });
 }
 
 interface Running {
   readonly owner: number;
   readonly info: TerminalInfo;
   readonly pty: Pty;
+  /** The second docker exec that ends a container program inside the container. */
+  readonly end: Command["end"];
+  /** Resolves when the PTY's program has exited. */
+  readonly exited: Promise<void>;
   pending: string;
   timer: ReturnType<typeof setTimeout> | undefined;
+  /** Characters sent and not yet acknowledged as drawn (flow control). */
+  unacked: number;
+  paused: boolean;
 }
 
 /**
@@ -172,12 +325,59 @@ export class TerminalHost {
   private readonly running = new Map<number, Running>();
   private nextId = 1;
 
+  /** Per window: the host programs (cwd and argv) the person confirmed, or main itself built. */
+  private readonly approved = new Map<number, Set<string>>();
+
   constructor(
     private readonly spawn: SpawnPty,
     private readonly environment: TerminalEnvironment,
     /** Delivers an event to the window that owns the terminal. */
     private readonly emit: (owner: number, event: TerminalEvent) => void,
+    /**
+     * Asks the person, in main's own dialog, whether to run a program on the host. The renderer
+     * cannot answer it: a host program runs only once this said yes (or main built the spec).
+     */
+    private readonly askHost: (owner: number, prompt: HostPrompt) => Promise<boolean> = () => Promise.resolve(false),
+    private readonly newTag: () => string = () => randomUUID(),
   ) {}
+
+  private static approvalKey(spec: TerminalSpec): string {
+    return JSON.stringify([spec.cwd, spec.argv]);
+  }
+
+  /**
+   * Record that `owner` may run `spec` on the host without asking: for a spec main built itself
+   * from its own constants (the kit's `run.sh`, D53.8), never for one the renderer sent.
+   */
+  approveHost(owner: number, spec: TerminalSpec): void {
+    const set = this.approved.get(owner) ?? new Set<string>();
+    set.add(TerminalHost.approvalKey(spec));
+    this.approved.set(owner, set);
+  }
+
+  /**
+   * Ask the person whether `owner` may run the (unvalidated) `rawSpec` on the host, showing its
+   * exact argv and cwd; `true` when it may (or need not ask: a container spec, the login shell, or
+   * one already confirmed). The answer is remembered for that window until it closes or reloads.
+   */
+  async confirmHost(owner: number, rawSpec: unknown): Promise<TerminalResult<boolean>> {
+    const parsed = parseSpec(rawSpec);
+    if (!parsed.ok) return parsed;
+    const spec = parsed.value;
+    if (!needsHostConfirmation(spec) || this.isApproved(owner, spec)) return { ok: true, value: true };
+    let yes: boolean;
+    try {
+      yes = await this.askHost(owner, { argv: spec.argv, cwd: spec.cwd, command: formatArgv(spec.argv), title: spec.title });
+    } catch (e) {
+      return { ok: false, error: `could not ask: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (yes) this.approveHost(owner, spec);
+    return { ok: true, value: yes };
+  }
+
+  private isApproved(owner: number, spec: TerminalSpec): boolean {
+    return this.approved.get(owner)?.has(TerminalHost.approvalKey(spec)) ?? false;
+  }
 
   /** Start a terminal for `owner` from an unvalidated spec, at an initial size. */
   open(owner: number, rawSpec: unknown, cols: unknown, rows: unknown): TerminalResult<TerminalInfo> {
@@ -185,7 +385,10 @@ export class TerminalHost {
     if (!parsed.ok) return parsed;
     if (!isValidSize(cols, rows)) return { ok: false, error: "not a terminal size" };
     const spec = parsed.value;
-    const command = commandFor(spec, this.environment);
+    if (needsHostConfirmation(spec) && !this.isApproved(owner, spec)) {
+      return { ok: false, error: "running a program on the host needs your confirmation first" };
+    }
+    const command = commandFor(spec, this.environment, this.newTag());
     if (!command.ok) return command;
 
     let pty: Pty;
@@ -201,7 +404,19 @@ export class TerminalHost {
       return { ok: false, error: `could not start ${command.value.file}: ${e instanceof Error ? e.message : String(e)}` };
     }
     const id = this.nextId++;
-    const entry: Running = { owner, info: { id, spec }, pty, pending: "", timer: undefined };
+    let markExited = (): void => undefined;
+    const exited = new Promise<void>((resolve) => (markExited = resolve));
+    const entry: Running = {
+      owner,
+      info: { id, spec },
+      pty,
+      end: command.value.end,
+      exited,
+      pending: "",
+      timer: undefined,
+      unacked: 0,
+      paused: false,
+    };
     this.running.set(id, entry);
     pty.onData((data) => {
       entry.pending += data;
@@ -211,6 +426,7 @@ export class TerminalHost {
     pty.onExit(({ exitCode, signal }) => {
       this.flush(entry);
       this.running.delete(id);
+      markExited();
       this.emit(owner, { id, kind: "exit", exitCode, ...(signal ? { signal } : {}) });
     });
     return { ok: true, value: entry.info };
@@ -222,7 +438,39 @@ export class TerminalHost {
     if (entry.pending === "") return;
     const data = entry.pending;
     entry.pending = "";
+    entry.unacked += data.length;
+    // Past the high watermark the PTY is not read until the renderer catches up: the program
+    // blocks on a full buffer instead of growing the IPC queue and xterm's write buffer.
+    if (!entry.paused && entry.unacked > FLOW.high && this.running.has(entry.info.id)) {
+      entry.paused = true;
+      try {
+        entry.pty.pause();
+      } catch {
+        // Exited: nothing to pause.
+      }
+    }
     this.emit(entry.owner, { id: entry.info.id, kind: "data", data });
+  }
+
+  /** The renderer drew `chars` of a terminal's output. Whether it was taken. */
+  ack(owner: number, id: unknown, chars: unknown): boolean {
+    const entry = this.owned(owner, id);
+    if (entry === undefined || !Number.isInteger(chars) || (chars as number) < 1 || (chars as number) > MAX_ACK_CHARS) return false;
+    entry.unacked = Math.max(0, entry.unacked - (chars as number));
+    if (entry.paused && entry.unacked < FLOW.low) {
+      entry.paused = false;
+      try {
+        entry.pty.resume();
+      } catch {
+        // Exited: nothing to resume.
+      }
+    }
+    return true;
+  }
+
+  /** Whether main has stopped reading terminal `id` until its output is drawn (for tests). */
+  isPaused(id: number): boolean {
+    return this.running.get(id)?.paused ?? false;
   }
 
   /** The terminal `id`, if `owner` owns it and it is still running. */
@@ -252,26 +500,61 @@ export class TerminalHost {
     return true;
   }
 
-  /** End a terminal's process. Its exit arrives as an event, as for any other ending. */
-  close(owner: number, id: unknown): boolean {
+  /**
+   * End a terminal's program, and say whether it is seen to have ended. The PTY's exit still
+   * arrives as an event. A host program is sent a hangup and is confirmed by its exit. A container
+   * program is ended inside the container by the end command, and confirmed only by that command's
+   * success: killing the `docker exec` client is not taken to end what it runs.
+   */
+  async close(owner: number, id: unknown): Promise<TerminalResult<TerminalEnd>> {
     const entry = this.owned(owner, id);
-    if (entry === undefined) return false;
-    entry.pty.kill();
-    return true;
+    if (entry === undefined) return { ok: false, error: "no such terminal" };
+    return { ok: true, value: await this.end(entry) };
   }
 
-  /** End every terminal `owner` runs (its window closed), or every terminal (the app quits). */
+  private async end(entry: Running): Promise<TerminalEnd> {
+    try {
+      entry.pty.kill();
+    } catch {
+      // Already gone.
+    }
+    if (entry.end === undefined) {
+      const exited = await Promise.race([
+        entry.exited.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), HOST_EXIT_WAIT_MS).unref?.()),
+      ]);
+      return exited
+        ? { target: "host", confirmed: true, detail: "the program ended" }
+        : { target: "host", confirmed: false, detail: `the program was sent a hangup and had not exited after ${HOST_EXIT_WAIT_MS / 1000} s` };
+    }
+    let result: { code: number | null; output: string };
+    try {
+      result = await this.environment.run(entry.end.file, entry.end.args, END_TIMEOUT_MS);
+    } catch (e) {
+      result = { code: null, output: e instanceof Error ? e.message : String(e) };
+    }
+    return result.code === 0
+      ? { target: "container", confirmed: true, detail: "the program in the container ended" }
+      : {
+          target: "container",
+          confirmed: false,
+          detail: `could not confirm the program in the container ended (${result.code === null ? "the end command did not finish" : `exit ${result.code}`}${result.output ? `: ${result.output}` : ""}); it may still be running`,
+        };
+  }
+
+  /**
+   * End every terminal `owner` runs (its window closed or reloaded), or every terminal (the app
+   * quits). The ends are sent, not awaited: there is no screen left to report them on.
+   */
   closeAll(owner?: number): void {
     for (const entry of [...this.running.values()]) {
       if (owner !== undefined && entry.owner !== owner) continue;
       if (entry.timer !== undefined) clearTimeout(entry.timer);
       this.running.delete(entry.info.id);
-      try {
-        entry.pty.kill();
-      } catch {
-        // Already gone.
-      }
+      void this.end(entry);
     }
+    if (owner === undefined) this.approved.clear();
+    else this.approved.delete(owner);
   }
 
   /** The terminals `owner` runs. */

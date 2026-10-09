@@ -50,7 +50,7 @@ import { DesignFeeds } from "./designFeeds";
 import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
-import { TerminalHost, machineEnvironment, type SpawnPty } from "./terminals";
+import { TerminalHost, machineEnvironment, machineRoots, type HostPrompt, type SpawnPty } from "./terminals";
 import { AppUpdater, machineRunner } from "./update";
 
 /**
@@ -75,16 +75,31 @@ const tokenFile = process.env[TOKEN_FILE_VAR]?.trim() || tokenPath(homedir(), po
 const daemon = new DaemonClient({ url, tokenFile, trustedRoot: homedir() });
 
 /**
- * Where terminals run: the container `.container/run.sh` starts (`JKB_CONTAINER_NAME`, the variable
- * it reads, default `jkb-dev`) and the one directory both sides see, the repos mount (`HOST_REPOS`
- * and `CTR_REPOS` there).
+ * Where terminals run (`machineRoots`): the container `.container/run.sh` starts and the repos
+ * mount, both spellings of the host's side resolved once, here.
  */
-const terminalRoots: TerminalRoots = {
-  container: process.env["JKB_CONTAINER_NAME"]?.trim() || "jkb-dev",
-  containerRepos: "/home/vscode/repos",
-  hostRepos: join(homedir(), "repos"),
-  hostHome: homedir(),
-};
+const terminalRoots: TerminalRoots = machineRoots(homedir(), process.env);
+
+/**
+ * Main's own confirmation before a program runs on the host (D53.10): the exact argv and cwd, in a
+ * native dialog the renderer cannot answer for it.
+ */
+async function askHost(owner: number, prompt: HostPrompt): Promise<boolean> {
+  const contents = webContents.fromId(owner);
+  const win = contents === undefined ? null : BrowserWindow.fromWebContents(contents);
+  const options: MessageBoxOptions = {
+    type: "warning",
+    buttons: ["Cancel", "Run on the host"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: "Run on the host?",
+    message: `Run "${prompt.title}" on the host, outside the container?`,
+    detail: `It runs as you, with everything your account can reach.\n\nProgram: ${prompt.command}\nIn: ${prompt.cwd}`,
+  };
+  const answer = win === null ? await dialog.showMessageBox(options) : await dialog.showMessageBox(win, options);
+  return answer.response === 1;
+}
 
 function loginShell(): string | undefined {
   try {
@@ -111,6 +126,7 @@ const terminals = new TerminalHost(
     const contents = webContents.fromId(owner);
     if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.terminalEvent, event);
   },
+  askHost,
 );
 
 /**
@@ -226,8 +242,16 @@ function registerBridge(): void {
   ipcMain.on(BRIDGE_CHANNELS.terminalResize, (event, id: unknown, cols: unknown, rows: unknown) => {
     if (isTrusted(event)) terminals.resize(event.sender.id, id, cols, rows);
   });
-  ipcMain.on(BRIDGE_CHANNELS.terminalClose, (event, id: unknown) => {
-    if (isTrusted(event)) terminals.close(event.sender.id, id);
+  ipcMain.on(BRIDGE_CHANNELS.terminalAck, (event, id: unknown, chars: unknown) => {
+    if (isTrusted(event)) terminals.ack(event.sender.id, id, chars);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.terminalClose, (event, id: unknown) => {
+    assertTrusted(event);
+    return terminals.close(event.sender.id, id);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.terminalConfirmHost, (event, spec: unknown) => {
+    assertTrusted(event);
+    return terminals.confirmHost(event.sender.id, spec);
   });
 
   // Live design updates. Only a design's own topic is subscribed to (`isDesignTopic`, checked in
@@ -246,9 +270,13 @@ function registerBridge(): void {
     assertTrusted(event);
     return containerKit.status();
   });
-  ipcMain.handle(BRIDGE_CHANNELS.containerSpec, (event, action: unknown) => {
+  ipcMain.handle(BRIDGE_CHANNELS.containerSpec, async (event, action: unknown) => {
     assertTrusted(event);
-    return containerKit.spec(action);
+    const answer = await containerKit.spec(action);
+    // Main built this host spec from the kit it located and the action's one flag, not from
+    // anything the renderer sent, so it runs without asking (the Container tab's buttons are the ask).
+    if (answer.ok) terminals.approveHost(event.sender.id, answer.value);
+    return answer;
   });
 
   // The Sessions tab (D53.9): the needs-input feed — `claude/notify` and nothing else, with the

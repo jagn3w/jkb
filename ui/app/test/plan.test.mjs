@@ -31,7 +31,7 @@ const { pinThenPrompt, planTarget, playPlanSpec, playTaskSpec, taskTarget, PLAY_
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const { parseSpec } = await load(path.join(src, "shared", "terminal.ts"));
 
-const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostHome: "/Users/me" };
+const ROOTS = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: "/Users/me/repos", hostReposReal: "/Users/me/repos", hostHome: "/Users/me" };
 const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
 const ok = (value) => ({ ok: true, value });
 

@@ -19,7 +19,7 @@ import type {
   PromptAnnouncement,
 } from "@jkb/core";
 
-import type { TerminalEvent, TerminalInfo, TerminalResult, TerminalRoots, TerminalSpec } from "./terminal";
+import type { TerminalEnd, TerminalEvent, TerminalInfo, TerminalResult, TerminalRoots, TerminalSpec } from "./terminal";
 
 /** The IPC channels the bridge uses. One name per call, never built at runtime. */
 export const BRIDGE_CHANNELS = {
@@ -30,6 +30,8 @@ export const BRIDGE_CHANNELS = {
   terminalWrite: "jkb:terminal:write",
   terminalResize: "jkb:terminal:resize",
   terminalClose: "jkb:terminal:close",
+  terminalAck: "jkb:terminal:ack",
+  terminalConfirmHost: "jkb:terminal:confirm-host",
   /** main → renderer: a terminal's output or exit. */
   terminalEvent: "jkb:terminal:event",
   designSubscribe: "jkb:design:subscribe",
@@ -62,8 +64,19 @@ export interface TerminalBridge {
   /** Send keystrokes or a paste (at most `MAX_WRITE_CHARS` at a time). */
   write(id: number, data: string): void;
   resize(id: number, cols: number, rows: number): void;
-  /** End the terminal's process; its exit arrives as an event. */
-  close(id: number): void;
+  /**
+   * End the terminal's program, and say whether it was seen to end (`TerminalEnd`); its exit also
+   * arrives as an event. Only `confirmed` may be shown as "ended".
+   */
+  close(id: number): Promise<TerminalResult<TerminalEnd>>;
+  /** The renderer drew `chars` of the terminal's output (flow control, `FLOW`). */
+  ack(id: number, chars: number): void;
+  /**
+   * Ask the person, in main's own dialog showing the exact argv and cwd, whether `spec` may run on
+   * the host. `true` without asking when it need not (a container spec, the login shell, or one
+   * already confirmed in this window). Main refuses to open an unconfirmed host program.
+   */
+  confirmHost(spec: TerminalSpec): Promise<TerminalResult<boolean>>;
   /** Hear every terminal event for this window. Returns the unsubscribe. */
   onEvent(listener: (event: TerminalEvent) => void): () => void;
 }
