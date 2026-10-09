@@ -5180,7 +5180,15 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
     std::fs::create_dir_all(f.repo.join("sub")).unwrap();
     f.jkb()
         .current_dir(f.repo.join("sub"))
-        .args(["design", "export", &uid, "--to", "../docs/export.md"])
+        .args([
+            "design",
+            "export",
+            &uid,
+            "--to",
+            "../docs/export.md",
+            "--repo",
+            "proj",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("wrote"));
@@ -5213,7 +5221,10 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
             .stderr(predicate::str::contains("edited by hand"));
     }
     // Re-exporting (the target is remembered) puts the render back.
-    f.jkb().args(["design", "export", &uid]).assert().success();
+    f.jkb()
+        .args(["design", "export", &uid, "--repo", "proj"])
+        .assert()
+        .success();
     check().success();
 
     // A PROPOSED edit is a new version but not new approved text: neither check fails, so a
@@ -5264,6 +5275,62 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
         .stderr(predicate::str::contains("docs/export.md"));
     std::fs::write(&path, &generated).unwrap();
 
+    // A design of another repo is exported only into its own checkout; a copy of its export put
+    // here is a stray the database check names.
+    let other = json(&[
+        "design",
+        "create",
+        "Other",
+        "--repo",
+        "other",
+        "--body",
+        "Elsewhere.\n",
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args([
+            "design",
+            "export",
+            &other,
+            "--to",
+            "docs/other.md",
+            "--repo",
+            "proj",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("of repo other"));
+    assert!(!f.repo.join("docs/other.md").exists());
+    let elsewhere = f.home.path().join("other");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    git(&elsewhere, &["init", "-q", "-b", "main"]);
+    f.jkb()
+        .current_dir(&elsewhere)
+        .args([
+            "design",
+            "export",
+            &other,
+            "--to",
+            "docs/other.md",
+            "--repo",
+            "other",
+        ])
+        .assert()
+        .success();
+    std::fs::copy(
+        elsewhere.join("docs/other.md"),
+        f.repo.join("docs/stray.md"),
+    )
+    .unwrap();
+    check().success();
+    against_db()
+        .failure()
+        .stderr(predicate::str::contains("docs/stray.md"))
+        .stderr(predicate::str::contains("stray export"));
+    std::fs::remove_file(f.repo.join("docs/stray.md")).unwrap();
+
     // The design's doc target with no file: the database check reports it.
     std::fs::remove_file(&path).unwrap();
     check().success();
@@ -5300,9 +5367,40 @@ fn the_export_check_opens_no_database_and_reaches_no_daemon() {
             .args(["design", "export", "--check"]);
         cmd.assert()
     };
+    // What `actions/checkout` writes into every CI checkout, and what jkb's audited git refuses:
+    // the check finds the checkout without running git at all.
+    git(
+        &f.repo,
+        &[
+            "config",
+            "--local",
+            "http.https://github.com/.extraheader",
+            "AUTHORIZATION: basic eDp5",
+        ],
+    );
     run()
         .success()
         .stdout(predicate::str::contains("1 generated"));
+    // A linked worktree (whose `.git` is a file) is its own checkout, with its own docs/.
+    git(&f.repo, &["add", "-A"]);
+    git(&f.repo, &["commit", "-qm", "docs"]);
+    let linked = f.home.path().join("linked");
+    git(
+        &f.repo,
+        &["worktree", "add", "-q", linked.to_str().unwrap()],
+    );
+    std::fs::write(linked.join("docs/gen.md"), format!("{generated}edited\n")).unwrap();
+    {
+        let mut cmd = jkb(None);
+        cmd.current_dir(linked.join("docs"))
+            .env("HOME", &home)
+            .env("JKB_DB", nowhere.join("jkb.db"))
+            .args(["design", "export", "--check"]);
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("docs/gen.md"));
+    }
+    run().success();
     // And it still judges the file: a hand edit fails it, with no database anywhere.
     std::fs::write(f.repo.join("docs/gen.md"), format!("{generated}more\n")).unwrap();
     run()

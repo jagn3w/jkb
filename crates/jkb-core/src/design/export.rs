@@ -62,6 +62,9 @@ pub struct Exported {
     pub uid: String,
     /// Its title.
     pub title: String,
+    /// The repo it belongs to (the segment after `designs/` in its namespace); its doc target is a
+    /// path in that repo's checkout.
+    pub repo: Option<String>,
     /// Where it is written; `None` when the design names no target yet.
     pub doc_target: Option<String>,
     /// The version it was rendered at.
@@ -120,16 +123,44 @@ impl Generated<'_> {
     }
 }
 
+/// Whether `line`, leading whitespace and a byte-order mark aside, starts as the header does.
+fn starts_like_header(line: &str) -> bool {
+    line.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace())
+        .starts_with(GENERATED.trim_end())
+}
+
+/// Whether some line of `file` other than the first starts like the generated header, outside a
+/// fenced code block (where a hand-written doc may show the format).
+fn header_below_line_one(file: &str) -> bool {
+    let mut fenced = false;
+    for line in file.lines().skip(1) {
+        let lead = line.trim_start();
+        if lead.starts_with("```") || lead.starts_with("~~~") {
+            fenced = !fenced;
+        } else if !fenced && starts_like_header(line) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Read a file's generated header, if it has one.
+///
+/// The header is exactly the first line. One anywhere else — a blank line or front matter added
+/// above it, indentation, a byte-order mark — is [`Generated::Malformed`], never hand-written: a
+/// generated file must not leave the check because something was put in front of its header.
 #[must_use]
 pub fn parse(file: &str) -> Generated<'_> {
     let (first, body) = file.split_once('\n').unwrap_or((file, ""));
-    let marker = GENERATED.trim_end();
     let Some(rest) = first.strip_prefix(GENERATED) else {
-        let lead = first.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
-        return if lead.starts_with(marker) || first.starts_with(marker) {
+        return if starts_like_header(first) {
             Generated::Malformed(
                 "its first line looks like the generated header but is not exactly one",
+            )
+        } else if header_below_line_one(file) {
+            Generated::Malformed(
+                "it carries the generated header below its first line — something was added \
+                 above it",
             )
         } else {
             Generated::Hand
@@ -195,11 +226,31 @@ pub fn approved_text(design: &DesignText) -> String {
     for (start, end) in ranges {
         let start = start.max(at);
         if end > start {
+            if !out.is_empty() && start > at {
+                separate(&mut out, &text[at..start]);
+            }
             out.push_str(&text[start..end]);
             at = end;
         }
     }
     out
+}
+
+/// What a skipped `gap` of PROPOSED text leaves between two approved spans: its line structure, at
+/// most a paragraph break — never its words. Without it, two spans quoted without their trailing
+/// newline ran together (`Decided.## D2`), and the second heading was lost.
+fn separate(out: &mut String, gap: &str) {
+    let have = out.chars().rev().take_while(|&c| c == '\n').count();
+    let breaks = gap.matches('\n').count();
+    if breaks == 0 {
+        if !out.ends_with(char::is_whitespace) {
+            out.push(' ');
+        }
+        return;
+    }
+    for _ in have..(have + breaks).min(2) {
+        out.push('\n');
+    }
 }
 
 /// The whole generated file for `design`: the header, then its approved text, ending in a newline
@@ -214,6 +265,20 @@ pub fn render(design: &DesignText) -> String {
     out.push('\n');
     out.push_str(&body);
     out
+}
+
+/// The repo a design belongs to: the segment after `designs/` in its primary namespace.
+///
+/// # Errors
+/// A database error.
+pub fn repo_of(conn: &Connection, id: ItemId) -> Result<Option<String>> {
+    Ok(crate::item::primary_namespace(conn, id)?.and_then(|ns| {
+        ns.strip_prefix(super::ROOT)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split('/').next())
+            .filter(|r| !r.is_empty())
+            .map(str::to_owned)
+    }))
 }
 
 /// A design's export metadata, by its item id.
@@ -266,10 +331,10 @@ fn repo_path(path: &str, what: &str) -> Result<String> {
     Ok(path.to_owned())
 }
 
-/// Record where a design's export is written: `path`, relative to the repository root and under
-/// `docs/`, and named by no other design (two designs rendering one file would each read the
-/// other's export as drift). The rule is the table's UNIQUE constraint too, so an undo that would
-/// break it is refused rather than applied.
+/// Record where a design's export is written: `path`, relative to the root of the design's repo and
+/// under `docs/`, and named by no other design of that repo (two designs rendering one file would
+/// each read the other's export as drift). The rule is the table's `UNIQUE (repo, path)` too, so an
+/// undo that would break it is refused rather than applied.
 ///
 /// # Errors
 /// An unknown design, a path that is not a `docs/` file, or one another design already targets.
@@ -287,37 +352,48 @@ pub fn set_doc_target(
         )));
     }
     let id = design_id(conn, uid)?;
+    let repo = repo_of(conn, id)?.ok_or_else(|| {
+        invalid(format!(
+            "design {uid} is in no repo (`{}/<repo>`), so its doc target names no checkout",
+            super::ROOT
+        ))
+    })?;
     let taken: Option<String> = conn
         .prepare_cached(
             "SELECT i.uid FROM design_doc_targets t JOIN items i ON i.id = t.design_id
-              WHERE t.path = ?1 AND t.design_id <> ?2",
+              WHERE t.repo = ?1 AND t.path = ?2 AND t.design_id <> ?3",
         )?
-        .query_row(params![path, id.get()], |r| r.get(0))
+        .query_row(params![repo, path, id.get()], |r| r.get(0))
         .optional()?;
     if let Some(other) = taken {
         return Err(invalid(format!(
-            "design {other} already exports to `{path}` — give this one its own file"
+            "design {other} already exports to `{path}` in repo {repo} — give this one its own file"
         )));
     }
-    let current: Option<String> = conn
-        .prepare_cached("SELECT path FROM design_doc_targets WHERE design_id = ?1")?
-        .query_row([id.get()], |r| r.get(0))
+    let current: Option<(String, String)> = conn
+        .prepare_cached("SELECT repo, path FROM design_doc_targets WHERE design_id = ?1")?
+        .query_row([id.get()], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    if current.as_deref() == Some(path.as_str()) {
+    if current
+        .as_ref()
+        .is_some_and(|(r, p)| *r == repo && *p == path)
+    {
         return Ok(());
     }
     conn.prepare_cached(
-        "INSERT INTO design_doc_targets (design_id, path) VALUES (?1, ?2)
-         ON CONFLICT (design_id) DO UPDATE SET path = excluded.path",
+        "INSERT INTO design_doc_targets (design_id, repo, path) VALUES (?1, ?2, ?3)
+         ON CONFLICT (design_id) DO UPDATE SET repo = excluded.repo, path = excluded.path",
     )?
-    .execute(params![id.get(), path])?;
+    .execute(params![id.get(), repo, path])?;
     changelog::upsert(
         conn,
         meta,
         Entity::DesignDocTargets,
         &id.get().to_string(),
-        current.map(|p| json!({ "path": p })).as_ref(),
-        Some(&json!({ "design_id": id.get(), "path": path })),
+        current
+            .map(|(r, p)| json!({ "repo": r, "path": p }))
+            .as_ref(),
+        Some(&json!({ "design_id": id.get(), "repo": repo, "path": path })),
     )
 }
 
@@ -383,9 +459,11 @@ pub fn add_sources(
 /// An unknown design, or one whose stored text or metadata does not read.
 pub fn export(conn: &Connection, uid: &str) -> Result<Exported> {
     let design = read(conn, uid)?;
-    let doc_target = meta(conn, uid)?.doc_target;
+    let id = design_id(conn, uid)?;
+    let doc_target = meta_of(conn, id)?.doc_target;
     Ok(Exported {
         text: render(&design),
+        repo: repo_of(conn, id)?,
         uid: design.uid,
         title: design.title,
         doc_target,

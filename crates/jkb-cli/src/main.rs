@@ -465,7 +465,8 @@ enum DesignCmd {
         /// Every design of the repo (the ambient one, or `--repo`) that has a doc target.
         #[arg(long, conflicts_with = "check")]
         all: bool,
-        /// With `--all` or `--check --against-db`: this repo's designs (`designs/<repo>`).
+        /// The repo this checkout is (default: the ambient one). A design is exported only into
+        /// its own repo's checkout; with `--all` or `--check --against-db`, that repo's designs.
         #[arg(long)]
         repo: Option<String>,
         /// Write nothing; fail if a generated `docs/` file was edited since it was exported (its

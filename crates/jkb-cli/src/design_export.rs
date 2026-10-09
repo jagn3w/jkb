@@ -22,16 +22,29 @@ use jkb_core::design::export::{self as gen, Generated, DOCS_DIR};
 
 use crate::ops_cli::{unexpected, Ops};
 
+/// The checkout `dir` is in: the nearest directory at or above it holding a `.git` entry — a
+/// directory in a main checkout, a `gitdir:` file in a linked worktree.
+///
+/// Found by looking, never by running git. `gitrepo::root` spawns jkb's audited git, which refuses
+/// a repository whose own config carries keys outside its allowlist — and `actions/checkout`
+/// writes `http.https://github.com/.extraheader` into every CI checkout, as a developer's
+/// `credential.helper`, `http.*` or `includeIf` would locally. The drift check failed every CI push
+/// that way (review round 2). Nothing here needs git: only where the checkout's files are.
+fn root_of(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|d| std::fs::symlink_metadata(d.join(".git")).is_ok())
+        .map(Path::to_path_buf)
+}
+
 /// The checkout's root, and the current directory, both canonical so one strips from the other.
 fn checkout() -> Result<(PathBuf, PathBuf)> {
-    let cwd = std::env::current_dir().context("reading the current directory")?;
-    let root = crate::gitrepo::root(&cwd)?
-        .context("not inside a git work tree — `jkb design export` writes into a checkout")?;
-    let canon = |p: &Path| {
-        p.canonicalize()
-            .with_context(|| format!("resolving {}", p.display()))
-    };
-    Ok((canon(&root)?, canon(&cwd)?))
+    let cwd = std::env::current_dir()
+        .context("reading the current directory")?
+        .canonicalize()
+        .context("resolving the current directory")?;
+    let root = root_of(&cwd)
+        .context("not inside a git checkout — `jkb design export` reads and writes one")?;
+    Ok((root, cwd))
 }
 
 /// `arg` (relative to `cwd`, or absolute) as a `/`-separated path relative to `root`.
@@ -96,7 +109,22 @@ fn write(root: &Path, e: &Export) -> Result<bool> {
     Ok(true)
 }
 
-/// `jkb design export <uid> [--to <path>]` and `jkb design export --all`.
+/// Refuse a design that is not of `here`, the repo this checkout is: its doc target is a path in
+/// its own repo's checkout, and written into another one it would be a stray file that names it.
+fn same_repo(e: &Export, here: &str) -> Result<()> {
+    if e.repo.as_deref() == Some(here) {
+        return Ok(());
+    }
+    bail!(
+        "design {} is of repo {}, but this checkout is repo {here} — export it from its own \
+         checkout (or name this checkout's repo with --repo)",
+        e.uid,
+        e.repo.as_deref().unwrap_or("(none)")
+    )
+}
+
+/// `jkb design export <uid> [--to <path>]` and `jkb design export --all`. Either way only into the
+/// checkout of the design's own repo: `here` is the ambient repo, or `--repo`.
 fn export(
     ops: &Ops<'_>,
     uid: Option<String>,
@@ -104,23 +132,29 @@ fn export(
     repo: Option<String>,
 ) -> Result<()> {
     let (root, cwd) = checkout()?;
-    if let (Some(uid), Some(to)) = (&uid, to) {
-        let path = repo_relative(&root, &cwd, to)?;
-        meta_answer(
-            ops,
-            "design.target",
-            Request::DesignTarget {
-                uid: uid.clone(),
-                path,
-            },
-        )?;
+    let here = crate::design_cli::repo_of(ops, repo)?;
+    if let Some(uid) = &uid {
+        for e in exports(ops, Some(uid.clone()), None)? {
+            same_repo(&e, &here)?;
+        }
+        if let Some(to) = to {
+            let path = repo_relative(&root, &cwd, to)?;
+            meta_answer(
+                ops,
+                "design.target",
+                Request::DesignTarget {
+                    uid: uid.clone(),
+                    path,
+                },
+            )?;
+        }
     }
-    let repo = match uid {
-        Some(_) => None,
-        None => Some(crate::design_cli::repo_of(ops, repo)?),
-    };
     let all = uid.is_none();
-    let list = exports(ops, uid, repo)?;
+    let scope = all.then(|| here.clone());
+    let list = exports(ops, uid, scope)?;
+    for e in &list {
+        same_repo(e, &here)?;
+    }
     let mut done = Vec::new();
     for e in &list {
         let changed = write(&root, e)?;
@@ -265,7 +299,7 @@ pub(crate) fn check_files(repo: Option<&str>, json: bool) -> Result<()> {
 /// What is wrong with one generated file against its design now, or `None` when its body is the
 /// design's render. Only the body is compared: the header's version token moves with every edit,
 /// a PROPOSED one included, and is information for the reader.
-fn drift(ops: &Ops<'_>, rel: &str, text: &str, uid: &str) -> Option<String> {
+fn drift(ops: &Ops<'_>, here: &str, rel: &str, text: &str, uid: &str) -> Option<String> {
     let rendered = match exports(ops, Some(uid.to_owned()), None) {
         Ok(mut list) if list.len() == 1 => list.remove(0),
         Ok(_) => {
@@ -279,6 +313,13 @@ fn drift(ops: &Ops<'_>, rel: &str, text: &str, uid: &str) -> Option<String> {
             ))
         }
     };
+    if rendered.repo.as_deref() != Some(here) {
+        return Some(format!(
+            "{rel}: generated from design {uid} of repo {}, but this checkout is repo {here} — a \
+             stray export; delete it",
+            rendered.repo.as_deref().unwrap_or("(none)")
+        ));
+    }
     if rendered.doc_target.as_deref() != Some(rel) {
         return Some(format!(
             "{rel}: carries design {uid}'s header, but that design exports to {} — delete the \
@@ -306,16 +347,16 @@ fn drift(ops: &Ops<'_>, rel: &str, text: &str, uid: &str) -> Option<String> {
 /// against its design's render now, and every design of the repo whose doc target has no file.
 fn check_against_db(ops: &Ops<'_>, repo: Option<String>) -> Result<()> {
     let (root, _) = checkout()?;
+    let repo = crate::design_cli::repo_of(ops, repo)?;
     let files = generated_files(&root)?;
     let mut problems = Vec::new();
     for (rel, text) in &files {
         if let Some(p) = tampered(rel, text) {
             problems.push(p);
         } else if let Some(uid) = gen::generated_from(text) {
-            problems.extend(drift(ops, rel, text, uid));
+            problems.extend(drift(ops, &repo, rel, text, uid));
         }
     }
-    let repo = crate::design_cli::repo_of(ops, repo)?;
     for e in exports(ops, None, Some(repo))? {
         let Some(target) = e.doc_target.as_deref() else {
             continue;
@@ -340,7 +381,6 @@ fn check_against_db(ops: &Ops<'_>, repo: Option<String>) -> Result<()> {
 pub(crate) struct ExportArgs {
     pub uid: Option<String>,
     pub to: Option<String>,
-    pub all: bool,
     pub repo: Option<String>,
     pub check: bool,
     pub against_db: bool,
@@ -355,7 +395,6 @@ pub(crate) fn run(ops: &Ops<'_>, args: ExportArgs) -> Result<()> {
     let ExportArgs {
         uid,
         to,
-        all,
         repo,
         check,
         against_db,
@@ -363,12 +402,8 @@ pub(crate) fn run(ops: &Ops<'_>, args: ExportArgs) -> Result<()> {
     match (check, against_db) {
         (true, true) => check_against_db(ops, repo),
         (true, false) => check_files(repo.as_deref(), ops.json),
-        (false, _) => {
-            if repo.is_some() && !all {
-                bail!("`--repo` goes with `--all` or `--check --against-db`");
-            }
-            export(ops, uid, to.as_deref(), repo)
-        }
+        // `--all` is the absence of a uid, which clap enforces.
+        (false, _) => export(ops, uid, to.as_deref(), repo),
     }
 }
 
@@ -408,8 +443,26 @@ pub(crate) fn source(ops: &Ops<'_>, uid: String, paths: &[String]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::repo_relative;
+    use super::{repo_relative, root_of};
     use std::path::Path;
+
+    /// The checkout is the nearest directory with a `.git` entry, a directory or a linked
+    /// worktree's `gitdir:` file, found without running git.
+    #[test]
+    fn the_checkout_is_the_nearest_directory_with_a_git_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        std::fs::create_dir_all(main.join("docs/deep")).unwrap();
+        assert_eq!(root_of(&main.join("docs/deep")), Some(main.clone()));
+        let linked = main.join("work/linked");
+        std::fs::create_dir_all(linked.join("docs")).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: ../../.git/worktrees/linked\n").unwrap();
+        assert_eq!(root_of(&linked.join("docs")), Some(linked));
+        let bare = dir.path().join("none");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(root_of(&bare).is_none_or(|r| !r.starts_with(dir.path())));
+    }
 
     #[test]
     fn a_path_is_resolved_against_the_cwd_and_made_relative_to_the_root() {

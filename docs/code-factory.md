@@ -1272,16 +1272,24 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   span's surviving approved pieces, which published text nobody approved — "We must not log tokens."
   with "not" deleted exported as "We must  log tokens." (review round 1; pinned by
   `a_demoted_span_is_not_exported_at_all`). A demoted span reads PROPOSED as a whole (D53.5), and so
-  is exported as nothing until it is re-approved.
+  is exported as nothing until it is re-approved. Between two approved spans, the PROPOSED text
+  skipped leaves its line breaks (at most a paragraph break), never its words: spans quoted without
+  a trailing newline otherwise ran together, `Decided.## D2` (review round 2).
 - **The header** is the file's first line:
   `<!-- generated from jkb design <uid>, edit there (version <token>, blake3 <hex>) -->`, the hash being
   that of the body below it. A file without it is hand-written and never checked. A first line that
-  looks like the header but does not read (trimmed, a byte-order mark or indentation in front) is
-  reported, never taken for hand-written.
+  looks like the header but does not read (trimmed, a byte-order mark or indentation in front), or a
+  header below the first line (a blank line or front matter put above it), is reported, never taken
+  for hand-written. A hand-written doc may still show the header in prose or in a fenced block.
 - **`jkb design export --check` opens no database and reaches no daemon** — it re-hashes each
   generated `docs/` file's body and fails, naming the file and its design, when it no longer matches
   its header: a hand edit. `main` dispatches it before remote mode, before `commands::ensure_installed`
-  and before any `open_db`. `scripts/check.sh` and `.github/workflows/ci.yml` both run it. *Amended in
+  and before any `open_db`. `scripts/check.sh` and `.github/workflows/ci.yml` both run it. It finds
+  the checkout by walking up to the nearest `.git` entry (a linked worktree's is a file), **never by
+  running git**: jkb's audited git refuses a repository whose local config carries keys outside its
+  allowlist, and `actions/checkout` writes `http.https://github.com/.extraheader` into every CI
+  checkout, so the first CI step failed on every push (review round 2; pinned by a test that sets
+  that key). The CI checkout also sets `persist-credentials: false`. *Amended in
   review round 1:* the first build re-rendered from the live database, so the gate ran the branch's
   binary against the shared `~/.jkb/jkb.db` — migrating it forward on a branch with a new migration,
   being refused by it on an older branch, needing a daemon in the container, rewriting the user's
@@ -1293,13 +1301,23 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   run by hand. It compares bodies only, so a PROPOSED edit (a new version, the same approved text)
   passes it too. The database-free check cannot know any doc target, so a deleted generated file
   passes it; that is the price of a gate every machine can run.
-- **A doc target is a `docs/` file, one design's alone, and each fact is a row** (`V026`:
+- **A design is exported only into its own repo's checkout** (the ambient repo, or `--repo`):
+  `design.export` answers the design's repo, `export` refuses another repo's design, and
+  `--against-db` names a generated file whose design is of another repo as a stray.
+- **A doc target is a `docs/` file of the design's repo, one design's alone there, and each fact
+  is a row** (`V026`:
   `design_doc_targets`, `design_sources`). They were keys of the design item's `metadata` first, and
   undo restores a column whole: undoing an older target write dropped sources recorded after it, and
   could restore a target another design had taken since, because the one-design-per-file rule lived
-  only in the writer. Now each write undoes alone and the rule is the table's `UNIQUE (path)`, so an
+  only in the writer. Now each write undoes alone and the rule is the table's `UNIQUE (repo, path)`
+  (a target is relative to its repo's checkout, so two repos may each have `docs/a.md`), so an
   undo that would break it is refused (pinned by `undoing_a_doc_target_keeps_the_sources_recorded_after_it`
-  and `undo_cannot_give_two_designs_one_doc_target`). V026 moves existing keys over.
+  and `undo_cannot_give_two_designs_one_doc_target`). V026 moves existing keys over, and raises the
+  undo watermark (V014) to the newest transaction that wrote those keys into a design's metadata:
+  undone after the move, such an entry would restore a blob nothing reads while the rows stayed,
+  and report success. Later, unrelated work stays undoable. The tables' cascades fire only on
+  `jkb undo` of a design's create, which must therefore count these rows as the design's later
+  work.
 - **The attest hook defers `design source` and `design export --to`** (`remote::beyond_rbac`): the
   first reads files the caller names, the second writes to one. The rest of `jkb design` is an op on
   the design alone and stays approvable.

@@ -567,7 +567,7 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
         DesignCmd::Export {
             uid,
             to,
-            all,
+            all: _,
             repo,
             check,
             against_db,
@@ -576,7 +576,6 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             crate::design_export::ExportArgs {
                 uid,
                 to,
-                all,
                 repo,
                 check,
                 against_db,

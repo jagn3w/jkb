@@ -99,6 +99,9 @@ pub struct Export {
     pub uid: String,
     /// Its title.
     pub title: String,
+    /// The repo it belongs to (`designs/<repo>`): its doc target is a path in that repo's checkout.
+    #[serde(default)]
+    pub repo: Option<String>,
     /// Where it is written, relative to the repository root; `None` when it names no target.
     pub doc_target: Option<String>,
     /// The version token it was rendered at.
@@ -112,6 +115,7 @@ impl From<design::Exported> for Export {
         Self {
             uid: e.uid,
             title: e.title,
+            repo: e.repo,
             doc_target: e.doc_target,
             version: e.version.token(),
             text: e.text,

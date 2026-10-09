@@ -1514,6 +1514,25 @@ fn a_demoted_span_is_not_exported_at_all() {
     }
 }
 
+/// Skipped PROPOSED text between two approved spans leaves its line breaks (at most a paragraph
+/// break) and never its words, so spans quoted without their trailing newline do not run together.
+#[test]
+fn a_skipped_gap_keeps_its_line_breaks_between_spans() {
+    let db = db();
+    let uid = create(
+        &db,
+        "## D1\nDecided.\n\n## D2\nPending.\n\n## D3\nAlso decided. Draft. Kept.\n",
+    );
+    for quote in ["## D1\nDecided.", "## D3\nAlso decided.", "Kept."] {
+        let s = span(&db, &uid, quote, Reviewer::Operator).unwrap();
+        approve_as(&db, &s, Approver::Operator).unwrap();
+    }
+    assert_eq!(
+        exported_body(&db, &uid),
+        "## D1\nDecided.\n\n## D3\nAlso decided. Kept.\n"
+    );
+}
+
 /// A file always ends in a newline, so an editor adding one is not drift.
 #[test]
 fn an_export_ends_in_a_newline() {
@@ -1555,9 +1574,13 @@ fn only_the_header_marks_a_generated_file() {
     assert!(export::parse(&generated).intact());
     assert_eq!(export::parse("# Hand-written\n"), export::Generated::Hand);
     assert_eq!(export::parse(""), export::Generated::Hand);
-    // Anywhere but the first line is prose that mentions it.
+    // Prose that mentions the header mid-line, or a fenced block that shows it, is hand-written.
     assert_eq!(
-        export::parse("# T\n<!-- generated from jkb design design:a-1, edit -->"),
+        export::parse("# T\nThe first line reads `<!-- generated from jkb design <uid>, …`.\n"),
+        export::Generated::Hand
+    );
+    assert_eq!(
+        export::parse(&format!("# T\n```\n{generated}\n```\n")),
         export::Generated::Hand
     );
     // A first line that claims to be the header but does not read is never taken as hand-written:
@@ -1569,6 +1592,9 @@ fn only_the_header_marks_a_generated_file() {
         format!("  {generated}"),
         "<!-- generated from jkb design\nbody".to_owned(),
         generated.replace(&hash, "XYZ"),
+        // Something put above the header: a blank line, front matter.
+        format!("\n{generated}"),
+        format!("---\ntitle: x\n---\n{generated}"),
     ] {
         assert!(
             matches!(export::parse(&bad), export::Generated::Malformed(_)),
@@ -1597,8 +1623,16 @@ fn a_doc_target_is_a_docs_file_one_design_owns() {
     }
     set_target(&db, &a, "docs/a.md").unwrap();
     assert_eq!(exported(&db, &a).doc_target.as_deref(), Some("docs/a.md"));
+    assert_eq!(exported(&db, &a).repo.as_deref(), Some("jkb"));
     let e = set_target(&db, &b, "docs/a.md").unwrap_err().to_string();
     assert!(e.contains(&a), "{e}");
+    // A path is relative to the design's repo: another repo's design may use the same one.
+    let web = db
+        .write_txn("t", |c, m| super::create(c, m, "web", "Web", "w"))
+        .unwrap()
+        .uid;
+    set_target(&db, &web, "docs/a.md").unwrap();
+    assert_eq!(exported(&db, &web).repo.as_deref(), Some("web"));
     // Setting it again is no write: no changelog row, so undo takes back the write before it.
     let rows = changelog_rows(&db);
     set_target(&db, &a, "docs/a.md").unwrap();
