@@ -38,8 +38,17 @@ export const LAUNCH_SCRIPT = `set -euo pipefail; ${RECORD_THEN_CLAUDE}`;
  */
 export const PLAY_TASK_SCRIPT = `set -euo pipefail; dir=$(jkb --json task work "$4" | jq -Rer 'fromjson? | objects | .worktree | strings'); cd "$dir"; ${RECORD_THEN_CLAUDE}`;
 
-/** Resume a recorded session where it runs: `$1` is the session uuid. */
-export const RESUME_SCRIPT = 'exec claude --resume "$1"';
+/**
+ * Resume a recorded session where it runs: `$1` is the session uuid, `$2` the directory it ran in.
+ * The terminal starts in a directory that always exists and the script moves into `$2`, so a
+ * directory that is gone — a task's worktree, removed when the task landed — is said plainly and
+ * ends the resume before Claude starts, instead of failing inside `docker exec -w`. It is not
+ * resumed anywhere else: Claude finds a session by the directory it ran in (D53.6).
+ */
+export const RESUME_SCRIPT =
+  'cd -- "$2" 2>/dev/null || { case $2 in /*) d=$2 ;; *) d=${PWD%/}/${2#./} ;; esac; ' +
+  'printf "jkb: %s no longer exists (a task removes its worktree when it lands), so this session cannot be resumed.\\n" "$d" >&2; exit 1; }; ' +
+  'exec claude --resume "$1"';
 
 /** Where a design's repo is in the container: its directory under the repos mount. */
 export function repoDir(roots: TerminalRoots, repo: string): string {
@@ -105,20 +114,26 @@ export function resumeSpec(prompt: DesignPromptRecord, roots: TerminalRoots): Te
 /**
  * `claude --resume <session>` in the container, in `cwd` — carried back through the repos mount when
  * it is a host path — titled `title`. What every resume runs: a recorded prompt's (above), a session
- * the Sessions tab lists, and a terminal re-attached after a rebuild (D53.9).
+ * the Sessions tab lists, and a terminal re-attached after a rebuild (D53.9). The terminal starts
+ * where nothing can be missing and `RESUME_SCRIPT` moves into `cwd`, refusing plainly when it is
+ * gone.
  */
 export function sessionResumeSpec(
   ask: { readonly session: string; readonly cwd: string; readonly title: string },
   roots: TerminalRoots,
 ): TerminalSpec {
-  const hostOnly = !under(ask.cwd, roots.containerRepos) && under(ask.cwd, roots.hostRepos);
-  const cwd = hostOnly
-    ? roots.containerRepos.replace(/\/+$/, "") + ask.cwd.slice(roots.hostRepos.replace(/\/+$/, "").length)
-    : ask.cwd;
+  const ctr = roots.containerRepos.replace(/\/+$/, "");
+  const host = roots.hostRepos.replace(/\/+$/, "");
+  const hostOnly = !under(ask.cwd, ctr) && under(ask.cwd, host);
+  const cwd = hostOnly ? ctr + ask.cwd.slice(host.length) : ask.cwd;
+  // Under the repos mount the terminal starts at its root — which exists on both sides, so the
+  // target toggle still carries the resume across — and the script moves into the directory,
+  // relative to it. Elsewhere it starts at `/` and moves to the absolute path.
+  const [start, dir] = under(cwd, ctr) ? [roots.containerRepos, `./${cwd.slice(ctr.length + 1)}`] : ["/", cwd];
   return {
     target: "container",
-    cwd,
-    argv: ["/bin/bash", "-lc", RESUME_SCRIPT, "claude", ask.session],
+    cwd: start,
+    argv: ["/bin/bash", "-lc", RESUME_SCRIPT, "claude", ask.session, dir],
     title: ask.title,
     sessionUuid: ask.session,
   };

@@ -655,7 +655,7 @@ enum DesignPromptCmd {
     Record {
         /// The design.
         uid: String,
-        /// The pre-minted session uuid the launch passes to `claude --session-id`.
+        /// The pre-minted session uuid the launch passes to `claude --session-id`, lowercase.
         #[arg(long)]
         session: String,
         /// Where the session starts — where `claude --resume` must run (this directory when
@@ -665,7 +665,8 @@ enum DesignPromptCmd {
         /// What starts it: `discuss`, `play`, `task` or `new`.
         #[arg(long)]
         launch: String,
-        /// The plan or task it is started on.
+        /// The plan a `play`, or the task a `task`, is started on (one of this design's); none
+        /// for `discuss` and `new`.
         #[arg(long)]
         subject: Option<String>,
         /// Its title, as the Prompts pane lists it.

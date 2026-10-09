@@ -87,7 +87,7 @@ pub fn record(
     let done = prompts::record(
         conn,
         meta,
-        &prompts::NewPrompt {
+        &prompts::RecordPrompt {
             design: ask.uid,
             session: ask.session,
             cwd: ask.cwd,

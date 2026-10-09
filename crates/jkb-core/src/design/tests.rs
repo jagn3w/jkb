@@ -1031,10 +1031,10 @@ fn undoing_a_plan_takes_back_the_plan_and_its_steps() {
         .is_none());
 }
 
-const SESSION: &str = "0F8FAD5B-D9CB-469F-A165-70867728950E";
+const SESSION: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
 
-fn ask(design: &str, session: &str, cwd: &str) -> prompts::NewPrompt {
-    prompts::NewPrompt {
+fn ask(design: &str, session: &str, cwd: &str) -> prompts::RecordPrompt {
+    prompts::RecordPrompt {
         design: design.to_owned(),
         session: session.to_owned(),
         cwd: cwd.to_owned(),
@@ -1044,12 +1044,12 @@ fn ask(design: &str, session: &str, cwd: &str) -> prompts::NewPrompt {
     }
 }
 
-fn record(db: &Db, a: prompts::NewPrompt) -> Result<PromptRecord> {
+fn record(db: &Db, a: prompts::RecordPrompt) -> Result<PromptRecord> {
     db.write_txn("t", move |c, m| prompts::record(c, m, &a))
         .map(|r| r.prompt)
 }
 
-fn wrote(db: &Db, a: prompts::NewPrompt) -> bool {
+fn wrote(db: &Db, a: prompts::RecordPrompt) -> bool {
     db.write_txn("t", move |c, m| prompts::record(c, m, &a))
         .unwrap()
         .wrote
@@ -1065,9 +1065,11 @@ fn a_prompt_is_recorded_under_its_design_by_its_session_uuid() {
     let db = db();
     let uid = create(&db, "x");
     let p = record(&db, ask(&uid, SESSION, "/repos/jkb")).unwrap();
-    let session = SESSION.to_ascii_lowercase();
-    assert_eq!(p.uid, format!("prompt:{session}"));
-    assert_eq!(p.session, session, "stored as claude --resume takes it");
+    assert_eq!(p.uid, format!("prompt:{SESSION}"));
+    assert_eq!(
+        p.session, SESSION,
+        "stored as claude --session-id was given it"
+    );
     assert_eq!(p.design, uid);
     assert_eq!(p.cwd, "/repos/jkb");
     assert_eq!(p.launch, Launch::Discuss);
@@ -1115,12 +1117,12 @@ fn a_session_resolves_to_the_prompt_it_was_recorded_with() {
     let of = |session: &'static str| db.read(move |c| prompts::of_session(c, session)).unwrap();
     assert_eq!(of(SESSION), None, "nothing recorded yet");
     let p = record(&db, ask(&uid, SESSION, "/repos/jkb")).unwrap();
+    assert_eq!(of(SESSION), Some(p.clone()));
     assert_eq!(
-        of(SESSION),
-        Some(p.clone()),
+        of("0F8FAD5B-D9CB-469F-A165-70867728950E"),
+        Some(p),
         "found from any case of the uuid"
     );
-    assert_eq!(of("0f8fad5b-d9cb-469f-a165-70867728950e"), Some(p));
     assert_eq!(
         of("not-a-uuid"),
         None,
@@ -1135,7 +1137,7 @@ fn a_session_is_one_prompt_and_rerecording_it_moves_only_its_cwd() {
     let uid = create(&db, "x");
     assert!(wrote(&db, ask(&uid, SESSION, "/repos/jkb")));
     let first = record(&db, ask(&uid, SESSION, "/repos/jkb")).unwrap();
-    let mut again = ask(&uid, &SESSION.to_ascii_lowercase(), "/Users/me/repos/jkb");
+    let mut again = ask(&uid, SESSION, "/Users/me/repos/jkb");
     again.title = "Something else".to_owned();
     let moved = record(&db, again).unwrap();
     assert_eq!(moved.uid, first.uid);
@@ -1163,18 +1165,31 @@ fn a_prompt_refuses_what_resume_could_not_use() {
     let db = db();
     let uid = create(&db, "x");
     for (session, cwd, title, why) in [
-        ("not-a-uuid", "/r", "t", "not a session uuid"),
+        ("not-a-uuid", "/r", "t", "not a lowercase session uuid"),
         (
             "0f8fad5b-d9cb-469f-a165-70867728950",
             "/r",
             "t",
-            "not a session uuid",
+            "not a lowercase session uuid",
         ),
         (
             "0f8fad5b-d9cb-469f-a165-70867728950g",
             "/r",
             "t",
-            "not a session uuid",
+            "not a lowercase session uuid",
+        ),
+        // Another spelling is refused, not rewritten: claude was handed the caller's spelling.
+        (
+            "0F8FAD5B-D9CB-469F-A165-70867728950E",
+            "/r",
+            "t",
+            "not a lowercase session uuid",
+        ),
+        (
+            " 0f8fad5b-d9cb-469f-a165-70867728950e",
+            "/r",
+            "t",
+            "not a lowercase session uuid",
         ),
         (SESSION, "repos/jkb", "t", "absolute path"),
         (SESSION, "/r\0x", "t", "absolute path"),
@@ -1186,6 +1201,7 @@ fn a_prompt_refuses_what_resume_could_not_use() {
         assert!(err.to_string().contains(why), "{session} {cwd:?}: {err}");
     }
     let mut a = ask(&uid, SESSION, "/r");
+    a.launch = Launch::Task;
     a.subject = Some("task:nope".to_owned());
     assert!(record(&db, a)
         .unwrap_err()
@@ -1211,6 +1227,73 @@ fn a_prompt_refuses_what_resume_could_not_use() {
     assert_eq!(p.subject.as_deref(), Some(plan.uid.as_str()));
     assert_eq!(p.title.chars().count(), prompts::MAX_TITLE_CHARS);
     assert!(p.title.ends_with('…') && !p.title.contains('\n'));
+}
+
+/// A *Play* names one of this design's plans, a task's *Play* one of its tasks, and a *Discuss* or
+/// *New prompt* nothing: the pane lists the subject under the design, so it must be the design's.
+#[test]
+fn a_prompt_subject_is_the_launchs_kind_and_this_designs() {
+    let db = db();
+    let uid = create(&db, "x");
+    let other = create(&db, "y");
+    let plan = new_plan(&db, &uid, &["a"]).unwrap();
+    let step = step_id(&db, &plan.steps[0].uid);
+    task_under(&db, step, "task:mine");
+    // A one-off, directly under the design.
+    let design_uid = uid.clone();
+    let design_item = db.read(move |c| design_id(c, &design_uid)).unwrap();
+    task_under(&db, design_item, "task:direct");
+    let theirs = new_plan(&db, &other, &["b"]).unwrap();
+    let their_step = step_id(&db, &theirs.steps[0].uid);
+    task_under(&db, their_step, "task:theirs");
+    db.write_txn("t", |c, m| {
+        task::create(c, m, &task::NewTask::new("task:loose", "x"))
+    })
+    .unwrap();
+
+    let try_record = |launch: Launch, subject: &str| {
+        let mut a = ask(&uid, SESSION, "/r");
+        a.launch = launch;
+        a.subject = Some(subject.to_owned());
+        record(&db, a).map(|_| ()).map_err(|e| e.to_string())
+    };
+    for (launch, subject, why) in [
+        (Launch::Play, theirs.uid.as_str(), "not this design's"),
+        (Launch::Task, "task:theirs", "not this design's"),
+        (Launch::Task, "task:loose", "not this design's"),
+        (Launch::Play, "task:mine", "is a task"),
+        (Launch::Task, plan.uid.as_str(), "is a exec_plan"),
+        (Launch::Play, uid.as_str(), "is a design"),
+        (Launch::Discuss, plan.uid.as_str(), "names no subject"),
+        (Launch::New, "task:mine", "names no subject"),
+    ] {
+        let err = try_record(launch, subject).unwrap_err();
+        assert!(err.contains(why), "{launch:?} {subject}: {err}");
+    }
+    assert!(
+        prompts_of(&db, &uid).is_empty(),
+        "nothing refused was written"
+    );
+
+    try_record(Launch::Task, "task:mine").unwrap();
+    for (session, launch, subject) in [
+        (
+            "11111111-2222-3333-4444-555555555555",
+            Launch::Task,
+            "task:direct",
+        ),
+        (
+            "22222222-2222-3333-4444-555555555555",
+            Launch::Play,
+            plan.uid.as_str(),
+        ),
+    ] {
+        let mut a = ask(&uid, session, "/r");
+        a.launch = launch;
+        a.subject = Some(subject.to_owned());
+        record(&db, a).unwrap();
+    }
+    assert_eq!(prompts_of(&db, &uid).len(), 3);
 }
 
 #[test]

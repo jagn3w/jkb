@@ -5096,7 +5096,7 @@ fn a_session_is_recorded_from_where_it_starts_and_listed_with_its_resume() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not a session uuid"));
+        .stderr(predicate::str::contains("not a lowercase session uuid"));
 }
 
 /// `jkb workflow agent` (D53.7): a script reads a packaged template filled in; the operator copies

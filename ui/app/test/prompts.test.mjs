@@ -65,17 +65,25 @@ test("a recorded session resumes in its recorded cwd, under its own session id",
   const spec = resumeSpec(record(), ROOTS);
   assert.deepEqual(spec, {
     target: "container",
-    cwd: "/home/vscode/repos/jkb/.jkb/work/build",
-    argv: ["/bin/bash", "-lc", RESUME_SCRIPT, "claude", UUID],
+    // The terminal starts at the repos mount, which always exists; the script moves into the
+    // recorded directory, relative to it, so a directory that is gone is said, not a docker error.
+    cwd: "/home/vscode/repos",
+    argv: ["/bin/bash", "-lc", RESUME_SCRIPT, "claude", UUID, "./jkb/.jkb/work/build"],
     title: "Resume · Play · Build it",
     sessionUuid: UUID,
   });
   assert.equal(parseSpec(spec).ok, true, "main accepts it");
   // A session the toggle moved to the host recorded a host path: carried back through the mount.
-  assert.equal(resumeSpec(record({ cwd: "/Users/me/repos/jkb" }), ROOTS).cwd, "/home/vscode/repos/jkb");
-  // ... and the toggle takes the resume to the host again, where it was recorded.
-  assert.equal(retarget(resumeSpec(record({ cwd: "/Users/me/repos/jkb" }), ROOTS), "host", ROOTS).cwd, "/Users/me/repos/jkb");
-  assert.equal(resumeSpec(record({ cwd: "/elsewhere" }), ROOTS).cwd, "/elsewhere", "outside both mounts: as recorded");
+  const moved = resumeSpec(record({ cwd: "/Users/me/repos/jkb" }), ROOTS);
+  assert.equal(moved.cwd, "/home/vscode/repos");
+  assert.equal(moved.argv.at(-1), "./jkb");
+  // ... and the toggle takes the resume to the host again: the mount's root there, the same
+  // relative directory, so it lands where it was recorded.
+  assert.equal(retarget(moved, "host", ROOTS).cwd, "/Users/me/repos");
+  assert.equal(resumeSpec(record({ cwd: "/home/vscode/repos" }), ROOTS).argv.at(-1), "./");
+  const elsewhere = resumeSpec(record({ cwd: "/elsewhere" }), ROOTS);
+  assert.equal(elsewhere.cwd, "/", "outside both mounts: from the root...");
+  assert.equal(elsewhere.argv.at(-1), "/elsewhere", "...into the directory as recorded");
 });
 
 /** Stand-ins: `jkb` logging a record call (or refusing one), `claude` reporting what it got. */
@@ -117,10 +125,33 @@ test("a refused record stops the launch before Claude starts", () => {
   assert.match(r.stderr, /not reachable/);
 });
 
-test("a resume runs `claude --resume` and nothing else", () => {
+test("a resume runs `claude --resume` in the recorded directory and nothing else", () => {
   const { run, recorded } = stand_ins();
-  const r = run(RESUME_SCRIPT, [UUID], work);
+  const repos = fs.mkdtempSync(path.join(work, "repos-"));
+  fs.mkdirSync(path.join(repos, "jkb", ".jkb", "work", "build"), { recursive: true });
+  const r = run(RESUME_SCRIPT, [UUID, "./jkb/.jkb/work/build"], repos);
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout, `${work}|--resume|${UUID}|`);
+  assert.equal(r.stdout, `${repos}/jkb/.jkb/work/build|--resume|${UUID}|`);
   assert.equal(recorded(), "", "a resume records nothing: the session already is one");
+  // Outside the mount: an absolute directory, from `/`.
+  const abs = run(RESUME_SCRIPT, [UUID, path.join(repos, "jkb")], "/");
+  assert.equal(abs.status, 0, abs.stderr);
+  assert.equal(abs.stdout, `${repos}/jkb|--resume|${UUID}|`);
+});
+
+test("a session whose directory is gone (a landed task's worktree) is said to be unresumable, and Claude never starts", () => {
+  const { run } = stand_ins();
+  const repos = fs.mkdtempSync(path.join(work, "repos-"));
+  fs.mkdirSync(path.join(repos, "jkb"));
+  const r = run(RESUME_SCRIPT, [UUID, "./jkb/.jkb/work/build"], repos);
+  assert.notEqual(r.status, 0);
+  assert.equal(r.stdout, "", "claude never ran");
+  assert.equal(
+    r.stderr,
+    `jkb: ${repos}/jkb/.jkb/work/build no longer exists (a task removes its worktree when it lands), so this session cannot be resumed.\n`,
+  );
+  const abs = run(RESUME_SCRIPT, [UUID, "/no/such/dir"], "/");
+  assert.notEqual(abs.status, 0);
+  assert.equal(abs.stdout, "");
+  assert.match(abs.stderr, /^jkb: \/no\/such\/dir no longer exists/);
 });

@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 
 use jkb_types::ItemId;
 
-use super::{announce, design_id, invalid, not_found, set_metadata};
+use super::{announce, design_id, invalid, not_found, set_metadata, PLAN_KIND};
+use crate::nstype::tasks::KIND_TASK;
 use crate::store::WriteMeta;
 use crate::{containment, item, Result};
 
@@ -106,7 +107,7 @@ pub struct Recorded {
 
 /// What [`record`] writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewPrompt {
+pub struct RecordPrompt {
     /// The design.
     pub design: String,
     /// The pre-minted session uuid.
@@ -115,27 +116,80 @@ pub struct NewPrompt {
     pub cwd: String,
     /// What started it.
     pub launch: Launch,
-    /// The plan or task it was started on.
+    /// The plan a *Play* or the task a task's *Play* was started on; `None` for the others.
     pub subject: Option<String>,
     /// Its title.
     pub title: String,
 }
 
-/// `session` as a lowercase uuid, or why it is not one. Claude Code's `--session-id` takes a uuid,
-/// and the uid is built from it, so nothing else is accepted.
-fn session_id(session: &str) -> Result<String> {
-    let s = session.trim().to_ascii_lowercase();
-    let groups: Vec<&str> = s.split('-').collect();
+/// `session` if it is a lowercase uuid, or why it is not one. Claude Code's `--session-id` takes a
+/// uuid, and the uid is built from it, so nothing else is accepted. Another spelling of one is
+/// refused rather than rewritten: the launch hands Claude the caller's spelling, so a rewritten
+/// record could name a session other than the one Claude was given (unmeasured whether Claude
+/// folds case — the refusal makes the question moot). The app mints lowercase ids.
+fn session_id(session: &str) -> Result<&str> {
+    let groups: Vec<&str> = session.split('-').collect();
     let shaped = groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
-        && groups
-            .iter()
-            .all(|g| g.chars().all(|c| c.is_ascii_hexdigit()));
+        && groups.iter().all(|g| {
+            g.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        });
     if !shaped {
         return Err(invalid(format!(
-            "`{session}` is not a session uuid — `claude --session-id` takes one"
+            "`{session}` is not a lowercase session uuid — `claude --session-id` takes one"
         )));
     }
-    Ok(s)
+    Ok(session)
+}
+
+/// Whether `item` is contained, at any depth, by `ancestor`.
+fn contained_by(conn: &Connection, item: ItemId, ancestor: ItemId) -> Result<bool> {
+    let mut at = item;
+    // Bounded like `plan::place_of`: a tree ends, a corrupted table should not spin.
+    for _ in 0..128 {
+        match containment::parent(conn, at)? {
+            Some(p) if p == ancestor => return Ok(true),
+            Some(p) => at = p,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// `subject` checked against the launch: a *Play* names one of this design's plans, a task's *Play*
+/// one of its tasks (under a step or directly under the design), and a *Discuss* or *New prompt*
+/// nothing — it works the design itself.
+fn check_subject(
+    conn: &Connection,
+    design: ItemId,
+    launch: Launch,
+    subject: Option<&str>,
+) -> Result<()> {
+    let Some(s) = subject else {
+        return Ok(());
+    };
+    let (kind, what) = match launch {
+        Launch::Play => (PLAN_KIND, "plan"),
+        Launch::Task => (KIND_TASK, "task"),
+        Launch::Discuss | Launch::New => {
+            return Err(invalid(format!(
+                "a `{}` prompt works the design itself, so it names no subject, not `{s}`",
+                launch.as_str()
+            )))
+        }
+    };
+    let id = item::id_for_uid(conn, s)?.ok_or_else(|| not_found(format!("no {what} `{s}`")))?;
+    let found = item::get(conn, id)?.map(|m| m.kind).unwrap_or_default();
+    if found != kind {
+        return Err(invalid(format!(
+            "a `{}` prompt is started on a {what}, and `{s}` is a {found}",
+            launch.as_str()
+        )));
+    }
+    if !contained_by(conn, id, design)? {
+        return Err(invalid(format!("{what} `{s}` is not this design's")));
+    }
+    Ok(())
 }
 
 fn clean_cwd(cwd: &str) -> Result<&str> {
@@ -217,9 +271,11 @@ fn existing(conn: &Connection, uid: &str) -> Result<Option<(ItemId, Value, Promp
 /// restarted on the other target).
 ///
 /// # Errors
-/// An unknown design or subject, a session that is not a uuid, a relative cwd, an empty title, a
-/// session already recorded for another design, or a database error.
-pub fn record(conn: &Connection, meta: &WriteMeta, ask: &NewPrompt) -> Result<Recorded> {
+/// An unknown design, a subject that is not one of the design's plans (for a *Play*) or tasks (for
+/// a task's *Play*) or any subject on a *Discuss* or *New prompt*, a session that is not a lowercase
+/// uuid, a relative cwd, an empty title, a session already recorded for another design, or a
+/// database error.
+pub fn record(conn: &Connection, meta: &WriteMeta, ask: &RecordPrompt) -> Result<Recorded> {
     let design = design_id(conn, &ask.design)?;
     let session = session_id(&ask.session)?;
     let cwd = clean_cwd(&ask.cwd)?;
@@ -229,12 +285,8 @@ pub fn record(conn: &Connection, meta: &WriteMeta, ask: &NewPrompt) -> Result<Re
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    if let Some(s) = subject {
-        if item::id_for_uid(conn, s)?.is_none() {
-            return Err(not_found(format!("no plan or task `{s}`")));
-        }
-    }
-    let uid = uid_for(&session);
+    check_subject(conn, design, ask.launch, subject)?;
+    let uid = uid_for(session);
     if let Some((id, mut value, found)) = existing(conn, &uid)? {
         if found.design != ask.design {
             return Err(invalid(format!(
@@ -305,10 +357,13 @@ fn recorded(conn: &Connection, meta: &WriteMeta, design: &str, uid: &str) -> Res
 /// # Errors
 /// An item named like a prompt that is not one, unreadable metadata, or a database error.
 pub fn of_session(conn: &Connection, session: &str) -> Result<Option<PromptRecord>> {
-    let Ok(session) = session_id(session) else {
+    // Looked up in any case: every record is lowercase (`record` refuses another spelling), so
+    // folding here can only find the one session it names.
+    let lower = session.to_ascii_lowercase();
+    let Ok(session) = session_id(&lower) else {
         return Ok(None);
     };
-    Ok(existing(conn, &uid_for(&session))?.map(|(_, _, record)| record))
+    Ok(existing(conn, &uid_for(session))?.map(|(_, _, record)| record))
 }
 
 /// A design's prompts, newest first.

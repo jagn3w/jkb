@@ -381,12 +381,11 @@ test("after the rebuild each recorded session is resumed in its terminal — and
   );
   assert.deepEqual(plan[0].spec, {
     target: "container",
-    cwd: "/home/vscode/repos/jkb/.jkb/work/build",
-    argv: ["/bin/bash", "-lc", RESUME_SCRIPT, "claude", S1],
+    cwd: "/home/vscode/repos",
+    argv: ["/bin/bash", "-lc", RESUME_SCRIPT, "claude", S1, "./jkb/.jkb/work/build"],
     title: "Play · build",
     sessionUuid: S1,
   });
-  assert.equal(RESUME_SCRIPT, 'exec claude --resume "$1"');
   assert.equal(plan[2].spec.sessionUuid, "cccccccc-0000-0000-0000-000000000000");
 
   const merged = mergeRecords(recorded.slice(0, 2), [{ ...recorded[0], key: 7 }]);

@@ -42,7 +42,7 @@ use crdt::{Crdt, Piece, PieceKind};
 pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 pub use export::{DesignMeta, Exported, Source};
 pub use plan::{PlanTask, PlanView, Plans, StepView, TaskPlace, PLAN_KIND};
-pub use prompts::{Launch, NewPrompt, PromptRecord, Recorded, PROMPT_KIND};
+pub use prompts::{Launch, PromptRecord, RecordPrompt, Recorded, PROMPT_KIND};
 use yrs::Text as _;
 
 /// The item kind of a design.

@@ -446,7 +446,15 @@ requests), and `src/renderer/src/design/` `launch.ts` (every launch and resume a
   (the terminal's toggle restarts the program on the other side, which runs the launch again from
   there). Recording it under another design is refused. The item's content is its title; the design,
   session, cwd, launch (`discuss`/`play`/`task`/`new`) and subject (the plan or task a *Play* named)
-  are its metadata. Session ids are stored lowercase, as `claude --resume` takes them.
+  are its metadata. The subject is checked against the launch: a plan's *Play* names one of this
+  design's plans, a task's *Play* one of its tasks (under a step, or directly under the design), and a
+  *Discuss* or *New prompt* names none — the pane lists the subject under the design, so one from
+  another design, or of another kind, is refused (caught in review). A session id is a **lowercase**
+  uuid, and another spelling is **refused, not rewritten**: the launch hands Claude the caller's
+  spelling, so a record that folded case could name a session other than the one Claude was given.
+  *Unmeasured:* whether Claude folds a session id's case — the refusal makes it moot, and the app mints
+  lowercase ids (`crypto.randomUUID`). Looking a session up (`design.prompt_of`) folds case, since
+  every record is lowercase.
 - **The launch records, not the app, and it records where Claude starts.** Every launch the Design tab
   makes — *Discuss*, a plan's *Play*, a task's *Play*, *New prompt* — runs one script:
   `jkb design prompt record <design> --session <uuid> …` then `exec claude --session-id <uuid>`. The
@@ -462,6 +470,18 @@ requests), and `src/renderer/src/design/` `launch.ts` (every launch and resume a
   through the repos mount, and the toggle takes it to the host again. *Unmeasured, stated:* the
   container's and the host's Claude session stores are separate, so a session started on the host
   resumes only on the host.
+- **A prompt whose directory is gone is unresumable, said so in its terminal.** A task's *Play* records
+  the task's worktree, which is removed when the task lands, so every task-launched prompt eventually
+  names a directory that no longer exists — and `docker exec -w` into it fails before anything of ours
+  runs (caught in review). So a resume's terminal starts at the repos mount's root, which always
+  exists on both sides, and the script moves into the recorded directory *relative to it* (the toggle
+  rebases the root and the relative path follows); outside the mount it starts at `/` and moves to the
+  absolute path. A directory that is gone ends the script before Claude starts with `jkb: <dir> no
+  longer exists (a task removes its worktree when it lands), so this session cannot be resumed.` It is
+  **not** resumed in the design's repo instead: Claude finds a session by the directory it ran in
+  (*unmeasured, stated*, the same premise D53.9's re-attach rests on), so a resume elsewhere would
+  not find it. The pane still offers Resume on every row: whether a container
+  directory exists is known only in the container, and asking before every render would be a poll.
 - **The pane is live through the design's topic.** A record that wrote something is announced on
   `design/<uid>` as a `prompt` message (the editor's feed already holds that topic, and ignores the
   kind); main forwards it, and the pane re-reads its list — on that, a `gap`, a design switch or its
