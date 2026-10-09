@@ -68,10 +68,33 @@ daemon URL and token path rules, op/response/error shapes, reply decoding — is
 - **`require("electron")` downloads the binary when it is missing** (measured on electron 44.5:
   its `index.js` spawns `install.js` on a miss), so the smoke finds the binary through `path.txt`
   itself and skips without touching the network.
-- **The daemon token is read `O_NOFOLLOW`** and must be a small regular file holding one word:
-  `~/.jkb` is writable from the dev container, and a planted link would have the app send
-  whatever it points at as a header. The CLI's reader follows links; the app is the first host
-  client that holds the root token in a long-lived GUI process, so it is the stricter one.
+- **The daemon token is read with no link anywhere below the home** — `~/.jkb`, `daemon`, the
+  `<port>` directory and the token itself are each refused if a symbolic link, the leaf opened
+  `O_NOFOLLOW|O_NONBLOCK` — and must be a small regular file holding one word: `~/.jkb` is
+  writable from the dev container, and a planted link at any of those would have the app send
+  whatever it points at as a header. The first version checked only the leaf (`O_NOFOLLOW` guards
+  the last component alone), so a linked `<port>` directory sent a file the container chose; and
+  without `O_NONBLOCK` a FIFO at the path parked a libuv thread in `open()` before the
+  regular-file check could run. Node has no `openat`, so the chain is walked by path before and
+  after the open and the opened file must still be the one the path names (device, inode); a link
+  swapped in and back out between those calls is the residual race, closed on the writer's side
+  (`jkb_daemon::token::write` holds the directory by handle). A refusal is its own code,
+  `token_refused` (client-side, never on the wire), shown as *jkb token refused* rather than
+  *unreachable* — restarting `jkb serve` would rewrite the token and erase the evidence — and no
+  failure message carries the token's absolute path across the bridge. The CLI's reader follows
+  links; the app is the first host client that holds the root token in a long-lived GUI process,
+  so it is the stricter one.
+- **The renderer's page is the built file, or a loopback dev server on purpose.** The page main
+  loads is the page it trusts with the bridge, so `ELECTRON_RENDERER_URL` (set by
+  `electron-vite dev`) is honoured only with `JKB_APP_DEV_RENDERER=1` (set by `pnpm run dev` and
+  nowhere else) and only as an `http://` URL on `127.0.0.1`, `[::1]` or `localhost`; set any other
+  way, main refuses to start. The first version honoured any value in an unpackaged app, and every
+  build then was unpackaged: an inherited `ELECTRON_RENDERER_URL=http://example.net` became a
+  remote page with `window.jkb` and the root token behind it. A packaged app ignores the variable.
+- **The wire constants are pinned to Rust by a test** (`ui/core/test/wire-parity.test.mjs` reads
+  `DEFAULT_ADDR`, `PROTOCOL_VERSION`, `MAX_BODY_BYTES` and the `ErrorCode` variants out of the
+  crates' sources). A non-2xx reply that is not a jkb `ApiError` is `unavailable` — something else
+  answered — as `jkb_daemon::client` reads it, not `internal`.
 - **pnpm 11 holds back releases younger than its minimum release age**, and `pnpm add` answered by
   adding an exemption to `pnpm-workspace.yaml`. The exemption was removed and slightly older
   versions pinned instead (electron 44.5.1, playwright-core 1.63.0): the gate is a supply-chain
@@ -79,7 +102,17 @@ daemon URL and token path rules, op/response/error shapes, reply decoding — is
 - **CI runs the smoke under `xvfb-run`** with Ubuntu 24.04's AppArmor userns restriction lifted,
   rather than with `--no-sandbox` — the renderer sandbox is what the smoke is there to exercise.
   Not yet observed green on a runner when this was written; the agent sandbox has no Electron
-  binary and no display, so there the smoke skips, saying so.
+  binary and no display, so there the smoke skips, saying so. **In CI a skip is a failure:** the
+  job sets `JKB_REQUIRE_ELECTRON_SMOKE=1`, which turns any reason to skip into a failing test
+  (`smoke-required.test.mjs` runs the smoke with its binary taken away to pin that). Before it, a
+  runner that lost the binary or the display passed green having run nothing.
+- **The smoke asserts the window's `webPreferences` from main** (`sandbox`, `contextIsolation`,
+  `nodeIntegration`, `webviewTag`, via `webContents.getLastWebPreferences()`), not only what the
+  page can see: with `sandbox: false` and context isolation intact, the page still has no
+  `require` or `process`, so the renderer-side check alone passed with the sandbox off.
+  `getLastWebPreferences` is undocumented; if Electron drops it the test fails rather than passes.
+  The unreachable-daemon smoke writes a token for its closed port, so the status it checks comes
+  from a refused connection, not from a missing token.
 
 ### Visual language
 

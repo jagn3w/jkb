@@ -56,7 +56,9 @@ The app you use is the **installed copy** (D53.3): `scripts/setup.sh` builds it 
 `origin/main` under `~/.local/share/jkb-app/src` with that clone's `scripts/build-app.sh`, and the app
 updates itself from its menu (*jkb ▸ Update from main…*). Run from this checkout (`dev`, `start`), it
 refuses to start unless `JKB_APP_FROM_CHECKOUT=1` says that is deliberate: it runs unsandboxed on the
-host, and an agent can write this checkout. `pnpm --filter @jkb/app run package` is the packaging
+host, and an agent can write this checkout. `dev` loads the page from electron-vite's dev server, and
+sets `JKB_APP_DEV_RENDERER=1` to say so: an `ELECTRON_RENDERER_URL` without it, or naming anything
+but an `http://` server on loopback, refuses to start (D53.1). `pnpm --filter @jkb/app run package` is the packaging
 step (`electron-builder --dir`, `app/electron-builder.yml`); `build-app.sh` is what runs it.
 
 It talks to `jkb serve` at `$JKB_REMOTE` (default `127.0.0.1:7117`) with the token at

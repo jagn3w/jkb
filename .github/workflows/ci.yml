@@ -324,9 +324,13 @@ jobs:
       # a display — xvfb-run gives it one — and Chromium's sandbox, which Ubuntu 24.04's AppArmor
       # denies unprivileged user namespaces by default. The sysctl lifts that one restriction on
       # this throwaway runner, rather than launching Electron with --no-sandbox: the renderer
-      # sandbox is the boundary the smoke exists to exercise (D53.1). Without a display the smoke
-      # skips and says so, which here would be a skip passing for green.
+      # sandbox is the boundary the smoke exists to exercise (D53.1). Without a binary or a display
+      # the smoke skips and says so; JKB_REQUIRE_ELECTRON_SMOKE=1 turns that skip into a failure
+      # here, so a runner that lost either cannot pass green having run none of it
+      # (ui/app/test/smoke-required.test.mjs pins that the flag does).
       - name: allow Chromium's sandbox (Ubuntu 24.04 AppArmor)
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: test
+        env:
+          JKB_REQUIRE_ELECTRON_SMOKE: "1"
         run: xvfb-run -a pnpm run test

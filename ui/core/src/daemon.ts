@@ -27,8 +27,12 @@ export const REMOTE_VAR = "JKB_REMOTE";
 export const TOKEN_FILE_VAR = "JKB_REMOTE_TOKEN_FILE";
 
 /**
- * `jkb_api::ErrorCode`, snake_case as serialized. `unknown` is a code from a newer daemon that
- * this build does not know; treat it like `internal`.
+ * `jkb_api::ErrorCode`, snake_case as serialized ([`WIRE_ERROR_CODES`]). `unknown` is a code from a
+ * newer daemon that this build does not know; treat it like `internal`.
+ *
+ * Plus one code that is never on the wire: `token_refused`, the client refusing the daemon's token
+ * file itself (a link, not a regular file, not a token) — kept apart from `unavailable` because it
+ * is a sign of tampering, not of a daemon that is down. A daemon sending it decodes as `unknown`.
  */
 export type ErrorCode =
   | "no_such_topic"
@@ -48,9 +52,11 @@ export type ErrorCode =
   | "unsupported"
   | "forbidden"
   | "internal"
-  | "unknown";
+  | "unknown"
+  | "token_refused";
 
-const ERROR_CODES: ReadonlySet<string> = new Set<ErrorCode>([
+/** Every `jkb_api::ErrorCode` as serialized, in declaration order; pinned to the Rust enum by a test. */
+export const WIRE_ERROR_CODES: readonly ErrorCode[] = [
   "no_such_topic",
   "topic_conflict",
   "no_such_group",
@@ -69,7 +75,9 @@ const ERROR_CODES: ReadonlySet<string> = new Set<ErrorCode>([
   "forbidden",
   "internal",
   "unknown",
-]);
+];
+
+const ERROR_CODES: ReadonlySet<string> = new Set<string>(WIRE_ERROR_CODES);
 
 /** `jkb_api::ApiError`: why an op failed. */
 export interface ApiError {
@@ -171,15 +179,17 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** The error a non-2xx body carries, or one describing why it carries none. */
+/** The error a non-2xx body carries, or `unavailable` when the body is not a jkb `ApiError`. */
 function errorFrom(status: number, parsed: unknown, raw: string): ApiError {
   if (isObject(parsed) && typeof parsed["code"] === "string" && typeof parsed["message"] === "string") {
     const code = ERROR_CODES.has(parsed["code"]) ? (parsed["code"] as ErrorCode) : "unknown";
     const seq = parsed["seq"];
     return typeof seq === "number" ? { code, message: parsed["message"], seq } : { code, message: parsed["message"] };
   }
+  // Not jkb serve's answer — a proxy, or another service on its port — so not a refusal of the
+  // request: the daemon is out of reach, as `jkb_daemon::client::decode` reads it.
   const snippet = raw.length > 200 ? `${raw.slice(0, 200)}…` : raw;
-  return apiError("internal", `jkb serve answered HTTP ${status} with no error body: ${snippet}`);
+  return apiError("unavailable", `HTTP ${status} from something other than jkb serve (a proxy?): ${snippet}`);
 }
 
 function parse(body: string): unknown {

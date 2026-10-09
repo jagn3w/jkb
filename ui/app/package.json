@@ -7,7 +7,7 @@
   "scripts": {
     "build": "pnpm run typecheck && electron-vite build",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
-    "dev": "electron-vite dev",
+    "dev": "JKB_APP_DEV_RENDERER=1 electron-vite dev",
     "start": "electron-vite preview",
     "test": "node --test \"test/*.test.mjs\"",
     "package": "electron-builder --dir --config electron-builder.yml"

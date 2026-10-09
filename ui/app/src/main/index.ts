@@ -47,21 +47,32 @@ import type { TerminalResult, TerminalRoots } from "../shared/terminal";
 import { ContainerKit, machineKit } from "./container";
 import { DaemonClient } from "./daemon";
 import { DesignFeeds } from "./designFeeds";
+import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
 import { TerminalHost, machineEnvironment, type SpawnPty } from "./terminals";
 import { AppUpdater, machineRunner } from "./update";
 
-/** Why this process may not run — it is a checkout, and nobody said that was deliberate — or `undefined`. */
-const refusal = checkoutRefusal(app.isPackaged, process.env);
+/**
+ * Where the page comes from: the built file, or — from `pnpm run dev` only, and only on loopback —
+ * the dev server `electron-vite dev` names (`devRenderer.ts`). Never a dev server in a packaged app.
+ */
+const rendererFrom = rendererSource(app.isPackaged, process.env);
 
-/** Set by `electron-vite dev` to the renderer's dev server; never honoured by a packaged app. */
-const DEV_RENDERER_URL = (!app.isPackaged && process.env["ELECTRON_RENDERER_URL"]?.trim()) || undefined;
+/**
+ * Why this process may not run — it is a checkout, and nobody said that was deliberate; or it was
+ * pointed at a renderer it will not load — or `undefined`.
+ */
+const refusal =
+  checkoutRefusal(app.isPackaged, process.env) ?? (rendererFrom.kind === "refused" ? rendererFrom.reason : undefined);
+
+/** The dev server's page, when that is where the page comes from. */
+const DEV_RENDERER_URL = rendererFrom.kind === "dev" ? rendererFrom.url : undefined;
 const RENDERER_FILE = join(__dirname, "../renderer/index.html");
 
 const url = daemonUrl(process.env[REMOTE_VAR]);
 const tokenFile = process.env[TOKEN_FILE_VAR]?.trim() || tokenPath(homedir(), portOf(url));
-const daemon = new DaemonClient({ url, tokenFile });
+const daemon = new DaemonClient({ url, tokenFile, trustedRoot: homedir() });
 
 /**
  * Where terminals run: the container `.container/run.sh` starts (`JKB_CONTAINER_NAME`, the variable

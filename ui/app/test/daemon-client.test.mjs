@@ -5,6 +5,7 @@
 // token file on disk. Nothing is mocked but the daemon's answers.
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -181,4 +182,80 @@ test("the token file must be a small regular file holding one word, never a link
   const dir = path.join(work, "a-dir");
   fs.mkdirSync(dir);
   assert.match((await readToken(dir)).error.message, /not a regular file|EISDIR/);
+});
+
+/** A home with `~/.jkb/daemon/7117/token` holding `tok`, and a decoy token the container chose. */
+function home() {
+  const h = fs.mkdtempSync(path.join(work, "home-"));
+  const port = path.join(h, ".jkb", "daemon", "7117");
+  fs.mkdirSync(port, { recursive: true });
+  fs.writeFileSync(path.join(port, "token"), "tok", { mode: 0o600 });
+  const decoy = path.join(h, "elsewhere", "7117");
+  fs.mkdirSync(decoy, { recursive: true });
+  fs.writeFileSync(path.join(decoy, "token"), "chosen-by-the-container", { mode: 0o600 });
+  return { h, token: path.join(port, "token"), decoy };
+}
+
+// `~/.jkb` is the container's to write: a link at ANY component below the home — the `daemon`
+// directory, the `<port>` directory, the token — would have the app send the file it points at.
+test("a symbolic link anywhere below the home is refused, not only at the token", async () => {
+  const plain = home();
+  assert.deepEqual(await readToken(plain.token, plain.h), { ok: true, value: "tok" });
+
+  const port = home();
+  fs.rmSync(path.dirname(port.token), { recursive: true });
+  fs.symlinkSync(port.decoy, path.dirname(port.token));
+  const viaPort = await readToken(port.token, port.h);
+  assert.equal(viaPort.ok, false, "the decoy behind a linked <port> directory was read");
+  assert.equal(viaPort.error.code, "token_refused");
+  assert.match(viaPort.error.message, /\.jkb\/daemon\/7117 is a symbolic link/);
+
+  const daemonDir = home();
+  const real = path.join(daemonDir.h, ".jkb", "daemon");
+  fs.renameSync(real, path.join(daemonDir.h, "moved"));
+  fs.symlinkSync(path.join(daemonDir.h, "moved"), real);
+  const viaDaemon = await readToken(daemonDir.token, daemonDir.h);
+  assert.equal(viaDaemon.ok, false, "a linked daemon directory was followed");
+  assert.match(viaDaemon.error.message, /\.jkb\/daemon is a symbolic link/);
+
+  // The client passes its trusted root through.
+  const client = new DaemonClient({ url: "http://127.0.0.1:1", tokenFile: port.token, trustedRoot: port.h });
+  assert.equal((await client.hello()).error.code, "token_refused");
+});
+
+// Without O_NONBLOCK, open() on a FIFO waits for a writer, parking a libuv thread for good.
+test("a FIFO at the token path is refused at once, not waited on", { skip: process.platform === "win32" }, async () => {
+  const fifo = path.join(work, "fifo-token");
+  const made = spawnSync("mkfifo", [fifo]);
+  assert.equal(made.status, 0, `mkfifo: ${made.stderr}`);
+  let timer;
+  const read = readToken(fifo);
+  const timedOut = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("blocked"), 2000);
+  });
+  const outcome = await Promise.race([read, timedOut]);
+  clearTimeout(timer);
+  if (outcome === "blocked") {
+    // Release the parked open so the test process can exit, then fail.
+    fs.closeSync(fs.openSync(fifo, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK));
+    await read;
+    assert.fail("readToken blocked opening a FIFO");
+  }
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.error.code, "token_refused");
+  assert.match(outcome.error.message, /not a regular file/);
+});
+
+// The message crosses the bridge, and the renderer is not told where the token lives (AppInfo).
+test("a token failure names no absolute path", async () => {
+  const { h, token } = home();
+  const missing = await readToken(path.join(h, ".jkb", "daemon", "9", "token"), h);
+  assert.equal(missing.error.code, "unavailable");
+  assert.match(missing.error.message, /ENOENT/);
+  fs.writeFileSync(token, "two words");
+  const bad = await readToken(token, h);
+  for (const outcome of [missing, bad]) {
+    assert.ok(!outcome.error.message.includes(h), `the home path leaked: ${outcome.error.message}`);
+    assert.ok(!outcome.error.message.includes(work), `the work path leaked: ${outcome.error.message}`);
+  }
 });

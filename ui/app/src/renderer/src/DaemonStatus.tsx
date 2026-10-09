@@ -40,7 +40,11 @@ export function DaemonStatus(): React.JSX.Element {
         ? `jkb · schema ${status.hello.schema_version}`
         : status.error.code === "unavailable"
           ? "jkb serve unreachable"
-          : `jkb · ${status.error.code}`;
+          : status.error.code === "token_refused"
+            ? // Not "unreachable": restarting jkb serve would rewrite the token and erase the
+              // evidence of whatever was planted in ~/.jkb/daemon.
+              "jkb token refused"
+            : `jkb · ${status.error.code}`;
   const detail =
     status.kind === "failed"
       ? status.error.message

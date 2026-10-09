@@ -2,11 +2,15 @@
 //
 // Needs the Electron binary, which `pnpm install` downloads from GitHub releases — unreachable
 // from the agent sandbox, where installs run with ELECTRON_SKIP_BINARY_DOWNLOAD=1. Without it,
-// or without a display on Linux, these tests SKIP and say why; they are never reported green.
+// or without a display on Linux, these tests SKIP and say why. Where the smoke must run — CI sets
+// JKB_REQUIRE_ELECTRON_SMOKE=1 — a reason to skip is a failure instead, so a runner that lost its
+// binary or its display cannot pass green without having run any of it.
 // They run against `out/`, so `pnpm run build` comes first (as in check.sh and CI).
 //
 // The app is pointed at a daemon that is not there (a closed loopback port, and a HOME of its
-// own), so it never talks to the operator's real `jkb serve` and the status reads unreachable.
+// own holding a token for that port), so it never talks to the operator's real `jkb serve`, and
+// its request really goes out and is refused: the status reads unreachable for the transport,
+// not for a missing token.
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -50,12 +54,24 @@ function skipReason() {
   return undefined;
 }
 
+/** Set where the smoke must run (CI): a reason to skip is then a failure. */
+const REQUIRE_VAR = "JKB_REQUIRE_ELECTRON_SMOKE";
+
 const skip = skipReason();
-if (skip !== undefined) console.log(`# Electron smoke skipped: ${skip}`);
+if (skip !== undefined) {
+  if (process.env[REQUIRE_VAR] === "1") {
+    test(`the Electron smoke runs (${REQUIRE_VAR}=1)`, () => {
+      assert.fail(`${REQUIRE_VAR}=1, but the Electron smoke cannot run here: ${skip}`);
+    });
+  } else {
+    console.log(`# Electron smoke skipped: ${skip}`);
+  }
+}
 
 let app;
 let page;
 let home;
+let port;
 
 before(async () => {
   if (skip !== undefined) return;
@@ -64,8 +80,12 @@ before(async () => {
   // A port nothing listens on: bind one, note it, close it.
   const probe = http.createServer();
   await new Promise((r) => probe.listen(0, "127.0.0.1", r));
-  const port = probe.address().port;
+  port = probe.address().port;
   await new Promise((r) => probe.close(r));
+  // A token where jkb serve on that port would write one, so the hello gets as far as the socket.
+  const tokenDir = path.join(home, ".jkb", "daemon", String(port));
+  fs.mkdirSync(tokenDir, { recursive: true });
+  fs.writeFileSync(path.join(tokenDir, "token"), "smoke-token", { mode: 0o600 });
 
   app = await electron.launch({
     executablePath: binary,
@@ -93,6 +113,29 @@ test("run from a checkout without JKB_APP_FROM_CHECKOUT=1, the app refuses to st
   assert.match(r.stderr, /JKB_APP_FROM_CHECKOUT=1/);
 });
 
+// D53.1: an inherited ELECTRON_RENDERER_URL must not make a remote page the one main trusts with
+// the bridge. Which URLs pass is pinned by dev-renderer.test.mjs; this is the refusal, in main.
+test("pointed at a renderer off loopback, the app refuses to start", { skip }, () => {
+  const env = { ...process.env, HOME: home, JKB_APP_FROM_CHECKOUT: "1", JKB_APP_DEV_RENDERER: "1", ELECTRON_RENDERER_URL: "http://example.net" };
+  const r = spawnSync(binary, [appDir], { env, encoding: "utf8", timeout: 30_000 });
+  assert.equal(r.status, 1, `exit ${r.status}, signal ${r.signal}; stderr: ${r.stderr}`);
+  assert.match(r.stderr, /must be an http:\/\/ URL on loopback/);
+});
+
+// What the window was made with, from main: the renderer-side checks below cannot see `sandbox`
+// (a renderer with `sandbox: false` but context isolation still shows no require or process).
+test("the window's renderer is sandboxed and isolated, with no Node integration", { skip }, async () => {
+  const prefs = await app.evaluate(({ BrowserWindow }) => {
+    const contents = BrowserWindow.getAllWindows()[0]?.webContents;
+    if (contents === undefined) return "no window";
+    // Undocumented but long-standing (Electron's own lib reads it); if it goes, this fails loudly.
+    if (typeof contents.getLastWebPreferences !== "function") return "no getLastWebPreferences";
+    const p = contents.getLastWebPreferences();
+    return { sandbox: p.sandbox, contextIsolation: p.contextIsolation, nodeIntegration: p.nodeIntegration, webviewTag: p.webviewTag };
+  });
+  assert.deepEqual(prefs, { sandbox: true, contextIsolation: true, nodeIntegration: false, webviewTag: false });
+});
+
 test("the renderer has no Node, only the bridge", { skip }, async () => {
   const globals = await page.evaluate(() => ({
     require: typeof globalThis.require,
@@ -106,6 +149,8 @@ test("the daemon's status is shown, and an absent daemon reads unreachable", { s
   const status = page.locator(".daemon-status");
   await status.and(page.locator('[data-state="failed"]')).waitFor();
   assert.match(await status.innerText(), /unreachable/);
+  // The request went out (the token was read) and nothing answered on the port.
+  assert.match(await status.getAttribute("title"), new RegExp(`cannot reach jkb serve at http://127\\.0\\.0\\.1:${port}`));
 });
 
 for (const [id, label] of [

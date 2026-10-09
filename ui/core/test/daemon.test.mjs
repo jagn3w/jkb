@@ -67,9 +67,19 @@ test("an error reply keeps its code, message and seq; an unknown code reads as u
   const newer = decodeOpReply(400, JSON.stringify({ code: "from_the_future", message: "m" }));
   assert.equal(newer.error.code, "unknown");
 
+});
+
+// As `jkb_daemon::client::decode` reads it: an error body that is not a jkb `ApiError` came from
+// something else on the way (a proxy, another service on the port), so the daemon is out of reach
+// rather than at fault.
+test("a non-2xx reply that is not a jkb error is unavailable, not internal", () => {
   const bare = decodeOpReply(502, "Bad Gateway");
-  assert.equal(bare.error.code, "internal");
-  assert.match(bare.error.message, /HTTP 502/);
+  assert.equal(bare.error.code, "unavailable");
+  assert.match(bare.error.message, /HTTP 502 from something other than jkb serve/);
+
+  const hello = decodeHelloReply(404, "<html>not found</html>");
+  assert.equal(hello.error.code, "unavailable");
+  assert.match(hello.error.message, /HTTP 404/);
 });
 
 test("hello is checked for shape and protocol", () => {

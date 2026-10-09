@@ -10,7 +10,8 @@
 // launching Electron. The wire format itself (URLs, reply decoding) is `@jkb/core`'s.
 
 import { constants } from "node:fs";
-import { open } from "node:fs/promises";
+import { lstat, open } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import {
   MAX_BODY_BYTES,
@@ -36,6 +37,11 @@ export interface DaemonClientOptions {
   readonly url: string;
   /** Where the daemon writes its token (`@jkb/core`'s `tokenPath`, or `JKB_REMOTE_TOKEN_FILE`). */
   readonly tokenFile: string;
+  /**
+   * The directory below which no component of `tokenFile` may be a link (`readToken`): the home
+   * directory. Unset, or not above `tokenFile`, only the token file itself is checked.
+   */
+  readonly trustedRoot?: string;
   /** How long a call may take, past any long-poll wait. */
   readonly timeoutMs?: number;
   /** The fetch to use; the global one by default. */
@@ -57,43 +63,90 @@ function describe(e: unknown): string {
 }
 
 /**
+ * The first component of `path` strictly below `root` — `root` itself excluded, the leaf included —
+ * that is a symbolic link, named relative to `root`; or `undefined` when there is none. A missing
+ * component is not a link: the open that follows says it is missing.
+ */
+async function linkBelow(root: string, path: string): Promise<string | undefined> {
+  const parts = relative(root, path).split(sep);
+  let at = root;
+  for (const part of parts) {
+    at = join(at, part);
+    try {
+      if ((await lstat(at)).isSymbolicLink()) return relative(root, at);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/** Whether `path` lies strictly below `root`. */
+function isBelow(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+/**
  * Read the daemon's token from `path`, whitespace trimmed.
  *
- * `~/.jkb` is writable from the dev container, so the file is opened without following a link
- * (a planted link would have the app read, and send as a header, whatever it points at) and must
- * be a small regular file holding one printable word.
+ * `~/.jkb` is writable from the dev container, so a link planted at **any** component below
+ * `trustedRoot` is refused — the `daemon` directory, the `<port>` directory, or the token itself
+ * — as is anything but a small regular file holding one printable word. A planted link would have
+ * the app read, and send as a header, whatever it points at. `trustedRoot` (the home directory) and
+ * its ancestors are trusted: the container cannot replace its bind's own root. When `path` is not
+ * below `trustedRoot`, its own directory is the trusted root and only the leaf is checked.
+ *
+ * Node has no `openat`, so the walk is by path: the chain is checked before the open, the leaf is
+ * opened `O_NOFOLLOW`, and after it the chain is checked again and the opened file must be the one
+ * the path names now (device and inode). A link swapped in and out between those calls is the
+ * residual race; the Rust writer (`jkb_daemon::token::write`), which holds the root token's
+ * directory by handle, is the side that closes it. `O_NONBLOCK` makes a FIFO at the path open at
+ * once — to be refused as not a regular file — instead of parking a libuv thread until a writer
+ * appears.
+ *
+ * Failures carry no absolute path: the message crosses the bridge, and the renderer is not told
+ * where the token lives (`AppInfo`). A component is named relative to the trusted root.
  */
-export async function readToken(path: string): Promise<Outcome<string>> {
-  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+export async function readToken(path: string, trustedRoot?: string): Promise<Outcome<string>> {
+  const root = trustedRoot !== undefined && isBelow(trustedRoot, path) ? trustedRoot : dirname(path);
+  const refused = (why: string): Outcome<string> => failed("token_refused", `refusing the daemon token: ${why}`);
+  const linked = async (): Promise<Outcome<string> | undefined> => {
+    const link = await linkBelow(root, path);
+    return link === undefined ? undefined : refused(`${link} is a symbolic link`);
+  };
+
+  const before = await linked();
+  if (before !== undefined) return before;
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
   let handle;
   try {
     handle = await open(path, flags);
   } catch (e) {
     const code = (e as { code?: unknown }).code;
-    if (code === "ELOOP" || code === "EMLINK") {
-      return failed("unavailable", `refusing the daemon token at ${path}: it is a symbolic link`);
-    }
+    if (code === "ELOOP" || code === "EMLINK") return refused(`${relative(root, path)} is a symbolic link`);
     return failed(
       "unavailable",
-      `no daemon token at ${path} (${describe(e)}); is jkb serve running on the host?`,
+      `no daemon token (${typeof code === "string" ? code : "unreadable"}); is jkb serve running on the host?`,
     );
   }
   try {
     const stat = await handle.stat();
-    if (!stat.isFile()) {
-      return failed("unavailable", `refusing the daemon token at ${path}: not a regular file`);
-    }
-    if (stat.size > MAX_TOKEN_BYTES) {
-      return failed("unavailable", `refusing the daemon token at ${path}: ${stat.size} bytes is not a token`);
+    if (!stat.isFile()) return refused("it is not a regular file");
+    if (stat.size > MAX_TOKEN_BYTES) return refused(`${stat.size} bytes is not a token`);
+    const after = await linked();
+    if (after !== undefined) return after;
+    const now = await lstat(path).catch(() => undefined);
+    if (now === undefined || now.dev !== stat.dev || now.ino !== stat.ino) {
+      return refused("the file changed while it was opened");
     }
     const token = (await handle.readFile("utf8")).trim();
-    if (token === "") return failed("unavailable", `${path} holds no token`);
-    if (!/^[\x21-\x7e]+$/.test(token)) {
-      return failed("unavailable", `${path} does not hold a token (expected one printable word)`);
-    }
+    if (token === "") return failed("unavailable", "the daemon token file holds no token");
+    if (!/^[\x21-\x7e]+$/.test(token)) return refused("the file does not hold a token (expected one printable word)");
     return { ok: true, value: token };
   } catch (e) {
-    return failed("unavailable", `reading the daemon token at ${path}: ${describe(e)}`);
+    const code = (e as { code?: unknown }).code;
+    return failed("unavailable", `reading the daemon token: ${typeof code === "string" ? code : describe(e)}`);
   } finally {
     await handle.close();
   }
@@ -103,6 +156,7 @@ export async function readToken(path: string): Promise<Outcome<string>> {
 export class DaemonClient {
   readonly url: string;
   readonly #tokenFile: string;
+  readonly #trustedRoot: string | undefined;
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
   #token: string | undefined;
@@ -110,6 +164,7 @@ export class DaemonClient {
   constructor(options: DaemonClientOptions) {
     this.url = options.url;
     this.#tokenFile = options.tokenFile;
+    this.#trustedRoot = options.trustedRoot;
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.#fetch = options.fetch ?? globalThis.fetch;
   }
@@ -154,7 +209,7 @@ export class DaemonClient {
 
   async #currentToken(fresh: boolean): Promise<Outcome<string>> {
     if (!fresh && this.#token !== undefined) return { ok: true, value: this.#token };
-    const read = await readToken(this.#tokenFile);
+    const read = await readToken(this.#tokenFile, this.#trustedRoot);
     this.#token = read.ok ? read.value : undefined;
     return read;
   }
