@@ -135,9 +135,8 @@ export function ContainerTab(): React.JSX.Element {
 
   const run = async (action: ContainerAction): Promise<void> => {
     setBusy(true);
-    // The terminal runs ONCE: the drawer offers no Restart and no Container/Host toggle for it. A
-    // Restart re-ran the action (a Remove, say) past the confirmation, with the buttons enabled and no
-    // status read after, and the toggle could move the host-only run.sh into the container (review s8
+    // The terminal runs ONCE: the drawer offers no Restart for it. A Restart re-ran the action (a
+    // Remove, say) past the confirmation, with the buttons enabled and no status read after (review s8
     // round 1). So every run of an action comes through here, one at a time (`ActionGate`).
     const started = await runAction(action, gate.current, {
       confirm: (message) => window.confirm(message),

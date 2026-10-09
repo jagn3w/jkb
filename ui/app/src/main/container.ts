@@ -9,10 +9,9 @@
 // `DC_KIT_DIR` puts it — under the ACCOUNT's home, which is also what `run.sh` builds its own HOME
 // from — and its `run.sh --kit-path` must answer that same directory before anything else is run
 // from it. The renderer names an action and main turns it into the kit's program and its flag, so the
-// tab never spells a path. That is a convenience, not a boundary: the spec goes back to the renderer,
-// which opens it through the generic `terminal.open`, and that accepts any host argv by design
-// (D53.10). The renderer is the app's own page; what keeps the checkout's run.sh from running is that
-// nothing in the app names it, and that run.sh itself refuses to start a container from a checkout.
+// tab never spells a path; main then issues that exact spec to the window (`TerminalHost.issueHost`),
+// and `terminal.open` refuses any host argv it did not issue (D53.10) -- within the limits D53.10
+// states for that gate.
 
 import { execFile } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
@@ -135,8 +134,8 @@ export class ContainerKit {
   /**
    * The terminal a button opens: the kit's `run.sh` with the action's one flag, on the HOST (it
    * drives docker from outside the container), so its output streams into the integrated terminal.
-   * `action` comes from the renderer and is checked here; nothing else of the spec does. A
-   * convenience, not a gate: the renderer opens the spec through `terminal.open`, which takes any argv.
+   * `action` comes from the renderer and is checked here; nothing else of the spec does. The caller
+   * issues the answer to the window (`issueHost`), the only host argv that window may then open.
    */
   async spec(action: unknown): Promise<ContainerResult<TerminalSpec>> {
     if (!isContainerAction(action)) return { ok: false, error: `not a container action: ${JSON.stringify(action)}` };

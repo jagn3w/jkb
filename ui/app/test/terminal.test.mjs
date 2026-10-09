@@ -104,7 +104,9 @@ test("main resolves the repos root's link once, and keeps the spelling", () => {
   const roots = main.machineRoots(home, { JKB_CONTAINER_NAME: " jkb-alt " }, home);
   assert.equal(roots.hostRepos, path.join(home, "repos"));
   assert.equal(roots.hostReposReal, fs.realpathSync(real));
-  assert.equal(roots.container, "jkb-alt");
+  // run.sh's own ${JKB_CONTAINER_NAME:-jkb-dev}, untrimmed (`containerName`, review s8 round 2): a
+  // trimmed name sent terminals to another container than the tab's buttons address.
+  assert.equal(roots.container, " jkb-alt ");
   assert.equal(shared.containerPathOf(path.join(fs.realpathSync(real), "jkb"), roots), "/home/vscode/repos/jkb");
   const bare = main.machineRoots(path.join(work, "no-such-home"), {}, path.join(work, "no-such-home"));
   assert.equal(bare.hostReposReal, bare.hostRepos, "a root that does not exist yet is only its spelling");
@@ -668,9 +670,9 @@ test("a terminal opened to run once may not run again; every other may", () => {
   let s = S.reduce(S.INITIAL_STATE, { type: "open", key: 1, spec: spec({ target: "host", cwd: "/h", argv: ["/k/run.sh", "--rm"] }), placement: "drawer", once: true });
   s = S.reduce(s, { type: "open", key: 2, spec: spec(), placement: "drawer" });
   s = S.reduce(s, { type: "status", key: 1, status: { kind: "exited", exitCode: 0 } });
-  assert.equal(S.canRerun(s.entries[0]), false, "the Container tab's run.sh --rm: no Restart, no toggle");
+  assert.equal(S.canRerun(s.entries[0]), false, "the Container tab's run.sh --rm: no Restart, no relaunch");
   assert.equal(S.canRerun(s.entries[1]), true);
-  // The reducer is the rule: a restart of a run-once terminal (Restart, a relaunch, the target toggle
+  // The reducer is the rule: a restart of a run-once terminal (Restart and every relaunch
   // all dispatch it) is a no-op that returns the very same state, which is how the provider knows not
   // to start its program again.
   const before = s;

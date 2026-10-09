@@ -29,9 +29,8 @@ export interface TerminalEntry {
   readonly placement: Placement;
   readonly status: TerminalStatus;
   /**
-   * Run once, for its caller: no Restart and no target toggle (`canRerun`). The Container tab's
-   * buttons open these: a rerun of `run.sh --rm` would skip the tab's confirmation and its status
-   * read, and the toggle would move the host-only `run.sh` into the container.
+   * Run once, for its caller: no Restart and no relaunch (`canRerun`). The Container tab's buttons
+   * open these: a rerun of `run.sh --rm` would skip the tab's confirmation and its status read.
    */
   readonly once?: boolean;
 }
@@ -91,7 +90,7 @@ export function reduce(state: TerminalsState, action: TerminalAction): Terminals
     case "restart": {
       // THE RULE, in one place: a terminal opened to run once, or one that is gone, is not restarted,
       // and the state comes back unchanged -- the same object, which is how the provider knows not
-      // to start its program (`rerun`). Restart, relaunch and the target toggle all come through here.
+      // to start its program (`rerun`). Restart and every relaunch come through here.
       const entry = state.entries.find((e) => e.key === action.key);
       if (entry === undefined || !canRerun(entry)) return state;
       return {
@@ -134,7 +133,7 @@ export function reduce(state: TerminalsState, action: TerminalAction): Terminals
 }
 
 /**
- * Whether the terminal may run its program again, by Restart, a relaunch or the target toggle: every
+ * Whether the terminal may run its program again, by Restart or a relaunch: every
  * terminal but one opened to run once. The reducer's `restart` enforces it; the chrome asks it only
  * to hide the buttons.
  */

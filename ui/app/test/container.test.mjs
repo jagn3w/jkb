@@ -157,7 +157,7 @@ test("an action the tab does not offer is refused, flags and programs included",
 test("the Container tab opens each action's terminal to run once", () => {
   // The tab is not rendered in these tests, so its one call is read: a Restart in the drawer re-ran
   // an action (a Remove) past the tab's confirmation, with its buttons enabled and no status read
-  // after, and the Container/Host toggle could move the host-only run.sh into the container.
+  // after.
   const tab = fs.readFileSync(path.join(src, "renderer", "src", "tabs", "ContainerTab.tsx"), "utf8");
   const opens = [...tab.matchAll(/\bopen: \(spec\) => ([^\n]*)/g)].map((m) => m[1]);
   assert.equal(opens.length, 1, "runAction is given one way to open a terminal");

@@ -725,25 +725,21 @@ it, read `--status`, build each button's terminal spec), `window.jkb.container` 
 - **The renderer names an action; main picks the program and its flag.** `container.spec(action)`
   refuses anything that is not one of the five actions (a flag, a path, an object), and answers a
   **host** terminal spec — `[<kit>/.container/run.sh, <flag>]`, from the account's home — that the tab
-  opens in the integrated terminal's drawer, so the output streams there. **A convenience, not a
-  boundary** (corrected, review s8 round 1): the spec goes back to the renderer, which opens it through
-  the generic `terminal.open`, and that accepts any host argv by design (D53.10). What keeps the
-  checkout's `run.sh` from running is that nothing in the app names it and that `run.sh` itself refuses
-  to start a container from a checkout. main's `run.sh --status` and the terminal start from one
+  opens in the integrated terminal's drawer, so the output streams there. Review s8 round 1 called this
+  a convenience rather than a boundary, because `terminal.open` then took any host argv; D53.10's
+  `issueHost` has since made main's spec the only host argv a window may open, so the action check is
+  the gate for host programs, within the limits D53.10 states for it. main's `run.sh --status` and the terminal start from one
   environment rule (`hostEnv`), so both hand `run.sh` the same `JKB_CONTAINER_NAME`; a container
   terminal enters `containerName`'s answer, `run.sh`'s own `${JKB_CONTAINER_NAME:-jkb-dev}`, untrimmed
   (it trimmed, and a name with a trailing space split the terminals from the buttons). A container
-  terminal finds `docker` by run.sh's rule too — each absolute line of the kit home's `path-keep`, then
-  run.sh's own PATH in its order (`dockerSearchPath`, held equal to run.sh's `jkb_path` by a test) — and
-  the host roots are the account's home, where run.sh mounts `repos` from (round 3: a Docker Desktop
-  named only in `path-keep` worked for the buttons and not for any terminal).
-- **A button's terminal runs once.** It is opened with no Restart and no Container/Host toggle. As
-  first built it was "a terminal like any other", and the drawer's Restart re-ran a finished Remove with
-  no confirmation, with the tab's buttons enabled, and with no `--status` read after; the toggle could
-  move the host-only `run.sh` into the container. The rule is the terminal reducer's: its `restart` on a
-  run-once terminal returns the state unchanged, and the provider's one `rerun` starts a program only
-  when the reducer changed the state — Restart, relaunch and the toggle all go through it (round 1 had
-  put a check in each of them, which a fourth caller would forget).
+  terminal finds `docker` by run.sh's rule too (D53.10, *docker*; round 3: a Docker Desktop named only
+  in `path-keep` worked for the buttons and not for any terminal).
+- **A button's terminal runs once.** It is opened with no Restart. As first built it was "a terminal
+  like any other", and the drawer's Restart re-ran a finished Remove with no confirmation, with the
+  tab's buttons enabled, and with no `--status` read after. The rule is the terminal reducer's: its
+  `restart` on a run-once terminal returns the state unchanged, and the provider's one `rerun` starts a
+  program only when the reducer changed the state — Restart, relaunch and `open`'s relaunch of an ended
+  session all go through it (round 1 had put a check in each caller, which the next one would forget).
 - **One action at a time, from the click.** `containerRun.ts`'s `ActionGate` is taken synchronously,
   before the first await, and released when the run's terminal ends or by any path that opens none. The
   tab's `running` state is set only after main's spec and the sessions read, so a quick second Build had
@@ -871,8 +867,12 @@ Ctrl+` and is resized by its top edge; its height is a per-window convenience.
   must be set where the app is launched (`launchctl setenv JKB_CONTAINER_NAME …` on macOS, then
   relaunch; or start the app from that shell). The *New terminal* button's tooltip names the
   container it enters, so a mismatch is visible. A name that is not one (`--privileged`) is refused
-  rather than handed to docker as a flag. `docker` itself is looked for at fixed absolute paths,
-  never on `PATH`: a GUI app's `PATH` is not the shell's.
+  rather than handed to docker as a flag. `docker` itself is looked for by **run.sh's rule**, never
+  on the app's `PATH` (a GUI app's is not the shell's): each absolute line of the kit home's
+  `path-keep` under the account's home, then run.sh's own fixed PATH in its order
+  (`dockerSearchPath`; a test reads run.sh's `jkb_path` and `jkb_keepf` and holds them equal). It
+  had a fixed list of its own, which missed a Docker Desktop named only in `path-keep` and put
+  `/usr/local/bin` before `/usr/bin` (review s8 round 3).
 - **A host terminal is the login shell, or a spec main built.** `TerminalHost.open` refuses a host
   spec with an argv unless main issued exactly that `(cwd, argv)` to that window (`issueHost`, as
   the Container tab's `run.sh <flag>` is handed out; D53.8), until the window closes or reloads. A
