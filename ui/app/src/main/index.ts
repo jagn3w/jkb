@@ -50,7 +50,7 @@ import { DesignFeeds } from "./designFeeds";
 import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
-import { TerminalHost, machineEnvironment, machineRoots, type SpawnPty } from "./terminals";
+import { TerminalHost, accountHome, machineEnvironment, machineRoots, type SpawnPty } from "./terminals";
 import { AppUpdater, machineRunner } from "./update";
 
 /**
@@ -108,17 +108,7 @@ const terminals = new TerminalHost(
   },
 );
 
-/**
- * The installed container kit (D53.8), under the ACCOUNT's home — the passwd entry, which is what
- * `run.sh` builds its own HOME from — rather than `$HOME`, which a launching terminal can set.
- */
-function accountHome(): string {
-  try {
-    return userInfo().homedir || homedir();
-  } catch {
-    return homedir();
-  }
-}
+/** The installed container kit (D53.8), under the ACCOUNT's home (`accountHome`). */
 const containerKit = new ContainerKit(machineKit(accountHome(), process.env));
 
 /** The installed copy's clean clone and its builder, under the same account home as the kit (D53.3). */

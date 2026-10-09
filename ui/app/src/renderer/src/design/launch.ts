@@ -104,8 +104,8 @@ function under(path: string, root: string): boolean {
 
 /**
  * The terminal that resumes a recorded prompt: `claude --resume <uuid>` in the cwd it was recorded
- * with. Sessions start in the container, so it resumes there; a session that was moved to the host
- * by the terminal's toggle recorded a host path, which is carried back through the repos mount.
+ * with. Sessions run in the container, so it resumes there; a recorded host path is carried back
+ * through the repos mount.
  */
 export function resumeSpec(prompt: DesignPromptRecord, roots: TerminalRoots): TerminalSpec {
   return sessionResumeSpec({ session: prompt.session, cwd: prompt.cwd, title: titled("Resume", prompt.title) }, roots);

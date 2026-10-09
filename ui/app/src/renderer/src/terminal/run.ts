@@ -94,6 +94,8 @@ export class TerminalRun {
       this.screen.status({ kind: "failed", error: result.error });
       return;
     }
+    // A stop (the tab's close) that came while it opened has taken this PTY and is ending it.
+    if (this.ptyId !== result.value.id) return;
     this.screen.status({ kind: "running" });
     this.screen.attach(result.value.id);
   }

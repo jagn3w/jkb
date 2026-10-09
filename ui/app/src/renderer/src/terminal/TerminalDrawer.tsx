@@ -138,7 +138,7 @@ export function TerminalDrawer(): React.JSX.Element {
           type="button"
           className="terminal-action"
           aria-label="New host terminal"
-          title="New login shell on this machine, outside the container (it runs only what you type)"
+          title="New login shell on this machine, outside the container: whatever is typed into it runs with your account's full access"
           disabled={terminals.roots === undefined}
           onClick={() => terminals.openShell("host")}
         >

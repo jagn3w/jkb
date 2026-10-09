@@ -1,5 +1,5 @@
-//! The small pieces the drawer and the popover share: where a terminal runs, how it stands, and
-//! the toggle that moves it between the container and the host.
+//! The small pieces the drawer and the popover share: where a terminal runs (fixed when it opens,
+//! D53.10), how it stands, and its Restart.
 
 import { targetLabel, type TerminalTarget } from "../../../shared/terminal";
 import { statusLabel, type TerminalEntry } from "./state";

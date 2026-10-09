@@ -707,7 +707,8 @@ or mislead, POSIX quoting across sh/bash/zsh, PATH lookup through a login shell 
 target is now FIXED when it opens. The host runs only an interactive login shell (the person types
 the command) and the specs main itself builds (the Container tab's `run.sh` actions); Claude
 sessions, *Play*, *Discuss* and *Resume* always run in the container. Running chosen programs on
-the host, and moving a terminal between the two, is tracked as a backlog task (cut from D53.10).
+the host, and moving a terminal between the two, is tracked as
+`task:code-factory-terminal-run-progra-18dcc253c3beb828` (cut from D53.10).
 
 **As built (subtask 2).** The contract is `src/shared/terminal.ts` (the spec, its validator
 `parseSpec`, the path mapping, the events); main's half is `src/main/terminals.ts` (`TerminalHost`:
@@ -731,9 +732,18 @@ Ctrl+` and is resized by its top edge; its height is a per-window convenience.
   never on `PATH`: a GUI app's `PATH` is not the shell's.
 - **A host terminal is the login shell, or a spec main built.** `TerminalHost.open` refuses a host
   spec with an argv unless main issued exactly that `(cwd, argv)` to that window (`issueHost`, as
-  the Container tab's `run.sh <flag>` is handed out; D53.8), until the window closes or reloads. No
-  renderer caller can run a program of its choosing outside the container. A host program is named
-  by absolute path; nothing is looked up on the app's `PATH`.
+  the Container tab's `run.sh <flag>` is handed out; D53.8), until the window closes or reloads. A
+  host program is named by absolute path; nothing is looked up on the app's `PATH`.
+  **What this gate is, and is not (review s2-r4).** It stops a program being routed to the host BY
+  ACCIDENT — a caller building a spec with the wrong target, a session spec carried to the wrong
+  side. It is not a boundary against the renderer: the host login shell (the operator's chosen
+  "host session") takes `write`, so whatever drives the renderer can type any command into one it
+  opens and have it run on the host with the person's account. The renderer is therefore trusted
+  for host execution, as it is for every daemon op it sends. The actual defence is keeping the
+  renderer the app's own code: `contextIsolation`, `sandbox`, no `nodeIntegration`, no navigation
+  or new windows, every bridge call checked to come from the top frame of the app's own page
+  (`isTrusted`), and a built page whose CSP allows scripts from `'self'` only (`electron.vite.config.ts`)
+  with network sources closed (D53.1).
 - **Ending a program is explicit, and confirmed (review s2-r1).** Closing a container terminal
   kills the `docker exec` client AND runs a second `docker exec <container> /bin/sh -c <END_SCRIPT>
   jkb-terminal-end <record>`, which sends the recorded process group SIGHUP (what a closing terminal
@@ -753,11 +763,17 @@ Ctrl+` and is resized by its top edge; its height is a per-window convenience.
   unconfirmed — not a re-attach, not a *Resume* reaching it through `planOpen`, which shows such a
   tab rather than relaunching it — until *Restart*, the person's explicit override. An open still in
   flight is awaited before an end, so a PTY whose open lands after its tab was closed (or its start
-  was superseded) is ended like any other rather than dropped. That one remembered end is all the
+  was superseded) is ended like any other rather than dropped, and the start that opened it carries
+  on only while it still owns that PTY — a close that took it meanwhile is not undone by marking
+  the tab running again (review s2-r4). Whether a program may be running is one predicate,
+  `mayBeLive` (starting, running, closing, or failed with `mayBeRunning`), used by `planOpen` and by
+  re-attach (D53.9) alike. That one remembered end is all the
   tracking a fixed-target terminal needs, since its only stop-then-start is its own; round 2's
   `EndRecord` and closed-tab orphans existed for the toggle and went with it. Tested with a fake
   bridge (`test/terminal.test.mjs`, "one terminal's starts and ends"). A window's close or reload,
-  and quit, send the ends without waiting: the renderer that would show them is gone. A program
+  and quit, send the ends without waiting: the renderer that would show them is gone. Such a
+  terminal is still read until it ends, but its output and exit are no longer sent to that window —
+  a reloaded page under the same id would hold them as a terminal still opening. A program
   that exits on its own leaves its record file in the container's `/tmp` (one line, gone when the
   container restarts).
 - **Main trusts nothing the renderer sends.** `parseSpec` refuses unknown fields (there is no `env`
@@ -769,7 +785,8 @@ Ctrl+` and is resized by its top edge; its height is a per-window convenience.
 - **Paths cross through the repos mount** (`HOST_REPOS` ⇄ `CTR_REPOS` in `run.sh`), the one
   directory both sides see. Like `run.sh`'s `container_path`, both spellings of the host root map:
   `TerminalRoots.hostReposReal` is `~/repos` with its links resolved, once, by main
-  (`machineRoots`), so a cwd from `git rev-parse --show-toplevel` under a symlinked `~/repos` still
+  (`machineRoots`; `~` is the ACCOUNT's home, `accountHome`, as `run.sh` mounts it, not a `$HOME`
+  the app was started with), so a cwd from `git rev-parse --show-toplevel` under a symlinked `~/repos` still
   lands in the repo rather than in `CTR_REPOS`. `containerPathOf` is the one statement of the host
   → container rule (the Sessions tab's resume and its "shell here" use it); `hostPathOf` the other
   way (`gitPlace`). A host badge on a tab is drawn inverted so it cannot be read as the quiet
@@ -813,7 +830,9 @@ Ctrl+` and is resized by its top edge; its height is a per-window convenience.
   (ESC[30;107m — round 2 darkened bright white to #404040, which left such text at 1.7:1; review
   s2-r3), and black on them reads at 3:1 or better. Drawn as text, xterm's `minimumContrastRatio`
   (3, `MIN_CONTRAST_RATIO`) darkens them where they meet the ground. Every dark value but `black`
-  (conventionally a ground) reads at 3:1 on the dark ground. Pinned in the test.
+  (conventionally a ground) reads at 3:1 on the dark ground. White and bright white also differ
+  from `--terminal-selection` in both schemes, so a selection over them shows (light white was
+  #d3d3d1, the selection's own colour; review s2-r4). Pinned in the test.
 
 What it cost to learn:
 
@@ -847,7 +866,9 @@ What it cost to learn:
 - **A pre-existing flake, measured, not fixed:** "output is gathered into few messages" loses the
   tail of a fast program's output in a few runs (2 of 15 on the unchanged tree, linux-arm64, node-pty
   1.1.0): node-pty reports the exit and drops what was still in the master's buffer. Delaying the
-  exit by 50 ms did not help (3 of 20), so the data is lost rather than late.
+  exit by 50 ms did not help (3 of 20), so the data is lost rather than late. The test now has its
+  program pause 200 ms before exiting, since what it measures is the gathering (0 of 20 failed
+  after); the loss itself is node-pty's and is not fixed here.
 
 ## Subtasks, in landing order
 

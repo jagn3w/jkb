@@ -44,7 +44,7 @@ export const INITIAL_STATE: TerminalsState = { entries: [], active: undefined, p
 export type TerminalAction =
   | { readonly type: "open"; readonly key: number; readonly spec: TerminalSpec; readonly placement: Placement }
   | { readonly type: "status"; readonly key: number; readonly status: TerminalStatus }
-  /** The terminal starts again from `spec` (a restart, or the target toggle). */
+  /** The terminal starts again from `spec` (a Restart, a relaunch, a re-attach). */
   | { readonly type: "restart"; readonly key: number; readonly spec: TerminalSpec }
   | { readonly type: "close"; readonly key: number }
   | { readonly type: "select"; readonly key: number }
@@ -132,17 +132,29 @@ export type OpenPlan =
   | { readonly kind: "relaunch"; readonly entry: TerminalEntry }
   | { readonly kind: "new" };
 
+/**
+ * Whether a terminal's program may be running: starting, running, being ended, or ended without
+ * confirmation. The one statement of it — what `planOpen` shows rather than relaunches and what
+ * re-attach (D53.9) leaves alone — so nothing starts a second program beside one that may run.
+ */
+export function mayBeLive(status: TerminalStatus): boolean {
+  switch (status.kind) {
+    case "starting":
+    case "running":
+    case "closing":
+      return true;
+    case "failed":
+      return status.mayBeRunning === true;
+    case "exited":
+      return false;
+  }
+}
+
 export function planOpen(state: TerminalsState, spec: TerminalSpec): OpenPlan {
   const entry = findSession(state, spec.sessionUuid);
   if (entry === undefined) return { kind: "new" };
-  // A program that may still be running (its end unconfirmed) is shown, never started beside:
-  // only an explicit Restart overrides that.
-  const live =
-    entry.status.kind === "starting" ||
-    entry.status.kind === "running" ||
-    entry.status.kind === "closing" ||
-    (entry.status.kind === "failed" && entry.status.mayBeRunning === true);
-  return { kind: live ? "show" : "relaunch", entry };
+  // Only an explicit Restart starts beside a program that may still be running.
+  return { kind: mayBeLive(entry.status) ? "show" : "relaunch", entry };
 }
 
 /** The drawer's terminals, in tab order. */

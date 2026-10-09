@@ -8,7 +8,10 @@
 // wrapper recording the program's process group inside the container so that closing it can end it
 // there (`END_SCRIPT`), not only end the docker client. A host terminal is the login shell, which
 // runs nothing until it is typed into, or a spec main itself built and issued (`issueHost`, the
-// Container tab's `run.sh` actions); a host argv the renderer made up is refused. A terminal's
+// Container tab's `run.sh` actions); a host argv the renderer made up is refused. That refusal
+// stops ACCIDENTAL host routing only: a host login shell takes `write`, so the renderer is trusted
+// for host execution, and the defence is that the renderer is the app's own code (contextIsolation,
+// sandbox, the bridge's top-frame check, a `script-src 'self'` CSP; D53.1, D53.10). A terminal's
 // target is fixed when it opens. Every terminal belongs to the window that opened it: only that
 // window can write to it, resize it, acknowledge its output or close it, it hears only that
 // window's events, and it is ended when that window closes.
@@ -16,6 +19,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
+import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -214,6 +218,19 @@ export function terminalEnv(env: Readonly<Record<string, string | undefined>>): 
   return out;
 }
 
+/**
+ * The ACCOUNT's home — the passwd entry, which is what `run.sh` builds its own HOME from (and so
+ * where it finds the kit and mounts `~/repos` from) — rather than `$HOME`, which a launching
+ * terminal can set.
+ */
+export function accountHome(): string {
+  try {
+    return userInfo().homedir || homedir();
+  } catch {
+    return homedir();
+  }
+}
+
 /** The container's repos directory (`CTR_REPOS` in `.container/run.sh`). */
 export const CONTAINER_REPOS = "/home/vscode/repos";
 
@@ -224,8 +241,13 @@ export const CONTAINER_REPOS = "/home/vscode/repos";
  * the one directory both sides see: `~/repos` as spelled and with its links resolved
  * (`HOST_REPOS`/`HOST_REPOS_REAL`), so a path reached through either maps into the container.
  */
-export function machineRoots(home: string, env: Readonly<Record<string, string | undefined>>): TerminalRoots {
-  const hostRepos = join(home, "repos");
+export function machineRoots(
+  home: string,
+  env: Readonly<Record<string, string | undefined>>,
+  account: string = accountHome(),
+): TerminalRoots {
+  // `run.sh` mounts `~/repos` of the ACCOUNT's home, whatever `$HOME` the app was started with.
+  const hostRepos = join(account, "repos");
   let hostReposReal = hostRepos;
   try {
     hostReposReal = realpathSync(hostRepos);
@@ -309,6 +331,11 @@ interface Running {
   exitCheck: ReturnType<typeof setInterval> | undefined;
   /** The program has exited: whatever is left is read through, never paused for again. */
   draining: boolean;
+  /**
+   * Its window closed or reloaded (`closeAll`): it is still read (and ended), but nothing more is
+   * sent — a reloaded page under the same id would hold its output and exit as a terminal opening.
+   */
+  disowned: boolean;
 }
 
 /**
@@ -391,6 +418,7 @@ export class TerminalHost {
       paused: false,
       exitCheck: undefined,
       draining: false,
+      disowned: false,
     };
     this.running.set(id, entry);
     pty.onData((data) => {
@@ -405,7 +433,7 @@ export class TerminalHost {
       this.flush(entry);
       this.running.delete(id);
       markExited();
-      this.emit(owner, { id, kind: "exit", exitCode, ...(signal ? { signal } : {}) });
+      if (!entry.disowned) this.emit(owner, { id, kind: "exit", exitCode, ...(signal ? { signal } : {}) });
     });
     return { ok: true, value: entry.info };
   }
@@ -435,7 +463,7 @@ export class TerminalHost {
       }, PAUSED_EXIT_CHECK_MS);
       entry.exitCheck.unref?.();
     }
-    this.emit(entry.owner, { id: entry.info.id, kind: "data", data });
+    if (!entry.disowned) this.emit(entry.owner, { id: entry.info.id, kind: "data", data });
   }
 
   /** The renderer drew `chars` of a terminal's output. Whether it was taken. */
@@ -563,6 +591,7 @@ export class TerminalHost {
     for (const entry of [...this.running.values()]) {
       if (owner !== undefined && entry.owner !== owner) continue;
       if (entry.timer !== undefined) clearTimeout(entry.timer);
+      entry.disowned = true;
       this.running.delete(entry.info.id);
       void this.end(entry);
     }

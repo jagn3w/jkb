@@ -215,9 +215,9 @@ test("the Container tab offers the kit's buttons and says what the kit answered"
   await pane.locator(".container-error, .container-findings").first().waitFor();
 });
 
-// The integrated terminal (D53.10). A new terminal is a container terminal, labelled so; the
-// toggle moves it to the host, where it is a real shell. The container side is not exercised here
-// (no dev container in CI): what it runs is pinned by terminal.test.mjs.
+// The integrated terminal (D53.10). A new terminal is a container terminal, labelled so; "+ host"
+// opens a login shell on the host, where it is a real shell. The container side is not exercised
+// here (no dev container in CI): what it runs is pinned by terminal.test.mjs.
 test("the terminal opens in the container by default, and a host terminal is a login shell", { skip }, async () => {
   await page.getByRole("button", { name: "New terminal", exact: true }).click();
   const tab = page.locator(".terminal-tab").first();

@@ -11,7 +11,7 @@ import type { ContainerAction } from "@jkb/core";
 
 import type { TerminalRoots, TerminalSpec } from "../../../shared/terminal";
 import { resumedDir, sessionResumeSpec } from "../design/launch";
-import type { TerminalEntry } from "../terminal/state";
+import { mayBeLive, type TerminalEntry } from "../terminal/state";
 
 /** The Container tab's actions that end the container's processes: rebuild, stop, remove. */
 export const TEARS_DOWN: readonly ContainerAction[] = ["build", "stop", "remove"];
@@ -37,7 +37,7 @@ function isAttached(e: TerminalEntry): e is TerminalEntry & { readonly spec: Ter
   return (
     e.spec.sessionUuid !== undefined &&
     e.spec.target === "container" &&
-    (e.status.kind === "running" || e.status.kind === "starting")
+    mayBeLive(e.status)
   );
 }
 
@@ -85,7 +85,7 @@ export function reattachPlan(
     const spec = sessionResumeSpec({ session: a.session, cwd: a.cwd, title: a.title }, roots);
     const entry = entries.find((e) => e.key === a.key && e.spec.sessionUuid === a.session);
     if (entry === undefined) return { kind: "open", spec };
-    if (entry.status.kind === "running" || entry.status.kind === "starting") return { kind: "survived", key: a.key };
+    if (mayBeLive(entry.status)) return { kind: "survived", key: a.key };
     return { kind: "relaunch", key: a.key, spec };
   });
 }

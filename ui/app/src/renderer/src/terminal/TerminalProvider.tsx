@@ -131,7 +131,7 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
   const openShell = useCallback(
     (target: TerminalTarget = DEFAULT_TARGET): void => {
       if (roots === undefined) return;
-      // Titled for what it runs, not where: the toggle can move it, and the badge says where.
+      // Titled for what it runs, not where: the badge says where.
       open({ target, cwd: defaultCwd(target, roots), argv: [], title: "shell" });
     },
     [open, roots],

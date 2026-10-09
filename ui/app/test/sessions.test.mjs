@@ -406,3 +406,13 @@ test("after the rebuild each recorded session is resumed in its terminal — and
   const merged = mergeRecords(recorded.slice(0, 2), [{ ...recorded[0], key: 7 }]);
   assert.deepEqual(merged.map((a) => [a.session, a.key]), [[S2, 2], [S1, 7]], "a second teardown keeps the newest record of a session");
 });
+
+test("re-attach leaves alone a terminal whose program may still run, as planOpen does", () => {
+  const recorded = [{ key: 1, session: S1, cwd: "/home/vscode/repos/jkb", target: "container", title: "Play · build" }];
+  for (const status of [{ kind: "closing" }, { kind: "failed", error: "x", mayBeRunning: true }]) {
+    const plan = reattachPlan(recorded, [entry(1, claudeSpec(S1), status)], true, ROOTS);
+    assert.deepEqual(plan.map((p) => p.kind), ["survived"], `${JSON.stringify(status)} is not relaunched beside`);
+  }
+  const ended = reattachPlan(recorded, [entry(1, claudeSpec(S1), { kind: "failed", error: "x" })], true, ROOTS);
+  assert.deepEqual(ended.map((p) => p.kind), ["relaunch"]);
+});

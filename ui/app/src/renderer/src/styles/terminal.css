@@ -30,8 +30,7 @@
 
 .drawer-toggle,
 .terminal-action,
-.terminal-close,
-.target-toggle button {
+.terminal-close {
   appearance: none;
   border: 0;
   background: transparent;
@@ -45,8 +44,7 @@
 
 .drawer-toggle:hover,
 .terminal-action:hover:not(:disabled),
-.terminal-close:hover,
-.target-toggle button:hover:not(:disabled) {
+.terminal-close:hover {
   background: var(--surface-hover);
   color: var(--ink);
 }
@@ -69,8 +67,7 @@
   font-weight: 400;
 }
 
-.terminal-action:disabled,
-.target-toggle button:disabled {
+.terminal-action:disabled {
   cursor: default;
   opacity: 0.5;
 }
@@ -143,23 +140,6 @@
 
 .terminal-status[data-failed] {
   color: var(--alert);
-}
-
-.target-toggle {
-  display: inline-flex;
-  border: var(--hairline-width) solid var(--hairline);
-  border-radius: var(--radius);
-  padding: 1px;
-}
-
-.target-toggle button {
-  padding: 0 var(--space-2);
-}
-
-.target-toggle button[aria-pressed="true"] {
-  background: var(--surface-active);
-  color: var(--ink);
-  cursor: default;
 }
 
 .drawer-body {

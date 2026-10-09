@@ -101,14 +101,21 @@ test("main resolves the repos root's link once, and keeps the spelling", () => {
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(real, { recursive: true });
   fs.symlinkSync(real, path.join(home, "repos"));
-  const roots = main.machineRoots(home, { JKB_CONTAINER_NAME: " jkb-alt " });
+  const roots = main.machineRoots(home, { JKB_CONTAINER_NAME: " jkb-alt " }, home);
   assert.equal(roots.hostRepos, path.join(home, "repos"));
   assert.equal(roots.hostReposReal, fs.realpathSync(real));
   assert.equal(roots.container, "jkb-alt");
   assert.equal(shared.containerPathOf(path.join(fs.realpathSync(real), "jkb"), roots), "/home/vscode/repos/jkb");
-  const bare = main.machineRoots(path.join(work, "no-such-home"), {});
+  const bare = main.machineRoots(path.join(work, "no-such-home"), {}, path.join(work, "no-such-home"));
   assert.equal(bare.hostReposReal, bare.hostRepos, "a root that does not exist yet is only its spelling");
   assert.equal(bare.container, "jkb-dev");
+});
+
+test("the repos roots are under the account's home, not a $HOME the app was started with", () => {
+  const roots = main.machineRoots("/somewhere/else", {});
+  assert.equal(roots.hostRepos, path.join(os.userInfo().homedir, "repos"), "as run.sh mounts it");
+  assert.equal(roots.hostHome, "/somewhere/else");
+  assert.equal(main.accountHome(), os.userInfo().homedir);
 });
 
 test("a paste is chunked without splitting a surrogate pair", () => {
@@ -282,16 +289,41 @@ test("only the owner can type into, resize or close a terminal", async () => {
 });
 
 test("closing a window ends its terminals and no one else's", async () => {
-  const { h, until } = host();
-  const a = h.open(1, spec({ target: "host", cwd: work, argv: ["/bin/cat"] }), 80, 24).value.id;
-  const b = h.open(2, spec({ target: "host", cwd: work, argv: ["/bin/cat"] }), 80, 24).value.id;
+  const { h, events, until } = host();
+  const started = (owner) => {
+    const id = h.open(owner, spec({ target: "host", cwd: work, argv: ["/bin/sh", "-c", "echo PID $$; exec /bin/cat"] }), 80, 24).value.id;
+    return id;
+  };
+  const a = started(1);
+  const b = started(2);
+  const pidOf = async (id) => {
+    await until((ev) => /PID \d+/.test(output(ev, id)), `${id}'s pid`);
+    return Number(output(events, id).match(/PID (\d+)/)[1]);
+  };
+  const [pa, pb] = [await pidOf(a), await pidOf(b)];
   h.closeAll(1);
   assert.deepEqual(h.list(1), []);
   assert.deepEqual(h.list(2).map((t) => t.id), [b]);
   assert.equal(h.write(1, a, "x"), false, "a closed window's terminal takes nothing");
+  await poll(() => !alive(pa), "a to end");
+  assert.ok(alive(pb), "b runs on");
   h.closeAll();
   assert.deepEqual(h.list(2), []);
-  await until((ev) => ev.some((e) => e.id === b && e.kind === "exit"), "b's exit");
+  await poll(() => !alive(pb), "b to end");
+});
+
+test("after its window closes or reloads, a terminal is ended but sends that window nothing more", async () => {
+  const { h, events, until } = host();
+  const script = "trap 'echo BYE; exit 0' HUP; echo UP $$; while :; do sleep 0.05; done";
+  const id = h.open(5, spec({ target: "host", cwd: work, argv: ["/bin/sh", "-c", script] }), 80, 24).value.id;
+  await until((ev) => /UP \d+/.test(output(ev, id)), "the program");
+  const pid = Number(output(events, id).match(/UP (\d+)/)[1]);
+  const seen = events.length;
+  h.closeAll(5);
+  // It ends (its hangup handler prints and exits), and its last words and exit go nowhere.
+  await poll(() => !alive(pid), "the program to end");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(events.slice(seen), [], "no output or exit after the window let it go");
 });
 
 test("a bad spec, size or missing directory starts nothing", () => {
@@ -573,7 +605,9 @@ test("a fast producer is held near the high watermark until its output is acknow
 
 test("output is gathered into few messages", async () => {
   const { h, events, until } = host();
-  const id = h.open(1, spec({ target: "host", cwd: work, argv: ["/bin/sh", "-c", "i=0; while [ $i -lt 2000 ]; do echo line$i; i=$((i+1)); done"] }), 80, 24).value.id;
+  // The pause before the exit: node-pty can drop a fast program's last output at its exit (D53.10,
+  // the measured flake), which is not what this test is about.
+  const id = h.open(1, spec({ target: "host", cwd: work, argv: ["/bin/sh", "-c", "i=0; while [ $i -lt 2000 ]; do echo line$i; i=$((i+1)); done; sleep 0.2"] }), 80, 24).value.id;
   await until((ev) => ev.some((e) => e.id === id && e.kind === "exit"), "the exit");
   const text = output(events, id);
   assert.match(text, /line1999/);
@@ -754,6 +788,20 @@ test("a PTY whose open lands after its tab was closed is ended, and the close wa
   assert.equal(closed.confirmed, true);
 });
 
+test("a stop while an open is in flight ends that PTY, and the start does not claim it back", async () => {
+  const { run, calls, statuses, landOpen, settle } = fakeRun();
+  const starting = run.start(spec({ argv: ["claude", "--resume", "u"] }));
+  await settle();
+  // The tab's close: a stop alone, no new start.
+  const stopping = run.stop();
+  await landOpen(0);
+  assert.equal((await stopping).confirmed, true);
+  await starting;
+  assert.deepEqual(calls, [["open", 1, "claude --resume u"], ["detach", 1], ["close", 1]], "never attached");
+  assert.equal(run.id, undefined);
+  assert.ok(!statuses.some((st) => st.kind === "running"), "never shown as running");
+});
+
 test("a restart during an open in flight ends the first PTY before opening the second", async () => {
   const { run, calls, landOpen, settle } = fakeRun();
   void run.start(spec({ argv: ["a"] }));
@@ -816,6 +864,10 @@ test("a tab being closed, or whose end was unconfirmed, is shown rather than sta
   assert.equal(S.statusLabel(s.entries[0].status), "may still run");
   s = S.reduce(s, { type: "status", key: 1, status: { kind: "failed", error: "x" } });
   assert.equal(S.planOpen(s, resume).kind, "relaunch", "an ordinary failure is started again");
+  assert.deepEqual(
+    [{ kind: "starting" }, { kind: "running" }, { kind: "closing" }, { kind: "failed", error: "x", mayBeRunning: true }, { kind: "failed", error: "x" }, { kind: "exited", exitCode: 0 }].map(S.mayBeLive),
+    [true, true, true, true, false, false],
+  );
 });
 
 test("held output dropped unseen is reported, so main can count it as drawn", () => {
@@ -882,6 +934,13 @@ test("the terminal has all 16 ANSI colours as light and dark tokens, readable as
     if (key !== "black") assert.ok(contrast(dark[token], dark["--terminal-bg"]) >= 3, `${key} ${dark[token]} on the dark ground`);
   }
   assert.ok(theme.MIN_CONTRAST_RATIO >= 3, "a light colour drawn as text is fixed up");
+  // A selection over cells painted white or bright white must still show (review s2-r4).
+  for (const [name, scheme] of [["light", light], ["dark", dark]]) {
+    for (const key of theme.BACKGROUND_ANSI) {
+      const c = scheme[theme.ANSI_TOKENS[key]];
+      assert.ok(contrast(c, scheme["--terminal-selection"]) >= 1.2, `${key} ${c} vs the selection ${scheme["--terminal-selection"]}, ${name}`);
+    }
+  }
   assert.equal(Object.keys(theme.ANSI_TOKENS).length, 16);
 });
 
