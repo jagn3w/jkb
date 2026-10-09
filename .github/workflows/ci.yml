@@ -100,6 +100,12 @@ jobs:
       # drives a real jkb. It runs HERE, against the jkb the tests above built, rather than in the
       # `ui` job, which has no Rust toolchain — there it skipped on every run and passed green.
       # JKB_REQUIRE_WIRE turns a missing binary into a failure, so this step cannot skip.
+      #
+      # It installs with ELECTRON_SKIP_BINARY_DOWNLOAD, and shares its pnpm store cache with the
+      # `ui` job (same lockfile key). pnpm's side-effects cache records a package's postinstall
+      # result in the store, keyed by package and not by environment, so a skipped Electron
+      # download saved here was restored there as "already built" and the `ui` job's smoke found
+      # no binary. --config.side-effects-cache=false keeps this install's skip out of the store.
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: ui/package.json
@@ -115,7 +121,7 @@ jobs:
           JKB_BIN: ${{ github.workspace }}/target/debug/jkb
           JKB_REQUIRE_WIRE: "1"
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --config.side-effects-cache=false
           node --test app/test/yjs-wire.test.mjs
 
       # docs/ generated from jkb designs (design D55.6), the same step scripts/check.sh runs. The
@@ -347,6 +353,13 @@ jobs:
 
       - name: install
         run: pnpm install --frozen-lockfile
+
+      # Fetch the Electron binary explicitly rather than trusting the install to have run
+      # electron's postinstall: a store restored from a cache can carry that postinstall's result
+      # from an install that skipped the download (see the `check` job's wire step). install.js is
+      # the postinstall itself; it does nothing when the binary is already there.
+      - name: Electron binary
+        run: node app/node_modules/electron/install.js
 
       # `build` is the whole gate: each package type-checks before emitting, and `pnpm -r`
       # runs topologically so @jkb/core's .d.ts exists before the adapter checks against it.
