@@ -1279,6 +1279,8 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   does not already end a line, else a space. Each simpler rule broke something: no separator ran
   spans together (`Decided.## D2`, round 2); counting the gap's line ends split a table at a skipped
   row (round 3); adding nothing after a line end merged two approved paragraphs (round 4).
+  Indentation a span took along after its last line break is dropped first, either way, so a span
+  ending in the next line's indent leaves a tight list tight (round 6).
 - **The header** is the file's first line:
   `<!-- generated from jkb design <uid>, edit there (version <token>, blake3 <hex>) -->`, the hash being
   that of the body below it. A file without it is hand-written and never checked. **Only the first
@@ -1315,7 +1317,9 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   answers the design's repo, `export` refuses another repo's design, and `--against-db` names a
   generated file whose design is of another repo as a stray. `jkb design source` applies the same
   checkout-repo rule before recording anything (pinned by `a_design_records_its_sources_with_their_blake3`).
-  A design's repo is asked of `design.list`, never of `design.export`: rendering refuses a design
+  A design's repo is derived on the client from its `design.list` row's namespace (by core's
+  `export::repo_in`; no wire field, so an older daemon still answers it — round 6), never asked of
+  `design.export`: rendering refuses a design
   whose target another design shares, and `export --to` — the remedy that refusal names — and
   `design source` must work on exactly that design (round 5; pinned by
   `a_shared_doc_target_is_cleared_by_export_to`). Not covered: a submodule inside a

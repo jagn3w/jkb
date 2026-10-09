@@ -1573,6 +1573,19 @@ fn a_span_ending_in_indentation_leaves_exactly_one_blank_line() {
     assert_eq!(exported_body(&db, &uid), "- one\n  cont.\n\n- two\n");
 }
 
+/// The no-blank-line twin: a span ending in the next line's indentation, with one line skipped,
+/// leaves the list tight — no indentation before the next item's line.
+#[test]
+fn a_span_ending_in_indentation_keeps_a_tight_list_tight() {
+    let db = db();
+    let uid = create(&db, "- one\n  cont.\n  draft\n- two\n");
+    for quote in ["- one\n  cont.\n  ", "- two\n"] {
+        let s = span(&db, &uid, quote, Reviewer::Operator).unwrap();
+        approve_as(&db, &s, Approver::Operator).unwrap();
+    }
+    assert_eq!(exported_body(&db, &uid), "- one\n  cont.\n- two\n");
+}
+
 /// Skipping one whole line adds nothing when the output already ends one, so a table keeps its
 /// rows together: no blank line where a PROPOSED row was.
 #[test]

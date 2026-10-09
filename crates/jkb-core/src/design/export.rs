@@ -231,13 +231,18 @@ pub fn approved_text(design: &DesignText) -> String {
 /// row was skipped, splitting the table (round 3); adding nothing after a line end merged two
 /// approved paragraphs into one (round 4).
 fn separate(out: &mut String, gap: &str) {
-    let tail = &out[out.trim_end().len()..];
-    let joined = format!("{tail}{gap}");
+    let content = out.trim_end().len();
+    let joined = format!("{}{gap}", &out[content..]);
     let lines: Vec<&str> = joined.split('\n').collect();
     let blank = lines.len() > 2
         && lines[1..lines.len() - 1]
             .iter()
             .any(|l| l.trim().is_empty());
+    // Indentation the span took along after its last line break belongs to the skipped line, not
+    // to the output: kept, it made a tight list loose.
+    if let Some(at) = out[content..].rfind('\n') {
+        out.truncate(content + at + 1);
+    }
     if blank {
         // Whatever whitespace the output ends in (a line break, an indentation the span took
         // along) is replaced by exactly one blank line.

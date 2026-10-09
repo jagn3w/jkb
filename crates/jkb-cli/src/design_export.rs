@@ -135,7 +135,16 @@ fn design_is_here(ops: &Ops<'_>, uid: &str, here: &str) -> Result<()> {
         .into_iter()
         .find(|d| d.uid == uid)
         .with_context(|| format!("no design {uid}"))?;
-    same_repo(uid, design.repo.as_deref(), here)
+    same_repo(uid, repo_of_row(&design).as_deref(), here)
+}
+
+/// A listed design's repo, derived here from its namespace by the one rule core uses
+/// (`export::repo_in`) rather than read from a wire field an older daemon would not send.
+fn repo_of_row(design: &Design) -> Option<String> {
+    design
+        .namespace
+        .as_deref()
+        .and_then(jkb_core::design::export::repo_in)
 }
 
 /// The repo the checkout at `root` is: the mount covering `root` itself, since `root` is where the
@@ -499,6 +508,21 @@ mod tests {
 
     /// The checkout is the nearest directory with a `.git` entry, a directory or a linked
     /// worktree's `gitdir:` file, found without running git.
+    /// A `design.list` row as any daemon sends it — no `repo` field — is accepted, and its repo is
+    /// derived from the namespace, so version skew between client and daemon cannot hide it.
+    #[test]
+    fn a_listed_designs_repo_comes_from_its_namespace() {
+        let row: jkb_api::designs::Design = serde_json::from_value(serde_json::json!({
+            "uid": "design:x-1",
+            "title": "X",
+            "namespace": "designs/proj",
+            "seq": 1,
+            "topic": "design/design.x-1",
+        }))
+        .unwrap();
+        assert_eq!(super::repo_of_row(&row).as_deref(), Some("proj"));
+    }
+
     #[test]
     fn the_checkout_is_the_nearest_directory_with_a_git_entry() {
         let dir = tempfile::tempdir().unwrap();

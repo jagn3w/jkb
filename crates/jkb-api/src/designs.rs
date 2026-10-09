@@ -38,9 +38,6 @@ pub struct Design {
     pub title: String,
     /// Where it lives (`designs/<repo>`).
     pub namespace: Option<String>,
-    /// The repo it belongs to (the segment after `designs/` in its namespace).
-    #[serde(default)]
-    pub repo: Option<String>,
     /// Its newest update's seq.
     pub seq: i64,
     /// The `mq` topic its updates are announced on.
@@ -59,7 +56,6 @@ impl From<DesignRow> for Design {
             topic: design::topic(&d.uid),
             uid: d.uid,
             title: d.title,
-            repo: d.namespace.as_deref().and_then(design::export::repo_in),
             namespace: d.namespace,
             seq: d.seq,
             doc_target: d.meta.doc_target,
