@@ -115,8 +115,22 @@ after(async () => {
     ]);
     clearTimeout(timer);
     if (!quit) {
-      proc.kill("SIGKILL");
-      assert.fail(`the app did not quit within ${QUIT_WAIT_MS} ms of being asked to: killed it`);
+      // Say what was still running before killing it: whether Electron itself is alive (the quit
+      // hold never re-quit) or has exited while something it started holds the pipes Playwright
+      // waits on, and which processes those are.
+      const exited = proc.exitCode !== null || proc.signalCode !== null;
+      const tree = spawnSync("ps", ["-eo", "pid,ppid,pgid,stat,args", "--forest"], { encoding: "utf8" }).stdout;
+      // Playwright starts Electron as its own process group: kill the group, so a child holding the
+      // pipes goes too and the test file can exit, then Electron itself if the group kill failed.
+      try {
+        process.kill(-proc.pid, "SIGKILL");
+      } catch {
+        proc.kill("SIGKILL");
+      }
+      assert.fail(
+        `the app did not quit within ${QUIT_WAIT_MS} ms of being asked to: killed it. ` +
+          `Electron pid ${proc.pid} ${exited ? `had exited (code ${proc.exitCode}, signal ${proc.signalCode})` : "was still running"}.\n${tree}`,
+      );
     }
   }
   if (home !== undefined) fs.rmSync(home, { recursive: true, force: true });
@@ -162,7 +176,7 @@ test("the renderer has no Node, only the bridge", { skip }, async () => {
     process: typeof globalThis.process,
     bridge: Object.keys(window.jkb).sort(),
   }));
-  assert.deepEqual(globals, { require: "undefined", process: "undefined", bridge: ["design", "hello", "info", "op", "terminal"] });
+  assert.deepEqual(globals, { require: "undefined", process: "undefined", bridge: ["container", "design", "hello", "info", "notify", "op", "sessions", "terminal"] });
 });
 
 test("the daemon's status is shown, and an absent daemon reads unreachable", { skip }, async () => {
