@@ -20,7 +20,7 @@
 // **`serve` is the consumer of the `claude/notify` queue** (design r3.2 N2,
 // openspec/changes/jkb-message-queue/design-r3.md). The Claude Code hook no longer runs this
 // binary: it tells `jkb serve` what happened, jkb's notification machine decides, and its posts and
-// withdrawals arrive here through `jkb mq subscribe` — the NDJSON protocol in docs/message-queue.md.
+// withdrawals arrive here through `jkb mq subscribe` — the NDJSON protocol in docs/daemon-and-messaging.md.
 // Run by launchd as `com.jkb.notifier`, pointing at the BUNDLE's binary so the notification centre
 // finds the bundle identifier. Deciding whether a post can be *displayed* is this process's job,
 // because it is the only one that can ask: authorized and not alert-style `none` posts through the
