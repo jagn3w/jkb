@@ -1,27 +1,41 @@
 //! `docs/` generated from designs (design D55.5–6).
 //!
-//! A design's **export** is its text with every PROPOSED range left out and no span markers, under
-//! one header line naming the design and the version it was rendered at. The header is also how a
-//! generated file is recognised: [`generated_from`] reads it back, and a file without it is
-//! hand-written and never checked. Rendering is pure ([`render`]) so the drift check re-renders
-//! in memory exactly what an export writes — there is one definition of the file, not two.
+//! A design's **export** is its approved text with no span markers, under one header line naming
+//! the design, the version it was rendered at, and the blake3 of the text below the header. The
+//! header is also how a generated file is recognised: [`parse`] reads it back, and a file without
+//! it is hand-written and never checked.
 //!
-//! A design's metadata records where its export goes (`doc_target`, a repo-relative path under
-//! `docs/`) and the files it was made from (`sources`, each with the blake3 of its content then).
+//! The hash is what makes the drift check database-free (D55.6, amended): `jkb design export
+//! --check` re-hashes each generated file's body and compares it with the hash its header records,
+//! so a hand edit fails the gate on any machine — CI included — without opening a database or
+//! reaching a daemon. Whether the design has moved on since is a different question, asked only
+//! with the live design at hand (`--check --against-db`). Rendering is pure ([`render`]), so that
+//! comparison re-renders in memory exactly what an export writes.
+//!
+//! A design's doc target (a repo-relative path under `docs/`) and the files it was made from (each
+//! with the blake3 of its content then) are rows of their own (V026), so each write undoes alone.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{json, Value};
+use serde_json::json;
 
-use super::{crdt, design_id, invalid, read, set_metadata, DesignText, SpanState, Version};
+use super::{design_id, invalid, read, DesignText, SpanState, Version};
+use crate::changelog::{self, Entity};
 use crate::{Error, Result};
+use jkb_types::ItemId;
 
-/// The start of a generated file's first line. Everything after the design's uid is information
-/// for the reader; only the uid is read back.
+/// The start of a generated file's first line.
 pub const GENERATED: &str = "<!-- generated from jkb design ";
 
 /// The directory every doc target lives under, so the drift check (which scans it) sees every
 /// generated file.
 pub const DOCS_DIR: &str = "docs/";
+
+/// Between the design's uid and the version token in the header.
+const VERSION_AT: &str = ", edit there (version ";
+/// Between the version token and the body's hash.
+const HASH_AT: &str = ", blake3 ";
+/// The header's end.
+const CLOSE: &str = ") -->";
 
 /// A file a design was made from: its repo-relative path and the blake3 of its content then.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,12 +46,12 @@ pub struct Source {
     pub blake3: String,
 }
 
-/// What a design's metadata says about its export and its sources.
+/// What a design records about its export and its sources.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DesignMeta {
     /// Where its export is written, relative to the repository root.
     pub doc_target: Option<String>,
-    /// The files it was made from.
+    /// The files it was made from, in the order they were first recorded.
     pub sources: Vec<Source>,
 }
 
@@ -56,39 +70,121 @@ pub struct Exported {
     pub text: String,
 }
 
-/// The header line (without its newline) of a design exported at `version`.
+/// Lowercase hex blake3 of an export's body, as its header records it.
 #[must_use]
-pub fn header(uid: &str, version: &Version) -> String {
+pub fn body_hash(body: &str) -> String {
+    crate::blob::hash_bytes(body.as_bytes())
+}
+
+/// The header line (without its newline) of a design exported at `version` with `body` below it.
+#[must_use]
+pub fn header(uid: &str, version: &Version, body: &str) -> String {
     format!(
-        "{GENERATED}{uid}, edit there (version {}) -->",
-        version.token()
+        "{GENERATED}{uid}{VERSION_AT}{}{HASH_AT}{}{CLOSE}",
+        version.token(),
+        body_hash(body)
     )
 }
 
-/// The design a generated file names in its header; `None` for a file that is not generated.
-#[must_use]
-pub fn generated_from(file: &str) -> Option<&str> {
-    let first = file.lines().next()?;
-    let (uid, _) = first.strip_prefix(GENERATED)?.split_once(',')?;
-    (!uid.is_empty()).then_some(uid)
+/// What a file's first line says it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Generated<'a> {
+    /// No generated header: hand-written, and not checked.
+    Hand,
+    /// A first line that claims to be the generated header but does not read as one — trimmed by
+    /// hand, or preceded by a byte-order mark or whitespace. Never silently taken as hand-written:
+    /// that would let a generated file out of the check by damaging its first line.
+    Malformed(&'static str),
+    /// A generated file.
+    File {
+        /// The design it names.
+        uid: &'a str,
+        /// The version token it was rendered at (information for the reader only).
+        version: &'a str,
+        /// The blake3 its header records for the body.
+        blake3: &'a str,
+        /// Everything after the header line.
+        body: &'a str,
+    },
 }
 
-/// The design's text with every PROPOSED range left out: only words some anchored span holds as
-/// approved (or staged, or implemented) are kept, in text order. Words removed since an approval
-/// are gone from the text and so from the export.
+impl Generated<'_> {
+    /// For a generated file, whether its body is still the one its header records — `false` means
+    /// it was edited by hand since it was exported.
+    #[must_use]
+    pub fn intact(&self) -> bool {
+        match self {
+            Self::File { blake3, body, .. } => body_hash(body) == *blake3,
+            Self::Hand | Self::Malformed(_) => false,
+        }
+    }
+}
+
+/// Read a file's generated header, if it has one.
+#[must_use]
+pub fn parse(file: &str) -> Generated<'_> {
+    let (first, body) = file.split_once('\n').unwrap_or((file, ""));
+    let marker = GENERATED.trim_end();
+    let Some(rest) = first.strip_prefix(GENERATED) else {
+        let lead = first.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
+        return if lead.starts_with(marker) || first.starts_with(marker) {
+            Generated::Malformed(
+                "its first line looks like the generated header but is not exactly one",
+            )
+        } else {
+            Generated::Hand
+        };
+    };
+    let parsed = rest.split_once(VERSION_AT).and_then(|(uid, tail)| {
+        let (version, blake3) = tail.strip_suffix(CLOSE)?.split_once(HASH_AT)?;
+        let hex = blake3.len() == 64
+            && blake3
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let word = |w: &str| !w.is_empty() && !w.contains(char::is_whitespace);
+        (word(uid) && word(version) && hex).then_some((uid, version, blake3))
+    });
+    match parsed {
+        Some((uid, version, blake3)) => Generated::File {
+            uid,
+            version,
+            blake3,
+            body,
+        },
+        None => Generated::Malformed(
+            "its generated header does not read (it must name the design, the version and the \
+             body's blake3)",
+        ),
+    }
+}
+
+/// The design a generated file names in its header; `None` for a file that is not (or not
+/// readably) generated.
+#[must_use]
+pub fn generated_from(file: &str) -> Option<&str> {
+    match parse(file) {
+        Generated::File { uid, .. } => Some(uid),
+        Generated::Hand | Generated::Malformed(_) => None,
+    }
+}
+
+/// The design's approved text: every span the document still anchors and that is APPROVED (or
+/// STAGED, or IMPLEMENTED), whole, in text order. Everything else is PROPOSED and left out —
+/// uncovered text, an unapproved span, and **a demoted span as a whole** (D53.5): once any of an
+/// approved span's words changed, what is left of it is not text anyone approved. Joining its
+/// surviving pieces would publish exactly that — "We must not log tokens." with "not" deleted
+/// would export as "We must  log tokens.".
 #[must_use]
 pub fn approved_text(design: &DesignText) -> String {
     let text = &design.text;
     let mut ranges: Vec<(usize, usize)> = design
         .spans
         .iter()
-        .filter(|s| s.anchored)
-        .flat_map(|s| &s.pieces)
-        .filter(|p| p.state != SpanState::Proposed && !p.removed && p.end > p.start)
-        .map(|p| {
+        .filter(|s| s.anchored && s.state != SpanState::Proposed && s.end > s.start)
+        .map(|s| {
             (
-                crdt::utf16_to_byte(text, p.start),
-                crdt::utf16_to_byte(text, p.end),
+                super::crdt::utf16_to_byte(text, s.start),
+                super::crdt::utf16_to_byte(text, s.end),
             )
         })
         .collect();
@@ -110,50 +206,31 @@ pub fn approved_text(design: &DesignText) -> String {
 /// (an editor or formatter adds one, and that alone must not read as drift).
 #[must_use]
 pub fn render(design: &DesignText) -> String {
-    let body = approved_text(design);
-    let mut out = header(&design.uid, &design.version);
+    let mut body = approved_text(design);
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    let mut out = header(&design.uid, &design.version, &body);
     out.push('\n');
     out.push_str(&body);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
     out
 }
 
-fn item_metadata(conn: &Connection, uid: &str) -> Result<(jkb_types::ItemId, Value)> {
-    let id = design_id(conn, uid)?;
-    let raw: String = conn
-        .prepare_cached("SELECT metadata FROM items WHERE id = ?1")?
-        .query_row([id.get()], |r| r.get(0))?;
-    let value = serde_json::from_str(&raw)
-        .map_err(|e| invalid(format!("design {uid} has unreadable metadata: {e}")))?;
-    Ok((id, value))
-}
-
-/// Read a design's export metadata out of its item's `metadata` JSON.
-pub(super) fn meta_of(uid: &str, metadata: &Value) -> Result<DesignMeta> {
-    let doc_target = metadata
-        .get("doc_target")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let sources = match metadata.get("sources") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(list)) => list
-            .iter()
-            .map(|s| {
-                let field = |k: &str| s.get(k).and_then(Value::as_str).map(str::to_owned);
-                Ok(Source {
-                    path: field("path").ok_or_else(|| {
-                        invalid(format!("design {uid} has a source with no path"))
-                    })?,
-                    blake3: field("blake3").ok_or_else(|| {
-                        invalid(format!("design {uid} has a source with no blake3"))
-                    })?,
-                })
+/// A design's export metadata, by its item id.
+pub(super) fn meta_of(conn: &Connection, id: ItemId) -> Result<DesignMeta> {
+    let doc_target = conn
+        .prepare_cached("SELECT path FROM design_doc_targets WHERE design_id = ?1")?
+        .query_row([id.get()], |r| r.get(0))
+        .optional()?;
+    let sources = conn
+        .prepare_cached("SELECT path, blake3 FROM design_sources WHERE design_id = ?1 ORDER BY id")?
+        .query_map([id.get()], |r| {
+            Ok(Source {
+                path: r.get(0)?,
+                blake3: r.get(1)?,
             })
-            .collect::<Result<_>>()?,
-        Some(_) => return Err(invalid(format!("design {uid}'s sources are not a list"))),
-    };
+        })?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(DesignMeta {
         doc_target,
         sources,
@@ -163,10 +240,9 @@ pub(super) fn meta_of(uid: &str, metadata: &Value) -> Result<DesignMeta> {
 /// A design's export metadata.
 ///
 /// # Errors
-/// An unknown design, or metadata that does not read.
+/// An unknown design, or a database error.
 pub fn meta(conn: &Connection, uid: &str) -> Result<DesignMeta> {
-    let (_, value) = item_metadata(conn, uid)?;
-    meta_of(uid, &value)
+    meta_of(conn, design_id(conn, uid)?)
 }
 
 /// `path` as a stored repo-relative path: not empty, not absolute, and with no `.`, `..` or empty
@@ -190,26 +266,10 @@ fn repo_path(path: &str, what: &str) -> Result<String> {
     Ok(path.to_owned())
 }
 
-fn set_key(
-    conn: &Connection,
-    meta: &crate::WriteMeta,
-    uid: &str,
-    key: &str,
-    v: Value,
-) -> Result<()> {
-    let (id, mut value) = item_metadata(conn, uid)?;
-    match value.as_object_mut() {
-        Some(obj) => {
-            obj.insert(key.to_owned(), v);
-        }
-        None => value = json!({ key: v }),
-    }
-    set_metadata(conn, meta, id, &value)
-}
-
 /// Record where a design's export is written: `path`, relative to the repository root and under
 /// `docs/`, and named by no other design (two designs rendering one file would each read the
-/// other's export as drift).
+/// other's export as drift). The rule is the table's UNIQUE constraint too, so an undo that would
+/// break it is refused rather than applied.
 ///
 /// # Errors
 /// An unknown design, a path that is not a `docs/` file, or one another design already targets.
@@ -226,27 +286,43 @@ pub fn set_doc_target(
              not `{path}`"
         )));
     }
-    let current = self::meta(conn, uid)?.doc_target;
+    let id = design_id(conn, uid)?;
     let taken: Option<String> = conn
         .prepare_cached(
-            "SELECT uid FROM items
-              WHERE kind = ?1 AND uid <> ?2 AND json_extract(metadata, '$.doc_target') = ?3",
+            "SELECT i.uid FROM design_doc_targets t JOIN items i ON i.id = t.design_id
+              WHERE t.path = ?1 AND t.design_id <> ?2",
         )?
-        .query_row(params![super::KIND, uid, path], |r| r.get(0))
+        .query_row(params![path, id.get()], |r| r.get(0))
         .optional()?;
     if let Some(other) = taken {
         return Err(invalid(format!(
             "design {other} already exports to `{path}` — give this one its own file"
         )));
     }
+    let current: Option<String> = conn
+        .prepare_cached("SELECT path FROM design_doc_targets WHERE design_id = ?1")?
+        .query_row([id.get()], |r| r.get(0))
+        .optional()?;
     if current.as_deref() == Some(path.as_str()) {
         return Ok(());
     }
-    set_key(conn, meta, uid, "doc_target", Value::String(path))
+    conn.prepare_cached(
+        "INSERT INTO design_doc_targets (design_id, path) VALUES (?1, ?2)
+         ON CONFLICT (design_id) DO UPDATE SET path = excluded.path",
+    )?
+    .execute(params![id.get(), path])?;
+    changelog::upsert(
+        conn,
+        meta,
+        Entity::DesignDocTargets,
+        &id.get().to_string(),
+        current.map(|p| json!({ "path": p })).as_ref(),
+        Some(&json!({ "design_id": id.get(), "path": path })),
+    )
 }
 
-/// Record files a design was made from (D55.5). A path recorded before is replaced, so recording
-/// a source again re-hashes it; the others are kept.
+/// Record files a design was made from (D55.5). A path recorded before is re-hashed in place; the
+/// others are kept. Each path is its own row, so undoing one recording takes back only it.
 ///
 /// # Errors
 /// An unknown design, a path that is not repo-relative, or a hash that is not blake3 hex.
@@ -256,8 +332,7 @@ pub fn add_sources(
     uid: &str,
     sources: &[Source],
 ) -> Result<()> {
-    let mut now = self::meta(conn, uid)?.sources;
-    let before = now.clone();
+    let id = design_id(conn, uid)?;
     for s in sources {
         let path = repo_path(&s.path, "a source path")?;
         let hex = s.blake3.len() == 64
@@ -270,22 +345,36 @@ pub fn add_sources(
                 s.blake3
             )));
         }
-        match now.iter_mut().find(|n| n.path == path) {
-            Some(n) => n.blake3.clone_from(&s.blake3),
-            None => now.push(Source {
-                path,
-                blake3: s.blake3.clone(),
-            }),
-        }
+        let before: Option<(i64, String)> = conn
+            .prepare_cached(
+                "SELECT id, blake3 FROM design_sources WHERE design_id = ?1 AND path = ?2",
+            )?
+            .query_row(params![id.get(), path], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let row = match &before {
+            Some((_, hash)) if *hash == s.blake3 => continue,
+            Some((row, _)) => {
+                conn.prepare_cached("UPDATE design_sources SET blake3 = ?2 WHERE id = ?1")?
+                    .execute(params![row, s.blake3])?;
+                *row
+            }
+            None => conn
+                .prepare_cached(
+                    "INSERT INTO design_sources (design_id, path, blake3) VALUES (?1, ?2, ?3)
+                     RETURNING id",
+                )?
+                .query_row(params![id.get(), path, s.blake3], |r| r.get(0))?,
+        };
+        changelog::upsert(
+            conn,
+            meta,
+            Entity::DesignSources,
+            &row.to_string(),
+            before.map(|(_, hash)| json!({ "blake3": hash })).as_ref(),
+            Some(&json!({ "design_id": id.get(), "path": path, "blake3": s.blake3 })),
+        )?;
     }
-    if now == before {
-        return Ok(());
-    }
-    let list = now
-        .iter()
-        .map(|s| json!({ "path": s.path, "blake3": s.blake3 }))
-        .collect();
-    set_key(conn, meta, uid, "sources", Value::Array(list))
+    Ok(())
 }
 
 /// The design `uid` rendered for its doc target.

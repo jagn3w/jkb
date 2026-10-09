@@ -167,6 +167,10 @@ entities! {
     DesignUpdates => "design_updates",
     /// A design's compaction — bookkeeping: the document it stores is the one its updates made.
     DesignSnapshots => "design_snapshots",
+    /// Where a design's export is written (D55.6), keyed by the design's item id (its rowid).
+    DesignDocTargets => "design_doc_targets",
+    /// A file a design was made from (D55.5), keyed by the row's `id`.
+    DesignSources => "design_sources",
     /// `undo` markers, whose `entity_id` is the reverted transaction's id.
     Changelog => "changelog",
 }
@@ -236,7 +240,9 @@ impl Entity {
             | Self::Bindings
             | Self::Mounts
             | Self::Ingestions
-            | Self::Containment => InsertInverse::DeleteRow,
+            | Self::Containment
+            | Self::DesignDocTargets
+            | Self::DesignSources => InsertInverse::DeleteRow,
             Self::DesignUpdates => InsertInverse::ForwardUpdate,
             // Keyed by a uri, a transaction id and a content hash respectively, so a rowid
             // delete would address some other row; none is ever logged with op `insert`.

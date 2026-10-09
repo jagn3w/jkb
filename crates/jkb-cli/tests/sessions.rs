@@ -5111,9 +5111,14 @@ fn a_waiver_is_refused_before_anything_moves_to_a_container_terminal() {
 }
 
 /// `docs/` generated from designs (D55.5–6), against a real checkout — the export writes into it
-/// and the check reads it back, so this lives with the real-repo fixture. A hand-edited generated
-/// file fails the check, and so does one whose design moved on; a hand-written doc is not checked.
+/// and the checks read it back, so this lives with the real-repo fixture.
+///
+/// `--check` is database-free (D55.6, amended): it fails on a hand-edited generated file — its body
+/// no longer the one its header hashed — and on a damaged header, and passes a hand-written doc.
+/// `--check --against-db` also fails on a design that moved on since its export, a stale copy, and
+/// a doc target with no file, none of which a file alone can show.
 #[test]
+#[allow(clippy::too_many_lines)] // one export lifecycle, read top to bottom
 fn a_hand_edited_generated_doc_fails_the_export_check() {
     let f = Fixture::new();
     let json = |args: &[&str]| -> serde_json::Value {
@@ -5122,6 +5127,18 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
         serde_json::from_slice(&out.stdout).unwrap()
     };
     let check = || f.jkb().args(["design", "export", "--check"]).assert();
+    let against_db = || {
+        f.jkb()
+            .args([
+                "design",
+                "export",
+                "--check",
+                "--against-db",
+                "--repo",
+                "proj",
+            ])
+            .assert()
+    };
     let body = "# Draft heading\n## D1\nDecided.\n";
     let uid = json(&[
         "design", "create", "Export", "--repo", "proj", "--body", body,
@@ -5169,56 +5186,134 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
         .stdout(predicate::str::contains("wrote"));
     let path = f.repo.join("docs/export.md");
     let file = std::fs::read_to_string(&path).unwrap();
+    let approved = "## D1\nDecided.\n";
     assert_eq!(
         file,
         format!(
-            "<!-- generated from jkb design {uid}, edit there (version {}) -->\n## D1\nDecided.\n",
-            version()
+            "<!-- generated from jkb design {uid}, edit there (version {}, blake3 {}) -->\n{approved}",
+            version(),
+            jkb_core::design::export::body_hash(approved)
         ),
-        "the approved text alone, under the header"
+        "the approved text alone, under the header that hashes it"
     );
     let listed = json(&["design", "ls", "--repo", "proj"]);
     assert_eq!(listed[0]["doc_target"], "docs/export.md");
     check()
         .success()
         .stdout(predicate::str::contains("1 generated"));
+    against_db().success();
 
-    // Edited by hand: the check fails, naming the file and the design.
+    // Edited by hand: both checks fail, naming the file and the design.
     std::fs::write(&path, format!("{file}A line nobody approved.\n")).unwrap();
-    check()
-        .failure()
-        .stderr(predicate::str::contains("docs/export.md"))
-        .stderr(predicate::str::contains(uid.as_str()));
+    for failed in [check(), against_db()] {
+        failed
+            .failure()
+            .stderr(predicate::str::contains("docs/export.md"))
+            .stderr(predicate::str::contains(uid.as_str()))
+            .stderr(predicate::str::contains("edited by hand"));
+    }
     // Re-exporting (the target is remembered) puts the render back.
     f.jkb().args(["design", "export", &uid]).assert().success();
     check().success();
 
-    // The design moves on — even a PROPOSED edit is a new version — and the file is stale until
-    // `--all` re-renders it.
+    // A PROPOSED edit is a new version but not new approved text: neither check fails, so a
+    // design's unapproved drafting never reddens another branch's gate.
     f.jkb()
         .args(["design", "edit", &uid, "--base", &version()])
         .args(["--insert-after", "Draft heading", "--text", " (new)"])
         .assert()
         .success();
-    check()
+    check().success();
+    against_db().success();
+    // An edit inside the approved span demotes it: the design moved on. The file alone cannot
+    // show that; the database check does, until `--all` re-renders.
+    f.jkb()
+        .args(["design", "edit", &uid, "--base", &version()])
+        .args(["--insert-after", "Decided", "--text", " maybe"])
+        .assert()
+        .success();
+    check().success();
+    against_db()
         .failure()
         .stderr(predicate::str::contains("moved on"));
     f.jkb()
         .args(["design", "export", "--all", "--repo", "proj"])
         .assert()
         .success();
-    check().success();
+    against_db().success();
     assert_eq!(
         std::fs::read_to_string(f.repo.join("docs/hand.md")).unwrap(),
         "# Hand-written\n",
         "a hand-written doc is never touched"
     );
 
-    // A generated file the design does not export to is stale, not silently accepted.
+    // A generated file the design does not export to is stale: intact, so only the database can
+    // say so.
     std::fs::copy(&path, f.repo.join("docs/copy.md")).unwrap();
-    check()
+    check().success();
+    against_db()
         .failure()
         .stderr(predicate::str::contains("docs/copy.md"));
+    std::fs::remove_file(f.repo.join("docs/copy.md")).unwrap();
+
+    // A header damaged by hand is not silently taken for a hand-written file.
+    let generated = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("\u{feff}{generated}")).unwrap();
+    check()
+        .failure()
+        .stderr(predicate::str::contains("docs/export.md"));
+    std::fs::write(&path, &generated).unwrap();
+
+    // The design's doc target with no file: the database check reports it.
+    std::fs::remove_file(&path).unwrap();
+    check().success();
+    against_db()
+        .failure()
+        .stderr(predicate::str::contains("docs/export.md"))
+        .stderr(predicate::str::contains("does not exist"));
+}
+
+/// `jkb design export --check` opens no database and reaches no daemon (D55.6, amended), so
+/// `scripts/check.sh` and CI run it on any machine. Here the database it would open is in a
+/// directory that does not exist, and remote mode names a port nothing listens on: the check still
+/// passes, and creates neither the database nor anything under `HOME`.
+#[test]
+fn the_export_check_opens_no_database_and_reaches_no_daemon() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.repo.join("docs")).unwrap();
+    let body = "Approved.\n";
+    let hash = jkb_core::design::export::body_hash(body);
+    let generated = format!(
+        "<!-- generated from jkb design design:x-1, edit there (version 1.AA, blake3 {hash}) -->\n{body}"
+    );
+    std::fs::write(f.repo.join("docs/gen.md"), &generated).unwrap();
+    let nowhere = f.home.path().join("no-such-dir");
+    let home = f.home.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let run = || {
+        let mut cmd = jkb(None);
+        cmd.current_dir(&f.repo)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("JKB_DB", nowhere.join("jkb.db"))
+            .env("JKB_REMOTE", "127.0.0.1:9")
+            .args(["design", "export", "--check"]);
+        cmd.assert()
+    };
+    run()
+        .success()
+        .stdout(predicate::str::contains("1 generated"));
+    // And it still judges the file: a hand edit fails it, with no database anywhere.
+    std::fs::write(f.repo.join("docs/gen.md"), format!("{generated}more\n")).unwrap();
+    run()
+        .failure()
+        .stderr(predicate::str::contains("design:x-1"));
+    assert!(!nowhere.exists(), "no database was created");
+    assert_eq!(
+        std::fs::read_dir(&home).unwrap().count(),
+        0,
+        "nothing was written under HOME (no commands install, no store)"
+    );
 }
 
 /// Sources (D55.5): each recorded, repo-relative, with the blake3 of its content, in the design's

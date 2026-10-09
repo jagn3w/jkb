@@ -288,8 +288,9 @@ fn a_design_records_its_doc_target_and_sources_and_exports_its_approved_text() {
     assert_eq!(
         one[0].text,
         format!(
-            "<!-- generated from jkb design {uid}, edit there (version {}) -->\nDecided.\n",
-            doc.version
+            "<!-- generated from jkb design {uid}, edit there (version {}, blake3 {}) -->\nDecided.\n",
+            doc.version,
+            jkb_core::design::export::body_hash("Decided.\n")
         )
     );
     assert_eq!(

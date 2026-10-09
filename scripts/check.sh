@@ -74,10 +74,12 @@ JKB_REQUIRE_BUILT_JKB=1
 export JKB_CHECK_BIN JKB_REQUIRE_BUILT_JKB
 
 # docs/ is generated from jkb designs (design D55.6). A generated file is one whose first line is
-# the `generated from jkb design <uid>` header, and it must be exactly its design's render now: a
-# difference is a hand edit, or a design that moved on without a re-export. Hand-written docs carry
-# no header and are not checked. The rule — which files, what they must say — is the binary's
-# alone (`jkb design export --check`); this line only runs it, with the binary built above.
+# the `generated from jkb design <uid>` header, and that header records the blake3 of the body
+# below it: a body that no longer matches is a hand edit. The check opens NO database and reaches no
+# daemon — it reads only this checkout's docs/ — so it neither migrates, depends on nor is refused
+# by the operator's store, and it is the same gate here, in CI (ci.yml runs it too) and in a fresh
+# clone. Whether a design has moved on since its export is a database question, asked by hand with
+# `jkb design export --check --against-db`. Hand-written docs carry no header and are not checked.
 echo "==> generated docs (jkb design export --check)"
 (cd "$(dirname "$0")/.." && "$JKB_CHECK_BIN" design export --check)
 

@@ -567,10 +567,21 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
         DesignCmd::Export {
             uid,
             to,
-            all: _,
+            all,
             repo,
             check,
-        } => crate::design_export::run(ops, uid, to.as_deref(), repo, check),
+            against_db,
+        } => crate::design_export::run(
+            ops,
+            crate::design_export::ExportArgs {
+                uid,
+                to,
+                all,
+                repo,
+                check,
+                against_db,
+            },
+        ),
         DesignCmd::Source { uid, paths } => crate::design_export::source(ops, uid, &paths),
         DesignCmd::Prompt { what } => prompt_cmd(ops, what),
         DesignCmd::Plan { what } => plan_cmd(ops, what),

@@ -113,6 +113,12 @@ jobs:
           pnpm install --frozen-lockfile
           node --test app/test/yjs-wire.test.mjs
 
+      # docs/ generated from jkb designs (design D55.6), the same step scripts/check.sh runs. The
+      # check is database-free -- each generated file's header records the blake3 of its body -- so
+      # a runner with no jkb store judges it exactly as a developer's machine does.
+      - name: generated docs (jkb design export --check)
+        run: cargo run -q -p jkb-cli --bin jkb -- design export --check
+
       # The auto-mode posture's tests (design D48). Hermetic and seconds-long: no Rust, no
       # session, no network — they only exercise the JSON merge/subset logic against a temp
       # CLAUDE_CONFIG_DIR. `check.sh` skips them when jq is missing; the runner always has jq,

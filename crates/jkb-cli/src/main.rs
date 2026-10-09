@@ -447,9 +447,10 @@ enum DesignCmd {
         plain: bool,
     },
     /// Write a design's approved text to its `docs/` file (D55.6): every PROPOSED range left out,
-    /// no span markers, under a header naming the design and its version. `--to` records the
-    /// file once; `--all` re-renders every design of the repo that has one; `--check` re-renders
-    /// in memory and fails on any `docs/` file carrying the header that differs.
+    /// no span markers, under a header naming the design, its version and the body's blake3.
+    /// `--to` records the file once; `--all` re-renders every design of the repo that has one.
+    /// `--check` opens no database: it fails on any `docs/` file whose header's hash no longer
+    /// matches its body (a hand edit). `--check --against-db` also compares with the live designs.
     Export {
         /// The design (omit with `--all` or `--check`).
         #[arg(
@@ -464,12 +465,18 @@ enum DesignCmd {
         /// Every design of the repo (the ambient one, or `--repo`) that has a doc target.
         #[arg(long, conflicts_with = "check")]
         all: bool,
-        /// With `--all`: this repo's designs (`designs/<repo>`).
-        #[arg(long, requires = "all")]
+        /// With `--all` or `--check --against-db`: this repo's designs (`designs/<repo>`).
+        #[arg(long)]
         repo: Option<String>,
-        /// Write nothing; fail if a generated `docs/` file differs from its design's render.
+        /// Write nothing; fail if a generated `docs/` file was edited since it was exported (its
+        /// body no longer matches the blake3 its header records). Opens no database and reaches
+        /// no daemon, so it runs the same in `scripts/check.sh`, CI and a fresh clone.
         #[arg(long)]
         check: bool,
+        /// With `--check`: also compare each generated file with its design's render now, and
+        /// report a design whose doc target has no file. Needs the database (or the daemon).
+        #[arg(long, requires = "check")]
+        against_db: bool,
     },
     /// Record files a design was made from, each with the blake3 of its content now (D55.5).
     Source {
@@ -1530,6 +1537,23 @@ fn run(cli: Cli) -> Result<()> {
     if let Command::Attest { cmd } = &cli.command {
         rbac_cli::attest(cmd);
         return Ok(());
+    }
+
+    // The generated-docs drift check (D55.6, amended): it reads only the checkout's `docs/`, so it
+    // runs ahead of remote mode and opens no database — `scripts/check.sh` and CI run it, and a gate
+    // must not migrate, depend on or be refused by whatever store the machine holds. Not even
+    // `commands::ensure_installed`, which writes the user's Claude config.
+    if let Command::Design {
+        cmd:
+            DesignCmd::Export {
+                check: true,
+                against_db: false,
+                repo,
+                ..
+            },
+    } = &cli.command
+    {
+        return design_export::check_files(repo.as_deref(), cli.json);
     }
 
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's

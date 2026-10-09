@@ -9,7 +9,7 @@ Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the convent
 session is expected to know. This is the first app with jkb as its substrate and will not be the
 last, so the rules in **D53.1** are written to be inherited, not just followed here.
 
-Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane), 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not), 8 (the Container tab), 9 (the Sessions tab) and 10 (the installed copy and Update from main) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
+Status: **decided; subtasks 1 (the scaffold), 2 (the terminal), 3 (the design data model), 4 (the Document pane), 5 (execution plans and the Tasks pane), 6 (the Prompts pane), 7a (the Workflows tab; 7b, rewiring the workflow scripts to read their templates from jkb, is not), 8 (the Container tab), 9 (the Sessions tab), 10 (the installed copy and Update from main) and 11a (`jkb design export`, D55.6 below) are built, the rest are not.** Each subsection names the subtask that builds it. Mark a
 decision superseded in place (with the measurement that reversed it) rather than editing it away.
 
 ## D53.1 — An app over jkb is a client of the op set, never a backend
@@ -1251,6 +1251,59 @@ What it cost to learn:
   program pause 200 ms before exiting, since what it measures is the gathering (0 of 20 failed
   after); the loss itself is node-pty's and is not fixed here.
 
+## D55.6 — `docs/` is generated from jkb designs (`jkb design export`)
+
+Decided in the design-migration pass (`openspec/changes/jkb-design-migration/design.md`, D55.6, which
+is local-only, so the rules are recorded here too). One source of truth (jkb), with git still
+versioning the rendered record; two-way sync and an unenforced export were both rejected as drift.
+
+**As built (subtask 11a).** The rendering and the header are `crates/jkb-core/src/design/export.rs`;
+the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.rs`.
+
+| Op | CLI | What |
+|---|---|---|
+| `design.export` (read) | `jkb design export <design> [--to docs/<file>]`, `--all [--repo]` | The design rendered for its doc target; `--to` records the target first. |
+| `design.target` (`design` write) | `--to` above | Record a design's doc target. |
+| `design.sources` (`design` write) | `jkb design source <design> <path>…` | Record files a design was made from, each with the blake3 of its content now (D55.5). |
+
+- **The export is the approved text alone.** Every span the document still anchors and that is
+  APPROVED (or STAGED, or IMPLEMENTED), whole, in text order; no span markers. Uncovered text, an
+  unapproved span and **a demoted span as a whole** are left out. The first build joined a demoted
+  span's surviving approved pieces, which published text nobody approved — "We must not log tokens."
+  with "not" deleted exported as "We must  log tokens." (review round 1; pinned by
+  `a_demoted_span_is_not_exported_at_all`). A demoted span reads PROPOSED as a whole (D53.5), and so
+  is exported as nothing until it is re-approved.
+- **The header** is the file's first line:
+  `<!-- generated from jkb design <uid>, edit there (version <token>, blake3 <hex>) -->`, the hash being
+  that of the body below it. A file without it is hand-written and never checked. A first line that
+  looks like the header but does not read (trimmed, a byte-order mark or indentation in front) is
+  reported, never taken for hand-written.
+- **`jkb design export --check` opens no database and reaches no daemon** — it re-hashes each
+  generated `docs/` file's body and fails, naming the file and its design, when it no longer matches
+  its header: a hand edit. `main` dispatches it before remote mode, before `commands::ensure_installed`
+  and before any `open_db`. `scripts/check.sh` and `.github/workflows/ci.yml` both run it. *Amended in
+  review round 1:* the first build re-rendered from the live database, so the gate ran the branch's
+  binary against the shared `~/.jkb/jkb.db` — migrating it forward on a branch with a new migration,
+  being refused by it on an older branch, needing a daemon in the container, rewriting the user's
+  Claude commands on every run — and compared the whole file, version token included, so any edit to
+  a design (a PROPOSED one too) failed the gate in every checkout. CI had no store and could not run it
+  at all. The version token is now information for the reader only.
+- **What only the database knows** — a design that moved on since its export, a stale copy of a
+  generated file, a doc target with no file — is `jkb design export --check --against-db [--repo]`,
+  run by hand. It compares bodies only, so a PROPOSED edit (a new version, the same approved text)
+  passes it too. The database-free check cannot know any doc target, so a deleted generated file
+  passes it; that is the price of a gate every machine can run.
+- **A doc target is a `docs/` file, one design's alone, and each fact is a row** (`V026`:
+  `design_doc_targets`, `design_sources`). They were keys of the design item's `metadata` first, and
+  undo restores a column whole: undoing an older target write dropped sources recorded after it, and
+  could restore a target another design had taken since, because the one-design-per-file rule lived
+  only in the writer. Now each write undoes alone and the rule is the table's `UNIQUE (path)`, so an
+  undo that would break it is refused (pinned by `undoing_a_doc_target_keeps_the_sources_recorded_after_it`
+  and `undo_cannot_give_two_designs_one_doc_target`). V026 moves existing keys over.
+- **The attest hook defers `design source` and `design export --to`** (`remote::beyond_rbac`): the
+  first reads files the caller names, the second writes to one. The rest of `jkb design` is an op on
+  the design alone and stays approvable.
+
 ## Subtasks, in landing order
 
 Landed one at a time onto the staging branch, each reviewed before the next starts:
@@ -1266,4 +1319,5 @@ Landed one at a time onto the staging branch, each reviewed before the next star
 8. Container tab + image labels (D53.8).
 9. Sessions tab, needs-input dot, re-attach (D53.9).
 10. Installed copy + update-from-main (D53.3).
+11a. `jkb design export`: `docs/` generated from designs, and its drift check (D55.6).
 11. Migrate existing tasks into the design schema (D53.6).

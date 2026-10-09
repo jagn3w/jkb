@@ -441,8 +441,7 @@ pub fn create(
 /// A database error.
 pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT i.id, i.uid, COALESCE(i.content, ''), i.metadata FROM items i WHERE i.kind = ?1
-          ORDER BY i.uid",
+        "SELECT i.id, i.uid, COALESCE(i.content, '') FROM items i WHERE i.kind = ?1 ORDER BY i.uid",
     )?;
     let rows = stmt
         .query_map([KIND], |r| {
@@ -450,13 +449,12 @@ pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
                 ItemId::new(r.get(0)?),
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let wanted = repo.map(|r| format!("{ROOT}/{r}"));
     let mut out = Vec::new();
-    for (id, uid, title, metadata) in rows {
+    for (id, uid, title) in rows {
         let namespace = item::primary_namespace(conn, id)?;
         if let Some(w) = &wanted {
             let under = namespace
@@ -466,11 +464,9 @@ pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
                 continue;
             }
         }
-        let metadata: Value = serde_json::from_str(&metadata)
-            .map_err(|e| invalid(format!("design {uid} has unreadable metadata: {e}")))?;
         out.push(DesignRow {
             seq: newest_seq(conn, id)?,
-            meta: export::meta_of(&uid, &metadata)?,
+            meta: export::meta_of(conn, id)?,
             uid,
             title,
             namespace,
@@ -492,7 +488,7 @@ pub fn row(conn: &Connection, uid: &str) -> Result<DesignRow> {
             .unwrap_or_default(),
         namespace: item::primary_namespace(conn, id)?,
         seq: newest_seq(conn, id)?,
-        meta: export::meta(conn, uid)?,
+        meta: export::meta_of(conn, id)?,
     })
 }
 

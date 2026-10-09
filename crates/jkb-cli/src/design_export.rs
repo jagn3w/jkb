@@ -3,16 +3,22 @@
 //!
 //! The ops are pure database work (`jkb_api`'s rule), so everything that touches the checkout is
 //! here: resolving paths against the repository root, writing a design's render to its doc target,
-//! hashing a source, and the drift check `scripts/check.sh` runs. What a generated file *is* — its
-//! header and its text — is `jkb_core::design::export`'s alone; this side writes and compares the
-//! bytes the op answers and never renders anything itself.
+//! hashing a source, and the drift checks. What a generated file *is* — its header, the body hash
+//! it records, its text — is `jkb_core::design::export`'s alone; this side writes and compares the
+//! bytes and never renders anything itself.
+//!
+//! Two checks, deliberately apart (D55.6, amended). `--check` opens no database: each generated
+//! file's header records the blake3 of its body, so a hand edit is seen from the file alone, the
+//! same in `scripts/check.sh`, CI and a fresh clone. `--check --against-db` asks the live designs
+//! too — has one moved on since its export, does a design's doc target have no file — which only a
+//! machine holding the designs can answer.
 
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
 use jkb_api::designs::{Design, Export, Source};
 use jkb_api::{Request, Response};
-use jkb_core::design::export::{generated_from, DOCS_DIR};
+use jkb_core::design::export::{self as gen, Generated, DOCS_DIR};
 
 use crate::ops_cli::{unexpected, Ops};
 
@@ -158,7 +164,107 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// What is wrong with one generated file, or `None` when it is its design's render.
+/// Every generated `docs/` file under `root`: its repo-relative path and what its first line says.
+/// Files that are not UTF-8 are not text, so not generated; hand-written ones are left out.
+fn generated_files(root: &Path) -> Result<Vec<(String, String)>> {
+    let docs = root.join(DOCS_DIR);
+    let mut files = Vec::new();
+    if docs.is_dir() {
+        files_under(&docs, &mut files)?;
+    }
+    files.sort();
+    let mut out = Vec::new();
+    for path in files {
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let rel = repo_relative(root, root, &path.to_string_lossy())?;
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if !matches!(gen::parse(&text), Generated::Hand) {
+            out.push((rel, text));
+        }
+    }
+    Ok(out)
+}
+
+/// What is wrong with one generated file on its own, with no database: a header that does not
+/// read, or a body that is no longer the one its header hashed.
+fn tampered(rel: &str, text: &str) -> Option<String> {
+    match gen::parse(text) {
+        Generated::Hand => None,
+        Generated::Malformed(why) => Some(format!(
+            "{rel}: {why} — re-export it from its design (`jkb design export <design>`), or delete \
+             the first line if the file is meant to be hand-written"
+        )),
+        g @ Generated::File { uid, .. } => (!g.intact()).then(|| {
+            format!(
+                "{rel}: edited by hand since it was exported from design {uid} (its body no longer \
+                 matches the blake3 in its header). Make the change in the design (`jkb design \
+                 edit`), then `jkb design export {uid}`"
+            )
+        }),
+    }
+}
+
+/// Report a check's problems and fail when there are any.
+fn report(json: bool, what: &str, checked: &[String], problems: &[String]) -> Result<()> {
+    if json {
+        let report = serde_json::json!({ "checked": checked, "drift": problems });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for p in problems {
+            eprintln!("drift: {p}");
+        }
+    }
+    if !problems.is_empty() {
+        bail!(
+            "{} problem(s) among {} generated docs/ file(s)",
+            problems.len(),
+            checked.len()
+        );
+    }
+    if !json {
+        println!("{} generated docs/ file(s) {what}", checked.len());
+    }
+    Ok(())
+}
+
+/// `jkb design export --check`: every `docs/` file carrying the generated header must still be the
+/// body that header hashed. Opens no database and reaches no daemon (dispatched in `main` before
+/// either), so it is the same gate in `scripts/check.sh`, CI and a fresh clone.
+///
+/// What it cannot see, by construction: whether a design moved on since its export, and a design
+/// whose doc target has no file at all — both are facts about the database. `--against-db` asks
+/// them.
+///
+/// # Errors
+/// Not inside a git checkout, an unreadable file, `--repo` (which names designs, and so a
+/// database), or a tampered generated file.
+pub(crate) fn check_files(repo: Option<&str>, json: bool) -> Result<()> {
+    if repo.is_some() {
+        bail!(
+            "`--repo` names designs, which `--check` alone never reads — add `--against-db` to \
+             compare with them"
+        );
+    }
+    let (root, _) = checkout()?;
+    let files = generated_files(&root)?;
+    let problems: Vec<String> = files
+        .iter()
+        .filter_map(|(rel, text)| tampered(rel, text))
+        .collect();
+    let checked: Vec<String> = files.into_iter().map(|(rel, _)| rel).collect();
+    report(
+        json,
+        "match the bodies their headers hash",
+        &checked,
+        &problems,
+    )
+}
+
+/// What is wrong with one generated file against its design now, or `None` when its body is the
+/// design's render. Only the body is compared: the header's version token moves with every edit,
+/// a PROPOSED one included, and is information for the reader.
 fn drift(ops: &Ops<'_>, rel: &str, text: &str, uid: &str) -> Option<String> {
     let rendered = match exports(ops, Some(uid.to_owned()), None) {
         Ok(mut list) if list.len() == 1 => list.remove(0),
@@ -183,81 +289,86 @@ fn drift(ops: &Ops<'_>, rel: &str, text: &str, uid: &str) -> Option<String> {
                 .map_or_else(|| "no file".to_owned(), |t| format!("`{t}`"))
         ));
     }
-    (rendered.text != text).then(|| {
+    let body = |t: &str| match gen::parse(t) {
+        Generated::File { body, .. } => Some(body.to_owned()),
+        Generated::Hand | Generated::Malformed(_) => None,
+    };
+    (body(&rendered.text) != body(text)).then(|| {
         format!(
-            "{rel}: differs from design {uid} at version {} — it was edited by hand, or the design \
-             moved on since it was exported. Make the change in the design (`jkb design edit`), \
-             then `jkb design export {uid}`",
+            "{rel}: differs from design {uid} at version {} — the design moved on since it was \
+             exported. Re-export it with `jkb design export {uid}`",
             rendered.version
         )
     })
 }
 
-/// `jkb design export --check`: every `docs/` file whose first line is the generated header must be
-/// exactly its design's render now. Files without the header are hand-written and not checked.
-fn check(ops: &Ops<'_>) -> Result<()> {
+/// `jkb design export --check --against-db`: everything `--check` asks, then each generated file
+/// against its design's render now, and every design of the repo whose doc target has no file.
+fn check_against_db(ops: &Ops<'_>, repo: Option<String>) -> Result<()> {
     let (root, _) = checkout()?;
-    let docs = root.join(DOCS_DIR);
-    let mut files = Vec::new();
-    if docs.is_dir() {
-        files_under(&docs, &mut files)?;
-    }
-    files.sort();
-    let mut checked = Vec::new();
+    let files = generated_files(&root)?;
     let mut problems = Vec::new();
-    for path in files {
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let rel = repo_relative(&root, &root, &path.to_string_lossy())?;
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            continue; // not text, so not a generated file
-        };
-        let Some(uid) = generated_from(text) else {
+    for (rel, text) in &files {
+        if let Some(p) = tampered(rel, text) {
+            problems.push(p);
+        } else if let Some(uid) = gen::generated_from(text) {
+            problems.extend(drift(ops, rel, text, uid));
+        }
+    }
+    let repo = crate::design_cli::repo_of(ops, repo)?;
+    for e in exports(ops, None, Some(repo))? {
+        let Some(target) = e.doc_target.as_deref() else {
             continue;
         };
-        checked.push(rel.clone());
-        if let Some(problem) = drift(ops, &rel, text, uid) {
-            problems.push(problem);
+        if !files.iter().any(|(rel, _)| rel == target) {
+            let what = if root.join(target).exists() {
+                "is there but does not carry the generated header"
+            } else {
+                "does not exist"
+            };
+            problems.push(format!(
+                "{target}: design {} exports here, but the file {what} — `jkb design export {}`",
+                e.uid, e.uid
+            ));
         }
     }
-    if ops.json {
-        let report = serde_json::json!({ "checked": checked, "drift": problems });
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        for p in &problems {
-            eprintln!("drift: {p}");
-        }
-    }
-    if !problems.is_empty() {
-        bail!(
-            "{} of {} generated docs/ file(s) differ from their designs",
-            problems.len(),
-            checked.len()
-        );
-    }
-    if !ops.json {
-        println!(
-            "{} generated docs/ file(s) match their designs",
-            checked.len()
-        );
-    }
-    Ok(())
+    let checked: Vec<String> = files.into_iter().map(|(rel, _)| rel).collect();
+    report(ops.json, "match their designs", &checked, &problems)
 }
 
-/// `jkb design export …`.
+/// The arguments of `jkb design export`.
+pub(crate) struct ExportArgs {
+    pub uid: Option<String>,
+    pub to: Option<String>,
+    pub all: bool,
+    pub repo: Option<String>,
+    pub check: bool,
+    pub against_db: bool,
+}
+
+/// `jkb design export …`. A bare `--check` never gets here: `main` runs it, database-free, before
+/// anything opens one ([`check_files`]); it is answered the same way here, for a caller that did.
 ///
 /// # Errors
 /// The op's refusal, a path outside the checkout, an unwritable target, or drift under `--check`.
-pub(crate) fn run(
-    ops: &Ops<'_>,
-    uid: Option<String>,
-    to: Option<&str>,
-    repo: Option<String>,
-    check_only: bool,
-) -> Result<()> {
-    if check_only {
-        check(ops)
-    } else {
-        export(ops, uid, to, repo)
+pub(crate) fn run(ops: &Ops<'_>, args: ExportArgs) -> Result<()> {
+    let ExportArgs {
+        uid,
+        to,
+        all,
+        repo,
+        check,
+        against_db,
+    } = args;
+    match (check, against_db) {
+        (true, true) => check_against_db(ops, repo),
+        (true, false) => check_files(repo.as_deref(), ops.json),
+        (false, _) => {
+            if repo.is_some() && !all {
+                bail!("`--repo` goes with `--all` or `--check --against-db`");
+            }
+            export(ops, uid, to.as_deref(), repo)
+        }
     }
 }
 

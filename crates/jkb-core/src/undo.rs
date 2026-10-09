@@ -506,6 +506,10 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     (Op::Update, Some(Entity::TagDefs), Inverse::Columns),
     (Op::Update, Some(Entity::Namespaces), Inverse::Columns),
     (Op::Update, Some(Entity::Ingestions), Inverse::Columns),
+    // A design's doc target and sources are rows of their own (V026) so each write undoes alone,
+    // and the target's UNIQUE path refuses an undo that would hand one file to two designs.
+    (Op::Update, Some(Entity::DesignDocTargets), Inverse::Columns),
+    (Op::Update, Some(Entity::DesignSources), Inverse::Columns),
     (Op::Delete, Some(Entity::Placements), Inverse::ReinsertRow),
     (
         Op::Delete,

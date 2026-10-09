@@ -1224,6 +1224,11 @@ mod tests {
         "jkb ingest https://example.com/page",
         "jkb --json ingest --ns inbox https://example.com/page",
         "echo '{}' | jkb task review file --findings repos/x/codereviews/y --from -",
+        // A design op names no local file: the export writes the target the design holds, and
+        // the drift check reads only the checkout's `docs/`.
+        "jkb design export design:x",
+        "jkb design export --check",
+        "jkb design export --check --against-db",
     ];
 
     /// Lines the classifier cannot model, so it does not approve them -- only an approval overrides
@@ -1271,6 +1276,11 @@ mod tests {
         "jkb ingest HTTPS://example.com",
         "jkb mcp",
         "echo '{}' | jkb mcp",
+        // `design source` hashes files the caller names; `export --to` writes to one.
+        "jkb design source design:x secrets/.env",
+        "jkb --json design source design:x README.md docs/a.md",
+        "jkb design export design:x --to docs/a.md",
+        "jkb design export design:x --to=../elsewhere.md",
         "jkb task review file --findings repos/x/codereviews/y --from result.json",
         "jkb task review file --findings=n --from=result.json",
         "cd repo && jkb task review file --from r.json --findings n",

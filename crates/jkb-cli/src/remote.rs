@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use super::rbac_cli::RoleCmd;
-use super::{Cli, Command, CommandsCmd, NsCmd, TaskCmd, TaskReviewCmd};
+use super::{Cli, Command, CommandsCmd, DesignCmd, NsCmd, TaskCmd, TaskReviewCmd};
 
 /// How a command behaves with `JKB_REMOTE` set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +185,11 @@ pub fn beyond_rbac(command: &Command) -> bool {
         // A file is read and parsed here; a URL is rendered, which reads no local file.
         Command::Ingest { path, .. } => !jkb_ingest::is_url(path),
         // Its `ingest_path` tool reads a file here, named in a request on stdin this cannot see.
-        Command::Mcp => true,
+        Command::Mcp
+        // `design source` reads and hashes the files the caller names.
+        | Command::Design {
+            cmd: DesignCmd::Source { .. },
+        } => true,
         // The review result, from a file -- or from stdin with `-`, which an approved line can fill
         // only from `echo`, with text the model wrote: a redirect, or any other command piping in,
         // is never approved.
@@ -199,6 +203,13 @@ pub fn beyond_rbac(command: &Command) -> bool {
         Command::Task {
             cmd: TaskCmd::Land { gate, .. },
         } => gate.is_some(),
+        // `design export --to` writes the design's render to a file the caller names (and records
+        // it as the design's target). Every other `design` verb is an op on the design alone:
+        // `export` without `--to` writes the target the design already holds, and `--check` reads
+        // only the checkout's `docs/`.
+        Command::Design {
+            cmd: DesignCmd::Export { to, .. },
+        } => to.is_some(),
         Command::Task { .. }
         // Refused with `JKB_REMOTE` set ([`support`]): they would read here, but never run here.
         | Command::Mount { .. }

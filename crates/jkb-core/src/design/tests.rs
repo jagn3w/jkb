@@ -1408,17 +1408,36 @@ fn exported(db: &Db, uid: &str) -> Exported {
     db.read(move |c| export::export(c, &uid)).unwrap()
 }
 
-/// The body after the generated header.
+/// The body after the generated header, which must parse, name `uid` and hash the body.
 fn exported_body(db: &Db, uid: &str) -> String {
     let file = exported(db, uid).text;
-    let (head, body) = file.split_once('\n').unwrap();
-    assert_eq!(export::generated_from(head), Some(uid));
+    let generated = export::parse(&file);
+    let export::Generated::File {
+        uid: named, body, ..
+    } = generated
+    else {
+        panic!("not a generated file: {file}");
+    };
+    assert_eq!(named, uid);
+    assert!(generated.intact(), "the header hashes the body: {file}");
     body.to_owned()
 }
 
-fn set_target(db: &Db, uid: &str, path: &str) -> Result<()> {
+fn set_target(db: &Db, uid: &str, path: &str) -> Result<i64> {
     let (uid, path) = (uid.to_owned(), path.to_owned());
-    db.write_txn("t", move |c, m| export::set_doc_target(c, m, &uid, &path))
+    db.write_txn("t", move |c, m| {
+        export::set_doc_target(c, m, &uid, &path)?;
+        Ok(m.txn_id)
+    })
+}
+
+fn changelog_rows(db: &Db) -> i64 {
+    db.read(|c| Ok(c.query_row("SELECT count(*) FROM changelog", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+fn undo_txn(db: &Db, txn: i64) -> Result<usize> {
+    db.write_txn("t", move |c, m| crate::undo::undo(c, m, txn))
 }
 
 /// D55.6: only approved words reach the file. Uncovered text, an unapproved span, and words edited
@@ -1444,9 +1463,8 @@ fn an_export_is_the_approved_text_alone_under_a_header_naming_the_version() {
     assert!(!file.text.contains('⟦'), "no span markers: {}", file.text);
     assert_eq!(
         file.text.lines().next().unwrap(),
-        export::header(&uid, &cat(&db, &uid).version)
+        export::header(&uid, &cat(&db, &uid).version, "## D1\nDecided.\n")
     );
-
     // Words added inside the approved span since its approval demote the whole span, so none of
     // it is approved text any more (every piece of a demoted span reads PROPOSED, D53.5).
     edit_at(
@@ -1460,8 +1478,40 @@ fn an_export_is_the_approved_text_alone_under_a_header_naming_the_version() {
     // ...and the header names the new version, so a file rendered before reads as drift.
     assert_eq!(
         exported(&db, &uid).text.lines().next().unwrap(),
-        export::header(&uid, &cat(&db, &uid).version)
+        export::header(&uid, &cat(&db, &uid).version, "")
     );
+}
+
+/// D53.5: a demoted span is PROPOSED as a whole, so none of it is exported — never the approved
+/// pieces that survived the edit, joined. Each edit below would otherwise publish text nobody
+/// approved: a deletion inverts the sentence, a replacement leaves a hole, an insertion is split
+/// around.
+#[test]
+fn a_demoted_span_is_not_exported_at_all() {
+    for (edit, what) in [
+        (replace("not ", ""), "a deletion"),
+        (replace("not", "always"), "a replacement"),
+        (insert_after("must", " never"), "an insertion"),
+    ] {
+        let db = db();
+        let uid = create(&db, "Kept.\nWe must not log tokens.\n");
+        let kept = span(&db, &uid, "Kept.\n", Reviewer::Operator).unwrap();
+        let rule = span(&db, &uid, "We must not log tokens.\n", Reviewer::Operator).unwrap();
+        approve_as(&db, &kept, Approver::Operator).unwrap();
+        approve_as(&db, &rule, Approver::Operator).unwrap();
+        assert_eq!(exported_body(&db, &uid), "Kept.\nWe must not log tokens.\n");
+        let w = edit_at(&db, &uid, &token(&db, &uid), edit).unwrap();
+        assert_eq!(w.demoted, vec![rule.clone()], "{what}");
+        assert_eq!(
+            exported_body(&db, &uid),
+            "Kept.\n",
+            "{what}: the demoted span is left out whole"
+        );
+        // Re-approving the new words exports them.
+        approve_as(&db, &rule, Approver::Operator).unwrap();
+        let body = exported_body(&db, &uid);
+        assert!(body.starts_with("Kept.\nWe must "), "{what}: {body}");
+    }
 }
 
 /// A file always ends in a newline, so an editor adding one is not drift.
@@ -1474,20 +1524,61 @@ fn an_export_ends_in_a_newline() {
     assert_eq!(exported_body(&db, &uid), "Decided, no newline\n");
 }
 
+/// The header carries the body's hash, so whether a generated file was hand-edited is answered
+/// from the file alone — no database.
 #[test]
-fn only_the_header_marks_a_generated_file() {
-    let generated = "<!-- generated from jkb design design:a-1, edit there (version 1.x) -->\nbody";
-    assert_eq!(export::generated_from(generated), Some("design:a-1"));
-    assert_eq!(export::generated_from("# Hand-written\n"), None);
-    assert_eq!(export::generated_from(""), None);
-    // Anywhere but the first line is prose that mentions it.
-    assert_eq!(
-        export::generated_from("# T\n<!-- generated from jkb design design:a-1, edit -->"),
-        None
-    );
+fn the_header_hashes_the_body_so_a_hand_edit_is_seen_without_a_database() {
+    let db = db();
+    let uid = create(&db, "Decided.\n");
+    let s = span(&db, &uid, "Decided.\n", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let file = exported(&db, &uid).text;
+    assert!(export::parse(&file).intact());
+    let edited = format!("{file}A line nobody approved.\n");
+    let parsed = export::parse(&edited);
+    assert!(matches!(parsed, export::Generated::File { .. }));
+    assert!(!parsed.intact(), "an added line");
+    assert!(!export::parse(&file.replace("Decided", "Undecided")).intact());
+    // The version token is information only: a design that moved on leaves the file intact.
+    let (head, body) = file.split_once('\n').unwrap();
+    let token = cat(&db, &uid).version.token();
+    let moved = format!("{}\n{body}", head.replace(&token, "99.AAAA"));
+    assert!(export::parse(&moved).intact());
 }
 
-/// The doc target is a `docs/` file, one design's alone, recorded in metadata and undoable.
+#[test]
+fn only_the_header_marks_a_generated_file() {
+    let hash = export::body_hash("body");
+    let generated =
+        format!("<!-- generated from jkb design design:a-1, edit there (version 1.x, blake3 {hash}) -->\nbody");
+    assert_eq!(export::generated_from(&generated), Some("design:a-1"));
+    assert!(export::parse(&generated).intact());
+    assert_eq!(export::parse("# Hand-written\n"), export::Generated::Hand);
+    assert_eq!(export::parse(""), export::Generated::Hand);
+    // Anywhere but the first line is prose that mentions it.
+    assert_eq!(
+        export::parse("# T\n<!-- generated from jkb design design:a-1, edit -->"),
+        export::Generated::Hand
+    );
+    // A first line that claims to be the header but does not read is never taken as hand-written:
+    // trimmed by hand, no hash, a byte-order mark or indentation in front.
+    for bad in [
+        "<!-- generated from jkb design design:a-1, edit there -->\nbody".to_owned(),
+        "<!-- generated from jkb design design:a-1, edit there (version 1.x) -->\nbody".to_owned(),
+        format!("\u{feff}{generated}"),
+        format!("  {generated}"),
+        "<!-- generated from jkb design\nbody".to_owned(),
+        generated.replace(&hash, "XYZ"),
+    ] {
+        assert!(
+            matches!(export::parse(&bad), export::Generated::Malformed(_)),
+            "{bad:?}"
+        );
+        assert_eq!(export::generated_from(&bad), None);
+    }
+}
+
+/// The doc target is a `docs/` file, one design's alone, recorded and undoable.
 #[test]
 fn a_doc_target_is_a_docs_file_one_design_owns() {
     let db = db();
@@ -1508,8 +1599,10 @@ fn a_doc_target_is_a_docs_file_one_design_owns() {
     assert_eq!(exported(&db, &a).doc_target.as_deref(), Some("docs/a.md"));
     let e = set_target(&db, &b, "docs/a.md").unwrap_err().to_string();
     assert!(e.contains(&a), "{e}");
-    // Setting it again is no write: nothing for undo to take back.
+    // Setting it again is no write: no changelog row, so undo takes back the write before it.
+    let rows = changelog_rows(&db);
     set_target(&db, &a, "docs/a.md").unwrap();
+    assert_eq!(changelog_rows(&db), rows, "a repeat logs nothing");
     set_target(&db, &a, "docs/a2.md").unwrap();
     let listed = db.read(|c| list(c, Some("jkb"))).unwrap();
     let row = listed.iter().find(|d| d.uid == a).unwrap();
@@ -1524,7 +1617,47 @@ fn a_doc_target_is_a_docs_file_one_design_owns() {
     );
 }
 
-/// D55.5: sources are recorded by path with their blake3; recording a path again re-hashes it.
+/// Each key is its own write: undoing an older doc-target write keeps sources recorded since.
+#[test]
+fn undoing_a_doc_target_keeps_the_sources_recorded_after_it() {
+    let db = db();
+    let a = create(&db, "a");
+    let target_txn = set_target(&db, &a, "docs/a.md").unwrap();
+    let source = Source {
+        path: "README.md".into(),
+        blake3: crate::blob::hash_bytes(b"r"),
+    };
+    {
+        let (a, source) = (a.clone(), source.clone());
+        db.write_txn("t", move |c, m| export::add_sources(c, m, &a, &[source]))
+            .unwrap();
+    }
+    undo_txn(&db, target_txn).unwrap();
+    let meta = {
+        let a = a.clone();
+        db.read(move |c| export::meta(c, &a)).unwrap()
+    };
+    assert_eq!(meta.doc_target, None, "the target write is taken back");
+    assert_eq!(meta.sources, vec![source], "the later sources are not");
+}
+
+/// Undo cannot hand one file to two designs: the target's uniqueness is the table's, and an undo
+/// that would break it is refused with nothing changed.
+#[test]
+fn undo_cannot_give_two_designs_one_doc_target() {
+    let db = db();
+    let a = create(&db, "a");
+    let b = create(&db, "b");
+    set_target(&db, &a, "docs/a.md").unwrap();
+    let moved = set_target(&db, &a, "docs/a2.md").unwrap();
+    set_target(&db, &b, "docs/a.md").unwrap();
+    assert!(undo_txn(&db, moved).is_err(), "A back onto B's file");
+    assert_eq!(exported(&db, &a).doc_target.as_deref(), Some("docs/a2.md"));
+    assert_eq!(exported(&db, &b).doc_target.as_deref(), Some("docs/a.md"));
+}
+
+/// D55.5: sources are recorded by path with their blake3; recording a path again re-hashes it, and
+/// recording it unchanged is no write.
 #[test]
 fn sources_are_recorded_by_path_and_rehashed_in_place() {
     let db = db();
@@ -1542,6 +1675,13 @@ fn sources_are_recorded_by_path_and_rehashed_in_place() {
         src("openspec/x/design.md", b"x"),
     ])
     .unwrap();
+    let rows = changelog_rows(&db);
+    add(vec![src("docs/a.md", b"a")]).unwrap();
+    assert_eq!(
+        changelog_rows(&db),
+        rows,
+        "an unchanged source logs nothing"
+    );
     add(vec![src("docs/a.md", b"a2")]).unwrap();
     let meta = {
         let uid = uid.clone();
@@ -1556,6 +1696,16 @@ fn sources_are_recorded_by_path_and_rehashed_in_place() {
         db.read(move |c| row(c, &uid)).unwrap()
     };
     assert_eq!(row.meta, meta);
+    // Undo re-hash: the old hash comes back, the other source stays.
+    undo_last(&db);
+    let meta = {
+        let uid = uid.clone();
+        db.read(move |c| export::meta(c, &uid)).unwrap()
+    };
+    assert_eq!(
+        meta.sources,
+        vec![src("docs/a.md", b"a"), src("openspec/x/design.md", b"x")]
+    );
     assert!(add(vec![Source {
         path: "a.md".into(),
         blake3: "not-hex".into()
