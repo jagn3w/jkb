@@ -1,7 +1,7 @@
 //! Edge repository: the typed directed graph over items.
 //!
-//! `depends_on` edges must stay acyclic (design D5); [`link`] rejects any edge
-//! that would close a cycle, checked with a reachability CTE.
+//! `depends_on` and `parent_of` edges must each stay acyclic (design D5, D34); [`link`] rejects
+//! any edge that would close a cycle of its type, checked with a reachability CTE.
 
 use std::collections::HashMap;
 
@@ -14,15 +14,16 @@ use crate::changelog::{Entity, Op};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
-/// Create a typed edge `src -> dst`. Idempotent on `(src, dst, type)`. For
-/// `depends_on`, rejects edges that would introduce a cycle.
+/// Create a typed edge `src -> dst`. Idempotent on `(src, dst, type)`. For `depends_on` and
+/// `parent_of`, rejects an edge that would close a cycle of that type — every writer of those
+/// edges (`task::add_subtask`, `jkb inv link`, the `tasks` file sync) passes through here.
 ///
 /// Leaves `weight` NULL — use [`link_weighted`] for signed evidence edges
 /// (`supports`/`contradicts`).
 ///
 /// # Errors
-/// Returns a validation error if a `depends_on` edge would create a cycle, or a
-/// database error if a statement fails.
+/// Returns a validation error if a `depends_on` or `parent_of` edge would create a cycle, or
+/// a database error if a statement fails.
 pub fn link(
     conn: &Connection,
     meta: &WriteMeta,
@@ -44,8 +45,8 @@ pub fn link(
 /// [`link`] never silently erases one. To clear a weight, [`unlink`] then re-link.
 ///
 /// # Errors
-/// Returns a validation error if a `depends_on` edge would create a cycle or if `weight`
-/// is not finite, or a database error if a statement fails.
+/// Returns a validation error if a `depends_on` or `parent_of` edge would create a cycle or if
+/// `weight` is not finite, or a database error if a statement fails.
 pub fn link_weighted(
     conn: &Connection,
     meta: &WriteMeta,
@@ -59,6 +60,25 @@ pub fn link_weighted(
         return Err(TypeError::Validation(format!(
             "depends_on {src} -> {dst} would create a cycle"
         ))
+        .into());
+    }
+    if edge_type == EdgeType::ParentOf && is_parent_or_above(conn, dst, src)? {
+        let uid = |id: ItemId| -> Result<String> {
+            Ok(conn
+                .prepare_cached("SELECT uid FROM items WHERE id = ?1")?
+                .query_row([id.get()], |r| r.get::<_, String>(0))
+                .optional()?
+                .unwrap_or_else(|| id.to_string()))
+        };
+        let (child, parent) = (uid(dst)?, uid(src)?);
+        return Err(TypeError::Validation(if src == dst {
+            format!("`{child}` cannot be its own parent")
+        } else {
+            format!(
+                "`{child}` cannot go under `{parent}`: `{parent}` is inside `{child}`, so \
+                 `{child}` would be its own ancestor"
+            )
+        })
         .into());
     }
     // A NaN/infinite weight would silently poison every downstream aggregate.
@@ -141,6 +161,28 @@ fn creates_cycle(conn: &Connection, src: ItemId, dst: ItemId) -> Result<bool> {
         .query_row(params![dst.get(), src.get()], |row| row.get(0))
         .optional()?;
     Ok(hit.is_some())
+}
+
+/// Whether `ancestor` is `item` or one of its `parent_of` ancestors. `UNION` de-duplicates, so a
+/// cycle a hand-edited database already holds still ends the walk.
+///
+/// Edges only: containment guards its own cycles (`containment::contain`), and the `tasks` file
+/// sync writes edges without containment, so a containment row its edge has left behind must not
+/// refuse a re-indent the file legitimately made.
+fn is_parent_or_above(conn: &Connection, ancestor: ItemId, item: ItemId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "WITH RECURSIVE up(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT e.src_item_id FROM edges e JOIN up ON e.dst_item_id = up.id
+                  WHERE e.type = 'parent_of'
+             )
+             SELECT 1 FROM up WHERE id = ?2 LIMIT 1",
+        )?
+        .query_row(params![item.get(), ancestor.get()], |r| r.get::<_, i64>(0))
+        .optional()?
+        .is_some())
 }
 
 /// The direct `depends_on` targets of `item`.
@@ -604,6 +646,45 @@ mod tests {
 
         let deps = db.read(move |conn| dependencies(conn, a)).unwrap();
         assert_eq!(deps, vec![b]);
+    }
+
+    /// `parent_of` is guarded at the one writer every caller passes — `task::add_subtask`,
+    /// `jkb inv link` and the `tasks` sync alike — so no writer can make a task its own ancestor.
+    #[test]
+    fn parent_of_stays_acyclic() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, c) = db
+            .write_txn("t", |conn, meta| {
+                let a = upsert(conn, meta, &task("a"))?;
+                let b = upsert(conn, meta, &task("b"))?;
+                let c = upsert(conn, meta, &task("c"))?;
+                link(conn, meta, a, b, EdgeType::ParentOf, None)?;
+                link(conn, meta, b, c, EdgeType::ParentOf, None)?;
+                // Re-linking an existing edge is not a cycle.
+                link(conn, meta, b, c, EdgeType::ParentOf, None)?;
+                Ok((a, c))
+            })
+            .unwrap();
+        let e = db
+            .write_txn("t", move |conn, meta| {
+                link(conn, meta, c, a, EdgeType::ParentOf, None)
+            })
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("`a` cannot go under `c`: `c` is inside `a`"),
+            "{e}"
+        );
+        let e = db
+            .write_txn("t", move |conn, meta| {
+                link(conn, meta, a, a, EdgeType::ParentOf, None)
+            })
+            .unwrap_err();
+        assert!(e.to_string().contains("its own parent"), "{e}");
+        assert!(db
+            .read(move |conn| edges_from(conn, c, EdgeType::ParentOf))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

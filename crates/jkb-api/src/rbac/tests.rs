@@ -976,9 +976,11 @@ fn a_grant_no_longer_grantable_is_marked_in_the_full_listing() {
         .all(|g| g.grantable));
 }
 
-/// `task.move` is granted exactly as `task.place` is: the same permission, held to the moved task.
+/// `task.move` is granted as `task.place` is — the same permission, held to the moved task — and a
+/// scoped caller is held to the new parent too, as `task.add --under` is: a subtask moved under an
+/// unrelated task would hold that task off the frontier and its land gate.
 #[test]
-fn task_move_is_granted_and_scoped_as_task_place_is() {
+fn task_move_is_granted_as_task_place_and_held_to_the_parent_s_scope() {
     let parse = |r: serde_json::Value| -> crate::Request { serde_json::from_value(r).unwrap() };
     let place = parse(json!({ "op": "task.place", "uid": "u", "ns": "n" }));
     let moved = parse(json!({ "op": "task.move", "uid": "u", "under": "p" }));
@@ -987,22 +989,41 @@ fn task_move_is_granted_and_scoped_as_task_place_is() {
 
     let kb = Kb::new();
     let a = add(&kb.op, "task a");
-    let b_task = add(&kb.op, "task b");
-    let parent = add(&kb.op, "parent");
+    let unrelated = add(&kb.op, "unrelated");
+    let under_a = |text: &str| match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": text, "under": a }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let (sub, sibling) = (under_a("sub"), under_a("sibling"));
     let (_, token) = grant(&kb.op, "coordinator", Some(&a), "coord");
     let c = kb.as_token(&token);
-    match ok(&c, json!({ "op": "task.move", "uid": a, "under": parent })) {
+
+    let e = refused(
+        &c,
+        json!({ "op": "task.move", "uid": sub, "under": unrelated }),
+    );
+    assert!(
+        e.message.contains("moves tasks only under that task"),
+        "{e:?}"
+    );
+    match ok(
+        &c,
+        json!({ "op": "task.move", "uid": sub, "under": sibling }),
+    ) {
         Response::TaskMoved { moved } => assert!(moved.moved, "{moved:?}"),
         other => panic!("{other:?}"),
     }
     let e = refused(
         &c,
-        json!({ "op": "task.move", "uid": b_task, "under": parent }),
+        json!({ "op": "task.move", "uid": unrelated, "under": a }),
     );
     assert!(e.message.contains("scoped to another task"), "{e:?}");
     let (_, rev) = grant(&kb.op, "reviewer", Some(&a), "rev-1");
     refused(
         &kb.as_token(&rev),
-        json!({ "op": "task.move", "uid": a, "under": b_task }),
+        json!({ "op": "task.move", "uid": sub, "under": a }),
     );
 }

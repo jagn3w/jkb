@@ -3616,9 +3616,10 @@ impl LocalBackend {
             }
             Request::TaskMove { uid, under } => {
                 let roots = self.file_roots.clone();
+                let scope = principal.scope;
                 Response::TaskMoved {
                     moved: task_write(db, actor, uid, move |c, m, uid| {
-                        tasks::move_under(c, m, uid, &under, roots.as_ref())
+                        tasks::move_under(c, m, uid, &under, roots.as_ref(), scope)
                     })?,
                 }
             }

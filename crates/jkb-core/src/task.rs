@@ -370,9 +370,10 @@ pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> 
 ///
 /// A parent with any non-terminal child leaves the ready frontier (design D34.3), so this
 /// is how a task too big for one branch is split into the pieces that actually get worked.
-/// Cycle-guarded here, so a task cannot become its own ancestor: [`edge::link`] guards only
-/// `depends_on`, and a `parent_of` cycle would make the tree walks that bound their depth silently
-/// drop the loop. New subtasks cannot close one; [`move_under`] can, and is refused through this.
+/// Cycle-guarded, so a task cannot become its own ancestor: [`edge::link`] refuses a `parent_of`
+/// edge from a task already inside `child`, and [`crate::containment::contain`] a containment row
+/// that would close a loop. A new subtask cannot close one; [`move_under`] could, and is refused
+/// through these.
 ///
 /// An execution plan or a design span is never a task's parent (design D53.6): a plan's work is
 /// under its steps, and a plan's listing and its *archived* both walk only from the steps, so a task
@@ -396,46 +397,11 @@ pub fn add_subtask(
             ))));
         }
     }
-    if is_ancestor_or_self(conn, child, parent)? {
-        let uid = |id: ItemId| -> Result<String> {
-            Ok(crate::item::get(conn, id)?.map_or_else(|| id.to_string(), |m| m.uid))
-        };
-        let (c, p) = (uid(child)?, uid(parent)?);
-        return Err(Error::Types(TypeError::Validation(if child == parent {
-            format!("`{c}` cannot be its own parent")
-        } else {
-            format!(
-                "`{c}` cannot go under `{p}`: `{p}` is inside `{c}`, so the move would make \
-                 `{c}` its own ancestor"
-            )
-        })));
-    }
     // The edge records the relationship; the containment row records that the child lives
     // inside the parent. Both here so they cannot drift — this is the only supported way to
     // make a subtask.
     edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
     crate::containment::contain(conn, meta, child, parent, 0)
-}
-
-/// Whether `ancestor` is `item` or above it, by containment or by a `parent_of` edge — both,
-/// because a file-synced task's parent is only its edge (the serializer writes no containment).
-/// `UNION` de-duplicates, so a cycle a hand-edited database already holds still ends the walk.
-fn is_ancestor_or_self(conn: &Connection, ancestor: ItemId, item: ItemId) -> Result<bool> {
-    Ok(conn
-        .prepare_cached(
-            "WITH RECURSIVE up(id) AS (
-                 SELECT ?1
-                 UNION
-                 SELECT c.parent_item_id FROM containment c JOIN up ON c.child_item_id = up.id
-                 UNION
-                 SELECT e.src_item_id FROM edges e JOIN up ON e.dst_item_id = up.id
-                  WHERE e.type = 'parent_of'
-             )
-             SELECT 1 FROM up WHERE id = ?2 LIMIT 1",
-        )?
-        .query_row(params![item.get(), ancestor.get()], |r| r.get::<_, i64>(0))
-        .optional()?
-        .is_some())
 }
 
 /// What [`move_under`] did.
@@ -460,11 +426,14 @@ pub enum Moved {
 /// part of, not where it is filed.
 ///
 /// Refused for a task bound to a synced `file://` line: the tasks serializer owns that task's
-/// parent through the file's indentation, so the next sync would put it back.
+/// parent through the file's indentation, so the next sync would put it back. Refused, too, under
+/// a parent bound to one: the file declares exactly its line's children, so the next sync would
+/// unlink the edge to a task that is not in it and leave the containment row behind.
 ///
 /// # Errors
 /// [`TypeError::NotFound`] when either item is missing; a validation error when `child` is not a
-/// task, is bound to a file, or the move is refused by [`add_subtask`]; otherwise a database error.
+/// task, either is bound to a file, or the move is refused by [`add_subtask`]; otherwise a database
+/// error.
 pub fn move_under(
     conn: &Connection,
     meta: &WriteMeta,
@@ -480,11 +449,11 @@ pub fn move_under(
             task.uid, task.kind
         )));
     }
-    if crate::item::get(conn, new_parent)?.is_none() {
+    let Some(parent) = crate::item::get(conn, new_parent)? else {
         return Err(Error::Types(TypeError::NotFound(format!(
             "item {new_parent}"
         ))));
-    }
+    };
     if let Some(file) = binding::get(conn, child)?
         .as_ref()
         .and_then(|b| binding::file_path(&b.uri))
@@ -493,6 +462,16 @@ pub fn move_under(
             "`{}` is a line of {file}, whose indentation is its parent: edit the file to move it \
              (a move here would be put back by the next sync)",
             task.uid
+        )));
+    }
+    if let Some(file) = binding::get(conn, new_parent)?
+        .as_ref()
+        .and_then(|b| binding::file_path(&b.uri))
+    {
+        return Err(invalid(format!(
+            "`{}` is a line of {file}, which declares exactly its children: add the task under it \
+             in the file (a parent edge to a task not in the file is removed by the next sync)",
+            parent.uid
         )));
     }
     let edge_parents = parent_edges(conn, child)?;
@@ -1778,6 +1757,47 @@ mod tests {
             assert!(e.to_string().contains("its own parent"), "{e}");
             assert_eq!(parent_of(&f.db, top), (None, vec![]));
             assert_eq!(parent_of(&f.db, sub), (Some(top), vec![top]));
+        }
+
+        /// A containment row its edge has left behind (sync unlinks edges, never containment) is
+        /// still a loop the move would close: `containment::contain` refuses it.
+        #[test]
+        fn a_move_under_a_task_contained_without_an_edge_is_refused_as_a_cycle() {
+            let f = fixture();
+            let (top, sub) = (f.a, f.t);
+            let grand =
+                f.db.write_txn("t", move |c, m| {
+                    let g = create(c, m, &NewTask::new("task:g", "g"))?;
+                    containment::contain(c, m, g, sub, 0)?;
+                    Ok(g)
+                })
+                .unwrap();
+            let e = mv(&f.db, top, grand).unwrap_err();
+            assert!(e.to_string().contains("cannot be contained by it"), "{e}");
+            assert_eq!(parent_of(&f.db, top), (None, vec![]));
+        }
+
+        #[test]
+        fn a_move_under_a_file_bound_parent_is_refused() {
+            let f = fixture();
+            let a = f.a;
+            f.db.write_txn("t", move |c, m| {
+                binding::set(
+                    c,
+                    m,
+                    a,
+                    "file:///r/tasks.md#a1",
+                    Some(SyncMode::Bidirectional),
+                    None,
+                )
+            })
+            .unwrap();
+            let e = mv(&f.db, f.loose, a).unwrap_err();
+            assert!(
+                e.to_string().contains("add the task under it in the file"),
+                "{e}"
+            );
+            assert_eq!(parent_of(&f.db, f.loose), (None, vec![]));
         }
 
         #[test]

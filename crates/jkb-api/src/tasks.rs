@@ -800,8 +800,9 @@ pub struct Moved {
 /// and containment replaced, its placements and binding untouched.
 ///
 /// # Errors
-/// [`ErrorCode::NotFound`] for either reference, [`ErrorCode::Forbidden`] under `roots`, a refusal
-/// from [`task::move_under`] (not a task, bound to a file, a plan or span parent, a cycle), or a
+/// [`ErrorCode::NotFound`] for either reference; [`ErrorCode::Forbidden`] under `roots`, or — for a
+/// caller held to the task `scope` — a new parent outside that task; a refusal from
+/// [`task::move_under`] (not a task, either bound to a file, a plan or span parent, a cycle); or a
 /// failed write.
 pub fn move_under(
     conn: &Connection,
@@ -809,9 +810,21 @@ pub fn move_under(
     reference: &str,
     under: &str,
     roots: Option<&FileRoots>,
+    scope: Option<ItemId>,
 ) -> Result<Moved, ApiError> {
     let id = writable(conn, reference, roots)?;
     let parent = task::resolve_ref(conn, under)?.ok_or_else(|| no_item(under))?;
+    // The op's target is the moved task; the parent is written too — it gains a subtask, which
+    // holds it off the frontier and its land gate — so a scoped caller is held to it as
+    // `task.add --under` is. Here, on the scope the caller has once admitted, as `task.place`.
+    if let Some(scope) = scope {
+        if !jkb_core::roles::in_scope(conn, scope, parent)? {
+            return Err(forbidden(format!(
+                "a caller held to one task moves tasks only under that task or its subtasks, not \
+                 under `{under}`"
+            )));
+        }
+    }
     let uid_of = |id: ItemId| -> Result<String, ApiError> {
         Ok(item::get(conn, id)?.map_or_else(|| id.to_string(), |m| m.uid))
     };

@@ -3388,3 +3388,26 @@ fn task_move_reparents_names_the_parent_it_left_and_is_unchanged_when_repeated()
     .unwrap_err();
     assert!(e.message.contains("its own ancestor"), "{e:?}");
 }
+
+/// A line of a synced tasks.md declares exactly its children; a managed task moved under one would
+/// lose its parent edge at the next sync and keep a stray containment row.
+#[test]
+fn task_move_under_a_task_filed_in_a_synced_file_is_refused() {
+    let (db, inside, _outside, managed) = mutate_fixture();
+    let host = LocalBackend::new(db.clone());
+    let e = call(
+        &host,
+        json!({ "op": "task.move", "uid": managed, "under": inside }),
+    )
+    .unwrap_err();
+    assert!(
+        e.message.contains("add the task under it in the file"),
+        "{e:?}"
+    );
+    let Response::Children { children, .. } =
+        call(&host, json!({ "op": "task.subtasks", "uid": inside })).unwrap()
+    else {
+        panic!("children")
+    };
+    assert!(children.is_empty(), "{children:?}");
+}
