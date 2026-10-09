@@ -50,7 +50,7 @@ import { DesignFeeds } from "./designFeeds";
 import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
-import { TerminalHost, machineEnvironment, machineRoots, type HostPrompt, type SpawnPty } from "./terminals";
+import { TerminalHost, machineEnvironment, machineRoots, type SpawnPty } from "./terminals";
 import { AppUpdater, machineRunner } from "./update";
 
 /**
@@ -80,28 +80,6 @@ const daemon = new DaemonClient({ url, tokenFile, trustedRoot: homedir() });
  */
 const terminalRoots: TerminalRoots = machineRoots(homedir(), process.env);
 
-/**
- * Main's own confirmation before a program runs on the host (D53.10): the exact argv and cwd, in a
- * native dialog the renderer cannot answer for it.
- */
-async function askHost(owner: number, prompt: HostPrompt): Promise<boolean> {
-  const contents = webContents.fromId(owner);
-  const win = contents === undefined ? null : BrowserWindow.fromWebContents(contents);
-  const options: MessageBoxOptions = {
-    type: "warning",
-    buttons: ["Cancel", "Run on the host"],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-    title: "Run on the host?",
-    // Made visible and bounded by `hostPromptText`: a renderer's newlines or bidi controls cannot
-    // make this misstate what runs.
-    message: prompt.message,
-    detail: prompt.detail,
-  };
-  const answer = win === null ? await dialog.showMessageBox(options) : await dialog.showMessageBox(win, options);
-  return answer.response === 1;
-}
 
 function loginShell(): string | undefined {
   try {
@@ -128,7 +106,6 @@ const terminals = new TerminalHost(
     const contents = webContents.fromId(owner);
     if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.terminalEvent, event);
   },
-  askHost,
 );
 
 /**
@@ -232,8 +209,9 @@ function registerBridge(): void {
   });
 
   // The terminal. Main validates every argument (`terminals.ts`); a terminal answers only the
-  // window that opened it. Writes, resizes and closes are fire-and-forget (`send`, not `invoke`):
-  // one round trip per keystroke buys nothing, and an untrusted one is dropped.
+  // window that opened it. Writes, resizes and acks are fire-and-forget (`send`, not `invoke`):
+  // one round trip per keystroke buys nothing, and an untrusted one is dropped. Close is invoked:
+  // its answer (`TerminalEnd`) is the only confirmation that the program ended.
   ipcMain.handle(BRIDGE_CHANNELS.terminalOpen, (event, spec: unknown, cols: unknown, rows: unknown): TerminalResult<unknown> => {
     assertTrusted(event);
     return terminals.open(event.sender.id, spec, cols, rows);
@@ -251,10 +229,7 @@ function registerBridge(): void {
     assertTrusted(event);
     return terminals.close(event.sender.id, id);
   });
-  ipcMain.handle(BRIDGE_CHANNELS.terminalConfirmHost, (event, spec: unknown) => {
-    assertTrusted(event);
-    return terminals.confirmHost(event.sender.id, spec);
-  });
+
 
   // Live design updates. Only a design's own topic is subscribed to (`isDesignTopic`, checked in
   // the feeds), with the app's one consumer group.
@@ -276,8 +251,8 @@ function registerBridge(): void {
     assertTrusted(event);
     const answer = await containerKit.spec(action);
     // Main built this host spec from the kit it located and the action's one flag, not from
-    // anything the renderer sent, so it runs without asking (the Container tab's buttons are the ask).
-    if (answer.ok) terminals.approveHost(event.sender.id, answer.value);
+    // anything the renderer sent: the one kind of host program a window may open.
+    if (answer.ok) terminals.issueHost(event.sender.id, answer.value);
     return answer;
   });
 

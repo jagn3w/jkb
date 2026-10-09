@@ -112,6 +112,8 @@ export function parseSpec(value: unknown): TerminalResult<TerminalSpec> {
   }
   if (bytes > SPEC_LIMITS.maxArgBytes) return bad("argv is too long");
   if (argv.length > 0 && argv[0] === "") return bad("argv[0] must name a program");
+  // `exec -a x rm …` under bash or zsh runs `rm`: a program is never named by an option.
+  if (argv.length > 0 && (argv[0] as string).startsWith("-")) return bad("argv[0] must name a program, not an option");
   if (typeof title !== "string" || title.trim() === "" || title.length > SPEC_LIMITS.maxTitle) {
     return bad(`title must be a non-empty string of at most ${SPEC_LIMITS.maxTitle} characters`);
   }
@@ -190,19 +192,6 @@ export function containerPathOf(path: string, roots: TerminalRoots): string | un
 }
 
 /**
- * `spec` moved to `target` (the per-terminal toggle). The program and title are kept; the
- * working directory is translated through the repos mount, the one directory both sides see,
- * and falls back to the target's default when it lies outside it — a container path means
- * nothing on the host, and naming it there would only fail.
- */
-export function retarget(spec: TerminalSpec, target: TerminalTarget, roots: TerminalRoots): TerminalSpec {
-  if (spec.target === target) return spec;
-  const mapped =
-    target === "host" ? rebase(spec.cwd, roots.containerRepos, roots.hostRepos) : containerPathOf(spec.cwd, roots);
-  return { ...spec, target, cwd: mapped ?? defaultCwd(target, roots) };
-}
-
-/**
  * `path` in the host's filesystem, spelled under `hostRepos`: a container path under the repos
  * mount is carried to the host's side of it; a path under either spelling of the host's repos
  * directory is kept (re-spelled under `hostRepos`); anything else is `undefined`, since neither
@@ -218,20 +207,6 @@ export function hostPathOf(path: string, roots: TerminalRoots): string | undefin
   return undefined;
 }
 
-/**
- * `arg` quoted for a POSIX shell (and zsh): single quotes, with each `'` closed, escaped and reopened.
- * Total (every string, including newlines, comes back as itself) and the only quoting the terminal
- * does. A word is left bare only when it is made of characters no shell in `POSIX_SHELLS` expands.
- */
-export function shellQuote(arg: string): string {
-  // No `=` among the bare characters: zsh expands a word starting with one (`=ls` is `/usr/bin/ls`).
-  return /^[A-Za-z0-9_\/.,:@%+-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`;
-}
-
-/** `argv` as one line a person can read and a POSIX shell would run as the same words. */
-export function formatArgv(argv: readonly string[]): string {
-  return argv.map(shellQuote).join(" ");
-}
 
 /** How a target is named on a terminal's tab, so it is never ambiguous where a command runs. */
 export function targetLabel(target: TerminalTarget): string {

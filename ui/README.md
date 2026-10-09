@@ -80,10 +80,12 @@ terminal enters `$JKB_CONTAINER_NAME` (default `jkb-dev`, as `.container/run.sh`
 app's own environment: an app launched from the Dock or Finder does not see what your shell rc
 exports, so for a non-default name run `launchctl setenv JKB_CONTAINER_NAME <name>` and relaunch
 the app (or start it from that shell). The *New terminal* button's tooltip names the container it
-enters. Closing a container terminal also ends its program inside the container with a second
-`docker exec` (D53.10); when that cannot be confirmed the terminal says the program may still be
-running, and nothing new starts beside it until you press Restart. A program is run on the host only after the app's own dialog shows you its
-exact command and directory. Ctrl+` folds the drawer.
+enters. A terminal's target is fixed when it opens: Claude sessions and every program run in the
+container, and a host terminal is only an interactive login shell or one of the Container tab's
+`run.sh` actions (running chosen programs on the host was cut from D53.10 and is a backlog task).
+Closing a container terminal also ends its program inside the container with a second
+`docker exec` (D53.10); when that cannot be confirmed the tab stays, saying the program may still
+be running, and nothing new starts in it until you press Restart. Ctrl+` folds the drawer.
 
 ## Run the extension
 

@@ -463,15 +463,15 @@ requests), and `src/renderer/src/design/` `launch.ts` (every launch and resume a
 - **A prompt's uid is its session's: `prompt:<uuid>`.** "One per session" is then the uniqueness of a
   uid, not a rule every caller must remember. Recording the same session again is the same prompt:
   nothing is written when it is recorded from where it already was, and its cwd moves when it is not
-  (the terminal's toggle restarts the program on the other side, which runs the launch again from
-  there). Recording it under another design is refused. The item's content is its title; the design,
+  (a launch run again from elsewhere; the terminal's host toggle, which once did this, was cut —
+  D53.10). Recording it under another design is refused. The item's content is its title; the design,
   session, cwd, launch (`discuss`/`play`/`task`/`new`) and subject (the plan or task a *Play* named)
   are its metadata. The subject is checked against the launch when the session is first recorded: a
   plan's *Play* must name one of this design's plans, a task's *Play* one of its tasks (under a step,
   or directly under the design), and a *Discuss* or *New prompt* names none — the pane lists the
   subject under the design, so a missing one, one from another design, or one of another kind is
   refused (caught in review). Recording the session again checks no subject: it writes only the cwd,
-  and the plan or task leaving the design since must not stop the toggle from restarting it. A session id is a **lowercase**
+  and the plan or task leaving the design since must not stop a re-record. A session id is a **lowercase**
   uuid, and another spelling is **refused, not rewritten**: the launch hands Claude the caller's
   spelling, so a record that folded case could name a session other than the one Claude was given.
   *Unmeasured:* whether Claude folds a session id's case — the refusal makes it moot, and the app mints
@@ -488,16 +488,14 @@ requests), and `src/renderer/src/design/` `launch.ts` (every launch and resume a
   an implementer's does not.
 - **Resume is `claude --resume <uuid>` in the recorded cwd, in the container**, opened with the session
   id as the terminal's `sessionUuid`, so resuming a session whose terminal is still open shows that
-  terminal. A session the toggle moved to the host recorded a host path; the resume carries it back
-  through the repos mount, and the toggle takes it to the host again. *Unmeasured, stated:* the
-  container's and the host's Claude session stores are separate, so a session started on the host
-  resumes only on the host.
+  terminal. A recorded host path (from before the host toggle was cut, D53.10) is carried back
+  through the repos mount (`containerPathOf`, either spelling of the host's root), so the resume
+  still runs in the container.
 - **A prompt whose directory is gone is unresumable, said so in its terminal.** A task's *Play* records
   the task's worktree, which is removed when the task lands, so every task-launched prompt eventually
   names a directory that no longer exists — and `docker exec -w` into it fails before anything of ours
   runs (caught in review). So a resume's terminal starts at the repos mount's root, which always
-  exists on both sides, and the script moves into the recorded directory *relative to it* (the toggle
-  rebases the root and the relative path follows); outside the mount it starts at `/` and moves to the
+  exists on both sides, and the script moves into the recorded directory *relative to it*; outside the mount it starts at `/` and moves to the
   absolute path. Since a resume's own cwd is no longer the session's directory, re-attach (D53.9),
   when the registry does not know where a session runs, reads the directory back from the resume's
   argv (`resumedDir`, `sessionResumeSpec`'s inverse) rather than the spec's cwd. A directory that is
@@ -696,18 +694,28 @@ the renderer's `sessions/` (`watch.ts`, the provider every tab reads the dot fro
 One React component used by every tab: a collapsible bottom drawer (and a popover variant for
 *Discuss*), multiple tabs, xterm.js in the renderer, `node-pty` in main.
 
-- **Default target is the container** (`docker exec -it -w <cwd> <container> …`); a per-terminal
-  toggle makes it a **host** session, labelled as such in the tab so it is never ambiguous where a
-  command runs.
+- **Default target is the container** (`docker exec -it -w <cwd> <container> …`); a **host**
+  terminal is labelled as such in the tab so it is never ambiguous where a command runs.
 - A terminal is created from a **spec** (`{target, cwd, argv, title, sessionUuid?}`) built by the
   caller from CLI output; the component has no knowledge of Claude or jkb.
 
+**Superseded in part (review s2-r3, the operator's call): the per-terminal Container | Host toggle
+is cut.** Three review rounds kept finding defects in the one mechanism the toggle needed — running
+a renderer-built argv on the host (a confirmation dialog the renderer must not be able to answer
+or mislead, POSIX quoting across sh/bash/zsh, PATH lookup through a login shell that skips
+`~/.zshrc`) and tracking ends across a stop on one side and a start on the other. A terminal's
+target is now FIXED when it opens. The host runs only an interactive login shell (the person types
+the command) and the specs main itself builds (the Container tab's `run.sh` actions); Claude
+sessions, *Play*, *Discuss* and *Resume* always run in the container. Running chosen programs on
+the host, and moving a terminal between the two, is tracked as a backlog task (cut from D53.10).
+
 **As built (subtask 2).** The contract is `src/shared/terminal.ts` (the spec, its validator
-`parseSpec`, `retarget`, the events); main's half is `src/main/terminals.ts` (`TerminalHost`: the
-PTYs, the command each spec runs); the renderer's is `src/renderer/src/terminal/` (a reducer for
-what is open where, one xterm instance per terminal that outlives its view, the drawer, the
-popover, and `useTerminals()` — `open(spec, "drawer" | "popover")` is what a tab calls). The drawer
-folds with Ctrl+` and is resized by its top edge; its height is a per-window convenience.
+`parseSpec`, the path mapping, the events); main's half is `src/main/terminals.ts` (`TerminalHost`:
+the PTYs, the command each spec runs, ending them); the renderer's is `src/renderer/src/terminal/`
+(a reducer for what is open where, `run.ts` for the order one terminal starts and ends its
+programs, one xterm instance per terminal that outlives its view, the drawer, the popover, and
+`useTerminals()` — `open(spec, "drawer" | "popover")` is what a tab calls). The drawer folds with
+Ctrl+` and is resized by its top edge; its height is a per-window convenience.
 
 - **A container terminal is `docker exec -i -t -e TERM=… -w <cwd> <container> /bin/sh -c
   <WRAPPER_SCRIPT> jkb-terminal <record> <argv>`**, with `/bin/bash -l` (absolute, as the kit names
@@ -721,76 +729,56 @@ folds with Ctrl+` and is resized by its top edge; its height is a per-window con
   container it enters, so a mismatch is visible. A name that is not one (`--privileged`) is refused
   rather than handed to docker as a flag. `docker` itself is looked for at fixed absolute paths,
   never on `PATH`: a GUI app's `PATH` is not the shell's.
-- **Ending a container program is explicit (review s2-r1).** Closing, restarting or retargeting a
-  container terminal kills the `docker exec` client AND runs a second `docker exec <container>
-  /bin/sh -c <END_SCRIPT> jkb-terminal-end <record>`, which sends the recorded process group SIGHUP
-  (what a closing terminal sends, and what an interactive `bash`, which ignores TERM, passes on to
-  its jobs), TERM after 2 s and KILL after 4 s, and exits 0 only once the recorded process is gone.
-  `close` answers a `TerminalEnd { target, confirmed, detail }`: `confirmed` is true only for that
-  exit 0 (or, on the host, the program's own exit after its hangup). The UI says "ended" only then;
-  otherwise it writes the end command's failure and "it may still be running".
-  **No start goes ahead beside a program that may still run (review s2-r2).** Each terminal keeps an
-  `EndRecord` (`terminal/ending.ts`): every end is recorded as it is SENT, and every start — the
-  toggle, a re-toggle that sent nothing itself, a *Resume* reaching the tab through `planOpen` —
-  waits for all of them and does not start while any came back unconfirmed. The tab then reads
-  `failed` with `mayBeRunning` ("may still run"), which `planOpen` shows rather than relaunches; only
-  *Restart* (`override`) runs it anyway, as a deliberate act, and clears the record. Closing a tab
-  with × awaits its end too: the tab goes at once, but a program that was running is kept as an
-  **orphan** (`TerminalsState.orphans`) until its end is known — forgotten if confirmed; if not,
-  shown in the drawer (which opens for it) with a *Dismiss*. An open of the same `sessionUuid`
-  meanwhile gets a new tab that inherits the orphan's end and waits on it like any other
-  (`afterOrphan`), so a Resume after × cannot start a second `claude --resume` beside a survivor.
-  A window's close or reload, and quit, send the ends without waiting: the renderer that would
-  record them is gone.
-  A program that exits on its own leaves its record file in the container's `/tmp` (one line, gone
-  when the container restarts).
-- **A program on the host runs only on main's own confirmation.** `TerminalHost.open` refuses a
-  host spec with a non-empty argv unless that window confirmed exactly that `(cwd, argv)` through
-  `confirmHost`, which shows main's native dialog with the argv (shell-quoted, `formatArgv`) and the
-  cwd; the renderer cannot answer it. What the dialog shows is made visible and bounded
-  (`hostPromptText`/`visible`): C0/C1 controls, line and paragraph separators, bidi controls and
-  zero-width characters are written as `\n`, `\t` or `\u{…}`, and each of title, command and cwd
-  is cut at `PROMPT_PART_CHARS` (600; the title at 80) with the rest counted — so a renderer cannot
-  push the payload below the visible text with newlines or reverse it with U+202E. Only the shown
-  text is escaped; the argv that runs is the one confirmed. A yes lasts for the window until it closes or reloads, so
-  *Restart* does not ask again. The one exception is a spec main built itself from its own constants
-  (the Container tab's `run.sh <flag>`, D53.8), approved as main hands it out. The toggle always
-  confirms a move to the host: a program through that dialog, the login shell (which runs nothing
-  until typed into) through the page's own confirm showing the cwd. A move to the container does not
-  ask.
-- **A bare program name on the host runs through the login shell.** A host argv whose `argv[0]` is
-  absolute runs as it is; a bare one (`claude`, carried over by the toggle from a container spec)
-  runs as `<$SHELL> -l -c 'exec <argv, POSIX-quoted>'`, so it is found on the PATH the person's
-  profile builds — a Dock-launched app's own PATH is launchd's `/usr/bin:/bin:/usr/sbin:/sbin`,
-  without `~/.local/bin`. Chosen over requiring an absolute `argv[0]`, which would make the toggle
-  refuse every container spec (they name programs bare, for the container's PATH). The quoting is
-  single quotes with `'\''`; a word is left bare only when made of characters none of the accepted
-  shells expands — not `=`, which zsh (macOS's default login shell) expands at a word's start
-  (`=ls` is `/usr/bin/ls`, `=x` is an error; review s2-r2). A login shell outside that family (fish,
-  whose single quotes treat `\` differently) is not trusted with the words, and `/bin/sh -l` runs
-  them. Pinned in `test/terminal.test.mjs` against each real login shell present (`/bin/sh`, `bash`,
-  `zsh`; all three on the linux-arm64 dev container), whose profile alone puts the program on PATH,
-  with `'`, spaces, `$`, a trailing `\`, `*`, an empty word, `=x`, `=ls`, `~` and `a=b`.
+- **A host terminal is the login shell, or a spec main built.** `TerminalHost.open` refuses a host
+  spec with an argv unless main issued exactly that `(cwd, argv)` to that window (`issueHost`, as
+  the Container tab's `run.sh <flag>` is handed out; D53.8), until the window closes or reloads. No
+  renderer caller can run a program of its choosing outside the container. A host program is named
+  by absolute path; nothing is looked up on the app's `PATH`.
+- **Ending a program is explicit, and confirmed (review s2-r1).** Closing a container terminal
+  kills the `docker exec` client AND runs a second `docker exec <container> /bin/sh -c <END_SCRIPT>
+  jkb-terminal-end <record>`, which sends the recorded process group SIGHUP (what a closing terminal
+  sends, and what an interactive `bash`, which ignores TERM, passes on to its jobs), TERM after 2 s
+  and KILL after 4 s, and exits 0 only once the recorded process is gone. A host program gets the
+  same ladder from main (`HOST_END_MS`: hangup, TERM at 2 s, KILL at 4 s, unconfirmed at 5 s;
+  review s2-r3). `close` answers a `TerminalEnd { target, confirmed, detail }`, and the UI says a
+  program ended only when `confirmed`. Main reads a terminal through from the moment it starts
+  ending it (round 3's must-fix): a program that writes as it handles its hangup — `make`'s
+  "*** Hangup", a cleanup message — would otherwise block on a paused PTY nobody will acknowledge
+  and never exit. Measured: a hangup handler that writes 300 KB after the PTY paused exits 0 on its
+  own (with the read-through removed it was killed by TERM).
+- **An unconfirmed end keeps the tab.** Closing a tab whose program runs marks it `closing`
+  ("ending") until the end answers: confirmed, the tab goes; unconfirmed, it stays, reads "may still
+  run" (`failed` with `mayBeRunning`) and says why on its screen; closing it again forgets it.
+  `run.ts` (`TerminalRun`) remembers the last end, and nothing starts in that terminal while it is
+  unconfirmed — not a re-attach, not a *Resume* reaching it through `planOpen`, which shows such a
+  tab rather than relaunching it — until *Restart*, the person's explicit override. An open still in
+  flight is awaited before an end, so a PTY whose open lands after its tab was closed (or its start
+  was superseded) is ended like any other rather than dropped. That one remembered end is all the
+  tracking a fixed-target terminal needs, since its only stop-then-start is its own; round 2's
+  `EndRecord` and closed-tab orphans existed for the toggle and went with it. Tested with a fake
+  bridge (`test/terminal.test.mjs`, "one terminal's starts and ends"). A window's close or reload,
+  and quit, send the ends without waiting: the renderer that would show them is gone. A program
+  that exits on its own leaves its record file in the container's `/tmp` (one line, gone when the
+  container restarts).
 - **Main trusts nothing the renderer sends.** `parseSpec` refuses unknown fields (there is no `env`
-  to smuggle in), relative or NUL-bearing paths, and oversized argv; sizes and writes are bounded. A
-  terminal belongs to the window that opened it: only that window can write to it, resize it or
-  close it, and it is killed when that window closes or reloads. The PTYs never cross the bridge,
-  only their output does.
-- **The toggle restarts the program on the other side.** A process cannot move between the
-  container and the host, so switching ends it (see above) and starts the spec again there. The cwd
-  crosses through the repos mount (`HOST_REPOS` ⇄ `CTR_REPOS` in `run.sh`), the one directory both
-  sides see; outside it, the target's default. Like `run.sh`'s `container_path`, both spellings of
-  the host root map: `TerminalRoots.hostReposReal` is `~/repos` with its links resolved, once, by
-  main (`machineRoots`), so a cwd from `git rev-parse --show-toplevel` under a symlinked `~/repos`
-  still lands in the repo rather than in `CTR_REPOS`. `containerPathOf` is the one statement of the
-  host → container rule; the Sessions tab's resume (`sessionResumeSpec`) uses it too. The badge on
-  the tab says where it runs, and a host badge is drawn inverted so it cannot be read as the quiet
+  to smuggle in), relative or NUL-bearing paths, an `argv[0]` that is an option (`-a`: bash's and
+  zsh's `exec -a x rm …` runs `rm`), and oversized argv; sizes and writes are bounded. A terminal
+  belongs to the window that opened it: only that window can write to it, resize it, acknowledge
+  it or close it, and it is ended when that window closes or reloads. The PTYs never cross the
+  bridge, only their output does.
+- **Paths cross through the repos mount** (`HOST_REPOS` ⇄ `CTR_REPOS` in `run.sh`), the one
+  directory both sides see. Like `run.sh`'s `container_path`, both spellings of the host root map:
+  `TerminalRoots.hostReposReal` is `~/repos` with its links resolved, once, by main
+  (`machineRoots`), so a cwd from `git rev-parse --show-toplevel` under a symlinked `~/repos` still
+  lands in the repo rather than in `CTR_REPOS`. `containerPathOf` is the one statement of the host
+  → container rule (the Sessions tab's resume and its "shell here" use it); `hostPathOf` the other
+  way (`gitPlace`). A host badge on a tab is drawn inverted so it cannot be read as the quiet
   default.
-- **A second open with the same `sessionUuid` shows the terminal while its program is starting or
-  running** (`planOpen`), so a double-clicked *Play* or *Discuss* does not start a second Claude on
-  one session. Once that program has exited or failed, the open runs the NEW spec in the same tab:
-  a *Resume* on a prompt whose launch terminal is still in the drawer, dead, runs `claude --resume`
-  rather than reselecting the corpse (review s6).
+- **A second open with the same `sessionUuid` shows the terminal while its program is starting,
+  running, ending or may still be running** (`planOpen`), so a double-clicked *Play* or *Discuss*
+  does not start a second Claude on one session. Once that program has exited or failed, the open
+  runs the NEW spec in the same tab: a *Resume* on a prompt whose launch terminal is still in the
+  drawer, dead, runs `claude --resume` rather than reselecting the corpse (review s6).
 - **Output is flow-controlled.** Main counts the characters it sent a terminal that the renderer has
   not acknowledged; past `FLOW.high` (100 000) it pauses the PTY (`pty.pause()`), so a `yes` blocks
   on a full kernel buffer instead of growing the IPC queue and xterm's write buffer until the
@@ -805,22 +793,27 @@ folds with Ctrl+` and is resized by its top edge; its height is a per-window con
   `lib/unixTerminal.js`), then destroys it with whatever is unread, and only then reports the exit;
   a paused socket never drains, so the end of a burst was lost whenever the ack came late. While
   paused, main checks every `PAUSED_EXIT_CHECK_MS` (50) whether the program's process still exists,
-  and once it does not, resumes and never pauses that terminal again. Measured: a program that
-  writes past the watermark, waits for the pause, writes a 2 000-character tail and exits with no
-  acknowledgement at all now delivers every character (it lost the whole tail with the check
-  removed); an ack arriving after the exit is refused as for nothing. **The cost, computed, not
-  measured in Electron:** a hidden or minimized window's renderer is throttled (Chromium's
-  `backgroundThrottling`, left on), so its write callbacks — and so the acks — slow down, and a
-  terminal in a background window is held to roughly the watermark per acknowledgement round. A
-  long build in a hidden window runs slower than it would unthrottled; it does not lose output, and
-  nothing the person has not seen piles up in the renderer. Turning `backgroundThrottling` off
-  would lift the cap at the price of a busy hidden renderer; not chosen.
+  and once it does not, resumes and never pauses that terminal again; the exit's own final flush
+  never pauses either, so no check is left polling. Measured: a program that writes past the
+  watermark, waits for the pause, writes a 2 000-character tail and exits with no acknowledgement at
+  all now delivers every character (it lost the whole tail with the check removed); an ack arriving
+  after the exit is refused as for nothing. **The cost, computed, not measured in Electron:** a
+  hidden or minimized window's renderer is throttled (Chromium's `backgroundThrottling`, left on),
+  so its write callbacks — and so the acks — slow down, and a terminal in a background window is
+  held to roughly the watermark per acknowledgement round. A long build in a hidden window runs
+  slower than it would unthrottled; it does not lose output, and nothing the person has not seen
+  piles up in the renderer. Turning `backgroundThrottling` off would lift the cap at the price of a
+  busy hidden renderer; not chosen.
 - **Pastes are chunked below `MAX_WRITE_CHARS` without splitting a surrogate pair** (`chunkWrite`),
   which would otherwise reach the PTY as two U+FFFD.
 - **The 16 ANSI colours are design tokens** (`--terminal-ansi-*`, a light and a dark value each, read
-  by `terminal/theme.ts`). xterm's defaults are for a dark ground; on the light one its white, bright
-  white and yellow vanished. Every light value reads at 3:1 or better on `--terminal-bg`, and every
-  dark one but `black` (conventionally a ground) does on the dark ground; pinned in the test.
+  by `terminal/theme.ts`). xterm's defaults are for a dark ground; on the light one its yellow all
+  but vanished. On the light ground every colour but white and bright white reads at 3:1 or better
+  as text; those two stay light because programs use them as BACKGROUNDS behind black text
+  (ESC[30;107m — round 2 darkened bright white to #404040, which left such text at 1.7:1; review
+  s2-r3), and black on them reads at 3:1 or better. Drawn as text, xterm's `minimumContrastRatio`
+  (3, `MIN_CONTRAST_RATIO`) darkens them where they meet the ground. Every dark value but `black`
+  (conventionally a ground) reads at 3:1 on the dark ground. Pinned in the test.
 
 What it cost to learn:
 

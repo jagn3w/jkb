@@ -13,8 +13,13 @@ export type Placement = "drawer" | "popover";
 export type TerminalStatus =
   | { readonly kind: "starting" }
   | { readonly kind: "running" }
+  /** Its tab was closed and its program is being ended; the tab goes once that is confirmed. */
+  | { readonly kind: "closing" }
   | { readonly kind: "exited"; readonly exitCode: number; readonly signal?: number }
-  /** `mayBeRunning`: not started because an earlier program here may still be running. */
+  /**
+   * `mayBeRunning`: its program's end was not confirmed (a close, or a start refused because of
+   * one), so it may still be running.
+   */
   | { readonly kind: "failed"; readonly error: string; readonly mayBeRunning?: boolean };
 
 export interface TerminalEntry {
@@ -25,20 +30,8 @@ export interface TerminalEntry {
   readonly status: TerminalStatus;
 }
 
-/**
- * A closed tab whose program was not seen to end: its end is still in flight (`detail` unset) or
- * came back unconfirmed. Kept after the tab is gone, so a later open of the same session does not
- * start a second program beside it, and shown in the drawer until dismissed.
- */
-export interface Orphan {
-  readonly key: number;
-  readonly spec: TerminalSpec;
-  readonly detail?: string;
-}
-
 export interface TerminalsState {
   readonly entries: readonly TerminalEntry[];
-  readonly orphans: readonly Orphan[];
   /** The drawer's front terminal. */
   readonly active: number | undefined;
   /** The terminal in the popover, if it is open. */
@@ -46,19 +39,14 @@ export interface TerminalsState {
   readonly drawerOpen: boolean;
 }
 
-export const INITIAL_STATE: TerminalsState = { entries: [], orphans: [], active: undefined, popover: undefined, drawerOpen: false };
+export const INITIAL_STATE: TerminalsState = { entries: [], active: undefined, popover: undefined, drawerOpen: false };
 
 export type TerminalAction =
   | { readonly type: "open"; readonly key: number; readonly spec: TerminalSpec; readonly placement: Placement }
   | { readonly type: "status"; readonly key: number; readonly status: TerminalStatus }
   /** The terminal starts again from `spec` (a restart, or the target toggle). */
   | { readonly type: "restart"; readonly key: number; readonly spec: TerminalSpec }
-  /** The tab goes; its program's end is in flight, so it is kept as an orphan until that is known. */
   | { readonly type: "close"; readonly key: number }
-  /** A closed tab's end came back: a confirmed one forgets it, an unconfirmed one keeps it. */
-  | { readonly type: "orphanEnded"; readonly key: number; readonly confirmed: boolean; readonly detail: string }
-  /** Forget an orphan: dismissed, or taken over by a new tab of its session. */
-  | { readonly type: "dropOrphan"; readonly key: number }
   | { readonly type: "select"; readonly key: number }
   | { readonly type: "toDrawer"; readonly key: number }
   | { readonly type: "drawer"; readonly open: boolean }
@@ -94,10 +82,6 @@ export function reduce(state: TerminalsState, action: TerminalAction): Terminals
         entries: state.entries.map((e) => (e.key === action.key ? { ...e, spec: action.spec, status: { kind: "starting" } } : e)),
       };
     case "close": {
-      const closing = state.entries.find((e) => e.key === action.key);
-      // A program still running (or starting) is ended now; until that end is known it may run on.
-      const live = closing !== undefined && (closing.status.kind === "running" || closing.status.kind === "starting" || (closing.status.kind === "failed" && closing.status.mayBeRunning === true));
-      const orphans = live ? [...state.orphans, { key: closing.key, spec: closing.spec }] : state.orphans;
       const index = drawerKeys(state.entries).indexOf(action.key);
       const entries = state.entries.filter((e) => e.key !== action.key);
       const remaining = drawerKeys(entries);
@@ -107,24 +91,12 @@ export function reduce(state: TerminalsState, action: TerminalAction): Terminals
       return {
         ...state,
         entries,
-        orphans,
         active,
         popover: state.popover === action.key ? undefined : state.popover,
         drawerOpen: state.drawerOpen && remaining.length > 0,
       };
     }
-    case "orphanEnded":
-      if (!state.orphans.some((o) => o.key === action.key)) return state;
-      return {
-        ...state,
-        // An unconfirmed end opens the drawer, where it is shown, so it is not missed.
-        drawerOpen: state.drawerOpen || !action.confirmed,
-        orphans: action.confirmed
-          ? state.orphans.filter((o) => o.key !== action.key)
-          : state.orphans.map((o) => (o.key === action.key ? { ...o, detail: action.detail } : o)),
-      };
-    case "dropOrphan":
-      return { ...state, orphans: state.orphans.filter((o) => o.key !== action.key) };
+
     case "select":
       return drawerKeys(state.entries).includes(action.key) ? { ...state, active: action.key, drawerOpen: true } : state;
     case "toDrawer":
@@ -158,21 +130,17 @@ export function findSession(state: TerminalsState, sessionUuid: string | undefin
 export type OpenPlan =
   | { readonly kind: "show"; readonly entry: TerminalEntry }
   | { readonly kind: "relaunch"; readonly entry: TerminalEntry }
-  /** A closed tab of this session may still be running: a new tab, which waits for its end. */
-  | { readonly kind: "afterOrphan"; readonly orphan: Orphan }
   | { readonly kind: "new" };
 
 export function planOpen(state: TerminalsState, spec: TerminalSpec): OpenPlan {
   const entry = findSession(state, spec.sessionUuid);
-  if (entry === undefined) {
-    const orphan = spec.sessionUuid === undefined ? undefined : state.orphans.find((o) => o.spec.sessionUuid === spec.sessionUuid);
-    return orphan === undefined ? { kind: "new" } : { kind: "afterOrphan", orphan };
-  }
+  if (entry === undefined) return { kind: "new" };
   // A program that may still be running (its end unconfirmed) is shown, never started beside:
   // only an explicit Restart overrides that.
   const live =
     entry.status.kind === "starting" ||
     entry.status.kind === "running" ||
+    entry.status.kind === "closing" ||
     (entry.status.kind === "failed" && entry.status.mayBeRunning === true);
   return { kind: live ? "show" : "relaunch", entry };
 }
@@ -189,6 +157,8 @@ export function statusLabel(status: TerminalStatus): string {
       return "starting";
     case "running":
       return "";
+    case "closing":
+      return "ending";
     case "exited":
       return status.signal ? `signal ${status.signal}` : `exit ${status.exitCode}`;
     case "failed":

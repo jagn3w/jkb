@@ -18,7 +18,7 @@ import {
   type TaskDetail,
 } from "@jkb/core";
 
-import { retarget } from "../../../shared/terminal";
+import { containerPathOf } from "../../../shared/terminal";
 import { sessionResumeSpec, titled } from "../design/launch";
 import { useNavigation } from "../navigation";
 import { loadHolders, type Holders } from "../sessions/data";
@@ -255,7 +255,7 @@ function SessionPreview({ row, terminalKey }: { readonly row: SessionRow; readon
     const roots = terminals.roots;
     if (roots === undefined) return;
     // `root` is the host's spelling (main read git there); the shell runs in the container.
-    terminals.open(retarget({ target: "host", cwd: root, argv: [], title: "shell" }, "container", roots), "drawer");
+    terminals.open({ target: "container", cwd: containerPathOf(root, roots) ?? roots.containerRepos, argv: [], title: "shell" }, "drawer");
   };
 
   const showTask = async (uid: string): Promise<void> => {

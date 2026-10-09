@@ -2,10 +2,20 @@
 //
 // Pure (the token reader is passed in), so the mapping is tested without a window. Every colour is
 // a token with a light and a dark value in `styles/tokens.css`, including the 16 ANSI colours:
-// xterm's own palette is drawn for a dark ground, and on the light one its white, bright white and
-// yellow are all but invisible.
+// xterm's own palette is drawn for a dark ground, and on the light one its yellow was all but
+// invisible.
 
 import type { ITheme } from "@xterm/xterm";
+
+/**
+ * xterm's `minimumContrastRatio`: a foreground drawn below this contrast against its background is
+ * adjusted until it reaches it. White and bright white stay light so they work as backgrounds,
+ * and this keeps them readable when a program draws them as text on the light ground.
+ */
+export const MIN_CONTRAST_RATIO = 3;
+
+/** The ANSI colours that must work as backgrounds behind black text, and are fixed up as text. */
+export const BACKGROUND_ANSI = ["white", "brightWhite"] as const;
 
 /** xterm's ANSI palette keys and the token each one reads. */
 export const ANSI_TOKENS = {

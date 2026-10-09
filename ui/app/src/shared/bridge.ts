@@ -31,7 +31,6 @@ export const BRIDGE_CHANNELS = {
   terminalResize: "jkb:terminal:resize",
   terminalClose: "jkb:terminal:close",
   terminalAck: "jkb:terminal:ack",
-  terminalConfirmHost: "jkb:terminal:confirm-host",
   /** main → renderer: a terminal's output or exit. */
   terminalEvent: "jkb:terminal:event",
   designSubscribe: "jkb:design:subscribe",
@@ -71,12 +70,6 @@ export interface TerminalBridge {
   close(id: number): Promise<TerminalResult<TerminalEnd>>;
   /** The renderer drew `chars` of the terminal's output (flow control, `FLOW`). */
   ack(id: number, chars: number): void;
-  /**
-   * Ask the person, in main's own dialog showing the exact argv and cwd, whether `spec` may run on
-   * the host. `true` without asking when it need not (a container spec, the login shell, or one
-   * already confirmed in this window). Main refuses to open an unconfirmed host program.
-   */
-  confirmHost(spec: TerminalSpec): Promise<TerminalResult<boolean>>;
   /** Hear every terminal event for this window. Returns the unsubscribe. */
   onEvent(listener: (event: TerminalEvent) => void): () => void;
 }

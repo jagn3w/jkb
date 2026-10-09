@@ -63,9 +63,11 @@
   --terminal-bg: #ffffff;
   --terminal-selection: #d3d3d1;
   /*
-   * Its 16 ANSI colours, for a light ground: "white" and the bright set are darkened, since a
-   * program writing bright white or yellow expects a dark ground and would vanish on this one.
-   * Every one reads at 3:1 or better on --terminal-bg (pinned by app/test/terminal.test.mjs).
+   * Its 16 ANSI colours, for a light ground. The colours are dark enough to read as text on
+   * --terminal-bg (3:1 or better). White and bright white stay light, because programs also use
+   * them as BACKGROUNDS behind black text (ESC[30;107m, a status bar). As text on this ground they
+   * would vanish, so xterm's minimumContrastRatio (terminal/theme.ts) darkens them where they are
+   * drawn as text. Both cases are pinned by app/test/terminal.test.mjs.
    */
   --terminal-ansi-black: #191919;
   --terminal-ansi-red: #c42b1c;
@@ -74,7 +76,7 @@
   --terminal-ansi-blue: #2563eb;
   --terminal-ansi-magenta: #a626a4;
   --terminal-ansi-cyan: #0e7490;
-  --terminal-ansi-white: #6b6b6b;
+  --terminal-ansi-white: #d3d3d1;
   --terminal-ansi-bright-black: #6b6b6b;
   --terminal-ansi-bright-red: #b91c1c;
   --terminal-ansi-bright-green: #166534;
@@ -82,7 +84,7 @@
   --terminal-ansi-bright-blue: #1d4ed8;
   --terminal-ansi-bright-magenta: #86198f;
   --terminal-ansi-bright-cyan: #155e75;
-  --terminal-ansi-bright-white: #404040;
+  --terminal-ansi-bright-white: #f7f7f5;
 
   /* Motion. */
   --motion: 150ms;

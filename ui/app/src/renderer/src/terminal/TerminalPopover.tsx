@@ -1,4 +1,4 @@
-import { RestartButton, StatusNote, TargetBadge, TargetToggle } from "./TerminalChrome";
+import { RestartButton, StatusNote, TargetBadge } from "./TerminalChrome";
 import { useTerminals } from "./TerminalProvider";
 import { TerminalView } from "./TerminalView";
 
@@ -19,7 +19,6 @@ export function TerminalPopover(): React.JSX.Element | null {
         <StatusNote entry={entry} />
         <span className="spacer" />
         <RestartButton entry={entry} />
-        <TargetToggle entry={entry} />
         <button type="button" className="terminal-action" onClick={() => terminals.toDrawer(entry.key)}>
           Move to drawer
         </button>

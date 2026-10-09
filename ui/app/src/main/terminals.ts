@@ -6,11 +6,12 @@
 // A terminal is made from a spec the renderer sends, validated by `parseSpec` before anything
 // runs. A container terminal is `docker exec -it -w <cwd> <container> <wrapper> <argv>`, the
 // wrapper recording the program's process group inside the container so that closing it can end it
-// there (`END_SCRIPT`), not only end the docker client; a host terminal runs `argv` itself (a bare
-// program name through the login shell). A host terminal that runs a program needs the person's
-// confirmation, asked by main, before it starts. Every terminal belongs to the window that opened
-// it: only that window can write to it, resize it, acknowledge its output or close it, it hears
-// only that window's events, and it is ended when that window closes.
+// there (`END_SCRIPT`), not only end the docker client. A host terminal is the login shell, which
+// runs nothing until it is typed into, or a spec main itself built and issued (`issueHost`, the
+// Container tab's `run.sh` actions); a host argv the renderer made up is refused. A terminal's
+// target is fixed when it opens. Every terminal belongs to the window that opened it: only that
+// window can write to it, resize it, acknowledge its output or close it, it hears only that
+// window's events, and it is ended when that window closes.
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -21,7 +22,6 @@ import {
   FLOW,
   MAX_ACK_CHARS,
   MAX_WRITE_CHARS,
-  formatArgv,
   isValidSize,
   parseSpec,
   type TerminalEnd,
@@ -120,7 +120,12 @@ export const END_SCRIPT = [
 
 /** How long main waits for the in-container end, and for a host program to exit after its hangup. */
 export const END_TIMEOUT_MS = 10_000;
-export const HOST_EXIT_WAIT_MS = 3_000;
+
+/**
+ * The host end, as `END_SCRIPT` does it in the container: a hangup, TERM if the program is still
+ * there after `term` ms, KILL after `kill` ms, and unconfirmed if it has not exited by `giveUp`.
+ */
+export const HOST_END_MS = { term: 2_000, kill: 4_000, giveUp: 5_000 } as const;
 
 /** The program a container terminal runs when its spec names none: the image's shell, by absolute path. */
 export const CONTAINER_SHELL: readonly string[] = ["/bin/bash", "-l"];
@@ -156,24 +161,6 @@ export interface Command {
   readonly end?: { readonly file: string; readonly args: readonly string[] };
 }
 
-/** Login shells that take POSIX quoting, so `formatArgv`'s words reach the program unchanged. */
-const POSIX_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh"]);
-
-/**
- * How a host spec's argv runs. A program named by absolute path runs as it is. A bare name
- * (`claude`) runs through the login shell — `<shell> -l -c 'exec <argv, quoted>'` — so it is found
- * on the PATH the person's profile builds: a Dock-launched app's own PATH is launchd's minimal one,
- * where `~/.local/bin` is not. A login shell that does not take POSIX quoting (fish) is not trusted
- * to keep the words intact; `/bin/sh -l` runs it instead.
- */
-export function hostArgv(argv: readonly string[], hostShell: string): { file: string; args: string[] } {
-  const [program, ...rest] = argv;
-  if (program === undefined) return { file: hostShell, args: ["-l"] };
-  if (program.startsWith("/")) return { file: program, args: rest };
-  const shell = POSIX_SHELLS.has(hostShell.slice(hostShell.lastIndexOf("/") + 1)) ? hostShell : "/bin/sh";
-  return { file: shell, args: ["-l", "-c", `exec ${formatArgv(argv)}`] };
-}
-
 /**
  * The command a spec runs. A container spec's `cwd` is the container's and goes to `docker exec
  * -w`; the docker client itself starts in the host's home, which exists. `tag` names the
@@ -205,54 +192,12 @@ export function commandFor(spec: TerminalSpec, env: TerminalEnvironment, tag: st
     };
   }
   if (!env.isDirectory(spec.cwd)) return { ok: false, error: `no such directory on the host: ${spec.cwd}` };
-  return { ok: true, value: { ...hostArgv(spec.argv, env.hostShell), cwd: spec.cwd } };
-}
-
-/** Whether running `spec` needs the person's confirmation first: a program, on the host. */
-export function needsHostConfirmation(spec: TerminalSpec): boolean {
-  return spec.target === "host" && spec.argv.length > 0;
-}
-
-/** What main shows when it asks to run a program on the host: the exact words and where. */
-export interface HostPrompt {
-  readonly argv: readonly string[];
-  readonly cwd: string;
-  /** What the dialog says (`hostPromptText`): every part made visible and bounded. */
-  readonly message: string;
-  readonly detail: string;
-}
-
-/** The most of any one part (title, command, cwd) the confirmation dialog shows. */
-export const PROMPT_PART_CHARS = 600;
-
-/**
- * Characters that would make the dialog misstate what runs: C0/C1 controls and DEL (a newline
- * pushes the payload below what is read), line and paragraph separators, bidi controls (U+202E
- * shows text reversed) and zero-width characters.
- */
-const HIDDEN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/gu;
-
-/**
- * `text` as the dialog shows it: every hidden or layout-changing character written as a visible
- * `\u{…}` escape (`\n` and `\t` by name), and at most `max` characters, the rest counted. For
- * display only: what runs is the argv itself.
- */
-export function visible(text: string, max: number = PROMPT_PART_CHARS): string {
-  const shown = text.replace(HIDDEN, (c) => {
-    if (c === "\n") return "\\n";
-    if (c === "\t") return "\\t";
-    return `\\u{${(c.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}}`;
-  });
-  const chars = [...shown];
-  return chars.length <= max ? shown : `${chars.slice(0, max).join("")}… (${chars.length - max} more characters not shown)`;
-}
-
-/** What main's confirmation dialog says for a host program: its exact argv and cwd, made visible. */
-export function hostPromptText(spec: TerminalSpec): { message: string; detail: string } {
-  return {
-    message: `Run "${visible(spec.title, 80)}" on the host, outside the container?`,
-    detail: `It runs as you, with everything your account can reach.\n\nProgram: ${visible(formatArgv(spec.argv))}\nIn: ${visible(spec.cwd)}`,
-  };
+  const [program, ...args] = spec.argv;
+  if (program === undefined) return { ok: true, value: { file: env.hostShell, args: ["-l"], cwd: spec.cwd } };
+  // Only main's own specs carry a host argv, and they name their program absolutely; nothing is
+  // looked up on the app's PATH (a Dock-launched app's is launchd's, not the shell's).
+  if (!program.startsWith("/")) return { ok: false, error: `a host program is named by absolute path: ${program}` };
+  return { ok: true, value: { file: program, args, cwd: spec.cwd } };
 }
 
 /**
@@ -380,58 +325,30 @@ export class TerminalHost {
   private readonly running = new Map<number, Running>();
   private nextId = 1;
 
-  /** Per window: the host programs (cwd and argv) the person confirmed, or main itself built. */
-  private readonly approved = new Map<number, Set<string>>();
+  /** Per window: the host programs (cwd and argv) main itself built and handed that window. */
+  private readonly issued = new Map<number, Set<string>>();
 
   constructor(
     private readonly spawn: SpawnPty,
     private readonly environment: TerminalEnvironment,
     /** Delivers an event to the window that owns the terminal. */
     private readonly emit: (owner: number, event: TerminalEvent) => void,
-    /**
-     * Asks the person, in main's own dialog, whether to run a program on the host. The renderer
-     * cannot answer it: a host program runs only once this said yes (or main built the spec).
-     */
-    private readonly askHost: (owner: number, prompt: HostPrompt) => Promise<boolean> = () => Promise.resolve(false),
     private readonly newTag: () => string = () => randomUUID(),
   ) {}
 
-  private static approvalKey(spec: TerminalSpec): string {
+  private static hostKey(spec: TerminalSpec): string {
     return JSON.stringify([spec.cwd, spec.argv]);
   }
 
   /**
-   * Record that `owner` may run `spec` on the host without asking: for a spec main built itself
-   * from its own constants (the kit's `run.sh`, D53.8), never for one the renderer sent.
+   * Let `owner` run `spec` on the host: only for a spec main built itself from its own constants
+   * (the kit's `run.sh` with an action's flag, D53.8), as it hands it out — never for one the
+   * renderer sent. It lasts until that window closes or reloads.
    */
-  approveHost(owner: number, spec: TerminalSpec): void {
-    const set = this.approved.get(owner) ?? new Set<string>();
-    set.add(TerminalHost.approvalKey(spec));
-    this.approved.set(owner, set);
-  }
-
-  /**
-   * Ask the person whether `owner` may run the (unvalidated) `rawSpec` on the host, showing its
-   * exact argv and cwd; `true` when it may (or need not ask: a container spec, the login shell, or
-   * one already confirmed). The answer is remembered for that window until it closes or reloads.
-   */
-  async confirmHost(owner: number, rawSpec: unknown): Promise<TerminalResult<boolean>> {
-    const parsed = parseSpec(rawSpec);
-    if (!parsed.ok) return parsed;
-    const spec = parsed.value;
-    if (!needsHostConfirmation(spec) || this.isApproved(owner, spec)) return { ok: true, value: true };
-    let yes: boolean;
-    try {
-      yes = await this.askHost(owner, { argv: spec.argv, cwd: spec.cwd, ...hostPromptText(spec) });
-    } catch (e) {
-      return { ok: false, error: `could not ask: ${e instanceof Error ? e.message : String(e)}` };
-    }
-    if (yes) this.approveHost(owner, spec);
-    return { ok: true, value: yes };
-  }
-
-  private isApproved(owner: number, spec: TerminalSpec): boolean {
-    return this.approved.get(owner)?.has(TerminalHost.approvalKey(spec)) ?? false;
+  issueHost(owner: number, spec: TerminalSpec): void {
+    const set = this.issued.get(owner) ?? new Set<string>();
+    set.add(TerminalHost.hostKey(spec));
+    this.issued.set(owner, set);
   }
 
   /** Start a terminal for `owner` from an unvalidated spec, at an initial size. */
@@ -440,8 +357,9 @@ export class TerminalHost {
     if (!parsed.ok) return parsed;
     if (!isValidSize(cols, rows)) return { ok: false, error: "not a terminal size" };
     const spec = parsed.value;
-    if (needsHostConfirmation(spec) && !this.isApproved(owner, spec)) {
-      return { ok: false, error: "running a program on the host needs your confirmation first" };
+    // The host runs the login shell, or a program main built; never argv the renderer chose.
+    if (spec.target === "host" && spec.argv.length > 0 && !(this.issued.get(owner)?.has(TerminalHost.hostKey(spec)) ?? false)) {
+      return { ok: false, error: "the host runs only its login shell or what the app itself built; programs run in the container" };
     }
     const command = commandFor(spec, this.environment, this.newTag());
     if (!command.ok) return command;
@@ -481,6 +399,8 @@ export class TerminalHost {
       else entry.timer ??= setTimeout(() => this.flush(entry), FLUSH_MS);
     });
     pty.onExit(({ exitCode, signal }) => {
+      // Never paused again: the final flush must not start an exit check nothing would clear.
+      entry.draining = true;
       this.unpause(entry);
       this.flush(entry);
       this.running.delete(id);
@@ -584,19 +504,16 @@ export class TerminalHost {
   }
 
   private async end(entry: Running): Promise<TerminalEnd> {
+    // Read through from now on: a program that writes as it handles its hangup (`make`'s
+    // "*** Hangup", a cleanup message) would otherwise block on a full buffer nobody will
+    // acknowledge — the renderer stopped listening when it asked for the end — and never exit.
+    entry.draining = true;
+    this.unpause(entry);
+    if (entry.end === undefined) return this.endHost(entry);
     try {
       entry.pty.kill();
     } catch {
       // Already gone.
-    }
-    if (entry.end === undefined) {
-      const exited = await Promise.race([
-        entry.exited.then(() => true),
-        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), HOST_EXIT_WAIT_MS).unref?.()),
-      ]);
-      return exited
-        ? { target: "host", confirmed: true, detail: "the program ended" }
-        : { target: "host", confirmed: false, detail: `the program was sent a hangup and had not exited after ${HOST_EXIT_WAIT_MS / 1000} s` };
     }
     let result: { code: number | null; output: string };
     try {
@@ -613,6 +530,31 @@ export class TerminalHost {
         };
   }
 
+  /** A host program: hangup, then TERM, then KILL (`HOST_END_MS`), confirmed by its exit. */
+  private async endHost(entry: Running): Promise<TerminalEnd> {
+    let gone = false;
+    void entry.exited.then(() => (gone = true));
+    const signal = (sig: string): void => {
+      try {
+        if (!gone) entry.pty.kill(sig);
+      } catch {
+        // Already gone.
+      }
+    };
+    const wait = (ms: number): Promise<boolean> =>
+      Promise.race([
+        entry.exited.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms).unref?.()),
+      ]);
+    signal("SIGHUP");
+    if (await wait(HOST_END_MS.term)) return { target: "host", confirmed: true, detail: "the program ended" };
+    signal("SIGTERM");
+    if (await wait(HOST_END_MS.kill - HOST_END_MS.term)) return { target: "host", confirmed: true, detail: "the program ended" };
+    signal("SIGKILL");
+    if (await wait(HOST_END_MS.giveUp - HOST_END_MS.kill)) return { target: "host", confirmed: true, detail: "the program ended (killed)" };
+    return { target: "host", confirmed: false, detail: `the program had not exited ${HOST_END_MS.giveUp / 1000} s after a hangup, TERM and KILL; it may still be running` };
+  }
+
   /**
    * End every terminal `owner` runs (its window closed or reloaded), or every terminal (the app
    * quits). The ends are sent, not awaited: there is no screen left to report them on.
@@ -621,13 +563,11 @@ export class TerminalHost {
     for (const entry of [...this.running.values()]) {
       if (owner !== undefined && entry.owner !== owner) continue;
       if (entry.timer !== undefined) clearTimeout(entry.timer);
-      if (entry.exitCheck !== undefined) clearInterval(entry.exitCheck);
-      entry.exitCheck = undefined;
       this.running.delete(entry.info.id);
       void this.end(entry);
     }
-    if (owner === undefined) this.approved.clear();
-    else this.approved.delete(owner);
+    if (owner === undefined) this.issued.clear();
+    else this.issued.delete(owner);
   }
 
   /** The terminals `owner` runs. */

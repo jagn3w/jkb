@@ -218,17 +218,19 @@ test("the Container tab offers the kit's buttons and says what the kit answered"
 // The integrated terminal (D53.10). A new terminal is a container terminal, labelled so; the
 // toggle moves it to the host, where it is a real shell. The container side is not exercised here
 // (no dev container in CI): what it runs is pinned by terminal.test.mjs.
-test("the terminal opens in the container by default, and the toggle runs it on the host", { skip }, async () => {
-  page.on("dialog", (dialog) => void dialog.accept());
-  await page.getByRole("button", { name: "New terminal" }).click();
+test("the terminal opens in the container by default, and a host terminal is a login shell", { skip }, async () => {
+  await page.getByRole("button", { name: "New terminal", exact: true }).click();
   const tab = page.locator(".terminal-tab").first();
   await tab.waitFor();
   assert.equal(await tab.locator(".target-badge").innerText(), "container");
   assert.equal(await page.locator(".drawer-toggle").getAttribute("aria-expanded"), "true");
+  // A terminal's target is fixed when it opens (D53.10): there is no toggle to move it.
+  assert.equal(await page.getByRole("group", { name: "Where this terminal runs" }).count(), 0);
 
-  await page.getByRole("group", { name: "Where this terminal runs" }).getByRole("button", { name: "Host" }).click();
-  await tab.locator('.target-badge[data-target="host"]').waitFor();
-  assert.equal(await tab.locator(".target-badge").innerText(), "host");
+  await page.getByRole("button", { name: "New host terminal" }).click();
+  const hostTab = page.locator(".terminal-tab").nth(1);
+  await hostTab.locator('.target-badge[data-target="host"]').waitFor();
+  assert.equal(await hostTab.locator(".target-badge").innerText(), "host");
 
   const screen = page.locator("#terminal-drawer-body .terminal-panel:not([hidden]) .xterm");
   await screen.click();
@@ -241,6 +243,7 @@ test("the terminal opens in the container by default, and the toggle runs it on 
   await page.keyboard.press("Control+Backquote");
   assert.equal(await page.locator(".drawer-toggle").getAttribute("aria-expanded"), "true", "and opens it");
 
-  await tab.getByRole("button", { name: /^Close / }).click();
-  assert.equal(await page.locator(".terminal-tab").count(), 0);
+  // Closing ends each program first; a tab goes once its end is confirmed.
+  for (const t of [hostTab, tab]) await t.getByRole("button", { name: /^Close / }).click();
+  await page.waitForFunction(() => document.querySelectorAll(".terminal-tab").length === 0, undefined, { timeout: 15_000 });
 });

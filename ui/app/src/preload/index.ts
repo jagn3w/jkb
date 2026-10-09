@@ -19,7 +19,6 @@ const bridge: JkbBridge = {
     resize: (id, cols, rows) => ipcRenderer.send(BRIDGE_CHANNELS.terminalResize, id, cols, rows),
     close: (id) => ipcRenderer.invoke(BRIDGE_CHANNELS.terminalClose, id),
     ack: (id, chars) => ipcRenderer.send(BRIDGE_CHANNELS.terminalAck, id, chars),
-    confirmHost: (spec) => ipcRenderer.invoke(BRIDGE_CHANNELS.terminalConfirmHost, spec),
     onEvent: (listener) => {
       // Only the payload reaches the renderer, never the IPC event (whose `sender` is an
       // `ipcRenderer` that could send on any channel).
