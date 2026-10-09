@@ -11,6 +11,7 @@ mod archive;
 mod atomic;
 mod commands;
 mod design_cli;
+mod design_export;
 mod doctor;
 mod git_audit;
 mod gitrepo;
@@ -444,6 +445,39 @@ enum DesignCmd {
         /// The text alone: no markers, no header.
         #[arg(long)]
         plain: bool,
+    },
+    /// Write a design's approved text to its `docs/` file (D55.6): every PROPOSED range left out,
+    /// no span markers, under a header naming the design and its version. `--to` records the
+    /// file once; `--all` re-renders every design of the repo that has one; `--check` re-renders
+    /// in memory and fails on any `docs/` file carrying the header that differs.
+    Export {
+        /// The design (omit with `--all` or `--check`).
+        #[arg(
+            required_unless_present_any = ["all", "check"],
+            conflicts_with_all = ["all", "check"]
+        )]
+        uid: Option<String>,
+        /// Where its export goes, under `docs/` (relative to the current directory); recorded in
+        /// the design, so later exports need not repeat it.
+        #[arg(long, requires = "uid")]
+        to: Option<String>,
+        /// Every design of the repo (the ambient one, or `--repo`) that has a doc target.
+        #[arg(long, conflicts_with = "check")]
+        all: bool,
+        /// With `--all`: this repo's designs (`designs/<repo>`).
+        #[arg(long, requires = "all")]
+        repo: Option<String>,
+        /// Write nothing; fail if a generated `docs/` file differs from its design's render.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Record files a design was made from, each with the blake3 of its content now (D55.5).
+    Source {
+        /// The design.
+        uid: String,
+        /// The files, relative to the current directory and inside the repository.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
     },
     /// Edit by quote. The quote is matched in the version `--base` names (the token `jkb design
     /// cat` printed), and the edit merges with everything written since; it is refused only

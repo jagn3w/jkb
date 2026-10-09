@@ -1231,3 +1231,164 @@ fn prompts_list_newest_first_and_undo_takes_one_back() {
         .unwrap()
         .is_none());
 }
+
+// ---- export (D55.5–6) ---------------------------------------------------------------------------
+
+fn exported(db: &Db, uid: &str) -> Exported {
+    let uid = uid.to_owned();
+    db.read(move |c| export::export(c, &uid)).unwrap()
+}
+
+/// The body after the generated header.
+fn exported_body(db: &Db, uid: &str) -> String {
+    let file = exported(db, uid).text;
+    let (head, body) = file.split_once('\n').unwrap();
+    assert_eq!(export::generated_from(head), Some(uid));
+    body.to_owned()
+}
+
+fn set_target(db: &Db, uid: &str, path: &str) -> Result<()> {
+    let (uid, path) = (uid.to_owned(), path.to_owned());
+    db.write_txn("t", move |c, m| export::set_doc_target(c, m, &uid, &path))
+}
+
+/// D55.6: only approved words reach the file. Uncovered text, an unapproved span, and words edited
+/// into an approved span after its approval are all PROPOSED and left out; no span markers.
+#[test]
+fn an_export_is_the_approved_text_alone_under_a_header_naming_the_version() {
+    let db = db();
+    let uid = create(
+        &db,
+        "Intro, not decided.\n## D1\nDecided.\n## D2\nPending.\n",
+    );
+    assert_eq!(
+        exported_body(&db, &uid),
+        "",
+        "nothing approved, nothing exported"
+    );
+    let d1 = span(&db, &uid, "## D1\nDecided.\n", Reviewer::Operator).unwrap();
+    span(&db, &uid, "## D2\nPending.\n", Reviewer::Operator).unwrap();
+    approve_as(&db, &d1, Approver::Operator).unwrap();
+    assert_eq!(exported_body(&db, &uid), "## D1\nDecided.\n");
+    let file = exported(&db, &uid);
+    assert!(!file.text.contains('⟦'), "no span markers: {}", file.text);
+    assert_eq!(
+        file.text.lines().next().unwrap(),
+        export::header(&uid, &cat(&db, &uid).version)
+    );
+
+    // Words added inside the approved span since its approval are not approved words.
+    edit_at(
+        &db,
+        &uid,
+        &token(&db, &uid),
+        insert_after("Decided", " maybe"),
+    )
+    .unwrap();
+    assert_eq!(exported_body(&db, &uid), "## D1\nDecided.\n");
+    // ...and the header names the new version, so a file rendered before reads as drift.
+    assert_eq!(
+        exported(&db, &uid).text.lines().next().unwrap(),
+        export::header(&uid, &cat(&db, &uid).version)
+    );
+}
+
+/// A file always ends in a newline, so an editor adding one is not drift.
+#[test]
+fn an_export_ends_in_a_newline() {
+    let db = db();
+    let uid = create(&db, "Decided, no newline");
+    let s = span(&db, &uid, "Decided, no newline", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    assert_eq!(exported_body(&db, &uid), "Decided, no newline\n");
+}
+
+#[test]
+fn only_the_header_marks_a_generated_file() {
+    let generated = "<!-- generated from jkb design design:a-1, edit there (version 1.x) -->\nbody";
+    assert_eq!(export::generated_from(generated), Some("design:a-1"));
+    assert_eq!(export::generated_from("# Hand-written\n"), None);
+    assert_eq!(export::generated_from(""), None);
+    // Anywhere but the first line is prose that mentions it.
+    assert_eq!(
+        export::generated_from("# T\n<!-- generated from jkb design design:a-1, edit -->"),
+        None
+    );
+}
+
+/// The doc target is a `docs/` file, one design's alone, recorded in metadata and undoable.
+#[test]
+fn a_doc_target_is_a_docs_file_one_design_owns() {
+    let db = db();
+    let a = create(&db, "a");
+    let b = create(&db, "b");
+    for bad in [
+        "/abs/docs/a.md",
+        "docs/../x.md",
+        "docs//a.md",
+        "./docs/a.md",
+        "README.md",
+        "docs/",
+        "",
+    ] {
+        assert!(set_target(&db, &a, bad).is_err(), "{bad:?} accepted");
+    }
+    set_target(&db, &a, "docs/a.md").unwrap();
+    assert_eq!(exported(&db, &a).doc_target.as_deref(), Some("docs/a.md"));
+    let e = set_target(&db, &b, "docs/a.md").unwrap_err().to_string();
+    assert!(e.contains(&a), "{e}");
+    // Setting it again is no write: nothing for undo to take back.
+    set_target(&db, &a, "docs/a.md").unwrap();
+    set_target(&db, &a, "docs/a2.md").unwrap();
+    let listed = db.read(|c| list(c, Some("jkb"))).unwrap();
+    let row = listed.iter().find(|d| d.uid == a).unwrap();
+    assert_eq!(row.meta.doc_target.as_deref(), Some("docs/a2.md"));
+    undo_last(&db);
+    assert_eq!(exported(&db, &a).doc_target.as_deref(), Some("docs/a.md"));
+    // `exports` renders exactly the designs that have a target.
+    let all = db.read(|c| export::exports(c, Some("jkb"))).unwrap();
+    assert_eq!(
+        all.iter().map(|e| e.uid.as_str()).collect::<Vec<_>>(),
+        vec![a.as_str()]
+    );
+}
+
+/// D55.5: sources are recorded by path with their blake3; recording a path again re-hashes it.
+#[test]
+fn sources_are_recorded_by_path_and_rehashed_in_place() {
+    let db = db();
+    let uid = create(&db, "x");
+    let add = |sources: Vec<Source>| {
+        let uid = uid.clone();
+        db.write_txn("t", move |c, m| export::add_sources(c, m, &uid, &sources))
+    };
+    let src = |path: &str, bytes: &[u8]| Source {
+        path: path.to_owned(),
+        blake3: crate::blob::hash_bytes(bytes),
+    };
+    add(vec![
+        src("docs/a.md", b"a"),
+        src("openspec/x/design.md", b"x"),
+    ])
+    .unwrap();
+    add(vec![src("docs/a.md", b"a2")]).unwrap();
+    let meta = {
+        let uid = uid.clone();
+        db.read(move |c| export::meta(c, &uid)).unwrap()
+    };
+    assert_eq!(
+        meta.sources,
+        vec![src("docs/a.md", b"a2"), src("openspec/x/design.md", b"x")]
+    );
+    let row = {
+        let uid = uid.clone();
+        db.read(move |c| row(c, &uid)).unwrap()
+    };
+    assert_eq!(row.meta, meta);
+    assert!(add(vec![Source {
+        path: "a.md".into(),
+        blake3: "not-hex".into()
+    }])
+    .is_err());
+    assert!(add(vec![src("../a.md", b"a")]).is_err());
+}

@@ -223,6 +223,7 @@ impl Request {
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
             | Self::DesignCat { .. }
+            | Self::DesignExport { .. }
             | Self::DesignState { .. }
             | Self::DesignSpans { .. }
             | Self::DesignPlan { .. }
@@ -286,7 +287,9 @@ impl Request {
             | Self::DesignStage { .. }
             | Self::DesignPlanCreate { .. }
             | Self::DesignPlanStep { .. }
-            | Self::DesignPromptRecord { .. } => OpPermission::Design,
+            | Self::DesignPromptRecord { .. }
+            | Self::DesignTarget { .. }
+            | Self::DesignSources { .. } => OpPermission::Design,
             Self::DesignApprove { .. } => OpPermission::DesignApprove,
             Self::AttestMint { .. } | Self::AttestRelease { .. } => OpPermission::Attest,
             // Waiving the review gate is the operator's escape hatch, whoever the strategy lets land.
@@ -376,6 +379,8 @@ impl Request {
             | Self::DesignPlanCreate { .. }
             | Self::DesignPlanStep { .. }
             | Self::DesignPromptRecord { .. }
+            | Self::DesignTarget { .. }
+            | Self::DesignSources { .. }
             | Self::DesignCompact { .. } => Target::Shared,
             // Held by their own callee: a filing writes only a namespace nobody holds, and becomes
             // a task's round only when recorded; recording holds a scoped caller to its task
@@ -428,6 +433,7 @@ impl Request {
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
             | Self::DesignCat { .. }
+            | Self::DesignExport { .. }
             | Self::DesignState { .. }
             | Self::DesignSpans { .. }
             | Self::DesignPlan { .. }

@@ -42,6 +42,12 @@ pub struct Design {
     pub seq: i64,
     /// The `mq` topic its updates are announced on.
     pub topic: String,
+    /// Where `jkb design export` writes it, relative to the repository root (D55.6).
+    #[serde(default)]
+    pub doc_target: Option<String>,
+    /// The files it was made from, each with the blake3 of its content then (D55.5).
+    #[serde(default)]
+    pub sources: Vec<Source>,
 }
 
 impl From<DesignRow> for Design {
@@ -52,6 +58,63 @@ impl From<DesignRow> for Design {
             title: d.title,
             namespace: d.namespace,
             seq: d.seq,
+            doc_target: d.meta.doc_target,
+            sources: d.meta.sources.into_iter().map(Source::from).collect(),
+        }
+    }
+}
+
+/// A file a design was made from (D55.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Source {
+    /// Relative to the repository root.
+    pub path: String,
+    /// Lowercase hex blake3 of its content when it was recorded.
+    pub blake3: String,
+}
+
+impl From<design::Source> for Source {
+    fn from(s: design::Source) -> Self {
+        Self {
+            path: s.path,
+            blake3: s.blake3,
+        }
+    }
+}
+
+impl From<Source> for design::Source {
+    fn from(s: Source) -> Self {
+        Self {
+            path: s.path,
+            blake3: s.blake3,
+        }
+    }
+}
+
+/// A design rendered for its doc target, as `design.export` answers it (D55.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Export {
+    /// The design.
+    pub uid: String,
+    /// Its title.
+    pub title: String,
+    /// Where it is written, relative to the repository root; `None` when it names no target.
+    pub doc_target: Option<String>,
+    /// The version token it was rendered at.
+    pub version: String,
+    /// The whole file: the generated header, then the approved text.
+    pub text: String,
+}
+
+impl From<design::Exported> for Export {
+    fn from(e: design::Exported) -> Self {
+        Self {
+            uid: e.uid,
+            title: e.title,
+            doc_target: e.doc_target,
+            version: e.version.token(),
+            text: e.text,
         }
     }
 }
@@ -273,6 +336,52 @@ pub fn create(
     body: &str,
 ) -> Result<Design, ApiError> {
     Ok(design::create(conn, meta, repo, title, body)?.into())
+}
+
+/// `design.export`: one design rendered for its doc target, or — with no `uid` — every design (of
+/// `repo`, when named) that has one.
+///
+/// # Errors
+/// An unknown design, or one whose text or metadata does not read.
+pub fn export(
+    conn: &Connection,
+    uid: Option<&str>,
+    repo: Option<&str>,
+) -> Result<Vec<Export>, ApiError> {
+    let exported = match uid {
+        Some(uid) => vec![design::export::export(conn, uid)?],
+        None => design::export::exports(conn, repo)?,
+    };
+    Ok(exported.into_iter().map(Export::from).collect())
+}
+
+/// `design.target`: record where a design's export is written.
+///
+/// # Errors
+/// The engine's refusal of the path.
+pub fn set_target(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    path: &str,
+) -> Result<Design, ApiError> {
+    design::export::set_doc_target(conn, meta, uid, path)?;
+    Ok(design::row(conn, uid)?.into())
+}
+
+/// `design.sources`: record files a design was made from.
+///
+/// # Errors
+/// The engine's refusal of a path or a hash.
+pub fn add_sources(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    sources: Vec<Source>,
+) -> Result<Design, ApiError> {
+    let sources: Vec<design::Source> = sources.into_iter().map(design::Source::from).collect();
+    design::export::add_sources(conn, meta, uid, &sources)?;
+    Ok(design::row(conn, uid)?.into())
 }
 
 /// `design.cat`.

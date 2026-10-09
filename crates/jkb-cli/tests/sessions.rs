@@ -5109,3 +5109,146 @@ fn a_waiver_is_refused_before_anything_moves_to_a_container_terminal() {
         "nothing moved"
     );
 }
+
+/// `docs/` generated from designs (D55.5–6), against a real checkout — the export writes into it
+/// and the check reads it back, so this lives with the real-repo fixture. A hand-edited generated
+/// file fails the check, and so does one whose design moved on; a hand-written doc is not checked.
+#[test]
+fn a_hand_edited_generated_doc_fails_the_export_check() {
+    let f = Fixture::new();
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = f.jkb().arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let check = || f.jkb().args(["design", "export", "--check"]).assert();
+    let body = "# Draft heading\n## D1\nDecided.\n";
+    let uid = json(&[
+        "design", "create", "Export", "--repo", "proj", "--body", body,
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let version = || {
+        json(&["design", "cat", &uid])["version"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let span = json(&[
+        "design",
+        "span",
+        &uid,
+        "--base",
+        &version(),
+        "--find",
+        "## D1\nDecided.\n",
+    ])["span"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args(["design", "approve", &span])
+        .assert()
+        .success();
+
+    // Nothing generated yet: the check passes, and a hand-written doc is never its business.
+    std::fs::create_dir_all(f.repo.join("docs")).unwrap();
+    std::fs::write(f.repo.join("docs/hand.md"), "# Hand-written\n").unwrap();
+    check()
+        .success()
+        .stdout(predicate::str::contains("0 generated"));
+
+    // `--to` from a subdirectory is resolved against it, and recorded as repo-relative.
+    std::fs::create_dir_all(f.repo.join("sub")).unwrap();
+    f.jkb()
+        .current_dir(f.repo.join("sub"))
+        .args(["design", "export", &uid, "--to", "../docs/export.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote"));
+    let path = f.repo.join("docs/export.md");
+    let file = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        file,
+        format!(
+            "<!-- generated from jkb design {uid}, edit there (version {}) -->\n## D1\nDecided.\n",
+            version()
+        ),
+        "the approved text alone, under the header"
+    );
+    let listed = json(&["design", "ls", "--repo", "proj"]);
+    assert_eq!(listed[0]["doc_target"], "docs/export.md");
+    check()
+        .success()
+        .stdout(predicate::str::contains("1 generated"));
+
+    // Edited by hand: the check fails, naming the file and the design.
+    std::fs::write(&path, format!("{file}A line nobody approved.\n")).unwrap();
+    check()
+        .failure()
+        .stderr(predicate::str::contains("docs/export.md"))
+        .stderr(predicate::str::contains(uid.as_str()));
+    // Re-exporting (the target is remembered) puts the render back.
+    f.jkb().args(["design", "export", &uid]).assert().success();
+    check().success();
+
+    // The design moves on — even a PROPOSED edit is a new version — and the file is stale until
+    // `--all` re-renders it.
+    f.jkb()
+        .args(["design", "edit", &uid, "--base", &version()])
+        .args(["--insert-after", "Draft heading", "--text", " (new)"])
+        .assert()
+        .success();
+    check()
+        .failure()
+        .stderr(predicate::str::contains("moved on"));
+    f.jkb()
+        .args(["design", "export", "--all", "--repo", "proj"])
+        .assert()
+        .success();
+    check().success();
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("docs/hand.md")).unwrap(),
+        "# Hand-written\n",
+        "a hand-written doc is never touched"
+    );
+
+    // A generated file the design does not export to is stale, not silently accepted.
+    std::fs::copy(&path, f.repo.join("docs/copy.md")).unwrap();
+    check()
+        .failure()
+        .stderr(predicate::str::contains("docs/copy.md"));
+}
+
+/// Sources (D55.5): each recorded, repo-relative, with the blake3 of its content, in the design's
+/// listing.
+#[test]
+fn a_design_records_its_sources_with_their_blake3() {
+    let f = Fixture::new();
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = f.jkb().arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let uid = json(&["design", "create", "Sources", "--repo", "proj"])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::create_dir_all(f.repo.join("sub")).unwrap();
+    let out = f
+        .jkb()
+        .current_dir(f.repo.join("sub"))
+        .args(["--json", "design", "source", &uid, "../README.md"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let design: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(design["sources"][0]["path"], "README.md");
+    assert_eq!(
+        design["sources"][0]["blake3"],
+        jkb_core::blob::hash_bytes(b"base\n")
+    );
+    let listed = json(&["design", "ls", "--repo", "proj"]);
+    assert_eq!(listed[0]["sources"][0]["path"], "README.md");
+}

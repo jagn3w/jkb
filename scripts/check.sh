@@ -63,6 +63,14 @@ cargo clippy --all-targets --all-features -- -D warnings
 echo "==> build jkb (for the shell tests)"
 cargo build -p jkb-cli --bin jkb
 
+# docs/ is generated from jkb designs (design D55.6). A generated file is one whose first line is
+# the `generated from jkb design <uid>` header, and it must be exactly its design's render now: a
+# difference is a hand edit, or a design that moved on without a re-export. Hand-written docs carry
+# no header and are not checked. The rule — which files, what they must say — is the binary's
+# alone (`jkb design export --check`); this line only runs it, with the binary built above.
+echo "==> generated docs (jkb design export --check)"
+(cd "$(dirname "$0")/.." && "${CARGO_TARGET_DIR:-$PWD/target}/debug/jkb" design export --check)
+
 # The shell under scripts/ is part of the codebase too, and setup.sh's installs are not
 # reachable from a Rust test. Each *.test.sh is self-contained and runs in a temp dir.
 echo "==> shell tests (scripts/tests)"

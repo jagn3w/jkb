@@ -805,6 +805,32 @@ pub enum Request {
         /// The design.
         uid: String,
     },
+    /// A design rendered for its doc target, or every design with one ([`designs::export`]).
+    #[serde(rename = "design.export")]
+    DesignExport {
+        /// The design; omitted for every design that has a doc target.
+        #[serde(default)]
+        uid: Option<String>,
+        /// With no `uid`: only this repo's (`designs/<repo>`).
+        #[serde(default)]
+        repo: Option<String>,
+    },
+    /// Record where a design's export is written ([`designs::set_target`]).
+    #[serde(rename = "design.target")]
+    DesignTarget {
+        /// The design.
+        uid: String,
+        /// Relative to the repository root, under `docs/`.
+        path: String,
+    },
+    /// Record files a design was made from ([`designs::add_sources`]).
+    #[serde(rename = "design.sources")]
+    DesignSources {
+        /// The design.
+        uid: String,
+        /// Each path, with the blake3 of its content now.
+        sources: Vec<designs::Source>,
+    },
     /// What a peer lacks, as one Yjs update ([`designs::state`]).
     #[serde(rename = "design.state")]
     DesignState {
@@ -1531,6 +1557,9 @@ impl Request {
         "design.list",
         "design.create",
         "design.cat",
+        "design.export",
+        "design.target",
+        "design.sources",
         "design.state",
         "design.spans",
         "design.apply",
@@ -1663,6 +1692,9 @@ impl Request {
             Self::DesignList { .. } => "design.list",
             Self::DesignCreate { .. } => "design.create",
             Self::DesignCat { .. } => "design.cat",
+            Self::DesignExport { .. } => "design.export",
+            Self::DesignTarget { .. } => "design.target",
+            Self::DesignSources { .. } => "design.sources",
             Self::DesignState { .. } => "design.state",
             Self::DesignSpans { .. } => "design.spans",
             Self::DesignApply { .. } => "design.apply",
@@ -1759,6 +1791,7 @@ impl Request {
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
             | Self::DesignCat { .. }
+            | Self::DesignExport { .. }
             | Self::DesignState { .. }
             | Self::DesignSpans { .. }
             | Self::DesignPlan { .. }
@@ -1848,6 +1881,8 @@ impl Request {
             | Self::DesignPlanCreate { .. }
             | Self::DesignPlanStep { .. }
             | Self::DesignPromptRecord { .. }
+            | Self::DesignTarget { .. }
+            | Self::DesignSources { .. }
             | Self::DesignCompact { .. } => false,
         }
     }
@@ -2368,6 +2403,16 @@ pub enum Response {
         /// The new design.
         design: designs::Design,
     },
+    /// A `design.export`.
+    DesignExports {
+        /// The rendered designs, by uid.
+        exports: Vec<designs::Export>,
+    },
+    /// A `design.target` or `design.sources`: the design after it.
+    DesignMeta {
+        /// The design.
+        design: designs::Design,
+    },
     /// A `design.cat`.
     DesignText {
         /// The design at its current version.
@@ -2541,6 +2586,8 @@ impl Response {
             | Self::TicketsReleased { .. }
             | Self::Designs { .. }
             | Self::DesignCreated { .. }
+            | Self::DesignExports { .. }
+            | Self::DesignMeta { .. }
             | Self::DesignText { .. }
             | Self::DesignUpdate { .. }
             | Self::DesignSpans { .. }
@@ -2652,6 +2699,8 @@ impl Response {
             | Self::Ticket { .. }
             | Self::TicketsReleased { .. }
             | Self::Designs { .. }
+            | Self::DesignExports { .. }
+            | Self::DesignMeta { .. }
             | Self::DesignText { .. }
             | Self::DesignUpdate { .. }
             | Self::DesignSpans { .. }
@@ -3838,6 +3887,18 @@ impl LocalBackend {
                 design: db.write_txn_with(actor, move |c, m| {
                     designs::create(c, m, &repo, &title, &body)
                 })?,
+            },
+            Request::DesignExport { uid, repo } => Response::DesignExports {
+                exports: db
+                    .read_with(move |c| designs::export(c, uid.as_deref(), repo.as_deref()))?,
+            },
+            Request::DesignTarget { uid, path } => Response::DesignMeta {
+                design: db
+                    .write_txn_with(actor, move |c, m| designs::set_target(c, m, &uid, &path))?,
+            },
+            Request::DesignSources { uid, sources } => Response::DesignMeta {
+                design: db
+                    .write_txn_with(actor, move |c, m| designs::add_sources(c, m, &uid, sources))?,
             },
             Request::DesignCat { uid } => Response::DesignText {
                 design: Box::new(db.read_with(move |c| designs::cat(c, &uid))?),

@@ -23,6 +23,7 @@
 
 pub mod crdt;
 mod discuss;
+pub mod export;
 pub mod plan;
 pub mod prompts;
 
@@ -39,6 +40,7 @@ use crate::store::WriteMeta;
 use crate::{containment, edge, item, ns, placement, Error, Result};
 use crdt::{Crdt, Piece, PieceKind};
 pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
+pub use export::{DesignMeta, Exported, Source};
 pub use plan::{PlanTask, PlanView, Plans, StepView, TaskPlace, PLAN_KIND};
 pub use prompts::{Launch, NewPrompt, PromptRecord, Recorded, PROMPT_KIND};
 use yrs::Text as _;
@@ -200,6 +202,8 @@ pub struct DesignRow {
     pub namespace: Option<String>,
     /// Its newest update.
     pub seq: i64,
+    /// Where its export is written, and the files it was made from (D55.5–6).
+    pub meta: DesignMeta,
 }
 
 /// One piece of a span's text and the state it is in.
@@ -413,6 +417,7 @@ pub fn create(
         title: title.to_owned(),
         namespace: Some(path),
         seq,
+        meta: DesignMeta::default(),
     })
 }
 
@@ -422,7 +427,8 @@ pub fn create(
 /// A database error.
 pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT i.id, i.uid, COALESCE(i.content, '') FROM items i WHERE i.kind = ?1 ORDER BY i.uid",
+        "SELECT i.id, i.uid, COALESCE(i.content, ''), i.metadata FROM items i WHERE i.kind = ?1
+          ORDER BY i.uid",
     )?;
     let rows = stmt
         .query_map([KIND], |r| {
@@ -430,12 +436,13 @@ pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
                 ItemId::new(r.get(0)?),
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let wanted = repo.map(|r| format!("{ROOT}/{r}"));
     let mut out = Vec::new();
-    for (id, uid, title) in rows {
+    for (id, uid, title, metadata) in rows {
         let namespace = item::primary_namespace(conn, id)?;
         if let Some(w) = &wanted {
             let under = namespace
@@ -445,14 +452,34 @@ pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
                 continue;
             }
         }
+        let metadata: Value = serde_json::from_str(&metadata)
+            .map_err(|e| invalid(format!("design {uid} has unreadable metadata: {e}")))?;
         out.push(DesignRow {
             seq: newest_seq(conn, id)?,
+            meta: export::meta_of(&uid, &metadata)?,
             uid,
             title,
             namespace,
         });
     }
     Ok(out)
+}
+
+/// One design, as the listing shows it.
+///
+/// # Errors
+/// An unknown design, or metadata that does not read.
+pub fn row(conn: &Connection, uid: &str) -> Result<DesignRow> {
+    let id = design_id(conn, uid)?;
+    Ok(DesignRow {
+        uid: uid.to_owned(),
+        title: item::get(conn, id)?
+            .and_then(|m| m.content)
+            .unwrap_or_default(),
+        namespace: item::primary_namespace(conn, id)?,
+        seq: newest_seq(conn, id)?,
+        meta: export::meta(conn, uid)?,
+    })
 }
 
 /// The newest seq a design holds, counting its compaction.

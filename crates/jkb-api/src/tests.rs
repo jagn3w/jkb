@@ -434,6 +434,18 @@ fn samples() -> Vec<Request> {
         Request::DesignCat {
             uid: "design:x".into(),
         },
+        Request::DesignExport {
+            uid: Some("design:x".into()),
+            repo: None,
+        },
+        Request::DesignTarget {
+            uid: "design:x".into(),
+            path: "docs/x.md".into(),
+        },
+        Request::DesignSources {
+            uid: "design:x".into(),
+            sources: vec![],
+        },
         Request::DesignState {
             uid: "design:x".into(),
             since: None,
@@ -1627,6 +1639,7 @@ const READS: &[&str] = &[
     "workflow.agent",
     "design.list",
     "design.cat",
+    "design.export",
     "design.state",
     "design.spans",
     "design.plan",

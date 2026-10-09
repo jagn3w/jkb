@@ -25,7 +25,7 @@ fn text_arg(value: String) -> Result<String> {
 }
 
 /// The repo a design lives under: as given, or the ambient one (the first segment after `repos/`).
-fn repo_of(ops: &Ops<'_>, repo: Option<String>) -> Result<String> {
+pub(crate) fn repo_of(ops: &Ops<'_>, repo: Option<String>) -> Result<String> {
     if let Some(repo) = repo {
         return Ok(repo);
     }
@@ -419,11 +419,14 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             } else {
                 for d in designs {
                     println!(
-                        "{}  {}  [{}] seq={}",
+                        "{}  {}  [{}] seq={}{}",
                         d.uid,
                         d.title,
                         d.namespace.unwrap_or_default(),
-                        d.seq
+                        d.seq,
+                        d.doc_target
+                            .map(|t| format!("  exports to {t}"))
+                            .unwrap_or_default()
                     );
                 }
             }
@@ -563,6 +566,14 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             let w = written(ops, "design.apply", Request::DesignApply { uid, update })?;
             print_written(ops, &w)
         }
+        DesignCmd::Export {
+            uid,
+            to,
+            all: _,
+            repo,
+            check,
+        } => crate::design_export::run(ops, uid, to.as_deref(), repo, check),
+        DesignCmd::Source { uid, paths } => crate::design_export::source(ops, uid, &paths),
         DesignCmd::Prompt { what } => prompt_cmd(ops, what),
         DesignCmd::Plan { what } => plan_cmd(ops, what),
         DesignCmd::Compact { uid } => {

@@ -207,6 +207,89 @@ fn a_span_is_approved_only_by_the_reviewer_it_names() {
     }
 }
 
+/// D55.5–6 over the wire: a designer records a doc target and sources, the listing carries both,
+/// and `design.export` answers the generated file — for one design, or every one with a target.
+#[test]
+fn a_design_records_its_doc_target_and_sources_and_exports_its_approved_text() {
+    let kb = Kb::new();
+    let designer = kb.as_role("designer");
+    let implementer = kb.as_role("implementer");
+    let uid = create(&designer, "Draft. Decided.");
+    create(&designer, "no target");
+    let e = call(
+        &implementer,
+        json!({ "op": "design.target", "uid": uid, "path": "docs/f.md" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+    let hash = "a".repeat(64);
+    for (r, check_sources) in [
+        (
+            json!({ "op": "design.target", "uid": uid, "path": "docs/f.md" }),
+            false,
+        ),
+        (
+            json!({ "op": "design.sources", "uid": uid,
+                    "sources": [{ "path": "openspec/x/design.md", "blake3": hash }] }),
+            true,
+        ),
+    ] {
+        match ok(&designer, r) {
+            Response::DesignMeta { design } => {
+                assert_eq!(design.doc_target.as_deref(), Some("docs/f.md"));
+                assert_eq!(design.sources.len(), usize::from(check_sources));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let e = call(
+        &designer,
+        json!({ "op": "design.target", "uid": uid, "path": "../f.md" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    match ok(&kb.op, json!({ "op": "design.list", "repo": "jkb" })) {
+        Response::Designs { designs } => {
+            let d = designs.iter().find(|d| d.uid == uid).unwrap();
+            let v = serde_json::to_value(d).unwrap();
+            assert_eq!(v["doc_target"], "docs/f.md");
+            assert_eq!(v["sources"][0]["path"], "openspec/x/design.md");
+            assert_eq!(v["sources"][0]["blake3"], hash);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let version = cat(&designer, &uid).version;
+    let span = written(ok(
+        &designer,
+        json!({ "op": "design.span", "uid": uid, "base": version, "find": "Decided." }),
+    ))
+    .span
+    .unwrap();
+    ok(&kb.op, json!({ "op": "design.approve", "span": span }));
+    let exports = |r: Value| match ok(&implementer, r) {
+        Response::DesignExports { exports } => exports,
+        other => panic!("{other:?}"),
+    };
+    let one = exports(json!({ "op": "design.export", "uid": uid }));
+    assert_eq!(one.len(), 1);
+    let doc = cat(&kb.op, &uid);
+    assert_eq!(one[0].version, doc.version);
+    assert_eq!(
+        one[0].text,
+        format!(
+            "<!-- generated from jkb design {uid}, edit there (version {}) -->\nDecided.\n",
+            doc.version
+        )
+    );
+    assert_eq!(
+        exports(json!({ "op": "design.export", "repo": "jkb" })),
+        one,
+        "every design with a target, and only those"
+    );
+    assert!(exports(json!({ "op": "design.export", "repo": "other" })).is_empty());
+}
+
 #[allow(clippy::needless_pass_by_value)] // every call site builds its ask inline
 fn prompt_of(b: &LocalBackend, ask: Value) -> crate::designs::Prompt {
     match ok(b, json!({ "op": "design.prompt", "ask": ask })) {
