@@ -323,7 +323,9 @@ run from the kit and never the checkout, with the output in its integrated termi
 were added for it, and each goes through the start path rather than beside it:
 
 - **One thing per call.** A mode refuses a second mode, and a flag that acts as it is read (`--stop`,
-  `--rm`, `--install-kit`, `--print-args`, …) refuses anything beside it: a second mode used to
+  `--rm`, `--install-kit`, …) refuses anything beside it — except `--print-args`, which refuses only
+  what comes before it and reads what follows as its own (`--print-args <root> --posture`, as
+  `check-config.sh` and `mutate-verify.sh` call it): a second mode used to
   overwrite the first, and `--status --rm` removed the container it was asked to describe (review s8
   round 1).
 - **`--verify` and `--install-extensions` act on a running container only.** A container that is not
@@ -357,20 +359,33 @@ were added for it, and each goes through the start path rather than beside it:
   own HEAD under `JKB_RUN_FROM_CHECKOUT=1` — and `jkb.built-at`, UTC. **Read from git's files, never
   by running git** (`lib.sh`'s `dc_git_head`): this is the host, unsandboxed, and git in a checkout
   reads that repository's config, whose `core.fsmonitor` is a program it runs. A reftable repository,
-  an unborn branch or anything that is not a full hex object name is `unknown`, never a guess, and so is
-  a `HEAD` that is not a regular file (a FIFO planted there hung `--install-kit` on the host). The
-  build's note says which: a kit installed before it recorded a source is told to reinstall, and
-  `--install-kit` no longer calls such a kit current while its checkout has a readable HEAD; a checkout
-  whose HEAD cannot be read is said to be one, since no reinstall would change it.
-- **The kit's staleness opens nothing odd.** `dc_kit_stale` handed each kit path to `diff -rq`, which
-  blocks reading a FIFO given as an argument (measured: `timeout 3 diff -rq <file> <fifo>` exits 124;
-  inside a directory diff only reports one), so a FIFO planted at `scripts/lib.sh` in the checkout hung
-  every kit start, `--install-kit` and `--status`. A kit path that is a link or neither a regular file
-  nor a directory (`dc_plain_path`) is now stale without being opened, and `--install-kit`'s list names
-  it. The mirror's refusal of an odd kit names `KIT_REFRESH` rather than a bare `run.sh --install-kit`.
+  an unborn branch or anything that is not a full hex object name is `unknown`, never a guess. **No
+  link is followed and no ref leaves `refs/heads`:** the line read lands in the kit marker and the image
+  label, which both reach the container, so `HEAD -> ~/<a file whose first line is hex>` or `ref:
+  refs/heads/../../<that file>` made the host read a file of the agent's choosing into them (review s8
+  round 3). `.git`'s directory, `HEAD`, `commondir`, the ref file and `packed-refs` must not be links, a
+  branch with a `..` segment is refused, and the ref file's directory must resolve physically under the
+  common directory's `refs/heads` (so a `refs/heads` that is itself a link is refused too). Every read
+  is bounded (`dc_line1`, below). *Residual, stated:* a `gitdir:` or `commondir` line still names the
+  directories read, wherever they are; only a `HEAD`-shaped file and a ref under that directory's
+  `refs/heads` are read there, and only a full hex name passes. The build's note says why a build is
+  `unknown`: a kit installed before it recorded a source is told to reinstall, and `--install-kit` no
+  longer calls such a kit current while its checkout has a readable HEAD; a checkout whose HEAD cannot
+  be read is said to be one, since no reinstall would change it.
   *Stated, not measured:* the commit is HEAD at the copy, so an uncommitted edit to a kit path rides
   in the kit without being in that commit; `--status`'s `kit_changed` shows a checkout that has moved
   since, not a kit that was dirty when copied.
+- **The kit's staleness opens nothing odd, and no read of the checkout can hang.** `dc_kit_stale` handed each kit path to `diff -rq`, which
+  blocks reading a FIFO given as an argument (measured: `timeout 3 diff -rq <file> <fifo>` exits 124;
+  inside a directory diff only reports one), so a FIFO planted at `scripts/lib.sh` in the checkout hung
+  every kit start, `--install-kit` and `--status`. A kit path that is a link or neither a regular file
+  nor a directory (`dc_plain_path`) is stale without being opened, and `--install-kit`'s list names it.
+  **The type check is not what holds**, though: a regular file swapped for a FIFO between the check and
+  the open still blocks the reader (review s8 round 3). So every host-side read of a checkout file —
+  `diff` and `cmp` here, `head` and `awk` in `dc_git_head` — runs under `dc_bounded`, which kills it
+  after `DC_READ_BOUND` (10s) and reads that as stale, or as `unknown`. Bash's own, polled, because
+  `timeout` is not on a stock Mac. The mirror's refusal of an odd kit names `KIT_REFRESH` rather than a
+  bare `run.sh --install-kit`.
 - **`jkb.built-at` is when the content was first built, not when `--build` last ran.** A label is part
   of an image's configuration, so a time that changed every build would give every `--build` — and
   every start under `JKB_CONTAINER_IMAGE` — a new image id, and the image check would then refuse

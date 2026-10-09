@@ -18,7 +18,7 @@
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 
@@ -59,8 +59,10 @@ export type SpawnPty = (
 /** What main knows about the machine it runs on, resolved per open (docker may appear later). */
 export interface TerminalEnvironment {
   readonly roots: TerminalRoots;
-  /** The `docker` client, by absolute path, or `undefined` when none was found. */
+  /** The `docker` client, by absolute path, or `undefined` when none was found (`dockerSearchPath`). */
   docker(): string | undefined;
+  /** Where `docker` was looked for, for the message when it was not found. */
+  dockerSearched(): readonly string[];
   /** The host's login shell, by absolute path. */
   readonly hostShell: string;
   /** The environment a host terminal (and the docker client) starts with. */
@@ -149,17 +151,26 @@ export const CONTAINER_SHELL: readonly string[] = ["/bin/bash", "-l"];
 export const TERM = "xterm-256color";
 
 /**
- * Where `docker` is looked for. Absolute paths only, never `PATH`: a GUI app's `PATH` is not the
- * shell's (on macOS it is launchd's minimal one), and the kit's rule is that what runs outside the
- * sandbox is named absolutely (`.container/README.md`). These are where Docker Desktop, Homebrew
- * and the distributions put it.
+ * The fixed half of the PATH `.container/run.sh` builds for itself, in its order (its first line,
+ * `jkb_path=`). A test reads run.sh and holds the two equal.
  */
-export const DOCKER_CANDIDATES: readonly string[] = [
-  "/usr/local/bin/docker",
-  "/opt/homebrew/bin/docker",
-  "/usr/bin/docker",
-  "/Applications/Docker.app/Contents/Resources/bin/docker",
-];
+export const RUN_SH_PATH: readonly string[] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/opt/homebrew/bin"];
+
+/** The kit home's `path-keep`, under the account's home: run.sh's `jkb_keepf`. */
+export const PATH_KEEP_IN_HOME = ".local/share/jkb-container-kit/path-keep";
+
+/**
+ * Where a container terminal looks for `docker`: RUN.SH'S RULE, so a terminal runs the docker client
+ * the Container tab's buttons run (review s8 round 3). It had a list of its own, which missed a
+ * Docker Desktop in `~/.docker/bin` named in path-keep -- the tab worked and every container terminal
+ * said "docker not found" -- and put `/usr/local/bin` before `/usr/bin`, the other way round from
+ * run.sh. So: each absolute line of path-keep, then `RUN_SH_PATH`. Never the app's own `PATH`: a GUI
+ * app's is not the shell's, and what runs outside the sandbox is named absolutely.
+ */
+export function dockerSearchPath(pathKeep: string | undefined): string[] {
+  const kept = (pathKeep ?? "").split("\n").filter((line) => line.startsWith("/"));
+  return [...kept, ...RUN_SH_PATH];
+}
 
 /** A container name `docker exec` will take as a name, never as a flag. */
 const CONTAINER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
@@ -185,7 +196,7 @@ export function commandFor(spec: TerminalSpec, env: TerminalEnvironment, tag: st
   if (spec.target === "container") {
     const docker = env.docker();
     if (docker === undefined) {
-      return { ok: false, error: `docker not found (looked in ${DOCKER_CANDIDATES.join(", ")})` };
+      return { ok: false, error: `docker not found (looked in ${env.dockerSearched().join(", ")}, as run.sh does)` };
     }
     const container = env.roots.container;
     if (!CONTAINER_NAME.test(container)) return { ok: false, error: `not a container name: ${JSON.stringify(container)}` };
@@ -218,7 +229,8 @@ export function commandFor(spec: TerminalSpec, env: TerminalEnvironment, tag: st
 /**
  * The environment any program main starts on the host begins from: main's own, without Electron's
  * variables (`ELECTRON_RUN_AS_NODE` would turn a child Electron into Node). The one rule, for a
- * terminal and for the container kit's `run.sh --status` alike, so the run.sh that `--status` asks and
+ * terminal, the container kit's `run.sh --status` and the updater's runs alike (the updater also drops
+ * git's repository selection), so the run.sh that `--status` asks and
  * the run.sh a button runs are handed the same `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`. Which
  * container a CONTAINER terminal enters is `containerName`'s, below.
  */
@@ -283,8 +295,16 @@ export function machineRoots(
   };
 }
 
-/** The real machine: docker by `DOCKER_CANDIDATES`, the host shell from `$SHELL`. */
-export function machineEnvironment(roots: TerminalRoots, env: Readonly<Record<string, string | undefined>>, loginShell?: string): TerminalEnvironment {
+/**
+ * The real machine: docker by run.sh's rule (`dockerSearchPath`, path-keep under the ACCOUNT's home,
+ * where run.sh reads it), the host shell from `$SHELL`.
+ */
+export function machineEnvironment(
+  roots: TerminalRoots,
+  env: Readonly<Record<string, string | undefined>>,
+  loginShell?: string,
+  account: string = accountHome(),
+): TerminalEnvironment {
   const isFile = (p: string): boolean => {
     try {
       return statSync(p).isFile();
@@ -292,12 +312,31 @@ export function machineEnvironment(roots: TerminalRoots, env: Readonly<Record<st
       return false;
     }
   };
+  const isExecutable = (p: string): boolean => {
+    try {
+      accessSync(p, constants.X_OK);
+      return isFile(p);
+    } catch {
+      return false;
+    }
+  };
+  // Read per open, as run.sh reads it per run: a path-keep line added later is honoured without a restart.
+  const searched = (): string[] => {
+    let keep: string | undefined;
+    try {
+      keep = readFileSync(join(account, PATH_KEEP_IN_HOME), "utf8");
+    } catch {
+      keep = undefined;
+    }
+    return dockerSearchPath(keep);
+  };
   const shell = [env["SHELL"], loginShell, "/bin/zsh", "/bin/bash", "/bin/sh"].find(
     (s): s is string => s !== undefined && s.startsWith("/") && isFile(s),
   );
   return {
     roots,
-    docker: () => DOCKER_CANDIDATES.find(isFile),
+    docker: () => searched().map((d) => join(d, "docker")).find(isExecutable),
+    dockerSearched: searched,
     hostShell: shell ?? "/bin/sh",
     env,
     isDirectory: (p) => {

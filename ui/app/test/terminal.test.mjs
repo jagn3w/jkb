@@ -140,6 +140,7 @@ function environment(over = {}) {
   return {
     roots: ROOTS,
     docker: () => "/usr/local/bin/docker",
+    dockerSearched: () => ["/k", "/usr/bin"],
     hostShell: "/bin/zsh",
     env: {},
     isDirectory: () => true,
@@ -184,7 +185,7 @@ test("a container terminal is docker exec -it -w <cwd> <container> <wrapper> <ar
 test("a container terminal without docker, or with a flag for a container name, is refused", () => {
   const none = main.commandFor(spec(), environment({ docker: () => undefined }), TAG);
   assert.equal(none.ok, false);
-  assert.match(none.error, /docker not found \(looked in \/usr\/local\/bin\/docker/);
+  assert.match(none.error, /docker not found \(looked in \/k, \/usr\/bin, as run\.sh does\)/);
   const flag = main.commandFor(spec(), environment({ roots: { ...ROOTS, container: "--privileged" } }), TAG);
   assert.equal(flag.ok, false);
   assert.match(flag.error, /not a container name/);
@@ -210,9 +211,34 @@ test("a terminal's environment drops Electron's variables and sets TERM", () => 
 });
 
 test("docker is looked for by absolute path only", () => {
-  for (const p of main.DOCKER_CANDIDATES) assert.ok(p.startsWith("/"), p);
+  for (const p of main.dockerSearchPath("relative/dir\n/abs/dir\n")) assert.ok(p.startsWith("/"), p);
   const machine = main.machineEnvironment(ROOTS, { SHELL: "relative-shell" }, undefined);
   assert.ok(machine.hostShell.startsWith("/"), "a relative $SHELL is not taken");
+});
+
+test("a container terminal finds docker by run.sh's own rule: path-keep, then run.sh's PATH, in its order", () => {
+  // The rule's two halves are read out of run.sh, so the app and the kit cannot drift apart.
+  const runSh = fs.readFileSync(path.join(here, "..", "..", "..", ".container", "run.sh"), "utf8");
+  const jkbPath = /jkb_path=([^;]+);/.exec(runSh);
+  assert.ok(jkbPath, "run.sh builds jkb_path");
+  assert.deepEqual(main.RUN_SH_PATH, jkbPath[1].split(":"));
+  const keepf = /jkb_keepf="\$jkb_home\/([^"]+)"/.exec(runSh);
+  assert.ok(keepf, "run.sh names path-keep under the account's home");
+  assert.equal(main.PATH_KEEP_IN_HOME, keepf[1]);
+  assert.deepEqual(main.dockerSearchPath("/Users/me/.docker/bin\nnot/absolute\n\n"), ["/Users/me/.docker/bin", ...main.RUN_SH_PATH]);
+  assert.deepEqual(main.dockerSearchPath(undefined), [...main.RUN_SH_PATH]);
+
+  // On the machine: a docker named only by path-keep is the one a terminal runs.
+  const home = fs.mkdtempSync(path.join(work, "home-"));
+  const bin = path.join(home, ".docker", "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, "docker"), "#!/bin/sh\n", { mode: 0o755 });
+  fs.mkdirSync(path.dirname(path.join(home, main.PATH_KEEP_IN_HOME)), { recursive: true });
+  fs.writeFileSync(path.join(home, main.PATH_KEEP_IN_HOME), `${bin}\n`);
+  // Read from the ACCOUNT's home, where run.sh reads it, whatever $HOME (hostHome) the app started with.
+  const machine = main.machineEnvironment({ ...ROOTS, hostHome: "/elsewhere" }, {}, undefined, home);
+  assert.equal(machine.docker(), path.join(bin, "docker"));
+  assert.deepEqual(machine.dockerSearched(), [bin, ...main.RUN_SH_PATH]);
 });
 
 // ---- main's PTY host, with real PTYs --------------------------------------------------------

@@ -32,6 +32,7 @@ import {
 
 import { GIT_SELECTION } from "../shared/gitEnv";
 import { plain, type RunFile, type RunResult } from "./container";
+import { hostEnv } from "./terminals";
 
 /** How long fetching `main` may take. */
 export const FETCH_TIMEOUT_MS = 5 * 60_000;
@@ -192,10 +193,9 @@ export class AppUpdater {
  * home) agree with the `--app-home` it is given, whatever HOME the app was launched with.
  */
 export function machineRunner(home: string, env: Readonly<Record<string, string | undefined>>): RunFile {
-  const childEnv: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (v !== undefined && !k.startsWith("ELECTRON_") && !GIT_SELECTION.includes(k)) childEnv[k] = v;
-  }
+  // hostEnv's rule (one place for what a host program must not inherit), less git's selection.
+  const childEnv = hostEnv(env);
+  for (const k of GIT_SELECTION) delete childEnv[k];
   childEnv["HOME"] = home;
   return (file, args, timeoutMs) =>
     new Promise((resolve) => {

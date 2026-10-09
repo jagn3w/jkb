@@ -22,7 +22,8 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=t GIT
 #   args-hash     its jkb.args-hash label;  ctr-image  its image id
 #   images/<name> `docker image inspect` JSON, by tag or id (`/` and `:` spelled `_`)
 #   down          present = the daemon is unreachable
-#   running-said  the answer to the first .State.Running query only (a container that changes state)
+#   status-said   the answer to the first .State.Status query only, then removed: a container that
+#                 changes state between run.sh's two looks
 #   build.json    what a `docker build` produces (its Config.Labels gain the build's --label values)
 # Every call is appended to <dir>/calls, one per line.
 stub_docker() {
@@ -34,9 +35,6 @@ D="$d"
 printf '%s\\n' "\$*" >> "\$D/calls"
 key() { printf '%s' "\$1" | tr '/:' '__'; }
 running() {
-    # running-said: what the FIRST .State.Running query answers, then removed -- a container stopped
-    # between run.sh's early check and its dispatch.
-    if [ -f "\$D/running-said" ]; then cat "\$D/running-said"; rm -f "\$D/running-said"; return; fi
     # As docker answers it: a paused or restarting container is Running too.
     case "\$(cat "\$D/state" 2>/dev/null)" in running|paused|restarting) echo true ;; *) echo false ;; esac
 }
@@ -57,7 +55,7 @@ case "\$1" in
         [ "\$1" = container ] && shift
         shift
         [ "\${1:-}" = -f ] && { fmt="\$2"; shift 2; }
-        case "\$fmt" in *State.Running*) [ -f "\$D/running-said" ] && { running; exit 0; } ;; esac
+        case "\$fmt" in *State.Status*) [ -f "\$D/status-said" ] && { cat "\$D/status-said"; rm -f "\$D/status-said"; exit 0; } ;; esac
         [ -f "\$D/state" ] || exit 1
         case "\$fmt" in
             "") ctr_json ;;
@@ -387,13 +385,13 @@ case12_a_container_stopped_mid_run_is_not_started_by_a_mode() {
     for mode in --verify --install-extensions; do
         # Stopped: the early check sees it running, the dispatch sees it exited.
         printf 'exited' > "$d/state"; printf '%s' "$want" > "$d/args-hash"; printf 'sha256:img' > "$d/ctr-image"
-        printf 'true' > "$d/running-said"; : > "$d/calls"
+        printf 'running' > "$d/status-said"; : > "$d/calls"
         kit_run "$d" "$mode"
         if [ "$rc" -ne 0 ] && grep -q 'acts on a running container only' <<<"$err" && ! grep -qE '^start( |$)' <<<"$calls"; then
             ok "run.sh $mode on a container stopped after the early check refuses rather than starting it"
         else fail "run.sh $mode on a container stopped after the early check refuses rather than starting it" "rc=$rc err=$(tail -2 <<<"$err") calls: $(cut -c1-40 <<<"$calls" | tr '\n' ';')"; fi
         # Removed: the dispatch sees no container at all.
-        rm -f "$d/state"; printf 'true' > "$d/running-said"; : > "$d/calls"
+        rm -f "$d/state"; printf 'running' > "$d/status-said"; : > "$d/calls"
         kit_run "$d" "$mode"
         if [ "$rc" -ne 0 ] && grep -q 'acts on a running container only' <<<"$err" \
            && ! grep -qE '^run ' <<<"$(grep -v -- '--entrypoint true' <<<"$calls")"; then
@@ -494,6 +492,54 @@ case18_an_odd_kit_names_the_kits_refresh() {
     else fail "a kit holding a special file is refused with the kit's own refresh command" "rc=$rc err=$(tail -3 <<<"$err")"; fi
 }
 
+# --------------------------------------------------------------------------------------------
+# Review s8 round 3.
+# --------------------------------------------------------------------------------------------
+
+case19_dc_git_head_follows_no_link_and_no_ref_out_of_refs_heads() {
+    local secret="$work/host-secret" hex=89abcdef0123456789abcdef0123456789abcdef r name
+    mkdir -p "$work/outside"
+    printf '%s\n' "$hex" > "$secret"; printf '%s\n' "$hex" > "$work/outside/tok"
+    # mkrepo <name>: a repository on main at one commit, whose HEAD reads fine before it is tampered with.
+    mkrepo() { r="$work/r19-$1"; git init -q -b main "$r" && git -C "$r" commit -q --allow-empty -m one && dc_git_head "$r" >/dev/null; }
+    refused() { # refused <what>
+        if ! got="$(dc_git_head "$r")" && ! grep -q "$hex" <<<"$got"; then ok "dc_git_head refuses $1"
+        else fail "dc_git_head refuses $1" "got [$got]"; fi
+    }
+    local got
+    mkrepo head-link || { fail "case19" "no repository"; return; }
+    rm "$r/.git/HEAD"; ln -s "$secret" "$r/.git/HEAD"; refused "a HEAD that is a link to a host file"
+    mkrepo dotdot; printf 'ref: refs/heads/../../../../host-secret\n' > "$r/.git/HEAD"; refused "a branch that climbs out of refs/heads with .."
+    mkrepo dirlink; mv "$r/.git/refs/heads" "$r/.git/refs/heads.real"; ln -s "$work/outside" "$r/.git/refs/heads"
+    printf 'ref: refs/heads/tok\n' > "$r/.git/HEAD"; refused "a ref under a refs/heads that is a link out"
+    mkrepo reflink; ln -s "$secret" "$r/.git/refs/heads/evil"; printf 'ref: refs/heads/evil\n' > "$r/.git/HEAD"; refused "a loose ref that is a link"
+    mkrepo packedlink; git -C "$r" pack-refs --all; printf '%s refs/heads/main\n' "$hex" > "$work/packed"
+    rm "$r/.git/packed-refs"; ln -s "$work/packed" "$r/.git/packed-refs"; refused "a packed-refs that is a link"
+    mkrepo gitlink; mv "$r/.git" "$r/.git.real"; ln -s "$r/.git.real" "$r/.git"; refused "a .git that is a link"
+    mkdir -p "$work/outside-git/refs/heads"; printf '%s\n' "$hex" > "$work/outside-git/refs/heads/main"
+    mkrepo commondir; printf '%s\n' "$work/outside-git" > "$r/.git/commondir.target"; ln -s "$r/.git/commondir.target" "$r/.git/commondir"
+    refused "a commondir that is a link"
+}
+
+case20_a_fifo_swapped_in_after_the_check_is_bounded_not_a_hang() {
+    local k="$work/k20" c="$work/c20" p got rc20=0 r="$work/r20"
+    while IFS= read -r p; do
+        mkdir -p "$(dirname "$k/$p")" "$(dirname "$c/$p")"
+        case "$p" in .container) mkdir -p "$k/$p" "$c/$p"; echo x > "$k/$p/f"; echo x > "$c/$p/f" ;;
+                     *) echo x > "$k/$p"; echo x > "$c/$p" ;; esac
+    done <<<"$(dc_kit_paths)"
+    rm -f "$c/scripts/lib.sh"; mkfifo "$c/scripts/lib.sh"
+    # The swap, made certain: the type check is told the path is plain, as it was a moment before.
+    got="$(timeout 20 bash -c '. "$1/.container/lib.sh"; DC_READ_BOUND=1; dc_plain_path() { return 0; }; dc_kit_stale "$2" "$3"' _ "$repo_root" "$k" "$c" 2>&1)" || rc20=$?
+    if [ "$rc20" -eq 0 ] && [ "$got" = scripts/lib.sh ]; then ok "a FIFO that passes the type check is stale once the bounded diff gives up, never a hang"
+    else fail "a FIFO that passes the type check is stale once the bounded diff gives up, never a hang" "rc=$rc20 (124 = it hung) got=[$got]"; fi
+    git init -q -b main "$r" && git -C "$r" commit -q --allow-empty -m one
+    rm "$r/.git/HEAD"; mkfifo "$r/.git/HEAD"; rc20=0
+    timeout 20 bash -c '. "$1/.container/lib.sh"; DC_READ_BOUND=1; dc_regular() { return 0; }; dc_git_head "$2"' _ "$repo_root" "$r" >/dev/null 2>&1 || rc20=$?
+    if [ "$rc20" -eq 1 ]; then ok "...and so is a HEAD that is a FIFO by the time it is read: unknown"
+    else fail "...and so is a HEAD that is a FIFO by the time it is read: unknown" "rc=$rc20 (124 = it hung)"; fi
+}
+
 run_cases case1_dc_git_head_reads_loose_packed_detached_and_worktrees case2_dc_git_head_says_unknown_rather_than_guess \
           case3_the_kit_records_what_it_was_copied_from case4_status_reports_the_image_labels_and_no_container \
           case5_status_drift_is_the_start_paths_answer case6_status_with_the_daemon_down_is_an_answer \
@@ -502,5 +548,6 @@ run_cases case1_dc_git_head_reads_loose_packed_detached_and_worktrees case2_dc_g
           case11_one_thing_per_call case12_a_container_stopped_mid_run_is_not_started_by_a_mode \
           case13_a_head_that_is_not_a_file_is_unknown_not_a_hang case14_status_names_the_kits_refresh_never_the_checkouts \
           case15_a_kit_with_no_source_takes_one_from_a_reinstall case16_a_paused_or_restarting_container_is_refused_at_the_first_look \
-          case17_a_fifo_at_a_kit_path_is_stale_not_a_hang case18_an_odd_kit_names_the_kits_refresh
+          case17_a_fifo_at_a_kit_path_is_stale_not_a_hang case18_an_odd_kit_names_the_kits_refresh \
+          case19_dc_git_head_follows_no_link_and_no_ref_out_of_refs_heads case20_a_fifo_swapped_in_after_the_check_is_bounded_not_a_hang
 finish

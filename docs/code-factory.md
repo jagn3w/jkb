@@ -732,7 +732,11 @@ it, read `--status`, build each button's terminal spec), `window.jkb.container` 
   to start a container from a checkout. main's `run.sh --status` and the terminal start from one
   environment rule (`hostEnv`), so both hand `run.sh` the same `JKB_CONTAINER_NAME`; a container
   terminal enters `containerName`'s answer, `run.sh`'s own `${JKB_CONTAINER_NAME:-jkb-dev}`, untrimmed
-  (it trimmed, and a name with a trailing space split the terminals from the buttons).
+  (it trimmed, and a name with a trailing space split the terminals from the buttons). A container
+  terminal finds `docker` by run.sh's rule too — each absolute line of the kit home's `path-keep`, then
+  run.sh's own PATH in its order (`dockerSearchPath`, held equal to run.sh's `jkb_path` by a test) — and
+  the host roots are the account's home, where run.sh mounts `repos` from (round 3: a Docker Desktop
+  named only in `path-keep` worked for the buttons and not for any terminal).
 - **A button's terminal runs once.** It is opened with no Restart and no Container/Host toggle. As
   first built it was "a terminal like any other", and the drawer's Restart re-ran a finished Remove with
   no confirmation, with the tab's buttons enabled, and with no `--status` read after; the toggle could

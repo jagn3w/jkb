@@ -618,6 +618,38 @@ dc_kit_checkout() { # dc_kit_checkout <kit dir>
     printf '%s\n' "$c"
 }
 
+# How long a host-side read of an agent-writable file may take, in seconds (dc_bounded). A plain
+# assignment, never read from the environment; the tests set it lower after sourcing this file.
+DC_READ_BOUND=10
+
+# dc_bounded <seconds> <command>... -> the command's status, or 124 when it ran past <seconds> and
+# was killed. For a host-side read of a file the agent can replace: a type check before the open
+# cannot hold, since a regular file swapped for a FIFO between the check and the open blocks the
+# reader (`diff`, `head`) for good (review s8 round 3). `timeout` is not on a stock Mac, where run.sh
+# runs, so this is bash's own: the command in the background, polled fifty times a second (a read
+# that answers at once costs one poll).
+dc_bounded() { # dc_bounded <seconds> <command>...
+    local limit=$(( $1 * 50 )) pid i=0
+    shift
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$i" -ge "$limit" ]; then kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; fi
+        sleep 0.02; i=$((i + 1))
+    done
+    wait "$pid"
+}
+
+# dc_line1 <file> -> the file's first line, or rc 1 when it is a link, not a regular file, or does
+# not answer within DC_READ_BOUND (a FIFO swapped in after the check).
+dc_regular() { # dc_regular <path> -> rc 0 for a regular file that is not a link
+    [ ! -L "$1" ] && [ -f "$1" ]
+}
+dc_line1() { # dc_line1 <file>
+    dc_regular "$1" || return 1
+    dc_bounded "$DC_READ_BOUND" head -1 "$1" 2>/dev/null
+}
+
 # THE COMMIT AND BRANCH A CHECKOUT STANDS ON, READ FROM ITS FILES -- NEVER BY RUNNING GIT (D53.8).
 # The image's `jkb.source-commit`/`jkb.source-branch` labels come from here, and this runs on the host,
 # unsandboxed, against a checkout the agent can write: git there reads the repository's own config,
@@ -626,30 +658,47 @@ dc_kit_checkout() { # dc_kit_checkout <kit dir>
 # directory, or a `gitdir:` file for a worktree; a worktree's branches live in its `commondir`; a
 # branch is a loose ref or a `packed-refs` line. A reftable repository, a symbolic ref that is not a
 # branch, or anything that does not end in a full hex object name is rc 1 -- "unknown", never a guess.
+# NO LINK IS FOLLOWED AND NO REF LEAVES refs/heads (review s8 round 3). The agent writes .git, and the
+# line read lands in the kit marker and an image label, both of which reach the container: `HEAD ->
+# ~/<a file whose first line is hex>`, or `ref: refs/heads/../../../<that file>`, made the host read
+# a file of the agent's choosing into them. So .git, HEAD, commondir, the ref file and packed-refs must
+# be regular files (or directories) that are not links, a branch name with a `..` segment is refused,
+# and the ref file's directory must resolve, physically, inside the common directory's refs/heads.
+# Every read is bounded (dc_line1). Residual, stated: a `gitdir:`/`commondir` line still names the
+# directories read, and those may be anywhere; what is read there is only a HEAD-shaped file and a ref
+# under its refs/heads, and only a full hex name passes.
 # Prints `<commit>\t<branch>`, the branch empty when HEAD is detached.
 dc_git_head() { # dc_git_head <checkout>
-    local root="$1" gd common head ref sha="" branch="" c
+    local root="$1" gd common head ref sha="" branch="" c heads dir
     if [ -d "$root/.git" ]; then gd="$root/.git"
     elif [ -f "$root/.git" ]; then
-        gd="$(sed -n 's/^gitdir: //p' "$root/.git" 2>/dev/null | head -1)"
+        gd="$(dc_line1 "$root/.git")" || return 1
+        gd="${gd#gitdir: }"
         case "$gd" in "") return 1 ;; /*) ;; *) gd="$root/$gd" ;; esac
     else return 1
     fi
+    # The git directory itself is not a link: this also refuses a `.git` that is one.
+    [ -d "$gd" ] && [ ! -L "$gd" ] || return 1
     common="$gd"
-    if [ -f "$gd/commondir" ]; then
-        c="$(head -1 "$gd/commondir" 2>/dev/null)"
+    if [ -e "$gd/commondir" ] || [ -L "$gd/commondir" ]; then
+        c="$(dc_line1 "$gd/commondir")" || return 1
         case "$c" in "") ;; /*) common="$c" ;; *) common="$gd/$c" ;; esac
     fi
-    # A REGULAR FILE, like every other read here: the agent can write .git (all but config and hooks),
-    # and a FIFO planted as HEAD hung --install-kit and setup.sh on the host, with no message.
-    [ -f "$gd/HEAD" ] || return 1
-    head="$(head -1 "$gd/HEAD" 2>/dev/null)"
+    head="$(dc_line1 "$gd/HEAD")" || return 1
     case "$head" in
         "ref: refs/heads/"*)
             ref="${head#ref: }"; branch="${ref#refs/heads/}"
-            if [ -f "$common/$ref" ]; then sha="$(head -1 "$common/$ref" 2>/dev/null)"
-            elif [ -f "$common/packed-refs" ]; then
-                sha="$(awk -v r="$ref" '$2 == r { print $1; exit }' "$common/packed-refs" 2>/dev/null)"
+            case "/$branch/" in */../*|*/./*|//) return 1 ;; esac
+            # The common directory resolved, refs/heads NOT: a refs/heads that is itself a link
+            # resolves elsewhere, so the ref file's directory is not under this.
+            heads="$(cd "$common" 2>/dev/null && pwd -P)/refs/heads" || heads=""
+            dir="$(cd "$(dirname "$common/$ref")" 2>/dev/null && pwd -P)" || dir=""
+            if [ -n "$heads" ] && [ -n "$dir" ] && [ -e "$common/$ref" -o -L "$common/$ref" ]; then
+                case "$dir/" in "$heads"/*) ;; *) return 1 ;; esac
+                sha="$(dc_line1 "$common/$ref")" || return 1
+            elif [ -e "$common/packed-refs" ] || [ -L "$common/packed-refs" ]; then
+                dc_regular "$common/packed-refs" || return 1
+                sha="$(dc_bounded "$DC_READ_BOUND" awk -v r="$ref" '$2 == r { print $1; exit }' "$common/packed-refs" 2>/dev/null)" || return 1
             fi ;;
         "ref: "*) return 1 ;;
         *) sha="$head" ;;
@@ -706,7 +755,7 @@ dc_kit_changes() { # dc_kit_changes <kit dir> <checkout>
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             if ! grep -qxF -- "$f" <<<"$kfiles"; then printf '%s (new)\n' "$f"
-            elif ! cmp -s -- "$1/$f" "$2/$f"; then printf '%s\n' "$f"
+            elif ! dc_bounded "$DC_READ_BOUND" cmp -s -- "$1/$f" "$2/$f"; then printf '%s\n' "$f"
             fi
         done <<<"$cfiles"
         while IFS= read -r f; do
@@ -735,7 +784,9 @@ dc_kit_stale() { # dc_kit_stale <kit dir> <checkout>
     local p
     while IFS= read -r p; do
         if ! dc_plain_path "$1/$p" || ! dc_plain_path "$2/$p"; then printf '%s\n' "$p"; continue; fi
-        diff -rq "$1/$p" "$2/$p" >/dev/null 2>&1 || printf '%s\n' "$p"
+        # BOUNDED, because the check above cannot hold: a file swapped for a FIFO after it still blocks
+        # diff's open (review s8 round 3). Past the bound, the path is stale -- never a hang.
+        dc_bounded "$DC_READ_BOUND" diff -rq "$1/$p" "$2/$p" >/dev/null 2>&1 || printf '%s\n' "$p"
     done <<EOF
 $(dc_kit_paths)
 EOF
