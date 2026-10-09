@@ -62,9 +62,36 @@ fn span(db: &Db, uid: &str, quote: &str, reviewer: Reviewer) -> Result<String> {
     .map(|w| w.span.unwrap())
 }
 
-fn approve_as(db: &Db, span: &str, who: Approver) -> Result<SpanView> {
+/// The design a span belongs to.
+fn design_of_span(db: &Db, span: &str) -> String {
     let span = span.to_owned();
-    db.write_txn("t", move |c, m| approve(c, m, &span, &who))
+    db.read(move |c| span_item(c, &span).map(|(_, _, d)| d))
+        .unwrap()
+}
+
+/// Approve `span` at the version the reviewer reads now.
+fn approve_as(db: &Db, span: &str, who: Approver) -> Result<SpanView> {
+    let base = token(db, &design_of_span(db, span));
+    approve_at(db, span, &base, who)
+}
+
+fn approve_at(db: &Db, span: &str, base: &str, who: Approver) -> Result<SpanView> {
+    let (span, base) = (span.to_owned(), base.to_owned());
+    db.write_txn("t", move |c, m| approve(c, m, &span, &base, &who))
+}
+
+/// An app peer holding the design as it is now.
+fn peer_of(db: &Db, uid: &str) -> Crdt {
+    let u = uid.to_owned();
+    let (state, _) = db.read(move |c| super::state(c, &u, None)).unwrap();
+    let peer = Crdt::new();
+    peer.apply(&state).unwrap();
+    peer
+}
+
+fn apply_bytes(db: &Db, uid: &str, bytes: Vec<u8>) -> Result<Written> {
+    let u = uid.to_owned();
+    db.write_txn("t", move |c, m| apply(c, m, &u, &bytes))
 }
 
 fn view_of(db: &Db, design: &str, span: &str) -> SpanView {
@@ -538,7 +565,7 @@ fn spans_do_not_overlap() {
     let uid = create(&db, "one two three");
     span(&db, &uid, "one two", Reviewer::Operator).unwrap();
     let e = span(&db, &uid, "two three", Reviewer::Operator).unwrap_err();
-    assert!(e.to_string().contains("overlaps"), "{e}");
+    assert!(e.to_string().contains("overlap"), "{e}");
     span(&db, &uid, "three", Reviewer::Operator).unwrap();
 }
 
@@ -565,24 +592,6 @@ fn replacing_a_spans_text_reanchors_it_over_the_new_words() {
     assert_eq!(v.state, SpanState::Proposed);
 }
 
-fn step(db: &Db, uid: &str) -> ItemId {
-    let uid = uid.to_owned();
-    db.write_txn("t", move |c, m| {
-        item::upsert(
-            c,
-            m,
-            &item::NewItem {
-                uid,
-                kind: STEP_KIND.into(),
-                content: Some("scaffold".into()),
-                content_hash: None,
-                mime: None,
-            },
-        )
-    })
-    .unwrap()
-}
-
 fn task_under(db: &Db, step: ItemId, uid: &str) -> ItemId {
     let uid = uid.to_owned();
     db.write_txn("t", move |c, m| {
@@ -605,14 +614,16 @@ fn staged_and_implemented_are_derived_from_edges_and_task_status() {
     let db = db();
     let uid = create(&db, "Build the scaffold.");
     let sp = span(&db, &uid, "Build the scaffold.", Reviewer::Operator).unwrap();
-    let st = step(&db, "step:scaffold");
-    let err = stage_into(&db, &sp, "step:scaffold").unwrap_err();
+    let plan = new_plan(&db, &uid, &["scaffold"]).unwrap();
+    let step_uid = plan.steps[0].uid.clone();
+    let st = step_id(&db, &step_uid);
+    let err = stage_into(&db, &sp, &step_uid).unwrap_err();
     assert!(err.to_string().contains("approve it first"), "{err}");
     approve_as(&db, &sp, Approver::Operator).unwrap();
     let err = stage_into(&db, &sp, &uid).unwrap_err();
     assert!(err.to_string().contains("not a plan step"), "{err}");
     assert_eq!(
-        stage_into(&db, &sp, "step:scaffold").unwrap().state,
+        stage_into(&db, &sp, &step_uid).unwrap().state,
         SpanState::Staged
     );
     // A step with no tasks under it has implemented nothing.
@@ -632,7 +643,7 @@ fn staged_and_implemented_are_derived_from_edges_and_task_status() {
     set(child, TaskStatus::Done);
     let v = view_of(&db, &uid, &sp);
     assert_eq!(v.state, SpanState::Implemented);
-    assert_eq!(v.steps, vec!["step:scaffold".to_owned()]);
+    assert_eq!(v.steps, vec![step_uid.clone()]);
     set(child, TaskStatus::Open);
     assert_eq!(view_of(&db, &uid, &sp).state, SpanState::Staged);
 }
@@ -1546,4 +1557,324 @@ fn sources_are_recorded_by_path_and_rehashed_in_place() {
     }])
     .is_err());
     assert!(add(vec![src("../a.md", b"a")]).is_err());
+}
+
+// ---- review round 1 (subtask 3): approval attests to a range, read-version approval, the
+// ---- applied delta, the create undo, derived-state gates ---------------------------------------
+
+/// Re-anchor `span` over UTF-16 `[start, end)` as an app peer would, through `design.apply`.
+fn reanchor(db: &Db, uid: &str, span: &str, start: u32, end: u32) -> Result<Written> {
+    let peer = peer_of(db, uid);
+    let ((), update) = peer
+        .change(|txn, body, spans| Crdt::anchor(txn, body, spans, span, start, end))
+        .unwrap();
+    apply_bytes(db, uid, update.unwrap())
+}
+
+/// Must-fix 1: an approval attests to the words in the span, not to whatever the anchors cover
+/// later. Moving an approved span's anchors over unapproved text through `design.apply` demotes it.
+#[test]
+fn moving_an_approved_spans_anchors_over_other_text_demotes_it() {
+    let db = db();
+    let uid = create(&db, "one. two. three.");
+    let a = span(&db, &uid, "one.", Reviewer::Operator).unwrap();
+    approve_as(&db, &a, Approver::Operator).unwrap();
+    let w = reanchor(&db, &uid, &a, 0, 16).unwrap();
+    assert_eq!(w.demoted, vec![a.clone()]);
+    let v = view_of(&db, &uid, &a);
+    assert_eq!(v.text, "one. two. three.");
+    assert_eq!(v.state, SpanState::Proposed, "{v:?}");
+    assert!(v.demoted);
+    let plan = new_plan(&db, &uid, &["s"]).unwrap();
+    assert!(stage_into(&db, &a, &plan.steps[0].uid).is_err());
+    // Shrinking the anchors off approved words demotes it too: they no longer hold what was read.
+    let b = {
+        let uid = create(&db, "alpha beta gamma");
+        let b = span(&db, &uid, "alpha beta", Reviewer::Operator).unwrap();
+        approve_as(&db, &b, Approver::Operator).unwrap();
+        reanchor(&db, &uid, &b, 0, 5).unwrap();
+        view_of(&db, &uid, &b)
+    };
+    assert_eq!(b.state, SpanState::Proposed, "{b:?}");
+}
+
+/// Must-fix 1: the overlap rule holds for a span written through `design.apply`, too.
+#[test]
+fn an_applied_update_that_makes_spans_overlap_is_refused() {
+    let db = db();
+    let uid = create(&db, "one. two. three.");
+    span(&db, &uid, "one.", Reviewer::Operator).unwrap();
+    let b = span(&db, &uid, "three.", Reviewer::Operator).unwrap();
+    let before = rows(&db, &uid);
+    let e = reanchor(&db, &uid, &b, 0, 16).unwrap_err();
+    assert!(e.to_string().contains("overlap"), "{e}");
+    assert_eq!(rows(&db, &uid), before, "a refused update was stored");
+    // Re-anchoring clear of the other span is fine.
+    reanchor(&db, &uid, &b, 5, 16).unwrap();
+}
+
+#[derive(Debug, Clone)]
+enum Op {
+    Insert(usize, char),
+    Delete(usize, usize),
+    Reanchor(usize, usize),
+}
+
+fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+    use proptest::prelude::*;
+    prop_oneof![
+        (0usize..64, prop::char::range('A', 'Z')).prop_map(|(p, c)| Op::Insert(p, c)),
+        (0usize..64, 1usize..4).prop_map(|(p, n)| Op::Delete(p, n)),
+        (0usize..64, 0usize..64).prop_map(|(a, b)| Op::Reanchor(a, b)),
+    ]
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+    /// The invariant approval exists for (D53.5): **a span reads approved only while its text is
+    /// exactly the words that were approved**, whatever editors and peers do to the text and to the
+    /// anchors since.
+    #[test]
+    fn a_span_reads_approved_only_while_its_text_is_the_approved_words(
+        len in 6usize..24,
+        lo in 0usize..24,
+        width in 1usize..8,
+        ops in proptest::collection::vec(op(), 1..8),
+    ) {
+        // Distinct characters, so every quote is unique.
+        let body: String = "abcdefghijklmnopqrstuvwxyz0123456789".chars().take(len).collect();
+        let lo = lo % len;
+        let hi = (lo + width).min(len);
+        let quote = body[lo..hi].to_owned();
+        let db = db();
+        let uid = create(&db, &body);
+        let s = span(&db, &uid, &quote, Reviewer::Operator).unwrap();
+        approve_as(&db, &s, Approver::Operator).unwrap();
+        for o in ops {
+            let now = text(&db, &uid);
+            let n = u32::try_from(now.len()).unwrap();
+            match o {
+                Op::Insert(p, c) => {
+                    let p = u32::try_from(p).unwrap() % (n + 1);
+                    let peer = peer_of(&db, &uid);
+                    let ((), u) = peer
+                        .change(|txn, body, _| {
+                            body.insert(txn, p, &c.to_string());
+                            Ok(())
+                        })
+                        .unwrap();
+                    apply_bytes(&db, &uid, u.unwrap()).unwrap();
+                }
+                Op::Delete(p, k) if n > 0 => {
+                    let p = u32::try_from(p).unwrap() % n;
+                    let k = u32::try_from(k).unwrap().min(n - p);
+                    let peer = peer_of(&db, &uid);
+                    let ((), u) = peer
+                        .change(|txn, body, _| {
+                            body.remove_range(txn, p, k);
+                            Ok(())
+                        })
+                        .unwrap();
+                    apply_bytes(&db, &uid, u.unwrap()).unwrap();
+                }
+                Op::Reanchor(a, b) if n > 0 => {
+                    let a = u32::try_from(a).unwrap() % n;
+                    let b = u32::try_from(b).unwrap() % n;
+                    let (a, b) = (a.min(b), a.max(b) + 1);
+                    reanchor(&db, &uid, &s, a, b).unwrap();
+                }
+                Op::Delete(..) | Op::Reanchor(..) => {}
+            }
+            let v = view_of(&db, &uid, &s);
+            if v.state != SpanState::Proposed {
+                proptest::prop_assert_eq!(&v.text, &quote, "{:?}", v);
+            }
+        }
+    }
+}
+
+/// Must-fix 2: what `design.apply` stores is the change it made, so undoing a peer's full-state
+/// update (sync step 2 carries the whole delete set) reverts only that change — the text deleted
+/// long before stays deleted.
+#[test]
+fn undoing_a_full_state_update_reverts_only_what_it_changed() {
+    let db = db();
+    let uid = create(&db, "A B C");
+    edit_at(&db, &uid, &token(&db, &uid), replace("B ", "")).unwrap();
+    assert_eq!(text(&db, &uid), "A C");
+    let peer = peer_of(&db, &uid);
+    peer.change(|txn, body, _| {
+        body.insert(txn, 3, "!");
+        Ok(())
+    })
+    .unwrap();
+    apply_bytes(&db, &uid, peer.encode_state()).unwrap();
+    assert_eq!(text(&db, &uid), "A C!");
+    undo_last(&db);
+    assert_eq!(text(&db, &uid), "A C");
+}
+
+/// Must-fix 3: undoing a design's creation deletes the item, which would cascade every later update
+/// away — refused once anything else wrote to the design; still allowed while nothing has.
+#[test]
+fn undoing_a_designs_creation_is_refused_once_it_was_written_since() {
+    let db = db();
+    let uid = create(&db, "body");
+    let u = uid.clone();
+    let created: i64 = db
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT u.txn_id FROM design_updates u JOIN items i ON i.id = u.design_id
+                  WHERE i.uid = ?1 AND u.seq = 1",
+                [u],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("body", " more")).unwrap();
+    let e = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, created))
+        .unwrap_err();
+    assert!(e.to_string().contains("append-only"), "{e}");
+    assert_eq!(text(&db, &uid), "body more");
+}
+
+/// Must-fix 4: an approval is of the version the reviewer read. A span changed since is refused;
+/// a change elsewhere in the design is not the span's and does not stop it.
+#[test]
+fn approval_is_at_the_version_read_and_refused_when_the_span_changed_since() {
+    let db = db();
+    let uid = create(&db, "Store it in Postgres. Other.");
+    let s = span(&db, &uid, "Store it in Postgres.", Reviewer::Operator).unwrap();
+    let read = token(&db, &uid);
+    edit_at(&db, &uid, &token(&db, &uid), replace("Postgres", "MongoDB")).unwrap();
+    let e = approve_at(&db, &s, &read, Approver::Operator).unwrap_err();
+    assert!(e.to_string().contains("changed since"), "{e}");
+    assert_eq!(view_of(&db, &uid, &s).state, SpanState::Proposed);
+
+    let read = token(&db, &uid);
+    edit_at(&db, &uid, &token(&db, &uid), replace("Other.", "Else.")).unwrap();
+    let v = approve_at(&db, &s, &read, Approver::Operator).unwrap();
+    assert_eq!(v.state, SpanState::Approved);
+    assert_eq!(v.text, "Store it in MongoDB.");
+    assert!(approve_at(&db, &s, "nonsense", Approver::Operator).is_err());
+}
+
+/// A span whose anchors a peer removed reads PROPOSED, and `stage` agrees with that derived state.
+#[test]
+fn an_unanchored_approved_span_is_not_staged() {
+    let db = db();
+    let uid = create(&db, "one. two.");
+    let s = span(&db, &uid, "one.", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let plan = new_plan(&db, &uid, &["s"]).unwrap();
+    let peer = peer_of(&db, &uid);
+    let sp = s.clone();
+    let ((), u) = peer
+        .change(|txn, _, spans| {
+            yrs::Map::remove(spans, txn, &sp);
+            Ok(())
+        })
+        .unwrap();
+    apply_bytes(&db, &uid, u.unwrap()).unwrap();
+    let v = view_of(&db, &uid, &s);
+    assert!(!v.anchored);
+    assert_eq!(v.state, SpanState::Proposed);
+    let e = stage_into(&db, &s, &plan.steps[0].uid).unwrap_err();
+    assert!(e.to_string().contains("PROPOSED"), "{e}");
+}
+
+/// A span whose words were all deleted covers nothing, and an approval attests to words.
+#[test]
+fn a_span_with_no_words_is_not_approved() {
+    let db = db();
+    let uid = create(&db, "aXb");
+    let s = span(&db, &uid, "X", Reviewer::Operator).unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), replace("X", "")).unwrap();
+    let v = view_of(&db, &uid, &s);
+    assert_eq!((v.start, v.end), (1, 1));
+    let e = approve_as(&db, &s, Approver::Operator).unwrap_err();
+    assert!(e.to_string().contains("covers no words"), "{e}");
+}
+
+/// IMPLEMENTED needs every staged step to have tasks, all done: one step's finished work does not
+/// stand in for another step's.
+#[test]
+fn implemented_needs_tasks_done_under_every_staged_step() {
+    let db = db();
+    let uid = create(&db, "Do both.");
+    let s = span(&db, &uid, "Do both.", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let plan = new_plan(&db, &uid, &["one", "two"]).unwrap();
+    stage_into(&db, &s, &plan.steps[0].uid).unwrap();
+    stage_into(&db, &s, &plan.steps[1].uid).unwrap();
+    let t1 = task_under(&db, step_id(&db, &plan.steps[0].uid), "task:one");
+    set_status(&db, t1, TaskStatus::Done);
+    assert_eq!(view_of(&db, &uid, &s).state, SpanState::Staged);
+    let t2 = task_under(&db, step_id(&db, &plan.steps[1].uid), "task:two");
+    set_status(&db, t2, TaskStatus::Done);
+    assert_eq!(view_of(&db, &uid, &s).state, SpanState::Implemented);
+}
+
+/// A span is staged only into a step of its own design's plans.
+#[test]
+fn a_span_is_not_staged_into_another_designs_plan() {
+    let db = db();
+    let mine = create(&db, "Mine.");
+    let s = span(&db, &mine, "Mine.", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let other = create(&db, "Theirs.");
+    let theirs = new_plan(&db, &other, &["x"]).unwrap();
+    let e = stage_into(&db, &s, &theirs.steps[0].uid).unwrap_err();
+    assert!(e.to_string().contains("another design"), "{e}");
+    let own = new_plan(&db, &mine, &["y"]).unwrap();
+    stage_into(&db, &s, &own.steps[0].uid).unwrap();
+}
+
+/// An approval and a staging are announced on the design's topic, so a subscriber redraws states.
+#[test]
+fn approving_and_staging_are_announced_on_the_designs_topic() {
+    let db = db();
+    let uid = create(&db, "Announce me.");
+    let s = span(&db, &uid, "Announce me.", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let plan = new_plan(&db, &uid, &["s"]).unwrap();
+    stage_into(&db, &s, &plan.steps[0].uid).unwrap();
+    let name = topic(&uid);
+    let msgs = db
+        .read(move |c| crate::mq::tail(c, &name, 50, crate::mq::now_ms()))
+        .unwrap();
+    let states: Vec<&str> = msgs
+        .iter()
+        .filter(|m| m.kind == "span")
+        .map(|m| m.payload["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["APPROVED", "STAGED"]);
+}
+
+/// Past `COMPACT_AT` rows a write folds the older ones away, keeping the newest `COMPACT_KEEP`: the
+/// text is unchanged and the newest update can still be undone.
+#[test]
+fn a_long_editing_session_is_compacted_as_it_goes() {
+    let db = db();
+    let uid = create(&db, "x");
+    let n = usize::try_from(COMPACT_AT).unwrap() + 4;
+    for _ in 0..n {
+        edit_at(&db, &uid, &token(&db, &uid), insert_after("x", "y")).unwrap();
+    }
+    assert!(rows(&db, &uid) <= COMPACT_AT, "{}", rows(&db, &uid));
+    let expect = format!("x{}", "y".repeat(n));
+    assert_eq!(text(&db, &uid), expect);
+    undo_last(&db);
+    assert_eq!(text(&db, &uid), format!("x{}", "y".repeat(n - 1)));
+}
+
+#[test]
+fn a_span_with_no_width_renders_its_open_marker_before_its_close() {
+    let db = db();
+    let uid = create(&db, "aXb");
+    let s = span(&db, &uid, "X", Reviewer::Operator).unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), replace("X", "")).unwrap();
+    assert_eq!(render(&cat(&db, &uid)), format!("a⟦{s} PROPOSED⟧⟦/{s}⟧b"));
 }

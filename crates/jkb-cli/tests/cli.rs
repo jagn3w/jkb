@@ -4947,7 +4947,7 @@ fn a_design_is_edited_by_quote_against_the_version_read() {
         .unwrap()
         .to_owned();
     jkb(&db)
-        .args(["design", "approve", &span])
+        .args(["design", "approve", &span, "--base", &version()])
         .assert()
         .success()
         .stdout(predicate::str::contains("APPROVED"));
@@ -5044,8 +5044,12 @@ fn a_plan_is_built_and_played_through_the_cli() {
         .as_str()
         .unwrap()
         .to_owned();
+    let read = json(&["design", "cat", &uid])["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     jkb(&db)
-        .args(["design", "approve", &span])
+        .args(["design", "approve", &span, "--base", &read])
         .assert()
         .success();
     jkb(&db)

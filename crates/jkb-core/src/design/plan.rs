@@ -310,6 +310,26 @@ fn view(
     })
 }
 
+/// The design a plan step belongs to: its plan's container. What [`super::stage`] holds a span to —
+/// a span staged into another design's plan would derive STAGED and IMPLEMENTED from tasks no view
+/// of its own design connects to it.
+///
+/// # Errors
+/// A step no plan contains, a plan no design contains, or a database error.
+pub(crate) fn design_of_step(conn: &Connection, step: ItemId, step_uid: &str) -> Result<ItemId> {
+    let plan = containment::parent(conn, step)?
+        .ok_or_else(|| invalid(format!("plan step {step_uid} is contained by no plan")))?;
+    let meta = item::get(conn, plan)?
+        .ok_or_else(|| invalid(format!("plan step {step_uid}'s plan is gone")))?;
+    if meta.kind != PLAN_KIND {
+        return Err(invalid(format!(
+            "plan step {step_uid} is contained by a {}, not a plan",
+            meta.kind
+        )));
+    }
+    Ok(design_of(conn, plan, &meta.uid)?.0)
+}
+
 /// The design a plan belongs to: its container.
 fn design_of(conn: &Connection, plan_item: ItemId, plan: &str) -> Result<(ItemId, String)> {
     let parent = containment::parent(conn, plan_item)?

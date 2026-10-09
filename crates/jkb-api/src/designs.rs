@@ -475,8 +475,9 @@ pub struct SpanAsk {
     pub reviewer: Option<String>,
 }
 
-/// `design.approve`, as `principal`: the operator, or a Claude session recorded by its label. The
-/// engine refuses an approver the span does not name (D53.5).
+/// `design.approve`, as `principal`: the operator, or a Claude session recorded by its label, at the
+/// version `base` the reviewer read. The engine refuses an approver the span does not name, and a
+/// span whose words changed since `base` (D53.4–5).
 ///
 /// # Errors
 /// The engine's refusal.
@@ -484,6 +485,7 @@ pub fn approve(
     conn: &Connection,
     meta: &WriteMeta,
     span: &str,
+    base: &str,
     principal: &Principal,
 ) -> Result<Span, ApiError> {
     let approver = if principal.is_operator() {
@@ -491,7 +493,7 @@ pub fn approve(
     } else {
         Approver::Claude(principal.label.clone())
     };
-    Ok(design::approve(conn, meta, span, &approver)?.into())
+    Ok(design::approve(conn, meta, span, base, &approver)?.into())
 }
 
 /// `design.stage`.

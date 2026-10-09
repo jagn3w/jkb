@@ -175,11 +175,15 @@ fn a_span_is_approved_only_by_the_reviewer_it_names() {
     ))
     .span
     .unwrap();
-    let e = call(&designer, json!({ "op": "design.approve", "span": mine })).unwrap_err();
+    let e = call(
+        &designer,
+        json!({ "op": "design.approve", "span": mine, "base": cat(&kb.op, &uid).version }),
+    )
+    .unwrap_err();
     assert!(e.message.contains("only the operator"), "{e:?}");
     match ok(
         &designer,
-        json!({ "op": "design.approve", "span": claudes }),
+        json!({ "op": "design.approve", "span": claudes, "base": cat(&kb.op, &uid).version }),
     ) {
         Response::DesignSpan { span } => {
             assert_eq!(span.state, "APPROVED");
@@ -187,7 +191,10 @@ fn a_span_is_approved_only_by_the_reviewer_it_names() {
         }
         other => panic!("{other:?}"),
     }
-    match ok(&kb.op, json!({ "op": "design.approve", "span": mine })) {
+    match ok(
+        &kb.op,
+        json!({ "op": "design.approve", "span": mine, "base": cat(&kb.op, &uid).version }),
+    ) {
         Response::DesignSpan { span } => {
             assert_eq!(span.approved_by.as_deref(), Some("operator"));
         }
@@ -266,7 +273,10 @@ fn a_design_records_its_doc_target_and_sources_and_exports_its_approved_text() {
     ))
     .span
     .unwrap();
-    ok(&kb.op, json!({ "op": "design.approve", "span": span }));
+    ok(
+        &kb.op,
+        json!({ "op": "design.approve", "span": span, "base": cat(&kb.op, &uid).version }),
+    );
     let exports = |r: Value| match ok(&implementer, r) {
         Response::DesignExports { exports } => exports,
         other => panic!("{other:?}"),
@@ -478,7 +488,10 @@ fn staged() -> Staged {
     ))
     .span
     .unwrap();
-    ok(&kb.op, json!({ "op": "design.approve", "span": span }));
+    ok(
+        &kb.op,
+        json!({ "op": "design.approve", "span": span, "base": cat(&kb.op, &uid).version }),
+    );
     ok(
         &kb.op,
         json!({ "op": "design.stage", "span": span, "step": step }),
@@ -867,4 +880,69 @@ fn a_plan_play_names_the_open_tasks_not_on_the_chosen_strategy() {
         "{}",
         newer.prompt
     );
+}
+
+/// D53.5 through D52.9: a `reviewer`-typed subagent, attested by a harness ticket, approves a span
+/// naming `claude` — the path roles.rs documents for a reviewer. Unbound, so held to one task for
+/// shared writes: an approval is not one (the engine holds it to the reviewer the span names), and
+/// editing the design still is.
+#[test]
+fn an_attested_reviewer_subagent_approves_a_span_naming_claude() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "one. two.");
+    let version = cat(&kb.op, &uid).version;
+    let span_of = |find: &str, reviewer: &str| {
+        written(ok(
+            &kb.op,
+            json!({ "op": "design.span", "uid": uid, "base": version, "find": find,
+                    "reviewer": reviewer }),
+        ))
+        .span
+        .unwrap()
+    };
+    let operators = span_of("one.", "operator");
+    let claudes = span_of("two.", "claude");
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "reviewer", "role": "reviewer" }),
+    );
+    let as_token = |token: String| {
+        LocalBackend::new(kb.db.clone())
+            .with_tickets(Arc::clone(&kb.tickets))
+            .with_caller(Caller::Token(token))
+    };
+    let ticket = match ok(
+        &as_token(container),
+        json!({ "op": "attest.mint", "session": "s", "agent_id": "r1",
+                "agent_type": "reviewer", "tool_use_id": "t" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let reviewer = as_token(ticket);
+    let base = cat(&kb.op, &uid).version;
+    match ok(
+        &reviewer,
+        json!({ "op": "design.approve", "span": claudes, "base": base }),
+    ) {
+        Response::DesignSpan { span } => assert_eq!(span.state, "APPROVED"),
+        other => panic!("{other:?}"),
+    }
+    let e = call(
+        &reviewer,
+        json!({ "op": "design.approve", "span": operators, "base": base }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("only the operator"), "{e:?}");
+    let e = call(
+        &reviewer,
+        json!({ "op": "design.edit", "uid": uid, "base": base,
+                "edit": { "how": "replace", "find": "one.", "with": "1." } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
 }

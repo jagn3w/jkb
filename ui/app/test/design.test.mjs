@@ -120,12 +120,14 @@ test("a feed joins the app's group, then delivers each update to every window ho
         { seq: 9, kind: "update", payload: { design: "design:factory-1", seq: 4, update: null } },
         { seq: 10, kind: "prompt", payload: { design: "design:factory-1", prompt: "prompt:p" } },
         { seq: 11, kind: "prompt", payload: { design: "design:factory-1" } },
+        { seq: 12, kind: "span", payload: { design: "design:factory-1", span: "span:s", state: "APPROVED" } },
+        { seq: 13, kind: "span", payload: { design: "design:factory-1", span: "span:s" } },
       ],
     }),
   );
   await until(() => daemon.calls.some((c) => c.request.op === "mq.ack"), "the ack");
   assert.deepEqual(
-    heard.map((h) => [h.owner, h.event.kind, h.event.seq ?? h.event.prompt, h.event.update]),
+    heard.map((h) => [h.owner, h.event.kind, h.event.seq ?? h.event.prompt ?? h.event.span, h.event.update]),
     [
       [1, "update", 3, "AA=="],
       [2, "update", 3, "AA=="],
@@ -133,9 +135,11 @@ test("a feed joins the app's group, then delivers each update to every window ho
       [2, "update", 4, null],
       [1, "prompt", "prompt:p", undefined],
       [2, "prompt", "prompt:p", undefined],
+      [1, "span", "span:s", undefined],
+      [2, "span", "span:s", undefined],
     ],
   );
-  assert.equal(daemon.calls.find((c) => c.request.op === "mq.ack").request.seq, 11, "acked through the last message");
+  assert.equal(daemon.calls.find((c) => c.request.op === "mq.ack").request.seq, 13, "acked through the last message");
   assert.equal(daemon.calls.filter((c) => c.request.op === "mq.group_create").length, 1, "one feed per topic");
 
   // The feed ends when its last window goes: after the held poll answers, nothing more is asked.

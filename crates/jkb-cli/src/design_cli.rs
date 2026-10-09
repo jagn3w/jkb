@@ -24,20 +24,13 @@ fn text_arg(value: String) -> Result<String> {
     Ok(buf)
 }
 
-/// The repo a design lives under: as given, or the ambient one (the first segment after `repos/`).
+/// The repo a design lives under: as given, or the ambient one ([`Ops::ambient_repo`]).
 pub(crate) fn repo_of(ops: &Ops<'_>, repo: Option<String>) -> Result<String> {
     if let Some(repo) = repo {
         return Ok(repo);
     }
-    let ambient = ops.ambient_here()?.and_then(|mount| {
-        mount
-            .strip_prefix("repos/")
-            .unwrap_or(&mount)
-            .split('/')
-            .next()
-            .map(str::to_owned)
-    });
-    ambient.context("not inside a mounted repo — name one with --repo")
+    ops.ambient_repo()?
+        .context("not inside a mounted repo — name one with --repo")
 }
 
 fn written(ops: &Ops<'_>, op: &str, request: Request) -> Result<Written> {
@@ -403,9 +396,11 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             let repo = if all || global {
                 None
             } else {
+                // Outside a repo every design is listed; an ambient lookup that fails is an error,
+                // never a reason to list everything.
                 match repo {
                     Some(r) => Some(r),
-                    None => repo_of(ops, None).ok(),
+                    None => ops.ambient_repo()?,
                 }
             };
             let designs = match ops.call(Request::DesignList { repo })? {
@@ -534,8 +529,8 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             }
             Ok(())
         }
-        DesignCmd::Approve { span } => {
-            let s = span_answer(ops, "design.approve", Request::DesignApprove { span })?;
+        DesignCmd::Approve { span, base } => {
+            let s = span_answer(ops, "design.approve", Request::DesignApprove { span, base })?;
             print_span(ops, &s)
         }
         DesignCmd::Stage { span, step } => {

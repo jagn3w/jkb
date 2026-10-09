@@ -5148,7 +5148,7 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
         .unwrap()
         .to_owned();
     f.jkb()
-        .args(["design", "approve", &span])
+        .args(["design", "approve", &span, "--base", &version()])
         .assert()
         .success();
 

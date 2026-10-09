@@ -896,11 +896,15 @@ pub enum Request {
         #[serde(default)]
         reviewer: Option<String>,
     },
-    /// Approve a span, as the reviewer it names ([`designs::approve`]).
+    /// Approve a span, as the reviewer it names, at the version the reviewer read
+    /// ([`designs::approve`]).
     #[serde(rename = "design.approve")]
     DesignApprove {
         /// The span.
         span: String,
+        /// The version token the reviewer read the span at (`design.cat`'s `version`). Refused when
+        /// the span's words changed since (D53.4: read-version, never read-latest).
+        base: String,
     },
     /// Stage an approved span into a plan step ([`designs::stage`]).
     #[serde(rename = "design.stage")]
@@ -2643,7 +2647,9 @@ impl Response {
     #[must_use]
     pub const fn announces_a_send(&self) -> bool {
         match self {
-            Self::Sent { .. } => true,
+            // An approval or a staging is announced on its design's topic (`kind = "span"`); an
+            // approval that already held writes nothing, and costs subscribers one spare poll.
+            Self::Sent { .. } | Self::DesignSpan { .. } => true,
             Self::Notified { sent, .. } => *sent > 0,
             // Every stored design update is announced on `design/<uid>` (D53.4).
             Self::DesignWritten { written } => written.seq.is_some(),
@@ -2733,7 +2739,6 @@ impl Response {
             | Self::DesignText { .. }
             | Self::DesignUpdate { .. }
             | Self::DesignSpans { .. }
-            | Self::DesignSpan { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignWorkPrompt { .. }
             | Self::DesignNewPrompt { .. }
@@ -3992,12 +3997,12 @@ impl LocalBackend {
                     written: db.write_txn_with(actor, move |c, m| designs::span(c, m, &ask))?,
                 }
             }
-            Request::DesignApprove { span } => {
+            Request::DesignApprove { span, base } => {
                 let who = principal.clone();
                 Response::DesignSpan {
-                    span: Box::new(
-                        db.write_txn_with(actor, move |c, m| designs::approve(c, m, &span, &who))?,
-                    ),
+                    span: Box::new(db.write_txn_with(actor, move |c, m| {
+                        designs::approve(c, m, &span, &base, &who)
+                    })?),
                 }
             }
             Request::DesignStage { span, step } => Response::DesignSpan {

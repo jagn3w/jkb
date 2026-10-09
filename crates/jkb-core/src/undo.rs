@@ -873,6 +873,7 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
 /// better. Adding a predicted constraint check here would be the fifth round of predicting.
 fn blocker(
     conn: &Connection,
+    txn_id: i64,
     op: &str,
     table: &str,
     entity_id: &str,
@@ -906,6 +907,15 @@ fn blocker(
     ) && entity_id.parse::<i64>().is_err()
     {
         return Some(format!("its changelog key `{entity_id}` is not a row id"));
+    }
+    // Deleting an item cascades to its design document, so an item insert is undone only while the
+    // document holds nothing a later transaction wrote (D53.4).
+    if op == Op::Insert.as_str() && table == Entity::Items.as_str() {
+        if let Some(why) = entity_id.parse::<i64>().ok().and_then(|row| {
+            crate::design::undo_would_lose(conn, ItemId::new(row), txn_id).transpose()
+        }) {
+            return Some(why.unwrap_or_else(|e| e.to_string()));
+        }
     }
     if inverse == Inverse::DesignRevert {
         if let Some(why) = entity_id
@@ -1107,7 +1117,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         .iter()
         .filter(|(op, table, _, _)| is_work(op, table))
         .filter_map(|(op, table, entity_id, before)| {
-            blocker(conn, op, table, entity_id, before.as_deref())
+            blocker(conn, txn_id, op, table, entity_id, before.as_deref())
                 .map(|why| format!("`{op}` on `{table}` ({why})"))
         })
         .collect::<BTreeSet<_>>()

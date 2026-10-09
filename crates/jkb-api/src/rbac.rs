@@ -375,7 +375,6 @@ impl Request {
             | Self::DesignApply { .. }
             | Self::DesignEdit { .. }
             | Self::DesignSpan { .. }
-            | Self::DesignApprove { .. }
             | Self::DesignStage { .. }
             | Self::DesignPlanCreate { .. }
             | Self::DesignPlanStep { .. }
@@ -383,11 +382,15 @@ impl Request {
             | Self::DesignTarget { .. }
             | Self::DesignSources { .. }
             | Self::DesignCompact { .. } => Target::Shared,
+            // An approval is held to the reviewer the span names by the engine (`design::approve`),
+            // and is how a mapped `reviewer` subagent — attested, so held to one task for shared
+            // writes — signs off a span naming `claude` (D53.5). Shared, it could never run.
+            Self::DesignApprove { .. }
             // Held by their own callee: a filing writes only a namespace nobody holds, and becomes
             // a task's round only when recorded; recording holds a scoped caller to its task
             // (`review::record`); revoking holds a grant to what it minted; attesting is the
             // container credential's alone.
-            Self::TaskReviewFile(_)
+            | Self::TaskReviewFile(_)
             | Self::TaskReviewRecord(_)
             | Self::RoleRevoke { .. }
             | Self::AttestMint { .. }

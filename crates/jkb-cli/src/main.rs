@@ -530,10 +530,14 @@ enum DesignCmd {
         /// The design.
         uid: String,
     },
-    /// Approve a span — as the reviewer it names.
+    /// Approve a span — as the reviewer it names, at the version you read it in.
     Approve {
         /// The span.
         span: String,
+        /// The version token `jkb design cat` printed when you read the span. Refused when the
+        /// span's words changed since: an approval is of the words you read, never of the latest.
+        #[arg(long)]
+        base: String,
     },
     /// Stage an approved span into an execution plan's step.
     Stage {

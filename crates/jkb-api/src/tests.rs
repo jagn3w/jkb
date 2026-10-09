@@ -481,6 +481,7 @@ fn samples() -> Vec<Request> {
         },
         Request::DesignApprove {
             span: "span:x".into(),
+            base: "0.".into(),
         },
         Request::DesignStage {
             span: "span:x".into(),

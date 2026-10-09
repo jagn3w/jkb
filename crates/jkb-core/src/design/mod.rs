@@ -17,15 +17,18 @@
 //! base* is refused, never guessed at.
 //!
 //! **Span state is one recorded fact and two derived ones** (D53.5). APPROVED is recorded on the
-//! span's item, as a snapshot of the document at the approval; which words are still the approved
-//! ones is derived by comparing the text with that snapshot. STAGED (a `stages` edge to a plan step)
-//! and IMPLEMENTED (every task under those steps `done`) are read from the graph, never stored.
+//! span's item, as the Yjs ids of the words approved, in the version the reviewer read
+//! ([`crdt::Crdt::attest`]); whether those are still the span's words is derived by diffing the
+//! text against them. STAGED (a `stages` edge to a plan step) and IMPLEMENTED (every staged step has
+//! tasks, all `done`) are read from the graph, never stored.
 
 pub mod crdt;
 mod discuss;
 pub mod export;
 pub mod plan;
 pub mod prompts;
+
+use std::collections::BTreeSet;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -38,7 +41,7 @@ use crate::changelog::{self, Entity, Op};
 use crate::mq::{self, Draft, QueueError, TopicSpec};
 use crate::store::WriteMeta;
 use crate::{containment, edge, item, ns, placement, Error, Result};
-use crdt::{Crdt, Piece, PieceKind};
+use crdt::{Crdt, Piece, PieceKind, Pieces};
 pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 pub use export::{DesignMeta, Exported, Source};
 pub use plan::{PlanTask, PlanView, Plans, StepView, TaskPlace, PLAN_KIND};
@@ -60,6 +63,13 @@ const UID_SLUG_MAX: usize = 32;
 const INLINE_UPDATE_MAX: usize = 32 * 1024;
 /// How long a live-update message is kept: a subscriber that was away longer re-reads the state.
 const TOPIC_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// How many update rows a design holds before a write folds the older ones into its snapshot. Every
+/// write rebuilds the document from its rows, so without a bound one editor sending an update per
+/// keystroke made each write slower than the last, on the one writer thread every write waits on.
+const COMPACT_AT: i64 = if cfg!(test) { 24 } else { 4096 };
+/// How many of the newest rows an automatic compaction keeps: a version read that recently can still
+/// be edited against, and an update that recent can still be undone.
+const COMPACT_KEEP: i64 = if cfg!(test) { 8 } else { 1024 };
 
 fn invalid(why: impl Into<String>) -> Error {
     TypeError::Validation(why.into()).into()
@@ -130,7 +140,7 @@ pub enum SpanState {
     Approved,
     /// Approved, and staged into at least one plan step (a `stages` edge). Derived.
     Staged,
-    /// Staged, and every task under those steps is `done`. Derived.
+    /// Staged, and every staged step has at least one task, all `done`. Derived.
     Implemented,
 }
 
@@ -600,6 +610,7 @@ fn append_row(
         None,
         Some(&json!({ "design": uid, "seq": seq, "bytes": update.len() })),
     )?;
+    compact_if_due(conn, meta, design)?;
     Ok(seq)
 }
 
@@ -690,15 +701,19 @@ pub fn read(conn: &Connection, uid: &str) -> Result<DesignText> {
 #[must_use]
 pub fn render(design: &DesignText) -> String {
     let text = &design.text;
-    // (byte, closes-first, marker): a span closing where another opens closes first.
+    // (byte, closes-first, marker): a span closing where another opens closes first. A span with no
+    // width is one marker pair, so its close cannot sort before its own open.
     let mut marks: Vec<(usize, u8, String)> = Vec::new();
     for s in design.spans.iter().filter(|s| s.anchored) {
-        marks.push((
-            crdt::utf16_to_byte(text, s.start),
-            1,
-            format!("⟦{} {}⟧", s.uid, s.state.as_str()),
-        ));
-        marks.push((crdt::utf16_to_byte(text, s.end), 0, format!("⟦/{}⟧", s.uid)));
+        let open = format!("⟦{} {}⟧", s.uid, s.state.as_str());
+        let close = format!("⟦/{}⟧", s.uid);
+        let start = crdt::utf16_to_byte(text, s.start);
+        if s.end <= s.start {
+            marks.push((start, 1, format!("{open}{close}")));
+            continue;
+        }
+        marks.push((start, 1, open));
+        marks.push((crdt::utf16_to_byte(text, s.end), 0, close));
     }
     marks.sort_by_key(|a| (a.0, a.1));
     let mut out = String::with_capacity(text.len() + marks.len() * 24);
@@ -729,53 +744,115 @@ pub fn state(conn: &Connection, uid: &str, since: Option<&[u8]>) -> Result<(Vec<
 
 /// Merge an editor's update (`design.apply`): validated against the document, stored, announced.
 ///
+/// What is stored and announced is the change the update made here ([`Crdt::merge`]), never the
+/// bytes as sent: a peer's update may carry what the design already has, and `jkb undo` reverts the
+/// stored row. An update may also rewrite span anchors (the `spans` map is the document's); one that
+/// would make two spans overlap is refused, as [`add_span`] refuses one, and one that moves an
+/// approved span's anchors off its words demotes it ([`Crdt::pieces`]).
+///
 /// # Errors
-/// Bytes that are not a Yjs v1 update, or one that builds on changes this design does not have.
+/// Bytes that are not a Yjs v1 update, one that builds on changes this design does not have, or one
+/// that makes two spans overlap.
 pub fn apply(conn: &Connection, meta: &WriteMeta, uid: &str, update: &[u8]) -> Result<Written> {
     let id = design_id(conn, uid)?;
-    let (doc, _) = load(conn, id)?;
-    let before = span_views(conn, id, &doc)?;
-    let was = doc.snapshot();
-    doc.apply(update)?;
+    let (doc, version) = load(conn, id)?;
+    let before = before_write(conn, id, &doc)?;
+    let delta = doc.merge(update)?;
     if doc.has_missing() {
         return Err(invalid(
             "the update builds on changes this design does not have — send the updates it \
              depends on first (or re-sync with `design.state`)",
         ));
     }
-    if doc.snapshot() == was {
-        let (_, version) = load(conn, id)?;
+    let Some(delta) = delta else {
         return Ok(Written {
             seq: None,
             version,
             demoted: Vec::new(),
             span: None,
         });
-    }
-    let seq = append_row(conn, meta, id, uid, update)?;
+    };
+    let seq = append_row(conn, meta, id, uid, &delta)?;
     finish(conn, id, &doc, &before, Some(seq), None)
 }
 
+/// What a write is checked against afterwards ([`finish`]): the span pairs that already overlapped,
+/// and the spans whose approval held.
+struct Before {
+    overlaps: BTreeSet<(String, String)>,
+    held: Vec<String>,
+}
+
+/// The pairs of a design's spans whose ranges overlap in `doc`, each pair in uid order. A span with
+/// no width overlaps nothing.
+fn overlaps(doc: &Crdt, items: &[SpanItem]) -> BTreeSet<(String, String)> {
+    let ranges: Vec<(&str, u32, u32)> = items
+        .iter()
+        .filter_map(|s| {
+            doc.range(&s.uid)
+                .filter(|(a, b)| a < b)
+                .map(|(a, b)| (s.uid.as_str(), a, b))
+        })
+        .collect();
+    let mut out = BTreeSet::new();
+    for (i, (u, s, e)) in ranges.iter().enumerate() {
+        for (v, os, oe) in &ranges[i + 1..] {
+            if s < oe && os < e {
+                let (a, b) = if u < v { (u, v) } else { (v, u) };
+                out.insert(((*a).to_owned(), (*b).to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// What [`finish`] compares a write against, read from the document before it. Only spans with an
+/// approval are diffed — the costly part — so a design with none approved pays for none.
+fn before_write(conn: &Connection, design: ItemId, doc: &Crdt) -> Result<Before> {
+    let items = span_items(conn, design)?;
+    let mut held = Vec::new();
+    if items.iter().any(SpanItem::has_approval) {
+        let text = doc.text();
+        for span in items.iter().filter(|s| s.has_approval()) {
+            if view(conn, span, doc, &text)?.state != SpanState::Proposed {
+                held.push(span.uid.clone());
+            }
+        }
+    }
+    Ok(Before {
+        overlaps: overlaps(doc, &items),
+        held,
+    })
+}
+
 /// The answer to a write that merged `doc`: its version, and the spans it demoted.
+///
+/// **Spans do not overlap**, however the write reached the document: a pair overlapping now that
+/// did not before refuses the write (the transaction rolls back, row and announcement with it). One
+/// check here, rather than one per writer, because `design.apply` writes the `spans` map as freely
+/// as `design.span` does.
 fn finish(
     conn: &Connection,
     id: ItemId,
     doc: &Crdt,
-    before: &[SpanView],
+    before: &Before,
     seq: Option<i64>,
     span: Option<String>,
 ) -> Result<Written> {
-    let after = span_views(conn, id, doc)?;
-    let demoted = after
-        .iter()
-        .filter(|a| a.demoted)
-        .filter(|a| {
-            before
-                .iter()
-                .any(|b| b.uid == a.uid && b.approved_by.is_some() && !b.demoted)
-        })
-        .map(|a| a.uid.clone())
-        .collect();
+    let items = span_items(conn, id)?;
+    if let Some((a, b)) = overlaps(doc, &items).difference(&before.overlaps).next() {
+        return Err(invalid(format!(
+            "span {a} would overlap span {b}: each piece of a design is in exactly one state, so \
+             spans do not overlap"
+        )));
+    }
+    let text = doc.text();
+    let mut demoted = Vec::new();
+    for span in items.iter().filter(|s| before.held.contains(&s.uid)) {
+        if view(conn, span, doc, &text)?.state == SpanState::Proposed {
+            demoted.push(span.uid.clone());
+        }
+    }
     Ok(Written {
         seq,
         version: Version {
@@ -837,7 +914,7 @@ pub fn edit(
     let id = design_id(conn, uid)?;
     let base = Version::parse(base)?;
     let (now, _) = load(conn, id)?;
-    let before = span_views(conn, id, &now)?;
+    let before = before_write(conn, id, &now)?;
     let doc = load_base(conn, id, &base, &now)?;
     let text = doc.text();
     let (targeted, update) = match edit {
@@ -932,7 +1009,7 @@ pub fn add_span(
     let id = design_id(conn, uid)?;
     let base = Version::parse(base)?;
     let (now, _) = load(conn, id)?;
-    let before = span_views(conn, id, &now)?;
+    let before = before_write(conn, id, &now)?;
     let doc = load_base(conn, id, &base, &now)?;
     let (s, e) = locate(&doc.text(), find, occurrence)?;
     let ids = doc.ids(s, e);
@@ -947,18 +1024,6 @@ pub fn add_span(
         doc.change(|txn, body, spans| Crdt::anchor(txn, body, spans, &span, s, e))?;
     let update = update.ok_or_else(|| invalid("the span wrote nothing"))?;
     now.apply(&update)?;
-    if let Some((ns, ne)) = now.range(&span) {
-        for other in now.span_uids().into_iter().filter(|o| *o != span) {
-            if let Some((os, oe)) = now.range(&other) {
-                if ns < oe && os < ne {
-                    return Err(invalid(format!(
-                        "the quote overlaps span {other}: each piece of a design is in exactly one \
-                         state, so spans do not overlap"
-                    )));
-                }
-            }
-        }
-    }
     let span_id = item::upsert(
         conn,
         meta,
@@ -1010,6 +1075,33 @@ struct SpanItem {
     id: ItemId,
     uid: String,
     metadata: Value,
+}
+
+impl SpanItem {
+    /// The approval the item records, if any.
+    fn approval(&self) -> Option<&Value> {
+        self.metadata.get("approval").filter(|a| !a.is_null())
+    }
+
+    fn has_approval(&self) -> bool {
+        self.approval().is_some()
+    }
+
+    /// The words its approval attests to ([`Crdt::attest`]); `None` with no approval, or one that
+    /// records no readable attestation — which reads as demoted, never as approved.
+    fn attested(&self) -> Option<yrs::Snapshot> {
+        let b64 = self.approval()?.get("attested")?.as_str()?;
+        let bytes = STANDARD.decode(b64).ok()?;
+        crdt::decode_snapshot(&bytes).ok()
+    }
+}
+
+/// Whether a span's approval holds now: it has one, none of its words changed or moved, and it is
+/// anchored over at least one character. **The one predicate** behind a span's derived state
+/// ([`view`]) and the gate on staging it ([`stage`]) — two hand-copied versions once disagreed, and
+/// `stage` took an unanchored span whose state read PROPOSED.
+fn approval_holds(approved: bool, demoted: bool, range: Option<(u32, u32)>) -> bool {
+    approved && !demoted && range.is_some_and(|(s, e)| s < e)
 }
 
 fn span_item(conn: &Connection, uid: &str) -> Result<(SpanItem, ItemId, String)> {
@@ -1085,10 +1177,10 @@ fn approved_state(conn: &Connection, span: ItemId) -> Result<(SpanState, Vec<Str
     if steps.is_empty() {
         return Ok((SpanState::Approved, Vec::new()));
     }
-    // Every task contained, at any depth, under the steps. IMPLEMENTED needs at least one: a step
-    // with no tasks under it has implemented nothing.
+    // Every task contained, at any depth, under each step. IMPLEMENTED needs every step to have at
+    // least one, all `done`: a step with no tasks under it has implemented nothing, and another
+    // step's finished work does not stand in for it.
     let mut implemented = true;
-    let mut tasks = 0;
     let mut stmt = conn.prepare_cached(
         "WITH RECURSIVE under(id) AS (
              SELECT child_item_id FROM containment WHERE parent_item_id = ?1
@@ -1100,10 +1192,9 @@ fn approved_state(conn: &Connection, span: ItemId) -> Result<(SpanState, Vec<Str
     )?;
     for (step, _) in &steps {
         let (count, open): (i64, i64) = stmt.query_row([step], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        tasks += count;
-        implemented &= open == 0;
+        implemented &= count > 0 && open == 0;
     }
-    let state = if implemented && tasks > 0 {
+    let state = if implemented {
         SpanState::Implemented
     } else {
         SpanState::Staged
@@ -1134,7 +1225,7 @@ fn view(conn: &Connection, span: &SpanItem, doc: &Crdt, text: &str) -> Result<Sp
             .and_then(Value::as_str)
             .unwrap_or("operator"),
     )?;
-    let approval = span.metadata.get("approval").filter(|a| !a.is_null());
+    let approval = span.approval();
     let field = |key: &str| {
         approval
             .and_then(|a| a.get(key))
@@ -1144,53 +1235,61 @@ fn view(conn: &Connection, span: &SpanItem, doc: &Crdt, text: &str) -> Result<Sp
     let range = doc.range(&span.uid);
     let (start, end) = range.unwrap_or((0, 0));
     let (words, steps) = approved_state(conn, span.id)?;
-    let pieces = match (&approval, range) {
-        (_, None) => Vec::new(),
-        (None, Some(_)) => vec![SpanPiece {
+    let whole = |state| {
+        vec![SpanPiece {
             start,
             end,
-            state: SpanState::Proposed,
+            state,
             removed: false,
             text: slice(text, start, end),
-        }],
-        (Some(_), Some(_)) => {
-            let snapshot = field("snapshot").ok_or_else(|| {
-                invalid(format!(
-                    "span {} has an approval with no snapshot",
-                    span.uid
-                ))
-            })?;
-            let snapshot = STANDARD
-                .decode(snapshot)
-                .map_err(|e| invalid(format!("span {}'s approval is unreadable: {e}", span.uid)))?;
-            doc.pieces(&span.uid, &crdt::decode_snapshot(&snapshot)?)?
-                .into_iter()
-                .map(
-                    |Piece {
-                         start,
-                         end,
-                         kind,
-                         text,
-                     }| SpanPiece {
-                        start,
-                        end,
-                        state: if kind == PieceKind::Approved {
-                            words
-                        } else {
-                            SpanState::Proposed
-                        },
-                        removed: kind == PieceKind::Removed,
-                        text,
-                    },
-                )
-                .collect()
-        }
+        }]
     };
-    let demoted = approval.is_some() && pieces.iter().any(|p| p.state == SpanState::Proposed);
-    let state = if approval.is_none() || demoted || range.is_none() {
-        SpanState::Proposed
-    } else {
+    let (pieces, displaced) = match (approval, range) {
+        (_, None) => (Vec::new(), false),
+        (None, Some(_)) => (whole(SpanState::Proposed), false),
+        (Some(_), Some(_)) => match span.attested() {
+            // An approval with no record of which words it attests to cannot vouch for any.
+            None => (whole(SpanState::Proposed), true),
+            Some(attested) => {
+                let Pieces { pieces, displaced } =
+                    doc.pieces(&span.uid, &attested)?.unwrap_or(Pieces {
+                        pieces: Vec::new(),
+                        displaced: false,
+                    });
+                let pieces = pieces
+                    .into_iter()
+                    .map(
+                        |Piece {
+                             start,
+                             end,
+                             kind,
+                             text,
+                         }| SpanPiece {
+                            start,
+                            end,
+                            state: if kind == PieceKind::Approved {
+                                words
+                            } else {
+                                SpanState::Proposed
+                            },
+                            removed: kind == PieceKind::Removed,
+                            text,
+                        },
+                    )
+                    .collect();
+                (pieces, displaced)
+            }
+        },
+    };
+    let demoted = approval.is_some()
+        && (displaced
+            || pieces
+                .iter()
+                .any(|p: &SpanPiece| p.state == SpanState::Proposed));
+    let state = if approval_holds(approval.is_some(), demoted, range) {
         words
+    } else {
+        SpanState::Proposed
     };
     Ok(SpanView {
         uid: span.uid.clone(),
@@ -1224,22 +1323,26 @@ fn span_now(conn: &Connection, span: &SpanItem, design: ItemId) -> Result<SpanVi
     view(conn, span, &doc, &doc.text())
 }
 
-/// Approve a span: record the document as it is now as the words `approver` attests to (D53.5).
-/// Only the reviewer the span names approves it — a span naming the operator is the operator's
+/// Approve a span **as the reviewer read it**: `base` is the version token the reviewer read the
+/// span at (D53.4 — read-version semantics, never read-latest). The approval records the Yjs ids of
+/// the span's words in that version ([`Crdt::attest`]), and is refused when those words are not the
+/// span's words now — changed, removed, or added to since — so no one approves words they did not
+/// read. Only the reviewer the span names approves it: a span naming the operator is the operator's
 /// alone; one naming Claude is a Claude session's, or the operator's, who holds every permission.
 ///
-/// A span approved and unchanged since is answered as it is, writing nothing.
+/// A span whose approval already holds is answered as it is, writing nothing.
 ///
 /// # Errors
-/// An unknown span, an approver it does not name, a span whose anchors are gone, or a database
-/// error.
+/// An unknown span, an approver it does not name, a malformed or foreign token, a span unanchored
+/// or covering no words (now or in `base`), one changed since `base`, or a database error.
 pub fn approve(
     conn: &Connection,
     meta: &WriteMeta,
     span_uid: &str,
+    base: &str,
     approver: &Approver,
 ) -> Result<SpanView> {
-    let (mut span, design, _) = span_item(conn, span_uid)?;
+    let (mut span, design, design_uid) = span_item(conn, span_uid)?;
     let reviewer = Reviewer::parse(
         span.metadata
             .get("reviewer")
@@ -1251,41 +1354,70 @@ pub fn approve(
             "span {span_uid} names the operator as its reviewer, so only the operator approves it"
         )));
     }
+    let base = Version::parse(base)?;
     let (doc, _) = load(conn, design)?;
-    let current = view(conn, &span, &doc, &doc.text())?;
+    let text = doc.text();
+    let current = view(conn, &span, &doc, &text)?;
     if !current.anchored {
         return Err(invalid(format!(
             "span {span_uid} is no longer anchored in its design — there are no words to approve"
         )));
     }
-    if current.approved_by.is_some() && !current.demoted {
+    if current.state != SpanState::Proposed {
         return Ok(current);
     }
-    let snapshot = STANDARD.encode(crdt::encode_snapshot(&doc.snapshot()));
+    let read = load_base(conn, design, &base, &doc)?;
+    let (s, e) = read.range(span_uid).ok_or_else(|| {
+        invalid(format!(
+            "span {span_uid} is not anchored in the version you read — re-read with `jkb design \
+             cat` and approve the version you read"
+        ))
+    })?;
+    if s >= e {
+        return Err(invalid(format!(
+            "span {span_uid} covers no words in the version you read — an approval attests to \
+             words, so there is nothing to approve"
+        )));
+    }
+    let attested = STANDARD.encode(crdt::encode_snapshot(&read.attest(s, e)?));
     let at: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |r| {
         r.get(0)
     })?;
     if let Some(obj) = span.metadata.as_object_mut() {
         obj.insert(
             "approval".to_owned(),
-            json!({ "snapshot": snapshot, "by": approver.label(), "at": at }),
+            json!({
+                "attested": attested,
+                "version": base.token(),
+                "by": approver.label(),
+                "at": at,
+            }),
         );
     }
+    let signed = view(conn, &span, &doc, &text)?;
+    if signed.state == SpanState::Proposed {
+        return Err(invalid(format!(
+            "span {span_uid} changed since the version you read, so its words now are not the \
+             words you read — re-read with `jkb design cat` and approve the version you read"
+        )));
+    }
     set_metadata(conn, meta, span.id, &span.metadata)?;
-    view(conn, &span, &doc, &doc.text())
+    announce_span(conn, meta, &design_uid, &signed)?;
+    Ok(signed)
 }
 
 /// Stage an approved span into a plan step: a `stages` edge (D53.6). STAGED is derived from it.
 ///
 /// # Errors
-/// An unknown span or step, a span not (or no longer wholly) approved, or a database error.
+/// An unknown span or step, a span whose derived state is PROPOSED (not, or no longer, approved),
+/// or a database error.
 pub fn stage(
     conn: &Connection,
     meta: &WriteMeta,
     span_uid: &str,
     step_uid: &str,
 ) -> Result<SpanView> {
-    let (span, design, _) = span_item(conn, span_uid)?;
+    let (span, design, design_uid) = span_item(conn, span_uid)?;
     let step = item::id_for_uid(conn, step_uid)?
         .ok_or_else(|| not_found(format!("no plan step `{step_uid}`")))?;
     let kind = item::get(conn, step)?.map(|m| m.kind).unwrap_or_default();
@@ -1294,16 +1426,38 @@ pub fn stage(
             "`{step_uid}` is a {kind}, not a plan step ({STEP_KIND})"
         )));
     }
-    let current = span_now(conn, &span, design)?;
-    if current.approved_by.is_none() || current.demoted {
+    if plan::design_of_step(conn, step, step_uid)? != design {
         return Err(invalid(format!(
-            "span {span_uid} is {}: only approved words are staged — approve it first (`jkb design \
-             approve {span_uid}`)",
-            current.state.as_str()
+            "plan step {step_uid} belongs to another design's plan: a span is staged only into a \
+             step of its own design ({design_uid})"
+        )));
+    }
+    let current = span_now(conn, &span, design)?;
+    if current.state == SpanState::Proposed {
+        return Err(invalid(format!(
+            "span {span_uid} is PROPOSED: only approved words are staged — approve it first (`jkb \
+             design approve {span_uid} --base <token>`)"
         )));
     }
     edge::link(conn, meta, span.id, step, EdgeType::Stages, None)?;
-    span_now(conn, &span, design)
+    let staged = span_now(conn, &span, design)?;
+    announce_span(conn, meta, &design_uid, &staged)?;
+    Ok(staged)
+}
+
+/// Tell a design's subscribers a span's state changed (`kind = "span"` on `design/<uid>`): an
+/// approval or a staging writes item metadata and edges, not the document, so no `update` carries
+/// it. Best effort, as [`publish`] is. A task finishing (IMPLEMENTED) is not announced here — it is
+/// derived from task status, which this module does not write — so a subscriber re-reads
+/// `design.spans` on any message, and on a `gap`.
+fn announce_span(conn: &Connection, meta: &WriteMeta, design: &str, span: &SpanView) -> Result<()> {
+    announce(
+        conn,
+        meta,
+        design,
+        "span",
+        json!({ "design": design, "span": span.uid, "state": span.state.as_str() }),
+    )
 }
 
 /// Fold a design's updates into its snapshot. Versions older than the result can no longer be
@@ -1314,10 +1468,21 @@ pub fn stage(
 pub fn compact(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Compacted> {
     let id = design_id(conn, uid)?;
     let (doc, version) = load(conn, id)?;
+    compact_into(conn, meta, id, &doc, version.seq)
+}
+
+/// Store `doc` — the design through `through` — as its snapshot and delete the rows it covers.
+fn compact_into(
+    conn: &Connection,
+    meta: &WriteMeta,
+    id: ItemId,
+    doc: &Crdt,
+    through: i64,
+) -> Result<Compacted> {
     let previous = snapshot_row(conn, id)?.map(|(seq, _)| seq);
-    if version.seq == 0 || previous == Some(version.seq) {
+    if through == 0 || previous.is_some_and(|p| p >= through) {
         return Ok(Compacted {
-            through: version.seq,
+            through: previous.unwrap_or(through),
             removed: 0,
         });
     }
@@ -1326,10 +1491,10 @@ pub fn compact(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Compact
          ON CONFLICT(design_id) DO UPDATE SET seq = excluded.seq, state_v1 = excluded.state_v1,
              created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
     )?
-    .execute(params![id.get(), version.seq, doc.encode_state()])?;
+    .execute(params![id.get(), through, doc.encode_state()])?;
     let removed = conn
         .prepare_cached("DELETE FROM design_updates WHERE design_id = ?1 AND seq <= ?2")?
-        .execute(params![id.get(), version.seq])?;
+        .execute(params![id.get(), through])?;
     changelog::append(
         conn,
         meta,
@@ -1337,12 +1502,30 @@ pub fn compact(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Compact
         Entity::DesignSnapshots,
         &id.get().to_string(),
         Some(&json!({ "seq": previous })),
-        Some(&json!({ "seq": version.seq, "removed": removed })),
+        Some(&json!({ "seq": through, "removed": removed })),
     )?;
-    Ok(Compacted {
-        through: version.seq,
-        removed,
-    })
+    Ok(Compacted { through, removed })
+}
+
+/// Past [`COMPACT_AT`] rows, fold all but the newest [`COMPACT_KEEP`] into the snapshot, so the
+/// cost of rebuilding the document for a write stays bounded however long an editor types. What it
+/// costs is the same as an operator's compaction, on older rows only: a version read before the
+/// fold can no longer be edited against (re-read and retry), and an update folded away can no
+/// longer be undone (refused by name, [`unrevertable`]).
+fn compact_if_due(conn: &Connection, meta: &WriteMeta, id: ItemId) -> Result<()> {
+    let (rows, newest): (i64, i64) = conn
+        .prepare_cached(
+            "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM design_updates WHERE design_id = ?1",
+        )?
+        .query_row([id.get()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if rows <= COMPACT_AT {
+        return Ok(());
+    }
+    let through = newest - COMPACT_KEEP;
+    let doc = Crdt::new();
+    load_into(conn, id, Some(through), &doc)?;
+    compact_into(conn, meta, id, &doc, through)?;
+    Ok(())
 }
 
 /// Why the update row `rowid` cannot be reverted, or `None` when it can — `undo`'s pre-flight.
@@ -1385,6 +1568,30 @@ pub(crate) fn revert_update(conn: &Connection, meta: &WriteMeta, rowid: i64) -> 
     };
     store_row(conn, meta, design, &uid, &revert)?;
     Ok(1)
+}
+
+/// Why `jkb undo` of transaction `txn`'s insert of `item` would lose design history, or `None`:
+/// the item holds document rows another transaction wrote, or a compaction. Undoing the insert
+/// deletes the item, and `ON DELETE CASCADE` would take every later update with it — text written
+/// after the create, spans whose metadata names the design, and the rows `jkb undo` of each later
+/// edit needs. `undo`'s pre-flight asks this for every `(insert, items)` entry, so the rule holds
+/// at the one place an item insert is reverted rather than at each caller.
+///
+/// # Errors
+/// A database error.
+pub(crate) fn undo_would_lose(conn: &Connection, item: ItemId, txn: i64) -> Result<Option<String>> {
+    let (later, compacted): (bool, bool) = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM design_updates WHERE design_id = ?1 AND txn_id <> ?2),
+                    EXISTS (SELECT 1 FROM design_snapshots WHERE design_id = ?1)",
+        )?
+        .query_row(params![item.get(), txn], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok((later || compacted).then(|| {
+        "it created a design that has been written since, and deleting the design would take \
+         every later update with it; a design's history is append-only (D53.4), even an undo of \
+         an edit appends, so a design written to after its creation is kept"
+            .to_owned()
+    }))
 }
 
 /// Whether removing `item` would lose a design document — its updates are not part of an item

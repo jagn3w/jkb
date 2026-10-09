@@ -45,15 +45,7 @@ fn investigation_path(ops: &Ops<'_>, name: &str, global: bool) -> Result<String>
     if global {
         return Ok(format!("{root}/{name}"));
     }
-    let repo = ops.ambient_here()?.and_then(|mount| {
-        mount
-            .strip_prefix("repos/")
-            .unwrap_or(&mount)
-            .split('/')
-            .next()
-            .map(str::to_owned)
-    });
-    Ok(match repo {
+    Ok(match ops.ambient_repo()? {
         Some(repo) => format!("{root}/{repo}/{name}"),
         None => format!("{root}/{name}"),
     })

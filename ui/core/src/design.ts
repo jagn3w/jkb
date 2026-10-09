@@ -274,6 +274,24 @@ export function parseAnnouncement(payload: unknown): DesignAnnouncement | undefi
   return { design: payload["design"], seq: payload["seq"], update: isString(update) ? update : null };
 }
 
+/**
+ * A `span` message on a design topic: an approval or a staging changed a span's state
+ * (`jkb_core::design::announce_span`). Neither writes the document, so no `update` carries it;
+ * the editor re-reads `design.cat` for the states.
+ */
+export interface SpanAnnouncement {
+  readonly design: string;
+  readonly span: string;
+  readonly state: string;
+}
+
+/** The payload of a `span` message on a design topic, or `undefined` when it is not one. */
+export function parseSpanAnnouncement(payload: unknown): SpanAnnouncement | undefined {
+  if (!isObject(payload) || !isString(payload["design"]) || !isString(payload["span"]) || !isString(payload["state"]))
+    return undefined;
+  return { design: payload["design"], span: payload["span"], state: payload["state"] };
+}
+
 // ---- base64 -----------------------------------------------------------------------------------
 //
 // Standard base64 with padding, as the ops carry update bytes and state vectors (`base64`'s

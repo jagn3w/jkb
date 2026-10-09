@@ -17,6 +17,7 @@ import type {
   OpResponse,
   Outcome,
   PromptAnnouncement,
+  SpanAnnouncement,
 } from "@jkb/core";
 
 import type { TerminalEnd, TerminalEvent, TerminalInfo, TerminalResult, TerminalRoots, TerminalSpec } from "./terminal";
@@ -86,6 +87,7 @@ export interface TerminalBridge {
 export type DesignFeedEvent =
   | ({ readonly topic: string; readonly kind: "update" } & DesignAnnouncement)
   | ({ readonly topic: string; readonly kind: "prompt" } & PromptAnnouncement)
+  | ({ readonly topic: string; readonly kind: "span" } & SpanAnnouncement)
   | { readonly topic: string; readonly kind: "gap"; readonly message: string }
   | { readonly topic: string; readonly kind: "error"; readonly message: string }
   | { readonly topic: string; readonly kind: "live" };

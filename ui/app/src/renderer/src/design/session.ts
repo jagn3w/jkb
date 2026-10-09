@@ -308,6 +308,10 @@ export class DesignSession {
       case "prompt":
         // The Prompts pane's, not the document's.
         return;
+      case "span":
+        // An approval or a staging: the text is unchanged, the states are not.
+        this.#scheduleSpans();
+        return;
     }
   }
 

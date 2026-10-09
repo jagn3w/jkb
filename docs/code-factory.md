@@ -314,7 +314,7 @@ wire-compatible), so the CLI and the app edit the same document with no translat
 - **Storage:** `design_updates(design_id, seq, update BLOB, actor, txn_id, created_at)` —
   append-only Yjs v1 updates — plus a periodic `design_snapshots` compaction. The document is
   the merge of its updates; the table is the source of truth, any rendered text is derived.
-- **Every update is a `write_txn` with a changelog entry** (`Entity::DesignUpdate`), so it is
+- **Every update is a `write_txn` with a changelog entry** (`Entity::DesignUpdates` — the name as built), so it is
   audited like any mutation. **`jkb undo` of an update is a new forward update** that reverts it
   (delete what it inserted, restore what it deleted — the Yjs `UndoManager` construction, done in
   `yrs`), never a row deletion: deleting history from a CRDT corrupts every peer that already
@@ -325,8 +325,9 @@ wire-compatible), so the CLI and the app edit the same document with no translat
   announcement is a hint, never the bytes merged (subtask 4, below). Updates are idempotent and
   commutative, so at-least-once delivery is enough.
 - **Claude edits through the CLI against the version it read, and the CRDT merges.**
-  `jkb design cat <uid>` prints the text with span markers **and a version token** (the Yjs state
-  vector it was read at). `jkb design edit <uid> --base <token> --find <quote> [--occurrence n]
+  `jkb design cat <uid>` prints the text with span markers **and a version token** (~~the Yjs state
+  vector it was read at~~ — *superseded as built:* `<seq>.<state vector>`, because a state vector
+  alone cannot rebuild the text that was read; see the as-built bullet below). `jkb design edit <uid> --base <token> --find <quote> [--occurrence n]
   --replace <text>` / `--insert-after <quote>` / `--span <id> --replace` resolves the quote **in
   the base snapshot**, converts it to Yjs item ids, and builds the update against that snapshot.
   Appending it merges with everything written since, the same way two app peers merge. Both
@@ -352,15 +353,19 @@ Each piece of design text is in exactly one state:
 - **A span** is a range anchored by two Yjs `RelativePosition`s (they move with the text), stored
   in the document's `spans` `Y.Map` and mirrored to a `design_span` item so edges can point at
   it. New text is covered by no span and **reads as PROPOSED**.
-- **APPROVED is the only recorded state.** `jkb design approve <span>` (by the reviewer the span
+- **APPROVED is the only recorded state.** `jkb design approve <span> --base <token>` (by the reviewer the span
   names: `operator` or `claude`, enforced by D52 RBAC) records it.
 - **STAGED and IMPLEMENTED are derived, never set** — the D47 rule that an op is derived, never
   chosen, applied to state. STAGED = an approved span with a `stages` edge to at least one
-  execution-plan step. IMPLEMENTED = every task reachable from those steps is `done`. A column
+  execution-plan step. IMPLEMENTED = every task reachable from those steps is `done` (*as built:*
+  every staged step has at least one task, and all are `done` — see below). A column
   that stored them would disagree with the edges the first time a task reopened.
-- **Editing approved text demotes it.** An insertion inside an approved span splits it, and the
-  edited range is PROPOSED again; the CLI reports the demotion. Approval attests to words, so
-  changed words are unapproved words.
+- **Editing approved text demotes it.** ~~An insertion inside an approved span splits it, and the
+  edited range is PROPOSED again~~ — *superseded as built:* the span's pieces show which words are
+  new or removed, and the **whole span** reads PROPOSED until re-approved (a span half-approved
+  would let STAGED rest on words no reviewer read); see "APPROVED is recorded on the span's item"
+  below. The CLI reports the demotion. Approval attests to words, so changed words are unapproved
+  words.
 - **Selection → Claude:** selecting text and choosing *Discuss* opens the terminal popover with a
   Claude session whose prompt carries the design uid and the selected span's anchors
   (`jkb design prompt discuss <uid> --range …` builds it — the prompt is CLI output, not app
@@ -392,27 +397,81 @@ to learn, and what was decided past the text above:
   changelogged — the `undo` marker is its record, and undoing an undo is not something `undo` does. A
   compaction is logged as bookkeeping (`BOOKKEEPING`), so a bare `jkb undo` reaches past it; an update
   it folded away is refused by name, never reverted on a guess.
-- **APPROVED is recorded on the span's item, not in the CRDT**: `metadata.approval` holds a Yjs snapshot
-  (state vector + deletions) of the document at the approval, and the reviewer the span names is on the
-  item too. Any editor can write the document, so a reviewer stored there could be rewritten by any peer.
-  Which words are still the approved ones is derived by diffing the text against that snapshot: words
-  written inside the span since read PROPOSED, the rest keep the span's state, and words deleted from it
-  are reported as a zero-width removed piece. A span with any of either is `demoted` and reads PROPOSED
-  as a whole until re-approved; `jkb design edit` names the spans it demoted.
+- **`design.apply` stores the change it made, not the bytes it was sent** (`Crdt::merge`: the
+  transaction's own insertions and deletions, re-encoded). A peer's sync-step-2 answer
+  (`encodeStateAsUpdate(doc, sv)`) carries the document's whole delete set; stored verbatim, `jkb undo`
+  of it seeded the `UndoManager` with every deletion in the design and put text deleted long before
+  back (review round 1; `undoing_a_full_state_update_reverts_only_what_it_changed` fails with the raw
+  bytes stored). What is announced is the same delta.
+- **Undoing a design's creation is refused once anything else wrote to it** (`design::undo_would_lose`,
+  asked by `undo`'s pre-flight for every `(insert, items)` entry): deleting the item cascades
+  (`ON DELETE CASCADE`) every later update away, orphaning its spans and every later edit's undo. While
+  only the create's own rows exist it is still undone. Enforced at the one place an item insert is
+  reverted, not by each caller (round 1).
+- **A write folds old rows into the snapshot as it goes**: past 4096 rows, all but the newest 1024 are
+  compacted (`compact_if_due`, from the one logged writer of rows). Every write rebuilds the document
+  from its rows on the single writer thread, so one editor applying per keystroke made every write
+  slower than the last (round 1). The cost is the operator's compaction's, on old rows only: a version
+  older than the fold is re-read, an update older than it is not undone. Span diffing on a write is
+  skipped entirely when no span has an approval.
+- **APPROVED is recorded on the span's item, not in the CRDT**: `metadata.approval` holds what the
+  approval attests to, the version it was made at and who made it; the reviewer the span names is on
+  the item too. Any editor can write the document, so a reviewer stored there could be rewritten by any
+  peer.
+- **An approval attests to the span's words, by their Yjs ids** (`Crdt::attest`): it stores a snapshot
+  whose only visible body characters are the span's characters in the version read. *Superseded first
+  build:* a snapshot of the whole document, cut to the span's current range when diffed — so a
+  `design.apply` that moved an approved span's anchors over unapproved text made that text read
+  APPROVED, and `design.stage` took it (review round 1). Diffing against the attested words, a
+  character is approved only if it is one of them and still present: words written inside the span
+  since read PROPOSED, attested words deleted are a zero-width removed piece, and attested words left
+  outside the anchors (the anchors were moved) mark the span `displaced`. Any of the three demotes the
+  span, which reads PROPOSED as a whole until re-approved; `jkb design edit` names the spans it demoted.
+  An approval recording no readable attestation reads demoted, never approved. Pinned by the proptest
+  `a_span_reads_approved_only_while_its_text_is_the_approved_words` (random peer inserts, deletes and
+  anchor rewrites; fails against the whole-document snapshot).
+- **Approval is of the version the reviewer read** (`design.approve {span, base}`, `jkb design approve
+  <span> --base <token>`): the attested words are taken from `base`, and the approval is refused if
+  they are not the span's words now — the D53.4 read-version rule, applied to approval. *Superseded
+  first build:* approve snapshotted the latest document, so an edit landing between the reviewer's read
+  and the approval was approved unseen (round 1). A span covering no characters (its words all
+  deleted) is refused: an approval attests to words.
+- **One predicate decides whether an approval holds** (`approval_holds`: approved, not demoted,
+  anchored over at least one character), behind both the span's derived state and `design.stage`'s
+  gate, which refuses a span whose derived state is PROPOSED. A hand-copied gate in `stage` once lacked
+  the anchored clause and staged a span that read PROPOSED (round 1).
+- **A span is staged only into a step of its own design's plans** (`plan::design_of_step`): staged into
+  another design's plan, its STAGED/IMPLEMENTED derived from tasks no view of its design connects to.
 - **Anchors**: the start sticks to the span's first character and the end to its last, so text typed at
   either edge stays outside and only an insertion strictly inside splits the span. Spans may not
-  overlap — each piece of text is in exactly one state.
+  overlap — each piece of text is in exactly one state. The rule is checked once, after every write
+  (`finish`: a pair overlapping now that did not before refuses the write), because `design.apply`
+  writes the `spans` map as freely as `design.span` does; it was first checked in `add_span` alone
+  (round 1).
 - **Who approves**: a span naming `operator` is the operator's alone; one naming `claude` is approved by
   a Claude principal (recorded by its label) or the operator, who holds every permission. RBAC adds
   `design` (coordinator, designer) and `design_approve` (those and the reviewer); compaction is the
-  operator's; a design write is no one task's (`Target::Shared`).
-- **IMPLEMENTED needs at least one task** under the span's steps (containment, any depth), all `done`:
-  a step with no tasks has implemented nothing, so vacuous truth is refused.
+  operator's. A design write is no one task's (`Target::Shared`), so a principal held to one task —
+  a task-scoped grant, or an attested subagent — does not write designs: the main session and unscoped
+  grants do. **An approval is `Target::Free`**: the engine holds it to the reviewer the span names, and
+  it is how a `reviewer`-typed subagent (attested by a harness ticket) signs off a span naming `claude`.
+  Shared, that path could never run (round 1; `an_attested_reviewer_subagent_approves_a_span_naming_claude`).
+- **IMPLEMENTED needs every staged step to have at least one task** under it (containment, any depth),
+  all `done`: a step with no tasks has implemented nothing, so vacuous truth is refused — per step, not
+  across them, or one step's finished task stood in for an empty second step (round 1).
 - **Live updates** go to topic `design/<uid>` with the uid's `:` spelled `.` (not a topic character),
   payload `{design, seq, update}` with the update inline up to 32 KiB. Best effort: a full or oversized
-  queue costs a subscriber a `design.state` re-read, never the write.
+  queue costs a subscriber a `design.state` re-read, never the write. An approval or a staging writes
+  no update, so each is announced as `kind = "span"`, `{design, span, state}`, and the editor re-reads
+  the span states on it (round 1). A task finishing (IMPLEMENTED) is not announced: it is task status,
+  which the design engine does not write, and the editor re-reads states after every update and gap.
 - **A design cannot be removed** (`item::remove`, even with `--force`): its updates are not in the
-  delete's snapshot, so `jkb undo` would bring back a design with no text.
+  delete's snapshot, so `jkb undo` would bring back a design with no text. Nor can its creation be
+  undone once anything else wrote to it (above).
+- **`jkb design` and `jkb inv` share one ambient-repo rule** (`Ops::ambient_repo`): the first segment
+  after `repos/` of the ambient mount, and none for a mount elsewhere. Each carried a copy that took a
+  non-repo mount's first segment for a repo (`designs/references`), and `design ls` turned a failed
+  ambient lookup into listing every repo's designs (round 1).
 - ~~**Unmeasured here, stated:** byte compatibility with the app's JavaScript `yjs`.~~ *Measured in
   subtask 4* (below): `ui/app/test/yjs-wire.test.mjs` drives a real `jkb` with `yjs` 13.6.33 as the
   editor — jkb's state loaded, an editor update merged after a two-unit character, a CLI edit merged
