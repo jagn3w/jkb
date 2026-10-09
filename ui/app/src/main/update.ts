@@ -14,7 +14,7 @@
 // a running Electron app loads its helpers from the bundle by path, so it is never swapped under.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import {
@@ -22,6 +22,8 @@ import {
   APP_HOME_IN_HOME,
   APP_INSTALLER_IN_SRC,
   APP_INSTALL_LOG_IN_HOME,
+  APP_INSTALL_RESULT_IN_HOME,
+  APP_LOCK_IN_HOME,
   APP_LOG_IN_HOME,
   APP_SRC_IN_HOME,
   APP_STAGED_IN_HOME,
@@ -35,12 +37,16 @@ import {
   installedExecutable,
   isCommitId,
   parseCommitLog,
+  parseInstallResult,
   parseInstalledStamp,
   type ContainerResult,
   type UpdatePlan,
 } from "@jkb/core";
 
 import { GIT_SELECTION } from "../shared/gitEnv";
+
+// The list scripts/lib.sh's APP_GIT_SELECTION mirrors (a test holds them equal), re-exported for it.
+export { GIT_SELECTION };
 import { plain } from "./container";
 
 /** How long fetching `main` may take. */
@@ -68,12 +74,18 @@ export interface RunResult {
   readonly stderr: string;
   /** The run hit its timeout, and its process group was stopped. */
   readonly timedOut?: boolean;
+  /** The timeout needed SIGKILL: the program may not have run its own exit handling (a lock's release). */
+  readonly forced?: boolean;
   /** The signal that ended the program, when one did. */
   readonly signal?: string;
 }
 
-/** Run `file` with `args`, without a shell, to completion or `timeoutMs`. */
-export type RunFile = (file: string, args: readonly string[], timeoutMs: number) => Promise<RunResult>;
+/**
+ * Run `file` with `args`, without a shell, to completion or `timeoutMs`. With `logFile`, its output
+ * is appended to that file instead of piped back (and `stdout` is the file's tail): what a run that
+ * must outlive this process needs, since a pipe into an exited process kills the writer.
+ */
+export type RunFile = (file: string, args: readonly string[], timeoutMs: number, logFile?: string) => Promise<RunResult>;
 
 /** Start `file` with `args` detached, outliving this process, its output appended to `logFile`. */
 export type StartDetached = (file: string, args: readonly string[], logFile: string) => void;
@@ -244,6 +256,30 @@ export class AppUpdater {
   }
 
   /**
+   * A staged build the last install step did not install, and why, or `undefined`: something is
+   * staged, it is not what runs, and `install.result` says the step ran for it and did not succeed
+   * (75: another build or install held the lock; 76: a copy was running; else a failure). What the
+   * app tells the user at startup, since the step ran after it quit.
+   */
+  pendingInstall(): { commit: string; status: number } | undefined {
+    const staged = this.stagedCommit();
+    if (staged === undefined || staged === this.running.commit) return undefined;
+    let result: ReturnType<typeof parseInstallResult>;
+    try {
+      result = parseInstallResult(readFileSync(join(this.home, APP_INSTALL_RESULT_IN_HOME), "utf8"));
+    } catch {
+      return undefined;
+    }
+    if (result === undefined || result.status === 0) return undefined;
+    if (result.commit !== undefined && result.commit !== staged) return undefined;
+    return { commit: staged, status: result.status };
+  }
+
+  get lockDir(): string {
+    return join(this.home, APP_LOCK_IN_HOME);
+  }
+
+  /**
    * Fetch `main` and say what an update would take. Builds and moves nothing; the fetch goes to
    * `UPDATE_SHOWN_REF`, which no build or install reads, so it needs no lock.
    */
@@ -282,8 +318,10 @@ export class AppUpdater {
 
   /**
    * Build and stage `target` — which must still be `main`'s tip, the commit the user was shown — with
-   * the clone's builder (`--update-to`, which checks that under its lock). Installs nothing. The
-   * build's output goes to `logFile`. Answers the commit staged.
+   * the clone's builder (`--update-to`, which checks that under its lock). Installs nothing. A build
+   * of `target` already staged (an install that did not go through) is not built again. The build's
+   * output goes straight to `logFile`, not through this process, so a quit mid-build leaves it to
+   * finish staging. Answers the commit staged.
    */
   async apply(target: unknown): Promise<Result<string>> {
     if (this.building) return { ok: false, error: "An update is already building." };
@@ -292,24 +330,27 @@ export class AppUpdater {
     if (refused !== undefined) return { ok: false, error: refused };
     const builder = join(this.src, APP_BUILDER_IN_SRC);
     if (!existsSync(builder)) return { ok: false, error: `The clone at ${this.src} has no ${APP_BUILDER_IN_SRC}; run scripts/setup.sh.` };
+    if (this.stagedCommit() === target) return { ok: true, value: target };
     this.building = true;
     try {
       const argv = [builder, "--update-to", target];
+      this.writeLog(`$ ${argv.join(" ")}\n`);
       let r: RunResult;
       try {
-        r = await this.run("/bin/bash", argv, this.buildTimeoutMs);
+        r = await this.run("/bin/bash", argv, this.buildTimeoutMs, this.logFile);
       } catch (e) {
         return { ok: false, error: `could not run ${builder}: ${e instanceof Error ? e.message : String(e)}` };
       }
-      this.writeLog(`$ ${argv.join(" ")}\n${r.stdout}${r.stderr === "" ? "" : `\n--- stderr ---\n${r.stderr}`}\n`);
       const output = tail(`${r.stdout}\n${r.stderr}`);
+      const lockAdvice = `If no build or install of Code Factory is running, remove ${this.lockDir}.`;
       if (r.code === BUILD_EXIT.busy) {
-        return { ok: false, error: `Another build or install of Code Factory is running; try again when it finishes.\n\n${output}` };
+        return { ok: false, error: `Another build or install of Code Factory holds its lock (${this.lockDir}). ${lockAdvice}\n\n${output}` };
       }
       if (r.code !== 0) {
+        const forced = r.forced === true ? ` It had to be killed, so it may have left its lock behind: ${lockAdvice}` : "";
         return {
           ok: false,
-          error: `The build ${describeEnd(r, this.buildTimeoutMs)}. Nothing was installed (a build only stages). Its output is in ${this.logFile}.\n\n${output}`,
+          error: `The build ${describeEnd(r, this.buildTimeoutMs)}. Nothing was installed (a build only stages).${forced} Its output is in ${this.logFile}.\n\n${output}`,
         };
       }
       const staged = this.stagedCommit();
@@ -370,6 +411,34 @@ export function machineEnv(home: string, env: Readonly<Record<string, string | u
   return childEnv;
 }
 
+/** Whether any process in group `pgid` exists. */
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The last `max` bytes of `file`, as text, or "". */
+function fileTail(file: string, max = 256 * 1024): string {
+  try {
+    const size = statSync(file).size;
+    const fd = openSync(file, "r");
+    try {
+      const len = Math.min(size, max);
+      const buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      return buf.toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
 function signalGroup(pgid: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-pgid, signal);
@@ -380,12 +449,13 @@ function signalGroup(pgid: number, signal: NodeJS.Signals): void {
 
 /**
  * Run programs on the real machine from `home`, in `machineEnv`. Each run is its own process group,
- * and a timeout stops the WHOLE group (SIGTERM, then SIGKILL after `graceMs`) — pnpm and
- * electron-builder, not just the bash that started them.
+ * and a timeout stops the WHOLE group (SIGTERM, then SIGKILL after `graceMs` if any of it is left,
+ * which `forced` reports) — pnpm and electron-builder, not just the bash that started them. With a
+ * `logFile` the run's output goes there, not through a pipe into this process.
  */
 export function machineRunner(home: string, env: Readonly<Record<string, string | undefined>>, graceMs = KILL_GRACE_MS): RunFile {
   const childEnv = machineEnv(home, env);
-  return (file, args, timeoutMs) =>
+  return (file, args, timeoutMs, logFile) =>
     new Promise((resolve) => {
       let settled = false;
       const finish = (r: RunResult): void => {
@@ -401,37 +471,53 @@ export function machineRunner(home: string, env: Readonly<Record<string, string 
         return all.length > MAX_OUTPUT ? all.slice(-MAX_OUTPUT) : all;
       };
       let child: ChildProcess;
+      let fd: number | undefined;
       try {
-        child = spawn(file, [...args], { cwd: home, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+        if (logFile !== undefined) {
+          mkdirSync(dirname(logFile), { recursive: true });
+          fd = openSync(logFile, "a");
+        }
+        child = spawn(file, [...args], { cwd: home, env: childEnv, detached: true, stdio: ["ignore", fd ?? "pipe", fd ?? "pipe"] });
       } catch (e) {
         finish({ code: null, stdout: "", stderr: e instanceof Error ? e.message : String(e) });
         return;
+      } finally {
+        if (fd !== undefined) closeSync(fd);
       }
+      // With a log file the output is read back from it, once the run is over.
+      const out = (): string => (logFile === undefined ? stdout : fileTail(logFile));
       child.stdout?.setEncoding("utf8").on("data", (c: string) => (stdout = keep(stdout, c)));
       child.stderr?.setEncoding("utf8").on("data", (c: string) => (stderr = keep(stderr, c)));
       let timedOut = false;
+      let forced = false;
       const timer = setTimeout(() => {
         timedOut = true;
         const pid = child.pid;
-        if (pid !== undefined) {
-          signalGroup(pid, "SIGTERM");
-          setTimeout(() => signalGroup(pid, "SIGKILL"), graceMs).unref();
-        }
-        // Not waiting on 'close': a member of the group holding the pipes would hold it open.
+        if (pid !== undefined) signalGroup(pid, "SIGTERM");
         setTimeout(() => {
-          child.stdout?.destroy();
-          child.stderr?.destroy();
-          finish({ code: null, stdout, stderr, timedOut: true });
+          if (pid !== undefined && groupAlive(pid)) {
+            signalGroup(pid, "SIGKILL");
+            forced = true;
+          }
+          // Not waiting on 'close': a member of the group holding the pipes would hold it open.
+          setTimeout(() => {
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            finish({ code: null, stdout: out(), stderr, timedOut: true, forced });
+          }, 200);
         }, graceMs);
       }, timeoutMs);
       child.on("error", (e) => {
         clearTimeout(timer);
-        finish({ code: null, stdout, stderr: stderr === "" ? e.message : stderr });
+        finish({ code: null, stdout: out(), stderr: stderr === "" ? e.message : stderr });
       });
       child.on("close", (code, signal) => {
         clearTimeout(timer);
-        if (timedOut) finish({ code: null, stdout, stderr, timedOut: true });
-        else finish({ code: code ?? null, stdout, stderr, ...(signal === null ? {} : { signal }) });
+        if (timedOut) {
+          // The leader went on SIGTERM; the grace timer may still find the rest of the group.
+          if (!forced && child.pid !== undefined && groupAlive(child.pid)) return;
+          finish({ code: null, stdout: out(), stderr, timedOut: true, forced });
+        } else finish({ code: code ?? null, stdout: out(), stderr, ...(signal === null ? {} : { signal }) });
       });
     });
 }

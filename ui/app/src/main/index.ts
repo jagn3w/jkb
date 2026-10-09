@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  BUILD_EXIT,
   REMOTE_VAR,
   TOKEN_FILE_VAR,
   daemonUrl,
@@ -360,13 +361,15 @@ async function updateFromMain(): Promise<void> {
     await messageBox({ type: "info", message: "Code Factory is up to date with main", detail: `Installed: ${plan.value.target.slice(0, 12)}` });
     return;
   }
+  // A build of this commit already staged (an install that did not go through) is installed as it is.
+  const staged = updater.stagedCommit() === plan.value.target;
   const { response } = await messageBox({
     type: "question",
-    buttons: ["Build Update", "Cancel"],
+    buttons: [staged ? "Install It" : "Build Update", "Cancel"],
     defaultId: 0,
     cancelId: 1,
     message: summary.message,
-    detail: summary.detail,
+    detail: staged ? `${summary.detail}\n\nThis commit is already built and staged; it is not built again.` : summary.detail,
   });
   if (response !== 0) return;
   showBusy(true);
@@ -376,16 +379,40 @@ async function updateFromMain(): Promise<void> {
     await messageBox({ type: "error", message: "The update was not built", detail: done.error });
     return;
   }
+  await offerInstall(`Code Factory ${done.value.slice(0, 12)} is ready`, "It is installed once the app has quit — never while it runs. Open terminals close.");
+}
+
+/** Ask when to install the staged build: now (quit, install, relaunch) or at the next quit. */
+async function offerInstall(message: string, detail: string): Promise<void> {
   const ready = await messageBox({
     type: "question",
     buttons: ["Quit and Install", "Install When I Quit"],
     defaultId: 0,
     cancelId: 1,
-    message: `Code Factory ${done.value.slice(0, 12)} is ready`,
-    detail: "It is installed once the app has quit — never while it runs. Open terminals close.",
+    message,
+    detail,
   });
   installOnQuit = { relaunch: ready.response === 0 };
   if (ready.response === 0) app.quit();
+}
+
+/**
+ * At startup: a staged build the last install step did not install (it ran after the app quit, so
+ * nobody saw why). Said, with the reason, and offered again.
+ */
+async function notePendingInstall(): Promise<void> {
+  const pending = updater.pendingInstall();
+  if (pending === undefined) return;
+  const why =
+    pending.status === BUILD_EXIT.running
+      ? "a copy of Code Factory was still running"
+      : pending.status === BUILD_EXIT.busy
+        ? "another build or install held its lock"
+        : `it failed (status ${pending.status})`;
+  await offerInstall(
+    `Code Factory ${pending.commit.slice(0, 12)} was built but not installed`,
+    `The last install did not go through: ${why}. Its output is in ${updater.installLogFile}.`,
+  );
 }
 
 /** The application menu: the platform's standard menus, plus *jkb* with *Update from main…*. */
@@ -422,6 +449,7 @@ if (refusal !== undefined) {
     installMenu();
     registerBridge();
     createWindow();
+    void notePendingInstall();
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
@@ -440,7 +468,8 @@ app.on("will-quit", (event) => {
   // first pass, before the notify leave below holds the quit: it is a detached spawn that returns at
   // once, and the step itself waits for this process to exit, so neither delays the other. Once,
   // because the leave re-quits and this handler runs again. A quit during a build leaves that build
-  // to finish staging; the next update or setup.sh takes it from there.
+  // running (its output goes to update.log, not to this process) to finish staging; if it still
+  // holds the lock when the install step starts, the step records that (75) and the next start says so.
   if (installOnQuit !== undefined && !installerStarted) {
     installerStarted = true;
     const started = updater.startInstaller(process.pid, installOnQuit.relaunch);

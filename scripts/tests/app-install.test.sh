@@ -18,6 +18,8 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 
 new_workdir
 isolate_git "$work/home"
+# Where the account's home is, for app_account_home: the tests' own, never the real one.
+export JKB_APP_ACCOUNT_HOME="$work/home"
 
 os="$(uname -s)"
 # What electron-builder leaves on this platform, relative to ui/, and its executable inside it.
@@ -38,8 +40,10 @@ case "\$*" in
     *"run package"*)
         mkdir -p "$product" "\$(dirname "$product_exe")" && printf '%s\n' "\${STUB_ID:-x}" >"$product/id" \\
             && { [ ! -f app/out/commit ] || cp app/out/commit "$product/commit"; } \\
-            && printf '#!/bin/sh\necho ran >>"\${STUB_RAN:-/dev/null}"\n' >"$product_exe" && chmod +x "$product_exe" ;;
-    *"run build"*) [ -z "\${STUB_FAIL_BUILD:-}" ] || exit 1; mkdir -p app/out ;;
+            && printf '#!/bin/sh\necho ran >>"\${STUB_RAN:-/dev/null}"\n' >"$product_exe" && chmod +x "$product_exe" \\
+            && { [ -z "\${STUB_UNREADABLE:-}" ] || { echo secret >"$product/secret" && chmod 000 "$product/secret"; }; } ;;
+    *"run build"*) [ -z "\${STUB_FAIL_BUILD:-}" ] || exit 1; mkdir -p app/out
+                   [ -z "\${STUB_HANG:-}" ] || { : >"\$STUB_HANG"; sleep 30; } ;;
 esac
 exit 0
 EOF
@@ -217,6 +221,14 @@ case4() {
     STUB_FAIL_BUILD=1 build "$app_home" >/dev/null 2>&1 && fail "builder: failed build" "exit 0"
     [ "$(app_staged_commit "$app_home")" = "$main" ] && ok "builder: a failed build leaves the staged copy alone" \
         || fail "builder: failed build" "staged=$(app_staged_commit "$app_home")"
+    # A copy into staging that fails (here an unreadable file; a full disk in life) keeps the last
+    # staged copy whole, and leaves no half-made one.
+    STUB_UNREADABLE=1 build "$app_home" >/dev/null 2>&1 && fail "builder: failed copy" "exit 0"
+    [ "$(app_staged_commit "$app_home")" = "$main" ] && [ "$(cat "$app_home/staged/app/id" 2>/dev/null)" = first ] \
+        && [ ! -e "$app_home/staged.new" ] && [ ! -e "$app_home/lock" ] \
+        && ok "builder: a failed copy into staging keeps the last staged copy, and unlocks" \
+        || fail "builder: failed copy" "staged=$(app_staged_commit "$app_home") $(ls "$app_home")"
+    chmod -R u+rw "$src/ui/app/dist" 2>/dev/null
     # --update-to: the app's path. A commit that is no longer main's tip is refused and nothing moves.
     land three
     local head_before
@@ -274,6 +286,9 @@ case5() {
         && [ "$(app_installed_dest "$app_home")" = "$dest" ] && [ ! -e "$app_home/staged" ] && [ ! -e "$app_home/lock" ] \
         && ok "install: swaps the staged app in, stamps commit and dest, removes the staged copy, unlocks" \
         || fail "install: first" "id=$(cat "$dest/id" 2>&1) stamp=$(cat "$app_home/installed" 2>&1)"
+    [ "$(cat "$app_home/install.result" 2>/dev/null)" = "$(printf 'status=0\ncommit=%s' "$main")" ] \
+        && ok "install: records its outcome for the app (install.result)" \
+        || fail "install: result" "$(cat "$app_home/install.result" 2>&1)"
     if [ "$os" = Linux ]; then
         grep -qF "Exec=\"$dest/code-factory\"" "$work/xdg/applications/jkb-code-factory.desktop" 2>/dev/null \
             && ok "install: writes a desktop entry for the installed app" \
@@ -317,12 +332,24 @@ case5() {
     [ "$rc" = 1 ] && [ "$(cat "$dest/id")" = second ] && [ -n "$(app_staged_commit "$app_home")" ] \
         && ok "install: a stamp it cannot write refuses the swap, keeping the app and the staged copy" \
         || fail "install: unwritable stamp" "rc=$rc id=$(cat "$dest/id") $out"
-    # A held lock: 75, nothing swapped.
-    mkdir -p "$app_home/lock" && echo 1 >"$app_home/lock/pid" && echo theirs >"$app_home/lock/token"
-    out="$(install "$app_home" "$dest" 2>&1)"; rc=$?
+    # A held lock: 75, nothing swapped, the lock's path and holder named, and NOT relaunched — another
+    # install is at work.
+    mkdir -p "$app_home/lock" && echo 4242 >"$app_home/lock/pid" && echo theirs >"$app_home/lock/token"
+    : >"$work/c5/ran"
+    out="$(STUB_RAN="$work/c5/ran" install "$app_home" "$dest" --relaunch 2>&1)"; rc=$?
     rm -rf "$app_home/lock"
-    [ "$rc" = "$APP_EXIT_BUSY" ] && [ "$(cat "$dest/id")" = second ] && ok "install: a held lock is busy (75), nothing swapped" \
-        || fail "install: lock" "rc=$rc $out"
+    sleep 0.3
+    case "$out" in *"$app_home/lock"*"pid 4242"*"remove it"*) local named=1 ;; *) local named=0 ;; esac
+    [ "$rc" = "$APP_EXIT_BUSY" ] && [ "$(cat "$dest/id")" = second ] && [ "$named" = 1 ] && [ ! -s "$work/c5/ran" ] \
+        && ok "install: a held lock is busy (75): nothing swapped, the lock and holder named, no relaunch" \
+        || fail "install: lock" "rc=$rc ran=$(cat "$work/c5/ran") $out"
+    # A `set -e` failure after the lock is taken (stdout closed: the first echo fails) releases it,
+    # through app_lock's EXIT trap, and records the failure.
+    out="$(install "$app_home" "$dest" 2>&1 >&-)"; rc=$?
+    [ "$rc" != 0 ] && [ ! -e "$app_home/lock" ] && [ "$(cat "$dest/id")" = second ] \
+        && grep -qx "status=$rc" "$app_home/install.result" \
+        && ok "install: a set -e failure after taking the lock releases it and records the failure" \
+        || fail "install: set -e" "rc=$rc lock=$(ls "$app_home/lock" 2>&1) $(cat "$app_home/install.result" 2>&1) $out"
 }
 
 # --- 6. app_swap: only over jkb's app, and a failure leaves the installed app in place -------------
@@ -356,6 +383,25 @@ case6() {
     [ "$(cat "$d/dest/id" 2>/dev/null)" = new ] && [ -z "$(ls -d "$d"/dest.new.* 2>/dev/null)" ] \
         && ok "swap: a failed rename puts the installed app back" \
         || fail "swap: rollback" "dest=$(cat "$d/dest/id" 2>&1) temp=$(ls -d "$d"/dest.new.* 2>&1)"
+    # A copy started while the new one was being copied (the Dock, a relaunch): app_swap checks again
+    # right before moving the old bundle aside, refuses with 76, and leaves no temp copy.
+    run_as_app "$d/dest"
+    local swap_rc=0
+    app_swap "$d/newer" "$d/dest" "$h" 2>/dev/null || swap_rc=$?
+    stop_app
+    rm -f "$(app_executable "$os" "$d/dest")"
+    [ "$swap_rc" = "$APP_EXIT_RUNNING" ] && [ "$(cat "$d/dest/id")" = new ] && [ -z "$(ls -d "$d"/dest.new.* 2>/dev/null)" ] \
+        && ok "swap: a copy running from dest when it comes to move it aside refuses (76)" \
+        || fail "swap: running re-check" "rc=$swap_rc id=$(cat "$d/dest/id")"
+    # A helper process counts: on macOS they run from Contents/Frameworks, not the main executable.
+    local helper="$d/dest/Contents/Frameworks/Code Factory Helper (GPU).app/Contents/MacOS/Code Factory Helper (GPU)"
+    mkdir -p "$(dirname "$helper")" && cp "$(command -v sleep)" "$helper"
+    "$helper" 30 & app_pid=$!
+    sleep 0.2
+    app_running "$os" "$d/dest" && ok "running: a helper process anywhere in the bundle counts" \
+        || fail "running: helper" "not seen"
+    stop_app
+    rm -rf "$d/dest/Contents"
     # A first install vouches for its dest BEFORE anything moves: if the final stamp then cannot be
     # written, the next install still replaces it rather than refusing it as foreign.
     local h2="$d/home2"
@@ -374,7 +420,7 @@ case7() {
     mkdir -p "$h"
     dest="$(app_default_dest "$os" "$h" "$app_home")"
     step() {
-        (HOME="$h" JKB_APP_BUILD_TEST=1 PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg7" install_app "$checkout" "$app_home" >/dev/null 2>&1
+        (HOME="$h" JKB_APP_ACCOUNT_HOME="$h" JKB_APP_BUILD_TEST=1 PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg7" install_app "$checkout" "$app_home" >/dev/null 2>&1
          echo "$app_state" >"$work/c7/state")
         cat "$work/c7/state"
     }
@@ -408,6 +454,26 @@ case7() {
         && ok "install_app: installs once nothing runs or holds the lock, and releases it" \
         || fail "install_app: after" "$(cat "$work/c7/state"); lock: $(ls "$app_home/lock" 2>&1)"
 
+    # Ctrl-C during the build: the whole foreground group gets SIGINT, and the lock is released by
+    # app_lock's own trap in install_app's subshell (job control on, so the job takes SIGINT as an
+    # interactive one would).
+    land four
+    rm -f "$work/c7/hang"
+    set -m
+    (HOME="$h" JKB_APP_ACCOUNT_HOME="$h" JKB_APP_BUILD_TEST=1 PNPM_HOME="$stub" STUB_HANG="$work/c7/hang" \
+        install_app "$checkout" "$app_home" >/dev/null 2>&1) &
+    local job=$!
+    set +m
+    local i=0
+    while [ ! -e "$work/c7/hang" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    [ -d "$app_home/lock" ] || fail "premise: the build holds the lock" "no lock while building"
+    kill -INT -- "-$job" 2>/dev/null
+    wait "$job" 2>/dev/null
+    [ -e "$work/c7/hang" ] && [ ! -e "$app_home/lock" ] \
+        && ok "install_app: Ctrl-C mid-build releases the lock" \
+        || fail "install_app: SIGINT" "hang=$(ls "$work/c7/hang" 2>&1) lock=$(ls "$app_home/lock" 2>&1)"
+    [ "$(step)" = installed ] && ok "install_app: and the next run installs" || fail "install_app: after SIGINT" "$(cat "$work/c7/state")"
+
     NO_BUILDER=1 fixture c7b
     [ "$(step)" = no-builder ] && ok "install_app: a main without the builder says so" \
         || fail "install_app: no builder" "$(cat "$work/c7/state")"
@@ -427,5 +493,25 @@ case7() {
     done
 }
 
-run_cases case1 case2 case3 case4 case5 case6 case7
+# --- 8. one home: the account's, from the user database, not $HOME -------------------------------
+case8() {
+    local expect u
+    u="$(id -un)"
+    if command -v getent >/dev/null 2>&1; then
+        expect="$(getent passwd "$u" | cut -d: -f6)"
+    else
+        expect="$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory: //')"
+    fi
+    [ -n "$expect" ] || { fail "premise: the account's home" "no getent or dscl"; return; }
+    local got
+    got="$(env -u JKB_APP_ACCOUNT_HOME -u JKB_APP_BUILD_TEST HOME="$work/not-the-home" bash -c '. "$0"; app_account_home; app_default_home' "$repo_root/scripts/lib.sh")"
+    [ "$got" = "$(printf '%s\n%s' "$expect" "$expect/.local/share/jkb-app")" ] \
+        && ok "home: with HOME elsewhere, the app home is under the account's home ($expect)" \
+        || fail "home: account" "got $got, want $expect"
+    got="$(env -u JKB_APP_BUILD_TEST HOME="$work/not-the-home" JKB_APP_ACCOUNT_HOME=/elsewhere bash -c '. "$0"; app_account_home' "$repo_root/scripts/lib.sh")"
+    [ "$got" = "$expect" ] && ok "home: the tests' override is ignored outside the tests" \
+        || fail "home: override" "got $got"
+}
+
+run_cases case1 case2 case3 case4 case5 case6 case7 case8
 finish

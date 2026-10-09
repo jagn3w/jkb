@@ -14,6 +14,7 @@ import {
   installedExecutable,
   isCommitId,
   parseCommitLog,
+  parseInstallResult,
   parseInstalledStamp,
   updateSummary,
 } from "../dist/index.js";
@@ -87,4 +88,11 @@ test("a rewritten main and a missing stamp are said, not hidden", () => {
   const fresh = updateSummary({ installed: undefined, target: B, commits: [], diverged: false });
   assert.equal(fresh?.message, "Build Code Factory from main?");
   assert.match(fresh?.detail ?? "", /No installed commit is recorded/);
+});
+
+test("the install step's result is read for its status and commit", () => {
+  assert.deepEqual(parseInstallResult(`status=76\ncommit=${A}\n`), { status: 76, commit: A });
+  assert.deepEqual(parseInstallResult("status=75\ncommit=\n"), { status: 75, commit: undefined });
+  assert.equal(parseInstallResult("commit=x\n"), undefined);
+  assert.equal(parseInstallResult(""), undefined);
 });

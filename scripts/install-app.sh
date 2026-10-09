@@ -5,8 +5,8 @@
 #
 # scripts/build-app.sh stages a build at <app-home>/staged ({app/, commit}). This swaps it in at the
 # one place the app runs from (~/Applications/Code Factory.app on macOS, <app-home>/app elsewhere) —
-# but ONLY while no copy of the app is running (lib.sh's app_running, from `ps -ww`): a running
-# Electron app loads its helpers from the bundle by path, so a swap under it would run the new
+# but ONLY while no copy of the app is running (lib.sh's app_running, from `ps -ww`, checked again
+# just before the old bundle is moved aside): a running Electron app loads its helpers from the bundle by path, so a swap under it would run the new
 # bundle's helpers in the old process. If one is running, nothing is swapped and the staged copy is
 # kept for next time (exit 76).
 #
@@ -15,8 +15,11 @@
 # (`commit=`, `dest=`), then the staged copy is removed. On Linux it writes a desktop entry.
 #
 # --wait-pid PID: first wait (up to two minutes) for PID — the app that started this on its way out —
-# and every other copy of the app to exit. --relaunch: start the app afterwards, whatever happened,
-# unless a copy is running. The app's *Update from main…* starts this detached with both; setup.sh
+# and every process running from the app's bundle to exit. --relaunch: start the app afterwards (the
+# new copy, or the old one when the install failed), except after 75 or 76 and never while one runs.
+# Every outcome is recorded in <app-home>/install.result (`status=`, `commit=`) for the app to read
+# at its next start; the lock is released and the relaunch made from the EXIT trap, so a `set -e`
+# failure or a signal ends the same way. The app's *Update from main…* starts this detached with both; setup.sh
 # runs it with neither, after build-app.sh, when the app is not running.
 #
 # It holds lib.sh's app lock (or proceeds under its caller's, JKB_APP_LOCK_TOKEN). Exit status: 0
@@ -54,32 +57,48 @@ done
 
 app_check_home "$app_home" || exit 2
 os="$(uname -s)"
-[ -n "$dest" ] || dest="$(app_default_dest "$os" "$HOME" "$app_home")"
+[ -n "$dest" ] || dest="$(app_default_dest "$os" "$(app_account_home)" "$app_home")"
 exe="$(app_executable "$os" "$dest")"
+commit=""
 
-# end <status> <message> — release the lock, relaunch if asked and nothing runs, and exit.
-end() {
+# app_on_exit <status> — run however this script ends (lib.sh's app_lock calls it from its EXIT
+# trap once the lock is held, after releasing it; the trap below before that). Records the outcome
+# for the app to read at its next start (<app-home>/install.result), and relaunches if asked —
+# never after 75 (another install is at work) or 76 (a copy is running), and never while one runs.
+app_on_exit() {
     local status="$1"
-    shift
-    [ "$#" -eq 0 ] || printf 'install-app.sh: %s\n' "$*" >&2
-    app_unlock "$app_home"
-    if [ "$relaunch" = 1 ] && ! app_running "$os" "$dest" && [ -e "$exe" ]; then
+    { printf '%s\n' "status=$status" "commit=$commit" >"$app_home/install.result.tmp" \
+        && mv -f "$app_home/install.result.tmp" "$app_home/install.result"; } 2>/dev/null || :
+    case "$status" in "$APP_EXIT_BUSY"|"$APP_EXIT_RUNNING") return 0 ;; esac
+    if [ "$relaunch" = 1 ] && [ -e "$exe" ] && ! app_running "$os" "$dest"; then
         if [ "$os" = Darwin ]; then
             open "$dest" >/dev/null 2>&1 || :
         else
             nohup "$exe" >/dev/null 2>&1 &
         fi
     fi
+    return 0
+}
+trap '_rc=$?; app_on_exit "$_rc"; exit "$_rc"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap '' PIPE
+
+# fail <status> <message> — say why, and exit (the EXIT trap does the rest).
+fail() {
+    local status="$1"
+    shift
+    printf 'install-app.sh: %s\n' "$*" >&2
     exit "$status"
 }
-trap 'end 143 "stopped"' TERM INT HUP
 
 if [ -n "$wait_pid" ]; then
-    case "$wait_pid" in *[!0-9]*) end 2 "--wait-pid is not a pid: $wait_pid" ;; esac
+    case "$wait_pid" in *[!0-9]*) fail 2 "--wait-pid is not a pid: $wait_pid" ;; esac
     tries=600
     while kill -0 "$wait_pid" 2>/dev/null || app_running "$os" "$dest"; do
         tries=$((tries - 1))
-        [ "$tries" -gt 0 ] || end "$APP_EXIT_RUNNING" "Code Factory is still running; the staged copy is kept for the next install"
+        [ "$tries" -gt 0 ] || fail "$APP_EXIT_RUNNING" "Code Factory is still running; the staged copy is kept for the next install"
         sleep 0.2
     done
 fi
@@ -88,29 +107,35 @@ lock_rc=0
 app_lock "$app_home" || lock_rc=$?
 case "$lock_rc" in
     0) ;;
-    1) end "$APP_EXIT_BUSY" ;;
-    *) end 1 ;;
+    1) exit "$APP_EXIT_BUSY" ;;
+    *) exit 1 ;;
 esac
 
 commit="$(app_staged_commit "$app_home")"
-[ -n "$commit" ] || end 1 "nothing is staged in $app_home/$APP_STAGED_IN_APP_HOME (scripts/build-app.sh stages a build)"
+[ -n "$commit" ] || fail 1 "nothing is staged in $app_home/$APP_STAGED_IN_APP_HOME (scripts/build-app.sh stages a build)"
 running=0
 app_running "$os" "$dest" || running=$?
 case "$running" in
-    0) end "$APP_EXIT_RUNNING" "Code Factory is running from $dest: quit it to install ${commit:0:12}; the staged copy is kept" ;;
-    2) end 1 "cannot tell whether Code Factory is running (no ps), so nothing is swapped" ;;
+    0) fail "$APP_EXIT_RUNNING" "Code Factory is running from $dest: quit it to install ${commit:0:12}; the staged copy is kept" ;;
+    2) fail 1 "cannot tell whether Code Factory is running (no ps), so nothing is swapped" ;;
 esac
 
 echo "==> installing Code Factory ${commit:0:12} at $dest"
-app_swap "$app_home/$APP_STAGED_IN_APP_HOME/app" "$dest" "$app_home" || end 1 "the installed app is unchanged"
+swap_rc=0
+app_swap "$app_home/$APP_STAGED_IN_APP_HOME/app" "$dest" "$app_home" || swap_rc=$?
+case "$swap_rc" in
+    0) ;;
+    "$APP_EXIT_RUNNING") fail "$APP_EXIT_RUNNING" "the staged copy is kept for the next install" ;;
+    *) fail 1 "the installed app is unchanged" ;;
+esac
 # The stamp names the commit now in place. If it cannot be written, app_swap's own stamp still names
 # <dest> (with the commit before), so the next install sees a stale commit and replaces it.
 app_stamp "$app_home" "$commit" "$dest" \
     || warn "Code Factory ${commit:0:12} is installed, but $app_home/installed could not be written; the next install re-stamps it"
-rm -rf "${app_home:?}/$APP_STAGED_IN_APP_HOME"
+rm -rf "${app_home:?}/$APP_STAGED_IN_APP_HOME" || warn "could not remove the staged copy; the next build replaces it"
 
 if [ "$os" = Linux ]; then
-    apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    apps="${XDG_DATA_HOME:-$(app_account_home)/.local/share}/applications"
     if mkdir -p "$apps" && cat >"$apps/.jkb-code-factory.desktop.tmp" <<EOF && mv -f "$apps/.jkb-code-factory.desktop.tmp" "$apps/jkb-code-factory.desktop"; then
 [Desktop Entry]
 Type=Application
@@ -126,4 +151,3 @@ EOF
     fi
 fi
 echo "installed Code Factory ${commit:0:12} at $dest"
-end 0

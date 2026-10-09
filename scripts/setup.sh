@@ -54,7 +54,7 @@ watcher_state=running
 serve_state=unchecked
 kit_state=installed
 app_state=skipped
-app_home="$HOME/.local/share/jkb-app"
+app_home="$(app_default_home)"
 db="${JKB_DB:-$HOME/.jkb/jkb.db}"
 
 while [ "$#" -gt 0 ]; do
@@ -413,7 +413,7 @@ render_setup_summary < <(
   printf 'watcher=%s\n' "$watcher_state"
   printf 'serve=%s\n' "$serve_state"
   printf 'kit=%s %s\n' "$kit_state" "$("$repo_root/.container/run.sh" --kit-path 2>/dev/null || echo '(unknown)')"
-  printf 'app=%s %s\n' "$app_state" "$(app_default_dest "$(uname -s)" "$HOME" "$app_home")"
+  printf 'app=%s %s\n' "$app_state" "$(app_default_dest "$(uname -s)" "$(app_account_home)" "$app_home")"
   printf 'topic=%s %s\n' "$notify_topic_state" "$notify_topic"
   printf 'notifier=%s %s\n' "$notifier_state" "${notifier_pid:-}"
 )

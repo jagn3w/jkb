@@ -20,8 +20,9 @@
 # this script. setup.sh moves the clone itself (lib.sh's app_clone_refresh) and runs this without it.
 #
 # It holds lib.sh's app lock throughout (or proceeds under its caller's, passed in
-# JKB_APP_LOCK_TOKEN), so two builds never share the clone or the staging directory. Exit status:
-# 0 staged; 75 another build or install holds the lock; anything else, a failure.
+# JKB_APP_LOCK_TOKEN), so two builds never share the clone or the staging directory; app_lock
+# releases it however this ends. Exit status: 0 staged; 75 another build or install holds the lock
+# (stderr names it and its holder); anything else, a failure.
 #
 # Repository selection (GIT_DIR and the rest) and Electron's variables are dropped first, for every
 # caller: the post-merge hook runs setup.sh with GIT_DIR naming the merged repository, and pnpm's
@@ -68,8 +69,6 @@ case "$lock_rc" in
     1) exit "$APP_EXIT_BUSY" ;;
     *) exit 1 ;;
 esac
-trap 'app_unlock "$app_home"' EXIT
-trap 'exit 143' TERM INT HUP
 
 if [ -n "$update_to" ]; then
     case "$update_to" in *[!0-9a-f]*) die "--update-to is not a commit id: $update_to" ;; esac
@@ -113,11 +112,14 @@ pnpm --filter @jkb/app run package
 built="$(app_built_product "$repo_root/ui/app/dist" "$os")" || die "the package step left no app to stage"
 
 # --- stage --------------------------------------------------------------------------------------
-# Whole or not at all: built beside, then renamed over the last staged copy (abandoned or not).
+# Whole or not at all: built beside, and only once complete renamed over the last staged copy, so a
+# failed copy (a full disk) leaves that copy as it was.
 staged="$app_home/$APP_STAGED_IN_APP_HOME"
-rm -rf "$staged.new" "$staged"
+rm -rf "$staged.new" "$staged.old"
 mkdir -p "$staged.new"
-cp -pR "$built" "$staged.new/app" || die "could not copy $built into $staged.new"
-printf '%s\n' "$commit" >"$staged.new/commit" || die "could not write $staged.new/commit"
-mv "$staged.new" "$staged" || die "could not move $staged.new to $staged"
+cp -pR "$built" "$staged.new/app" || { rm -rf "$staged.new"; die "could not copy $built into $staged.new"; }
+printf '%s\n' "$commit" >"$staged.new/commit" || { rm -rf "$staged.new"; die "could not write $staged.new/commit"; }
+if [ -e "$staged" ]; then mv "$staged" "$staged.old" || die "could not move the last staged copy aside"; fi
+mv "$staged.new" "$staged" || { [ ! -e "$staged.old" ] || mv "$staged.old" "$staged"; die "could not move $staged.new to $staged"; }
+rm -rf "$staged.old"
 echo "staged Code Factory ${commit:0:12} at $staged; scripts/install-app.sh installs it"

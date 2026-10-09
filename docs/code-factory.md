@@ -162,24 +162,32 @@ installed app:
   `pnpm install --frozen-lockfile`, `pnpm --filter "@jkb/app..." run build` (each package
   type-checks before it emits), the commit written to `ui/app/out/commit` (packed with `out/**`, so
   the app knows what *it* is), `pnpm --filter @jkb/app run package` (`electron-builder --dir`), and
-  the result copied whole to `<app-home>/staged/{app,commit}` (built beside and renamed, replacing
-  any earlier or abandoned staged copy). `--update-to SHA` is the app's way in: under the lock it
+  the result copied whole to `<app-home>/staged/{app,commit}` (copied to `staged.new` and renamed
+  over the last staged copy only once complete, so a failed copy keeps that one). `--update-to SHA` is the app's way in: under the lock it
   fetches `main`, refuses unless the tip is SHA (the commit the user was shown), moves and cleans
   the clone, and builds with *that* commit's copy of the script.
 - **`scripts/install-app.sh` is the one step that swaps,** and only while no copy is running
   (`app_running`, from `ps -ww -A -o args=` — `-ww` because BSD ps otherwise cuts the path to the
-  terminal width; it matches the executable at `app_executable`, `…/Contents/MacOS/Code Factory`
-  on macOS and `…/code-factory` elsewhere, which Electron's helpers share). If one runs it swaps
-  nothing, keeps the staged copy, and exits 76. Otherwise `app_swap` (below) puts `staged/app` at
-  the one place the app runs from, the stamp `<app-home>/installed` (`commit=`, `dest=`) names it,
-  the staged copy is removed, and on Linux a desktop entry is written. `--wait-pid PID` first waits
-  (up to two minutes) for PID and every copy of the app to exit; `--relaunch` then starts the app —
-  the new one, or the old one when nothing could be installed — unless a copy is running.
+  terminal width; it matches any process whose arguments name the bundle prefix `<dest>/`, so
+  Electron's helpers count too — on macOS they run from `Contents/Frameworks/Code Factory
+  Helper*.app/`, not `Contents/MacOS/`). It checks before it starts, and `app_swap` checks again
+  right before it moves the old bundle aside (the copy takes seconds; a copy opened meanwhile from
+  the Dock must not lose its bundle). If one runs it swaps nothing, keeps the staged copy, and exits
+  76. Otherwise `app_swap` (below) puts `staged/app` at the one place the app runs from, the stamp
+  `<app-home>/installed` (`commit=`, `dest=`) names it, the staged copy is removed, and on Linux a
+  desktop entry is written. `--wait-pid PID` first waits (up to two minutes) for PID and every
+  process of the bundle to exit; `--relaunch` then starts the app — the new one, or the old one
+  when the install failed — but never after 75 (another install is at work) or 76, and never while
+  a copy runs. Every outcome is written to `<app-home>/install.result` (`status=`, `commit=`), and
+  the release, the record and the relaunch all happen in the EXIT trap, so a `set -e` failure or a
+  signal ends the same way as success.
 - **setup.sh (`install_app`)**: under the lock, `app_clone_refresh` (clone from the checkout's
   `origin` on first use only — after that the clone's own `origin` is fetched, so a checkout cannot
   redirect it; fetch `+refs/heads/main:refs/remotes/origin/main`; detach there with `--force`;
   `git clean -ffd`, which keeps ignored build state such as `node_modules`), then the clone's
-  `build-app.sh` and `install-app.sh`. It is `unchanged`, building nothing, when the stamp names
+  `build-app.sh` and `install-app.sh`, all in a subshell of its own so the lock's traps (below)
+  release it however the step ends — Ctrl-C during the build included. It is `unchanged`, building
+  nothing, when the stamp names
   `main`'s tip and the app is where it was put (setup.sh runs after every pull touching `ui/`);
   **`running`, building nothing, when the app is running** — the summary says to quit Code Factory
   and re-run setup.sh (or use its own update) — and `busy` when the lock is held.
@@ -190,16 +198,27 @@ installed app:
   "opportunistically" (measured: without it the plan's fetch moved `origin/main`), so it needs no
   lock — and shows `installed..main`, where *installed* is the running copy's `out/commit` and only
   failing that the stamp. On a yes it runs `build-app.sh --update-to <sha>` while the app keeps
-  working, requires the staged commit to be that sha, and asks *Quit and Install* or *Install When
-  I Quit*. On `will-quit` it starts `install-app.sh --wait-pid <its pid> [--relaunch]` detached
-  (output in `<app-home>/install.log`). Quitting during a build abandons nothing that matters: the
-  build finishes staging, and the next update or setup.sh rebuilds over it.
+  working — unless that sha is already staged (an install that did not go through), which is
+  offered as it is — requires the staged commit to be that sha, and asks *Quit and Install* or
+  *Install When I Quit*. On `will-quit` it starts `install-app.sh --wait-pid <its pid> [--relaunch]`
+  detached (output in `<app-home>/install.log`). The build's output goes straight to
+  `update.log`, never through a pipe into the app (review round 4 measured a detached build with
+  piped output dying at its next write once the app had exited), so a quit mid-build leaves the
+  build running to finish staging. If it still holds the lock when the install step starts, the
+  step records 75. **At its next start the app reads `install.result`**: a staged build that is not
+  what runs, whose install did not succeed, is reported with the reason (a copy was running,
+  another build or install held the lock, or a failure) and offered again.
 - **The staging lock** is `<app-home>/lock`, a plain `mkdir` with `token` and `pid`, held by
   `build-app.sh`, `install-app.sh` and `install_app` (which hands its token to the two scripts in
   `JKB_APP_LOCK_TOKEN`, so they proceed under it). It serializes the clone, the staging directory
   and the swap. There is **no stale-lock breaking**: a lock left by a run that died is reported,
-  with its path, for the operator to remove. Busy is exit 75 in both scripts; any other lock error
-  is a plain failure.
+  with its path and holder pid, for the operator to remove. So releasing it is `app_lock`'s own job
+  (review round 4: holders that had to remember an explicit unlock leaked it on Ctrl-C and on `set -e`
+  exits): taking it installs the holder's EXIT/INT/TERM/HUP traps (and ignores SIGPIPE, so a write to
+  a closed pipe fails through `set -e` rather than killing the holder past its trap). Only SIGKILL
+  leaves it — which the app says, naming the lock, when its build timeout had to SIGKILL the build.
+  Busy is exit 75 in both scripts, and the message names the lock and its holder; any other lock
+  error is a plain failure.
 - **The swap replaces only what jkb installed.** `app_swap` replaces something already at the
   destination only when the stamp's `dest=` names it (a hand-built or foreign app refuses, so jkb
   never moves aside, and later deletes, what it cannot show it wrote). Before anything moves it
@@ -213,7 +232,13 @@ installed app:
   (`JKB_APP_BUILD_TEST=1`): a copy installed anywhere else refuses to start, and a stamp naming it
   would make every later install refuse the real one. The app's `installedAppDir` /
   `installedExecutable` and lib.sh's `app_default_dest` / `app_executable` / `app_default_home` are
-  held equal by a test, as are the exit statuses (`BUILD_EXIT`, `APP_EXIT_*`).
+  held equal by a test, as are the exit statuses (`BUILD_EXIT`, `APP_EXIT_*`) and the environment
+  scrub list (`GIT_SELECTION`, `APP_GIT_SELECTION`).
+- **One home: the account's.** Both sides take it from the user database, not `$HOME`: the app's
+  `accountHome()` (`os.userInfo().homedir`) and lib.sh's `app_account_home` (`~user`, expanded by
+  getpwnam), which `app_default_home`, the destination and setup.sh all use. Review round 4: an
+  install made under a `HOME` that is not the passwd home landed where the app would never accept
+  it. A test sets `HOME` elsewhere and requires the passwd home.
 - **Where things go:** `~/.local/share/jkb-app/{src,staged,installed,update.log,install.log,previous,lock}`;
   the app at `~/Applications/Code Factory.app` (macOS) or `~/.local/share/jkb-app/app/code-factory`
   (Linux).

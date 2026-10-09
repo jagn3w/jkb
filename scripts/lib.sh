@@ -2206,10 +2206,32 @@ app_default_dest() {
         *)      printf '%s\n' "$3/app" ;;
     esac
 }
-# app_default_home — the app's home: the clone, the stamp, staging, the lock. ui/core's
-# APP_HOME_IN_HOME names the same place; the app identifies its installed copy by it.
+# app_account_home — the account's home directory from the user database (passwd), NOT $HOME: the
+# app finds its installed copy from the same place (main's `accountHome()`, `os.userInfo().homedir`),
+# whatever HOME a shell or wrapper exported, so the two cannot disagree. The tests point it elsewhere
+# with JKB_APP_ACCOUNT_HOME, honoured only with JKB_APP_BUILD_TEST=1.
+app_account_home() {
+    local u h=""
+    if [ "${JKB_APP_BUILD_TEST:-}" = 1 ] && [ -n "${JKB_APP_ACCOUNT_HOME:-}" ]; then
+        printf '%s\n' "$JKB_APP_ACCOUNT_HOME"
+        return 0
+    fi
+    u="$(id -un 2>/dev/null)" || u=""
+    case "$u" in
+        ''|*[!A-Za-z0-9._-]*) ;;
+        # ~user is expanded from the user database (getpwnam), not from HOME.
+        *) eval "h=~$u" ;;
+    esac
+    case "$h" in
+        /*) printf '%s\n' "$h" ;;
+        *)  warn "could not read $u's home from the user database; using HOME ($HOME)"; printf '%s\n' "$HOME" ;;
+    esac
+}
+
+# app_default_home — the app's home: the clone, the stamp, staging, the lock, under the account's
+# home. ui/core's APP_HOME_IN_HOME names the same place; the app identifies its installed copy by it.
 app_default_home() {
-    printf '%s\n' "$HOME/.local/share/jkb-app"
+    printf '%s\n' "$(app_account_home)/.local/share/jkb-app"
 }
 
 # app_check_home <app-home> — whether build-app.sh / install-app.sh may use <app-home>: absolute,
@@ -2227,9 +2249,12 @@ app_check_home() {
 # every step it runs: the post-merge hook hands setup.sh a GIT_DIR naming the merged repository,
 # which pnpm's lifecycle scripts and git-hosted dependencies would act on, and an ELECTRON_* from the
 # app would make a child Electron run as Node.
+# APP_GIT_SELECTION is the list; the app's machineEnv drops the same (a test holds them equal).
+APP_GIT_SELECTION="GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES"
 app_scrub_env() {
     local v
-    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    # shellcheck disable=SC2086
+    unset $APP_GIT_SELECTION
     for v in $(compgen -e); do
         case "$v" in ELECTRON_*) unset "$v" ;; esac
     done
@@ -2245,15 +2270,16 @@ app_executable() {
     esac
 }
 
-# app_running <uname -s> <dest> — whether any process is running the app installed at <dest> (its
-# main process or a helper, which Electron starts from the same bundle): 0 yes, 1 no, 2 cannot tell
-# (no `ps`). `-ww`: BSD ps cuts `args` to the terminal's width otherwise, and the path is long.
+# app_running <uname -s> <dest> — whether any process is running from the app bundle at <dest>: 0
+# yes, 1 no, 2 cannot tell (no `ps`). It matches the bundle's prefix (`<dest>/`), not only the main
+# executable, so Electron's helpers count too — on macOS they run from
+# `Contents/Frameworks/Code Factory Helper*.app/…`, not `Contents/MacOS/`. `-ww`: BSD ps cuts `args`
+# to the terminal's width otherwise, and the path is long. (<uname -s> is kept for the callers' sake.)
 app_running() {
-    local exe procs
-    exe="$(app_executable "$1" "$2")"
+    local procs
     procs="$(ps -ww -A -o args= 2>/dev/null)" || return 2
     case "$procs" in
-        *"$exe"*) return 0 ;;
+        *"$2/"*) return 0 ;;
     esac
     return 1
 }
@@ -2270,6 +2296,9 @@ app_running() {
 # so they hold `<app-home>/lock`, a plain `mkdir` lock. Its holder hands its `token` to the step it
 # runs in JKB_APP_LOCK_TOKEN, and that step proceeds under it instead of taking it again. There is
 # no stale-lock breaking: a lock left by a run that died is reported with its path, to remove by hand.
+# So the RELEASE is app_lock's own job, not its callers': taking the lock installs the shell's
+# EXIT/INT/TERM/HUP traps that release it, however the holder ends (a `set -e` failure, Ctrl-C, a
+# TERM). Only SIGKILL can leave it behind.
 APP_LOCK_IN_APP_HOME=lock
 APP_STAGED_IN_APP_HOME=staged
 
@@ -2279,10 +2308,15 @@ APP_EXIT_BUSY=75
 APP_EXIT_RUNNING=76
 
 # app_lock <app-home> — take the lock, or proceed under the caller's (its token in
-# JKB_APP_LOCK_TOKEN). Sets `app_lock_token`, and `app_lock_taken` (1 when this call took it, so the
-# matching app_unlock releases it). Returns 1 when another run holds it, 2 on any other error.
+# JKB_APP_LOCK_TOKEN). Sets `app_lock_token`, and `app_lock_taken` (1 when this call took it). Returns
+# 1 when another run holds it (saying which, and where), 2 on any other error.
+#
+# When it takes the lock it OWNS this shell's EXIT, INT, TERM, HUP and PIPE traps: INT/TERM/HUP exit
+# (130/143/129), PIPE is ignored, and EXIT releases the lock and then calls `app_on_exit <status>` if the script
+# defines one. So call it in a process or subshell of its own — a script, or `( … )`.
 app_lock() {
     local lock="$1/$APP_LOCK_IN_APP_HOME"
+    _app_lock_home="$1"
     app_lock_taken=0
     app_lock_token="${JKB_APP_LOCK_TOKEN:-}"
     if [ -n "$app_lock_token" ] && [ "$(cat "$lock/token" 2>/dev/null)" = "$app_lock_token" ]; then
@@ -2304,6 +2338,20 @@ app_lock() {
         return 2
     fi
     app_lock_taken=1
+    trap '_app_lock_exit' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    # A write to a closed pipe then fails (and `set -e` exits through the trap) instead of killing
+    # the holder outright with SIGPIPE, which no trap sees.
+    trap '' PIPE
+}
+
+_app_lock_exit() {
+    local rc=$?
+    app_unlock "$_app_lock_home"
+    if declare -F app_on_exit >/dev/null; then app_on_exit "$rc"; fi
+    exit "$rc"
 }
 
 # app_unlock <app-home> — release the lock, if app_lock took it.
@@ -2338,44 +2386,47 @@ app_staged_commit() {
 install_app() {
     local checkout="$1" app_home="$2" rc=0
     app_state=failed
-    app_lock "$app_home" || rc=$?
+    # In a subshell of its own, so app_lock's traps release the lock however it ends (Ctrl-C during
+    # the build included) without touching setup.sh's traps. Its status carries the state out.
+    ( _install_app_locked "$checkout" "$app_home" ) || rc=$?
     case "$rc" in
-        0) ;;
-        1) app_state=busy; return 0 ;;
-        *) return 0 ;;
-    esac
-    _install_app_locked "$checkout" "$app_home"
-    app_unlock "$app_home"
-    return 0
-}
-
-_install_app_locked() {
-    local checkout="$1" app_home="$2" src tip os dest rc=0
-    src="$app_home/src"
-    os="$(uname -s)"
-    dest="$(app_default_dest "$os" "$HOME" "$app_home")"
-    app_clone_refresh "$checkout" "$src" || return 0
-    tip="$(_git -C "$src" rev-parse --verify --quiet HEAD)" || return 0
-    if [ "$(app_installed_commit "$app_home")" = "$tip" ] && [ -d "$dest" ]; then
-        app_state=unchanged
-        return 0
-    fi
-    if [ ! -f "$src/scripts/build-app.sh" ] || [ ! -f "$src/scripts/install-app.sh" ]; then
-        app_state=no-builder
-        return 0
-    fi
-    # Not even built while it runs: install-app.sh would refuse the swap anyway.
-    if app_running "$os" "$dest"; then
-        app_state=running
-        return 0
-    fi
-    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home" || return 0
-    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/install-app.sh" --app-home "$app_home" || rc=$?
-    case "$rc" in
-        0) app_state=installed ;;
+        0)  app_state=installed ;;
+        10) app_state=unchanged ;;
+        11) app_state=no-builder ;;
+        "$APP_EXIT_BUSY") app_state=busy ;;
         "$APP_EXIT_RUNNING") app_state=running ;;
     esac
     return 0
+}
+
+# _install_app_locked <checkout> <app-home> — install_app's body, in its subshell: exits 0 installed,
+# 10 unchanged, 11 no builder, 75 busy, 76 running, anything else failed.
+_install_app_locked() {
+    local checkout="$1" app_home="$2" src tip os dest rc=0
+    app_lock "$app_home" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) exit "$APP_EXIT_BUSY" ;;
+        *) exit 1 ;;
+    esac
+    src="$app_home/src"
+    os="$(uname -s)"
+    dest="$(app_default_dest "$os" "$(app_account_home)" "$app_home")"
+    app_clone_refresh "$checkout" "$src" || exit 1
+    tip="$(_git -C "$src" rev-parse --verify --quiet HEAD)" || exit 1
+    if [ "$(app_installed_commit "$app_home")" = "$tip" ] && [ -d "$dest" ]; then
+        exit 10
+    fi
+    if [ ! -f "$src/scripts/build-app.sh" ] || [ ! -f "$src/scripts/install-app.sh" ]; then
+        exit 11
+    fi
+    # Not even built while it runs: install-app.sh would refuse the swap anyway.
+    if app_running "$os" "$dest"; then
+        exit "$APP_EXIT_RUNNING"
+    fi
+    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home" || exit 1
+    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/install-app.sh" --app-home "$app_home" || exit $?
+    exit 0
 }
 
 # app_installed_dest <app-home> — where the stamp says jkb installed the app, or nothing.
@@ -2394,8 +2445,9 @@ app_stamp() {
     { printf '%s\n' "commit=$2" "dest=$3" >"$1/installed.tmp" && mv -f "$1/installed.tmp" "$1/installed"; } 2>/dev/null
 }
 
-# app_swap <built> <dest> <app-home> — install the directory <built> at <dest>. Callers make sure no
-# copy is running (install-app.sh is the one caller).
+# app_swap <built> <dest> <app-home> — install the directory <built> at <dest>; returns 76
+# (APP_EXIT_RUNNING) without swapping if a copy is running from <dest> when it comes to move it aside.
+# install-app.sh is the one caller.
 #
 # Only over what jkb installed: something already at <dest> is replaced only when <app-home>'s stamp
 # says jkb installed the app there. Anything else (a hand-built app, a copy from elsewhere) refuses,
@@ -2429,6 +2481,13 @@ app_swap() {
         return 1
     fi
     if [ -e "$dest" ] || [ -L "$dest" ]; then
+        # Checked again here, at the last moment: the copy above takes seconds, and a copy of the app
+        # started meanwhile (the Dock, a relaunch) must not have its bundle renamed away.
+        if app_running "$(uname -s)" "$dest"; then
+            rm -rf "$new"
+            warn "Code Factory was started from $dest during the install; nothing was swapped"
+            return "$APP_EXIT_RUNNING"
+        fi
         if ! rm -rf "$prev" || ! mkdir -p "$(dirname "$prev")" || ! mv "$dest" "$prev"; then
             rm -rf "$new"
             warn "could not move the installed app at $dest aside"

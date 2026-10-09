@@ -26,6 +26,23 @@ export const APP_INSTALL_LOG_IN_HOME = `${APP_HOME_IN_HOME}/install.log`;
 /** Where `build-app.sh` stages a build — `app/` and its `commit` — for `install-app.sh` to swap in. */
 export const APP_STAGED_IN_HOME = `${APP_HOME_IN_HOME}/staged`;
 
+/** What the install step's last run ended with (`status=`, `commit=`), for the app's next start. */
+export const APP_INSTALL_RESULT_IN_HOME = `${APP_HOME_IN_HOME}/install.result`;
+
+/**
+ * The lock a build or install holds (scripts/lib.sh's `app_lock`): a `mkdir`, released by its holder's
+ * own exit trap and never broken by another run, so one a killed run left is removed by hand.
+ */
+export const APP_LOCK_IN_HOME = `${APP_HOME_IN_HOME}/lock`;
+
+/** The install step's last outcome, from `APP_INSTALL_RESULT_IN_HOME`'s text, or `undefined`. */
+export function parseInstallResult(text: string): { status: number; commit: string | undefined } | undefined {
+  const status = /^status=(\d+)\s*$/m.exec(text);
+  if (status === null) return undefined;
+  const commit = /^commit=(\S*)\s*$/m.exec(text)?.[1];
+  return { status: Number(status[1]), commit: isCommitId(commit) ? commit : undefined };
+}
+
 /**
  * `build-app.sh`'s and `install-app.sh`'s exit statuses past plain failure (lib.sh's `APP_EXIT_*`):
  * another build or install holds the lock; a copy of the app is running, so nothing was swapped.

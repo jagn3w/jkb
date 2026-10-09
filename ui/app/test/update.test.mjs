@@ -29,7 +29,8 @@ async function load(entry) {
   return require(outfile);
 }
 
-const { AppUpdater, machineRunner, machineStarter, isInstalledCopy, builtCommit, startupRefusal, describeEnd } = await load(
+const updateBundle = path.join(work, "update.ts.cjs");
+const { AppUpdater, machineRunner, machineStarter, isInstalledCopy, builtCommit, startupRefusal, describeEnd, GIT_SELECTION } = await load(
   path.join(here, "..", "src", "main", "update.ts"),
 );
 const core = await import(path.join(here, "..", "..", "core", "dist", "index.js"));
@@ -88,6 +89,8 @@ fi
 if [ -e "$src/BUSY" ]; then exit 75; fi
 if [ -e "$src/FAIL_BUILD" ]; then echo "the build broke here" >&2; exit 3; fi
 if [ -e "$src/NO_STAGE" ]; then echo "finished, staged nothing"; exit 0; fi
+if [ -e "$src/STUBBORN" ]; then trap '' TERM; sleep 60 >/dev/null 2>&1 & echo $! >"$app_home/sleeper"; wait; fi
+if [ -e "$src/LATE" ]; then echo "starting"; sleep 1.5; for i in 1 2 3 4 5; do echo "still writing $i"; done; fi
 if [ -e "$src/SLOW" ] || [ -e "$src/KILLED" ]; then
   sleep 60 >/dev/null 2>&1 &
   echo $! >"$app_home/sleeper"
@@ -264,7 +267,7 @@ test("a builder that finds the lock held (75) says another build or install is r
   const plan = await f.updater.plan();
   const r = await f.updater.apply(plan.value.target);
   assert.equal(r.ok, false);
-  assert.match(r.error, /Another build or install of Code Factory is running/);
+  assert.match(r.error, /Another build or install of Code Factory holds its lock/);
 });
 
 test("a timed-out build is stopped with its whole process group, and said to have installed nothing", async () => {
@@ -399,7 +402,8 @@ test("the install step is started only with something staged, for this pid, rela
 
 test("as the app quits: the real install step waits for it to exit, then swaps, stamps and relaunches", async () => {
   const ran = path.join(work, `ran-${n}`);
-  const f = fixture({ starterEnv: { ...gitEnv, STUB_RAN: ran } });
+  // The step finds the account's home from the user database; pointed at this fixture's (tests only).
+  const f = fixture({ starterEnv: { ...gitEnv, STUB_RAN: ran, JKB_APP_BUILD_TEST: "1", JKB_APP_ACCOUNT_HOME: path.join(work, `f${n}`, "home") } });
   const before = f.head();
   f.stamp(before);
   const tip = f.land("second");
@@ -430,8 +434,95 @@ test("the installed copy's place, the app home, staging and the exit statuses ag
     assert.equal(dest, core.installedAppDir(platform, home));
     assert.equal(sh('app_executable "$1" "$2"', uname, dest), core.installedExecutable(platform, home));
   }
-  const appHome = execFileSync("/bin/bash", ["-c", '. "$0"; app_default_home', lib], { encoding: "utf8", env: { ...process.env, HOME: "/h" } }).trim();
-  assert.equal(appHome, `/h/${core.APP_HOME_IN_HOME}`);
+  // One home: lib.sh's is the account's from the user database — the one main's accountHome() reads
+  // (os.userInfo().homedir) — not $HOME.
+  const env = { ...process.env, HOME: path.join(work, "not-the-home") };
+  delete env.JKB_APP_BUILD_TEST;
+  delete env.JKB_APP_ACCOUNT_HOME;
+  const appHome = execFileSync("/bin/bash", ["-c", '. "$0"; app_default_home', lib], { encoding: "utf8", env }).trim();
+  assert.equal(appHome, `${os.userInfo().homedir}/${core.APP_HOME_IN_HOME}`);
   assert.equal(`${core.APP_HOME_IN_HOME}/${sh('printf %s "$APP_STAGED_IN_APP_HOME"')}`, core.APP_STAGED_IN_HOME);
   assert.deepEqual({ busy: Number(sh('printf %s "$APP_EXIT_BUSY"')), running: Number(sh('printf %s "$APP_EXIT_RUNNING"')) }, { ...core.BUILD_EXIT });
+});
+
+test("a quit mid-build leaves the build running to finish staging: its output does not go through the app", async () => {
+  const f = fixture();
+  const tip = f.land("written after the app is gone", "LATE");
+  // The app: a separate process that starts the build and exits 300ms later, mid-build.
+  const app = path.join(work, `quitting-app-${n}.cjs`);
+  fs.writeFileSync(
+    app,
+    `const { AppUpdater, machineRunner } = require(${JSON.stringify(updateBundle)});
+const [home, exe, target, env] = [process.argv[2], process.argv[3], process.argv[4], JSON.parse(process.argv[5])];
+const u = new AppUpdater(home, machineRunner(home, env, 200), () => {}, { exe, platform: process.platform, commit: undefined });
+void u.apply(target);
+setTimeout(() => process.exit(0), 300);
+`,
+  );
+  execFileSync(process.execPath, [app, f.home, f.installedExe, tip, JSON.stringify(gitEnv)]);
+  await until(() => f.updater.stagedCommit() === tip, "the orphaned build to stage");
+  assert.match(fs.readFileSync(f.updater.logFile, "utf8"), /still writing 5/);
+});
+
+test("a build of the target already staged is not built again", async () => {
+  const f = fixture();
+  const tip = f.land("second");
+  assert.ok((await f.updater.apply(tip)).ok);
+  fs.rmSync(path.join(f.appHome, "builds"));
+  const again = await f.updater.apply(tip);
+  assert.ok(again.ok, again.error);
+  assert.equal(again.value, tip);
+  assert.ok(!fs.existsSync(path.join(f.appHome, "builds")), "the builder did not run");
+});
+
+test("a held lock (75) is named, with what to do if nothing holds it", async () => {
+  const f = fixture();
+  f.land("busy", "BUSY");
+  const plan = await f.updater.plan();
+  const r = await f.updater.apply(plan.value.target);
+  assert.equal(r.ok, false);
+  assert.ok(r.error.includes(f.updater.lockDir), r.error);
+  assert.match(r.error, /If no build or install of Code Factory is running, remove/);
+});
+
+test("a timed-out build that had to be SIGKILLed says it may have left its lock", async () => {
+  const f = fixture({ buildTimeoutMs: 300 });
+  f.land("ignores TERM", "STUBBORN");
+  const plan = await f.updater.plan();
+  const r = await f.updater.apply(plan.value.target);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /timed out/);
+  assert.match(r.error, /may have left its lock behind/);
+  assert.ok(r.error.includes(f.updater.lockDir));
+  const sleeper = Number(fs.readFileSync(path.join(f.appHome, "sleeper"), "utf8"));
+  await until(() => !alive(sleeper), "the stubborn child to be killed", 3_000);
+});
+
+test("at startup, a staged build the last install step did not install is reported with why", async () => {
+  const running = "a".repeat(40);
+  const f = fixture({ commit: running });
+  assert.equal(f.updater.pendingInstall(), undefined, "nothing staged");
+  const tip = f.land("second");
+  assert.ok((await f.updater.apply(tip)).ok);
+  assert.equal(f.updater.pendingInstall(), undefined, "staged, but no install step has run for it");
+  const result = (status, commit = tip) => fs.writeFileSync(path.join(f.appHome, "install.result"), `status=${status}\ncommit=${commit}\n`);
+  result(76);
+  assert.deepEqual(f.updater.pendingInstall(), { commit: tip, status: 76 });
+  result(75, "");
+  assert.deepEqual(f.updater.pendingInstall(), { commit: tip, status: 75 }, "a busy step never read what was staged");
+  result(1, "b".repeat(40));
+  assert.equal(f.updater.pendingInstall(), undefined, "a result about another commit");
+  result(0);
+  assert.equal(f.updater.pendingInstall(), undefined, "it went through");
+  const g = fixture({ commit: tip });
+  fs.mkdirSync(path.join(g.appHome, "staged", "app"), { recursive: true });
+  fs.writeFileSync(path.join(g.appHome, "staged", "commit"), `${tip}\n`);
+  fs.writeFileSync(path.join(g.appHome, "install.result"), `status=76\ncommit=${tip}\n`);
+  assert.equal(g.updater.pendingInstall(), undefined, "what is staged is what runs");
+});
+
+test("the runner's scrub list is lib.sh's", () => {
+  const lib = path.join(repoRoot, "scripts", "lib.sh");
+  const list = execFileSync("/bin/bash", ["-c", '. "$0"; printf %s "$APP_GIT_SELECTION"', lib], { encoding: "utf8" });
+  assert.deepEqual([...GIT_SELECTION].sort(), list.split(" ").sort());
 });
