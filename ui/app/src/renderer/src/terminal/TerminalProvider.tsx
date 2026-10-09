@@ -9,7 +9,7 @@ import {
 } from "../../../shared/terminal";
 import { TerminalEventRouter } from "./router";
 import { TerminalSession, themeFromTokens } from "./session";
-import { INITIAL_STATE, canRerun, planOpen, reduce, type Placement, type TerminalsState } from "./state";
+import { INITIAL_STATE, planOpen, reduce, type Placement, type TerminalsState } from "./state";
 
 /**
  * The integrated terminal, as every tab sees it (D53.10). A caller builds a `TerminalSpec` (from
@@ -106,15 +106,27 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
     return () => media.removeEventListener("change", onChange);
   }, []);
 
+  /**
+   * The ONE way a terminal's program starts again: the reducer's `restart` decides, and the program
+   * starts only when it changed the state (a run-once terminal's restart changes nothing). Restart,
+   * relaunch and `open`'s relaunch of an ended session all come through here. `override`: the
+   * person's explicit act, which starts even beside a program that may still be running.
+   */
+  const rerun = useCallback((key: number, spec: TerminalSpec, override = false): boolean => {
+    const session = sessions.current.get(key);
+    const action = { type: "restart", key, spec } as const;
+    if (session === undefined || reduce(stateRef.current, action) === stateRef.current) return false;
+    dispatch(action);
+    void session.start(spec, override ? { override: true } : undefined);
+    return true;
+  }, []);
+
   const open = useCallback((spec: TerminalSpec, placement: Placement = "drawer", options?: { readonly once?: boolean }): number => {
     const plan = planOpen(stateRef.current, spec);
     if (plan.kind === "show" || plan.kind === "relaunch") {
       const { key } = plan.entry;
       const session = sessions.current.get(key);
-      if (plan.kind === "relaunch" && session !== undefined) {
-        dispatch({ type: "restart", key, spec });
-        void session.start(spec);
-      }
+      if (plan.kind === "relaunch") rerun(key, spec);
       if (plan.entry.placement === "drawer") dispatch({ type: "select", key });
       session?.focus();
       return key;
@@ -127,7 +139,7 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
     dispatch({ type: "open", key, spec, placement, once: options?.once === true });
     void session.start(spec);
     return key;
-  }, []);
+  }, [rerun]);
 
   const openShell = useCallback(
     (target: TerminalTarget = DEFAULT_TARGET): void => {
@@ -157,24 +169,15 @@ export function TerminalProvider({ children }: { readonly children: React.ReactN
     });
   }, []);
 
-  const restart = useCallback((key: number): void => {
-    const entry = stateRef.current.entries.find((e) => e.key === key);
-    const session = sessions.current.get(key);
-    if (entry === undefined || session === undefined || !canRerun(entry)) return;
-    dispatch({ type: "restart", key, spec: entry.spec });
-    // The person's explicit act: it starts even beside a program that may still be running.
-    void session.start(entry.spec, { override: true });
-  }, []);
+  const restart = useCallback(
+    (key: number): void => {
+      const entry = stateRef.current.entries.find((e) => e.key === key);
+      if (entry !== undefined) rerun(key, entry.spec, true);
+    },
+    [rerun],
+  );
 
-  const relaunch = useCallback((key: number, spec: TerminalSpec): boolean => {
-    const session = sessions.current.get(key);
-    const entry = stateRef.current.entries.find((e) => e.key === key);
-    if (session === undefined || entry === undefined || !canRerun(entry)) return false;
-    dispatch({ type: "restart", key, spec });
-    void session.start(spec);
-    return true;
-  }, []);
-
+  const relaunch = useCallback((key: number, spec: TerminalSpec): boolean => rerun(key, spec), [rerun]);
 
   const toggleDrawer = useCallback(() => dispatch({ type: "toggleDrawer" }), []);
 

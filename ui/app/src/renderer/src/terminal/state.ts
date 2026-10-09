@@ -88,11 +88,17 @@ export function reduce(state: TerminalsState, action: TerminalAction): Terminals
     }
     case "status":
       return { ...state, entries: state.entries.map((e) => (e.key === action.key ? { ...e, status: action.status } : e)) };
-    case "restart":
+    case "restart": {
+      // THE RULE, in one place: a terminal opened to run once, or one that is gone, is not restarted,
+      // and the state comes back unchanged -- the same object, which is how the provider knows not
+      // to start its program (`rerun`). Restart, relaunch and the target toggle all come through here.
+      const entry = state.entries.find((e) => e.key === action.key);
+      if (entry === undefined || !canRerun(entry)) return state;
       return {
         ...state,
         entries: state.entries.map((e) => (e.key === action.key ? { ...e, spec: action.spec, status: { kind: "starting" } } : e)),
       };
+    }
     case "close": {
       const index = drawerKeys(state.entries).indexOf(action.key);
       const entries = state.entries.filter((e) => e.key !== action.key);
@@ -129,7 +135,8 @@ export function reduce(state: TerminalsState, action: TerminalAction): Terminals
 
 /**
  * Whether the terminal may run its program again, by Restart, a relaunch or the target toggle: every
- * terminal but one opened to run once. The provider asks this before each, so no caller can forget.
+ * terminal but one opened to run once. The reducer's `restart` enforces it; the chrome asks it only
+ * to hide the buttons.
  */
 export function canRerun(entry: TerminalEntry): boolean {
   return entry.once !== true;

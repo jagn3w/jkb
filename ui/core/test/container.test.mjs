@@ -146,10 +146,13 @@ test("a stale kit's remedy is run.sh's own command, the KIT's run.sh, never the 
   assert.match(none, /the kit's own run\.sh --install-kit/);
 });
 
-test("Build is said to start a stopped container only where the start path would", () => {
+test("Build is said to start a stopped container only where the start path would, and only if the rebuild changes nothing", () => {
   const ctr = (state) => ({ state, image_id: "sha256:a", args_hash: "h1", image: null });
-  assert.deepEqual(say({ container: ctr("exited") }), [["note", "jkb-dev is exited. Build starts it again."]]);
-  assert.deepEqual(say({ container: ctr("created"), drift: { args: "same", image: "unknown" } }), [["note", "jkb-dev is created. Build starts it again."]]);
+  // Build rebuilds first, and --status cannot know whether that changes the image (a reinstalled kit's
+  // labels do): so both outcomes are said, never a bare "starts it again".
+  const both = "Build rebuilds the image, then starts it again; if the build changed the image, run.sh refuses the old container: Remove, then Build.";
+  assert.deepEqual(say({ container: ctr("exited") }), [["note", `jkb-dev is exited. ${both}`]]);
+  assert.deepEqual(say({ container: ctr("created"), drift: { args: "same", image: "unknown" } }), [["note", `jkb-dev is created. ${both}`]]);
   // Drift the start path refuses: the state is said plainly, and the stale line carries the remedy.
   for (const drift of [
     { args: "differs", image: "same" },
@@ -159,7 +162,7 @@ test("Build is said to start a stopped container only where the start path would
     const said = say({ container: ctr("exited"), drift });
     assert.deepEqual(said[0], ["note", "jkb-dev is exited."], JSON.stringify(drift));
     assert.ok(said.slice(1).some(([level, text]) => level === "stale" && /Remove it, then Build/.test(text)));
-    assert.ok(!said.some(([, text]) => /Build starts it again/.test(text)));
+    assert.ok(!said.some(([, text]) => /starts it again/.test(text)));
   }
   // A state the start path has no arm for: Build would collide with the name.
   for (const state of ["paused", "restarting", "dead"]) {

@@ -954,10 +954,19 @@ docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
 
 # --verify AND --install-extensions ACT ON A RUNNING CONTAINER, never make one: a button that checks
 # the container must not be the one that builds or creates it. Asked here, before the build below.
-if [ "$MODE" != start ] \
-   && [ "$(docker container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" != true ]; then
-    die "$NAME is not running, and --$MODE acts on a running container only. Start it first: $0"
-fi
+# BY .State.Status, THE DISPATCH'S OWN QUESTION, at both looks. This one read .State.Running, which is
+# true for a paused or restarting container too, so those passed here and were refused at the second
+# look with "Start it first" -- advice the start path cannot follow, since it has no arm for either
+# state (review s8 round 2). One function, so the two looks give one answer and one remedy.
+mode_needs_running() { # mode_needs_running <.State.Status, empty when there is no container>
+    case "$1" in
+        running) return 0 ;;
+        "") die "there is no container named $NAME, and --$MODE acts on a running container only. Start one first: $0" ;;
+        exited|created) die "$NAME is $1, and --$MODE acts on a running container only. Start it first: $0" ;;
+        *) die "$NAME is $1, and --$MODE acts on a running container only; run.sh does not start a container from that state. Recreate it (the image and the volumes survive): $0 --rm && $0" ;;
+    esac
+}
+[ "$MODE" = start ] || mode_needs_running "$(docker container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || true)"
 
 # The narrowed ~/.jkb binds and the credential's directory must exist on the host: a bind whose source
 # is missing is a hard error (D52.8). The credential itself is written by `jkb role rotate-container
@@ -1040,9 +1049,7 @@ fresh=0
 # starts or creates whatever `$state` says is not running, so a container stopped or removed between
 # them sent --verify into `docker start` or `docker run` -- the button that checks the container making
 # one (review s8 round 1). Only `running` reaches an arm that starts nothing.
-if [ "$MODE" != start ] && [ "$state" != running ]; then
-    die "$NAME is ${state:-gone} now, and --$MODE acts on a running container only. Start it first: $0"
-fi
+[ "$MODE" = start ] || mode_needs_running "$state"
 
 # CAN DOCKER APPLY THE PROFILE? ASKED ABOVE THE DISPATCH, so it dominates every arm (D45.5).
 #
@@ -1456,7 +1463,10 @@ fi
 # in the kit would put its target's bytes in the container. dc_install_kit refuses them in the copy
 # it makes; this holds the line for a kit made any other way (review round 14).
 kit_odd="$(dc_unsafe_entries "$kit_src")"
-[ -z "$kit_odd" ] || die "the kit at $kit_src holds something that is not a regular file or a directory, so it is not mirrored: $kit_odd -- reinstall it: run.sh --install-kit"
+# The remedy is KIT_REFRESH, the kit's own command: a bare `run.sh --install-kit` read from a checkout
+# runs the copy the agent can rewrite (review s8 round 2). From a checkout there is no kit to refresh,
+# and the staged copy came from the checkout, so the odd entry is the checkout's to remove.
+[ -z "$kit_odd" ] || die "the kit at $kit_src holds something that is not a regular file or a directory, so it is not mirrored: $kit_odd -- ${KIT_REFRESH:+reinstall it: $KIT_REFRESH}${KIT_REFRESH:-remove it from $repo}"
 kit_rc=0; dc_mirror_hooks "$kit_src" "$DC_CTR_KIT" "$NAME" docker "the container kit" || kit_rc=$?
 [ -z "$kit_stage" ] || rm -rf "$kit_stage"
 [ "$kit_rc" -eq 0 ] || die "could not install the container kit at $DC_CTR_KIT in $NAME -- the sweep, setup.sh and verify.sh run only from there, never from the checkout the agent can write"

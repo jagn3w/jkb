@@ -13,6 +13,7 @@ import {
 import { liveCwds, loadHolders } from "../sessions/data";
 import { mergeRecords, reattachPlan, recordAttached, tearsDown, type Attached } from "../sessions/reattach";
 import { useTerminals } from "../terminal/TerminalProvider";
+import { ActionGate, runAction } from "./containerRun";
 
 type Loaded =
   | { readonly kind: "loading" }
@@ -77,6 +78,9 @@ export function ContainerTab(): React.JSX.Element {
   const [notice, setNotice] = useState<string | undefined>(undefined);
   /** The terminal running a button's action, until it ends. */
   const [running, setRunning] = useState<{ readonly key: number; readonly action: ContainerAction } | undefined>(undefined);
+  /** One action at a time, taken on the click itself (`ActionGate`); `busy` redraws the buttons. */
+  const gate = useRef(new ActionGate());
+  const [busy, setBusy] = useState(false);
   const live = useRef(true);
 
   /** Read `--status`; resolves to what it said (`undefined` when it could not be read). */
@@ -124,32 +128,37 @@ export function ContainerTab(): React.JSX.Element {
   useEffect(() => {
     if (!ended) return;
     setRunning(undefined);
+    gate.current.release();
+    setBusy(false);
     void load().then(reattach);
   }, [ended, load, reattach]);
 
   const run = async (action: ContainerAction): Promise<void> => {
-    const spec = CONTAINER_ACTIONS.find((a) => a.id === action);
-    if (spec === undefined) return;
-    if (spec.ends && !window.confirm(`${spec.label} the container? ${spec.summary}`)) return;
-    setNotice(undefined);
-    const answer = await window.jkb.container.spec(action);
-    if (!answer.ok) {
-      setNotice(answer.error);
+    setBusy(true);
+    // The terminal runs ONCE: the drawer offers no Restart and no Container/Host toggle for it. A
+    // Restart re-ran the action (a Remove, say) past the confirmation, with the buttons enabled and no
+    // status read after, and the toggle could move the host-only run.sh into the container (review s8
+    // round 1). So every run of an action comes through here, one at a time (`ActionGate`).
+    const started = await runAction(action, gate.current, {
+      confirm: (message) => window.confirm(message),
+      spec: (a) => window.jkb.container.spec(a),
+      notice: setNotice,
+      beforeOpen: async (a) => {
+        if (!tearsDown(a)) return;
+        // Recorded before the run starts: where each session really runs is the registry's word (a
+        // task's Play moves into its worktree after its terminal opened), read now while it is live.
+        const holders = await loadHolders((r) => window.jkb.op(r), false);
+        const cwds = holders.ok ? liveCwds(holders.value.holders) : new Map<string, string>();
+        const recorded = recordAttached(terminalsRef.current.state.entries, (s) => cwds.get(s));
+        setAttached((older) => mergeRecords(older, recorded));
+      },
+      open: (spec) => terminalsRef.current.open(spec, "drawer", { once: true }),
+    });
+    if (started === undefined) {
+      if (!gate.current.busy) setBusy(false);
       return;
     }
-    if (tearsDown(action)) {
-      // Recorded before the run starts: where each session really runs is the registry's word (a
-      // task's Play moves into its worktree after its terminal opened), read now while it is live.
-      const holders = await loadHolders((r) => window.jkb.op(r), false);
-      const cwds = holders.ok ? liveCwds(holders.value.holders) : new Map<string, string>();
-      const recorded = recordAttached(terminalsRef.current.state.entries, (s) => cwds.get(s));
-      setAttached((older) => mergeRecords(older, recorded));
-    }
-    // Run ONCE: the drawer offers no Restart and no Container/Host toggle for it. A Restart re-ran the
-    // action (a Remove, say) past the confirmation above, with the buttons enabled and no status read
-    // after, and the toggle could move the host-only run.sh into the container (review s8 round 1).
-    // So every run of an action goes through this function, and `running` covers each one.
-    setRunning({ key: terminals.open(answer.value, "drawer", { once: true }), action });
+    setRunning(started);
   };
 
   const current = status.kind === "loaded" ? status.value : undefined;
@@ -175,7 +184,7 @@ export function ContainerTab(): React.JSX.Element {
               data-action={a.id}
               data-ends={a.ends ? "true" : undefined}
               title={can.enabled ? a.summary : `${a.summary} Unavailable: ${can.why ?? ""}.`}
-              disabled={!can.enabled || running !== undefined}
+              disabled={!can.enabled || running !== undefined || busy}
               onClick={() => void run(a.id)}
             >
               {running?.action === a.id ? `${a.label}…` : a.label}

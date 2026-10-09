@@ -131,6 +131,17 @@ export const END_TIMEOUT_MS = 10_000;
  */
 export const HOST_END_MS = { term: 2_000, kill: 4_000, giveUp: 5_000 } as const;
 
+/**
+ * The container `docker exec` enters: `run.sh`'s own rule, `NAME="${JKB_CONTAINER_NAME:-jkb-dev}"` --
+ * unset or empty is the default, anything else is taken as it is. It trimmed, so `'jkb-alt '` sent
+ * terminals into `jkb-alt` while run.sh and the tab's buttons addressed `'jkb-alt '` (review s8 round 2);
+ * untrimmed, such a name fails in both places alike.
+ */
+export function containerName(env: Readonly<Record<string, string | undefined>>): string {
+  const name = env["JKB_CONTAINER_NAME"];
+  return name === undefined || name === "" ? "jkb-dev" : name;
+}
+
 /** The program a container terminal runs when its spec names none: the image's shell, by absolute path. */
 export const CONTAINER_SHELL: readonly string[] = ["/bin/bash", "-l"];
 
@@ -207,8 +218,9 @@ export function commandFor(spec: TerminalSpec, env: TerminalEnvironment, tag: st
 /**
  * The environment any program main starts on the host begins from: main's own, without Electron's
  * variables (`ELECTRON_RUN_AS_NODE` would turn a child Electron into Node). The one rule, for a
- * terminal and for the container kit's `run.sh --status` alike, so the two never read different
- * `JKB_CONTAINER_NAME`s and show one container while acting on another.
+ * terminal and for the container kit's `run.sh --status` alike, so the run.sh that `--status` asks and
+ * the run.sh a button runs are handed the same `JKB_CONTAINER_NAME`/`JKB_CONTAINER_IMAGE`. Which
+ * container a CONTAINER terminal enters is `containerName`'s, below.
  */
 export function hostEnv(env: Readonly<Record<string, string | undefined>>): Record<string, string> {
   const out: Record<string, string> = {};
@@ -263,7 +275,7 @@ export function machineRoots(
     // Not there yet: only the spelling can name it.
   }
   return {
-    container: env["JKB_CONTAINER_NAME"]?.trim() || "jkb-dev",
+    container: containerName(env),
     containerRepos: CONTAINER_REPOS,
     hostRepos,
     hostReposReal,

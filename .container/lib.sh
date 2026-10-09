@@ -699,6 +699,8 @@ dc_kit_changes() { # dc_kit_changes <kit dir> <checkout>
         # for a path missing on one side ended --install-kit silently, before it installed anything
         # (review round 19). A find error prints into the list, so it is seen, not fatal.
         kfiles=""; cfiles=""
+        # Said, not walked: dc_install_kit refuses it, and this list is what --install-kit prints first.
+        if ! dc_plain_path "$2/$p"; then printf '%s (not a regular file or directory)\n' "$p"; continue; fi
         if [ -e "$1/$p" ]; then kfiles="$( (cd "$1" && find "$p" -type f 2>&1) | sort || true)"; fi
         if [ -e "$2/$p" ]; then cfiles="$( (cd "$2" && find "$p" -type f 2>&1) | sort || true)"; fi
         while IFS= read -r f; do
@@ -716,10 +718,23 @@ $(dc_kit_paths)
 EOF
 }
 
-# dc_kit_stale <kit dir> <checkout> -> the kit paths that differ from the checkout, one per line.
+# dc_plain_path <path> -> rc 0 when <path> is absent, a regular file or a directory, and not a link.
+# What may be handed to a program that OPENS it on the host: `diff -rq` given a FIFO as an argument
+# blocks reading it (measured: `timeout 3 diff -rq <file> <fifo>` exits 124), and the checkout's kit
+# paths are the agent's to replace -- the hang dc_git_head refuses for HEAD (review s8 round 2). Inside
+# a directory diff only reports a special file ("... is a fifo"), so the top level is what needs this.
+dc_plain_path() { # dc_plain_path <path>
+    [ -L "$1" ] && return 1
+    [ -e "$1" ] || return 0
+    [ -f "$1" ] || [ -d "$1" ]
+}
+
+# dc_kit_stale <kit dir> <checkout> -> the kit paths that differ from the checkout, one per line. A
+# path that is not plain on either side differs, without being opened.
 dc_kit_stale() { # dc_kit_stale <kit dir> <checkout>
     local p
     while IFS= read -r p; do
+        if ! dc_plain_path "$1/$p" || ! dc_plain_path "$2/$p"; then printf '%s\n' "$p"; continue; fi
         diff -rq "$1/$p" "$2/$p" >/dev/null 2>&1 || printf '%s\n' "$p"
     done <<EOF
 $(dc_kit_paths)

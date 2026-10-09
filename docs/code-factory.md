@@ -730,13 +730,20 @@ it, read `--status`, build each button's terminal spec), `window.jkb.container` 
   the generic `terminal.open`, and that accepts any host argv by design (D53.10). What keeps the
   checkout's `run.sh` from running is that nothing in the app names it and that `run.sh` itself refuses
   to start a container from a checkout. main's `run.sh --status` and the terminal start from one
-  environment rule (`hostEnv`), so both resolve `JKB_CONTAINER_NAME` alike.
-- **A button's terminal runs once.** It is opened with no Restart and no Container/Host toggle
-  (`canRerun`, asked by the terminal provider before every restart, relaunch and retarget). As first
-  built it was "a terminal like any other", and the drawer's Restart re-ran a finished Remove with no
-  confirmation, with the tab's buttons enabled, and with no `--status` read after; the toggle could move
-  the host-only `run.sh` into the container. So every run of an action goes through the tab's own
-  button — its confirmation, its disabled buttons while it runs, and its `--status` read when it ends.
+  environment rule (`hostEnv`), so both hand `run.sh` the same `JKB_CONTAINER_NAME`; a container
+  terminal enters `containerName`'s answer, `run.sh`'s own `${JKB_CONTAINER_NAME:-jkb-dev}`, untrimmed
+  (it trimmed, and a name with a trailing space split the terminals from the buttons).
+- **A button's terminal runs once.** It is opened with no Restart and no Container/Host toggle. As
+  first built it was "a terminal like any other", and the drawer's Restart re-ran a finished Remove with
+  no confirmation, with the tab's buttons enabled, and with no `--status` read after; the toggle could
+  move the host-only `run.sh` into the container. The rule is the terminal reducer's: its `restart` on a
+  run-once terminal returns the state unchanged, and the provider's one `rerun` starts a program only
+  when the reducer changed the state — Restart, relaunch and the toggle all go through it (round 1 had
+  put a check in each of them, which a fourth caller would forget).
+- **One action at a time, from the click.** `containerRun.ts`'s `ActionGate` is taken synchronously,
+  before the first await, and released when the run's terminal ends or by any path that opens none. The
+  tab's `running` state is set only after main's spec and the sessions read, so a quick second Build had
+  started a second `run.sh` against the same container, whose end then went unnoticed (round 2).
 - **The kit is found where `lib.sh` puts it, and asked to agree.** `DC_KIT_DIR` is under the
   *account's* home (the passwd entry, which is what `run.sh` builds its own HOME from), not `$HOME`,
   which a launching terminal can set; and the kit's own `run.sh --kit-path` must name that same
@@ -745,9 +752,13 @@ it, read `--status`, build each button's terminal spec), `window.jkb.container` 
   recomputed, and each finding carries the remedy `run.sh` itself prints (*Remove it, then Build*). The
   stale-kit remedy is `--status`'s `kit_refresh`, shown verbatim: the **kit's** `run.sh --install-kit`.
   The tab had composed `<checkout>/.container/run.sh --install-kit` itself — a command the operator
-  pastes into a host terminal, naming a script the agent can rewrite. *Build starts it again* is said
-  only of an exited or created container with no drift the start path refuses; a stale one gets its
-  state and the stale line's remedy, and one paused, restarting or dead (a state the start path has no
+  pastes into a host terminal, naming a script the agent can rewrite. For an exited or created
+  container with no drift the start path refuses, the tab says *Build rebuilds the image, then starts it
+  again; if the build changed the image, run.sh refuses the old container: Remove, then Build* —
+  both outcomes, because Build rebuilds first and `--status` cannot know whether that changes the image
+  (a reinstalled kit's source labels do). Round 1 said a bare *Build starts it again*, which the path the
+  tab's own kit remedy leads to then contradicted. A stale one gets its state and the stale line's
+  remedy, and one paused, restarting or dead (a state the start path has no
   arm for: its `docker run` would collide with the name) is stale itself, *Remove it, then Build*. A
   button that cannot act on the container as it stands is disabled with the reason in its title
   (Verify and Install extensions need it running; Stop needs it running, paused or restarting, which

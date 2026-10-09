@@ -331,7 +331,10 @@ were added for it, and each goes through the start path rather than beside it:
   that builds or creates it — even under `JKB_CONTAINER_IMAGE`, which a start always builds. That early
   refusal is the fast one; the one that holds is asked again on the state the dispatch acts on, because
   the dispatch starts or creates whatever that state says is not running, and a container stopped or
-  removed between the two reads sent the mode into `docker start` or `docker run`. Both then
+  removed between the two reads sent the mode into `docker start` or `docker run`. Both looks read
+  `.State.Status` through one function: the first had read `.State.Running`, which is true for a paused
+  or restarting container, so those passed it and were then told to "start it first" — which the start
+  path cannot do; they are now refused at once with its remedy, `--rm` and start. Both then
   take the start path's own route: the drift checks (a stale container is refused with the same
   `--rm && run.sh` advice), the settle, the firewall re-raise, and the kit mirror refreshed from the
   kit. `--install-extensions` stops there and runs `install-extensions.sh` from the mirror, with the
@@ -359,6 +362,12 @@ were added for it, and each goes through the start path rather than beside it:
   build's note says which: a kit installed before it recorded a source is told to reinstall, and
   `--install-kit` no longer calls such a kit current while its checkout has a readable HEAD; a checkout
   whose HEAD cannot be read is said to be one, since no reinstall would change it.
+- **The kit's staleness opens nothing odd.** `dc_kit_stale` handed each kit path to `diff -rq`, which
+  blocks reading a FIFO given as an argument (measured: `timeout 3 diff -rq <file> <fifo>` exits 124;
+  inside a directory diff only reports one), so a FIFO planted at `scripts/lib.sh` in the checkout hung
+  every kit start, `--install-kit` and `--status`. A kit path that is a link or neither a regular file
+  nor a directory (`dc_plain_path`) is now stale without being opened, and `--install-kit`'s list names
+  it. The mirror's refusal of an odd kit names `KIT_REFRESH` rather than a bare `run.sh --install-kit`.
   *Stated, not measured:* the commit is HEAD at the copy, so an uncommitted edit to a kit path rides
   in the kit without being in that commit; `--status`'s `kit_changed` shows a checkout that has moved
   since, not a kit that was dirty when copied.

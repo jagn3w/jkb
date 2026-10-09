@@ -37,7 +37,8 @@ running() {
     # running-said: what the FIRST .State.Running query answers, then removed -- a container stopped
     # between run.sh's early check and its dispatch.
     if [ -f "\$D/running-said" ]; then cat "\$D/running-said"; rm -f "\$D/running-said"; return; fi
-    [ "\$(cat "\$D/state" 2>/dev/null)" = running ] && echo true || echo false
+    # As docker answers it: a paused or restarting container is Running too.
+    case "\$(cat "\$D/state" 2>/dev/null)" in running|paused|restarting) echo true ;; *) echo false ;; esac
 }
 ctr_json() {
     [ -f "\$D/state" ] || return 1
@@ -441,6 +442,58 @@ case15_a_kit_with_no_source_takes_one_from_a_reinstall() {
     else fail "...after which it does match" "rc=$rc out=$out err=$err"; fi
 }
 
+
+# --------------------------------------------------------------------------------------------
+# Review s8 round 2.
+# --------------------------------------------------------------------------------------------
+
+case16_a_paused_or_restarting_container_is_refused_at_the_first_look() {
+    local d="$work/s16" st looks
+    stub_docker "$d"
+    image_json sha256:img '{}' > "$d/images/jkb-dev"
+    for st in paused restarting; do
+        printf '%s' "$st" > "$d/state"; : > "$d/calls"
+        kit_run "$d" --verify
+        looks="$(grep -c 'State\.' <<<"$calls")"
+        if [ "$rc" -ne 0 ] && grep -q "is $st, and --verify acts on a running container only" <<<"$err" \
+           && grep -qF -- '--rm && ' <<<"$err" && [ "$looks" = 1 ] && ! grep -qE '^(build|start|run)( |$)' <<<"$calls"; then
+            ok "--verify on a $st container is refused at the first look, with the recreate remedy (Running is true for it)"
+        else fail "--verify on a $st container is refused at the first look, with the recreate remedy (Running is true for it)" "rc=$rc looks=$looks err=$(tail -2 <<<"$err")"; fi
+    done
+}
+
+case17_a_fifo_at_a_kit_path_is_stale_not_a_hang() {
+    local k="$work/k17" c="$work/c17" p got rc17=0
+    while IFS= read -r p; do
+        mkdir -p "$(dirname "$k/$p")" "$(dirname "$c/$p")"
+        case "$p" in .container) mkdir -p "$k/$p" "$c/$p"; echo x > "$k/$p/f"; echo x > "$c/$p/f" ;;
+                     *) echo x > "$k/$p"; echo x > "$c/$p" ;; esac
+    done <<<"$(dc_kit_paths)"
+    rm -f "$c/scripts/lib.sh"; mkfifo "$c/scripts/lib.sh"
+    got="$(timeout 5 bash -c '. "$1/.container/lib.sh"; dc_kit_stale "$2" "$3"' _ "$repo_root" "$k" "$c" 2>&1)" || rc17=$?
+    if [ "$rc17" -eq 0 ] && [ "$got" = scripts/lib.sh ]; then ok "a FIFO at a kit path in the checkout is stale, never opened"
+    else fail "a FIFO at a kit path in the checkout is stale, never opened" "rc=$rc17 (124 = it hung) got=[$got]"; fi
+    rc17=0
+    got="$(timeout 5 bash -c '. "$1/.container/lib.sh"; dc_kit_changes "$2" "$3"' _ "$repo_root" "$k" "$c" 2>&1)" || rc17=$?
+    if [ "$rc17" -eq 0 ] && [ "$got" = "scripts/lib.sh (not a regular file or directory)" ]; then ok "...and --install-kit's list names it as such"
+    else fail "...and --install-kit's list names it as such" "rc=$rc17 got=[$got]"; fi
+}
+
+case18_an_odd_kit_names_the_kits_refresh() {
+    local d="$work/s18" want kit
+    stub_docker "$d"
+    image_json sha256:img '{}' > "$d/images/jkb-dev"
+    kit_run "$d" --status
+    want="$(jq -r '.want_args_hash' <<<"$out")"
+    kit="$d/home/.local/share/jkb-container-kit/kit"
+    printf 'running' > "$d/state"; printf '%s' "$want" > "$d/args-hash"; printf 'sha256:img' > "$d/ctr-image"
+    mkfifo "$kit/.container/odd"
+    kit_run "$d" --verify
+    if [ "$rc" -ne 0 ] && grep -qF "reinstall it: $kit/.container/run.sh --install-kit" <<<"$err"; then
+        ok "a kit holding a special file is refused with the kit's own refresh command"
+    else fail "a kit holding a special file is refused with the kit's own refresh command" "rc=$rc err=$(tail -3 <<<"$err")"; fi
+}
+
 run_cases case1_dc_git_head_reads_loose_packed_detached_and_worktrees case2_dc_git_head_says_unknown_rather_than_guess \
           case3_the_kit_records_what_it_was_copied_from case4_status_reports_the_image_labels_and_no_container \
           case5_status_drift_is_the_start_paths_answer case6_status_with_the_daemon_down_is_an_answer \
@@ -448,5 +501,6 @@ run_cases case1_dc_git_head_reads_loose_packed_detached_and_worktrees case2_dc_g
           case9_a_build_is_stamped_with_its_source_and_time case10_a_detached_source_is_labelled_detached \
           case11_one_thing_per_call case12_a_container_stopped_mid_run_is_not_started_by_a_mode \
           case13_a_head_that_is_not_a_file_is_unknown_not_a_hang case14_status_names_the_kits_refresh_never_the_checkouts \
-          case15_a_kit_with_no_source_takes_one_from_a_reinstall
+          case15_a_kit_with_no_source_takes_one_from_a_reinstall case16_a_paused_or_restarting_container_is_refused_at_the_first_look \
+          case17_a_fifo_at_a_kit_path_is_stale_not_a_hang case18_an_odd_kit_names_the_kits_refresh
 finish

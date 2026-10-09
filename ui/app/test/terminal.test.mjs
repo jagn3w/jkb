@@ -616,6 +616,13 @@ test("output is gathered into few messages", async () => {
   assert.ok(messages < 50, `2000 lines arrived in ${messages} messages`);
 });
 
+test("a container terminal enters the container run.sh names: its own ${JKB_CONTAINER_NAME:-jkb-dev}", () => {
+  assert.equal(main.containerName({}), "jkb-dev");
+  assert.equal(main.containerName({ JKB_CONTAINER_NAME: "" }), "jkb-dev", "empty is unset, as ${:-} reads it");
+  assert.equal(main.containerName({ JKB_CONTAINER_NAME: "jkb-alt" }), "jkb-alt");
+  assert.equal(main.containerName({ JKB_CONTAINER_NAME: "jkb-alt " }), "jkb-alt ", "never trimmed: run.sh does not trim it");
+});
+
 // ---- the renderer's state -------------------------------------------------------------------
 
 const S = state;
@@ -637,8 +644,17 @@ test("a terminal opened to run once may not run again; every other may", () => {
   s = S.reduce(s, { type: "status", key: 1, status: { kind: "exited", exitCode: 0 } });
   assert.equal(S.canRerun(s.entries[0]), false, "the Container tab's run.sh --rm: no Restart, no toggle");
   assert.equal(S.canRerun(s.entries[1]), true);
-  s = S.reduce(s, { type: "restart", key: 1, spec: s.entries[0].spec });
-  assert.equal(S.canRerun(s.entries[0]), false, "and nothing the reducer does makes it rerunnable");
+  // The reducer is the rule: a restart of a run-once terminal (Restart, a relaunch, the target toggle
+  // all dispatch it) is a no-op that returns the very same state, which is how the provider knows not
+  // to start its program again.
+  const before = s;
+  s = S.reduce(s, { type: "restart", key: 1, spec: { ...s.entries[0].spec, target: "container", cwd: "/home/vscode/repos" } });
+  assert.equal(s, before, "a restart of a run-once terminal changes nothing");
+  assert.deepEqual(s.entries[0].status, { kind: "exited", exitCode: 0 }, "it stays exited");
+  assert.equal(S.reduce(s, { type: "restart", key: 99, spec: spec() }), s, "nor does a restart of a terminal that is gone");
+  const restarted = S.reduce(s, { type: "restart", key: 2, spec: spec({ title: "again" }) });
+  assert.notEqual(restarted, s);
+  assert.equal(restarted.entries[1].status.kind, "starting", "any other terminal restarts");
   assert.equal("once" in S.reduce(S.INITIAL_STATE, { type: "open", key: 3, spec: spec(), placement: "drawer", once: false }).entries[0], false);
 });
 

@@ -228,11 +228,13 @@ const STOPPABLE: readonly string[] = ["running", "paused", "restarting"];
  * What the tab says about `s`, in order: the container's state, then each way it differs from what a
  * start would make it, each with the remedy `run.sh` itself prints. Pure, so every case is a test row.
  *
- * "Build starts it again" is said only where it is true: a stopped container a start would take up,
- * with no drift the start path refuses (any args drift, an image that differs). A stale one says its
- * state and lets the stale lines carry the remedy; one in a state the start path has no arm for
- * (paused, restarting, dead) cannot be started by Build at all -- its `docker run` would collide with
- * the name -- so it is stale in itself.
+ * What Build does to a stopped container is said with its condition, because `--status` cannot know
+ * it: Build REBUILDS the image first, and a build that changes it (a reinstalled kit's new source
+ * labels, a changed Dockerfile) makes the start path refuse the old container as running an older
+ * build (review s8 round 2: "Build starts it again" was said, and Build then refused). So a stopped
+ * container with no drift is told both outcomes. A stale one says its state and lets the stale lines
+ * carry the remedy; one in a state the start path has no arm for (paused, restarting, dead) cannot be
+ * started by Build at all -- its `docker run` would collide with the name -- so it is stale in itself.
  */
 export function findings(s: ContainerStatus): Finding[] {
   if (s.docker === "unreachable") {
@@ -245,7 +247,10 @@ export function findings(s: ContainerStatus): Finding[] {
     out.push({ level: "ok", text: `${s.name} is running.` });
   } else if (RESTARTABLE.includes(s.container.state)) {
     const startable = s.drift.args === "same" && s.drift.image !== "differs";
-    out.push({ level: "note", text: `${s.name} is ${s.container.state}.${startable ? " Build starts it again." : ""}` });
+    out.push({
+      level: "note",
+      text: `${s.name} is ${s.container.state}.${startable ? " Build rebuilds the image, then starts it again; if the build changed the image, run.sh refuses the old container: Remove, then Build." : ""}`,
+    });
   } else {
     out.push({
       level: "stale",

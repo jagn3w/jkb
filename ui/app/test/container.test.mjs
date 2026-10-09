@@ -159,9 +159,57 @@ test("the Container tab opens each action's terminal to run once", () => {
   // an action (a Remove) past the tab's confirmation, with its buttons enabled and no status read
   // after, and the Container/Host toggle could move the host-only run.sh into the container.
   const tab = fs.readFileSync(path.join(src, "renderer", "src", "tabs", "ContainerTab.tsx"), "utf8");
-  const opens = [...tab.matchAll(/terminals\.open\(([^;]*)\)/g)].map((m) => m[1]);
-  assert.ok(opens.length > 0, "the tab opens its action terminals through terminals.open");
-  const actionOpens = opens.filter((a) => a.startsWith("answer.value"));
-  assert.equal(actionOpens.length, 1, `one open runs an action: ${JSON.stringify(opens)}`);
-  assert.match(actionOpens[0], /\{ once: true \}/);
+  const opens = [...tab.matchAll(/\bopen: \(spec\) => ([^\n]*)/g)].map((m) => m[1]);
+  assert.equal(opens.length, 1, "runAction is given one way to open a terminal");
+  assert.match(opens[0], /\.open\(spec, "drawer", \{ once: true \}\)/);
+  assert.match(tab, /runAction\(action, gate\.current,/, "and every action runs through runAction and the tab's one gate");
+});
+
+const { ActionGate, runAction } = await load(path.join(src, "renderer", "src", "tabs", "containerRun.ts"));
+
+/** Deps whose spec answers only when `answer()` is called, so a second click lands mid-run. */
+function deps({ confirm = true, ok = true } = {}) {
+  const log = [];
+  let answer;
+  const pending = new Promise((resolve) => (answer = resolve));
+  return {
+    log,
+    answer: () => answer(ok ? { ok: true, value: { target: "host", cwd: "/h", argv: ["/k/run.sh", "--build"], title: "container: build" } } : { ok: false, error: "no kit" }),
+    d: {
+      confirm: (m) => (log.push(`confirm ${m.split("?")[0]}`), confirm),
+      spec: (a) => (log.push(`spec ${a}`), pending),
+      beforeOpen: async (a) => void log.push(`before ${a}`),
+      open: (spec) => (log.push(`open ${spec.argv.join(" ")}`), 7),
+      notice: (m) => m !== undefined && log.push(`notice ${m}`),
+    },
+  };
+}
+
+test("a second click while an action is starting runs nothing: the gate is taken before the first await", async () => {
+  const gate = new ActionGate();
+  const t = deps();
+  const first = runAction("build", gate, t.d);
+  const second = await runAction("build", gate, t.d);
+  assert.equal(second, undefined, "the double click is refused");
+  assert.equal(await runAction("remove", gate, t.d), undefined, "as is any other action");
+  t.answer();
+  assert.deepEqual(await first, { key: 7, action: "build" });
+  assert.deepEqual(t.log, ["spec build", "before build", "open /k/run.sh --build"], "one spec, one terminal");
+  assert.equal(gate.busy, true, "held until the tab sees the terminal end");
+  gate.release();
+  assert.equal(gate.busy, false);
+});
+
+test("every path that opens no terminal releases the gate", async () => {
+  const gate = new ActionGate();
+  const declined = deps({ confirm: false });
+  assert.equal(await runAction("remove", gate, declined.d), undefined);
+  assert.deepEqual(declined.log, ["confirm Remove the container"], "declined: main is not asked");
+  assert.equal(gate.busy, false);
+  const refused = deps({ ok: false });
+  const r = runAction("verify", gate, refused.d);
+  refused.answer();
+  assert.equal(await r, undefined);
+  assert.deepEqual(refused.log, ["spec verify", "notice no kit"]);
+  assert.equal(gate.busy, false);
 });
