@@ -244,6 +244,21 @@ pub fn in_tasks_file(conn: &Connection, item: ItemId) -> Result<bool> {
     Ok(crate::binding::serializer_for(conn, item)?.as_deref() == Some("tasks"))
 }
 
+/// What [`edit_content`] does to an item's content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentEdit<'a> {
+    /// Replace the content with `text` — only while it is still `expected`, when that is given.
+    Replace {
+        /// The new content.
+        text: &'a str,
+        /// The content the edit was made against (a draft's starting point); `None` replaces
+        /// whatever is there.
+        expected: Option<&'a str>,
+    },
+    /// Append this text: nothing it was based on can be lost, so it needs no base.
+    Append(&'a str),
+}
+
 /// Replace an item's content with `text`, or append it, through [`set_content`] — the one rule for an
 /// edit, shared by `jkb task edit` (`jkb_api::tasks::edit`) and `jkb item edit`. An item in a tasks
 /// file ([`in_tasks_file`]) appends with a single newline (its body is contiguous indented lines) and
@@ -251,30 +266,44 @@ pub fn in_tasks_file(conn: &Connection, item: ItemId) -> Result<bool> {
 /// (`jkb_sync::task_content_problem`), handed in because core does not depend on it: a blank line
 /// ending the body, an indented checkbox becoming a child task, a trailing `^x` or `@x` becoming an
 /// identity or a due date. The *result* is judged, not the text sent. Any other item appends after a
-/// blank line. With `max_bytes`, a result longer than that is refused. Answers whether the item is in
-/// a tasks file.
+/// blank line. With `max_bytes`, a result longer than that is refused. A replace with an `expected`
+/// base is refused with [`Error::Stale`] unless the item's content is still exactly that base, so an
+/// editor whose draft started before someone else's write cannot erase it. Answers whether the item
+/// is in a tasks file.
 ///
 /// # Errors
-/// A validation error for a refused result, [`jkb_types::Error::NotFound`] via [`set_content`], or a
-/// failed read or write.
+/// A validation error for a refused result, [`Error::Stale`] for a replace whose base no longer
+/// holds, [`jkb_types::Error::NotFound`] via [`set_content`], or a failed read or write.
 pub fn edit_content(
     conn: &Connection,
     meta: &WriteMeta,
     item: ItemId,
-    text: &str,
-    append: bool,
+    edit: &ContentEdit<'_>,
     max_bytes: Option<usize>,
     tasks_problem: &dyn Fn(&str) -> Option<String>,
 ) -> Result<bool> {
     let tasks_file = in_tasks_file(conn, item)?;
-    let content = if append {
-        let separator = if tasks_file { "\n" } else { "\n\n" };
-        match get_content(conn, item)? {
-            Some(existing) if !existing.is_empty() => format!("{existing}{separator}{text}"),
-            _ => text.to_owned(),
+    let content = match *edit {
+        ContentEdit::Append(text) => {
+            let separator = if tasks_file { "\n" } else { "\n\n" };
+            match get_content(conn, item)? {
+                Some(existing) if !existing.is_empty() => format!("{existing}{separator}{text}"),
+                _ => text.to_owned(),
+            }
         }
-    } else {
-        text.to_owned()
+        ContentEdit::Replace { text, expected } => {
+            if let Some(expected) = expected {
+                let current = get_content(conn, item)?.unwrap_or_default();
+                if current != expected {
+                    return Err(Error::Stale(
+                        "the item's text changed since this edit read it; nothing was written — \
+                         re-read it and apply the edit again"
+                            .to_owned(),
+                    ));
+                }
+            }
+            text.to_owned()
+        }
     };
     // The size first: the round-trip probe parses the whole text, inside the writer's transaction.
     if let Some(max) = max_bytes {

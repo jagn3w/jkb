@@ -518,7 +518,9 @@ pub enum PromptAsk {
     Play {
         /// The plan.
         plan: String,
-        /// The workflow strategy the operator chose for the plan's tasks; the default when omitted.
+        /// The workflow strategy the operator chose for the plan's tasks. Pins nothing: the prompt
+        /// says which open tasks run it and names any that do not. Omitted, no choice is claimed and
+        /// each task keeps its own (the default while unpinned).
         #[serde(default)]
         strategy: Option<String>,
     },

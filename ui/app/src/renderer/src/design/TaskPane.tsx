@@ -1,6 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { decodeTaskDetail, isTerminal, planOps, playPins, type PlanTask, type TaskDetail } from "@jkb/core";
+import {
+  decodeTaskDetail,
+  isTerminal,
+  planOps,
+  playPins,
+  rebaseDraft,
+  saveDraft,
+  type Draft,
+  type Pick,
+  type PlanTask,
+  type TaskDetail,
+} from "@jkb/core";
 
 type Detail =
   | { readonly kind: "loading" }
@@ -14,24 +25,32 @@ const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(reque
  * transitions — with its text editable through `task.edit` (replace, or append a note) and *Play*,
  * which pins it to the strategy the operator picked (if any) and starts Claude in its own
  * worktree. A viewer/editor over the existing `task.*` ops; nothing here is the app's own state.
+ *
+ * A draft remembers the text it started from, and Save sends it as `task.edit`'s `expected`: a note
+ * appended meanwhile (the Play session's Claude, `jkb task edit --append`) makes jkb refuse the Save
+ * as `stale` instead of erasing the note. The draft is kept, the task's text as it now is is shown
+ * beside it, and the operator discards the draft or keeps it over the new text knowingly.
  */
 export function TaskPane({
   task,
-  strategy,
+  pick,
   busy,
   onPlay,
   onChanged,
   onNotice,
 }: {
   readonly task: PlanTask | undefined;
-  readonly strategy: string | undefined;
+  /** The strategy the operator picked for a Play, if any. */
+  readonly pick: Pick | undefined;
   readonly busy: boolean;
   readonly onPlay: (task: PlanTask) => void;
   readonly onChanged: () => void;
   readonly onNotice: (message: string) => void;
 }): React.JSX.Element {
   const [detail, setDetail] = useState<Detail>({ kind: "loading" });
-  const [draft, setDraft] = useState<string | undefined>(undefined);
+  const [draft, setDraft] = useState<Draft | undefined>(undefined);
+  /** The Save was refused as stale: the task's text changed under the draft. */
+  const [conflict, setConflict] = useState<string | undefined>(undefined);
   const [note, setNote] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -45,11 +64,11 @@ export function TaskPane({
     void load();
   }, [load]);
 
-  const write = async (text: string, append: boolean): Promise<boolean> => {
+  const append = async (text: string): Promise<boolean> => {
     if (task === undefined) return false;
     setSaving(true);
     try {
-      const answer = await op(planOps.edit(task.uid, text, append));
+      const answer = await op(planOps.edit(task.uid, text, true));
       if (!answer.ok) {
         onNotice(`${task.uid}: ${answer.error.message}`);
         return false;
@@ -60,6 +79,34 @@ export function TaskPane({
     } finally {
       setSaving(false);
     }
+  };
+
+  const save = async (d: Draft): Promise<void> => {
+    if (task === undefined) return;
+    setSaving(true);
+    try {
+      const saved = await saveDraft(op, task.uid, d);
+      if (saved.kind === "failed") {
+        onNotice(`${task.uid}: ${saved.message}`);
+        return;
+      }
+      // Either way the text shown beside the draft must be the task's as it is now.
+      await load();
+      if (saved.kind === "stale") {
+        setConflict(saved.message);
+        return;
+      }
+      setDraft(undefined);
+      setConflict(undefined);
+      onChanged();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const discard = (): void => {
+    setDraft(undefined);
+    setConflict(undefined);
   };
 
   if (task === undefined) {
@@ -74,8 +121,8 @@ export function TaskPane({
   }
 
   const loaded = detail.kind === "loaded" ? detail.detail : undefined;
-  const text = draft ?? loaded?.content ?? "";
-  const repin = playPins([task], strategy).length > 0;
+  const text = draft?.text ?? loaded?.content ?? "";
+  const repin = playPins([task], pick).length > 0;
 
   return (
     <section className="task-pane">
@@ -87,7 +134,7 @@ export function TaskPane({
           className="bar-button play-button"
           disabled={busy || isTerminal(task.status)}
           onClick={() => onPlay(task)}
-          title={repin ? `Pins the task to ${strategy}, then opens its worktree with Claude` : "Opens its worktree with Claude"}
+          title={repin ? `Pins the task to ${pick?.listed}, then opens its worktree with Claude` : "Opens its worktree with Claude"}
         >
           ▶ Play
         </button>
@@ -109,7 +156,7 @@ export function TaskPane({
           <dt>Strategy</dt>
           <dd>
             {task.strategy}
-            {repin && <span className="muted"> · Play pins it to {strategy}</span>}
+            {repin && <span className="muted"> · Play pins it to {pick?.listed}</span>}
           </dd>
         </dl>
         {detail.kind === "failed" && <p className="muted plan-hint">Cannot read the task: {detail.message}</p>}
@@ -119,20 +166,48 @@ export function TaskPane({
             value={text}
             rows={8}
             disabled={loaded === undefined || saving}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              const value = e.target.value;
+              setDraft((d) => ({ text: value, base: d?.base ?? loaded?.content ?? "" }));
+            }}
             aria-label="Task text"
           />
         </label>
+        {conflict !== undefined && draft !== undefined && loaded !== undefined && (
+          <div className="task-conflict" role="alert">
+            <p>The task changed since you started editing, so Save wrote nothing. Your draft is kept; the task now reads:</p>
+            <pre className="task-current">{loaded.content}</pre>
+            <div className="task-actions">
+              <button type="button" className="bar-button" disabled={saving} onClick={discard}>
+                Discard my draft
+              </button>
+              <button
+                type="button"
+                className="bar-button"
+                disabled={saving}
+                title="Merge what you need from the text above into your draft first: the next Save replaces it"
+                onClick={() => {
+                  setDraft(rebaseDraft(draft, loaded.content));
+                  setConflict(undefined);
+                }}
+              >
+                Keep my draft over it
+              </button>
+            </div>
+          </div>
+        )}
         <div className="task-actions">
           <button
             type="button"
             className="bar-button"
-            disabled={draft === undefined || draft === loaded?.content || saving}
-            onClick={() => void write(text, false).then((ok) => ok && setDraft(undefined))}
+            disabled={draft === undefined || draft.text === draft.base || conflict !== undefined || saving}
+            onClick={() => {
+              if (draft !== undefined) void save(draft);
+            }}
           >
             Save
           </button>
-          <button type="button" className="bar-button" disabled={draft === undefined || saving} onClick={() => setDraft(undefined)}>
+          <button type="button" className="bar-button" disabled={draft === undefined || saving} onClick={discard}>
             Revert
           </button>
         </div>
@@ -141,7 +216,7 @@ export function TaskPane({
           onSubmit={(e) => {
             e.preventDefault();
             if (note.trim() === "") return;
-            void write(note, true).then((ok) => ok && setNote(""));
+            void append(note).then((ok) => ok && setNote(""));
           }}
         >
           <input

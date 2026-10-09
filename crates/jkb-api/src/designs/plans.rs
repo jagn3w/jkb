@@ -171,8 +171,10 @@ pub struct WorkPrompt {
     pub title: String,
     /// The design it belongs to (a task under none has none).
     pub design: Option<String>,
-    /// The strategy the prompt names: the one chosen for a plan, the one a task runs.
-    pub strategy: String,
+    /// The strategy the prompt names, as a task pinned to it reports it (`name@version` for a
+    /// definition): for a plan, the one the operator chose (`None` when none was — each task then
+    /// runs its own); for a task, the one it runs (`default:<name>` when unpinned).
+    pub strategy: Option<String>,
     /// The prompt itself: what the session is started with.
     pub prompt: String,
 }
@@ -207,9 +209,56 @@ fn task_line(t: &PlanTask) -> String {
     )
 }
 
+/// The plan prompt's strategy sentence: what the open tasks actually run under the pick (naming any
+/// not on it), or that no strategy was chosen. `picked` is as a pinned task reports it.
+fn strategy_lines(p: &mut String, view: &Plan, picked: Option<&str>, default: &str) {
+    if let Some(chosen) = picked {
+        // What the tasks run is read, not assumed: this prompt pins nothing (the app pins before it
+        // asks; `jkb design prompt play --strategy` does not), so a task the pins missed is named.
+        let off: Vec<&PlanTask> = view
+            .steps
+            .iter()
+            .flat_map(|s| s.tasks.iter())
+            .filter(|t| {
+                !jkb_types::TaskStatus::is_terminal_str(t.status.as_deref()) && t.strategy != chosen
+            })
+            .collect();
+        if off.is_empty() {
+            let _ = writeln!(
+                p,
+                "Workflow strategy: {chosen}. The operator chose it for this plan, and its open \
+                 tasks run under it."
+            );
+        } else {
+            let _ = writeln!(
+                p,
+                "Workflow strategy: {chosen}. The operator chose it for this plan, but these open \
+                 tasks are not pinned to it and run their own until the operator pins them: {}.",
+                off.iter()
+                    .map(|t| format!("{} ({})", t.uid, t.strategy))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let _ = writeln!(
+            p,
+            "A task you add runs the default ({default}) until the operator pins it, so name the \
+             tasks you add when you finish."
+        );
+    } else {
+        let _ = writeln!(
+            p,
+            "Workflow strategy: no choice for this plan — each task runs its own, named beside it \
+             (`default:{default}` when unpinned). A task you add runs the default ({default}) until \
+             the operator pins it, so name the tasks you add when you finish."
+        );
+    }
+}
+
 /// The *Play* prompt for a plan (D53.6): the plan, its steps, their tasks, the spans they stage,
-/// and the workflow strategy the work runs under — `strategy` when the operator chose one; with
-/// none, each task's own (the default for an unpinned one), and the prompt claims no choice.
+/// and the workflow strategy the work runs under — `strategy` when the operator chose one, said to
+/// cover only the open tasks actually pinned to it (any other is named); with none, each task's own
+/// (the default for an unpinned one), and the prompt claims no choice. Pins nothing.
 ///
 /// # Errors
 /// An unknown plan or strategy.
@@ -223,10 +272,11 @@ pub fn play_prompt(
         .and_then(|m| m.content)
         .unwrap_or_default();
     let (default, _) = workflow::default_strategy(conn)?;
+    // The pick as a task pinned to it reports it (`resolve_strategy`'s name: `name@version` for a
+    // definition), so it is compared with each task's strategy by one identity.
     let picked = strategy
         .map(|name| workflow::resolve_strategy(conn, name).map(|(n, _)| n))
         .transpose()?;
-    let chosen = picked.clone().unwrap_or_else(|| default.clone());
     let mut p = String::new();
     let _ = writeln!(
         p,
@@ -235,21 +285,7 @@ pub fn play_prompt(
         view.title, view.uid, design_title, view.design
     );
     let _ = writeln!(p);
-    if picked.is_some() {
-        let _ = writeln!(
-            p,
-            "Workflow strategy: {chosen}. The operator chose it for this plan, and its open tasks \
-             run under it. A task you add runs the default ({default}) until the operator pins it, \
-             so name the tasks you add when you finish."
-        );
-    } else {
-        let _ = writeln!(
-            p,
-            "Workflow strategy: no choice for this plan — each task runs its own, named beside it \
-             (`default:{default}` when unpinned). A task you add runs the default ({default}) until \
-             the operator pins it, so name the tasks you add when you finish."
-        );
-    }
+    strategy_lines(&mut p, &view, picked.as_deref(), &default);
     if view.archived {
         let _ = writeln!(
             p,
@@ -307,7 +343,7 @@ pub fn play_prompt(
         uid: view.uid,
         title: view.title,
         design: Some(view.design),
-        strategy: chosen,
+        strategy: picked,
         prompt: p,
     })
 }
@@ -380,7 +416,7 @@ pub fn task_prompt(conn: &Connection, reference: &str) -> Result<WorkPrompt, Api
         design: place.map(|pl| pl.design.0),
         uid,
         title,
-        strategy,
+        strategy: Some(strategy),
         prompt: p,
     })
 }

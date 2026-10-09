@@ -192,6 +192,7 @@ fn edit(ops: &Ops<'_>, uid: &str, text: &[String], stdin: bool, append: bool) ->
         uid: uid.to_owned(),
         text: new_text,
         append,
+        expected: None,
     })? {
         Response::Edited { file_backed } => file_backed,
         other => return unexpected("task.edit", &other),

@@ -67,8 +67,9 @@ pub struct PlanView {
     pub title: String,
     /// The design it plans.
     pub design: String,
-    /// Every task under it is terminal (and it has at least one): hidden from listings unless
-    /// asked, shown in the history drawer. Derived, never stored.
+    /// Every task its steps list is terminal (and it has at least one): hidden from listings
+    /// unless asked, shown in the history drawer. Derived, never stored, from the same walk as
+    /// `steps[*].tasks`.
     pub archived: bool,
     /// Its steps, in order.
     pub steps: Vec<StepView>,
@@ -286,25 +287,17 @@ fn view(
             tasks,
         });
     }
-    // Every task contained under the plan, at any depth — the same reach IMPLEMENTED has.
-    let (count, open): (i64, i64) = conn
-        .prepare_cached(
-            "WITH RECURSIVE under(id) AS (
-                 SELECT child_item_id FROM containment WHERE parent_item_id = ?1
-                 UNION
-                 SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
-             )
-             SELECT COUNT(*), COALESCE(SUM(i.status IS NULL OR i.status NOT IN (?2, ?3)), 0)
-               FROM under u JOIN items i ON i.id = u.id WHERE i.kind = 'task'",
-        )?
-        .query_row(
-            params![
-                plan_item.get(),
-                TaskStatus::Done.as_str(),
-                TaskStatus::Cancelled.as_str()
-            ],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+    // Archived is judged on exactly the tasks the view lists — one walk — so a task the listing
+    // cannot show (one contained by the plan itself, say) can neither hold the plan open unseen nor
+    // be silently left out of a plan called finished. `task::add_subtask` refuses such a parent.
+    let mut count = 0usize;
+    let mut open = 0usize;
+    for t in steps.iter().flat_map(|s: &StepView| s.tasks.iter()) {
+        count += 1;
+        if !TaskStatus::is_terminal_str(t.status.as_deref()) {
+            open += 1;
+        }
+    }
     Ok(PlanView {
         uid,
         title,

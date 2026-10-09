@@ -531,7 +531,7 @@ fn play_prompts_name_the_plan_and_the_strategy_its_work_runs_under() {
         json!({ "kind": "play", "plan": plan, "strategy": "coordinated" }),
     );
     assert_eq!(prompt.kind, "play");
-    assert_eq!(prompt.strategy, "coordinated");
+    assert_eq!(prompt.strategy.as_deref(), Some("coordinated"));
     assert_eq!(prompt.design.as_deref(), Some(uid.as_str()));
     for needle in [
         plan.as_str(),
@@ -559,7 +559,10 @@ fn play_prompts_name_the_plan_and_the_strategy_its_work_runs_under() {
 
     // With no strategy chosen the prompt claims no choice: each task runs its own.
     let unchosen = work_prompt(&kb.op, json!({ "kind": "play", "plan": plan }));
-    assert_eq!(unchosen.strategy, "design-reviewed");
+    assert_eq!(
+        unchosen.strategy, None,
+        "no pick is reported as none, not the default"
+    );
     assert!(
         unchosen.prompt.contains("no choice for this plan"),
         "{}",
@@ -578,7 +581,7 @@ fn play_prompts_name_the_plan_and_the_strategy_its_work_runs_under() {
     );
     let one = work_prompt(&kb.op, json!({ "kind": "task", "uid": task }));
     assert_eq!(one.kind, "task");
-    assert_eq!(one.strategy, "autonomous");
+    assert_eq!(one.strategy.as_deref(), Some("autonomous"));
     for needle in [
         task.as_str(),
         uid.as_str(),
@@ -755,4 +758,67 @@ fn a_new_prompt_carries_the_operators_words_and_how_to_read_the_design() {
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+}
+
+/// The plan's *Play* says the pick covers its open tasks only when each is pinned to it — compared
+/// by the identity a pinned task reports (`name@version` for a definition) — and names the others.
+#[test]
+fn a_plan_play_names_the_open_tasks_not_on_the_chosen_strategy() {
+    let Staged { kb, plan, task, .. } = staged();
+    let claims = |p: &str| p.contains("its open tasks run under it");
+    let off = work_prompt(
+        &kb.op,
+        json!({ "kind": "play", "plan": plan, "strategy": "coordinated" }),
+    );
+    assert!(!claims(&off.prompt), "{}", off.prompt);
+    assert!(
+        off.prompt.contains(&format!(
+            "not pinned to it and run their own until the operator pins them: {task} \
+             (default:design-reviewed)"
+        )),
+        "{}",
+        off.prompt
+    );
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.set", "uid": task, "strategy": "coordinated" }),
+    );
+    let on = work_prompt(
+        &kb.op,
+        json!({ "kind": "play", "plan": plan, "strategy": "coordinated" }),
+    );
+    assert!(claims(&on.prompt), "{}", on.prompt);
+
+    // A definition: the pick resolves to its newest version, and a task pinned to an older one is
+    // not on it.
+    let define = || {
+        ok(
+            &kb.op,
+            json!({ "op": "workflow.define", "name": "mine",
+                    "spec": { "graph": "direct", "toggles": { "lands": ["operator", "coordinator"] } } }),
+        )
+    };
+    define();
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.set", "uid": task, "strategy": "mine" }),
+    );
+    let pinned = work_prompt(
+        &kb.op,
+        json!({ "kind": "play", "plan": plan, "strategy": "mine" }),
+    );
+    assert_eq!(pinned.strategy.as_deref(), Some("mine@1"));
+    assert!(claims(&pinned.prompt), "{}", pinned.prompt);
+    define();
+    let newer = work_prompt(
+        &kb.op,
+        json!({ "kind": "play", "plan": plan, "strategy": "mine" }),
+    );
+    assert_eq!(newer.strategy.as_deref(), Some("mine@2"));
+    assert!(!claims(&newer.prompt), "{}", newer.prompt);
+    assert!(
+        newer.prompt.contains(&format!("{task} (mine@1)")),
+        "{}",
+        newer.prompt
+    );
 }

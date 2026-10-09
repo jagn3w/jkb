@@ -193,6 +193,7 @@ fn samples() -> Vec<Request> {
             uid: "u".into(),
             text: "t".into(),
             append: false,
+            expected: Some("t0".into()),
         },
         Request::TaskTag {
             uid: "u".into(),
@@ -3208,4 +3209,58 @@ fn an_added_due_is_held_to_the_line() {
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+}
+
+/// A Save from a draft names the body it started from; a note appended since (an agent's `jkb task
+/// edit --append`) makes that base stale, and the replace is refused rather than erasing the note.
+#[test]
+fn a_task_edit_replace_against_a_stale_base_is_refused_and_writes_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let id = db
+        .write_txn("t", |c, m| {
+            jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:t", "Title"))
+        })
+        .unwrap();
+    let body = || {
+        db.read(move |c| jkb_core::item::get_content(c, id))
+            .unwrap()
+            .unwrap_or_default()
+    };
+    let base = body();
+    call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "blocked on X", "append": true }),
+    )
+    .unwrap();
+    let noted = body();
+    assert!(noted.contains("blocked on X"), "{noted}");
+    let e = call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "Title, reworded", "expected": base }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Stale, "{e:?}");
+    assert_eq!(body(), noted, "the refused replace wrote nothing");
+    // Against the body as it now is, the replace is served; with no base, as before.
+    call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "Title, reworded", "expected": noted }),
+    )
+    .unwrap();
+    assert_eq!(body(), "Title, reworded");
+    call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "Again" }),
+    )
+    .unwrap();
+    assert_eq!(body(), "Again");
+    // A base guards a replace only.
+    let e = call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "x", "append": true, "expected": "Again" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert_eq!(body(), "Again");
 }

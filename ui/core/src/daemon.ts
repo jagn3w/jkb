@@ -51,6 +51,7 @@ export type ErrorCode =
   | "not_found"
   | "unsupported"
   | "forbidden"
+  | "stale"
   | "internal"
   | "unknown"
   | "token_refused";
@@ -73,6 +74,7 @@ export const WIRE_ERROR_CODES: readonly ErrorCode[] = [
   "not_found",
   "unsupported",
   "forbidden",
+  "stale",
   "internal",
   "unknown",
 ];

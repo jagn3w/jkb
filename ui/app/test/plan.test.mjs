@@ -25,7 +25,7 @@ async function load(entry) {
 }
 
 const src = path.join(here, "..", "src");
-const { pinThenPrompt, playPlanSpec, playTaskSpec, PLAY_TASK_SCRIPT } = await load(
+const { pinThenPrompt, planTarget, playPlanSpec, playTaskSpec, taskTarget, PLAY_TASK_SCRIPT } = await load(
   path.join(src, "renderer", "src", "design", "play.ts"),
 );
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
@@ -56,40 +56,103 @@ const workPrompt = (over = {}) => ({
   ...over,
 });
 
-/** A stand-in `op`: records each request, answers pins with `pinAnswer` and prompts with `prompt`. */
-function stub({ pinAnswer = () => ok({ result: "workflow" }), prompt = workPrompt() } = {}) {
+const STRATEGIES = {
+  result: "strategies",
+  default: "design-reviewed",
+  strategies: [
+    { name: "design-reviewed", preset: true, describe: "" },
+    { name: "coordinated", preset: true, describe: "" },
+    { name: "mine@2", preset: false, describe: "" },
+  ],
+};
+
+/** A `design.plans` answer: one plan `plan:x` with `tasks` under its one step, and `oneOffs`. */
+const listing = (tasks, oneOffs = []) => ({
+  result: "design_plans",
+  list: {
+    uid: "design:d",
+    plans: [{ uid: "plan:x", title: "First cut", design: "design:d", archived: false, steps: [{ uid: "step:s", text: "s", spans: [], tasks }] }],
+    hidden: 0,
+    tasks: oneOffs,
+  },
+});
+
+/**
+ * A stand-in `op`: records each request, answers pins with `pinAnswer`, prompts with `prompt`, the
+ * strategies with `strategies` and `design.plans` with `plans()` — read at the call, so a test can
+ * change what jkb holds between the pane's read and the Play's.
+ */
+function stub({ pinAnswer = () => ok({ result: "workflow" }), prompt = workPrompt(), plans = () => listing([task()]), strategies = STRATEGIES } = {}) {
   const calls = [];
   const op = async (request) => {
     calls.push(request);
     if (request.op === "workflow.set") return pinAnswer(request);
+    if (request.op === "workflow.strategies") return ok(strategies);
+    if (request.op === "design.plans") return ok(plans());
     return ok({ result: "design_work_prompt", prompt });
   };
-  return { op, calls };
+  return { op, calls, pins: () => calls.filter((c) => c.op === "workflow.set") };
 }
 
+const PLAN = planTarget("design:d", "plan:x");
+
 test("Play pins the open tasks not already on the chosen strategy, then asks for the prompt", async () => {
-  const { op, calls } = stub();
   const tasks = [
     task({ uid: "task:open" }),
     task({ uid: "task:on-it", strategy: "mine@2" }),
     task({ uid: "task:done", status: "done" }),
   ];
+  const { op, calls } = stub({ plans: () => listing(tasks) });
   const ask = { op: "design.prompt", ask: { kind: "play", plan: "plan:x", strategy: "mine" } };
-  const answer = await pinThenPrompt(op, tasks, "mine@2", ask);
+  const answer = await pinThenPrompt(op, PLAN, "mine", ask);
   assert.equal(answer.ok, true);
-  assert.deepEqual(calls, [{ op: "workflow.set", uid: "task:open", strategy: "mine" }, ask]);
+  assert.deepEqual(calls, [
+    { op: "workflow.strategies" },
+    { op: "design.plans", uid: "design:d", all: true },
+    { op: "workflow.set", uid: "task:open", strategy: "mine" },
+    ask,
+  ]);
+});
+
+test("Play pins from what jkb holds when it is pressed, not from the pane's last read", async () => {
+  // The pane read one task; Claude has since added another under the step, and `mine` was
+  // redefined (v2 -> v3), so the task the pane saw on `mine@2` is no longer on what `mine` names.
+  const fresh = [task({ uid: "task:seen", strategy: "mine@2" }), task({ uid: "task:added-since" })];
+  const { op, pins } = stub({
+    plans: () => listing(fresh),
+    strategies: { ...STRATEGIES, strategies: [...STRATEGIES.strategies.slice(0, 2), { name: "mine@3", preset: false, describe: "" }] },
+  });
+  assert.equal((await pinThenPrompt(op, PLAN, "mine", { op: "design.prompt" })).ok, true);
+  assert.deepEqual(
+    pins().map((p) => p.uid),
+    ["task:seen", "task:added-since"],
+  );
+  // A task's own Play reads its task afresh too, one-offs included; one already on the pick is left.
+  const one = stub({ plans: () => listing([], [task({ uid: "task:one-off", strategy: "coordinated" })]) });
+  assert.equal((await pinThenPrompt(one.op, taskTarget("design:d", "task:one-off"), "coordinated", { op: "design.prompt" })).ok, true);
+  assert.deepEqual(one.pins(), []);
+  // A pick no longer listed, or a target gone from the design, starts nothing.
+  const gone = stub();
+  const r = await pinThenPrompt(gone.op, PLAN, "deleted", { op: "design.prompt" });
+  assert.equal(r.ok, false);
+  assert.match(r.error.message, /no longer listed/);
+  const r2 = await pinThenPrompt(gone.op, taskTarget("design:d", "task:nope"), "coordinated", { op: "design.prompt" });
+  assert.equal(r2.ok, false);
+  assert.deepEqual(gone.pins(), []);
+  assert.equal(gone.calls.filter((c) => c.op === "design.prompt").length, 0);
 });
 
 test("a refused pin stops the Play before any prompt, naming the task", async () => {
   const { op, calls } = stub({
     pinAnswer: (r) => (r.uid === "task:b" ? { ok: false, error: { code: "forbidden", message: "operator only" } } : ok({ result: "workflow" })),
+    plans: () => listing([task(), task({ uid: "task:b" }), task({ uid: "task:c" })]),
   });
-  const answer = await pinThenPrompt(op, [task(), task({ uid: "task:b" }), task({ uid: "task:c" })], "coordinated", { op: "design.prompt" });
+  const answer = await pinThenPrompt(op, PLAN, "coordinated", { op: "design.prompt" });
   assert.equal(answer.ok, false);
   assert.equal(answer.error.code, "forbidden");
   assert.match(answer.error.message, /task:b to coordinated: operator only/);
   assert.deepEqual(
-    calls.map((c) => c.uid ?? c.op),
+    calls.filter((c) => c.op !== "workflow.strategies" && c.op !== "design.plans").map((c) => c.uid ?? c.op),
     ["task:a", "task:b"],
     "stopped at the refusal: no third pin, no prompt",
   );
@@ -97,23 +160,23 @@ test("a refused pin stops the Play before any prompt, naming the task", async ()
 
 test("with no strategy chosen nothing is pinned, and a malformed prompt answer is refused", async () => {
   const { op, calls } = stub({ prompt: workPrompt({ prompt: "" }) });
-  const answer = await pinThenPrompt(op, [task()], undefined, { op: "design.prompt" });
+  const answer = await pinThenPrompt(op, PLAN, undefined, { op: "design.prompt" });
   assert.equal(answer.ok, false);
   assert.equal(answer.error.code, "internal");
-  assert.deepEqual(calls, [{ op: "design.prompt" }]);
+  assert.deepEqual(calls, [{ op: "design.prompt" }], "nothing read, nothing pinned");
 });
 
 test("a Play left on the default pins no defaulting task; an explicit pick of the default pins them", async () => {
   const tasks = [task({ uid: "task:a" }), task({ uid: "task:b", status: "in_progress" })];
   const ask = { op: "design.prompt", ask: { kind: "play", plan: "plan:x" } };
-  const left = stub();
-  assert.equal((await pinThenPrompt(left.op, tasks, undefined, ask)).ok, true);
+  const left = stub({ plans: () => listing(tasks) });
+  assert.equal((await pinThenPrompt(left.op, PLAN, undefined, ask)).ok, true);
   assert.deepEqual(left.calls, [ask], "no workflow.set row for a task reporting default:design-reviewed");
 
-  const picked = stub();
+  const picked = stub({ plans: () => listing(tasks) });
   const pickedAsk = { op: "design.prompt", ask: { kind: "play", plan: "plan:x", strategy: "design-reviewed" } };
-  assert.equal((await pinThenPrompt(picked.op, tasks, "design-reviewed", pickedAsk)).ok, true);
-  assert.deepEqual(picked.calls, [
+  assert.equal((await pinThenPrompt(picked.op, PLAN, "design-reviewed", pickedAsk)).ok, true);
+  assert.deepEqual(picked.calls.slice(2), [
     { op: "workflow.set", uid: "task:a", strategy: "design-reviewed" },
     { op: "workflow.set", uid: "task:b", strategy: "design-reviewed" },
     pickedAsk,

@@ -4,8 +4,10 @@ import {
   decodePlanList,
   decodeStrategies,
   partitionPlans,
+  pickOf,
   planOps,
   planTasks,
+  strategyName,
   type ExecPlan,
   type PlanList,
   type PlanTask,
@@ -13,7 +15,7 @@ import {
 } from "@jkb/core";
 
 import { useTerminals } from "../terminal/TerminalProvider";
-import { pinThenPrompt, playPlanSpec, playTaskSpec } from "./play";
+import { pinThenPrompt, planTarget, playPlanSpec, playTaskSpec, taskTarget } from "./play";
 import { TaskPane } from "./TaskPane";
 
 type Listing =
@@ -123,7 +125,8 @@ function PlanCard({
  * Tasks pane for the task selected, then any panes the tab puts below (the Prompts pane). Every
  * read and write is an op; the strategy picker chooses what a *Play* pins its tasks to before Claude
  * starts — only when the operator picked one: left on "each task's own", nothing is pinned and
- * unpinned tasks keep following the default.
+ * unpinned tasks keep following the default. A pick is held by its bare name, the one identity
+ * `workflow.set` resolves; the strategies are re-read with the plans, and again by *Play* itself.
  */
 export function PlanColumn({
   design,
@@ -140,29 +143,32 @@ export function PlanColumn({
   const terminals = useTerminals();
   const [listing, setListing] = useState<Listing>({ kind: "loading" });
   const [strategies, setStrategies] = useState<Strategies | undefined>(undefined);
+  /** The operator's explicit pick, by bare name; `undefined` is "each task's own". */
   const [strategy, setStrategy] = useState<string | undefined>(undefined);
   const [selected, setSelected] = useState<string | undefined>(undefined);
   const [history, setHistory] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  const loadStrategies = useCallback(async () => {
+    const answer = decodeStrategies(await op(planOps.strategies()));
+    if (!answer.ok) return;
+    setStrategies(answer.value);
+    // A pick no longer listed (its definition gone) falls back to "each task's own", never to a
+    // value the picker cannot show.
+    setStrategy((s) => (pickOf(answer.value, s) === undefined ? undefined : s));
+  }, []);
+
   const load = useCallback(async () => {
     setListing((l) => (l.kind === "loaded" ? l : { kind: "loading" }));
-    const answer = decodePlanList(await op(planOps.plans(design)));
+    const [answer] = await Promise.all([op(planOps.plans(design)).then(decodePlanList), loadStrategies()]);
     setListing(answer.ok ? { kind: "loaded", list: answer.value } : { kind: "failed", message: answer.error.message });
-  }, [design]);
+  }, [design, loadStrategies]);
 
   useEffect(() => {
     setListing({ kind: "loading" });
     setSelected(undefined);
     void load();
   }, [load]);
-
-  useEffect(() => {
-    void (async () => {
-      const answer = decodeStrategies(await op(planOps.strategies()));
-      if (answer.ok) setStrategies(answer.value);
-    })();
-  }, []);
 
   const list = listing.kind === "loaded" ? listing.list : undefined;
   const { live, archived } = useMemo(() => partitionPlans(list?.plans ?? []), [list]);
@@ -171,9 +177,10 @@ export function PlanColumn({
     [list],
   );
   const task = allTasks.find((t) => t.uid === selected);
+  const pick = pickOf(strategies, strategy);
 
   const play = useCallback(
-    async (what: "plan" | "task", uid: string, tasks: readonly PlanTask[]) => {
+    async (what: "plan" | "task", uid: string) => {
       const roots = terminals.roots;
       if (roots === undefined) {
         onNotice("The terminal is not ready yet.");
@@ -182,7 +189,8 @@ export function PlanColumn({
       setBusy(true);
       try {
         const request = what === "plan" ? planOps.play(uid, strategy) : planOps.playTask(uid);
-        const answer = await pinThenPrompt(op, tasks, strategy, request);
+        const target = what === "plan" ? planTarget(design, uid) : taskTarget(design, uid);
+        const answer = await pinThenPrompt(op, target, strategy, request);
         if (!answer.ok) {
           onNotice(answer.error.message);
           return;
@@ -215,7 +223,7 @@ export function PlanColumn({
                 Each task's own{strategies === undefined ? "" : ` (default ${strategies.default})`}
               </option>
               {(strategies?.strategies ?? []).map((s) => (
-                <option key={s.name} value={s.name} title={s.describe}>
+                <option key={s.name} value={strategyName(s.name)} title={s.describe}>
                   {s.name}
                   {s.name === strategies?.default ? " (default)" : ""}
                 </option>
@@ -247,7 +255,7 @@ export function PlanColumn({
                 selectedTask={selected}
                 onSelect={setSelected}
                 busy={busy}
-                onPlay={(plan) => void play("plan", plan.uid, planTasks(plan))}
+                onPlay={(plan) => void play("plan", plan.uid)}
               />
             ))
           )}
@@ -286,9 +294,9 @@ export function PlanColumn({
       <TaskPane
         key={task?.uid ?? "none"}
         task={task}
-        strategy={strategy}
+        pick={pick}
         busy={busy}
-        onPlay={(t) => void play("task", t.uid, [t])}
+        onPlay={(t) => void play("task", t.uid)}
         onChanged={() => void load()}
         onNotice={onNotice}
       />

@@ -400,9 +400,13 @@ text above:
 - **Nothing about a plan is stored that the graph says.** A plan is contained by its design, its steps
   by the plan (containment position is their order), a step's tasks by the step (`jkb task add …
   --under <step>`, the ordinary subtask path, so the step is the task's parent the way a parent task
-  is). **Archived is derived on every read**: a plan with at least one task, every task under it at
-  any depth `done` or `cancelled`. A plan with no tasks is a draft, not finished work — the vacuous
-  truth IMPLEMENTED also refuses — and a reopened task brings its plan back with no write.
+  is). **Archived is derived on every read**: a plan with at least one task, every task its steps
+  list (at any depth below a step) `done` or `cancelled`. A plan with no tasks is a draft, not
+  finished work — the vacuous truth IMPLEMENTED also refuses — and a reopened task brings its plan
+  back with no write. Archived and the listing are **one walk**: archived once counted every task
+  contained anywhere under the plan while the listing reached only tasks under a step, so a task put
+  directly under the plan held it open forever and showed nowhere (caught in review).
+  `task::add_subtask` now refuses a plan or a span as a task's parent, so no op can put one there.
 - **`design.plans` takes `all`**, as `jkb ls` does for terminal tasks; the listing says how many
   archived plans it left out. The app always asks for all and splits them itself, so the drawer is
   one read with the pane.
@@ -416,11 +420,19 @@ text above:
   choice once pinned every unpinned task on every Play, freezing it off any later change of the
   default (caught in review). An explicit pick that equals the default does pin those tasks — that
   freeze is what choosing asks for — and the decision is one pure helper, `playPins`, that the
-  terminal and the Tasks pane's "Play pins it to" hint both use. With no pick, the prompt says no
-  strategy was chosen rather than claiming the operator chose the default. The prompt names the
-  strategy chosen and each task's own (`default:<name>` when unpinned),
-  and tells Claude that a task it adds runs the default until the operator pins it — an agent cannot
-  pin, by D52's rule. A definition is listed as `name@version` and pinned by `name` (its newest).
+  terminal and the Tasks pane's "Play pins it to" hint both use. **A pick has one identity**: the
+  picker holds the bare name, which is what `workflow.set` and the prompt resolve, and tasks are
+  compared with what that name resolves to now (`pickOf`: the listing's `name@version`, which is what
+  a task pinned to it reports). **Play pins from a fresh read**: it re-reads `workflow.strategies`
+  and `design.plans` right before pinning, since the pane is not live — a task Claude added since, or
+  a definition redefined since, was otherwise skipped or needlessly repinned (caught in review); the
+  refresh button re-reads the strategies with the plans. **The prompt says what the tasks run, never
+  what was meant to happen**: `design.prompt` pins nothing (nor does `jkb design prompt play
+  --strategy`), so with a pick it says the pick covers the open tasks only when each is on it, and
+  otherwise names the ones that are not. With no pick it says no strategy was chosen, and its
+  answer's `strategy` is `null` rather than the default posing as a choice. The prompt names each
+  task's own strategy (`default:<name>` when unpinned), and tells Claude that a task it adds runs the
+  default until the operator pins it — an agent cannot pin, by D52's rule.
 - **A task's *Play* is `jkb task work` in the container, then Claude in the worktree it answers.** The
   script reads the worktree from `--json` with `jq` (in the image), skipping lines that are not JSON
   (`task work` prints a note first when it cancels a pending removal); a refusal or an answer with no
@@ -429,7 +441,12 @@ text above:
   the pin, so it is the one its gates will use.
 - **The Tasks pane is `task.show` and `task.edit`**: status, claim holder, strategy and transitions
   shown; the task's text edited in place (replace) or a note appended. Claims are shown, not changed
-  here — a claim is a session's, taken by `task work`.
+  here — a claim is a session's, taken by `task work`. **A replace names its base**: `task.edit`
+  takes `expected`, the text the draft started from, and `item::edit_content` refuses the replace as
+  `stale` (a new error code) when the text is no longer that — a Save once silently erased a note
+  the Play session appended while the draft was open (caught in review). The pane keeps the draft,
+  shows the task's text as it now is, and offers to discard the draft or keep it over that text; an
+  append takes no base, since it loses nothing.
 - **Plans are re-read on demand** (a design switch, the refresh button, after a Play or an edit), not
   live: no topic carries task or plan changes yet, and D53.1 rules out a poll loop.
 

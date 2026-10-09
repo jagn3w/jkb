@@ -372,14 +372,28 @@ pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> 
 /// is how a task too big for one branch is split into the pieces that actually get worked.
 /// Cycle-guarded by [`edge::link`], so a task cannot become its own ancestor.
 ///
+/// An execution plan or a design span is never a task's parent (design D53.6): a plan's work is
+/// under its steps, and a plan's listing and its *archived* both walk only from the steps, so a task
+/// contained by the plan itself (or by a span) would be in neither — invisible, never prompted for.
+///
 /// # Errors
-/// Returns a validation error if the edge would create a cycle; otherwise a database error.
+/// Returns a validation error if the edge would create a cycle, or if `parent` is an execution
+/// plan or a design span; otherwise a database error.
 pub fn add_subtask(
     conn: &Connection,
     meta: &WriteMeta,
     parent: ItemId,
     child: ItemId,
 ) -> Result<()> {
+    if let Some(p) = crate::item::get(conn, parent)? {
+        if p.kind == crate::design::plan::PLAN_KIND || p.kind == crate::design::SPAN_KIND {
+            return Err(Error::Types(TypeError::Validation(format!(
+                "`{}` is a {}, which holds no tasks: add the task under one of its plan's steps \
+                 (`jkb design plan show` lists them) or under the design for a one-off",
+                p.uid, p.kind
+            ))));
+        }
+    }
     // The edge records the relationship and refuses a cycle; the containment row records
     // that the child lives inside the parent. Both here so they cannot drift — this is the
     // only supported way to make a subtask.

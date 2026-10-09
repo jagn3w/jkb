@@ -14,7 +14,10 @@ import {
   planOps,
   planTasks,
   strategyName,
+  pickOf,
   playPins,
+  rebaseDraft,
+  saveDraft,
   tasksToPin,
 } from "../dist/index.js";
 
@@ -61,6 +64,9 @@ test("a work prompt, the strategies and a task decode", () => {
   assert.deepEqual(decodeWorkPrompt(ok({ result: "design_work_prompt", prompt })), ok(prompt));
   assert.equal(decodeWorkPrompt(ok({ result: "design_work_prompt", prompt: { ...prompt, prompt: "" } })).ok, false);
   assert.equal(decodeWorkPrompt(ok({ result: "design_prompt", prompt })).ok, false, "a Discuss answer is not a Play one");
+  // A plan's Play with nothing picked reports no strategy, not the default.
+  const unpicked = { ...prompt, strategy: null };
+  assert.deepEqual(decodeWorkPrompt(ok({ result: "design_work_prompt", prompt: unpicked })), ok(unpicked));
 
   const strategies = { result: "strategies", default: "design-reviewed", strategies: [{ name: "coordinated", preset: true, describe: "d", spec: {} }] };
   assert.equal(decodeStrategies(ok(strategies)).value.default, "design-reviewed");
@@ -92,6 +98,13 @@ test("requests are the ops' own shapes, a definition resolved by its name", () =
   assert.deepEqual(planOps.playTask("task:a"), { op: "design.prompt", ask: { kind: "task", uid: "task:a" } });
   assert.deepEqual(planOps.pin("task:a", "coordinated"), { op: "workflow.set", uid: "task:a", strategy: "coordinated" });
   assert.deepEqual(planOps.edit("task:a", "note", true), { op: "task.edit", uid: "task:a", text: "note", append: true });
+  assert.deepEqual(planOps.edit("task:a", "new", false, "old"), {
+    op: "task.edit",
+    uid: "task:a",
+    text: "new",
+    append: false,
+    expected: "old",
+  });
   assert.equal(strategyName("mine@12"), "mine");
   assert.equal(strategyName("autonomous"), "autonomous");
 });
@@ -129,15 +142,59 @@ test("a Play with no strategy picked pins nothing, so unpinned tasks keep follow
   ];
   // The picker shows the default (`design-reviewed`) but the operator never touched it.
   assert.deepEqual(playPins(tasks, undefined), []);
+  const listing = {
+    default: "design-reviewed",
+    strategies: [
+      { name: "design-reviewed", preset: true, describe: "" },
+      { name: "mine@3", preset: false, describe: "" },
+    ],
+  };
+  const preset = pickOf(listing, "design-reviewed");
   // An explicit pick equal to the default is a choice: it pins the open tasks only defaulting to
   // it, freezing them there, and leaves a task already pinned to it alone.
-  assert.deepEqual(playPins([...tasks, task({ uid: "task:on-it", strategy: "design-reviewed" })], "design-reviewed"), [
+  assert.deepEqual(playPins([...tasks, task({ uid: "task:on-it", strategy: "design-reviewed" })], preset), [
     { op: "workflow.set", uid: "task:unpinned", strategy: "design-reviewed" },
     { op: "workflow.set", uid: "task:also", strategy: "design-reviewed" },
     { op: "workflow.set", uid: "task:pinned", strategy: "design-reviewed" },
   ]);
-  // A listed definition is pinned by its name.
-  assert.deepEqual(playPins([task()], "mine@2"), [{ op: "workflow.set", uid: "task:a", strategy: "mine" }]);
+  // A definition is one identity: pinned by its bare name, compared by what that name resolves to
+  // now (its newest listed version), so a task on an older version is repinned and one on the
+  // newest is left alone — whichever spelling the pick was made with.
+  for (const picked of ["mine", "mine@2", "mine@3"]) {
+    assert.deepEqual(pickOf(listing, picked), { name: "mine", listed: "mine@3" });
+  }
+  const mine = pickOf(listing, "mine");
+  assert.deepEqual(playPins([task({ uid: "task:old", strategy: "mine@2" }), task({ uid: "task:new", strategy: "mine@3" })], mine), [
+    { op: "workflow.set", uid: "task:old", strategy: "mine" },
+  ]);
+  assert.equal(pickOf(listing, "gone"), undefined, "a pick no longer listed resolves to nothing");
+  assert.equal(pickOf(undefined, "mine"), undefined);
   // The plan's prompt request names a strategy only when one was picked.
   assert.deepEqual(planOps.play("plan:x", undefined), { op: "design.prompt", ask: { kind: "play", plan: "plan:x" } });
+});
+
+test("a Save names the text its draft started from; a stale one is told apart and keeps the draft", async () => {
+  const calls = [];
+  let current = "Build it";
+  const op = async (request) => {
+    calls.push(request);
+    if (request.expected !== undefined && request.expected !== current) {
+      return { ok: false, error: { code: "stale", message: "the item's text changed" } };
+    }
+    current = request.text;
+    return ok({ result: "edited", file_backed: false });
+  };
+  const draft = { text: "Build it well", base: "Build it" };
+  // The Play session's Claude appends a note after the draft opened.
+  current = "Build it\n\nblocked on X";
+  assert.deepEqual(await saveDraft(op, "task:a", draft), { kind: "stale", message: "the item's text changed" });
+  assert.equal(current, "Build it\n\nblocked on X", "the note survives");
+  assert.deepEqual(calls[0], { op: "task.edit", uid: "task:a", text: "Build it well", append: false, expected: "Build it" });
+  // Kept over the text the operator was shown, the next Save replaces exactly that.
+  const kept = rebaseDraft(draft, current);
+  assert.deepEqual(kept, { text: "Build it well", base: "Build it\n\nblocked on X" });
+  assert.deepEqual(await saveDraft(op, "task:a", kept), { kind: "saved" });
+  assert.equal(current, "Build it well");
+  const refused = async () => ({ ok: false, error: { code: "invalid", message: "would not round-trip" } });
+  assert.deepEqual(await saveDraft(refused, "task:a", kept), { kind: "failed", message: "would not round-trip" });
 });

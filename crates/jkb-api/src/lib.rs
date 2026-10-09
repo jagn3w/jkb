@@ -382,6 +382,10 @@ pub enum Request {
         /// Append rather than replace.
         #[serde(default)]
         append: bool,
+        /// For a replace: the body the edit was made against. Written only while the body is still
+        /// exactly this, else refused as [`ErrorCode::Stale`]. Left off the wire when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<String>,
     },
     /// Add, set or remove a `facet=value` tag.
     #[serde(rename = "task.tag")]
@@ -2771,6 +2775,9 @@ pub enum ErrorCode {
     /// A write this backend's clients may not make: one that would have the host's sync write a file
     /// outside the directories they may cause host writes in ([`tasks::FileRoots`]).
     Forbidden,
+    /// A write made against a read that no longer holds (a `task.edit` replace whose `expected`
+    /// body is not the current one). Nothing was written: re-read, and apply the edit again.
+    Stale,
     /// Anything else: a database or internal failure.
     Internal,
     /// A code this build does not know, from a newer peer. Clients treat it like `internal`.
@@ -2864,6 +2871,7 @@ impl From<jkb_core::Error> for ApiError {
                 }
             },
             jkb_core::Error::SchemaNewer { .. } => ErrorCode::SchemaNewer,
+            jkb_core::Error::Stale(_) => ErrorCode::Stale,
             jkb_core::Error::Types(jkb_types::Error::Validation(_)) => ErrorCode::Invalid,
             jkb_core::Error::Types(jkb_types::Error::NotFound(_)) => ErrorCode::NotFound,
             jkb_core::Error::Sqlite(rusqlite::Error::SqliteFailure(f, _))
@@ -3499,11 +3507,24 @@ impl LocalBackend {
                 })?;
                 Response::Applied {}
             }
-            Request::TaskEdit { uid, text, append } => {
+            Request::TaskEdit {
+                uid,
+                text,
+                append,
+                expected,
+            } => {
                 let roots = self.file_roots.clone();
                 Response::Edited {
                     file_backed: task_write(db, actor, uid, move |c, m, uid| {
-                        tasks::edit(c, m, uid, &text, append, roots.as_ref())
+                        tasks::edit(
+                            c,
+                            m,
+                            uid,
+                            &text,
+                            append,
+                            expected.as_deref(),
+                            roots.as_ref(),
+                        )
                     })?,
                 }
             }

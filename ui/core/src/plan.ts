@@ -7,7 +7,7 @@
 // The Rust side is the source of truth: `crates/jkb-api/src/designs/plans.rs` (the shapes) and
 // `crates/jkb-core/src/design/plan.rs` (the rules — archived is derived there, never here).
 
-import type { OpResponse, Outcome } from "./daemon.js";
+import type { OpRequest, OpResponse, Outcome } from "./daemon.js";
 import { failed } from "./daemon.js";
 import type { Span } from "./design.js";
 
@@ -58,7 +58,11 @@ export interface WorkPrompt {
   readonly uid: string;
   readonly title: string;
   readonly design: string | null;
-  readonly strategy: string;
+  /**
+   * As a task pinned to it reports it (`name@version` for a definition): for a plan, the strategy the
+   * operator picked, `null` when none was; for a task, the one it runs.
+   */
+  readonly strategy: string | null;
   readonly prompt: string;
 }
 
@@ -112,8 +116,12 @@ export const planOps = {
   /** Pin a task to a strategy (the operator's; the app holds the operator's token). */
   pin: (uid: string, strategy: string) => ({ op: "workflow.set", uid, strategy: strategyName(strategy) }),
   show: (uid: string) => ({ op: "task.show", uid }),
-  /** Replace a task's text, or append a note to it. */
-  edit: (uid: string, text: string, append: boolean) => ({ op: "task.edit", uid, text, append }),
+  /**
+   * Replace a task's text, or append a note to it. A replace names the text it was made against
+   * (`expected`), and jkb refuses it as `stale` when the task's text is no longer that.
+   */
+  edit: (uid: string, text: string, append: boolean, expected?: string) =>
+    expected === undefined ? { op: "task.edit", uid, text, append } : { op: "task.edit", uid, text, append, expected },
 } as const;
 
 /**
@@ -148,12 +156,36 @@ export function planTasks(plan: ExecPlan): PlanTask[] {
 }
 
 /**
- * The tasks a *Play* under `strategy` (a `workflow.strategies` name) must pin first: the open ones
- * not already running it. A task already pinned to it is left alone — pinning writes a row of its
- * history — and a terminal one is not work the Play starts.
+ * The tasks a *Play* under `strategy` must pin first: the open ones not already running it.
+ * `strategy` is the identity a task pinned to it reports — a `workflow.strategies` listing's
+ * `name@version` for a definition, the name for a preset ([`Pick.listed`]). A task already pinned to
+ * it is left alone — pinning writes a row of its history — and a terminal one is not work the Play
+ * starts.
  */
 export function tasksToPin(tasks: readonly PlanTask[], strategy: string): PlanTask[] {
   return tasks.filter((t) => !isTerminal(t.status) && t.strategy !== strategy);
+}
+
+/**
+ * An explicit strategy pick, by its one identity: `name` is what `workflow.set` and *Play* send, and
+ * `listed` is what it resolves to now — what a task pinned to it reports (`mine@3`) — read from a
+ * `workflow.strategies` listing. Compare tasks with `listed`; pin with `name`.
+ */
+export interface Pick {
+  readonly name: string;
+  readonly listed: string;
+}
+
+/**
+ * The pick `name` (a bare strategy name) resolves to in `strategies`, the listing being each
+ * definition's newest version — what `workflow.set` resolves the bare name to. `undefined` when it is
+ * no longer listed.
+ */
+export function pickOf(strategies: Strategies | undefined, name: string | undefined): Pick | undefined {
+  if (strategies === undefined || name === undefined) return undefined;
+  const bare = strategyName(name);
+  const s = strategies.strategies.find((x) => strategyName(x.name) === bare);
+  return s === undefined ? undefined : { name: bare, listed: s.name };
 }
 
 /**
@@ -164,8 +196,45 @@ export function tasksToPin(tasks: readonly PlanTask[], strategy: string): PlanTa
  * `default:<name>`, since freezing them on it — off whatever the default later becomes — is what
  * an explicit choice asks for.
  */
-export function playPins(tasks: readonly PlanTask[], picked: string | undefined): ReturnType<typeof planOps.pin>[] {
-  return picked === undefined ? [] : tasksToPin(tasks, picked).map((t) => planOps.pin(t.uid, picked));
+export function playPins(tasks: readonly PlanTask[], picked: Pick | undefined): ReturnType<typeof planOps.pin>[] {
+  return picked === undefined ? [] : tasksToPin(tasks, picked.listed).map((t) => planOps.pin(t.uid, picked.name));
+}
+
+// ---- editing a task's text ----------------------------------------------------------------------
+
+/**
+ * The Tasks pane's edit of a task's text: what it reads now, and the text it was started from. A
+ * Save sends `base` as `task.edit`'s `expected`, so a note appended meanwhile (by the Play session's
+ * Claude, say) is never erased by it.
+ */
+export interface Draft {
+  readonly text: string;
+  readonly base: string;
+}
+
+/** A Save's outcome: written; refused because the task changed under the draft; or refused. */
+export type Saved =
+  | { readonly kind: "saved" }
+  | { readonly kind: "stale"; readonly message: string }
+  | { readonly kind: "failed"; readonly message: string };
+
+/** Save `draft` over task `uid`'s text, only while that text is still the draft's base. */
+export async function saveDraft(
+  op: (request: OpRequest) => Promise<Outcome<OpResponse>>,
+  uid: string,
+  draft: Draft,
+): Promise<Saved> {
+  const answer = await op(planOps.edit(uid, draft.text, false, draft.base));
+  if (answer.ok) return { kind: "saved" };
+  return { kind: answer.error.code === "stale" ? "stale" : "failed", message: answer.error.message };
+}
+
+/**
+ * After a `stale` refusal, the operator read the task's `current` text and chose to keep their draft:
+ * the draft, now based on `current`, so the next Save replaces exactly what they saw.
+ */
+export function rebaseDraft(draft: Draft, current: string): Draft {
+  return { text: draft.text, base: current };
 }
 
 // ---- decoding answers -------------------------------------------------------------------------
@@ -255,7 +324,7 @@ export function decodeWorkPrompt(o: Outcome<OpResponse>): Outcome<WorkPrompt> {
       isString(v["uid"]) &&
       isString(v["title"]) &&
       isOptString(v["design"]) &&
-      isString(v["strategy"]) &&
+      isOptString(v["strategy"]) &&
       isString(v["prompt"]) &&
       v["prompt"] !== "",
   );

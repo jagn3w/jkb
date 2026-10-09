@@ -624,21 +624,34 @@ pub fn set(
 /// tasks file refuses a *result* the tasks serializer would not read back as written — within
 /// [`MAX_CONTENT_BYTES`] for a task, and for any item under `roots`.
 ///
+/// A replace with `expected` — the content the client's draft started from — writes only while the
+/// body is still exactly that, so a note appended after the draft opened (by an agent's `jkb task edit
+/// --append`, say) is never erased by a Save; refused with [`ErrorCode::Stale`] instead. The check is
+/// here, in the one transaction, not left to every client to re-read first.
+///
 /// Answers whether the task is file-backed, so a client can say its file is written by the host's sync.
 ///
 /// # Errors
 /// For a task in a tasks file, a result that would not round-trip (a blank or whitespace-only line in
 /// the body, a checkbox line, trailing modifier or anchor tokens); a result over
-/// [`MAX_CONTENT_BYTES`]; [`ErrorCode::NotFound`]; [`ErrorCode::Forbidden`] under `roots`; or a failed
-/// write.
+/// [`MAX_CONTENT_BYTES`]; [`ErrorCode::Stale`] for a replace whose `expected` base no longer holds;
+/// `expected` with `append` ([`ErrorCode::Invalid`]); [`ErrorCode::NotFound`];
+/// [`ErrorCode::Forbidden`] under `roots`; or a failed write.
 pub fn edit(
     conn: &Connection,
     meta: &jkb_core::WriteMeta,
     reference: &str,
     text: &str,
     append: bool,
+    expected: Option<&str>,
     roots: Option<&FileRoots>,
 ) -> Result<bool, ApiError> {
+    if append && expected.is_some() {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            "`expected` guards a replace; an append loses nothing and takes none",
+        ));
+    }
     let id = writable(conn, reference, roots)?;
     // A task's body is bounded everywhere. Any other item — an ingested document can be megabytes —
     // is bounded only for a client of `jkb serve`, whose request the host did not choose; on the host
@@ -649,8 +662,11 @@ pub fn edit(
         conn,
         meta,
         id,
-        text,
-        append,
+        &if append {
+            item::ContentEdit::Append(text)
+        } else {
+            item::ContentEdit::Replace { text, expected }
+        },
         cap,
         &jkb_sync::task_content_problem,
     )?)

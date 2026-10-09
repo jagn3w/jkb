@@ -632,7 +632,9 @@ enum DesignPromptCmd {
     Play {
         /// The plan.
         plan: String,
-        /// The workflow strategy chosen for the plan's tasks (the default when omitted).
+        /// The workflow strategy the operator chose for the plan's tasks. It pins nothing (pin with
+        /// `jkb workflow set`; the app's Play pins first): the prompt names any open task not on
+        /// it. Omitted, each task keeps its own strategy (the default while unpinned).
         #[arg(long)]
         strategy: Option<String>,
     },

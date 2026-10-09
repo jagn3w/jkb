@@ -941,6 +941,54 @@ fn a_plan_whose_tasks_are_all_terminal_is_archived_and_hidden_unless_asked() {
     assert!(!plans_of(&db, &uid, false).plans[0].archived);
 }
 
+/// Archived and the listing are one walk: a task the steps do not reach (here contained by the
+/// plan itself, which `task::add_subtask` now refuses) neither holds the plan open unseen nor shows.
+#[test]
+fn archived_is_judged_on_exactly_the_tasks_the_plan_lists() {
+    let db = db();
+    let uid = create(&db, "x");
+    let p = new_plan(&db, &uid, &["one"]).unwrap();
+    let listed = task_under(&db, step_id(&db, &p.steps[0].uid), "task:a");
+    let _stray = task_under(&db, step_id(&db, &p.uid), "task:stray");
+    set_status(&db, listed, TaskStatus::Done);
+    let all = plans_of(&db, &uid, true);
+    let uids: Vec<&str> = all.plans[0].tasks().map(|t| t.uid.as_str()).collect();
+    assert_eq!(uids, ["task:a"], "the stray task is not listed");
+    assert!(
+        all.plans[0].archived,
+        "so it cannot hold the plan open either"
+    );
+}
+
+#[test]
+fn a_task_cannot_be_made_a_subtask_of_a_plan_or_a_span() {
+    let db = db();
+    let uid = create(&db, "Scaffold the app.");
+    let p = new_plan(&db, &uid, &["one"]).unwrap();
+    let sp = span(&db, &uid, "Scaffold the app.", Reviewer::Operator).unwrap();
+    for parent in [p.uid.clone(), sp] {
+        let pid = step_id(&db, &parent);
+        let e = db
+            .write_txn("t", move |c, m| {
+                let t = task::create(c, m, &task::NewTask::new("task:x", "x"))?;
+                task::add_subtask(c, m, pid, t)
+            })
+            .unwrap_err();
+        assert!(e.to_string().contains("holds no tasks"), "{parent}: {e}");
+    }
+    // A step and the design itself still take one.
+    let step = step_id(&db, &p.steps[0].uid);
+    let u = uid.clone();
+    let d = db.read(move |c| design_id(c, &u)).unwrap();
+    for (n, parent) in [step, d].into_iter().enumerate() {
+        db.write_txn("t", move |c, m| {
+            let t = task::create(c, m, &task::NewTask::new(format!("task:ok{n}"), "x"))?;
+            task::add_subtask(c, m, parent, t)
+        })
+        .unwrap();
+    }
+}
+
 #[test]
 fn a_task_lists_its_claim_holder() {
     let db = db();

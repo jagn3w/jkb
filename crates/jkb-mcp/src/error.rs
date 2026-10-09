@@ -50,6 +50,7 @@ impl Error {
                     | ErrorCode::Forbidden
                     | ErrorCode::Unsupported
                     | ErrorCode::TooLarge
+                    | ErrorCode::Stale
             ),
             Self::Types(jkb_types::Error::Validation(_) | jkb_types::Error::NotFound(_))
             | Self::Source(_) => true,

@@ -263,6 +263,27 @@
   min-width: 0;
 }
 
+.task-conflict {
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  font-size: var(--text-sm);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+}
+
+.task-conflict p {
+  margin: 0 0 var(--space-1);
+}
+
+.task-current {
+  margin: 0;
+  max-height: 12em;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
 .task-subhead {
   margin: var(--space-3) 0 var(--space-1);
   font-size: var(--text-sm);

@@ -506,7 +506,7 @@ pub const fn status_for(code: ErrorCode) -> StatusCode {
         }
         ErrorCode::Unsupported => StatusCode::NOT_IMPLEMENTED,
         ErrorCode::Forbidden => StatusCode::FORBIDDEN,
-        ErrorCode::TopicConflict => StatusCode::CONFLICT,
+        ErrorCode::TopicConflict | ErrorCode::Stale => StatusCode::CONFLICT,
         ErrorCode::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ErrorCode::Invalid | ErrorCode::AckBeyondEnd | ErrorCode::CorruptPayload => {
             StatusCode::UNPROCESSABLE_ENTITY
