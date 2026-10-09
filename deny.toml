@@ -16,6 +16,12 @@ ignore = [
     # `rav1e`/`image`); there is no maintained drop-in and no known exploit. Revisit when
     # those upstreams migrate off `paste`.
     "RUSTSEC-2024-0436",
+    # `smallstr` is unmaintained (not a vulnerability). It is a transitive dep of `yrs`,
+    # the CRDT behind design documents (D53.4), which uses it for one 8-byte inline string
+    # buffer (`SplittableString` in yrs's block.rs). yrs 0.28.0 is the latest release and
+    # still depends on it, so there is no upgrade path and no known exploit. Revisit when
+    # yrs moves to `compact_str`/`smol_str` (the advisory's suggested alternatives).
+    "RUSTSEC-2026-0215",
 ]
 
 [licenses]
