@@ -82,6 +82,10 @@ fn samples() -> Vec<Request> {
             group: "g".into(),
             seq: 1,
         },
+        Request::MqGroupDelete {
+            topic: "t".into(),
+            group: "g".into(),
+        },
         Request::MqCompact { force: false },
         Request::MqInspect {},
         Request::MqTail {
@@ -874,6 +878,27 @@ fn notify_ops_run_the_machine_and_report_what_it_did() {
         panic!("expected sessions")
     };
     assert_eq!((sessions.len(), sessions[0].owner.as_str()), (1, "4242"));
+    // The derived state crosses the wire: what Code Factory's needs-input dot reads (D53.9).
+    assert_eq!(sessions[0].state, "awaiting_tool", "a prompt naming a tool");
+    call(
+        &b,
+        json!({
+            "op": "notify.event", "session": "s2", "event": "needed",
+            "message": "Claude is waiting for your input"
+        }),
+    )
+    .unwrap();
+    let Response::Sessions { sessions } =
+        call(&b, json!({ "op": "notify.open_sessions" })).unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    let idle = sessions.iter().find(|s| s.session == "s2").unwrap();
+    assert_eq!(
+        serde_json::to_value(idle).unwrap()["state"],
+        "awaiting_user",
+        "the idle prompt, as the wire spells it"
+    );
 
     // A mismatched tool does not move it; the refusal says why.
     let Response::Notified { moved, refusal, .. } = call(
@@ -906,6 +931,43 @@ fn notify_ops_run_the_machine_and_report_what_it_did() {
     )
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid);
+}
+
+/// A consumer leaving for good (Code Factory on quit, D53.9) removes its group, so what it never
+/// read stops holding the topic; leaving twice is not an error.
+#[test]
+fn a_group_delete_removes_the_group_and_is_idempotent() {
+    let b = backend();
+    call(&b, json!({ "op": "mq.topic_create", "topic": "t" })).unwrap();
+    call(
+        &b,
+        json!({ "op": "mq.group_create", "topic": "t", "group": "code-factory" }),
+    )
+    .unwrap();
+    let deleted = call(
+        &b,
+        json!({ "op": "mq.group_delete", "topic": "t", "group": "code-factory" }),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&deleted).unwrap(),
+        json!({ "result": "group_deleted", "deleted": true })
+    );
+    assert!(!deleted.announces_a_send());
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "mq.group_delete", "topic": "t", "group": "code-factory" }),
+        )
+        .unwrap(),
+        Response::GroupDeleted { deleted: false }
+    );
+    let err = call(
+        &b,
+        json!({ "op": "mq.poll", "topic": "t", "group": "code-factory", "max": 1 }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NoSuchGroup);
 }
 
 #[test]

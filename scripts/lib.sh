@@ -1709,8 +1709,8 @@ render_setup_summary() {
                 esac ;;
             notifier=*)
                 case "$state" in
-                    subscribed)     printf '  • notifier:   running (pid %s); the topic has a consumer group\n' "$detail" ;;
-                    not-subscribed) printf '  • notifier:   running, but NOTHING subscribed to the topic; nothing is shown (see notifier.log)\n' ;;
+                    subscribed)     printf '  • notifier:   running (pid %s); its macos-notifier group is on the topic\n' "$detail" ;;
+                    not-subscribed) printf '  • notifier:   running, but its macos-notifier group is NOT on the topic; nothing is shown (see notifier.log)\n' ;;
                     not-running)    printf '  • notifier:   loaded but NOT running; nothing is shown (see notifier.log)\n' ;;
                     not-loaded)     printf '  • notifier:   NOT loaded; nothing is shown (see the warnings above)\n' ;;
                     no-topic)       printf '  • notifier:   running (pid %s); not checked further — this jkb cannot name the topic\n' "$detail" ;;
@@ -1775,8 +1775,8 @@ build_notifier() {
 # report_notifier <db> <topic-state> <topic> <label> <do_service> — on macOS, what can be established
 # about the notifier that displays notifications, stated no stronger than it was checked. Sets
 # `notifier_state` and `notifier_pid`:
-#   subscribed      its launchd agent has a running process (a PID), and the topic has a consumer group
-#   not-subscribed  running, but the topic has no group — nothing will be shown
+#   subscribed      its launchd agent has a running process (a PID), and the topic has the notifier's group
+#   not-subscribed  running, but the topic has no `macos-notifier` group — nothing will be shown
 #   not-running     loaded, with no process (crash-looping, or exited)
 #   not-loaded      no agent — nothing will be shown, however authorized the bundle is
 #   no-topic        running, but this jkb cannot name the topic, so there is nothing to ask
@@ -1785,11 +1785,13 @@ build_notifier() {
 # `subscribed` is NOT "notifications are shown": a group outlives its consumer by the idle period
 # (7 days), and a running notifier may have a failing subscription (its notifier.log says). What it
 # rules out is the two states setup used to report as healthy — a bundle with no agent, and an agent
-# loaded but not running (both stage-5 reviews). A group, not a group NAME, because that is what the
-# daemon asks before it sends anything.
+# loaded but not running (both stage-5 reviews). The notifier's OWN group by name (`macos-notifier`,
+# main.swift's default, which the agent setup installs does not override): any group used to do, and
+# Code Factory's `code-factory` group, left on the topic by an app that quit, then made a notifier
+# whose subscription never joined read as subscribed (D53.9 review).
 report_notifier() {
     local db="$1" topic_state="$2" topic="$3" label="$4" do_service="$5"
-    local listing waited=0 wait_for="${JKB_NOTIFIER_READY_WAIT:-10}" groups rc
+    local listing waited=0 wait_for="${JKB_NOTIFIER_READY_WAIT:-10}" groups rc group=macos-notifier
     notifier_pid=""
     if [ "$do_service" != 1 ]; then notifier_state=skipped; return 0; fi
     # The agent's own state first: it does not depend on the topic, and a topic create that failed
@@ -1821,12 +1823,15 @@ report_notifier() {
             warn "could not list the consumer groups of $topic, so whether the notifier subscribed is unknown: $groups"
             return 0
         fi
-        case "$groups" in *'"name"'*) notifier_state=subscribed; return 0 ;; esac
+        # `--json` pretty-prints, so the name follows `"name": `; tolerate any spacing.
+        if grep -Eq '"name"[[:space:]]*:[[:space:]]*"'"$group"'"' <<<"$groups"; then
+            notifier_state=subscribed; return 0
+        fi
         [ "$waited" -ge "$wait_for" ] && break
         sleep 1; waited=$((waited + 1))
     done
     notifier_state=not-subscribed
-    warn "$label is running but nothing has subscribed to $topic within ${wait_for}s — see notifier.log beside the database"
+    warn "$label is running but its group $group has not joined $topic within ${wait_for}s — see notifier.log beside the database"
 }
 
 # --- a database on a shared filesystem ------------------------------------------------------

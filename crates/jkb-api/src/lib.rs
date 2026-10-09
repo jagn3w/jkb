@@ -111,6 +111,14 @@ pub enum Request {
         /// The seq to commit through.
         seq: i64,
     },
+    /// Remove a consumer group (a consumer leaving for good); idempotent.
+    #[serde(rename = "mq.group_delete")]
+    MqGroupDelete {
+        /// The topic.
+        topic: String,
+        /// The group.
+        group: String,
+    },
     /// Remove idle groups and reap consumed, expired messages.
     #[serde(rename = "mq.compact")]
     MqCompact {
@@ -1486,6 +1494,7 @@ impl Request {
         "mq.group_create",
         "mq.poll",
         "mq.ack",
+        "mq.group_delete",
         "mq.compact",
         "mq.inspect",
         "mq.tail",
@@ -1621,6 +1630,7 @@ impl Request {
             Self::MqGroupCreate { .. } => "mq.group_create",
             Self::MqPoll { .. } => "mq.poll",
             Self::MqAck { .. } => "mq.ack",
+            Self::MqGroupDelete { .. } => "mq.group_delete",
             Self::MqCompact { .. } => "mq.compact",
             Self::MqInspect {} => "mq.inspect",
             Self::MqTail { .. } => "mq.tail",
@@ -1812,6 +1822,7 @@ impl Request {
             | Self::MqGroupCreate { .. }
             | Self::MqPoll { .. }
             | Self::MqAck { .. }
+            | Self::MqGroupDelete { .. }
             | Self::MqCompact { .. }
             | Self::MqInspect {}
             | Self::MqTail { .. }
@@ -1904,6 +1915,11 @@ pub enum Response {
     Created {
         /// `false` when it already existed.
         created: bool,
+    },
+    /// A group delete: whether there was such a group.
+    GroupDeleted {
+        /// `false` when there was none (already gone, or never made).
+        deleted: bool,
     },
     /// A send: the assigned seq.
     Sent {
@@ -2613,6 +2629,7 @@ impl Response {
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
+            | Self::GroupDeleted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -2634,6 +2651,7 @@ impl Response {
             // A recorded prompt is announced on its design's topic (D53.6), when it wrote.
             Self::DesignPromptRecorded { wrote, .. } => *wrote,
             Self::Created { .. }
+            | Self::GroupDeleted { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
             | Self::Compacted { .. }
@@ -3214,6 +3232,9 @@ impl LocalBackend {
                         .collect(),
                 }
             }
+            Request::MqGroupDelete { topic, group } => Response::GroupDeleted {
+                deleted: db.write_txn(actor, move |c, m| mq::group_delete(c, m, &topic, &group))?,
+            },
             Request::MqAck { topic, group, seq } => Response::Position {
                 position: db
                     .write_txn(actor, move |c, m| mq::ack(c, m, &topic, &group, seq, now))?,

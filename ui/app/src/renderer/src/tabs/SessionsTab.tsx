@@ -19,10 +19,12 @@ import {
 } from "@jkb/core";
 
 import { containerPathOf } from "../../../shared/terminal";
-import { sessionResumeSpec, titled } from "../design/launch";
+import { titled } from "../design/launch";
 import { useNavigation } from "../navigation";
 import { loadHolders, type Holders } from "../sessions/data";
 import { useNeedsInput } from "../sessions/NeedsInputProvider";
+import { HOST_SESSION_NOTE, owningTerminals, sessionAction } from "../sessions/resume";
+import type { TerminalEntry } from "../terminal/state";
 import { useTerminals } from "../terminal/TerminalProvider";
 
 const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(request);
@@ -59,7 +61,9 @@ const shortId = (session: string): string => session.slice(0, 8);
  * consumer group on `claude/notify` (`sessions/watch.ts`). Selecting a session previews it and
  * resolves *Jump to context*: the design prompt it was launched as, and the task(s) recording its
  * worktree's branch. A session the app started runs in one of its terminals and is shown there; any
- * other can be resumed (`claude --resume` in its directory), never re-attached.
+ * other that ran in the container can be resumed there (`claude --resume=<id>` in its directory),
+ * never re-attached; of one that ran on the host the tab says only that — the app runs no program on
+ * the host, and offers none to run (`sessions/resume.ts`).
  *
  * The registry is re-read on demand — Refresh, the *Ended too* toggle, and whenever a notification
  * moves (which the feed already announces). Nothing announces a session starting or ending, and
@@ -91,11 +95,9 @@ export function SessionsTab(): React.JSX.Element {
     () => joinSessions(listing.kind === "loaded" ? listing.value.holders : [], needs.records),
     [listing, needs.records],
   );
-  const owned = useMemo(() => {
-    const keys = new Map<string, number>();
-    for (const e of terminals.state.entries) if (e.spec.sessionUuid !== undefined) keys.set(e.spec.sessionUuid, e.key);
-    return keys;
-  }, [terminals.state.entries]);
+  // Only a terminal starting or running a session owns it — the rule re-attach records by — so one
+  // whose program ended neither hides Resume nor claims a re-attach the next Build will not do.
+  const owned = useMemo(() => owningTerminals(terminals.state.entries), [terminals.state.entries]);
   const row = rows.find((r) => r.session === selected) ?? rows[0];
 
   const refresh = (): void => {
@@ -172,7 +174,7 @@ export function SessionsTab(): React.JSX.Element {
           )}
         </section>
         <section className="sessions-preview" aria-label="Session">
-          {row === undefined ? <p className="muted plan-hint">Select a session.</p> : <SessionPreview key={row.session} row={row} terminalKey={owned.get(row.session)} />}
+          {row === undefined ? <p className="muted plan-hint">Select a session.</p> : <SessionPreview key={row.session} row={row} owner={owned.get(row.session)} />}
         </section>
       </div>
     </div>
@@ -222,20 +224,20 @@ function useSessionContext(row: SessionRow): Context {
   return { prompt, place };
 }
 
-function SessionPreview({ row, terminalKey }: { readonly row: SessionRow; readonly terminalKey: number | undefined }): React.JSX.Element {
+function SessionPreview({ row, owner }: { readonly row: SessionRow; readonly owner: TerminalEntry | undefined }): React.JSX.Element {
   const terminals = useTerminals();
   const nav = useNavigation();
   const context = useSessionContext(row);
   const [task, setTask] = useState<Loaded<TaskDetail> | undefined>(undefined);
+  const taskAsked = useRef(0);
   const [notice, setNotice] = useState<string | undefined>(undefined);
   const prompt = context.prompt.kind === "loaded" ? context.prompt.value : null;
 
-  const showTerminal = (): void => {
-    if (terminalKey === undefined) return;
-    const entry = terminals.state.entries.find((e) => e.key === terminalKey);
-    if (entry?.placement === "popover") terminals.toDrawer(terminalKey);
-    else terminals.select(terminalKey);
-    terminals.session(terminalKey)?.focus();
+  const showTerminal = (key: number): void => {
+    const entry = terminals.state.entries.find((e) => e.key === key);
+    if (entry?.placement === "popover") terminals.toDrawer(key);
+    else terminals.select(key);
+    terminals.session(key)?.focus();
   };
 
   const resume = (): void => {
@@ -244,11 +246,27 @@ function SessionPreview({ row, terminalKey }: { readonly row: SessionRow; readon
       setNotice("The terminal is not ready yet.");
       return;
     }
+    const title = titled("Resume", prompt?.title ?? shortId(row.session));
+    const action = sessionAction(row, prompt, terminals.state.entries, roots, title);
+    if (action.kind === "refused") {
+      setNotice(`Cannot resume: ${action.why}`);
+      return;
+    }
+    if (action.kind === "show") {
+      showTerminal(action.key);
+      return;
+    }
+    if (action.kind === "host") {
+      // Said, and nothing more: the app runs no program on the host, and offers none to run (D53.9).
+      setNotice(HOST_SESSION_NOTE);
+      return;
+    }
     if (row.live && !window.confirm("This session is still running in another process. Resume it here as well? Two processes on one session both write its transcript.")) {
       return;
     }
-    const title = titled("Resume", prompt?.title ?? shortId(row.session));
-    terminals.open(sessionResumeSpec({ session: row.session, cwd: row.cwd || prompt?.cwd || roots.containerRepos, title }, roots), "drawer");
+    setNotice(undefined);
+    // An ended terminal of this session is started again in place by `open` (`planOpen`).
+    terminals.open(action.spec, "drawer");
   };
 
   const shellAt = (root: string): void => {
@@ -258,9 +276,19 @@ function SessionPreview({ row, terminalKey }: { readonly row: SessionRow; readon
     terminals.open({ target: "container", cwd: containerPathOf(root, roots) ?? roots.containerRepos, argv: [], title: "shell" }, "drawer");
   };
 
+  // Each ask is numbered and only the latest answer is shown, so a slower earlier one cannot
+  // overwrite the task clicked last; the preview's unmount bumps it too.
+  useEffect(() => {
+    const asked = taskAsked;
+    return () => {
+      asked.current++;
+    };
+  }, []);
   const showTask = async (uid: string): Promise<void> => {
+    const mine = ++taskAsked.current;
     setTask({ kind: "loading" });
     const answer = decodeTaskDetail(await op(planOps.show(uid)));
+    if (mine !== taskAsked.current) return;
     setTask(answer.ok ? { kind: "loaded", value: answer.value } : { kind: "failed", message: answer.error.message });
   };
 
@@ -272,8 +300,8 @@ function SessionPreview({ row, terminalKey }: { readonly row: SessionRow; readon
           {prompt?.title ?? shortDir(row.cwd)}
         </h2>
         <span className="spacer" />
-        {terminalKey !== undefined ? (
-          <button type="button" className="bar-button" onClick={showTerminal} title="The app's terminal running this session">
+        {owner !== undefined ? (
+          <button type="button" className="bar-button" onClick={() => showTerminal(owner.key)} title="The app's terminal running this session">
             Show terminal
           </button>
         ) : (
@@ -282,7 +310,7 @@ function SessionPreview({ row, terminalKey }: { readonly row: SessionRow; readon
             className="bar-button"
             disabled={!isSessionUuid(row.session)}
             onClick={resume}
-            title={isSessionUuid(row.session) ? `claude --resume ${row.session}` : "Only a session with a uuid can be resumed"}
+            title={isSessionUuid(row.session) ? `claude --resume=${row.session}, in the container` : "Only a session with a lowercase uuid can be resumed"}
           >
             Resume
           </button>
@@ -324,7 +352,13 @@ function SessionPreview({ row, terminalKey }: { readonly row: SessionRow; readon
             </>
           )}
           <dt>Owner</dt>
-          <dd>{terminalKey !== undefined ? "this app — re-attached if the container is rebuilt" : "another process (viewable and resumable, not re-attached)"}</dd>
+          <dd>
+            {owner === undefined
+              ? "no terminal of this app runs it (viewable and resumable, not re-attached)"
+              : owner.spec.target === "container"
+                ? "this app — re-attached if the container is rebuilt"
+                : "this app, on the host — a rebuild does not end it"}
+          </dd>
         </dl>
 
         <h3>Context</h3>

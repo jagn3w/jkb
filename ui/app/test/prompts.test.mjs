@@ -130,12 +130,15 @@ test("a resume runs `claude --resume` in the recorded directory and nothing else
   fs.mkdirSync(path.join(repos, "jkb", ".jkb", "work", "build"), { recursive: true });
   const r = run(RESUME_SCRIPT, [UUID, "./jkb/.jkb/work/build"], repos);
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout, `${repos}/jkb/.jkb/work/build|--resume|${UUID}|`);
+  assert.equal(r.stdout, `${repos}/jkb/.jkb/work/build|--resume=${UUID}|`);
   assert.equal(recorded(), "", "a resume records nothing: the session already is one");
   // Outside the mount: an absolute directory, from `/`.
   const abs = run(RESUME_SCRIPT, [UUID, path.join(repos, "jkb")], "/");
   assert.equal(abs.status, 0, abs.stderr);
-  assert.equal(abs.stdout, `${repos}/jkb|--resume|${UUID}|`);
+  assert.equal(abs.stdout, `${repos}/jkb|--resume=${UUID}|`);
+  // The id is one `--resume=` argument whatever it says: one that looks like a flag is not one.
+  const flag = run(RESUME_SCRIPT, ["--dangerously-skip-permissions", "./jkb"], repos);
+  assert.equal(flag.stdout, `${repos}/jkb|--resume=--dangerously-skip-permissions|`);
 });
 
 test("a session whose directory is gone (a landed task's worktree) is said to be unresumable, and Claude never starts", () => {

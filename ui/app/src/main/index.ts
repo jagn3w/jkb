@@ -130,6 +130,7 @@ const notifyFeed = new NotifyFeed(
     const contents = webContents.fromId(owner);
     if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.notifyEvent, event);
   },
+  { log: (message) => process.stderr.write(`code-factory: ${message}\n`) },
 );
 
 /** Every feed a window can hold, ended together when it closes or reloads. */
@@ -416,9 +417,20 @@ if (refusal !== undefined) {
   });
 }
 
-app.on("will-quit", () => {
+/** How long quitting waits for the daemon to take the app's group off `claude/notify` (D53.9). */
+const LEAVE_WAIT_MS = 1500;
+let leftNotify = false;
+
+app.on("will-quit", (event) => {
   terminals.closeAll();
   closeFeeds();
+  // Once: hold the quit until the app's group is off `claude/notify` (or the wait runs out), then
+  // quit again. A group left there would keep every later notification unreapable until the topic's
+  // cap refuses `notify.event`.
+  if (leftNotify) return;
+  leftNotify = true;
+  event.preventDefault();
+  void notifyFeed.leaveAll(LEAVE_WAIT_MS).finally(() => app.quit());
 });
 
 app.on("window-all-closed", () => {

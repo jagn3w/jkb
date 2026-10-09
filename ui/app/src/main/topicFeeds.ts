@@ -5,8 +5,11 @@
 //
 // A subscription, never a poll loop on a timer: each feed holds an `mq.poll` with `wait_ms` open on
 // `jkb serve`, which answers the moment a message is sent. The app reads with its own consumer
-// group, `code-factory` — one name, so a closed app leaves one group per topic behind (removed by
-// the queue once idle), never one per launch. Delivery is at-least-once, and every message the app
+// group, `code-factory` — one name, so a closed app leaves at most one group per topic behind
+// (removed by the queue once idle), never one per launch. A kind that says `leaves` removes its group
+// when its feed ends and when the app quits (`leaveAll`): `claude/notify` does, because a group left
+// there holds every later notification unreapable, and at the topic's cap `notify.event` is refused
+// (D53.9). Delivery is at-least-once, and every message the app
 // reads is idempotent to hear twice (an update merges, a notification change re-reads); a message
 // *missed* (a group the queue removed while the app was away) is reported as a `gap`, and the window
 // re-reads the state.
@@ -41,6 +44,11 @@ export interface FeedKind<E> {
   readonly refusal: string;
   /** The events a message makes (none for a message the windows need not hear). */
   events(topic: string, kind: unknown, payload: unknown): readonly E[];
+  /**
+   * Remove the app's group (`mq.group_delete`) when the feed ends — its last window gone — and on
+   * quit, rather than leave it holding the topic until the queue removes it as idle.
+   */
+  readonly leaves?: boolean;
 }
 
 export interface FeedOptions {
@@ -53,6 +61,12 @@ export interface FeedOptions {
   readonly maxBackoffMs?: number;
   /** How to wait between retries; `setTimeout` by default. */
   readonly sleep?: (ms: number) => Promise<void>;
+  /**
+   * Told when a group removal (`leaves`) did not land — refused (a daemon older than
+   * `mq.group_delete` answers `bad_request`), or unreachable — so the group left behind is said
+   * somewhere rather than nowhere. Nothing by default.
+   */
+  readonly log?: (message: string) => void;
 }
 
 type Owner = number;
@@ -63,6 +77,8 @@ interface Feed {
   /** Subscribers waiting for the group to be joined. */
   waiters: ((outcome: Outcome<null>) => void)[];
   joined: boolean;
+  /** The app's group was removed on quit: nothing more is sent for this feed. */
+  left: boolean;
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -73,11 +89,18 @@ export class TopicFeeds<E> {
   readonly #deliver: (owner: Owner, event: E | FeedStatusEvent) => void;
   readonly #kind: FeedKind<E>;
   readonly #feeds = new Map<string, Feed>();
+  /** A topic's group removal in flight: a feed starting on it waits, so the removal cannot land after its join. */
+  readonly #leaving = new Map<string, Promise<unknown>>();
+  /** A topic's `mq.group_create` in flight: quitting waits for it and removes what it created. */
+  readonly #joining = new Map<string, Promise<Outcome<OpResponse>>>();
   readonly #waitMs: number;
   readonly #max: number;
   readonly #minBackoff: number;
   readonly #maxBackoff: number;
   readonly #sleep: (ms: number) => Promise<void>;
+  readonly #log: (message: string) => void;
+  /** Set by `leaveAll`: the app is quitting, and no feed joins again. */
+  #closed = false;
 
   constructor(
     op: FeedOp,
@@ -93,6 +116,7 @@ export class TopicFeeds<E> {
     this.#minBackoff = options.minBackoffMs ?? 500;
     this.#maxBackoff = options.maxBackoffMs ?? 30_000;
     this.#sleep = options.sleep ?? defaultSleep;
+    this.#log = options.log ?? (() => {});
   }
 
   /** The topics with a feed running, for tests and diagnostics. */
@@ -109,6 +133,7 @@ export class TopicFeeds<E> {
     if (!this.#kind.accepts(topic)) {
       return Promise.resolve({ ok: false, error: { code: "bad_request", message: this.#kind.refusal } });
     }
+    if (this.#closed) return Promise.resolve({ ok: false, error: { code: "unavailable", message: "the app is quitting" } });
     const running = this.#feeds.get(topic);
     if (running !== undefined) {
       running.owners.add(owner);
@@ -117,7 +142,7 @@ export class TopicFeeds<E> {
     }
     // The owner and the waiter are in place before the loop starts: it runs synchronously up to its
     // first call, and a feed with no owner ends there.
-    const feed: Feed = { topic, owners: new Set([owner]), waiters: [], joined: false };
+    const feed: Feed = { topic, owners: new Set([owner]), waiters: [], joined: false, left: false };
     this.#feeds.set(topic, feed);
     const joined = new Promise<Outcome<null>>((resolve) => feed.waiters.push(resolve));
     void this.#run(feed);
@@ -135,6 +160,57 @@ export class TopicFeeds<E> {
       if (owner === undefined) feed.owners.clear();
       else feed.owners.delete(owner);
     }
+  }
+
+  /**
+   * On quit: stop delivering, and remove the app's group from every topic of a kind that `leaves`,
+   * waiting at most `timeoutMs` for the daemon. Never rejects; a removal that does not land in time
+   * leaves the group to the queue's idle removal, as a crash would.
+   */
+  async leaveAll(timeoutMs: number): Promise<void> {
+    this.#closed = true;
+    this.closeAll();
+    if (this.#kind.leaves !== true) return;
+    // Removals already in flight are waited for too: a feed whose last window just closed is
+    // removing its group, and a feed waiting on that removal to rejoin finds no owner after it. A join
+    // in flight may yet create the group, so it is waited for and what it created is removed.
+    const removals = [
+      ...this.#leaving.values(),
+      ...[...this.#joining].map(([topic, create]) => {
+        const feed = this.#feeds.get(topic);
+        if (feed !== undefined) feed.left = true;
+        return create.then((created) => (created.ok ? this.#leave(topic) : undefined));
+      }),
+      ...[...this.#feeds.values()]
+        .filter((feed) => feed.joined && !feed.left)
+        .map((feed) => {
+          feed.left = true;
+          return this.#leave(feed.topic);
+        }),
+    ];
+    if (removals.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(removals),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+  }
+
+  #leave(topic: string): Promise<unknown> {
+    const removal = this.#op({ op: "mq.group_delete", topic, group: APP_GROUP }).then(
+      (answer) => {
+        if (!answer.ok) this.#log(`could not take the app's group off ${topic}, so it holds the topic until the queue removes it as idle: ${answer.error.message}`);
+      },
+      (e: unknown) => this.#log(`could not take the app's group off ${topic}: ${e instanceof Error ? e.message : String(e)}`),
+    );
+    const done = removal.finally(() => {
+      if (this.#leaving.get(topic) === done) this.#leaving.delete(topic);
+    });
+    this.#leaving.set(topic, done);
+    return done;
   }
 
   #emit(feed: Feed, event: E | FeedStatusEvent): void {
@@ -169,10 +245,25 @@ export class TopicFeeds<E> {
       if (feed.owners.size === 0) {
         this.#feeds.delete(topic);
         this.#settle(feed, { ok: false, error: { code: "unavailable", message: "unsubscribed" } });
+        if (this.#kind.leaves === true && feed.joined && !feed.left) {
+          feed.left = true;
+          void this.#leave(topic);
+        }
         return;
       }
       if (!feed.joined) {
-        const joined = await this.#op({ op: "mq.group_create", topic, group: APP_GROUP });
+        // A removal of this topic's group still in flight lands first, never after this join.
+        const leaving = this.#leaving.get(topic);
+        if (leaving !== undefined) {
+          await leaving;
+          // Its owners may have gone meanwhile (the app quitting): ask again before joining.
+          continue;
+        }
+        const create = this.#op({ op: "mq.group_create", topic, group: APP_GROUP });
+        this.#joining.set(topic, create);
+        const joined = await create.finally(() => {
+          if (this.#joining.get(topic) === create) this.#joining.delete(topic);
+        });
         if (!joined.ok) {
           // A topic that does not exist is not transient: nothing this daemon holds sends on it.
           if (joined.error.code === "no_such_topic") {
@@ -187,6 +278,8 @@ export class TopicFeeds<E> {
           continue;
         }
         feed.joined = true;
+        // A join that lands after quit was already claimed by `leaveAll`, which removes it.
+        if (!this.#closed) feed.left = false;
         this.#settle(feed, { ok: true, value: null });
         if (rejoin) {
           // A gap says everything `live` would, and more: the window re-reads.

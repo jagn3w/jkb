@@ -351,7 +351,9 @@ fi
 #
 # The TOPIC is created on every platform: a producer never creates one, and the hook in a Linux dev
 # container still reaches a Mac's daemon. Nothing fills it where nobody consumes — the machine sends
-# only to a topic with a consumer group, and the group is the notifier's, so only a Mac has one.
+# only to a topic with a consumer group. Its groups are the notifier's (`macos-notifier`, only on a
+# Mac) and Code Factory's (`code-factory`, while the app reads it, D53.9); setup reports on the
+# notifier's own group by name (`report_notifier`).
 say "notification topic"
 provision_notify_topic "$db"
 [ "$notify_topic_state" = ready ] && echo "  • $notify_topic ready"

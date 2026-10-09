@@ -256,7 +256,10 @@ export function notifyLabel(record: NotifyRecord | null): string | undefined {
 export interface GitPlace {
   /** The checkout's root (the directory holding `.git`), in the filesystem it was read in. */
   readonly root: string;
-  /** The repo key — the checkout root's basename, as `jkb_cli::gitrepo::key` derives it (the `repo=` tag). */
+  /**
+   * The repo key — the MAIN checkout's basename (a linked worktree's is the directory holding its
+   * `commondir`), as `repo_ctx` derives the `repo=` tag: `gitrepo::key(gitrepo::main_root(cwd))`.
+   */
   readonly repo: string;
   /** The checked-out branch; `null` when HEAD is detached. */
   readonly branch: string | null;
@@ -280,7 +283,7 @@ export function parseHead(text: string): string | null | undefined {
   return /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(line) ? null : undefined;
 }
 
-/** The repo key of a checkout rooted at `root`: its basename (`gitrepo::key`). */
+/** The repo key of a main checkout rooted at `root`: its basename (`gitrepo::key`). */
 export function repoKeyOf(root: string): string | undefined {
   const name = root.replace(/\/+$/, "").split("/").pop() ?? "";
   return name === "" || name === "." || name === ".." ? undefined : name;
@@ -291,7 +294,11 @@ export function tasksOn(byBranch: ReadonlyMap<string, readonly BranchTask[]>, br
   return branch === null ? [] : (byBranch.get(branch) ?? []);
 }
 
-/** Whether `session` is a uuid — the only kind of id `claude --resume` and a terminal's `sessionUuid` take. */
+/**
+ * Whether `session` is a lowercase uuid — the only id a resume is built from (jkb stores session ids
+ * lowercase, as `claude --resume` takes them). Anything else, including an id that begins with `-`
+ * and would be read as a flag, is never put on a command line.
+ */
 export function isSessionUuid(session: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(session);
 }

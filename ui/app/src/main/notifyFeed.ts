@@ -8,9 +8,14 @@
 //
 // What the app's group changes on the daemon: `claude/notify` is written to only while it has a
 // group (`notify::observe`), so with the app open a machine without a notifier now has its posts and
-// withdrawals sent — read here, and reaped like any consumed message. Closed, the group goes idle and
-// the queue removes it; reopened, the feed joins from now and re-reads the records, which hold
-// everything still on screen.
+// withdrawals sent — read here, and reaped like any consumed message. The app takes its group off the
+// topic when it stops reading: the feed's last window closing (macOS keeps a windowless app running)
+// and quit both remove it (`leaves`). Left there, it would hold every later post and withdrawal
+// unreapable, and at the topic's cap (10,000 messages) `notify.event` is refused `queue_full` — the
+// macOS notifier then shows nothing. When it still stays — a crash, a daemon that does not answer
+// within the quit's wait, or one older than `mq.group_delete` (which refuses it, and main logs that) —
+// is D53.9's *Residual* in docs/code-factory.md; `jkb mq group rm` removes it by hand.
+// Reopened, the feed joins from now and re-reads the records, which hold everything still on screen.
 
 import { NOTIFY_TOPIC, parseNotifyMessage } from "@jkb/core";
 
@@ -22,6 +27,7 @@ type NotifyMessageEvent = Exclude<NotifyFeedEvent, FeedStatusEvent>;
 const NOTIFY_FEED: FeedKind<NotifyMessageEvent> = {
   accepts: (topic: unknown): topic is string => topic === NOTIFY_TOPIC,
   refusal: `only ${NOTIFY_TOPIC} is a notification topic`,
+  leaves: true,
   events(topic, kind, payload) {
     const moved = parseNotifyMessage(kind, payload);
     return moved === undefined ? [] : [{ topic, kind: "changed", session: moved.session }];

@@ -132,6 +132,15 @@ pub enum GroupCmd {
         /// The topic.
         topic: String,
     },
+    /// Remove a consumer group, so what it has not read stops holding the topic (e.g. a
+    /// `code-factory` group a crashed app left on `claude/notify`). Removing one that is not there
+    /// is not an error.
+    Rm {
+        /// The topic.
+        topic: String,
+        /// The group.
+        group: String,
+    },
 }
 
 /// A refusal with its wire error, displayed as the message alone. [`run`] prints its error — or
@@ -311,6 +320,27 @@ fn dispatch(backend: &dyn Backend, cmd: MqCmd, json_out: bool) -> Result<()> {
                     println!("created group {group} on {topic}");
                 }
                 _ => println!("group {group} already exists on {topic} (position kept)"),
+            }
+            Ok(())
+        }
+        MqCmd::Group {
+            cmd: GroupCmd::Rm { topic, group },
+        } => {
+            let r = call(
+                backend,
+                Request::MqGroupDelete {
+                    topic: topic.clone(),
+                    group: group.clone(),
+                },
+            )?;
+            if json_out {
+                return print_json(&r);
+            }
+            match r {
+                Response::GroupDeleted { deleted: true } => {
+                    println!("removed group {group} from {topic}");
+                }
+                _ => println!("no such group {group} on {topic}"),
             }
             Ok(())
         }

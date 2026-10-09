@@ -148,8 +148,12 @@ export function ContainerTab(): React.JSX.Element {
         // task's Play moves into its worktree after its terminal opened), read now while it is live.
         const holders = await loadHolders((r) => window.jkb.op(r), false);
         const cwds = holders.ok ? liveCwds(holders.value.holders) : new Map<string, string>();
-        const recorded = recordAttached(terminalsRef.current.state.entries, (s) => cwds.get(s));
-        setAttached((older) => mergeRecords(older, recorded));
+        const recorded = recordAttached(terminalsRef.current.state.entries, (s) => cwds.get(s), holders.ok ? undefined : holders.error.message);
+        setAttached((older) => mergeRecords(older, recorded.attached));
+        // Exactly what was not recorded, each with its reason: those sessions are not re-attached.
+        if (recorded.dropped.length > 0) {
+          setNotice(`Not re-attached after this run: ${recorded.dropped.map((d) => `${d.title} (${d.why})`).join("; ")}.`);
+        }
       },
       open: (spec) => terminalsRef.current.open(spec, "drawer", { once: true }),
     });

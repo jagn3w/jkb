@@ -171,6 +171,7 @@ test("jump to context: a session's prompt, a worktree's git files, and the tasks
   assert.equal(decodeBranchTasks(ok({ result: "branch_tasks", tasks: { a: [{ uid: 1 }] } })).ok, false);
 
   assert.ok(isSessionUuid(S1));
-  assert.ok(isSessionUuid(S1.toUpperCase()));
+  assert.equal(isSessionUuid(S1.toUpperCase()), false, "lowercase only: jkb stores ids lowercase, and nothing else reaches a command line");
+  assert.equal(isSessionUuid("--dangerously-skip-permissions"), false);
   assert.equal(isSessionUuid("abc"), false);
 });

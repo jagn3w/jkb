@@ -11,7 +11,7 @@
 // prompt is CLI output, not app string-building"), and everything that varies is a positional
 // parameter, never spliced into a script.
 
-import type { DesignPromptRecord, Launch } from "@jkb/core";
+import { isSessionUuid, type DesignPromptRecord, type Launch } from "@jkb/core";
 
 import { containerPathOf, type TerminalRoots, type TerminalSpec } from "../../../shared/terminal";
 
@@ -48,7 +48,7 @@ export const PLAY_TASK_SCRIPT = `set -euo pipefail; dir=$(jkb --json task work "
 export const RESUME_SCRIPT =
   'cd -- "$2" 2>/dev/null || { case $2 in /*) d=$2 ;; *) d=${PWD%/}/${2#./} ;; esac; ' +
   'printf "jkb: %s no longer exists (a task removes its worktree when it lands), so this session cannot be resumed.\\n" "$d" >&2; exit 1; }; ' +
-  'exec claude --resume "$1"';
+  'exec claude --resume="$1"';
 
 /** Where a design's repo is in the container: its directory under the repos mount. */
 export function repoDir(roots: TerminalRoots, repo: string): string {
@@ -107,7 +107,7 @@ function under(path: string, root: string): boolean {
  * with. Sessions run in the container, so it resumes there; a recorded host path is carried back
  * through the repos mount.
  */
-export function resumeSpec(prompt: DesignPromptRecord, roots: TerminalRoots): TerminalSpec {
+export function resumeSpec(prompt: DesignPromptRecord, roots: TerminalRoots): TerminalSpec | undefined {
   return sessionResumeSpec({ session: prompt.session, cwd: prompt.cwd, title: titled("Resume", prompt.title) }, roots);
 }
 
@@ -117,11 +117,16 @@ export function resumeSpec(prompt: DesignPromptRecord, roots: TerminalRoots): Te
  * the Sessions tab lists, and a terminal re-attached after a rebuild (D53.9). The terminal starts
  * where nothing can be missing and `RESUME_SCRIPT` moves into `cwd`, refusing plainly when it is
  * gone.
+ *
+ * `undefined` for a session that is not a lowercase uuid: the id comes from records a container
+ * process writes, and is never put on a command line unless it is one (D53.9). `RESUME_SCRIPT` also
+ * passes it as `--resume=<id>`, so even a value that slipped past could not be read as a flag.
  */
 export function sessionResumeSpec(
   ask: { readonly session: string; readonly cwd: string; readonly title: string },
   roots: TerminalRoots,
-): TerminalSpec {
+): TerminalSpec | undefined {
+  if (!isSessionUuid(ask.session)) return undefined;
   const ctr = roots.containerRepos.replace(/\/+$/, "");
   // A host path (through either spelling of the host's repos root, `containerPathOf`) is carried
   // into the container through the mount.

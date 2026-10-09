@@ -676,6 +676,29 @@ pub fn group_create(
     })
 }
 
+/// Remove a consumer group: a consumer leaving for good, so that what it has not read stops holding
+/// the topic. Code Factory leaves `claude/notify` this way when it quits (design D53.9): its group
+/// would otherwise keep every later notification unreapable until the idle removal, and a topic at
+/// its cap refuses `send` — which is how `notify.event` would fail. Idempotent: `false` when there
+/// was no such group. What only this group held back is reaped by the next send at the cap or the
+/// next compaction, under the usual rule.
+///
+/// # Errors
+/// [`QueueError::NoSuchTopic`], [`QueueError::Invalid`] for the name, or a database error.
+pub fn group_delete(
+    conn: &Connection,
+    _meta: &WriteMeta,
+    topic: &str,
+    group: &str,
+) -> Result<bool> {
+    check_name("group name", group)?;
+    let (topic_id, _) = topic_row(conn, topic)?;
+    let removed = conn
+        .prepare_cached("DELETE FROM mq_groups WHERE topic_id = ?1 AND name = ?2")?
+        .execute(params![topic_id, group])?;
+    Ok(removed == 1)
+}
+
 /// Up to `max` messages after the group's position — or after `after`, when that is further on — in
 /// `seq` order. Records the poll (which is what keeps an idle-but-alive consumer's group from being
 /// removed), so it is a write.

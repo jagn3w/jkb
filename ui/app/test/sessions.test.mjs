@@ -5,6 +5,7 @@
 // Bundled with esbuild, as in shell.test.mjs.
 
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -32,7 +33,9 @@ const { gitPlace } = await load(path.join(src, "main", "gitPlace.ts"));
 const { NotifyWatch } = await load(path.join(src, "renderer", "src", "sessions", "watch.ts"));
 const { loadHolders, liveCwds, MAX_PAGES } = await load(path.join(src, "renderer", "src", "sessions", "data.ts"));
 const { recordAttached, reattachPlan, mergeRecords, tearsDown } = await load(path.join(src, "renderer", "src", "sessions", "reattach.ts"));
-const { RESUME_SCRIPT, sessionResumeSpec } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
+const { RESUME_SCRIPT, PLAY_TASK_SCRIPT, sessionResumeSpec, resumedDir } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
+const { sessionAction, owningTerminals, HOST_SESSION_NOTE } = await load(path.join(src, "renderer", "src", "sessions", "resume.ts"));
+const { jumpTo } = await load(path.join(src, "renderer", "src", "design", "jump.ts"));
 
 const ok = (value) => ({ ok: true, value });
 const err = (code, message = code) => ({ ok: false, error: { code, message } });
@@ -117,6 +120,119 @@ test("the needs-input feed is the app's own group on claude/notify, and says whi
   await until(() => polls.waiting === 1, "the next poll");
   polls.answer(ok({ result: "messages", messages: [] }));
   await until(() => feed.topics.length === 0, "the feed to end");
+  await until(() => daemon.calls.some((c) => c.request.op === "mq.group_delete"), "the group to be removed");
+  assert.deepEqual(
+    daemon.calls.filter((c) => c.request.op === "mq.group_delete").map((c) => c.request),
+    [{ op: "mq.group_delete", topic: "claude/notify", group: "code-factory" }],
+    "its last window gone, the app takes its group off the topic rather than hold it until the idle removal",
+  );
+});
+
+test("a feed ending waits for no one, and a window joining while its removal is in flight joins after it lands", async () => {
+  const polls = heldPolls();
+  const removals = [];
+  const daemon = scriptedDaemon({
+    "mq.group_create": () => ok({ result: "created", created: true }),
+    "mq.poll": polls.poll,
+    "mq.group_delete": () => new Promise((resolve) => removals.push(resolve)),
+  });
+  const feed = new NotifyFeed(daemon.op, () => {}, { sleep: tick });
+  await feed.join(1);
+  await until(() => polls.waiting === 1, "the long-poll");
+  feed.leave(1);
+  polls.answer(ok({ result: "messages", messages: [] }));
+  await until(() => removals.length === 1, "the removal");
+  const rejoined = feed.join(2);
+  await tick();
+  assert.equal(daemon.calls.filter((c) => c.request.op === "mq.group_create").length, 1, "the join waits for the removal");
+  removals.shift()(ok({ result: "group_deleted", deleted: true }));
+  assert.deepEqual(await rejoined, ok(null));
+  assert.equal(daemon.calls.filter((c) => c.request.op === "mq.group_create").length, 2, "joined after it landed");
+  feed.closeAll();
+  await until(() => polls.waiting === 1, "the rejoined poll");
+  polls.answer(ok({ result: "messages", messages: [] }));
+  await until(() => feed.topics.length === 0, "the feed to end");
+});
+
+test("quitting takes the app's group off claude/notify, waits a bounded time, and nothing joins after it", async () => {
+  const polls = heldPolls();
+  const removals = [];
+  const logged = [];
+  const daemon = scriptedDaemon({
+    "mq.group_create": () => ok({ result: "created", created: true }),
+    "mq.poll": polls.poll,
+    "mq.group_delete": () => new Promise((resolve) => removals.push(resolve)),
+  });
+  const feed = new NotifyFeed(daemon.op, () => {}, { sleep: tick, log: (m) => logged.push(m) });
+  await feed.join(1);
+  await until(() => polls.waiting === 1, "the long-poll");
+  // A window's feed ended and is removing the group; another window is waiting on that to rejoin.
+  feed.leave(1);
+  polls.answer(ok({ result: "messages", messages: [] }));
+  await until(() => removals.length === 1, "the first removal");
+  const waiting = feed.join(2);
+  // Quit now. The daemon never answers: quitting is held only for the wait.
+  const started = Date.now();
+  await feed.leaveAll(30);
+  assert.ok(Date.now() - started < 1000, "bounded");
+  assert.equal((await feed.join(3)).error.message, "the app is quitting", "no join after quit");
+  // The removal lands after the quit: the waiting join finds no owner and never recreates the group.
+  removals.shift()(ok({ result: "group_deleted", deleted: true }));
+  await waiting;
+  await until(() => feed.topics.length === 0, "the feed to end");
+  assert.equal(daemon.calls.filter((c) => c.request.op === "mq.group_create").length, 1, "the group is not recreated after quit");
+
+  // A daemon that predates the op refuses it: said, not swallowed.
+  const old = scriptedDaemon({ "mq.group_create": () => ok({ result: "created", created: true }), "mq.poll": heldPolls().poll });
+  const f2 = new NotifyFeed(old.op, () => {}, { sleep: tick, log: (m) => logged.push(m) });
+  await f2.join(1);
+  await f2.leaveAll(1000);
+  assert.match(logged.at(-1), /could not take the app's group off claude\/notify.*unexpected mq.group_delete/);
+
+  // Quitting while a window's removal is still in flight waits for that one too (within the bound).
+  const p3 = heldPolls();
+  const held = [];
+  const d3 = scriptedDaemon({
+    "mq.group_create": () => ok({ result: "created", created: true }),
+    "mq.poll": p3.poll,
+    "mq.group_delete": () => new Promise((resolve) => held.push(resolve)),
+  });
+  const f3 = new NotifyFeed(d3.op, () => {}, { sleep: tick });
+  await f3.join(1);
+  await until(() => p3.waiting === 1, "the long-poll");
+  f3.leave(1);
+  p3.answer(ok({ result: "messages", messages: [] }));
+  await until(() => held.length === 1, "the in-flight removal");
+  let quit = false;
+  const quitting = f3.leaveAll(5000).then(() => (quit = true));
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(quit, false, "the quit waits for the removal in flight");
+  held.shift()(ok({ result: "group_deleted", deleted: true }));
+  await quitting;
+});
+
+test("a join still in flight at quit is waited for, and the group it created is removed", async () => {
+  const creates = [];
+  const deletes = [];
+  const d = scriptedDaemon({
+    "mq.group_create": () => new Promise((resolve) => creates.push(resolve)),
+    "mq.poll": heldPolls().poll,
+    "mq.group_delete": (r) => {
+      deletes.push(r);
+      return ok({ result: "group_deleted", deleted: true });
+    },
+  });
+  const f = new NotifyFeed(d.op, () => {}, { sleep: tick });
+  const joining = f.join(1);
+  await until(() => creates.length === 1, "the join in flight");
+  const quitting = f.leaveAll(5000);
+  // The create lands after the quit began: the group it made is taken off again, once.
+  creates.shift()(ok({ result: "created", created: true }));
+  await quitting;
+  await joining;
+  await until(() => f.topics.length === 0, "the feed to end");
+  for (let i = 0; i < 5; i++) await tick();
+  assert.deepEqual(deletes.map((r) => r.request ?? r), [{ op: "mq.group_delete", topic: "claude/notify", group: "code-factory" }]);
 });
 
 test("the needs-input feed reads only claude/notify, and a daemon without it is told, not retried", async () => {
@@ -137,7 +253,7 @@ test("the needs-input feed reads only claude/notify, and a daemon without it is 
 
 /** A repos directory with a main checkout and a linked worktree, as git lays them out. */
 function repos() {
-  const root = fs.mkdtempSync(path.join(work, "repos-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(work, "repos-")));
   const main = path.join(root, "jkb");
   fs.mkdirSync(path.join(main, ".git", "worktrees", "build"), { recursive: true });
   fs.writeFileSync(path.join(main, ".git", "HEAD"), "ref: refs/heads/main\n");
@@ -145,6 +261,7 @@ function repos() {
   fs.mkdirSync(path.join(wt, "src"), { recursive: true });
   fs.writeFileSync(path.join(wt, ".git"), "gitdir: ../../../.git/worktrees/build\n");
   fs.writeFileSync(path.join(main, ".git", "worktrees", "build", "HEAD"), "ref: refs/heads/task/build-1\n");
+  fs.writeFileSync(path.join(main, ".git", "worktrees", "build", "commondir"), "../..\n");
   return { root, main, wt };
 }
 
@@ -152,10 +269,10 @@ test("a session's directory resolves to its checkout, repo key and branch, from 
   const { root, main, wt } = repos();
   const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: root, hostReposReal: root, hostHome: "/home/me" };
   assert.deepEqual(gitPlace(main, roots), ok({ root: main, repo: "jkb", branch: "main" }));
-  assert.deepEqual(gitPlace(path.join(wt, "src"), roots), ok({ root: wt, repo: "build", branch: "task/build-1" }), "a linked worktree, from a subdirectory");
+  assert.deepEqual(gitPlace(path.join(wt, "src"), roots), ok({ root: wt, repo: "jkb", branch: "task/build-1" }), "a linked worktree, from a subdirectory, keyed by its main checkout as `repo_ctx` tags tasks");
   assert.deepEqual(
     gitPlace("/home/vscode/repos/jkb/.jkb/work/build", roots),
-    ok({ root: wt, repo: "build", branch: "task/build-1" }),
+    ok({ root: wt, repo: "jkb", branch: "task/build-1" }),
     "a container path is read on the host's side of the repos mount",
   );
   // An absolute gitdir in the container's spelling (git writes absolute ones too) is carried across.
@@ -163,6 +280,12 @@ test("a session's directory resolves to its checkout, repo key and branch, from 
   assert.equal(gitPlace(wt, roots).value.branch, "task/build-1");
   fs.writeFileSync(path.join(main, ".git", "worktrees", "build", "HEAD"), "0123456789abcdef0123456789abcdef01234567\n");
   assert.equal(gitPlace(wt, roots).value.branch, null, "detached");
+  // The common dir in the container's spelling, as git writes it when the worktree was added there.
+  fs.writeFileSync(path.join(main, ".git", "worktrees", "build", "commondir"), "/home/vscode/repos/jkb/.git\n");
+  assert.equal(gitPlace(wt, roots).value.repo, "jkb");
+  // A git dir with no `commondir` (a submodule's) is keyed by its own checkout.
+  fs.rmSync(path.join(main, ".git", "worktrees", "build", "commondir"));
+  assert.equal(gitPlace(wt, roots).value.repo, "build");
 });
 
 test("only the repos directory is looked at, nothing is followed out of it, and no file's contents cross", () => {
@@ -192,6 +315,78 @@ test("only the repos directory is looked at, nothing is followed out of it, and 
   fs.mkdirSync(path.join(root, "other"));
   fs.writeFileSync(path.join(root, "other", ".git"), "[core]\n\tbare = false\n");
   assert.equal(gitPlace(path.join(root, "other"), roots).error, `${path.join(root, "other", ".git")} is not a worktree's gitdir file`);
+});
+
+test("a link anywhere along the path, not only at its end, cannot lead the reader out of the repos directory as the path stands when resolved", () => {
+  const { root, main, wt } = repos();
+  const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: root, hostHome: "/home/me" };
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(work, "outside-")));
+  fs.mkdirSync(path.join(outside, "proj", ".git"), { recursive: true });
+  fs.writeFileSync(path.join(outside, "proj", ".git", "HEAD"), "ref: refs/heads/secret\n");
+  fs.mkdirSync(path.join(outside, "wt"), { recursive: true });
+  fs.writeFileSync(path.join(outside, "wt", "HEAD"), "ref: refs/heads/secret\n");
+  fs.symlinkSync(outside, path.join(root, "x"));
+  // The session's directory runs through the link: refused, nothing under it is read.
+  for (const cwd of [path.join(root, "x", "proj"), "/home/vscode/repos/x/proj"]) {
+    const r = gitPlace(cwd, roots);
+    assert.equal(r.ok, false, cwd);
+    assert.match(r.error, /outside the repos directory through a link/, cwd);
+  }
+  // A gitdir line through a linked directory: refused.
+  fs.writeFileSync(path.join(wt, ".git"), "gitdir: ../../../../x/wt\n");
+  assert.match(gitPlace(wt, roots).error, /points outside the repos directory/);
+  // A commondir through one: refused, not keyed by whatever is out there.
+  fs.writeFileSync(path.join(wt, ".git"), "gitdir: ../../../.git/worktrees/build\n");
+  fs.writeFileSync(path.join(main, ".git", "worktrees", "build", "commondir"), "../../../../x/proj/.git\n");
+  assert.match(gitPlace(wt, roots).error, /commondir points outside the repos directory/);
+  // Missing is said apart from outside: a removed git dir, or a commondir naming nothing.
+  fs.writeFileSync(path.join(main, ".git", "worktrees", "build", "commondir"), "../gone\n");
+  assert.match(gitPlace(wt, roots).error, /commondir names a directory that does not exist$/);
+  fs.writeFileSync(path.join(wt, ".git"), "gitdir: ../../../.git/worktrees/removed\n");
+  assert.equal(gitPlace(wt, roots).error, `${path.join(wt, ".git")} names a directory that does not exist`);
+  fs.writeFileSync(path.join(wt, ".git"), "gitdir: ../../../.git/worktrees/build\n");
+  fs.writeFileSync(path.join(main, ".git", "worktrees", "build", "commondir"), "../..\n");
+  // A link that stays inside is resolved, and the place is reported where it really is.
+  fs.symlinkSync(main, path.join(root, "alias"));
+  assert.deepEqual(gitPlace(path.join(root, "alias"), roots), ok({ root: main, repo: "jkb", branch: "main" }));
+});
+
+test("with a symlinked repos directory the root crosses in the host's spelling, so Shell here can carry it across", () => {
+  const { root, main, wt } = repos();
+  const link = path.join(fs.realpathSync(fs.mkdtempSync(path.join(work, "link-"))), "repos");
+  fs.symlinkSync(root, link);
+  const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: link, hostHome: "/home/me" };
+  const rel = (p) => path.join(link, path.relative(root, p));
+  assert.deepEqual(gitPlace(rel(main), roots), ok({ root: rel(main), repo: "jkb", branch: "main" }));
+  assert.deepEqual(gitPlace("/home/vscode/repos/jkb/.jkb/work/build/src", roots), ok({ root: rel(wt), repo: "jkb", branch: "task/build-1" }));
+  assert.deepEqual(gitPlace(link, roots).ok, false, "the repos directory itself is no checkout");
+});
+
+test("a FIFO planted as HEAD (or .git, or commondir) is refused, never waited on", () => {
+  const { root, main, wt } = repos();
+  const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: root, hostHome: "/home/me" };
+  // Run in a child, so a blocking open shows as a timeout rather than hanging the test runner itself.
+  const probe = path.join(work, "probe-fifo.cjs");
+  fs.writeFileSync(
+    probe,
+    `const { gitPlace } = require(${JSON.stringify(path.join(work, "gitPlace.ts.cjs"))});\n` +
+      `const [cwd, roots] = JSON.parse(process.argv[2]);\n` +
+      `process.stdout.write(JSON.stringify(gitPlace(cwd, roots)));\n`,
+  );
+  const run = (cwd) => {
+    const r = spawnSync(process.execPath, [probe, JSON.stringify([cwd, roots])], { timeout: 5000, encoding: "utf8" });
+    assert.equal(r.error?.code, undefined, `gitPlace(${cwd}) did not return: ${r.error?.message}`);
+    return JSON.parse(r.stdout);
+  };
+  fs.rmSync(path.join(main, ".git", "HEAD"));
+  execFileSync("mkfifo", [path.join(main, ".git", "HEAD")]);
+  assert.match(run(main).error, /HEAD names no branch/);
+  fs.rmSync(path.join(main, ".git", "worktrees", "build", "commondir"));
+  execFileSync("mkfifo", [path.join(main, ".git", "worktrees", "build", "commondir")]);
+  assert.match(run(wt).error, /commondir names no directory/, "a commondir that cannot be read is not taken as none");
+  fs.rmSync(path.join(wt, ".git"));
+  execFileSync("mkfifo", [path.join(wt, ".git")]);
+  assert.match(run(wt).error, /is not a file or a directory/);
 });
 
 // ---- the renderer's needs-input watch -------------------------------------------------------------
@@ -345,7 +540,8 @@ test("a teardown records the app's live container sessions, where they really ru
     entry(4, claudeSpec("aaaaaaaa-0000-0000-0000-000000000000"), { kind: "exited", exitCode: 0 }),
     entry(5, claudeSpec("bbbbbbbb-0000-0000-0000-000000000000"), { kind: "starting" }),
   ];
-  const recorded = recordAttached(entries, (s) => (s === S1 ? "/home/vscode/repos/jkb/.jkb/work/build" : undefined));
+  const { attached: recorded, dropped } = recordAttached(entries, (s) => (s === S1 ? "/home/vscode/repos/jkb/.jkb/work/build" : undefined));
+  assert.deepEqual(dropped, []);
   assert.deepEqual(
     recorded,
     [
@@ -361,7 +557,7 @@ test("a resumed session the registry does not know is recorded where the resume 
   const atRoot = sessionResumeSpec({ session: S2, cwd: "/home/vscode/repos", title: "Resume · y" }, ROOTS);
   const outside = sessionResumeSpec({ session: "aaaaaaaa-0000-0000-0000-000000000000", cwd: "/elsewhere", title: "Resume · z" }, ROOTS);
   assert.equal(resumed.cwd, "/home/vscode/repos", "the terminal starts at the mount's root");
-  const recorded = recordAttached([entry(1, resumed), entry(2, atRoot), entry(3, outside)], () => undefined);
+  const { attached: recorded } = recordAttached([entry(1, resumed), entry(2, atRoot), entry(3, outside)], () => undefined);
   assert.deepEqual(
     recorded.map((a) => a.cwd),
     ["/home/vscode/repos/jkb/.jkb/work/build", "/home/vscode/repos", "/elsewhere"],
@@ -415,4 +611,155 @@ test("re-attach leaves alone a terminal whose program may still run, as planOpen
   }
   const ended = reattachPlan(recorded, [entry(1, claudeSpec(S1), { kind: "failed", error: "x" })], true, ROOTS);
   assert.deepEqual(ended.map((p) => p.kind), ["relaunch"]);
+});
+
+test("a teardown does not record a task's Play at its repo root when the registry cannot place it, and says exactly which and why", () => {
+  const play = (session) => claudeSpec(session, { argv: ["/bin/bash", "-lc", PLAY_TASK_SCRIPT, "claude", "design:x", session, "task"] });
+  const entries = [
+    entry(1, play(S1)),
+    entry(2, play(S2)),
+    entry(3, claudeSpec("cccccccc-0000-0000-0000-000000000000")),
+    entry(4, claudeSpec("DDDDDDDD-0000-0000-0000-000000000000")),
+  ];
+  const placed = (s) => (s === S2 ? "/home/vscode/repos/jkb/.jkb/work/t" : undefined);
+  const { attached, dropped } = recordAttached(entries, placed);
+  assert.deepEqual(
+    attached.map((a) => [a.session, a.cwd]),
+    [
+      [S2, "/home/vscode/repos/jkb/.jkb/work/t"],
+      ["cccccccc-0000-0000-0000-000000000000", "/home/vscode/repos/jkb"],
+    ],
+    "the Play the registry did not place is left out, not resumed in the repo root; another launch keeps its own directory",
+  );
+  assert.deepEqual(
+    dropped.map((d) => [d.key, d.why]),
+    [
+      [1, "the session registry has no record of where this task's Play runs"],
+      [4, "its id is not a lowercase session uuid"],
+    ],
+    "after a read that worked, a dropped Play is still reported",
+  );
+  const failed = recordAttached(entries, () => undefined, "daemon down");
+  assert.deepEqual(
+    failed.dropped.map((d) => d.key),
+    [1, 2, 4],
+  );
+  assert.match(failed.dropped[0].why, /could not be read \(daemon down\)/);
+  assert.deepEqual(recordAttached([entry(3, claudeSpec("cccccccc-0000-0000-0000-000000000000"))], () => undefined, "down").dropped, [], "a failed read that drops nothing says nothing");
+});
+
+test("a resume is built only from a lowercase uuid, and passes it as --resume=<id>", () => {
+  for (const bad of ["--dangerously-skip-permissions", "0F8FAD5B-D9CB-469F-A165-70867728950E", "", "x"]) {
+    assert.equal(sessionResumeSpec({ session: bad, cwd: "/home/vscode/repos/jkb", title: "t" }, ROOTS), undefined, bad);
+  }
+  assert.match(RESUME_SCRIPT, /exec claude --resume="\$1"$/);
+});
+
+// ---- the Sessions tab's button ---------------------------------------------------------------------
+
+const CONTAINER_INSTANCE = "jkb-dev#pid:[4026532556]/pid:[4026532556]";
+const holder = (over = {}) => ({
+  session: S1,
+  pid: "42",
+  instance: CONTAINER_INSTANCE,
+  cwd: "/home/vscode/repos/jkb/.jkb/work/build",
+  startedAt: 1,
+  startSource: "startup",
+  seenAt: 5,
+  endedAt: null,
+  endReason: null,
+  ...over,
+});
+const row = (holders, over = {}) => ({
+  session: S1,
+  live: holders.some((h) => h.endedAt === null),
+  holders,
+  cwd: holders.find((h) => h.endedAt === null)?.cwd ?? holders[0]?.cwd ?? "",
+  startedAt: 1,
+  seenAt: 5,
+  endedAt: null,
+  endReason: null,
+  notify: null,
+  needsInput: false,
+  ...over,
+});
+
+test("Resume runs only in the container; of a host session the tab says only that, with no command", () => {
+  const container = sessionAction(row([holder()]), null, [], ROOTS, "Resume · x");
+  assert.equal(container.kind, "resume");
+  assert.deepEqual(
+    [container.spec.target, resumedDir(container.spec), container.spec.argv[4]],
+    ["container", "/home/vscode/repos/jkb/.jkb/work/build", S1],
+  );
+
+  // A host editor's session: no command, no directory — nothing to run, nothing to copy.
+  for (const cwd of ["/Users/me/my proj", "/a\\'b; rm -rf ~"]) {
+    assert.deepEqual(sessionAction(row([holder({ instance: "Johns-Mac", cwd })]), null, [], ROOTS, "t"), { kind: "host" });
+  }
+  assert.equal(HOST_SESSION_NOTE, "This session ran on the host; resume it from a terminal there.");
+  assert.equal(sessionAction(row([holder({ instance: "box/pid:[1]", cwd: "/x" })]), null, [], ROOTS, "t").kind, "host", "a Linux host records a namespace but no boot");
+
+  // An id that is not a lowercase uuid is never put on any command line.
+  for (const bad of ["--dangerously-skip-permissions", S1.toUpperCase()]) {
+    for (const instance of [CONTAINER_INSTANCE, "Johns-Mac"]) {
+      const a = sessionAction(row([holder({ session: bad, instance })], { session: bad }), null, [], ROOTS, "t");
+      assert.equal(a.kind, "refused", `${bad} ${instance}`);
+    }
+  }
+
+  // Nothing says where: refused, never the container at the repos root.
+  assert.match(sessionAction(row([holder({ instance: "" })]), null, [], ROOTS, "t").why, /host or in the container/);
+  assert.match(sessionAction(row([holder({ cwd: "" })]), null, [], ROOTS, "t").why, /no directory/);
+  assert.match(sessionAction(row([]), null, [], ROOTS, "t").why, /no process/);
+  // Known only by its design prompt: where the prompt was recorded, as the Design tab resumes it.
+  const prompted = sessionAction(row([]), { cwd: "/home/vscode/repos/jkb/.jkb/work/p" }, [], ROOTS, "t");
+  assert.deepEqual([prompted.spec.target, resumedDir(prompted.spec)], ["container", "/home/vscode/repos/jkb/.jkb/work/p"]);
+
+  // The lead holder decides: the live one over a more recent ended one.
+  const mixed = row([holder({ instance: "Johns-Mac", cwd: "/Users/me/proj", endedAt: 9, seenAt: 9 }), holder()]);
+  assert.equal(sessionAction(mixed, null, [], ROOTS, "t").spec.target, "container");
+});
+
+test("the app's own terminal for a session decides over any registry row: it ran in the container", () => {
+  const forged = row([holder({ instance: "Johns-Mac", cwd: "/Users/me/anywhere" })]);
+  // A Discuss/New launch ran in its terminal's directory.
+  const launched = entry(4, claudeSpec(S1), { kind: "exited", exitCode: 0 });
+  const a = sessionAction(forged, null, [launched], ROOTS, "t");
+  assert.deepEqual([a.kind, a.key, a.spec.target, resumedDir(a.spec)], ["resume", 4, "container", "/home/vscode/repos/jkb"]);
+  // A resume terminal: where that resume moved.
+  const resumed = entry(5, sessionResumeSpec({ session: S1, cwd: "/home/vscode/repos/jkb/.jkb/work/w", title: "t" }, ROOTS), { kind: "exited", exitCode: 0 });
+  assert.equal(resumedDir(sessionAction(forged, null, [resumed], ROOTS, "t").spec), "/home/vscode/repos/jkb/.jkb/work/w");
+  // A task's Play: its worktree from a container-side row or its prompt — never a host row.
+  const play = entry(6, claudeSpec(S1, { argv: ["/bin/bash", "-lc", PLAY_TASK_SCRIPT, "claude", "design:x", S1, "task"] }), { kind: "exited", exitCode: 0 });
+  assert.match(sessionAction(forged, null, [play], ROOTS, "t").why, /Nothing records where this task's Play ran/);
+  assert.equal(resumedDir(sessionAction(forged, { cwd: "/home/vscode/repos/jkb/.jkb/work/p" }, [play], ROOTS, "t").spec), "/home/vscode/repos/jkb/.jkb/work/p");
+  assert.equal(resumedDir(sessionAction(row([holder()]), null, [play], ROOTS, "t").spec), "/home/vscode/repos/jkb/.jkb/work/build");
+});
+
+test("only a starting or running terminal owns a session; an ended one is where Resume relaunches it", () => {
+  const running = entry(4, claudeSpec(S1));
+  const exited = entry(4, claudeSpec(S1), { kind: "exited", exitCode: 137 });
+  const failed = entry(4, claudeSpec(S1), { kind: "failed", error: "gone" });
+  assert.deepEqual(sessionAction(row([holder()]), null, [running], ROOTS, "t"), { kind: "show", key: 4 });
+  for (const dead of [exited, failed]) {
+    assert.equal(owningTerminals([dead]).size, 0, dead.status.kind);
+    const a = sessionAction(row([holder()]), null, [dead], ROOTS, "t");
+    assert.deepEqual([a.kind, a.key, resumedDir(a.spec)], ["resume", 4, "/home/vscode/repos/jkb"], `${dead.status.kind}: where its own terminal ran it`);
+  }
+  assert.equal(owningTerminals([entry(5, claudeSpec(S1), { kind: "starting" })]).get(S1).key, 5);
+});
+
+// ---- the Design tab, on a jump --------------------------------------------------------------------
+
+test("a jump opens the design in its own repo, or says why it cannot — never another design", () => {
+  const d = (uid, namespace) => ({ uid, title: uid, namespace, seq: 1, topic: `design/${uid}` });
+  const listing = { designs: [d("design:a", "designs/jkb"), d("design:x", "elsewhere/x")], loading: false, error: undefined };
+  assert.deepEqual(jumpTo({ ...listing, loading: true }, "design:a", false), { kind: "wait" });
+  assert.deepEqual(jumpTo(listing, "design:a", false), { kind: "open", repo: "jkb", uid: "design:a" });
+  assert.match(jumpTo(listing, "design:x", false).notice, /not under designs\/<repo>/, "found, but in no repo the tab lists");
+  assert.deepEqual(jumpTo(listing, "design:new", false), { kind: "reload" });
+  assert.match(jumpTo(listing, "design:new", true).notice, /not a design this daemon lists/);
+  const failedListing = { designs: undefined, loading: false, error: "daemon down" };
+  assert.deepEqual(jumpTo(failedListing, "design:a", false), { kind: "reload" });
+  assert.match(jumpTo(failedListing, "design:a", true).notice, /could not be listed \(daemon down\)/, "a failed listing is not the design's absence");
 });

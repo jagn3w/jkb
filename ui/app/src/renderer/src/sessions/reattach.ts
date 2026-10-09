@@ -7,10 +7,10 @@
 // running. A session another editor started is listed by the Sessions tab and can be resumed there,
 // but never re-attached: the app does not own its process.
 
-import type { ContainerAction } from "@jkb/core";
+import { isSessionUuid, type ContainerAction } from "@jkb/core";
 
 import type { TerminalRoots, TerminalSpec } from "../../../shared/terminal";
-import { resumedDir, sessionResumeSpec } from "../design/launch";
+import { PLAY_TASK_SCRIPT, resumedDir, sessionResumeSpec } from "../design/launch";
 import { mayBeLive, type TerminalEntry } from "../terminal/state";
 
 /** The Container tab's actions that end the container's processes: rebuild, stop, remove. */
@@ -41,23 +41,48 @@ function isAttached(e: TerminalEntry): e is TerminalEntry & { readonly spec: Ter
   );
 }
 
+/** A live app-owned session a teardown could not record, and why: it will not be re-attached. */
+export interface Unrecorded {
+  readonly key: number;
+  readonly session: string;
+  readonly title: string;
+  readonly why: string;
+}
+
 /**
  * The live app-owned sessions, recorded before a teardown. `cwdOf` is where the session really runs —
- * the session registry's directory (a task's *Play* moves into its worktree after the terminal
- * starts, so the spec's directory is not it). When the registry does not know: the directory a
- * resume moves into (its spec starts at the repos mount's root), else the terminal's own directory.
+ * the session registry's directory. When the registry does not know: the directory a resume moves
+ * into (its spec starts at the repos mount's root), else the terminal's own directory — except for a
+ * task's *Play*, which moves into its worktree after the terminal starts, so its spec's directory
+ * (the repo root) is NOT where the session is and `claude --resume` there would find nothing. Such a
+ * session is returned in `dropped`, with the reason: `registryProblem` when the registry could not be
+ * read, else that it has no record of the session. The caller reports exactly those.
  */
 export function recordAttached(
   entries: readonly TerminalEntry[],
   cwdOf: (session: string) => string | undefined,
-): Attached[] {
-  return entries.filter(isAttached).map((e) => ({
-    key: e.key,
-    session: e.spec.sessionUuid,
-    cwd: cwdOf(e.spec.sessionUuid) || resumedDir(e.spec) || e.spec.cwd,
-    target: "container",
-    title: e.spec.title,
-  }));
+  registryProblem?: string,
+): { readonly attached: Attached[]; readonly dropped: Unrecorded[] } {
+  const attached: Attached[] = [];
+  const dropped: Unrecorded[] = [];
+  for (const e of entries.filter(isAttached)) {
+    if (!isSessionUuid(e.spec.sessionUuid)) {
+      dropped.push({ key: e.key, session: e.spec.sessionUuid, title: e.spec.title, why: "its id is not a lowercase session uuid" });
+      continue;
+    }
+    const cwd =
+      cwdOf(e.spec.sessionUuid) || resumedDir(e.spec) || (e.spec.argv[2] === PLAY_TASK_SCRIPT ? "" : e.spec.cwd);
+    if (cwd !== "") {
+      attached.push({ key: e.key, session: e.spec.sessionUuid, cwd, target: "container", title: e.spec.title });
+      continue;
+    }
+    const why =
+      registryProblem !== undefined
+        ? `the session registry could not be read (${registryProblem}), and a task's Play runs in its worktree, not where its terminal opened`
+        : "the session registry has no record of where this task's Play runs";
+    dropped.push({ key: e.key, session: e.spec.sessionUuid, title: e.spec.title, why });
+  }
+  return { attached, dropped };
 }
 
 /** What to do with one recorded session once the teardown's run has ended. */
@@ -81,12 +106,14 @@ export function reattachPlan(
   roots: TerminalRoots,
 ): Reattach[] | undefined {
   if (!running) return undefined;
-  return recorded.map((a) => {
+  return recorded.flatMap((a): Reattach[] => {
     const spec = sessionResumeSpec({ session: a.session, cwd: a.cwd, title: a.title }, roots);
+    // `recordAttached` never records a session that is not a uuid; one that is not cannot be resumed.
+    if (spec === undefined) return [];
     const entry = entries.find((e) => e.key === a.key && e.spec.sessionUuid === a.session);
-    if (entry === undefined) return { kind: "open", spec };
-    if (mayBeLive(entry.status)) return { kind: "survived", key: a.key };
-    return { kind: "relaunch", key: a.key, spec };
+    if (entry === undefined) return [{ kind: "open", spec }];
+    if (mayBeLive(entry.status)) return [{ kind: "survived", key: a.key }];
+    return [{ kind: "relaunch", key: a.key, spec }];
   });
 }
 

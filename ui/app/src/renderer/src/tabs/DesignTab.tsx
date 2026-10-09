@@ -4,6 +4,7 @@ import { decodeDesignPrompt, decodeDesigns, designOps, designRepos, repoOf, SPAN
 
 import { DocumentEditor } from "../design/DocumentEditor";
 import { discussSpec, exclusive } from "../design/discuss";
+import { jumpTo } from "../design/jump";
 import { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading, type Listing } from "../design/listing";
 import { PlanColumn } from "../design/PlanColumn";
 import { PromptsPane } from "../design/PromptsPane";
@@ -117,24 +118,26 @@ export function DesignTab(): React.JSX.Element {
   const { designRequest } = useNavigation();
   const [handled, setHandled] = useState<{ readonly seq: number; readonly reloaded: boolean }>({ seq: 0, reloaded: false });
   useEffect(() => {
-    if (designRequest === undefined || designRequest.seq === handled.seq || listing.loading) return;
-    const found = listing.designs?.find((d) => d.uid === designRequest.uid);
-    if (found !== undefined) {
-      const r = repoOf(found.namespace);
-      if (r !== undefined) {
-        setRepo(r);
-        remember(LAST_REPO_KEY, r);
-      }
-      setUid(found.uid);
-      remember(LAST_DESIGN_KEY, found.uid);
-      setHandled({ seq: designRequest.seq, reloaded: false });
-    } else if (!handled.reloaded) {
-      setHandled({ seq: handled.seq, reloaded: true });
-      void load();
-    } else {
-      setNotice(`${designRequest.uid} is not a design this daemon lists.`);
-      setHandled({ seq: designRequest.seq, reloaded: false });
+    if (designRequest === undefined || designRequest.seq === handled.seq) return;
+    const jump = jumpTo(listing, designRequest.uid, handled.reloaded);
+    switch (jump.kind) {
+      case "wait":
+        return;
+      case "open":
+        setRepo(jump.repo);
+        remember(LAST_REPO_KEY, jump.repo);
+        setUid(jump.uid);
+        remember(LAST_DESIGN_KEY, jump.uid);
+        break;
+      case "reload":
+        setHandled({ seq: handled.seq, reloaded: true });
+        void load();
+        return;
+      case "refused":
+        setNotice(jump.notice);
+        break;
     }
+    setHandled({ seq: designRequest.seq, reloaded: false });
   }, [designRequest, handled, listing, load]);
 
   const designs = useMemo(() => listing.designs ?? [], [listing.designs]);

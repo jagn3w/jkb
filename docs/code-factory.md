@@ -555,7 +555,8 @@ requests), and `src/renderer/src/design/` `launch.ts` (every launch and resume a
   (the daemon unreachable, an unknown design) stops the script before Claude starts, so no session
   exists without its prompt. The container's credential is a coordinator grant, which holds `design`;
   an implementer's does not.
-- **Resume is `claude --resume <uuid>` in the recorded cwd, in the container**, opened with the session
+- **Resume is `claude --resume=<uuid>` in the recorded cwd, in the container — never on the host**
+  (D53.9: the app runs no program on the host, and a lowercase uuid is the only id it resumes), opened with the session
   id as the terminal's `sessionUuid`, so resuming a session whose terminal is still open shows that
   terminal. A recorded host path (from before the host toggle was cut, D53.10) is carried back
   through the repos mount (`containerPathOf`, either spelling of the host's root), so the resume
@@ -804,15 +805,29 @@ the renderer's `sessions/` (`watch.ts`, the provider every tab reads the dot fro
   Design tab with that design open (the shell's `navigation.ts`). The worktree is read by **main from
   git's files** — the `.git` file's `gitdir:` line, then `HEAD` — never by running git: the app runs
   unsandboxed on the host, and a repo under the repos mount is writable from the container. Only paths
-  under the repos mount are looked at (either side's spelling), the walk stops at the first `.git` and
-  never leaves the mount, a `gitdir` pointing outside it is refused, links are not followed, and only
-  the place (root, repo key = the root's basename as `gitrepo::key` derives it, branch) crosses back.
-  The repo key and branch then go to `task.by_branch`.
+  under the repos mount are looked at (either side's spelling), and only once `realpath` puts them under
+  the mount's real path too — a link anywhere along the path, not only its last component, cannot lead
+  the reader out; the walk stops at the first `.git` and never leaves the mount; a `gitdir` or a
+  worktree's `commondir` resolving outside it is refused; the file read is never a link (`O_NOFOLLOW`)
+  and is opened `O_NONBLOCK`, so a FIFO the container plants as `HEAD` is refused rather than hanging
+  main in `open`. The resolution and the reads are separate steps — a directory swapped for a link
+  between them is followed — so what that race can reach is bounded by what is read: a few hundred
+  bytes, of which only a parsed ref crosses back. The root crosses in the host's own spelling of the
+  repos directory, never its real path, so *Shell here* can carry it across a symlinked one. Only the place crosses back: the checkout's root, its branch, and the repo key — the
+  **main checkout's** basename (for a linked worktree, the directory holding its `commondir`), because
+  that is what `jkb task work` tags `repo=` with (`repo_ctx`: `gitrepo::key(gitrepo::main_root(cwd))`).
+  Keying by the worktree's own directory name, as first built, found no task for any worktree session
+  (review round 1). The repo key and branch then go to `task.by_branch`. A design the jump finds outside
+  every `designs/<repo>` is refused with a notice rather than answered by the active repo's first design,
+  and a design listing that failed is reported as failed, not as the design's absence.
 - **Re-attach follows the terminal, not a guess.** Build, Stop and Remove record before their run starts
   every terminal the app opened with a `sessionUuid`, on the container, still running; where each
   session *runs* comes from the registry (`session.list`'s cwd), not the terminal's spec — a task's
   *Play* moves into its worktree after the terminal opens, and `claude --resume` finds a session by its
-  directory. When the run ends and `--status` says the container is running, each recorded terminal that
+  directory. A task's *Play* the registry cannot place (its read failed) is not recorded at the
+  terminal's directory, which for a Play is the repo root (see *Re-attach reports exactly what it
+  could not record*, below).
+  When the run ends and `--status` says the container is running, each recorded terminal that
   ended is relaunched in place with `claude --resume` (a closed one gets a new terminal; one still
   running was not torn down and is left alone). After a Stop or a Remove the record waits for the next
   run that leaves the container running, with *Re-attach now* and *Forget* on the Container tab. The
@@ -821,10 +836,58 @@ the renderer's `sessions/` (`watch.ts`, the provider every tab reads the dot fro
   notification change; nothing announces a session starting or ending, and D53.1 rules out a poll loop.
   The preview is the session's facts and context (and a task's text on *Show task*), not its
   transcript, which lives in Claude Code's own store and is not jkb's to serve.
-- *Residual, stated:* while the app is closed its group still exists and holds what it has not read
-  unreapable, until the queue removes it as idle (7 days) — the same exposure a stopped notifier's group
-  has ([notifications.md](notifications.md)). The queue has no op to drop a group, so the app cannot
-  leave on quit.
+- **Owning a session is running it.** A terminal owns a session only while it is starting or running
+  it — the rule re-attach records by — so a terminal whose program ended neither shows *Show terminal*
+  nor claims a re-attach; *Resume* starts it again in that terminal (`terminals.open` relaunches an
+  ended terminal of the session in place, `planOpen`, D53.10). "May be live" is `mayBeLive`, the one
+  statement re-attach and `planOpen` share. No terminal of the app can move to the host any more (the
+  toggle is cut, D53.10), so a session terminal stays in the container.
+- **Resume runs only in the container; the app runs no program on the host, and offers none.** The
+  operator's rule: Claude sessions — Play, Discuss, Resume — always run in the container. Round 1
+  resumed a host editor's session on the host, choosing the side and the directory from the holder's
+  `instance` and `cwd`; round 2 found that those fields, and the session id, are written by the
+  session's own hooks, so a container process could have the unsandboxed app run `claude` with a
+  flag-shaped "id" (`--dangerously-skip-permissions`) in any host directory. Round 2 replaced it with a
+  quoted command for the operator to copy; round 3 found the quoting was POSIX-only (a fish user could
+  be handed a command that breaks out of its quotes) and that a forged row could turn the app's own
+  container session into that command. Both removed, not patched:
+  - **The app's own terminal decides first.** A terminal of the app that ran the session — running,
+    or ended — is the app's record that it ran in the container; Resume relaunches it there, in that
+    terminal, in that terminal's directory (a resume's own directory; for a task's *Play*, which moves
+    into its worktree, a container-side registry row or its prompt, else refused). No registry row can
+    turn it into anything else.
+  - **The registry decides only for a session the app has no terminal for.** A holder whose instance
+    names a boot (`#…`, which the dev container always records) resumes in the container, where a
+    forged row reaches nothing the container could not already. Any other is a host session, and the tab
+    says only *This session ran on the host; resume it from a terminal there* — no command, no
+    directory, nothing to copy. A holder with no instance or no directory is refused with the reason;
+    only a session nothing has a process for falls back to its design prompt's recorded directory, as
+    the Design tab's Resume does.
+- **A resume is built only from a lowercase uuid, as `--resume=<id>`.** `sessionResumeSpec` — the one
+  builder every resume goes through (the Sessions tab, the Prompts pane, re-attach) — returns nothing
+  for any other id, and `RESUME_SCRIPT` passes the id glued to its flag, so even a value that slipped
+  past could not be read as a flag of its own.
+- **Re-attach reports exactly what it could not record.** `recordAttached` returns the sessions it
+  dropped with the reason — a task's *Play* the registry has no record of (or could not be read for),
+  or an id that is not a uuid — and the Container tab names exactly those; a failed registry read that
+  dropped nothing says nothing.
+- **The app leaves `claude/notify` when it stops reading.** A new op, `mq.group_delete` (CLI:
+  `jkb mq group rm <topic> <group>`), removes the app's group when the feed's last window closes
+  (macOS keeps a windowless app running) and on quit, which waits up to 1.5 s for it — and for any
+  removal already in flight. As first built the group stayed after every ordinary quit, holding each
+  later post and withdrawal unreapable; at the topic's cap `send` is refused, so `notify.event` failed
+  `queue_full` and the notifier showed nothing. A join waits for a removal still in flight and then
+  asks again whether anyone still wants the feed; after quit nothing joins; and a join already in
+  flight when quit begins is waited for within the same bound, and the group it created is removed —
+  so a removal never lands after a join, and no join recreates the group after quit (round 3 found the
+  in-flight join). A removal that does not land is written to main's stderr.
+- *Residual, stated:* the group stays when the app **crashes**, when the daemon does not answer within
+  the wait, and when the daemon predates `mq.group_delete` (it refuses the op `bad_request`; main logs
+  it) — until the queue removes it as idle (7 days), like a stopped notifier's, or the operator runs
+  `jkb mq group rm claude/notify code-factory`. The estimate, unmeasured: each prompt is a post and a
+  withdrawal, and a turn ending with something on screen one more, so a few agents at ~1,500 messages
+  a day reach the 10,000-message cap in about 6.7 days — inside the idle bound, so a crash during heavy
+  use can still fill the topic before the group goes.
 - *Unmeasured here, stated:* the Electron smoke for the tab (no binary in the sandbox), and a rebuild
   re-attaching against a real container (no Docker in the sandbox): `reattach.ts`'s plan is what is pinned.
 

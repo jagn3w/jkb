@@ -257,6 +257,16 @@ case7() {
         || fail "agent not running" "got '$got'"
     got="$(report TS=ready DS=1 'STUB_GROUPS=[{"name":"macos-notifier","position":0}]')"
     [ "$got" = "subscribed 4321" ] && ok "a running agent whose group joined: subscribed, with its pid" || fail "agent subscribed" "got '$got'"
+    got="$(report TS=ready DS=1 'STUB_GROUPS=[
+  {
+    "name": "macos-notifier",
+    "position": 0
+  }
+]')"
+    [ "$got" = "subscribed 4321" ] && ok "the group as \`--json\` really prints it (pretty): subscribed" || fail "agent subscribed, pretty" "got '$got'"
+    got="$(report TS=ready DS=1 JKB_NOTIFIER_READY_WAIT=0 'STUB_GROUPS=[{"name":"code-factory","position":0}]')"
+    [ "$got" = "not-subscribed 4321" ] && ok "only Code Factory's group on the topic: not-subscribed — another consumer is not the notifier" \
+        || fail "only code-factory listed" "got '$got'"
     got="$(report TS=conflict DS=1 JKB_NOTIFIER_READY_WAIT=0)"
     [ "$got" = "not-subscribed 4321" ] && ok "a running agent with no group on the topic: not-subscribed" \
         || fail "agent not subscribed" "got '$got'"

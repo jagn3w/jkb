@@ -3494,6 +3494,40 @@ fn mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack() {
     );
 }
 
+/// `jkb mq group rm` removes a group (what a crashed Code Factory left on `claude/notify`, D53.9),
+/// says when there was none, and answers `--json` with the op's own result.
+#[test]
+fn mq_group_rm_removes_a_group_and_says_when_there_was_none() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("x.db");
+    let run = |args: &[&str]| {
+        let out = jkb(&db).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&["mq", "topic", "create", "t"]);
+    run(&["mq", "group", "create", "t", "code-factory"]);
+    assert_eq!(
+        run(&["mq", "group", "rm", "t", "code-factory"]).trim(),
+        "removed group code-factory from t"
+    );
+    assert!(!run(&["--json", "mq", "group", "ls", "t"]).contains("code-factory"));
+    assert_eq!(
+        run(&["mq", "group", "rm", "t", "code-factory"]).trim(),
+        "no such group code-factory on t"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&run(&["--json", "mq", "group", "rm", "t", "code-factory"])).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "result": "group_deleted", "deleted": false })
+    );
+}
+
 /// The reap service compacts the queue on its pass — and a database it cannot open stops only the
 /// compaction, never the sweep: not a garbage file, but a real database carrying a migration this
 /// binary does not know, which is the divergence the sweep was made schema-independent for.

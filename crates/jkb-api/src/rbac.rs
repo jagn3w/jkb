@@ -236,6 +236,7 @@ impl Request {
             | Self::MqGroupCreate { .. }
             | Self::MqPoll { .. }
             | Self::MqAck { .. }
+            | Self::MqGroupDelete { .. }
             | Self::MqInspect {}
             | Self::MqTail { .. }
             | Self::NotifyEvent { .. }
@@ -446,6 +447,7 @@ impl Request {
             | Self::MqGroupCreate { .. }
             | Self::MqPoll { .. }
             | Self::MqAck { .. }
+            | Self::MqGroupDelete { .. }
             | Self::MqInspect {}
             | Self::MqTail { .. }
             | Self::NotifyEvent { .. }

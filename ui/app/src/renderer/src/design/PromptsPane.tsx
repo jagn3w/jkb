@@ -102,7 +102,12 @@ export function PromptsPane({
       onNotice("The terminal is not ready yet.");
       return;
     }
-    terminals.open(resumeSpec(prompt, roots), "drawer");
+    const spec = resumeSpec(prompt, roots);
+    if (spec === undefined) {
+      onNotice(`${prompt.session} is not a session uuid, so it is not resumed.`);
+      return;
+    }
+    terminals.open(spec, "drawer");
   };
 
   return (
