@@ -2,8 +2,8 @@ use proptest::prelude::*;
 use serde_json::json;
 
 use super::{
-    ack, compact, group_create, inspect, now_ms, poll, poll_needed, send, tail, topic_create,
-    Created, Delivered, Draft, QueueError, Start, TopicSpec, MAX_BATCH,
+    ack, compact, group_create, group_delete, inspect, now_ms, poll, poll_needed, send, tail,
+    topic_create, Created, Delivered, Draft, QueueError, Start, TopicSpec, MAX_BATCH,
 };
 use crate::{Db, Error};
 
@@ -275,6 +275,42 @@ fn at_the_cap_consumed_messages_are_reaped_oldest_first_and_otherwise_the_write_
     assert_eq!(held_seqs(&db), vec![s[2], s3, s4]);
     let err = do_send(&db, draft("k", 5), T0).unwrap_err();
     assert!(matches!(queue_err(err), QueueError::QueueFull { .. }));
+}
+
+#[test]
+fn a_group_that_leaves_stops_holding_the_topic_at_its_cap() {
+    let spec = TopicSpec {
+        max_messages: 2,
+        ..TopicSpec::default()
+    };
+    let db = db_with_topic(spec);
+    do_group(&db, "notifier", Start::FromStart, T0);
+    do_group(&db, "app", Start::FromStart, T0);
+    let a = do_send(&db, draft("k", 1), T0).unwrap();
+    let b = do_send(&db, draft("k", 2), T0).unwrap();
+    do_ack(&db, "notifier", b, T0).unwrap();
+    let err = do_send(&db, draft("k", 3), T0).unwrap_err();
+    assert!(
+        matches!(queue_err(err), QueueError::QueueFull { .. }),
+        "the app's unread group holds what the notifier consumed"
+    );
+    let left = |g: &'static str| {
+        db.write_txn("t", move |c, m| group_delete(c, m, "t", g))
+            .unwrap()
+    };
+    assert!(left("app"));
+    assert!(!left("app"), "idempotent: a second leave finds nothing");
+    let c = do_send(&db, draft("k", 3), T0).unwrap();
+    assert_eq!(
+        held_seqs(&db),
+        vec![b, c],
+        "the oldest consumed one was reaped"
+    );
+    assert!(!held_seqs(&db).contains(&a));
+    let err = db
+        .write_txn("t", |c, m| group_delete(c, m, "nope", "app"))
+        .unwrap_err();
+    assert!(matches!(queue_err(err), QueueError::NoSuchTopic(_)));
 }
 
 #[test]

@@ -578,6 +578,14 @@ EOF
 $(dc_kit_paths)
 EOF
     printf 'checkout=%s\n' "$src" > "$new/$DC_KIT_MARKER" || { rm -rf "$new"; return 1; }
+    # ...AND THE COMMIT AND BRANCH IT STOOD ON, which the image is labelled with when it is built from
+    # this kit (D53.8). The checkout's HEAD at the copy: an uncommitted edit to a kit path rides along
+    # in the copy and is not in that commit, which .container/README.md states beside the labels.
+    local src_head
+    if src_head="$(dc_git_head "$src")"; then
+        printf 'commit=%s\nbranch=%s\n' "${src_head%%$'\t'*}" "${src_head#*$'\t'}" >> "$new/$DC_KIT_MARKER" \
+            || { rm -rf "$new"; return 1; }
+    fi
     chmod -R go-w "$new" && chmod 0755 "$new" || { rm -rf "$new"; return 1; }
     old=""
     if [ -e "$kit" ] || [ -L "$kit" ]; then
@@ -610,6 +618,123 @@ dc_kit_checkout() { # dc_kit_checkout <kit dir>
     printf '%s\n' "$c"
 }
 
+# How long a host-side read of an agent-writable file may take, in seconds (dc_bounded). A plain
+# assignment, never read from the environment; the tests set it lower after sourcing this file.
+DC_READ_BOUND=10
+
+# dc_bounded <seconds> <command>... -> the command's status, or 124 when it ran past <seconds> and
+# was killed. For a host-side read of a file the agent can replace: a type check before the open
+# cannot hold, since a regular file swapped for a FIFO between the check and the open blocks the
+# reader (`diff`, `head`) for good (review s8 round 3). `timeout` is not on a stock Mac, where run.sh
+# runs, so this is bash's own: the command in the background, polled fifty times a second (a read
+# that answers at once costs one poll).
+dc_bounded() { # dc_bounded <seconds> <command>...
+    local limit=$(( $1 * 50 )) pid i=0
+    shift
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$i" -ge "$limit" ]; then kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; fi
+        sleep 0.02; i=$((i + 1))
+    done
+    wait "$pid"
+}
+
+# dc_line1 <file> -> the file's first line, or rc 1 when it is a link, not a regular file, or does
+# not answer within DC_READ_BOUND (a FIFO swapped in after the check).
+dc_regular() { # dc_regular <path> -> rc 0 for a regular file that is not a link
+    [ ! -L "$1" ] && [ -f "$1" ]
+}
+dc_line1() { # dc_line1 <file>
+    dc_regular "$1" || return 1
+    dc_bounded "$DC_READ_BOUND" head -1 "$1" 2>/dev/null
+}
+
+# THE COMMIT AND BRANCH A CHECKOUT STANDS ON, READ FROM ITS FILES -- NEVER BY RUNNING GIT (D53.8).
+# The image's `jkb.source-commit`/`jkb.source-branch` labels come from here, and this runs on the host,
+# unsandboxed, against a checkout the agent can write: git there reads the repository's own config,
+# whose `core.fsmonitor` is a program git runs. Every other host-side git call in this directory runs
+# from `/` for the same reason (dc_global_hooks_path). So HEAD is read as git stores it: `.git` is the
+# directory, or a `gitdir:` file for a worktree; a worktree's branches live in its `commondir`; a
+# branch is a loose ref or a `packed-refs` line. A reftable repository, a symbolic ref that is not a
+# branch, or anything that does not end in a full hex object name is rc 1 -- "unknown", never a guess.
+# NO LINK IS FOLLOWED AND NO REF LEAVES refs/heads (review s8 round 3). The agent writes .git, and the
+# line read lands in the kit marker and an image label, both of which reach the container: `HEAD ->
+# ~/<a file whose first line is hex>`, or `ref: refs/heads/../../../<that file>`, made the host read
+# a file of the agent's choosing into them. So .git, HEAD, commondir, the ref file and packed-refs must
+# be regular files (or directories) that are not links, a branch name with a `..` segment is refused,
+# and the ref file's directory must resolve, physically, inside the common directory's refs/heads.
+# Every read is bounded (dc_line1). Residual, stated: a `gitdir:`/`commondir` line still names the
+# directories read, and those may be anywhere; what is read there is only a HEAD-shaped file and a ref
+# under its refs/heads, and only a full hex name passes.
+# Prints `<commit>\t<branch>`, the branch empty when HEAD is detached.
+dc_git_head() { # dc_git_head <checkout>
+    local root="$1" gd common head ref sha="" branch="" c heads dir
+    if [ -d "$root/.git" ]; then gd="$root/.git"
+    elif [ -f "$root/.git" ]; then
+        gd="$(dc_line1 "$root/.git")" || return 1
+        gd="${gd#gitdir: }"
+        case "$gd" in "") return 1 ;; /*) ;; *) gd="$root/$gd" ;; esac
+    else return 1
+    fi
+    # The git directory itself is not a link: this also refuses a `.git` that is one.
+    [ -d "$gd" ] && [ ! -L "$gd" ] || return 1
+    common="$gd"
+    if [ -e "$gd/commondir" ] || [ -L "$gd/commondir" ]; then
+        c="$(dc_line1 "$gd/commondir")" || return 1
+        case "$c" in "") ;; /*) common="$c" ;; *) common="$gd/$c" ;; esac
+    fi
+    head="$(dc_line1 "$gd/HEAD")" || return 1
+    case "$head" in
+        "ref: refs/heads/"*)
+            ref="${head#ref: }"; branch="${ref#refs/heads/}"
+            case "/$branch/" in */../*|*/./*|//) return 1 ;; esac
+            # The common directory resolved, refs/heads NOT: a refs/heads that is itself a link
+            # resolves elsewhere, so the ref file's directory is not under this.
+            heads="$(cd "$common" 2>/dev/null && pwd -P)/refs/heads" || heads=""
+            dir="$(cd "$(dirname "$common/$ref")" 2>/dev/null && pwd -P)" || dir=""
+            if [ -n "$heads" ] && [ -n "$dir" ] && [ -e "$common/$ref" -o -L "$common/$ref" ]; then
+                case "$dir/" in "$heads"/*) ;; *) return 1 ;; esac
+                sha="$(dc_line1 "$common/$ref")" || return 1
+            elif [ -e "$common/packed-refs" ] || [ -L "$common/packed-refs" ]; then
+                dc_regular "$common/packed-refs" || return 1
+                sha="$(dc_bounded "$DC_READ_BOUND" awk -v r="$ref" '$2 == r { print $1; exit }' "$common/packed-refs" 2>/dev/null)" || return 1
+            fi ;;
+        "ref: "*) return 1 ;;
+        *) sha="$head" ;;
+    esac
+    case "$sha" in ""|*[!0-9a-f]*) return 1 ;; esac
+    [ "${#sha}" -eq 40 ] || [ "${#sha}" -eq 64 ] || return 1
+    # A branch name goes into the kit marker (one line per field) and a docker label: git refuses
+    # whitespace and control characters in a ref name, so one that has them was not written by git.
+    case "$branch" in *[[:space:][:cntrl:]]*) return 1 ;; esac
+    printf '%s\t%s\n' "$sha" "$branch"
+}
+
+# dc_kit_source <kit dir> -> `<commit>\t<branch>` the kit was copied from, as dc_install_kit recorded
+# them, or rc 1 when it recorded none (a kit installed before it did, or from a checkout whose HEAD
+# could not be read).
+dc_kit_source() { # dc_kit_source <kit dir>
+    local commit branch
+    commit="$(sed -n 's/^commit=//p' "$1/$DC_KIT_MARKER" 2>/dev/null | head -1)"
+    branch="$(sed -n 's/^branch=//p' "$1/$DC_KIT_MARKER" 2>/dev/null | head -1)"
+    [ -n "$commit" ] || return 1
+    printf '%s\t%s\n' "$commit" "$branch"
+}
+
+# dc_source_labels [<commit>\t<branch>] -> the `jkb.source-commit`/`jkb.source-branch` label values,
+# `<commit>\t<branch>`: a detached HEAD (empty branch) is `(detached)`, and no source at all is
+# `unknown` for both. The ONE place that mapping is written: build_image labels with it and the tests
+# expect what it says, so a detached CI checkout cannot make the two disagree.
+dc_source_labels() { # dc_source_labels [<commit>\t<branch>]
+    local commit=unknown branch=unknown
+    if [ -n "${1:-}" ]; then
+        commit="${1%%$'\t'*}"; branch="${1#*$'\t'}"
+        [ -n "$branch" ] || branch="(detached)"
+    fi
+    printf '%s\t%s\n' "$commit" "$branch"
+}
+
 # dc_kit_changes <kit dir> <checkout> -> every FILE that differs between the kit and the checkout,
 # one per line, relative to the checkout: what a refresh will copy in. dc_kit_stale below answers
 # per kit path (`.container`), which named one directory for ~25 files (review round 17).
@@ -623,12 +748,14 @@ dc_kit_changes() { # dc_kit_changes <kit dir> <checkout>
         # for a path missing on one side ended --install-kit silently, before it installed anything
         # (review round 19). A find error prints into the list, so it is seen, not fatal.
         kfiles=""; cfiles=""
+        # Said, not walked: dc_install_kit refuses it, and this list is what --install-kit prints first.
+        if ! dc_plain_path "$2/$p"; then printf '%s (not a regular file or directory)\n' "$p"; continue; fi
         if [ -e "$1/$p" ]; then kfiles="$( (cd "$1" && find "$p" -type f 2>&1) | sort || true)"; fi
         if [ -e "$2/$p" ]; then cfiles="$( (cd "$2" && find "$p" -type f 2>&1) | sort || true)"; fi
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             if ! grep -qxF -- "$f" <<<"$kfiles"; then printf '%s (new)\n' "$f"
-            elif ! cmp -s -- "$1/$f" "$2/$f"; then printf '%s\n' "$f"
+            elif ! dc_bounded "$DC_READ_BOUND" cmp -s -- "$1/$f" "$2/$f"; then printf '%s\n' "$f"
             fi
         done <<<"$cfiles"
         while IFS= read -r f; do
@@ -640,11 +767,26 @@ $(dc_kit_paths)
 EOF
 }
 
-# dc_kit_stale <kit dir> <checkout> -> the kit paths that differ from the checkout, one per line.
+# dc_plain_path <path> -> rc 0 when <path> is absent, a regular file or a directory, and not a link.
+# What may be handed to a program that OPENS it on the host: `diff -rq` given a FIFO as an argument
+# blocks reading it (measured: `timeout 3 diff -rq <file> <fifo>` exits 124), and the checkout's kit
+# paths are the agent's to replace -- the hang dc_git_head refuses for HEAD (review s8 round 2). Inside
+# a directory diff only reports a special file ("... is a fifo"), so the top level is what needs this.
+dc_plain_path() { # dc_plain_path <path>
+    [ -L "$1" ] && return 1
+    [ -e "$1" ] || return 0
+    [ -f "$1" ] || [ -d "$1" ]
+}
+
+# dc_kit_stale <kit dir> <checkout> -> the kit paths that differ from the checkout, one per line. A
+# path that is not plain on either side differs, without being opened.
 dc_kit_stale() { # dc_kit_stale <kit dir> <checkout>
     local p
     while IFS= read -r p; do
-        diff -rq "$1/$p" "$2/$p" >/dev/null 2>&1 || printf '%s\n' "$p"
+        if ! dc_plain_path "$1/$p" || ! dc_plain_path "$2/$p"; then printf '%s\n' "$p"; continue; fi
+        # BOUNDED, because the check above cannot hold: a file swapped for a FIFO after it still blocks
+        # diff's open (review s8 round 3). Past the bound, the path is stale -- never a hang.
+        dc_bounded "$DC_READ_BOUND" diff -rq "$1/$p" "$2/$p" >/dev/null 2>&1 || printf '%s\n' "$p"
     done <<EOF
 $(dc_kit_paths)
 EOF

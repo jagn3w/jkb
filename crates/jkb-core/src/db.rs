@@ -130,8 +130,12 @@ mod tests {
         // V021 the edge indexes a paged walk reads by,
         // V022 roles, grants and task workflows (role_grants, agent_role_map, agent_bindings,
         // workflow_transitions, workflow_strategies),
-        // V023 a task's review record out of tags (reviews).
-        assert_eq!(user_version, 23);
+        // V023 a task's review record out of tags (reviews),
+        // V024 design documents as CRDT updates (design_updates, design_snapshots),
+        // V025 the operator's workflow agent templates (workflow_agents),
+        // V026 a design's doc target and sources out of its metadata (design_doc_targets,
+        // design_sources).
+        assert_eq!(user_version, 26);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -295,7 +299,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 23);
+        assert_eq!(user_version, 26);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

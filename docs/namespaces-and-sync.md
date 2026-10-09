@@ -489,6 +489,30 @@ and nothing ever held an entry to the second.
   judged, and zero is honest only where a named guard says the row was deliberately skipped. Arms
   answering `Ok(0)` for work they had not done were worse than raising: `undo` wrote its marker on
   the strength of it, so clearing the obstruction and retrying met "already undone".
+- **Undoing a design's creation is refused while later work would cascade away with it**
+  (`design::undo_would_lose`, asked by `undo`'s pre-flight for every `(insert, items)` entry, design
+  items only). Deleting the item cascades (`ON DELETE CASCADE`) every row keyed by it, and a design's
+  updates are append-only (D53.4): text written after the create, its spans, and every later edit's
+  undo went with it. The undo is refused while a table in `design::DESIGN_OWNED` — an explicit list,
+  one line per table, today `design_updates`, `design_doc_targets` and `design_sources` (V026,
+  D55.6) — holds a row whose `txn_id` is a later transaction not
+  itself undone and not an `undo` (whose forward revert of an undone edit is no work of its own);
+  the refusal names the newest such transaction, which `jkb undo` takes back next, and once the later
+  work is undone the creation undoes. A compacted design (`design_snapshots`, which has no `txn_id`,
+  folds later rows into itself and is never undone) keeps its creation for good, and that refusal is
+  checked **first**: naming a transaction to undo instead sent the user to undo their own edits for
+  nothing (round 5). A table
+  belongs on the list only if it records its writer in `txn_id`; there is no changelog fallback, so
+  what lacks one is a stated gap: `containment` (a plan put under a design by a later transaction is
+  orphaned by undoing the design's creation; a span is not, as `design.span` writes a
+  `design_updates` row too).
+  *Tried and dropped (Code Factory subtask 3, review rounds 3-4):* a generic guard for every item —
+  refuse while any later changelog entry, or any row of any `ON DELETE CASCADE` table found in the
+  live schema, belonged to the item. It confused rowids with item ids when attributing a row to the
+  entry that wrote it, so unrelated transactions were blamed and rows `undo` re-inserted had no
+  writer, making a creation permanently un-undoable; and it counted rows of unlogged audit tables
+  (`task_transitions`, written by e.g. `task.pr_record`), so a task's creation and the transaction
+  the refusal named refused each other for ever. Non-design undo is unchanged.
 - **User-visible: `V014` draws a date line.** A write-time guard cannot reach backwards, and
   inferring whether a legacy payload happens to be invertible is the same mistake one level along.
   So `undo_watermark` is seeded to `MAX(txn_id)` at upgrade: **`jkb undo` cannot reach anything

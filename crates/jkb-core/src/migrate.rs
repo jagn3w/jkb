@@ -424,3 +424,161 @@ mod reviews_migration_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod design_exports_migration_tests {
+    use super::embedded;
+    use refinery::Target;
+    use rusqlite::{params, Connection};
+
+    /// V026 moves a design's `doc_target` and `sources` metadata keys into rows of their own and
+    /// strips them from the metadata, leaving other keys and other kinds alone. And undo
+    /// history ends at the newest transaction that wrote those keys, so none of them can be undone
+    /// into a blob nothing reads, while later work stays undoable.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one migration scenario, seeded and read back top to bottom
+    fn v026_moves_doc_targets_and_sources_out_of_design_metadata() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(25))
+            .run(&mut conn)
+            .unwrap();
+        let h = "a".repeat(64);
+        for (id, uid, kind, metadata, ns) in [
+            (
+                1,
+                "design:a",
+                "design",
+                format!(
+                    r#"{{"doc_target":"docs/a.md","sources":[{{"path":"README.md","blake3":"{h}"}}],"keep":1}}"#
+                ),
+                Some("designs/jkb"),
+            ),
+            (
+                2,
+                "design:b",
+                "design",
+                r#"{"doc_target":"docs/a.md"}"#.to_owned(),
+                Some("designs/jkb"),
+            ),
+            (
+                3,
+                "design:c",
+                "design",
+                r#"{"doc_target":"docs/a.md"}"#.to_owned(),
+                Some("designs/web/sub"),
+            ),
+            (
+                4,
+                "note:x",
+                "note",
+                r#"{"doc_target":"docs/x.md"}"#.to_owned(),
+                None,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO items (id, uid, kind, metadata) VALUES (?1, ?2, ?3, ?4)",
+                params![id, uid, kind, metadata],
+            )
+            .unwrap();
+            if let Some(ns) = ns {
+                conn.execute(
+                    "INSERT OR IGNORE INTO namespaces (path, kind) VALUES (?1, 'logical')",
+                    [ns],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO placements (item_id, namespace_id, role)
+                     SELECT ?1, id, 'primary' FROM namespaces WHERE path = ?2",
+                    params![id, ns],
+                )
+                .unwrap();
+            }
+        }
+        // The 872aec5 build logged its target write as a design metadata update (txn 7); txn 9 is
+        // later, unrelated work; txn 8 writes another item's metadata with the same key.
+        let meta_entry = |before: &str, after: &str| serde_json::json!({ "b": { "metadata": before }, "a": { "metadata": after } });
+        let target = meta_entry("{}", r#"{"doc_target":"docs/a.md"}"#);
+        let note = meta_entry("{}", r#"{"doc_target":"docs/x.md"}"#);
+        for (txn, entity, before, after) in [
+            (7, "1", target["b"].to_string(), target["a"].to_string()),
+            (8, "4", note["b"].to_string(), note["a"].to_string()),
+            (
+                9,
+                "1",
+                r#"{"content":"x"}"#.to_owned(),
+                r#"{"content":"y"}"#.to_owned(),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO changelog (txn_id, op, entity_type, entity_id, before, after)
+                 VALUES (?1, 'update', 'items', ?2, ?3, ?4)",
+                params![txn, entity, before, after],
+            )
+            .unwrap();
+        }
+        embedded::migrations::runner().run(&mut conn).unwrap();
+
+        let targets: Vec<(i64, String)> = conn
+            .prepare("SELECT design_id, path FROM design_doc_targets ORDER BY design_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        // Every design's target moves; two of one repo on one file is `exports`' refusal to make.
+        assert_eq!(
+            targets,
+            vec![
+                (1, "docs/a.md".to_owned()),
+                (2, "docs/a.md".to_owned()),
+                (3, "docs/a.md".to_owned()),
+            ]
+        );
+        let sources: Vec<(i64, String, String)> = conn
+            .prepare("SELECT design_id, path, blake3 FROM design_sources")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(sources, vec![(1, "README.md".to_owned(), h)]);
+        let metadata = |id: i64| -> String {
+            conn.query_row("SELECT metadata FROM items WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(metadata(1), r#"{"keep":1}"#);
+        assert_eq!(metadata(2), "{}");
+        assert_eq!(metadata(4), r#"{"doc_target":"docs/x.md"}"#, "not a design");
+        let watermark: i64 = conn
+            .query_row("SELECT from_txn FROM undo_watermark", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            watermark, 7,
+            "history ends at the design's key write, not the note's or later work"
+        );
+    }
+
+    /// A database that never wrote those keys keeps its watermark.
+    #[test]
+    fn v026_leaves_the_watermark_of_a_database_without_the_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(25))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO changelog (txn_id, op, entity_type, entity_id, before, after)
+             VALUES (4, 'update', 'items', '1', '{\"content\":\"x\"}', 'not json')",
+            [],
+        )
+        .unwrap();
+        embedded::migrations::runner().run(&mut conn).unwrap();
+        let watermark: i64 = conn
+            .query_row("SELECT from_txn FROM undo_watermark", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(watermark, 0);
+    }
+}

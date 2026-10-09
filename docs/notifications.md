@@ -61,12 +61,23 @@ failure lasts. Each run restarts once however many of its end signals arrive.
 **A topic nobody reads is not written to.** A message no group consumes is never reapable, so a topic
 with no groups fills to its 10,000-message cap and then refuses every hook call. On a machine with no
 notifier that is the topic's whole life. So the machine still moves the record but sends only while
-`claude/notify` has a group — and the only group is the notifier's (`macos-notifier`, created from
-now by its `jkb mq subscribe`), so only a Mac running the agent receives anything. `scripts/setup.sh`
+`claude/notify` has a group. There are two consumers: the notifier's (`macos-notifier`, created from
+now by its `jkb mq subscribe`), and the Code Factory app's own `code-factory` group, which feeds its
+needs-input dot while the app is open (D53.9, [code-factory.md](code-factory.md)) — so a Mac running the
+agent, or any machine with the app open, has its posts and withdrawals sent; with neither, nothing is.
+The app takes its group off the topic when it stops reading — its last window closing, and quit — with
+`mq.group_delete`: left there, its group held every later post and withdrawal unreapable, and once the
+topic reached its cap `notify.event` was refused `queue_full`, so the notifier showed nothing after an
+ordinary quit (D53.9 review). When it still stays — a crash, a daemon that does not answer in time, or
+one older than the op — is D53.9's *Residual*, with its time-to-cap estimate; `jkb mq group rm
+claude/notify code-factory` removes it by hand. `scripts/setup.sh`
 creates the topic on every platform, because a producer never creates one. On macOS it reports only
 what it checked (`report_notifier` in `scripts/lib.sh`): the agent has a running process (a PID from
-`launchctl list`, not merely "loaded", which a crash-looping agent also is) and the topic has a consumer
-group — the question the daemon asks. That is deliberately not "notifications are shown": a group
+`launchctl list`, not merely "loaded", which a crash-looping agent also is) and the topic has the
+notifier's own group, `macos-notifier` (main.swift's default, which the installed agent does not
+override). Any group used to do — the question the daemon asks — and then a `code-factory` group left
+by the app made a notifier whose subscription never joined read as `subscribed` (D53.9 review;
+`services.test.sh` pins the case). That is still deliberately not "notifications are shown": a group
 outlives its consumer by 7 idle days, and a running notifier can have a failing subscription (its
 `notifier.log` says). What it rules out is the two states setup once reported as healthy — an
 authorized bundle with no agent, and an agent loaded but not running (both stage-5 reviews). A group

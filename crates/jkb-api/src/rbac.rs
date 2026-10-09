@@ -53,6 +53,11 @@ pub enum OpPermission {
     Land,
     /// Fire or observe a workflow event — decided per event by the task's strategy.
     Workflow,
+    /// Write a design document: create one, edit or merge into it, make or stage a span (D53.4).
+    Design,
+    /// Approve a design span — and only as the reviewer the span names, which the op itself holds
+    /// it to (D53.5).
+    DesignApprove,
     /// Mint or revoke grants.
     Grant,
     /// Mint and release harness tickets — the container credential's own job.
@@ -72,6 +77,8 @@ impl jkb_rbac::Permission for OpPermission {
         Self::Review,
         Self::Land,
         Self::Workflow,
+        Self::Design,
+        Self::DesignApprove,
         Self::Grant,
         Self::Attest,
         Self::Admin,
@@ -87,6 +94,8 @@ impl jkb_rbac::Permission for OpPermission {
             Self::Review => "review",
             Self::Land => "land",
             Self::Workflow => "workflow",
+            Self::Design => "design",
+            Self::DesignApprove => "design_approve",
             Self::Grant => "grant",
             Self::Attest => "attest",
             Self::Admin => "admin",
@@ -117,6 +126,8 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
                 // with no reviewer involved. A round is a reviewer's, or the operator's.
                 OpPermission::Workflow,
                 OpPermission::Grant,
+                OpPermission::Design,
+                OpPermission::DesignApprove,
             ],
         },
         Grant {
@@ -126,6 +137,10 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
                 OpPermission::Hook,
                 OpPermission::TaskWrite,
                 OpPermission::Workflow,
+                // The design is the designer's to write, and a span naming `claude` is a Claude
+                // session's to approve (D53.5).
+                OpPermission::Design,
+                OpPermission::DesignApprove,
             ],
         },
         Grant {
@@ -145,6 +160,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
                 OpPermission::Hook,
                 OpPermission::Review,
                 OpPermission::Workflow,
+                OpPermission::DesignApprove,
             ],
         },
         Grant {
@@ -201,12 +217,26 @@ impl Request {
             | Self::RoleWhoami {}
             | Self::RoleBind { .. }
             | Self::WorkflowShow { .. }
-            | Self::WorkflowStrategies {} => OpPermission::Read,
+            | Self::WorkflowStrategies {}
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents {}
+            | Self::WorkflowAgent { .. }
+            | Self::DesignList { .. }
+            | Self::DesignCat { .. }
+            | Self::DesignExport { .. }
+            | Self::DesignState { .. }
+            | Self::DesignSpans { .. }
+            | Self::DesignPlan { .. }
+            | Self::DesignPlans { .. }
+            | Self::DesignPrompt { .. }
+            | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. } => OpPermission::Read,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
             | Self::MqPoll { .. }
             | Self::MqAck { .. }
+            | Self::MqGroupDelete { .. }
             | Self::MqInspect {}
             | Self::MqTail { .. }
             | Self::NotifyEvent { .. }
@@ -251,6 +281,17 @@ impl Request {
             | Self::TaskCloseMerged { .. } => OpPermission::Land,
             Self::WorkflowFire { .. } | Self::WorkflowObserve { .. } => OpPermission::Workflow,
             Self::RoleGrant { .. } | Self::RoleRevoke { .. } => OpPermission::Grant,
+            Self::DesignCreate { .. }
+            | Self::DesignApply { .. }
+            | Self::DesignEdit { .. }
+            | Self::DesignSpan { .. }
+            | Self::DesignStage { .. }
+            | Self::DesignPlanCreate { .. }
+            | Self::DesignPlanStep { .. }
+            | Self::DesignPromptRecord { .. }
+            | Self::DesignTarget { .. }
+            | Self::DesignSources { .. } => OpPermission::Design,
+            Self::DesignApprove { .. } => OpPermission::DesignApprove,
             Self::AttestMint { .. } | Self::AttestRelease { .. } => OpPermission::Attest,
             // Waiving the review gate is the operator's escape hatch, whoever the strategy lets land.
             Self::TaskReviewWaive { .. }
@@ -263,7 +304,12 @@ impl Request {
             | Self::RoleMap { .. }
             | Self::RoleRotateContainer { .. }
             | Self::WorkflowSet { .. }
-            | Self::WorkflowDefine { .. } => OpPermission::Admin,
+            | Self::WorkflowDefine { .. }
+            // The packaged templates are read-only to everyone; the copies the workflow scripts read
+            // instead are the operator's, as choosing a strategy is.
+            | Self::WorkflowAgentCopy { .. }
+            | Self::WorkflowAgentSet { .. }
+            | Self::DesignCompact { .. } => OpPermission::Admin,
         }
     }
 
@@ -321,12 +367,30 @@ impl Request {
             | Self::MqCompact { .. }
             | Self::RoleMap { .. }
             | Self::RoleRotateContainer { .. }
-            | Self::WorkflowDefine { .. } => Target::Shared,
+            | Self::WorkflowDefine { .. }
+            | Self::WorkflowAgentCopy { .. }
+            | Self::WorkflowAgentSet { .. }
+            // A design is no one task's.
+            | Self::DesignCreate { .. }
+            | Self::DesignApply { .. }
+            | Self::DesignEdit { .. }
+            | Self::DesignSpan { .. }
+            | Self::DesignStage { .. }
+            | Self::DesignPlanCreate { .. }
+            | Self::DesignPlanStep { .. }
+            | Self::DesignPromptRecord { .. }
+            | Self::DesignTarget { .. }
+            | Self::DesignSources { .. }
+            | Self::DesignCompact { .. } => Target::Shared,
+            // An approval is held to the reviewer the span names by the engine (`design::approve`),
+            // and is how a mapped `reviewer` subagent — attested, so held to one task for shared
+            // writes — signs off a span naming `claude` (D53.5). Shared, it could never run.
+            Self::DesignApprove { .. }
             // Held by their own callee: a filing writes only a namespace nobody holds, and becomes
             // a task's round only when recorded; recording holds a scoped caller to its task
             // (`review::record`); revoking holds a grant to what it minted; attesting is the
             // container credential's alone.
-            Self::TaskReviewFile(_)
+            | Self::TaskReviewFile(_)
             | Self::TaskReviewRecord(_)
             | Self::RoleRevoke { .. }
             | Self::AttestMint { .. }
@@ -368,11 +432,25 @@ impl Request {
             | Self::RoleWhoami {}
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents {}
+            | Self::WorkflowAgent { .. }
+            | Self::DesignList { .. }
+            | Self::DesignCat { .. }
+            | Self::DesignExport { .. }
+            | Self::DesignState { .. }
+            | Self::DesignSpans { .. }
+            | Self::DesignPlan { .. }
+            | Self::DesignPlans { .. }
+            | Self::DesignPrompt { .. }
+            | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. }
             | Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
             | Self::MqPoll { .. }
             | Self::MqAck { .. }
+            | Self::MqGroupDelete { .. }
             | Self::MqInspect {}
             | Self::MqTail { .. }
             | Self::NotifyEvent { .. }

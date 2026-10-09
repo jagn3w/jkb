@@ -1,0 +1,100 @@
+/* The Container tab (D53.8): what the container is, and the kit's run.sh buttons. Colour is meaning
+ * only: the one alert is drift (and a status that could not be read); everything else is ink. */
+
+.container-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.container-tab .bar-button[data-ends="true"]:hover:not(:disabled) {
+  color: var(--alert);
+}
+
+.container-tab .bar-button:disabled {
+  cursor: default;
+  color: var(--ink-faint);
+}
+
+.container-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-md);
+}
+
+.container-error {
+  margin: 0;
+  color: var(--alert);
+  white-space: pre-wrap;
+  font-size: var(--text-sm);
+}
+
+.container-findings {
+  margin: 0 0 var(--space-4);
+  padding: 0;
+  list-style: none;
+}
+
+.container-findings li {
+  padding: var(--space-1) var(--space-2);
+  border-left: 2px solid var(--hairline-strong);
+  margin-bottom: var(--space-1);
+}
+
+.container-findings li[data-level="stale"] {
+  border-left-color: var(--alert);
+  background: var(--alert-soft);
+}
+
+.container-findings li[data-level="note"] {
+  color: var(--ink-muted);
+}
+
+.container-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--space-6);
+}
+
+.container-grid h2 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+
+.container-grid h3 {
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink-muted);
+}
+
+.container-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+}
+
+.container-facts dt {
+  color: var(--ink-muted);
+}
+
+.container-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.container-facts dd[data-drift="differs"],
+.container-facts dd[data-drift="unrecorded"] {
+  color: var(--alert);
+}
+
+.container-tab code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}

@@ -323,6 +323,32 @@ fn the_idle_prompt_is_cleared_by_the_user_not_by_a_tool() {
     assert!(records(&db).is_empty());
 }
 
+/// The record's derived state is what Code Factory's needs-input dot reads (D53.9): a prompt that
+/// named a tool awaits permission, any other awaits the user. Pinned on the records the machine
+/// itself wrote, so a swapped arm or a constant answer in `state_of` fails here.
+#[test]
+fn a_record_says_whether_it_awaits_the_user_or_a_tool() {
+    let db = db(true);
+    apply(&db, needed("s1")).unwrap();
+    let idle = Observation {
+        message: "Claude is waiting for your input".to_owned(),
+        ..obs(NotifEvent::Needed, "s2")
+    };
+    apply(&db, idle).unwrap();
+    let mut got: Vec<(String, NotifState)> = records(&db)
+        .into_iter()
+        .map(|r| (r.session.clone(), r.state()))
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            ("s1".to_owned(), NotifState::AwaitingTool),
+            ("s2".to_owned(), NotifState::AwaitingUser),
+        ]
+    );
+}
+
 /// **A topic nobody reads is not written to**, or on a machine with no notifier it fills to its
 /// cap and then refuses every hook call. The record still moves, so the machine's state does not
 /// depend on whether anyone is listening.

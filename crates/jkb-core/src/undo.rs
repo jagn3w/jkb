@@ -125,6 +125,9 @@ enum Inverse {
     ReinsertRow,
     /// Delete the inserted row by `rowid`.
     DeleteRow,
+    /// Append a design update that reverts the one inserted ([`crate::design::revert_update`]) —
+    /// the [`InsertInverse::ForwardUpdate`] answer. Nothing is deleted.
+    DesignRevert,
 }
 
 /// The generic inverse driven by a before-state made of column values, if this entry has one —
@@ -503,6 +506,10 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     (Op::Update, Some(Entity::TagDefs), Inverse::Columns),
     (Op::Update, Some(Entity::Namespaces), Inverse::Columns),
     (Op::Update, Some(Entity::Ingestions), Inverse::Columns),
+    // A design's doc target and sources are rows of their own (V026) so each write undoes alone,
+    // and the target's UNIQUE path refuses an undo that would hand one file to two designs.
+    (Op::Update, Some(Entity::DesignDocTargets), Inverse::Columns),
+    (Op::Update, Some(Entity::DesignSources), Inverse::Columns),
     (Op::Delete, Some(Entity::Placements), Inverse::ReinsertRow),
     (
         Op::Delete,
@@ -511,6 +518,12 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
     ),
     (Op::Delete, Some(Entity::Edges), Inverse::ReinsertRow),
     (Op::Delete, Some(Entity::Namespaces), Inverse::ReinsertRow),
+    // A design update is reverted by a newer update, never by deleting the row (D53.4).
+    (
+        Op::Insert,
+        Some(Entity::DesignUpdates),
+        Inverse::DesignRevert,
+    ),
     // Any table whose inserts delete by rowid; an insert into anything else is uninvertible, not
     // deleted on a guess. The wildcard entry must stay LAST: `inverse_for` is first-match-wins, so
     // a table-specific `insert` inverse placed after it would never be reached.
@@ -550,6 +563,8 @@ fn is_work(op: &str, table: &str) -> bool {
 /// copy. Two spellings of one rule is the shape this whole module is a correction of.
 const BOOKKEEPING: &[(Op, Entity)] = &[
     (Op::Update, Entity::SyncState),
+    // A compaction rewrites how a design is stored, not what it says.
+    (Op::Update, Entity::DesignSnapshots),
     (Op::Undo, Entity::Changelog),
 ];
 
@@ -588,6 +603,7 @@ fn inverse_for(op: &str, table: &str) -> Option<Inverse> {
 /// before-state.
 fn invert_entry(
     conn: &Connection,
+    meta: &WriteMeta,
     op: &str,
     table: &str,
     entity_id: &str,
@@ -658,6 +674,10 @@ fn invert_entry(
         }
         Inverse::SyncStateRow => {
             rows += revert_sync_state(conn, entity_id, snapshot("sync journal before-state")?)?;
+        }
+        // A forward update, appended: the reverted row stays, as every peer that merged it has it.
+        Inverse::DesignRevert => {
+            rows += crate::design::revert_update(conn, meta, rowid()?)?;
         }
         // A mount edit is inverted by putting the previous configuration back. `jkb mount
         // create` doubles as the update command, so without this the generic insert
@@ -857,6 +877,7 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
 /// better. Adding a predicted constraint check here would be the fifth round of predicting.
 fn blocker(
     conn: &Connection,
+    txn_id: i64,
     op: &str,
     table: &str,
     entity_id: &str,
@@ -886,9 +907,31 @@ fn blocker(
             | Inverse::EdgeWeight
             | Inverse::MountConfig
             | Inverse::ContainmentRow
+            | Inverse::DesignRevert
     ) && entity_id.parse::<i64>().is_err()
     {
         return Some(format!("its changelog key `{entity_id}` is not a row id"));
+    }
+    // Deleting a design cascades its document away, so a design's creation is undone only while
+    // `design::undo_would_lose` finds no later work: no compaction, and no row in a design-owned
+    // table (`design::DESIGN_OWNED`) whose `txn_id` is a later transaction not itself undone and not
+    // an `undo`. Design-only on purpose — the rule and the generic guard tried and dropped are under
+    // D47 in docs/namespaces-and-sync.md. Every other item's insert undoes as it always has.
+    if op == Op::Insert.as_str() && table == Entity::Items.as_str() {
+        if let Some(why) = entity_id.parse::<i64>().ok().and_then(|row| {
+            crate::design::undo_would_lose(conn, ItemId::new(row), txn_id).transpose()
+        }) {
+            return Some(why.unwrap_or_else(|e| e.to_string()));
+        }
+    }
+    if inverse == Inverse::DesignRevert {
+        if let Some(why) = entity_id
+            .parse::<i64>()
+            .ok()
+            .and_then(|row| crate::design::unrevertable(conn, row).transpose())
+        {
+            return Some(why.unwrap_or_else(|e| e.to_string()));
+        }
     }
     None
 }
@@ -931,12 +974,13 @@ fn watermark(conn: &Connection) -> Result<i64> {
 
 /// "This transaction has already been undone", as `SQL`, spelled **once**.
 ///
-/// Two callers need it against different operands — [`select_work_txn`] correlates it with each
-/// row it scans, [`already_undone`] asks it of one bound id — so the operand is the only hole,
-/// and it is an identifier or a placeholder this module writes, never a value. Written out twice
+/// Three callers need it against different operands — [`select_work_txn`] correlates it with each
+/// row it scans, [`already_undone`] asks it of one bound id, and `design::undo_would_lose` correlates
+/// it with each design-owned row's `txn_id` (D47, docs/namespaces-and-sync.md) — so the operand is
+/// the only hole, and it is an identifier or a placeholder this module writes, never a value. Written out twice
 /// the copies would answer differently, and the answer decides whether `DeleteRow` runs a second
 /// time against row ids `SQLite` has since reissued.
-fn undone_sql(operand: &str) -> String {
+pub(crate) fn undone_sql(operand: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM changelog u
                   WHERE u.op = 'undo' AND u.entity_id = CAST({operand} AS TEXT))"
@@ -1081,7 +1125,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         .iter()
         .filter(|(op, table, _, _)| is_work(op, table))
         .filter_map(|(op, table, entity_id, before)| {
-            blocker(conn, op, table, entity_id, before.as_deref())
+            blocker(conn, txn_id, op, table, entity_id, before.as_deref())
                 .map(|why| format!("`{op}` on `{table}` ({why})"))
         })
         .collect::<BTreeSet<_>>()
@@ -1124,10 +1168,13 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // The statuses are read **before** the inversion and again after it, so what gets recorded is
     // what actually happened rather than what an entry said it would do.
     let statuses_before = task_statuses(conn, &entries)?;
+    // An approval or a staging is announced on its design's topic when made; its reversal must be
+    // too, or an open editor keeps drawing the span APPROVED or STAGED (D53.5).
+    let spans = crate::design::spans_touched(conn, &entries)?;
 
     let mut reverted = 0;
     for (op, table, entity_id, before) in entries {
-        match invert_entry(conn, &op, &table, &entity_id, before.as_deref()) {
+        match invert_entry(conn, meta, &op, &table, &entity_id, before.as_deref()) {
             Ok(rows) => reverted += rows,
             Err(e) => {
                 let why = format!("reversing `{op}` on `{table}` failed: {e}");
@@ -1144,6 +1191,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     }
 
     record_status_restores(conn, meta, &statuses_before)?;
+    crate::design::announce_spans(conn, meta, &spans)?;
 
     changelog::append(
         conn,

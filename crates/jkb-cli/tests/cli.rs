@@ -3494,6 +3494,40 @@ fn mq_subscribe_speaks_ndjson_over_pipes_and_resumes_after_the_ack() {
     );
 }
 
+/// `jkb mq group rm` removes a group (what a crashed Code Factory left on `claude/notify`, D53.9),
+/// says when there was none, and answers `--json` with the op's own result.
+#[test]
+fn mq_group_rm_removes_a_group_and_says_when_there_was_none() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("x.db");
+    let run = |args: &[&str]| {
+        let out = jkb(&db).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&["mq", "topic", "create", "t"]);
+    run(&["mq", "group", "create", "t", "code-factory"]);
+    assert_eq!(
+        run(&["mq", "group", "rm", "t", "code-factory"]).trim(),
+        "removed group code-factory from t"
+    );
+    assert!(!run(&["--json", "mq", "group", "ls", "t"]).contains("code-factory"));
+    assert_eq!(
+        run(&["mq", "group", "rm", "t", "code-factory"]).trim(),
+        "no such group code-factory on t"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&run(&["--json", "mq", "group", "rm", "t", "code-factory"])).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "result": "group_deleted", "deleted": false })
+    );
+}
+
 /// The reap service compacts the queue on its pass — and a database it cannot open stops only the
 /// compaction, never the sweep: not a garbage file, but a real database carrying a migration this
 /// binary does not know, which is the divergence the sweep was made schema-independent for.
@@ -4805,4 +4839,639 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
         "hook_event_name": "SubagentStop", "session_id": "sess-1", "agent_id": "ag-7",
     }));
     assert!(!whoami(&sub).status.success(), "released at SubagentStop");
+}
+
+/// A quote beginning with `-` (a Markdown list item) is a value, not a flag, in every quote option
+/// (`--find`, `--insert-after`, `design span --find`), in the separated spelling — the one that
+/// needs `allow_hyphen_values` (`--find=- x` parses without it).
+#[test]
+fn a_quote_that_begins_with_a_dash_is_a_value() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let listed = jkb(&db)
+        .args(["--json", "design", "create", "List", "--repo", "jkb"])
+        .args(["--body=- one\n- two\n"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let list_uid = listed["uid"].as_str().unwrap().to_owned();
+    let list_version = || -> String {
+        let out = jkb(&db)
+            .args(["--json", "design", "cat", &list_uid])
+            .output()
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        doc["version"].as_str().unwrap().to_owned()
+    };
+    jkb(&db)
+        .args(["design", "edit", &list_uid, "--base", &list_version()])
+        .args(["--find", "- one", "--replace", "- uno"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "edit", &list_uid, "--base", &list_version()])
+        .args(["--insert-after", "- two", "--text", "!"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "span", &list_uid, "--base", &list_version()])
+        .args(["--find", "- uno"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "cat", &list_uid, "--plain"])
+        .assert()
+        .success()
+        .stdout("- uno\n- two!\n");
+}
+
+/// The design edit loop an agent runs (D53.4): `cat` for the text and its version token, `edit` by
+/// quote against that token — merged over an edit made since — then a span approved and demoted.
+#[test]
+fn a_design_is_edited_by_quote_against_the_version_read() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args([
+            "--json", "design", "create", "Code", "Factory", "--repo", "jkb",
+        ])
+        .args(["--body", "The app reads the database. It writes nothing."])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uid = created["uid"].as_str().unwrap().to_owned();
+    let version = || -> String {
+        let out = jkb(&db)
+            .args(["--json", "design", "cat", &uid])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        doc["version"].as_str().unwrap().to_owned()
+    };
+    let base = version();
+    jkb(&db)
+        .args(["design", "edit", &uid, "--base", &base])
+        .args(["--insert-after", "The app", "--text", " (desktop)"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "edit", &uid, "--base", &base])
+        .args(["--find", "writes nothing", "--replace", "writes via ops"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update 3"));
+    jkb(&db)
+        .args(["design", "cat", &uid, "--plain"])
+        .assert()
+        .success()
+        .stdout("The app (desktop) reads the database. It writes via ops.");
+    // A quote that is not in the version read is refused, never guessed at.
+    jkb(&db)
+        .args(["design", "edit", &uid, "--base", &base])
+        .args(["--find", "(desktop)", "--replace", "x"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not in the version you read"));
+
+    let out = jkb(&db)
+        .args(["--json", "design", "span", &uid, "--base", &version()])
+        .args(["--find", "It writes via ops."])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let span = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["span"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    jkb(&db)
+        .args(["design", "approve", &span, "--base", &version()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("APPROVED"));
+    jkb(&db)
+        .args(["design", "cat", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "⟦{span} APPROVED⟧It writes via ops.⟦/{span}⟧"
+        )));
+    jkb(&db)
+        .args(["design", "edit", &uid, "--base", &version()])
+        .args(["--insert-after", "writes ", "--text", "only "])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("demoted: {span}")));
+    // `jkb undo` reverts the edit as a forward update: the approved words are back, so the span reads
+    // APPROVED again, with nothing re-approved.
+    jkb(&db).args(["undo"]).assert().success();
+    jkb(&db)
+        .args(["design", "cat", &uid, "--plain"])
+        .assert()
+        .success()
+        .stdout("The app (desktop) reads the database. It writes via ops.");
+    jkb(&db)
+        .args(["design", "spans", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("APPROVED"));
+    // *Discuss* (D53.5): the prompt the app starts Claude with is this command's output.
+    jkb(&db)
+        .args(["design", "prompt", "discuss", &uid, "--range", "0..7"])
+        .args(["--base", &base])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("```\nThe app\n```"))
+        .stdout(predicate::str::contains(format!("--base {base}")))
+        .stdout(predicate::str::contains(format!("jkb design cat {uid}")));
+    jkb(&db)
+        .args(["design", "prompt", "discuss", &uid, "--range", "7"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<start>..<end>"));
+}
+
+/// Execution plans (D53.6) through the CLI: a plan with steps, a span staged into a step, a task
+/// under it, and the *Play* prompts the app starts Claude with.
+#[test]
+fn a_plan_is_built_and_played_through_the_cli() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = jkb(&db).arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let uid = json(&[
+        "design",
+        "create",
+        "Factory",
+        "--repo",
+        "jkb",
+        "--body",
+        "Scaffold the app.",
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let plan = json(&[
+        "design", "plan", "create", &uid, "First", "cut", "--step", "scaffold", "--step", "deploy",
+    ]);
+    let plan_uid = plan["uid"].as_str().unwrap().to_owned();
+    assert_eq!(plan["title"], "First cut");
+    let step = plan["steps"][0]["uid"].as_str().unwrap().to_owned();
+    jkb(&db)
+        .args(["design", "plan", "step", &plan_uid, "watch", "it"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("3. watch it"));
+
+    let version = json(&["design", "cat", &uid])["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let span = json(&[
+        "design",
+        "span",
+        &uid,
+        "--base",
+        &version,
+        "--find",
+        "Scaffold the app.",
+    ])["span"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = json(&["design", "cat", &uid])["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    jkb(&db)
+        .args(["design", "approve", &span, "--base", &read])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "stage", &span, &step])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("STAGED"));
+    let task = json(&[
+        "task",
+        "add",
+        "Build the scaffold",
+        "--under",
+        &step,
+        "--managed",
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    jkb(&db)
+        .args(["design", "plan", "ls", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("stages {span} STAGED")))
+        .stdout(predicate::str::contains(format!("[open] {task}")));
+    jkb(&db)
+        .args([
+            "design",
+            "prompt",
+            "play",
+            &plan_uid,
+            "--strategy",
+            "coordinated",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workflow strategy: coordinated"))
+        .stdout(predicate::str::contains(&task))
+        .stdout(predicate::str::contains(&span));
+    jkb(&db)
+        .args(["design", "prompt", "task", &task])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("jkb task work {task}")))
+        .stdout(predicate::str::contains(&plan_uid));
+}
+
+/// Design prompts (D53.6) through the CLI: the *New prompt* text, a launch recording its session
+/// from the directory it runs in, and the listing with the command that resumes it.
+#[test]
+fn a_session_is_recorded_from_where_it_starts_and_listed_with_its_resume() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let created = jkb(&db)
+        .args(["--json", "design", "create", "Factory", "--repo", "jkb"])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    let uid = serde_json::from_slice::<serde_json::Value>(&created.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    jkb(&db)
+        .args(["design", "prompt", "new", &uid, "Tighten", "the", "intro"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("jkb design cat {uid}")))
+        .stdout(predicate::str::contains("Tighten the intro"));
+    assert_cmd::Command::from_std(jkb(&db))
+        .args(["design", "prompt", "new", &uid, "-"])
+        .write_stdin("from stdin")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("from stdin"));
+
+    jkb(&db)
+        .args(["design", "prompt", "ls", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no prompts)"));
+    // No --cwd: the record names the directory the launch runs in, where `claude --resume` must.
+    let session = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    let cwd = dir.path().join("it's here");
+    std::fs::create_dir(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    jkb(&db)
+        .current_dir(&cwd)
+        .args([
+            "design",
+            "prompt",
+            "record",
+            &uid,
+            "--session",
+            session,
+            "--launch",
+            "new",
+            "--subject",
+            "",
+            "--title",
+            "New · Tighten the intro",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("prompt:{session}")));
+    let quoted = format!("'{}'", cwd.display().to_string().replace('\'', r"'\''"));
+    jkb(&db)
+        .args(["design", "prompt", "ls", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[new]  New · Tighten the intro"))
+        .stdout(predicate::str::contains(format!(
+            "resume: cd {quoted} && claude --resume {session}"
+        )));
+    jkb(&db)
+        .args([
+            "design",
+            "prompt",
+            "record",
+            &uid,
+            "--session",
+            "nope",
+            "--launch",
+            "new",
+            "--title",
+            "t",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a lowercase session uuid"));
+}
+
+/// `jkb workflow agent` (D53.7): a script reads a packaged template filled in; the operator copies
+/// and edits it, which the same read then answers; `export` writes it into a packaged-templates file
+/// as its next version.
+#[test]
+fn workflow_agent_copy_set_show_and_export() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let listed = jkb(&db)
+        .args(["--json", "workflow", "agent", "list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert!(v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["name"] == "swarm-status" && a["source"] == "packaged"));
+
+    // A placeholder left empty is refused rather than run with a hole in the prompt.
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "show",
+            "swarm-status",
+            "--var",
+            "status=open",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no value for"));
+
+    jkb(&db)
+        .args(["workflow", "agent", "copy", "swarm-status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("as swarm-status v1"));
+    let template = dir.path().join("t.md");
+    std::fs::write(&template, "Set {{status}} on {{commands}}.").unwrap();
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "set",
+            "swarm-status",
+            "--template-file",
+        ])
+        .arg(&template)
+        .args(["--model", "session"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("swarm-status is now v2"));
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "show",
+            "swarm-status",
+            "--var",
+            "status=open",
+            "--var",
+            "commands=x",
+        ])
+        .assert()
+        .success()
+        .stdout("Set open on x.");
+
+    // Export into a copy of the packaged file: that entry moves to its next version.
+    let file = dir.path().join("agents.json");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../jkb-core/src/workflow/agents.json"),
+        &file,
+    )
+    .unwrap();
+    jkb(&db)
+        .args(["workflow", "agent", "export", "swarm-status", "--file"])
+        .arg(&file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("swarm-status packaged as v2"));
+    let text: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let entry = text["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "swarm-status")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        entry["template"],
+        serde_json::json!(["Set {{status}} on {{commands}}."])
+    );
+    assert_eq!(entry["permissions"]["model"], serde_json::Value::Null);
+}
+
+/// `jkb workflow agent export` refuses a copy built on another packaged version than the file holds,
+/// naming both, and `--override-base` exports it anyway.
+#[test]
+fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    // Copying a packaged template to change it is one command: the edit rides in the copy.
+    let bad = dir.path().join("bad.md");
+    std::fs::write(&bad, "open {{brace").unwrap();
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "copy",
+            "swarm-status",
+            "--template-file",
+        ])
+        .arg(&bad)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("{{"));
+    jkb(&db)
+        .args(["--json", "workflow", "agent", "show", "swarm-status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"source\":\"packaged\""));
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "copy",
+            "swarm-status",
+            "--describe",
+            "mine",
+            "--model",
+            "haiku",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("as swarm-status v1"));
+    let shown = jkb(&db)
+        .args(["--json", "workflow", "agent", "show", "swarm-status"])
+        .output()
+        .unwrap();
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["agent"]["describe"], "mine");
+    assert_eq!(shown["agent"]["permissions"]["model"], "haiku");
+    assert_eq!(shown["agent"]["version"], 1);
+    let file = dir.path().join("agents.json");
+    let mut upstream: serde_json::Value =
+        serde_json::from_str(include_str!("../../jkb-core/src/workflow/agents.json")).unwrap();
+    // Upstream moves on: the file packages a v2 of its own, and the copy is still built on v1.
+    // Exporting it would overwrite v2 with text that never saw it, so it is refused, naming both —
+    // unless overridden.
+    for a in upstream["agents"].as_array_mut().unwrap() {
+        if a["name"] == "swarm-status" {
+            a["version"] = serde_json::json!(2);
+            a["template"] = serde_json::json!(["Set {{status}} upstream."]);
+        }
+    }
+    std::fs::write(&file, serde_json::to_string_pretty(&upstream).unwrap()).unwrap();
+    jkb(&db)
+        .args(["workflow", "agent", "export", "swarm-status", "--file"])
+        .arg(&file)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("built on packaged v1")
+                .and(predicate::str::contains("the file packages v2"))
+                .and(predicate::str::contains("update jkb")),
+        );
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "export",
+            "swarm-status",
+            "--override-base",
+            "--file",
+        ])
+        .arg(&file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("swarm-status packaged as v3"));
+}
+
+/// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or
+/// the default; without `--graph` a task is required.
+#[test]
+fn workflow_show_graph_prints_the_machines() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args([
+            "--json",
+            "workflow",
+            "show",
+            "--graph",
+            "--strategy",
+            "coordinated",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["strategy"], "coordinated");
+    assert!(v["workflow"]["transitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["event"] == "approve_design"
+            && t["roles"] == serde_json::json!(["operator", "coordinator"])));
+    assert!(!v["lifecycle"]["states"].as_array().unwrap().is_empty());
+    // Every row says who fires it: an applied lifecycle row says so, rather than printing nothing.
+    let text = jkb(&db)
+        .args(["workflow", "show", "--graph"])
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("strategy:  design-reviewed"), "{text}");
+    let lifecycle = text.split("\nlifecycle:\n").nth(1).unwrap();
+    for row in lifecycle.lines().filter(|l| !l.trim().is_empty()) {
+        let event = row.split_whitespace().nth(1).unwrap();
+        let want = match event {
+            "land" => " operator",
+            "override" => " operator, coordinator",
+            _ if row.ends_with(" observed") => " observed",
+            _ => " applied",
+        };
+        assert!(row.ends_with(want), "{row:?}");
+    }
+    jkb(&db)
+        .args(["workflow", "show"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--graph"));
+}
+
+/// `jkb task edit` and `jkb item edit` take the base a replace was made against (`--expected`, or
+/// `--expected-file`): a note appended since makes it stale, and the replace exits non-zero having
+/// written nothing.
+#[test]
+fn an_edit_with_a_stale_expected_base_is_refused_and_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "Build it"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let uid = v["uid"].as_str().unwrap().to_owned();
+    let content = || {
+        let shown = jkb(&db)
+            .args(["--json", "task", "show", &uid])
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+        v["content"].as_str().unwrap().to_owned()
+    };
+    let read = content();
+    jkb(&db)
+        .args(["task", "edit", &uid, "--append", "blocked on X"])
+        .assert()
+        .success();
+    let noted = content();
+    for cmd in ["task", "item"] {
+        jkb(&db)
+            .args([cmd, "edit", &uid, "Build it well", "--expected", &read])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("stale"));
+        assert_eq!(content(), noted, "`{cmd} edit` wrote nothing");
+    }
+    let base = dir.path().join("base.txt");
+    std::fs::write(&base, &noted).unwrap();
+    jkb(&db)
+        .args(["item", "edit", &uid, "Build it well", "--expected-file"])
+        .arg(&base)
+        .assert()
+        .success();
+    assert_eq!(content(), "Build it well");
+    jkb(&db)
+        .args(["task", "edit", &uid, "Again", "--expected", "Build it well"])
+        .assert()
+        .success();
+    assert_eq!(content(), "Again");
+    jkb(&db)
+        .args(["task", "edit", &uid, "--append", "x", "--expected", "Again"])
+        .assert()
+        .failure();
 }

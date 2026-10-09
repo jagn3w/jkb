@@ -87,6 +87,12 @@ pub enum Error {
         reason: String,
     },
 
+    /// A write made against a read that no longer holds: what it was based on changed since (a
+    /// replace whose expected content is not the current one). Nothing was written; re-read and
+    /// retry.
+    #[error("stale: {0}")]
+    Stale(String),
+
     /// A schema migration left the database with dangling foreign-key references
     /// (detected by the post-migration `foreign_key_check`).
     #[error("migration left {0} foreign-key violation(s); database integrity check failed")]

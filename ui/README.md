@@ -14,8 +14,12 @@ database directly. Anything the UI does, the terminal can do (design D31).
 | **`core/`** (`@jkb/core`) | Portable TypeScript — **no `vscode`, no Node APIs**. The `JkbClient` transport interface (`client.ts`), domain models (`model.ts`: `NodeRef` / `TreeChild` / `NodeDetails` / `MutationIntent`), the node-kind **registry** (`registry.ts`), row colour policy (`decoration.ts`), detail HTML rendering (`details.ts`), per-folder count formatting (`summary.ts`), and the staging/In-Flight row shapes and labels (`staging.ts`). Reused verbatim by any host. |
 | **`vscode/`** (`jkb-explorer`) | The VS Code extension: `cliClient.ts` (spawns `jkb --json` — the only Node-specific transport), `tree.ts` (the Explorer `TreeDataProvider`), `inflight.ts` (the In Flight `TreeDataProvider`), `detailsPanel.ts` (the Webview details host), `decorations.ts` (row colours/badges), `claude.ts` (starting a session in the Claude Code extension), and `extension.ts` (command wiring). |
 
-A future web app is a third package that reuses `@jkb/core` with an HTTP-backed `JkbClient`
-— no rewrite of the models, registry, staging labels, or rendering.
+| **`app/`** (`@jkb/app`) | **Code Factory**, the jkb desktop app (Electron + React, built by electron-vite; design record [docs/code-factory.md](../docs/code-factory.md), D53). `src/main` holds the window, the bridge's handlers and `daemon.ts` — the `jkb serve` HTTP client and the only holder of the daemon's token; `src/preload` builds `window.jkb` from `src/shared/bridge.ts`, the typed contract; `src/renderer` is the React shell (the four tabs, design tokens in `styles/tokens.css`) and the integrated terminal (`src/renderer/src/terminal/`: xterm.js, drawer and popover; its PTYs are `node-pty` in `src/main/terminals.ts`, D53.10). The renderer has no Node and reaches jkb only through the bridge. |
+
+`@jkb/core`'s `daemon.ts` is the `jkb serve` wire protocol as data (where the daemon and its
+token are, the op/response/error shapes, reply decoding), shared by every adapter that speaks
+HTTP to the daemon. A future web app is another package that reuses `@jkb/core` the same way —
+no rewrite of the models, registry, staging labels, or rendering.
 
 ## Develop
 
@@ -37,6 +41,51 @@ no framework and no new dependency. A test bundles the module it covers with esb
 here for the extension bundle), aliasing `vscode` to a stub, so it needs neither a running
 VS Code nor `dist/`. That suits glue over an API we do not own: what it pins is our half —
 which command is asked for, with which arguments, and the state kept between two windows.
+
+`@jkb/core`'s tests (`core/test`) run against its emitted `dist/`, so `build` precedes `test`.
+
+## The desktop app (`app/`)
+
+```sh
+pnpm --filter @jkb/app run build   # type-check main/preload and renderer, then bundle to out/
+pnpm --filter @jkb/app run test    # client against a real HTTP server, tab shell, Electron smoke
+JKB_APP_FROM_CHECKOUT=1 pnpm --filter @jkb/app run start   # run the built app (needs the Electron binary)
+```
+
+The app you use is the **installed copy** (D53.3): `scripts/setup.sh` builds it from a clean clone of
+`origin/main` under `~/.local/share/jkb-app/src` with that clone's `scripts/build-app.sh`, and the app
+updates itself from its menu (*jkb ▸ Update from main…*). Run from this checkout (`dev`, `start`), it
+refuses to start unless `JKB_APP_FROM_CHECKOUT=1` says that is deliberate: it runs unsandboxed on the
+host, and an agent can write this checkout. `dev` loads the page from electron-vite's dev server, and
+sets `JKB_APP_DEV_RENDERER=1` to say so: an `ELECTRON_RENDERER_URL` without it, or naming anything
+but an `http://` server on loopback, refuses to start (D53.1). `pnpm --filter @jkb/app run package` is the packaging
+step (`electron-builder --dir`, `app/electron-builder.yml`); `build-app.sh` is what runs it.
+
+It talks to `jkb serve` at `$JKB_REMOTE` (default `127.0.0.1:7117`) with the token at
+`$JKB_REMOTE_TOKEN_FILE` (default `~/.jkb/daemon/<port>/token`) — the same variables and paths the
+CLI's remote mode uses. Start the daemon first (`jkb serve`).
+
+`pnpm install` downloads the Electron binary from GitHub releases. Where that is unreachable (the
+agent sandbox) install with `ELECTRON_SKIP_BINARY_DOWNLOAD=1`: type-check and bundle need no
+binary, and the Electron smoke (`app/test/smoke.test.mjs`, one test per tab and one for the
+terminal) skips and says why. On Linux it also needs a display (`xvfb-run`), as in CI.
+
+The Design tab's Document pane (D53.4–5) edits a design's Yjs text live. `app/test/yjs-wire.test.mjs`
+measures the editor's `yjs` against jkb's `yrs` with a real `jkb`: set `JKB_BIN` to one built from
+this tree (`scripts/check.sh` does); without it the test skips and says so.
+
+The terminal's `node-pty` compiles on Linux with node-gyp, which downloads Node's headers from
+nodejs.org; where that is unreachable add `npm_config_nodedir=/usr` to the install. A container
+terminal enters `$JKB_CONTAINER_NAME` (default `jkb-dev`, as `.container/run.sh`), read from the
+app's own environment: an app launched from the Dock or Finder does not see what your shell rc
+exports, so for a non-default name run `launchctl setenv JKB_CONTAINER_NAME <name>` and relaunch
+the app (or start it from that shell). The *New terminal* button's tooltip names the container it
+enters. A terminal's target is fixed when it opens: Claude sessions and every program run in the
+container, and a host terminal is only an interactive login shell or one of the Container tab's
+`run.sh` actions (running chosen programs on the host was cut from D53.10 and is a backlog task).
+Closing a container terminal also ends its program inside the container with a second
+`docker exec` (D53.10); when that cannot be confirmed the tab stays, saying the program may still
+be running, and nothing new starts in it until you press Restart. Ctrl+` folds the drawer.
 
 ## Run the extension
 

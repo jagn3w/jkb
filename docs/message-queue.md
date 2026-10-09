@@ -35,7 +35,8 @@ These are the user's, decided 2026-09-13; the code states them in `mq.rs`'s modu
   reaps what the rule allows, oldest first; if that is not enough it is **refused** with `queue_full`.
 - **Idle groups** — nobody has polled or acked for 7 days by default — are removed by compaction, so a
   consumer that never returns cannot hold a topic full for ever. A consumer whose group was removed is
-  told `no_such_group`, recreates it from now, and accepts the gap.
+  told `no_such_group`, recreates it from now, and accepts the gap. A consumer that knows it is leaving
+  removes its own group (`mq.group_delete`) rather than wait out the idle period.
 - **Compaction** runs in the reap service (`jkb task reap --watch`) every pass, and does nothing for a
   topic compacted within its interval (3 days by default). It opens the database on its own, so a
   schema the reap binary does not know stops only the compaction, never the sweep.
@@ -57,11 +58,12 @@ routinely built from different checkouts.
 | `mq.group_create` | `topic`, `group`, `from_start?` | `created` {`created`} |
 | `mq.poll` | `topic`, `group`, `max`, `after?` | `messages` {`messages`} |
 | `mq.ack` | `topic`, `group`, `seq` | `position` {`position`} |
+| `mq.group_delete` | `topic`, `group` | `group_deleted` {`deleted`} — a consumer leaving for good, so what it has not read stops holding the topic (Code Factory on quit, [code-factory.md](code-factory.md) D53.9); `false` when there was no such group |
 | `mq.compact` | `force?` | `compacted` {…counts} |
 | `mq.inspect` | — | `topics` {`topics`} |
 | `mq.tail` | `topic`, `limit` | `messages` {`messages`} |
 | `notify.event` | `session`, `event` (`needed`\|`tool_finished`\|`user_acted`\|`turn_ended`\|`session_ended`), `tool?`, `message?`, `cwd?`, `owner?`, `instance?` (an `owner` is refused without it) — every event but `session_ended` also marks the process running in the session registry | `notified` {`state`, `moved`, `effects`, `refusal?`, `sent`} |
-| `notify.open_sessions` | — | `sessions` {`sessions`: [{`session`, `tool`, `owner`, `instance`, `updated_at`}]} |
+| `notify.open_sessions` | — | `sessions` {`sessions`: [{`session`, `tool`, `owner`, `instance`, `updated_at`, `state`}]} — `state` is `awaiting_user` or `awaiting_tool`, derived by the daemon (empty from an older one); a client reads it rather than deciding from `tool` ([code-factory.md](code-factory.md) D53.9) |
 | `notify.gone` | `session`, `owner`, `instance` (as `notify.open_sessions` reported them) | `notified` {…} |
 | `session.started` | `session`, `source`, `pid?`, `instance?` (a `pid` is refused without it), `cwd?` | `session_start` {`was`: `unknown`\|`live`\|`ended`} (the session's state before) |
 | `session.ended` | `session`, `reason`, `pid?`, `instance?` — ends that process's hold only | `session_end` {`outcome`: `recorded`\|`already_ended`} |
@@ -80,7 +82,7 @@ routinely built from different checkouts.
 | `task.why` | `uid` | `history` {`entries`} (budgeted) |
 | `task.add` | `text`, `home?`, `under?`, `backlog?`, `global_backlog?`, `sync?`, `managed?`, `cwd?`, `client_home?`, `literal?` (the text is the title, no modifiers read), `priority?`, `due?`, `also?` (a reference placement) | `added` {`id`, `uid`, `home`, `binding`}, or `needs_global_backlog_assent` |
 | `task.set` | `uid`, `status?`, `priority?`, `due?` | `applied` |
-| `task.edit` | `uid` (any item's), `text`, `append?` | `edited` {`file_backed`} — the result is capped at 256 KiB for a task, and for any item a client of `jkb serve` edits |
+| `task.edit` | `uid` (any item's), `text`, `append?`, `expected?` | `edited` {`file_backed`} — the result is capped at 256 KiB for a task, and for any item a client of `jkb serve` edits. `expected` is a replace's base, the content the edit was made against: refused as `stale` when the content is no longer exactly that, and refused (`invalid`) together with `append` |
 | `task.tag` | `uid`, `facet_value`, `mode` (`add`\|`set`\|`rm`) | `applied` |
 | `task.depend` / `task.undepend` | `uid`, `dep` | `applied` |
 | `task.place` | `uid`, `ns`, `home?` | `applied` |
@@ -413,7 +415,8 @@ route this backend does not serve), `forbidden` (a write whose host-side effect 
 cause — see the task-mutate set), `ack_beyond_end`, `corrupt_payload` (with `seq`, so a consumer can ack past
 it), `bad_request`, `busy` (transient — retry: another writer held the database lock past the busy
 timeout, or, over HTTP, the daemon is at a concurrency limit or the group already has a long-poll in
-progress), `internal`, and `schema_newer` — a newer `jkb` migrated the database, so this build must
+progress), `stale` (HTTP 409: a `task.edit` replace whose `expected` base no longer holds — nothing
+was written; re-read and retry), `internal`, and `schema_newer` — a newer `jkb` migrated the database, so this build must
 not write to it. That one means different things by where it comes from: **in-process**, this process
 is too old and only a newer binary helps (exit, and let a supervisor start one); **from `jkb serve`**,
 the daemon is too old and `setup.sh` restarts it on the newer binary, so waiting helps. Over HTTP two
@@ -431,6 +434,12 @@ write lock, so an idle subscriber does not contend with every other writer sever
 
 `mq.tail` shows a message whose stored payload does not parse with its raw text and
 `"unreadable": true`, rather than stopping at it.
+
+`jkb mq group rm <topic> <group>` is `mq.group_delete` from the shell: it prints `removed group <g>
+from <t>` or `no such group <g> on <t>` (neither is an error), and under `--json` the op's own result,
+`{"result":"group_deleted","deleted":…}`. It is how an operator clears a group a consumer left behind
+— a crashed Code Factory's `code-factory` on `claude/notify` ([code-factory.md](code-factory.md) D53.9)
+— without waiting out the idle removal.
 
 ## `jkb mq subscribe` — the consumer stream
 

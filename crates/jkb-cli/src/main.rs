@@ -6,9 +6,12 @@
 //! Read/task/query commands default their namespace scope to the mount covering the
 //! current directory (design D19), overridable with `--global`.
 
+mod agent_cli;
 mod archive;
 mod atomic;
 mod commands;
+mod design_cli;
+mod design_export;
 mod doctor;
 mod git_audit;
 mod gitrepo;
@@ -368,6 +371,12 @@ enum Command {
         #[command(subcommand)]
         cmd: InvCmd,
     },
+    /// Design documents (D53.4): CRDT text you edit by quote against the version you read, with
+    /// spans that are approved, staged and implemented. Start with `jkb design cat <uid>`.
+    Design {
+        #[command(subcommand)]
+        cmd: DesignCmd,
+    },
     /// The content-addressed blob archive. File sync stores the bytes of every version it
     /// settles and blobs are never deleted, so this is a complete history of every synced
     /// file — the recovery path when a sync has written a wrong version over your work.
@@ -399,6 +408,295 @@ enum BlobCmd {
     Cat {
         /// The blake3 hash (a unique prefix is enough).
         hash: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesignCmd {
+    /// List the designs (the ambient repo's, or `--repo`'s; `--all` for every repo's).
+    Ls {
+        /// Only this repo's designs (`designs/<repo>`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Every repo's designs.
+        #[arg(long, conflicts_with = "repo")]
+        all: bool,
+    },
+    /// Create a design under `designs/<repo>` (the ambient repo unless `--repo`).
+    Create {
+        /// Its title.
+        #[arg(num_args = 1.., required = true)]
+        title: Vec<String>,
+        /// The repo it designs.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Its first text.
+        #[arg(long, conflicts_with = "stdin")]
+        body: Option<String>,
+        /// Read its first text from stdin.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Print a design's text with span markers (`⟦<span> STATE⟧ … ⟦/<span>⟧`) and the version
+    /// token an edit takes as `--base`. Quote text without the markers.
+    Cat {
+        /// The design.
+        uid: String,
+        /// The text alone: no markers, no header.
+        #[arg(long)]
+        plain: bool,
+    },
+    /// Write a design's approved text to its `docs/` file (D55.6): every PROPOSED range left out,
+    /// no span markers, under a header naming the design, its version and the body's blake3.
+    /// `--to` records the file once; `--all` re-renders every design of the repo that has one.
+    /// `--check` opens no database: it fails on any `docs/` file whose header's hash no longer
+    /// matches its body (a hand edit). `--check --against-db` also compares with the live designs.
+    Export {
+        /// The design (omit with `--all` or `--check`).
+        #[arg(
+            required_unless_present_any = ["all", "check"],
+            conflicts_with_all = ["all", "check"]
+        )]
+        uid: Option<String>,
+        /// Where its export goes, under `docs/` (relative to the current directory); recorded in
+        /// the design, so later exports need not repeat it.
+        #[arg(long, requires = "uid")]
+        to: Option<String>,
+        /// Every design that has a doc target, of the repo this checkout's root is mounted as.
+        #[arg(long, conflicts_with = "check")]
+        all: bool,
+        /// The repo this checkout is, which must agree with the mount covering its root: a design
+        /// is exported only into its own repo's checkout. Checked, never chosen by this flag.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Write nothing; fail if a generated `docs/` file was edited since it was exported (its
+        /// body no longer matches the blake3 its header records). Opens no database and reaches
+        /// no daemon, so it runs the same in `scripts/check.sh`, CI and a fresh clone.
+        #[arg(long)]
+        check: bool,
+        /// With `--check`: also compare each generated file with its design's render now, and
+        /// report a design whose doc target has no file. Needs the database (or the daemon).
+        #[arg(long, requires = "check")]
+        against_db: bool,
+    },
+    /// Record files a design was made from, each with the blake3 of its content now (D55.5).
+    Source {
+        /// The design.
+        uid: String,
+        /// The files, relative to the current directory and inside the repository.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+    },
+    /// Edit by quote. The quote is matched in the version `--base` names (the token `jkb design
+    /// cat` printed), and the edit merges with everything written since; it is refused only
+    /// when the quoted text was deleted since, or the base predates a compaction.
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["find", "insert_after", "span"])))]
+    Edit {
+        /// The design.
+        uid: String,
+        /// The version token you read the quote at.
+        #[arg(long)]
+        base: String,
+        /// Replace this quote's text with `--replace`. A quote may begin with `-` (a list item).
+        #[arg(long, requires = "replace", allow_hyphen_values = true)]
+        find: Option<String>,
+        /// Insert `--text` right after this quote. A quote may begin with `-`.
+        #[arg(long, requires = "text", allow_hyphen_values = true)]
+        insert_after: Option<String>,
+        /// Replace this span's whole text with `--replace`; the span then covers it.
+        #[arg(long, requires = "replace")]
+        span: Option<String>,
+        /// Which match of the quote, from 1, when it occurs more than once.
+        #[arg(long)]
+        occurrence: Option<usize>,
+        /// The new text (empty with `--find` deletes the quote). `-` reads it from stdin.
+        #[arg(long, allow_hyphen_values = true)]
+        replace: Option<String>,
+        /// The text `--insert-after` inserts. `-` reads it from stdin.
+        #[arg(long, allow_hyphen_values = true)]
+        text: Option<String>,
+    },
+    /// Make a span over a quote (matched in `--base`), to be approved by `--reviewer`.
+    Span {
+        /// The design.
+        uid: String,
+        /// The version token you read the quote at.
+        #[arg(long)]
+        base: String,
+        /// The quote the span covers. It may begin with `-` (a list item).
+        #[arg(long, allow_hyphen_values = true)]
+        find: String,
+        /// Which match, from 1.
+        #[arg(long)]
+        occurrence: Option<usize>,
+        /// Who approves it: `operator` (default) or `claude`.
+        #[arg(long, default_value = "operator")]
+        reviewer: String,
+    },
+    /// A design's spans and their states: PROPOSED, APPROVED, STAGED, IMPLEMENTED.
+    Spans {
+        /// The design.
+        uid: String,
+    },
+    /// Approve a span — as the reviewer it names, at the version you read it in.
+    Approve {
+        /// The span.
+        span: String,
+        /// The version token `jkb design cat` printed when you read the span. Refused when the
+        /// span's words changed since: an approval is of the words you read, never of the latest.
+        #[arg(long)]
+        base: String,
+    },
+    /// Stage an approved span into an execution plan's step.
+    Stage {
+        /// The span.
+        span: String,
+        /// The plan step.
+        step: String,
+    },
+    /// What a peer at `--since` (a base64 state vector) lacks, as one base64 Yjs update.
+    State {
+        /// The design.
+        uid: String,
+        /// The peer's state vector, base64; omitted for the whole document.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Merge a Yjs v1 update (base64) — what the editor sends.
+    Apply {
+        /// The design.
+        uid: String,
+        /// The update, base64; `-` reads it from stdin.
+        update: String,
+    },
+    /// Fold a design's updates into one snapshot (operator). Versions read before it can no
+    /// longer be edited against.
+    Compact {
+        /// The design.
+        uid: String,
+    },
+    /// Print the prompt a Claude session over a design is started with.
+    Prompt {
+        #[command(subcommand)]
+        what: DesignPromptCmd,
+    },
+    /// Execution plans: a design's ordered steps, the spans staged into them, and their tasks.
+    Plan {
+        #[command(subcommand)]
+        what: DesignPlanCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesignPlanCmd {
+    /// A design's execution plans and its one-off tasks. A plan whose tasks are all done or
+    /// cancelled is archived, and listed only with `--all`.
+    Ls {
+        /// The design.
+        uid: String,
+        /// Archived plans too.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Create an execution plan under a design, with its steps in order.
+    Create {
+        /// The design.
+        uid: String,
+        /// The plan's title.
+        #[arg(num_args = 1.., required = true)]
+        title: Vec<String>,
+        /// A step, in order (repeat): a coarse stage such as `scaffold` or `deploy`.
+        #[arg(long = "step")]
+        steps: Vec<String>,
+    },
+    /// Append a step to a plan. Stage approved spans into it with `jkb design stage`, and add its
+    /// tasks with `jkb task add … --under <step>`.
+    Step {
+        /// The plan.
+        plan: String,
+        /// What the step is.
+        #[arg(num_args = 1.., required = true)]
+        text: Vec<String>,
+    },
+    /// One plan: its steps, the spans each stages, and their tasks.
+    Show {
+        /// The plan.
+        plan: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesignPromptCmd {
+    /// Discuss a selection: the design, the version read, and the selected text as the quote (and
+    /// occurrence) an edit names it by. What the app's *Discuss* starts Claude with.
+    Discuss {
+        /// The design.
+        uid: String,
+        /// The selection, as UTF-16 offsets `<start>..<end>` into the text at `--base`.
+        #[arg(long)]
+        range: String,
+        /// The version token the selection was made in (the current version when omitted).
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// *Play* an execution plan: the plan, its steps, their tasks, the spans they stage, and the
+    /// workflow strategy the work runs under. What the app's *Play* starts Claude with.
+    Play {
+        /// The plan.
+        plan: String,
+        /// The workflow strategy the operator chose for the plan's tasks. It pins nothing (pin with
+        /// `jkb workflow set`; the app's Play pins first): the prompt names any open task not on
+        /// it. Omitted, each task keeps its own strategy (the default while unpinned).
+        #[arg(long)]
+        strategy: Option<String>,
+    },
+    /// *Play* one task: what it is, where it sits in its design, and the strategy it runs.
+    Task {
+        /// The task.
+        uid: String,
+    },
+    /// A *New prompt*: a session on a design started with your own words, after how to read and
+    /// edit the design. What the app's *New prompt* starts Claude with.
+    New {
+        /// The design.
+        uid: String,
+        /// What to ask (`-` reads stdin); omitted, Claude reads the design and asks you.
+        text: Vec<String>,
+    },
+    /// Record the Claude Code session a launch is about to start, BEFORE it starts: one prompt per
+    /// session, contained by its design, so the Prompts pane can resume it. Recording a session
+    /// again moves its cwd.
+    Record {
+        /// The design.
+        uid: String,
+        /// The pre-minted session uuid the launch passes to `claude --session-id`, lowercase.
+        #[arg(long)]
+        session: String,
+        /// Where the session starts — where `claude --resume` must run (this directory when
+        /// omitted).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// What starts it: `discuss`, `play`, `task` or `new`.
+        #[arg(long)]
+        launch: String,
+        /// The plan a `play`, or the task a `task`, is started on (one of this design's); none
+        /// for `discuss` and `new`.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Its title, as the Prompts pane lists it.
+        #[arg(long)]
+        title: String,
+    },
+    /// A design's recorded prompts, newest first, each with the command that resumes it.
+    Ls {
+        /// The design.
+        uid: String,
+    },
+    /// The prompt a Claude Code session was recorded with — the design it worked — or nothing
+    /// (exit 0, `(none)`) when no launch recorded it.
+    Of {
+        /// The session id.
+        session: String,
     },
 }
 
@@ -623,6 +921,13 @@ enum ItemCmd {
         /// Append to the existing content (blank-line separated) instead of replacing.
         #[arg(long)]
         append: bool,
+        /// Replace only while the content is still exactly this — what you read before editing.
+        /// Refused as stale (exit non-zero, nothing written) if it changed since.
+        #[arg(long, conflicts_with = "append", allow_hyphen_values = true)]
+        expected: Option<String>,
+        /// `--expected`, read from this file (its bytes exactly).
+        #[arg(long, conflicts_with_all = ["append", "expected"])]
+        expected_file: Option<PathBuf>,
     },
 }
 
@@ -718,7 +1023,8 @@ enum TaskCmd {
     Add {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
-        /// Home the task in the ambient repo's backlog (`tasks/<repo>/.backlog`)
+        /// Home the task in the ambient mount's backlog (`tasks/<mount>/.backlog`, e.g.
+        /// `tasks/repos/jkb/.backlog`)
         /// instead of its inbox. Outside a repo, confirms a global `tasks/.backlog`.
         #[arg(long)]
         backlog: bool,
@@ -784,6 +1090,13 @@ enum TaskCmd {
         /// Append to the existing content (blank-line separated) instead of replacing.
         #[arg(long)]
         append: bool,
+        /// Replace only while the content is still exactly this — what you read before editing.
+        /// Refused as stale (exit non-zero, nothing written) if it changed since.
+        #[arg(long, conflicts_with = "append", allow_hyphen_values = true)]
+        expected: Option<String>,
+        /// `--expected`, read from this file (its bytes exactly).
+        #[arg(long, conflicts_with_all = ["append", "expected"])]
+        expected_file: Option<PathBuf>,
     },
     /// Add or remove a `facet=value` tag on a task.
     Tag {
@@ -1227,6 +1540,23 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // The generated-docs drift check (D55.6, amended): it reads only the checkout's `docs/`, so it
+    // runs ahead of remote mode and opens no database — `scripts/check.sh` and CI run it, and a gate
+    // must not migrate, depend on or be refused by whatever store the machine holds. Not even
+    // `commands::ensure_installed`, which writes the user's Claude config.
+    if let Command::Design {
+        cmd:
+            DesignCmd::Export {
+                check: true,
+                against_db: false,
+                repo,
+                ..
+            },
+    } = &cli.command
+    {
+        return design_export::check_files(repo.as_deref(), cli.json);
+    }
+
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
     // kernel that is the host's `jkb.db`, which a process on each side of the bind corrupts — so
     // every other command either goes to the daemon or is refused here, at dispatch, before it has
@@ -1369,7 +1699,8 @@ fn run(cli: Cli) -> Result<()> {
         | Command::Related { .. }
         | Command::Blob { .. }
         | Command::History { .. }
-        | Command::Inv { .. } => {
+        | Command::Inv { .. }
+        | Command::Design { .. } => {
             anyhow::bail!("internal: a command served as an op missed ops_cli's dispatch")
         }
         Command::Commands { cmd } => match cmd {

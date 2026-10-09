@@ -1690,6 +1690,17 @@ render_setup_summary() {
                     failed)    printf '  • container:  kit NOT installed; see the warnings above\n' ;;
                     *)         warn "unrecognised kit state: $line" ;;
                 esac ;;
+            app=*)
+                case "$state" in
+                    installed)  printf '  • app:        Code Factory installed at %s; it updates itself (jkb ▸ Update from main…)\n' "$detail" ;;
+                    unchanged)  printf '  • app:        Code Factory at %s is already main'"'"'s tip\n' "$detail" ;;
+                    no-builder) printf '  • app:        NOT installed: origin/main has no scripts/build-app.sh yet\n' ;;
+                    running)    printf '  • app:        NOT updated: quit Code Factory (running from %s) and re-run setup.sh to update it, or use its jkb ▸ Update from main…\n' "$detail" ;;
+                    busy)       printf '  • app:        NOT updated: another build or install of Code Factory holds its lock (see the warnings above)\n' ;;
+                    skipped)    printf '  • app:        skipped (--no-app)\n' ;;
+                    failed)     printf '  • app:        NOT installed; see the warnings above (an installed copy is unchanged)\n' ;;
+                    *)          warn "unrecognised app state: $line" ;;
+                esac ;;
             topic=*)
                 case "$state" in
                     ready)    printf '  • topic:      %s ready\n' "$detail" ;;
@@ -1700,8 +1711,8 @@ render_setup_summary() {
                 esac ;;
             notifier=*)
                 case "$state" in
-                    subscribed)     printf '  • notifier:   running (pid %s); the topic has a consumer group\n' "$detail" ;;
-                    not-subscribed) printf '  • notifier:   running, but NOTHING subscribed to the topic; nothing is shown (see notifier.log)\n' ;;
+                    subscribed)     printf '  • notifier:   running (pid %s); its macos-notifier group is on the topic\n' "$detail" ;;
+                    not-subscribed) printf '  • notifier:   running, but its macos-notifier group is NOT on the topic; nothing is shown (see notifier.log)\n' ;;
                     not-running)    printf '  • notifier:   loaded but NOT running; nothing is shown (see notifier.log)\n' ;;
                     not-loaded)     printf '  • notifier:   NOT loaded; nothing is shown (see the warnings above)\n' ;;
                     no-topic)       printf '  • notifier:   running (pid %s); not checked further — this jkb cannot name the topic\n' "$detail" ;;
@@ -1766,8 +1777,8 @@ build_notifier() {
 # report_notifier <db> <topic-state> <topic> <label> <do_service> — on macOS, what can be established
 # about the notifier that displays notifications, stated no stronger than it was checked. Sets
 # `notifier_state` and `notifier_pid`:
-#   subscribed      its launchd agent has a running process (a PID), and the topic has a consumer group
-#   not-subscribed  running, but the topic has no group — nothing will be shown
+#   subscribed      its launchd agent has a running process (a PID), and the topic has the notifier's group
+#   not-subscribed  running, but the topic has no `macos-notifier` group — nothing will be shown
 #   not-running     loaded, with no process (crash-looping, or exited)
 #   not-loaded      no agent — nothing will be shown, however authorized the bundle is
 #   no-topic        running, but this jkb cannot name the topic, so there is nothing to ask
@@ -1776,11 +1787,13 @@ build_notifier() {
 # `subscribed` is NOT "notifications are shown": a group outlives its consumer by the idle period
 # (7 days), and a running notifier may have a failing subscription (its notifier.log says). What it
 # rules out is the two states setup used to report as healthy — a bundle with no agent, and an agent
-# loaded but not running (both stage-5 reviews). A group, not a group NAME, because that is what the
-# daemon asks before it sends anything.
+# loaded but not running (both stage-5 reviews). The notifier's OWN group by name (`macos-notifier`,
+# main.swift's default, which the agent setup installs does not override): any group used to do, and
+# Code Factory's `code-factory` group, left on the topic by an app that quit, then made a notifier
+# whose subscription never joined read as subscribed (D53.9 review).
 report_notifier() {
     local db="$1" topic_state="$2" topic="$3" label="$4" do_service="$5"
-    local listing waited=0 wait_for="${JKB_NOTIFIER_READY_WAIT:-10}" groups rc
+    local listing waited=0 wait_for="${JKB_NOTIFIER_READY_WAIT:-10}" groups rc group=macos-notifier
     notifier_pid=""
     if [ "$do_service" != 1 ]; then notifier_state=skipped; return 0; fi
     # The agent's own state first: it does not depend on the topic, and a topic create that failed
@@ -1812,12 +1825,15 @@ report_notifier() {
             warn "could not list the consumer groups of $topic, so whether the notifier subscribed is unknown: $groups"
             return 0
         fi
-        case "$groups" in *'"name"'*) notifier_state=subscribed; return 0 ;; esac
+        # `--json` pretty-prints, so the name follows `"name": `; tolerate any spacing.
+        if grep -Eq '"name"[[:space:]]*:[[:space:]]*"'"$group"'"' <<<"$groups"; then
+            notifier_state=subscribed; return 0
+        fi
         [ "$waited" -ge "$wait_for" ] && break
         sleep 1; waited=$((waited + 1))
     done
     notifier_state=not-subscribed
-    warn "$label is running but nothing has subscribed to $topic within ${wait_for}s — see notifier.log beside the database"
+    warn "$label is running but its group $group has not joined $topic within ${wait_for}s — see notifier.log beside the database"
 }
 
 # --- a database on a shared filesystem ------------------------------------------------------
@@ -2076,4 +2092,455 @@ EOF
         return 1
     fi
     echo "   $n shell file(s) parse"
+}
+
+# --- Code Factory: the installed copy (docs/code-factory.md, D53.3) -------------------------------
+# The desktop app runs unsandboxed on the host and opens host terminals, so it is never run from a
+# checkout an agent can write. It is built from a CLEAN CLONE of origin/main under the account's
+# ~/.local/share/jkb-app (which the dev container does not mount), by that clone's own
+# scripts/build-app.sh into a staging directory, and swapped into place by the clone's
+# scripts/install-app.sh only while no copy is running (see "staging, and the one install step"
+# below). Here rather than inline for the reason every setup.sh section moved here:
+# scripts/tests/app-install.test.sh drives these against real repositories.
+
+# The ref an install builds from, and the refspec that fetches main into it (app_clone_refresh,
+# build-app.sh --update-to). The app's plan fetches main elsewhere (ui/core's UPDATE_SHOWN_REF), so
+# it never moves this one.
+APP_UPDATE_REF=refs/remotes/origin/main
+APP_UPDATE_REFSPEC="+refs/heads/main:$APP_UPDATE_REF"
+
+# app_installed_commit <app-home> — the commit install-app.sh stamped as installed, or nothing.
+app_installed_commit() {
+    local line
+    [ -f "$1/installed" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            commit=*) printf '%s\n' "${line#commit=}"; return 0 ;;
+        esac
+    done <"$1/installed"
+}
+
+# app_clone_refresh <checkout> <src> — make <src> a clone of <checkout>'s origin, moved to the tip
+# of origin/main with nothing else in its tree. Creates the clone on first use, from the URL of the
+# checkout's `origin`; after that the clone's own `origin` is what it fetches, so nothing a checkout
+# says later redirects it. Returns non-zero, saying why on stderr, when it cannot.
+#
+# GIT_TERMINAL_PROMPT=0: the post-merge hook runs setup.sh, and a credential prompt there would hang
+# the pull rather than fail it.
+app_clone_refresh() {
+    local checkout="$1" src="$2" url
+    if [ ! -e "$src/.git" ]; then
+        if ! url="$(_git -C "$checkout" config --get remote.origin.url)" || [ -z "$url" ]; then
+            warn "$checkout has no origin remote to clone the app's source from"
+            return 1
+        fi
+        # Not over a directory that holds something else: that is not ours to replace.
+        if [ -e "$src" ] && [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
+            warn "$src exists and is not a git clone; move it aside and re-run"
+            return 1
+        fi
+        if ! mkdir -p "$(dirname "$src")" \
+           || ! GIT_TERMINAL_PROMPT=0 _git clone --quiet --no-checkout "$url" "$src"; then
+            warn "could not clone $url into $src"
+            return 1
+        fi
+    fi
+    if ! GIT_TERMINAL_PROMPT=0 _git -C "$src" fetch --quiet --no-tags origin "$APP_UPDATE_REFSPEC"; then
+        warn "could not fetch main into $src"
+        return 1
+    fi
+    if ! _git -C "$src" checkout --quiet --detach --force "$APP_UPDATE_REF" \
+       || ! _git -C "$src" clean -ffdq; then
+        warn "could not move $src to origin/main"
+        return 1
+    fi
+}
+
+# app_clone_check <src> — whether <src> is exactly origin/main: HEAD at its tip, and no tracked
+# change or untracked file (ignored ones — node_modules, build output — are allowed). What
+# build-app.sh refuses to build anything else on. Says why on stderr.
+app_clone_check() {
+    local src="$1" head tip dirty
+    if ! head="$(_git -C "$src" rev-parse --verify --quiet HEAD)" \
+       || ! tip="$(_git -C "$src" rev-parse --verify --quiet "$APP_UPDATE_REF^{commit}")"; then
+        warn "$src has no HEAD or no origin/main"
+        return 1
+    fi
+    if [ "$head" != "$tip" ]; then
+        warn "$src is at ${head:0:12}, not origin/main (${tip:0:12}); the app is built from main and nothing else"
+        return 1
+    fi
+    if ! dirty="$(_git -C "$src" status --porcelain --untracked-files=all)"; then
+        warn "git could not say whether $src is clean"
+        return 1
+    fi
+    if [ -n "$dirty" ]; then
+        warn "$src has changes that are not on main:"
+        printf '%s\n' "$dirty" | sed -n '1,10p' >&2
+        return 1
+    fi
+}
+
+# app_built_product <dist> <uname -s> — the one packaged app electron-builder left in <dist>:
+# `mac*/Code Factory.app` on macOS (mac, mac-arm64, …), `linux*-unpacked` elsewhere. Fails unless
+# there is exactly one, so a stale product of another architecture is never the one installed.
+app_built_product() {
+    local dist="$1" os="$2" found="" n=0 p
+    for p in "$dist"/mac*/"Code Factory.app" "$dist"/linux*-unpacked; do
+        [ -d "$p" ] || continue
+        case "$os:$p" in
+            Darwin:*.app|Linux:*-unpacked) found="$p"; n=$((n + 1)) ;;
+        esac
+    done
+    if [ "$n" -ne 1 ]; then
+        warn "expected one packaged app in $dist for $os, found $n"
+        return 1
+    fi
+    printf '%s\n' "$found"
+}
+
+# app_default_dest <uname -s> <home> <app-home> — where the installed app goes: ~/Applications on
+# macOS, <app-home>/app elsewhere.
+app_default_dest() {
+    case "$1" in
+        Darwin) printf '%s\n' "$2/Applications/Code Factory.app" ;;
+        *)      printf '%s\n' "$3/app" ;;
+    esac
+}
+# app_account_home — the account's home directory from the user database (passwd), NOT $HOME: the
+# app finds its installed copy from the same place (main's `accountHome()`, `os.userInfo().homedir`),
+# whatever HOME a shell or wrapper exported, so the two cannot disagree. The tests point it elsewhere
+# with JKB_APP_ACCOUNT_HOME, honoured only with JKB_APP_BUILD_TEST=1.
+app_account_home() {
+    local u h=""
+    if [ "${JKB_APP_BUILD_TEST:-}" = 1 ] && [ -n "${JKB_APP_ACCOUNT_HOME:-}" ]; then
+        printf '%s\n' "$JKB_APP_ACCOUNT_HOME"
+        return 0
+    fi
+    u="$(id -un 2>/dev/null)" || u=""
+    case "$u" in
+        ''|*[!A-Za-z0-9._-]*) ;;
+        # ~user is expanded from the user database (getpwnam), not from HOME.
+        *) eval "h=~$u" ;;
+    esac
+    case "$h" in
+        /*) printf '%s\n' "$h" ;;
+        *)  warn "could not read $u's home from the user database; using HOME ($HOME)"; printf '%s\n' "$HOME" ;;
+    esac
+}
+
+# app_default_home — the app's home: the clone, the stamp, staging, the lock, under the account's
+# home. ui/core's APP_HOME_IN_HOME names the same place; the app identifies its installed copy by it.
+app_default_home() {
+    printf '%s\n' "$(app_account_home)/.local/share/jkb-app"
+}
+
+# app_check_home <app-home> — whether build-app.sh / install-app.sh may use <app-home>: absolute,
+# and the default unless JKB_APP_BUILD_TEST=1 (the tests). Anywhere else, the app installed there
+# would refuse to start and the stamp would vouch for a place no update installs to.
+app_check_home() {
+    case "$1" in /*) ;; *) warn "--app-home must be an absolute path: $1"; return 1 ;; esac
+    if [ "$1" != "$(app_default_home)" ] && [ "${JKB_APP_BUILD_TEST:-}" != 1 ]; then
+        warn "--app-home other than $(app_default_home) is for the tests: the app runs only from there"
+        return 1
+    fi
+}
+
+# app_scrub_env — drop git's repository selection and Electron's variables from this shell, for
+# every step it runs: the post-merge hook hands setup.sh a GIT_DIR naming the merged repository,
+# which pnpm's lifecycle scripts and git-hosted dependencies would act on, and an ELECTRON_* from the
+# app would make a child Electron run as Node.
+# APP_GIT_SELECTION is the list; the app's machineEnv drops the same (a test holds them equal).
+APP_GIT_SELECTION="GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES"
+app_scrub_env() {
+    local v
+    # shellcheck disable=SC2086
+    unset $APP_GIT_SELECTION
+    for v in $(compgen -e); do
+        case "$v" in ELECTRON_*) unset "$v" ;; esac
+    done
+}
+
+# app_executable <uname -s> <dest> — the program a running copy of the app installed at <dest> is:
+# what `ps` shows for it, and what the app compares its own executable with (ui/core/src/update.ts,
+# `installedExecutable`, names the same two).
+app_executable() {
+    case "$1" in
+        Darwin) printf '%s\n' "$2/Contents/MacOS/Code Factory" ;;
+        *)      printf '%s\n' "$2/code-factory" ;;
+    esac
+}
+
+# app_running <uname -s> <dest> — whether any process is running from the app bundle at <dest>: 0
+# yes, 1 no, 2 cannot tell (no `ps`). It matches the bundle's prefix (`<dest>/`), not only the main
+# executable, so Electron's helpers count too — on macOS they run from
+# `Contents/Frameworks/Code Factory Helper*.app/…`, not `Contents/MacOS/`. `-ww`: BSD ps cuts `args`
+# to the terminal's width otherwise, and the path is long. (<uname -s> is kept for the callers' sake.)
+app_running() {
+    local procs
+    procs="$(ps -ww -A -o args= 2>/dev/null)" || return 2
+    case "$procs" in
+        *"$2/"*) return 0 ;;
+    esac
+    return 1
+}
+
+# --- staging, and the one install step ------------------------------------------------------------
+# A running app is NEVER swapped under: Electron loads its helpers from the bundle by path, so the
+# old process would run the new bundle's. So building and installing are two steps:
+#   build-app.sh     builds main into <app-home>/staged ({app/, commit}); touches nothing installed
+#   install-app.sh   the ONE place that swaps: only when no copy is running, staged -> dest, stamp
+# setup.sh runs both when the app is not running (`install_app`); the app's *Update from main…* runs
+# the build, then on quit starts install-app.sh detached to wait for it to exit, swap and relaunch.
+#
+# The staging lock: both steps, and setup.sh's clone refresh, act on the clone and the staging dir,
+# so they hold `<app-home>/lock`, a plain `mkdir` lock. Its holder hands its `token` to the step it
+# runs in JKB_APP_LOCK_TOKEN, and that step proceeds under it instead of taking it again. There is
+# no stale-lock breaking: a lock left by a run that died is reported with its path, to remove by hand.
+# So the RELEASE is app_lock's own job, not its callers': taking the lock installs the shell's
+# EXIT/INT/TERM/HUP traps that release it, however the holder ends (a `set -e` failure, Ctrl-C, a
+# TERM). Only SIGKILL can leave it behind (or a signal in the instant between the mkdir and the
+# statement after it that marks the lock as this shell's).
+APP_LOCK_IN_APP_HOME=lock
+APP_STAGED_IN_APP_HOME=staged
+
+# The exit statuses past plain failure, of both steps (@jkb/core's BUILD_EXIT names the same):
+# another build or install holds the lock; a copy of the app is running, so nothing was swapped.
+APP_EXIT_BUSY=75
+APP_EXIT_RUNNING=76
+
+# app_lock <app-home> — take the lock, or proceed under the caller's (its token in
+# JKB_APP_LOCK_TOKEN). Sets `app_lock_token`, and `app_lock_taken` (1 when this call took it). Returns
+# 1 when another run holds it (saying which, and where), 2 on any other error.
+#
+# When it takes the lock it OWNS this shell's EXIT, INT, TERM, HUP and PIPE traps: INT/TERM/HUP exit
+# (130/143/129), PIPE is ignored, and EXIT releases the lock and then calls `app_on_exit <status>` if the script
+# defines one. So call it in a process or subshell of its own — a script, or `( … )`.
+app_lock() {
+    local lock="$1/$APP_LOCK_IN_APP_HOME"
+    _app_lock_home="$1"
+    app_lock_taken=0
+    app_lock_token="${JKB_APP_LOCK_TOKEN:-}"
+    if [ -n "$app_lock_token" ] && [ "$(cat "$lock/token" 2>/dev/null)" = "$app_lock_token" ]; then
+        return 0
+    fi
+    mkdir -p "$1" || { warn "could not create $1"; return 2; }
+    app_lock_token="$$.$RANDOM.$RANDOM.$(date +%s)"
+    # The traps go in BEFORE the mkdir, so the lock is covered from the statement after it; the EXIT
+    # trap releases only once `app_lock_taken` says the lock is this shell's.
+    trap '_app_lock_exit' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    # A write to a closed pipe then fails (and `set -e` exits through the trap) instead of killing
+    # the holder outright with SIGPIPE, which no trap sees.
+    trap '' PIPE
+    if ! mkdir "$lock" 2>/dev/null; then
+        if [ -d "$lock" ]; then
+            warn "another build or install of Code Factory holds $lock (pid $(cat "$lock/pid" 2>/dev/null || echo '?')); if none is running, remove it"
+            return 1
+        fi
+        warn "could not create $lock"
+        return 2
+    fi
+    app_lock_taken=1
+    if ! printf '%s\n' "$app_lock_token" >"$lock/token" || ! printf '%s\n' "$$" >"$lock/pid"; then
+        app_unlock "$1"
+        warn "could not write $lock"
+        return 2
+    fi
+}
+
+_app_lock_exit() {
+    local rc=$?
+    app_unlock "$_app_lock_home"
+    if declare -F app_on_exit >/dev/null; then app_on_exit "$rc"; fi
+    exit "$rc"
+}
+
+# app_unlock <app-home> — release the lock, if app_lock took it.
+app_unlock() {
+    local token
+    [ "${app_lock_taken:-0}" = 1 ] || return 0
+    app_lock_taken=0
+    # This shell made the directory; its token is ours, or not written yet (a signal between the
+    # mkdir and the write).
+    token="$(cat "$1/$APP_LOCK_IN_APP_HOME/token" 2>/dev/null)" || token=""
+    case "$token" in ''|"$app_lock_token") rm -rf "${1:?}/$APP_LOCK_IN_APP_HOME" ;; esac
+    return 0
+}
+
+# app_staged_commit <app-home> — the commit staged for install, or nothing.
+app_staged_commit() {
+    local c
+    [ -d "$1/$APP_STAGED_IN_APP_HOME/app" ] || return 0
+    c="$(cat "$1/$APP_STAGED_IN_APP_HOME/commit" 2>/dev/null)" || return 0
+    case "$c" in *[!0-9a-f]*|'') return 0 ;; esac
+    [ "${#c}" -eq 40 ] && printf '%s\n' "$c"
+    return 0
+}
+
+# install_app <checkout> <app-home> — setup.sh's app step, under the lock: move the clone to
+# origin/main, then run THE CLONE'S build-app.sh and install-app.sh (never <checkout>'s). Reports, so
+# it returns 0 and sets `app_state`:
+#   installed   built and installed origin/main's tip now
+#   unchanged   that tip is already installed (stamped, and the app is where it was put)
+#   running     Code Factory is running: nothing is built or swapped; quit it and re-run setup.sh
+#               (or use its own *Update from main…*, which installs on quit)
+#   busy        another build or install holds the lock
+#   no-builder  origin/main has no scripts/build-app.sh + install-app.sh yet
+#   failed      anything else, said on stderr; an installed app is left as it was
+# The unchanged arm is what keeps this cheap: setup.sh runs after every pull that touches ui/.
+install_app() {
+    local checkout="$1" app_home="$2" rc=0
+    app_state=failed
+    # In a subshell of its own, so app_lock's traps release the lock however it ends (Ctrl-C during
+    # the build included) without touching setup.sh's traps. Its status carries the state out.
+    ( _install_app_locked "$checkout" "$app_home" ) || rc=$?
+    case "$rc" in
+        0)  app_state=installed ;;
+        10) app_state=unchanged ;;
+        11) app_state=no-builder ;;
+        "$APP_EXIT_BUSY") app_state=busy ;;
+        "$APP_EXIT_RUNNING") app_state=running ;;
+    esac
+    return 0
+}
+
+# _install_app_locked <checkout> <app-home> — install_app's body, in its subshell: exits 0 installed,
+# 10 unchanged, 11 no builder, 75 busy, 76 running, anything else failed.
+_install_app_locked() {
+    local checkout="$1" app_home="$2" src tip os dest rc=0
+    app_lock "$app_home" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) exit "$APP_EXIT_BUSY" ;;
+        *) exit 1 ;;
+    esac
+    src="$app_home/src"
+    os="$(uname -s)"
+    dest="$(app_default_dest "$os" "$(app_account_home)" "$app_home")"
+    app_clone_refresh "$checkout" "$src" || exit 1
+    tip="$(_git -C "$src" rev-parse --verify --quiet HEAD)" || exit 1
+    if [ "$(app_installed_commit "$app_home")" = "$tip" ] && [ -d "$dest" ]; then
+        exit 10
+    fi
+    if [ ! -f "$src/scripts/build-app.sh" ] || [ ! -f "$src/scripts/install-app.sh" ]; then
+        exit 11
+    fi
+    # Not even built while it runs: install-app.sh would refuse the swap anyway.
+    if app_running "$os" "$dest"; then
+        exit "$APP_EXIT_RUNNING"
+    fi
+    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home" || exit 1
+    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/install-app.sh" --app-home "$app_home" || exit $?
+    exit 0
+}
+
+# app_installed_dest <app-home> — where the stamp says jkb installed the app, or nothing.
+app_installed_dest() {
+    local line
+    [ -f "$1/installed" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            dest=*) printf '%s\n' "${line#dest=}"; return 0 ;;
+        esac
+    done <"$1/installed"
+}
+
+# app_stamp <app-home> <commit> <dest> — write <app-home>/installed whole (`commit=`, `dest=`).
+app_stamp() {
+    { printf '%s\n' "commit=$2" "dest=$3" >"$1/installed.tmp" && mv -f "$1/installed.tmp" "$1/installed"; } 2>/dev/null
+}
+
+# app_swap <built> <dest> <app-home> — install the directory <built> at <dest>; returns 76
+# (APP_EXIT_RUNNING) without swapping if a copy is running from <dest> when it comes to move it aside.
+# install-app.sh is the one caller.
+#
+# Only over what jkb installed: something already at <dest> is replaced only when <app-home>'s stamp
+# says jkb installed the app there. Anything else (a hand-built app, a copy from elsewhere) refuses,
+# so jkb never moves aside — and later deletes — what it cannot show it wrote. Before anything moves,
+# the stamp is rewritten to name <dest> (keeping the commit it named), so that if the stamp cannot be
+# completed after the swap, it still vouches for <dest> and the next install replaces it.
+#
+# Copied beside <dest> first, so a failed copy leaves the installed app as it was; then the installed
+# one is MOVED to <app-home>/previous (replacing the older one there, which an earlier stamped swap
+# put there) and the copy renamed into place. <previous> is the one-step rollback. If the final rename
+# fails, the old app is moved back.
+app_swap() {
+    local built="$1" dest="$2" app_home="$3" prev trash new moved=0 had_stamp=0 old_stamp=""
+    prev="$app_home/previous"
+    trash="$prev.trash"
+    # A fixed name, so an interrupted run's half copy is cleared by the next one.
+    new="$dest.new"
+    if [ ! -d "$built" ]; then
+        warn "nothing to install: $built is not a directory"
+        return 1
+    fi
+    if { [ -e "$dest" ] || [ -L "$dest" ]; } && [ "$(app_installed_dest "$app_home")" != "$dest" ]; then
+        warn "$dest exists and jkb's stamp ($app_home/installed) does not say jkb installed it; move it aside and re-run"
+        return 1
+    fi
+    # The stamp is made to name <dest> before anything moves (see above), and put back as it was on
+    # every failure below: a failed first install must not leave it vouching for a <dest> jkb never
+    # filled, or a later install would move aside — and delete — whatever app is put there.
+    if [ -f "$app_home/installed" ]; then
+        had_stamp=1
+        old_stamp="$(cat "$app_home/installed")" || { warn "could not read $app_home/installed"; return 1; }
+    fi
+    if ! app_stamp "$app_home" "$(app_installed_commit "$app_home")" "$dest"; then
+        warn "could not write $app_home/installed; nothing was installed"
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$dest")" || ! rm -rf "$new" "$trash" || ! cp -pR "$built" "$new"; then
+        rm -rf "$new"
+        _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
+        warn "could not copy $built beside $dest"
+        return 1
+    fi
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        # The old previous/ goes aside by one rename (deleting a bundle takes seconds), so that the
+        # running-copy check below is the last thing before the old bundle is renamed away: a copy
+        # started during the copy above (the Dock, a relaunch) must not lose its bundle.
+        if [ -e "$prev" ] && ! mv "$prev" "$trash"; then
+            rm -rf "$new"
+            _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
+            warn "could not move $prev aside"
+            return 1
+        fi
+        if app_running "$(uname -s)" "$dest"; then
+            rm -rf "$new"
+            if [ -e "$trash" ]; then mv "$trash" "$prev" || :; fi
+            _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
+            warn "Code Factory was started from $dest during the install; nothing was swapped"
+            return "$APP_EXIT_RUNNING"
+        fi
+        if ! mkdir -p "$(dirname "$prev")" || ! mv "$dest" "$prev"; then
+            rm -rf "$new"
+            if [ -e "$trash" ]; then mv "$trash" "$prev" || :; fi
+            _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
+            warn "could not move the installed app at $dest aside"
+            return 1
+        fi
+        moved=1
+    fi
+    if ! mv "$new" "$dest"; then
+        if [ "$moved" = 1 ]; then mv "$prev" "$dest" || warn "the previous app is at $prev; move it back to $dest"; fi
+        if [ -e "$trash" ]; then mv "$trash" "$prev" || :; fi
+        rm -rf "$new"
+        _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
+        warn "could not move the new app into $dest"
+        return 1
+    fi
+    rm -rf "$trash"
+}
+
+# _app_swap_unstamp <app-home> <had-stamp> <old-stamp> — put the stamp back as app_swap found it.
+_app_swap_unstamp() {
+    if [ "$2" = 1 ]; then
+        { printf '%s\n' "$3" >"$1/installed.tmp" && mv -f "$1/installed.tmp" "$1/installed"; } 2>/dev/null \
+            || warn "could not restore $1/installed"
+    else
+        rm -f "$1/installed"
+    fi
 }

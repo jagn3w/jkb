@@ -46,6 +46,7 @@ pub const fn handles(command: &Command) -> bool {
         | Command::Blob { .. }
         | Command::History { .. }
         | Command::Inv { .. }
+        | Command::Design { .. }
         | Command::Ns {
             cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. },
         }
@@ -215,6 +216,7 @@ impl<'a> Ops<'a> {
             Command::Blob { cmd } => crate::item_cli::blob(self, cmd),
             Command::History { path } => crate::item_cli::history(self, &path),
             Command::Inv { cmd } => crate::inv_cli::run(self, cmd, self.global),
+            Command::Design { cmd } => crate::design_cli::run(self, cmd, self.global),
             Command::Ns {
                 cmd: NsCmd::Ls { scope },
             } => self.ns_ls(scope),
@@ -392,9 +394,35 @@ impl<'a> Ops<'a> {
         self.ambient_here()
     }
 
+    /// The repo the command runs in: the first segment after `repos/` of the ambient mount, or
+    /// `None` outside one — a mount elsewhere (`references/papers`) names no repo. The one
+    /// derivation `jkb design` and `jkb inv` share; each once carried its own copy, which took a
+    /// non-repo mount's first segment for a repo name.
+    ///
+    /// # Errors
+    /// The ambient lookup's.
+    pub(crate) fn ambient_repo(&self) -> Result<Option<String>> {
+        self.ambient_repo_at(&std::env::current_dir()?)
+    }
+
+    /// The repo whose mount covers `dir`, as [`Self::ambient_repo`] answers for the current one.
+    ///
+    /// # Errors
+    /// The ambient lookup's.
+    pub(crate) fn ambient_repo_at(&self, dir: &std::path::Path) -> Result<Option<String>> {
+        Ok(self
+            .ambient_at(dir)?
+            .and_then(|mount| repo_of_mount(&mount)))
+    }
+
     /// The ambient namespace, `--global` or not — task homing always reflects where you are.
     pub(crate) fn ambient_here(&self) -> Result<Option<String>> {
-        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        self.ambient_at(&std::env::current_dir()?)
+    }
+
+    /// The ambient namespace of `dir`: the namespace of the mount covering it, if any.
+    pub(crate) fn ambient_at(&self, dir: &std::path::Path) -> Result<Option<String>> {
+        let cwd = dir.to_string_lossy().into_owned();
         let home = std::env::var("HOME").unwrap_or_default();
         match self.call(Request::KbAmbient { cwd, home })? {
             Response::Ambient { namespace } => Ok(namespace),
@@ -782,6 +810,12 @@ pub(crate) fn op_error(e: ApiError, remote: bool, op: &str) -> anyhow::Error {
                  machine running `jkb serve` (./scripts/setup.sh there) and try again"
             )
         }
+        // A replace whose `--expected` base no longer holds: nothing was written.
+        ErrorCode::Stale => anyhow::anyhow!(
+            "{} (stale: it changed since you read it). Read it again, redo the edit against what it \
+             says now, and pass that as --expected",
+            e.message
+        ),
         _ => anyhow::Error::msg(e.message),
     }
 }
@@ -1075,9 +1109,31 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The repo a mount is in: the first segment after `repos/`; `None` for a mount outside `repos/`.
+fn repo_of_mount(mount: &str) -> Option<String> {
+    mount
+        .strip_prefix("repos/")?
+        .split('/')
+        .next()
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
+
+    #[test]
+    fn only_a_mount_under_repos_names_a_repo() {
+        assert_eq!(super::repo_of_mount("repos/jkb").as_deref(), Some("jkb"));
+        assert_eq!(
+            super::repo_of_mount("repos/jkb/crates").as_deref(),
+            Some("jkb")
+        );
+        for none in ["references/papers", "repos/", "repos", "jkb"] {
+            assert_eq!(super::repo_of_mount(none), None, "{none}");
+        }
+    }
     use jkb_api::kb::{GrepAnswer, GrepHit, ItemDetail, TaskDetail};
     use jkb_api::{ApiError, Backend, Request, Response};
 

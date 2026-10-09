@@ -7,7 +7,7 @@
 
 use jkb_fsm::{
     all_of, require_no, require_yes, Acceptance, Defect, Denial, Dest, Event, EventKind, Fact,
-    Machine, Outcome, Reconciliation, State, Stateful, Transition, Verdict,
+    Machine, Outcome, Reconciliation, State, Stateful, TableRow, Transition, Verdict,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -430,6 +430,59 @@ fn the_table_renders_as_a_diagram() {
     // Reconciliation edges are visually distinct, because the two kinds mean different things.
     assert!(dot.contains("style=dashed"));
     assert!(dot.contains("\"delivered\" [shape=doublecircle"));
+}
+
+#[test]
+fn the_table_is_data_row_for_row() {
+    let m = parcel();
+    let t = m.table();
+    // Every state, in declaration order, with where objects start and where they rest.
+    let states: Vec<_> = t
+        .states
+        .iter()
+        .map(|s| (s.name, s.initial, s.settled))
+        .collect();
+    assert_eq!(
+        states,
+        Parcel::ALL
+            .iter()
+            .map(|s| (s.name(), *s == Parcel::Ordered, s.is_settled()))
+            .collect::<Vec<_>>()
+    );
+    // Every row, in declaration order, saying what the dot output draws.
+    assert_eq!(t.transitions.len(), ROWS.len());
+    assert_eq!(
+        t.transitions[0],
+        TableRow {
+            from: "ordered",
+            event: "ship",
+            to: Some("shipped"),
+            reconciled: false,
+            guarded: true,
+            planned: false,
+        }
+    );
+    let gone = t.transitions.last().unwrap();
+    assert_eq!(
+        (gone.event, gone.reconciled, gone.guarded, gone.planned),
+        ("observed_courier_gone", true, true, true)
+    );
+}
+
+#[test]
+fn a_stated_destination_is_reported_as_none() {
+    const STATED: &[Transition<Parcel, Move, Facts, Fx>] = &[Transition {
+        from: Parcel::Ordered,
+        event: Move::WriteOff,
+        to: Dest::Stated(|_| Some(Parcel::Lost)),
+        guard: None,
+        plan: None,
+    }];
+    let m = Machine {
+        transitions: STATED,
+        initial: Parcel::Ordered,
+    };
+    assert_eq!(m.table().transitions[0].to, None);
 }
 
 // ---------------------------------------------------------------------------------------------

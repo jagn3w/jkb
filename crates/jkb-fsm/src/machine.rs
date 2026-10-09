@@ -309,6 +309,45 @@ pub enum Reconciliation<S, E, X> {
     Ambiguous(Vec<E>),
 }
 
+/// One state of a [`Table`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableState {
+    /// [`State::name`].
+    pub name: &'static str,
+    /// Whether objects start here.
+    pub initial: bool,
+    /// [`State::is_settled`].
+    pub settled: bool,
+    /// [`State::awaits_input`].
+    pub awaits_input: bool,
+}
+
+/// One row of a [`Table`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableRow {
+    /// The state it applies in.
+    pub from: &'static str,
+    /// The event it answers.
+    pub event: &'static str,
+    /// Where it goes; `None` for a destination the caller states ([`Dest::Stated`]).
+    pub to: Option<&'static str>,
+    /// An observation ([`EventKind::Reconciled`]) rather than an act.
+    pub reconciled: bool,
+    /// It has a guard.
+    pub guarded: bool,
+    /// It plans effects.
+    pub planned: bool,
+}
+
+/// A machine's transition table as data ([`Machine::table`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    /// Every state, in [`State::ALL`] order.
+    pub states: Vec<TableState>,
+    /// Every row, in declaration order.
+    pub transitions: Vec<TableRow>,
+}
+
 /// A declared lifecycle: the transition table plus where objects start.
 pub struct Machine<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> {
     /// The rows. Order is irrelevant to behaviour — [`crate::Defect::Nondeterministic`]
@@ -494,6 +533,41 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
             }
         }
         out
+    }
+
+    /// The transition table as plain data: every state and every row, in declaration order.
+    ///
+    /// What a surface that draws the machine reads (the app's Lifecycle pane, `jkb workflow show
+    /// --graph`), so the picture is the table rather than a second, hand-drawn copy of it. The
+    /// same facts [`Machine::dot`] draws, minus the layout: a guard and a plan are reported as
+    /// present or absent, since their code cannot cross a wire.
+    pub fn table(&self) -> Table {
+        Table {
+            states: S::ALL
+                .iter()
+                .map(|s| TableState {
+                    name: s.name(),
+                    initial: *s == self.initial,
+                    settled: s.is_settled(),
+                    awaits_input: s.awaits_input(),
+                })
+                .collect(),
+            transitions: self
+                .transitions
+                .iter()
+                .map(|t| TableRow {
+                    from: t.from.name(),
+                    event: t.event.name(),
+                    to: match t.to {
+                        Dest::To(to) => Some(to.name()),
+                        Dest::Stated(_) => None,
+                    },
+                    reconciled: t.event.kind() == EventKind::Reconciled,
+                    guarded: t.guard.is_some(),
+                    planned: t.plan.is_some(),
+                })
+                .collect(),
+        }
     }
 
     /// The transition table as a Graphviz digraph.

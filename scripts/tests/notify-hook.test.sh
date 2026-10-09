@@ -214,8 +214,11 @@ check "every event the hook handles is registered in settings.json" \
 # The names also appear in the Rust dispatcher, which the shim cannot see. `jkb notify events`
 # prints what it answers to, so all THREE spellings are diffed rather than two — renaming the
 # `"SessionStart"` literal in `hook()` disabled the sweep permanently with every check green.
-# Under CARGO_TARGET_DIR when it is set — the dev container sets it — or this compared a stale binary.
-built_jkb="${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target}/debug/jkb"
+# JKB_CHECK_BIN when the gate set it (check.sh: the binary it just built, located once from cargo
+# metadata; CI: the one its tests built) — a name only the gate sets, so an ambient JKB_BIN from
+# another checkout is never adopted. Run alone, under CARGO_TARGET_DIR when it is set — the dev
+# container sets it — or this compared a stale binary.
+built_jkb="${JKB_CHECK_BIN:-${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target}/debug/jkb}"
 # A binary that cannot answer is stale — built from a tree without `notify events` — and says so,
 # rather than being diffed as an empty list: that read as "the hook handles events jkb does not".
 if [ -x "$built_jkb" ]; then
@@ -226,6 +229,10 @@ if [ -x "$built_jkb" ]; then
   else
     fail "$built_jkb cannot answer \`notify events\` — it is stale or broken; rebuild it (./scripts/build.sh) and re-run"
   fi
+elif [ -n "${JKB_REQUIRE_BUILT_JKB:-}" ]; then
+  # The gate built one and says so: a missing binary here is a wrong path, not "not built yet", and
+  # skipping would pass the cross-check green having compared nothing.
+  fail "jkb events cross-check: JKB_REQUIRE_BUILT_JKB is set, but there is no jkb at $built_jkb"
 else
   printf '  --  %s\n' "jkb events cross-check ($built_jkb not built)"
 fi
@@ -310,7 +317,7 @@ else
   # Driven against THIS CHECKOUT's jkb, not whatever is installed. The shim delegates to the
   # first `jkb` on PATH, and an installed binary predating `notify` silently does nothing — which
   # is precisely what this test saw the first time it ran against the shim.
-  repo_target="${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target}/debug"
+  repo_target="$(dirname "$built_jkb")"
   if [ ! -x "$repo_target/jkb" ]; then
     fail "live round-trip: $repo_target/jkb is not built — run ./scripts/build.sh"
     live_bin=""

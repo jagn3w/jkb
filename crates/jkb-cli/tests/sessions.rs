@@ -5109,3 +5109,470 @@ fn a_waiver_is_refused_before_anything_moves_to_a_container_terminal() {
         "nothing moved"
     );
 }
+
+/// `docs/` generated from designs (D55.5–6), against a real checkout — the export writes into it
+/// and the checks read it back, so this lives with the real-repo fixture.
+///
+/// `--check` is database-free (D55.6, amended): it fails on a hand-edited generated file — its body
+/// no longer the one its header hashed — and on a damaged header, and passes a hand-written doc.
+/// `--check --against-db` also fails on a design that moved on since its export, a stale copy, and
+/// a doc target with no file, none of which a file alone can show.
+#[test]
+#[allow(clippy::too_many_lines)] // one export lifecycle, read top to bottom
+fn a_hand_edited_generated_doc_fails_the_export_check() {
+    let f = Fixture::new();
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = f.jkb().arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let check = || f.jkb().args(["design", "export", "--check"]).assert();
+    let against_db = || {
+        f.jkb()
+            .args([
+                "design",
+                "export",
+                "--check",
+                "--against-db",
+                "--repo",
+                "proj",
+            ])
+            .assert()
+    };
+    let body = "# Draft heading\n## D1\nDecided.\n";
+    let mount = |ns: &str, dir: &Path| {
+        f.jkb()
+            .args(["mount", "create", ns, dir.to_str().unwrap()])
+            .assert()
+            .success();
+    };
+    let uid = json(&[
+        "design", "create", "Export", "--repo", "proj", "--body", body,
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let version = || {
+        json(&["design", "cat", &uid])["version"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let span = json(&[
+        "design",
+        "span",
+        &uid,
+        "--base",
+        &version(),
+        "--find",
+        "## D1\nDecided.\n",
+    ])["span"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args(["design", "approve", &span, "--base", &version()])
+        .assert()
+        .success();
+
+    // Nothing generated yet: the check passes, and a hand-written doc is never its business.
+    std::fs::create_dir_all(f.repo.join("docs")).unwrap();
+    std::fs::write(f.repo.join("docs/hand.md"), "# Hand-written\n").unwrap();
+    check()
+        .success()
+        .stdout(predicate::str::contains("0 generated"));
+
+    // A checkout in no mounted repo is refused: which repo's designs belong in it is not known,
+    // and `--repo` cannot say so on its behalf.
+    f.jkb()
+        .args([
+            "design",
+            "export",
+            &uid,
+            "--to",
+            "docs/export.md",
+            "--repo",
+            "proj",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no mounted repo"));
+    mount("repos/proj", &f.repo);
+
+    // `--to` from a subdirectory is resolved against it, and recorded as repo-relative.
+    std::fs::create_dir_all(f.repo.join("sub")).unwrap();
+    f.jkb()
+        .current_dir(f.repo.join("sub"))
+        .args([
+            "design",
+            "export",
+            &uid,
+            "--to",
+            "../docs/export.md",
+            "--repo",
+            "proj",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote"));
+    let path = f.repo.join("docs/export.md");
+    let file = std::fs::read_to_string(&path).unwrap();
+    let approved = "## D1\nDecided.\n";
+    assert_eq!(
+        file,
+        format!(
+            "<!-- generated from jkb design {uid}, edit there (version {}, blake3 {}) -->\n{approved}",
+            version(),
+            jkb_core::design::export::body_hash(approved)
+        ),
+        "the approved text alone, under the header that hashes it"
+    );
+    let listed = json(&["design", "ls", "--repo", "proj"]);
+    assert_eq!(listed[0]["doc_target"], "docs/export.md");
+    check()
+        .success()
+        .stdout(predicate::str::contains("1 generated"));
+    against_db().success();
+
+    // Edited by hand: both checks fail, naming the file and the design.
+    std::fs::write(&path, format!("{file}A line nobody approved.\n")).unwrap();
+    for failed in [check(), against_db()] {
+        failed
+            .failure()
+            .stderr(predicate::str::contains("docs/export.md"))
+            .stderr(predicate::str::contains(uid.as_str()))
+            .stderr(predicate::str::contains("edited by hand"));
+    }
+    // Re-exporting (the target is remembered) puts the render back.
+    f.jkb()
+        .args(["design", "export", &uid, "--repo", "proj"])
+        .assert()
+        .success();
+    check().success();
+
+    // A PROPOSED edit is a new version but not new approved text: neither check fails, so a
+    // design's unapproved drafting never reddens another branch's gate.
+    f.jkb()
+        .args(["design", "edit", &uid, "--base", &version()])
+        .args(["--insert-after", "Draft heading", "--text", " (new)"])
+        .assert()
+        .success();
+    check().success();
+    against_db().success();
+    // An edit inside the approved span demotes it: the design moved on. The file alone cannot
+    // show that; the database check does, until `--all` re-renders.
+    f.jkb()
+        .args(["design", "edit", &uid, "--base", &version()])
+        .args(["--insert-after", "Decided", "--text", " maybe"])
+        .assert()
+        .success();
+    check().success();
+    against_db()
+        .failure()
+        .stderr(predicate::str::contains("moved on"));
+    f.jkb()
+        .args(["design", "export", "--all", "--repo", "proj"])
+        .assert()
+        .success();
+    against_db().success();
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("docs/hand.md")).unwrap(),
+        "# Hand-written\n",
+        "a hand-written doc is never touched"
+    );
+
+    // A generated file the design does not export to is stale: intact, so only the database can
+    // say so.
+    std::fs::copy(&path, f.repo.join("docs/copy.md")).unwrap();
+    check().success();
+    against_db()
+        .failure()
+        .stderr(predicate::str::contains("docs/copy.md"));
+    std::fs::remove_file(f.repo.join("docs/copy.md")).unwrap();
+
+    // A header damaged by hand is not silently taken for a hand-written file.
+    let generated = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("\u{feff}{generated}")).unwrap();
+    check()
+        .failure()
+        .stderr(predicate::str::contains("docs/export.md"));
+    std::fs::write(&path, &generated).unwrap();
+
+    // A design of another repo is exported only into its own checkout; a copy of its export put
+    // here is a stray the database check names.
+    let other = json(&[
+        "design",
+        "create",
+        "Other",
+        "--repo",
+        "other",
+        "--body",
+        "Elsewhere.\n",
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args(["design", "export", &other, "--to", "docs/other.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("of repo other"));
+    // ...and `--repo` cannot claim this checkout is another repo: it may only agree.
+    f.jkb()
+        .args(["design", "export", &uid, "--repo", "other"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--repo other, but this checkout is repo proj",
+        ));
+    assert!(!f.repo.join("docs/other.md").exists());
+    let elsewhere = f.home.path().join("other");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    git(&elsewhere, &["init", "-q", "-b", "main"]);
+    mount("repos/other", &elsewhere);
+    f.jkb()
+        .current_dir(&elsewhere)
+        .args([
+            "design",
+            "export",
+            &other,
+            "--to",
+            "docs/other.md",
+            "--repo",
+            "other",
+        ])
+        .assert()
+        .success();
+    std::fs::copy(
+        elsewhere.join("docs/other.md"),
+        f.repo.join("docs/stray.md"),
+    )
+    .unwrap();
+    check().success();
+    against_db()
+        .failure()
+        .stderr(predicate::str::contains("docs/stray.md"))
+        .stderr(predicate::str::contains("stray export"));
+    std::fs::remove_file(f.repo.join("docs/stray.md")).unwrap();
+
+    // A directory mounted as another repo inside this checkout cannot export into it either.
+    mount("repos/inner", &f.repo.join("sub"));
+    f.jkb()
+        .current_dir(f.repo.join("sub"))
+        .args(["design", "export", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "the current directory is in repo inner",
+        ));
+
+    // The design's doc target with no file: the database check reports it.
+    std::fs::remove_file(&path).unwrap();
+    check().success();
+    against_db()
+        .failure()
+        .stderr(predicate::str::contains("docs/export.md"))
+        .stderr(predicate::str::contains("does not exist"));
+}
+
+/// `jkb design export --check` opens no database and reaches no daemon (D55.6, amended), so
+/// `scripts/check.sh` and CI run it on any machine. Here the database it would open is in a
+/// directory that does not exist, and remote mode names a port nothing listens on: the check still
+/// passes, and creates neither the database nor anything under `HOME`.
+#[test]
+fn the_export_check_opens_no_database_and_reaches_no_daemon() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.repo.join("docs")).unwrap();
+    let body = "Approved.\n";
+    let hash = jkb_core::design::export::body_hash(body);
+    let generated = format!(
+        "<!-- generated from jkb design design:x-1, edit there (version 1.AA, blake3 {hash}) -->\n{body}"
+    );
+    std::fs::write(f.repo.join("docs/gen.md"), &generated).unwrap();
+    let nowhere = f.home.path().join("no-such-dir");
+    let home = f.home.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let run = || {
+        let mut cmd = jkb(None);
+        cmd.current_dir(&f.repo)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("JKB_DB", nowhere.join("jkb.db"))
+            .env("JKB_REMOTE", "127.0.0.1:9")
+            .args(["design", "export", "--check"]);
+        cmd.assert()
+    };
+    // What `actions/checkout` writes into every CI checkout, and what jkb's audited git refuses:
+    // the check finds the checkout without running git at all.
+    git(
+        &f.repo,
+        &[
+            "config",
+            "--local",
+            "http.https://github.com/.extraheader",
+            "AUTHORIZATION: basic eDp5",
+        ],
+    );
+    run()
+        .success()
+        .stdout(predicate::str::contains("1 generated"));
+    // A linked worktree (whose `.git` is a file) is its own checkout, with its own docs/.
+    git(&f.repo, &["add", "-A"]);
+    git(&f.repo, &["commit", "-qm", "docs"]);
+    let linked = f.home.path().join("linked");
+    git(
+        &f.repo,
+        &["worktree", "add", "-q", linked.to_str().unwrap()],
+    );
+    std::fs::write(linked.join("docs/gen.md"), format!("{generated}edited\n")).unwrap();
+    {
+        let mut cmd = jkb(None);
+        cmd.current_dir(linked.join("docs"))
+            .env("HOME", &home)
+            .env("JKB_DB", nowhere.join("jkb.db"))
+            .args(["design", "export", "--check"]);
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("docs/gen.md"));
+    }
+    run().success();
+    // A generated file re-saved in another encoding is still generated, and reported.
+    let mut latin1 = generated.clone().into_bytes();
+    latin1.extend_from_slice(b"caf\xe9\n");
+    std::fs::write(f.repo.join("docs/latin1.md"), latin1).unwrap();
+    run()
+        .failure()
+        .stderr(predicate::str::contains("docs/latin1.md"))
+        .stderr(predicate::str::contains("not UTF-8"));
+    std::fs::remove_file(f.repo.join("docs/latin1.md")).unwrap();
+    // And it still judges the file: a hand edit fails it, with no database anywhere.
+    std::fs::write(f.repo.join("docs/gen.md"), format!("{generated}more\n")).unwrap();
+    run()
+        .failure()
+        .stderr(predicate::str::contains("design:x-1"));
+    assert!(!nowhere.exists(), "no database was created");
+    assert_eq!(
+        std::fs::read_dir(&home).unwrap().count(),
+        0,
+        "nothing was written under HOME (no commands install, no store)"
+    );
+}
+
+/// Sources (D55.5): each recorded, repo-relative, with the blake3 of its content, in the design's
+/// listing.
+#[test]
+fn a_design_records_its_sources_with_their_blake3() {
+    let f = Fixture::new();
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = f.jkb().arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let uid = json(&["design", "create", "Sources", "--repo", "proj"])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args(["mount", "create", "repos/proj", f.repo.to_str().unwrap()])
+        .assert()
+        .success();
+    // Another repo's design cannot take this checkout's files as its sources.
+    let other = json(&["design", "create", "Other", "--repo", "other"])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args(["design", "source", &other, "README.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("of repo other"));
+    assert_eq!(
+        json(&["design", "ls", "--repo", "other"])[0]["sources"],
+        serde_json::json!([])
+    );
+    std::fs::create_dir_all(f.repo.join("sub")).unwrap();
+    let out = f
+        .jkb()
+        .current_dir(f.repo.join("sub"))
+        .args(["--json", "design", "source", &uid, "../README.md"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let design: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(design["sources"][0]["path"], "README.md");
+    assert_eq!(
+        design["sources"][0]["blake3"],
+        jkb_core::blob::hash_bytes(b"base\n")
+    );
+    let listed = json(&["design", "ls", "--repo", "proj"]);
+    assert_eq!(listed[0]["sources"][0]["path"], "README.md");
+}
+
+/// A design whose doc target another design of its repo shares cannot be rendered — but it can
+/// still be pointed elsewhere with `export --to` (the remedy the refusal names) and given sources:
+/// neither asks `design.export` for the design's repo.
+#[test]
+fn a_shared_doc_target_is_cleared_by_export_to() {
+    let f = Fixture::new();
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = f.jkb().arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    f.jkb()
+        .args(["mount", "create", "repos/proj", f.repo.to_str().unwrap()])
+        .assert()
+        .success();
+    let create = |repo: &str, title: &str| -> String {
+        json(&["design", "create", title, "--repo", repo])["uid"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let a = create("proj", "A");
+    let b = create("web", "B");
+    f.jkb()
+        .args(["design", "export", &a, "--to", "docs/a.md"])
+        .assert()
+        .success();
+    // B targets the same path in its own repo, then moves into proj: a collision no target write
+    // made, so nothing refused it.
+    let elsewhere = f.home.path().join("web");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    git(&elsewhere, &["init", "-q", "-b", "main"]);
+    f.jkb()
+        .args(["mount", "create", "repos/web", elsewhere.to_str().unwrap()])
+        .assert()
+        .success();
+    f.jkb()
+        .current_dir(&elsewhere)
+        .args(["design", "export", &b, "--to", "docs/a.md"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["ns", "mv", "designs/web", "designs/proj/web"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["design", "export", &a])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("both export to `docs/a.md`"));
+    // Sources can still be recorded on the shared design...
+    f.jkb()
+        .args(["design", "source", &b, "README.md"])
+        .assert()
+        .success();
+    // ...and `--to` clears the collision, after which both export.
+    f.jkb()
+        .args(["design", "export", &b, "--to", "docs/b.md"])
+        .assert()
+        .success();
+    f.jkb().args(["design", "export", &a]).assert().success();
+    f.jkb()
+        .args(["design", "export", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docs/b.md"));
+    assert!(f.repo.join("docs/a.md").exists() && f.repo.join("docs/b.md").exists());
+}

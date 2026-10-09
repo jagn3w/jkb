@@ -150,5 +150,5 @@ pub use check::Defect;
 pub use fact::Fact;
 pub use machine::{
     all_of, require_no, require_yes, Acceptance, Denial, Dest, Event, EventKind, Machine, Outcome,
-    Reconciliation, Remedy, State, Stateful, Transition, Verdict,
+    Reconciliation, Remedy, State, Stateful, Table, TableRow, TableState, Transition, Verdict,
 };

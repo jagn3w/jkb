@@ -137,7 +137,10 @@ implementation checklist and the **source of truth for what's done**.
   container with `~/.local/share/jkb-container-kit/kit/.container/run.sh` (`run.sh --kit-path` prints
   the kit's directory), never with the checkout's `run.sh`, which refuses: everything that runs outside the agent's
   sandbox comes from the kit (`.container/README.md`, "Everything unsandboxed runs from the kit").
-  Flags: `--no-extension`/`--no-service`/`--no-scaffold`/`--no-kit`/`--db`. `jkb ns mk <path>…` creates namespaces
+  The same rule installs the Code Factory app: built by a clean clone of `origin/main`
+  (`~/.local/share/jkb-app/src`, its own `scripts/build-app.sh`), never this checkout, and updated from
+  its menu (docs/code-factory.md, D53.3).
+  Flags: `--no-extension`/`--no-service`/`--no-scaffold`/`--no-kit`/`--no-app`/`--db`. `jkb ns mk <path>…` creates namespaces
   idempotently (the only way to make an empty namespace; others arise from placements/mounts).
 - Per-task status (with `[~]` partials and inline notes) is in
   `openspec/changes/jkb-v1-foundation/tasks.md` (v1) and
@@ -281,6 +284,7 @@ cost to learn, and which alternatives were rejected and why.
 | [docs/subsystems.md](docs/subsystems.md) | a crate you need to orient in | What each finished subsystem is and how it is put together. Reference, not live decisions — so it is the *last* row to check, never the first: if another row names your file, that row governs. |
 | [docs/ui-and-review.md](docs/ui-and-review.md) | `ui/`, `.claude/workflows/code-review.js` | The explorer is a CLI client, never a bespoke backend (D31); our reviewer returns structured findings (D37). |
 | [docs/notifications.md](docs/notifications.md) | `.claude/hooks/notify-sticky.sh`, `crates/jkb-cli/src/notify.rs`, `crates/jkb-core/src/notify.rs`, `crates/jkb-core/src/claude_session.rs`, the `notify.*` and `session.*` ops, `macos/notifier/`, `scripts/build-notifier.sh` | Sticky, self-clearing permission notifications: the hook → daemon → queue → `jkb-notifier serve` path and why it moved there, the producer-side sweep, why the notifier is ours, the three facts measured about it, and what no installer can do. |
+| [docs/code-factory.md](docs/code-factory.md) | `ui/app`, the `design.*` ops and `jkb design`, `workflow_agents`, any app built on jkb | The Code Factory desktop app (D53): apps are clients of the op set, the installed-copy trust rule, designs as CRDT documents with span states, and the subtask order. |
 | [docs/message-queue.md](docs/message-queue.md) | `crates/jkb-core/src/mq.rs`, `crates/jkb-api`, `crates/jkb-daemon` (`jkb serve`), `jkb mq` and remote mode (`crates/jkb-cli/src/{mq_cli,remote}.rs`), the reap service's compaction | The queue's rules (reaping, caps, TTL, idle groups — the user's), its typed operations, and the `jkb mq subscribe` NDJSON protocol a consumer in any language speaks. |
 
 Some rules about this set, because a split decision record fails in predictable ways:

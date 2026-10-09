@@ -1589,15 +1589,38 @@ _shell_shared_magics() {
         | grep -oE '^[[:space:]]+[0-9a-f]+\)' | tr -d ' )' | sort
 }
 
-# In the dev container, the host's ~/.jkb is a BIND MOUNT — a mount point in this mount namespace.
-# The live refusal is required there whatever the mount reports; keying it on the known FUSE magic
-# skipped it on exactly the backend the magic list did not know about.
-_jkb_is_a_bind_here() {
-    awk -v want="$1" '$5 == want { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo 2>/dev/null
+# _jkb_host_share <dir> [mountinfo] — print the mount point of a filesystem shared INTO <dir> from
+# elsewhere: <dir> itself or any mount beneath it whose VISIBLE entry is on a device other than `/`'s.
+# Visible = the last entry for that mount point; a later mount on the same path shadows an earlier
+# one, and the bubblewrap sandbox stacks exactly such entries.
+#
+# "A mount point at <dir>" was the test, and it held only while the container bound the host's whole
+# ~/.jkb. Two things broke it. The mount list narrowed to ~/.jkb/{logs,claude-memory} (D52.8), so
+# ~/.jkb stopped being a share and the assertion stopped checking one. And Claude Code's bubblewrap
+# sandbox re-binds every allowed path into its own namespace: measured in the dev container,
+# /proc/self/mountinfo lists /home/vscode/.jkb as a mount on device 0:54 — the device `/` is on —
+# while the real shares are virtiofs on 0:45. Read as the host's share, that local overlay failed
+# case11 on trunk and made merge-queue.sh eject every candidate.
+#
+# A different device is necessary for a share, not sufficient (a Linux host's separate /home has
+# its own device too). So this only FINDS the candidate, only inside the dev container, and case11
+# then asks lib.sh's shared_fs_kind whether it is a filesystem shared with another kernel — the one
+# rule verify.sh applies to the same bind.
+_jkb_host_share() {
+    awk -v want="$1" '
+        $5 == "/" { root = $3 }
+        $5 == want || index($5, want "/") == 1 {
+            if (!($5 in last)) order[++n] = $5
+            last[$5] = $3
+        }
+        END {
+            for (i = 1; i <= n; i++) if (last[order[i]] != root) { print order[i]; exit 0 }
+            exit 1
+        }' "${2:-/proc/self/mountinfo}" 2>/dev/null
 }
 
 case11() {
-    local sites rust shell odd m probe_dir rc=0 real_home calls
+    local sites rust shell odd m probe_dir rc=0 real_home share kind calls
     sites="$(_bare_sqlite_sites "$repo_root")"
     calls="$(_wrapper_calls)"
     if [ "$calls" != 1 ]; then
@@ -1706,24 +1729,93 @@ it — another process closing its last connection made every open beside it ref
     # The REAL home, not $HOME: the harness points HOME at a scratch directory, which is how this
     # assertion first skipped inside the very container it exists for.
     real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
-    if [ -n "$real_home" ] && _jkb_is_a_bind_here "$real_home/.jkb"; then
-        refuse_shared_db "$real_home/.jkb/jkb.db" 2>/dev/null; rc=$?
-        [ "$rc" = 3 ] && ok "inside the container, the host's ~/.jkb/jkb.db is refused" \
-            || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for the ~/.jkb bind \
-(fs magic $(stat -f -c %t "$real_home/.jkb" 2>/dev/null)) — a shared mount the magic list does not know"
-        ln -s "$real_home/.jkb/refusal-probe-missing.db" "$probe_dir/dangling.db"
-        refuse_shared_db "$probe_dir/dangling.db" 2>/dev/null; rc=$?
-        [ "$rc" = 3 ] && ok "a dangling link from a local directory into the bind is refused" \
-            || fail "shared-db: dangling link allowed" "refuse_shared_db returned $rc for a dangling \
-link into ~/.jkb — SQLite would create the database at the link's target"
+    # The share finder's three mountinfo shapes, pinned everywhere rather than only where a real
+    # sandbox stacks them: the root re-bind does not count, a share beneath it does unless a later
+    # root-device mount shadows it, and a sibling sharing the prefix (~/.jkb-container) is not under it.
+    mkdir -p "$work/mi"
+    printf '%s\n' '1 0 0:54 / / rw - overlay o rw' '2 1 0:54 /h/.jkb /h/.jkb rw - overlay o rw' \
+        '3 1 0:45 /s /h/.jkb-container ro - virtiofs v rw' > "$work/mi/rebind"
+    { cat "$work/mi/rebind"; echo '4 2 0:45 /s/logs /h/.jkb/logs rw - virtiofs v rw'; } > "$work/mi/share"
+    { cat "$work/mi/share"; echo '5 4 0:54 /h/x /h/.jkb/logs rw - overlay o rw'; } > "$work/mi/shadowed"
+    if ! _jkb_host_share /h/.jkb "$work/mi/rebind" >/dev/null \
+        && [ "$(_jkb_host_share /h/.jkb "$work/mi/share")" = /h/.jkb/logs ] \
+        && ! _jkb_host_share /h/.jkb "$work/mi/shadowed" >/dev/null; then
+        ok "the share finder skips the root re-bind, the prefix sibling and a shadowed share, and finds a share"
     else
-        skip "live bind refusal (~/.jkb is not a bind mount here)"
+        fail "shared-db: share finder" "_jkb_host_share misread a mountinfo fixture under $work/mi \
+(rebind: $(_jkb_host_share /h/.jkb "$work/mi/rebind"); share: $(_jkb_host_share /h/.jkb "$work/mi/share"); \
+shadowed: $(_jkb_host_share /h/.jkb "$work/mi/shadowed"))"
+    fi
+
+    # Inside the dev container, by the evidence verify.sh uses: the image sets JKB_NS_MARKER and the
+    # entrypoint writes the record. A set variable with no record is a container started past its
+    # entrypoint, which verify.sh fails too; reading it as "not a container" would skip the
+    # assertion exactly where it runs.
+    if [ -z "${JKB_NS_MARKER:-}" ]; then
+        skip "live bind refusal (not inside the dev container)"
+    elif [ ! -s "$JKB_NS_MARKER" ]; then
+        fail "shared-db: no namespace record" "JKB_NS_MARKER=$JKB_NS_MARKER is set but holds no record — \
+the container was started past its entrypoint, so this cannot tell what it is running inside"
+    elif ! share="$(_jkb_host_share "${real_home:-/nonexistent}/.jkb")"; then
+        fail "shared-db: no live share" "inside the dev container, nothing under ${real_home:-<no home>}/.jkb \
+is on a device other than /'s — the mount list changed and this assertion no longer exercises a share"
+    elif ! kind="$(shared_fs_kind "$(stat -f -c %t "$share" 2>/dev/null)")" || [ -z "$kind" ]; then
+        # verify.sh's rule, for the same reason: on a native Linux Docker host the bind is
+        # same-kernel ext4, where opening is correct and refusing would be the bug. The magic is
+        # printed, so a cross-kernel backend the list does not know shows up here, not nowhere.
+        skip "live bind refusal ($share is magic $(stat -f -c %t "$share" 2>/dev/null), not a filesystem shared with another kernel)"
+    else
+        refuse_shared_db "$share/jkb.db" 2>/dev/null; rc=$?
+        [ "$rc" = 3 ] && ok "inside the container, a database on the host's $kind share ($share) is refused" \
+            || fail "shared-db: live bind allowed" "refuse_shared_db returned $rc for $share/jkb.db \
+although shared_fs_kind names $share $kind — the refusal itself is broken, not the magic list"
+        ln -s "$share/refusal-probe-missing.db" "$probe_dir/dangling.db"
+        refuse_shared_db "$probe_dir/dangling.db" 2>/dev/null; rc=$?
+        [ "$rc" = 3 ] && ok "a dangling link from a local directory into the share is refused" \
+            || fail "shared-db: dangling link allowed" "refuse_shared_db returned $rc for a dangling \
+link into $share — SQLite would create the database at the link's target"
     fi
 }
 
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10 case11
+# The swarm's post-landing check (task-swarm.js unclosedTasks). The merge queue's landing record is
+# what closes a task; the workflow only checks. On 2026-10-08 an agent that "marked the group done"
+# instead closed the NEXT, unstarted task twice, so the check's one job is never to call unclosed
+# work closed. Every answer but "each task's own full-uid entry says done" must name the task.
+_unclosed_src() {
+    sed -n '/^function unclosedTasks(/,/^}/p' "$repo_root/.claude/workflows/task-swarm.js"
+}
+
+case12() {
+    local src out
+    src="$(_unclosed_src)"
+    if [ -z "$src" ]; then
+        fail "closed-check: premise" "did NOT find unclosedTasks in task-swarm.js — the cases below would pass vacuously"
+        return
+    fi
+    out="$(node -e "$src
+const g = { tasks: [{ uid: 'task:a-1' }, { uid: 'task:b-2' }] }
+const cases = [
+  ['no answer', null, 'task:a-1,task:b-2'],
+  ['empty answer', { tasks: [] }, 'task:a-1,task:b-2'],
+  ['a short uid', { tasks: [{ uid: 'a-1', status: 'done' }, { uid: 'task:b-2', status: 'done' }] }, 'task:a-1'],
+  ['an error', { tasks: [{ uid: 'task:a-1', status: 'unknown: bad_request' }, { uid: 'task:b-2', status: 'done' }] }, 'task:a-1'],
+  ['one not done', { tasks: [{ uid: 'task:a-1', status: 'done' }, { uid: 'task:b-2', status: 'needs_review' }] }, 'task:b-2'],
+  ['all done', { tasks: [{ uid: 'task:a-1', status: 'done' }, { uid: 'task:b-2', status: 'done' }] }, ''],
+]
+for (const [name, answer, want] of cases) {
+  const got = unclosedTasks(g, answer).map((n) => n.uid).join(',')
+  if (got !== want) console.log(name + ': got [' + got + '], want [' + want + ']')
+}" 2>&1)"
+    if [ -z "$out" ]; then
+        ok "the post-landing check names every task not shown done under its full uid, and passes only all-done"
+    else
+        fail "closed-check: verdicts" "$out"
+    fi
+}
+
+run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10 case11 case12
 
 finish

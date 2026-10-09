@@ -484,6 +484,16 @@ pub struct SessionRecord {
     pub updated_at: i64,
 }
 
+impl SessionRecord {
+    /// Where this session's notification stands: [`NotifState::AwaitingTool`] when the prompt named a
+    /// tool, else [`NotifState::AwaitingUser`]. The one derivation, so a reader of the record (the
+    /// Code Factory's needs-input dot, D53.9) never re-decides it.
+    #[must_use]
+    pub fn state(&self) -> NotifState {
+        state_of(Some(self))
+    }
+}
+
 const MAX_SESSION_BYTES: usize = jkb_types::MAX_SESSION_ID_BYTES;
 const MAX_INSTANCE_BYTES: usize = 150;
 const MAX_OWNER_BYTES: usize = 20;

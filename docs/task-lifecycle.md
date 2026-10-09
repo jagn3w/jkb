@@ -1229,6 +1229,29 @@ way). Update the host before, or with, the container.
 the swarm lands on its own runs under a strategy whose `lands` toggle includes the coordinator
 (`jkb workflow set <uid> autonomous`, or a defined one), or the operator lands it.
 
+**The swarm closes a task only by landing it.** The swarm's merge queue closes a landed group
+itself (`jkb task landed`, `observed_landed`). Behind it the workflow ran a second, `haiku`-model
+agent told to "mark every task in the group done" with a free `jkb task set --status done`.
+Measured on 2026-10-08, twice in one chain: each time that agent ran after the queue had already
+closed its group, and it set the NEXT task `done` (`open -> done`, an `override`, 42 s and 75 s
+after the landing). The swarm then started that task's dependents on work that did not exist. A
+later implementer caught the second one only because a note on its task told it to stop and say
+`BLOCKED:`. The step after a landing now only *checks* the group's tasks (`unclosedTasks`,
+pinned by `dev-scripts.test.sh` case12). It reports the ones that did not close as a stall, with
+the remedy, and never closes anything. Under the default `design-reviewed` strategy, where only
+the operator lands, that is every group: the queue's `jkb task landed` is refused and only prints
+a note. The old agent's `task set --status done` had been quietly closing them past that rule.
+
+*Rejected for now, with the reason:* a guard in `rbac::authorize` refusing a non-operator
+`task.set --status done` on an `open` task, so that no prompt could reintroduce this. Built, then
+dropped after review round 3. It cannot tell a swarm agent closing an untouched task from
+`/next-task` closing the task it just worked: both are a coordinator's `open -> done`, because
+`/next-task` never claims its task. Making `/next-task` claim first drew a must-fix of its own
+in each of the next two rounds (a release matching a per-process owner, no reopen on give-back,
+a `[~]` checkbox the close step no longer matches). So nothing in jkb yet stops a non-operator
+closing an unstarted task. The swarm simply no longer asks one to. The guard is a design task,
+`task:guard-in-jkb-against-a-non-opera-18dc8d24f389a8d8`: tie a `done` to whoever claimed or started the task.
+
 **Rejected, and why.**
 
 - *A role header beside the root bearer* (first draft): omitting it made the caller the operator.

@@ -311,7 +311,99 @@ $kit --build     # rebuild the image (needed after a Dockerfile or extension cha
 $kit --stop      # stop it; volumes and image survive
 $kit --rm        # remove it, so the next run redoes first-run setup
 $kit --dry-run   # print the docker command instead of running it
+$kit --verify               # check the RUNNING container again; builds, creates and starts nothing
+$kit --install-extensions   # run install-extensions.sh in the running container, from the mirror
+$kit --status               # what the container is, as one JSON object (the app's Container tab)
 ```
+
+### The buttons over the kit, and the image's own record of where it came from (D53.8)
+
+The Code Factory app's Container tab (`docs/code-factory.md`, D53.8) is buttons over these flags,
+run from the kit and never the checkout, with the output in its integrated terminal. Three of them
+were added for it, and each goes through the start path rather than beside it:
+
+- **One thing per call.** A mode refuses a second mode, and a flag that acts as it is read (`--stop`,
+  `--rm`, `--install-kit`, …) refuses anything beside it — except `--print-args`, which refuses only
+  what comes before it and reads what follows as its own (`--print-args <root> --posture`, as
+  `check-config.sh` and `mutate-verify.sh` call it): a second mode used to
+  overwrite the first, and `--status --rm` removed the container it was asked to describe (review s8
+  round 1).
+- **`--verify` and `--install-extensions` act on a running container only.** A container that is not
+  running is refused before the build, so the button that checks the container can never be the one
+  that builds or creates it — even under `JKB_CONTAINER_IMAGE`, which a start always builds. That early
+  refusal is the fast one; the one that holds is asked again on the state the dispatch acts on, because
+  the dispatch starts or creates whatever that state says is not running, and a container stopped or
+  removed between the two reads sent the mode into `docker start` or `docker run`. Both looks read
+  `.State.Status` through one function: the first had read `.State.Running`, which is true for a paused
+  or restarting container, so those passed it and were then told to "start it first" — which the start
+  path cannot do; they are now refused at once with its remedy, `--rm` and start. Both then
+  take the start path's own route: the drift checks (a stale container is refused with the same
+  `--rm && run.sh` advice), the settle, the firewall re-raise, and the kit mirror refreshed from the
+  kit. `--install-extensions` stops there and runs `install-extensions.sh` from the mirror, with the
+  image's PATH as `setup.sh` runs it (it builds the explorer with the toolchain; `check-config.sh`
+  names it beside `setup.sh`). `--verify` runs the sweep, the login, the hooks and the reap as a start
+  does — not first-run setup, which is the start's job and which `verify.sh` reports as missing —
+  then the one verify statement, and exits with its code. One route, because `check-config.sh` and
+  `mutate-config.sh` pin the sweep-before-verify order and the keep list on the *first* verify
+  statement in `run.sh`: a second copy for the mode would have been the one they read.
+- **`--status` changes nothing.** It prints the image tag's labels, the container's state and its own
+  image's labels, the declaration's args-hash, and the two drifts as `args_drift` and `image_drift`
+  answer them — the functions the start path refuses on, so the tab calls a container stale exactly
+  when a start would refuse it. A daemon that cannot be reached is an answer (`"docker":
+  "unreachable"`), not an error. `kit_refresh` is the command that refreshes a stale kit — run.sh's
+  one `KIT_REFRESH`, the **kit's** `run.sh --install-kit`, which the start's note names too — so the
+  app shows run.sh's remedy rather than composing one. It had composed the checkout's path: a command
+  the operator runs on the host by hand, naming a script the agent can rewrite.
+- **The build stamps the image** with `jkb.source-commit` and `jkb.source-branch` — the commit and
+  branch the kit was copied from, recorded in the kit's marker by `--install-kit`, or the checkout's
+  own HEAD under `JKB_RUN_FROM_CHECKOUT=1` — and `jkb.built-at`, UTC. **Read from git's files, never
+  by running git** (`lib.sh`'s `dc_git_head`): this is the host, unsandboxed, and git in a checkout
+  reads that repository's config, whose `core.fsmonitor` is a program it runs. A reftable repository,
+  an unborn branch or anything that is not a full hex object name is `unknown`, never a guess. **No
+  link is followed and no ref leaves `refs/heads`:** the line read lands in the kit marker and the image
+  label, which both reach the container, so `HEAD -> ~/<a file whose first line is hex>` or `ref:
+  refs/heads/../../<that file>` made the host read a file of the agent's choosing into them (review s8
+  round 3). `.git`'s directory, `HEAD`, `commondir`, the ref file and `packed-refs` must not be links, a
+  branch with a `..` segment is refused, and the ref file's directory must resolve physically under the
+  common directory's `refs/heads` (so a `refs/heads` that is itself a link is refused too). Every read
+  is bounded (`dc_line1`, below). *Residual, stated:* a `gitdir:` or `commondir` line still names the
+  directories read, wherever they are; only a `HEAD`-shaped file and a ref under that directory's
+  `refs/heads` are read there, and only a full hex name passes. The build's note says why a build is
+  `unknown`: a kit installed before it recorded a source is told to reinstall, and `--install-kit` no
+  longer calls such a kit current while its checkout has a readable HEAD; a checkout whose HEAD cannot
+  be read is said to be one, since no reinstall would change it.
+  *Stated, not measured:* the commit is HEAD at the copy, so an uncommitted edit to a kit path rides
+  in the kit without being in that commit; `--status`'s `kit_changed` shows a checkout that has moved
+  since, not a kit that was dirty when copied.
+- **The kit's staleness opens nothing odd, and no read of the checkout can hang.** `dc_kit_stale` handed each kit path to `diff -rq`, which
+  blocks reading a FIFO given as an argument (measured: `timeout 3 diff -rq <file> <fifo>` exits 124;
+  inside a directory diff only reports one), so a FIFO planted at `scripts/lib.sh` in the checkout hung
+  every kit start, `--install-kit` and `--status`. A kit path that is a link or neither a regular file
+  nor a directory (`dc_plain_path`) is stale without being opened, and `--install-kit`'s list names it.
+  **The type check is not what holds**, though: a regular file swapped for a FIFO between the check and
+  the open still blocks the reader (review s8 round 3). So every host-side read of a checkout file —
+  `diff` and `cmp` here, `head` and `awk` in `dc_git_head` — runs under `dc_bounded`, which kills it
+  after `DC_READ_BOUND` (10s) and reads that as stale, or as `unknown`. Bash's own, polled, because
+  `timeout` is not on a stock Mac. The mirror's refusal of an odd kit names `KIT_REFRESH` rather than a
+  bare `run.sh --install-kit`.
+- **`jkb.built-at` is when the content was first built, not when `--build` last ran.** A label is part
+  of an image's configuration, so a time that changed every build would give every `--build` — and
+  every start under `JKB_CONTAINER_IMAGE` — a new image id, and the image check would then refuse
+  every existing container as running an older build. So the build is two steps: the work, with no
+  time on it, writing its id to a file in the kit home (an agent writing that file would choose
+  whether the tag moves); then, only when that content differs from what the tag holds — layer
+  digests, platform and configuration less `jkb.built-at` and the classic builder's per-step
+  `Image`/`Hostname` (`image_content`) — a second, fully cached build that adds the time and moves the
+  tag. A planted image under a non-default name passes only by being that content. The source labels
+  *are* content, deliberately: a kit reinstalled at a new commit with an unchanged Dockerfile builds a
+  new image id, because the image now claims a different commit — so under `JKB_CONTAINER_IMAGE`,
+  where every start builds, the existing container is refused as an older build and must be
+  recreated, rather than running under an image whose label names a commit it was not built from. A
+  detached HEAD (a pull request's CI checkout) is labelled `(detached)` and no source `unknown`, both
+  mapped once by `lib.sh`'s `dc_source_labels`. *Unmeasured here:*
+  the agent sandbox has no Docker, so `--iidfile`, the cached second build and the inspect fields are
+  pinned against a stub (`scripts/tests/container-status.test.sh`) and the projection by
+  `run.sh --self-test`, not observed on BuildKit or the classic builder.
 
 ### It is not a Dev Containers config, and the file is not called `devcontainer.json`
 
@@ -392,8 +484,8 @@ not.
 ship a different build of the extension from the one you install on the host for reasons nobody
 decided. `setup.sh` calls that script too, but on a fresh container it finds no VS Code server and
 correctly does nothing: the server arrives when you **attach**, which is after setup has run. So on
-a new container this is the one step you run by hand, from a terminal in the attached window — see
-*Using it* above. (Under Dev Containers the order was the reverse, which is why it was never a
+a new container this is the one step left: run it from a terminal in the attached window, or from the
+host with the kit's `run.sh --install-extensions` (the Container tab's button) — see *Using it* above. (Under Dev Containers the order was the reverse, which is why it was never a
 separate step.) That script resolves
 `code-server` and its `--server-data-dir` itself when there is no `code` CLI, which is the dev
 container case. It builds from the checkout rather than from a snapshot baked into the image, so
@@ -582,8 +674,10 @@ sources the mirror's `lib.sh`.
   unsandboxed in the container, once per container. `install-extensions.sh` runs
   `scripts/install-extension.sh` from the checkout, which builds `ui/` through pnpm. That build rarely
   happens from `setup.sh`, whose call finds no VS Code server on a first start. It usually happens
-  when you run the mirror's `install-extensions.sh` by hand after attaching, as `verify.sh` advises,
-  and then it builds the checkout you are standing in. Building is what these steps are for, and it
+  after attaching, when you run the mirror's `install-extensions.sh` by hand as `verify.sh` advises,
+  or with one click: the kit's `run.sh --install-extensions`, which the Code Factory app's Container
+  tab offers as a button, execs the same mirror copy in the container. Either way it builds the
+  checkout's `ui/` in the container, as it stands. Building is what these steps are for, and it
   is the same exposure as the host's `post-merge` build (*Git runs the host's hooks*). The
   mitigation is the same too: review what you build.
 - *The kit is trusted at install.* The first `--install-kit`, and every `setup.sh` run, copy whatever
@@ -1363,8 +1457,10 @@ invalidates every cached unit.
 
 ## The container never opens the knowledge base — measured, not assumed
 
-`~/.jkb` is still bind-mounted (auto-memory, worktree archives, logs, the daemon's token), but no
-process in here opens `jkb.db`. Since the cutover (tasks S6.5) the container is in **remote mode**:
+Only `~/.jkb/{logs,claude-memory}` are bind-mounted, and no process in here opens `jkb.db`. (*Superseded
+by D52.8:* "`~/.jkb` is still bind-mounted (auto-memory, worktree archives, logs, the daemon's
+token)". The whole directory, the host's database and the root token among it, was bound until
+D52.8 narrowed the mount list; see "Only what the container uses of `~/.jkb`".) Since the cutover (tasks S6.5) the container is in **remote mode**:
 `JKB_REMOTE=host.docker.internal:7117` (`containerEnv`), so every `jkb` command reaches the host's
 knowledge base through `jkb serve` (next section) or is refused, and there is no database of the
 container's own. Before the cutover there was one — `JKB_DB` on a `jkb-kb-local` volume, empty at
@@ -1415,23 +1511,54 @@ refused as "cannot tell what filesystem" (met by a CLI test under a parallel run
 Rust and the shell copy skip it, each pinned by a test). Every script's database read goes
 through `jkb_sqlite` in
 `scripts/lib.sh`, which applies the same magic set — `scripts/tests/dev-scripts.test.sh` case11 fails
-on a bare call, on the two sets drifting, and inside the container on the live bind not being
-refused. So a process with remote mode switched off and `--db ~/.jkb/jkb.db` (or no `--db` at all), gets a
-refusal instead of the host's database — **once the installed `jkb` carries the refusal**: a binary built before it opens
-the host's database from in here (a review measured exactly that), so `setup.sh` must have rebuilt it,
-and `verify.sh` asks the installed binary to open a probe on the bind and requires the refusal.
-`db::open` also refuses any `file:` string: the bundled SQLite is compiled with `-DSQLITE_USE_URI`,
-and `--db file:/home/vscode/.jkb/jkb.db` opened the host's database past a guard that judged a
-relative path — measured, it listed the host's namespaces and touched its `-shm` before this fix. Measured in the container: `jkb --db ~/.jkb/refusal-probe/jkb.db ns ls` exits 1
-naming the FUSE bind and creates no database file (the CLI's `create_dir_all` of the parent still runs
-first, leaving an empty directory).
+on a bare call, on the two sets drifting, and inside the container on a live share not being
+refused. The live share is found by device, not by being a mount point: the first mount at or
+under `~/.jkb` whose visible entry is on a device other than `/`'s (measured: `~/.jkb/logs`,
+virtiofs, the mount case11 reports). "A mount point at
+`~/.jkb`" stopped meaning a share twice over. The mount list narrowed to `~/.jkb/{logs,claude-memory}`.
+And Claude Code's bubblewrap sandbox re-binds every allowed path, so `~/.jkb` *is* a mount point
+under it, but on `/`'s own overlay device (0:54, against virtiofs's 0:45, measured in
+`/proc/self/mountinfo`). Read as the host's share, that failed case11 on trunk, and
+`merge-queue.sh` then ejected every candidate. A different device is necessary for a share, not
+sufficient, so case11 applies `verify.sh`'s rule to what it finds, and the two cannot disagree. The
+assertion runs only inside the dev container (`$JKB_NS_MARKER` set; set with no record fails, as
+in `verify.sh`). It requires a candidate there (none fails), and it requires the refusal only when
+`shared_fs_kind` names the candidate's filesystem as one shared with another kernel. Otherwise it
+skips, printing the magic, because on a native Linux Docker host the bind is same-kernel ext4,
+where opening is correct and refusing would be the bug. The cost is that a cross-kernel backend
+the list does not know skips too. The printed magic is how it gets noticed, and the drift checks
+keep the shell list and `shared_fs.rs` equal.
+
+The refusal is exercised on a share that exists: `verify.sh` asks the installed binary to open a
+probe under `~/.jkb/logs` and, when that bind is a shared filesystem by the same `shared_fs_kind`
+test, requires the refusal, **once the installed `jkb` carries it** — a
+binary built before it opened the host's database from in here (a review measured exactly that),
+so `setup.sh` must have rebuilt it. `db::open` also refuses any `file:` string: the bundled SQLite
+is compiled with `-DSQLITE_USE_URI`, and `--db file:/home/vscode/.jkb/jkb.db` opened the host's
+database past a guard that judged a relative path — measured, it listed the host's namespaces and
+touched its `-shm` before this fix.
+
+*Superseded by the D52.8 narrowing (above, "Only what the container uses of `~/.jkb`"):* "a
+process with remote mode switched off and `--db ~/.jkb/jkb.db` (or no `--db` at all) gets a refusal
+instead of the host's database", and the measurement "`jkb --db ~/.jkb/refusal-probe/jkb.db ns ls`
+exits 1 naming the FUSE bind". Both were true while the whole of `~/.jkb` was bound in. Since
+D52.8, `~/.jkb` is an image directory: the host's database is not in the container to be refused,
+and a `--db` there is a container-local file that the guard rightly allows (remote mode still
+refuses `--db` before anything opens). Measured 2026-10-08 in a D52.8 container: `stat -f ~/.jkb`
+reports overlayfs (magic `794c7630`, the device `/` is on), and `refuse_shared_db
+~/.jkb/refusal-probe-r3/jkb.db` returns 0 without creating anything; `verify.sh` separately
+asserts the host's `jkb.db`, `-wal`, `daemon/` and `backups/` are absent.
 
 **Residual, stated.** The guard covers jkb and `jkb_sqlite`. Any *other* SQLite client run in the
 container — `python3 -c 'import sqlite3; sqlite3.connect(".../.jkb/jkb.db")'`, a hand-typed database
 shell — is not jkb and is not refused; `.claude/hooks/block-raw-sqlite.sh` matches only the shell,
-only for agent tool calls, and fails open. What would close that for good is the container not
-seeing the host's database file at all; the bind still carries it, because `~/.jkb` holds the token
-and the other shared state (`openspec/changes/jkb-message-queue/design-r3.md`).
+only for agent tool calls, and fails open. What closes that for good is the container not seeing
+the host's database file at all, and since D52.8 it does not: only `~/.jkb/{logs,claude-memory}`
+are bound. What remains, for the host's knowledge base, is nothing. For any other database, it is
+one created on a read-write share — those two, and the repository binds, which are virtiofs too —
+and opened from both kernels at once, which jkb and `jkb_sqlite` refuse and another client would not. *Superseded:* "the bind still carries it, because
+`~/.jkb` holds the token and the other shared state" (`openspec/changes/jkb-message-queue/design-r3.md`),
+true until D52.8 moved the token out and stopped binding `~/.jkb`.
 
 ## The one opening to the host: `jkb serve` on port 7117
 
@@ -1476,7 +1603,9 @@ variable's name to `remote.rs`'s `REMOTE_VAR`, and `mutate-config.sh` drifts and
 it needs a rebuild, like the rest of `containerEnv`. See [docs/notifications.md](../docs/notifications.md).
 
 **What `verify.sh` asks.** The kernel's answer above, at the address the *image* names; then the
-daemon's own answer (`/v1/hello` with the token from the `~/.jkb` bind — the path remote mode takes).
+daemon's own answer (`/v1/hello` with the container credential from the read-only `~/.jkb-container`
+bind, `$JKB_REMOTE_TOKEN_FILE` overriding — the path remote mode takes). *Superseded by D52.8:* "the
+token from the `~/.jkb` bind"; `~/.jkb` holds no token since D52.8 moved the credential out.
 A missing token is a **failure**, since the container depends on the daemon for every command
 (tasks S6.5) — unless `JKB_VERIFY_NO_DAEMON=1` says none is expected, which `mutate-verify.sh` sets
 because its scratch `~/.jkb` has no daemon (a CI runner would too); it is a note then, and a mutation

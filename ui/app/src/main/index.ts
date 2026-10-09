@@ -1,0 +1,503 @@
+//! The main process: windows, the bridge's handlers, and the one `jkb serve` client (D53.1).
+//
+// The process split is a security boundary. The renderer runs with no Node
+// (`contextIsolation`, `sandbox`, no `nodeIntegration`), may not navigate or open windows, and
+// reaches main only through the named bridge calls — each checked to come from the top frame of
+// a window this process created, showing the app's own page. The daemon's token is read and held
+// here and never crosses; so are the integrated terminal's PTYs (`terminals.ts`), whose output is
+// the only thing about them that does.
+//
+// It runs from the installed copy (D53.3): a packaged app, built from a host-side clean clone of
+// `origin/main` and updated from the menu (*jkb ▸ Update from main…*, `update.ts`). Run from anywhere
+// else — a checkout's `out/`, or a package left in a checkout's `dist/` — it refuses unless
+// `JKB_APP_FROM_CHECKOUT=1` says that is deliberate.
+
+import { homedir, userInfo } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  BUILD_EXIT,
+  REMOTE_VAR,
+  TOKEN_FILE_VAR,
+  daemonUrl,
+  failed,
+  portOf,
+  tokenPath,
+  updateSummary,
+  type OpRequest,
+} from "@jkb/core";
+import {
+  BrowserWindow,
+  Menu,
+  app,
+  dialog,
+  ipcMain,
+  nativeTheme,
+  webContents,
+  type IpcMainEvent,
+  type IpcMainInvokeEvent,
+  type MenuItemConstructorOptions,
+  type MessageBoxOptions,
+  type MessageBoxReturnValue,
+} from "electron";
+import type * as NodePty from "node-pty";
+
+import { BRIDGE_CHANNELS, type AppInfo } from "../shared/bridge";
+import type { TerminalResult, TerminalRoots } from "../shared/terminal";
+import { ContainerKit, machineKit } from "./container";
+import { DaemonClient } from "./daemon";
+import { DesignFeeds } from "./designFeeds";
+import { rendererSource } from "./devRenderer";
+import { gitPlace } from "./gitPlace";
+import { NotifyFeed } from "./notifyFeed";
+import { TerminalHost, accountHome, machineEnvironment, machineRoots, type SpawnPty } from "./terminals";
+import { AppUpdater, builtCommit, machineRunner, machineStarter, startupRefusal } from "./update";
+
+/**
+ * Where the page comes from: the built file, or — from `pnpm run dev` only, and only on loopback —
+ * the dev server `electron-vite dev` names (`devRenderer.ts`). Never a dev server in a packaged app.
+ */
+const rendererFrom = rendererSource(app.isPackaged, process.env);
+
+/**
+ * Why this process may not run — it is not the installed copy (`startupRefusal`: packaged, and its
+ * executable, links resolved, is the one install-app.sh installs), and nobody said that was
+ * deliberate; or it was pointed at a renderer it will not load — or `undefined`.
+ */
+const refusal =
+  startupRefusal({ isPackaged: app.isPackaged, exe: app.getPath("exe"), platform: process.platform, home: accountHome(), env: process.env }) ??
+  (rendererFrom.kind === "refused" ? rendererFrom.reason : undefined);
+
+/** The dev server's page, when that is where the page comes from. */
+const DEV_RENDERER_URL = rendererFrom.kind === "dev" ? rendererFrom.url : undefined;
+const RENDERER_FILE = join(__dirname, "../renderer/index.html");
+
+const url = daemonUrl(process.env[REMOTE_VAR]);
+const tokenFile = process.env[TOKEN_FILE_VAR]?.trim() || tokenPath(homedir(), portOf(url));
+const daemon = new DaemonClient({ url, tokenFile, trustedRoot: homedir() });
+
+/**
+ * Where terminals run (`machineRoots`): the container `.container/run.sh` starts and the repos
+ * mount, both spellings of the host's side resolved once, here.
+ */
+const terminalRoots: TerminalRoots = machineRoots(homedir(), process.env);
+
+
+function loginShell(): string | undefined {
+  try {
+    return userInfo().shell ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `node-pty`, loaded on the first terminal rather than at startup: it is a native module, and a
+ * build that cannot load it should lose its terminals, not its window.
+ */
+let ptyModule: typeof NodePty | undefined;
+const spawnPty: SpawnPty = (file, args, options) => {
+  ptyModule ??= require("node-pty") as typeof NodePty;
+  return ptyModule.spawn(file, args, options);
+};
+
+const terminals = new TerminalHost(
+  spawnPty,
+  machineEnvironment(terminalRoots, process.env, loginShell()),
+  (owner, event) => {
+    const contents = webContents.fromId(owner);
+    if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.terminalEvent, event);
+  },
+);
+
+/** The installed container kit (D53.8), under the ACCOUNT's home (`accountHome`). */
+const containerKit = new ContainerKit(machineKit(accountHome(), process.env));
+
+/**
+ * The installed copy's clean clone and its builder, under the same account home as the kit (D53.3).
+ * It is told what is running — this executable, and the commit built into `out/` (this file is
+ * `out/main/index.js`) — and updates only the installed copy.
+ */
+const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), process.env), machineStarter(accountHome(), process.env), {
+  exe: app.getPath("exe"),
+  platform: process.platform,
+  commit: builtCommit(join(__dirname, "..")),
+});
+
+/** Set by an update that staged a build: install it as this process quits, relaunching or not. */
+let installOnQuit: { relaunch: boolean } | undefined;
+
+/** Live design updates, one long-poll per open design shared by every window showing it (D53.4). */
+const designFeeds = new DesignFeeds(
+  (request, options) => daemon.op(request, options),
+  (owner, event) => {
+    const contents = webContents.fromId(owner);
+    if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.designEvent, event);
+  },
+);
+
+/** The needs-input feed: the app's own consumer group on `claude/notify`, one for every window (D53.9). */
+const notifyFeed = new NotifyFeed(
+  (request, options) => daemon.op(request, options),
+  (owner, event) => {
+    const contents = webContents.fromId(owner);
+    if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.notifyEvent, event);
+  },
+  { log: (message) => process.stderr.write(`code-factory: ${message}\n`) },
+);
+
+/** Every feed a window can hold, ended together when it closes or reloads. */
+function closeFeeds(owner?: number): void {
+  designFeeds.closeAll(owner);
+  notifyFeed.closeAll(owner);
+}
+
+/** The windows this process created: the only senders the bridge answers. */
+const windows = new Set<number>();
+
+/** Whether `frameUrl` is the app's own page, as opposed to anything it might be navigated to. */
+function isAppPage(frameUrl: string): boolean {
+  try {
+    const page = new URL(frameUrl);
+    if (DEV_RENDERER_URL !== undefined) return page.origin === new URL(DEV_RENDERER_URL).origin;
+    page.search = "";
+    page.hash = "";
+    return page.protocol === "file:" && fileURLToPath(page) === RENDERER_FILE;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a bridge call came from the top frame of one of our windows, on our page. */
+function isTrusted(event: IpcMainInvokeEvent | IpcMainEvent): boolean {
+  const frame = event.senderFrame;
+  return windows.has(event.sender.id) && frame !== null && frame.parent === null && isAppPage(frame.url);
+}
+
+/** Refuse a bridge call from anything but the top frame of one of our windows, on our page. */
+function assertTrusted(event: IpcMainInvokeEvent): void {
+  if (!isTrusted(event)) throw new Error("bridge call refused: not from the app's own page");
+}
+
+function isOpRequest(value: unknown): value is OpRequest {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof (value as { op?: unknown }).op === "string"
+  );
+}
+
+function registerBridge(): void {
+  ipcMain.handle(BRIDGE_CHANNELS.hello, (event) => {
+    assertTrusted(event);
+    return daemon.hello();
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.op, (event, request: unknown) => {
+    assertTrusted(event);
+    if (!isOpRequest(request)) return failed("bad_request", "an op is an object with a string `op`");
+    return daemon.op(request);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.info, (event): AppInfo => {
+    assertTrusted(event);
+    return {
+      daemonUrl: daemon.url,
+      platform: process.platform,
+      versions: {
+        electron: process.versions.electron,
+        chrome: process.versions.chrome,
+        node: process.versions.node,
+      },
+      terminal: terminalRoots,
+    };
+  });
+
+  // The terminal. Main validates every argument (`terminals.ts`); a terminal answers only the
+  // window that opened it. Writes, resizes and acks are fire-and-forget (`send`, not `invoke`):
+  // one round trip per keystroke buys nothing, and an untrusted one is dropped. Close is invoked:
+  // its answer (`TerminalEnd`) is the only confirmation that the program ended.
+  ipcMain.handle(BRIDGE_CHANNELS.terminalOpen, (event, spec: unknown, cols: unknown, rows: unknown): TerminalResult<unknown> => {
+    assertTrusted(event);
+    return terminals.open(event.sender.id, spec, cols, rows);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.terminalWrite, (event, id: unknown, data: unknown) => {
+    if (isTrusted(event)) terminals.write(event.sender.id, id, data);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.terminalResize, (event, id: unknown, cols: unknown, rows: unknown) => {
+    if (isTrusted(event)) terminals.resize(event.sender.id, id, cols, rows);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.terminalAck, (event, id: unknown, chars: unknown) => {
+    if (isTrusted(event)) terminals.ack(event.sender.id, id, chars);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.terminalClose, (event, id: unknown) => {
+    assertTrusted(event);
+    return terminals.close(event.sender.id, id);
+  });
+
+
+  // Live design updates. Only a design's own topic is subscribed to (`isDesignTopic`, checked in
+  // the feeds), with the app's one consumer group.
+  ipcMain.handle(BRIDGE_CHANNELS.designSubscribe, (event, topic: unknown) => {
+    assertTrusted(event);
+    return designFeeds.subscribe(event.sender.id, topic);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.designUnsubscribe, (event, topic: unknown) => {
+    if (isTrusted(event)) designFeeds.unsubscribe(event.sender.id, topic);
+  });
+
+  // The dev container, through the kit's run.sh (D53.8). The renderer names an action; main finds
+  // the kit, checks it, and builds the terminal spec that runs the action's one flag.
+  ipcMain.handle(BRIDGE_CHANNELS.containerStatus, (event) => {
+    assertTrusted(event);
+    return containerKit.status();
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.containerSpec, async (event, action: unknown) => {
+    assertTrusted(event);
+    const answer = await containerKit.spec(action);
+    // Main built this host spec from the kit it located and the action's one flag, not from
+    // anything the renderer sent: the one kind of host program a window may open.
+    if (answer.ok) terminals.issueHost(event.sender.id, answer.value);
+    return answer;
+  });
+
+  // The Sessions tab (D53.9): the needs-input feed — `claude/notify` and nothing else, with the
+  // app's one group — and where a session's directory is, read from git's files.
+  ipcMain.handle(BRIDGE_CHANNELS.notifySubscribe, (event) => {
+    assertTrusted(event);
+    return notifyFeed.join(event.sender.id);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.notifyUnsubscribe, (event) => {
+    if (isTrusted(event)) notifyFeed.leave(event.sender.id);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.sessionsPlace, (event, cwd: unknown) => {
+    assertTrusted(event);
+    return gitPlace(cwd, terminalRoots);
+  });
+}
+
+function createWindow(): void {
+  const win = new BrowserWindow({
+    width: 1280,
+    height: 820,
+    minWidth: 720,
+    minHeight: 480,
+    show: false,
+    title: "Code Factory",
+    // The page's own --bg, so the first frame does not flash the other theme.
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#191919" : "#ffffff",
+    webPreferences: {
+      preload: join(__dirname, "../preload/index.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webviewTag: false,
+      spellcheck: false,
+    },
+  });
+  const id = win.webContents.id;
+  windows.add(id);
+  win.on("closed", () => {
+    windows.delete(id);
+    terminals.closeAll(id);
+    closeFeeds(id);
+  });
+  // A reload starts a renderer that knows none of the old page's terminals: end them rather than
+  // leave processes nobody can see or type into.
+  win.webContents.on("did-start-navigation", (details) => {
+    if (details.isMainFrame && !details.isSameDocument) {
+      terminals.closeAll(id);
+      closeFeeds(id);
+    }
+  });
+  win.webContents.on("render-process-gone", () => {
+    terminals.closeAll(id);
+    closeFeeds(id);
+  });
+  win.once("ready-to-show", () => win.show());
+
+  // The app is one page. Links never open in it or in a new window.
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", (event) => event.preventDefault());
+  win.webContents.on("will-attach-webview", (event) => event.preventDefault());
+
+  if (DEV_RENDERER_URL !== undefined) {
+    void win.loadURL(DEV_RENDERER_URL);
+  } else {
+    void win.loadFile(RENDERER_FILE);
+  }
+}
+
+/** A message box, over the focused window when there is one. */
+function messageBox(options: MessageBoxOptions): Promise<MessageBoxReturnValue> {
+  const win = BrowserWindow.getFocusedWindow();
+  return win === null ? dialog.showMessageBox(options) : dialog.showMessageBox(win, options);
+}
+
+/** Every window's progress bar: indeterminate while `busy`, cleared otherwise. */
+function showBusy(busy: boolean): void {
+  for (const win of BrowserWindow.getAllWindows()) win.setProgressBar(busy ? 2 : -1);
+}
+
+/**
+ * *jkb ▸ Update from main…*: fetch `main`, show the commits it would take, and on a yes build and
+ * stage exactly that commit while the app keeps running; then install it as the app quits — now,
+ * relaunching, or whenever the user next quits (D53.3). A running app is never swapped under.
+ */
+async function updateFromMain(): Promise<void> {
+  if (updater.busy) {
+    await messageBox({ type: "info", message: "An update is already building." });
+    return;
+  }
+  showBusy(true);
+  const plan = await updater.plan();
+  showBusy(false);
+  if (!plan.ok) {
+    await messageBox({ type: "error", message: "Could not check main for an update", detail: plan.error });
+    return;
+  }
+  const summary = updateSummary(plan.value);
+  if (summary === undefined) {
+    await messageBox({ type: "info", message: "Code Factory is up to date with main", detail: `Installed: ${plan.value.target.slice(0, 12)}` });
+    return;
+  }
+  // A build of this commit already staged (an install that did not go through) is installed as it is.
+  const staged = updater.stagedCommit() === plan.value.target;
+  const { response } = await messageBox({
+    type: "question",
+    buttons: [staged ? "Install It" : "Build Update", "Cancel"],
+    defaultId: 0,
+    cancelId: 1,
+    message: summary.message,
+    detail: staged ? `${summary.detail}\n\nThis commit is already built and staged; it is not built again.` : summary.detail,
+  });
+  if (response !== 0) return;
+  showBusy(true);
+  const done = await updater.apply(plan.value.target);
+  showBusy(false);
+  if (!done.ok) {
+    await messageBox({ type: "error", message: "The update was not built", detail: done.error });
+    return;
+  }
+  await offerInstall(`Code Factory ${done.value.slice(0, 12)} is ready`, "It is installed once the app has quit — never while it runs. Open terminals close.");
+}
+
+/**
+ * Ask when to install the staged build: now (quit, install, relaunch), at the next quit, or not now
+ * (nothing is set; the build stays staged). Answers whether it was declined.
+ */
+async function offerInstall(message: string, detail: string): Promise<boolean> {
+  const ready = await messageBox({
+    type: "question",
+    buttons: ["Quit and Install", "Install When I Quit", "Not Now"],
+    defaultId: 0,
+    cancelId: 2,
+    message,
+    detail,
+  });
+  if (ready.response === 2) return true;
+  installOnQuit = { relaunch: ready.response === 0 };
+  if (ready.response === 0) app.quit();
+  return false;
+}
+
+/**
+ * At startup: a staged build that is not what runs — its install failed after the app quit, where
+ * nobody saw why, or the app quit while it was building. Said, with the reason when the install
+ * step left one for that build, and offered; *Not Now* stops the same offer coming back unchanged.
+ */
+async function notePendingInstall(): Promise<void> {
+  const pending = updater.pendingInstall();
+  if (pending === undefined) return;
+  const why =
+    pending.status === undefined
+      ? "It has not been installed yet."
+      : pending.status === BUILD_EXIT.running
+        ? "The last install did not go through: a copy of Code Factory was still running."
+        : pending.status === BUILD_EXIT.busy
+          ? "The last install did not go through: another build or install held its lock."
+          : `The last install failed (status ${pending.status}); its output is in ${updater.installLogFile}. If it keeps failing, deleting ${join(updater.appHome, "staged")} discards this build.`;
+  const declined = await offerInstall(`Code Factory ${pending.commit.slice(0, 12)} is built but not installed`, why);
+  if (declined) updater.dismissPending(pending);
+}
+
+/** The application menu: the platform's standard menus, plus *jkb* with *Update from main…*. */
+function installMenu(): void {
+  const mac = process.platform === "darwin";
+  const jkb: MenuItemConstructorOptions = {
+    label: "jkb",
+    submenu: [
+      { label: "Update from main…", click: () => void updateFromMain() },
+      // On macOS Quit is in the app menu; elsewhere this is the first menu, and it goes here.
+      ...(mac ? [] : [{ type: "separator" as const }, { role: "quit" as const }]),
+    ],
+  };
+  const template: MenuItemConstructorOptions[] = [
+    ...(mac ? [{ role: "appMenu" as const }] : []),
+    jkb,
+    { role: "editMenu" },
+    { role: "viewMenu" },
+    { role: "windowMenu" },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+// Nothing may be granted to a page by asking: no camera, notifications, clipboard reads, ….
+app.on("web-contents-created", (_event, contents) => {
+  contents.session.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+});
+
+if (refusal !== undefined) {
+  process.stderr.write(`code-factory: ${refusal}\n`);
+  app.exit(1);
+} else {
+  void app.whenReady().then(() => {
+    installMenu();
+    registerBridge();
+    createWindow();
+    void notePendingInstall();
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  });
+}
+
+/** How long quitting waits for the daemon to take the app's group off `claude/notify` (D53.9). */
+const LEAVE_WAIT_MS = 1500;
+let leftNotify = false;
+let installerStarted = false;
+
+app.on("will-quit", (event) => {
+  terminals.closeAll();
+  closeFeeds();
+  // The staged build goes in once this process — and every other copy — has exited. Started on the
+  // first pass, before the notify leave below holds the quit: it is a detached spawn that returns at
+  // once, and the step itself waits for this process to exit, so neither delays the other. Once,
+  // because a second quit during the leave below runs this handler again. A quit during a build leaves that build
+  // running (its output goes to update.log, not to this process) to finish staging, and the next
+  // start offers whatever is staged and not running (`pendingInstall`). If the build still holds the
+  // lock when an install step started here gets to it, the step records 75 and that start says why.
+  if (installOnQuit !== undefined && !installerStarted) {
+    installerStarted = true;
+    const started = updater.startInstaller(process.pid, installOnQuit.relaunch);
+    if (!started.ok) process.stderr.write(`code-factory: ${started.error}\n`);
+  }
+  // Once: hold the quit until the app's group is off `claude/notify` (or the wait runs out), then
+  // exit. A group left there would keep every later notification unreapable until the topic's cap
+  // refuses `notify.event`.
+  //
+  // EXIT, NOT QUIT. This used to call `app.quit()` again, expecting a second will-quit that this
+  // guard lets through. Measured in CI (Electron 44, Linux, the Electron smoke): the window and
+  // every terminal were gone, and the main process then sat idle until killed — the second
+  // `app.quit()` after a prevented will-quit never ended the process. `app.exit()` ends it at once
+  // without emitting the quit events again, which is all this second pass ever did: the windows
+  // are closed and the cleanup above has run.
+  if (leftNotify) return;
+  leftNotify = true;
+  event.preventDefault();
+  void notifyFeed.leaveAll(LEAVE_WAIT_MS).finally(() => app.exit(0));
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});

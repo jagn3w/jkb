@@ -2,7 +2,8 @@
 # both humans and the task-swarm merge queue get a trustworthy green signal (design D30).
 # The toolchain is pinned by rust-toolchain.toml (1.96.1); the two live-smoke tests (ollama,
 # Chrome) stay #[ignore]d because CI has neither. cargo-deny honours deny.toml, which ignores
-# RUSTSEC-2026-0192 (the unmaintained ttf-parser transitive dep, tracked separately).
+# RUSTSEC-2026-0192 (the unmaintained ttf-parser transitive dep, tracked separately) and
+# RUSTSEC-2026-0215 (the unmaintained smallstr, a transitive dep of yrs).
 name: CI
 
 on: [push, pull_request]
@@ -19,7 +20,12 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      # No credential left in .git/config: nothing in this job pushes, and jkb's audited git refuses
+      # a repository whose local config carries `http.*.extraheader`. (The generated-docs check
+      # below no longer runs git at all; this keeps the job's checkout like a developer's.)
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # The SAME code check.sh runs, not a second copy of the list: the two hand-written
       # copies drifted by a `*.md` skip within one commit of each other — green locally, red
@@ -28,12 +34,6 @@ jobs:
       # the way its header promises.
       - name: shell syntax
         run: bash -c '. scripts/lib.sh; check_shell_syntax "$PWD"'
-
-      # setup.sh's installs are not reachable from a Rust test, and one of them replaces the
-      # very hook that runs it. No `-e` guard on the glob, unlike check.sh: here, finding no
-      # tests is a failure.
-      - name: shell tests
-        run: for t in scripts/tests/*.test.sh; do bash "$t"; done
 
       # The workspace pulls heavy transitive deps (fastembed/ONNX, headless_chrome,
       # rav1e/image) and builds them twice (default + --features fastembed) plus a
@@ -84,6 +84,52 @@ jobs:
 
       - name: test (fastembed)
         run: cargo test --all --features fastembed
+
+      # setup.sh's installs are not reachable from a Rust test, and one of them replaces the
+      # very hook that runs it. No `-e` guard on the glob, unlike check.sh: here, finding no
+      # tests is a failure. AFTER the tests, which build target/debug/jkb: notify-hook.test.sh
+      # cross-checks the hook against `jkb notify events`, and run before any build it found no
+      # binary and skipped that check green on every run. JKB_REQUIRE_BUILT_JKB makes a missing
+      # binary a failure, as in check.sh.
+      - name: shell tests
+        env:
+          JKB_CHECK_BIN: ${{ github.workspace }}/target/debug/jkb
+          JKB_REQUIRE_BUILT_JKB: "1"
+        run: for t in scripts/tests/*.test.sh; do bash "$t"; done
+
+      # The editor's `yjs` against jkb's `yrs`, byte for byte (D53.4): ui/app/test/yjs-wire.test.mjs
+      # drives a real jkb. It runs HERE, against the jkb the tests above built, rather than in the
+      # `ui` job, which has no Rust toolchain — there it skipped on every run and passed green.
+      # JKB_REQUIRE_WIRE turns a missing binary into a failure, so this step cannot skip.
+      #
+      # It installs with ELECTRON_SKIP_BINARY_DOWNLOAD, and shares its pnpm store cache with the
+      # `ui` job (same lockfile key). pnpm's side-effects cache records a package's postinstall
+      # result in the store, keyed by package and not by environment, so a skipped Electron
+      # download saved here was restored there as "already built" and the `ui` job's smoke found
+      # no binary. --config.side-effects-cache=false keeps this install's skip out of the store.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: yjs ↔ yrs wire (against the jkb built above)
+        working-directory: ui
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          JKB_BIN: ${{ github.workspace }}/target/debug/jkb
+          JKB_REQUIRE_WIRE: "1"
+        run: |
+          pnpm install --frozen-lockfile --config.side-effects-cache=false
+          node --test app/test/yjs-wire.test.mjs
+
+      # docs/ generated from jkb designs (design D55.6), the same step scripts/check.sh runs. The
+      # check is database-free -- each generated file's header records the blake3 of its body -- so
+      # a runner with no jkb store judges it exactly as a developer's machine does.
+      - name: generated docs (jkb design export --check)
+        run: cargo run -q -p jkb-cli --bin jkb -- design export --check
 
       # The auto-mode posture's tests (design D48). Hermetic and seconds-long: no Rust, no
       # session, no network — they only exercise the JSON merge/subset logic against a temp
@@ -285,6 +331,9 @@ jobs:
   # locally must not become a skip in CI, or a type error merges on a green tick.
   ui:
     runs-on: ubuntu-latest
+    # Install, build and every package's tests take a few minutes. Bounded so a hung Electron
+    # smoke fails here rather than holding a runner for GitHub's six-hour default.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ui
@@ -309,6 +358,13 @@ jobs:
       - name: install
         run: pnpm install --frozen-lockfile
 
+      # Fetch the Electron binary explicitly rather than trusting the install to have run
+      # electron's postinstall: a store restored from a cache can carry that postinstall's result
+      # from an install that skipped the download (see the `check` job's wire step). install.js is
+      # the postinstall itself; it does nothing when the binary is already there.
+      - name: Electron binary
+        run: node app/node_modules/electron/install.js
+
       # `build` is the whole gate: each package type-checks before emitting, and `pnpm -r`
       # runs topologically so @jkb/core's .d.ts exists before the adapter checks against it.
       # (`pnpm -r run typecheck` alone is NOT equivalent — every typecheck is --noEmit, so on
@@ -316,8 +372,24 @@ jobs:
       - name: build (type-checks)
         run: pnpm run build
 
-      # The adapter's tests. They bundle the module under test themselves (with `vscode`
+      # The packages' tests. The adapter's bundle the module under test themselves (with `vscode`
       # stubbed), so they need no VS Code and no dist — but they do need a node new enough
       # for `node --test`, which is why this job pins one rather than taking the runner's.
+      #
+      # The app's Electron smoke (ui/app/test/smoke.test.mjs) launches the built app, so it needs
+      # a display — xvfb-run gives it one — and Chromium's sandbox, which Ubuntu 24.04's AppArmor
+      # denies unprivileged user namespaces by default. The sysctl lifts that one restriction on
+      # this throwaway runner, rather than launching Electron with --no-sandbox: the renderer
+      # sandbox is the boundary the smoke exists to exercise (D53.1). Without a binary or a display
+      # the smoke skips and says so; JKB_REQUIRE_ELECTRON_SMOKE=1 turns that skip into a failure
+      # here, so a runner that lost either cannot pass green having run none of it
+      # (ui/app/test/smoke-required.test.mjs pins that the flag does).
+      #
+      # yjs-wire.test.mjs skips here (no jkb in this job, so no JKB_BIN): it runs, required, in the
+      # `check` job against the jkb that job builds.
+      - name: allow Chromium's sandbox (Ubuntu 24.04 AppArmor)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: test
-        run: pnpm run test
+        env:
+          JKB_REQUIRE_ELECTRON_SMOKE: "1"
+        run: xvfb-run -a pnpm run test

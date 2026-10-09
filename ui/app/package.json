@@ -1,0 +1,46 @@
+{
+  "name": "@jkb/app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Code Factory, the jkb desktop app (Electron): a client of jkb serve's op set, never a backend (design D53).",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "build": "pnpm run typecheck && electron-vite build",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "dev": "JKB_APP_DEV_RENDERER=1 electron-vite dev",
+    "start": "electron-vite preview",
+    "test": "node --test --test-timeout=120000 \"test/*.test.mjs\"",
+    "package": "electron-builder --dir --config electron-builder.yml"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
+  },
+  "devDependencies": {
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/lang-markdown": "^6.5.2",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.14",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@jkb/core": "workspace:*",
+    "@lezer/highlight": "^1.2.5",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "electron": "^44.5.1",
+    "electron-builder": "^26.17.0",
+    "electron-vite": "^5.0.0",
+    "esbuild": "^0.25.12",
+    "playwright-core": "^1.63.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.7",
+    "y-codemirror.next": "^0.3.6",
+    "yjs": "^13.6.33"
+  }
+}

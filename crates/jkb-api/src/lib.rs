@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod claims;
+pub mod designs;
 pub mod health;
 pub mod ingest;
 pub mod inv;
@@ -43,6 +44,7 @@ pub mod review;
 pub mod sessions;
 pub mod staging;
 pub mod tasks;
+pub mod workflows;
 
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,6 +110,14 @@ pub enum Request {
         group: String,
         /// The seq to commit through.
         seq: i64,
+    },
+    /// Remove a consumer group (a consumer leaving for good); idempotent.
+    #[serde(rename = "mq.group_delete")]
+    MqGroupDelete {
+        /// The topic.
+        topic: String,
+        /// The group.
+        group: String,
     },
     /// Remove idle groups and reap consumed, expired messages.
     #[serde(rename = "mq.compact")]
@@ -380,6 +390,10 @@ pub enum Request {
         /// Append rather than replace.
         #[serde(default)]
         append: bool,
+        /// For a replace: the body the edit was made against. Written only while the body is still
+        /// exactly this, else refused as [`ErrorCode::Stale`]. Left off the wire when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<String>,
     },
     /// Add, set or remove a `facet=value` tag.
     #[serde(rename = "task.tag")]
@@ -730,6 +744,255 @@ pub enum Request {
     /// The presets and definitions ([`rbac::strategies`]).
     #[serde(rename = "workflow.strategies")]
     WorkflowStrategies {},
+    /// A strategy's workflow machine and the task lifecycle machine, as data
+    /// ([`workflows::graph`]): a task's own strategy, a named one, or the default.
+    #[serde(rename = "workflow.graph")]
+    WorkflowGraph {
+        /// The task whose strategy to draw.
+        #[serde(default)]
+        uid: Option<String>,
+        /// The strategy to draw.
+        #[serde(default)]
+        strategy: Option<String>,
+    },
+    /// Every agent template, each as the one in effect ([`workflows::list`]).
+    #[serde(rename = "workflow.agents")]
+    WorkflowAgents {},
+    /// One agent template, optionally filled in ([`workflows::show`]).
+    #[serde(rename = "workflow.agent")]
+    WorkflowAgent {
+        /// Its name.
+        name: String,
+        /// The packaged template, whatever overrides it.
+        #[serde(default)]
+        packaged: bool,
+        /// This version of the operator copy.
+        #[serde(default)]
+        version: Option<i64>,
+        /// Fill its placeholders with these values: every one, and nothing else.
+        #[serde(default)]
+        vars: Option<std::collections::BTreeMap<String, String>>,
+    },
+    /// Copy a template into an operator copy (operator; [`workflows::copy`]).
+    #[serde(rename = "workflow.agent_copy")]
+    WorkflowAgentCopy {
+        /// The template to copy.
+        from: String,
+        /// Copy the packaged text even when a copy overrides it.
+        #[serde(default)]
+        packaged: bool,
+        /// The copy's name; by default `from`, which then overrides the packaged template.
+        #[serde(default, rename = "as")]
+        as_name: Option<String>,
+        /// An edit applied to the copied text in the same write, validated with it: a refused edit
+        /// leaves no copy.
+        #[serde(default)]
+        edit: Option<workflows::AgentEdit>,
+    },
+    /// Edit an operator copy (operator; [`workflows::set`]).
+    #[serde(rename = "workflow.agent_set")]
+    WorkflowAgentSet {
+        /// The copy.
+        name: String,
+        /// What changes.
+        edit: workflows::AgentEdit,
+    },
+    /// The designs, or one repo's ([`designs::list`]).
+    #[serde(rename = "design.list")]
+    DesignList {
+        /// Only this repo's (`designs/<repo>`).
+        #[serde(default)]
+        repo: Option<String>,
+    },
+    /// Create a design under `designs/<repo>` ([`designs::create`]).
+    #[serde(rename = "design.create")]
+    DesignCreate {
+        /// The repo it designs.
+        repo: String,
+        /// Its title.
+        title: String,
+        /// Its first text.
+        #[serde(default)]
+        body: String,
+    },
+    /// A design's text, spans and version token ([`designs::cat`]).
+    #[serde(rename = "design.cat")]
+    DesignCat {
+        /// The design.
+        uid: String,
+    },
+    /// A design rendered for its doc target, or every design with one ([`designs::export`]).
+    #[serde(rename = "design.export")]
+    DesignExport {
+        /// The design; omitted for every design that has a doc target.
+        #[serde(default)]
+        uid: Option<String>,
+        /// With no `uid`: only this repo's (`designs/<repo>`).
+        #[serde(default)]
+        repo: Option<String>,
+    },
+    /// Record where a design's export is written ([`designs::set_target`]).
+    #[serde(rename = "design.target")]
+    DesignTarget {
+        /// The design.
+        uid: String,
+        /// Relative to the repository root, under `docs/`.
+        path: String,
+    },
+    /// Record files a design was made from ([`designs::add_sources`]).
+    #[serde(rename = "design.sources")]
+    DesignSources {
+        /// The design.
+        uid: String,
+        /// Each path, with the blake3 of its content now.
+        sources: Vec<designs::Source>,
+    },
+    /// What a peer lacks, as one Yjs update ([`designs::state`]).
+    #[serde(rename = "design.state")]
+    DesignState {
+        /// The design.
+        uid: String,
+        /// The peer's state vector, base64; omitted for the whole document.
+        #[serde(default)]
+        since: Option<String>,
+    },
+    /// A design's spans and their derived states ([`designs::spans`]).
+    #[serde(rename = "design.spans")]
+    DesignSpans {
+        /// The design.
+        uid: String,
+    },
+    /// Merge an editor's Yjs v1 update ([`designs::apply`]).
+    #[serde(rename = "design.apply")]
+    DesignApply {
+        /// The design.
+        uid: String,
+        /// The update, base64.
+        update: String,
+    },
+    /// Edit by quote, resolved against the version read ([`designs::edit`]).
+    #[serde(rename = "design.edit")]
+    DesignEdit {
+        /// The design.
+        uid: String,
+        /// The version token the quote was read at.
+        base: String,
+        /// What to do.
+        edit: designs::EditAsk,
+    },
+    /// Make a span over a quote, resolved against the version read ([`designs::span`]).
+    #[serde(rename = "design.span")]
+    DesignSpan {
+        /// The design.
+        uid: String,
+        /// The version token the quote was read at.
+        base: String,
+        /// The quote.
+        find: String,
+        /// Which match, from 1.
+        #[serde(default)]
+        occurrence: Option<usize>,
+        /// Who approves it: `operator` (the default) or `claude`.
+        #[serde(default)]
+        reviewer: Option<String>,
+    },
+    /// Approve a span, as the reviewer it names, at the version the reviewer read
+    /// ([`designs::approve`]).
+    #[serde(rename = "design.approve")]
+    DesignApprove {
+        /// The span.
+        span: String,
+        /// The version token the reviewer read the span at (`design.cat`'s `version`). Refused when
+        /// the span's words changed since (D53.4: read-version, never read-latest).
+        base: String,
+    },
+    /// Stage an approved span into a plan step ([`designs::stage`]).
+    #[serde(rename = "design.stage")]
+    DesignStage {
+        /// The span.
+        span: String,
+        /// The plan step.
+        step: String,
+    },
+    /// Create an execution plan under a design, with its steps in order
+    /// ([`designs::plans::create`]).
+    #[serde(rename = "design.plan_create")]
+    DesignPlanCreate {
+        /// The design.
+        uid: String,
+        /// The plan's title.
+        title: String,
+        /// Its steps, in order.
+        #[serde(default)]
+        steps: Vec<String>,
+    },
+    /// Append a step to an execution plan ([`designs::plans::add_step`]).
+    #[serde(rename = "design.plan_step")]
+    DesignPlanStep {
+        /// The plan.
+        plan: String,
+        /// What the step is.
+        text: String,
+    },
+    /// One execution plan: its steps, their tasks and staged spans ([`designs::plans::show`]).
+    #[serde(rename = "design.plan")]
+    DesignPlan {
+        /// The plan.
+        plan: String,
+    },
+    /// A design's execution plans and one-off tasks ([`designs::plans::list`]).
+    #[serde(rename = "design.plans")]
+    DesignPlans {
+        /// The design.
+        uid: String,
+        /// Include archived plans (every task terminal).
+        #[serde(default)]
+        all: bool,
+    },
+    /// A prompt for a Claude session over a design: *Discuss* a selection, or *Play* a plan or a
+    /// task ([`designs::prompt`]).
+    #[serde(rename = "design.prompt")]
+    DesignPrompt {
+        /// Which prompt, over what.
+        ask: designs::PromptAsk,
+    },
+    /// Record the Claude Code session a launch is about to start on a design, before it starts
+    /// ([`designs::prompts::record`]).
+    #[serde(rename = "design.prompt_record")]
+    DesignPromptRecord {
+        /// The design.
+        uid: String,
+        /// The pre-minted session uuid (`claude --session-id`).
+        session: String,
+        /// The absolute directory the session starts in, where it is resumed.
+        cwd: String,
+        /// What started it: `discuss`, `play`, `task` or `new`.
+        launch: String,
+        /// The plan or task it is started on.
+        #[serde(default)]
+        subject: Option<String>,
+        /// Its title.
+        title: String,
+    },
+    /// A design's recorded prompts, newest first ([`designs::prompts::list`]).
+    #[serde(rename = "design.prompts")]
+    DesignPrompts {
+        /// The design.
+        uid: String,
+    },
+    /// The prompt a Claude Code session was recorded with, if any — the link from a session back to
+    /// the design it worked ([`designs::prompts::of_session`], D53.9).
+    #[serde(rename = "design.prompt_of")]
+    DesignPromptOf {
+        /// The session id.
+        session: String,
+    },
+    /// Fold a design's updates into its snapshot (operator; [`jkb_core::design::compact`]).
+    #[serde(rename = "design.compact")]
+    DesignCompact {
+        /// The design.
+        uid: String,
+    },
     /// Mint a harness attestation ticket for one tool call (the container credential only;
     /// [`rbac::mint_ticket`]).
     #[serde(rename = "attest.mint")]
@@ -959,6 +1222,12 @@ pub struct NotifySession {
     pub instance: String,
     /// When the record was last written (Unix ms).
     pub updated_at: i64,
+    /// Where the notification stands: `awaiting_user` (no tool named — the idle prompt, and the
+    /// Code Factory's needs-input dot, D53.9) or `awaiting_tool` (a permission prompt naming
+    /// `tool`). Derived by [`notify::SessionRecord::state`], never by a reader. Empty from a daemon
+    /// that predates it.
+    #[serde(default)]
+    pub state: String,
 }
 
 /// One process's hold on a Claude Code session, as `session.list` reports it.
@@ -1229,6 +1498,7 @@ impl Request {
         "mq.group_create",
         "mq.poll",
         "mq.ack",
+        "mq.group_delete",
         "mq.compact",
         "mq.inspect",
         "mq.tail",
@@ -1300,6 +1570,33 @@ impl Request {
         "workflow.set",
         "workflow.define",
         "workflow.strategies",
+        "workflow.graph",
+        "workflow.agents",
+        "workflow.agent",
+        "workflow.agent_copy",
+        "workflow.agent_set",
+        "design.list",
+        "design.create",
+        "design.cat",
+        "design.export",
+        "design.target",
+        "design.sources",
+        "design.state",
+        "design.spans",
+        "design.apply",
+        "design.edit",
+        "design.span",
+        "design.approve",
+        "design.stage",
+        "design.plan_create",
+        "design.plan_step",
+        "design.plan",
+        "design.plans",
+        "design.prompt",
+        "design.prompt_record",
+        "design.prompts",
+        "design.prompt_of",
+        "design.compact",
         "attest.mint",
         "attest.release",
         "task.claims",
@@ -1337,6 +1634,7 @@ impl Request {
             Self::MqGroupCreate { .. } => "mq.group_create",
             Self::MqPoll { .. } => "mq.poll",
             Self::MqAck { .. } => "mq.ack",
+            Self::MqGroupDelete { .. } => "mq.group_delete",
             Self::MqCompact { .. } => "mq.compact",
             Self::MqInspect {} => "mq.inspect",
             Self::MqTail { .. } => "mq.tail",
@@ -1408,6 +1706,33 @@ impl Request {
             Self::WorkflowSet { .. } => "workflow.set",
             Self::WorkflowDefine { .. } => "workflow.define",
             Self::WorkflowStrategies {} => "workflow.strategies",
+            Self::WorkflowGraph { .. } => "workflow.graph",
+            Self::WorkflowAgents {} => "workflow.agents",
+            Self::WorkflowAgent { .. } => "workflow.agent",
+            Self::WorkflowAgentCopy { .. } => "workflow.agent_copy",
+            Self::WorkflowAgentSet { .. } => "workflow.agent_set",
+            Self::DesignList { .. } => "design.list",
+            Self::DesignCreate { .. } => "design.create",
+            Self::DesignCat { .. } => "design.cat",
+            Self::DesignExport { .. } => "design.export",
+            Self::DesignTarget { .. } => "design.target",
+            Self::DesignSources { .. } => "design.sources",
+            Self::DesignState { .. } => "design.state",
+            Self::DesignSpans { .. } => "design.spans",
+            Self::DesignApply { .. } => "design.apply",
+            Self::DesignEdit { .. } => "design.edit",
+            Self::DesignSpan { .. } => "design.span",
+            Self::DesignApprove { .. } => "design.approve",
+            Self::DesignStage { .. } => "design.stage",
+            Self::DesignPlanCreate { .. } => "design.plan_create",
+            Self::DesignPlanStep { .. } => "design.plan_step",
+            Self::DesignPlan { .. } => "design.plan",
+            Self::DesignPlans { .. } => "design.plans",
+            Self::DesignPrompt { .. } => "design.prompt",
+            Self::DesignPromptRecord { .. } => "design.prompt_record",
+            Self::DesignPrompts { .. } => "design.prompts",
+            Self::DesignPromptOf { .. } => "design.prompt_of",
+            Self::DesignCompact { .. } => "design.compact",
             Self::AttestMint { .. } => "attest.mint",
             Self::AttestRelease { .. } => "attest.release",
             Self::TaskClaims { .. } => "task.claims",
@@ -1482,12 +1807,26 @@ impl Request {
             | Self::RoleList { .. }
             | Self::RoleWhoami {}
             | Self::WorkflowShow { .. }
-            | Self::WorkflowStrategies {} => true,
+            | Self::WorkflowStrategies {}
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents {}
+            | Self::WorkflowAgent { .. }
+            | Self::DesignList { .. }
+            | Self::DesignCat { .. }
+            | Self::DesignExport { .. }
+            | Self::DesignState { .. }
+            | Self::DesignSpans { .. }
+            | Self::DesignPlan { .. }
+            | Self::DesignPlans { .. }
+            | Self::DesignPrompt { .. }
+            | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
             | Self::MqPoll { .. }
             | Self::MqAck { .. }
+            | Self::MqGroupDelete { .. }
             | Self::MqCompact { .. }
             | Self::MqInspect {}
             | Self::MqTail { .. }
@@ -1543,6 +1882,8 @@ impl Request {
             | Self::WorkflowObserve { .. }
             | Self::WorkflowSet { .. }
             | Self::WorkflowDefine { .. }
+            | Self::WorkflowAgentCopy { .. }
+            | Self::WorkflowAgentSet { .. }
             // In memory: no database at all, so the writer is as good as anywhere.
             | Self::AttestMint { .. }
             | Self::AttestRelease { .. }
@@ -1553,7 +1894,19 @@ impl Request {
             | Self::InvWrite(_)
             | Self::TaskPrRecord { .. }
             | Self::TaskCloseMerged { .. }
-            | Self::NsMv { .. } => false,
+            | Self::NsMv { .. }
+            | Self::DesignCreate { .. }
+            | Self::DesignApply { .. }
+            | Self::DesignEdit { .. }
+            | Self::DesignSpan { .. }
+            | Self::DesignApprove { .. }
+            | Self::DesignStage { .. }
+            | Self::DesignPlanCreate { .. }
+            | Self::DesignPlanStep { .. }
+            | Self::DesignPromptRecord { .. }
+            | Self::DesignTarget { .. }
+            | Self::DesignSources { .. }
+            | Self::DesignCompact { .. } => false,
         }
     }
 }
@@ -1566,6 +1919,11 @@ pub enum Response {
     Created {
         /// `false` when it already existed.
         created: bool,
+    },
+    /// A group delete: whether there was such a group.
+    GroupDeleted {
+        /// `false` when there was none (already gone, or never made).
+        deleted: bool,
     },
     /// A send: the assigned seq.
     Sent {
@@ -2031,6 +2389,31 @@ pub enum Response {
         /// The new version.
         version: i64,
     },
+    /// A `workflow.graph`.
+    WorkflowGraph {
+        /// The machines.
+        graph: Box<workflows::GraphView>,
+    },
+    /// A `workflow.agents`.
+    WorkflowAgents {
+        /// Every template, as the one in effect.
+        agents: Vec<workflows::AgentView>,
+        /// Every role a template may act as, as stored ([`workflows::role_names`]).
+        #[serde(default)]
+        roles: Vec<String>,
+    },
+    /// A `workflow.agent`, `workflow.agent_copy` or `workflow.agent_set`.
+    WorkflowAgent {
+        /// The template.
+        agent: Box<workflows::AgentView>,
+        /// Its prompt filled in, when values were given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rendered: Option<String>,
+        /// Whether anything was written (a copy always writes; an edit that changes nothing does
+        /// not). `false` for a read.
+        #[serde(default)]
+        wrote: bool,
+    },
     /// An `attest.mint`.
     Ticket {
         /// The ticket.
@@ -2040,6 +2423,110 @@ pub enum Response {
     TicketsReleased {
         /// How many.
         count: usize,
+    },
+    /// A `design.list`.
+    Designs {
+        /// The designs, by uid.
+        designs: Vec<designs::Design>,
+    },
+    /// A `design.create`.
+    DesignCreated {
+        /// The new design.
+        design: designs::Design,
+    },
+    /// A `design.export`.
+    DesignExports {
+        /// The rendered designs, by uid.
+        exports: Vec<designs::Export>,
+    },
+    /// A `design.target` or `design.sources`: the design after it.
+    DesignMeta {
+        /// The design.
+        design: designs::Design,
+    },
+    /// A `design.cat`.
+    DesignText {
+        /// The design at its current version.
+        design: Box<designs::DesignDoc>,
+    },
+    /// A `design.state`.
+    DesignUpdate {
+        /// What the peer lacks, as one Yjs v1 update, base64.
+        update: String,
+        /// The version it brings the peer to.
+        version: String,
+        /// That version's seq.
+        seq: i64,
+    },
+    /// A `design.spans`.
+    DesignSpans {
+        /// The spans, in text order.
+        spans: Vec<designs::Span>,
+    },
+    /// A `design.apply`, `design.edit` or `design.span`.
+    DesignWritten {
+        /// What it did.
+        written: designs::Written,
+    },
+    /// A `design.approve` or `design.stage`.
+    DesignSpan {
+        /// The span after it.
+        span: Box<designs::Span>,
+    },
+    /// A `design.prompt` for *Discuss*.
+    DesignPrompt {
+        /// The prompt and what it was built from.
+        prompt: Box<designs::Prompt>,
+    },
+    /// A `design.prompt` for *Play* (a plan or a task).
+    DesignWorkPrompt {
+        /// The prompt and what it was built from.
+        prompt: Box<designs::plans::WorkPrompt>,
+    },
+    /// A `design.prompt` for *New prompt*.
+    DesignNewPrompt {
+        /// The prompt and what it was built from.
+        prompt: Box<designs::prompts::NewPrompt>,
+    },
+    /// A `design.prompt_record`.
+    DesignPromptRecorded {
+        /// The prompt as recorded.
+        prompt: Box<designs::prompts::DesignPrompt>,
+        /// Whether anything was written — and so announced on the design's topic. A session
+        /// recorded again from where it already was writes nothing.
+        wrote: bool,
+    },
+    /// A `design.prompts`.
+    DesignPrompts {
+        /// The design.
+        uid: String,
+        /// Its prompts, newest first.
+        prompts: Vec<designs::prompts::DesignPrompt>,
+    },
+    /// A `design.prompt_of`.
+    DesignPromptOf {
+        /// The session asked about.
+        session: String,
+        /// The prompt it was recorded with; absent when no launch recorded it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<Box<designs::prompts::DesignPrompt>>,
+    },
+    /// A `design.plan`, `design.plan_create` or `design.plan_step`.
+    DesignPlan {
+        /// The plan after it.
+        plan: Box<designs::plans::Plan>,
+    },
+    /// A `design.plans`.
+    DesignPlans {
+        /// The design's plans and one-off tasks.
+        list: Box<designs::plans::PlanList>,
+    },
+    /// A `design.compact`.
+    DesignCompacted {
+        /// The snapshot covers every update through this seq.
+        through: i64,
+        /// How many update rows it replaced.
+        removed: usize,
     },
 }
 
@@ -2123,8 +2610,30 @@ impl Response {
             | Self::WorkflowMoved { .. }
             | Self::Strategies { .. }
             | Self::Defined { .. }
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents { .. }
+            | Self::WorkflowAgent { .. }
             | Self::Ticket { .. }
             | Self::TicketsReleased { .. }
+            | Self::Designs { .. }
+            | Self::DesignCreated { .. }
+            | Self::DesignExports { .. }
+            | Self::DesignMeta { .. }
+            | Self::DesignText { .. }
+            | Self::DesignUpdate { .. }
+            | Self::DesignSpans { .. }
+            | Self::DesignWritten { .. }
+            | Self::DesignSpan { .. }
+            | Self::DesignPrompt { .. }
+            | Self::DesignWorkPrompt { .. }
+            | Self::DesignNewPrompt { .. }
+            | Self::DesignPromptRecorded { .. }
+            | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. }
+            | Self::DesignPlan { .. }
+            | Self::DesignPlans { .. }
+            | Self::DesignCompacted { .. }
+            | Self::GroupDeleted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -2138,9 +2647,17 @@ impl Response {
     #[must_use]
     pub const fn announces_a_send(&self) -> bool {
         match self {
-            Self::Sent { .. } => true,
+            // An approval or a staging is announced on its design's topic (`kind = "span"`); an
+            // approval that already held writes nothing, and costs subscribers one spare poll.
+            Self::Sent { .. } | Self::DesignSpan { .. } => true,
             Self::Notified { sent, .. } => *sent > 0,
+            // Every stored design update is announced on `design/<uid>` (D53.4).
+            Self::DesignWritten { written } => written.seq.is_some(),
+            Self::DesignCreated { design } => design.seq > 0,
+            // A recorded prompt is announced on its design's topic (D53.6), when it wrote.
+            Self::DesignPromptRecorded { wrote, .. } => *wrote,
             Self::Created { .. }
+            | Self::GroupDeleted { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
             | Self::Compacted { .. }
@@ -2211,8 +2728,25 @@ impl Response {
             | Self::WorkflowMoved { .. }
             | Self::Strategies { .. }
             | Self::Defined { .. }
+            | Self::WorkflowGraph { .. }
+            | Self::WorkflowAgents { .. }
+            | Self::WorkflowAgent { .. }
             | Self::Ticket { .. }
             | Self::TicketsReleased { .. }
+            | Self::Designs { .. }
+            | Self::DesignExports { .. }
+            | Self::DesignMeta { .. }
+            | Self::DesignText { .. }
+            | Self::DesignUpdate { .. }
+            | Self::DesignSpans { .. }
+            | Self::DesignPrompt { .. }
+            | Self::DesignWorkPrompt { .. }
+            | Self::DesignNewPrompt { .. }
+            | Self::DesignPrompts { .. }
+            | Self::DesignPromptOf { .. }
+            | Self::DesignPlan { .. }
+            | Self::DesignPlans { .. }
+            | Self::DesignCompacted { .. }
             | Self::NeedsGlobalBacklogAssent {} => false,
         }
     }
@@ -2271,6 +2805,9 @@ pub enum ErrorCode {
     /// A write this backend's clients may not make: one that would have the host's sync write a file
     /// outside the directories they may cause host writes in ([`tasks::FileRoots`]).
     Forbidden,
+    /// A write made against a read that no longer holds (a `task.edit` replace whose `expected`
+    /// body is not the current one). Nothing was written: re-read, and apply the edit again.
+    Stale,
     /// Anything else: a database or internal failure.
     Internal,
     /// A code this build does not know, from a newer peer. Clients treat it like `internal`.
@@ -2364,6 +2901,7 @@ impl From<jkb_core::Error> for ApiError {
                 }
             },
             jkb_core::Error::SchemaNewer { .. } => ErrorCode::SchemaNewer,
+            jkb_core::Error::Stale(_) => ErrorCode::Stale,
             jkb_core::Error::Types(jkb_types::Error::Validation(_)) => ErrorCode::Invalid,
             jkb_core::Error::Types(jkb_types::Error::NotFound(_)) => ErrorCode::NotFound,
             jkb_core::Error::Sqlite(rusqlite::Error::SqliteFailure(f, _))
@@ -2699,6 +3237,9 @@ impl LocalBackend {
                         .collect(),
                 }
             }
+            Request::MqGroupDelete { topic, group } => Response::GroupDeleted {
+                deleted: db.write_txn(actor, move |c, m| mq::group_delete(c, m, &topic, &group))?,
+            },
             Request::MqAck { topic, group, seq } => Response::Position {
                 position: db
                     .write_txn(actor, move |c, m| mq::ack(c, m, &topic, &group, seq, now))?,
@@ -2762,6 +3303,7 @@ impl LocalBackend {
                     .read(notify::open_sessions)?
                     .into_iter()
                     .map(|r| NotifySession {
+                        state: r.state().as_str().to_owned(),
                         session: r.session,
                         tool: r.tool,
                         owner: r.owner,
@@ -2998,11 +3540,24 @@ impl LocalBackend {
                 })?;
                 Response::Applied {}
             }
-            Request::TaskEdit { uid, text, append } => {
+            Request::TaskEdit {
+                uid,
+                text,
+                append,
+                expected,
+            } => {
                 let roots = self.file_roots.clone();
                 Response::Edited {
                     file_backed: task_write(db, actor, uid, move |c, m, uid| {
-                        tasks::edit(c, m, uid, &text, append, roots.as_ref())
+                        tasks::edit(
+                            c,
+                            m,
+                            uid,
+                            &text,
+                            append,
+                            expected.as_deref(),
+                            roots.as_ref(),
+                        )
                     })?,
                 }
             }
@@ -3334,6 +3889,207 @@ impl LocalBackend {
                 Response::Strategies {
                     strategies,
                     default,
+                }
+            }
+            Request::WorkflowGraph { uid, strategy } => Response::WorkflowGraph {
+                graph: Box::new(db.read_with(move |c| {
+                    workflows::graph(c, uid.as_deref(), strategy.as_deref())
+                })?),
+            },
+            Request::WorkflowAgents {} => Response::WorkflowAgents {
+                agents: db.read_with(workflows::list)?,
+                roles: workflows::role_names(),
+            },
+            Request::WorkflowAgent {
+                name,
+                packaged,
+                version,
+                vars,
+            } => {
+                let (agent, rendered) = db.read_with(move |c| {
+                    workflows::show(c, &name, packaged, version, vars.as_ref())
+                })?;
+                Response::WorkflowAgent {
+                    agent: Box::new(agent),
+                    rendered,
+                    wrote: false,
+                }
+            }
+            Request::WorkflowAgentCopy {
+                from,
+                packaged,
+                as_name,
+                edit,
+            } => Response::WorkflowAgent {
+                agent: Box::new(db.write_txn_with(actor, move |c, m| {
+                    workflows::copy(c, m, &from, packaged, as_name.as_deref(), edit)
+                })?),
+                rendered: None,
+                wrote: true,
+            },
+            Request::WorkflowAgentSet { name, edit } => {
+                let (agent, wrote) =
+                    db.write_txn_with(actor, move |c, m| workflows::set(c, m, &name, edit))?;
+                Response::WorkflowAgent {
+                    agent: Box::new(agent),
+                    rendered: None,
+                    wrote,
+                }
+            }
+            Request::DesignList { repo } => Response::Designs {
+                designs: db.read_with(move |c| designs::list(c, repo.as_deref()))?,
+            },
+            Request::DesignCreate { repo, title, body } => Response::DesignCreated {
+                design: db.write_txn_with(actor, move |c, m| {
+                    designs::create(c, m, &repo, &title, &body)
+                })?,
+            },
+            Request::DesignExport { uid, repo } => Response::DesignExports {
+                exports: db
+                    .read_with(move |c| designs::export(c, uid.as_deref(), repo.as_deref()))?,
+            },
+            Request::DesignTarget { uid, path } => Response::DesignMeta {
+                design: db
+                    .write_txn_with(actor, move |c, m| designs::set_target(c, m, &uid, &path))?,
+            },
+            Request::DesignSources { uid, sources } => Response::DesignMeta {
+                design: db
+                    .write_txn_with(actor, move |c, m| designs::add_sources(c, m, &uid, sources))?,
+            },
+            Request::DesignCat { uid } => Response::DesignText {
+                design: Box::new(db.read_with(move |c| designs::cat(c, &uid))?),
+            },
+            Request::DesignState { uid, since } => {
+                let (update, version) =
+                    db.read_with(move |c| designs::state(c, &uid, since.as_deref()))?;
+                Response::DesignUpdate {
+                    update,
+                    seq: version.seq,
+                    version: version.token(),
+                }
+            }
+            Request::DesignSpans { uid } => Response::DesignSpans {
+                spans: db.read_with(move |c| designs::spans(c, &uid))?,
+            },
+            Request::DesignApply { uid, update } => Response::DesignWritten {
+                written: db
+                    .write_txn_with(actor, move |c, m| designs::apply(c, m, &uid, &update))?,
+            },
+            Request::DesignEdit { uid, base, edit } => Response::DesignWritten {
+                written: db
+                    .write_txn_with(actor, move |c, m| designs::edit(c, m, &uid, &base, edit))?,
+            },
+            Request::DesignSpan {
+                uid,
+                base,
+                find,
+                occurrence,
+                reviewer,
+            } => {
+                let ask = designs::SpanAsk {
+                    uid,
+                    base,
+                    find,
+                    occurrence,
+                    reviewer,
+                };
+                Response::DesignWritten {
+                    written: db.write_txn_with(actor, move |c, m| designs::span(c, m, &ask))?,
+                }
+            }
+            Request::DesignApprove { span, base } => {
+                let who = principal.clone();
+                Response::DesignSpan {
+                    span: Box::new(db.write_txn_with(actor, move |c, m| {
+                        designs::approve(c, m, &span, &base, &who)
+                    })?),
+                }
+            }
+            Request::DesignStage { span, step } => Response::DesignSpan {
+                span: Box::new(
+                    db.write_txn_with(actor, move |c, m| designs::stage(c, m, &span, &step))?,
+                ),
+            },
+            Request::DesignPlanCreate { uid, title, steps } => Response::DesignPlan {
+                plan: Box::new(db.write_txn_with(actor, move |c, m| {
+                    designs::plans::create(c, m, &uid, &title, &steps)
+                })?),
+            },
+            Request::DesignPlanStep { plan, text } => Response::DesignPlan {
+                plan: Box::new(db.write_txn_with(actor, move |c, m| {
+                    designs::plans::add_step(c, m, &plan, &text)
+                })?),
+            },
+            Request::DesignPlan { plan } => Response::DesignPlan {
+                plan: Box::new(db.read_with(move |c| designs::plans::show(c, &plan))?),
+            },
+            Request::DesignPlans { uid, all } => Response::DesignPlans {
+                list: Box::new(db.read_with(move |c| designs::plans::list(c, &uid, all))?),
+            },
+            Request::DesignPrompt { ask } => {
+                match db.read_with(move |c| designs::prompt(c, &ask))? {
+                    designs::PromptAnswer::Discuss(prompt) => Response::DesignPrompt {
+                        prompt: Box::new(prompt),
+                    },
+                    designs::PromptAnswer::Work(prompt) => Response::DesignWorkPrompt {
+                        prompt: Box::new(prompt),
+                    },
+                    designs::PromptAnswer::New(prompt) => Response::DesignNewPrompt {
+                        prompt: Box::new(prompt),
+                    },
+                }
+            }
+            Request::DesignPromptRecord {
+                uid,
+                session,
+                cwd,
+                launch,
+                subject,
+                title,
+            } => {
+                let (prompt, wrote) = db.write_txn_with(actor, move |c, m| {
+                    designs::prompts::record(
+                        c,
+                        m,
+                        designs::prompts::RecordAsk {
+                            uid,
+                            session,
+                            cwd,
+                            launch,
+                            subject,
+                            title,
+                        },
+                    )
+                })?;
+                Response::DesignPromptRecorded {
+                    prompt: Box::new(prompt),
+                    wrote,
+                }
+            }
+            Request::DesignPrompts { uid } => {
+                let prompts = db.read_with({
+                    let uid = uid.clone();
+                    move |c| designs::prompts::list(c, &uid)
+                })?;
+                Response::DesignPrompts { uid, prompts }
+            }
+            Request::DesignPromptOf { session } => {
+                let prompt = db.read_with({
+                    let session = session.clone();
+                    move |c| designs::prompts::of_session(c, &session)
+                })?;
+                Response::DesignPromptOf {
+                    session,
+                    prompt: prompt.map(Box::new),
+                }
+            }
+            Request::DesignCompact { uid } => {
+                let done = db.write_txn_with(actor, move |c, m| {
+                    jkb_core::design::compact(c, m, &uid).map_err(ApiError::from)
+                })?;
+                Response::DesignCompacted {
+                    through: done.through,
+                    removed: done.removed,
                 }
             }
             Request::AttestMint {

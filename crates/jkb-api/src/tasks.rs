@@ -521,7 +521,10 @@ fn settle_home(
     server_home: Option<&Path>,
 ) -> Result<bool, ApiError> {
     let invalid = |why: &str| ApiError::with_code(ErrorCode::Invalid, why);
-    let ambient_repo = || crate::kb::ambient(conn, &ask.cwd, &ask.client_home, server_home);
+    // The whole ambient mount namespace (`repos/proj`), not a repo name: a task is homed under
+    // `tasks/<mount>/…` (`tasks/repos/proj/.backlog`), which is what the inbox's D26.3 mirror and
+    // the tests pin. Unlike `jkb design`, which homes by repo name (`designs/proj`).
+    let ambient_mount = || crate::kb::ambient(conn, &ask.cwd, &ask.client_home, server_home);
     if explicit {
         if ask.backlog {
             return Err(invalid(
@@ -531,14 +534,14 @@ fn settle_home(
         }
     } else if ask.backlog {
         let root = task::DEFAULT_ROOT;
-        if let Some(repo) = ambient_repo()? {
-            spec.home = format!("{root}/{repo}/.backlog");
+        if let Some(mount) = ambient_mount()? {
+            spec.home = format!("{root}/{mount}/.backlog");
         } else {
             spec.home = format!("{root}/.backlog");
             return Ok(ask.global_backlog);
         }
-    } else if let Some(repo) = ambient_repo()? {
-        spec.home = format!("{}/{repo}/inbox", task::DEFAULT_ROOT);
+    } else if let Some(mount) = ambient_mount()? {
+        spec.home = format!("{}/{mount}/inbox", task::DEFAULT_ROOT);
         spec.mirrors = vec![task::DEFAULT_HOME.to_owned()];
     }
     Ok(true)
@@ -624,21 +627,34 @@ pub fn set(
 /// tasks file refuses a *result* the tasks serializer would not read back as written — within
 /// [`MAX_CONTENT_BYTES`] for a task, and for any item under `roots`.
 ///
+/// A replace with `expected` — the content the client's draft started from — writes only while the
+/// body is still exactly that, so a note appended after the draft opened (by an agent's `jkb task edit
+/// --append`, say) is never erased by a Save; refused with [`ErrorCode::Stale`] instead. The check is
+/// here, in the one transaction, not left to every client to re-read first.
+///
 /// Answers whether the task is file-backed, so a client can say its file is written by the host's sync.
 ///
 /// # Errors
 /// For a task in a tasks file, a result that would not round-trip (a blank or whitespace-only line in
 /// the body, a checkbox line, trailing modifier or anchor tokens); a result over
-/// [`MAX_CONTENT_BYTES`]; [`ErrorCode::NotFound`]; [`ErrorCode::Forbidden`] under `roots`; or a failed
-/// write.
+/// [`MAX_CONTENT_BYTES`]; [`ErrorCode::Stale`] for a replace whose `expected` base no longer holds;
+/// `expected` with `append` ([`ErrorCode::Invalid`]); [`ErrorCode::NotFound`];
+/// [`ErrorCode::Forbidden`] under `roots`; or a failed write.
 pub fn edit(
     conn: &Connection,
     meta: &jkb_core::WriteMeta,
     reference: &str,
     text: &str,
     append: bool,
+    expected: Option<&str>,
     roots: Option<&FileRoots>,
 ) -> Result<bool, ApiError> {
+    if append && expected.is_some() {
+        return Err(ApiError::with_code(
+            ErrorCode::Invalid,
+            "`expected` guards a replace; an append loses nothing and takes none",
+        ));
+    }
     let id = writable(conn, reference, roots)?;
     // A task's body is bounded everywhere. Any other item — an ingested document can be megabytes —
     // is bounded only for a client of `jkb serve`, whose request the host did not choose; on the host
@@ -649,8 +665,11 @@ pub fn edit(
         conn,
         meta,
         id,
-        text,
-        append,
+        &if append {
+            item::ContentEdit::Append(text)
+        } else {
+            item::ContentEdit::Replace { text, expected }
+        },
         cap,
         &jkb_sync::task_content_problem,
     )?)

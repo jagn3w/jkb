@@ -82,6 +82,10 @@ fn samples() -> Vec<Request> {
             group: "g".into(),
             seq: 1,
         },
+        Request::MqGroupDelete {
+            topic: "t".into(),
+            group: "g".into(),
+        },
         Request::MqCompact { force: false },
         Request::MqInspect {},
         Request::MqTail {
@@ -193,6 +197,7 @@ fn samples() -> Vec<Request> {
             uid: "u".into(),
             text: "t".into(),
             append: false,
+            expected: Some("t0".into()),
         },
         Request::TaskTag {
             uid: "u".into(),
@@ -402,6 +407,127 @@ fn samples() -> Vec<Request> {
             spec: json!({ "graph": "direct" }),
         },
         Request::WorkflowStrategies {},
+        Request::WorkflowGraph {
+            uid: None,
+            strategy: Some("autonomous".into()),
+        },
+        Request::WorkflowAgents {},
+        Request::WorkflowAgent {
+            name: "swarm-implementer".into(),
+            packaged: false,
+            version: None,
+            vars: None,
+        },
+        Request::WorkflowAgentCopy {
+            from: "swarm-implementer".into(),
+            packaged: false,
+            as_name: None,
+            edit: None,
+        },
+        Request::WorkflowAgentSet {
+            name: "swarm-implementer".into(),
+            edit: crate::workflows::AgentEdit {
+                describe: Some("d".into()),
+                ..crate::workflows::AgentEdit::default()
+            },
+        },
+        Request::DesignList { repo: None },
+        Request::DesignCreate {
+            repo: "jkb".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+        Request::DesignCat {
+            uid: "design:x".into(),
+        },
+        Request::DesignExport {
+            uid: Some("design:x".into()),
+            repo: None,
+        },
+        Request::DesignTarget {
+            uid: "design:x".into(),
+            path: "docs/x.md".into(),
+        },
+        Request::DesignSources {
+            uid: "design:x".into(),
+            sources: vec![],
+        },
+        Request::DesignState {
+            uid: "design:x".into(),
+            since: None,
+        },
+        Request::DesignSpans {
+            uid: "design:x".into(),
+        },
+        Request::DesignApply {
+            uid: "design:x".into(),
+            update: String::new(),
+        },
+        Request::DesignEdit {
+            uid: "design:x".into(),
+            base: "0.".into(),
+            edit: crate::designs::EditAsk::InsertAfter {
+                find: "a".into(),
+                occurrence: None,
+                text: "b".into(),
+            },
+        },
+        Request::DesignSpan {
+            uid: "design:x".into(),
+            base: "0.".into(),
+            find: "a".into(),
+            occurrence: None,
+            reviewer: None,
+        },
+        Request::DesignApprove {
+            span: "span:x".into(),
+            base: "0.".into(),
+        },
+        Request::DesignStage {
+            span: "span:x".into(),
+            step: "step:x".into(),
+        },
+        Request::DesignPlanCreate {
+            uid: "design:x".into(),
+            title: "t".into(),
+            steps: vec!["s".into()],
+        },
+        Request::DesignPlanStep {
+            plan: "plan:x".into(),
+            text: "s".into(),
+        },
+        Request::DesignPlan {
+            plan: "plan:x".into(),
+        },
+        Request::DesignPlans {
+            uid: "design:x".into(),
+            all: false,
+        },
+        Request::DesignPrompt {
+            ask: crate::designs::PromptAsk::Discuss {
+                uid: "design:x".into(),
+                base: None,
+                start: 0,
+                end: 1,
+            },
+        },
+        Request::DesignPromptRecord {
+            uid: "design:x".into(),
+            session: "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
+            cwd: "/r".into(),
+            launch: "new".into(),
+            subject: None,
+            title: "t".into(),
+        },
+        Request::DesignPrompts {
+            uid: "design:x".into(),
+        },
+        Request::DesignPromptOf {
+            session: "s".into(),
+        },
+        Request::DesignCompact {
+            uid: "design:x".into(),
+        },
         Request::AttestMint {
             session: "s".into(),
             agent_id: None,
@@ -753,6 +879,27 @@ fn notify_ops_run_the_machine_and_report_what_it_did() {
         panic!("expected sessions")
     };
     assert_eq!((sessions.len(), sessions[0].owner.as_str()), (1, "4242"));
+    // The derived state crosses the wire: what Code Factory's needs-input dot reads (D53.9).
+    assert_eq!(sessions[0].state, "awaiting_tool", "a prompt naming a tool");
+    call(
+        &b,
+        json!({
+            "op": "notify.event", "session": "s2", "event": "needed",
+            "message": "Claude is waiting for your input"
+        }),
+    )
+    .unwrap();
+    let Response::Sessions { sessions } =
+        call(&b, json!({ "op": "notify.open_sessions" })).unwrap()
+    else {
+        panic!("expected sessions")
+    };
+    let idle = sessions.iter().find(|s| s.session == "s2").unwrap();
+    assert_eq!(
+        serde_json::to_value(idle).unwrap()["state"],
+        "awaiting_user",
+        "the idle prompt, as the wire spells it"
+    );
 
     // A mismatched tool does not move it; the refusal says why.
     let Response::Notified { moved, refusal, .. } = call(
@@ -785,6 +932,43 @@ fn notify_ops_run_the_machine_and_report_what_it_did() {
     )
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid);
+}
+
+/// A consumer leaving for good (Code Factory on quit, D53.9) removes its group, so what it never
+/// read stops holding the topic; leaving twice is not an error.
+#[test]
+fn a_group_delete_removes_the_group_and_is_idempotent() {
+    let b = backend();
+    call(&b, json!({ "op": "mq.topic_create", "topic": "t" })).unwrap();
+    call(
+        &b,
+        json!({ "op": "mq.group_create", "topic": "t", "group": "code-factory" }),
+    )
+    .unwrap();
+    let deleted = call(
+        &b,
+        json!({ "op": "mq.group_delete", "topic": "t", "group": "code-factory" }),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&deleted).unwrap(),
+        json!({ "result": "group_deleted", "deleted": true })
+    );
+    assert!(!deleted.announces_a_send());
+    assert_eq!(
+        call(
+            &b,
+            json!({ "op": "mq.group_delete", "topic": "t", "group": "code-factory" }),
+        )
+        .unwrap(),
+        Response::GroupDeleted { deleted: false }
+    );
+    let err = call(
+        &b,
+        json!({ "op": "mq.poll", "topic": "t", "group": "code-factory", "max": 1 }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NoSuchGroup);
 }
 
 #[test]
@@ -1515,6 +1699,19 @@ const READS: &[&str] = &[
     "role.whoami",
     "workflow.show",
     "workflow.strategies",
+    "workflow.graph",
+    "workflow.agents",
+    "workflow.agent",
+    "design.list",
+    "design.cat",
+    "design.export",
+    "design.state",
+    "design.spans",
+    "design.plan",
+    "design.plans",
+    "design.prompt",
+    "design.prompts",
+    "design.prompt_of",
 ];
 
 #[test]
@@ -1918,7 +2115,14 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
     for request in samples() {
         let mut wire = serde_json::to_value(&request).unwrap();
         let names_an_item = request.op().starts_with("task.") || wire.get("uid").is_some();
-        if !names_an_item || request.is_agent_read() || MANY_TASK_WRITES.contains(&request.op()) {
+        // A design write names a design (`uid`) but writes only its update log and its spans' items,
+        // none of which is placed anywhere a sync exports from — and it refuses any other item kind.
+        let design_write = request.op().starts_with("design.");
+        if !names_an_item
+            || design_write
+            || request.is_agent_read()
+            || MANY_TASK_WRITES.contains(&request.op())
+        {
             continue;
         }
         if wire.get("uid").is_some() {
@@ -3069,4 +3273,58 @@ fn an_added_due_is_held_to_the_line() {
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+}
+
+/// A Save from a draft names the body it started from; a note appended since (an agent's `jkb task
+/// edit --append`) makes that base stale, and the replace is refused rather than erasing the note.
+#[test]
+fn a_task_edit_replace_against_a_stale_base_is_refused_and_writes_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let id = db
+        .write_txn("t", |c, m| {
+            jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:t", "Title"))
+        })
+        .unwrap();
+    let body = || {
+        db.read(move |c| jkb_core::item::get_content(c, id))
+            .unwrap()
+            .unwrap_or_default()
+    };
+    let base = body();
+    call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "blocked on X", "append": true }),
+    )
+    .unwrap();
+    let noted = body();
+    assert!(noted.contains("blocked on X"), "{noted}");
+    let e = call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "Title, reworded", "expected": base }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Stale, "{e:?}");
+    assert_eq!(body(), noted, "the refused replace wrote nothing");
+    // Against the body as it now is, the replace is served; with no base, as before.
+    call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "Title, reworded", "expected": noted }),
+    )
+    .unwrap();
+    assert_eq!(body(), "Title, reworded");
+    call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "Again" }),
+    )
+    .unwrap();
+    assert_eq!(body(), "Again");
+    // A base guards a replace only.
+    let e = call(
+        &b,
+        json!({ "op": "task.edit", "uid": "task:t", "text": "x", "append": true, "expected": "Again" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert_eq!(body(), "Again");
 }
