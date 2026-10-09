@@ -123,29 +123,29 @@ test("text no span covers reads PROPOSED, and runs cover the text once, in order
   ]);
 });
 
-test("a demoted span is drawn by its pieces, with removed words as zero-width marks", () => {
-  const demoted = span({
-    uid: "s",
-    start: 4,
-    end: 14,
-    state: "PROPOSED",
-    demoted: true,
-    pieces: [
-      { start: 4, end: 8, state: "APPROVED", removed: false, text: "keep" },
-      { start: 8, end: 10, state: "PROPOSED", removed: false, text: "ne" },
-      { start: 10, end: 10, state: "APPROVED", removed: true, text: "old " },
-      { start: 10, end: 14, state: "APPROVED", removed: false, text: "rest" },
-    ],
-  });
-  assert.deepEqual(stateRuns(14, [demoted]), {
+test("a demoted span is drawn PROPOSED throughout, with removed words as zero-width marks", () => {
+  // The engine's shape: every piece of a demoted span is PROPOSED; `added`/`removed` say which
+  // words changed since the approval.
+  const pieces = [
+    { start: 4, end: 8, state: "PROPOSED", removed: false, added: false, text: "keep" },
+    { start: 8, end: 10, state: "PROPOSED", removed: false, added: true, text: "ne" },
+    { start: 10, end: 10, state: "PROPOSED", removed: true, added: false, text: "old " },
+    { start: 10, end: 14, state: "PROPOSED", removed: false, added: false, text: "rest" },
+  ];
+  const drawn = {
     runs: [
       { from: 0, to: 4, state: "PROPOSED" },
-      { from: 4, to: 8, state: "APPROVED", span: "s" },
+      { from: 4, to: 8, state: "PROPOSED", span: "s" },
       { from: 8, to: 10, state: "PROPOSED", span: "s" },
-      { from: 10, to: 14, state: "APPROVED", span: "s" },
+      { from: 10, to: 14, state: "PROPOSED", span: "s" },
     ],
     removed: [{ at: 10, text: "old ", span: "s" }],
-  });
+  };
+  const demoted = (p) => span({ uid: "s", start: 4, end: 14, state: "PROPOSED", demoted: true, pieces: p });
+  assert.deepEqual(stateRuns(14, [demoted(pieces)]), drawn);
+  // …and so it is drawn even from an answer whose pieces still carry their old approval.
+  const stale = pieces.map((p) => (p.added || p.removed ? p : { ...p, state: "APPROVED" }));
+  assert.deepEqual(stateRuns(14, [demoted(stale)]), drawn);
 });
 
 test("ranges past the text are clipped and overlaps are drawn once", () => {

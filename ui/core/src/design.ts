@@ -32,6 +32,11 @@ export interface SpanPiece {
   readonly state: SpanState;
   /** Words removed since the approval: zero width now. */
   readonly removed: boolean;
+  /**
+   * Words written inside the span since the approval. A demoted span's pieces are all PROPOSED;
+   * this and `removed` say which words changed. Absent from a daemon older than the field.
+   */
+  readonly added?: boolean;
   readonly text: string;
 }
 
@@ -125,6 +130,7 @@ function isPiece(v: unknown): v is SpanPiece {
     isNumber(v["end"]) &&
     isState(v["state"]) &&
     typeof v["removed"] === "boolean" &&
+    (v["added"] === undefined || typeof v["added"] === "boolean") &&
     isString(v["text"])
   );
 }
@@ -366,9 +372,11 @@ export interface StateMap {
 
 /**
  * Which state each piece of a text of `length` UTF-16 units is in, from `design.cat`'s spans
- * (D53.5). Text no span covers is PROPOSED. A span's pieces carry its words' states — every piece
- * of a demoted span reads PROPOSED, its untouched words too, as `render` and `design.stage` read it —
- * and a span with no pieces is drawn whole in its state. Unanchored spans are not in the text at all.
+ * (D53.5). Text no span covers is PROPOSED. A span's pieces carry its words' states, and a span with
+ * no pieces is drawn whole in its state. **A demoted span is drawn PROPOSED throughout** — its
+ * untouched words too, whatever its pieces say — as `render`, `design.stage` and the export read it;
+ * the engine answers it that way, and this holds it whatever the answer. Its removed words are drawn
+ * as zero-width marks. Unanchored spans are not in the text at all.
  *
  * The engine keeps spans from overlapping; a run that would overlap an earlier one anyway is clipped
  * to start after it, so each unit is drawn exactly once whatever the answer holds.
@@ -387,7 +395,7 @@ export function stateRuns(length: number, spans: readonly Span[]): StateMap {
       }
       const from = clamp(p.start);
       const to = clamp(p.end);
-      if (to > from) covered.push({ from, to, state: p.state, span: s.uid });
+      if (to > from) covered.push({ from, to, state: s.demoted ? "PROPOSED" : p.state, span: s.uid });
     }
   }
   covered.sort((a, b) => a.from - b.from || a.to - b.to);

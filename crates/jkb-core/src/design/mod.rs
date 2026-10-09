@@ -227,6 +227,10 @@ pub struct SpanPiece {
     pub state: SpanState,
     /// Words removed since the approval (zero width now): what the demotion took out.
     pub removed: bool,
+    /// Words written inside the span since the approval: what the demotion put in. With `removed`,
+    /// the provenance a demoted span keeps — its `state` is PROPOSED throughout (D53.5), so this is
+    /// how a reader still tells the new words from the ones that were approved.
+    pub added: bool,
     /// The piece's text.
     pub text: String,
 }
@@ -1259,6 +1263,7 @@ fn view(conn: &Connection, span: &SpanItem, doc: &Crdt, text: &str) -> Result<Sp
             end,
             state,
             removed: false,
+            added: false,
             text: slice(text, start, end),
         }]
     };
@@ -1291,6 +1296,7 @@ fn view(conn: &Connection, span: &SpanItem, doc: &Crdt, text: &str) -> Result<Sp
                                 SpanState::Proposed
                             },
                             removed: kind == PieceKind::Removed,
+                            added: kind == PieceKind::Added,
                             text,
                         },
                     )
@@ -1306,8 +1312,8 @@ fn view(conn: &Connection, span: &SpanItem, doc: &Crdt, text: &str) -> Result<Sp
                 .any(|p: &SpanPiece| p.state == SpanState::Proposed));
     // ONE RULE FOR A DEMOTED SPAN: the whole span reads PROPOSED, every piece of it too. The editor
     // draws from the pieces (`stateRuns`), and with per-word states a demoted span's untouched
-    // words drew APPROVED while `render` and `stage` said PROPOSED. Words removed since the
-    // approval are still told apart (`removed`).
+    // words drew APPROVED while `render` and `stage` said PROPOSED. Which words were removed or
+    // added since the approval is still told apart (`removed`, `added`).
     let pieces = if demoted {
         pieces
             .into_iter()
@@ -1711,13 +1717,23 @@ pub(crate) fn undo_would_lose(conn: &Connection, item: ItemId, txn: i64) -> Resu
     if kind.as_deref() != Some(KIND) {
         return Ok(None);
     }
+    // The permanent refusal first: undoing later work cannot clear a compaction, so naming a
+    // transaction to undo instead would send the user to undo their own edits for nothing.
+    if snapshot_row(conn, item)?.is_some() {
+        return Ok(Some(
+            "it created a design that has been compacted (`design_snapshots`): the compaction \
+             folded later work into itself and is never undone, so the design keeps its creation"
+                .to_owned(),
+        ));
+    }
+    // The newest later transaction, the one `jkb undo` can take back next.
     for (table, column) in DESIGN_OWNED {
         let sql = format!(
             "SELECT t.txn_id FROM {table} t
               WHERE t.{column} = ?1 AND t.txn_id <> ?2 AND NOT {}
                 AND NOT EXISTS (SELECT 1 FROM changelog x
                                  WHERE x.txn_id = t.txn_id AND x.op = 'undo')
-              LIMIT 1",
+              ORDER BY t.txn_id DESC LIMIT 1",
             crate::undo::undone_sql("t.txn_id")
         );
         let later: Option<i64> = conn
@@ -1731,13 +1747,6 @@ pub(crate) fn undo_would_lose(conn: &Connection, item: ItemId, txn: i64) -> Resu
                  {later} first"
             )));
         }
-    }
-    if snapshot_row(conn, item)?.is_some() {
-        return Ok(Some(
-            "it created a design that has been compacted (`design_snapshots`): the compaction \
-             folded later work into itself and is never undone, so the design keeps its creation"
-                .to_owned(),
-        ));
     }
     Ok(None)
 }

@@ -89,10 +89,13 @@ fn print_span(ops: &Ops<'_>, s: &Span) -> Result<()> {
     }
     if s.demoted {
         for p in &s.pieces {
+            // Every piece of a demoted span is PROPOSED; its provenance says which words changed.
             let how = if p.removed {
                 "removed"
+            } else if p.added {
+                "added"
             } else {
-                p.state.as_str()
+                "unchanged"
             };
             println!("  {how:<11} {:?}", p.text);
         }

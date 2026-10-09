@@ -2012,6 +2012,14 @@ fn approval_counts_surrogate_pairs_in_utf16_units() {
     let split: Vec<&str> = v.pieces.iter().map(|p| p.text.as_str()).collect();
     assert_eq!(split, ["Keep 🦀", "🦀", " Ferris here."]);
     assert!(v.pieces.iter().all(|p| p.state == SpanState::Proposed));
+    // …and the words added since the approval are still told apart, by provenance (`added`).
+    let added: Vec<&str> = v
+        .pieces
+        .iter()
+        .filter(|p| p.added)
+        .map(|p| p.text.as_str())
+        .collect();
+    assert_eq!(added, ["🦀"]);
 }
 
 // ---- review rounds 3-4: the design-only creation guard -----------------------------------------
@@ -2058,4 +2066,67 @@ fn a_compacted_designs_creation_is_not_undone() {
         .write_txn("t", move |c, m| crate::undo::undo(c, m, made))
         .unwrap_err();
     assert!(e.to_string().contains("compacted"), "{e}");
+}
+
+/// The compaction refusal comes first: it is permanent, so the refusal must not name a later
+/// transaction to undo instead (that would undo the user's own edits for nothing).
+#[test]
+fn a_compacted_designs_refusal_comes_before_naming_later_work() {
+    let db = db();
+    let uid = create(&db, "body");
+    let made: i64 = db
+        .read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap();
+    let u = uid.clone();
+    db.write_txn("t", move |c, m| compact(c, m, &u)).unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("body", " more")).unwrap();
+    let e = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, made))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("compacted"), "{e}");
+    assert!(!e.contains("undo transaction"), "{e}");
+}
+
+/// The refusal names the newest later transaction — the one `jkb undo` takes back next.
+#[test]
+fn a_designs_creation_refusal_names_the_newest_later_transaction() {
+    let db = db();
+    let uid = create(&db, "a");
+    let made: i64 = db
+        .read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("a", "b")).unwrap();
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("ab", "c")).unwrap();
+    let newest: i64 = db
+        .read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM design_updates", [], |r| r.get(0))?))
+        .unwrap();
+    let e = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, made))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains(&format!("undo transaction {newest} first")),
+        "{e}"
+    );
+}
+
+/// A `stages` edge written around `design.stage` (`jkb inv link <span> stages <step>`) into another
+/// design's plan does not make the span STAGED: the state counts only its own design's steps.
+#[test]
+fn a_stages_edge_into_another_designs_plan_does_not_stage_the_span() {
+    let db = db();
+    let mine = create(&db, "Mine.");
+    let s = span(&db, &mine, "Mine.", Reviewer::Operator).unwrap();
+    approve_as(&db, &s, Approver::Operator).unwrap();
+    let other = create(&db, "Theirs.");
+    let theirs = new_plan(&db, &other, &["x"]).unwrap();
+    let (span_id, step) = (step_id(&db, &s), step_id(&db, &theirs.steps[0].uid));
+    db.write_txn("t", move |c, m| {
+        edge::link(c, m, span_id, step, EdgeType::Stages, None)
+    })
+    .unwrap();
+    let v = view_of(&db, &mine, &s);
+    assert_eq!(v.state, SpanState::Approved);
+    assert!(v.steps.is_empty(), "{v:?}");
 }

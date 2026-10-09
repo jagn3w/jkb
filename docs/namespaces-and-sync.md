@@ -496,8 +496,11 @@ and nothing ever held an entry to the second.
   undo went with it. The undo is refused while a table in `design::DESIGN_OWNED` — an explicit list,
   one line per table, today `design_updates` — holds a row whose `txn_id` is a later transaction not
   itself undone and not an `undo` (whose forward revert of an undone edit is no work of its own);
-  undo that work first and the creation undoes. A compacted design (`design_snapshots`, which has no
-  `txn_id`, folds later rows into itself and is never undone) keeps its creation for good. A table
+  the refusal names the newest such transaction, which `jkb undo` takes back next, and once the later
+  work is undone the creation undoes. A compacted design (`design_snapshots`, which has no `txn_id`,
+  folds later rows into itself and is never undone) keeps its creation for good, and that refusal is
+  checked **first**: naming a transaction to undo instead sent the user to undo their own edits for
+  nothing (round 5). A table
   belongs on the list only if it records its writer in `txn_id`; there is no changelog fallback, so
   what lacks one is a stated gap: `containment` (a plan put under a design by a later transaction is
   orphaned by undoing the design's creation; a span is not, as `design.span` writes a

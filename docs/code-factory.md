@@ -426,8 +426,11 @@ to learn, and what was decided past the text above:
   outside the anchors (the anchors were moved) mark the span `displaced`. Any of the three demotes the
   span, which reads PROPOSED as a whole until re-approved — **every piece of it too**, its untouched
   words included, so the editor (which draws from the pieces, `stateRuns`) agrees with `render`,
-  `design.stage` and the export; removed words are still marked `removed` (round 4: per-word states
-  had a demoted span's untouched words drawn APPROVED). `jkb design edit` names the spans it demoted.
+  `design.stage` and the export (round 4: per-word states had a demoted span's untouched words drawn
+  APPROVED). Which words changed is provenance, not state: each piece says `removed` or `added` since
+  the approval, so `jkb design spans` (`removed`/`added`/`unchanged`), `--json` and the editor still
+  show the edit (round 5); `stateRuns` itself draws a demoted span PROPOSED whatever its pieces say.
+  `jkb design edit` names the spans it demoted.
   An approval recording no readable attestation reads demoted, never approved. Pinned by the proptest
   `a_span_reads_approved_only_while_its_text_is_the_approved_words` (random peer inserts, deletes and
   anchor rewrites; fails against the whole-document snapshot).

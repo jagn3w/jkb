@@ -130,6 +130,10 @@ pub struct Piece {
     pub state: String,
     /// Words removed since the approval.
     pub removed: bool,
+    /// Words written inside the span since the approval. A demoted span's pieces are all
+    /// `PROPOSED`; this and `removed` say which words changed.
+    #[serde(default)]
+    pub added: bool,
     /// Its text.
     pub text: String,
 }
@@ -182,6 +186,7 @@ impl From<SpanView> for Span {
                     end: p.end,
                     state: p.state.as_str().to_owned(),
                     removed: p.removed,
+                    added: p.added,
                     text: p.text,
                 })
                 .collect(),
