@@ -36,31 +36,10 @@ export interface RunResult {
   readonly code: number | null;
   readonly stdout: string;
   readonly stderr: string;
-  /** The run hit its timeout (`code` is then null). */
-  readonly timedOut?: boolean;
-  /** The run was cancelled through its `AbortSignal` (`code` is then null). */
-  readonly cancelled?: boolean;
-  /** The signal that ended the program, when one did. */
-  readonly signal?: string;
-  /**
-   * From a runner that stops the whole process group when the run ends abnormally (timeout,
-   * cancellation, a signal): false when it confirmed the group gone, true when it could not.
-   * Absent when it never had to stop it.
-   */
-  readonly survivors?: boolean;
 }
 
-/**
- * Run `file` with `args`, without a shell, to completion, `timeoutMs`, or `signal`'s abort; `env` is
- * added to the runner's.
- */
-export type RunFile = (
-  file: string,
-  args: readonly string[],
-  timeoutMs: number,
-  env?: Readonly<Record<string, string>>,
-  signal?: AbortSignal,
-) => Promise<RunResult>;
+/** Run `file` with `args`, without a shell, to completion or `timeoutMs`. */
+export type RunFile = (file: string, args: readonly string[], timeoutMs: number) => Promise<RunResult>;
 
 /** What main knows about the machine, injected so the tests can stand a kit up anywhere. */
 export interface KitEnvironment {

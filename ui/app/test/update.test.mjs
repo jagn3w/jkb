@@ -1,13 +1,14 @@
-//! *jkb ▸ Update from main…* in main, without a window (D53.3): fetching main into the clean clone,
-//! the commits an update would take, and building exactly the commit shown with the clone's own
-//! builder. Against real git repositories in a scratch home; the builder is a stand-in that stamps
-//! what it was run on, as scripts/build-app.sh does (that script is tested in
-//! scripts/tests/app-install.test.sh).
+//! *jkb ▸ Update from main…* in main, without a window (D53.3): fetching main to show it, the commits
+//! an update would take, building and staging exactly the commit shown with the clone's own builder,
+//! and starting the install step as the app quits. Against real git repositories in a scratch home;
+//! the builder is a stand-in that stages what it was run on, as scripts/build-app.sh does (that
+//! script is tested in scripts/tests/app-install.test.sh). The install step is the real
+//! scripts/install-app.sh.
 //
 // The module is bundled with esbuild, as in container.test.mjs.
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -17,6 +18,7 @@ import test, { after } from "node:test";
 import * as esbuild from "esbuild";
 
 const here = import.meta.dirname;
+const repoRoot = path.join(here, "..", "..", "..");
 const work = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "jkb-app-update-")));
 after(() => fs.rmSync(work, { recursive: true, force: true }));
 const require = createRequire(import.meta.url);
@@ -27,7 +29,9 @@ async function load(entry) {
   return require(outfile);
 }
 
-const { AppUpdater, machineRunner, isInstalledCopy, builtCommit, takeAppLock, breakStaleLock } = await load(path.join(here, "..", "src", "main", "update.ts"));
+const { AppUpdater, machineRunner, machineStarter, isInstalledCopy, builtCommit, startupRefusal, describeEnd } = await load(
+  path.join(here, "..", "src", "main", "update.ts"),
+);
 const core = await import(path.join(here, "..", "..", "core", "dist", "index.js"));
 
 /** git with an empty configuration, so the machine's own never reaches these repositories. */
@@ -43,50 +47,82 @@ const gitEnv = {
 for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]) delete gitEnv[k];
 const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { env: gitEnv, encoding: "utf8" }).trim();
 
+/** Whether a process `pid` exists. */
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+/** Wait (polling) until `cond()` holds, or fail after `ms`. */
+async function until(cond, what, ms = 30_000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) assert.fail(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 /**
- * The stand-in builder: logs its arguments and the lock token it was handed beside the lock's own,
- * fails when FAIL_BUILD is in the clone, exits 0 without stamping when NO_STAMP is, hangs (with a
- * background child, as pnpm has) when SLOW is, else stamps the clone's HEAD into <app-home>/installed.
+ * The stand-in builder, as scripts/build-app.sh: with --update-to SHA it fetches main, refuses
+ * unless the tip is SHA, and moves and cleans the clone. Then by marker file in the clone: BUSY exits
+ * 75, FAIL_BUILD fails, NO_STAGE exits 0 staging nothing, SLOW hangs (with a background child, as pnpm
+ * has), KILLED kills itself; otherwise it stages the clone's HEAD — an app whose executable, run,
+ * appends "ran" to $STUB_RAN.
  */
 const BUILDER = `#!/bin/bash
 set -eu
-app_home="$2"
 src="$(cd "$(dirname "$0")/.." && pwd)"
+app_home="$(dirname "$src")"
 echo "built $*" >>"$app_home/builds"
-echo "handed=\${JKB_APP_LOCK_TOKEN:-} lock=$(cat "$app_home/lock/token" 2>/dev/null)" >>"$app_home/lockseen"
-if [ -e "$src/FAIL_BUILD" ]; then echo "the build broke here" >&2; exit 3; fi
-if [ -e "$src/NO_STAMP" ]; then echo "finished, stamped nothing"; exit 0; fi
-if [ -e "$src/UNRECORDED" ]; then echo "swapped, could not stamp" >&2; exit 77; fi
-if [ -e "$src/KILLED" ]; then
-  sleep 60 >/dev/null 2>&1 &
-  echo $! >"$app_home/sleeper"
-  kill -9 $$
+if [ "\${1:-}" = --update-to ]; then
+  git -C "$src" fetch -q --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+  tip="$(git -C "$src" rev-parse refs/remotes/origin/main)"
+  [ "$tip" = "$2" ] || { echo "origin/main moved since it was shown" >&2; exit 1; }
+  git -C "$src" checkout -q --detach --force "$tip"
+  git -C "$src" clean -ffdq
 fi
-if [ -e "$src/SLOW" ]; then
+if [ -e "$src/BUSY" ]; then exit 75; fi
+if [ -e "$src/FAIL_BUILD" ]; then echo "the build broke here" >&2; exit 3; fi
+if [ -e "$src/NO_STAGE" ]; then echo "finished, staged nothing"; exit 0; fi
+if [ -e "$src/SLOW" ] || [ -e "$src/KILLED" ]; then
   sleep 60 >/dev/null 2>&1 &
   echo $! >"$app_home/sleeper"
+  if [ -e "$src/KILLED" ]; then kill -9 $$; fi
   wait
 fi
-echo "building $(git -C "$src" rev-parse HEAD)"
-printf 'commit=%s\\n' "$(git -C "$src" rev-parse HEAD)" >"$app_home/installed"
+head="$(git -C "$src" rev-parse HEAD)"
+echo "building $head"
+rm -rf "$app_home/staged"
+if [ "$(uname -s)" = Darwin ]; then exe="$app_home/staged/app/Contents/MacOS/Code Factory"; else exe="$app_home/staged/app/code-factory"; fi
+mkdir -p "$(dirname "$exe")"
+printf '#!/bin/sh\\necho ran >>"\${STUB_RAN:-/dev/null}"\\n' >"$exe"
+chmod +x "$exe"
+echo "$head" >"$app_home/staged/app/id"
+echo "$head" >"$app_home/staged/commit"
 `;
 
 let n = 0;
 /**
- * A home holding the app's clone of a bare origin whose main carries the stand-in builder, and an
- * installed copy's executable (a plain file) where build-app.sh puts it. The updater runs as that
- * copy unless `exe` says otherwise.
+ * A home holding the app's clone of a bare origin whose main carries the stand-in builder and the
+ * real install-app.sh and lib.sh; and an installed copy's executable (a plain file) where the install
+ * step puts it. The updater runs as that copy unless `exe` says otherwise. `starterEnv` starts the
+ * install step for real (machineStarter); otherwise starts are recorded in `started`.
  */
-function fixture({ clone = true, exe, commit, run, buildTimeoutMs } = {}) {
+function fixture({ clone = true, exe, commit, buildTimeoutMs, starterEnv } = {}) {
   const d = path.join(work, `f${n++}`);
   const seed = path.join(d, "seed");
   const origin = path.join(d, "origin.git");
   const home = path.join(d, "home");
-  const appHome = path.join(home, ".local/share/jkb-app");
-  const src = path.join(appHome, "src");
+  const appHome = path.join(home, core.APP_HOME_IN_HOME);
+  const src = path.join(home, core.APP_SRC_IN_HOME);
   fs.mkdirSync(path.join(seed, "scripts"), { recursive: true });
   git(d, "init", "-q", "-b", "main", seed);
   fs.writeFileSync(path.join(seed, "scripts", "build-app.sh"), BUILDER, { mode: 0o755 });
+  for (const f of ["install-app.sh", "lib.sh"]) fs.copyFileSync(path.join(repoRoot, "scripts", f), path.join(seed, "scripts", f));
   git(seed, "add", "-A");
   git(seed, "commit", "-q", "-m", "one");
   git(d, "clone", "-q", "--bare", seed, origin);
@@ -100,18 +136,21 @@ function fixture({ clone = true, exe, commit, run, buildTimeoutMs } = {}) {
     git(seed, "push", "-q", "origin", "main");
     return git(seed, "rev-parse", "HEAD");
   };
-  const stamp = (c) => fs.writeFileSync(path.join(appHome, "installed"), `commit=${c}\n`);
+  const installedDir = core.installedAppDir(process.platform, home);
+  // The stamp names where jkb installed the app, so the install step may replace it.
+  const stamp = (c) => fs.writeFileSync(path.join(appHome, "installed"), `commit=${c}\ndest=${installedDir}\n`);
   const installedExe = core.installedExecutable(process.platform, home);
   fs.mkdirSync(path.dirname(installedExe), { recursive: true });
   fs.writeFileSync(installedExe, "");
-  const runner = machineRunner(home, gitEnv, 200);
+  const started = [];
   const updater = new AppUpdater(
     home,
-    run === undefined ? runner : run(runner),
+    machineRunner(home, gitEnv, 200),
+    starterEnv !== undefined ? machineStarter(home, starterEnv) : (file, args, log) => started.push({ file, args, log }),
     { exe: exe ?? installedExe, platform: process.platform, commit },
     { buildTimeoutMs },
   );
-  return { seed, home, appHome, src, land, stamp, updater, installedExe, head: () => git(seed, "rev-parse", "HEAD") };
+  return { seed, home, appHome, src, land, stamp, updater, installedDir, installedExe, started, head: () => git(seed, "rev-parse", "HEAD") };
 }
 
 test("with no clone, nothing is fetched and setup.sh is named", async () => {
@@ -129,7 +168,7 @@ test("installed at main's tip: nothing to take", async () => {
   assert.deepEqual(r.value, { installed: f.head(), target: f.head(), commits: [], diverged: false });
 });
 
-test("a plan fetches main and lists what landed since the installed commit, newest first", async () => {
+test("a plan fetches main to a ref no build reads and lists what landed since, newest first; it moves nothing", async () => {
   const f = fixture();
   const installed = f.head();
   f.stamp(installed);
@@ -144,8 +183,9 @@ test("a plan fetches main and lists what landed since the installed commit, newe
     ["third change", "second change"],
   );
   assert.equal(r.value.diverged, false);
-  // A plan moves nothing: the clone's HEAD is where it was, and nothing was built.
   assert.equal(git(f.src, "rev-parse", "HEAD"), installed);
+  assert.equal(git(f.src, "rev-parse", "refs/remotes/origin/main"), installed, "origin/main, which a build checks, is not moved by a plan");
+  assert.equal(git(f.src, "rev-parse", core.UPDATE_SHOWN_REF), tip);
   assert.ok(!fs.existsSync(path.join(f.appHome, "builds")));
 });
 
@@ -158,98 +198,131 @@ test("a stamp naming a commit main does not have is a divergence, not an error",
   assert.deepEqual(r.value.commits, []);
 });
 
-test("apply moves the clone to the commit shown, cleans it, runs the clone's builder, and checks the stamp", async () => {
+test("apply runs the clone's builder --update-to the commit shown, which stages it; the installed app is untouched", async () => {
   const f = fixture();
-  f.stamp(f.head());
+  const installed = f.head();
+  f.stamp(installed);
   const tip = f.land("second");
   const plan = await f.updater.plan();
   assert.ok(plan.ok, plan.error);
   fs.writeFileSync(path.join(f.src, "stray"), "planted\n");
   const r = await f.updater.apply(plan.value.target);
   assert.ok(r.ok, r.error);
-  assert.deepEqual(r.value, { target: tip, unrecorded: false });
+  assert.equal(r.value, tip);
+  assert.equal(fs.readFileSync(path.join(f.appHome, "builds"), "utf8"), `built --update-to ${tip}\n`);
   assert.equal(git(f.src, "rev-parse", "HEAD"), tip);
-  assert.ok(!fs.existsSync(path.join(f.src, "stray")), "an untracked file in the clone is removed before the build");
-  assert.equal(f.updater.installed(), tip);
-  assert.equal(fs.readFileSync(path.join(f.appHome, "builds"), "utf8"), `built --app-home ${f.appHome} --replacing-running\n`);
+  assert.ok(!fs.existsSync(path.join(f.src, "stray")));
+  assert.equal(f.updater.stagedCommit(), tip);
+  assert.equal(f.updater.installed(), installed, "nothing is installed by a build");
+  assert.equal(fs.readFileSync(f.installedExe, "utf8"), "");
   assert.match(fs.readFileSync(f.updater.logFile, "utf8"), new RegExp(`building ${tip}`));
 });
 
-test("apply refuses a commit that is not main's fetched tip, and builds nothing", async () => {
+test("apply refuses what is not a commit id, and a commit main has moved past is refused by the builder", async () => {
   const f = fixture();
-  const old = f.head();
-  f.land("second");
-  assert.ok((await f.updater.plan()).ok);
-  const r = await f.updater.apply(old);
-  assert.equal(r.ok, false);
-  assert.match(r.error, /origin\/main moved/);
-  for (const bad of ["main", "HEAD", "a".repeat(39), undefined, { id: old }]) {
+  for (const bad of ["main", "HEAD", "a".repeat(39), undefined, { id: f.head() }]) {
     const b = await f.updater.apply(bad);
     assert.equal(b.ok, false);
     assert.match(b.error, /not a commit id/);
   }
   assert.ok(!fs.existsSync(path.join(f.appHome, "builds")));
+  const old = f.head();
+  f.land("second");
+  const r = await f.updater.apply(old);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /origin\/main moved/);
+  assert.equal(f.updater.stagedCommit(), undefined);
 });
 
-test("a failed build is reported with its output, and the stamp is not moved", async () => {
+test("a failed build is reported with its output; nothing is installed or staged", async () => {
   const f = fixture();
   const installed = f.head();
   f.stamp(installed);
   f.land("breaks the build", "FAIL_BUILD");
   const plan = await f.updater.plan();
-  assert.ok(plan.ok, plan.error);
   const r = await f.updater.apply(plan.value.target);
   assert.equal(r.ok, false);
-  assert.match(r.error, /The build failed \(exit 3\); the installed app is unchanged/);
+  assert.match(r.error, /The build failed \(exit 3\)\. Nothing was installed/);
   assert.match(r.error, /the build broke here/);
   assert.equal(f.updater.installed(), installed);
-  assert.match(fs.readFileSync(f.updater.logFile, "utf8"), /the build broke here/);
+  assert.equal(f.updater.stagedCommit(), undefined);
   assert.equal(f.updater.busy, false);
 });
 
-test("the runner drops a launching shell's repository selection", async () => {
+test("a build that exits 0 without staging the commit shown is a failure", async () => {
+  const f = fixture();
+  f.land("stages nothing", "NO_STAGE");
+  const plan = await f.updater.plan();
+  const r = await f.updater.apply(plan.value.target);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /did not stage/);
+});
+
+test("a builder that finds the lock held (75) says another build or install is running", async () => {
+  const f = fixture();
+  f.land("busy", "BUSY");
+  const plan = await f.updater.plan();
+  const r = await f.updater.apply(plan.value.target);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /Another build or install of Code Factory is running/);
+});
+
+test("a timed-out build is stopped with its whole process group, and said to have installed nothing", async () => {
+  const f = fixture({ buildTimeoutMs: 500 });
+  f.land("hangs", "SLOW");
+  const plan = await f.updater.plan();
+  const r = await f.updater.apply(plan.value.target);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /The build timed out after .* and was stopped\. Nothing was installed/);
+  const sleeper = Number(fs.readFileSync(path.join(f.appHome, "sleeper"), "utf8"));
+  await until(() => !alive(sleeper), `the build's child ${sleeper} to be stopped`, 3_000);
+});
+
+test("a builder killed by a signal is reported as killed, not as a timeout", async () => {
+  const f = fixture();
+  f.land("killed", "KILLED");
+  const plan = await f.updater.plan();
+  const r = await f.updater.apply(plan.value.target);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /The build was killed \(SIGKILL\)/);
+  assert.doesNotMatch(r.error, /timed out/);
+  process.kill(Number(fs.readFileSync(path.join(f.appHome, "sleeper"), "utf8")), "SIGKILL");
+});
+
+test("describeEnd words each way a run can end", () => {
+  assert.equal(describeEnd({ code: 3, stdout: "", stderr: "" }, 1000), "failed (exit 3)");
+  assert.equal(describeEnd({ code: null, stdout: "", stderr: "", timedOut: true }, 2000), "timed out after 2s and was stopped");
+  assert.equal(describeEnd({ code: null, stdout: "", stderr: "", signal: "SIGKILL" }, 1000), "was killed (SIGKILL)");
+  assert.equal(describeEnd({ code: null, stdout: "", stderr: "" }, 1000), "could not be run");
+});
+
+test("the runner drops a launching shell's repository selection and Electron's variables, and sets GIT_TERMINAL_PROMPT=0", async () => {
   const f = fixture();
   f.stamp(f.head());
   const tip = f.land("second");
-  const updater = new AppUpdater(f.home, machineRunner(f.home, { ...gitEnv, GIT_DIR: path.join(work, "elsewhere"), ELECTRON_RUN_AS_NODE: "1" }), {
-    exe: f.installedExe,
-    platform: process.platform,
-    commit: undefined,
-  });
+  const updater = new AppUpdater(
+    f.home,
+    machineRunner(f.home, { ...gitEnv, GIT_DIR: path.join(work, "elsewhere"), ELECTRON_RUN_AS_NODE: "1" }),
+    () => {},
+    { exe: f.installedExe, platform: process.platform, commit: undefined },
+  );
   const r = await updater.plan();
   assert.ok(r.ok, r.error);
   assert.equal(r.value.target, tip);
+  const env = await machineRunner(f.home, { ...gitEnv, GIT_TERMINAL_PROMPT: "1", ELECTRON_RUN_AS_NODE: "1" })("/usr/bin/env", [], 10_000);
+  assert.match(env.stdout, /^GIT_TERMINAL_PROMPT=0$/m);
+  assert.doesNotMatch(env.stdout, /ELECTRON_RUN_AS_NODE/);
+  assert.match(env.stdout, new RegExp(`^HOME=${f.home}$`, "m"));
 });
-
-test("the runner sets GIT_TERMINAL_PROMPT=0, whatever the launching shell had", async () => {
-  const home = fs.mkdtempSync(path.join(work, "env-"));
-  const r = await machineRunner(home, { ...gitEnv, GIT_TERMINAL_PROMPT: "1" })("/usr/bin/env", [], 10_000);
-  assert.equal(r.code, 0);
-  assert.match(r.stdout, /^GIT_TERMINAL_PROMPT=0$/m);
-});
-
-/** Whether a process `pid` exists. */
-function alive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e.code === "EPERM";
-  }
-}
 
 test("a timeout stops the whole process group, not only the program started", async () => {
   const home = fs.mkdtempSync(path.join(work, "group-"));
   const pidFile = path.join(home, "child");
-  const r = await machineRunner(home, gitEnv, 200)(
-    "/bin/bash",
-    ["-c", `sleep 60 >/dev/null 2>&1 & echo $! >"${pidFile}"; wait`],
-    300,
-  );
+  const r = await machineRunner(home, gitEnv, 200)("/bin/bash", ["-c", `sleep 60 >/dev/null 2>&1 & echo $! >"${pidFile}"; wait`], 300);
   assert.equal(r.code, null);
-  assert.equal(r.survivors, false);
+  assert.equal(r.timedOut, true);
   const child = Number(fs.readFileSync(pidFile, "utf8"));
-  assert.ok(!alive(child), `the background child ${child} outlived the timeout`);
+  await until(() => !alive(child), `the background child ${child} to be stopped`, 3_000);
 });
 
 test("an update runs only as the installed copy: any other copy is refused before it fetches or builds", async () => {
@@ -265,16 +338,32 @@ test("an update runs only as the installed copy: any other copy is refused befor
   const a = await f.updater.apply(tip);
   assert.equal(a.ok, false);
   assert.match(a.error, /is not the installed one/);
-  assert.notEqual(git(f.src, "rev-parse", "origin/main"), tip, "nothing was fetched");
+  assert.throws(() => git(f.src, "rev-parse", "--verify", "--quiet", core.UPDATE_SHOWN_REF), "nothing was fetched");
   assert.ok(!fs.existsSync(path.join(f.appHome, "builds")));
-  // A link to the installed executable is the installed copy.
   const link = path.join(work, `link-${n}`);
   fs.symlinkSync(f.installedExe, link);
   assert.equal(isInstalledCopy(link, process.platform, f.home), true);
   assert.equal(isInstalledCopy(elsewhere, process.platform, f.home), false);
 });
 
-test("what is running beats the stamp: a copy swapped in under it does not make it up to date", async () => {
+test("at startup only the installed copy runs, unless JKB_APP_FROM_CHECKOUT=1", () => {
+  const f = fixture();
+  const elsewhere = path.join(work, `dist-${n}`, "code-factory");
+  fs.mkdirSync(path.dirname(elsewhere), { recursive: true });
+  fs.writeFileSync(elsewhere, "");
+  const link = path.join(work, `startup-link-${n}`);
+  fs.symlinkSync(f.installedExe, link);
+  const facts = (over) => ({ isPackaged: true, exe: f.installedExe, platform: process.platform, home: f.home, env: {}, ...over });
+  assert.equal(startupRefusal(facts({})), undefined, "the installed copy runs");
+  assert.equal(startupRefusal(facts({ exe: link })), undefined, "a link to it is it");
+  const packagedElsewhere = startupRefusal(facts({ exe: elsewhere }));
+  assert.match(packagedElsewhere ?? "", /not running from its installed copy/, "a package left in a checkout's dist/ is refused");
+  assert.ok((packagedElsewhere ?? "").includes(f.installedExe), "the refusal names the installed copy");
+  assert.match(startupRefusal(facts({ isPackaged: false })) ?? "", /JKB_APP_FROM_CHECKOUT=1/, "a checkout's out/ is refused");
+  assert.equal(startupRefusal(facts({ exe: elsewhere, env: { JKB_APP_FROM_CHECKOUT: "1" } })), undefined);
+});
+
+test("what is running beats the stamp", async () => {
   const f0 = fixture();
   const old = f0.head();
   const f = fixture({ commit: old });
@@ -284,7 +373,6 @@ test("what is running beats the stamp: a copy swapped in under it does not make 
   assert.ok(r.ok, r.error);
   assert.equal(r.value.target, tip);
   assert.notEqual(r.value.installed, tip);
-  // builtCommit reads out/commit, and nothing else.
   const out = fs.mkdtempSync(path.join(work, "out-"));
   assert.equal(builtCommit(out), undefined);
   fs.writeFileSync(path.join(out, "commit"), `${tip}\n`);
@@ -293,213 +381,57 @@ test("what is running beats the stamp: a copy swapped in under it does not make 
   assert.equal(builtCommit(out), undefined);
 });
 
-test("a build that exits 0 without stamping the commit shown is a failure, not an install", async () => {
+test("the install step is started only with something staged, for this pid, relaunching when asked", async () => {
   const f = fixture();
-  f.stamp(f.head());
-  f.land("stamps nothing", "NO_STAMP");
-  const plan = await f.updater.plan();
-  assert.ok(plan.ok, plan.error);
-  const r = await f.updater.apply(plan.value.target);
-  assert.equal(r.ok, false);
-  assert.match(r.error, /did not record .* as installed/);
-});
-
-test("a timed-out build is stopped with everything it started, not reported unchanged, and the lock is released", async () => {
-  const f = fixture({ buildTimeoutMs: 500 });
-  const installed = f.head();
-  f.stamp(installed);
-  f.land("hangs", "SLOW");
-  const plan = await f.updater.plan();
-  assert.ok(plan.ok, plan.error);
-  const r = await f.updater.apply(plan.value.target);
-  assert.equal(r.ok, false);
-  assert.match(r.error, /timed out after .*, and every process it started has stopped/);
-  assert.doesNotMatch(r.error, /unchanged/);
-  const sleeper = Number(fs.readFileSync(path.join(f.appHome, "sleeper"), "utf8"));
-  assert.ok(!alive(sleeper), `the build's child ${sleeper} outlived the timeout`);
-  assert.equal(f.updater.installed(), installed);
-  assert.ok(!fs.existsSync(f.updater.lockDir));
-});
-
-test("a timed-out build whose processes may survive keeps the lock, and says the app may still change", async () => {
-  const f = fixture({
-    run: (real) => (file, args, ms, env) =>
-      file === "/bin/bash" ? Promise.resolve({ code: null, stdout: "", stderr: "", timedOut: true, survivors: true }) : real(file, args, ms, env),
-  });
-  f.stamp(f.head());
+  assert.equal(f.updater.startInstaller(1234, true).ok, false);
+  assert.deepEqual(f.started, []);
   f.land("second");
   const plan = await f.updater.plan();
-  assert.ok(plan.ok, plan.error);
-  const r = await f.updater.apply(plan.value.target);
-  assert.equal(r.ok, false);
-  assert.match(r.error, /could not be confirmed stopped: the installed app may still change/);
-  assert.ok(fs.existsSync(f.updater.lockDir), "the lock stays held");
-  assert.equal(fs.readFileSync(path.join(f.updater.lockDir, "pid"), "utf8").trim(), String(process.pid));
-});
-
-test("apply holds the install lock, hands the builder its token, and refuses a lock another holds", async () => {
-  const f = fixture();
-  f.stamp(f.head());
-  f.land("second");
-  const plan = await f.updater.plan();
-  assert.ok(plan.ok, plan.error);
-  // Held by a live holder (this test process): busy, and nothing moves or builds.
-  const before = git(f.src, "rev-parse", "HEAD");
-  fs.mkdirSync(f.updater.lockDir);
-  fs.writeFileSync(path.join(f.updater.lockDir, "pid"), `${process.pid}\n`);
-  fs.writeFileSync(path.join(f.updater.lockDir, "token"), "theirs\n");
-  const busy = await f.updater.apply(plan.value.target);
-  assert.equal(busy.ok, false);
-  assert.match(busy.error, /Another install or update is running/);
-  assert.equal(git(f.src, "rev-parse", "HEAD"), before);
-  assert.ok(!fs.existsSync(path.join(f.appHome, "builds")));
-  assert.equal(fs.readFileSync(path.join(f.updater.lockDir, "token"), "utf8").trim(), "theirs");
-  // Left by a holder that is gone: broken, and the update proceeds under its own.
-  const dead = execFileSync("/bin/sh", ["-c", "echo $$"], { encoding: "utf8" }).trim();
-  fs.writeFileSync(path.join(f.updater.lockDir, "pid"), `${dead}\n`);
-  const r = await f.updater.apply(plan.value.target);
+  assert.ok((await f.updater.apply(plan.value.target)).ok);
+  const r = f.updater.startInstaller(1234, true);
   assert.ok(r.ok, r.error);
-  const seen = fs.readFileSync(path.join(f.appHome, "lockseen"), "utf8").trim();
-  const m = /^handed=(\S+) lock=(\S+)$/.exec(seen);
-  assert.ok(m !== null && m[1] === m[2] && m[1] !== "theirs", `the builder saw ${seen}`);
-  assert.ok(!fs.existsSync(f.updater.lockDir), "released after the build");
+  assert.deepEqual(f.started, [
+    { file: "/bin/bash", args: [path.join(f.src, core.APP_INSTALLER_IN_SRC), "--wait-pid", "1234", "--relaunch"], log: f.updater.installLogFile },
+  ]);
+  f.updater.startInstaller(1234, false);
+  assert.deepEqual(f.started[1].args.slice(1), ["--wait-pid", "1234"]);
 });
 
-test("the installed copy's place agrees with scripts/lib.sh", () => {
-  const lib = path.join(here, "..", "..", "..", "scripts", "lib.sh");
-  const sh = (fn, ...args) =>
-    execFileSync("/bin/bash", ["-c", `. "$0"; ${fn} "$@"`, lib, ...args], { encoding: "utf8" }).trim();
+test("as the app quits: the real install step waits for it to exit, then swaps, stamps and relaunches", async () => {
+  const ran = path.join(work, `ran-${n}`);
+  const f = fixture({ starterEnv: { ...gitEnv, STUB_RAN: ran } });
+  const before = f.head();
+  f.stamp(before);
+  const tip = f.land("second");
+  const plan = await f.updater.plan();
+  assert.ok((await f.updater.apply(plan.value.target)).ok);
+  // The app: a process the install step must outwait.
+  const app = spawn("sleep", ["30"], { stdio: "ignore" });
+  const r = f.updater.startInstaller(app.pid, true);
+  assert.ok(r.ok, r.error);
+  await new Promise((res) => setTimeout(res, 600));
+  assert.equal(f.updater.installed(), before, "nothing is swapped while the app runs");
+  assert.ok(!fs.existsSync(path.join(f.installedDir, "id")));
+  app.kill("SIGKILL");
+  // The step stamps, then removes the staged copy: wait for both.
+  await until(() => f.updater.installed() === tip && f.updater.stagedCommit() === undefined, "the install step to finish");
+  assert.equal(fs.readFileSync(path.join(f.installedDir, "id"), "utf8").trim(), tip);
+  assert.equal(f.updater.stagedCommit(), undefined, "the staged copy is consumed");
+  await until(() => fs.existsSync(ran), "the relaunch");
+  assert.match(fs.readFileSync(f.updater.installLogFile, "utf8"), /installed Code Factory/);
+});
+
+test("the installed copy's place, the app home, staging and the exit statuses agree with scripts/lib.sh", () => {
+  const lib = path.join(repoRoot, "scripts", "lib.sh");
+  const sh = (script, ...args) => execFileSync("/bin/bash", ["-c", `. "$0"; ${script}`, lib, ...args], { encoding: "utf8" }).trim();
   for (const [uname, platform] of [["Darwin", "darwin"], ["Linux", "linux"]]) {
     const home = "/home/u x";
-    const dest = sh("app_default_dest", uname, home, `${home}/${core.APP_HOME_IN_HOME}`);
+    const dest = sh('app_default_dest "$1" "$2" "$3"', uname, home, `${home}/${core.APP_HOME_IN_HOME}`);
     assert.equal(dest, core.installedAppDir(platform, home));
-    assert.equal(sh("app_executable", uname, dest), core.installedExecutable(platform, home));
+    assert.equal(sh('app_executable "$1" "$2"', uname, dest), core.installedExecutable(platform, home));
   }
-  const lockName = execFileSync("/bin/bash", ["-c", '. "$0"; printf %s "$APP_LOCK_IN_APP_HOME"', lib], { encoding: "utf8" });
-  assert.equal(core.APP_LOCK_IN_HOME, `${core.APP_HOME_IN_HOME}/${lockName}`);
-});
-
-/** A pid that is certainly not running: a child that has exited and been reaped. */
-const deadPid = () => execFileSync("/bin/sh", ["-c", "echo $$"], { encoding: "utf8" }).trim();
-
-test("a builder killed by a signal is not reported as a timeout, and its group is stopped", async () => {
-  const f = fixture();
-  f.stamp(f.head());
-  f.land("killed", "KILLED");
-  const plan = await f.updater.plan();
-  assert.ok(plan.ok, plan.error);
-  const r = await f.updater.apply(plan.value.target);
-  assert.equal(r.ok, false);
-  assert.match(r.error, /was killed \(SIGKILL\), and every process it started has stopped/);
-  assert.doesNotMatch(r.error, /timed out/);
-  const sleeper = Number(fs.readFileSync(path.join(f.appHome, "sleeper"), "utf8"));
-  assert.ok(!alive(sleeper), `the build's child ${sleeper} outlived its killed builder`);
-  assert.ok(!fs.existsSync(f.updater.lockDir));
-});
-
-test("cancel (a quit mid-update) stops the build's whole group and waits for it", async () => {
-  const f = fixture();
-  f.stamp(f.head());
-  f.land("hangs", "SLOW");
-  const plan = await f.updater.plan();
-  assert.ok(plan.ok, plan.error);
-  const pending = f.updater.apply(plan.value.target);
-  const sleeperFile = path.join(f.appHome, "sleeper");
-  for (let i = 0; i < 200 && !fs.existsSync(sleeperFile); i++) await new Promise((r) => setTimeout(r, 25));
-  await f.updater.cancel();
-  assert.equal(f.updater.busy, false);
-  const r = await pending;
-  assert.equal(r.ok, false);
-  assert.match(r.error, /was cancelled, and every process it started has stopped/);
-  const sleeper = Number(fs.readFileSync(sleeperFile, "utf8"));
-  assert.ok(!alive(sleeper), `the build's child ${sleeper} outlived the cancel`);
-  assert.ok(!fs.existsSync(f.updater.lockDir));
-});
-
-test("a build that swapped but could not stamp (77) is an install to relaunch into, flagged unrecorded", async () => {
-  const f = fixture();
-  f.stamp(f.head());
-  f.land("unrecorded", "UNRECORDED");
-  const plan = await f.updater.plan();
-  assert.ok(plan.ok, plan.error);
-  const r = await f.updater.apply(plan.value.target);
-  assert.ok(r.ok, r.error);
-  assert.deepEqual(r.value, { target: plan.value.target, unrecorded: true });
-});
-
-test("plan's fetch holds the install lock: under a running install it fetches nothing", async () => {
-  const f = fixture();
-  f.stamp(f.head());
-  const tip = f.land("second");
-  fs.mkdirSync(f.updater.lockDir);
-  fs.writeFileSync(path.join(f.updater.lockDir, "pid"), `${process.pid}\n`);
-  fs.writeFileSync(path.join(f.updater.lockDir, "token"), "setup\n");
-  const r = await f.updater.plan();
-  assert.equal(r.ok, false);
-  assert.match(r.error, /Another install or update is running/);
-  assert.notEqual(git(f.src, "rev-parse", "origin/main"), tip, "nothing was fetched");
-  fs.rmSync(f.updater.lockDir, { recursive: true });
-  const again = await f.updater.plan();
-  assert.ok(again.ok, again.error);
-  assert.ok(!fs.existsSync(f.updater.lockDir), "plan releases the lock");
-});
-
-test("a lock whose holder died but whose builder still runs is live", () => {
-  const dir = path.join(fs.mkdtempSync(path.join(work, "lock-")), "lock");
-  fs.mkdirSync(dir);
-  fs.writeFileSync(path.join(dir, "pid"), `${deadPid()}\n`);
-  fs.writeFileSync(path.join(dir, "builder"), `${process.pid}\n`);
-  fs.writeFileSync(path.join(dir, "token"), "theirs\n");
-  const r = takeAppLock(dir);
-  assert.equal(r.ok, false);
-  assert.equal(fs.readFileSync(path.join(dir, "token"), "utf8").trim(), "theirs");
-  fs.rmSync(path.join(dir, "builder"));
-  const taken = takeAppLock(dir);
-  assert.ok(taken.ok, taken.error);
-});
-
-test("two runs breaking one stale lock: the loser puts the winner's fresh lock back", () => {
-  const dir = path.join(fs.mkdtempSync(path.join(work, "race-")), "lock");
-  // The loser read pid `dead` as the stale holder; meanwhile the winner broke it and took a fresh one.
-  const dead = deadPid();
-  fs.mkdirSync(dir);
-  fs.writeFileSync(path.join(dir, "pid"), `${process.pid}\n`);
-  fs.writeFileSync(path.join(dir, "token"), "winner\n");
-  assert.equal(breakStaleLock(dir, dead), false);
-  assert.equal(fs.readFileSync(path.join(dir, "token"), "utf8").trim(), "winner");
-  assert.deepEqual(fs.readdirSync(path.dirname(dir)), ["lock"], "nothing left aside");
-  // The lock it did judge stale is removed.
-  fs.writeFileSync(path.join(dir, "pid"), `${dead}\n`);
-  assert.equal(breakStaleLock(dir, dead), true);
-  assert.deepEqual(fs.readdirSync(path.dirname(dir)), []);
-});
-
-test("a lock it made but could not name its holder in is removed, not left to read busy for good", () => {
-  const dir = path.join(fs.mkdtempSync(path.join(work, "full-")), "lock");
-  const nodeFs = require("node:fs");
-  const real = nodeFs.writeFileSync;
-  nodeFs.writeFileSync = (file, ...rest) => {
-    if (String(file).startsWith(dir)) throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
-    return real(file, ...rest);
-  };
-  let r;
-  try {
-    r = takeAppLock(dir);
-  } finally {
-    nodeFs.writeFileSync = real;
-  }
-  assert.equal(r.ok, false);
-  assert.match(r.error, /could not take the install lock/);
-  assert.ok(!fs.existsSync(dir));
-});
-
-test("build-app.sh's exit statuses and the update's flag agree with scripts/lib.sh and the builder", () => {
-  const lib = path.join(here, "..", "..", "..", "scripts", "lib.sh");
-  const read = (name) => Number(execFileSync("/bin/bash", ["-c", `. "$0"; printf %s "$${name}"`, lib], { encoding: "utf8" }));
-  assert.deepEqual(
-    { busy: read("APP_BUILD_EXIT_BUSY"), running: read("APP_BUILD_EXIT_RUNNING"), unrecorded: read("APP_BUILD_EXIT_UNRECORDED") },
-    { ...core.BUILD_EXIT },
-  );
-  const builder = fs.readFileSync(path.join(here, "..", "..", "..", "scripts", "build-app.sh"), "utf8");
-  assert.ok(builder.includes(`${core.BUILD_REPLACING_RUNNING}) replacing_running=1`));
+  const appHome = execFileSync("/bin/bash", ["-c", '. "$0"; app_default_home', lib], { encoding: "utf8", env: { ...process.env, HOME: "/h" } }).trim();
+  assert.equal(appHome, `/h/${core.APP_HOME_IN_HOME}`);
+  assert.equal(`${core.APP_HOME_IN_HOME}/${sh('printf %s "$APP_STAGED_IN_APP_HOME"')}`, core.APP_STAGED_IN_HOME);
+  assert.deepEqual({ busy: Number(sh('printf %s "$APP_EXIT_BUSY"')), running: Number(sh('printf %s "$APP_EXIT_RUNNING"')) }, { ...core.BUILD_EXIT });
 });

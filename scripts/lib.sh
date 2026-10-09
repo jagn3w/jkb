@@ -1695,9 +1695,8 @@ render_setup_summary() {
                     installed)  printf '  • app:        Code Factory installed at %s; it updates itself (jkb ▸ Update from main…)\n' "$detail" ;;
                     unchanged)  printf '  • app:        Code Factory at %s is already main'"'"'s tip\n' "$detail" ;;
                     no-builder) printf '  • app:        NOT installed: origin/main has no scripts/build-app.sh yet\n' ;;
-                    running)    printf '  • app:        NOT updated: Code Factory is running from %s; use jkb ▸ Update from main…, or quit it and re-run setup.sh\n' "$detail" ;;
-                    busy)       printf '  • app:        NOT updated: another install or the app'"'"'s own update is running (see the warnings above)\n' ;;
-                    unrecorded) printf '  • app:        Code Factory installed at %s, but its stamp could not be written (see the warnings above); the next install re-stamps it\n' "$detail" ;;
+                    running)    printf '  • app:        NOT updated: quit Code Factory (running from %s) and re-run setup.sh to update it, or use its jkb ▸ Update from main…\n' "$detail" ;;
+                    busy)       printf '  • app:        NOT updated: another build or install of Code Factory holds its lock (see the warnings above)\n' ;;
                     skipped)    printf '  • app:        skipped (--no-app)\n' ;;
                     failed)     printf '  • app:        NOT installed; see the warnings above (an installed copy is unchanged)\n' ;;
                     *)          warn "unrecognised app state: $line" ;;
@@ -2099,10 +2098,10 @@ EOF
 # The desktop app runs unsandboxed on the host and opens host terminals, so it is never run from a
 # checkout an agent can write. It is built from a CLEAN CLONE of origin/main under the account's
 # ~/.local/share/jkb-app (which the dev container does not mount), by that clone's own
-# scripts/build-app.sh, and copied into place. setup.sh calls `app_clone_refresh` and then the
-# clone's builder; the app's *Update from main…* moves the clone itself (ui/app/src/main/update.ts)
-# and runs the same builder. Here rather than inline for the reason every setup.sh section moved
-# here: scripts/tests/app-install.test.sh drives these against real repositories.
+# scripts/build-app.sh into a staging directory, and swapped into place by the clone's
+# scripts/install-app.sh only while no copy is running (see "staging, and the one install step"
+# below). Here rather than inline for the reason every setup.sh section moved here:
+# scripts/tests/app-install.test.sh drives these against real repositories.
 
 # The ref an install takes, and the refspec that fetches main into it. ui/core/src/update.ts names
 # the same two (UPDATE_REF, UPDATE_REFSPEC) for the app's side.
@@ -2207,6 +2206,34 @@ app_default_dest() {
         *)      printf '%s\n' "$3/app" ;;
     esac
 }
+# app_default_home — the app's home: the clone, the stamp, staging, the lock. ui/core's
+# APP_HOME_IN_HOME names the same place; the app identifies its installed copy by it.
+app_default_home() {
+    printf '%s\n' "$HOME/.local/share/jkb-app"
+}
+
+# app_check_home <app-home> — whether build-app.sh / install-app.sh may use <app-home>: absolute,
+# and the default unless JKB_APP_BUILD_TEST=1 (the tests). Anywhere else, the app installed there
+# would refuse to start and the stamp would vouch for a place no update installs to.
+app_check_home() {
+    case "$1" in /*) ;; *) warn "--app-home must be an absolute path: $1"; return 1 ;; esac
+    if [ "$1" != "$(app_default_home)" ] && [ "${JKB_APP_BUILD_TEST:-}" != 1 ]; then
+        warn "--app-home other than $(app_default_home) is for the tests: the app runs only from there"
+        return 1
+    fi
+}
+
+# app_scrub_env — drop git's repository selection and Electron's variables from this shell, for
+# every step it runs: the post-merge hook hands setup.sh a GIT_DIR naming the merged repository,
+# which pnpm's lifecycle scripts and git-hosted dependencies would act on, and an ELECTRON_* from the
+# app would make a child Electron run as Node.
+app_scrub_env() {
+    local v
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    for v in $(compgen -e); do
+        case "$v" in ELECTRON_*) unset "$v" ;; esac
+    done
+}
 
 # app_executable <uname -s> <dest> — the program a running copy of the app installed at <dest> is:
 # what `ps` shows for it, and what the app compares its own executable with (ui/core/src/update.ts,
@@ -2218,139 +2245,112 @@ app_executable() {
     esac
 }
 
-# app_running <uname -s> <dest> — whether a process is running the app installed at <dest>: 0 yes,
-# 1 no, 2 cannot tell (no `ps`). A running Electron app finds its helpers (renderer, GPU, the
-# node-pty helper) BY PATH when it spawns them, so a swap under it makes it load the new bundle's
-# helpers into the old browser process. Only the app's own update swaps under a running copy, and it
-# quits the moment the swap is done.
+# app_running <uname -s> <dest> — whether any process is running the app installed at <dest> (its
+# main process or a helper, which Electron starts from the same bundle): 0 yes, 1 no, 2 cannot tell
+# (no `ps`). `-ww`: BSD ps cuts `args` to the terminal's width otherwise, and the path is long.
 app_running() {
     local exe procs
     exe="$(app_executable "$1" "$2")"
-    procs="$(ps -A -o args= 2>/dev/null)" || return 2
+    procs="$(ps -ww -A -o args= 2>/dev/null)" || return 2
     case "$procs" in
         *"$exe"*) return 0 ;;
     esac
     return 1
 }
 
-# --- the app lock -------------------------------------------------------------------------------
-# One install at a time: the clone's checkout and clean, the build's `rm -rf app/dist`, the swap and
-# the stamp all act on shared state under <app-home>, and two runs interleaved can install a
-# half-built app or stamp A over B's app. Held by whoever starts the work — install_app (setup.sh),
-# the app's update (ui/app/src/main/update.ts, which takes the same lock the same way), or
-# build-app.sh run by hand — and RECOGNISED, not retaken, by the build-app.sh such a holder runs:
-# the holder passes the lock's token in $JKB_APP_LOCK_TOKEN, and build-app.sh proceeds only when the
-# lock it finds carries that token.
+# --- staging, and the one install step ------------------------------------------------------------
+# A running app is NEVER swapped under: Electron loads its helpers from the bundle by path, so the
+# old process would run the new bundle's. So building and installing are two steps:
+#   build-app.sh     builds main into <app-home>/staged ({app/, commit}); touches nothing installed
+#   install-app.sh   the ONE place that swaps: only when no copy is running, staged -> dest, stamp
+# setup.sh runs both when the app is not running (`install_app`); the app's *Update from main…* runs
+# the build, then on quit starts install-app.sh detached to wait for it to exit, swap and relaunch.
 #
-# `mkdir` is the lock (atomic everywhere; macOS has no flock(1)). It holds `pid` (the holder),
-# `token`, and `builder` — the pid of the build-app.sh that recognised it — so a lock stays live while
-# EITHER runs: a holder that quits or is killed mid-build (the app, setup.sh) leaves its builder
-# running, and that build must not be broken under. A lock neither of whose pids is running was left
-# by runs that died: `_app_lock_break` moves it aside under a name of its own, checks it is the dead
-# holder's, and only then removes it; if it is not (another run broke the stale lock and took a fresh
-# one first), it is renamed back. A lock with no pid yet is a holder between its mkdir and its write,
-# and is busy.
+# The staging lock: both steps, and setup.sh's clone refresh, act on the clone and the staging dir,
+# so they hold `<app-home>/lock`, a plain `mkdir` lock. Its holder hands its `token` to the step it
+# runs in JKB_APP_LOCK_TOKEN, and that step proceeds under it instead of taking it again. There is
+# no stale-lock breaking: a lock left by a run that died is reported with its path, to remove by hand.
 APP_LOCK_IN_APP_HOME=lock
+APP_STAGED_IN_APP_HOME=staged
 
-# build-app.sh's exit statuses past plain failure (its header says what each means; @jkb/core's
-# BUILD_EXIT names the same three, and a test holds them together).
-APP_BUILD_EXIT_BUSY=75
-APP_BUILD_EXIT_RUNNING=76
-APP_BUILD_EXIT_UNRECORDED=77
+# The exit statuses past plain failure, of both steps (@jkb/core's BUILD_EXIT names the same):
+# another build or install holds the lock; a copy of the app is running, so nothing was swapped.
+APP_EXIT_BUSY=75
+APP_EXIT_RUNNING=76
 
-# _app_lock_live <lock> — whether the holder or its builder is running.
-_app_lock_live() {
-    local p
-    for p in "$(cat "$1/pid" 2>/dev/null)" "$(cat "$1/builder" 2>/dev/null)"; do
-        case "$p" in ''|*[!0-9]*) continue ;; esac
-        kill -0 "$p" 2>/dev/null && return 0
-    done
-    return 1
-}
-
-# _app_lock_break <lock> <pid> — remove <lock>, which was read as held by the dead <pid>, unless it
-# has since become somebody else's. Returns 1 when it has (and leaves theirs where it was).
-_app_lock_break() {
-    local lock="$1" pid="$2" aside
-    aside="$lock.stale.$$.$RANDOM"
-    mv "$lock" "$aside" 2>/dev/null || return 1
-    if [ "$(cat "$aside/pid" 2>/dev/null)" != "$pid" ]; then
-        # Not the lock we judged stale: another run broke that one and took this. Put it back. $lock
-        # is absent (we just moved it), unless a third run mkdir'd in this instant; then theirs stays
-        # and this one is left aside, the residual this cannot close without a second lock.
-        [ -e "$lock" ] || mv "$aside" "$lock" 2>/dev/null
-        return 1
-    fi
-    rm -rf "$aside"
-}
-
-# app_lock <app-home> — take the lock, or recognise the caller's. Sets `app_lock_token` and
-# `app_lock_taken` (1 when this call took it, so the matching app_unlock releases it; 0 when the
-# caller holds it, in which case this process is recorded as its `builder`). Returns 1, saying who
-# holds it, when it is busy.
+# app_lock <app-home> — take the lock, or proceed under the caller's (its token in
+# JKB_APP_LOCK_TOKEN). Sets `app_lock_token`, and `app_lock_taken` (1 when this call took it, so the
+# matching app_unlock releases it). Returns 1 when another run holds it, 2 on any other error.
 app_lock() {
-    local lock="$1/$APP_LOCK_IN_APP_HOME" pid
+    local lock="$1/$APP_LOCK_IN_APP_HOME"
     app_lock_taken=0
     app_lock_token="${JKB_APP_LOCK_TOKEN:-}"
     if [ -n "$app_lock_token" ] && [ "$(cat "$lock/token" 2>/dev/null)" = "$app_lock_token" ]; then
-        printf '%s\n' "$$" >"$lock/builder" || { warn "could not write $lock/builder"; return 1; }
         return 0
     fi
-    mkdir -p "$1" || return 1
+    mkdir -p "$1" || { warn "could not create $1"; return 2; }
     if ! mkdir "$lock" 2>/dev/null; then
-        pid="$(cat "$lock/pid" 2>/dev/null)" || pid=""
-        case "$pid" in ''|*[!0-9]*) warn "another install holds $lock (it names no holder yet); if none is running, remove it"; return 1 ;; esac
-        if _app_lock_live "$lock"; then
-            warn "another install or update (pid $pid) holds $lock; if none is running, remove it"
+        if [ -d "$lock" ]; then
+            warn "another build or install of Code Factory holds $lock (pid $(cat "$lock/pid" 2>/dev/null || echo '?')); if none is running, remove it"
             return 1
         fi
-        _app_lock_break "$lock" "$pid" || { warn "another install is taking $lock"; return 1; }
-        mkdir "$lock" 2>/dev/null || { warn "another install took $lock"; return 1; }
+        warn "could not create $lock"
+        return 2
     fi
     app_lock_token="$$.$RANDOM.$RANDOM.$(date +%s)"
     if ! printf '%s\n' "$app_lock_token" >"$lock/token" || ! printf '%s\n' "$$" >"$lock/pid"; then
         rm -rf "$lock"
         warn "could not write $lock"
-        return 1
+        return 2
     fi
     app_lock_taken=1
 }
 
-# app_unlock <app-home> — release the lock, if app_lock took it and it is still this holder's.
+# app_unlock <app-home> — release the lock, if app_lock took it.
 app_unlock() {
-    local lock="$1/$APP_LOCK_IN_APP_HOME"
     [ "${app_lock_taken:-0}" = 1 ] || return 0
     app_lock_taken=0
-    [ "$(cat "$lock/token" 2>/dev/null)" = "$app_lock_token" ] && rm -rf "$lock"
+    [ "$(cat "$1/$APP_LOCK_IN_APP_HOME/token" 2>/dev/null)" = "$app_lock_token" ] && rm -rf "${1:?}/$APP_LOCK_IN_APP_HOME"
     return 0
 }
 
-# install_app <checkout> <app-home> — setup.sh's app step: move the clone to origin/main, then run
-# THE CLONE'S build-app.sh (never <checkout>'s), under the app lock. Reports, so it returns 0 and
-# sets `app_state`:
+# app_staged_commit <app-home> — the commit staged for install, or nothing.
+app_staged_commit() {
+    local c
+    [ -d "$1/$APP_STAGED_IN_APP_HOME/app" ] || return 0
+    c="$(cat "$1/$APP_STAGED_IN_APP_HOME/commit" 2>/dev/null)" || return 0
+    case "$c" in *[!0-9a-f]*|'') return 0 ;; esac
+    [ "${#c}" -eq 40 ] && printf '%s\n' "$c"
+    return 0
+}
+
+# install_app <checkout> <app-home> — setup.sh's app step, under the lock: move the clone to
+# origin/main, then run THE CLONE'S build-app.sh and install-app.sh (never <checkout>'s). Reports, so
+# it returns 0 and sets `app_state`:
 #   installed   built and installed origin/main's tip now
 #   unchanged   that tip is already installed (stamped, and the app is where it was put)
-#   running     the installed app is running, so nothing was swapped under it (see app_running);
-#               its own *Update from main…* takes the same tip, or quit it and re-run setup.sh
-#   busy        another install or the app's own update holds the lock
-#   unrecorded  the app was swapped in but its stamp could not be written (see the warnings)
-#   no-builder  origin/main has no scripts/build-app.sh yet: it predates the installed copy
+#   running     Code Factory is running: nothing is built or swapped; quit it and re-run setup.sh
+#               (or use its own *Update from main…*, which installs on quit)
+#   busy        another build or install holds the lock
+#   no-builder  origin/main has no scripts/build-app.sh + install-app.sh yet
 #   failed      anything else, said on stderr; an installed app is left as it was
 # The unchanged arm is what keeps this cheap: setup.sh runs after every pull that touches ui/.
 install_app() {
-    local checkout="$1" app_home="$2"
+    local checkout="$1" app_home="$2" rc=0
     app_state=failed
-    if ! app_lock "$app_home"; then
-        app_state=busy
-        return 0
-    fi
+    app_lock "$app_home" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) app_state=busy; return 0 ;;
+        *) return 0 ;;
+    esac
     _install_app_locked "$checkout" "$app_home"
     app_unlock "$app_home"
     return 0
 }
 
 _install_app_locked() {
-    local checkout="$1" app_home="$2" src tip os dest
+    local checkout="$1" app_home="$2" src tip os dest rc=0
     src="$app_home/src"
     os="$(uname -s)"
     dest="$(app_default_dest "$os" "$HOME" "$app_home")"
@@ -2360,23 +2360,20 @@ _install_app_locked() {
         app_state=unchanged
         return 0
     fi
-    if [ ! -f "$src/scripts/build-app.sh" ]; then
+    if [ ! -f "$src/scripts/build-app.sh" ] || [ ! -f "$src/scripts/install-app.sh" ]; then
         app_state=no-builder
         return 0
     fi
-    case "$(app_running "$os" "$dest"; echo $?)" in
-        0) app_state=running; return 0 ;;
-        2) warn "could not tell whether Code Factory is running (no ps); if it is, restart it after this" ;;
-    esac
-    # Checked here too, to skip a build that could not be swapped in; build-app.sh checks again right
-    # before its swap, since the app may be started while it builds.
-    local rc=0
-    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home" || rc=$?
+    # Not even built while it runs: install-app.sh would refuse the swap anyway.
+    if app_running "$os" "$dest"; then
+        app_state=running
+        return 0
+    fi
+    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home" || return 0
+    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/install-app.sh" --app-home "$app_home" || rc=$?
     case "$rc" in
         0) app_state=installed ;;
-        "$APP_BUILD_EXIT_BUSY") app_state=busy ;;
-        "$APP_BUILD_EXIT_RUNNING") app_state=running ;;
-        "$APP_BUILD_EXIT_UNRECORDED") app_state=unrecorded ;;
+        "$APP_EXIT_RUNNING") app_state=running ;;
     esac
     return 0
 }
@@ -2392,21 +2389,24 @@ app_installed_dest() {
     done <"$1/installed"
 }
 
-# app_swap <built> <dest> <app-home> — install the directory <built> at <dest>.
+# app_stamp <app-home> <commit> <dest> — write <app-home>/installed whole (`commit=`, `dest=`).
+app_stamp() {
+    { printf '%s\n' "commit=$2" "dest=$3" >"$1/installed.tmp" && mv -f "$1/installed.tmp" "$1/installed"; } 2>/dev/null
+}
+
+# app_swap <built> <dest> <app-home> — install the directory <built> at <dest>. Callers make sure no
+# copy is running (install-app.sh is the one caller).
 #
 # Only over what jkb installed: something already at <dest> is replaced only when <app-home>'s stamp
 # says jkb installed the app there. Anything else (a hand-built app, a copy from elsewhere) refuses,
-# so jkb never moves aside — and later deletes — what it cannot show it wrote.
+# so jkb never moves aside — and later deletes — what it cannot show it wrote. Before anything moves,
+# the stamp is rewritten to name <dest> (keeping the commit it named), so that if the stamp cannot be
+# completed after the swap, it still vouches for <dest> and the next install replaces it.
 #
 # Copied beside <dest> first, so a failed copy leaves the installed app as it was; then the installed
 # one is MOVED to <app-home>/previous (replacing the older one there, which an earlier stamped swap
 # put there) and the copy renamed into place. <previous> is the one-step rollback. If the final rename
 # fails, the old app is moved back.
-#
-# The swap does NOT make a running copy safe: it keeps its open files, but finds its helpers by path
-# when it spawns them, and after the rename those are the new bundle's. That is why build-app.sh checks
-# app_running right before calling this (unless the caller is the running copy, --replacing-running),
-# and why the app's own update relaunches as soon as this returns.
 app_swap() {
     local built="$1" dest="$2" app_home="$3" prev new moved=0
     prev="$app_home/previous"
@@ -2416,6 +2416,10 @@ app_swap() {
     fi
     if { [ -e "$dest" ] || [ -L "$dest" ]; } && [ "$(app_installed_dest "$app_home")" != "$dest" ]; then
         warn "$dest exists and jkb's stamp ($app_home/installed) does not say jkb installed it; move it aside and re-run"
+        return 1
+    fi
+    if ! app_stamp "$app_home" "$(app_installed_commit "$app_home")" "$dest"; then
+        warn "could not write $app_home/installed; nothing was installed"
         return 1
     fi
     new="$dest.new.$$"

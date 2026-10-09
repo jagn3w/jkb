@@ -140,108 +140,104 @@ runs from an agent-writable checkout.**
   (`~/.local/share/jkb-app/src`, never a worktree an agent can write) and install the packaged
   app (`electron-builder`) to `~/Applications` (macOS) / `~/.local/share/jkb-app` (Linux).
 - **In-app update** (menu: *jkb ▸ Update from main…*): fetch `origin/main` into that clone, show
-  the commit range being taken, build, then swap and relaunch. `main` is code that passed review
+  the commit range being taken, build, then install it as the app quits and relaunch (as built:
+  never swapped while it runs, below). `main` is code that passed review
   and landed; the lockfile is frozen (`--frozen-lockfile`). The update never builds from a branch
   or worktree.
 - Running from a checkout (`pnpm --filter @jkb/app dev`) refuses unless
   `JKB_APP_FROM_CHECKOUT=1` — the same opt-in `run.sh` uses — so it is a deliberate developer
   act, never the default.
 
-**As built (subtask 10).** Four pieces, one rule: what is installed is built by the clone's own
-code, at `origin/main`, and a checkout never gets a say.
+**As built (subtask 10, restructured after review round 3).** One rule above all: **a running app
+is never swapped.** An Electron app finds its helpers (renderer, GPU, node-pty's) *by path* when it
+spawns them, so a bundle replaced under a running copy makes the old browser process run the new
+bundle's helpers. So building and installing are two steps, and only one of them touches the
+installed app:
 
-- **`scripts/lib.sh`** holds the shell half, so `scripts/tests/app-install.test.sh` drives it against
-  real repositories: `app_clone_refresh` (clone from the checkout's `origin` on first use only — after
-  that the clone's own `origin` is fetched, so a checkout cannot redirect it later; fetch
-  `+refs/heads/main:refs/remotes/origin/main`; detach there with `--force`; `git clean -ffd`, which
-  keeps ignored build state such as `node_modules`), `app_clone_check` (HEAD is `origin/main`'s tip and
-  nothing is changed or untracked), `app_swap`, and `install_app`, setup.sh's step. setup.sh runs it
-  after the kit (`--no-app` skips it); it is `unchanged`, and builds nothing, when the stamp already
-  names `main`'s tip and the app is where it was put — setup.sh runs after every pull touching `ui/`.
-  It is `running`, and builds nothing, when a process is running the installed executable
-  (`app_running`, from `ps`): the app's own update takes the same tip. build-app.sh checks again
-  right before its swap (below), so an app started during the build is not swapped under either.
-- **One install at a time** (review round 1). The clone's checkout and clean, the build's
-  `rm -rf app/dist`, the swap and the stamp are shared state; a post-merge `setup.sh` during an
-  in-app update could otherwise install a half-built app or stamp A over B's app. `<app-home>/lock`
-  is a `mkdir` lock (no flock(1) on macOS) holding `pid` and `token`, taken by whoever starts an
-  install — `install_app`, the app's update (`takeAppLock`, the same protocol in TypeScript; its
-  *plan* holds it too, because the fetch moves the `origin/main` an install's builder checks), or
-  `build-app.sh` run by hand — and *recognised* by the `build-app.sh` such a holder runs, through
-  the token in `JKB_APP_LOCK_TOKEN`; that builder records its own pid as `builder`, and the lock is
-  live while either pid runs (round 2: a holder that quit or was killed mid-build left its builder
-  running under a lock that read as stale). A run that finds it held is `busy` (setup.sh), exits 75
-  (build-app.sh) or says so (the app). A lock neither of whose pids runs is moved aside under a name
-  of its own and checked to be that holder's before it is removed; if another run broke it and took
-  a fresh one first, that one is renamed back (round 2: it was left aside, unlocking the winner).
-  *Residual, stated:* a third run that mkdirs the lock in the instant between the two renames keeps
-  it, and the winner's is left aside; a holder whose pid has been reused looks alive, and the
-  message names the lock to remove.
-- **`scripts/build-app.sh`**, run only as the clone's copy, first drops git's six repository-selection
-  variables and every `ELECTRON_*` for every caller (the post-merge hook hands setup.sh a `GIT_DIR`,
-  which pnpm's lifecycle scripts would act on). It refuses unless its own repository *is*
-  `<app-home>/src` and `app_clone_check` passes, so a checkout's or worktree's copy builds nothing,
-  and holds the lock throughout. Then `pnpm install --frozen-lockfile`, `pnpm --filter "@jkb/app..."
-  run build` (each package type-checks before it emits), the commit written to `ui/app/out/commit`
-  (packed with `out/**`, so the app knows what *it* is), `pnpm --filter @jkb/app run package`
-  (`electron-builder --dir`, `ui/app/electron-builder.yml`), a check that no copy is running from
-  the destination (exit 76; only the app's own update passes `--replacing-running`, since it is that
-  copy and relaunches at once), the swap, and last the stamp `<app-home>/installed` (`commit=<sha>`,
-  `dest=<path>`). A stamp it cannot write after the swap exits 77 — *installed but unrecorded*, which
-  setup.sh reports as `unrecorded` and the app relaunches into — never the plain failure that means
-  "unchanged". It installs only at `app_default_dest`, the place the app's identity check accepts:
-  `--dest` exists for the tests alone (`JKB_APP_BUILD_TEST=1`), since a copy installed elsewhere
-  refuses to start and its stamp would make every later install refuse the real one (round 2). On
-  Linux it writes a desktop entry.
-- **Where things go:** `~/.local/share/jkb-app/{src,installed,update.log,previous,lock}`; the app at
-  `~/Applications/Code Factory.app` (macOS) or `~/.local/share/jkb-app/app/code-factory` (Linux).
-- **The swap replaces only what jkb installed.** Something already at the destination is replaced
-  only when the stamp's `dest=` names it; a hand-built or foreign app there refuses, so jkb never
-  moves aside (and later deletes) what it cannot show it wrote. The copy is made beside the
-  destination first (a failed copy changes nothing), the installed app is moved to `previous/` (the
-  one-step rollback) and the copy renamed in. A failed rename moves the old one back.
-- **A swap does not leave a running copy whole.** *Corrected in review round 1:* this said the
-  running app "keeps reading its files until it relaunches". It keeps the files it has open, but an
-  Electron app finds its helpers (renderer, GPU, node-pty's) by path when it spawns them, so after
-  the rename it loads the new bundle's helpers into the old browser process. So build-app.sh does
-  not swap under a running copy unless that copy asked it to, and the in-app update relaunches the
-  moment the build returns.
-- **In the app**, `src/main/update.ts` (`AppUpdater`) and `@jkb/core`'s `update.ts` (paths, the stamp,
-  the commit log, the confirmation's words, `checkoutRefusal`, and `installedAppDir` /
-  `installedExecutable`, which a test holds equal to lib.sh's `app_default_dest` / `app_executable`).
-  *jkb ▸ Update from main…* (on macOS the second menu, after the app menu Apple names after the app)
-  runs only as the installed copy — its executable, links resolved, is `installedExecutable` — since
-  the builder installs there and main relaunches what is running: from anywhere else it would rebuild
-  that place, relaunch this copy unchanged, and report "up to date" for good. It fetches, shows
-  `installed..origin/main` with its commits, where *installed* is the commit built into the running
-  copy (`out/commit`) and only failing that the stamp — the stamp says what was last installed, not
-  what is running — saying so when that commit is not an ancestor, i.e. `main` was rewritten. On a
-  yes it takes the lock, checks that `origin/main` is still the commit it showed, moves the clone
-  there, cleans it, runs the clone's `build-app.sh` with the lock's token, requires the stamp to name
-  that commit (or the builder's 77, said in a dialog), then `app.relaunch()` and `app.quit()` (so
-  `will-quit` ends the terminals and feeds). A build that fails says the installed app is unchanged
-  and leaves its output in `update.log`. **Quitting mid-update cancels it** (`before-quit` waits for
-  `AppUpdater.cancel`, which stops the build's group) rather than leaving it to swap and stamp with
-  nothing to relaunch.
-- **A timeout stops everything the build started.** Each run is its own process group (`detached`),
-  and a timeout sends the group SIGTERM, then SIGKILL, then polls until it is gone; killing only
-  `bash` (as `execFile`'s timeout did) left pnpm, electron-builder and the swap running on to swap and
-  stamp after the app said the build had failed. The same happens when the builder is cancelled or
-  killed by a signal from outside (the OOM killer), and the result says which (`timedOut`,
-  `cancelled`, `signal`). The app says the build "stopped" only when the runner confirmed the group
-  gone (`survivors: false`), and then not "unchanged" (it may have been stopped mid-swap; `previous/`
-  holds the replaced app); otherwise it says the installed app may still change and keeps the lock.
-- **The environment.** Git and the builder run with Electron's variables and git's repository
-  selection stripped, so a launching shell's `GIT_DIR` cannot point the fetch elsewhere, and with
-  `GIT_TERMINAL_PROMPT=0`, as lib.sh's fetch of the same refspec has: a credential prompt on the
-  terminal the app was started from would hang the update instead of failing it.
-- **The refusal is in main**, before any window: unless it is the installed copy — packaged, *and*
-  its executable is `installedExecutable` — or `JKB_APP_FROM_CHECKOUT=1` is set, it prints why and
-  exits 1. One check covers `dev`, `start`, any other way of running `out/` from a checkout, and a
-  package electron-builder left in a checkout's `dist/` (`app.isPackaged` alone let that run:
-  review round 1). A copy moved elsewhere, such as `/Applications`, is refused the same way and the
-  message names the installed copy. The Electron smoke sets the variable, and has a case that the
-  build refuses without it.
+- **`scripts/build-app.sh` builds and STAGES; it installs nothing.** Run only as the clean clone's
+  copy (it refuses unless its own repository *is* `<app-home>/src` and `app_clone_check` passes —
+  HEAD is `origin/main`'s tip, nothing changed or untracked). It first drops git's six
+  repository-selection variables and every `ELECTRON_*` for every caller (`app_scrub_env`: the
+  post-merge hook hands setup.sh a `GIT_DIR`, which pnpm's lifecycle scripts would act on). Then
+  `pnpm install --frozen-lockfile`, `pnpm --filter "@jkb/app..." run build` (each package
+  type-checks before it emits), the commit written to `ui/app/out/commit` (packed with `out/**`, so
+  the app knows what *it* is), `pnpm --filter @jkb/app run package` (`electron-builder --dir`), and
+  the result copied whole to `<app-home>/staged/{app,commit}` (built beside and renamed, replacing
+  any earlier or abandoned staged copy). `--update-to SHA` is the app's way in: under the lock it
+  fetches `main`, refuses unless the tip is SHA (the commit the user was shown), moves and cleans
+  the clone, and builds with *that* commit's copy of the script.
+- **`scripts/install-app.sh` is the one step that swaps,** and only while no copy is running
+  (`app_running`, from `ps -ww -A -o args=` — `-ww` because BSD ps otherwise cuts the path to the
+  terminal width; it matches the executable at `app_executable`, `…/Contents/MacOS/Code Factory`
+  on macOS and `…/code-factory` elsewhere, which Electron's helpers share). If one runs it swaps
+  nothing, keeps the staged copy, and exits 76. Otherwise `app_swap` (below) puts `staged/app` at
+  the one place the app runs from, the stamp `<app-home>/installed` (`commit=`, `dest=`) names it,
+  the staged copy is removed, and on Linux a desktop entry is written. `--wait-pid PID` first waits
+  (up to two minutes) for PID and every copy of the app to exit; `--relaunch` then starts the app —
+  the new one, or the old one when nothing could be installed — unless a copy is running.
+- **setup.sh (`install_app`)**: under the lock, `app_clone_refresh` (clone from the checkout's
+  `origin` on first use only — after that the clone's own `origin` is fetched, so a checkout cannot
+  redirect it; fetch `+refs/heads/main:refs/remotes/origin/main`; detach there with `--force`;
+  `git clean -ffd`, which keeps ignored build state such as `node_modules`), then the clone's
+  `build-app.sh` and `install-app.sh`. It is `unchanged`, building nothing, when the stamp names
+  `main`'s tip and the app is where it was put (setup.sh runs after every pull touching `ui/`);
+  **`running`, building nothing, when the app is running** — the summary says to quit Code Factory
+  and re-run setup.sh (or use its own update) — and `busy` when the lock is held.
+- **The app (*jkb ▸ Update from main…*, `src/main/update.ts`)** runs only as the installed copy
+  (its executable, links resolved, is `installedExecutable`; anywhere else it would install there
+  and leave itself "up to date" for good). It fetches `main` into `refs/jkb-app/shown` — a ref no
+  build or install reads, with `--refmap=` so git does not also move `origin/main`
+  "opportunistically" (measured: without it the plan's fetch moved `origin/main`), so it needs no
+  lock — and shows `installed..main`, where *installed* is the running copy's `out/commit` and only
+  failing that the stamp. On a yes it runs `build-app.sh --update-to <sha>` while the app keeps
+  working, requires the staged commit to be that sha, and asks *Quit and Install* or *Install When
+  I Quit*. On `will-quit` it starts `install-app.sh --wait-pid <its pid> [--relaunch]` detached
+  (output in `<app-home>/install.log`). Quitting during a build abandons nothing that matters: the
+  build finishes staging, and the next update or setup.sh rebuilds over it.
+- **The staging lock** is `<app-home>/lock`, a plain `mkdir` with `token` and `pid`, held by
+  `build-app.sh`, `install-app.sh` and `install_app` (which hands its token to the two scripts in
+  `JKB_APP_LOCK_TOKEN`, so they proceed under it). It serializes the clone, the staging directory
+  and the swap. There is **no stale-lock breaking**: a lock left by a run that died is reported,
+  with its path, for the operator to remove. Busy is exit 75 in both scripts; any other lock error
+  is a plain failure.
+- **The swap replaces only what jkb installed.** `app_swap` replaces something already at the
+  destination only when the stamp's `dest=` names it (a hand-built or foreign app refuses, so jkb
+  never moves aside, and later deletes, what it cannot show it wrote). Before anything moves it
+  rewrites the stamp to name the destination (keeping the old commit), so if the final stamp then
+  cannot be written the app is still jkb's and the next install, seeing a stale commit, replaces
+  it. A stamp that cannot be written at all refuses the swap. The copy is made beside the
+  destination first, the old app moved to `previous/` (the one-step rollback), the copy renamed in;
+  a failed rename moves the old one back.
+- **One place to install, and it is the place the app accepts.** `--dest` (install-app.sh) and an
+  `--app-home` other than `~/.local/share/jkb-app` (both scripts) are for the tests only
+  (`JKB_APP_BUILD_TEST=1`): a copy installed anywhere else refuses to start, and a stamp naming it
+  would make every later install refuse the real one. The app's `installedAppDir` /
+  `installedExecutable` and lib.sh's `app_default_dest` / `app_executable` / `app_default_home` are
+  held equal by a test, as are the exit statuses (`BUILD_EXIT`, `APP_EXIT_*`).
+- **Where things go:** `~/.local/share/jkb-app/{src,staged,installed,update.log,install.log,previous,lock}`;
+  the app at `~/Applications/Code Factory.app` (macOS) or `~/.local/share/jkb-app/app/code-factory`
+  (Linux).
+- **The app's processes.** Git and the builder run with Electron's variables and git's repository
+  selection stripped and `GIT_TERMINAL_PROMPT=0` (a credential prompt on the terminal the app was
+  started from would hang rather than fail), `HOME` the account's. Each build is its own process
+  group, and a timeout stops the whole group (SIGTERM, then SIGKILL); `describeEnd` words a timeout,
+  a signal and an exit apart. A build that fails installs nothing, because a build never installs.
+- **The refusal is in main**, before any window (`startupRefusal`, a plain function under test):
+  unless it is the installed copy — packaged, *and* its executable is `installedExecutable` — or
+  `JKB_APP_FROM_CHECKOUT=1` is set, it prints why and exits 1. One check covers `dev`, `start`, any
+  other way of running `out/` from a checkout, a package electron-builder left in a checkout's
+  `dist/` (`app.isPackaged` alone let that run), and a copy moved elsewhere such as
+  `/Applications`; the message names the installed copy. The Electron smoke sets the variable, and
+  has a case that the build refuses without it.
+- ~~**The lock-supervised in-place update** (review rounds 1–2).~~ *Superseded, review round 3.*
+  The first design swapped the app in place while it ran and relaunched at once; making that safe
+  grew a shared lock with holder and builder pids, stale-lock breaking with a rename-back for the
+  break race, a `--replacing-running` exemption, exit codes for "swapped but unstamped", and a
+  cancel-on-quit of the in-flight build. **Each review round found defects in the locking the round
+  before had added** (round 2: a quit left a live build under a lock that read as stale, and two
+  breakers could unlock the winner; round 3: the exemption let an update swap under a second
+  instance, and the shell and TypeScript lock twins disagreed on EPERM). The operator stopped
+  patching and removed the cause: nothing swaps a running app, so nothing needs to supervise one.
 - **Packaging decisions** (`electron-builder.yml`): `asarUnpack` for `node-pty` (a native module and,
   on macOS, an executable `spawn-helper`, neither of which runs from inside an asar); `npmRebuild:
   false`, because node-pty is Node-API and the build pnpm made loads in Electron as it is (D53.10);
@@ -257,9 +253,12 @@ code, at `origin/main`, and a checkout never gets a say.
   distribution (`electronDist`; the real one is a GitHub download the sandbox cannot reach), found
   node-pty through pnpm and left it — `build/Release/pty.node` included — under
   `resources/app.asar.unpacked`. *Unmeasured, stated:* a real package and launch on macOS and Linux
-  (the Electron download), the relaunch after a swap, `out/commit` read back from inside the
-  packaged asar (`files: out/**` packs it; main reads it at `join(__dirname, "..")`), `app_running`
-  against a real Electron process tree on macOS, and on Linux whether Chromium's sandbox starts
+  (the Electron download); `install-app.sh` started from a real quitting Electron app and its
+  relaunch (`open` on macOS, the executable on Linux — the tests drive it with a stand-in process
+  and a stub executable, Linux only); `out/commit` read back from inside the packaged asar
+  (`files: out/**` packs it; main reads it at `join(__dirname, "..")`); `app_running` against a
+  real Electron process tree on macOS (the macOS paths are exercised only through
+  `app_executable`/`installedExecutable` agreement here); and on Linux whether Chromium's sandbox starts
   under Ubuntu 24.04's AppArmor user-namespace restriction outside CI, where it is lifted (D53.2).
 
 ## D53.4 — Designs are CRDT documents stored in jkb

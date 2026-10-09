@@ -261,8 +261,9 @@ fi
 
 # --- Code Factory, the desktop app (D53.3) ------------------------------------
 # NOT built from this checkout, which agents can write: the app runs unsandboxed on the host. The
-# clean clone under ~/.local/share/jkb-app is moved to origin/main and THE CLONE'S build-app.sh
-# builds and installs it (lib.sh's install_app). Wrapped like every step after the binary.
+# clean clone under ~/.local/share/jkb-app is moved to origin/main, THE CLONE'S build-app.sh
+# builds and stages it and its install-app.sh swaps it in — and while the app is running, nothing is
+# built or swapped (lib.sh's install_app). Wrapped like every step after the binary.
 if [ "$do_app" -eq 1 ]; then
   say "Code Factory desktop app (built from origin/main, not from this checkout)"
   install_app "$repo_root" "$app_home"

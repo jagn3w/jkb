@@ -19,10 +19,8 @@ import { fileURLToPath } from "node:url";
 import {
   REMOTE_VAR,
   TOKEN_FILE_VAR,
-  checkoutRefusal,
   daemonUrl,
   failed,
-  installedExecutable,
   portOf,
   tokenPath,
   updateSummary,
@@ -53,7 +51,7 @@ import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
 import { TerminalHost, accountHome, machineEnvironment, machineRoots, type SpawnPty } from "./terminals";
-import { AppUpdater, builtCommit, isInstalledCopy, machineRunner } from "./update";
+import { AppUpdater, builtCommit, machineRunner, machineStarter, startupRefusal } from "./update";
 
 /**
  * Where the page comes from: the built file, or — from `pnpm run dev` only, and only on loopback —
@@ -62,16 +60,13 @@ import { AppUpdater, builtCommit, isInstalledCopy, machineRunner } from "./updat
 const rendererFrom = rendererSource(app.isPackaged, process.env);
 
 /**
- * Why this process may not run — it is not the installed copy (a package whose executable, links
- * resolved, is the one build-app.sh installed), and nobody said that was deliberate; or it was
- * pointed at a renderer it will not load — or `undefined`.
+ * Why this process may not run — it is not the installed copy (`startupRefusal`: packaged, and its
+ * executable, links resolved, is the one install-app.sh installs), and nobody said that was
+ * deliberate; or it was pointed at a renderer it will not load — or `undefined`.
  */
 const refusal =
-  checkoutRefusal(
-    app.isPackaged && isInstalledCopy(app.getPath("exe"), process.platform, accountHome()),
-    process.env,
-    installedExecutable(process.platform, accountHome()),
-  ) ?? (rendererFrom.kind === "refused" ? rendererFrom.reason : undefined);
+  startupRefusal({ isPackaged: app.isPackaged, exe: app.getPath("exe"), platform: process.platform, home: accountHome(), env: process.env }) ??
+  (rendererFrom.kind === "refused" ? rendererFrom.reason : undefined);
 
 /** The dev server's page, when that is where the page comes from. */
 const DEV_RENDERER_URL = rendererFrom.kind === "dev" ? rendererFrom.url : undefined;
@@ -123,11 +118,14 @@ const containerKit = new ContainerKit(machineKit(accountHome(), process.env));
  * It is told what is running — this executable, and the commit built into `out/` (this file is
  * `out/main/index.js`) — and updates only the installed copy.
  */
-const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), process.env), {
+const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), process.env), machineStarter(accountHome(), process.env), {
   exe: app.getPath("exe"),
   platform: process.platform,
   commit: builtCommit(join(__dirname, "..")),
 });
+
+/** Set by an update that staged a build: install it as this process quits, relaunching or not. */
+let installOnQuit: { relaunch: boolean } | undefined;
 
 /** Live design updates, one long-poll per open design shared by every window showing it (D53.4). */
 const designFeeds = new DesignFeeds(
@@ -341,8 +339,9 @@ function showBusy(busy: boolean): void {
 }
 
 /**
- * *jkb ▸ Update from main…*: fetch `main` into the clean clone, show the commits it would take,
- * and on a yes build exactly that commit, swap it in and relaunch (D53.3).
+ * *jkb ▸ Update from main…*: fetch `main`, show the commits it would take, and on a yes build and
+ * stage exactly that commit while the app keeps running; then install it as the app quits — now,
+ * relaunching, or whenever the user next quits (D53.3). A running app is never swapped under.
  */
 async function updateFromMain(): Promise<void> {
   if (updater.busy) {
@@ -363,7 +362,7 @@ async function updateFromMain(): Promise<void> {
   }
   const { response } = await messageBox({
     type: "question",
-    buttons: ["Update and Relaunch", "Cancel"],
+    buttons: ["Build Update", "Cancel"],
     defaultId: 0,
     cancelId: 1,
     message: summary.message,
@@ -373,25 +372,20 @@ async function updateFromMain(): Promise<void> {
   showBusy(true);
   const done = await updater.apply(plan.value.target);
   showBusy(false);
-  // Quitting cancelled it (`before-quit`): no dialog over a quit.
-  if (quitting) return;
   if (!done.ok) {
-    await messageBox({ type: "error", message: "The update did not install", detail: done.error });
+    await messageBox({ type: "error", message: "The update was not built", detail: done.error });
     return;
   }
-  if (done.value.unrecorded) {
-    await messageBox({
-      type: "warning",
-      message: "Installed, but not recorded",
-      detail: `Code Factory ${done.value.target.slice(0, 12)} is in place, but its stamp could not be written (see ${updater.logFile}). It relaunches now; the next install records it.`,
-    });
-  }
-  // The updater runs only as the installed copy, and the build swapped the new one in at that path,
-  // so relaunching starts the new build. At once: until this process goes, the helpers it spawns
-  // come from the new bundle (lib.sh's app_swap). `quit`, not `exit`, so `will-quit` ends the
-  // terminals and feeds as on any quit.
-  app.relaunch();
-  app.quit();
+  const ready = await messageBox({
+    type: "question",
+    buttons: ["Quit and Install", "Install When I Quit"],
+    defaultId: 0,
+    cancelId: 1,
+    message: `Code Factory ${done.value.slice(0, 12)} is ready`,
+    detail: "It is installed once the app has quit — never while it runs. Open terminals close.",
+  });
+  installOnQuit = { relaunch: ready.response === 0 };
+  if (ready.response === 0) app.quit();
 }
 
 /** The application menu: the platform's standard menus, plus *jkb* with *Update from main…*. */
@@ -434,25 +428,24 @@ if (refusal !== undefined) {
   });
 }
 
-/** Set once a quit has begun, so an update it cancels shows no dialog. */
-let quitting = false;
-
-// A quit during an update stops the build first — its whole process group — rather than leaving it
-// to build, swap and stamp with nobody to relaunch, under a lock whose holder is gone.
-app.on("before-quit", (event) => {
-  quitting = true;
-  if (!updater.busy) return;
-  event.preventDefault();
-  void updater.cancel().then(() => app.quit());
-});
-
 /** How long quitting waits for the daemon to take the app's group off `claude/notify` (D53.9). */
 const LEAVE_WAIT_MS = 1500;
 let leftNotify = false;
+let installerStarted = false;
 
 app.on("will-quit", (event) => {
   terminals.closeAll();
   closeFeeds();
+  // The staged build goes in once this process — and every other copy — has exited. Started on the
+  // first pass, before the notify leave below holds the quit: it is a detached spawn that returns at
+  // once, and the step itself waits for this process to exit, so neither delays the other. Once,
+  // because the leave re-quits and this handler runs again. A quit during a build leaves that build
+  // to finish staging; the next update or setup.sh takes it from there.
+  if (installOnQuit !== undefined && !installerStarted) {
+    installerStarted = true;
+    const started = updater.startInstaller(process.pid, installOnQuit.relaunch);
+    if (!started.ok) process.stderr.write(`code-factory: ${started.error}\n`);
+  }
   // Once: hold the quit until the app's group is off `claude/notify` (or the wait runs out), then
   // quit again. A group left there would keep every later notification unreapable until the topic's
   // cap refuses `notify.event`.

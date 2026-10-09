@@ -20,30 +20,21 @@ export const APP_STAMP_IN_HOME = `${APP_HOME_IN_HOME}/installed`;
 /** The output of the last update's build, kept for when it fails. */
 export const APP_LOG_IN_HOME = `${APP_HOME_IN_HOME}/update.log`;
 
-/**
- * The lock one install holds at a time (scripts/lib.sh's `app_lock`, taken the same way): a directory
- * holding `pid` and `token`. Whoever starts an install takes it; the builder it runs recognises it by
- * the token in `APP_LOCK_TOKEN_VAR` instead of taking it again.
- */
-export const APP_LOCK_IN_HOME = `${APP_HOME_IN_HOME}/lock`;
+/** The output of the last install step (`install-app.sh`, started detached as the app quits). */
+export const APP_INSTALL_LOG_IN_HOME = `${APP_HOME_IN_HOME}/install.log`;
+
+/** Where `build-app.sh` stages a build — `app/` and its `commit` — for `install-app.sh` to swap in. */
+export const APP_STAGED_IN_HOME = `${APP_HOME_IN_HOME}/staged`;
 
 /**
- * `build-app.sh`'s exit statuses past plain failure (lib.sh's `APP_BUILD_EXIT_*`): another install
- * holds the lock; a copy is running and nothing was swapped; the app WAS swapped in but the stamp
- * could not be written.
+ * `build-app.sh`'s and `install-app.sh`'s exit statuses past plain failure (lib.sh's `APP_EXIT_*`):
+ * another build or install holds the lock; a copy of the app is running, so nothing was swapped.
  */
-export const BUILD_EXIT = { busy: 75, running: 76, unrecorded: 77 } as const;
-
-/** The flag the app's own update passes `build-app.sh`: it is the running copy, and relaunches. */
-export const BUILD_REPLACING_RUNNING = "--replacing-running";
-
-/** The variable that hands the lock's token to the builder (lib.sh reads the same name). */
-export const APP_LOCK_TOKEN_VAR = "JKB_APP_LOCK_TOKEN";
+export const BUILD_EXIT = { busy: 75, running: 76 } as const;
 
 /**
  * The commit a build is of, written by `build-app.sh` into the app's `out/` before packaging, so the
- * running app knows what it is: the stamp says what was last installed, which is not the same thing
- * once a copy has been swapped in under a running one.
+ * running app knows what it is: the stamp says what was last installed, not what this process runs.
  */
 export const BUILT_COMMIT_IN_OUT = "commit";
 
@@ -62,18 +53,31 @@ export function installedExecutable(platform: string, home: string): string {
   return platform === "darwin" ? `${dir}/Contents/MacOS/Code Factory` : `${dir}/code-factory`;
 }
 
-/** The builder, inside the clone. Run from the clone, never from a checkout. */
+/** The builder, inside the clone. Run from the clone, never from a checkout. It only stages. */
 export const APP_BUILDER_IN_SRC = "scripts/build-app.sh";
+
+/** The one step that swaps a staged build in, inside the clone; it swaps only while nothing runs. */
+export const APP_INSTALLER_IN_SRC = "scripts/install-app.sh";
 
 /** The one ref an update takes. Never a branch an agent pushes, never a worktree. */
 export const UPDATE_REF = "refs/remotes/origin/main";
 
 /**
  * The refspec that fetches `main` into `UPDATE_REF`, forced: `main` is what was landed. Fetched with
- * `GIT_TERMINAL_PROMPT=0` on both sides (lib.sh's `app_clone_refresh`, the app's `machineRunner`), so
+ * `GIT_TERMINAL_PROMPT=0` everywhere (lib.sh's `app_clone_refresh`, build-app.sh, the app's `machineRunner`), so
  * a credential prompt fails the fetch rather than hanging it.
  */
 export const UPDATE_REFSPEC = `+refs/heads/main:${UPDATE_REF}`;
+
+/**
+ * Where the app's *plan* fetches `main` to show it: a ref no build or install reads, so a plan needs
+ * no lock and cannot move `origin/main` under a running build. The build fetches `UPDATE_REF` itself,
+ * under its lock, and refuses unless that tip is the commit shown.
+ */
+export const UPDATE_SHOWN_REF = "refs/jkb-app/shown";
+
+/** The refspec a plan fetches with. */
+export const UPDATE_SHOWN_REFSPEC = `+refs/heads/main:${UPDATE_SHOWN_REF}`;
 
 /** The opt-in for running the app from a checkout, as `run.sh` has `JKB_RUN_FROM_CHECKOUT`. */
 export const FROM_CHECKOUT_VAR = "JKB_APP_FROM_CHECKOUT";
@@ -135,10 +139,10 @@ export function parseCommitLog(text: string): UpdateCommit[] {
 export interface UpdatePlan {
   /**
    * The commit running now (built into the app), else the stamp's; `undefined` when neither says.
-   * The running copy's own commit wins: it is what the user has, whatever was swapped in since.
+   * The running copy's own commit wins: it is what the user has, whatever was installed since.
    */
   readonly installed: string | undefined;
-  /** `origin/main`'s tip, as fetched: the commit the update builds and nothing else. */
+  /** `main`'s tip, as fetched: the commit the update builds and nothing else. */
   readonly target: string;
   /** `installed..target`, newest first. Empty when nothing is installed to count from. */
   readonly commits: readonly UpdateCommit[];
@@ -165,7 +169,9 @@ export function updateSummary(plan: UpdatePlan): { message: string; detail: stri
     if (more > 0) lines.push(`… and ${more} more`);
   }
   lines.push("");
-  lines.push("The app is rebuilt from that commit with the frozen lockfile, swapped in, and relaunched. Open terminals close.");
+  lines.push(
+    "The app is built from that commit with the frozen lockfile while you keep working. It is installed when the app quits — never while it runs — and relaunched if you choose; open terminals close then.",
+  );
   const n = plan.commits.length;
   const message =
     plan.installed === undefined ? "Build Code Factory from main?" : `Take ${n} commit${n === 1 ? "" : "s"} from main?`;
