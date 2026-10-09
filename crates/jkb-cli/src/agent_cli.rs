@@ -12,7 +12,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use jkb_api::workflows::{AgentEdit, AgentView};
 use jkb_api::{Backend, Request, Response};
 use jkb_core::workflow::agents::{self, AgentPermissions, Isolation, Writes};
@@ -39,7 +39,9 @@ pub enum AgentCmd {
         vars: Vec<String>,
     },
     /// Copy a template into an operator copy (operator). Under its own name the copy overrides the
-    /// packaged template; `--packaged` copies the packaged text back over an existing copy.
+    /// packaged template; `--packaged` copies the packaged text back over an existing copy. The
+    /// edit flags `set` takes apply to the copied text in the same write: a refused edit leaves no
+    /// copy behind, so copying a packaged template to change it is this one command.
     Copy {
         /// The template to copy.
         from: String,
@@ -49,32 +51,15 @@ pub enum AgentCmd {
         /// Copy the packaged text even when a copy overrides it.
         #[arg(long)]
         packaged: bool,
+        #[command(flatten)]
+        edit: EditArgs,
     },
     /// Edit an operator copy (operator), appending a version.
     Set {
         /// The copy.
         name: String,
-        /// The new prompt, from a file (`-` reads stdin).
-        #[arg(long, value_name = "FILE")]
-        template_file: Option<PathBuf>,
-        /// operator, coordinator, designer, implementer, reviewer or `systemic_reviewer`.
-        #[arg(long)]
-        role: Option<String>,
-        /// One line on what it does.
-        #[arg(long)]
-        describe: Option<String>,
-        /// Where it runs: none or worktree.
-        #[arg(long)]
-        isolation: Option<String>,
-        /// The model it runs on; `session` for the session's own.
-        #[arg(long)]
-        model: Option<String>,
-        /// The most it may change: nothing, kb, git or code.
-        #[arg(long)]
-        writes: Option<String>,
-        /// The agents it hands off to, comma-separated (empty for none).
-        #[arg(long)]
-        hands_off_to: Option<String>,
+        #[command(flatten)]
+        edit: EditArgs,
     },
     /// Write a template into the repository's packaged-templates file as its next version — what a
     /// contribution commits. Run in the checkout the contribution is made from.
@@ -90,6 +75,79 @@ pub enum AgentCmd {
         #[arg(long)]
         override_base: bool,
     },
+}
+
+/// The fields `set` changes, and `copy` changes in the copy it makes.
+#[derive(Args)]
+pub struct EditArgs {
+    /// The new prompt, from a file (`-` reads stdin).
+    #[arg(long, value_name = "FILE")]
+    template_file: Option<PathBuf>,
+    /// operator, coordinator, designer, implementer, reviewer or `systemic_reviewer`.
+    #[arg(long)]
+    role: Option<String>,
+    /// One line on what it does.
+    #[arg(long)]
+    describe: Option<String>,
+    /// Where it runs: none or worktree.
+    #[arg(long)]
+    isolation: Option<String>,
+    /// The model it runs on; `session` for the session's own.
+    #[arg(long)]
+    model: Option<String>,
+    /// The most it may change: nothing, kb, git or code.
+    #[arg(long)]
+    writes: Option<String>,
+    /// The agents it hands off to, comma-separated (empty for none).
+    #[arg(long)]
+    hands_off_to: Option<String>,
+}
+
+impl EditArgs {
+    /// The edit these flags name, or `None` for no flags. A permission flag changes that one
+    /// permission of `current`'s, which is read only when one is given.
+    fn into_edit(
+        self,
+        current: impl FnOnce() -> Result<AgentPermissions>,
+    ) -> Result<Option<AgentEdit>> {
+        let Self {
+            template_file,
+            role,
+            describe,
+            isolation: iso,
+            model,
+            writes: w,
+            hands_off_to,
+        } = self;
+        let permissions = if iso.is_some() || model.is_some() || w.is_some() {
+            let current = current()?;
+            Some(AgentPermissions {
+                isolation: iso.as_deref().map_or(Ok(current.isolation), isolation)?,
+                model: match model.as_deref() {
+                    None => current.model,
+                    Some("session") => None,
+                    Some(m) => Some(m.to_owned()),
+                },
+                writes: w.as_deref().map_or(Ok(current.writes), writes)?,
+            })
+        } else {
+            None
+        };
+        let edit = AgentEdit {
+            template: template_file.as_deref().map(read_template).transpose()?,
+            role,
+            describe,
+            permissions,
+            hands_off_to: hands_off_to.map(|h| {
+                h.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }),
+        };
+        Ok((edit != AgentEdit::default()).then_some(edit))
+    }
 }
 
 fn call(b: &dyn Backend, r: Request) -> Result<Response> {
@@ -108,13 +166,17 @@ fn agent_of(op: &str, r: Response) -> Result<(AgentView, Option<String>, bool)> 
 }
 
 fn show(b: &dyn Backend, name: &str) -> Result<AgentView> {
+    show_from(b, name, false)
+}
+
+fn show_from(b: &dyn Backend, name: &str, packaged: bool) -> Result<AgentView> {
     Ok(agent_of(
         "workflow.agent",
         call(
             b,
             Request::WorkflowAgent {
                 name: name.to_owned(),
-                packaged: false,
+                packaged,
                 version: None,
                 vars: None,
             },
@@ -266,7 +328,9 @@ pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
             from,
             as_name,
             packaged,
+            edit,
         } => {
+            let edit = edit.into_edit(|| Ok(show_from(b, &from, packaged)?.permissions))?;
             let (a, _, _) = agent_of(
                 "workflow.agent_copy",
                 call(
@@ -275,7 +339,7 @@ pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
                         from,
                         packaged,
                         as_name,
-                        edit: None,
+                        edit,
                     },
                 )?,
             )?;
@@ -291,43 +355,11 @@ pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
             }
             Ok(())
         }
-        AgentCmd::Set {
-            name,
-            template_file,
-            role,
-            describe,
-            isolation: iso,
-            model,
-            writes: w,
-            hands_off_to,
-        } => {
-            let permissions = if iso.is_some() || model.is_some() || w.is_some() {
-                let current = show(b, &name)?.permissions;
-                Some(AgentPermissions {
-                    isolation: iso.as_deref().map_or(Ok(current.isolation), isolation)?,
-                    model: match model.as_deref() {
-                        None => current.model,
-                        Some("session") => None,
-                        Some(m) => Some(m.to_owned()),
-                    },
-                    writes: w.as_deref().map_or(Ok(current.writes), writes)?,
-                })
-            } else {
-                None
-            };
-            let edit = AgentEdit {
-                template: template_file.as_deref().map(read_template).transpose()?,
-                role,
-                describe,
-                permissions,
-                hands_off_to: hands_off_to.map(|h| {
-                    h.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .collect()
-                }),
-            };
+        AgentCmd::Set { name, edit } => {
+            // No flags is an empty edit, which the op refuses by name.
+            let edit = edit
+                .into_edit(|| Ok(show(b, &name)?.permissions))?
+                .unwrap_or_default();
             let (a, _, wrote) = agent_of(
                 "workflow.agent_set",
                 call(b, Request::WorkflowAgentSet { name, edit })?,
@@ -367,7 +399,11 @@ pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
             let agent = view
                 .to_agent()
                 .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-            let (out, version) = agents::export(&text, &agent, view.packaged_base, override_base)?;
+            let base = agents::ExportBase {
+                built_on: view.packaged_base,
+                installed: view.packaged_version,
+            };
+            let (out, version) = agents::export(&text, &agent, base, override_base)?;
             crate::atomic::write(&file, out.as_bytes())?;
             if json_out {
                 println!(

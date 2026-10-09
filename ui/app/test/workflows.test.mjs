@@ -5,7 +5,7 @@
 // Bundled with esbuild, as in prompts.test.mjs.
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -97,13 +97,28 @@ function leftovers(checkout) {
 }
 
 /** Stand-ins: `jkb` writing an export into the packaged file of the tree it runs in; `gh` logging. */
-function stand_ins({ refuse = false } = {}) {
+/**
+ * Stand-ins: `jkb` writing an export into the packaged file of the tree it runs in; `gh` logging.
+ * `hold`: the first `jkb` marks `reached` and waits while `hold` exists, so a test can start a
+ * second run while the first is mid-export. `fixedName`: `mktemp` always answers the same directory, forcing
+ * two runs onto one name. `fixedDate`: `date` always answers the same second.
+ */
+function stand_ins({ refuse = false, hold = false, fixedName = false, fixedDate = false } = {}) {
   const bin = fs.mkdtempSync(path.join(work, "bin-"));
   const log = path.join(bin, "gh.log");
+  const holdFile = path.join(bin, "hold");
+  const reached = path.join(bin, "reached");
+  if (hold) fs.writeFileSync(holdFile, "");
+  // Only the first run to get here waits: `mkdir` is atomic, so a second run never holds.
+  const wait = hold ? `if mkdir '${reached}' 2>/dev/null; then while [ -e '${holdFile}' ]; do sleep 0.05; done; fi; ` : "";
   const jkb = refuse
     ? 'echo "jkb serve is not reachable" >&2; exit 1'
-    : `printf '{\\n  "agents": ["%s"]\\n}\\n' "$4" > '${PACKAGED_FILE}'; echo "$4 packaged as v1"`;
+    : `${wait}printf '{\\n  "agents": ["%s"]\\n}\\n' "$4" > '${PACKAGED_FILE}'; echo "$4 packaged as v1"`;
   fs.writeFileSync(path.join(bin, "jkb"), `#!/bin/bash\n${jkb}\n`, { mode: 0o755 });
+  if (fixedDate) fs.writeFileSync(path.join(bin, "date"), "#!/bin/bash\necho 20261009120000\n", { mode: 0o755 });
+  if (fixedName) {
+    fs.writeFileSync(path.join(bin, "mktemp"), `#!/bin/bash\nd="\${@: -1}"; d="\${d%-*}-fixed"; mkdir -p "$d"; echo "$d"\n`, { mode: 0o755 });
+  }
   fs.writeFileSync(
     path.join(bin, "gh"),
     `#!/bin/bash\nprintf '%s|' "$PWD" "GH_REPO=\${GH_REPO-}" "GH_HOST=\${GH_HOST-}" "$@" >> '${log}'\n`,
@@ -115,7 +130,23 @@ function stand_ins({ refuse = false } = {}) {
       encoding: "utf8",
       env: { ...process.env, ...GIT_ENV, PATH: `${bin}:${process.env.PATH}`, ...env },
     });
-  return { run, gh: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "") };
+  const start = (args, cwd) => {
+    const child = spawn("/bin/bash", ["-c", CONTRIBUTE_SCRIPT, "contribute", ...args], {
+      cwd,
+      env: { ...process.env, ...GIT_ENV, PATH: `${bin}:${process.env.PATH}` },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    return new Promise((resolve) => child.on("close", (status) => resolve({ status, stdout, stderr })));
+  };
+  const reachedExport = async () => {
+    for (let i = 0; i < 400 && !fs.existsSync(reached); i++) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(fs.existsSync(reached), "the first run reached its export");
+  };
+  const release = () => fs.rmSync(holdFile, { force: true });
+  return { run, start, reachedExport, release, gh: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "") };
 }
 
 test("Contribute commits only the exported file, off origin/main, pushes it and opens the pull request", () => {
@@ -124,14 +155,14 @@ test("Contribute commits only the exported file, off origin/main, pushes it and 
   const r = run(["swarm-status"], checkout);
   assert.equal(r.status, 0, r.stderr);
   const branch = /contributed swarm-status on (\S+)/.exec(r.stdout)?.[1];
-  assert.match(branch ?? "", /^agent-template\/swarm-status-\d{14}$/);
+  assert.match(branch ?? "", /^agent-template\/swarm-status-\d{14}-\w{6}$/);
   // Pushed: one commit on top of main, changing the packaged file and nothing else.
   assert.equal(git(origin, "rev-parse", `${branch}~1`), git(origin, "rev-parse", "main"));
   assert.equal(git(origin, "diff", "--name-only", `main..${branch}`), PACKAGED_FILE);
   assert.match(git(origin, "show", `${branch}:${PACKAGED_FILE}`), /"swarm-status"/);
   // The pull request is asked for that branch, against main.
   const asked = gh();
-  assert.match(asked, /\|pr\|create\|--base\|main\|--head\|agent-template\/swarm-status-\d{14}\|--title\|workflow agents: contribute swarm-status\|/);
+  assert.match(asked, /\|pr\|create\|--base\|main\|--head\|agent-template\/swarm-status-\d{14}-\w{6}\|--title\|workflow agents: contribute swarm-status\|/);
   // The operator's checkout is untouched, and the worktree and its local branch are gone.
   assert.equal(git(checkout, "branch", "--show-current"), "mine");
   assert.equal(fs.readFileSync(path.join(checkout, "scratch.txt"), "utf8"), "mine\n");
@@ -197,5 +228,46 @@ test("a refused export stops before anything is committed or pushed", () => {
   assert.deepEqual(leftovers(checkout), { worktrees: 0, dirs: [], branches: "" });
   const again = run(["swarm-status"], checkout);
   assert.notEqual(again.status, 0);
+  assert.deepEqual(leftovers(checkout), { worktrees: 0, dirs: [], branches: "" });
+});
+
+test("two contributions started together each get their own name, and both land", async () => {
+  const { origin, checkout } = repos();
+  const { start, run, reachedExport, release } = stand_ins({ hold: true, fixedDate: true });
+  const first = start(["swarm-status"], checkout);
+  await reachedExport();
+  // The same second, the same template: a second click while the first is mid-export.
+  const second = run(["swarm-status"], checkout);
+  release();
+  const one = await first;
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(one.status, 0, one.stderr);
+  const branches = git(origin, "branch", "--list", "agent-template/*").split("\n").map((b) => b.trim());
+  assert.equal(new Set(branches).size, 2, branches.join(","));
+  assert.deepEqual(leftovers(checkout), { worktrees: 0, dirs: [], branches: "" });
+});
+
+test("a run that collides with a live one removes nothing of it", async () => {
+  const { origin, checkout } = repos();
+  const { start, run, reachedExport, release } = stand_ins({ hold: true, fixedName: true, fixedDate: true });
+  const first = start(["swarm-status"], checkout);
+  await reachedExport();
+  const live = git(checkout, "worktree", "list", "--porcelain")
+    .split("\n")
+    .filter((l) => l.startsWith("worktree "))
+    .map((l) => l.slice("worktree ".length))
+    .find((w) => w.includes(`${path.sep}.jkb${path.sep}work${path.sep}`));
+  assert.ok(live, "the first run's worktree");
+  // Forced onto the first run's name, the second is refused before it makes anything...
+  const second = run(["swarm-status"], checkout);
+  assert.notEqual(second.status, 0);
+  assert.match(second.stderr, /already exists/);
+  // ...and leaves the first run's worktree and branch where they were.
+  assert.ok(fs.existsSync(path.join(live, PACKAGED_FILE)), "the live worktree is intact");
+  assert.notEqual(git(checkout, "branch", "--list", "agent-template/*"), "");
+  release();
+  const one = await first;
+  assert.equal(one.status, 0, one.stderr);
+  assert.notEqual(git(origin, "branch", "--list", "agent-template/*"), "");
   assert.deepEqual(leftovers(checkout), { worktrees: 0, dirs: [], branches: "" });
 });

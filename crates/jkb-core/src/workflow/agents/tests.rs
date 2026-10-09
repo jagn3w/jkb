@@ -2,11 +2,27 @@ use std::collections::BTreeMap;
 
 use super::{
     copy, export, list, packaged, packaged_base, parse_file, placeholders, render, resolve, set,
-    validate_name, versions, write_file, AgentPermissions, Edit, Isolation, Pick, Source, Writes,
-    PACKAGED_JSON,
+    validate_name, versions, write_file, AgentPermissions, Edit, ExportBase, Isolation, Pick,
+    Source, Writes, PACKAGED_JSON,
 };
 use crate::roles::Role;
 use crate::Db;
+
+/// The base of a copy built on `v` in a jkb that packages `v` too.
+fn installed_at(v: Option<i64>) -> ExportBase {
+    ExportBase {
+        built_on: v,
+        installed: v,
+    }
+}
+
+/// An edit that makes a copy differ from the packaged text.
+fn mine() -> Edit {
+    Edit {
+        describe: Some("the operator's".into()),
+        ..Edit::default()
+    }
+}
 
 fn db() -> Db {
     Db::open_in_memory().unwrap()
@@ -162,7 +178,11 @@ fn a_packaged_template_is_read_only_and_a_copy_overrides_it() {
         .unwrap();
     assert!(wrote);
     assert_eq!(edited.version, 2);
-    assert_eq!(edited.based_on, None);
+    // An edit of a copy that was the packaged text records that packaged version as its base.
+    assert_eq!(
+        edited.based_on.as_deref(),
+        Some(format!("packaged:swarm-implementer@{pv}").as_str())
+    );
 
     // What the script reads by name is now the operator's text; the packaged one is still there.
     let effective = db
@@ -318,8 +338,10 @@ fn a_copy_taken_from_an_older_packaged_version_is_behind() {
         .find(|a| a.name == "swarm-claim")
         .unwrap()
         .version;
-    db.write_txn("test", |c, m| copy(c, m, "swarm-claim", false, None, None))
-        .unwrap();
+    db.write_txn("test", |c, m| {
+        copy(c, m, "swarm-claim", false, None, Some(mine()))
+    })
+    .unwrap();
     // As if this copy had been taken before the packaged text moved on.
     db.write_txn("test", move |c, _| {
         c.execute(
@@ -376,6 +398,7 @@ fn export_replaces_an_entry_with_the_next_version_or_appends_a_new_one() {
     let unchanged = db
         .read(|c| resolve(c, "swarm-status", Pick::Effective))
         .unwrap();
+    let base = installed_at(base);
     let same = export(PACKAGED_JSON, &unchanged, base, false)
         .unwrap_err()
         .to_string();
@@ -431,7 +454,7 @@ fn export_replaces_an_entry_with_the_next_version_or_appends_a_new_one() {
         .unwrap();
     // Built on no packaged `my-status`, and the file has none: appended as v1.
     assert_eq!(db.read(|c| packaged_base(c, "my-status")).unwrap(), None);
-    let (text, version) = export(PACKAGED_JSON, &mine, None, false).unwrap();
+    let (text, version) = export(PACKAGED_JSON, &mine, ExportBase::default(), false).unwrap();
     assert_eq!(version, 1);
     let file = parse_file(&text).unwrap();
     assert_eq!(file.agents.last().unwrap().name, "my-status");
@@ -457,8 +480,9 @@ fn export_refuses_a_copy_built_on_another_version_than_the_file_holds() {
     let copy_of = db
         .read(|c| resolve(c, "swarm-status", Pick::Effective))
         .unwrap();
-    let base = db.read(|c| packaged_base(c, "swarm-status")).unwrap();
-    let pv = base.unwrap();
+    let built_on = db.read(|c| packaged_base(c, "swarm-status")).unwrap();
+    let pv = built_on.unwrap();
+    let base = installed_at(built_on);
     // Upstream has moved on: the target file holds the next version of the entry.
     let mut upstream = parse_file(PACKAGED_JSON).unwrap();
     let e = upstream
@@ -478,6 +502,24 @@ fn export_refuses_a_copy_built_on_another_version_than_the_file_holds() {
             && refused.contains(&format!("the file packages v{}", pv + 1)),
         "{refused}"
     );
+    // It is this jkb that is behind the file, so re-copying would loop: it says to update jkb.
+    assert!(refused.contains("update jkb"), "{refused}");
+    // Where only the copy is behind (this jkb packages the file's version), re-copying is the cure.
+    let behind_only = export(
+        &upstream,
+        &copy_of,
+        ExportBase {
+            built_on: Some(pv),
+            installed: Some(pv + 1),
+        },
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        behind_only.contains("copy swarm-status --packaged") && !behind_only.contains("update jkb"),
+        "{behind_only}"
+    );
     // A deliberate revert is allowed, and writes the version after the file's.
     let (_, version) = export(&upstream, &copy_of, base, true).unwrap();
     assert_eq!(version, pv + 2);
@@ -496,16 +538,27 @@ fn export_refuses_a_copy_built_on_another_version_than_the_file_holds() {
     let refused = export(
         &write_file(&other).unwrap(),
         &installed,
-        Some(installed.version),
+        installed_at(Some(installed.version)),
         false,
     )
     .unwrap_err()
     .to_string();
-    assert!(refused.contains("the file packages v"), "{refused}");
+    assert!(
+        refused.contains("the file packages v") && refused.contains("update jkb"),
+        "{refused}"
+    );
     // A name the file has, against a template built on none of it.
-    let refused = export(PACKAGED_JSON, &copy_of, None, false)
-        .unwrap_err()
-        .to_string();
+    let refused = export(
+        PACKAGED_JSON,
+        &copy_of,
+        ExportBase {
+            built_on: None,
+            installed: Some(pv),
+        },
+        false,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
         refused.contains("built on packaged no version"),
         "{refused}"
@@ -573,8 +626,10 @@ fn a_recopy_of_a_copy_keeps_its_packaged_base() {
         .find(|a| a.name == "swarm-claim")
         .unwrap()
         .version;
-    db.write_txn("test", |c, m| copy(c, m, "swarm-claim", false, None, None))
-        .unwrap();
+    db.write_txn("test", |c, m| {
+        copy(c, m, "swarm-claim", false, None, Some(mine()))
+    })
+    .unwrap();
     db.write_txn("test", move |c, _| {
         c.execute(
             "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-claim'",
@@ -618,4 +673,83 @@ fn a_recopy_of_a_copy_keeps_its_packaged_base() {
 fn a_placeholder_refusal_states_the_leading_character_rule() {
     let why = placeholders("{{1st_task}}").unwrap_err().to_string();
     assert!(why.contains("starting with a letter or `_`"), "{why}");
+}
+
+#[test]
+fn a_copy_that_a_merged_contribution_made_current_is_built_on_the_installed_version() {
+    let db = db();
+    let pv = packaged()
+        .unwrap()
+        .iter()
+        .find(|a| a.name == "swarm-status")
+        .unwrap()
+        .version;
+    db.write_txn("test", |c, m| copy(c, m, "swarm-status", false, None, None))
+        .unwrap();
+    // As if the copy had been taken from the version before, edited, contributed, merged as the
+    // version this jkb packages, and installed: its text is the packaged text, its chain is old.
+    db.write_txn("test", move |c, _| {
+        c.execute(
+            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-status'",
+            [format!("packaged:swarm-status@{}", pv - 1)],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let row = |db: &Db| {
+        db.read(list)
+            .unwrap()
+            .into_iter()
+            .find(|l| l.agent.name == "swarm-status")
+            .unwrap()
+    };
+    let listed = row(&db);
+    assert!(!listed.behind_packaged, "current, not behind");
+    assert_eq!(listed.packaged_base, Some(pv));
+    // The next edit is built on the installed version, and exports against a file holding it.
+    let (edited, _) = db
+        .write_txn("test", |c, m| {
+            set(
+                c,
+                m,
+                "swarm-status",
+                Edit {
+                    describe: Some("the next edit".into()),
+                    ..Edit::default()
+                },
+            )
+        })
+        .unwrap();
+    let listed = row(&db);
+    assert_eq!(listed.packaged_base, Some(pv));
+    assert!(!listed.behind_packaged);
+    let (_, version) = export(
+        PACKAGED_JSON,
+        &edited,
+        ExportBase {
+            built_on: listed.packaged_base,
+            installed: listed.packaged_version,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(version, pv + 1);
+    // ...and a re-copy of that copy onto its own name keeps it too.
+    db.write_txn("test", |c, m| copy(c, m, "swarm-status", true, None, None))
+        .unwrap();
+    db.write_txn("test", move |c, _| {
+        c.execute(
+            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-status'",
+            [format!("packaged:swarm-status@{}", pv - 1)],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let again = db
+        .write_txn("test", |c, m| copy(c, m, "swarm-status", false, None, None))
+        .unwrap();
+    assert_eq!(
+        again.based_on.as_deref(),
+        Some(format!("packaged:swarm-status@{pv}").as_str())
+    );
 }

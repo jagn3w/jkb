@@ -15,11 +15,11 @@ use jkb_core::workflow::strategy::StrategySpec;
 use jkb_core::workflow::{Phase, WorkflowEvent};
 use jkb_core::{task, WriteMeta};
 use jkb_fsm::Table;
-use jkb_rbac::Permission as _;
+use jkb_rbac::{Grants as _, Permission as _};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::rbac::OP_GRANTS;
+use crate::rbac::{OpPermission, OP_GRANTS};
 use crate::{ApiError, ErrorCode};
 
 fn invalid(why: impl Into<String>) -> ApiError {
@@ -305,8 +305,9 @@ pub struct GraphEdge {
     /// anyone's, and its guard decides).
     pub roles: Vec<String>,
     /// Who fires it, in one word or list, for every surface to print the same: `observed` (the
-    /// facts decide), `applied` (jkb applies it as part of an op, no role fires it), the roles, or
-    /// `no one` when the strategy lets no role fire an act.
+    /// facts decide), `applied` (jkb applies it as part of the op that moves it, whose own grant
+    /// decides), the roles (a workflow act, the lifecycle's `land` per the strategy's `lands`
+    /// toggle, its `override` per who holds `task.set --status`), or `no one`.
     pub fired_by: String,
 }
 
@@ -451,7 +452,31 @@ pub fn graph(
             })
         },
     );
-    let lifecycle = machine_view(&jkb_core::lifecycle::machine().table(), |_| None, |_| None);
+    // Two lifecycle acts have a role that fires them: landing, which the strategy's `lands` toggle
+    // decides (what `rbac` checks `task.land` against), and the operator's override, which is
+    // `task.set --status` and so whoever holds that op class. Every other row jkb applies as part
+    // of the op that moves it.
+    let lifecycle = machine_view(
+        &jkb_core::lifecycle::machine().table(),
+        |_| None,
+        |event| match event {
+            "land" => Some(
+                <Role as jkb_rbac::Role>::ALL
+                    .iter()
+                    .filter(|r| spec.may_land(&[**r]).is_allowed())
+                    .map(|r| r.as_str().to_owned())
+                    .collect(),
+            ),
+            "override" => Some(
+                OP_GRANTS
+                    .roles_for(OpPermission::TaskStatus)
+                    .into_iter()
+                    .map(|r| r.as_str().to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        },
+    );
     Ok(GraphView {
         strategy: source,
         graph: spec.graph.as_str().to_owned(),

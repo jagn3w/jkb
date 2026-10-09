@@ -5202,21 +5202,48 @@ fn workflow_agent_copy_set_show_and_export() {
 fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
-    jkb(&db)
-        .args(["workflow", "agent", "copy", "swarm-status"])
-        .assert()
-        .success();
+    // Copying a packaged template to change it is one command: the edit rides in the copy.
+    let bad = dir.path().join("bad.md");
+    std::fs::write(&bad, "open {{brace").unwrap();
     jkb(&db)
         .args([
             "workflow",
             "agent",
-            "set",
+            "copy",
+            "swarm-status",
+            "--template-file",
+        ])
+        .arg(&bad)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("{{"));
+    jkb(&db)
+        .args(["--json", "workflow", "agent", "show", "swarm-status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"source\":\"packaged\""));
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "copy",
             "swarm-status",
             "--describe",
             "mine",
+            "--model",
+            "haiku",
         ])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("as swarm-status v1"));
+    let shown = jkb(&db)
+        .args(["--json", "workflow", "agent", "show", "swarm-status"])
+        .output()
+        .unwrap();
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["agent"]["describe"], "mine");
+    assert_eq!(shown["agent"]["permissions"]["model"], "haiku");
+    assert_eq!(shown["agent"]["version"], 1);
     let file = dir.path().join("agents.json");
     let mut upstream: serde_json::Value =
         serde_json::from_str(include_str!("../../jkb-core/src/workflow/agents.json")).unwrap();
@@ -5237,7 +5264,8 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         .failure()
         .stderr(
             predicate::str::contains("built on packaged v1")
-                .and(predicate::str::contains("the file packages v2")),
+                .and(predicate::str::contains("the file packages v2"))
+                .and(predicate::str::contains("update jkb")),
         );
     jkb(&db)
         .args([
@@ -5295,10 +5323,14 @@ fn workflow_show_graph_prints_the_machines() {
     assert!(text.contains("strategy:  design-reviewed"), "{text}");
     let lifecycle = text.split("\nlifecycle:\n").nth(1).unwrap();
     for row in lifecycle.lines().filter(|l| !l.trim().is_empty()) {
-        assert!(
-            row.ends_with(" applied") || row.ends_with(" observed"),
-            "{row:?}"
-        );
+        let event = row.split_whitespace().nth(1).unwrap();
+        let want = match event {
+            "land" => " operator",
+            "override" => " operator, coordinator",
+            _ if row.ends_with(" observed") => " observed",
+            _ => " applied",
+        };
+        assert!(row.ends_with(want), "{row:?}");
     }
     jkb(&db)
         .args(["workflow", "show"])

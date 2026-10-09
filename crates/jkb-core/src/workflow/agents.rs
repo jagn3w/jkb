@@ -127,7 +127,8 @@ pub struct Agent {
     /// What it says.
     pub def: AgentDef,
     /// What a copy was made from: `packaged:<name>@<v>` or `<name>@<v>`. `None` for a packaged
-    /// template and for an edit, which follows the version before it.
+    /// template and for an edit, which follows the version before it — except an edit of a copy
+    /// that said exactly what the packaged template says, which records that packaged version.
     pub based_on: Option<String>,
     /// When a copy's version was written; `None` for a packaged template.
     pub defined_at: Option<String>,
@@ -476,24 +477,35 @@ fn packaged_named(name: &str) -> Result<Option<&'static Agent>> {
     Ok(packaged()?.iter().find(|a| a.name == name))
 }
 
+/// What [`export`] checks a target file against: the packaged versions of the template's name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExportBase {
+    /// The version the template is built on ([`Listed::packaged_base`]); `None` for none.
+    pub built_on: Option<i64>,
+    /// The version this jkb has compiled in ([`Listed::packaged_version`]); `None` for none.
+    pub installed: Option<i64>,
+}
+
 /// Write `agent` into the packaged-templates file `file` (its current text), returning the new
 /// text and the version it was packaged as: the entry of that name is replaced with the next
 /// version, or appended as version 1. What *Contribute to jkb* commits.
 ///
-/// `base` is the packaged version of this name the template is built on ([`Listed::packaged_base`]),
-/// and it must be the version `file` holds — `None` when `file` has no entry of the name. A copy
-/// built on an older version would otherwise be written over a newer one, silently undoing every
-/// change made upstream since, under a pull request that describes one edit. `override_base`
-/// writes it anyway: a deliberate revert.
+/// `base.built_on` must be the version `file` holds — `None` when `file` has no entry of the name.
+/// A copy built on an older version would otherwise be written over a newer one, silently undoing
+/// every change made upstream since, under a pull request that describes one edit. The refusal
+/// says which side is behind: when this jkb's own packaged version is not the file's, copying the
+/// packaged template afresh would only record the same stale version again, so it says to update
+/// jkb (or build it from the file's commit) first. `override_base` writes it anyway: a deliberate
+/// revert.
 ///
 /// # Errors
-/// [`Error::Types`] if `file` is malformed, holds a different version of the name than `base`
-/// (naming both) unless `override_base`, or already packages exactly this template — a pull
-/// request that changes nothing.
+/// [`Error::Types`] if `file` is malformed, holds a different version of the name than
+/// `base.built_on` (naming both) unless `override_base`, or already packages exactly this
+/// template — a pull request that changes nothing.
 pub fn export(
     file: &str,
     agent: &Agent,
-    base: Option<i64>,
+    base: ExportBase,
     override_base: bool,
 ) -> Result<(String, i64)> {
     let mut parsed = parse_file(file)?;
@@ -503,14 +515,28 @@ pub fn export(
         .iter()
         .find(|e| e.name == agent.name)
         .map(|e| e.version);
-    if in_file != base && !override_base {
+    if in_file != base.built_on && !override_base {
         let said = |v: Option<i64>| v.map_or_else(|| "no version".to_owned(), |v| format!("v{v}"));
+        let remedy = if base.installed == in_file {
+            format!(
+                "this jkb packages the file's version, so copy it afresh (`jkb workflow agent \
+                 copy {} --packaged`) and redo the edit",
+                agent.name
+            )
+        } else {
+            format!(
+                "this jkb packages {} of it, not the file's, so a fresh copy would be built on \
+                 the wrong version too: update jkb (or build it from the file's commit) first, \
+                 then copy the packaged template afresh and redo the edit",
+                said(base.installed)
+            )
+        };
         return Err(invalid(format!(
             "`{}` is built on packaged {} but the file packages {} of it: exporting would \
-             overwrite that version with text that never saw it. Copy the packaged template \
-             afresh and redo the edit, or override the check to replace it deliberately",
+             overwrite that version with text that never saw it. {remedy} — or override the \
+             check to replace it deliberately",
             agent.name,
-            said(base),
+            said(base.built_on),
             said(in_file)
         )));
     }
@@ -753,7 +779,11 @@ pub fn standing(conn: &Connection, name: &str) -> Result<Listed> {
 
 fn listed(conn: &Connection, name: &str, packaged: Option<&Agent>) -> Result<Listed> {
     let copy = newest_copy(conn, name)?;
+    // A copy that says exactly what this jkb's packaged template says is built on it, whatever
+    // its chain records: once the operator's own contribution is merged and installed, their copy
+    // is current, not behind.
     let base = match (&copy, packaged) {
+        (Some(c), Some(p)) if c.def == p.def => Some(p.version),
         (Some(_), _) => packaged_base(conn, name)?,
         (None, p) => p.map(|p| p.version),
     };
@@ -775,6 +805,15 @@ fn listed(conn: &Connection, name: &str, packaged: Option<&Agent>) -> Result<Lis
         packaged_base: base,
         matches_packaged: matches,
     })
+}
+
+/// `packaged:<name>@<v>` when `def` is exactly this jkb's packaged `name`: a version written from a
+/// text equal to the installed packaged one records that as its base, so a copy whose text a merged
+/// contribution made current is not still taken to be built on the version before.
+fn base_if_packaged(name: &str, def: &AgentDef) -> Result<Option<String>> {
+    Ok(packaged_named(name)?
+        .filter(|p| p.def == *def)
+        .map(|p| format!("packaged:{name}@{}", p.version)))
 }
 
 fn append(conn: &Connection, name: &str, def: &AgentDef, based_on: Option<&str>) -> Result<Agent> {
@@ -849,7 +888,8 @@ pub fn copy(
     }
     let based_on = match source.source {
         Source::Packaged => format!("packaged:{}@{}", source.name, source.version),
-        Source::Operator => format!("{}@{}", source.name, source.version),
+        Source::Operator => base_if_packaged(target, &source.def)?
+            .unwrap_or_else(|| format!("{}@{}", source.name, source.version)),
     };
     let mut def = source.def;
     if let Some(edit) = edit {
@@ -920,7 +960,8 @@ pub fn set(conn: &Connection, _meta: &WriteMeta, name: &str, edit: Edit) -> Resu
     if def == current.def {
         return Ok((current, false));
     }
-    Ok((append(conn, name, &def, None)?, true))
+    let based_on = base_if_packaged(name, &current.def)?;
+    Ok((append(conn, name, &def, based_on.as_deref())?, true))
 }
 
 #[cfg(test)]

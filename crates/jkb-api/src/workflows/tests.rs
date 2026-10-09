@@ -176,6 +176,18 @@ fn bad_asks_are_named_refusals() {
     .is_err());
 }
 
+/// The `autonomous` preset's machines: its `lands` toggle lets the coordinator land.
+fn direct_lands() -> super::GraphView {
+    let kb = Kb::new();
+    match ok(
+        &kb.op,
+        json!({ "op": "workflow.graph", "strategy": "autonomous" }),
+    ) {
+        Response::WorkflowGraph { graph } => *graph,
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
 fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     let kb = Kb::new();
@@ -221,10 +233,6 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
         edge(&coordinated, "design_review", "approve_design").fired_by,
         "operator, coordinator"
     );
-    for t in &g.lifecycle.transitions {
-        let want = if t.reconciled { "observed" } else { "applied" };
-        assert_eq!(t.fired_by, want, "{} --{}-->", t.from, t.event);
-    }
     assert!(g
         .lifecycle
         .transitions
@@ -310,4 +318,37 @@ fn a_copy_with_an_edit_is_one_op_and_a_refused_edit_leaves_no_copy() {
         json!({ "op": "workflow.agent_copy", "from": "swarm-implementer", "packaged": true }),
     ));
     assert!(back.matches_packaged);
+}
+
+#[test]
+fn the_lifecycle_names_who_lands_and_who_overrides() {
+    let kb = Kb::new();
+    let g = match ok(&kb.op, json!({ "op": "workflow.graph" })) {
+        Response::WorkflowGraph { graph } => *graph,
+        other => panic!("{other:?}"),
+    };
+    // The lifecycle's land is the strategy's landers, its override whoever may state a status;
+    // every other act jkb applies inside the op that moves it.
+    let lands = |g: &super::GraphView| -> Vec<String> {
+        let mut by: Vec<String> = g
+            .lifecycle
+            .transitions
+            .iter()
+            .filter(|t| t.event == "land")
+            .map(|t| t.fired_by.clone())
+            .collect();
+        by.dedup();
+        by
+    };
+    assert_eq!(lands(&g), vec!["operator"]);
+    assert_eq!(lands(&direct_lands()), vec!["operator, coordinator"]);
+    for t in &g.lifecycle.transitions {
+        let want = match (t.reconciled, t.event.as_str()) {
+            (true, _) => "observed",
+            (false, "land") => "operator",
+            (false, "override") => "operator, coordinator",
+            _ => "applied",
+        };
+        assert_eq!(t.fired_by, want, "{} --{}-->", t.from, t.event);
+    }
 }
