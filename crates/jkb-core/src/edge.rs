@@ -15,8 +15,10 @@ use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
 /// Create a typed edge `src -> dst`. Idempotent on `(src, dst, type)`. For `depends_on` and
-/// `parent_of`, rejects an edge that would close a cycle of that type — every writer of those
-/// edges (`task::add_subtask`, `jkb inv link`, the `tasks` file sync) passes through here.
+/// `parent_of`, rejects an edge that would close a cycle of that type — which guards the forward
+/// writers that link through here (`task::add_subtask`, `jkb inv link`, the `tasks` file sync).
+/// Not `jkb undo`: it reinserts an edge with its own SQL, and an out-of-order undo can restore a
+/// cycle (filed as a follow-up task).
 ///
 /// Leaves `weight` NULL — use [`link_weighted`] for signed evidence edges
 /// (`supports`/`contradicts`).
@@ -648,8 +650,8 @@ mod tests {
         assert_eq!(deps, vec![b]);
     }
 
-    /// `parent_of` is guarded at the one writer every caller passes — `task::add_subtask`,
-    /// `jkb inv link` and the `tasks` sync alike — so no writer can make a task its own ancestor.
+    /// `parent_of` is guarded here, where `task::add_subtask`, `jkb inv link` and the `tasks` sync
+    /// all link, so none of them can make a task its own ancestor.
     #[test]
     fn parent_of_stays_acyclic() {
         let db = Db::open_in_memory().unwrap();

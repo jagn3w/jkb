@@ -14,8 +14,9 @@
 //! ## What this does NOT replace
 //! The `parent_of` / `derived_from` edges survive, carrying what a containment row cannot:
 //! `jkb related` traversal, `derived_from` as the provenance search reads for
-//! `source_document`, and the `tasks` file serializer's indentation round-trip. [`crate::task::add_subtask`] writes both the edge and the
-//! containment row in one call so they cannot drift; [`contain`] records only the row.
+//! `source_document`, and the `tasks` file serializer's indentation round-trip.
+//! [`crate::task::add_subtask`] writes both the edge and the containment row in one call so they
+//! cannot drift; [`contain`] records only the row.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;

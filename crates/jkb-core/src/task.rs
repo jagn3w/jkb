@@ -373,15 +373,22 @@ pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> 
 /// Cycle-guarded, so a task cannot become its own ancestor: [`edge::link`] refuses a `parent_of`
 /// edge from a task already inside `child`, and [`crate::containment::contain`] a containment row
 /// that would close a loop. A new subtask cannot close one; [`move_under`] could, and is refused
-/// through these.
+/// through these. Those guards cover the forward writers only: `jkb undo` restores edges and
+/// containment rows with its own SQL, and an out-of-order undo can put a loop back (filed as a
+/// follow-up task, not handled here).
+///
+/// A parent bound to a synced `file://` line takes only a child bound to that same file: the file
+/// declares exactly its lines' children, so the next sync would unlink the edge to any other task
+/// and leave its containment row behind.
 ///
 /// An execution plan or a design span is never a task's parent (design D53.6): a plan's work is
 /// under its steps, and a plan's listing and its *archived* both walk only from the steps, so a task
 /// contained by the plan itself (or by a span) would be in neither — invisible, never prompted for.
 ///
 /// # Errors
-/// Returns a validation error if `child` is `parent` or one of its ancestors, or if `parent` is an
-/// execution plan or a design span; otherwise a database error.
+/// Returns a validation error if `child` is `parent` or one of its ancestors, if `parent` is an
+/// execution plan or a design span, or if `parent` is a line of a synced file `child` is not
+/// filed in; otherwise a database error.
 pub fn add_subtask(
     conn: &Connection,
     meta: &WriteMeta,
@@ -395,6 +402,22 @@ pub fn add_subtask(
                  (`jkb design plan show` lists them) or under the design for a one-off",
                 p.uid, p.kind
             ))));
+        }
+        let file_of = |id: ItemId| -> Result<Option<String>> {
+            Ok(binding::get(conn, id)?
+                .as_ref()
+                .and_then(|b| binding::file_path(&b.uri))
+                .map(str::to_owned))
+        };
+        if let Some(file) = file_of(parent)? {
+            if file_of(child)?.as_deref() != Some(file.as_str()) {
+                return Err(Error::Types(TypeError::Validation(format!(
+                    "`{}` is a line of {file}, which declares exactly its children: add the task \
+                     under it in the file (a parent edge to a task not in the file is removed by \
+                     the next sync)",
+                    p.uid
+                ))));
+            }
         }
     }
     // The edge records the relationship; the containment row records that the child lives
@@ -427,8 +450,7 @@ pub enum Moved {
 ///
 /// Refused for a task bound to a synced `file://` line: the tasks serializer owns that task's
 /// parent through the file's indentation, so the next sync would put it back. Refused, too, under
-/// a parent bound to one: the file declares exactly its line's children, so the next sync would
-/// unlink the edge to a task that is not in it and leave the containment row behind.
+/// a parent bound to one, by [`add_subtask`].
 ///
 /// # Errors
 /// [`TypeError::NotFound`] when either item is missing; a validation error when `child` is not a
@@ -449,11 +471,11 @@ pub fn move_under(
             task.uid, task.kind
         )));
     }
-    let Some(parent) = crate::item::get(conn, new_parent)? else {
+    if crate::item::get(conn, new_parent)?.is_none() {
         return Err(Error::Types(TypeError::NotFound(format!(
             "item {new_parent}"
         ))));
-    };
+    }
     if let Some(file) = binding::get(conn, child)?
         .as_ref()
         .and_then(|b| binding::file_path(&b.uri))
@@ -462,16 +484,6 @@ pub fn move_under(
             "`{}` is a line of {file}, whose indentation is its parent: edit the file to move it \
              (a move here would be put back by the next sync)",
             task.uid
-        )));
-    }
-    if let Some(file) = binding::get(conn, new_parent)?
-        .as_ref()
-        .and_then(|b| binding::file_path(&b.uri))
-    {
-        return Err(invalid(format!(
-            "`{}` is a line of {file}, which declares exactly its children: add the task under it \
-             in the file (a parent edge to a task not in the file is removed by the next sync)",
-            parent.uid
         )));
     }
     let edge_parents = parent_edges(conn, child)?;

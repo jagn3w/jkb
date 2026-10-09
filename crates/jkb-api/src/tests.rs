@@ -3411,3 +3411,41 @@ fn task_move_under_a_task_filed_in_a_synced_file_is_refused() {
     };
     assert!(children.is_empty(), "{children:?}");
 }
+
+/// `task.add --under` a line of a synced file takes only a child filed in that file: a managed one
+/// would get an edge the next sync removes and a containment row it leaves behind.
+#[test]
+fn task_add_under_a_task_filed_in_a_synced_file_takes_only_a_line_of_that_file() {
+    let (db, inside, _outside, _managed) = mutate_fixture();
+    let host = LocalBackend::new(db.clone());
+    let e = call(
+        &host,
+        json!({ "op": "task.add", "text": "stray", "under": inside, "managed": true }),
+    )
+    .unwrap_err();
+    assert!(
+        e.message.contains("add the task under it in the file"),
+        "{e:?}"
+    );
+    let filed = match call(
+        &host,
+        json!({ "op": "task.add", "text": "filed", "under": inside }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let Response::Children { children, .. } =
+        call(&host, json!({ "op": "task.subtasks", "uid": inside })).unwrap()
+    else {
+        panic!("children")
+    };
+    assert_eq!(
+        children
+            .into_iter()
+            .map(|c| c.reference)
+            .collect::<Vec<_>>(),
+        [filed]
+    );
+}

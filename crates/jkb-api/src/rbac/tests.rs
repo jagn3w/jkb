@@ -1027,3 +1027,51 @@ fn task_move_is_granted_as_task_place_and_held_to_the_parent_s_scope() {
         json!({ "op": "task.move", "uid": sub, "under": a }),
     );
 }
+
+/// An attested subagent's first write binds it to the task that write names; a `task.move` first
+/// would bind it to the moved task and then refuse every parent outside it. Refused up front, with
+/// how to bind, and the subagent left unbound.
+#[test]
+fn an_attested_subagent_s_first_write_cannot_be_a_move() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let under_a = |text: &str| match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": text, "under": a }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let (sub, sibling) = (under_a("sub"), under_a("sibling"));
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "implementer", "role": "implementer" }),
+    );
+    let hook = kb.as_token(&container);
+    let ticket = |tool: &str| match ok(
+        &hook,
+        json!({ "op": "attest.mint", "session": "s1", "agent_id": "ag1",
+                "agent_type": "implementer", "tool_use_id": tool }),
+    ) {
+        Response::Ticket { token } => kb.as_token(&token),
+        other => panic!("{other:?}"),
+    };
+    let e = refused(
+        &ticket("tool-1"),
+        json!({ "op": "task.move", "uid": sub, "under": sibling }),
+    );
+    assert!(e.message.contains("jkb role bind"), "{e:?}");
+    // Still unbound: it binds to `a` and then moves within it.
+    ok(&ticket("tool-2"), json!({ "op": "role.bind", "uid": a }));
+    match ok(
+        &ticket("tool-3"),
+        json!({ "op": "task.move", "uid": sub, "under": sibling }),
+    ) {
+        Response::TaskMoved { moved } => assert!(moved.moved, "{moved:?}"),
+        other => panic!("{other:?}"),
+    }
+}
