@@ -393,6 +393,7 @@ fn a_discussed_passage_with_an_edge_line_break_is_quoted_exactly() {
     for needle in [
         "Exactly, as a JSON string: \"foo\\n\"",
         "begins or ends with whitespace or a line break",
+        "--find=$'foo\\n'",
     ] {
         assert!(
             prompt.prompt.contains(needle),
@@ -776,9 +777,12 @@ fn a_new_prompt_carries_the_operators_words_and_how_to_read_the_design() {
         format!("jkb design cat {uid}"),
         format!("jkb design plan ls {uid}"),
         "\n````\nTighten the ```intro``` please.\n````\n".to_owned(),
+        // The one spelling of an edit every prompt teaches (`edit_usage`), the same as Discuss's.
+        format!("jkb design edit {uid} --base <token> --find=<quote> --replace=<text>"),
     ] {
         assert!(p.prompt.contains(&needle), "{needle}: {}", p.prompt);
     }
+    assert!(!p.prompt.contains("--find <quote>"), "{}", p.prompt);
     let blank = new("");
     assert!(
         blank.prompt.contains("has not said what they want yet"),

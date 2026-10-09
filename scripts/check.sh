@@ -62,6 +62,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 # judge the tree they are in.
 echo "==> build jkb (for the shell tests)"
 cargo build -p jkb-cli --bin jkb
+# Where that build put it, decided ONCE and used by every step below (the docs check, the shell
+# tests, the ui's yjs-wire test). The target directory is cargo's own answer, so a `build.target-dir`
+# in a cargo config is followed everywhere, not only by the steps that remembered to ask.
+target_dir="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+[ -n "$target_dir" ] || { echo "cargo metadata named no target directory" >&2; exit 1; }
+JKB_BIN="$target_dir/debug/jkb"
+export JKB_BIN
 
 # docs/ is generated from jkb designs (design D55.6). A generated file is one whose first line is
 # the `generated from jkb design <uid>` header, and it must be exactly its design's render now: a
@@ -69,7 +76,7 @@ cargo build -p jkb-cli --bin jkb
 # no header and are not checked. The rule — which files, what they must say — is the binary's
 # alone (`jkb design export --check`); this line only runs it, with the binary built above.
 echo "==> generated docs (jkb design export --check)"
-(cd "$(dirname "$0")/.." && "${CARGO_TARGET_DIR:-$PWD/target}/debug/jkb" design export --check)
+(cd "$(dirname "$0")/.." && "$JKB_BIN" design export --check)
 
 # The shell under scripts/ is part of the codebase too, and setup.sh's installs are not
 # reachable from a Rust test. Each *.test.sh is self-contained and runs in a temp dir.
@@ -115,14 +122,11 @@ esac
 if command -v pnpm >/dev/null 2>&1; then
     # `test` after `build`: the tests bundle their own module, so they do not need dist — but
     # a type error is the cheaper failure to read, so it is the one reported first.
-    # JKB_BIN: the jkb built above (`build jkb`), against which the app's yjs-wire test measures
-    # the editor's Yjs updates (D53.4). This gate always builds one, so the test is REQUIRED here
-    # (JKB_REQUIRE_WIRE): a missing binary fails rather than skipping green. The target directory is
-    # cargo's own answer, so a `build.target-dir` in a cargo config is followed too.
-    target_dir="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
-    JKB_BIN="${target_dir:-${CARGO_TARGET_DIR:-$(cd "$(dirname "$0")/.." && pwd)/target}}/debug/jkb"
+    # JKB_BIN (exported after `build jkb`) is what the app's yjs-wire test measures the editor's Yjs
+    # updates against (D53.4). This gate always builds one, so the test is REQUIRED here
+    # (JKB_REQUIRE_WIRE): a missing binary fails rather than skipping green.
     JKB_REQUIRE_WIRE=1
-    export JKB_BIN JKB_REQUIRE_WIRE
+    export JKB_REQUIRE_WIRE
     (cd "$(dirname "$0")/../ui" && pnpm run build && pnpm run test)
 else
     echo "   (skipped: pnpm not found — install it, or set PNPM_HOME; CI runs this gate)"

@@ -345,9 +345,11 @@ the Yjs peer, `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `disc
   says the count holds only with `V`. *Found in review.*
 - **The quote is also given as a JSON string**, and a passage with whitespace or a line break at an
   edge says so. A fence cannot show those, but the quote and its occurrence count them: copying the
-  visible `foo` of a selected `foo\n` matched a third time and edited the wrong line. Values are
-  spelled `--find=<quote>`, because a quote starting with `-` (a Markdown list item) otherwise parses
-  as a flag.
+  visible `foo` of a selected `foo\n` matched a third time and edited the wrong line. Such a passage
+  names bash's `$'…'` quoting, the shell spelling that passes a real line break. `--find`,
+  `--insert-after` and `design span --find` take values beginning with `-` (`allow_hyphen_values`),
+  because a Markdown list item is a common quote. Both prompts that teach an edit (*Discuss* and
+  *New prompt*) build it from one string, `designs::edit_usage`, so the two cannot drift apart.
 - **The offsets are sent with the version whose text is the screen's.** The pane waits for every
   local edit to be saved, re-reads with `design.cat`, and sends that version only if its text is the
   text the selection was made in; otherwise it asks for the selection again. Every other reason
@@ -400,11 +402,23 @@ the Yjs peer, `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `disc
   `a failed pull does not cancel a failed edit's retry`).
 - **The editor is read-only until the first load has merged.** Text typed into the empty document
   before the load was sent as a real edit, and landed at one end of the design's text.
-- **Edits outlive the pane that held them.** A session the pane stops showing is *closed*, not
-  disposed: it sends what it still holds, then disposes itself (a stopped session holds nothing it
-  will send). Switching design or repo says that edits are still being saved. A Refresh keeps the
-  designs it already has while it loads and when it fails. Emptying the list for a moment closed the
-  open design and, before `close`, dropped its unsent edits.
+- **One session per design per window, reused (`design/registry.ts`).** Edits outlive the pane
+  that held them. A pane *attaches* to the registry's session for a design and *detaches* when it
+  stops showing it, by picker, *Jump to context* or the tab closing. The session it leaves keeps
+  sending what it holds and is disposed only once it has nothing unsent and no pane. Reopening the
+  design reattaches to that same session, unless the session has stopped. A session owns the
+  design's feed: it subscribes when it opens and unsubscribes when it is disposed. *Why one, not one
+  per pane:* the first fix closed the old pane's session lazily. Main keeps one feed owner per window
+  and topic, with no count, so when a design was reopened while the old session was still sending,
+  that session's late unsubscribe ended the feed under the new one, which went silently deaf. Any
+  wait on the old session also stayed blocked, and with it the one-at-a-time *Discuss* guard for
+  every design. Making the overlap impossible was simpler than counting it (found in review, round
+  2; pinned by `a design reopened while its old pane's edits are unsent reuses the session, and
+  stays live`). A detached session also ends every wait on it: a *Discuss* pending there resolves
+  as `closed`. Its resend retries are bounded (10 by default). A refusal or a give-up while
+  detached is reported as a notice naming the design, since no pane showed its status. Leaving a
+  design with unsent edits says they are still being saved. A Refresh keeps the designs it already
+  has while it loads and when it fails: emptying the list for a moment detached the open design.
 - **`@codemirror/language` is held at 6.12.4** (a workspace `overrides` entry): 6.13.0, published the
   day before, imports `@codemirror/streamparser` without declaring it, and the renderer did not bundle.
 

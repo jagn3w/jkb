@@ -489,11 +489,11 @@ enum DesignCmd {
         /// The version token you read the quote at.
         #[arg(long)]
         base: String,
-        /// Replace this quote's text with `--replace`.
-        #[arg(long, requires = "replace")]
+        /// Replace this quote's text with `--replace`. A quote may begin with `-` (a list item).
+        #[arg(long, requires = "replace", allow_hyphen_values = true)]
         find: Option<String>,
-        /// Insert `--text` right after this quote.
-        #[arg(long, requires = "text")]
+        /// Insert `--text` right after this quote. A quote may begin with `-`.
+        #[arg(long, requires = "text", allow_hyphen_values = true)]
         insert_after: Option<String>,
         /// Replace this span's whole text with `--replace`; the span then covers it.
         #[arg(long, requires = "replace")]
@@ -515,8 +515,8 @@ enum DesignCmd {
         /// The version token you read the quote at.
         #[arg(long)]
         base: String,
-        /// The quote the span covers.
-        #[arg(long)]
+        /// The quote the span covers. It may begin with `-` (a list item).
+        #[arg(long, allow_hyphen_values = true)]
         find: String,
         /// Which match, from 1.
         #[arg(long)]

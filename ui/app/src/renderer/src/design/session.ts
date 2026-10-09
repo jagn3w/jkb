@@ -60,7 +60,7 @@ const TRANSIENT = new Set(["unavailable", "busy", "internal", "unknown"]);
 export type Unsettled =
   /** The session stopped (a refused edit or design): nothing it shows can be named. */
   | { readonly kind: "failed"; readonly message: string }
-  /** The session was closed while waiting. */
+  /** The pane left the design while waiting (the session is detached or disposed). */
   | { readonly kind: "closed" }
   /** `design.cat` could not be read. */
   | { readonly kind: "unread"; readonly message: string }
@@ -74,6 +74,8 @@ type SpansRead = { readonly kept: true } | { readonly kept: false; readonly unre
 class Retry {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #backoff: number;
+  /** Attempts scheduled since the last success, or since `recount`. */
+  attempts = 0;
   constructor(
     readonly min: number,
     readonly max: number,
@@ -87,9 +89,14 @@ class Retry {
       again();
     }, this.#backoff);
     this.#backoff = Math.min(this.#backoff * 2, this.max);
+    this.attempts += 1;
   }
   reset(): void {
     this.#backoff = this.min;
+    this.attempts = 0;
+  }
+  recount(): void {
+    this.attempts = 0;
   }
   cancel(): void {
     clearTimeout(this.#timer);
@@ -100,6 +107,11 @@ class Retry {
 export interface DesignSessionOptions {
   /** How long after a change the spans are re-read. */
   readonly spansDelayMs?: number;
+  /**
+   * How many times a detached session (no pane shows it) retries sending its edits before it gives
+   * up and stops, which its registry reports. An attached session retries for as long as it is shown.
+   */
+  readonly detachedRetries?: number;
   readonly minBackoffMs?: number;
   readonly maxBackoffMs?: number;
 }
@@ -136,12 +148,15 @@ export class DesignSession {
   #unlisten: (() => void) | undefined;
   #idle: (() => void)[] = [];
   #disposed = false;
+  #attached = true;
+  readonly #detachedRetries: number;
 
   constructor(bridge: SessionBridge, uid: string, topic: string, options: DesignSessionOptions = {}) {
     this.#bridge = bridge;
     this.#uid = uid;
     this.#topic = topic;
     this.#spansDelay = options.spansDelayMs ?? 250;
+    this.#detachedRetries = options.detachedRetries ?? 10;
     const min = options.minBackoffMs ?? 500;
     const max = options.maxBackoffMs ?? 30_000;
     this.#flushRetry = new Retry(min, max);
@@ -235,14 +250,21 @@ export class DesignSession {
     if (await this.#join()) await this.pull();
   }
 
+  /** Whether a pane shows this session. */
+  get attached(): boolean {
+    return this.#attached;
+  }
+
   /**
-   * Close the session once its edits are sent: a pane that stops showing a design must not drop
-   * what was typed into it. It is disposed at once when nothing is waiting, or when the session has
-   * stopped (a refused edit is never sent).
+   * Shown again, or no longer shown (`registry.ts` decides). Detached, the session keeps sending what
+   * it holds — with bounded retries — and every wait on it ends: a *Discuss* pending on a design the
+   * pane has left resolves as `closed` rather than holding the one-at-a-time guard.
    */
-  close(): void {
-    this.#listeners.clear();
-    void this.idle().then(() => this.dispose());
+  setAttached(attached: boolean): void {
+    if (this.#attached === attached || this.#disposed) return;
+    this.#attached = attached;
+    this.#flushRetry.recount();
+    if (!attached) this.#settleIdle();
   }
 
   dispose(): void {
@@ -354,6 +376,10 @@ export class DesignSession {
         if (!answer.ok) {
           // Not sent: back at the head of the queue, ahead of anything written since.
           this.#outbox = [...batch, ...this.#outbox];
+          if (!this.#attached && this.#flushRetry.attempts >= this.#detachedRetries) {
+            this.#fail(`not saved after ${this.#detachedRetries} retries: ${answer.error.message}`);
+            return;
+          }
           this.#trouble(answer.error, this.#flushRetry, () => void this.#flush());
           return;
         }
@@ -367,7 +393,11 @@ export class DesignSession {
       this.#scheduleSpans();
     } finally {
       this.#sending = false;
-      if (this.#outbox.length === 0) this.#settleIdle();
+      if (this.#outbox.length === 0 && !this.#disposed) {
+        this.#settleIdle();
+        // Now `unsent` is false: a registry waiting to dispose a detached session hears it.
+        this.#changed();
+      }
     }
   }
 
@@ -419,7 +449,7 @@ export class DesignSession {
 
   /** Resolves when every local edit has been sent (or the session has stopped). */
   idle(): Promise<void> {
-    if (!this.unsent || this.#disposed || this.status.kind === "failed") {
+    if (!this.unsent || this.#disposed || !this.#attached || this.status.kind === "failed") {
       return Promise.resolve();
     }
     return new Promise((resolve) => this.#idle.push(resolve));
@@ -433,7 +463,11 @@ export class DesignSession {
   async settledVersion(): Promise<{ readonly ok: true; readonly doc: DesignDoc } | { readonly ok: false; readonly why: Unsettled }> {
     await this.idle();
     const stopped = (): Unsettled | undefined =>
-      this.#disposed ? { kind: "closed" } : this.status.kind === "failed" ? { kind: "failed", message: this.status.message } : undefined;
+      this.#disposed || !this.#attached
+        ? { kind: "closed" }
+        : this.status.kind === "failed"
+          ? { kind: "failed", message: this.status.message }
+          : undefined;
     const before = stopped();
     if (before !== undefined) return { ok: false, why: before };
     const read = await this.#readSpans();

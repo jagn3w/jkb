@@ -7,7 +7,8 @@ import { discussSpec, exclusive } from "../design/discuss";
 import { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading, type Listing } from "../design/listing";
 import { PlanColumn } from "../design/PlanColumn";
 import { PromptsPane } from "../design/PromptsPane";
-import { DesignSession, type SyncStatus } from "../design/session";
+import { SessionRegistry } from "../design/registry";
+import type { DesignSession, SessionBridge, SyncStatus } from "../design/session";
 import { useNavigation } from "../navigation";
 import { useTerminals } from "../terminal/TerminalProvider";
 
@@ -40,31 +41,41 @@ const STATUS_LABEL: Record<SyncStatus["kind"], string> = {
   failed: "Stopped",
 };
 
+/** The window's one registry of design sessions (`registry.ts`): one session per design, reused. */
+let registry: SessionRegistry | undefined;
+function registryOf(): SessionRegistry {
+  registry ??= new SessionRegistry(bridgeOf());
+  return registry;
+}
+
 /**
- * The open design's session, re-rendered on every change of status or spans. A session the pane
- * stops showing is closed, not disposed: it sends what it still holds first (`DesignSession.close`).
+ * The open design's session, re-rendered on every change of status or spans. The pane attaches to
+ * the registry's session and detaches when it stops showing it; the session itself outlives the pane
+ * until what it holds is sent.
  */
 function useSession(design: Design | undefined): DesignSession | undefined {
   const [session, setSession] = useState<DesignSession | undefined>(undefined);
   const [, bump] = useState(0);
+  const title = design?.title ?? "";
   useEffect(() => {
     if (design === undefined) {
       setSession(undefined);
       return undefined;
     }
-    const s = new DesignSession(bridgeOf(), design.uid, design.topic);
+    const reg = registryOf();
+    const s = reg.attach({ uid: design.uid, topic: design.topic, title });
     setSession(s);
     const off = s.onChange(() => bump((n) => n + 1));
-    void s.open();
     return () => {
       off();
-      s.close();
+      reg.detach(s);
     };
+    // The title only names the design in notices: a rename does not reopen it.
   }, [design?.uid, design?.topic]);
   return session;
 }
 
-function bridgeOf(): ConstructorParameters<typeof DesignSession>[0] {
+function bridgeOf(): SessionBridge {
   return {
     op: (request) => window.jkb.op(request),
     subscribe: (topic) => window.jkb.design.subscribe(topic),
@@ -136,20 +147,17 @@ export function DesignTab(): React.JSX.Element {
   // under this one's name.
   const session = opened !== undefined && opened.uid === design?.uid ? opened : undefined;
 
-  // Switching away from a design with edits not yet sent: they are sent in the background
-  // (`useSession` closes the session, it does not drop it), and the operator is told so.
-  const leaving = (): void => {
-    if (session?.unsent === true) setNotice(`Edits to ${design?.title ?? "the design"} are still being saved in the background.`);
-  };
+  // What the registry says about designs the pane has left — still saving, or not saved — whichever
+  // way the pane left them (a picker, *Jump to context*, the tab closing).
+  useEffect(() => registryOf().onNotice((n) => setNotice(n.message)), []);
+
   const pickRepo = (next: string): void => {
-    leaving();
     setRepo(next);
     remember(LAST_REPO_KEY, next);
     setUid(undefined);
     remember(LAST_DESIGN_KEY, undefined);
   };
   const pickDesign = (next: string): void => {
-    leaving();
     setUid(next);
     remember(LAST_DESIGN_KEY, next);
   };

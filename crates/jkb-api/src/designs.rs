@@ -581,6 +581,15 @@ pub(crate) fn longest_backtick_run(s: &str) -> usize {
     s.split(|c| c != '`').map(str::len).max().unwrap_or(0)
 }
 
+/// How Claude edits a design's text, as every prompt that teaches it says it (*Discuss*, *New
+/// prompt*): one spelling, so the prompts cannot drift apart on a CLI rule.
+pub(crate) fn edit_usage(uid: &str) -> String {
+    format!(
+        "`jkb design edit {uid} --base <token> --find=<quote> --replace=<text>` (or \
+         `--insert-after=<quote> --text=<text>`)"
+    )
+}
+
 /// The *Discuss* prompt: the design, the version read, the selection as the quote an edit names it
 /// by, the spans it touches, and how to read and edit the design through the CLI.
 fn discuss_prompt(d: &design::Discussion) -> String {
@@ -609,7 +618,9 @@ fn discuss_prompt(d: &design::Discussion) -> String {
         let _ = writeln!(
             p,
             "It begins or ends with whitespace or a line break, which the block above does not \
-             show: quote it as the JSON string has it."
+             show: quote it as the JSON string has it. In bash, `$'…'` quoting passes a line break \
+             as `\\n` (e.g. `--find=$'foo\\n'`); a plain `'…'` or `\"…\"` passes the two \
+             characters."
         );
     }
     match d.occurrence {
@@ -653,11 +664,9 @@ fn discuss_prompt(d: &design::Discussion) -> String {
         p,
         "When they do, edit through the CLI against a version you read — your edit merges with \
          anything written since, and the quote is matched in that version, never the latest: \
-         `jkb design edit {uid} --base <token> --find=<quote> --replace=<text>` (or \
-         `--insert-after=<quote> --text=<text>`). Spell each quote with `=`: one beginning \
-         with `-`, as a list item does, is otherwise read as a flag. Against a version you read \
-         yourself, quote enough of the surrounding text that it occurs once there.",
-        uid = d.uid
+         {}. Against a version you read yourself, quote enough of the surrounding text that it \
+         occurs once there.",
+        edit_usage(&d.uid)
     );
     // The occurrence counts matches in the version the selection was made in, and in no other: it
     // is given only beside that version's token, never as part of a command with another one.

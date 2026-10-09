@@ -4807,6 +4807,50 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
     assert!(!whoami(&sub).status.success(), "released at SubagentStop");
 }
 
+/// A quote beginning with `-` (a Markdown list item) is a value, not a flag, in every quote option
+/// (`--find`, `--insert-after`, `design span --find`), spelled with or without `=`.
+#[test]
+fn a_quote_that_begins_with_a_dash_is_a_value() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let listed = jkb(&db)
+        .args(["--json", "design", "create", "List", "--repo", "jkb"])
+        .args(["--body=- one\n- two\n"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let list_uid = listed["uid"].as_str().unwrap().to_owned();
+    let list_version = || -> String {
+        let out = jkb(&db)
+            .args(["--json", "design", "cat", &list_uid])
+            .output()
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        doc["version"].as_str().unwrap().to_owned()
+    };
+    jkb(&db)
+        .args(["design", "edit", &list_uid, "--base", &list_version()])
+        .args(["--find", "- one", "--replace", "- uno"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "edit", &list_uid, "--base", &list_version()])
+        .args(["--insert-after", "- two", "--text", "!"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "span", &list_uid, "--base", &list_version()])
+        .args(["--find=- uno"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["design", "cat", &list_uid, "--plain"])
+        .assert()
+        .success()
+        .stdout("- uno\n- two!\n");
+}
+
 /// The design edit loop an agent runs (D53.4): `cat` for the text and its version token, `edit` by
 /// quote against that token — merged over an edit made since — then a span approved and demoted.
 #[test]

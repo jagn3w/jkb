@@ -158,10 +158,9 @@ pub fn new_prompt(conn: &Connection, uid: &str, text: &str) -> Result<NewPrompt,
         p,
         "Read the design first: `jkb design cat {uid}` prints it with span markers and a version \
          token, and `jkb design plan ls {uid}` its execution plans and their tasks. Change its text \
-         only through the CLI, against the version you read — `jkb design edit {uid} --base <token> \
-         --find <quote> --replace <text>` (or `--insert-after <quote> --text <text>`) — and only \
-         when the operator asks. Editing approved text makes it PROPOSED again until it is \
-         re-approved."
+         only through the CLI, against the version you read — {} — and only when the operator \
+         asks. Editing approved text makes it PROPOSED again until it is re-approved.",
+        super::edit_usage(uid)
     );
     let _ = writeln!(p);
     if text.is_empty() {

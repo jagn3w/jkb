@@ -45,6 +45,7 @@ const src = path.join(here, "..", "src");
 const { DesignFeeds, DESIGN_GROUP } = await load(path.join(src, "main", "designFeeds.ts"));
 const { DesignSession } = await load(path.join(src, "renderer", "src", "design", "session.ts"));
 const { discussSpec, exclusive, repoDir } = await load(path.join(src, "renderer", "src", "design", "discuss.ts"));
+const { SessionRegistry } = await load(path.join(src, "renderer", "src", "design", "registry.ts"));
 const { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading } = await load(path.join(src, "renderer", "src", "design", "listing.ts"));
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const Y = require("yjs");
@@ -442,26 +443,149 @@ test("a failed pull does not cancel a failed edit's retry: both are retried, and
   s.dispose();
 });
 
-test("closing a session sends what it still holds before disposing it", async () => {
-  const jkb = standInJkb("abc");
-  const s = Session(jkb.bridge, "d", TOPIC, quick);
-  await s.open();
+// ---- the window's registry: one session per design -----------------------------------------------
+
+/** A registry over a stand-in jkb, counting feed joins and leaves; its sessions are disposed after. */
+function registryOver(jkb, options = quick) {
+  const feed = { subscribed: 0, unsubscribed: 0 };
+  const bridge = {
+    ...jkb.bridge,
+    op: (request) => jkb.bridge.op(request),
+    subscribe: async (topic) => {
+      feed.subscribed += 1;
+      return jkb.bridge.subscribe(topic);
+    },
+    unsubscribe: (topic) => {
+      feed.unsubscribed += 1;
+      jkb.bridge.unsubscribe(topic);
+    },
+  };
+  const registry = new SessionRegistry(bridge, options);
+  const notices = [];
+  registry.onNotice((n) => notices.push(n.message));
+  const attach = () => {
+    const s = registry.attach({ uid: "d", topic: TOPIC, title: "Code Factory" });
+    opened.push(s);
+    return s;
+  };
+  return { registry, feed, notices, attach };
+}
+
+/** Make the stand-in's daemon unreachable until `back()`. */
+function downUntilBack(jkb) {
   const realOp = jkb.bridge.op;
   let down = true;
   jkb.bridge.op = async (request) => (down ? err("unavailable", "down") : realOp(request));
+  return {
+    back() {
+      down = false;
+    },
+  };
+}
+
+test("a design reopened while its old pane's edits are unsent reuses the session, and stays live", async () => {
+  const jkb = standInJkb("abc");
+  const { registry, feed, notices, attach } = registryOver(jkb);
+  const first = attach();
+  await until(() => first.status.kind === "live", "the load");
+  const daemon = downUntilBack(jkb);
+  first.text.insert(3, " typed");
+  await until(() => first.status.kind === "retrying", "the retry");
+  registry.detach(first);
+  assert.deepEqual(notices, ["Edits to Code Factory are still being saved in the background."]);
+
+  const again = attach();
+  assert.equal(again, first, "one session per design: the pane reattaches to the one still sending");
+  daemon.back();
+  await until(() => bodyOf(jkb.table) === "abc typed", "the old pane's edits, sent");
+  await until(() => again.status.kind === "live", "Saved");
+  assert.equal(feed.subscribed, 1);
+  assert.equal(feed.unsubscribed, 0, "nothing ended the feed under the reopened pane");
+  // Still hearing other editors.
+  jkb.writeElsewhere((t) => t.insert(0, ">"));
+  await until(() => again.text.toString() === ">abc typed", "a later edit from elsewhere");
+  registry.detach(again);
+  assert.equal(registry.session("d"), undefined, "nothing unsent and no pane: disposed");
+  assert.equal(feed.unsubscribed, 1);
+});
+
+test("a detached session sends what it holds, then is disposed and leaves the feed", async () => {
+  const jkb = standInJkb("abc");
+  // No span re-read to wake the registry: the drained outbox alone must.
+  const { registry, feed, attach } = registryOver(jkb, { ...quick, spansDelayMs: 60_000 });
+  const s = attach();
+  await until(() => s.status.kind === "live", "the load");
+  const daemon = downUntilBack(jkb);
   s.text.insert(3, " typed while away");
   await until(() => s.status.kind === "retrying", "the retry");
-  assert.equal(s.unsent, true);
-  s.close();
-  await tick();
-  down = false;
-  await until(() => bodyOf(jkb.table) === "abc typed while away", "the held edit, sent after close");
-  await until(() => s.doc.isDestroyed, "the dispose once sent");
-  // Nothing waiting: closed at once.
-  const t = Session(jkb.bridge, "d", TOPIC, quick);
-  await t.open();
-  t.close();
-  await until(() => t.doc.isDestroyed, "the dispose");
+  registry.detach(s);
+  assert.equal(registry.session("d"), s, "kept while it holds edits");
+  daemon.back();
+  await until(() => bodyOf(jkb.table) === "abc typed while away", "the held edit, sent after the pane left");
+  await until(() => registry.session("d") === undefined, "the dispose once sent");
+  assert.ok(s.doc.isDestroyed);
+  assert.equal(feed.unsubscribed, 1);
+});
+
+test("a detached session's refused edit is reported naming the design, and its retries are bounded", async () => {
+  const refused = standInJkb("abc");
+  const r1 = registryOver(refused);
+  const s = r1.attach();
+  await until(() => s.status.kind === "live", "the load");
+  const realOp = refused.bridge.op;
+  let answer = err("unavailable", "down");
+  refused.bridge.op = async (request) => (request.op === "design.apply" ? answer : realOp(request));
+  s.text.insert(3, "d");
+  await until(() => s.status.kind === "retrying", "the retry");
+  r1.registry.detach(s);
+  answer = err("invalid", "the update does not apply");
+  await until(() => r1.registry.session("d") === undefined, "the dispose");
+  assert.equal(r1.notices.at(-1), "Edits to Code Factory were not saved: invalid: the update does not apply");
+
+  // A daemon that never answers: a detached session gives up after its retries, and says so.
+  const gone = standInJkb("abc");
+  const r2 = registryOver(gone, { ...quick, detachedRetries: 3 });
+  const t = r2.attach();
+  await until(() => t.status.kind === "live", "the load");
+  downUntilBack(gone);
+  t.text.insert(3, "d");
+  await until(() => t.status.kind === "retrying", "the retry");
+  r2.registry.detach(t);
+  await until(() => r2.registry.session("d") === undefined, "the give-up");
+  assert.match(r2.notices.at(-1), /^Edits to Code Factory were not saved: not saved after 3 retries/);
+});
+
+test("a Discuss waiting on a design the pane has left resolves as closed", async () => {
+  const jkb = standInJkb("abc");
+  // Retries far from their bound: the wait ends because the pane left, not because the session gave up.
+  const { registry, attach } = registryOver(jkb, { ...quick, detachedRetries: 1_000_000 });
+  const s = attach();
+  await until(() => s.status.kind === "live", "the load");
+  downUntilBack(jkb);
+  s.text.insert(3, "d");
+  const waiting = s.settledVersion();
+  await until(() => s.status.kind === "retrying", "the retry");
+  registry.detach(s);
+  const late = new Promise((r) => setTimeout(() => r("still waiting"), 2000));
+  assert.deepEqual(await Promise.race([waiting, late]), { ok: false, why: { kind: "closed" } });
+  assert.notEqual(s.status.kind, "failed");
+});
+
+test("a stopped session is not reused: reopening the design opens a fresh one", async () => {
+  const jkb = standInJkb("abc");
+  const { registry, attach } = registryOver(jkb);
+  const s = attach();
+  await until(() => s.status.kind === "live", "the load");
+  const realOp = jkb.bridge.op;
+  jkb.bridge.op = async (request) => (request.op === "design.apply" ? err("invalid", "no") : realOp(request));
+  s.text.insert(0, "x");
+  await until(() => s.status.kind === "failed", "the refusal");
+  jkb.bridge.op = realOp;
+  const t = attach();
+  assert.notEqual(t, s);
+  assert.ok(s.doc.isDestroyed);
+  await until(() => t.status.kind === "live", "the fresh load");
+  registry.detach(t);
 });
 
 test("a design with no topic yet is joined once it has one, and re-read then", async () => {
