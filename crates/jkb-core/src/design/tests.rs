@@ -1423,6 +1423,14 @@ fn exported_body(db: &Db, uid: &str) -> String {
     body.to_owned()
 }
 
+fn exported_repo(db: &Db, uid: &str) -> Option<String> {
+    let id = {
+        let uid = uid.to_owned();
+        db.read(move |c| design_id(c, &uid)).unwrap()
+    };
+    db.read(move |c| export::repo_of(c, id)).unwrap()
+}
+
 fn set_target(db: &Db, uid: &str, path: &str) -> Result<i64> {
     let (uid, path) = (uid.to_owned(), path.to_owned());
     db.write_txn("t", move |c, m| {
@@ -1514,8 +1522,8 @@ fn a_demoted_span_is_not_exported_at_all() {
     }
 }
 
-/// Skipped PROPOSED text between two approved spans leaves one line break (or a space) and never
-/// its words, so spans quoted without their trailing newline do not run together.
+/// Skipped PROPOSED text between two approved spans leaves at most a paragraph break (a blank line
+/// in it), else a line break or a space, and never its words, so spans quoted without their trailing newline do not run together.
 #[test]
 fn a_skipped_gap_keeps_its_line_breaks_between_spans() {
     let db = db();
@@ -1529,8 +1537,27 @@ fn a_skipped_gap_keeps_its_line_breaks_between_spans() {
     }
     assert_eq!(
         exported_body(&db, &uid),
-        "## D1\nDecided.\n## D3\nAlso decided. Kept.\n"
+        "## D1\nDecided.\n\n## D3\nAlso decided. Kept.\n"
     );
+}
+
+/// Two approved paragraphs with only the blank line between them uncovered stay two paragraphs,
+/// whether their spans include their trailing newline or not.
+#[test]
+fn two_approved_paragraphs_stay_two_paragraphs() {
+    for quotes in [["Para one.", "Para two."], ["Para one.\n", "Para two.\n"]] {
+        let db = db();
+        let uid = create(&db, "Para one.\n\nPara two.\n");
+        for quote in quotes {
+            let s = span(&db, &uid, quote, Reviewer::Operator).unwrap();
+            approve_as(&db, &s, Approver::Operator).unwrap();
+        }
+        assert_eq!(
+            exported_body(&db, &uid),
+            "Para one.\n\nPara two.\n",
+            "{quotes:?}"
+        );
+    }
 }
 
 /// Skipping one whole line adds nothing when the output already ends one, so a table keeps its
@@ -1815,6 +1842,40 @@ fn an_undo_that_puts_two_designs_on_one_file_fails_the_export() {
         e.contains(&a) && e.contains(&b) && e.contains("docs/a.md"),
         "{e}"
     );
+    // A single-design export refuses too, either design.
+    for uid in [&a, &b] {
+        let uid = uid.clone();
+        let e = db
+            .read(move |c| export::export(c, &uid))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("docs/a.md"), "{e}");
+    }
+}
+
+/// `jkb ns mv` of a design into a repo where its target is taken does not go through
+/// `set_doc_target`; the export then refuses, naming both.
+#[test]
+fn a_move_into_a_repo_where_the_path_is_taken_fails_the_export() {
+    let db = db();
+    let a = create(&db, "a");
+    set_target(&db, &a, "docs/a.md").unwrap();
+    let b = db
+        .write_txn("t", |c, m| super::create(c, m, "web", "B", "b"))
+        .unwrap()
+        .uid;
+    set_target(&db, &b, "docs/a.md").unwrap();
+    db.write_txn("t", |c, m| {
+        crate::ns::move_subtree(c, m, "designs/web", "designs/jkb/web")
+    })
+    .unwrap();
+    assert_eq!(exported_repo(&db, &b).as_deref(), Some("jkb"));
+    let b2 = b.clone();
+    let e = db
+        .read(move |c| export::export(c, &b2))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains(&a) && e.contains(&b), "{e}");
 }
 
 /// A design's repo is its namespace now, so one file per repo holds across `jkb ns mv`: the moved

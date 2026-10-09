@@ -130,7 +130,8 @@ fn checkout_repo(ops: &Ops<'_>, root: &Path, cwd: &Path, asked: Option<String>) 
     let here = ops.ambient_repo_at(root)?.with_context(|| {
         format!(
             "the checkout at {} is in no mounted repo, so which repo's designs belong in it is not \
-             known — mount it (`jkb mount create repos/<repo> {}`)",
+             known — mount it as the README does (`jkb mount create repos/<repo> {} --include \
+             \"**/*.md\" --mode bidirectional`)",
             root.display(),
             root.display()
         )
@@ -219,8 +220,9 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Every generated `docs/` file under `root`: its repo-relative path and what its first line says.
-/// Files that are not UTF-8 are not text, so not generated; hand-written ones are left out.
+/// Every generated `docs/` file under `root`, by repo-relative path, with its text. Whether a file is
+/// generated is decided by its first line's bytes; a generated file that is not UTF-8 comes back with
+/// no text, so it is reported rather than skipped. Hand-written files are left out.
 fn generated_files(root: &Path) -> Result<Vec<(String, Option<String>)>> {
     let docs = root.join(DOCS_DIR);
     let mut files = Vec::new();
@@ -441,9 +443,16 @@ pub(crate) fn run(ops: &Ops<'_>, args: ExportArgs) -> Result<()> {
 /// `jkb design source <uid> <path>…`: record each file with the blake3 of its content now.
 ///
 /// # Errors
-/// An unreadable file, one outside the checkout, or the op's refusal.
+/// An unreadable file, one outside the checkout, a design of another repo than this checkout's, or
+/// the op's refusal.
 pub(crate) fn source(ops: &Ops<'_>, uid: String, paths: &[String]) -> Result<()> {
     let (root, cwd) = checkout()?;
+    // A design's sources are files of its own repo: recorded from another repo's checkout they
+    // would name paths and hashes that are not its.
+    let here = checkout_repo(ops, &root, &cwd, None)?;
+    for e in exports(ops, Some(uid.clone()), None)? {
+        same_repo(&e, &here)?;
+    }
     let sources = paths
         .iter()
         .map(|p| {

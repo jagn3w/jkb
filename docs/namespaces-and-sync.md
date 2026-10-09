@@ -505,7 +505,7 @@ and nothing ever held an entry to the second.
   belongs on the list only if it records its writer in `txn_id`; there is no changelog fallback, so
   what lacks one is a stated gap: `containment` (a plan put under a design by a later transaction is
   orphaned by undoing the design's creation; a span is not, as `design.span` writes a
-  `design_updates` row too), and a design's doc target and sources until they gain `txn_id`.
+  `design_updates` row too).
   *Tried and dropped (Code Factory subtask 3, review rounds 3-4):* a generic guard for every item —
   refuse while any later changelog entry, or any row of any `ON DELETE CASCADE` table found in the
   live schema, belonged to the item. It confused rowids with item ids when attributing a row to the

@@ -1273,10 +1273,12 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   with "not" deleted exported as "We must  log tokens." (review round 1; pinned by
   `a_demoted_span_is_not_exported_at_all`). A demoted span reads PROPOSED as a whole (D53.5), and so
   is exported as nothing until it is re-approved. Between two approved spans the skipped PROPOSED
-  text leaves nothing when the output already ends a line, else one line break if it had any, else
-  a space — never its words. Spans quoted without a trailing newline otherwise ran together,
-  `Decided.## D2` (review round 2); counting the gap's own line ends instead put a blank line where
-  one table row was skipped, splitting the table (round 3).
+  text leaves at most a paragraph break and never its words, decided by blank lines: if the gap,
+  with the line break the output already ends in, holds an empty or whitespace-only line, the
+  output ends in exactly one blank line; otherwise a line break if the gap had one and the output
+  does not already end a line, else a space. Each simpler rule broke something: no separator ran
+  spans together (`Decided.## D2`, round 2); counting the gap's line ends split a table at a skipped
+  row (round 3); adding nothing after a line end merged two approved paragraphs (round 4).
 - **The header** is the file's first line:
   `<!-- generated from jkb design <uid>, edit there (version <token>, blake3 <hex>) -->`, the hash being
   that of the body below it. A file without it is hand-written and never checked. **Only the first
@@ -1321,9 +1323,12 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   may each have `docs/a.md`, so one-design-per-file is per repo, and a design's repo is its namespace
   *now*: round 2 stored a copy in the row under `UNIQUE (repo, path)`, which `jkb ns mv` left stale
   (round 3). The rule is checked where a target is set, against each holder's repo then (pinned by
-  `doc_target_uniqueness_follows_a_namespace_move`). An undo restoring an older target does not go
-  through that check, so `design::export::exports` refuses a repo where two designs name one file,
-  naming both (`an_undo_that_puts_two_designs_on_one_file_fails_the_export`). V026 moves existing keys
+  `doc_target_uniqueness_follows_a_namespace_move`). Two paths do not go through that check: an undo
+  restoring an older target, and `jkb ns mv` of a design into a repo where its path is taken. So
+  `design::export::export` itself refuses a design whose file another design now in its repo also
+  names, naming both — a single-design export and `--all` alike (round 4; pinned by
+  `an_undo_that_puts_two_designs_on_one_file_fails_the_export` and
+  `a_move_into_a_repo_where_the_path_is_taken_fails_the_export`). V026 moves existing keys
   over, and raises the
   undo watermark (V014) to the newest transaction that wrote those keys into a design's metadata:
   undone after the move, such an entry would restore a blob nothing reads while the rows stayed,

@@ -9,8 +9,9 @@
 -- path relative to the checkout of the design's repo, and one file of a repo is one design's alone.
 -- That rule is NOT a constraint here: a design's repo is derived from its namespace, which
 -- `jkb ns mv` can change, so a stored copy would go stale. It is checked where a target is set
--- (`design::export::set_doc_target`), and `design::export::exports` refuses a repo in which two
--- designs name one file (which an undo restoring an older target can still produce).
+-- (`design::export::set_doc_target`), and `design::export::export` refuses a design whose file
+-- another design now in its repo also names — which an undo restoring an older target, or a
+-- `jkb ns mv` of a design into a repo where its path is taken, can still produce.
 --
 -- The cascades fire on one path: `jkb undo` of a design's create, which deletes the item
 -- (`item::remove` refuses a design). Both tables are in `design::DESIGN_OWNED`, so that undo is

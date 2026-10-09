@@ -5472,6 +5472,24 @@ fn a_design_records_its_sources_with_their_blake3() {
         .as_str()
         .unwrap()
         .to_owned();
+    f.jkb()
+        .args(["mount", "create", "repos/proj", f.repo.to_str().unwrap()])
+        .assert()
+        .success();
+    // Another repo's design cannot take this checkout's files as its sources.
+    let other = json(&["design", "create", "Other", "--repo", "other"])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args(["design", "source", &other, "README.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("of repo other"));
+    assert_eq!(
+        json(&["design", "ls", "--repo", "other"])[0]["sources"],
+        serde_json::json!([])
+    );
     std::fs::create_dir_all(f.repo.join("sub")).unwrap();
     let out = f
         .jkb()

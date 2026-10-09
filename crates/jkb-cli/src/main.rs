@@ -462,7 +462,7 @@ enum DesignCmd {
         /// the design, so later exports need not repeat it.
         #[arg(long, requires = "uid")]
         to: Option<String>,
-        /// Every design of the repo (the ambient one, or `--repo`) that has a doc target.
+        /// Every design that has a doc target, of the repo this checkout's root is mounted as.
         #[arg(long, conflicts_with = "check")]
         all: bool,
         /// The repo this checkout is, which must agree with the mount covering its root: a design

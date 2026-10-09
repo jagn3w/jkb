@@ -20,7 +20,7 @@ use serde_json::json;
 
 use super::{design_id, invalid, read, DesignText, SpanState, Version};
 use crate::changelog::{self, Entity};
-use crate::{Error, Result};
+use crate::Result;
 use jkb_types::ItemId;
 
 /// The start of a generated file's first line.
@@ -219,16 +219,33 @@ pub fn approved_text(design: &DesignText) -> String {
     out
 }
 
-/// What a skipped `gap` of PROPOSED text leaves between two approved spans: nothing when the
-/// output already ends a line, else one line break if the gap had any, else a space — never the
-/// gap's words. Without it, two spans quoted without their trailing newline ran together
-/// (`Decided.## D2`); counting the gap's own line ends instead put a blank line where one table row
-/// or list item was skipped, which splits the table.
+/// What a skipped `gap` of PROPOSED text leaves between two approved spans — never the gap's words,
+/// at most a paragraph break. Decided by blank lines: when the gap, read together with the line
+/// break the output already ends in, holds an empty or whitespace-only line, the spans were separate
+/// paragraphs and the output ends in exactly one blank line. Otherwise the line structure is kept
+/// without adding any: a line break if the gap had one and the output does not end a line already,
+/// else a space.
+///
+/// Each simpler rule broke something: no separator ran spans quoted without their trailing newline
+/// together (`Decided.## D2`, round 2); counting the gap's line ends put a blank line where one table
+/// row was skipped, splitting the table (round 3); adding nothing after a line end merged two
+/// approved paragraphs into one (round 4).
 fn separate(out: &mut String, gap: &str) {
-    if out.ends_with('\n') {
-        return;
+    let tail = &out[out.trim_end().len()..];
+    let joined = format!("{tail}{gap}");
+    let lines: Vec<&str> = joined.split('\n').collect();
+    let blank = lines.len() > 2
+        && lines[1..lines.len() - 1]
+            .iter()
+            .any(|l| l.trim().is_empty());
+    if blank {
+        let have = out.chars().rev().take_while(|&c| c == '\n').count();
+        for _ in have..2 {
+            out.push('\n');
+        }
+    } else if !out.ends_with('\n') {
+        out.push(if gap.contains('\n') { '\n' } else { ' ' });
     }
-    out.push(if gap.contains('\n') { '\n' } else { ' ' });
 }
 
 /// The whole generated file for `design`: the header, then its approved text, ending in a newline
@@ -311,8 +328,9 @@ fn repo_path(path: &str, what: &str) -> Result<String> {
 
 /// Record where a design's export is written: `path`, relative to the root of the design's repo and
 /// under `docs/`, and named by no other design of that repo (two designs rendering one file would
-/// each read the other's export as drift). An undo restoring an older target does not come through
-/// here, so [`exports`] refuses a repo where it left two designs on one file.
+/// each read the other's export as drift). Two other paths do not come through here and can still
+/// leave two designs of one repo on one file: an undo restoring an older target, and `jkb ns mv` of
+/// a design into a repo where its path is taken. [`export`] refuses such a design, naming both.
 ///
 /// # Errors
 /// An unknown design, a path that is not a `docs/` file, or one another design already targets.
@@ -336,22 +354,11 @@ pub fn set_doc_target(
             super::ROOT
         ))
     })?;
-    // One file of a repo is one design's: checked against each holder's repo NOW, since a repo is
-    // its namespace and a stored copy would go stale on `jkb ns mv`.
-    let holders: Vec<(i64, String)> = conn
-        .prepare_cached(
-            "SELECT t.design_id, i.uid FROM design_doc_targets t JOIN items i ON i.id = t.design_id
-              WHERE t.path = ?1 AND t.design_id <> ?2",
-        )?
-        .query_map(params![path, id.get()], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    for (other, other_uid) in holders {
-        if repo_of(conn, ItemId::new(other))?.as_deref() == Some(repo.as_str()) {
-            return Err(invalid(format!(
-                "design {other_uid} already exports to `{path}` in repo {repo} — give this one its \
-                 own file"
-            )));
-        }
+    if let Some(other) = sharer(conn, id, Some(&repo), &path)? {
+        return Err(invalid(format!(
+            "design {other} already exports to `{path}` in repo {repo} — give this one its own \
+             file"
+        )));
     }
     let current: Option<(String, i64)> = conn
         .prepare_cached("SELECT path, txn_id FROM design_doc_targets WHERE design_id = ?1")?
@@ -444,17 +451,49 @@ pub fn add_sources(
     Ok(())
 }
 
+/// Another design that is now in `repo` and names `path` as its doc target, if any. Asked live, of
+/// each holder's namespace: a repo is a namespace, which `jkb ns mv` can change.
+fn sharer(conn: &Connection, id: ItemId, repo: Option<&str>, path: &str) -> Result<Option<String>> {
+    let holders: Vec<(i64, String)> = conn
+        .prepare_cached(
+            "SELECT t.design_id, i.uid FROM design_doc_targets t JOIN items i ON i.id = t.design_id
+              WHERE t.path = ?1 AND t.design_id <> ?2",
+        )?
+        .query_map(params![path, id.get()], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (other, other_uid) in holders {
+        if repo.is_some() && repo_of(conn, ItemId::new(other))?.as_deref() == repo {
+            return Ok(Some(other_uid));
+        }
+    }
+    Ok(None)
+}
+
 /// The design `uid` rendered for its doc target.
 ///
 /// # Errors
-/// An unknown design, or one whose stored text or metadata does not read.
+/// An unknown design, one whose stored text or metadata does not read, or one whose doc target
+/// another design now in its repo also names — which `set_doc_target` refuses, but an undo
+/// restoring an older target, or `jkb ns mv` of a design into a repo where its path is taken, can
+/// still leave. Refused here, so a single-design export and `--all` alike never let two designs
+/// overwrite one file.
 pub fn export(conn: &Connection, uid: &str) -> Result<Exported> {
     let design = read(conn, uid)?;
     let id = design_id(conn, uid)?;
     let doc_target = meta_of(conn, id)?.doc_target;
+    let repo = repo_of(conn, id)?;
+    if let Some(path) = &doc_target {
+        if let Some(other) = sharer(conn, id, repo.as_deref(), path)? {
+            return Err(invalid(format!(
+                "designs {uid} and {other} of repo {} both export to `{path}` — point one \
+                 elsewhere with `jkb design export <design> --to docs/<file>`",
+                repo.as_deref().unwrap_or("(none)")
+            )));
+        }
+    }
     Ok(Exported {
         text: render(&design),
-        repo: repo_of(conn, id)?,
+        repo,
         uid: design.uid,
         title: design.title,
         doc_target,
@@ -465,28 +504,11 @@ pub fn export(conn: &Connection, uid: &str) -> Result<Exported> {
 /// Every design (of `repo`, when named) that has a doc target, rendered for it, by uid.
 ///
 /// # Errors
-/// A design whose stored text or metadata does not read, or two designs of one repo naming one
-/// file — which `set_doc_target` refuses, but an undo restoring an older target can leave.
+/// A design [`export`] refuses.
 pub fn exports(conn: &Connection, repo: Option<&str>) -> Result<Vec<Exported>> {
-    let out = super::list(conn, repo)?
+    super::list(conn, repo)?
         .into_iter()
         .filter(|d| d.meta.doc_target.is_some())
         .map(|d| export(conn, &d.uid))
-        .collect::<std::result::Result<Vec<_>, Error>>()?;
-    for (i, a) in out.iter().enumerate() {
-        if let Some(b) = out[..i]
-            .iter()
-            .find(|b| b.repo == a.repo && b.doc_target == a.doc_target)
-        {
-            return Err(invalid(format!(
-                "designs {} and {} of repo {} both export to `{}` — point one elsewhere with \
-                 `jkb design export <design> --to docs/<file>`",
-                b.uid,
-                a.uid,
-                a.repo.as_deref().unwrap_or("(none)"),
-                a.doc_target.as_deref().unwrap_or_default()
-            )));
-        }
-    }
-    Ok(out)
+        .collect()
 }
