@@ -418,6 +418,7 @@ fn samples() -> Vec<Request> {
             from: "swarm-implementer".into(),
             packaged: false,
             as_name: None,
+            edit: None,
         },
         Request::WorkflowAgentSet {
             name: "swarm-implementer".into(),

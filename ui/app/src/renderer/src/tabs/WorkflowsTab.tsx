@@ -8,7 +8,7 @@ import {
   strategyName,
   workflowOps,
   workflowsOf,
-  type AgentTemplate,
+  type AgentList,
   type Strategies,
   type WorkflowGraph,
 } from "@jkb/core";
@@ -56,7 +56,7 @@ const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(reque
  * edit, and D53.1 rules out a poll loop.
  */
 export function WorkflowsTab(): React.JSX.Element {
-  const [agents, setAgents] = useState<Loaded<readonly AgentTemplate[]>>({ kind: "loading" });
+  const [agents, setAgents] = useState<Loaded<AgentList>>({ kind: "loading" });
   const [strategies, setStrategies] = useState<Strategies | undefined>(undefined);
   const [strategy, setStrategy] = useState<string | undefined>(undefined);
   const [graph, setGraph] = useState<Loaded<WorkflowGraph>>({ kind: "loading" });
@@ -93,7 +93,8 @@ export function WorkflowsTab(): React.JSX.Element {
     };
   }, [strategy]);
 
-  const list = agents.kind === "loaded" ? agents.value : [];
+  const list = useMemo(() => (agents.kind === "loaded" ? agents.value.agents : []), [agents]);
+  const roles = agents.kind === "loaded" ? agents.value.roles : [];
   const workflows = useMemo(() => workflowsOf(list), [list]);
   const activeWorkflow = workflow !== undefined && workflows.includes(workflow) ? workflow : workflows[0];
   const agent = list.find((a) => a.name === selected && a.workflow === activeWorkflow);
@@ -208,7 +209,7 @@ export function WorkflowsTab(): React.JSX.Element {
         </div>
         <aside className="workflows-side">
           {agent !== undefined ? (
-            <AgentPanel agent={agent} onSaved={onSaved} onNotice={onNotice} />
+            <AgentPanel agent={agent} roles={roles} onSaved={onSaved} onNotice={onNotice} />
           ) : (
             <p className="muted plan-hint workflows-pick">Pick an agent in the graph to see its template and permissions.</p>
           )}

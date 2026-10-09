@@ -15,9 +15,6 @@ export type Writes = "nothing" | "kb" | "git" | "code";
 
 export const ISOLATIONS: readonly Isolation[] = ["none", "worktree"];
 export const WRITES: readonly Writes[] = ["nothing", "kb", "git", "code"];
-/** `jkb_core::roles::Role`, as stored. */
-export const ROLES = ["operator", "coordinator", "designer", "implementer", "reviewer", "systemic_reviewer"] as const;
-export type RoleName = (typeof ROLES)[number];
 
 /** `jkb_core::workflow::agents::AgentPermissions`. */
 export interface AgentPermissions {
@@ -49,6 +46,16 @@ export interface AgentTemplate {
   readonly packaged_version: number | null;
   readonly overrides_packaged: boolean;
   readonly behind_packaged: boolean;
+  /** The packaged version of this name the template in effect is built on; `null` for none. */
+  readonly packaged_base: number | null;
+  /** An operator copy that says exactly what the packaged template says: nothing to contribute. */
+  readonly matches_packaged: boolean;
+}
+
+/** `workflow.agents`' answer: every template, and every role one may act as (this jkb's, never a copy). */
+export interface AgentList {
+  readonly agents: readonly AgentTemplate[];
+  readonly roles: readonly string[];
 }
 
 /** `jkb_api::workflows::GraphState`. */
@@ -72,6 +79,8 @@ export interface GraphEdge {
   readonly planned: boolean;
   /** Who the strategy lets fire it; empty for an observation (anyone's; its guard decides). */
   readonly roles: readonly string[];
+  /** Who fires it, as jkb words it for every surface: `observed`, `applied`, the roles, or `no one`. */
+  readonly fired_by: string;
 }
 
 /** `jkb_api::workflows::MachineView`. */
@@ -107,12 +116,16 @@ export interface AgentEdit {
 export const workflowOps = {
   agents: () => ({ op: "workflow.agents" }),
   agent: (name: string, packaged = false) => ({ op: "workflow.agent", name, packaged }),
-  /** An operator copy of `from` under its own name (overriding the packaged one), or `as`. */
-  copy: (from: string, opts: { readonly packaged?: boolean; readonly as?: string } = {}) => ({
+  /**
+   * An operator copy of `from` under its own name (overriding the packaged one), or `as`; with
+   * `edit`, applied to the copied text in the same write (a refused edit leaves no copy).
+   */
+  copy: (from: string, opts: { readonly packaged?: boolean; readonly as?: string; readonly edit?: AgentEdit } = {}) => ({
     op: "workflow.agent_copy",
     from,
     packaged: opts.packaged ?? false,
     ...(opts.as === undefined ? {} : { as: opts.as }),
+    ...(opts.edit === undefined ? {} : { edit: opts.edit }),
   }),
   set: (name: string, edit: AgentEdit) => ({ op: "workflow.agent_set", name, edit }),
   /** A named strategy's machines, or the default's. */
@@ -138,6 +151,23 @@ export function editBetween(current: AgentTemplate, draft: AgentDraft): AgentEdi
   if (p.isolation !== q.isolation || p.model !== q.model || p.writes !== q.writes) out.permissions = p;
   if (draft.hands_off_to.join(",") !== current.hands_off_to.join(",")) out.hands_off_to = draft.hands_off_to;
   return out;
+}
+
+/**
+ * The one request a save makes, or `undefined` when there is nothing to save. A packaged template is
+ * read-only in jkb, so its save is a copy carrying the edit — one op, validated whole, never a copy
+ * followed by an edit that could be refused and leave the copy behind. A copy is edited as itself.
+ */
+export function saveRequest(current: AgentTemplate, draft: AgentDraft) {
+  const edit = editBetween(current, draft);
+  const changed = Object.keys(edit).length > 0;
+  if (current.source === "packaged") return workflowOps.copy(current.name, changed ? { edit } : {});
+  return changed ? workflowOps.set(current.name, edit) : undefined;
+}
+
+/** Contribute has something to offer: an operator copy that is not just the packaged text. */
+export function canContribute(a: AgentTemplate): boolean {
+  return a.source === "operator" && !a.matches_packaged;
 }
 
 /** The fields the side panel edits. */
@@ -205,7 +235,9 @@ function isAgent(v: unknown): v is AgentTemplate {
     isOptString(v["defined_at"]) &&
     (v["packaged_version"] === null || v["packaged_version"] === undefined || isNumber(v["packaged_version"])) &&
     isBool(v["overrides_packaged"]) &&
-    isBool(v["behind_packaged"])
+    isBool(v["behind_packaged"]) &&
+    (v["packaged_base"] === null || v["packaged_base"] === undefined || isNumber(v["packaged_base"])) &&
+    (v["matches_packaged"] === undefined || isBool(v["matches_packaged"]))
   );
 }
 
@@ -215,18 +247,22 @@ function normal(a: AgentTemplate): AgentTemplate {
     based_on: a.based_on ?? null,
     defined_at: a.defined_at ?? null,
     packaged_version: a.packaged_version ?? null,
+    packaged_base: a.packaged_base ?? null,
+    matches_packaged: a.matches_packaged ?? false,
     permissions: { ...a.permissions, model: a.permissions.model ?? null },
   };
 }
 
 /** `workflow.agents`' answer. */
-export function decodeAgents(o: Outcome<OpResponse>): Outcome<readonly AgentTemplate[]> {
+export function decodeAgents(o: Outcome<OpResponse>): Outcome<AgentList> {
   if (!o.ok) return o;
-  const agents = o.value.result === "workflow_agents" ? o.value["agents"] : undefined;
-  if (!Array.isArray(agents) || !agents.every(isAgent)) {
+  const ours = o.value.result === "workflow_agents";
+  const agents = ours ? o.value["agents"] : undefined;
+  const roles = ours ? o.value["roles"] : undefined;
+  if (!Array.isArray(agents) || !agents.every(isAgent) || !isStrings(roles)) {
     return failed("internal", "jkb serve did not answer with well-formed `workflow_agents`");
   }
-  return { ok: true, value: agents.map(normal) };
+  return { ok: true, value: { agents: agents.map(normal), roles } };
 }
 
 /** `workflow.agent`'s, `workflow.agent_copy`'s or `workflow.agent_set`'s answer. */
@@ -260,7 +296,8 @@ function isEdge(v: unknown): v is GraphEdge {
     isBool(v["reconciled"]) &&
     isBool(v["guarded"]) &&
     isBool(v["planned"]) &&
-    isStrings(v["roles"])
+    isStrings(v["roles"]) &&
+    isString(v["fired_by"])
   );
 }
 

@@ -563,16 +563,12 @@ fn show_graph(
         ] {
             println!("\n{title}:");
             for t in &m.transitions {
-                let by = if t.reconciled {
-                    "observed".to_owned()
-                } else {
-                    t.roles.join(", ")
-                };
                 println!(
-                    "  {:<16} {:<20} -> {:<16} {by}",
+                    "  {:<16} {:<20} -> {:<16} {}",
                     t.from,
                     t.event,
-                    t.to.as_deref().unwrap_or("(stated)")
+                    t.to.as_deref().unwrap_or("(stated)"),
+                    t.fired_by
                 );
             }
         }

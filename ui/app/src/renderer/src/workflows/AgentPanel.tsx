@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 
 import {
+  canContribute,
   decodeAgent,
   draftOf,
   editBetween,
   ISOLATIONS,
   placeholdersOf,
-  ROLES,
+  saveRequest,
   workflowOps,
   WRITES,
   type AgentDraft,
@@ -29,10 +30,12 @@ function handoffs(text: string): string[] {
 
 /**
  * One agent's side panel (D53.7): its template and permissions, edited in place and saved as an
- * operator copy. A packaged template is read-only in jkb, so its first save makes the copy (which
- * then overrides it — what the workflow script reads by name) and applies the edit to that; a copy
- * is edited as itself. *Revert* copies the packaged text back over the copy; *Contribute* exports the
- * saved copy to the packaged-templates file on a branch and opens a pull request, in the container.
+ * operator copy. A packaged template is read-only in jkb, so its first save is one op that makes the
+ * copy with the edit in it (the copy then overrides it — what the workflow script reads by name),
+ * and a refused edit leaves no copy; a copy is edited as itself. *Revert* copies the packaged text
+ * back over the copy; *Contribute* exports the saved copy to the packaged-templates file on a branch
+ * and opens a pull request, in the container — offered only for a copy that differs from the
+ * packaged text.
  *
  * The permissions shown are both halves: what the role may do in jkb (its op classes, enforced by
  * `jkb serve`) and what the script lets the agent do (where it runs, its model, the most it may
@@ -40,10 +43,13 @@ function handoffs(text: string): string[] {
  */
 export function AgentPanel({
   agent,
+  roles,
   onSaved,
   onNotice,
 }: {
   readonly agent: AgentTemplate;
+  /** The roles a template may act as, as `workflow.agents` answered them. */
+  readonly roles: readonly string[];
   readonly onSaved: (name: string) => void;
   readonly onNotice: (message: string, failed?: boolean) => void;
 }): React.JSX.Element {
@@ -77,24 +83,18 @@ export function AgentPanel({
 
   const save = (): Promise<void> =>
     run(async () => {
-      if (packaged) {
-        const copied = decodeAgent(await op(workflowOps.copy(agent.name)));
-        if (!copied.ok) {
-          onNotice(copied.error.message, true);
-          return false;
-        }
+      const request = saveRequest(agent, current);
+      if (request === undefined) return false;
+      const saved = decodeAgent(await op(request));
+      if (!saved.ok) {
+        onNotice(saved.error.message, true);
+        return false;
       }
-      if (dirty) {
-        const set = decodeAgent(await op(workflowOps.set(agent.name, edit)));
-        if (!set.ok) {
-          // A copy made just now stays, holding the packaged text: say so rather than hide it.
-          onNotice(packaged ? `Copied, but the edit was refused: ${set.error.message}` : set.error.message, true);
-          return packaged;
-        }
-        onNotice(`${agent.name} saved as v${set.value.agent.version}.`);
-      } else {
-        onNotice(`${agent.name} is now an operator copy.`);
-      }
+      onNotice(
+        packaged && !dirty
+          ? `${agent.name} is now an operator copy.`
+          : `${agent.name} saved as v${saved.value.agent.version}.`,
+      );
       return true;
     });
 
@@ -159,7 +159,7 @@ export function AgentPanel({
           <label className="field">
             <span>Role</span>
             <select value={current.role} disabled={busy} onChange={(e) => setDraft((d) => ({ ...d, role: e.target.value }))}>
-              {ROLES.map((r) => (
+              {(roles.includes(current.role) ? roles : [...roles, current.role]).map((r) => (
                 <option key={r} value={r}>
                   {r}
                 </option>
@@ -240,8 +240,14 @@ export function AgentPanel({
             <button
               type="button"
               className="bar-button"
-              disabled={busy || dirty}
-              title={dirty ? "Save first: the contribution exports the saved copy" : "Export to the packaged templates on a branch and open a pull request (in the container)"}
+              disabled={busy || dirty || !canContribute(agent)}
+              title={
+                dirty
+                  ? "Save first: the contribution exports the saved copy"
+                  : !canContribute(agent)
+                    ? "This copy is the packaged text: there is nothing to contribute"
+                    : "Export to the packaged templates on a branch and open a pull request (in the container)"
+              }
               onClick={contribute}
             >
               Contribute to jkb

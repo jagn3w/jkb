@@ -84,6 +84,11 @@ pub enum AgentCmd {
         /// The packaged-templates file; by default the one in the current directory's repository.
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Export even though the file packages a different version of the template than the one
+        /// it is built on — a deliberate revert of whatever changed upstream since. Without it
+        /// that is refused, naming both versions.
+        #[arg(long)]
+        override_base: bool,
     },
 }
 
@@ -206,12 +211,12 @@ fn print_agent(a: &AgentView) {
 pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
     match cmd {
         AgentCmd::List => {
-            let agents = match call(b, Request::WorkflowAgents {})? {
-                Response::WorkflowAgents { agents } => agents,
+            let (agents, roles) = match call(b, Request::WorkflowAgents {})? {
+                Response::WorkflowAgents { agents, roles } => (agents, roles),
                 other => bail!("workflow.agents: unexpected answer {other:?}"),
             };
             if json_out {
-                println!("{}", json!({ "agents": agents }));
+                println!("{}", json!({ "agents": agents, "roles": roles }));
                 return Ok(());
             }
             for a in &agents {
@@ -270,6 +275,7 @@ pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
                         from,
                         packaged,
                         as_name,
+                        edit: None,
                     },
                 )?,
             )?;
@@ -338,7 +344,11 @@ pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
             }
             Ok(())
         }
-        AgentCmd::Export { name, file } => {
+        AgentCmd::Export {
+            name,
+            file,
+            override_base,
+        } => {
             let file = if let Some(f) = file {
                 f
             } else {
@@ -353,10 +363,11 @@ pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
             let text = std::fs::read_to_string(&file).with_context(|| {
                 format!("reading the packaged-templates file {}", file.display())
             })?;
-            let agent = show(b, &name)?
+            let view = show(b, &name)?;
+            let agent = view
                 .to_agent()
                 .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-            let (out, version) = agents::export(&text, &agent)?;
+            let (out, version) = agents::export(&text, &agent, view.packaged_base, override_base)?;
             crate::atomic::write(&file, out.as_bytes())?;
             if json_out {
                 println!(

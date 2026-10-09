@@ -14,9 +14,9 @@ const y = (row: number): number => PAD + row * (NODE_H + GAP_Y);
 type Which = "workflow" | "lifecycle";
 
 /** Who fires a transition, as the table says: the strategy's roles, or an observation's guard. */
+/** Who fires a row, as jkb words it (`workflow.graph`'s `fired_by`): the CLI prints the same. */
 function firedBy(t: MachineTable["transitions"][number]): string {
-  if (t.reconciled) return "observed";
-  return t.roles.join(", ");
+  return t.fired_by;
 }
 
 /**
@@ -160,7 +160,7 @@ export function LifecyclePane({
                   {t.guarded ? <span className="muted"> · guarded</span> : null}
                 </td>
                 <td>{t.to ?? STATED}</td>
-                <td>{which === "workflow" ? firedBy(t) : t.reconciled ? "observed" : "applied"}</td>
+                <td>{firedBy(t)}</td>
               </tr>
             ))}
           </tbody>

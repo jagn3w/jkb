@@ -776,6 +776,10 @@ pub enum Request {
         /// The copy's name; by default `from`, which then overrides the packaged template.
         #[serde(default, rename = "as")]
         as_name: Option<String>,
+        /// An edit applied to the copied text in the same write, validated with it: a refused edit
+        /// leaves no copy.
+        #[serde(default)]
+        edit: Option<workflows::AgentEdit>,
     },
     /// Edit an operator copy (operator; [`workflows::set`]).
     #[serde(rename = "workflow.agent_set")]
@@ -2374,6 +2378,9 @@ pub enum Response {
     WorkflowAgents {
         /// Every template, as the one in effect.
         agents: Vec<workflows::AgentView>,
+        /// Every role a template may act as, as stored ([`workflows::role_names`]).
+        #[serde(default)]
+        roles: Vec<String>,
     },
     /// A `workflow.agent`, `workflow.agent_copy` or `workflow.agent_set`.
     WorkflowAgent {
@@ -3865,6 +3872,7 @@ impl LocalBackend {
             },
             Request::WorkflowAgents {} => Response::WorkflowAgents {
                 agents: db.read_with(workflows::list)?,
+                roles: workflows::role_names(),
             },
             Request::WorkflowAgent {
                 name,
@@ -3885,9 +3893,10 @@ impl LocalBackend {
                 from,
                 packaged,
                 as_name,
+                edit,
             } => Response::WorkflowAgent {
                 agent: Box::new(db.write_txn_with(actor, move |c, m| {
-                    workflows::copy(c, m, &from, packaged, as_name.as_deref())
+                    workflows::copy(c, m, &from, packaged, as_name.as_deref(), edit)
                 })?),
                 rendered: None,
                 wrote: true,

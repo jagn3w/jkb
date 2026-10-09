@@ -64,10 +64,22 @@ fn agent(r: Response) -> (super::AgentView, Option<String>, bool) {
 fn every_role_reads_templates_and_only_the_operator_writes_them() {
     let kb = Kb::new();
     let coordinator = kb.as_role("coordinator");
-    let listed = match ok(&coordinator, json!({ "op": "workflow.agents" })) {
-        Response::WorkflowAgents { agents } => agents,
+    let (listed, roles) = match ok(&coordinator, json!({ "op": "workflow.agents" })) {
+        Response::WorkflowAgents { agents, roles } => (agents, roles),
         other => panic!("{other:?}"),
     };
+    // The roles a template may take are this jkb's, so a client never keeps its own list.
+    assert_eq!(
+        roles,
+        [
+            "operator",
+            "coordinator",
+            "designer",
+            "implementer",
+            "reviewer",
+            "systemic_reviewer"
+        ]
+    );
     let imp = listed
         .iter()
         .find(|a| a.name == "swarm-implementer")
@@ -203,6 +215,21 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     // An observation is anyone's; an override names its own destination.
     let passed = edge(&g, "review", "review_passed");
     assert!(passed.reconciled && passed.guarded && passed.roles.is_empty());
+    // Who fires each row is one answer every surface prints.
+    assert_eq!(passed.fired_by, "observed");
+    assert_eq!(
+        edge(&coordinated, "design_review", "approve_design").fired_by,
+        "operator, coordinator"
+    );
+    for t in &g.lifecycle.transitions {
+        let want = if t.reconciled { "observed" } else { "applied" };
+        assert_eq!(t.fired_by, want, "{} --{}-->", t.from, t.event);
+    }
+    assert!(g
+        .lifecycle
+        .transitions
+        .iter()
+        .any(|t| t.fired_by == "applied"));
     assert_eq!(edge(&g, "design", "override").to, None);
     // The direct graph skips design review.
     let direct = graph(json!({ "op": "workflow.graph", "strategy": "autonomous" }));
@@ -217,20 +244,70 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     );
     assert!(g.lifecycle.states.iter().any(|s| s.name == "in_progress"));
 
-    // A task's own: its phase and status.
+    // A task's own: its phase, its status, and the strategy pinned on it — not the default.
     kb.db
         .write_txn("test", |c, m| {
             jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:w", "W"))
         })
         .unwrap();
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.set", "uid": "task:w", "strategy": "coordinated" }),
+    );
     let t = graph(json!({ "op": "workflow.graph", "uid": "task:w" }));
     assert_eq!(t.task.as_deref(), Some("task:w"));
     assert_eq!(t.phase.as_deref(), Some("design"));
     assert_eq!(t.status.as_deref(), Some("open"));
+    assert_eq!(t.strategy, "coordinated");
+    assert_eq!(t.graph, "reviewed-design");
+    assert_eq!(
+        edge(&t, "design_review", "approve_design").roles,
+        vec!["operator", "coordinator"]
+    );
     let e = call(
         &kb.op,
         json!({ "op": "workflow.graph", "uid": "task:none" }),
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound);
+}
+
+#[test]
+fn a_copy_with_an_edit_is_one_op_and_a_refused_edit_leaves_no_copy() {
+    let kb = Kb::new();
+    let e = call(
+        &kb.op,
+        json!({ "op": "workflow.agent_copy", "from": "swarm-implementer",
+                "edit": { "template": "{{ repo }}" } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    let (still, _, _) = agent(ok(
+        &kb.op,
+        json!({ "op": "workflow.agent", "name": "swarm-implementer" }),
+    ));
+    assert_eq!(
+        still.source,
+        jkb_core::workflow::agents::Source::Packaged,
+        "nothing overrides it"
+    );
+
+    let (made, _, wrote) = agent(ok(
+        &kb.op,
+        json!({ "op": "workflow.agent_copy", "from": "swarm-implementer",
+                "edit": { "template": "Build {{what}}.", "role": "reviewer" } }),
+    ));
+    assert!(wrote);
+    assert_eq!(made.version, 1);
+    assert_eq!(made.template, "Build {{what}}.");
+    assert_eq!(made.role, "reviewer");
+    assert!(!made.matches_packaged);
+    assert_eq!(made.packaged_base, made.packaged_version);
+
+    // Reverting makes it the packaged text again: nothing to contribute.
+    let (back, _, _) = agent(ok(
+        &kb.op,
+        json!({ "op": "workflow.agent_copy", "from": "swarm-implementer", "packaged": true }),
+    ));
+    assert!(back.matches_packaged);
 }

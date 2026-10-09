@@ -145,6 +145,14 @@ pub struct Listed {
     pub overrides_packaged: bool,
     /// The copy was taken from an older packaged version than the one compiled in now.
     pub behind_packaged: bool,
+    /// The packaged version of this name the template in effect is built on: the packaged
+    /// template's own version when no copy overrides it, else the one the copy's chain of copies
+    /// was first taken from ([`packaged_base`]). `None` for a template built on no packaged version
+    /// of its name. What [`export`] checks the target file against.
+    pub packaged_base: Option<i64>,
+    /// An operator copy is in effect and says exactly what the packaged template says: there is
+    /// nothing in it to contribute.
+    pub matches_packaged: bool,
 }
 
 // -------------------------------------------------------------------------------------------
@@ -186,8 +194,8 @@ enum Piece<'a> {
 }
 
 /// Split a template into text and `{{placeholders}}`. Every `{{` opens one, which must close with
-/// `}}` around a name of `a-z`, `0-9` and `_`: a template that cannot be filled unambiguously is
-/// refused when it is saved, not when a script first fills it.
+/// `}}` around a name of `a-z`, `0-9` and `_` that starts with a letter or `_`: a template that
+/// cannot be filled unambiguously is refused when it is saved, not when a script first fills it.
 fn pieces(template: &str) -> Result<Vec<Piece<'_>>> {
     let mut out = Vec::new();
     let mut rest = template;
@@ -202,7 +210,8 @@ fn pieces(template: &str) -> Result<Vec<Piece<'_>>> {
         let name = &after[..close];
         if !is_placeholder_name(name) {
             return Err(invalid(format!(
-                "`{{{{{name}}}}}` is not a placeholder: a name of lowercase letters, digits and `_`"
+                "`{{{{{name}}}}}` is not a placeholder: a name of lowercase letters, digits and `_`, \
+                 starting with a letter or `_`"
             )));
         }
         out.push(Piece::Slot(name));
@@ -471,12 +480,40 @@ fn packaged_named(name: &str) -> Result<Option<&'static Agent>> {
 /// text and the version it was packaged as: the entry of that name is replaced with the next
 /// version, or appended as version 1. What *Contribute to jkb* commits.
 ///
+/// `base` is the packaged version of this name the template is built on ([`Listed::packaged_base`]),
+/// and it must be the version `file` holds — `None` when `file` has no entry of the name. A copy
+/// built on an older version would otherwise be written over a newer one, silently undoing every
+/// change made upstream since, under a pull request that describes one edit. `override_base`
+/// writes it anyway: a deliberate revert.
+///
 /// # Errors
-/// [`Error::Types`] if `file` is malformed, or already packages exactly this template — a pull
+/// [`Error::Types`] if `file` is malformed, holds a different version of the name than `base`
+/// (naming both) unless `override_base`, or already packages exactly this template — a pull
 /// request that changes nothing.
-pub fn export(file: &str, agent: &Agent) -> Result<(String, i64)> {
+pub fn export(
+    file: &str,
+    agent: &Agent,
+    base: Option<i64>,
+    override_base: bool,
+) -> Result<(String, i64)> {
     let mut parsed = parse_file(file)?;
     agent.def.validate()?;
+    let in_file = parsed
+        .agents
+        .iter()
+        .find(|e| e.name == agent.name)
+        .map(|e| e.version);
+    if in_file != base && !override_base {
+        let said = |v: Option<i64>| v.map_or_else(|| "no version".to_owned(), |v| format!("v{v}"));
+        return Err(invalid(format!(
+            "`{}` is built on packaged {} but the file packages {} of it: exporting would \
+             overwrite that version with text that never saw it. Copy the packaged template \
+             afresh and redo the edit, or override the check to replace it deliberately",
+            agent.name,
+            said(base),
+            said(in_file)
+        )));
+    }
     let Some(entry) = parsed.agents.iter_mut().find(|e| e.name == agent.name) else {
         parsed
             .agents
@@ -633,22 +670,52 @@ pub fn resolve(conn: &Connection, name: &str, pick: Pick) -> Result<Agent> {
     }
 }
 
-/// The packaged version a copy was last taken from, if it was taken from the packaged template of
-/// its own name: what says whether the packaged text has moved on since.
-fn copied_from_packaged(conn: &Connection, name: &str) -> Result<Option<i64>> {
-    let based: Option<String> = conn
-        .prepare_cached(
-            "SELECT based_on FROM workflow_agents WHERE name = ?1 AND based_on IS NOT NULL
-             ORDER BY version DESC LIMIT 1",
-        )?
-        .query_row([name], |r| r.get(0))
-        .optional()?;
-    Ok(based
-        .as_deref()
-        .and_then(|b| b.strip_prefix("packaged:"))
-        .and_then(|b| b.strip_prefix(name))
-        .and_then(|b| b.strip_prefix('@'))
-        .and_then(|v| v.parse().ok()))
+/// The most copies [`packaged_base`] follows before giving up: far past any real chain, and a stop
+/// for a corrupted one that loops.
+const MAX_CHAIN: usize = 1024;
+
+/// The packaged version of `name` the newest operator copy of `name` is built on, following the
+/// chain of copies back to a packaged template: what says whether the packaged text has moved on
+/// since, and what [`export`] checks a target file against.
+///
+/// A copy records the template it was taken from — `packaged:<n>@<v>`, or `<n>@<v>` for another
+/// operator copy, possibly of the same name (`copy x` when `x` is already a copy) — and an edit
+/// follows the version before it. Reading only the newest `based_on` would make a re-copy of a copy
+/// look like a fresh base, clearing the stale-copy warning while the text is still built on the old
+/// packaged version. `None` when the chain ends at no packaged template, or at one of another name.
+///
+/// # Errors
+/// A database error.
+pub fn packaged_base(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    let mut at: (String, Option<i64>) = (name.to_owned(), None);
+    for _ in 0..MAX_CHAIN {
+        let based: Option<String> = conn
+            .prepare_cached(
+                "SELECT based_on FROM workflow_agents
+                 WHERE name = ?1 AND based_on IS NOT NULL AND (?2 IS NULL OR version <= ?2)
+                 ORDER BY version DESC LIMIT 1",
+            )?
+            .query_row(params![at.0, at.1], |r| r.get(0))
+            .optional()?;
+        let Some(based) = based else {
+            return Ok(None);
+        };
+        let (packaged, rest) = match based.strip_prefix("packaged:") {
+            Some(rest) => (true, rest),
+            None => (false, based.as_str()),
+        };
+        let Some((from, version)) = rest
+            .rsplit_once('@')
+            .and_then(|(n, v)| Some((n, v.parse::<i64>().ok()?)))
+        else {
+            return Ok(None);
+        };
+        if packaged {
+            return Ok((from == name).then_some(version));
+        }
+        at = (from.to_owned(), Some(version));
+    }
+    Ok(None)
 }
 
 /// Every template, packaged ones in the file's order and then the operator's own by name — each as
@@ -686,8 +753,13 @@ pub fn standing(conn: &Connection, name: &str) -> Result<Listed> {
 
 fn listed(conn: &Connection, name: &str, packaged: Option<&Agent>) -> Result<Listed> {
     let copy = newest_copy(conn, name)?;
-    let behind = match (packaged, &copy) {
-        (Some(p), Some(_)) => copied_from_packaged(conn, name)?.is_some_and(|v| v < p.version),
+    let base = match (&copy, packaged) {
+        (Some(_), _) => packaged_base(conn, name)?,
+        (None, p) => p.map(|p| p.version),
+    };
+    let behind = copy.is_some() && packaged.is_some_and(|p| base.is_some_and(|v| v < p.version));
+    let matches = match (&copy, packaged) {
+        (Some(c), Some(p)) => c.def == p.def,
         _ => false,
     };
     let overrides = packaged.is_some() && copy.is_some();
@@ -700,6 +772,8 @@ fn listed(conn: &Connection, name: &str, packaged: Option<&Agent>) -> Result<Lis
         packaged_version: packaged.map(|p| p.version),
         overrides_packaged: overrides,
         behind_packaged: behind,
+        packaged_base: base,
+        matches_packaged: matches,
     })
 }
 
@@ -737,18 +811,24 @@ fn append(conn: &Connection, name: &str, def: &AgentDef, based_on: Option<&str>)
 /// already overrides it — how an operator goes back to it. A new version of the target is
 /// appended; nothing is replaced.
 ///
+/// `edit`, when given, is applied to the copied text before anything is written, and the result
+/// validated as one: a first save of an edited packaged template is one version, and an edit that
+/// is refused leaves no copy behind (a copy left holding the packaged text would override every
+/// later packaged version, and nothing deletes it).
+///
 /// A copy under another *packaged* template's name is refused: it would silently replace that
 /// agent's prompt with an unrelated one.
 ///
 /// # Errors
-/// [`Error::Types`] for an unknown source, a malformed name, or a copy onto another packaged name;
-/// a database error.
+/// [`Error::Types`] for an unknown source, a malformed name, a copy onto another packaged name, or
+/// an edit that does not validate; a database error.
 pub fn copy(
     conn: &Connection,
     _meta: &WriteMeta,
     from: &str,
     packaged: bool,
     as_name: Option<&str>,
+    edit: Option<Edit>,
 ) -> Result<Agent> {
     let source = resolve(
         conn,
@@ -771,7 +851,11 @@ pub fn copy(
         Source::Packaged => format!("packaged:{}@{}", source.name, source.version),
         Source::Operator => format!("{}@{}", source.name, source.version),
     };
-    append(conn, target, &source.def, Some(&based_on))
+    let mut def = source.def;
+    if let Some(edit) = edit {
+        edit.apply(&mut def);
+    }
+    append(conn, target, &def, Some(&based_on))
 }
 
 /// What [`set`] changes; `None` leaves a field as it is.
@@ -789,8 +873,30 @@ pub struct Edit {
     pub hands_off_to: Option<Vec<String>>,
 }
 
+impl Edit {
+    /// Write the fields this edit names into `def`.
+    fn apply(self, def: &mut AgentDef) {
+        if let Some(t) = self.template {
+            def.template = t;
+        }
+        if let Some(r) = self.role {
+            def.role = r;
+        }
+        if let Some(d) = self.describe {
+            def.describe = d;
+        }
+        if let Some(p) = self.permissions {
+            def.permissions = p;
+        }
+        if let Some(h) = self.hands_off_to {
+            def.hands_off_to = h;
+        }
+    }
+}
+
 /// Edit the operator copy `name`, appending a version — or nothing, when the edit changes nothing
-/// (`false` beside the copy as it stands). A packaged template is never edited: copy it first.
+/// (`false` beside the copy as it stands). A packaged template is never edited in place: [`copy`]
+/// it, with the edit, as one write.
 ///
 /// # Errors
 /// [`Error::Types`] for a name with no operator copy, an empty edit, or a definition that does not
@@ -810,21 +916,7 @@ pub fn set(conn: &Connection, _meta: &WriteMeta, name: &str, edit: Edit) -> Resu
         });
     };
     let mut def = current.def.clone();
-    if let Some(t) = edit.template {
-        def.template = t;
-    }
-    if let Some(r) = edit.role {
-        def.role = r;
-    }
-    if let Some(d) = edit.describe {
-        def.describe = d;
-    }
-    if let Some(p) = edit.permissions {
-        def.permissions = p;
-    }
-    if let Some(h) = edit.hands_off_to {
-        def.hands_off_to = h;
-    }
+    edit.apply(&mut def);
     if def == current.def {
         return Ok((current, false));
     }

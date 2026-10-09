@@ -27,6 +27,7 @@ fn invalid(why: impl Into<String>) -> ApiError {
 }
 
 /// An agent template as the ops answer it.
+#[allow(clippy::struct_excessive_bools)] // an answer's independent flags, not state
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentView {
     /// Its name.
@@ -65,6 +66,14 @@ pub struct AgentView {
     pub overrides_packaged: bool,
     /// The copy was taken from an older packaged version than the one in this jkb.
     pub behind_packaged: bool,
+    /// The packaged version of this name the template in effect is built on, following a copy's
+    /// chain of copies back to it (`agents::packaged_base`); `None` when it is built on none.
+    /// What `jkb workflow agent export` checks the target file against.
+    #[serde(default)]
+    pub packaged_base: Option<i64>,
+    /// The copy in effect says exactly what the packaged template says: nothing to contribute.
+    #[serde(default)]
+    pub matches_packaged: bool,
 }
 
 impl AgentView {
@@ -111,6 +120,7 @@ fn view(agent: Agent, standing: &Listed) -> Result<AgentView, ApiError> {
         standing.overrides_packaged,
         standing.behind_packaged,
     );
+    let (packaged_base, matches_packaged) = (standing.packaged_base, standing.matches_packaged);
     Ok(AgentView {
         role_ops: role_ops(agent.def.role),
         role: agent.def.role.as_str().to_owned(),
@@ -129,6 +139,8 @@ fn view(agent: Agent, standing: &Listed) -> Result<AgentView, ApiError> {
         packaged_version,
         overrides_packaged,
         behind_packaged,
+        packaged_base,
+        matches_packaged,
     })
 }
 
@@ -142,6 +154,16 @@ fn listed_view(l: &Listed) -> Result<AgentView, ApiError> {
 /// A database error, or a stored row this jkb cannot read.
 pub fn list(conn: &Connection) -> Result<Vec<AgentView>, ApiError> {
     agents::list(conn)?.iter().map(listed_view).collect()
+}
+
+/// Every role a template may act as, as stored: what `workflow.agents` answers beside the
+/// templates, so a client offers the roles this jkb knows rather than a copy of the list.
+#[must_use]
+pub fn role_names() -> Vec<String> {
+    <Role as jkb_rbac::Role>::ALL
+        .iter()
+        .map(|r| r.as_str().to_owned())
+        .collect()
 }
 
 /// `workflow.agent`: one template — the one in effect, the packaged one, or a version of the copy —
@@ -176,18 +198,21 @@ pub fn show(
     Ok((view(agent, &agents::standing(conn, name)?)?, rendered))
 }
 
-/// `workflow.agent_copy` (operator).
+/// `workflow.agent_copy` (operator), with `edit` applied to the copied text in the same write — how
+/// a first save of an edited packaged template is one validated op.
 ///
 /// # Errors
-/// As [`agents::copy`].
+/// As [`agents::copy`]; [`ErrorCode::Invalid`] for an unknown role.
 pub fn copy(
     conn: &Connection,
     meta: &WriteMeta,
     from: &str,
     packaged: bool,
     as_name: Option<&str>,
+    edit: Option<AgentEdit>,
 ) -> Result<AgentView, ApiError> {
-    let agent = agents::copy(conn, meta, from, packaged, as_name)?;
+    let edit = edit.map(AgentEdit::into_core).transpose()?;
+    let agent = agents::copy(conn, meta, from, packaged, as_name, edit)?;
     let name = agent.name.clone();
     Ok(show(conn, &name, false, Some(agent.version), None)?.0)
 }
@@ -213,6 +238,18 @@ pub struct AgentEdit {
     pub hands_off_to: Option<Vec<String>>,
 }
 
+impl AgentEdit {
+    fn into_core(self) -> Result<Edit, ApiError> {
+        Ok(Edit {
+            template: self.template,
+            role: self.role.as_deref().map(Role::parse).transpose()?,
+            describe: self.describe,
+            permissions: self.permissions,
+            hands_off_to: self.hands_off_to,
+        })
+    }
+}
+
 /// `workflow.agent_set` (operator): edit an operator copy, appending a version when anything
 /// changed. Answers the copy as it stands, and whether it wrote.
 ///
@@ -224,19 +261,7 @@ pub fn set(
     name: &str,
     edit: AgentEdit,
 ) -> Result<(AgentView, bool), ApiError> {
-    let role = edit.role.as_deref().map(Role::parse).transpose()?;
-    let (agent, wrote) = agents::set(
-        conn,
-        meta,
-        name,
-        Edit {
-            template: edit.template,
-            role,
-            describe: edit.describe,
-            permissions: edit.permissions,
-            hands_off_to: edit.hands_off_to,
-        },
-    )?;
+    let (agent, wrote) = agents::set(conn, meta, name, edit.into_core()?)?;
     Ok((show(conn, name, false, Some(agent.version), None)?.0, wrote))
 }
 
@@ -279,6 +304,10 @@ pub struct GraphEdge {
     /// The roles the strategy lets fire it (the workflow machine's acts only; an observation is
     /// anyone's, and its guard decides).
     pub roles: Vec<String>,
+    /// Who fires it, in one word or list, for every surface to print the same: `observed` (the
+    /// facts decide), `applied` (jkb applies it as part of an op, no role fires it), the roles, or
+    /// `no one` when the strategy lets no role fire an act.
+    pub fired_by: String,
 }
 
 /// One machine.
@@ -313,10 +342,11 @@ pub struct GraphView {
     pub lifecycle: MachineView,
 }
 
+/// `roles` answers who may fire an act, or `None` for an event no role fires (jkb applies it).
 fn machine_view(
     table: &Table,
     next: impl Fn(&str) -> Option<(String, String)>,
-    roles: impl Fn(&str, bool) -> Vec<String>,
+    roles: impl Fn(&str) -> Option<Vec<String>>,
 ) -> MachineView {
     MachineView {
         states: table
@@ -337,14 +367,24 @@ fn machine_view(
         transitions: table
             .transitions
             .iter()
-            .map(|t| GraphEdge {
-                from: t.from.to_owned(),
-                event: t.event.to_owned(),
-                to: t.to.map(str::to_owned),
-                reconciled: t.reconciled,
-                guarded: t.guarded,
-                planned: t.planned,
-                roles: roles(t.event, t.reconciled),
+            .map(|t| {
+                let fired = if t.reconciled { None } else { roles(t.event) };
+                let fired_by = match &fired {
+                    _ if t.reconciled => "observed".to_owned(),
+                    None => "applied".to_owned(),
+                    Some(r) if r.is_empty() => "no one".to_owned(),
+                    Some(r) => r.join(", "),
+                };
+                GraphEdge {
+                    from: t.from.to_owned(),
+                    event: t.event.to_owned(),
+                    to: t.to.map(str::to_owned),
+                    reconciled: t.reconciled,
+                    guarded: t.guarded,
+                    planned: t.planned,
+                    roles: fired.unwrap_or_default(),
+                    fired_by,
+                }
             })
             .collect(),
     }
@@ -401,20 +441,17 @@ pub fn graph(
                 (role.as_str().to_owned(), step.to_owned())
             })
         },
-        |event, reconciled| match WorkflowEvent::parse(event) {
-            Some(e) if !reconciled => <Role as jkb_rbac::Role>::ALL
-                .iter()
-                .filter(|r| spec.authorize(&[**r], e).is_allowed())
-                .map(|r| r.as_str().to_owned())
-                .collect(),
-            _ => Vec::new(),
+        |event| {
+            WorkflowEvent::parse(event).map(|e| {
+                <Role as jkb_rbac::Role>::ALL
+                    .iter()
+                    .filter(|r| spec.authorize(&[**r], e).is_allowed())
+                    .map(|r| r.as_str().to_owned())
+                    .collect()
+            })
         },
     );
-    let lifecycle = machine_view(
-        &jkb_core::lifecycle::machine().table(),
-        |_| None,
-        |_, _| Vec::new(),
-    );
+    let lifecycle = machine_view(&jkb_core::lifecycle::machine().table(), |_| None, |_| None);
     Ok(GraphView {
         strategy: source,
         graph: spec.graph.as_str().to_owned(),

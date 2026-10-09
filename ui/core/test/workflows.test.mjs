@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   agentGraph,
+  canContribute,
   decodeAgent,
   decodeAgents,
   decodeWorkflowGraph,
@@ -15,6 +16,7 @@ import {
   layered,
   machineLayout,
   placeholdersOf,
+  saveRequest,
   workflowOps,
   workflowsOf,
 } from "../dist/index.js";
@@ -39,6 +41,8 @@ const agent = (over = {}) => ({
   packaged_version: 1,
   overrides_packaged: false,
   behind_packaged: false,
+  packaged_base: 1,
+  matches_packaged: false,
   ...over,
 });
 
@@ -52,17 +56,34 @@ test("the requests are the ops jkb serve takes", () => {
     packaged: true,
     as: "y",
   });
+  assert.deepEqual(workflowOps.copy("x", { edit: { describe: "d" } }), {
+    op: "workflow.agent_copy",
+    from: "x",
+    packaged: false,
+    edit: { describe: "d" },
+  });
   assert.deepEqual(workflowOps.set("x", { describe: "d" }), { op: "workflow.agent_set", name: "x", edit: { describe: "d" } });
   assert.deepEqual(workflowOps.graph(), { op: "workflow.graph" });
   assert.deepEqual(workflowOps.graph("coordinated"), { op: "workflow.graph", strategy: "coordinated" });
 });
 
 test("agents decode, and a malformed answer is a named failure", () => {
-  const listed = decodeAgents(ok({ result: "workflow_agents", agents: [agent({ packaged_version: undefined, based_on: undefined })] }));
+  const listed = decodeAgents(
+    ok({
+      result: "workflow_agents",
+      agents: [agent({ packaged_version: undefined, based_on: undefined, packaged_base: undefined, matches_packaged: undefined })],
+      roles: ["operator", "auditor"],
+    }),
+  );
   assert.equal(listed.ok, true);
-  assert.equal(listed.value[0].packaged_version, null);
-  assert.equal(listed.value[0].based_on, null);
-  assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [{ name: "x" }] })).ok, false);
+  assert.equal(listed.value.agents[0].packaged_version, null);
+  assert.equal(listed.value.agents[0].based_on, null);
+  assert.equal(listed.value.agents[0].packaged_base, null);
+  assert.equal(listed.value.agents[0].matches_packaged, false);
+  // The roles are the server's, whatever they are: a role added there is offered here.
+  assert.deepEqual(listed.value.roles, ["operator", "auditor"]);
+  assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [agent()] })).ok, false, "no roles");
+  assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [{ name: "x" }], roles: [] })).ok, false);
   assert.equal(decodeAgents(ok({ result: "strategies" })).ok, false);
   const one = decodeAgent(ok({ result: "workflow_agent", agent: agent(), wrote: true }));
   assert.equal(one.ok && one.value.wrote, true);
@@ -77,6 +98,32 @@ test("a save sends only what changed", () => {
   const draft = { ...draftOf(a), template: "Build it.", permissions: { ...a.permissions, model: "haiku" } };
   assert.deepEqual(editBetween(a, draft), { template: "Build it.", permissions: { isolation: "worktree", model: "haiku", writes: "code" } });
   assert.deepEqual(editBetween(a, { ...draftOf(a), hands_off_to: ["x"] }), { hands_off_to: ["x"] });
+});
+
+test("a save is one request: a packaged template's is a copy carrying the edit", () => {
+  const p = agent();
+  // Unchanged, it is a plain copy; edited, the edit rides in the same op, so a refused edit leaves no copy.
+  assert.deepEqual(saveRequest(p, draftOf(p)), { op: "workflow.agent_copy", from: "swarm-implementer", packaged: false });
+  assert.deepEqual(saveRequest(p, { ...draftOf(p), template: "{{ repo }}" }), {
+    op: "workflow.agent_copy",
+    from: "swarm-implementer",
+    packaged: false,
+    edit: { template: "{{ repo }}" },
+  });
+  const c = agent({ source: "operator", overrides_packaged: true });
+  assert.equal(saveRequest(c, draftOf(c)), undefined, "nothing to save");
+  assert.deepEqual(saveRequest(c, { ...draftOf(c), describe: "d" }), {
+    op: "workflow.agent_set",
+    name: "swarm-implementer",
+    edit: { describe: "d" },
+  });
+});
+
+test("Contribute is offered only for a copy that differs from the packaged text", () => {
+  assert.equal(canContribute(agent()), false, "a packaged template");
+  assert.equal(canContribute(agent({ source: "operator", overrides_packaged: true, matches_packaged: true })), false, "reverted");
+  assert.equal(canContribute(agent({ source: "operator", overrides_packaged: true })), true);
+  assert.equal(canContribute(agent({ source: "operator", packaged_version: null, packaged_base: null })), true, "the operator's own");
 });
 
 test("names and placeholders follow jkb's rules", () => {
@@ -133,10 +180,10 @@ const machine = {
     { name: "landed", initial: false, settled: true, awaits_input: false, next_role: null, next_step: null },
   ],
   transitions: [
-    { from: "design", event: "submit_design", to: "implement", reconciled: false, guarded: false, planned: false, roles: ["operator"] },
-    { from: "implement", event: "observed_landed", to: "landed", reconciled: true, guarded: true, planned: false, roles: [] },
-    { from: "implement", event: "reopen", to: "implement", reconciled: false, guarded: false, planned: false, roles: [] },
-    { from: "design", event: "override", to: null, reconciled: false, guarded: false, planned: false, roles: ["operator"] },
+    { from: "design", event: "submit_design", to: "implement", reconciled: false, guarded: false, planned: false, roles: ["operator"], fired_by: "operator" },
+    { from: "implement", event: "observed_landed", to: "landed", reconciled: true, guarded: true, planned: false, roles: [], fired_by: "observed" },
+    { from: "implement", event: "reopen", to: "implement", reconciled: false, guarded: false, planned: false, roles: [], fired_by: "applied" },
+    { from: "design", event: "override", to: null, reconciled: false, guarded: false, planned: false, roles: ["operator"], fired_by: "operator" },
   ],
 };
 
@@ -166,5 +213,11 @@ test("the graph answer decodes, with absent optionals as null", () => {
   assert.equal(g.ok, true);
   assert.equal(g.value.task, null);
   assert.equal(g.value.workflow.transitions[3].to, null);
+  assert.equal(g.value.lifecycle.transitions[2].fired_by, "applied", "who fires a row is jkb's word, not redecided here");
+  const unlabelled = { ...machine, transitions: machine.transitions.map(({ fired_by: _, ...t }) => t) };
+  assert.equal(
+    decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", workflow: unlabelled, lifecycle: machine } })).ok,
+    false,
+  );
   assert.equal(decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x" } })).ok, false);
 });

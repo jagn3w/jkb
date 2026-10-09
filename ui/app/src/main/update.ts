@@ -30,6 +30,7 @@ import {
   type UpdatePlan,
 } from "@jkb/core";
 
+import { GIT_SELECTION } from "../shared/gitEnv";
 import { plain, type RunFile, type RunResult } from "./container";
 
 /** How long fetching `main` may take. */
@@ -183,8 +184,6 @@ export class AppUpdater {
   }
 }
 
-/** Repository selection a launching shell may have exported; git honours it over `-C`. */
-const GIT_SELECTION = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"];
 
 /**
  * Run programs on the real machine from `home`, with `env` minus Electron's own variables (which

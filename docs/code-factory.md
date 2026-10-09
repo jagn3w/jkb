@@ -558,8 +558,15 @@ shapes, the requests, what a save sends, both layouts) and `src/renderer/src/wor
   agent with an unrelated prompt); under a new name it is the operator's own template. Copies are
   versioned and append-only like strategy definitions, and not changelogged for the same reason.
   Reverting is `copy <name> --packaged`, a new version holding the packaged text — nothing is deleted.
-  A copy records `packaged:<name>@<v>` it was taken from, so the listing says when the packaged
-  template has moved on since (`behind_packaged`).
+  A copy records what it was taken from — `packaged:<name>@<v>`, or `<name>@<v>` for another copy —
+  and its **packaged base** (`packaged_base`) is found by following that chain back to a packaged
+  template, so re-copying a copy onto its own name does not reset it; the listing says when the
+  packaged template has moved on since (`behind_packaged`), and when a copy says exactly what the
+  packaged one says (`matches_packaged`: nothing to contribute, and *Contribute* is disabled).
+- **A first save of a packaged template is one op.** `workflow.agent_copy` takes an optional `edit`,
+  applied to the copied text and validated with it in one write. Copying and then editing as two ops
+  left a copy holding the packaged text whenever the edit was refused — an override of every later
+  packaged version that Revert, which only appends, cannot remove.
 - **The templates were copied out of the scripts, not rewritten.** Each prompt function's template
   literal became a template whose `${…}` interpolations are `{{placeholders}}`; a conditional block
   (`${reviewHint ? … : ''}`) is one placeholder the script fills with the block it computes. The code
@@ -567,8 +574,9 @@ shapes, the requests, what a save sends, both layouts) and `src/renderer/src/wor
   as an agent); each lens and each skeptic angle is a template of its own, its question copied in.
   The file stores each prompt as an array of lines, so a contribution's pull request diffs line by line;
   a test holds the file to the canonical form `export` writes, so the diff is only the change.
-- **Placeholders are checked when saved and when filled.** `{{name}}` of `a-z0-9_`; an unclosed `{{` or
-  a malformed name is refused at save. Filling (`show --var k=v`, the op's `vars`) refuses a placeholder
+- **Placeholders are checked when saved and when filled.** `{{name}}` of `a-z0-9_`, starting with a
+  letter or `_` (so `{{1st_task}}` is refused, and the refusal says why); an unclosed `{{` or a
+  malformed name is refused at save. Filling (`show --var k=v`, the op's `vars`) refuses a placeholder
   with no value and a value with no placeholder, so a script and a template that have drifted apart
   fail loudly rather than run a prompt with a hole in it.
 - **Permissions are two halves, both shown.** The role's jkb op classes (`OP_GRANTS`, enforced by
@@ -580,16 +588,35 @@ shapes, the requests, what a save sends, both layouts) and `src/renderer/src/wor
   hands its result to (`hands_off_to`); the tab lays a workflow's agents out by distance from those
   nothing hands to, and an arrow running back (review → implementer) bends below. The strategy picker
   drives the Lifecycle pane, which marks the states where the selected agent's role acts next — the
-  agents' place in that strategy.
+  agents' place in that strategy. The role picker offers the roles `workflow.agents` answers beside the
+  templates, never a list the app keeps.
 - **The Lifecycle pane is the table.** `workflow.graph` answers the strategy's workflow machine — each
   state with who acts next (`next_actor`), each transition with the roles the strategy's permission
-  table lets fire it — and the task lifecycle machine, both from `Machine::table()`. Self-loops and
+  table lets fire it — and the task lifecycle machine, both from `Machine::table()`. Each transition
+  carries `fired_by`, the one answer both `jkb workflow show --graph` and the pane print: `observed`,
+  `applied` (a lifecycle move jkb makes as part of an op), the roles, or `no one`. Self-loops and
   overrides are listed under the picture rather than drawn (every live state has an override), and the
   list under it is every row.
 - **Contribute runs in a fresh worktree off `origin/main`**, under the checkout's `.jkb/work/`: export
-  the saved copy, commit only `agents.json`, push, `gh pr create`, remove the worktree. Never the
-  operator's checkout, so neither their branch nor their uncommitted work rides along. Pinned against a
-  real git repository with a local `origin` and stand-in `jkb`/`gh` (`ui/app/test/workflows.test.mjs`).
+  the saved copy, commit only `agents.json`, push, `gh pr create`. Never the operator's checkout, so
+  neither their branch nor their uncommitted work rides along. Pinned against a real git repository
+  with a local `origin` and stand-in `jkb`/`gh` (`ui/app/test/workflows.test.mjs`). Three rules the
+  script keeps, each pinned there:
+  - *Nothing writes `.git/config`*, which the container binds read-only: the branch is `--no-track`
+    and the push has no `-u`. Measured on git 2.51.1 with the config's lock held (how a read-only
+    config looks to git without a bind mount, and what the fixture does): `worktree add -b … origin/main`
+    exits 255 with `could not lock config file`, leaving a stray branch; with `--no-track` it exits 0.
+  - *No inherited repository*: it unsets the variables `gitrepo.rs` scrubs from jkb's git spawns, plus
+    `GH_REPO`/`GH_HOST` (`pr.rs`), from one list in `ui/app/src/shared/gitEnv.ts` that a test holds to
+    the Rust ones.
+  - *Nothing left behind*: an `EXIT` trap removes the worktree and the local branch however the script
+    ends; once pushed, the branch lives on `origin`.
+- **Export refuses a copy built on another version than the file holds.** `jkb workflow agent export`
+  checks the template's packaged base against the entry's version in the target file and refuses a
+  mismatch, naming both: otherwise a copy of v1, exported over an `origin/main` at v2, is written as v3
+  and silently reverts every v2 change under a pull request describing one edit. With no copy, the
+  installed packaged version is the base, so an installed jkb older than `origin/main` is caught the
+  same way. `--override-base` is the deliberate revert.
   *Unmeasured, stated:* the push and the pull request need the container's git credential and `gh`
   login, which the sandbox has neither of.
 

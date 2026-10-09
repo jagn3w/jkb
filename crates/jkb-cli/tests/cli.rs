@@ -5196,6 +5196,64 @@ fn workflow_agent_copy_set_show_and_export() {
     assert_eq!(entry["permissions"]["model"], serde_json::Value::Null);
 }
 
+/// `jkb workflow agent export` refuses a copy built on another packaged version than the file holds,
+/// naming both, and `--override-base` exports it anyway.
+#[test]
+fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["workflow", "agent", "copy", "swarm-status"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "set",
+            "swarm-status",
+            "--describe",
+            "mine",
+        ])
+        .assert()
+        .success();
+    let file = dir.path().join("agents.json");
+    let mut upstream: serde_json::Value =
+        serde_json::from_str(include_str!("../../jkb-core/src/workflow/agents.json")).unwrap();
+    // Upstream moves on: the file packages a v2 of its own, and the copy is still built on v1.
+    // Exporting it would overwrite v2 with text that never saw it, so it is refused, naming both —
+    // unless overridden.
+    for a in upstream["agents"].as_array_mut().unwrap() {
+        if a["name"] == "swarm-status" {
+            a["version"] = serde_json::json!(2);
+            a["template"] = serde_json::json!(["Set {{status}} upstream."]);
+        }
+    }
+    std::fs::write(&file, serde_json::to_string_pretty(&upstream).unwrap()).unwrap();
+    jkb(&db)
+        .args(["workflow", "agent", "export", "swarm-status", "--file"])
+        .arg(&file)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("built on packaged v1")
+                .and(predicate::str::contains("the file packages v2")),
+        );
+    jkb(&db)
+        .args([
+            "workflow",
+            "agent",
+            "export",
+            "swarm-status",
+            "--override-base",
+            "--file",
+        ])
+        .arg(&file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("swarm-status packaged as v3"));
+}
+
 /// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or
 /// the default; without `--graph` a task is required.
 #[test]
@@ -5227,11 +5285,21 @@ fn workflow_show_graph_prints_the_machines() {
         .any(|t| t["event"] == "approve_design"
             && t["roles"] == serde_json::json!(["operator", "coordinator"])));
     assert!(!v["lifecycle"]["states"].as_array().unwrap().is_empty());
-    jkb(&db)
+    // Every row says who fires it: an applied lifecycle row says so, rather than printing nothing.
+    let text = jkb(&db)
         .args(["workflow", "show", "--graph"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("strategy:  design-reviewed"));
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("strategy:  design-reviewed"), "{text}");
+    let lifecycle = text.split("\nlifecycle:\n").nth(1).unwrap();
+    for row in lifecycle.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            row.ends_with(" applied") || row.ends_with(" observed"),
+            "{row:?}"
+        );
+    }
     jkb(&db)
         .args(["workflow", "show"])
         .assert()
