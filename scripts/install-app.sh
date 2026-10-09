@@ -59,7 +59,9 @@ app_check_home "$app_home" || exit 2
 os="$(uname -s)"
 [ -n "$dest" ] || dest="$(app_default_dest "$os" "$(app_account_home)" "$app_home")"
 exe="$(app_executable "$os" "$dest")"
-commit=""
+# Read before the wait and the lock, so that every outcome recorded below names the build it was
+# about (read again once the lock is held: a build may have staged another meanwhile).
+commit="$(app_staged_commit "$app_home")"
 
 # app_on_exit <status> — run however this script ends (lib.sh's app_lock calls it from its EXIT
 # trap once the lock is held, after releasing it; the trap below before that). Records the outcome

@@ -4,9 +4,11 @@
 //
 // The app runs unsandboxed on the host and opens host terminals, so nothing it runs may come from
 // a checkout an agent can write. It is built from a clone of `origin/main` that only this machine
-// writes (`APP_SRC_IN_HOME`), by that clone's own `scripts/build-app.sh`, which records the commit
-// it installed in `APP_STAMP_IN_HOME`. An update fetches `main` into the clone, shows the commits
-// between that stamp and the fetched tip, and builds exactly the tip it showed.
+// writes (`APP_SRC_IN_HOME`), by that clone's own `scripts/build-app.sh`, which only STAGES the build
+// (`APP_STAGED_IN_HOME`). The clone's `scripts/install-app.sh` is the one step that swaps it in —
+// only while no copy runs — and the one writer of `APP_STAMP_IN_HOME`. An update fetches `main` to
+// `UPDATE_SHOWN_REF`, shows the commits from what is running (the commit built into the running
+// copy, else the stamp's) to the fetched tip, and builds exactly the tip it showed.
 
 /** Where the app's own state lives, under the account's home: the clone, the stamp, the log. */
 export const APP_HOME_IN_HOME = ".local/share/jkb-app";
@@ -14,7 +16,7 @@ export const APP_HOME_IN_HOME = ".local/share/jkb-app";
 /** The host-side clean clone of `origin/main` the app is built from. */
 export const APP_SRC_IN_HOME = `${APP_HOME_IN_HOME}/src`;
 
-/** What `build-app.sh` writes after a successful install: `commit=<sha>`. */
+/** What `install-app.sh` writes once it has swapped a build in: `commit=<sha>`, `dest=<path>`. */
 export const APP_STAMP_IN_HOME = `${APP_HOME_IN_HOME}/installed`;
 
 /** The output of the last update's build, kept for when it fails. */
@@ -76,24 +78,15 @@ export const APP_BUILDER_IN_SRC = "scripts/build-app.sh";
 /** The one step that swaps a staged build in, inside the clone; it swaps only while nothing runs. */
 export const APP_INSTALLER_IN_SRC = "scripts/install-app.sh";
 
-/** The one ref an update takes. Never a branch an agent pushes, never a worktree. */
-export const UPDATE_REF = "refs/remotes/origin/main";
-
-/**
- * The refspec that fetches `main` into `UPDATE_REF`, forced: `main` is what was landed. Fetched with
- * `GIT_TERMINAL_PROMPT=0` everywhere (lib.sh's `app_clone_refresh`, build-app.sh, the app's `machineRunner`), so
- * a credential prompt fails the fetch rather than hanging it.
- */
-export const UPDATE_REFSPEC = `+refs/heads/main:${UPDATE_REF}`;
-
 /**
  * Where the app's *plan* fetches `main` to show it: a ref no build or install reads, so a plan needs
- * no lock and cannot move `origin/main` under a running build. The build fetches `UPDATE_REF` itself,
- * under its lock, and refuses unless that tip is the commit shown.
+ * no lock and cannot move `origin/main` under a running build. The build (`build-app.sh
+ * --update-to`) fetches `origin/main` itself, under its lock, and refuses unless that tip is the
+ * commit shown. Never a branch an agent pushes, never a worktree.
  */
 export const UPDATE_SHOWN_REF = "refs/jkb-app/shown";
 
-/** The refspec a plan fetches with. */
+/** The refspec a plan fetches with: `main`, and only `main`, forced, since `main` is what landed. */
 export const UPDATE_SHOWN_REFSPEC = `+refs/heads/main:${UPDATE_SHOWN_REF}`;
 
 /** The opt-in for running the app from a checkout, as `run.sh` has `JKB_RUN_FROM_CHECKOUT`. */
@@ -123,7 +116,10 @@ export function isCommitId(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
 }
 
-/** The installed commit from `build-app.sh`'s stamp (or the app's own `out/commit`), or `undefined`. */
+/**
+ * The installed commit from `install-app.sh`'s stamp (`commit=<sha>` lines), or `undefined`. Not for
+ * `out/commit`, which holds a bare sha (`builtCommit` in the app reads that).
+ */
 export function parseInstalledStamp(text: string): string | undefined {
   for (const line of text.split("\n")) {
     const m = /^commit=(\S+)\s*$/.exec(line);

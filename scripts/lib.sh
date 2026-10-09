@@ -2103,12 +2103,13 @@ EOF
 # below). Here rather than inline for the reason every setup.sh section moved here:
 # scripts/tests/app-install.test.sh drives these against real repositories.
 
-# The ref an install takes, and the refspec that fetches main into it. ui/core/src/update.ts names
-# the same two (UPDATE_REF, UPDATE_REFSPEC) for the app's side.
+# The ref an install builds from, and the refspec that fetches main into it (app_clone_refresh,
+# build-app.sh --update-to). The app's plan fetches main elsewhere (ui/core's UPDATE_SHOWN_REF), so
+# it never moves this one.
 APP_UPDATE_REF=refs/remotes/origin/main
 APP_UPDATE_REFSPEC="+refs/heads/main:$APP_UPDATE_REF"
 
-# app_installed_commit <app-home> — the commit build-app.sh stamped as installed, or nothing.
+# app_installed_commit <app-home> — the commit install-app.sh stamped as installed, or nothing.
 app_installed_commit() {
     local line
     [ -f "$1/installed" ] || return 0
@@ -2298,7 +2299,8 @@ app_running() {
 # no stale-lock breaking: a lock left by a run that died is reported with its path, to remove by hand.
 # So the RELEASE is app_lock's own job, not its callers': taking the lock installs the shell's
 # EXIT/INT/TERM/HUP traps that release it, however the holder ends (a `set -e` failure, Ctrl-C, a
-# TERM). Only SIGKILL can leave it behind.
+# TERM). Only SIGKILL can leave it behind (or a signal in the instant between the mkdir and the
+# statement after it that marks the lock as this shell's).
 APP_LOCK_IN_APP_HOME=lock
 APP_STAGED_IN_APP_HOME=staged
 
@@ -2323,6 +2325,16 @@ app_lock() {
         return 0
     fi
     mkdir -p "$1" || { warn "could not create $1"; return 2; }
+    app_lock_token="$$.$RANDOM.$RANDOM.$(date +%s)"
+    # The traps go in BEFORE the mkdir, so the lock is covered from the statement after it; the EXIT
+    # trap releases only once `app_lock_taken` says the lock is this shell's.
+    trap '_app_lock_exit' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    # A write to a closed pipe then fails (and `set -e` exits through the trap) instead of killing
+    # the holder outright with SIGPIPE, which no trap sees.
+    trap '' PIPE
     if ! mkdir "$lock" 2>/dev/null; then
         if [ -d "$lock" ]; then
             warn "another build or install of Code Factory holds $lock (pid $(cat "$lock/pid" 2>/dev/null || echo '?')); if none is running, remove it"
@@ -2331,20 +2343,12 @@ app_lock() {
         warn "could not create $lock"
         return 2
     fi
-    app_lock_token="$$.$RANDOM.$RANDOM.$(date +%s)"
+    app_lock_taken=1
     if ! printf '%s\n' "$app_lock_token" >"$lock/token" || ! printf '%s\n' "$$" >"$lock/pid"; then
-        rm -rf "$lock"
+        app_unlock "$1"
         warn "could not write $lock"
         return 2
     fi
-    app_lock_taken=1
-    trap '_app_lock_exit' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap 'exit 129' HUP
-    # A write to a closed pipe then fails (and `set -e` exits through the trap) instead of killing
-    # the holder outright with SIGPIPE, which no trap sees.
-    trap '' PIPE
 }
 
 _app_lock_exit() {
@@ -2356,9 +2360,13 @@ _app_lock_exit() {
 
 # app_unlock <app-home> — release the lock, if app_lock took it.
 app_unlock() {
+    local token
     [ "${app_lock_taken:-0}" = 1 ] || return 0
     app_lock_taken=0
-    [ "$(cat "$1/$APP_LOCK_IN_APP_HOME/token" 2>/dev/null)" = "$app_lock_token" ] && rm -rf "${1:?}/$APP_LOCK_IN_APP_HOME"
+    # This shell made the directory; its token is ours, or not written yet (a signal between the
+    # mkdir and the write).
+    token="$(cat "$1/$APP_LOCK_IN_APP_HOME/token" 2>/dev/null)" || token=""
+    case "$token" in ''|"$app_lock_token") rm -rf "${1:?}/$APP_LOCK_IN_APP_HOME" ;; esac
     return 0
 }
 
@@ -2460,8 +2468,11 @@ app_stamp() {
 # put there) and the copy renamed into place. <previous> is the one-step rollback. If the final rename
 # fails, the old app is moved back.
 app_swap() {
-    local built="$1" dest="$2" app_home="$3" prev new moved=0
+    local built="$1" dest="$2" app_home="$3" prev trash new moved=0 had_stamp=0 old_stamp=""
     prev="$app_home/previous"
+    trash="$prev.trash"
+    # A fixed name, so an interrupted run's half copy is cleared by the next one.
+    new="$dest.new"
     if [ ! -d "$built" ]; then
         warn "nothing to install: $built is not a directory"
         return 1
@@ -2470,26 +2481,44 @@ app_swap() {
         warn "$dest exists and jkb's stamp ($app_home/installed) does not say jkb installed it; move it aside and re-run"
         return 1
     fi
+    # The stamp is made to name <dest> before anything moves (see above), and put back as it was on
+    # every failure below: a failed first install must not leave it vouching for a <dest> jkb never
+    # filled, or a later install would move aside — and delete — whatever app is put there.
+    if [ -f "$app_home/installed" ]; then
+        had_stamp=1
+        old_stamp="$(cat "$app_home/installed")" || { warn "could not read $app_home/installed"; return 1; }
+    fi
     if ! app_stamp "$app_home" "$(app_installed_commit "$app_home")" "$dest"; then
         warn "could not write $app_home/installed; nothing was installed"
         return 1
     fi
-    new="$dest.new.$$"
-    if ! mkdir -p "$(dirname "$dest")" || ! rm -rf "$new" || ! cp -pR "$built" "$new"; then
+    if ! mkdir -p "$(dirname "$dest")" || ! rm -rf "$new" "$trash" || ! cp -pR "$built" "$new"; then
         rm -rf "$new"
+        _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
         warn "could not copy $built beside $dest"
         return 1
     fi
     if [ -e "$dest" ] || [ -L "$dest" ]; then
-        # Checked again here, at the last moment: the copy above takes seconds, and a copy of the app
-        # started meanwhile (the Dock, a relaunch) must not have its bundle renamed away.
+        # The old previous/ goes aside by one rename (deleting a bundle takes seconds), so that the
+        # running-copy check below is the last thing before the old bundle is renamed away: a copy
+        # started during the copy above (the Dock, a relaunch) must not lose its bundle.
+        if [ -e "$prev" ] && ! mv "$prev" "$trash"; then
+            rm -rf "$new"
+            _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
+            warn "could not move $prev aside"
+            return 1
+        fi
         if app_running "$(uname -s)" "$dest"; then
             rm -rf "$new"
+            if [ -e "$trash" ]; then mv "$trash" "$prev" || :; fi
+            _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
             warn "Code Factory was started from $dest during the install; nothing was swapped"
             return "$APP_EXIT_RUNNING"
         fi
-        if ! rm -rf "$prev" || ! mkdir -p "$(dirname "$prev")" || ! mv "$dest" "$prev"; then
+        if ! mkdir -p "$(dirname "$prev")" || ! mv "$dest" "$prev"; then
             rm -rf "$new"
+            if [ -e "$trash" ]; then mv "$trash" "$prev" || :; fi
+            _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
             warn "could not move the installed app at $dest aside"
             return 1
         fi
@@ -2497,8 +2526,21 @@ app_swap() {
     fi
     if ! mv "$new" "$dest"; then
         if [ "$moved" = 1 ]; then mv "$prev" "$dest" || warn "the previous app is at $prev; move it back to $dest"; fi
+        if [ -e "$trash" ]; then mv "$trash" "$prev" || :; fi
         rm -rf "$new"
+        _app_swap_unstamp "$app_home" "$had_stamp" "$old_stamp"
         warn "could not move the new app into $dest"
         return 1
+    fi
+    rm -rf "$trash"
+}
+
+# _app_swap_unstamp <app-home> <had-stamp> <old-stamp> — put the stamp back as app_swap found it.
+_app_swap_unstamp() {
+    if [ "$2" = 1 ]; then
+        { printf '%s\n' "$3" >"$1/installed.tmp" && mv -f "$1/installed.tmp" "$1/installed"; } 2>/dev/null \
+            || warn "could not restore $1/installed"
+    else
+        rm -f "$1/installed"
     fi
 }

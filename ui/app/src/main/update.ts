@@ -48,6 +48,7 @@ import { GIT_SELECTION } from "../shared/gitEnv";
 // The list scripts/lib.sh's APP_GIT_SELECTION mirrors (a test holds them equal), re-exported for it.
 export { GIT_SELECTION };
 import { plain } from "./container";
+import { hostEnv } from "./terminals";
 
 /** How long fetching `main` may take. */
 export const FETCH_TIMEOUT_MS = 5 * 60_000;
@@ -146,6 +147,17 @@ export function startupRefusal(f: StartupFacts): string | undefined {
     f.env,
     installedExecutable(f.platform, f.home),
   );
+}
+
+/** The installed-copy offer the user declined, so the same one is not repeated at every start. */
+const APP_DISMISSED_IN_HOME = `${APP_HOME_IN_HOME}/install.dismissed`;
+
+function readOptional(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
 }
 
 /** The commit `build-app.sh` built into the app's `out/` directory, or `undefined`. */
@@ -256,23 +268,36 @@ export class AppUpdater {
   }
 
   /**
-   * A staged build the last install step did not install, and why, or `undefined`: something is
-   * staged, it is not what runs, and `install.result` says the step ran for it and did not succeed
-   * (75: another build or install held the lock; 76: a copy was running; else a failure). What the
-   * app tells the user at startup, since the step ran after it quit.
+   * A staged build that is not what runs, to offer at startup, or `undefined`. Any such build is
+   * offered — one staged after a quit mid-build as much as one whose install failed — and
+   * `install.result` only explains why it is not installed, and only when it names that build
+   * (`status`: 75 another build or install held the lock; 76 a copy was running; else a failure).
+   * Once the user has said *Not now* (`dismissPending`) to the same build with the same result, it
+   * is not offered again until either changes.
    */
-  pendingInstall(): { commit: string; status: number } | undefined {
+  pendingInstall(): { commit: string; status: number | undefined; key: string } | undefined {
     const staged = this.stagedCommit();
     if (staged === undefined || staged === this.running.commit) return undefined;
-    let result: ReturnType<typeof parseInstallResult>;
+    let text = "";
     try {
-      result = parseInstallResult(readFileSync(join(this.home, APP_INSTALL_RESULT_IN_HOME), "utf8"));
+      text = readFileSync(join(this.home, APP_INSTALL_RESULT_IN_HOME), "utf8");
     } catch {
-      return undefined;
+      // No install step has run.
     }
-    if (result === undefined || result.status === 0) return undefined;
-    if (result.commit !== undefined && result.commit !== staged) return undefined;
-    return { commit: staged, status: result.status };
+    const result = parseInstallResult(text);
+    const status = result !== undefined && result.commit === staged && result.status !== 0 ? result.status : undefined;
+    const key = `${staged} ${status ?? "-"} ${text.trim().replace(/\s+/g, " ")}`;
+    if (readOptional(join(this.home, APP_DISMISSED_IN_HOME)) === key) return undefined;
+    return { commit: staged, status, key };
+  }
+
+  /** Remember that the user declined `pending` (*Not now*): it is not offered again unchanged. */
+  dismissPending(pending: { key: string }): void {
+    try {
+      writeFileSync(join(this.home, APP_DISMISSED_IN_HOME), pending.key);
+    } catch {
+      // Then it is offered again; nothing worse.
+    }
   }
 
   get lockDir(): string {
@@ -395,19 +420,15 @@ export class AppUpdater {
 
 /**
  * The environment programs run with on the real machine: `env` minus Electron's own variables (which
- * would make a child Electron run as Node) and git's repository selection, with
- * `GIT_TERMINAL_PROMPT=0` (as lib.sh's fetches have: a credential prompt on the terminal the app was
- * started from would hang the update rather than fail it), and with `HOME` set to `home` — the
+ * would make a child Electron run as Node) and git's repository selection, and with `HOME` set to `home` — the
  * account's — so the scripts' defaults (the app home, where the app is installed, pnpm's home) are
  * the ones the app identifies itself by, whatever HOME the app was launched with.
  */
 export function machineEnv(home: string, env: Readonly<Record<string, string | undefined>>): Record<string, string> {
-  const childEnv: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (v !== undefined && !k.startsWith("ELECTRON_") && !GIT_SELECTION.includes(k)) childEnv[k] = v;
-  }
+  // hostEnv's rule (one place for what a host program must not inherit), less git's selection.
+  const childEnv = hostEnv(env);
+  for (const k of GIT_SELECTION) delete childEnv[k];
   childEnv["HOME"] = home;
-  childEnv["GIT_TERMINAL_PROMPT"] = "0";
   return childEnv;
 }
 
@@ -454,7 +475,10 @@ function signalGroup(pgid: number, signal: NodeJS.Signals): void {
  * `logFile` the run's output goes there, not through a pipe into this process.
  */
 export function machineRunner(home: string, env: Readonly<Record<string, string | undefined>>, graceMs = KILL_GRACE_MS): RunFile {
-  const childEnv = machineEnv(home, env);
+  // Only git and the build get GIT_TERMINAL_PROMPT=0 (as lib.sh's fetches have: a credential prompt
+  // on the terminal the app was started from would hang the update rather than fail it) — never the
+  // install step, whose environment the relaunched app inherits along with every terminal it opens.
+  const childEnv = { ...machineEnv(home, env), GIT_TERMINAL_PROMPT: "0" };
   return (file, args, timeoutMs, logFile) =>
     new Promise((resolve) => {
       let settled = false;
@@ -522,7 +546,10 @@ export function machineRunner(home: string, env: Readonly<Record<string, string 
     });
 }
 
-/** Start programs detached on the real machine, in `machineEnv`, their output appended to a log. */
+/**
+ * Start programs detached on the real machine, in `machineEnv` (and nothing more: the install step
+ * relaunches the app, which inherits this), their output appended to a log.
+ */
 export function machineStarter(home: string, env: Readonly<Record<string, string | undefined>>): StartDetached {
   const childEnv = machineEnv(home, env);
   return (file, args, logFile) => {

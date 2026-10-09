@@ -7,8 +7,8 @@ import test from "node:test";
 import {
   FROM_CHECKOUT_VAR,
   LISTED_COMMITS,
-  UPDATE_REF,
-  UPDATE_REFSPEC,
+  UPDATE_SHOWN_REF,
+  UPDATE_SHOWN_REFSPEC,
   checkoutRefusal,
   installedAppDir,
   installedExecutable,
@@ -41,8 +41,8 @@ test("the installed copy's place: ~/Applications on macOS, the app home elsewher
 });
 
 test("the update takes main, and only main", () => {
-  assert.equal(UPDATE_REF, "refs/remotes/origin/main");
-  assert.equal(UPDATE_REFSPEC, "+refs/heads/main:refs/remotes/origin/main");
+  assert.equal(UPDATE_SHOWN_REF, "refs/jkb-app/shown");
+  assert.equal(UPDATE_SHOWN_REFSPEC, "+refs/heads/main:refs/jkb-app/shown");
 });
 
 test("the stamp is read for a full commit id and nothing else", () => {

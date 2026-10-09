@@ -178,7 +178,8 @@ installed app:
   desktop entry is written. `--wait-pid PID` first waits (up to two minutes) for PID and every
   process of the bundle to exit; `--relaunch` then starts the app — the new one, or the old one
   when the install failed — but never after 75 (another install is at work) or 76, and never while
-  a copy runs. Every outcome is written to `<app-home>/install.result` (`status=`, `commit=`), and
+  a copy runs. Every outcome is written to `<app-home>/install.result` (`status=`, `commit=`, the
+  staged build read before the wait and the lock, so even a 75 or 76 names it), and
   the release, the record and the relaunch all happen in the EXIT trap, so a `set -e` failure or a
   signal ends the same way as success.
 - **setup.sh (`install_app`)**: under the lock, `app_clone_refresh` (clone from the checkout's
@@ -204,10 +205,13 @@ installed app:
   detached (output in `<app-home>/install.log`). The build's output goes straight to
   `update.log`, never through a pipe into the app (review round 4 measured a detached build with
   piped output dying at its next write once the app had exited), so a quit mid-build leaves the
-  build running to finish staging. If it still holds the lock when the install step starts, the
-  step records 75. **At its next start the app reads `install.result`**: a staged build that is not
-  what runs, whose install did not succeed, is reported with the reason (a copy was running,
-  another build or install held the lock, or a failure) and offered again.
+  build running to finish staging. **At its next start the app offers any staged build that is not
+  what runs** (`pendingInstall`) — one staged by a build the user quit during as much as one whose
+  install failed. `install.result` only explains why, and only when it names that build (a copy
+  was running, another build or install held the lock, or a failure, with what to delete if it
+  keeps failing). *Not Now* sets nothing, and the same build with the same result is not offered
+  again until one of them changes (review round 5: the offer read install.result alone, so it
+  missed a build staged after a quit, and pinned a result naming no build on whatever was staged).
 - **The staging lock** is `<app-home>/lock`, a plain `mkdir` with `token` and `pid`, held by
   `build-app.sh`, `install-app.sh` and `install_app` (which hands its token to the two scripts in
   `JKB_APP_LOCK_TOKEN`, so they proceed under it). It serializes the clone, the staging directory
@@ -215,8 +219,11 @@ installed app:
   with its path and holder pid, for the operator to remove. So releasing it is `app_lock`'s own job
   (review round 4: holders that had to remember an explicit unlock leaked it on Ctrl-C and on `set -e`
   exits): taking it installs the holder's EXIT/INT/TERM/HUP traps (and ignores SIGPIPE, so a write to
-  a closed pipe fails through `set -e` rather than killing the holder past its trap). Only SIGKILL
-  leaves it — which the app says, naming the lock, when its build timeout had to SIGKILL the build.
+  a closed pipe fails through `set -e` rather than killing the holder past its trap). The traps go
+  in before the `mkdir`, and EXIT releases only once the lock is marked as the shell's (with or
+  without its token written yet). Only SIGKILL leaves it, or a signal in the instant between the
+  `mkdir` and the statement after it — which the app says, naming the lock, when its build timeout
+  had to SIGKILL the build.
   Busy is exit 75 in both scripts, and the message names the lock and its holder; any other lock
   error is a plain failure.
 - **The swap replaces only what jkb installed.** `app_swap` replaces something already at the
@@ -224,9 +231,15 @@ installed app:
   never moves aside, and later deletes, what it cannot show it wrote). Before anything moves it
   rewrites the stamp to name the destination (keeping the old commit), so if the final stamp then
   cannot be written the app is still jkb's and the next install, seeing a stale commit, replaces
-  it. A stamp that cannot be written at all refuses the swap. The copy is made beside the
-  destination first, the old app moved to `previous/` (the one-step rollback), the copy renamed in;
-  a failed rename moves the old one back.
+  it; and on every failure it puts the stamp back as it found it (review round 5: a failed *first*
+  swap left it vouching for an empty destination, so a later install would have moved aside, and
+  deleted, whatever the user put there). A stamp that cannot be written at all refuses the swap.
+  The copy is made beside the destination first, under the fixed name `<dest>.new` (so an
+  interrupted run's half copy is cleared by the next one); the old `previous/` goes aside to
+  `previous.trash` by one rename, the running-copy check runs, and only then is the installed app
+  renamed to `previous/` (the one-step rollback) and the copy renamed in; the trash is deleted
+  after. Deleting the old `previous/` first took seconds — a window between the check and the
+  rename (review round 5). A failed rename moves everything back.
 - **One place to install, and it is the place the app accepts.** `--dest` (install-app.sh) and an
   `--app-home` other than `~/.local/share/jkb-app` (both scripts) are for the tests only
   (`JKB_APP_BUILD_TEST=1`): a copy installed anywhere else refuses to start, and a stamp naming it
@@ -243,8 +256,10 @@ installed app:
   the app at `~/Applications/Code Factory.app` (macOS) or `~/.local/share/jkb-app/app/code-factory`
   (Linux).
 - **The app's processes.** Git and the builder run with Electron's variables and git's repository
-  selection stripped and `GIT_TERMINAL_PROMPT=0` (a credential prompt on the terminal the app was
-  started from would hang rather than fail), `HOME` the account's. Each build is its own process
+  selection stripped, `HOME` the account's, and — git and the build only — `GIT_TERMINAL_PROMPT=0`
+  (a credential prompt on the terminal the app was started from would hang rather than fail). Not
+  the install step: on Linux it relaunches the app, which would inherit it and pass it to every
+  terminal, turning git's credential prompts off for the whole session (review round 5). Each build is its own process
   group, and a timeout stops the whole group (SIGTERM, then SIGKILL); `describeEnd` words a timeout,
   a signal and an exit apart. A build that fails installs nothing, because a build never installs.
 - **The refusal is in main**, before any window (`startupRefusal`, a plain function under test):

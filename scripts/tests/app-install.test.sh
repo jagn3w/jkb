@@ -341,7 +341,8 @@ case5() {
     sleep 0.3
     case "$out" in *"$app_home/lock"*"pid 4242"*"remove it"*) local named=1 ;; *) local named=0 ;; esac
     [ "$rc" = "$APP_EXIT_BUSY" ] && [ "$(cat "$dest/id")" = second ] && [ "$named" = 1 ] && [ ! -s "$work/c5/ran" ] \
-        && ok "install: a held lock is busy (75): nothing swapped, the lock and holder named, no relaunch" \
+        && grep -qx "commit=$(app_staged_commit "$app_home")" "$app_home/install.result" \
+        && ok "install: a held lock is busy (75): nothing swapped, the lock and holder named, no relaunch, the build named in the result" \
         || fail "install: lock" "rc=$rc ran=$(cat "$work/c5/ran") $out"
     # A `set -e` failure after the lock is taken (stdout closed: the first echo fails) releases it,
     # through app_lock's EXIT trap, and records the failure.
@@ -371,18 +372,22 @@ case6() {
     [ "$(cat "$d/dest/id")" = old ] && [ ! -e "$h/previous" ] && ok "swap: nothing to install leaves dest alone" \
         || fail "swap: missing build" "dest or prev changed"
     app_swap "$d/new" "$d/dest" "$h" 2>/dev/null
-    [ "$(cat "$d/dest/id")" = new ] && [ "$(cat "$h/previous/id")" = old ] && [ -z "$(ls -d "$d"/dest.new.* 2>/dev/null)" ] \
+    [ "$(cat "$d/dest/id")" = new ] && [ "$(cat "$h/previous/id")" = old ] && [ -z "$(ls -d "$d"/dest.new 2>/dev/null)" ] \
         && ok "swap: installs, keeps the old one as previous, leaves no temp copy" \
         || fail "swap: install" "dest=$(cat "$d/dest/id") prev=$(cat "$h/previous/id" 2>&1)"
     # The final rename fails: the app that was installed is moved back, and no temp copy is left.
     mkdir -p "$d/newer" && echo newer >"$d/newer/id"
+    local stamp_before
+    stamp_before="$(cat "$h/installed")"
     (
-        mv() { case "$1" in *.new.*) return 1 ;; esac; command mv "$@"; }
+        mv() { case "$1" in *.new) return 1 ;; esac; command mv "$@"; }
         app_swap "$d/newer" "$d/dest" "$h" 2>/dev/null
     ) && fail "swap: failed rename" "exit 0"
-    [ "$(cat "$d/dest/id" 2>/dev/null)" = new ] && [ -z "$(ls -d "$d"/dest.new.* 2>/dev/null)" ] \
-        && ok "swap: a failed rename puts the installed app back" \
-        || fail "swap: rollback" "dest=$(cat "$d/dest/id" 2>&1) temp=$(ls -d "$d"/dest.new.* 2>&1)"
+    [ "$(cat "$d/dest/id" 2>/dev/null)" = new ] && [ -z "$(ls -d "$d"/dest.new 2>/dev/null)" ] \
+        && [ "$(cat "$h/previous/id" 2>/dev/null)" = old ] && [ ! -e "$h/previous.trash" ] \
+        && [ "$(cat "$h/installed")" = "$stamp_before" ] \
+        && ok "swap: a failed rename puts the installed app, previous/ and the stamp back" \
+        || fail "swap: rollback" "dest=$(cat "$d/dest/id" 2>&1) prev=$(cat "$h/previous/id" 2>&1) temp=$(ls -d "$d"/dest.new 2>&1) stamp=$(cat "$h/installed")"
     # A copy started while the new one was being copied (the Dock, a relaunch): app_swap checks again
     # right before moving the old bundle aside, refuses with 76, and leaves no temp copy.
     run_as_app "$d/dest"
@@ -390,8 +395,9 @@ case6() {
     app_swap "$d/newer" "$d/dest" "$h" 2>/dev/null || swap_rc=$?
     stop_app
     rm -f "$(app_executable "$os" "$d/dest")"
-    [ "$swap_rc" = "$APP_EXIT_RUNNING" ] && [ "$(cat "$d/dest/id")" = new ] && [ -z "$(ls -d "$d"/dest.new.* 2>/dev/null)" ] \
-        && ok "swap: a copy running from dest when it comes to move it aside refuses (76)" \
+    [ "$swap_rc" = "$APP_EXIT_RUNNING" ] && [ "$(cat "$d/dest/id")" = new ] && [ -z "$(ls -d "$d"/dest.new 2>/dev/null)" ] \
+        && [ "$(cat "$h/previous/id" 2>/dev/null)" = old ] && [ ! -e "$h/previous.trash" ] \
+        && ok "swap: a copy running from dest when it comes to move it aside refuses (76), previous/ kept" \
         || fail "swap: running re-check" "rc=$swap_rc id=$(cat "$d/dest/id")"
     # A helper process counts: on macOS they run from Contents/Frameworks, not the main executable.
     local helper="$d/dest/Contents/Frameworks/Code Factory Helper (GPU).app/Contents/MacOS/Code Factory Helper (GPU)"
@@ -402,6 +408,23 @@ case6() {
         || fail "running: helper" "not seen"
     stop_app
     rm -rf "$d/dest/Contents"
+    # A half copy an interrupted run left at the fixed temp name is cleared by the next swap.
+    mkdir -p "$d/dest.new" && echo junk >"$d/dest.new/junk"
+    app_swap "$d/newer" "$d/dest" "$h" 2>/dev/null
+    [ "$(cat "$d/dest/id")" = newer ] && [ ! -e "$d/dest/junk" ] && [ ! -e "$d/dest.new" ] && [ ! -e "$h/previous.trash" ] \
+        && [ "$(cat "$h/previous/id")" = new ] \
+        && ok "swap: an interrupted run's temp copy is cleared; the old previous/ goes, trash and all" \
+        || fail "swap: leftover temp" "id=$(cat "$d/dest/id") $(ls "$d" "$h")"
+    # A failed FIRST install takes its stamp back: it must not vouch for a dest jkb never filled.
+    local h3="$d/home3"
+    mkdir -p "$h3"
+    (
+        mv() { case "$1" in *.new) return 1 ;; esac; command mv "$@"; }
+        app_swap "$d/new" "$d/dest3" "$h3" 2>/dev/null
+    ) && fail "swap: failed first install" "exit 0"
+    [ ! -e "$h3/installed" ] && [ ! -e "$d/dest3" ] \
+        && ok "swap: a failed first install leaves no stamp" \
+        || fail "swap: failed first install" "stamp=$(cat "$h3/installed" 2>&1)"
     # A first install vouches for its dest BEFORE anything moves: if the final stamp then cannot be
     # written, the next install still replaces it rather than refusing it as foreign.
     local h2="$d/home2"
@@ -493,6 +516,19 @@ case7() {
     done
 }
 
+# --- 8b. the lock: a holder that ends before writing its token still releases it ------------------
+case8b() {
+    local h="$work/c8b"
+    mkdir -p "$h"
+    ( app_lock "$h" && rm -f "$h/lock/token"; exit 0 )
+    [ ! -e "$h/lock" ] && ok "lock: a lock this shell made is released even with no token written yet" \
+        || fail "lock: tokenless" "$(ls "$h/lock" 2>&1)"
+    mkdir -p "$h/lock" && echo theirs >"$h/lock/token"
+    ( app_lock "$h"; exit 0 ) 2>/dev/null
+    [ "$(cat "$h/lock/token")" = theirs ] && ok "lock: a busy app_lock leaves the holder's lock alone" \
+        || fail "lock: busy" "$(ls "$h" 2>&1)"
+}
+
 # --- 8. one home: the account's, from the user database, not $HOME -------------------------------
 case8() {
     local expect u
@@ -513,5 +549,5 @@ case8() {
         || fail "home: override" "got $got"
 }
 
-run_cases case1 case2 case3 case4 case5 case6 case7 case8
+run_cases case1 case2 case3 case4 case5 case6 case7 case8 case8b
 finish

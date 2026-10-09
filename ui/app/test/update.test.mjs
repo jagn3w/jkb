@@ -498,27 +498,50 @@ test("a timed-out build that had to be SIGKILLed says it may have left its lock"
   await until(() => !alive(sleeper), "the stubborn child to be killed", 3_000);
 });
 
-test("at startup, a staged build the last install step did not install is reported with why", async () => {
+test("at startup, any staged build that is not what runs is offered; install.result only says why, for that build", async () => {
   const running = "a".repeat(40);
   const f = fixture({ commit: running });
   assert.equal(f.updater.pendingInstall(), undefined, "nothing staged");
   const tip = f.land("second");
   assert.ok((await f.updater.apply(tip)).ok);
-  assert.equal(f.updater.pendingInstall(), undefined, "staged, but no install step has run for it");
+  const pick = (p) => (p === undefined ? undefined : { commit: p.commit, status: p.status });
+  assert.deepEqual(pick(f.updater.pendingInstall()), { commit: tip, status: undefined }, "staged after a quit mid-build: offered, no step has run");
   const result = (status, commit = tip) => fs.writeFileSync(path.join(f.appHome, "install.result"), `status=${status}\ncommit=${commit}\n`);
   result(76);
-  assert.deepEqual(f.updater.pendingInstall(), { commit: tip, status: 76 });
+  assert.deepEqual(pick(f.updater.pendingInstall()), { commit: tip, status: 76 });
   result(75, "");
-  assert.deepEqual(f.updater.pendingInstall(), { commit: tip, status: 75 }, "a busy step never read what was staged");
+  assert.deepEqual(pick(f.updater.pendingInstall()), { commit: tip, status: undefined }, "a result naming no build explains nothing");
   result(1, "b".repeat(40));
-  assert.equal(f.updater.pendingInstall(), undefined, "a result about another commit");
-  result(0);
-  assert.equal(f.updater.pendingInstall(), undefined, "it went through");
+  assert.deepEqual(pick(f.updater.pendingInstall()), { commit: tip, status: undefined }, "a result about another build explains nothing");
+  // Not Now: the same build with the same result is not offered again; a new result is.
+  result(1);
+  const declined = f.updater.pendingInstall();
+  assert.deepEqual(pick(declined), { commit: tip, status: 1 });
+  f.updater.dismissPending(declined);
+  assert.equal(f.updater.pendingInstall(), undefined, "declined, and nothing has changed");
+  result(76);
+  assert.deepEqual(pick(f.updater.pendingInstall()), { commit: tip, status: 76 }, "the result changed: offered again");
   const g = fixture({ commit: tip });
   fs.mkdirSync(path.join(g.appHome, "staged", "app"), { recursive: true });
   fs.writeFileSync(path.join(g.appHome, "staged", "commit"), `${tip}\n`);
   fs.writeFileSync(path.join(g.appHome, "install.result"), `status=76\ncommit=${tip}\n`);
   assert.equal(g.updater.pendingInstall(), undefined, "what is staged is what runs");
+});
+
+test("GIT_TERMINAL_PROMPT=0 is for git and the build only: the install step (and the app it relaunches) never gets it", async () => {
+  const home = fs.mkdtempSync(path.join(work, "starter-"));
+  const log = path.join(home, "env.log");
+  const parent = { ...gitEnv };
+  delete parent.GIT_TERMINAL_PROMPT;
+  machineStarter(home, parent)("/usr/bin/env", [], log);
+  await until(() => fs.existsSync(log) && /^HOME=/m.test(fs.readFileSync(log, "utf8")), "the started program's output");
+  assert.doesNotMatch(fs.readFileSync(log, "utf8"), /GIT_TERMINAL_PROMPT/);
+  const kept = path.join(home, "kept.log");
+  machineStarter(home, { ...parent, GIT_TERMINAL_PROMPT: "1" })("/usr/bin/env", [], kept);
+  await until(() => fs.existsSync(kept) && /^HOME=/m.test(fs.readFileSync(kept, "utf8")), "the second program's output");
+  assert.match(fs.readFileSync(kept, "utf8"), /^GIT_TERMINAL_PROMPT=1$/m, "the user's own setting passes through");
+  const run = await machineRunner(home, parent)("/usr/bin/env", [], 10_000);
+  assert.match(run.stdout, /^GIT_TERMINAL_PROMPT=0$/m);
 });
 
 test("the runner's scrub list is lib.sh's", () => {
