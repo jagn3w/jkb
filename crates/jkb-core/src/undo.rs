@@ -972,7 +972,7 @@ fn watermark(conn: &Connection) -> Result<i64> {
 /// and it is an identifier or a placeholder this module writes, never a value. Written out twice
 /// the copies would answer differently, and the answer decides whether `DeleteRow` runs a second
 /// time against row ids `SQLite` has since reissued.
-fn undone_sql(operand: &str) -> String {
+pub(crate) fn undone_sql(operand: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM changelog u
                   WHERE u.op = 'undo' AND u.entity_id = CAST({operand} AS TEXT))"

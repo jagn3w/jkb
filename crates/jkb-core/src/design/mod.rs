@@ -1304,6 +1304,21 @@ fn view(conn: &Connection, span: &SpanItem, doc: &Crdt, text: &str) -> Result<Sp
             || pieces
                 .iter()
                 .any(|p: &SpanPiece| p.state == SpanState::Proposed));
+    // ONE RULE FOR A DEMOTED SPAN: the whole span reads PROPOSED, every piece of it too. The editor
+    // draws from the pieces (`stateRuns`), and with per-word states a demoted span's untouched
+    // words drew APPROVED while `render` and `stage` said PROPOSED. Words removed since the
+    // approval are still told apart (`removed`).
+    let pieces = if demoted {
+        pieces
+            .into_iter()
+            .map(|p| SpanPiece {
+                state: SpanState::Proposed,
+                ..p
+            })
+            .collect()
+    } else {
+        pieces
+    };
     let state = if approval_holds(approval.is_some(), demoted, range) {
         words
     } else {
@@ -1669,14 +1684,22 @@ pub(crate) fn revert_update(conn: &Connection, meta: &WriteMeta, rowid: i64) -> 
     Ok(1)
 }
 
-/// Why `jkb undo` of transaction `txn`'s insert of `item` would lose design history, or `None`:
-/// the item holds document rows another transaction wrote, a compaction, or contains items (spans,
-/// plans, prompts, tasks) another transaction put under it — the cascade would orphan them, and a
-/// plan whose design is gone can no longer be resolved. Undoing the insert
-/// deletes the item, and `ON DELETE CASCADE` would take every later update with it — text written
-/// after the create, spans whose metadata names the design, and the rows `jkb undo` of each later
-/// edit needs. `undo`'s pre-flight asks this for every `(insert, items)` entry, so the rule holds
-/// at the one place an item insert is reverted rather than at each caller.
+/// **Every table a design owns whose rows `jkb undo` of its creation must not cascade away**, as
+/// `(table, design column)`. Each has a `txn_id` column naming the transaction that wrote the row —
+/// that is how a later row is told from the creation's own, and a table without one does not belong
+/// here. One line per table: a design-owned table a migration adds (a doc target, its sources, once
+/// they carry `txn_id`) is one line here and is then held to the rule with no other change. The names
+/// are spliced into the query as identifiers, never values.
+const DESIGN_OWNED: &[(&str, &str)] = &[("design_updates", "design_id")];
+
+/// Why `jkb undo` of transaction `txn`'s insert of design `item` would lose later work, or `None`
+/// (and `None` for an item that is not a design). Undoing the insert deletes the item, and
+/// `ON DELETE CASCADE` takes every row of every [`DESIGN_OWNED`] table with it. So the undo is
+/// refused while one of those tables holds a row a later transaction wrote — one not itself undone,
+/// and not an `undo` (whose forward revert of an undone edit is no work of its own) — and while the
+/// design has a compaction (`design_snapshots` has no `txn_id`, folds later rows into itself, and
+/// is never undone). Asked by `undo`'s pre-flight for every `(insert, items)` entry. Design-only on
+/// purpose; why is recorded under D47 in docs/namespaces-and-sync.md.
 ///
 /// # Errors
 /// A database error.
@@ -1688,28 +1711,35 @@ pub(crate) fn undo_would_lose(conn: &Connection, item: ItemId, txn: i64) -> Resu
     if kind.as_deref() != Some(KIND) {
         return Ok(None);
     }
-    // A child is the transaction's own when the transaction logged containing it; anything else
-    // contained by the design (a span, a plan, a prompt, a one-off task) was written since.
-    let (later, compacted, children): (bool, bool, bool) = conn
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM design_updates WHERE design_id = ?1 AND txn_id <> ?2),
-                    EXISTS (SELECT 1 FROM design_snapshots WHERE design_id = ?1),
-                    EXISTS (SELECT 1 FROM containment c
-                             WHERE c.parent_item_id = ?1
-                               AND NOT EXISTS (SELECT 1 FROM changelog l
-                                                WHERE l.txn_id = ?2 AND l.entity_type = ?3
-                                                  AND l.entity_id = CAST(c.child_item_id AS TEXT)))",
-        )?
-        .query_row(
-            params![item.get(), txn, Entity::Containment.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-    Ok((later || compacted || children).then(|| {
-        "it created a design that has been written to or under since, and deleting the design \
-         would take every later update, and every plan, span and prompt under it, with it; a design's history is append-only (D53.4), even an undo of \
-         an edit appends, so a design written to after its creation is kept"
-            .to_owned()
-    }))
+    for (table, column) in DESIGN_OWNED {
+        let sql = format!(
+            "SELECT t.txn_id FROM {table} t
+              WHERE t.{column} = ?1 AND t.txn_id <> ?2 AND NOT {}
+                AND NOT EXISTS (SELECT 1 FROM changelog x
+                                 WHERE x.txn_id = t.txn_id AND x.op = 'undo')
+              LIMIT 1",
+            crate::undo::undone_sql("t.txn_id")
+        );
+        let later: Option<i64> = conn
+            .prepare_cached(&sql)?
+            .query_row(params![item.get(), txn], |r| r.get(0))
+            .optional()?;
+        if let Some(later) = later {
+            return Ok(Some(format!(
+                "it created a design that transaction {later} has written `{table}` rows for \
+                 since, and deleting the design would cascade them away — undo transaction \
+                 {later} first"
+            )));
+        }
+    }
+    if snapshot_row(conn, item)?.is_some() {
+        return Ok(Some(
+            "it created a design that has been compacted (`design_snapshots`): the compaction \
+             folded later work into itself and is never undone, so the design keeps its creation"
+                .to_owned(),
+        ));
+    }
+    Ok(None)
 }
 
 /// Whether removing `item` would lose a design document — its updates are not part of an item

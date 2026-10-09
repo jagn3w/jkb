@@ -403,13 +403,9 @@ to learn, and what was decided past the text above:
   of it seeded the `UndoManager` with every deletion in the design and put text deleted long before
   back (review round 1; `undoing_a_full_state_update_reverts_only_what_it_changed` fails with the raw
   bytes stored). What is announced is the same delta.
-- **Undoing a design's creation is refused once anything else wrote to it** (`design::undo_would_lose`,
-  asked by `undo`'s pre-flight for every `(insert, items)` entry): deleting the item cascades
-  (`ON DELETE CASCADE`) every later update away, orphaning its spans and every later edit's undo. While
-  only the create's own rows exist it is still undone. Enforced at the one place an item insert is
-  reverted, not by each caller (round 1). It counts what is *under* the design as well — a span, a
-  plan, a prompt or a one-off task another transaction contained in it: the cascade took the plan's
-  containment row, and its steps and tasks were left with no design to resolve (round 2).
+- **Undoing a design's creation is refused while later work would cascade away with it** — the rule,
+  its scope (designs only, by an explicit list of design-owned tables with `txn_id`) and the generic
+  guard tried and dropped are recorded once, under D47 in docs/namespaces-and-sync.md.
 - **A write folds old rows into the snapshot as it goes**: past 4096 rows, all but the newest 1024 are
   compacted (`compact_if_due`, from the one logged writer of rows). Every write rebuilds the document
   from its rows on the single writer thread, so one editor applying per keystroke made every write
@@ -428,7 +424,10 @@ to learn, and what was decided past the text above:
   character is approved only if it is one of them and still present: words written inside the span
   since read PROPOSED, attested words deleted are a zero-width removed piece, and attested words left
   outside the anchors (the anchors were moved) mark the span `displaced`. Any of the three demotes the
-  span, which reads PROPOSED as a whole until re-approved; `jkb design edit` names the spans it demoted.
+  span, which reads PROPOSED as a whole until re-approved — **every piece of it too**, its untouched
+  words included, so the editor (which draws from the pieces, `stateRuns`) agrees with `render`,
+  `design.stage` and the export; removed words are still marked `removed` (round 4: per-word states
+  had a demoted span's untouched words drawn APPROVED). `jkb design edit` names the spans it demoted.
   An approval recording no readable attestation reads demoted, never approved. Pinned by the proptest
   `a_span_reads_approved_only_while_its_text_is_the_approved_words` (random peer inserts, deletes and
   anchor rewrites; fails against the whole-document snapshot).
@@ -482,7 +481,7 @@ to learn, and what was decided past the text above:
   and gap.
 - **A design cannot be removed** (`item::remove`, even with `--force`): its updates are not in the
   delete's snapshot, so `jkb undo` would bring back a design with no text. Nor can its creation be
-  undone once anything else wrote to it (above).
+  undone while later work would cascade away with it (above).
 - **`jkb design` and `jkb inv` share one ambient-repo rule** (`Ops::ambient_repo`): the first segment
   after `repos/` of the ambient mount, and none for a mount elsewhere. Each carried a copy that took a
   non-repo mount's first segment for a repo (`designs/references`), and `design ls` turned a failed

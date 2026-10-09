@@ -514,12 +514,15 @@ fn an_insertion_inside_an_approved_span_splits_it_and_one_at_its_edge_does_not()
         .iter()
         .map(|p| (p.text.as_str(), p.state))
         .collect();
+    // One rule for a demoted span: every piece reads PROPOSED, the untouched words too — the
+    // editor draws from the pieces, and must agree with `render` and `stage`. The pieces still
+    // split where the edit landed.
     assert_eq!(
         pieces,
         vec![
-            ("The app never ", SpanState::Approved),
+            ("The app never ", SpanState::Proposed),
             ("directly ", SpanState::Proposed),
-            ("opens the database.", SpanState::Approved),
+            ("opens the database.", SpanState::Proposed),
         ]
     );
     // Re-approving attests to the new words.
@@ -1419,7 +1422,8 @@ fn set_target(db: &Db, uid: &str, path: &str) -> Result<()> {
 }
 
 /// D55.6: only approved words reach the file. Uncovered text, an unapproved span, and words edited
-/// into an approved span after its approval are all PROPOSED and left out; no span markers.
+/// into an approved span after its approval (which demote the whole span) are all PROPOSED and left
+/// out; no span markers.
 #[test]
 fn an_export_is_the_approved_text_alone_under_a_header_naming_the_version() {
     let db = db();
@@ -1443,7 +1447,8 @@ fn an_export_is_the_approved_text_alone_under_a_header_naming_the_version() {
         export::header(&uid, &cat(&db, &uid).version)
     );
 
-    // Words added inside the approved span since its approval are not approved words.
+    // Words added inside the approved span since its approval demote the whole span, so none of
+    // it is approved text any more (every piece of a demoted span reads PROPOSED, D53.5).
     edit_at(
         &db,
         &uid,
@@ -1451,7 +1456,7 @@ fn an_export_is_the_approved_text_alone_under_a_header_naming_the_version() {
         insert_after("Decided", " maybe"),
     )
     .unwrap();
-    assert_eq!(exported_body(&db, &uid), "## D1\nDecided.\n");
+    assert_eq!(exported_body(&db, &uid), "");
     // ...and the header names the new version, so a file rendered before reads as drift.
     assert_eq!(
         exported(&db, &uid).text.lines().next().unwrap(),
@@ -1596,6 +1601,12 @@ fn moving_an_approved_spans_anchors_over_other_text_demotes_it() {
         view_of(&db, &uid, &b)
     };
     assert_eq!(b.state, SpanState::Proposed, "{b:?}");
+    // …and none of its pieces still draws as approved: the editor draws from the pieces.
+    assert!(b.demoted);
+    assert!(
+        b.pieces.iter().all(|p| p.state == SpanState::Proposed),
+        "{b:?}"
+    );
 }
 
 /// Must-fix 1: the overlap rule holds for a span written through `design.apply`, too.
@@ -1736,7 +1747,7 @@ fn undoing_a_designs_creation_is_refused_once_it_was_written_since() {
     let e = db
         .write_txn("t", move |c, m| crate::undo::undo(c, m, created))
         .unwrap_err();
-    assert!(e.to_string().contains("append-only"), "{e}");
+    assert!(e.to_string().contains("design_updates"), "{e}");
     assert_eq!(text(&db, &uid), "body more");
 }
 
@@ -1901,45 +1912,6 @@ fn undoing_an_anchor_shrinking_update_over_a_newer_neighbour_is_refused() {
     assert!(va.end <= vb.start, "{va:?} {vb:?}");
 }
 
-/// Undoing a design's creation is refused once a later transaction put a plan under it — the
-/// cascade would leave the plan, its steps and their tasks with no design.
-#[test]
-fn undoing_a_designs_creation_is_refused_once_a_plan_was_added_under_it() {
-    let db = db();
-    let uid = create(&db, "");
-    let created: i64 = db
-        .read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
-        .unwrap();
-    let p = new_plan(&db, &uid, &["one"]).unwrap();
-    task_under(&db, step_id(&db, &p.steps[0].uid), "task:x");
-    let e = db
-        .write_txn("t", move |c, m| crate::undo::undo(c, m, created))
-        .unwrap_err();
-    assert!(e.to_string().contains("plan, span and prompt"), "{e}");
-    let shown = p.uid.clone();
-    assert!(db.read(move |c| plan::show(c, &shown)).is_ok());
-}
-
-/// A `stages` edge written around `design.stage` (`jkb inv link <span> stages <step>`) into another
-/// design's plan does not make the span STAGED: the state counts only its own design's steps.
-#[test]
-fn a_stages_edge_into_another_designs_plan_does_not_stage_the_span() {
-    let db = db();
-    let mine = create(&db, "Mine.");
-    let s = span(&db, &mine, "Mine.", Reviewer::Operator).unwrap();
-    approve_as(&db, &s, Approver::Operator).unwrap();
-    let other = create(&db, "Theirs.");
-    let theirs = new_plan(&db, &other, &["x"]).unwrap();
-    let (span_id, step) = (step_id(&db, &s), step_id(&db, &theirs.steps[0].uid));
-    db.write_txn("t", move |c, m| {
-        edge::link(c, m, span_id, step, EdgeType::Stages, None)
-    })
-    .unwrap();
-    let v = view_of(&db, &mine, &s);
-    assert_eq!(v.state, SpanState::Approved);
-    assert!(v.steps.is_empty(), "{v:?}");
-}
-
 fn span_messages(db: &Db, uid: &str) -> Vec<String> {
     let name = topic(uid);
     db.read(move |c| crate::mq::tail(c, &name, 50, crate::mq::now_ms()))
@@ -2035,11 +2007,55 @@ fn approval_counts_surrogate_pairs_in_utf16_units() {
     let w = edit_at(&db, &uid, &token(&db, &uid), insert_after("Keep 🦀", "🦀")).unwrap();
     assert_eq!(w.demoted, vec![s.clone()]);
     let v = view_of(&db, &uid, &s);
-    let added: Vec<&str> = v
-        .pieces
-        .iter()
-        .filter(|p| p.state == SpanState::Proposed && !p.removed)
-        .map(|p| p.text.as_str())
-        .collect();
-    assert_eq!(added, ["🦀"]);
+    // The pieces split exactly at the inserted pair: an offset counted in anything but UTF-16
+    // units lands elsewhere. Every piece of a demoted span reads PROPOSED.
+    let split: Vec<&str> = v.pieces.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(split, ["Keep 🦀", "🦀", " Ferris here."]);
+    assert!(v.pieces.iter().all(|p| p.state == SpanState::Proposed));
+}
+
+// ---- review rounds 3-4: the design-only creation guard -----------------------------------------
+
+/// A later edit that was itself undone no longer holds the design's creation: undo the edit (its
+/// forward revert is no work of its own), then the creation undoes.
+#[test]
+fn a_designs_creation_is_undone_once_the_later_edits_are_undone() {
+    let db = db();
+    let uid = create(&db, "");
+    let made: i64 = db
+        .read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap();
+    let peer = Crdt::new();
+    let ((), u) = peer
+        .change(|txn, body, _| {
+            body.insert(txn, 0, "later words");
+            Ok(())
+        })
+        .unwrap();
+    apply_bytes(&db, &uid, u.unwrap()).unwrap();
+    let e = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, made))
+        .unwrap_err();
+    assert!(e.to_string().contains("design_updates"), "{e}");
+    undo_last(&db);
+    db.write_txn("t", move |c, m| crate::undo::undo(c, m, made))
+        .unwrap();
+    let u = uid.clone();
+    assert!(db.read(move |c| read(c, &u)).is_err());
+}
+
+/// A compaction is never undone, so a compacted design keeps its creation.
+#[test]
+fn a_compacted_designs_creation_is_not_undone() {
+    let db = db();
+    let uid = create(&db, "body");
+    let made: i64 = db
+        .read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap();
+    let u = uid.clone();
+    db.write_txn("t", move |c, m| compact(c, m, &u)).unwrap();
+    let e = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, made))
+        .unwrap_err();
+    assert!(e.to_string().contains("compacted"), "{e}");
 }

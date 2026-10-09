@@ -366,9 +366,9 @@ export interface StateMap {
 
 /**
  * Which state each piece of a text of `length` UTF-16 units is in, from `design.cat`'s spans
- * (D53.5). Text no span covers is PROPOSED. A span's pieces carry its words' own states — a demoted
- * span's untouched words keep their approval, the words written into it read PROPOSED — and a span
- * with no pieces is drawn whole in its state. Unanchored spans are not in the text at all.
+ * (D53.5). Text no span covers is PROPOSED. A span's pieces carry its words' states — every piece
+ * of a demoted span reads PROPOSED, its untouched words too, as `render` and `design.stage` read it —
+ * and a span with no pieces is drawn whole in its state. Unanchored spans are not in the text at all.
  *
  * The engine keeps spans from overlapping; a run that would overlap an earlier one anyway is clipped
  * to start after it, so each unit is drawn exactly once whatever the answer holds.
