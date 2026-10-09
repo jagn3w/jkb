@@ -5140,6 +5140,12 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
             .assert()
     };
     let body = "# Draft heading\n## D1\nDecided.\n";
+    let mount = |ns: &str, dir: &Path| {
+        f.jkb()
+            .args(["mount", "create", ns, dir.to_str().unwrap()])
+            .assert()
+            .success();
+    };
     let uid = json(&[
         "design", "create", "Export", "--repo", "proj", "--body", body,
     ])["uid"]
@@ -5175,6 +5181,23 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
     check()
         .success()
         .stdout(predicate::str::contains("0 generated"));
+
+    // A checkout in no mounted repo is refused: which repo's designs belong in it is not known,
+    // and `--repo` cannot say so on its behalf.
+    f.jkb()
+        .args([
+            "design",
+            "export",
+            &uid,
+            "--to",
+            "docs/export.md",
+            "--repo",
+            "proj",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no mounted repo"));
+    mount("repos/proj", &f.repo);
 
     // `--to` from a subdirectory is resolved against it, and recorded as repo-relative.
     std::fs::create_dir_all(f.repo.join("sub")).unwrap();
@@ -5290,22 +5313,23 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
         .unwrap()
         .to_owned();
     f.jkb()
-        .args([
-            "design",
-            "export",
-            &other,
-            "--to",
-            "docs/other.md",
-            "--repo",
-            "proj",
-        ])
+        .args(["design", "export", &other, "--to", "docs/other.md"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("of repo other"));
+    // ...and `--repo` cannot claim this checkout is another repo: it may only agree.
+    f.jkb()
+        .args(["design", "export", &uid, "--repo", "other"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--repo other, but this checkout is repo proj",
+        ));
     assert!(!f.repo.join("docs/other.md").exists());
     let elsewhere = f.home.path().join("other");
     std::fs::create_dir_all(&elsewhere).unwrap();
     git(&elsewhere, &["init", "-q", "-b", "main"]);
+    mount("repos/other", &elsewhere);
     f.jkb()
         .current_dir(&elsewhere)
         .args([
@@ -5330,6 +5354,17 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
         .stderr(predicate::str::contains("docs/stray.md"))
         .stderr(predicate::str::contains("stray export"));
     std::fs::remove_file(f.repo.join("docs/stray.md")).unwrap();
+
+    // A directory mounted as another repo inside this checkout cannot export into it either.
+    mount("repos/inner", &f.repo.join("sub"));
+    f.jkb()
+        .current_dir(f.repo.join("sub"))
+        .args(["design", "export", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "the current directory is in repo inner",
+        ));
 
     // The design's doc target with no file: the database check reports it.
     std::fs::remove_file(&path).unwrap();
@@ -5401,6 +5436,15 @@ fn the_export_check_opens_no_database_and_reaches_no_daemon() {
             .stderr(predicate::str::contains("docs/gen.md"));
     }
     run().success();
+    // A generated file re-saved in another encoding is still generated, and reported.
+    let mut latin1 = generated.clone().into_bytes();
+    latin1.extend_from_slice(b"caf\xe9\n");
+    std::fs::write(f.repo.join("docs/latin1.md"), latin1).unwrap();
+    run()
+        .failure()
+        .stderr(predicate::str::contains("docs/latin1.md"))
+        .stderr(predicate::str::contains("not UTF-8"));
+    std::fs::remove_file(f.repo.join("docs/latin1.md")).unwrap();
     // And it still judges the file: a hand edit fails it, with no database anywhere.
     std::fs::write(f.repo.join("docs/gen.md"), format!("{generated}more\n")).unwrap();
     run()

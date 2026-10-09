@@ -117,14 +117,35 @@ fn same_repo(e: &Export, here: &str) -> Result<()> {
     }
     bail!(
         "design {} is of repo {}, but this checkout is repo {here} — export it from its own \
-         checkout (or name this checkout's repo with --repo)",
+         repo's checkout",
         e.uid,
         e.repo.as_deref().unwrap_or("(none)")
     )
 }
 
+/// The repo the checkout at `root` is: the mount covering `root` itself, since `root` is where the
+/// files are written. `--repo` and the current directory's mount may only agree with it — neither
+/// can point an export at another repo's design.
+fn checkout_repo(ops: &Ops<'_>, root: &Path, cwd: &Path, asked: Option<String>) -> Result<String> {
+    let here = ops.ambient_repo_at(root)?.with_context(|| {
+        format!(
+            "the checkout at {} is in no mounted repo, so which repo's designs belong in it is not \
+             known — mount it (`jkb mount create repos/<repo> {}`)",
+            root.display(),
+            root.display()
+        )
+    })?;
+    if let Some(there) = ops.ambient_repo_at(cwd)?.filter(|r| *r != here) {
+        bail!("the current directory is in repo {there}, but its checkout is repo {here}");
+    }
+    if let Some(asked) = asked.filter(|r| *r != here) {
+        bail!("--repo {asked}, but this checkout is repo {here}");
+    }
+    Ok(here)
+}
+
 /// `jkb design export <uid> [--to <path>]` and `jkb design export --all`. Either way only into the
-/// checkout of the design's own repo: `here` is the ambient repo, or `--repo`.
+/// checkout of the design's own repo ([`checkout_repo`]).
 fn export(
     ops: &Ops<'_>,
     uid: Option<String>,
@@ -132,7 +153,7 @@ fn export(
     repo: Option<String>,
 ) -> Result<()> {
     let (root, cwd) = checkout()?;
-    let here = crate::design_cli::repo_of(ops, repo)?;
+    let here = checkout_repo(ops, &root, &cwd, repo)?;
     if let Some(uid) = &uid {
         for e in exports(ops, Some(uid.clone()), None)? {
             same_repo(&e, &here)?;
@@ -200,7 +221,7 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 /// Every generated `docs/` file under `root`: its repo-relative path and what its first line says.
 /// Files that are not UTF-8 are not text, so not generated; hand-written ones are left out.
-fn generated_files(root: &Path) -> Result<Vec<(String, String)>> {
+fn generated_files(root: &Path) -> Result<Vec<(String, Option<String>)>> {
     let docs = root.join(DOCS_DIR);
     let mut files = Vec::new();
     if docs.is_dir() {
@@ -211,19 +232,26 @@ fn generated_files(root: &Path) -> Result<Vec<(String, String)>> {
     for path in files {
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let rel = repo_relative(root, root, &path.to_string_lossy())?;
-        let Ok(text) = String::from_utf8(bytes) else {
+        // Classified by the first line's bytes, so a generated file re-saved in another encoding is
+        // still a generated file — and reported, not skipped as "not text".
+        let first = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
+        if matches!(gen::parse(&String::from_utf8_lossy(first)), Generated::Hand) {
             continue;
-        };
-        if !matches!(gen::parse(&text), Generated::Hand) {
-            out.push((rel, text));
         }
+        out.push((rel, String::from_utf8(bytes).ok()));
     }
     Ok(out)
 }
 
 /// What is wrong with one generated file on its own, with no database: a header that does not
 /// read, or a body that is no longer the one its header hashed.
-fn tampered(rel: &str, text: &str) -> Option<String> {
+fn tampered(rel: &str, text: Option<&str>) -> Option<String> {
+    let Some(text) = text else {
+        return Some(format!(
+            "{rel}: carries the generated header but is not UTF-8 any more (re-saved in another \
+             encoding?) — re-export it from its design (`jkb design export <design>`)"
+        ));
+    };
     match gen::parse(text) {
         Generated::Hand => None,
         Generated::Malformed(why) => Some(format!(
@@ -285,7 +313,7 @@ pub(crate) fn check_files(repo: Option<&str>, json: bool) -> Result<()> {
     let files = generated_files(&root)?;
     let problems: Vec<String> = files
         .iter()
-        .filter_map(|(rel, text)| tampered(rel, text))
+        .filter_map(|(rel, text)| tampered(rel, text.as_deref()))
         .collect();
     let checked: Vec<String> = files.into_iter().map(|(rel, _)| rel).collect();
     report(
@@ -346,14 +374,17 @@ fn drift(ops: &Ops<'_>, here: &str, rel: &str, text: &str, uid: &str) -> Option<
 /// `jkb design export --check --against-db`: everything `--check` asks, then each generated file
 /// against its design's render now, and every design of the repo whose doc target has no file.
 fn check_against_db(ops: &Ops<'_>, repo: Option<String>) -> Result<()> {
-    let (root, _) = checkout()?;
-    let repo = crate::design_cli::repo_of(ops, repo)?;
+    let (root, cwd) = checkout()?;
+    let repo = checkout_repo(ops, &root, &cwd, repo)?;
     let files = generated_files(&root)?;
     let mut problems = Vec::new();
     for (rel, text) in &files {
-        if let Some(p) = tampered(rel, text) {
+        if let Some(p) = tampered(rel, text.as_deref()) {
             problems.push(p);
-        } else if let Some(uid) = gen::generated_from(text) {
+        } else if let Some(text) = text {
+            let Some(uid) = gen::generated_from(text) else {
+                continue;
+            };
             problems.extend(drift(ops, &repo, rel, text, uid));
         }
     }

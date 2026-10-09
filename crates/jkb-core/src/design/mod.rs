@@ -1689,10 +1689,14 @@ pub(crate) fn revert_update(conn: &Connection, meta: &WriteMeta, rowid: i64) -> 
 /// **Every table a design owns whose rows `jkb undo` of its creation must not cascade away**, as
 /// `(table, design column)`. Each has a `txn_id` column naming the transaction that wrote the row —
 /// that is how a later row is told from the creation's own, and a table without one does not belong
-/// here. One line per table: a design-owned table a migration adds (a doc target, its sources, once
-/// they carry `txn_id`) is one line here and is then held to the rule with no other change. The names
+/// here. One line per table: a design-owned table a migration adds is one line here and is then held
+/// to the rule with no other change. The names
 /// are spliced into the query as identifiers, never values.
-const DESIGN_OWNED: &[(&str, &str)] = &[("design_updates", "design_id")];
+const DESIGN_OWNED: &[(&str, &str)] = &[
+    ("design_updates", "design_id"),
+    ("design_doc_targets", "design_id"),
+    ("design_sources", "design_id"),
+];
 
 /// Why `jkb undo` of transaction `txn`'s insert of design `item` would lose later work, or `None`
 /// (and `None` for an item that is not a design). Undoing the insert deletes the item, and

@@ -494,7 +494,8 @@ and nothing ever held an entry to the second.
   items only). Deleting the item cascades (`ON DELETE CASCADE`) every row keyed by it, and a design's
   updates are append-only (D53.4): text written after the create, its spans, and every later edit's
   undo went with it. The undo is refused while a table in `design::DESIGN_OWNED` — an explicit list,
-  one line per table, today `design_updates` — holds a row whose `txn_id` is a later transaction not
+  one line per table, today `design_updates`, `design_doc_targets` and `design_sources` (V026,
+  D55.6) — holds a row whose `txn_id` is a later transaction not
   itself undone and not an `undo` (whose forward revert of an undone edit is no work of its own);
   the refusal names the newest such transaction, which `jkb undo` takes back next, and once the later
   work is undone the creation undoes. A compacted design (`design_snapshots`, which has no `txn_id`,

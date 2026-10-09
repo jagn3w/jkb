@@ -129,26 +129,14 @@ fn starts_like_header(line: &str) -> bool {
         .starts_with(GENERATED.trim_end())
 }
 
-/// Whether some line of `file` other than the first starts like the generated header, outside a
-/// fenced code block (where a hand-written doc may show the format).
-fn header_below_line_one(file: &str) -> bool {
-    let mut fenced = false;
-    for line in file.lines().skip(1) {
-        let lead = line.trim_start();
-        if lead.starts_with("```") || lead.starts_with("~~~") {
-            fenced = !fenced;
-        } else if !fenced && starts_like_header(line) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Read a file's generated header, if it has one.
 ///
-/// The header is exactly the first line. One anywhere else — a blank line or front matter added
-/// above it, indentation, a byte-order mark — is [`Generated::Malformed`], never hand-written: a
-/// generated file must not leave the check because something was put in front of its header.
+/// Only the first line decides. A first line that starts like the header but is not exactly one
+/// (trimmed, indented, a byte-order mark in front) is [`Generated::Malformed`], never hand-written.
+/// A header pushed below the first line (something added above it) is not looked for: the file
+/// reads as hand-written. Telling that apart from a hand-written doc that quotes the header — in a
+/// fenced or indented code block, in any of their nestings — was a Markdown parser's job, and the
+/// guarantee is the narrower one.
 #[must_use]
 pub fn parse(file: &str) -> Generated<'_> {
     let (first, body) = file.split_once('\n').unwrap_or((file, ""));
@@ -156,11 +144,6 @@ pub fn parse(file: &str) -> Generated<'_> {
         return if starts_like_header(first) {
             Generated::Malformed(
                 "its first line looks like the generated header but is not exactly one",
-            )
-        } else if header_below_line_one(file) {
-            Generated::Malformed(
-                "it carries the generated header below its first line — something was added \
-                 above it",
             )
         } else {
             Generated::Hand
@@ -236,21 +219,16 @@ pub fn approved_text(design: &DesignText) -> String {
     out
 }
 
-/// What a skipped `gap` of PROPOSED text leaves between two approved spans: its line structure, at
-/// most a paragraph break — never its words. Without it, two spans quoted without their trailing
-/// newline ran together (`Decided.## D2`), and the second heading was lost.
+/// What a skipped `gap` of PROPOSED text leaves between two approved spans: nothing when the
+/// output already ends a line, else one line break if the gap had any, else a space — never the
+/// gap's words. Without it, two spans quoted without their trailing newline ran together
+/// (`Decided.## D2`); counting the gap's own line ends instead put a blank line where one table row
+/// or list item was skipped, which splits the table.
 fn separate(out: &mut String, gap: &str) {
-    let have = out.chars().rev().take_while(|&c| c == '\n').count();
-    let breaks = gap.matches('\n').count();
-    if breaks == 0 {
-        if !out.ends_with(char::is_whitespace) {
-            out.push(' ');
-        }
+    if out.ends_with('\n') {
         return;
     }
-    for _ in have..(have + breaks).min(2) {
-        out.push('\n');
-    }
+    out.push(if gap.contains('\n') { '\n' } else { ' ' });
 }
 
 /// The whole generated file for `design`: the header, then its approved text, ending in a newline
@@ -333,8 +311,8 @@ fn repo_path(path: &str, what: &str) -> Result<String> {
 
 /// Record where a design's export is written: `path`, relative to the root of the design's repo and
 /// under `docs/`, and named by no other design of that repo (two designs rendering one file would
-/// each read the other's export as drift). The rule is the table's `UNIQUE (repo, path)` too, so an
-/// undo that would break it is refused rather than applied.
+/// each read the other's export as drift). An undo restoring an older target does not come through
+/// here, so [`exports`] refuses a repo where it left two designs on one file.
 ///
 /// # Errors
 /// An unknown design, a path that is not a `docs/` file, or one another design already targets.
@@ -358,42 +336,44 @@ pub fn set_doc_target(
             super::ROOT
         ))
     })?;
-    let taken: Option<String> = conn
+    // One file of a repo is one design's: checked against each holder's repo NOW, since a repo is
+    // its namespace and a stored copy would go stale on `jkb ns mv`.
+    let holders: Vec<(i64, String)> = conn
         .prepare_cached(
-            "SELECT i.uid FROM design_doc_targets t JOIN items i ON i.id = t.design_id
-              WHERE t.repo = ?1 AND t.path = ?2 AND t.design_id <> ?3",
+            "SELECT t.design_id, i.uid FROM design_doc_targets t JOIN items i ON i.id = t.design_id
+              WHERE t.path = ?1 AND t.design_id <> ?2",
         )?
-        .query_row(params![repo, path, id.get()], |r| r.get(0))
-        .optional()?;
-    if let Some(other) = taken {
-        return Err(invalid(format!(
-            "design {other} already exports to `{path}` in repo {repo} — give this one its own file"
-        )));
+        .query_map(params![path, id.get()], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (other, other_uid) in holders {
+        if repo_of(conn, ItemId::new(other))?.as_deref() == Some(repo.as_str()) {
+            return Err(invalid(format!(
+                "design {other_uid} already exports to `{path}` in repo {repo} — give this one its \
+                 own file"
+            )));
+        }
     }
-    let current: Option<(String, String)> = conn
-        .prepare_cached("SELECT repo, path FROM design_doc_targets WHERE design_id = ?1")?
+    let current: Option<(String, i64)> = conn
+        .prepare_cached("SELECT path, txn_id FROM design_doc_targets WHERE design_id = ?1")?
         .query_row([id.get()], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    if current
-        .as_ref()
-        .is_some_and(|(r, p)| *r == repo && *p == path)
-    {
+    if current.as_ref().is_some_and(|(p, _)| *p == path) {
         return Ok(());
     }
     conn.prepare_cached(
-        "INSERT INTO design_doc_targets (design_id, repo, path) VALUES (?1, ?2, ?3)
-         ON CONFLICT (design_id) DO UPDATE SET repo = excluded.repo, path = excluded.path",
+        "INSERT INTO design_doc_targets (design_id, path, txn_id) VALUES (?1, ?2, ?3)
+         ON CONFLICT (design_id) DO UPDATE SET path = excluded.path, txn_id = excluded.txn_id",
     )?
-    .execute(params![id.get(), repo, path])?;
+    .execute(params![id.get(), path, meta.txn_id])?;
     changelog::upsert(
         conn,
         meta,
         Entity::DesignDocTargets,
         &id.get().to_string(),
         current
-            .map(|(r, p)| json!({ "repo": r, "path": p }))
+            .map(|(p, txn)| json!({ "path": p, "txn_id": txn }))
             .as_ref(),
-        Some(&json!({ "design_id": id.get(), "repo": repo, "path": path })),
+        Some(&json!({ "design_id": id.get(), "path": path, "txn_id": meta.txn_id })),
     )
 }
 
@@ -421,33 +401,44 @@ pub fn add_sources(
                 s.blake3
             )));
         }
-        let before: Option<(i64, String)> = conn
+        let before: Option<(i64, String, i64)> = conn
             .prepare_cached(
-                "SELECT id, blake3 FROM design_sources WHERE design_id = ?1 AND path = ?2",
+                "SELECT id, blake3, txn_id FROM design_sources WHERE design_id = ?1 AND path = ?2",
             )?
-            .query_row(params![id.get(), path], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(params![id.get(), path], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .optional()?;
         let row = match &before {
-            Some((_, hash)) if *hash == s.blake3 => continue,
-            Some((row, _)) => {
-                conn.prepare_cached("UPDATE design_sources SET blake3 = ?2 WHERE id = ?1")?
-                    .execute(params![row, s.blake3])?;
+            Some((_, hash, _)) if *hash == s.blake3 => continue,
+            Some((row, _, _)) => {
+                conn.prepare_cached(
+                    "UPDATE design_sources SET blake3 = ?2, txn_id = ?3 WHERE id = ?1",
+                )?
+                .execute(params![row, s.blake3, meta.txn_id])?;
                 *row
             }
             None => conn
                 .prepare_cached(
-                    "INSERT INTO design_sources (design_id, path, blake3) VALUES (?1, ?2, ?3)
-                     RETURNING id",
+                    "INSERT INTO design_sources (design_id, path, blake3, txn_id)
+                     VALUES (?1, ?2, ?3, ?4) RETURNING id",
                 )?
-                .query_row(params![id.get(), path, s.blake3], |r| r.get(0))?,
+                .query_row(params![id.get(), path, s.blake3, meta.txn_id], |r| r.get(0))?,
         };
         changelog::upsert(
             conn,
             meta,
             Entity::DesignSources,
             &row.to_string(),
-            before.map(|(_, hash)| json!({ "blake3": hash })).as_ref(),
-            Some(&json!({ "design_id": id.get(), "path": path, "blake3": s.blake3 })),
+            before
+                .map(|(_, hash, txn)| json!({ "blake3": hash, "txn_id": txn }))
+                .as_ref(),
+            Some(&json!({
+                "design_id": id.get(),
+                "path": path,
+                "blake3": s.blake3,
+                "txn_id": meta.txn_id,
+            })),
         )?;
     }
     Ok(())
@@ -474,11 +465,28 @@ pub fn export(conn: &Connection, uid: &str) -> Result<Exported> {
 /// Every design (of `repo`, when named) that has a doc target, rendered for it, by uid.
 ///
 /// # Errors
-/// A design whose stored text or metadata does not read.
+/// A design whose stored text or metadata does not read, or two designs of one repo naming one
+/// file — which `set_doc_target` refuses, but an undo restoring an older target can leave.
 pub fn exports(conn: &Connection, repo: Option<&str>) -> Result<Vec<Exported>> {
-    super::list(conn, repo)?
+    let out = super::list(conn, repo)?
         .into_iter()
         .filter(|d| d.meta.doc_target.is_some())
         .map(|d| export(conn, &d.uid))
-        .collect::<std::result::Result<_, Error>>()
+        .collect::<std::result::Result<Vec<_>, Error>>()?;
+    for (i, a) in out.iter().enumerate() {
+        if let Some(b) = out[..i]
+            .iter()
+            .find(|b| b.repo == a.repo && b.doc_target == a.doc_target)
+        {
+            return Err(invalid(format!(
+                "designs {} and {} of repo {} both export to `{}` — point one elsewhere with \
+                 `jkb design export <design> --to docs/<file>`",
+                b.uid,
+                a.uid,
+                a.repo.as_deref().unwrap_or("(none)"),
+                a.doc_target.as_deref().unwrap_or_default()
+            )));
+        }
+    }
+    Ok(out)
 }

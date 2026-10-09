@@ -1514,8 +1514,8 @@ fn a_demoted_span_is_not_exported_at_all() {
     }
 }
 
-/// Skipped PROPOSED text between two approved spans leaves its line breaks (at most a paragraph
-/// break) and never its words, so spans quoted without their trailing newline do not run together.
+/// Skipped PROPOSED text between two approved spans leaves one line break (or a space) and never
+/// its words, so spans quoted without their trailing newline do not run together.
 #[test]
 fn a_skipped_gap_keeps_its_line_breaks_between_spans() {
     let db = db();
@@ -1529,8 +1529,21 @@ fn a_skipped_gap_keeps_its_line_breaks_between_spans() {
     }
     assert_eq!(
         exported_body(&db, &uid),
-        "## D1\nDecided.\n\n## D3\nAlso decided. Kept.\n"
+        "## D1\nDecided.\n## D3\nAlso decided. Kept.\n"
     );
+}
+
+/// Skipping one whole line adds nothing when the output already ends one, so a table keeps its
+/// rows together: no blank line where a PROPOSED row was.
+#[test]
+fn a_skipped_table_row_leaves_no_blank_line() {
+    let db = db();
+    let uid = create(&db, "| a |\n| b |\n| c |\n");
+    for quote in ["| a |\n", "| c |\n"] {
+        let s = span(&db, &uid, quote, Reviewer::Operator).unwrap();
+        approve_as(&db, &s, Approver::Operator).unwrap();
+    }
+    assert_eq!(exported_body(&db, &uid), "| a |\n| c |\n");
 }
 
 /// A file always ends in a newline, so an editor adding one is not drift.
@@ -1579,8 +1592,14 @@ fn only_the_header_marks_a_generated_file() {
         export::parse("# T\nThe first line reads `<!-- generated from jkb design <uid>, …`.\n"),
         export::Generated::Hand
     );
+    // Only the first line decides: a header pushed below it reads as hand-written (D55.6's
+    // narrower guarantee — telling it from a doc that quotes the header needs a Markdown parser).
     assert_eq!(
         export::parse(&format!("# T\n```\n{generated}\n```\n")),
+        export::Generated::Hand
+    );
+    assert_eq!(
+        export::parse(&format!("\n{generated}")),
         export::Generated::Hand
     );
     // A first line that claims to be the header but does not read is never taken as hand-written:
@@ -1592,9 +1611,6 @@ fn only_the_header_marks_a_generated_file() {
         format!("  {generated}"),
         "<!-- generated from jkb design\nbody".to_owned(),
         generated.replace(&hash, "XYZ"),
-        // Something put above the header: a blank line, front matter.
-        format!("\n{generated}"),
-        format!("---\ntitle: x\n---\n{generated}"),
     ] {
         assert!(
             matches!(export::parse(&bad), export::Generated::Malformed(_)),
@@ -1675,19 +1691,155 @@ fn undoing_a_doc_target_keeps_the_sources_recorded_after_it() {
     assert_eq!(meta.sources, vec![source], "the later sources are not");
 }
 
-/// Undo cannot hand one file to two designs: the target's uniqueness is the table's, and an undo
-/// that would break it is refused with nothing changed.
+/// Each target and source row records the transaction that last wrote it (as `design_updates`
+/// does), so undo of a design's create can tell rows a later transaction wrote; an undo that puts
+/// an older value back puts its writer back too.
 #[test]
-fn undo_cannot_give_two_designs_one_doc_target() {
+fn target_and_source_rows_record_their_writing_transaction() {
+    let db = db();
+    let a = create(&db, "a");
+    let txns = |sql: &'static str| -> Vec<i64> {
+        db.read(move |c| {
+            Ok(c.prepare(sql)?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+        .unwrap()
+    };
+    let first = set_target(&db, &a, "docs/a.md").unwrap();
+    let second = set_target(&db, &a, "docs/b.md").unwrap();
+    assert_eq!(txns("SELECT txn_id FROM design_doc_targets"), vec![second]);
+    undo_txn(&db, second).unwrap();
+    assert_eq!(txns("SELECT txn_id FROM design_doc_targets"), vec![first]);
+    let add = |bytes: &'static [u8]| {
+        let a = a.clone();
+        db.write_txn("t", move |c, m| {
+            export::add_sources(
+                c,
+                m,
+                &a,
+                &[Source {
+                    path: "README.md".into(),
+                    blake3: crate::blob::hash_bytes(bytes),
+                }],
+            )?;
+            Ok(m.txn_id)
+        })
+        .unwrap()
+    };
+    let recorded = add(b"r");
+    let rehashed = add(b"r2");
+    assert_eq!(txns("SELECT txn_id FROM design_sources"), vec![rehashed]);
+    undo_txn(&db, rehashed).unwrap();
+    assert_eq!(txns("SELECT txn_id FROM design_sources"), vec![recorded]);
+}
+
+/// Undoing a design's creation would cascade its doc target and sources away with the item, so it
+/// is refused while a later transaction wrote either (`DESIGN_OWNED`; the rule is D47's in
+/// docs/namespaces-and-sync.md). Each case on its own design, with no later text edit, so only the
+/// export table can be what refuses it.
+#[test]
+fn undoing_a_designs_creation_is_refused_once_a_target_or_source_was_written_since() {
+    let created_txn = |db: &Db, uid: &str| -> i64 {
+        let uid = uid.to_owned();
+        db.read(move |c| {
+            Ok(c.query_row(
+                "SELECT u.txn_id FROM design_updates u JOIN items i ON i.id = u.design_id
+                  WHERE i.uid = ?1 AND u.seq = 1",
+                [uid],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+    };
+    // A target written since.
+    let db = db();
+    let uid = create(&db, "body");
+    let created = created_txn(&db, &uid);
+    set_target(&db, &uid, "docs/a.md").unwrap();
+    let e = undo_txn(&db, created).unwrap_err().to_string();
+    assert!(e.contains("design_doc_targets"), "{e}");
+    assert_eq!(exported(&db, &uid).doc_target.as_deref(), Some("docs/a.md"));
+
+    // A source written since.
+    let db = self::db();
+    let uid = create(&db, "body");
+    let created = created_txn(&db, &uid);
+    {
+        let uid = uid.clone();
+        db.write_txn("t", move |c, m| {
+            export::add_sources(
+                c,
+                m,
+                &uid,
+                &[Source {
+                    path: "README.md".into(),
+                    blake3: crate::blob::hash_bytes(b"r"),
+                }],
+            )
+        })
+        .unwrap();
+    }
+    let e = undo_txn(&db, created).unwrap_err().to_string();
+    assert!(e.contains("design_sources"), "{e}");
+    let uid2 = uid.clone();
+    assert_eq!(
+        db.read(move |c| export::meta(c, &uid2))
+            .unwrap()
+            .sources
+            .len(),
+        1
+    );
+    // Once the later write is undone, the creation undoes.
+    undo_last(&db);
+    undo_txn(&db, created).unwrap();
+}
+
+/// An undo restoring an older target does not go through `set_doc_target`, so it can put two
+/// designs of one repo on one file; the export of that repo then refuses, naming both, rather than
+/// letting them overwrite each other.
+#[test]
+fn an_undo_that_puts_two_designs_on_one_file_fails_the_export() {
     let db = db();
     let a = create(&db, "a");
     let b = create(&db, "b");
     set_target(&db, &a, "docs/a.md").unwrap();
     let moved = set_target(&db, &a, "docs/a2.md").unwrap();
     set_target(&db, &b, "docs/a.md").unwrap();
-    assert!(undo_txn(&db, moved).is_err(), "A back onto B's file");
-    assert_eq!(exported(&db, &a).doc_target.as_deref(), Some("docs/a2.md"));
-    assert_eq!(exported(&db, &b).doc_target.as_deref(), Some("docs/a.md"));
+    undo_txn(&db, moved).unwrap();
+    let e = db
+        .read(|c| export::exports(c, Some("jkb")))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains(&a) && e.contains(&b) && e.contains("docs/a.md"),
+        "{e}"
+    );
+}
+
+/// A design's repo is its namespace now, so one file per repo holds across `jkb ns mv`: the moved
+/// design's target counts in the repo it moved to, and no longer in the one it left.
+#[test]
+fn doc_target_uniqueness_follows_a_namespace_move() {
+    let db = db();
+    let a = create(&db, "a");
+    set_target(&db, &a, "docs/a.md").unwrap();
+    db.write_txn("t", |c, m| {
+        crate::ns::move_subtree(c, m, "designs/jkb", "designs/web")
+    })
+    .unwrap();
+    assert_eq!(exported(&db, &a).repo.as_deref(), Some("web"));
+    let b = db
+        .write_txn("t", |c, m| super::create(c, m, "web", "B", "b"))
+        .unwrap()
+        .uid;
+    let e = set_target(&db, &b, "docs/a.md").unwrap_err().to_string();
+    assert!(
+        e.contains(&a),
+        "the moved design holds the file in its new repo: {e}"
+    );
+    let c = create(&db, "c");
+    set_target(&db, &c, "docs/a.md").unwrap();
 }
 
 /// D55.5: sources are recorded by path with their blake3; recording a path again re-hashes it, and

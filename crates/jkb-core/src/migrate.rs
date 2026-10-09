@@ -431,10 +431,8 @@ mod design_exports_migration_tests {
     use refinery::Target;
     use rusqlite::{params, Connection};
 
-    /// V026 moves a design's `doc_target` and `sources` metadata keys into rows of their own, keyed
-    /// by the design's repo, and strips them from the metadata, leaving other keys and other kinds
-    /// alone. Two designs of one repo naming one target (reachable only through the undo defect
-    /// V026 closes) leave it with the lower id; another repo's design keeps the same path. And undo
+    /// V026 moves a design's `doc_target` and `sources` metadata keys into rows of their own and
+    /// strips them from the metadata, leaving other keys and other kinds alone. And undo
     /// history ends at the newest transaction that wrote those keys, so none of them can be undone
     /// into a blob nothing reads, while later work stays undoable.
     #[test]
@@ -521,18 +519,20 @@ mod design_exports_migration_tests {
         }
         embedded::migrations::runner().run(&mut conn).unwrap();
 
-        let targets: Vec<(i64, String, String)> = conn
-            .prepare("SELECT design_id, repo, path FROM design_doc_targets ORDER BY design_id")
+        let targets: Vec<(i64, String)> = conn
+            .prepare("SELECT design_id, path FROM design_doc_targets ORDER BY design_id")
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
+        // Every design's target moves; two of one repo on one file is `exports`' refusal to make.
         assert_eq!(
             targets,
             vec![
-                (1, "jkb".to_owned(), "docs/a.md".to_owned()),
-                (3, "web".to_owned(), "docs/a.md".to_owned()),
+                (1, "docs/a.md".to_owned()),
+                (2, "docs/a.md".to_owned()),
+                (3, "docs/a.md".to_owned()),
             ]
         );
         let sources: Vec<(i64, String, String)> = conn

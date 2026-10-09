@@ -1272,15 +1272,20 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   span's surviving approved pieces, which published text nobody approved — "We must not log tokens."
   with "not" deleted exported as "We must  log tokens." (review round 1; pinned by
   `a_demoted_span_is_not_exported_at_all`). A demoted span reads PROPOSED as a whole (D53.5), and so
-  is exported as nothing until it is re-approved. Between two approved spans, the PROPOSED text
-  skipped leaves its line breaks (at most a paragraph break), never its words: spans quoted without
-  a trailing newline otherwise ran together, `Decided.## D2` (review round 2).
+  is exported as nothing until it is re-approved. Between two approved spans the skipped PROPOSED
+  text leaves nothing when the output already ends a line, else one line break if it had any, else
+  a space — never its words. Spans quoted without a trailing newline otherwise ran together,
+  `Decided.## D2` (review round 2); counting the gap's own line ends instead put a blank line where
+  one table row was skipped, splitting the table (round 3).
 - **The header** is the file's first line:
   `<!-- generated from jkb design <uid>, edit there (version <token>, blake3 <hex>) -->`, the hash being
-  that of the body below it. A file without it is hand-written and never checked. A first line that
-  looks like the header but does not read (trimmed, a byte-order mark or indentation in front), or a
-  header below the first line (a blank line or front matter put above it), is reported, never taken
-  for hand-written. A hand-written doc may still show the header in prose or in a fenced block.
+  that of the body below it. A file without it is hand-written and never checked. **Only the first
+  line decides**, read from its raw bytes: a first line that looks like the header but does not read
+  (trimmed, a byte-order mark or indentation in front) is reported, and so is a generated file whose
+  body is no longer UTF-8. A header pushed below the first line (something added above it) is NOT
+  looked for, and the file reads as hand-written: round 2 reported it, which needed telling it from a
+  hand-written doc quoting the header in fenced or indented code, in every nesting — a Markdown
+  parser's job. The guarantee is the narrower one (round 3).
 - **`jkb design export --check` opens no database and reaches no daemon** — it re-hashes each
   generated `docs/` file's body and fails, naming the file and its design, when it no longer matches
   its header: a hand edit. `main` dispatches it before remote mode, before `commands::ensure_installed`
@@ -1301,23 +1306,34 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   run by hand. It compares bodies only, so a PROPOSED edit (a new version, the same approved text)
   passes it too. The database-free check cannot know any doc target, so a deleted generated file
   passes it; that is the price of a gate every machine can run.
-- **A design is exported only into its own repo's checkout** (the ambient repo, or `--repo`):
-  `design.export` answers the design's repo, `export` refuses another repo's design, and
-  `--against-db` names a generated file whose design is of another repo as a stray.
+- **A design is exported only into its own repo's checkout.** The checkout's repo is the mount
+  covering its root — where the files are written — and a checkout in no mounted repo is refused.
+  `--repo` and the current directory's mount may only agree with it: round 2 took the repo from them,
+  so `--repo B` in checkout A, as its own refusal suggested, wrote B's export into A. `design.export`
+  answers the design's repo, `export` refuses another repo's design, and `--against-db` names a
+  generated file whose design is of another repo as a stray. Not covered: a submodule inside a
+  mounted repo reads as that repo, since the op set says which mount covers a directory but not
+  where its root is.
 - **A doc target is a `docs/` file of the design's repo, one design's alone there, and each fact
-  is a row** (`V026`:
-  `design_doc_targets`, `design_sources`). They were keys of the design item's `metadata` first, and
-  undo restores a column whole: undoing an older target write dropped sources recorded after it, and
-  could restore a target another design had taken since, because the one-design-per-file rule lived
-  only in the writer. Now each write undoes alone and the rule is the table's `UNIQUE (repo, path)`
-  (a target is relative to its repo's checkout, so two repos may each have `docs/a.md`), so an
-  undo that would break it is refused (pinned by `undoing_a_doc_target_keeps_the_sources_recorded_after_it`
-  and `undo_cannot_give_two_designs_one_doc_target`). V026 moves existing keys over, and raises the
+  is a row** (`V026`: `design_doc_targets`, `design_sources`). They were keys of the design item's
+  `metadata` first, and undo restores a column whole: undoing an older target write dropped sources
+  recorded after it (pinned by `undoing_a_doc_target_keeps_the_sources_recorded_after_it`). Two repos
+  may each have `docs/a.md`, so one-design-per-file is per repo, and a design's repo is its namespace
+  *now*: round 2 stored a copy in the row under `UNIQUE (repo, path)`, which `jkb ns mv` left stale
+  (round 3). The rule is checked where a target is set, against each holder's repo then (pinned by
+  `doc_target_uniqueness_follows_a_namespace_move`). An undo restoring an older target does not go
+  through that check, so `design::export::exports` refuses a repo where two designs name one file,
+  naming both (`an_undo_that_puts_two_designs_on_one_file_fails_the_export`). V026 moves existing keys
+  over, and raises the
   undo watermark (V014) to the newest transaction that wrote those keys into a design's metadata:
   undone after the move, such an entry would restore a blob nothing reads while the rows stayed,
   and report success. Later, unrelated work stays undoable. The tables' cascades fire only on
-  `jkb undo` of a design's create, which must therefore count these rows as the design's later
-  work.
+  `jkb undo` of a design's create. Both tables carry `txn_id` (the row's last writer) and are in
+  `design::DESIGN_OWNED`, so that undo is refused while either holds a row a later transaction wrote
+  — the rule is recorded once, under D47 in [namespaces-and-sync.md](namespaces-and-sync.md) (pinned
+  by `undoing_a_designs_creation_is_refused_once_a_target_or_source_was_written_since`). Round 3
+  found the first build's comment claiming a guard that did not exist: undo of the create deleted a
+  later target silently, and a later undo of that target wrote a marker for a no-op.
 - **The attest hook defers `design source` and `design export --to`** (`remote::beyond_rbac`): the
   first reads files the caller names, the second writes to one. The rest of `jkb design` is an op on
   the design alone and stays approvable.

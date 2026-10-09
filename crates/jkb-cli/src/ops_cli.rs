@@ -402,12 +402,27 @@ impl<'a> Ops<'a> {
     /// # Errors
     /// The ambient lookup's.
     pub(crate) fn ambient_repo(&self) -> Result<Option<String>> {
-        Ok(self.ambient_here()?.and_then(|mount| repo_of_mount(&mount)))
+        self.ambient_repo_at(&std::env::current_dir()?)
+    }
+
+    /// The repo whose mount covers `dir`, as [`Self::ambient_repo`] answers for the current one.
+    ///
+    /// # Errors
+    /// The ambient lookup's.
+    pub(crate) fn ambient_repo_at(&self, dir: &std::path::Path) -> Result<Option<String>> {
+        Ok(self
+            .ambient_at(dir)?
+            .and_then(|mount| repo_of_mount(&mount)))
     }
 
     /// The ambient namespace, `--global` or not — task homing always reflects where you are.
     pub(crate) fn ambient_here(&self) -> Result<Option<String>> {
-        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        self.ambient_at(&std::env::current_dir()?)
+    }
+
+    /// The ambient namespace of `dir`: the namespace of the mount covering it, if any.
+    pub(crate) fn ambient_at(&self, dir: &std::path::Path) -> Result<Option<String>> {
+        let cwd = dir.to_string_lossy().into_owned();
         let home = std::env::var("HOME").unwrap_or_default();
         match self.call(Request::KbAmbient { cwd, home })? {
             Response::Ambient { namespace } => Ok(namespace),
