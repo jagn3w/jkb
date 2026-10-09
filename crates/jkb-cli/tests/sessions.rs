@@ -5507,3 +5507,72 @@ fn a_design_records_its_sources_with_their_blake3() {
     let listed = json(&["design", "ls", "--repo", "proj"]);
     assert_eq!(listed[0]["sources"][0]["path"], "README.md");
 }
+
+/// A design whose doc target another design of its repo shares cannot be rendered — but it can
+/// still be pointed elsewhere with `export --to` (the remedy the refusal names) and given sources:
+/// neither asks `design.export` for the design's repo.
+#[test]
+fn a_shared_doc_target_is_cleared_by_export_to() {
+    let f = Fixture::new();
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = f.jkb().arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    f.jkb()
+        .args(["mount", "create", "repos/proj", f.repo.to_str().unwrap()])
+        .assert()
+        .success();
+    let create = |repo: &str, title: &str| -> String {
+        json(&["design", "create", title, "--repo", repo])["uid"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let a = create("proj", "A");
+    let b = create("web", "B");
+    f.jkb()
+        .args(["design", "export", &a, "--to", "docs/a.md"])
+        .assert()
+        .success();
+    // B targets the same path in its own repo, then moves into proj: a collision no target write
+    // made, so nothing refused it.
+    let elsewhere = f.home.path().join("web");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    git(&elsewhere, &["init", "-q", "-b", "main"]);
+    f.jkb()
+        .args(["mount", "create", "repos/web", elsewhere.to_str().unwrap()])
+        .assert()
+        .success();
+    f.jkb()
+        .current_dir(&elsewhere)
+        .args(["design", "export", &b, "--to", "docs/a.md"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["ns", "mv", "designs/web", "designs/proj/web"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["design", "export", &a])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("both export to `docs/a.md`"));
+    // Sources can still be recorded on the shared design...
+    f.jkb()
+        .args(["design", "source", &b, "README.md"])
+        .assert()
+        .success();
+    // ...and `--to` clears the collision, after which both export.
+    f.jkb()
+        .args(["design", "export", &b, "--to", "docs/b.md"])
+        .assert()
+        .success();
+    f.jkb().args(["design", "export", &a]).assert().success();
+    f.jkb()
+        .args(["design", "export", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docs/b.md"));
+    assert!(f.repo.join("docs/a.md").exists() && f.repo.join("docs/b.md").exists());
+}

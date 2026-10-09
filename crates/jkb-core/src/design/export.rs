@@ -222,7 +222,7 @@ pub fn approved_text(design: &DesignText) -> String {
 /// What a skipped `gap` of PROPOSED text leaves between two approved spans — never the gap's words,
 /// at most a paragraph break. Decided by blank lines: when the gap, read together with the line
 /// break the output already ends in, holds an empty or whitespace-only line, the spans were separate
-/// paragraphs and the output ends in exactly one blank line. Otherwise the line structure is kept
+/// paragraphs and the output's trailing whitespace becomes exactly one blank line. Otherwise the line structure is kept
 /// without adding any: a line break if the gap had one and the output does not end a line already,
 /// else a space.
 ///
@@ -239,10 +239,10 @@ fn separate(out: &mut String, gap: &str) {
             .iter()
             .any(|l| l.trim().is_empty());
     if blank {
-        let have = out.chars().rev().take_while(|&c| c == '\n').count();
-        for _ in have..2 {
-            out.push('\n');
-        }
+        // Whatever whitespace the output ends in (a line break, an indentation the span took
+        // along) is replaced by exactly one blank line.
+        out.truncate(out.trim_end().len());
+        out.push_str("\n\n");
     } else if !out.ends_with('\n') {
         out.push(if gap.contains('\n') { '\n' } else { ' ' });
     }
@@ -267,13 +267,18 @@ pub fn render(design: &DesignText) -> String {
 /// # Errors
 /// A database error.
 pub fn repo_of(conn: &Connection, id: ItemId) -> Result<Option<String>> {
-    Ok(crate::item::primary_namespace(conn, id)?.and_then(|ns| {
-        ns.strip_prefix(super::ROOT)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .and_then(|rest| rest.split('/').next())
-            .filter(|r| !r.is_empty())
-            .map(str::to_owned)
-    }))
+    Ok(crate::item::primary_namespace(conn, id)?.and_then(|ns| repo_in(&ns)))
+}
+
+/// The repo a design's namespace names: the segment after `designs/`.
+#[must_use]
+pub fn repo_in(namespace: &str) -> Option<String> {
+    namespace
+        .strip_prefix(super::ROOT)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split('/').next())
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned)
 }
 
 /// A design's export metadata, by its item id.

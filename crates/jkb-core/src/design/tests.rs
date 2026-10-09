@@ -1560,6 +1560,19 @@ fn two_approved_paragraphs_stay_two_paragraphs() {
     }
 }
 
+/// A span that ends in the indentation of a list item's continuation still leaves exactly one blank
+/// line before the next approved paragraph, not that indentation and two more line breaks.
+#[test]
+fn a_span_ending_in_indentation_leaves_exactly_one_blank_line() {
+    let db = db();
+    let uid = create(&db, "- one\n  cont.\n\n  draft\n\n- two\n");
+    for quote in ["- one\n  cont.\n\n  ", "- two\n"] {
+        let s = span(&db, &uid, quote, Reviewer::Operator).unwrap();
+        approve_as(&db, &s, Approver::Operator).unwrap();
+    }
+    assert_eq!(exported_body(&db, &uid), "- one\n  cont.\n\n- two\n");
+}
+
 /// Skipping one whole line adds nothing when the output already ends one, so a table keeps its
 /// rows together: no blank line where a PROPOSED row was.
 #[test]

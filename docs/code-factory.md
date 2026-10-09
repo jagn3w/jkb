@@ -1313,7 +1313,12 @@ the file half (paths, writing, the checks) is `crates/jkb-cli/src/design_export.
   `--repo` and the current directory's mount may only agree with it: round 2 took the repo from them,
   so `--repo B` in checkout A, as its own refusal suggested, wrote B's export into A. `design.export`
   answers the design's repo, `export` refuses another repo's design, and `--against-db` names a
-  generated file whose design is of another repo as a stray. Not covered: a submodule inside a
+  generated file whose design is of another repo as a stray. `jkb design source` applies the same
+  checkout-repo rule before recording anything (pinned by `a_design_records_its_sources_with_their_blake3`).
+  A design's repo is asked of `design.list`, never of `design.export`: rendering refuses a design
+  whose target another design shares, and `export --to` — the remedy that refusal names — and
+  `design source` must work on exactly that design (round 5; pinned by
+  `a_shared_doc_target_is_cleared_by_export_to`). Not covered: a submodule inside a
   mounted repo reads as that repo, since the op set says which mount covers a directory but not
   where its root is.
 - **A doc target is a `docs/` file of the design's repo, one design's alone there, and each fact

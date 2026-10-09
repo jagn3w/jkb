@@ -38,6 +38,9 @@ pub struct Design {
     pub title: String,
     /// Where it lives (`designs/<repo>`).
     pub namespace: Option<String>,
+    /// The repo it belongs to (the segment after `designs/` in its namespace).
+    #[serde(default)]
+    pub repo: Option<String>,
     /// Its newest update's seq.
     pub seq: i64,
     /// The `mq` topic its updates are announced on.
@@ -56,6 +59,7 @@ impl From<DesignRow> for Design {
             topic: design::topic(&d.uid),
             uid: d.uid,
             title: d.title,
+            repo: d.namespace.as_deref().and_then(design::export::repo_in),
             namespace: d.namespace,
             seq: d.seq,
             doc_target: d.meta.doc_target,
@@ -351,7 +355,10 @@ pub fn create(
 /// `repo`, when named) that has one.
 ///
 /// # Errors
-/// An unknown design, or one whose text or metadata does not read.
+/// An unknown design, one whose text or metadata does not read, or one whose doc target another
+/// design now in its repo also names (`design::export::export`). With no `uid` the whole listing
+/// fails on any such design, so a repo with a shared target exports nothing until one of the two
+/// is pointed elsewhere — which `design.target` does, as it does not render.
 pub fn export(
     conn: &Connection,
     uid: Option<&str>,

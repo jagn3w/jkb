@@ -111,16 +111,31 @@ fn write(root: &Path, e: &Export) -> Result<bool> {
 
 /// Refuse a design that is not of `here`, the repo this checkout is: its doc target is a path in
 /// its own repo's checkout, and written into another one it would be a stray file that names it.
-fn same_repo(e: &Export, here: &str) -> Result<()> {
-    if e.repo.as_deref() == Some(here) {
+fn same_repo(uid: &str, repo: Option<&str>, here: &str) -> Result<()> {
+    if repo == Some(here) {
         return Ok(());
     }
     bail!(
-        "design {} is of repo {}, but this checkout is repo {here} — export it from its own \
+        "design {uid} is of repo {}, but this checkout is repo {here} — export it from its own \
          repo's checkout",
-        e.uid,
-        e.repo.as_deref().unwrap_or("(none)")
+        repo.unwrap_or("(none)")
     )
+}
+
+/// Refuse design `uid` unless it is of `here`, asking its repo of `design.list` — never of
+/// `design.export`, which renders and so refuses a design whose target another design shares:
+/// `export --to` (the remedy that refusal names) and `design source` must work on exactly that
+/// design.
+fn design_is_here(ops: &Ops<'_>, uid: &str, here: &str) -> Result<()> {
+    let designs = match ops.call(Request::DesignList { repo: None })? {
+        Response::Designs { designs } => designs,
+        other => return unexpected("design.list", &other),
+    };
+    let design = designs
+        .into_iter()
+        .find(|d| d.uid == uid)
+        .with_context(|| format!("no design {uid}"))?;
+    same_repo(uid, design.repo.as_deref(), here)
 }
 
 /// The repo the checkout at `root` is: the mount covering `root` itself, since `root` is where the
@@ -156,9 +171,7 @@ fn export(
     let (root, cwd) = checkout()?;
     let here = checkout_repo(ops, &root, &cwd, repo)?;
     if let Some(uid) = &uid {
-        for e in exports(ops, Some(uid.clone()), None)? {
-            same_repo(&e, &here)?;
-        }
+        design_is_here(ops, uid, &here)?;
         if let Some(to) = to {
             let path = repo_relative(&root, &cwd, to)?;
             meta_answer(
@@ -175,7 +188,7 @@ fn export(
     let scope = all.then(|| here.clone());
     let list = exports(ops, uid, scope)?;
     for e in &list {
-        same_repo(e, &here)?;
+        same_repo(&e.uid, e.repo.as_deref(), &here)?;
     }
     let mut done = Vec::new();
     for e in &list {
@@ -450,9 +463,7 @@ pub(crate) fn source(ops: &Ops<'_>, uid: String, paths: &[String]) -> Result<()>
     // A design's sources are files of its own repo: recorded from another repo's checkout they
     // would name paths and hashes that are not its.
     let here = checkout_repo(ops, &root, &cwd, None)?;
-    for e in exports(ops, Some(uid.clone()), None)? {
-        same_repo(&e, &here)?;
-    }
+    design_is_here(ops, &uid, &here)?;
     let sources = paths
         .iter()
         .map(|p| {
