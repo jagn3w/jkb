@@ -11,8 +11,17 @@
 #
 # It installs the frozen lockfile, builds @jkb/core and the app, packages it (electron-builder
 # --dir), copies it to --dest (default ~/Applications/Code Factory.app on macOS, <app-home>/app
-# elsewhere) through lib.sh's `app_swap`, and records the commit in <app-home>/installed, which the
-# app's *jkb ▸ Update from main…* counts from. On Linux it also writes a desktop entry.
+# elsewhere) through lib.sh's `app_swap`, and records the commit and the destination in
+# <app-home>/installed. The commit is also built into the app (ui/app/out/commit), so the app knows
+# what IT is, which the stamp cannot say once something else has been swapped in under it. On Linux it
+# also writes a desktop entry.
+#
+# It holds lib.sh's app lock throughout (or recognises its caller's, passed in JKB_APP_LOCK_TOKEN),
+# so two installs never share the clone, app/dist or the swap; a run that finds the lock held exits 75.
+#
+# Repository selection (GIT_DIR and the rest) and Electron's variables are dropped first, for every
+# caller: the post-merge hook runs setup.sh with GIT_DIR naming the merged repository, and pnpm's
+# lifecycle scripts and git-hosted dependencies would act on it.
 #
 # Who runs it: scripts/setup.sh, after moving the clone to origin/main (`app_clone_refresh`), and
 # the installed app's update (ui/app/src/main/update.ts), after doing the same. Neither runs a
@@ -20,6 +29,12 @@
 #
 # Flags: --app-home DIR, --dest DIR, -h/--help.
 set -euo pipefail
+
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+for _var in $(compgen -e); do
+    case "$_var" in ELECTRON_*) unset "$_var" ;; esac
+done
+unset _var
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 # shellcheck source=scripts/lib.sh
@@ -52,6 +67,8 @@ if [ "$repo_root" != "$src_real" ]; then
   at origin/main (scripts/setup.sh makes it). To run a checkout deliberately:
     JKB_APP_FROM_CHECKOUT=1 pnpm --filter @jkb/app dev"
 fi
+app_lock "$app_home" || { printf 'build-app.sh: busy: another install holds the app lock\n' >&2; exit 75; }
+trap 'app_unlock "$app_home"' EXIT
 app_clone_check "$repo_root" || die "refusing to build: $repo_root is not exactly origin/main"
 commit="$(_git -C "$repo_root" rev-parse HEAD)"
 
@@ -70,16 +87,20 @@ cd "$repo_root/ui"
 pnpm install --frozen-lockfile
 # The app and what it depends on (@jkb/core), in order: each type-checks before it emits.
 pnpm --filter "@jkb/app..." run build
+# What this build is, inside it (electron-builder packs out/**): the app compares it with main.
+printf '%s\n' "$commit" >app/out/commit
 rm -rf app/dist
 pnpm --filter @jkb/app run package
 built="$(app_built_product "$repo_root/ui/app/dist" "$os")" || die "the package step left no app to install"
 
 # --- install ------------------------------------------------------------------------------------
 echo "==> installing $built at $dest"
-app_swap "$built" "$dest" "$app_home/previous" || die "the installed app is unchanged"
-# The stamp last, written whole: it says what is installed, so it changes only once that is true.
-mkdir -p "$app_home"
-printf 'commit=%s\n' "$commit" >"$app_home/installed.tmp" && mv -f "$app_home/installed.tmp" "$app_home/installed"
+app_swap "$built" "$dest" "$app_home" || die "the installed app is unchanged"
+# The stamp last, written whole: it says what is installed and where, so it changes only once that is
+# true. A failure here is the script's failure (an && list is exempt from set -e).
+{ printf 'commit=%s\ndest=%s\n' "$commit" "$dest" >"$app_home/installed.tmp" \
+    && mv -f "$app_home/installed.tmp" "$app_home/installed"; } \
+    || die "the app at $dest is ${commit:0:12}, but the stamp $app_home/installed could not be written"
 
 if [ "$os" = Linux ]; then
     apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"

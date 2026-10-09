@@ -8,8 +8,9 @@
 // the only thing about them that does.
 //
 // It runs from the installed copy (D53.3): a packaged app, built from a host-side clean clone of
-// `origin/main` and updated from the menu (*jkb ▸ Update from main…*, `update.ts`). Run from a
-// checkout, it refuses unless `JKB_APP_FROM_CHECKOUT=1` says that is deliberate.
+// `origin/main` and updated from the menu (*jkb ▸ Update from main…*, `update.ts`). Run from anywhere
+// else — a checkout's `out/`, or a package left in a checkout's `dist/` — it refuses unless
+// `JKB_APP_FROM_CHECKOUT=1` says that is deliberate.
 
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,7 @@ import {
   checkoutRefusal,
   daemonUrl,
   failed,
+  installedExecutable,
   portOf,
   tokenPath,
   updateSummary,
@@ -51,7 +53,7 @@ import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
 import { TerminalHost, accountHome, machineEnvironment, machineRoots, type SpawnPty } from "./terminals";
-import { AppUpdater, machineRunner } from "./update";
+import { AppUpdater, builtCommit, isInstalledCopy, machineRunner } from "./update";
 
 /**
  * Where the page comes from: the built file, or — from `pnpm run dev` only, and only on loopback —
@@ -60,11 +62,16 @@ import { AppUpdater, machineRunner } from "./update";
 const rendererFrom = rendererSource(app.isPackaged, process.env);
 
 /**
- * Why this process may not run — it is a checkout, and nobody said that was deliberate; or it was
+ * Why this process may not run — it is not the installed copy (a package whose executable, links
+ * resolved, is the one build-app.sh installed), and nobody said that was deliberate; or it was
  * pointed at a renderer it will not load — or `undefined`.
  */
 const refusal =
-  checkoutRefusal(app.isPackaged, process.env) ?? (rendererFrom.kind === "refused" ? rendererFrom.reason : undefined);
+  checkoutRefusal(
+    app.isPackaged && isInstalledCopy(app.getPath("exe"), process.platform, accountHome()),
+    process.env,
+    installedExecutable(process.platform, accountHome()),
+  ) ?? (rendererFrom.kind === "refused" ? rendererFrom.reason : undefined);
 
 /** The dev server's page, when that is where the page comes from. */
 const DEV_RENDERER_URL = rendererFrom.kind === "dev" ? rendererFrom.url : undefined;
@@ -111,8 +118,16 @@ const terminals = new TerminalHost(
 /** The installed container kit (D53.8), under the ACCOUNT's home (`accountHome`). */
 const containerKit = new ContainerKit(machineKit(accountHome(), process.env));
 
-/** The installed copy's clean clone and its builder, under the same account home as the kit (D53.3). */
-const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), process.env));
+/**
+ * The installed copy's clean clone and its builder, under the same account home as the kit (D53.3).
+ * It is told what is running — this executable, and the commit built into `out/` (this file is
+ * `out/main/index.js`) — and updates only the installed copy.
+ */
+const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), process.env), {
+  exe: app.getPath("exe"),
+  platform: process.platform,
+  commit: builtCommit(join(__dirname, "..")),
+});
 
 /** Live design updates, one long-poll per open design shared by every window showing it (D53.4). */
 const designFeeds = new DesignFeeds(
@@ -330,15 +345,6 @@ function showBusy(busy: boolean): void {
  * and on a yes build exactly that commit, swap it in and relaunch (D53.3).
  */
 async function updateFromMain(): Promise<void> {
-  if (!app.isPackaged) {
-    await messageBox({
-      type: "info",
-      message: "Update from main is for the installed copy",
-      detail:
-        "This app is running from a checkout (JKB_APP_FROM_CHECKOUT=1). Update the checkout with git; the installed copy updates itself from main.",
-    });
-    return;
-  }
   if (updater.busy) {
     await messageBox({ type: "info", message: "An update is already building." });
     return;
@@ -371,8 +377,10 @@ async function updateFromMain(): Promise<void> {
     await messageBox({ type: "error", message: "The update did not install", detail: done.error });
     return;
   }
-  // Swapped in under the same path, so relaunching starts the new build. `quit`, not `exit`, so
-  // `will-quit` ends the terminals and feeds as on any quit.
+  // The updater runs only as the installed copy, and the build swapped the new one in at that path,
+  // so relaunching starts the new build. At once: until this process goes, the helpers it spawns
+  // come from the new bundle (lib.sh's app_swap). `quit`, not `exit`, so `will-quit` ends the
+  // terminals and feeds as on any quit.
   app.relaunch();
   app.quit();
 }

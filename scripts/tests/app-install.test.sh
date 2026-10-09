@@ -21,15 +21,19 @@ isolate_git "$work/home"
 # What electron-builder leaves on this platform, relative to ui/.
 if [ "$(uname -s)" = Darwin ]; then product="app/dist/mac-arm64/Code Factory.app"; else product="app/dist/linux-unpacked"; fi
 
-# A stub pnpm: logs its arguments, and `run package` leaves a packaged app holding $STUB_ID.
+# A stub pnpm: logs its arguments and the repository selection / Electron variables it was given,
+# `run build` leaves app/out/ as electron-vite would, and `run package` leaves a packaged app holding
+# $STUB_ID and, as electron-builder packs out/**, out/commit.
 stub="$work/stub"
 mkdir -p "$stub"
 cat >"$stub/pnpm" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >>"$stub/log"
+printf 'GIT_DIR=%s GIT_INDEX_FILE=%s ELECTRON_RUN_AS_NODE=%s\n' "\${GIT_DIR:-}" "\${GIT_INDEX_FILE:-}" "\${ELECTRON_RUN_AS_NODE:-}" >>"$stub/env"
 case "\$*" in
-    *"run package"*) mkdir -p "$product" && printf '%s\n' "\${STUB_ID:-x}" >"$product/id" ;;
-    *"run build"*) [ -z "\${STUB_FAIL_BUILD:-}" ] || exit 1 ;;
+    *"run package"*) mkdir -p "$product" && printf '%s\n' "\${STUB_ID:-x}" >"$product/id" \
+                     && { [ ! -f app/out/commit ] || cp app/out/commit "$product/commit"; } ;;
+    *"run build"*) [ -z "\${STUB_FAIL_BUILD:-}" ] || exit 1; mkdir -p app/out ;;
 esac
 exit 0
 EOF
@@ -152,14 +156,26 @@ case4() {
         || ok "builder: a clone with a stray file refuses"
     rm "$src/stray"
     # The clone at main: built with the frozen lockfile, installed, stamped.
-    : >"$stub/log"
-    if ! out="$(STUB_ID=first build "$app_home" "$dest" 2>&1)"; then fail "builder: clean clone" "$out"; return; fi
+    : >"$stub/log"; : >"$stub/env"
+    # A post-merge hook's GIT_DIR and a launching app's ELECTRON_* reach no step of the build.
+    if ! out="$(GIT_DIR="$work/elsewhere.git" GIT_INDEX_FILE="$work/elsewhere.index" ELECTRON_RUN_AS_NODE=1 \
+                STUB_ID=first build "$app_home" "$dest" 2>&1)"; then fail "builder: clean clone" "$out"; return; fi
+    if [ -s "$stub/env" ] && ! grep -qv '^GIT_DIR= GIT_INDEX_FILE= ELECTRON_RUN_AS_NODE=$' "$stub/env"; then
+        ok "builder: pnpm runs without the caller's GIT_DIR, GIT_INDEX_FILE or ELECTRON_*"
+    else
+        fail "builder: environment scrub" "$(cat "$stub/env")"
+    fi
     grep -qx 'install --frozen-lockfile' "$stub/log" && ok "builder: installs with --frozen-lockfile" \
         || fail "builder: frozen lockfile" "$(cat "$stub/log")"
     [ "$(cat "$dest/id" 2>/dev/null)" = first ] && ok "builder: the packaged app is installed at --dest" \
         || fail "builder: installed" "no app at $dest"
     [ "$(app_installed_commit "$app_home")" = "$(git -C "$seed" rev-parse main)" ] \
         && ok "builder: stamps the commit it installed" || fail "builder: stamp" "$(cat "$app_home/installed" 2>&1)"
+    [ "$(app_installed_dest "$app_home")" = "$dest" ] && ok "builder: stamps where it installed it" \
+        || fail "builder: stamp dest" "$(cat "$app_home/installed" 2>&1)"
+    [ "$(cat "$dest/commit" 2>/dev/null)" = "$(git -C "$seed" rev-parse main)" ] \
+        && ok "builder: the commit is built into the app (out/commit)" \
+        || fail "builder: built-in commit" "$(cat "$dest/commit" 2>&1)"
     if [ "$(uname -s)" = Linux ]; then
         grep -qF "Exec=\"$dest/code-factory\"" "$work/xdg/applications/jkb-code-factory.desktop" 2>/dev/null \
             && ok "builder: writes a desktop entry for the installed app" \
@@ -179,21 +195,50 @@ case4() {
     [ "$(cat "$dest/id" 2>/dev/null)" = second ] && [ "$(app_installed_commit "$app_home")" != "$(git -C "$seed" rev-parse main)" ] \
         && ok "builder: a failed build leaves the app and the stamp as they were" \
         || fail "builder: failed build" "dest=$(cat "$dest/id" 2>&1) stamp=$(app_installed_commit "$app_home")"
+    # A stamp that cannot be written fails the build, rather than reporting an install it did not record.
+    mkdir -p "$app_home/installed.tmp/x"
+    if out="$(STUB_ID=third build "$app_home" "$dest" 2>&1)"; then
+        fail "builder: unwritable stamp" "exit 0: $out"
+    else
+        case "$out" in
+            *"could not be written"*) ok "builder: a stamp it cannot write fails the build, naming it" ;;
+            *) fail "builder: unwritable stamp" "$out" ;;
+        esac
+    fi
+    rm -rf "$app_home/installed.tmp"
 }
 
 # --- 5. app_swap: a failure leaves the installed app in place ------------------------------------
 case5() {
-    local d="$work/c5"
-    mkdir -p "$d/old" && echo old >"$d/old/id"
+    local d="$work/c5" h="$work/c5/home"
+    mkdir -p "$d/old" "$h" && echo old >"$d/old/id"
     cp -R "$d/old" "$d/dest"
-    app_swap "$d/missing" "$d/dest" "$d/prev" 2>/dev/null && fail "swap: missing build" "exit 0"
-    [ "$(cat "$d/dest/id")" = old ] && [ ! -e "$d/prev" ] && ok "swap: nothing to install leaves dest alone" \
-        || fail "swap: missing build" "dest or prev changed"
+    # An app at dest that jkb's stamp does not name is not jkb's: refused, and nothing is moved.
     mkdir -p "$d/new" && echo new >"$d/new/id"
-    app_swap "$d/new" "$d/dest" "$d/prev" 2>/dev/null
-    [ "$(cat "$d/dest/id")" = new ] && [ "$(cat "$d/prev/id")" = old ] && [ -z "$(ls -d "$d"/dest.new.* 2>/dev/null)" ] \
+    app_swap "$d/new" "$d/dest" "$h" 2>/dev/null && fail "swap: foreign dest" "exit 0"
+    [ "$(cat "$d/dest/id")" = old ] && [ ! -e "$h/previous" ] && ok "swap: an app jkb did not install is left alone" \
+        || fail "swap: foreign dest" "dest=$(cat "$d/dest/id") previous=$(ls "$h" 2>&1)"
+    printf 'commit=%s\ndest=%s\n' "$(printf 'a%.0s' $(seq 40))" "$d/elsewhere" >"$h/installed"
+    app_swap "$d/new" "$d/dest" "$h" 2>/dev/null && fail "swap: stamp names another dest" "exit 0"
+    [ "$(cat "$d/dest/id")" = old ] && ok "swap: a stamp naming another place does not vouch for dest" \
+        || fail "swap: stamp elsewhere" "dest=$(cat "$d/dest/id")"
+    printf 'commit=%s\ndest=%s\n' "$(printf 'a%.0s' $(seq 40))" "$d/dest" >"$h/installed"
+    app_swap "$d/missing" "$d/dest" "$h" 2>/dev/null && fail "swap: missing build" "exit 0"
+    [ "$(cat "$d/dest/id")" = old ] && [ ! -e "$h/previous" ] && ok "swap: nothing to install leaves dest alone" \
+        || fail "swap: missing build" "dest or prev changed"
+    app_swap "$d/new" "$d/dest" "$h" 2>/dev/null
+    [ "$(cat "$d/dest/id")" = new ] && [ "$(cat "$h/previous/id")" = old ] && [ -z "$(ls -d "$d"/dest.new.* 2>/dev/null)" ] \
         && ok "swap: installs, keeps the old one as previous, leaves no temp copy" \
-        || fail "swap: install" "dest=$(cat "$d/dest/id") prev=$(cat "$d/prev/id" 2>&1)"
+        || fail "swap: install" "dest=$(cat "$d/dest/id") prev=$(cat "$h/previous/id" 2>&1)"
+    # The final rename fails: the app that was installed is moved back, and no temp copy is left.
+    mkdir -p "$d/newer" && echo newer >"$d/newer/id"
+    (
+        mv() { case "$1" in *.new.*) return 1 ;; esac; command mv "$@"; }
+        app_swap "$d/newer" "$d/dest" "$h" 2>/dev/null
+    ) && fail "swap: failed rename" "exit 0"
+    [ "$(cat "$d/dest/id" 2>/dev/null)" = new ] && [ -z "$(ls -d "$d"/dest.new.* 2>/dev/null)" ] \
+        && ok "swap: a failed rename puts the installed app back" \
+        || fail "swap: rollback" "dest=$(cat "$d/dest/id" 2>&1) temp=$(ls -d "$d"/dest.new.* 2>&1)"
 }
 
 # --- 6. setup.sh's step: install_app and its states ----------------------------------------------
@@ -210,6 +255,33 @@ case6() {
     land two
     (HOME="$h" PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg6" install_app "$checkout" "$app_home" >/dev/null 2>&1; echo "$app_state" >"$work/c6/state")
     [ "$(cat "$work/c6/state")" = installed ] && ok "install_app: a new main is built again" || fail "install_app: new main" "$(cat "$work/c6/state")"
+    # The stamp names the tip but the app is gone: installed again, not `unchanged` forever.
+    local dest pid
+    dest="$(app_default_dest "$(uname -s)" "$h" "$app_home")"
+    rm -rf "$dest"
+    (HOME="$h" PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg6" install_app "$checkout" "$app_home" >/dev/null 2>&1; echo "$app_state" >"$work/c6/state")
+    [ "$(cat "$work/c6/state")" = installed ] && [ -d "$dest" ] && ok "install_app: a stamped tip whose app was removed is installed again" \
+        || fail "install_app: removed app" "$(cat "$work/c6/state")"
+    # A copy is running from dest: nothing is swapped under it.
+    land three
+    cp "$(command -v sleep)" "$(app_executable "$(uname -s)" "$dest")"
+    "$(app_executable "$(uname -s)" "$dest")" 30 & pid=$!
+    (HOME="$h" PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg6" install_app "$checkout" "$app_home" >/dev/null 2>&1; echo "$app_state" >"$work/c6/state")
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    [ "$(cat "$work/c6/state")" = running ] && [ "$(app_installed_commit "$app_home")" != "$(git -C "$seed" rev-parse main)" ] \
+        && ok "install_app: a running app is not swapped under" \
+        || fail "install_app: running" "$(cat "$work/c6/state")"
+    # Another install holds the lock (a live pid): busy, and the clone is not touched.
+    mkdir -p "$app_home/lock" && echo $$ >"$app_home/lock/pid" && echo other >"$app_home/lock/token"
+    (HOME="$h" PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg6" install_app "$checkout" "$app_home" >/dev/null 2>&1; echo "$app_state" >"$work/c6/state")
+    [ "$(cat "$work/c6/state")" = busy ] && [ "$(cat "$app_home/lock/token")" = other ] \
+        && ok "install_app: a held lock is busy, and is left to its holder" \
+        || fail "install_app: busy" "$(cat "$work/c6/state")"
+    rm -rf "$app_home/lock"
+    (HOME="$h" PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg6" install_app "$checkout" "$app_home" >/dev/null 2>&1; echo "$app_state" >"$work/c6/state")
+    [ "$(cat "$work/c6/state")" = installed ] && [ ! -e "$app_home/lock" ] \
+        && ok "install_app: installs once nothing runs or holds the lock, and releases it" \
+        || fail "install_app: after" "$(cat "$work/c6/state"); lock: $(ls "$app_home/lock" 2>&1)"
 
     NO_BUILDER=1 fixture c6b
     (HOME="$h" install_app "$checkout" "$app_home" >/dev/null 2>&1; echo "$app_state" >"$work/c6/state")
@@ -223,7 +295,7 @@ case6() {
         || fail "install_app: no origin" "$(cat "$work/c6/state")"
     # Every state install_app sets has a summary arm.
     local s out
-    for s in installed unchanged no-builder skipped failed; do
+    for s in installed unchanged running busy no-builder skipped failed; do
         out="$(printf 'app=%s /x\n' "$s" | render_setup_summary 2>&1)"
         case "$out" in
             *unrecognised*|"") fail "summary: app=$s" "$out" ;;
@@ -232,5 +304,34 @@ case6() {
     done
 }
 
-run_cases case1 case2 case3 case4 case5 case6
+# --- 7. build-app.sh and the app lock --------------------------------------------------------------
+case7() {
+    fixture c7
+    local src="$app_home/src" dest="$work/c7/installed" out dead
+    app_clone_refresh "$checkout" "$src" 2>/dev/null
+    # Held by a live holder: refused with 75, and the build never starts.
+    mkdir -p "$app_home/lock" && echo $$ >"$app_home/lock/pid" && echo theirs >"$app_home/lock/token"
+    : >"$stub/log"
+    out="$(build "$app_home" "$dest" 2>&1)"; local rc=$?
+    [ "$rc" = 75 ] && [ ! -s "$stub/log" ] && [ ! -e "$dest" ] && ok "lock: a held lock refuses the build (75) before it starts" \
+        || fail "lock: held" "rc=$rc log=$(cat "$stub/log") $out"
+    # The holder's own builder (its token) proceeds, and leaves the holder's lock alone.
+    if JKB_APP_LOCK_TOKEN=theirs build "$app_home" "$dest" >/dev/null 2>&1 && [ -d "$dest" ] \
+       && [ "$(cat "$app_home/lock/token" 2>/dev/null)" = theirs ]; then
+        ok "lock: the holder's builder (its token) proceeds and leaves the lock to the holder"
+    else
+        fail "lock: holder's token" "dest=$(ls "$dest" 2>&1) lock=$(cat "$app_home/lock/token" 2>&1)"
+    fi
+    # Left by a holder that died: broken, and the run's own lock is released at its end.
+    sh -c 'exit 0' & dead=$!; wait "$dead"
+    echo "$dead" >"$app_home/lock/pid"
+    land two; app_clone_refresh "$checkout" "$src" 2>/dev/null
+    if build "$app_home" "$dest" >/dev/null 2>&1 && [ ! -e "$app_home/lock" ] && [ -z "$(ls -d "$app_home"/lock.stale.* 2>/dev/null)" ]; then
+        ok "lock: a dead holder's lock is broken, and the run releases its own"
+    else
+        fail "lock: stale" "$(ls -a "$app_home")"
+    fi
+}
+
+run_cases case1 case2 case3 case4 case5 case6 case7
 finish

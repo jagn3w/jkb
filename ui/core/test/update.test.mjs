@@ -10,6 +10,8 @@ import {
   UPDATE_REF,
   UPDATE_REFSPEC,
   checkoutRefusal,
+  installedAppDir,
+  installedExecutable,
   isCommitId,
   parseCommitLog,
   parseInstalledStamp,
@@ -19,15 +21,22 @@ import {
 const A = "a".repeat(40);
 const B = "b".repeat(40);
 
-test("a checkout runs only when JKB_APP_FROM_CHECKOUT=1 says so; the installed copy always runs", () => {
+test("anything but the installed copy runs only when JKB_APP_FROM_CHECKOUT=1 says so; the installed copy always runs", () => {
   assert.equal(FROM_CHECKOUT_VAR, "JKB_APP_FROM_CHECKOUT");
   assert.equal(checkoutRefusal(true, {}), undefined);
   assert.equal(checkoutRefusal(false, { JKB_APP_FROM_CHECKOUT: "1" }), undefined);
   for (const env of [{}, { JKB_APP_FROM_CHECKOUT: "" }, { JKB_APP_FROM_CHECKOUT: "0" }, { JKB_APP_FROM_CHECKOUT: "yes" }]) {
-    const why = checkoutRefusal(false, env);
-    assert.match(why ?? "", /running from a checkout/);
+    const why = checkoutRefusal(false, env, "/h/.local/share/jkb-app/app/code-factory");
+    assert.match(why ?? "", /not running from its installed copy \(\/h\/\.local\/share\/jkb-app\/app\/code-factory\)/);
     assert.match(why ?? "", /JKB_APP_FROM_CHECKOUT=1/);
   }
+});
+
+test("the installed copy's place: ~/Applications on macOS, the app home elsewhere", () => {
+  assert.equal(installedAppDir("darwin", "/Users/u"), "/Users/u/Applications/Code Factory.app");
+  assert.equal(installedExecutable("darwin", "/Users/u"), "/Users/u/Applications/Code Factory.app/Contents/MacOS/Code Factory");
+  assert.equal(installedAppDir("linux", "/home/u"), "/home/u/.local/share/jkb-app/app");
+  assert.equal(installedExecutable("linux", "/home/u"), "/home/u/.local/share/jkb-app/app/code-factory");
 });
 
 test("the update takes main, and only main", () => {

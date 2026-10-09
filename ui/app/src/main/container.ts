@@ -36,10 +36,17 @@ export interface RunResult {
   readonly code: number | null;
   readonly stdout: string;
   readonly stderr: string;
+  /** Set on a timeout by a runner that stops the whole process group: true when it could not confirm it gone. */
+  readonly survivors?: boolean;
 }
 
-/** Run `file` with `args`, without a shell, to completion or `timeoutMs`. */
-export type RunFile = (file: string, args: readonly string[], timeoutMs: number) => Promise<RunResult>;
+/** Run `file` with `args`, without a shell, to completion or `timeoutMs`; `env` is added to the runner's. */
+export type RunFile = (
+  file: string,
+  args: readonly string[],
+  timeoutMs: number,
+  env?: Readonly<Record<string, string>>,
+) => Promise<RunResult>;
 
 /** What main knows about the machine, injected so the tests can stand a kit up anywhere. */
 export interface KitEnvironment {
