@@ -158,18 +158,25 @@ code, at `origin/main`, and a checkout never gets a say.
   nothing is changed or untracked), `app_swap`, and `install_app`, setup.sh's step. setup.sh runs it
   after the kit (`--no-app` skips it); it is `unchanged`, and builds nothing, when the stamp already
   names `main`'s tip and the app is where it was put — setup.sh runs after every pull touching `ui/`.
-  It is `running`, and swaps nothing, when a process is running the installed executable
-  (`app_running`, from `ps`): the app's own update takes the same tip.
+  It is `running`, and builds nothing, when a process is running the installed executable
+  (`app_running`, from `ps`): the app's own update takes the same tip. build-app.sh checks again
+  right before its swap (below), so an app started during the build is not swapped under either.
 - **One install at a time** (review round 1). The clone's checkout and clean, the build's
   `rm -rf app/dist`, the swap and the stamp are shared state; a post-merge `setup.sh` during an
   in-app update could otherwise install a half-built app or stamp A over B's app. `<app-home>/lock`
   is a `mkdir` lock (no flock(1) on macOS) holding `pid` and `token`, taken by whoever starts an
-  install — `install_app`, the app's update (`takeAppLock`, the same protocol in TypeScript), or
+  install — `install_app`, the app's update (`takeAppLock`, the same protocol in TypeScript; its
+  *plan* holds it too, because the fetch moves the `origin/main` an install's builder checks), or
   `build-app.sh` run by hand — and *recognised* by the `build-app.sh` such a holder runs, through
-  the token in `JKB_APP_LOCK_TOKEN`. A run that finds it held is `busy` (setup.sh), exits 75
-  (build-app.sh) or says so (the app). A lock whose holder pid is gone is moved aside under a name
-  of its own and checked to be that holder's before it is removed. *Residual, stated:* a holder
-  whose pid has been reused looks alive, and the message names the lock to remove.
+  the token in `JKB_APP_LOCK_TOKEN`; that builder records its own pid as `builder`, and the lock is
+  live while either pid runs (round 2: a holder that quit or was killed mid-build left its builder
+  running under a lock that read as stale). A run that finds it held is `busy` (setup.sh), exits 75
+  (build-app.sh) or says so (the app). A lock neither of whose pids runs is moved aside under a name
+  of its own and checked to be that holder's before it is removed; if another run broke it and took
+  a fresh one first, that one is renamed back (round 2: it was left aside, unlocking the winner).
+  *Residual, stated:* a third run that mkdirs the lock in the instant between the two renames keeps
+  it, and the winner's is left aside; a holder whose pid has been reused looks alive, and the
+  message names the lock to remove.
 - **`scripts/build-app.sh`**, run only as the clone's copy, first drops git's six repository-selection
   variables and every `ELECTRON_*` for every caller (the post-merge hook hands setup.sh a `GIT_DIR`,
   which pnpm's lifecycle scripts would act on). It refuses unless its own repository *is*
@@ -177,9 +184,15 @@ code, at `origin/main`, and a checkout never gets a say.
   and holds the lock throughout. Then `pnpm install --frozen-lockfile`, `pnpm --filter "@jkb/app..."
   run build` (each package type-checks before it emits), the commit written to `ui/app/out/commit`
   (packed with `out/**`, so the app knows what *it* is), `pnpm --filter @jkb/app run package`
-  (`electron-builder --dir`, `ui/app/electron-builder.yml`), the swap, and last the stamp
-  `<app-home>/installed` (`commit=<sha>`, `dest=<path>`). A stamp it cannot write fails the script.
-  On Linux it writes a desktop entry.
+  (`electron-builder --dir`, `ui/app/electron-builder.yml`), a check that no copy is running from
+  the destination (exit 76; only the app's own update passes `--replacing-running`, since it is that
+  copy and relaunches at once), the swap, and last the stamp `<app-home>/installed` (`commit=<sha>`,
+  `dest=<path>`). A stamp it cannot write after the swap exits 77 — *installed but unrecorded*, which
+  setup.sh reports as `unrecorded` and the app relaunches into — never the plain failure that means
+  "unchanged". It installs only at `app_default_dest`, the place the app's identity check accepts:
+  `--dest` exists for the tests alone (`JKB_APP_BUILD_TEST=1`), since a copy installed elsewhere
+  refuses to start and its stamp would make every later install refuse the real one (round 2). On
+  Linux it writes a desktop entry.
 - **Where things go:** `~/.local/share/jkb-app/{src,installed,update.log,previous,lock}`; the app at
   `~/Applications/Code Factory.app` (macOS) or `~/.local/share/jkb-app/app/code-factory` (Linux).
 - **The swap replaces only what jkb installed.** Something already at the destination is replaced
@@ -190,9 +203,9 @@ code, at `origin/main`, and a checkout never gets a say.
 - **A swap does not leave a running copy whole.** *Corrected in review round 1:* this said the
   running app "keeps reading its files until it relaunches". It keeps the files it has open, but an
   Electron app finds its helpers (renderer, GPU, node-pty's) by path when it spawns them, so after
-  the rename it loads the new bundle's helpers into the old browser process. So setup.sh does not
-  swap under a running copy (`running`, above), and the in-app update relaunches the moment the
-  build returns.
+  the rename it loads the new bundle's helpers into the old browser process. So build-app.sh does
+  not swap under a running copy unless that copy asked it to, and the in-app update relaunches the
+  moment the build returns.
 - **In the app**, `src/main/update.ts` (`AppUpdater`) and `@jkb/core`'s `update.ts` (paths, the stamp,
   the commit log, the confirmation's words, `checkoutRefusal`, and `installedAppDir` /
   `installedExecutable`, which a test holds equal to lib.sh's `app_default_dest` / `app_executable`).
@@ -205,15 +218,19 @@ code, at `origin/main`, and a checkout never gets a say.
   what is running — saying so when that commit is not an ancestor, i.e. `main` was rewritten. On a
   yes it takes the lock, checks that `origin/main` is still the commit it showed, moves the clone
   there, cleans it, runs the clone's `build-app.sh` with the lock's token, requires the stamp to name
-  that commit, then `app.relaunch()` and `app.quit()` (so `will-quit` ends the terminals and feeds).
-  A build that fails says the installed app is unchanged and leaves its output in `update.log`.
+  that commit (or the builder's 77, said in a dialog), then `app.relaunch()` and `app.quit()` (so
+  `will-quit` ends the terminals and feeds). A build that fails says the installed app is unchanged
+  and leaves its output in `update.log`. **Quitting mid-update cancels it** (`before-quit` waits for
+  `AppUpdater.cancel`, which stops the build's group) rather than leaving it to swap and stamp with
+  nothing to relaunch.
 - **A timeout stops everything the build started.** Each run is its own process group (`detached`),
   and a timeout sends the group SIGTERM, then SIGKILL, then polls until it is gone; killing only
   `bash` (as `execFile`'s timeout did) left pnpm, electron-builder and the swap running on to swap and
-  stamp after the app said the build had failed. A timed-out build is reported as stopped, not as
-  "unchanged" (it may have been stopped mid-swap; `previous/` holds the replaced app). If the group
-  cannot be confirmed gone, the app says the installed app may still change and keeps the lock until
-  it quits.
+  stamp after the app said the build had failed. The same happens when the builder is cancelled or
+  killed by a signal from outside (the OOM killer), and the result says which (`timedOut`,
+  `cancelled`, `signal`). The app says the build "stopped" only when the runner confirmed the group
+  gone (`survivors: false`), and then not "unchanged" (it may have been stopped mid-swap; `previous/`
+  holds the replaced app); otherwise it says the installed app may still change and keeps the lock.
 - **The environment.** Git and the builder run with Electron's variables and git's repository
   selection stripped, so a launching shell's `GIT_DIR` cannot point the fetch elsewhere, and with
   `GIT_TERMINAL_PROMPT=0`, as lib.sh's fetch of the same refspec has: a credential prompt on the

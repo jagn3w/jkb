@@ -27,6 +27,16 @@ export const APP_LOG_IN_HOME = `${APP_HOME_IN_HOME}/update.log`;
  */
 export const APP_LOCK_IN_HOME = `${APP_HOME_IN_HOME}/lock`;
 
+/**
+ * `build-app.sh`'s exit statuses past plain failure (lib.sh's `APP_BUILD_EXIT_*`): another install
+ * holds the lock; a copy is running and nothing was swapped; the app WAS swapped in but the stamp
+ * could not be written.
+ */
+export const BUILD_EXIT = { busy: 75, running: 76, unrecorded: 77 } as const;
+
+/** The flag the app's own update passes `build-app.sh`: it is the running copy, and relaunches. */
+export const BUILD_REPLACING_RUNNING = "--replacing-running";
+
 /** The variable that hands the lock's token to the builder (lib.sh reads the same name). */
 export const APP_LOCK_TOKEN_VAR = "JKB_APP_LOCK_TOKEN";
 

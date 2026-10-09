@@ -1697,6 +1697,7 @@ render_setup_summary() {
                     no-builder) printf '  • app:        NOT installed: origin/main has no scripts/build-app.sh yet\n' ;;
                     running)    printf '  • app:        NOT updated: Code Factory is running from %s; use jkb ▸ Update from main…, or quit it and re-run setup.sh\n' "$detail" ;;
                     busy)       printf '  • app:        NOT updated: another install or the app'"'"'s own update is running (see the warnings above)\n' ;;
+                    unrecorded) printf '  • app:        Code Factory installed at %s, but its stamp could not be written (see the warnings above); the next install re-stamps it\n' "$detail" ;;
                     skipped)    printf '  • app:        skipped (--no-app)\n' ;;
                     failed)     printf '  • app:        NOT installed; see the warnings above (an installed copy is unchanged)\n' ;;
                     *)          warn "unrecognised app state: $line" ;;
@@ -2241,37 +2242,69 @@ app_running() {
 # the holder passes the lock's token in $JKB_APP_LOCK_TOKEN, and build-app.sh proceeds only when the
 # lock it finds carries that token.
 #
-# `mkdir` is the lock (atomic everywhere; macOS has no flock(1)). It holds `pid` (the holder) and
-# `token`. A lock whose pid is not running was left by a holder that died: it is moved aside under a
-# name of its own and checked to be the dead holder's before it is removed, so two runs breaking the
-# same stale lock cannot both proceed. A lock with no pid yet is a holder between its mkdir and its
-# write, and is busy.
+# `mkdir` is the lock (atomic everywhere; macOS has no flock(1)). It holds `pid` (the holder),
+# `token`, and `builder` — the pid of the build-app.sh that recognised it — so a lock stays live while
+# EITHER runs: a holder that quits or is killed mid-build (the app, setup.sh) leaves its builder
+# running, and that build must not be broken under. A lock neither of whose pids is running was left
+# by runs that died: `_app_lock_break` moves it aside under a name of its own, checks it is the dead
+# holder's, and only then removes it; if it is not (another run broke the stale lock and took a fresh
+# one first), it is renamed back. A lock with no pid yet is a holder between its mkdir and its write,
+# and is busy.
 APP_LOCK_IN_APP_HOME=lock
+
+# build-app.sh's exit statuses past plain failure (its header says what each means; @jkb/core's
+# BUILD_EXIT names the same three, and a test holds them together).
+APP_BUILD_EXIT_BUSY=75
+APP_BUILD_EXIT_RUNNING=76
+APP_BUILD_EXIT_UNRECORDED=77
+
+# _app_lock_live <lock> — whether the holder or its builder is running.
+_app_lock_live() {
+    local p
+    for p in "$(cat "$1/pid" 2>/dev/null)" "$(cat "$1/builder" 2>/dev/null)"; do
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        kill -0 "$p" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# _app_lock_break <lock> <pid> — remove <lock>, which was read as held by the dead <pid>, unless it
+# has since become somebody else's. Returns 1 when it has (and leaves theirs where it was).
+_app_lock_break() {
+    local lock="$1" pid="$2" aside
+    aside="$lock.stale.$$.$RANDOM"
+    mv "$lock" "$aside" 2>/dev/null || return 1
+    if [ "$(cat "$aside/pid" 2>/dev/null)" != "$pid" ]; then
+        # Not the lock we judged stale: another run broke that one and took this. Put it back. $lock
+        # is absent (we just moved it), unless a third run mkdir'd in this instant; then theirs stays
+        # and this one is left aside, the residual this cannot close without a second lock.
+        [ -e "$lock" ] || mv "$aside" "$lock" 2>/dev/null
+        return 1
+    fi
+    rm -rf "$aside"
+}
 
 # app_lock <app-home> — take the lock, or recognise the caller's. Sets `app_lock_token` and
 # `app_lock_taken` (1 when this call took it, so the matching app_unlock releases it; 0 when the
-# caller holds it). Returns 1, saying who holds it, when it is busy.
+# caller holds it, in which case this process is recorded as its `builder`). Returns 1, saying who
+# holds it, when it is busy.
 app_lock() {
-    local lock="$1/$APP_LOCK_IN_APP_HOME" pid aside
+    local lock="$1/$APP_LOCK_IN_APP_HOME" pid
     app_lock_taken=0
     app_lock_token="${JKB_APP_LOCK_TOKEN:-}"
     if [ -n "$app_lock_token" ] && [ "$(cat "$lock/token" 2>/dev/null)" = "$app_lock_token" ]; then
+        printf '%s\n' "$$" >"$lock/builder" || { warn "could not write $lock/builder"; return 1; }
         return 0
     fi
     mkdir -p "$1" || return 1
     if ! mkdir "$lock" 2>/dev/null; then
         pid="$(cat "$lock/pid" 2>/dev/null)" || pid=""
-        case "$pid" in ''|*[!0-9]*) warn "another install holds $lock"; return 1 ;; esac
-        if kill -0 "$pid" 2>/dev/null; then
+        case "$pid" in ''|*[!0-9]*) warn "another install holds $lock (it names no holder yet); if none is running, remove it"; return 1 ;; esac
+        if _app_lock_live "$lock"; then
             warn "another install or update (pid $pid) holds $lock; if none is running, remove it"
             return 1
         fi
-        aside="$lock.stale.$$.$RANDOM"
-        if ! mv "$lock" "$aside" 2>/dev/null || [ "$(cat "$aside/pid" 2>/dev/null)" != "$pid" ]; then
-            warn "another install is taking $lock"
-            return 1
-        fi
-        rm -rf "$aside"
+        _app_lock_break "$lock" "$pid" || { warn "another install is taking $lock"; return 1; }
         mkdir "$lock" 2>/dev/null || { warn "another install took $lock"; return 1; }
     fi
     app_lock_token="$$.$RANDOM.$RANDOM.$(date +%s)"
@@ -2300,6 +2333,7 @@ app_unlock() {
 #   running     the installed app is running, so nothing was swapped under it (see app_running);
 #               its own *Update from main…* takes the same tip, or quit it and re-run setup.sh
 #   busy        another install or the app's own update holds the lock
+#   unrecorded  the app was swapped in but its stamp could not be written (see the warnings)
 #   no-builder  origin/main has no scripts/build-app.sh yet: it predates the installed copy
 #   failed      anything else, said on stderr; an installed app is left as it was
 # The unchanged arm is what keeps this cheap: setup.sh runs after every pull that touches ui/.
@@ -2334,9 +2368,16 @@ _install_app_locked() {
         0) app_state=running; return 0 ;;
         2) warn "could not tell whether Code Factory is running (no ps); if it is, restart it after this" ;;
     esac
-    if JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home"; then
-        app_state=installed
-    fi
+    # Checked here too, to skip a build that could not be swapped in; build-app.sh checks again right
+    # before its swap, since the app may be started while it builds.
+    local rc=0
+    JKB_APP_LOCK_TOKEN="$app_lock_token" /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home" || rc=$?
+    case "$rc" in
+        0) app_state=installed ;;
+        "$APP_BUILD_EXIT_BUSY") app_state=busy ;;
+        "$APP_BUILD_EXIT_RUNNING") app_state=running ;;
+        "$APP_BUILD_EXIT_UNRECORDED") app_state=unrecorded ;;
+    esac
     return 0
 }
 
@@ -2363,9 +2404,9 @@ app_installed_dest() {
 # fails, the old app is moved back.
 #
 # The swap does NOT make a running copy safe: it keeps its open files, but finds its helpers by path
-# when it spawns them, and after the rename those are the new bundle's. That is why setup.sh does not
-# swap under a running app (app_running), and why the app's own update relaunches as soon as this
-# returns.
+# when it spawns them, and after the rename those are the new bundle's. That is why build-app.sh checks
+# app_running right before calling this (unless the caller is the running copy, --replacing-running),
+# and why the app's own update relaunches as soon as this returns.
 app_swap() {
     local built="$1" dest="$2" app_home="$3" prev new moved=0
     prev="$app_home/previous"

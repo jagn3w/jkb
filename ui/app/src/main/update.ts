@@ -28,6 +28,8 @@ import {
   APP_LOG_IN_HOME,
   APP_SRC_IN_HOME,
   APP_STAMP_IN_HOME,
+  BUILD_EXIT,
+  BUILD_REPLACING_RUNNING,
   BUILT_COMMIT_IN_OUT,
   COMMIT_LOG_FORMAT,
   UPDATE_REF,
@@ -114,13 +116,51 @@ function readTrimmed(path: string): string | undefined {
   }
 }
 
+/** Whether the lock at `dir` is live: its holder (`pid`) or the builder that recognised it (`builder`) runs. */
+function lockLive(dir: string): boolean {
+  for (const name of ["pid", "builder"]) {
+    const p = readTrimmed(join(dir, name)) ?? "";
+    if (/^[0-9]+$/.test(p) && alive(Number(p))) return true;
+  }
+  return false;
+}
+
 /**
- * Take the install lock at `dir` — lib.sh's `app_lock`, the same way: `mkdir`, then `pid` and
- * `token` inside. A lock whose holder is gone is moved aside under a name of its own and checked to
- * be that holder's before it is removed. Answers the token, or why it is busy.
+ * Remove the lock at `dir`, which was read as held by the dead `pid`, unless it has since become
+ * somebody else's (lib.sh's `_app_lock_break`): it is moved aside under a name of its own and checked;
+ * if another run broke the stale lock and took a fresh one first, that one is renamed back. Whether
+ * it was removed.
+ */
+export function breakStaleLock(dir: string, pid: string): boolean {
+  const aside = `${dir}.stale.${process.pid}.${randomBytes(4).toString("hex")}`;
+  try {
+    renameSync(dir, aside);
+  } catch {
+    return false;
+  }
+  if (readTrimmed(join(aside, "pid")) !== pid) {
+    // `dir` is absent (just moved), unless a third run made it in this instant; theirs then stays.
+    if (!existsSync(dir)) {
+      try {
+        renameSync(aside, dir);
+      } catch {
+        // Theirs got there first.
+      }
+    }
+    return false;
+  }
+  rmSync(aside, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * Take the install lock at `dir` — lib.sh's `app_lock`, the same way: `mkdir`, then `token` and `pid`
+ * inside. A lock neither of whose pids (`pid`, `builder`) is running is broken (`breakStaleLock`).
+ * Answers the token, or why it is busy.
  */
 export function takeAppLock(dir: string): Result<string> {
   const busy = (why: string): Result<string> => ({ ok: false, error: `Another install or update is running (${why}). If none is, remove ${dir}.` });
+  let made = false;
   try {
     mkdirSync(dirname(dir), { recursive: true });
     try {
@@ -129,26 +169,22 @@ export function takeAppLock(dir: string): Result<string> {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
       const pid = readTrimmed(join(dir, "pid")) ?? "";
       if (!/^[0-9]+$/.test(pid)) return busy(`${dir} names no holder yet`);
-      if (alive(Number(pid))) return busy(`pid ${pid} holds ${dir}`);
-      const aside = `${dir}.stale.${process.pid}.${randomBytes(4).toString("hex")}`;
-      try {
-        renameSync(dir, aside);
-      } catch {
-        return busy(`another run is breaking ${dir}`);
-      }
-      if (readTrimmed(join(aside, "pid")) !== pid) return busy(`another run took ${dir}`);
-      rmSync(aside, { recursive: true, force: true });
+      if (lockLive(dir)) return busy(`pid ${pid} holds ${dir}`);
+      if (!breakStaleLock(dir, pid)) return busy(`another run took ${dir}`);
       try {
         mkdirSync(dir);
       } catch {
         return busy(`another run took ${dir}`);
       }
     }
+    made = true;
     const token = `${process.pid}.${randomBytes(12).toString("hex")}`;
     writeFileSync(join(dir, "token"), `${token}\n`);
     writeFileSync(join(dir, "pid"), `${process.pid}\n`);
     return { ok: true, value: token };
   } catch (e) {
+    // A lock this call made but could not name its holder in would read as busy for good.
+    if (made) rmSync(dir, { recursive: true, force: true });
     return { ok: false, error: `could not take the install lock ${dir}: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
@@ -163,6 +199,12 @@ export function releaseAppLock(dir: string, token: string): void {
   }
 }
 
+/** What an update installed: the commit, and whether the stamp failed to record it (it is in place). */
+export interface Applied {
+  readonly target: string;
+  readonly unrecorded: boolean;
+}
+
 export interface UpdaterOptions {
   /** How long the build may take (`BUILD_TIMEOUT_MS`). */
   readonly buildTimeoutMs?: number;
@@ -171,6 +213,9 @@ export interface UpdaterOptions {
 export class AppUpdater {
   /** Whether an update is building now: the menu refuses a second. */
   private building = false;
+
+  /** The running update's cancellation, and its completion: what `cancel` stops and waits for. */
+  private current: { abort: AbortController; done: Promise<unknown> } | undefined;
 
   private readonly buildTimeoutMs: number;
 
@@ -249,13 +294,28 @@ export class AppUpdater {
     }
   }
 
-  /** Fetch `main` into the clone and say what an update would take. Builds and moves nothing. */
+  /**
+   * Fetch `main` into the clone and say what an update would take. Builds and moves nothing, but
+   * moves `origin/main` in the clone an install reads, so it holds the install lock: a fetch under a
+   * running install would make its builder refuse the clone.
+   */
   async plan(): Promise<Result<UpdatePlan>> {
     const refused = this.notInstalled();
     if (refused !== undefined) return { ok: false, error: refused };
+    if (this.building) return { ok: false, error: "An update is already building." };
     if (!existsSync(join(this.src, ".git"))) {
       return { ok: false, error: `No clean clone at ${this.src}. scripts/setup.sh creates it, from a checkout you have reviewed.` };
     }
+    const lock = takeAppLock(this.lockDir);
+    if (!lock.ok) return lock;
+    try {
+      return await this.planLocked();
+    } finally {
+      releaseAppLock(this.lockDir, lock.value);
+    }
+  }
+
+  private async planLocked(): Promise<Result<UpdatePlan>> {
     const fetched = await this.gitOut(["fetch", "--quiet", "--no-tags", "origin", UPDATE_REFSPEC], "fetch origin main", FETCH_TIMEOUT_MS);
     if (!fetched.ok) return fetched;
     const tip = await this.gitOut(["rev-parse", "--verify", "--quiet", `${UPDATE_REF}^{commit}`], "rev-parse origin/main");
@@ -281,7 +341,7 @@ export class AppUpdater {
    * Move the clone to `target` — which must still be `origin/main`'s tip, the commit the user was
    * shown — and run the clone's builder, under the install lock. The build's output goes to `logFile`.
    */
-  async apply(target: unknown): Promise<Result<string>> {
+  async apply(target: unknown): Promise<Result<Applied>> {
     if (this.building) return { ok: false, error: "An update is already building." };
     if (!isCommitId(target)) return { ok: false, error: `not a commit id: ${JSON.stringify(target)}` };
     const refused = this.notInstalled();
@@ -289,9 +349,32 @@ export class AppUpdater {
     const lock = takeAppLock(this.lockDir);
     if (!lock.ok) return lock;
     this.building = true;
-    // Kept when a timed-out build's processes could not be confirmed gone: they may still swap and
-    // stamp, and a second install must not start under them. A later run breaks it once this
-    // process (its holder) has exited.
+    const abort = new AbortController();
+    const done = this.applyLocked(target, lock.value, abort.signal);
+    this.current = { abort, done };
+    try {
+      return await done;
+    } finally {
+      this.current = undefined;
+      this.building = false;
+    }
+  }
+
+  /**
+   * Stop a running update — its whole process group — and wait for it to finish. For quitting: an
+   * update left running after the app is gone would build and swap with nobody to relaunch it.
+   */
+  async cancel(): Promise<void> {
+    const c = this.current;
+    if (c === undefined) return;
+    c.abort.abort();
+    await c.done;
+  }
+
+  private async applyLocked(target: string, token: string, signal: AbortSignal): Promise<Result<Applied>> {
+    // Kept when the build's processes could not be confirmed gone: they may still swap and stamp, and
+    // a second install must not start under them. A later run breaks it once this process (its
+    // holder) and the builder have exited.
     let keepLock = false;
     try {
       const tip = await this.gitOut(["rev-parse", "--verify", "--quiet", `${UPDATE_REF}^{commit}`], "rev-parse origin/main");
@@ -308,31 +391,51 @@ export class AppUpdater {
 
       const builder = join(this.src, APP_BUILDER_IN_SRC);
       if (!existsSync(builder)) return { ok: false, error: `main at ${target.slice(0, 12)} has no ${APP_BUILDER_IN_SRC}.` };
+      // This copy is the installed one and relaunches the moment this returns, so the builder may
+      // swap under it; nothing else passes this flag.
+      const argv = [builder, "--app-home", this.appHome, BUILD_REPLACING_RUNNING];
       let r: RunResult;
       try {
-        r = await this.run("/bin/bash", [builder, "--app-home", this.appHome], this.buildTimeoutMs, { [APP_LOCK_TOKEN_VAR]: lock.value });
+        r = await this.run("/bin/bash", argv, this.buildTimeoutMs, { [APP_LOCK_TOKEN_VAR]: token }, signal);
       } catch (e) {
         return { ok: false, error: `could not run ${builder}: ${e instanceof Error ? e.message : String(e)}` };
       }
-      this.writeLog(`$ ${builder} --app-home ${this.appHome}\n${r.stdout}${r.stderr === "" ? "" : `\n--- stderr ---\n${r.stderr}`}\n`);
+      this.writeLog(`$ ${argv.join(" ")}\n${r.stdout}${r.stderr === "" ? "" : `\n--- stderr ---\n${r.stderr}`}\n`);
       const output = tail(`${r.stdout}\n${r.stderr}`);
+      if (r.code === null && r.signal === undefined && r.timedOut !== true && r.cancelled !== true) {
+        return { ok: false, error: `could not run ${builder}: ${r.stderr}` };
+      }
       if (r.code === null) {
-        const after = `timed out after ${Math.round(this.buildTimeoutMs / 1000)}s`;
-        if (r.survivors === true) {
-          keepLock = true;
+        const how =
+          r.timedOut === true
+            ? `timed out after ${Math.round(this.buildTimeoutMs / 1000)}s`
+            : r.cancelled === true
+              ? "was cancelled"
+              : `was killed (${r.signal ?? "by a signal"})`;
+        // "Stopped" only when the runner confirmed the whole group gone; anything unconfirmed may
+        // still swap and stamp.
+        if (r.survivors === false) {
           return {
             ok: false,
             error:
-              `The build ${after}, and some of its processes could not be stopped: the installed app may still ` +
-              `change. The install lock (${this.lockDir}) stays held until this app quits. Its output is in ${this.logFile}.\n\n${output}`,
+              `The build ${how}, and every process it started has stopped. It was not recorded as installed; if it ` +
+              `was stopped while swapping, the app it replaced is in ${join(this.appHome, "previous")}. Its output is in ${this.logFile}.\n\n${output}`,
           };
         }
+        keepLock = true;
         return {
           ok: false,
           error:
-            `The build ${after} and was stopped, every process it started with it. It was not recorded as installed; if it ` +
-            `was stopped while swapping, the app it replaced is in ${join(this.appHome, "previous")}. Its output is in ${this.logFile}.\n\n${output}`,
+            `The build ${how}, and its processes could not be confirmed stopped: the installed app may still ` +
+            `change. The install lock (${this.lockDir}) stays held while they or this app run. Its output is in ${this.logFile}.\n\n${output}`,
         };
+      }
+      if (r.code === BUILD_EXIT.unrecorded) {
+        // Swapped in: relaunch into it. The next install re-stamps; plan() reads the running commit.
+        return { ok: true, value: { target, unrecorded: true } };
+      }
+      if (r.code === BUILD_EXIT.busy) {
+        return { ok: false, error: `Another install holds the install lock; the installed app is unchanged.\n\n${output}` };
       }
       if (r.code !== 0) {
         return { ok: false, error: `The build failed (exit ${r.code}); the installed app is unchanged. Its output is in ${this.logFile}.\n\n${output}` };
@@ -340,10 +443,9 @@ export class AppUpdater {
       if (this.installed() !== target) {
         return { ok: false, error: `The build finished but did not record ${target.slice(0, 12)} as installed; see ${this.logFile}.` };
       }
-      return { ok: true, value: target };
+      return { ok: true, value: { target, unrecorded: false } };
     } finally {
-      this.building = false;
-      if (!keepLock) releaseAppLock(this.lockDir, lock.value);
+      if (!keepLock) releaseAppLock(this.lockDir, token);
     }
   }
 
@@ -415,7 +517,7 @@ export function machineRunner(home: string, env: Readonly<Record<string, string 
   }
   childEnv["HOME"] = home;
   childEnv["GIT_TERMINAL_PROMPT"] = "0";
-  return (file, args, timeoutMs, extraEnv = {}) =>
+  return (file, args, timeoutMs, extraEnv = {}, signal) =>
     new Promise((resolve) => {
       let settled = false;
       const finish = (r: RunResult): void => {
@@ -439,21 +541,41 @@ export function machineRunner(home: string, env: Readonly<Record<string, string 
       }
       child.stdout?.setEncoding("utf8").on("data", (c: string) => (stdout = keep(stdout, c)));
       child.stderr?.setEncoding("utf8").on("data", (c: string) => (stderr = keep(stderr, c)));
-      let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
+      // Ended abnormally — timed out, cancelled — or the program was killed by a signal from outside
+      // (the OOM killer): the rest of its group is stopped too, and `survivors` says whether that was
+      // confirmed.
+      let stopping = false;
+      const stop = (why: { timedOut?: true; cancelled?: true }, note: string): void => {
+        if (stopping) return;
+        stopping = true;
+        clearTimeout(timer);
         void stopGroup(child.pid, graceMs).then((gone) => {
           child.stdout?.destroy();
           child.stderr?.destroy();
-          finish({ code: null, stdout, stderr: stderr === "" ? `timed out after ${timeoutMs}ms` : stderr, survivors: !gone });
+          finish({ code: null, stdout, stderr: stderr === "" ? note : stderr, ...why, survivors: !gone });
         });
-      }, timeoutMs);
+      };
+      const timer = setTimeout(() => stop({ timedOut: true }, `timed out after ${timeoutMs}ms`), timeoutMs);
+      const onAbort = (): void => stop({ cancelled: true }, "cancelled");
+      if (signal?.aborted === true) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
       child.on("error", (e) => {
         clearTimeout(timer);
         finish({ code: null, stdout, stderr: stderr === "" ? e.message : stderr });
       });
+      child.on("exit", (code, sig) => {
+        if (stopping || sig === null) return;
+        stopping = true;
+        clearTimeout(timer);
+        void stopGroup(child.pid, graceMs).then((gone) => {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          finish({ code: null, stdout, stderr, signal: sig, survivors: !gone });
+        });
+      });
       child.on("close", (code) => {
-        if (timedOut) return;
+        signal?.removeEventListener("abort", onAbort);
+        if (stopping) return;
         clearTimeout(timer);
         finish({ code: code ?? null, stdout, stderr });
       });

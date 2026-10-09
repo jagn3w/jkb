@@ -109,7 +109,7 @@ test("run from a checkout without JKB_APP_FROM_CHECKOUT=1, the app refuses to st
   delete env.JKB_APP_FROM_CHECKOUT;
   const r = spawnSync(binary, [appDir], { env, encoding: "utf8", timeout: 30_000 });
   assert.equal(r.status, 1, `exit ${r.status}, signal ${r.signal}; stderr: ${r.stderr}`);
-  assert.match(r.stderr, /running from a checkout/);
+  assert.match(r.stderr, /not running from its installed copy/);
   assert.match(r.stderr, /JKB_APP_FROM_CHECKOUT=1/);
 });
 

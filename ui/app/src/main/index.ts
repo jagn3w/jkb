@@ -373,9 +373,18 @@ async function updateFromMain(): Promise<void> {
   showBusy(true);
   const done = await updater.apply(plan.value.target);
   showBusy(false);
+  // Quitting cancelled it (`before-quit`): no dialog over a quit.
+  if (quitting) return;
   if (!done.ok) {
     await messageBox({ type: "error", message: "The update did not install", detail: done.error });
     return;
+  }
+  if (done.value.unrecorded) {
+    await messageBox({
+      type: "warning",
+      message: "Installed, but not recorded",
+      detail: `Code Factory ${done.value.target.slice(0, 12)} is in place, but its stamp could not be written (see ${updater.logFile}). It relaunches now; the next install records it.`,
+    });
   }
   // The updater runs only as the installed copy, and the build swapped the new one in at that path,
   // so relaunching starts the new build. At once: until this process goes, the helpers it spawns
@@ -424,6 +433,18 @@ if (refusal !== undefined) {
     });
   });
 }
+
+/** Set once a quit has begun, so an update it cancels shows no dialog. */
+let quitting = false;
+
+// A quit during an update stops the build first — its whole process group — rather than leaving it
+// to build, swap and stamp with nobody to relaunch, under a lock whose holder is gone.
+app.on("before-quit", (event) => {
+  quitting = true;
+  if (!updater.busy) return;
+  event.preventDefault();
+  void updater.cancel().then(() => app.quit());
+});
 
 /** How long quitting waits for the daemon to take the app's group off `claude/notify` (D53.9). */
 const LEAVE_WAIT_MS = 1500;

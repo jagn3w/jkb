@@ -66,10 +66,12 @@ land() {
     git_q -C "$seed" add -A && git_q -C "$seed" commit -q -m "$1" && git_q -C "$seed" push -q origin main
 }
 
-# build <app-home> <dest> [script] — run a build-app.sh (the clone's by default) with the stub pnpm.
+# build <app-home> <dest> [script [flag…]] — run a build-app.sh (the clone's by default) with the stub
+# pnpm, at <dest> (--dest, which only JKB_APP_BUILD_TEST=1 allows).
 build() {
-    local script="${3:-$1/src/scripts/build-app.sh}"
-    PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg" /bin/bash "$script" --app-home "$1" --dest "$2"
+    local home="$1" dest="$2" script="${3:-$1/src/scripts/build-app.sh}"
+    shift 3 2>/dev/null || shift $#
+    JKB_APP_BUILD_TEST=1 PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg" /bin/bash "$script" --app-home "$home" --dest "$dest" "$@"
 }
 
 # --- 1. the clone follows origin/main, never the checkout's branch ------------------------------
@@ -197,15 +199,35 @@ case4() {
         || fail "builder: failed build" "dest=$(cat "$dest/id" 2>&1) stamp=$(app_installed_commit "$app_home")"
     # A stamp that cannot be written fails the build, rather than reporting an install it did not record.
     mkdir -p "$app_home/installed.tmp/x"
-    if out="$(STUB_ID=third build "$app_home" "$dest" 2>&1)"; then
-        fail "builder: unwritable stamp" "exit 0: $out"
-    else
-        case "$out" in
-            *"could not be written"*) ok "builder: a stamp it cannot write fails the build, naming it" ;;
-            *) fail "builder: unwritable stamp" "$out" ;;
-        esac
-    fi
+    out="$(STUB_ID=third build "$app_home" "$dest" 2>&1)"; local rc=$?
+    case "$rc:$out" in
+        "$APP_BUILD_EXIT_UNRECORDED:"*"could not be written"*)
+            [ "$(cat "$dest/id" 2>/dev/null)" = third ] \
+                && ok "builder: swapped but unstamped exits $APP_BUILD_EXIT_UNRECORDED, not plain failure" \
+                || fail "builder: unwritable stamp" "the app was not swapped: $(cat "$dest/id" 2>&1)" ;;
+        *) fail "builder: unwritable stamp" "rc=$rc $out" ;;
+    esac
     rm -rf "$app_home/installed.tmp"
+    # --dest is for the tests: without JKB_APP_BUILD_TEST=1 it is refused, and nothing is built.
+    : >"$stub/log"
+    out="$(PNPM_HOME="$stub" /bin/bash "$src/scripts/build-app.sh" --app-home "$app_home" --dest "$work/c4/other" 2>&1)"; rc=$?
+    [ "$rc" = 2 ] && [ ! -s "$stub/log" ] && [ ! -e "$work/c4/other" ] \
+        && ok "builder: --dest outside the tests is refused" || fail "builder: --dest gate" "rc=$rc $out"
+    # A copy running from dest: nothing is swapped under it, unless the caller is that copy.
+    land four
+    app_clone_refresh "$checkout" "$src" 2>/dev/null
+    local pid
+    cp "$(command -v sleep)" "$(app_executable "$(uname -s)" "$dest")"
+    "$(app_executable "$(uname -s)" "$dest")" 30 & pid=$!
+    out="$(STUB_ID=fourth build "$app_home" "$dest" 2>&1)"; rc=$?
+    [ "$rc" = "$APP_BUILD_EXIT_RUNNING" ] && [ "$(cat "$dest/id")" = third ] \
+        && ok "builder: a running copy at dest is not swapped under ($APP_BUILD_EXIT_RUNNING)" \
+        || fail "builder: running" "rc=$rc id=$(cat "$dest/id") $out"
+    out="$(STUB_ID=fourth build "$app_home" "$dest" "$src/scripts/build-app.sh" --replacing-running 2>&1)"; rc=$?
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    [ "$rc" = 0 ] && [ "$(cat "$dest/id")" = fourth ] \
+        && ok "builder: --replacing-running (the app's own update) swaps under itself" \
+        || fail "builder: --replacing-running" "rc=$rc id=$(cat "$dest/id") $out"
 }
 
 # --- 5. app_swap: a failure leaves the installed app in place ------------------------------------
@@ -278,6 +300,12 @@ case6() {
         && ok "install_app: a held lock is busy, and is left to its holder" \
         || fail "install_app: busy" "$(cat "$work/c6/state")"
     rm -rf "$app_home/lock"
+    # The builder swapped but could not stamp: reported as such, not as a plain failure.
+    mkdir -p "$app_home/installed.tmp/x"
+    (HOME="$h" PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg6" install_app "$checkout" "$app_home" >/dev/null 2>&1; echo "$app_state" >"$work/c6/state")
+    [ "$(cat "$work/c6/state")" = unrecorded ] && ok "install_app: swapped but unstamped is unrecorded" \
+        || fail "install_app: unrecorded" "$(cat "$work/c6/state")"
+    rm -rf "$app_home/installed.tmp"
     (HOME="$h" PNPM_HOME="$stub" XDG_DATA_HOME="$work/xdg6" install_app "$checkout" "$app_home" >/dev/null 2>&1; echo "$app_state" >"$work/c6/state")
     [ "$(cat "$work/c6/state")" = installed ] && [ ! -e "$app_home/lock" ] \
         && ok "install_app: installs once nothing runs or holds the lock, and releases it" \
@@ -295,7 +323,7 @@ case6() {
         || fail "install_app: no origin" "$(cat "$work/c6/state")"
     # Every state install_app sets has a summary arm.
     local s out
-    for s in installed unchanged running busy no-builder skipped failed; do
+    for s in installed unchanged running busy unrecorded no-builder skipped failed; do
         out="$(printf 'app=%s /x\n' "$s" | render_setup_summary 2>&1)"
         case "$out" in
             *unrecognised*|"") fail "summary: app=$s" "$out" ;;
@@ -313,7 +341,7 @@ case7() {
     mkdir -p "$app_home/lock" && echo $$ >"$app_home/lock/pid" && echo theirs >"$app_home/lock/token"
     : >"$stub/log"
     out="$(build "$app_home" "$dest" 2>&1)"; local rc=$?
-    [ "$rc" = 75 ] && [ ! -s "$stub/log" ] && [ ! -e "$dest" ] && ok "lock: a held lock refuses the build (75) before it starts" \
+    [ "$rc" = "$APP_BUILD_EXIT_BUSY" ] && [ ! -s "$stub/log" ] && [ ! -e "$dest" ] && ok "lock: a held lock refuses the build (75) before it starts" \
         || fail "lock: held" "rc=$rc log=$(cat "$stub/log") $out"
     # The holder's own builder (its token) proceeds, and leaves the holder's lock alone.
     if JKB_APP_LOCK_TOKEN=theirs build "$app_home" "$dest" >/dev/null 2>&1 && [ -d "$dest" ] \
@@ -322,8 +350,33 @@ case7() {
     else
         fail "lock: holder's token" "dest=$(ls "$dest" 2>&1) lock=$(cat "$app_home/lock/token" 2>&1)"
     fi
-    # Left by a holder that died: broken, and the run's own lock is released at its end.
+    # The builder that recognised its holder's token recorded itself, so the lock outlives the holder.
+    case "$(cat "$app_home/lock/builder" 2>/dev/null)" in
+        ''|*[!0-9]*) fail "lock: builder pid" "$(ls "$app_home/lock")" ;;
+        *) ok "lock: the holder's builder records its pid in the lock" ;;
+    esac
     sh -c 'exit 0' & dead=$!; wait "$dead"
+    # The holder died but the builder it started is still running (the app quit mid-update): live.
+    sleep 30 & local builder=$!
+    echo "$dead" >"$app_home/lock/pid"; echo "$builder" >"$app_home/lock/builder"
+    : >"$stub/log"
+    out="$(build "$app_home" "$dest" 2>&1)"; rc=$?
+    kill "$builder" 2>/dev/null; wait "$builder" 2>/dev/null
+    [ "$rc" = "$APP_BUILD_EXIT_BUSY" ] && [ ! -s "$stub/log" ] && [ "$(cat "$app_home/lock/token")" = theirs ] \
+        && ok "lock: a dead holder whose builder still runs is busy, not stale" \
+        || fail "lock: live builder" "rc=$rc $out"
+    # Two runs break the same stale lock: the loser, finding the winner's fresh lock where the stale
+    # one was, puts it back rather than leaving the winner unlocked.
+    echo "$$" >"$app_home/lock/pid"; echo winner >"$app_home/lock/token"
+    if _app_lock_break "$app_home/lock" "$dead" 2>/dev/null; then
+        fail "lock: break race" "broke a lock that is no longer the dead holder's"
+    elif [ "$(cat "$app_home/lock/token" 2>/dev/null)" = winner ] && [ -z "$(ls -d "$app_home"/lock.stale.* 2>/dev/null)" ]; then
+        ok "lock: a lock taken since it was judged stale is put back, not left aside"
+    else
+        fail "lock: break race" "lock=$(cat "$app_home/lock/token" 2>&1) aside=$(ls -d "$app_home"/lock.stale.* 2>&1)"
+    fi
+    rm -f "$app_home/lock/builder"
+    # Left by a holder that died: broken, and the run's own lock is released at its end.
     echo "$dead" >"$app_home/lock/pid"
     land two; app_clone_refresh "$checkout" "$src" 2>/dev/null
     if build "$app_home" "$dest" >/dev/null 2>&1 && [ ! -e "$app_home/lock" ] && [ -z "$(ls -d "$app_home"/lock.stale.* 2>/dev/null)" ]; then

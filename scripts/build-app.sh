@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and install Code Factory, the jkb desktop app, from the app's clean clone (D53.3).
 #
-#   ~/.local/share/jkb-app/src/scripts/build-app.sh [--app-home DIR] [--dest DIR]
+#   ~/.local/share/jkb-app/src/scripts/build-app.sh [--app-home DIR] [--replacing-running]
 #
 # The app runs unsandboxed on this machine and opens host terminals, so it is built only from the
 # clone of origin/main under --app-home (default ~/.local/share/jkb-app; the clone is its `src/`),
@@ -10,14 +10,24 @@
 # with `JKB_APP_FROM_CHECKOUT=1 pnpm --filter @jkb/app dev` instead.
 #
 # It installs the frozen lockfile, builds @jkb/core and the app, packages it (electron-builder
-# --dir), copies it to --dest (default ~/Applications/Code Factory.app on macOS, <app-home>/app
-# elsewhere) through lib.sh's `app_swap`, and records the commit and the destination in
+# --dir), copies it to the one place the app runs from (~/Applications/Code Factory.app on macOS,
+# <app-home>/app elsewhere: lib.sh's `app_default_dest`, which the app's own identity check agrees
+# with) through lib.sh's `app_swap`, and records the commit and the destination in
 # <app-home>/installed. The commit is also built into the app (ui/app/out/commit), so the app knows
 # what IT is, which the stamp cannot say once something else has been swapped in under it. On Linux it
 # also writes a desktop entry.
 #
 # It holds lib.sh's app lock throughout (or recognises its caller's, passed in JKB_APP_LOCK_TOKEN),
-# so two installs never share the clone, app/dist or the swap; a run that finds the lock held exits 75.
+# so two installs never share the clone, app/dist or the swap.
+#
+# It does not swap under a running copy (lib.sh's `app_running`, checked right before the swap): a
+# running Electron app loads its helpers from the bundle by path. Only the app's own update passes
+# --replacing-running, because it is that copy and relaunches the moment this returns.
+#
+# Exit status: 0 installed; 75 another install holds the lock; 76 a copy is running, nothing swapped;
+# 77 the app WAS swapped in but the stamp could not be written (relaunch it; the next install
+# re-stamps); anything else, the installed app is unchanged. lib.sh's APP_BUILD_EXIT_* and
+# @jkb/core's BUILD_EXIT name the same codes.
 #
 # Repository selection (GIT_DIR and the rest) and Electron's variables are dropped first, for every
 # caller: the post-merge hook runs setup.sh with GIT_DIR naming the merged repository, and pnpm's
@@ -27,7 +37,9 @@
 # the installed app's update (ui/app/src/main/update.ts), after doing the same. Neither runs a
 # checkout's copy of this file: they run the clone's.
 #
-# Flags: --app-home DIR, --dest DIR, -h/--help.
+# Flags: --app-home DIR, --replacing-running, -h/--help. (--dest DIR exists for the tests only, with
+# JKB_APP_BUILD_TEST=1: an app installed anywhere else refuses to start and the stamp would vouch for
+# a place no update installs to.)
 set -euo pipefail
 
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
@@ -42,10 +54,16 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 
 app_home="$HOME/.local/share/jkb-app"
 dest=""
+replacing_running=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --app-home) app_home="${2:?--app-home needs a directory}"; shift ;;
-        --dest)     dest="${2:?--dest needs a directory}"; shift ;;
+        --replacing-running) replacing_running=1 ;;
+        --dest)
+            if [ "${JKB_APP_BUILD_TEST:-}" != 1 ]; then
+                echo "build-app.sh: --dest is for the tests: the app installs only where it runs from" >&2; exit 2
+            fi
+            dest="${2:?--dest needs a directory}"; shift ;;
         -h|--help)  sed -n '2,/^set -/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          echo "build-app.sh: unknown flag: $1 (see --help)" >&2; exit 2 ;;
     esac
@@ -67,7 +85,7 @@ if [ "$repo_root" != "$src_real" ]; then
   at origin/main (scripts/setup.sh makes it). To run a checkout deliberately:
     JKB_APP_FROM_CHECKOUT=1 pnpm --filter @jkb/app dev"
 fi
-app_lock "$app_home" || { printf 'build-app.sh: busy: another install holds the app lock\n' >&2; exit 75; }
+app_lock "$app_home" || { printf 'build-app.sh: busy: another install holds the app lock\n' >&2; exit "$APP_BUILD_EXIT_BUSY"; }
 trap 'app_unlock "$app_home"' EXIT
 app_clone_check "$repo_root" || die "refusing to build: $repo_root is not exactly origin/main"
 commit="$(_git -C "$repo_root" rev-parse HEAD)"
@@ -95,12 +113,20 @@ built="$(app_built_product "$repo_root/ui/app/dist" "$os")" || die "the package 
 
 # --- install ------------------------------------------------------------------------------------
 echo "==> installing $built at $dest"
+if [ "$replacing_running" = 0 ]; then
+    case "$(app_running "$os" "$dest"; echo $?)" in
+        0) printf 'build-app.sh: Code Factory is running from %s; quit it and re-run, or use its jkb ▸ Update from main…\n' "$dest" >&2
+           exit "$APP_BUILD_EXIT_RUNNING" ;;
+        2) warn "could not tell whether Code Factory is running (no ps); if it is, restart it after this" ;;
+    esac
+fi
 app_swap "$built" "$dest" "$app_home" || die "the installed app is unchanged"
 # The stamp last, written whole: it says what is installed and where, so it changes only once that is
 # true. A failure here is the script's failure (an && list is exempt from set -e).
 { printf 'commit=%s\ndest=%s\n' "$commit" "$dest" >"$app_home/installed.tmp" \
     && mv -f "$app_home/installed.tmp" "$app_home/installed"; } \
-    || die "the app at $dest is ${commit:0:12}, but the stamp $app_home/installed could not be written"
+    || { printf 'build-app.sh: the app at %s is %s, but the stamp %s/installed could not be written\n' "$dest" "${commit:0:12}" "$app_home" >&2
+         exit "$APP_BUILD_EXIT_UNRECORDED"; }
 
 if [ "$os" = Linux ]; then
     apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
