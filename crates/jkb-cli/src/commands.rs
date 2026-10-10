@@ -153,16 +153,12 @@ fn asset_path(base: &Path, kind: &Kind, stem: &str) -> PathBuf {
         .join(format!("{}.{}", installed_name(stem), kind.ext))
 }
 
-/// What a `jkb` from before the prefix rename installed, as `(dir, file)`: its own fixed list, not
-/// the current bundle's stems with the prefix taken off. Derived from the bundle, it named a user's
-/// own `agents/reviewer.md` as jkb's (no jkb ever wrote one) and stopped naming the workflows an old
-/// jkb really did write once the bundle stopped shipping them. Read-only: see [`legacy_siblings`].
+/// What a `jkb` from before the prefix rename installed, as `(dir, file)`: the two workflow scripts,
+/// the only assets ever written without the prefix (commands carried it from their first release,
+/// 7621cd1). A fixed list, not the current bundle's stems with the prefix taken off: derived, it
+/// named a user's own `agents/reviewer.md` and `commands/review.md` as jkb's, and stopped naming the
+/// workflows once the bundle no longer shipped them. Read-only: see [`legacy_siblings`].
 const LEGACY: &[(&str, &str)] = &[
-    ("commands", "design-pass.md"),
-    ("commands", "next-task.md"),
-    ("commands", "review.md"),
-    ("commands", "review-log.md"),
-    ("commands", "task-swarm.md"),
     ("workflows", "code-review.js"),
     ("workflows", "task-swarm.js"),
 ];
@@ -281,10 +277,10 @@ fn report_legacy(base: &Path) {
         return;
     }
     println!(
-        "\n{} unprefixed file(s) share a name with a bundled asset. A jkb from before the \
-         `{ASSET_PREFIX}` rename installed files under these names; this jkb neither writes nor \
-         removes them, because they may equally be your own. Delete by hand if they are not \
-         yours:",
+        "\n{} unprefixed workflow file(s) found. A jkb from before the `{ASSET_PREFIX}` rename \
+         installed its workflow scripts under these names, and jkb no longer ships workflows; \
+         this jkb neither writes nor removes them, because they may equally be your own. Delete \
+         by hand if they are not yours:",
         found.len()
     );
     for path in found {
@@ -733,13 +729,15 @@ mod tests {
         const OLD: &str = "// installed by a jkb from before the rename\n";
         let dir = tempfile::tempdir().expect("temp config dir");
         let base = dir.path();
-        std::fs::create_dir_all(base.join("commands")).unwrap();
-        let stale = base.join("commands").join("review.md");
+        std::fs::create_dir_all(base.join("workflows")).unwrap();
+        let stale = base.join("workflows").join("code-review.js");
         std::fs::write(&stale, OLD).unwrap();
-        // A user's own agent under a name jkb now ships prefixed: no jkb ever wrote it unprefixed,
-        // so it is not reported as one.
-        std::fs::create_dir_all(base.join("agents")).unwrap();
-        std::fs::write(base.join("agents").join("reviewer.md"), "mine").unwrap();
+        // A user's own command and agent under names jkb ships prefixed: no jkb ever wrote either
+        // unprefixed, so neither is reported as one.
+        for (dir, file) in [("commands", "review.md"), ("agents", "reviewer.md")] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+            std::fs::write(base.join(dir).join(file), "mine").unwrap();
+        }
 
         super::install_into(base).expect("install");
         super::uninstall_from(base).expect("uninstall");

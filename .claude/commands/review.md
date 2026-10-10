@@ -1,11 +1,12 @@
 ---
-description: Review the current change and file what it finds. One jkb-reviewer owns the round. It reviews alone, or splits a large change across up to three child reviewers, then files the findings as tasks and records the round against the branch, which is what `jkb task land` checks.
+description: Review the current change and file what it finds. This session coordinates; one jkb-reviewer reviews a small change, or up to three review the areas of a large one. The findings are filed as tasks and the round is recorded against the branch, which is what `jkb task land` checks.
 argument-hint: "[range]  [-- anything to focus on]"
 ---
 
-This command runs the repository's code review. This session coordinates it, and one
-`jkb-reviewer` subagent owns the round: it reviews the change, files every finding as a jkb task,
-and records the round against the branch. Its calls are attested as the reviewer role, so it may
+This command runs the repository's code review. This session coordinates it. For a small change,
+one `jkb-reviewer` subagent reviews it, files every finding as a jkb task, and records the round
+against the branch. For a large one, this session splits it across up to three reviewers and has the
+merged findings filed and recorded as one round. Its calls are attested as the reviewer role, so it may
 file and record, and it may not change code or task statuses. The prompts come from `jkb workflow
 agent show`, so an operator copy saved in Code Factory's Workflows tab is what runs.
 
@@ -66,12 +67,12 @@ jkb workflow agent show review-coordinator --var repo="$(git rev-parse --show-to
   --var diff_cmd="<diff_cmd>" --var findings_ns="$findings_ns" --var focus_block="<focus_block>"
 ```
 
-Follow what it prints. It tells you how to fill the reviewer's prompt and start the one
-`jkb-reviewer`.
+Follow what it prints. It tells you how to fill the reviewers' prompts, when to split, and how
+to file the pre-existing findings yourself.
 
 ## 3. Report
 
-Relay the reviewer's report:
+Relay the report:
 - **Findings for this change:** grouped by severity, each as `file:line` · summary.
 - **Pre-existing findings:** each with its backlog uid. If any of them is a must-fix, say so in a
   sentence. The branch can land over it, and somebody should still know it is there.

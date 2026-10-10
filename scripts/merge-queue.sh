@@ -14,9 +14,8 @@
 #               <base> and still changes nothing against it, however many commits it carries.
 #               Both are handed back.
 #   2  eject   — gate failed on the integrated result; <base> never moved.
-#   3  error   — setup problem: a worktree or branch the queue cannot use, a branch with no
-#               common ancestor with <base> at all, or another run holding this worktree's lock.
-#               Nothing changed.
+#   3  error   — setup problem: a worktree or branch the queue cannot use, or a branch with no
+#               common ancestor with <base> at all. Nothing changed.
 #   5  stall   — <branch> is already an ancestor of <base>, and the graph cannot say whether an
 #               earlier entry landed its work or it was never committed to. A person decides.
 #   4  stall   — this worktree needs a human. Three arms reach it, and they do NOT all mean the
@@ -134,11 +133,22 @@ queue_outcome() {
     0) echo landed ;;
     1 | 2) echo eject ;;
     3 | 4 | 5) echo stall ;;
-    *) echo "stall: unknown exit $1" ;;
+    *)
+      if [ "$1" -gt 128 ] 2>/dev/null; then
+        echo "stall: killed by signal $(($1 - 128))"
+      else
+        echo "stall: unknown exit $1"
+      fi
+      ;;
   esac
 }
-LOCK_HELD=""
-trap 'rc=$?; [ -n "$LOCK_HELD" ] && rmdir "$LOCK_HELD" 2>/dev/null; echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"' EXIT
+# A SIGNAL IS NOT A LANDING. Bash runs the EXIT trap on a fatal signal with `$?` still holding the
+# last command's status — measured: a TERM mid-gate printed `merge-queue: landed (exit 0)` while the
+# base never moved. Each one is turned into its own 128+n exit first, which classifies as a stall.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'rc=$?; echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"' EXIT
 
 # WHICH jkb, AND WHICH STORE. This script writes to the knowledge base (step 3 records the
 # landing), and a swarm run can be configured with its own binary (`cfg.jkb`) and its own database
@@ -152,15 +162,6 @@ trap 'rc=$?; [ -n "$LOCK_HELD" ] && rmdir "$LOCK_HELD" 2>/dev/null; echo "merge-
 : "${JKB:=jkb}"
 
 cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; exit 3; }
-# ONE RUN PER WORKTREE, HELD HERE. Two runs in one integration worktree interleave their checkouts,
-# so one gate builds the other's tree and its base fast-forwards onto a commit nothing gated. The
-# swarm used to serialise merges in its workflow script; a coordinator is told to, and this is what
-# makes forgetting harmless. `mkdir` is atomic everywhere (`flock` is not on macOS). A lock left by a
-# killed run stalls the next one with its path, for a person to remove.
-lock="$(git rev-parse --absolute-git-dir 2>/dev/null)/jkb-merge-queue.lock"
-mkdir "$lock" 2>/dev/null \
-  || { echo "error: another merge-queue run holds $lock (remove it if none is running)"; exit 3; }
-LOCK_HELD="$lock"
 git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; exit 3; }
 git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; exit 3; }
 # AND IT MUST HAVE SOMETHING TO GRAFT. A branch sitting at the base tip rebases to a no-op, and

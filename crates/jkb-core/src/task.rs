@@ -952,18 +952,25 @@ fn ids_json(ids: &[ItemId]) -> String {
     crate::sql::json_ids(ids.iter().map(|id| id.get()))
 }
 
-/// The ready frontier's ids, in [`ready`]'s order, at most `limit` of them — ordered and cut in SQL
-/// without loading a single body, for a caller that loads the rows it keeps one at a time.
+/// The ready frontier's ids among those `query` matches, in [`ready`]'s order, at most `limit` of
+/// them — ordered and cut in SQL without loading a single body, for a caller that loads the rows it
+/// keeps one at a time.
+///
+/// **The whole query, not its scope and tags.** This took only those two, so every other predicate
+/// a caller wrote (`-tag:`, `status:`, `priority<`) was dropped without a word and the frontier
+/// answered as if it had not been asked: the swarm coordinator's `-tag:swarm-settled=…` exclusion
+/// was a no-op, and a run whose given-up tasks came straight back never ended. `kind` is forced to
+/// `task` and readiness added; everything else the caller asked for narrows it.
 ///
 /// # Errors
 /// Returns an error if evaluation or the ordering query fails.
-pub fn ready_ids(
-    conn: &Connection,
-    scope: Scope,
-    tags: &[TagPred],
-    limit: Option<usize>,
-) -> Result<Vec<ItemId>> {
-    let ids = ready_query(scope, tags).evaluate(conn)?;
+pub fn ready_ids(conn: &Connection, query: Query, limit: Option<usize>) -> Result<Vec<ItemId>> {
+    let ids = Query {
+        kind: Some("task".to_owned()),
+        ready: true,
+        ..query
+    }
+    .evaluate(conn)?;
     let limit = limit.map_or(-1, |l| i64::try_from(l).unwrap_or(i64::MAX));
     let sql = format!(
         "SELECT id FROM items WHERE id IN (SELECT value FROM json_each(?1))
@@ -1091,8 +1098,14 @@ mod tests {
                 .map(|r| r.id)
                 .collect();
             assert_eq!(listed.len(), 7);
-            assert_eq!(super::ready_ids(c, Scope::All, &[], None)?, listed);
-            assert_eq!(super::ready_ids(c, Scope::All, &[], Some(3))?, listed[..3]);
+            assert_eq!(
+                super::ready_ids(c, crate::query::Query::default(), None)?,
+                listed
+            );
+            assert_eq!(
+                super::ready_ids(c, crate::query::Query::default(), Some(3))?,
+                listed[..3]
+            );
             let many: Vec<_> = (1..=40_000).map(jkb_types::ItemId::new).collect();
             assert_eq!(super::load_ordered(c, &many)?.len(), 7);
             Ok(())

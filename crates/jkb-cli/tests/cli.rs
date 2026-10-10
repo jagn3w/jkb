@@ -489,22 +489,32 @@ fn task_tag_add_and_remove_roundtrip() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let uid = add_task(&db, "taggable");
+    add_task(&db, "untouched");
 
     jkb(&db)
         .args(["task", "tag", "add", &uid, "size=small"])
         .assert()
         .success();
-    // Filtering the frontier by the tag finds it.
+    // Filtering the frontier by the tag finds it, and only it. (`tag:` is the query DSL's spelling;
+    // `#size=small` is quick-add's, and here it is a full-text word. This step used `#` and still
+    // passed while the frontier dropped every predicate but scope and tags: unfiltered, the frontier
+    // held the tagged task anyway.)
     jkb(&db)
-        .args(["--global", "task", "next", "#size=small"])
+        .args(["--global", "task", "next", "tag:size=small"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("taggable"));
+        .stdout(predicate::str::contains("taggable"))
+        .stdout(predicate::str::contains("untouched").not());
 
     jkb(&db)
         .args(["task", "tag", "rm", &uid, "size=small"])
         .assert()
         .success();
+    jkb(&db)
+        .args(["--global", "task", "next", "tag:size=small"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("taggable").not());
     // A malformed tag is rejected.
     jkb(&db)
         .args(["task", "tag", "add", &uid, "nofacet"])

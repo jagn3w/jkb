@@ -520,7 +520,7 @@ pub fn ready(
     let q = scoped(dsl, default_scope)?;
     // Ordered and limited over ids alone, then loaded a row at a time within the budget: loading the
     // frontier first held every task's body before `limit` cut it to one.
-    let ids = task::ready_ids(conn, q.scope, &q.tags, limit)?;
+    let ids = task::ready_ids(conn, q, limit)?;
     item_rows(conn, &ids, budget)
 }
 

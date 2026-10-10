@@ -1828,6 +1828,44 @@ fn the_ready_frontier_is_in_priority_order_and_honours_its_limit() {
     assert_eq!(uids(Some(2)), ["task:high", "task:low"]);
 }
 
+/// Every predicate of the frontier's query narrows it, not only its scope and tags: a negated tag
+/// used to be dropped without a word, so the swarm coordinator's `-tag:swarm-settled=<owner>` excluded
+/// nothing and a given-up group was ready again the moment its claim was released.
+#[test]
+fn the_ready_frontier_honours_every_predicate_it_is_given() {
+    use jkb_core::task;
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        for (uid, priority) in [("task:settled", Some(1)), ("task:fresh", Some(3))] {
+            let mut t = task::NewTask::new(uid, uid);
+            t.priority = priority;
+            t.home = "tasks/f".into();
+            task::create(c, m, &t)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    call(
+        &b,
+        json!({ "op": "task.tag", "uid": "task:settled", "facet_value": "swarm-settled=host:42",
+                "mode": "set" }),
+    )
+    .unwrap();
+    let uids = |dsl: &str| match call(
+        &b,
+        json!({ "op": "task.ready", "dsl": dsl, "default_scope": "tasks/f" }),
+    )
+    .unwrap()
+    {
+        Response::Items { items, .. } => items.into_iter().map(|i| i.uid).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(uids(""), ["task:settled", "task:fresh"]);
+    assert_eq!(uids("-tag:swarm-settled=host:42"), ["task:fresh"]);
+    assert_eq!(uids("priority>2"), ["task:fresh"]);
+}
+
 #[test]
 fn a_task_larger_than_the_budget_is_shown_whole_and_not_called_cut() {
     use jkb_core::task;

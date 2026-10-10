@@ -110,7 +110,7 @@ fn every_subagent_template_renders_as_an_agent_definition() {
         );
         assert!(!d.markdown.contains("{{"), "{} holds a placeholder", d.name);
     }
-    // A reviewer reads and runs, and may start children.
+    // A reviewer reads and runs; neither type can start a worker, which would attest as its own role.
     let tools = |n: &str| {
         defs.iter()
             .find(|d| d.name == n)
@@ -122,11 +122,14 @@ fn every_subagent_template_renders_as_an_agent_definition() {
     };
     assert_eq!(
         tools("jkb-reviewer").as_deref(),
-        Some("tools: Read, Grep, Glob, Bash, Agent")
+        Some("tools: Read, Grep, Glob, Bash")
     );
-    // ...and no `Agent`: an implementer that could start a `jkb-reviewer` could review its own branch.
     let imp = tools("jkb-implementer").unwrap();
-    assert!(imp.contains("Edit") && !imp.contains("Agent"), "{imp}");
+    assert!(imp.contains("Edit"), "{imp}");
+    for d in &defs {
+        let t = tools(&d.name).unwrap();
+        assert!(!t.contains("Agent"), "{} may start workers: {t}", d.name);
+    }
 }
 
 /// Every placeholder a coordinator template tells it to pass is one the target template has, and
@@ -896,6 +899,13 @@ fn setup_maps_every_subagent_type_to_its_templates_role() {
             "scripts/setup.sh does not map `{}` to `{}` (`{line}`)",
             a.name,
             a.def.role.as_str()
+        );
+        // ...and the bare type it replaces is cleared, not mapped: a repository's own `reviewer`
+        // agent must not attest as the reviewer.
+        let bare = a.name.trim_start_matches(super::SUBAGENT_PREFIX);
+        assert!(
+            !setup.contains(&format!("role map {bare} ")),
+            "scripts/setup.sh still maps the bare `{bare}`"
         );
     }
 }

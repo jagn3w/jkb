@@ -1442,6 +1442,13 @@ queue_outcome 99" 2>&1)"
         stall:\ unknown\ exit\ 99) ;;
         *) bad="$bad 99(undocumented-code-not-stalled:$out)" ;;
     esac
+    # ...and a death by signal stalls too, naming the signal, never falling into a real arm.
+    out="$(bash -c "$src
+queue_outcome 143" 2>&1)"
+    case "$out" in
+        stall:\ killed\ by\ signal\ 15) ;;
+        *) bad="$bad 143(signal-not-stalled:$out)" ;;
+    esac
 
     if [ -n "$bad" ]; then
         fail "queue-contract: codes" "merge-queue.sh documents $n exit codes and queue_outcome \

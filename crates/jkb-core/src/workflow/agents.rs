@@ -510,9 +510,11 @@ pub struct SubagentDef {
 /// standing contract, not its task — the task prompt a coordinator passes is the template it
 /// fills with `jkb workflow agent show`, which does honour an operator copy (and why a copy of a
 /// subagent template is refused: it would be shown as in effect and never installed). A worker that
-/// may write nothing beyond the KB gets a read-and-run tool list (no `Edit`/`Write`), with `Agent` so
-/// a reviewer can split a large change across children; one that writes code or git gets the editing
-/// tools and **no** `Agent`, so an implementer cannot start a reviewer of its own branch.
+/// may write nothing beyond the KB gets a read-and-run tool list (no `Edit`/`Write`); one that writes
+/// code or git gets the editing tools. **Neither gets `Agent`.** A subagent can start subagents
+/// (measured on this Claude Code: a nested start returned), and each child attests as its own type,
+/// so a reviewer holding `Agent` could start a `jkb-implementer` and edit code, and an implementer
+/// could start a reviewer of its own branch. Workers never start workers; a coordinator splits.
 ///
 /// # Errors
 /// [`Error::Types`] for a subagent template without the `jkb-` prefix, with a placeholder (a
@@ -540,7 +542,7 @@ pub fn subagent_definitions() -> Result<Vec<SubagentDef>> {
                 serde_json::to_string(&a.def.describe).map_err(|e| invalid(e.to_string()))?;
             let mut md = format!("---\nname: {}\ndescription: {describe}\n", a.name);
             md.push_str(match a.def.permissions.writes {
-                Writes::Nothing | Writes::Kb => "tools: Read, Grep, Glob, Bash, Agent\n",
+                Writes::Nothing | Writes::Kb => "tools: Read, Grep, Glob, Bash\n",
                 Writes::Git | Writes::Code => {
                     "tools: Read, Grep, Glob, Edit, Write, NotebookEdit, Bash, TodoWrite\n"
                 }

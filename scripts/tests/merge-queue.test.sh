@@ -186,20 +186,28 @@ echo "==> scripts/merge-queue.sh: what it exits, and whether the base moved"
 mkdir -p "$work/bin"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$JKB_CALLS"\nexit 0\n' >"$work/bin/jkb"
 chmod +x "$work/bin/jkb"
-case_locked() {      # a second run in the same worktree stalls, and leaves the holder's lock
-    local r lock; r="$(mkrepo locked)"
+case_signalled() {   # killed mid-gate: never `landed`, and the base never moves
+    local r pid out; r="$(mkrepo signalled)"
+    printf '#!/bin/sh\nsleep 5\nexit 0\n' >"$r/scripts/build.sh"
+    git -C "$r" add -A; git -C "$r" commit -qm slow-gate
     git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
     git -C "$r" checkout -q trunk
-    lock="$(git -C "$r" rev-parse --absolute-git-dir)/jkb-merge-queue.lock"
-    mkdir "$lock"
-    check "a run while another holds the worktree stalls" "$r" 3 still 0
-    [ -d "$lock" ] || fail "queue: lock" "the stalled run removed a lock it did not take"
-    rmdir "$lock"
-    check "the same branch lands once the lock is free" "$r" 0 moved 1
-    [ -d "$lock" ] && fail "queue: lock" "a finished run left its lock behind" || true
+    local pre; pre="$(git -C "$r" rev-parse trunk)"
+    ( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb JKB_CALLS="$r/.jkb-calls" \
+        exec bash scripts/merge-queue.sh feat trunk "$r" >"$work/signalled.out" 2>&1 ) &
+    pid=$!
+    sleep 2; kill -TERM "$pid"; wait "$pid" 2>/dev/null
+    out="$(tail -1 "$work/signalled.out")"
+    case "$out" in
+        "merge-queue: stall: killed by signal 15 (exit 143)")
+            ok "a queue killed mid-gate reports a stall, never a landing" ;;
+        *) fail "queue: signalled" "a TERM mid-gate ended with: $out" ;;
+    esac
+    [ "$(git -C "$r" rev-parse trunk)" = "$pre" ] \
+        || fail "queue: signalled base" "a queue killed mid-gate moved the base"
 }
 
-run_cases case_locked case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
+run_cases case_signalled case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
           case_conflict case_already_landed case_wedged case_already_merged
 
 finish
