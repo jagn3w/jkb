@@ -975,3 +975,103 @@ fn a_grant_no_longer_grantable_is_marked_in_the_full_listing() {
         .filter(|g| g.id != id)
         .all(|g| g.grantable));
 }
+
+/// `task.move` is granted as `task.place` is — the same permission, held to the moved task — and a
+/// scoped caller is held to the new parent too, as `task.add --under` is: a subtask moved under an
+/// unrelated task would hold that task off the frontier and its land gate.
+#[test]
+fn task_move_is_granted_as_task_place_and_held_to_the_parent_s_scope() {
+    let parse = |r: serde_json::Value| -> crate::Request { serde_json::from_value(r).unwrap() };
+    let place = parse(json!({ "op": "task.place", "uid": "u", "ns": "n" }));
+    let moved = parse(json!({ "op": "task.move", "uid": "u", "under": "p" }));
+    assert_eq!(moved.permission(), place.permission());
+    assert_eq!(moved.target(), place.target());
+
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let unrelated = add(&kb.op, "unrelated");
+    let under_a = |text: &str| match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": text, "under": a }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let (sub, sibling) = (under_a("sub"), under_a("sibling"));
+    let (_, token) = grant(&kb.op, "coordinator", Some(&a), "coord");
+    let c = kb.as_token(&token);
+
+    let e = refused(
+        &c,
+        json!({ "op": "task.move", "uid": sub, "under": unrelated }),
+    );
+    assert!(
+        e.message.contains("moves tasks only under that task"),
+        "{e:?}"
+    );
+    match ok(
+        &c,
+        json!({ "op": "task.move", "uid": sub, "under": sibling }),
+    ) {
+        Response::TaskMoved { moved } => assert!(moved.moved, "{moved:?}"),
+        other => panic!("{other:?}"),
+    }
+    let e = refused(
+        &c,
+        json!({ "op": "task.move", "uid": unrelated, "under": a }),
+    );
+    assert!(e.message.contains("scoped to another task"), "{e:?}");
+    let (_, rev) = grant(&kb.op, "reviewer", Some(&a), "rev-1");
+    refused(
+        &kb.as_token(&rev),
+        json!({ "op": "task.move", "uid": sub, "under": a }),
+    );
+}
+
+/// An attested subagent's first write binds it to the task that write names; a `task.move` first
+/// would bind it to the moved task and then refuse every parent outside it. Refused up front, with
+/// how to bind, and the subagent left unbound.
+#[test]
+fn an_attested_subagent_s_first_write_cannot_be_a_move() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    let under_a = |text: &str| match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": text, "under": a }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let (sub, sibling) = (under_a("sub"), under_a("sibling"));
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "implementer", "role": "implementer" }),
+    );
+    let hook = kb.as_token(&container);
+    let ticket = |tool: &str| match ok(
+        &hook,
+        json!({ "op": "attest.mint", "session": "s1", "agent_id": "ag1",
+                "agent_type": "implementer", "tool_use_id": tool }),
+    ) {
+        Response::Ticket { token } => kb.as_token(&token),
+        other => panic!("{other:?}"),
+    };
+    let e = refused(
+        &ticket("tool-1"),
+        json!({ "op": "task.move", "uid": sub, "under": sibling }),
+    );
+    assert!(e.message.contains("jkb role bind"), "{e:?}");
+    // Still unbound: it binds to `a` and then moves within it.
+    ok(&ticket("tool-2"), json!({ "op": "role.bind", "uid": a }));
+    match ok(
+        &ticket("tool-3"),
+        json!({ "op": "task.move", "uid": sub, "under": sibling }),
+    ) {
+        Response::TaskMoved { moved } => assert!(moved.moved, "{moved:?}"),
+        other => panic!("{other:?}"),
+    }
+}

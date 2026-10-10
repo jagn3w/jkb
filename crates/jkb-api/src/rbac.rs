@@ -257,6 +257,7 @@ impl Request {
             | Self::TaskDepend { .. }
             | Self::TaskUndepend { .. }
             | Self::TaskPlace { .. }
+            | Self::TaskMove { .. }
             | Self::TaskUnplace { .. }
             | Self::TaskBind { .. }
             | Self::IngestText(_)
@@ -327,6 +328,7 @@ impl Request {
             | Self::TaskDepend { uid, .. }
             | Self::TaskUndepend { uid, .. }
             | Self::TaskPlace { uid, .. }
+            | Self::TaskMove { uid, .. }
             | Self::TaskUnplace { uid, .. }
             | Self::TaskBind { uid, .. }
             | Self::TaskClaim { uid, .. }
@@ -1028,6 +1030,14 @@ pub fn authorize(
             }
             Ok(Admit::Run)
         }
+        // A first write binds the subagent to the task it names; a move also writes its new parent,
+        // which would then have to be inside the task just bound — the moved one. Refused up front,
+        // as an unbound review is, rather than as a misleading scope or cycle refusal.
+        (None, Some(_)) if matches!(request, Request::TaskMove { .. }) => Err(forbidden(format!(
+            "`{op}` refused: {} has not bound to the task it works on — run `jkb role bind <uid>` \
+             first, then move tasks under that task or its subtasks",
+            principal.label
+        ))),
         (None, Some((session, agent))) => Ok(Admit::BindThenRun {
             session: session.to_owned(),
             agent_id: agent.to_owned(),

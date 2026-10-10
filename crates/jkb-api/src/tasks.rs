@@ -783,6 +783,62 @@ pub fn place(
     Ok(())
 }
 
+/// What a `task.move` did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Moved {
+    /// Whether it moved: `false` when the task was already under that parent, and nothing was written.
+    pub moved: bool,
+    /// The parent it left, by uid; absent when it had none, or did not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The parent it is under now, by uid.
+    pub under: String,
+}
+
+/// `task.move`: move the existing task `reference` under the parent `under` — a task or an
+/// execution plan's step — through [`task::move_under`]: one transaction, its old `parent_of` edge
+/// and containment replaced, its placements and binding untouched.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] for either reference; [`ErrorCode::Forbidden`] under `roots`, or — for a
+/// caller held to the task `scope` — a new parent outside that task; a refusal from
+/// [`task::move_under`] (not a task, either bound to a file, a plan or span parent, a cycle); or a
+/// failed write.
+pub fn move_under(
+    conn: &Connection,
+    meta: &jkb_core::WriteMeta,
+    reference: &str,
+    under: &str,
+    roots: Option<&FileRoots>,
+    scope: Option<ItemId>,
+) -> Result<Moved, ApiError> {
+    let id = writable(conn, reference, roots)?;
+    let parent = task::resolve_ref(conn, under)?.ok_or_else(|| no_item(under))?;
+    // The op's target is the moved task; the parent is written too — it gains a subtask, which
+    // holds it off the frontier and its land gate — so a scoped caller is held to it as
+    // `task.add --under` is. Here, on the scope the caller has once admitted, as `task.place`.
+    if let Some(scope) = scope {
+        if !jkb_core::roles::in_scope(conn, scope, parent)? {
+            return Err(forbidden(format!(
+                "a caller held to one task moves tasks only under that task or its subtasks, not \
+                 under `{under}`"
+            )));
+        }
+    }
+    let uid_of = |id: ItemId| -> Result<String, ApiError> {
+        Ok(item::get(conn, id)?.map_or_else(|| id.to_string(), |m| m.uid))
+    };
+    let (moved, from) = match task::move_under(conn, meta, id, parent)? {
+        task::Moved::Unchanged => (false, None),
+        task::Moved::Moved { from } => (true, from.map(uid_of).transpose()?),
+    };
+    Ok(Moved {
+        moved,
+        from,
+        under: uid_of(parent)?,
+    })
+}
+
 /// `task.unplace`: remove a task's reference placement under `ns`; how many were removed (a missing
 /// namespace or mirror removes none).
 ///

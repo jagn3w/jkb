@@ -118,6 +118,7 @@ pub const fn support(command: &Command) -> Support {
                 | TaskCmd::Depend { .. }
                 | TaskCmd::Undepend { .. }
                 | TaskCmd::Place { .. }
+                | TaskCmd::Move { .. }
                 | TaskCmd::Unplace { .. }
                 | TaskCmd::Bind { .. }
                 | TaskCmd::Claim { .. }

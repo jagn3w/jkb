@@ -5475,3 +5475,72 @@ fn an_edit_with_a_stale_expected_base_is_refused_and_writes_nothing() {
         .assert()
         .failure();
 }
+
+/// `jkb task move`: an existing task re-parented under a plan step, answered in `--json`, a refused
+/// move writing nothing, and `jkb undo` putting the old parent back.
+#[test]
+fn task_move_reparents_under_a_step_refuses_a_plan_and_undoes() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = jkb(&db).arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let design = json(&[
+        "design", "create", "Factory", "--repo", "jkb", "--body", "Build.",
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let plan = json(&["design", "plan", "create", &design, "Cut", "--step", "one"]);
+    let plan_uid = plan["uid"].as_str().unwrap().to_owned();
+    let step = plan["steps"][0]["uid"].as_str().unwrap().to_owned();
+    let parent = add_task(&db, "old parent");
+    let child = json(&["task", "add", "the child", "--under", &parent, "--managed"])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let lists = |of: &str, uid: &str| -> bool {
+        let out = jkb(&db)
+            .args(["--json", "task", "subtasks", of])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).contains(uid)
+    };
+
+    let moved = json(&["task", "move", &child, "--under", &step]);
+    assert_eq!(
+        moved,
+        serde_json::json!({ "uid": child, "moved": true, "from": parent, "under": step })
+    );
+    assert!(lists(&step, &child) && !lists(&parent, &child));
+    jkb(&db)
+        .args(["design", "plan", "ls", &design])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("[open] {child}")));
+    jkb(&db)
+        .args(["task", "move", &child, "--under", &step])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"));
+
+    // A plan holds no tasks: refused, and the step keeps it.
+    jkb(&db)
+        .args(["task", "move", &child, "--under", &plan_uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("holds no tasks"));
+    assert!(lists(&step, &child));
+
+    jkb(&db).args(["undo"]).assert().success();
+    assert!(lists(&parent, &child), "undo puts the old parent back");
+    assert!(!lists(&step, &child));
+    jkb(&db)
+        .args(["design", "plan", "ls", &design])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&child).not());
+}

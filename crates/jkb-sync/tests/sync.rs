@@ -3239,3 +3239,55 @@ fn every_remedy_is_re_judged_and_a_settled_file_holds_no_judgement() {
     jkb_sync::sync_kb_changes(&db, "docs/plan", &mut judged).unwrap();
     assert_eq!(journal(&db, &uri_for(&tasks)).unwrap().0, "ok");
 }
+
+/// A file that swaps a parent and its child is not a cycle: `edge::link` refuses a `parent_of`
+/// cycle, so the reconcile drops the old edge before adding the new one.
+#[test]
+fn a_disk_reindent_that_swaps_parent_and_child_is_applied() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Backend\n- [ ] Set up CI ^setup\n  - [ ] Fix flaky test ^fix\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (setup, fix) = (format!("{uri}#setup"), format!("{uri}#fix"));
+    assert!(has_parent_edge(&db, &setup, &fix));
+
+    // Swapped back and forth: which source the reconcile visits first is a hash map's order, and
+    // only one of the two orders reached the old edge before dropping it.
+    for round in 0..8 {
+        let (parent, child) = if round % 2 == 0 {
+            (
+                ("Fix flaky test", "fix", &fix),
+                ("Set up CI", "setup", &setup),
+            )
+        } else {
+            (
+                ("Set up CI", "setup", &setup),
+                ("Fix flaky test", "fix", &fix),
+            )
+        };
+        fs::write(
+            &file,
+            format!(
+                "## Backend\n- [ ] {} ^{}\n  - [ ] {} ^{}\n",
+                parent.0, parent.1, child.0, child.1
+            ),
+        )
+        .unwrap();
+        sync(&db, "docs/plan").unwrap();
+        assert!(
+            has_parent_edge(&db, parent.2, child.2),
+            "round {round}: the swap landed"
+        );
+        assert!(
+            !has_parent_edge(&db, child.2, parent.2),
+            "round {round}: the old edge is gone"
+        );
+    }
+}

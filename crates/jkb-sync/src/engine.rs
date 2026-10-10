@@ -2395,6 +2395,7 @@ fn reconcile_edges(
         }
         // Current edges for all sources in one query, indexed by source.
         let mut current = edge::edges_from_many(conn, &srcs, kind)?;
+        let mut adds = Vec::new();
         for &src in &srcs {
             let want = desired.get(&src).cloned().unwrap_or_default();
             let have: HashSet<ItemId> = current
@@ -2402,12 +2403,16 @@ fn reconcile_edges(
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
-            for &dst in want.difference(&have) {
-                edge::link(conn, meta, src, dst, kind, None)?;
-            }
             for &dst in have.difference(&want) {
                 edge::unlink(conn, meta, src, dst, kind)?;
             }
+            adds.extend(want.difference(&have).map(|&dst| (src, dst)));
+        }
+        // Every removal before any addition: `edge::link` refuses an edge that closes a cycle
+        // with the edges present, so a file that swaps a parent and its child (or reverses a
+        // dependency) would be refused against the old edge it is about to drop.
+        for (src, dst) in adds {
+            edge::link(conn, meta, src, dst, kind, None)?;
         }
     }
     Ok(())

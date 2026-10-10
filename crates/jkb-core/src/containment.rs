@@ -13,10 +13,10 @@
 //!
 //! ## What this does NOT replace
 //! The `parent_of` / `derived_from` edges survive, carrying what a containment row cannot:
-//! [`crate::edge::link`]'s cycle guard, `jkb related` traversal, `derived_from` as the
-//! provenance search reads for `source_document`, and the `tasks` file serializer's
-//! indentation round-trip. [`crate::task::add_subtask`] writes both the edge and the
-//! containment row in one call so they cannot drift; [`contain`] records only the row.
+//! `jkb related` traversal, `derived_from` as the provenance search reads for
+//! `source_document`, and the `tasks` file serializer's indentation round-trip.
+//! [`crate::task::add_subtask`] writes both the edge and the containment row in one call so they
+//! cannot drift; [`contain`] records only the row.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
@@ -30,12 +30,12 @@ use crate::{changelog, Result};
 /// Record that `child` is contained by `parent`, at `position` among its siblings.
 /// Idempotent: re-containing the same pair updates the position.
 ///
-/// Prefer `crate::task::add_subtask`, which also links the `parent_of` edge (and so
-/// inherits its cycle guard). Use this directly only where the relationship edge is already
+/// Prefer `crate::task::add_subtask`, which also links the `parent_of` edge (cycle-guarded by
+/// [`crate::edge::link`]). Use this directly only where the relationship edge is already
 /// written, as the ingest pipeline does for chunks.
 ///
 /// # Errors
-/// Returns a validation error if `child` and `parent` are the same item; otherwise an error
+/// Returns a validation error if `child` is `parent` or contains it; otherwise an error
 /// if a statement or the changelog append fails.
 pub fn contain(
     conn: &Connection,
@@ -48,6 +48,26 @@ pub fn contain(
         return Err(
             jkb_types::Error::Validation(format!("item {child} cannot contain itself")).into(),
         );
+    }
+    // Containment is a tree: refuse a parent already inside `child`. The edge guard
+    // (`edge::link`) cannot see this — a containment row can outlive its `parent_of` edge, which
+    // the `tasks` file sync removes without touching containment.
+    let inside: Option<i64> = conn
+        .prepare_cached(
+            "WITH RECURSIVE up(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT c.parent_item_id FROM containment c JOIN up ON c.child_item_id = up.id
+             )
+             SELECT 1 FROM up WHERE id = ?2 LIMIT 1",
+        )?
+        .query_row(params![parent.get(), child.get()], |r| r.get(0))
+        .optional()?;
+    if inside.is_some() {
+        return Err(jkb_types::Error::Validation(format!(
+            "item {parent} is inside item {child}, so {child} cannot be contained by it"
+        ))
+        .into());
     }
     // This is an upsert, so whether it is an insert has to be established BEFORE writing.
     // Logging a re-parent as an `insert` made `undo` take the generic delete-by-rowid inverse
