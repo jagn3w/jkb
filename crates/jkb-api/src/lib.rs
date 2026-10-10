@@ -332,7 +332,8 @@ pub enum Request {
     /// The ready frontier.
     #[serde(rename = "task.ready")]
     TaskReady {
-        /// Query DSL: its scope and tags narrow the frontier.
+        /// Query DSL: every predicate narrows the frontier (`kind` is forced to `task`, and a `~`
+        /// vector term is not applied).
         dsl: String,
         /// The scope when the DSL names none.
         #[serde(default)]

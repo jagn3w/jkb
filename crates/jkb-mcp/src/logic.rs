@@ -92,8 +92,8 @@ pub struct GetContextArgs {
     pub n: Option<usize>,
 }
 
-/// `query` / `task_next` arguments (a DSL string; `task_next` uses only its
-/// scope/tag parts).
+/// `query` / `task_next` arguments (a DSL string; for `task_next` every predicate narrows the
+/// frontier, with the kind forced to `task`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryArgs {
     /// Query DSL (may be empty for `task_next` = the whole ready frontier).

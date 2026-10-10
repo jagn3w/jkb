@@ -186,25 +186,32 @@ echo "==> scripts/merge-queue.sh: what it exits, and whether the base moved"
 mkdir -p "$work/bin"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$JKB_CALLS"\nexit 0\n' >"$work/bin/jkb"
 chmod +x "$work/bin/jkb"
-case_signalled() {   # killed mid-gate: never `landed`, and the base never moves
-    local r pid out; r="$(mkrepo signalled)"
+case_signalled() {   # killed mid-gate by any signal: never `landed`, and the base never moves
+    local r pid out sig pre bad=""; r="$(mkrepo signalled)"
     printf '#!/bin/sh\nsleep 5\nexit 0\n' >"$r/scripts/build.sh"
     git -C "$r" add -A; git -C "$r" commit -qm slow-gate
     git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
     git -C "$r" checkout -q trunk
-    local pre; pre="$(git -C "$r" rev-parse trunk)"
-    ( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb JKB_CALLS="$r/.jkb-calls" \
-        exec bash scripts/merge-queue.sh feat trunk "$r" >"$work/signalled.out" 2>&1 ) &
-    pid=$!
-    sleep 2; kill -TERM "$pid"; wait "$pid" 2>/dev/null
-    out="$(tail -1 "$work/signalled.out")"
-    case "$out" in
-        "merge-queue: stall: killed by signal 15 (exit 143)")
-            ok "a queue killed mid-gate reports a stall, never a landing" ;;
-        *) fail "queue: signalled" "a TERM mid-gate ended with: $out" ;;
-    esac
-    [ "$(git -C "$r" rev-parse trunk)" = "$pre" ] \
-        || fail "queue: signalled base" "a queue killed mid-gate moved the base"
+    pre="$(git -C "$r" rev-parse trunk)"
+    # TERM and HUP are what a timeout or a closed terminal sends; PIPE and USR1 are ones nothing names,
+    # which is the point: the outcome must not depend on which signals someone thought to trap. (Not
+    # INT: a non-interactive shell starts background jobs with SIGINT ignored, so the queue would run
+    # to its real end and the case would test nothing.)
+    for sig in TERM HUP PIPE USR1; do
+        git -C "$r" checkout -q trunk 2>/dev/null; git -C "$r" reset -q --hard "$pre"
+        ( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb JKB_CALLS="$r/.jkb-calls" \
+            exec bash scripts/merge-queue.sh feat trunk "$r" >"$work/signalled.out" 2>&1 ) &
+        pid=$!
+        sleep 2; kill -s "$sig" "$pid"; wait "$pid" 2>/dev/null
+        out="$(tail -1 "$work/signalled.out")"
+        case "$out" in
+            "merge-queue: stall: ended without an outcome (exit "*")") ;;
+            *) bad=1; fail "queue: signalled $sig" "a $sig mid-gate ended with: $out"; continue ;;
+        esac
+        [ "$(git -C "$r" rev-parse trunk)" = "$pre" ] \
+            || { bad=1; fail "queue: signalled $sig base" "a queue killed by $sig mid-gate moved the base"; }
+    done
+    [ -n "$bad" ] || ok "a queue killed mid-gate by TERM, HUP, PIPE or USR1 reports a stall and leaves the base"
 }
 
 run_cases case_signalled case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \

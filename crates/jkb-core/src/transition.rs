@@ -968,7 +968,17 @@ mod tests {
         assert_eq!(found.unverifiable[0].owner, "agent:01JBX7Q4");
         assert_eq!(claimant_of(&db, id).as_deref(), Some("agent:01JBX7Q4"));
         // ...and the frontier still excludes it, so it is held rather than quietly handed out.
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert!(frontier.is_empty());
     }
 

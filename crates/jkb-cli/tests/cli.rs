@@ -496,7 +496,7 @@ fn task_tag_add_and_remove_roundtrip() {
         .assert()
         .success();
     // Filtering the frontier by the tag finds it, and only it. (`tag:` is the query DSL's spelling;
-    // `#size=small` is quick-add's, and here it is a full-text word. This step used `#` and still
+    // `#size=small` is quick-add's, and here it is a full-text word, which FTS5 rejects. This step used `#` and still
     // passed while the frontier dropped every predicate but scope and tags: unfiltered, the frontier
     // held the tagged task anyway.)
     jkb(&db)

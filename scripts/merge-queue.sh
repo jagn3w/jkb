@@ -133,22 +133,22 @@ queue_outcome() {
     0) echo landed ;;
     1 | 2) echo eject ;;
     3 | 4 | 5) echo stall ;;
-    *)
-      if [ "$1" -gt 128 ] 2>/dev/null; then
-        echo "stall: killed by signal $(($1 - 128))"
-      else
-        echo "stall: unknown exit $1"
-      fi
-      ;;
+    *) echo "stall: unknown exit $1" ;;
   esac
 }
-# A SIGNAL IS NOT A LANDING. Bash runs the EXIT trap on a fatal signal with `$?` still holding the
-# last command's status — measured: a TERM mid-gate printed `merge-queue: landed (exit 0)` while the
-# base never moved. Each one is turned into its own 128+n exit first, which classifies as a stall.
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'rc=$?; echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"' EXIT
+# AN OUTCOME IS ONLY WHAT THE SCRIPT DECIDED. Bash runs the EXIT trap on a fatal signal with `$?`
+# still holding the last command's status — measured: TERM, PIPE, ALRM and USR1 mid-gate each printed
+# `merge-queue: landed (exit 0)` while the base never moved. Trapping signals one by one left the rest
+# reporting landings, so every deliberate exit goes through `finish`, which records its code, and an
+# exit that did not (a signal, a crash) is a stall whatever `$?` says.
+DECIDED=""
+finish() { DECIDED="$1"; exit "$1"; }
+trap 'rc=$?
+if [ "$DECIDED" = "$rc" ]; then
+  echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"
+else
+  echo "merge-queue: stall: ended without an outcome (exit $rc)"
+fi' EXIT
 
 # WHICH jkb, AND WHICH STORE. This script writes to the knowledge base (step 3 records the
 # landing), and a swarm run can be configured with its own binary (`cfg.jkb`) and its own database
@@ -161,9 +161,9 @@ trap 'rc=$?; echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"' EXIT
 # `--db` to thread through, and no second place for a future jkb call in this script to forget.
 : "${JKB:=jkb}"
 
-cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; exit 3; }
-git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; exit 3; }
-git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; exit 3; }
+cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; finish 3; }
+git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; finish 3; }
+git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; finish 3; }
 # AND IT MUST HAVE SOMETHING TO GRAFT. A branch sitting at the base tip rebases to a no-op, and
 # `merge --ff-only` then answers "Already up to date." with exit 0 — so the queue printed `landed:`
 # and called `jkb task landed`, which drives every task recording that branch to done with
@@ -196,7 +196,7 @@ git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branc
 _merge_base="$(git merge-base "$BASE" "$BRANCH" 2>/dev/null)" || _merge_base=""
 if [ -z "$_merge_base" ]; then
   echo "error: $BRANCH and $BASE have no common ancestor"
-  exit 3
+  finish 3
 fi
 
 # AN ANCESTOR IS A QUESTION THE GRAPH CANNOT ANSWER, so it is the one case that goes to a person.
@@ -214,7 +214,7 @@ fi
 # closed. Stalling says the true thing: somebody has to look.
 if git merge-base --is-ancestor "$BRANCH" "$BASE" 2>/dev/null; then
   echo "stall: $BRANCH is already an ancestor of $BASE — either an earlier entry landed its work and it was rebased since, or it was never committed to. The graph cannot tell those apart; close it with \`jkb task landed\` if the work is in, or send it back if it is not."
-  exit 5
+  finish 5
 fi
 
 # ...AND OTHERWISE, WHAT THE BRANCH CONTRIBUTES. A commit count does not answer that: measured on
@@ -229,7 +229,7 @@ fi
 # ahead is an ancestor and is answered above.
 if git diff --quiet "$_merge_base" "$BRANCH"; then
   echo "eject: $BRANCH diverged from $BASE but changes nothing against it — no work to land, however many commits it carries. Implement it, commit, and resubmit."
-  exit 1
+  finish 1
 fi
 
 PRE=$(git rev-parse HEAD)   # the base tip before this graft: what the gated result is compared
@@ -248,13 +248,13 @@ PRE=$(git rev-parse HEAD)   # the base tip before this graft: what the gated res
 if ! git checkout --detach "$BRANCH" >/tmp/merge-queue.log 2>&1; then
   git switch "$BASE" >/dev/null 2>&1
   echo "eject: cannot detach at $BRANCH (see /tmp/merge-queue.log)"
-  exit 1
+  finish 1
 fi
 if ! git rebase "$BASE" >/tmp/merge-queue.log 2>&1; then
   git rebase --abort >/dev/null 2>&1 || true
   git switch "$BASE" >/dev/null 2>&1
   echo "eject: rebase conflict onto $BASE"
-  exit 1
+  finish 1
 fi
 GRAFT=$(git rev-parse HEAD)   # the rebased commits (detached HEAD)
 
@@ -301,10 +301,10 @@ if ! { ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
   # is a claim about who wrote it last, and this script has more than one writer.
   if ! git switch "$BASE" >/tmp/merge-queue-switch.log 2>&1; then
     echo "stall: THE GATE FAILED after $(( $(date +%s) - start ))s (these commits did NOT pass) and this worktree could not be returned to $BASE — it is left detached at $GRAFT and the next run will fail at startup. Do NOT fast-forward $BASE onto it: the commits are ungated. Clear it by hand. git said: $(sed -n 1p /tmp/merge-queue-switch.log)"
-    exit 4
+    finish 4
   fi
   echo "eject: gate failed after $(( $(date +%s) - start ))s (see /tmp/merge-queue-*.log)"
-  exit 2
+  finish 2
 fi
 
 # 3. Green — put $BASE on the gated commit.
@@ -326,7 +326,7 @@ fi
 # `classifyMerge` was rewritten to defer to never reached a person at all.
 if ! git switch "$BASE" >/tmp/merge-queue-switch.log 2>&1; then
   echo "stall: the graft PASSED the gate, but $BASE could not be checked out again — another worktree may hold it, this tree may have changes the switch would overwrite, or an index.lock is held. git said: $(sed -n 1p /tmp/merge-queue-switch.log)"
-  exit 4
+  finish 4
 fi
 # NOTHING TO ADD IS ASKED OF THE CONTENT, NOT OF THE COMMIT COUNT — and it is asked HERE, after
 # the rebase, because at entry the two cases that reach an identical tree cannot be told apart.
@@ -345,7 +345,7 @@ if git diff --quiet "$PRE" "$GRAFT"; then
   "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
     || echo "note: could not record the landing of $BRANCH"
   echo "landed: $BRANCH → $BASE (no new content; $BASE already has everything this branch adds)"
-  exit 0
+  finish 0
 fi
 # HOOKS OFF. A fast-forward fires `post-merge`, which in this repository runs setup.sh —
 # cargo-installing the jkb binary, rebuilding the extension, reinstalling the watcher service.
@@ -354,7 +354,7 @@ fi
 # place to reinstall an operator's tooling mid-run.
 if ! git -c core.hooksPath=/dev/null merge --ff-only "$GRAFT" >/tmp/merge-queue-ff.log 2>&1; then
   echo "stall: the graft PASSED the gate, but the fast-forward of $BASE onto it failed. git said: $(sed -n 1p /tmp/merge-queue-ff.log)"
-  exit 4
+  finish 4
 fi
 # ...AND THE BASE MUST HAVE MOVED, which after the tree check above should be unreachable: a
 # fast-forward that leaves HEAD where it was means $GRAFT was already an ancestor, and then the
@@ -366,7 +366,7 @@ if [ "$(git rev-parse HEAD)" = "$PRE" ]; then
   "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
     || echo "note: could not record the landing of $BRANCH"
   echo "landed: $BRANCH → $BASE (no new commits; its content was already in $BASE)"
-  exit 0
+  finish 0
 fi
 
 # 4. Record that jkb itself grafted this branch (design D48), which is what closes the group's
@@ -380,4 +380,4 @@ fi
 "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
   || echo "note: could not record the landing of $BRANCH (the graft itself is done)"
 echo "landed: $BRANCH → $BASE in $(( $(date +%s) - start ))s"
-exit 0
+finish 0

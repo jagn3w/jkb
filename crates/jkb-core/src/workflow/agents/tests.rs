@@ -892,6 +892,24 @@ fn setup_maps_every_subagent_type_to_its_templates_role() {
         .filter(|a| a.def.workflow == super::SUBAGENTS_WORKFLOW)
         .collect();
     assert!(!subagents.is_empty());
+    // No loop maps a type to a role spelled by the same variable: that shape cannot be read here.
+    assert!(
+        !setup.contains(r#"role map "$t" "$t""#),
+        "scripts/setup.sh maps types through a loop variable, which this test cannot read"
+    );
+    let lines: Vec<&str> = setup.lines().collect();
+    let clear_at = lines
+        .iter()
+        .position(|l| l.contains(r#"role map "$t" --clear"#))
+        .expect("scripts/setup.sh has no clear loop");
+    let cleared: Vec<String> = lines[clear_at - 1]
+        .trim()
+        .strip_prefix("for t in ")
+        .and_then(|l| l.strip_suffix("; do"))
+        .expect("the clear loop's `for t in …; do` line")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
     for a in subagents {
         let line = format!("role map {} {} ", a.name, a.def.role.as_str());
         assert!(
@@ -901,11 +919,17 @@ fn setup_maps_every_subagent_type_to_its_templates_role() {
             a.def.role.as_str()
         );
         // ...and the bare type it replaces is cleared, not mapped: a repository's own `reviewer`
-        // agent must not attest as the reviewer.
+        // agent must not attest as the reviewer. Read from the clear loop's word list, because a
+        // literal search misses a mapping spelled through a loop variable — which is how the bare
+        // types were mapped (`for t in designer implementer reviewer; … role map "$t" "$t"`).
         let bare = a.name.trim_start_matches(super::SUBAGENT_PREFIX);
         assert!(
             !setup.contains(&format!("role map {bare} ")),
             "scripts/setup.sh still maps the bare `{bare}`"
+        );
+        assert!(
+            cleared.iter().any(|w| w == bare),
+            "scripts/setup.sh does not clear the bare `{bare}` (cleared: {cleared:?})"
         );
     }
 }

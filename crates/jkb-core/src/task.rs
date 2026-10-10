@@ -21,7 +21,7 @@ use jkb_types::{EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole
 
 use crate::changelog::{Entity, Op};
 use crate::dsl::{has_unterminated_quote, tokenize_escaped, unquote_unescape};
-use crate::query::{Query, Scope, TagPred};
+use crate::query::Query;
 use crate::store::WriteMeta;
 use crate::{binding, changelog, edge, item, ns, placement, tag, Error, Result};
 
@@ -891,18 +891,16 @@ pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Option<ItemId>>
 }
 
 /// The **ready frontier**: tasks (`kind = 'task'`) whose status is non-terminal and
-/// which have no `depends_on` edge to a non-terminal task, optionally narrowed to a
-/// `scope` and `tags`. Ordered by priority (ascending, nulls last) then due date
-/// (ascending, nulls last).
+/// which have no `depends_on` edge to a non-terminal task, narrowed by everything `query`
+/// asks. Ordered by priority (ascending, nulls last) then due date (ascending, nulls last).
 ///
-/// The structural filter (scope/tags + the ready anti-join) is delegated to
-/// [`Query::evaluate`] so there is one source of truth for readiness; this only adds
-/// the task-specific ordering over the resulting ids.
+/// The rows of [`ready_ids`], the one place the frontier's filter is built: this took a scope
+/// and tags, the shape that let every other predicate fall away silently.
 ///
 /// # Errors
 /// Returns an error if evaluation or the ordered load fails.
-pub fn ready(conn: &Connection, scope: Scope, tags: &[TagPred]) -> Result<Vec<TaskRow>> {
-    let ids = ready_query(scope, tags).evaluate(conn)?;
+pub fn ready(conn: &Connection, query: Query) -> Result<Vec<TaskRow>> {
+    let ids = ready_ids(conn, query, None)?;
     load_ordered(conn, &ids)
 }
 
@@ -937,17 +935,6 @@ fn load_ordered(conn: &Connection, ids: &[ItemId]) -> Result<Vec<TaskRow>> {
     Ok(rows)
 }
 
-/// The frontier's structural filter — the one [`ready`] and [`ready_ids`] both evaluate.
-fn ready_query(scope: Scope, tags: &[TagPred]) -> Query {
-    Query {
-        kind: Some("task".to_owned()),
-        ready: true,
-        scope,
-        tags: tags.to_vec(),
-        ..Query::default()
-    }
-}
-
 fn ids_json(ids: &[ItemId]) -> String {
     crate::sql::json_ids(ids.iter().map(|id| id.get()))
 }
@@ -957,10 +944,11 @@ fn ids_json(ids: &[ItemId]) -> String {
 /// keeps one at a time.
 ///
 /// **The whole query, not its scope and tags.** This took only those two, so every other predicate
-/// a caller wrote (`-tag:`, `status:`, `priority<`) was dropped without a word and the frontier
-/// answered as if it had not been asked: the swarm coordinator's `-tag:swarm-settled=…` exclusion
-/// was a no-op, and a run whose given-up tasks came straight back never ended. `kind` is forced to
-/// `task` and readiness added; everything else the caller asked for narrows it.
+/// a caller wrote (`-tag:`, `status:`, `priority<`, a full-text word) was dropped without a word
+/// and the frontier answered as if it had not been asked: the swarm coordinator's
+/// `-tag:swarm-settled=…` exclusion was a no-op, and a run whose given-up tasks came straight back
+/// never ended. `kind` is forced to `task` and readiness added; a `~"…"` vector term is not applied
+/// (it ranks, in `jkb-search`, and the frontier has its own order); everything else narrows it.
 ///
 /// # Errors
 /// Returns an error if evaluation or the ordering query fails.
@@ -1093,10 +1081,16 @@ mod tests {
         })
         .unwrap();
         db.read(|c| {
-            let listed: Vec<_> = super::ready(c, Scope::All, &[])?
-                .into_iter()
-                .map(|r| r.id)
-                .collect();
+            let listed: Vec<_> = super::ready(
+                c,
+                crate::query::Query {
+                    scope: Scope::All,
+                    ..crate::query::Query::default()
+                },
+            )?
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
             assert_eq!(listed.len(), 7);
             assert_eq!(
                 super::ready_ids(c, crate::query::Query::default(), None)?,
@@ -1390,7 +1384,17 @@ mod tests {
 
         // While b is open: a is blocked, only b is ready.
         assert!(db.read(move |conn| is_blocked(conn, a)).unwrap());
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert_eq!(uids(&frontier), vec!["task:b".to_owned()]);
 
         // Complete b.
@@ -1399,7 +1403,17 @@ mod tests {
 
         // Now a is unblocked and ready; b (done) drops out.
         assert!(!db.read(move |conn| is_blocked(conn, a)).unwrap());
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert_eq!(uids(&frontier), vec!["task:a".to_owned()]);
     }
 
@@ -1426,7 +1440,17 @@ mod tests {
         })
         .unwrap();
         assert!(!db.read(move |conn| is_blocked(conn, a)).unwrap());
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert_eq!(uids(&frontier), vec!["task:a".to_owned()]);
     }
 
@@ -1454,14 +1478,34 @@ mod tests {
         })
         .unwrap();
         assert!(db.read(move |conn| is_blocked(conn, a)).unwrap());
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert_eq!(uids(&frontier), vec!["task:b".to_owned()]);
 
         // Only once b lands (`done`) does a unblock.
         db.write_txn("t", move |conn, meta| set_status_str(conn, meta, b, "done"))
             .unwrap();
         assert!(!db.read(move |conn| is_blocked(conn, a)).unwrap());
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert_eq!(uids(&frontier), vec!["task:a".to_owned()]);
     }
 
@@ -1485,7 +1529,17 @@ mod tests {
         })
         .unwrap();
 
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         // p1 before p2 (priority asc), null-priority last.
         assert_eq!(
             uids(&frontier),
@@ -1510,12 +1564,28 @@ mod tests {
         .unwrap();
 
         let in_repo = db
-            .read(|conn| ready(conn, Scope::Subtree("repos/monorepo".to_owned()), &[]))
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::Subtree("repos/monorepo".to_owned()),
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
             .unwrap();
         assert_eq!(uids(&in_repo), vec!["task:repo".to_owned()]);
 
         let elsewhere = db
-            .read(|conn| ready(conn, Scope::Subtree("repos/other".to_owned()), &[]))
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::Subtree("repos/other".to_owned()),
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
             .unwrap();
         assert!(elsewhere.is_empty());
     }

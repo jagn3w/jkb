@@ -506,7 +506,7 @@ pub fn query_count(
     Ok(scoped(dsl, default_scope)?.evaluate(conn)?.len())
 }
 
-/// `task.ready`: the ready frontier for a DSL's scope and tags, by priority then due.
+/// `task.ready`: the ready frontier narrowed by the whole DSL, by priority then due.
 ///
 /// # Errors
 /// A malformed query, or a failed read.

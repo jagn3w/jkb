@@ -288,8 +288,9 @@ pub(crate) fn enforce(
 }
 
 /// A review round's result, as `jkb task review file` reads it: its `findings`, each with the fields
-/// the op files and whatever else the reviewer reports (`scope`, `kind`), which are ignored here —
-/// the reviewer files pre-existing findings to the backlog itself.
+/// the op files, a `scope` that is checked, and whatever else the reviewer reports (`kind`), which is
+/// ignored. A pre-existing finding is refused (see [`parse_result`]): the review coordinator files
+/// those to the backlog, and one filed here would hold the branch for a defect it did not cause.
 #[derive(serde::Deserialize)]
 struct WorkflowResult {
     findings: Vec<WorkflowFinding>,
@@ -320,6 +321,35 @@ struct WorkflowFinding {
     scenario: Option<String>,
     #[serde(default)]
     fix: Option<String>,
+    /// `introduced`, `aggravated` or `pre-existing`; absent reads as introduced.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// Read a review result, refusing one that files a pre-existing finding as the change's own.
+///
+/// **In the callee, not in the prompt.** Which findings are this change's was one clause in the
+/// review coordinator's prompt, and a pre-existing must-fix it forgot to set aside became an open
+/// must-fix on the branch (and a second task, once the coordinator also filed it to the backlog).
+fn parse_result(text: &str, what: &str) -> Result<WorkflowResult> {
+    let result: WorkflowResult = serde_json::from_str(text).with_context(|| {
+        format!(
+            "{what} is not a review result: a JSON object with a `findings` array of {{severity \
+             (must-fix|concern|nit), summary, file, line, scenario, fix}}"
+        )
+    })?;
+    if let Some(f) = result
+        .findings
+        .iter()
+        .find(|f| f.scope.as_deref() == Some("pre-existing"))
+    {
+        anyhow::bail!(
+            "{what} files a pre-existing finding (`{}`) as this change's own — nothing was filed. \
+             Pre-existing findings go to the backlog (`jkb task add --backlog`), not the round",
+            f.summary
+        );
+    }
+    Ok(result)
 }
 
 /// The largest workflow result `task review file` reads.
@@ -349,12 +379,7 @@ pub(crate) fn file_cmd(
             .with_context(|| format!("reading {}", from.display()))?;
         from.display().to_string()
     };
-    let result: WorkflowResult = serde_json::from_str(&text).with_context(|| {
-        format!(
-            "{what} is not a review result: a JSON object with a `findings` array of {{severity \
-             (must-fix|concern|nit), summary, file, line, scenario, fix}}"
-        )
-    })?;
+    let result = parse_result(&text, &what)?;
     // Whether the review ran fully is the op's to judge (`ReviewRun::refusal`); what a result must
     // say for it to judge is checked here, where the file can be named.
     let (Some(reviewers), Some(returned)) = (result.reviewers, result.returned) else {
@@ -532,6 +557,30 @@ fn print_recording(
 
 #[cfg(test)]
 mod tests {
+    /// A pre-existing finding is refused by the filer, whoever forgot to set it aside; introduced,
+    /// aggravated and unscoped ones file.
+    #[test]
+    fn a_pre_existing_finding_is_refused_and_the_rest_file() {
+        let result = |scope: &str| {
+            format!(
+                r#"{{"reviewers": 1, "returned": 1, "findings": [{{"severity": "must-fix",
+                    "summary": "s", {scope}}}]}}"#
+            )
+        };
+        let refused = super::parse_result(&result(r#""scope": "pre-existing""#), "r")
+            .err()
+            .expect("a pre-existing finding was accepted")
+            .to_string();
+        assert!(refused.contains("--backlog"), "{refused}");
+        for ok in [
+            r#""scope": "introduced""#,
+            r#""scope": "aggravated""#,
+            r#""file": "f""#,
+        ] {
+            assert!(super::parse_result(&result(ok), "r").is_ok(), "{ok}");
+        }
+    }
+
     use jkb_core::Db;
 
     /// A task whose reviews outnumber what one query takes is still gated by all of them — asked in
