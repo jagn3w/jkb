@@ -12,7 +12,7 @@ use jkb_daemon::server::{spawn, ServeConfig, ServeError};
 use serde_json::json;
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     db: Db,
     token: PathBuf,
     handle: Option<jkb_daemon::server::Handle>,
@@ -34,7 +34,7 @@ impl Fixture {
         let handle = spawn(db.clone(), &cfg).unwrap();
         let base = format!("http://{}", handle.addr);
         Self {
-            _dir: dir,
+            dir,
             db,
             token,
             handle: Some(handle),
@@ -1646,28 +1646,63 @@ fn expired_and_evicted_keys_run_again() {
     assert_eq!(tasks(&f), 3, "a's answer was evicted for b's");
 }
 
-/// A keyed request refused before it ran — here a long-poll whose group already has one held — records
-/// nothing: once the slot is free, a resend with the same key runs, rather than being told its
-/// original was refused.
+/// A keyed request refused before it ran — here a write refused `schema_newer` by the check ahead of
+/// every op, which goes through the keyed path — records nothing: once the database is servable again,
+/// a resend with the same key runs, rather than being answered with the refusal.
 #[test]
 fn a_keyed_request_refused_before_it_ran_is_not_recorded() {
     let f = Fixture::new();
-    topic_and_group(&f.client());
     let token = root_token(&f);
-    let poll = json!({ "op": "mq.poll", "topic": "t", "group": "g", "max": 10 });
-    let (refused, again) = std::thread::scope(|s| {
-        let holder = s.spawn(|| post_at(&f, "/v1/op?wait_ms=600", &token, None, &poll));
-        std::thread::sleep(Duration::from_millis(150));
-        let refused = post_at(&f, "/v1/op?wait_ms=100", &token, Some("k"), &poll);
-        assert_eq!(holder.join().unwrap().0, 200);
-        (
-            refused,
-            post_at(&f, "/v1/op?wait_ms=100", &token, Some("k"), &poll),
-        )
-    });
+    let future = jkb_core::supported_schema_version() + 1;
+    f.db.write_txn("test", move |conn, _| {
+        conn.execute(
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
+            [future],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let add = json!({ "op": "task.add", "text": "once" });
+    let refused = post(&f, &token, Some("k"), &add);
     assert_eq!(refused.0, 503, "{refused:?}");
-    assert!(refused.1.contains("already has a long-poll"), "{refused:?}");
-    assert_eq!(again.0, 200, "{again:?}");
+    assert!(refused.1.contains("schema_newer"), "{refused:?}");
+    // Undone behind the daemon's back: every write through it now refuses the newer schema.
+    rusqlite::Connection::open(f.dir.path().join("jkb.db"))
+        .unwrap()
+        .execute(
+            "DELETE FROM refinery_schema_history WHERE version = ?1",
+            [future],
+        )
+        .unwrap();
+    let ran = post(&f, &token, Some("k"), &add);
+    assert_eq!(ran.0, 200, "{ran:?}");
+    assert_eq!(tasks(&f), 1);
+}
+
+/// A replay re-resolves a token's caller under a read permit, so replays are bounded by the read
+/// budget like any read: with none free, a replay is `busy`.
+#[test]
+fn replays_are_bounded_by_the_read_budget() {
+    let f = Fixture::with(|cfg| cfg.max_reads = 0);
+    let Response::Granted { token, .. } = f
+        .client()
+        .call(
+            serde_json::from_value(
+                json!({ "op": "role.grant", "role": "coordinator", "agent": "c" }),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    let add = json!({ "op": "task.add", "text": "t" });
+    let first = post(&f, &token, Some("k"), &add);
+    assert_ne!(first.0, 503, "{first:?}");
+    let replay = post(&f, &token, Some("k"), &add);
+    assert_eq!(replay.0, 503, "{replay:?}");
+    assert!(replay.1.contains("read limit"), "{replay:?}");
 }
 
 /// A recorded answer is not replayed to a token revoked since: it is refused, as running the op would

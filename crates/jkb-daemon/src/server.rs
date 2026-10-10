@@ -1099,7 +1099,10 @@ async fn handle(
         .with_caller(caller.clone());
     // Every request past authentication holds an op permit from here — through the schema read, the
     // body and the parse — so authenticated clients cannot pile up unbounded work before the budget
-    // is asked. A long-poll trades it for a poll permit once it is known to be one.
+    // is asked. A long-poll trades it for a poll permit once it is known to be one. The one exemption
+    // is a keyed request whose key this caller already has recorded (`admission`): it reads its body
+    // without a permit, then is replayed (its token re-resolved under a read permit), waits on its
+    // original holding none, or — if the record expired meanwhile — takes an op permit to run.
     let Ok(op_permit) = admission(&state, &route.0, &key, &given) else {
         return Ok(busy("the daemon is at its concurrency limit; retry"));
     };
@@ -1349,13 +1352,23 @@ impl Op {
     /// Whether the caller's token still names a live principal: asked before a recorded answer is
     /// replayed, so a revoked token is refused, as it would be by running the op, not served the
     /// answer it was given while it was live.
+    ///
+    /// The read runs under a read permit, held by the blocking thread as [`call`]'s is, so replays
+    /// cannot queue unbounded reads on the reader connection; with none free the replay is `busy`.
     async fn still_resolves(&self) -> Result<(), ApiError> {
         if self.caller == Caller::Operator {
             return Ok(());
         }
+        let Ok(permit) = Arc::clone(&self.state.reads).try_acquire_owned() else {
+            return Err(ApiError::with_code(
+                ErrorCode::Busy,
+                "the daemon is at its read limit; retry",
+            ));
+        };
         let (caller, tickets) = (self.caller.clone(), self.backend.tickets().cloned());
         let reads = self.backend.reads().clone();
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             reads.read_with(move |c| {
                 jkb_api::rbac::resolve(c, &caller, tickets.as_deref()).map(|_| ())
             })
@@ -1413,16 +1426,16 @@ fn answer(state: &State, given: &str, served: Result<Response, ApiError>) -> Ans
     }
 }
 
-/// The permit a parsed request runs under, traded for its `op_permit` once its class is known, with
-/// its long-poll slot and wait: a long-poll waits under the poll budget, one per group; a read
-/// (`Request::is_agent_read`) queues on the one reader connection, so it waits under the read budget rather
-/// than holding an op permit a hook's write needs; an `ingest.text` takes its own small budget the same
-/// way; anything else keeps the op permit.
 /// Whether `request` is a long-poll: an `mq.poll` asked to wait.
 fn is_long_poll(request: &Request, asked_wait: Duration) -> bool {
     matches!(request, Request::MqPoll { .. }) && !asked_wait.is_zero()
 }
 
+/// The permit a parsed request runs under, traded for its `op_permit` once its class is known, with
+/// its long-poll slot and wait: a long-poll waits under the poll budget, one per group; a read
+/// (`Request::is_agent_read`) queues on the one reader connection, so it waits under the read budget rather
+/// than holding an op permit a hook's write needs; an `ingest.text` takes its own small budget the same
+/// way; anything else keeps the op permit.
 fn permit_for<'s>(
     state: &'s State,
     request: &Request,
@@ -1438,7 +1451,7 @@ fn permit_for<'s>(
 > {
     let busy = |why: String| ApiError::with_code(ErrorCode::Busy, why);
     match request {
-        Request::MqPoll { topic, group, .. } if !asked_wait.is_zero() => {
+        Request::MqPoll { topic, group, .. } if is_long_poll(request, asked_wait) => {
             let Ok(poll_permit) = Arc::clone(&state.polls).try_acquire_owned() else {
                 return Err(busy(
                     "the daemon is at its long-poll limit; retry".to_owned(),

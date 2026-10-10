@@ -54,12 +54,13 @@ pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The header naming a logical call (the daemon's `server::IDEMPOTENCY_KEY`).
 const IDEMPOTENCY_KEY: &str = crate::server::IDEMPOTENCY_KEY;
 
-/// How long the `GET /v1/hello` asking whether the daemon honours keys may take.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the `GET /v1/hello` asking whether the daemon honours keys may take, connect retries
+/// included — within the call's own deadline.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The pause before resending a keyed call whose resend was refused `busy` while an earlier attempt
-/// may still be running.
-const BUSY_PAUSE: Duration = Duration::from_millis(200);
+/// The pause before resending a keyed call whose resend got an answer that does not decide the op
+/// ([`decides`]) while an earlier attempt may still be running.
+const UNDECIDED_PAUSE: Duration = Duration::from_millis(200);
 
 /// What one call may spend, from [`RemoteBackend::budget`] — the one place it is decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,10 +115,26 @@ impl From<(reqwest::Error, bool)> for Failed {
 /// An attempt's outcome: the status and the whole body, or the transport's error.
 type Sent = Result<(reqwest::StatusCode, bytes::Bytes), reqwest::Error>;
 
-/// Whether an answer is jkb serve refusing `busy`.
-fn is_busy((status, bytes): &(reqwest::StatusCode, bytes::Bytes)) -> bool {
-    *status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        && serde_json::from_slice::<ApiError>(bytes).is_ok_and(|e| e.code == ErrorCode::Busy)
+/// Whether an error code from jkb serve decides the op — says what became of it — rather than only
+/// that this attempt got no verdict. The one place the rule lives.
+///
+/// Not deciding: `busy` (refused at a permit, or a resend told its original is still running or was
+/// refused), `unavailable`, `internal` (the daemon failed, or the op did not finish), and
+/// `bad_request` (on a client that sends well-formed JSON, a body that did not arrive). Everything else
+/// — a success, `unauthorized`, `forbidden`, `not_found`, `invalid`, `schema_newer` and the like — is
+/// the op's verdict, which every attempt of the call would get.
+const fn code_decides(code: ErrorCode) -> bool {
+    !matches!(
+        code,
+        ErrorCode::Busy | ErrorCode::Unavailable | ErrorCode::Internal | ErrorCode::BadRequest
+    )
+}
+
+/// Whether an answer decides the op ([`code_decides`]): a success, or jkb serve's refusal with a
+/// deciding code. An answer from something other than jkb serve (a proxy's 502) decides nothing.
+fn decides((status, bytes): &(reqwest::StatusCode, bytes::Bytes)) -> bool {
+    status.is_success()
+        || serde_json::from_slice::<ApiError>(bytes).is_ok_and(|e| code_decides(e.code))
 }
 
 /// Serves requests by calling a `jkb serve` daemon over HTTP.
@@ -334,32 +351,36 @@ impl RemoteBackend {
         })
     }
 
-    /// Whether the daemon honours `Idempotency-Key`: asked of `GET /v1/hello` once, within `left`, and
-    /// remembered. A probe that fails is not remembered, and counts as no.
-    fn honours_keys(&self, token: &str, left: Duration) -> bool {
+    /// Whether the daemon honours `Idempotency-Key`: asked of `GET /v1/hello` — through the same send
+    /// path as [`RemoteBackend::hello`], connect retries included, within `left` — and remembered.
+    /// `None` when the probe failed: nothing is remembered, and the caller asks again later.
+    fn honours_keys(&self, token: &str, left: Duration) -> Option<bool> {
         use std::sync::atomic::Ordering;
         match self.honours.load(Ordering::SeqCst) {
-            HONOURS_YES => return true,
-            HONOURS_NO => return false,
+            HONOURS_YES => return Some(true),
+            HONOURS_NO => return Some(false),
             _ => {}
         }
-        let said = self
-            .client
-            .get(format!("{}/v1/hello", self.base))
-            .bearer_auth(token)
-            .timeout(left.min(PROBE_TIMEOUT))
-            .send()
+        let url = format!("{}/v1/hello", self.base);
+        let (status, bytes) = self
+            .send_attempts(left.min(PROBE_TIMEOUT), None, token, |left| {
+                self.client.get(&url).bearer_auth(token).timeout(left)
+            })
+            .ok()?;
+        let hello = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
-            .filter(|resp| resp.status().is_success())
-            .and_then(|resp| resp.bytes().ok())
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-        let Some(hello) = said else {
-            return false;
-        };
+            .filter(|_| status.is_success())?;
         let yes = hello["idempotency"] == serde_json::Value::Bool(true);
         self.honours
             .store(if yes { HONOURS_YES } else { HONOURS_NO }, Ordering::SeqCst);
-        yes
+        Some(yes)
+    }
+
+    /// Forget whether the daemon honours keys: it may have been replaced — a token re-read after
+    /// `unauthorized`, or a failed connect, can mean a restart onto another `jkb serve`.
+    fn forget_honours(&self) {
+        self.honours
+            .store(HONOURS_UNKNOWN, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Send the request `build` makes, answer read whole. The one place the retry rule lives:
@@ -369,9 +390,12 @@ impl RemoteBackend {
     /// - With `resend_after` (a keyed call), an attempt unanswered that long is resent with the same
     ///   key — if the daemon honours keys ([`RemoteBackend::honours_keys`]) — and the earlier attempt
     ///   stays open: whichever is answered first is the answer. So is an attempt that failed after
-    ///   connecting. And once an earlier attempt may be running, a `busy` refusal of a resend means
-    ///   "not yet", not "not run": it is resent after [`BUSY_PAUSE`], under the same key, rather than
-    ///   handed to a caller who would retry it under a fresh one and apply it twice.
+    ///   connecting. A probe that fails is asked again one `resend_after` later.
+    /// - Once an earlier attempt may be running, only an answer that decides the op ([`decides`]) ends
+    ///   the call. Any other — `busy`, `unavailable`, a proxy's 502 — is kept as the call's answer if
+    ///   nothing better comes, and the call waits on for the attempts still open, or resends after
+    ///   [`UNDECIDED_PAUSE`] under the same key. Handed to the caller, it would be retried under a
+    ///   fresh key, and the write applied twice.
     /// - Anything else ends the call.
     ///
     /// The whole of it, retries and their pauses included, is held to ONE deadline, `budget` from
@@ -432,11 +456,18 @@ impl RemoteBackend {
                 if resend_at.is_some_and(|at| at <= Instant::now()) {
                     resend_at = None;
                     let left = deadline.saturating_duration_since(Instant::now());
-                    if !left.is_zero() && self.honours_keys(token, left) {
-                        may_run |= in_flight > 0 || connected;
-                        launch(deadline.saturating_duration_since(Instant::now()));
-                        in_flight += 1;
-                        resend_at = resend_after.map(|after| Instant::now() + after);
+                    match (!left.is_zero()).then(|| self.honours_keys(token, left)) {
+                        None | Some(Some(false)) => {}
+                        Some(Some(true)) => {
+                            may_run |= in_flight > 0 || connected;
+                            launch(deadline.saturating_duration_since(Instant::now()));
+                            in_flight += 1;
+                            resend_at = resend_after.map(|after| Instant::now() + after);
+                        }
+                        // The probe failed: asked again one interval later.
+                        Some(None) => {
+                            resend_at = resend_after.map(|after| Instant::now() + after);
+                        }
                     }
                 }
                 continue;
@@ -445,17 +476,18 @@ impl RemoteBackend {
             match sent {
                 Ok(answer) => {
                     connected = true;
-                    if may_run && resend_after.is_some() && is_busy(&answer) {
-                        // Not yet: an earlier attempt may be running. Waited out, or resent.
+                    if may_run && resend_after.is_some() && !decides(&answer) {
+                        // No verdict, and an earlier attempt may be running: waited out, or resent.
                         last = Some(Ok(answer));
                         if in_flight == 0 {
-                            resend_at = Some(Instant::now() + BUSY_PAUSE);
+                            resend_at = Some(Instant::now() + UNDECIDED_PAUSE);
                         }
                         continue;
                     }
                     return Ok(answer);
                 }
                 Err(error) if error.is_connect() => {
+                    self.forget_honours();
                     last = Some(Err((error, connected).into()));
                     if in_flight == 0 {
                         match delays.next() {
@@ -575,6 +607,9 @@ impl Backend for RemoteBackend {
         match self.attempt(&request, &self.token(false)?, key) {
             // A fixed token does not rotate, so there is nothing fresher to retry with.
             Err(e) if e.code == ErrorCode::Unauthorized && self.fixed.is_none() => {
+                // A rotated token is a restarted daemon, which may not be the one that said it honours
+                // keys.
+                self.forget_honours();
                 self.attempt(&request, &self.token(true)?, key)
             }
             other => other,
@@ -602,6 +637,8 @@ mod tests {
         AnswerAfter(Duration),
         /// Refuse it `busy`, as jkb serve does.
         Busy,
+        /// A proxy's 502, not jkb serve's.
+        Gateway,
     }
 
     fn http(status: &str, body: &str) -> String {
@@ -654,6 +691,9 @@ mod tests {
                 };
                 match plan[i.min(plan.len() - 1)] {
                     Then::Swallow => held.push(stream),
+                    Then::Gateway => {
+                        let _ = stream.write_all(http("502 Bad Gateway", "Bad Gateway").as_bytes());
+                    }
                     Then::Busy => {
                         let _ = stream.write_all(http("503 Service Unavailable", &busy).as_bytes());
                     }
@@ -775,6 +815,146 @@ mod tests {
         assert!(
             keys.iter().all(|k| k.is_some() && *k == keys[0]),
             "{keys:?}"
+        );
+    }
+
+    /// While an earlier attempt may be running, a resend's answer that does not decide the op — a
+    /// proxy's 502 — does not end the call: the original's success, arriving later, is the answer.
+    /// Ended on the 502, the caller would retry under a fresh key and apply the write twice.
+    #[test]
+    fn an_undecided_answer_to_a_resend_waits_for_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, keys) = stub(
+            vec![Then::AnswerAfter(Duration::from_millis(700)), Then::Gateway],
+            true,
+        );
+        let c = client(&base, &dir, Duration::from_millis(200));
+        assert_eq!(
+            c.call(Request::MqInspect {}).unwrap(),
+            Response::Position { position: 1 },
+            "the original's success, the only success the stub gave"
+        );
+        let keys = keys.lock().unwrap().clone();
+        assert!(keys.len() >= 2, "resent: {keys:?}");
+        assert!(
+            keys.iter().all(|k| k.is_some() && *k == keys[0]),
+            "{keys:?}"
+        );
+    }
+
+    /// "Honours keys" is forgotten when the daemon may have been replaced: here it restarts (its token
+    /// rotates, so the next call is refused `unauthorized` and re-reads it) as an older `jkb serve`
+    /// that does not honour keys. Its next stall is not resent.
+    #[test]
+    fn a_restarted_daemon_is_asked_again_whether_it_honours_keys() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let restarted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ops = Arc::new(AtomicUsize::new(0));
+        let (flag, count) = (Arc::clone(&restarted), Arc::clone(&ops));
+        let answer = serde_json::to_string(&Response::Position { position: 1 }).unwrap();
+        let unauthorized = serde_json::to_string(&jkb_api::ApiError::with_code(
+            jkb_api::ErrorCode::Unauthorized,
+            "rotated",
+        ))
+        .unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let hello = text.starts_with("get /v1/hello");
+                let reply = if !flag.load(Ordering::SeqCst) {
+                    // Before: honours keys; the first op is swallowed, the resend answered.
+                    if hello {
+                        http("200 OK", r#"{"idempotency":true}"#)
+                    } else if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        held.push(stream);
+                        continue;
+                    } else {
+                        http("200 OK", &answer)
+                    }
+                } else if text.contains("bearer t1") {
+                    http("401 Unauthorized", &unauthorized)
+                } else if hello {
+                    http("200 OK", r#"{"protocol":1}"#)
+                } else {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let reply = http("200 OK", &answer);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(600));
+                        let _ = stream.write_all(reply.as_bytes());
+                    });
+                    continue;
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        let token = dir.path().join("token");
+        crate::token::write(&token, "t1").unwrap();
+        let mut c = RemoteBackend::new(&base, token.clone()).unwrap();
+        c.attempt_timeout = Duration::from_millis(200);
+        c.call(Request::MqInspect {}).unwrap();
+        assert_eq!(c.honours.load(Ordering::SeqCst), super::HONOURS_YES);
+
+        crate::token::write(&token, "t2").unwrap();
+        restarted.store(true, Ordering::SeqCst);
+        let before = ops.load(Ordering::SeqCst);
+        c.call(Request::MqInspect {}).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            ops.load(Ordering::SeqCst) - before,
+            1,
+            "the restarted daemon does not honour keys: sent once"
+        );
+    }
+
+    /// A probe that fails — here its connects are refused, the daemon's port closed for a while — does
+    /// not settle the call: it is asked again one attempt later, and the call resends once it succeeds.
+    #[test]
+    fn a_failed_probe_is_asked_again_and_the_call_then_resent() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let answer = serde_json::to_string(&Response::Position { position: 1 }).unwrap();
+        std::thread::spawn(move || {
+            // The op: read and held. Then the port is closed for a second, so the probes' connects
+            // are refused, and opened again.
+            let (mut op, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = op.read(&mut buf);
+            drop(listener);
+            std::thread::sleep(Duration::from_secs(1));
+            let listener = TcpListener::bind(addr).unwrap();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let hello = buf[..n].starts_with(b"GET /v1/hello");
+                let reply = if hello {
+                    http("200 OK", r#"{"idempotency":true}"#)
+                } else {
+                    http("200 OK", &answer)
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+            drop(op);
+        });
+        let c = client(&format!("http://{addr}"), &dir, Duration::from_millis(200))
+            .with_deadlines(Duration::from_millis(200), Duration::from_secs(5))
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            c.call(Request::MqInspect {}).unwrap(),
+            Response::Position { position: 1 }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
         );
     }
 
