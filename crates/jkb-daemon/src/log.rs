@@ -38,6 +38,44 @@ pub fn err(message: &str) {
     eprintln!("{}", line(message));
 }
 
+/// What a panic said: its message, when it carried one.
+#[must_use]
+pub fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_owned())
+}
+
+/// The message of a panic's line: where, on which thread, and what it said.
+#[must_use]
+pub fn panic_message(
+    thread: Option<&str>,
+    location: Option<&std::panic::Location<'_>>,
+    payload: &(dyn std::any::Any + Send),
+) -> String {
+    let at = location.map_or_else(|| "an unknown location".to_owned(), ToString::to_string);
+    format!(
+        "jkb serve: thread '{}' panicked at {at}: {}",
+        thread.unwrap_or("<unnamed>"),
+        panic_text(payload)
+    )
+}
+
+/// Report every panic in this process as a stamped line on stderr, in place of the default report —
+/// so a panic in `serve.log` says when, and in which daemon, like every other line there.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let current = std::thread::current();
+        err(&panic_message(
+            current.name(),
+            info.location(),
+            info.payload(),
+        ));
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
@@ -50,6 +88,27 @@ mod tests {
         assert_eq!(
             format_line(at, 4242, "jkb serve listening on http://127.0.0.1:7117"),
             "2026-10-10T08:15:02.317Z pid 4242 jkb serve listening on http://127.0.0.1:7117"
+        );
+    }
+
+    #[test]
+    fn a_panic_line_says_where_which_thread_and_what() {
+        let here = std::panic::Location::caller();
+        let payload: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("the accept loop broke"));
+        assert_eq!(
+            panic_message(Some("jkb-serve-accept"), Some(here), payload.as_ref()),
+            format!(
+                "jkb serve: thread 'jkb-serve-accept' panicked at {}:{}:{}: the accept loop broke",
+                here.file(),
+                here.line(),
+                here.column()
+            )
+        );
+        let silent: Box<dyn std::any::Any + Send> = Box::new(7_u8);
+        assert_eq!(
+            panic_message(None, None, silent.as_ref()),
+            "jkb serve: thread '<unnamed>' panicked at an unknown location: a panic with no message"
         );
     }
 

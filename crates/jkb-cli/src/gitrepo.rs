@@ -2353,6 +2353,13 @@ mod tests {
              the caller's cwd changes nothing about which container is poked",
         ),
         (
+            "tests/cli.rs",
+            "serve_under_nohup_keeps_sighup_ignored",
+            "spawns `nohup` to start `jkb serve` with SIGHUP ignored; nohup resolves no \
+             repository, and the jkb it execs gets the program, arguments and every environment \
+             setting and removal of a `jkb()`-built command, so `jkb_bare`'s scrub reaches it",
+        ),
+        (
             "src/rbac_cli.rs",
             "bash_argv",
             "spawns `bash` to word-split literal command strings, with `jkb` shadowed by a shell \

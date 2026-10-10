@@ -3704,10 +3704,68 @@ fn serve_stamps_its_lines_and_stops_cleanly_on_sigterm() {
         .unwrap();
     assert_eq!(
         serve_line_message(&stopping, pid),
-        "jkb serve: stopping on a termination signal (SIGINT, SIGTERM or SIGHUP)"
+        "jkb serve: stopping on SIGTERM"
     );
     let status = serve.0.wait().unwrap();
     assert!(status.success(), "{status:?}");
+}
+
+/// Under `nohup` a hangup is ignored, and `jkb serve` must not undo that: ctrlc's `termination`
+/// feature installed its handler over the ignored SIGHUP, so a terminal closing behind
+/// `nohup jkb serve` stopped the daemon. SIGHUP keeps the disposition it was started with.
+#[test]
+fn serve_under_nohup_keeps_sighup_ignored() {
+    use std::io::BufRead as _;
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb/jkb.db");
+    let token = tmp.path().join("daemon/token");
+    let mut inner = jkb(&db);
+    inner
+        .args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+        .arg(&token);
+    // `nohup` starts it with SIGHUP ignored (std cannot without `unsafe`), and execs it: same pid.
+    // Everything `jkb()` set or removed in the environment is carried over.
+    let mut cmd = Command::new("nohup");
+    cmd.arg(inner.get_program()).args(inner.get_args());
+    for (key, value) in inner.get_envs() {
+        match value {
+            Some(v) => cmd.env(key, v),
+            None => cmd.env_remove(key),
+        };
+    }
+    if let Some(dir) = inner.get_current_dir() {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut serve = Daemon(cmd.spawn().unwrap());
+    let pid = serve.0.id();
+    let mut lines = std::io::BufReader::new(serve.0.stdout.take().unwrap()).lines();
+    let banner = lines.next().unwrap().unwrap();
+    assert!(
+        serve_line_message(&banner, pid).starts_with("jkb serve listening on http://"),
+        "{banner}"
+    );
+    let signal = |sig| {
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+            sig,
+        )
+        .unwrap();
+    };
+    signal(rustix::process::Signal::HUP);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        serve.0.try_wait().unwrap().is_none(),
+        "jkb serve under nohup ended on SIGHUP"
+    );
+    // ...and it still stops cleanly when asked to.
+    signal(rustix::process::Signal::TERM);
+    assert_eq!(
+        serve_line_message(&lines.next().unwrap().unwrap(), pid),
+        "jkb serve: stopping on SIGTERM"
+    );
+    assert!(serve.0.wait().unwrap().success());
 }
 
 /// `jkb service units` and `jkb service token-path` are what setup.sh activates and waits for, so they

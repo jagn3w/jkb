@@ -33,6 +33,7 @@ mod service;
 mod session;
 mod session_cli;
 mod staging;
+mod stop;
 mod task_cli;
 mod transcripts;
 
@@ -2369,8 +2370,7 @@ fn cmd_sync(
     if watch {
         let stop = Arc::new(AtomicBool::new(false));
         let handler_stop = Arc::clone(&stop);
-        ctrlc::set_handler(move || handler_stop.store(true, Ordering::Relaxed))
-            .context("installing Ctrl-C handler")?;
+        stop::on_stop(move |_| handler_stop.store(true, Ordering::Relaxed))?;
         if let Some(ns) = ns_path {
             println!("watching {ns} (Ctrl-C to stop)…");
             jkb_sync::watch(db, ns, debounce, &stop)?;
@@ -3468,10 +3468,10 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         report_reap(&report, dry_run, json, compaction.as_ref());
         return Ok(());
     }
-    // The service form. Ctrl-C stops it, the same shared-flag shape `sync --watch` uses.
+    // The service form. SIGINT or SIGTERM stops it, the same shared-flag shape `sync --watch` uses.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&stop);
-    let _ = ctrlc::set_handler(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+    let _ = stop::on_stop(move |_| flag.store(true, std::sync::atomic::Ordering::SeqCst));
     // Never zero: a sweep every 0 seconds is a busy loop that would keep a laptop awake.
     let interval = std::time::Duration::from_secs(interval_secs.max(60));
     // What the last sweep could only observe, so an unchanged observation is not re-printed. A
@@ -3746,6 +3746,19 @@ fn cmd_serve(
         std::env::var_os("JKB_NS_MARKER").is_some(),
         jkb_core::refuse_shared_filesystem,
     )?;
+    // A panic's report goes to serve.log too, so it is stamped like every other line.
+    jkb_daemon::log::install_panic_hook();
+    // The stop request is heard BEFORE the daemon starts, so "listening" also means a SIGINT or
+    // SIGTERM from then on is a clean stop — and one that comes while it starts is acted on as soon
+    // as it has. SIGHUP keeps its inherited disposition (src/stop.rs: ignored under `nohup`).
+    let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+    let held = tx.clone();
+    if let Err(e) = stop::on_stop(move |signal| {
+        let _ = tx.send(signal);
+    }) {
+        // The daemon serves regardless; a signal then ends it as its default disposition says.
+        jkb_daemon::log::err(&format!("jkb serve: no clean stop on a signal: {e:#}"));
+    }
     let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
     let path = db_path.to_path_buf();
     let open: jkb_daemon::server::Opener = Box::new(move || {
@@ -3765,23 +3778,12 @@ fn cmd_serve(
         handle.addr,
         token_path.display()
     ));
-    // SIGINT, SIGTERM (launchd's and systemd's stop) and SIGHUP: ctrlc's `termination` feature.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let held = tx.clone();
-    if let Err(e) = ctrlc::set_handler(move || {
-        let _ = tx.send(());
-    }) {
-        // One already ignored (`nohup`, or a shell's `&` ignoring SIGINT) is refused by ctrlc. The
-        // daemon serves on regardless; a signal then ends it as its default disposition says.
-        jkb_daemon::log::err(&format!(
-            "jkb serve: no clean stop on a signal (installing the handler failed: {e})"
-        ));
-    }
     // Wait for a signal — or for the server thread to end, which nothing here asked of it: a
     // daemon that stopped serving must not sit on as a process launchd counts as up, nor exit 0.
-    loop {
+    // (`held` keeps the channel open when no handler could be installed.)
+    let signal = loop {
         match rx.recv_timeout(SERVE_THREAD_CHECK) {
-            Ok(()) => break,
+            Ok(signal) => break signal,
             Err(_) if !handle.has_ended() => {}
             Err(_) => {
                 let why = match handle.join() {
@@ -3791,10 +3793,9 @@ fn cmd_serve(
                 anyhow::bail!("jkb serve: the server thread {why}; no longer serving");
             }
         }
-    }
+    };
     drop(held);
-    // ctrlc does not say which signal arrived.
-    jkb_daemon::log::out("jkb serve: stopping on a termination signal (SIGINT, SIGTERM or SIGHUP)");
+    jkb_daemon::log::out(&format!("jkb serve: stopping on {signal}"));
     handle
         .shutdown()
         .map_err(|panic| anyhow::anyhow!("jkb serve: the server thread panicked: {panic}"))

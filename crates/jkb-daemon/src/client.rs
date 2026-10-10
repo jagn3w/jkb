@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use jkb_api::{ApiError, Backend, ErrorCode, Request, Response};
 
@@ -24,7 +24,8 @@ pub const UNREACHABLE_FOR: Duration = Duration::from_secs(5);
 /// attest hook among them — untried for [`UNREACHABLE_FOR`].
 ///
 /// Only a connect failure is retried: then no byte reached the daemon, so a write cannot be applied
-/// twice. A request that connected and then failed or timed out is never retried.
+/// twice. A request that connected and then failed or timed out is never retried. Retries and their
+/// pauses fit inside the request's own deadline, never beyond it (`send_retrying_connect`).
 pub const CONNECT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(100), Duration::from_millis(300)];
 
@@ -37,6 +38,8 @@ pub struct RemoteBackend {
     /// token file's, and never re-read: it does not rotate with the daemon.
     fixed: Option<String>,
     client: reqwest::blocking::Client,
+    /// The client's connect timeout, which a retry must have room for before its deadline.
+    connect: Duration,
     poll_wait: Duration,
     /// How long a request may take beyond any long-poll wait.
     op_timeout: Duration,
@@ -63,6 +66,7 @@ impl RemoteBackend {
             token: Mutex::new(None),
             fixed: None,
             client: http_client(Duration::from_secs(1))?,
+            connect: Duration::from_secs(1),
             poll_wait: Duration::from_secs(2),
             op_timeout: Duration::from_secs(30),
             down_marker: None,
@@ -77,6 +81,7 @@ impl RemoteBackend {
     /// An [`ErrorCode::Internal`] error if the HTTP client cannot be rebuilt.
     pub fn with_deadlines(mut self, connect: Duration, total: Duration) -> Result<Self, ApiError> {
         self.client = http_client(connect)?;
+        self.connect = connect;
         self.op_timeout = total;
         Ok(self)
     }
@@ -178,13 +183,13 @@ impl RemoteBackend {
         }
         // Shared, so each attempt's copy is a reference count rather than the body again.
         let body = bytes::Bytes::from(body);
-        send_retrying_connect(|| {
+        self.send_retrying_connect(wait + self.op_timeout, |left| {
             self.client
                 .post(&url)
                 .bearer_auth(token)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body.clone())
-                .timeout(wait + self.op_timeout)
+                .timeout(left)
         })
         .map_err(|e| {
             // Only a failed CONNECT means the daemon is out of reach — refused, or the connect
@@ -192,7 +197,8 @@ impl RemoteBackend {
             // then ran past its deadline reached a daemon that is busy (a write lock held by
             // another process), and marking that down made every other client — a hook for a
             // permission prompt among them — give up without trying for the next few seconds.
-            // A connect error here is the last of [`CONNECT_RETRY_DELAYS`]' attempts.
+            // A connect error here is the last attempt: the retries ran out, or the deadline left
+            // no room for another.
             if e.is_connect() {
                 self.mark_unreachable(true);
             }
@@ -203,6 +209,38 @@ impl RemoteBackend {
         })
     }
 
+    /// Send the request `build` makes, building and sending it again after each of
+    /// [`CONNECT_RETRY_DELAYS`] while the failure is a failed connect — and only then: any other
+    /// error, a timeout after connecting among them, is returned at once. The one place the retry
+    /// rule lives.
+    ///
+    /// The whole of it, retries and their pauses included, is held to ONE deadline, `budget` from
+    /// now: `build` is handed the time left, for the attempt's own timeout, and a retry whose pause
+    /// and connect timeout would not fit before the deadline is not made. Each attempt given a fresh
+    /// budget ran a hook's request to about twice its `TOTAL` — past Claude Code's `SessionEnd`
+    /// budget — when a failed connect was followed by a slow answer.
+    fn send_retrying_connect(
+        &self,
+        budget: Duration,
+        build: impl Fn(Duration) -> reqwest::blocking::RequestBuilder,
+    ) -> reqwest::Result<reqwest::blocking::Response> {
+        let deadline = Instant::now() + budget;
+        let mut delays = CONNECT_RETRY_DELAYS.iter();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match build(left).send() {
+                Err(e) if e.is_connect() => match delays.next() {
+                    Some(delay) if Instant::now() + *delay + self.connect <= deadline => {
+                        std::thread::sleep(*delay);
+                    }
+                    // Out of retries, or of room for one: later pauses are only longer.
+                    _ => return Err(e),
+                },
+                other => return other,
+            }
+        }
+    }
+
     /// `GET /v1/hello`: the daemon's protocol, schema and op list.
     ///
     /// # Errors
@@ -210,13 +248,11 @@ impl RemoteBackend {
     pub fn hello(&self) -> Result<serde_json::Value, ApiError> {
         let token = self.token(false)?;
         let url = format!("{}/v1/hello", self.base);
-        let resp = send_retrying_connect(|| {
-            self.client
-                .get(&url)
-                .bearer_auth(&token)
-                .timeout(Duration::from_secs(5))
-        })
-        .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
+        let resp = self
+            .send_retrying_connect(Duration::from_secs(5), |left| {
+                self.client.get(&url).bearer_auth(&token).timeout(left)
+            })
+            .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
         decode(resp).map_err(|(e, _)| e)
     }
 
@@ -226,24 +262,6 @@ impl RemoteBackend {
         let result = decode(self.send(request, token)?);
         self.mark_unreachable(matches!(result, Err((_, Answered::NotJkb))));
         result.map_err(|(e, _)| e)
-    }
-}
-
-/// Send the request `build` makes, building and sending it again after each of
-/// [`CONNECT_RETRY_DELAYS`] while the failure is a failed connect — and only then: any other error,
-/// a timeout after connecting among them, is returned at once. The one place the retry rule lives.
-fn send_retrying_connect(
-    build: impl Fn() -> reqwest::blocking::RequestBuilder,
-) -> reqwest::Result<reqwest::blocking::Response> {
-    let mut delays = CONNECT_RETRY_DELAYS.iter();
-    loop {
-        match build().send() {
-            Err(e) if e.is_connect() => match delays.next() {
-                Some(delay) => std::thread::sleep(*delay),
-                None => return Err(e),
-            },
-            other => return other,
-        }
     }
 }
 

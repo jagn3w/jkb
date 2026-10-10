@@ -545,6 +545,76 @@ fn a_daemon_refusing_every_connect_is_marked_down_after_the_retries() {
     assert!(marker.exists(), "every attempt failed: remembered as down");
 }
 
+/// The retries live inside the request's own deadline. Two refused connects, then a daemon that
+/// accepts and never answers: the call ends by the deadline it started with. When each attempt got a
+/// fresh deadline of its own, this ran to ~400 ms of retries plus a whole second deadline — a hook's
+/// request past Claude Code's `SessionEnd` budget.
+#[test]
+fn connect_retries_and_a_slow_answer_finish_by_the_one_deadline() {
+    use std::io::Read as _;
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    let marker = dir.path().join("unreachable");
+    let port = free_port();
+    // Bound ~200 ms in: after the first retry (100 ms), before the second (400 ms).
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let _ = stream.read(&mut buf);
+        std::thread::sleep(Duration::from_secs(5));
+    });
+    let total = Duration::from_millis(700);
+    let c = RemoteBackend::new(&format!("http://127.0.0.1:{port}"), token)
+        .unwrap()
+        .with_deadlines(Duration::from_millis(200), total)
+        .unwrap()
+        .with_down_marker(marker.clone());
+    let started = Instant::now();
+    let err = c.call(Request::NotifyOpenSessions {}).unwrap_err();
+    let took = started.elapsed();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
+    // The second retry connected, so it was the slow answer that ended it, at the deadline.
+    assert!(
+        took < total + Duration::from_millis(200),
+        "took {took:?}, past the request's {total:?} deadline"
+    );
+    assert!(
+        !marker.exists(),
+        "the last attempt connected: busy, not down"
+    );
+}
+
+/// A retry whose pause and connect timeout would not fit before the request's deadline is not made:
+/// with 250 ms in all and 200 ms to connect, even the first (100 ms) pause leaves no room, so the
+/// refused connect is the only attempt — at once, and remembered as down.
+#[test]
+fn a_retry_that_would_not_fit_before_the_deadline_is_not_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    let marker = dir.path().join("unreachable");
+    let c = RemoteBackend::new(&format!("http://127.0.0.1:{}", free_port()), token)
+        .unwrap()
+        .with_deadlines(Duration::from_millis(200), Duration::from_millis(250))
+        .unwrap()
+        .with_down_marker(marker.clone());
+    let started = Instant::now();
+    let err = c.call(Request::NotifyOpenSessions {}).unwrap_err();
+    let took = started.elapsed();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
+    assert!(
+        took < Duration::from_millis(90),
+        "a retry was made: took {took:?}"
+    );
+    assert!(
+        marker.exists(),
+        "the only attempt failed to connect: remembered as down"
+    );
+}
+
 /// A request that CONNECTED and then ran past its deadline is not retried: it may have reached the
 /// daemon, so sending it again could apply a write twice. Exactly one connection is made.
 #[test]

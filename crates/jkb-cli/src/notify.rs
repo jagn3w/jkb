@@ -47,7 +47,9 @@ pub const CONNECT: Duration = Duration::from_millis(200);
 /// How long one request may take. `SessionStart` — a start and a sweep — starts no request once this
 /// has passed since the hook began, so it is bounded by about twice this (a request started just before
 /// the deadline runs its own full `TOTAL`), once per session. `SessionEnd`'s own, shorter limit is
-/// [`SESSION_END_SECOND_REQUEST`].
+/// [`SESSION_END_SECOND_REQUEST`]. A failed connect's retries and their pauses fit inside it
+/// (`RemoteBackend` holds the whole request to one deadline), so a request is bounded by this however
+/// its connects went.
 pub const TOTAL: Duration = Duration::from_secs(1);
 
 /// `SessionEnd`'s hooks get 1.5 s by default (Claude Code's hooks documentation), and it sends two
