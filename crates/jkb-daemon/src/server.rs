@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -92,6 +92,10 @@ pub struct ServeConfig {
     /// How long the answer to a request that carried an `Idempotency-Key` is kept for a resend of it
     /// ([`crate::idempotency`]).
     pub idempotency_ttl: Duration,
+    /// The youngest an answer may be evicted at, past the caps: longer than a keyed call's whole
+    /// client deadline (the 30 s op timeout), so an answer its client may still resend for is never
+    /// the one that goes. While nothing older can go, new keyed work is refused `busy`.
+    pub idempotency_min_age: Duration,
     /// How many keyed requests are remembered at most; past it the oldest answers go first.
     pub idempotency_entries: usize,
     /// How many bytes of keyed answers are kept at most; past it the oldest go first.
@@ -121,6 +125,7 @@ impl ServeConfig {
             reopen_every: Duration::from_secs(5),
             write_stall: Duration::from_secs(10),
             idempotency_ttl: Duration::from_mins(10),
+            idempotency_min_age: Duration::from_mins(1),
             idempotency_entries: 4096,
             idempotency_bytes: 64 * 1024 * 1024,
             duplicate_wait: Duration::from_mins(1),
@@ -165,6 +170,7 @@ pub struct Handle {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
     idem: Option<Arc<Mutex<Store<Answer>>>>,
+    waiting: Option<Arc<AtomicUsize>>,
 }
 
 impl Handle {
@@ -196,6 +202,15 @@ impl Handle {
             .as_ref()
             .and_then(|idem| idem.lock().ok().map(|idem| idem.in_progress()))
             .unwrap_or(0)
+    }
+
+    /// How many resends are waiting on their original now — for tests, as
+    /// [`Handle::keyed_in_progress`].
+    #[must_use]
+    pub fn keyed_waiting(&self) -> usize {
+        self.waiting
+            .as_ref()
+            .map_or(0, |waiting| waiting.load(Ordering::SeqCst))
     }
 
     /// Whether the server thread has ended. Nothing but [`Handle::shutdown`] asks it to, so while
@@ -257,6 +272,8 @@ struct State {
     grants: Mutex<GrantCache>,
     /// The keyed requests' answers, for a resend ([`crate::idempotency`]).
     idem: Arc<Mutex<Store<Answer>>>,
+    /// How many resends are waiting on their original ([`Handle::keyed_waiting`]).
+    waiting: Arc<AtomicUsize>,
     duplicate_wait: Duration,
 }
 
@@ -420,9 +437,11 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
     token::write(&cfg.token_path, &token)?;
     let idem = Arc::new(Mutex::new(Store::new(
         cfg.idempotency_ttl,
+        cfg.idempotency_min_age,
         cfg.idempotency_entries,
         cfg.idempotency_bytes,
     )));
+    let waiting = Arc::new(AtomicUsize::new(0));
     let state = Arc::new(State {
         serving: Mutex::new(serving),
         opener,
@@ -443,6 +462,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         tickets: Arc::default(),
         grants: Mutex::default(),
         idem: Arc::clone(&idem),
+        waiting: Arc::clone(&waiting),
         duplicate_wait: cfg.duplicate_wait,
     });
     let connections = Arc::new(Semaphore::new(connection_budget(cfg.max_connections)));
@@ -487,6 +507,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         })?;
     Ok(Handle {
         idem: Some(idem),
+        waiting: Some(waiting),
         addr,
         stop: Some(stop_tx),
         thread: Some(thread),
@@ -1101,7 +1122,9 @@ async fn handle(
         Err(e) => return Ok(refuse_and_close(&e)),
     };
     authed.store(true, Ordering::SeqCst);
-    let key = idempotency_key(&req, route.1 == KEYED_PATH);
+    // Scoped by the token presented, hashed, so one caller's key never returns another's answer.
+    let key = idempotency_key(&req, route.1 == KEYED_PATH)
+        .map(|key| key.map(|key| (jkb_core::roles::token_hash(&given), key)));
     let (backend, db) = match ready(&state).await {
         Ok(serving) => serving,
         Err(refusal) => return Ok(refuse(&refusal)),
@@ -1116,7 +1139,7 @@ async fn handle(
     // is a keyed request whose key this caller already has recorded (`admission`): it reads its body
     // without a permit, then is replayed or waits on its original holding none — or, if the record
     // expired meanwhile, takes an op permit to run.
-    let Ok(op_permit) = admission(&state, &route.0, &key, &given) else {
+    let Ok(op_permit) = admission(&state, &route.0, &key) else {
         return Ok(busy("the daemon is at its concurrency limit; retry"));
     };
     if route.0 == Method::GET {
@@ -1178,14 +1201,10 @@ async fn handle(
 fn admission(
     state: &State,
     method: &Method,
-    key: &Result<Option<String>, ApiError>,
-    given: &str,
+    key: &Result<Option<Key>, ApiError>,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
     if let (&Method::POST, Ok(Some(key))) = (method, key) {
-        let known = state
-            .idem
-            .lock()
-            .is_ok_and(|idem| idem.contains(&(jkb_core::roles::token_hash(given), key.clone())));
+        let known = state.idem.lock().is_ok_and(|idem| idem.contains(key));
         if known {
             return Ok(None);
         }
@@ -1201,12 +1220,10 @@ fn admission(
 async fn serve_keyed(
     state: Arc<State>,
     op: Op,
-    key: String,
+    key: Key,
     body: &[u8],
     held: &mut Option<Permit>,
 ) -> hyper::Response<Full<Bytes>> {
-    // Scoped by the token presented, hashed, so one caller's key never returns another's answer.
-    let key = (jkb_core::roles::token_hash(&op.given), key);
     let begun = state
         .idem
         .lock()
@@ -1221,10 +1238,15 @@ async fn serve_keyed(
         Some(Begin::Mismatch) => refuse(&ApiError::bad_request(
             "this Idempotency-Key was first used for a different request",
         )),
+        // Nothing ran, so `busy` is true: a retry under any key may run it.
+        Some(Begin::Full) => busy(
+            "the daemon's record of keyed requests is full of answers still within their clients' \
+             deadlines; retry",
+        ),
         Some(Begin::Wait(original)) => {
             // Waiting is no work: the permit goes back for others.
             drop(op);
-            await_original(original, state.duplicate_wait)
+            await_original(original, state.duplicate_wait, &state.waiting)
                 .await
                 .response()
         }
@@ -1297,12 +1319,36 @@ impl Drop for Recording {
 
 /// The answer of a keyed request's original, for a resend that arrived while it ran: waited for up to
 /// `limit`. An original refused before it ran shares nothing, and the resend is told to retry.
-async fn await_original(mut original: watch::Receiver<Option<Answer>>, limit: Duration) -> Answer {
-    let busy = |why: &str| Answer::refusal(&ApiError::with_code(ErrorCode::Busy, why));
+///
+/// Counted in `waiting` while it waits. Out of time, the answer is `unavailable`, not `busy`: the
+/// original is still running and may yet apply, which `busy` — nothing ran — would deny.
+async fn await_original(
+    mut original: watch::Receiver<Option<Answer>>,
+    limit: Duration,
+    waiting: &AtomicUsize,
+) -> Answer {
+    struct Waiting<'a>(&'a AtomicUsize);
+    impl Drop for Waiting<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    waiting.fetch_add(1, Ordering::SeqCst);
+    let _waiting = Waiting(waiting);
+    let refusal = |code, why: &str| Answer::refusal(&ApiError::with_code(code, why));
     match tokio::time::timeout(limit, original.wait_for(Option::is_some)).await {
-        Ok(Ok(answer)) => answer.clone().unwrap_or_else(|| busy("no answer")),
-        Ok(Err(_)) => busy("the first attempt with this Idempotency-Key was refused; retry"),
-        Err(_) => busy("the first attempt with this Idempotency-Key is still running; retry"),
+        Ok(Ok(answer)) => answer
+            .clone()
+            .unwrap_or_else(|| refusal(ErrorCode::Internal, "no answer")),
+        Ok(Err(_)) => refusal(
+            ErrorCode::Busy,
+            "the first attempt with this Idempotency-Key was refused before it ran; retry",
+        ),
+        Err(_) => refusal(
+            ErrorCode::Unavailable,
+            "the first attempt with this Idempotency-Key is still running and may yet apply; its \
+             answer did not come in time",
+        ),
     }
 }
 
@@ -1624,6 +1670,7 @@ mod tests {
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let handle = Handle {
             idem: None,
+            waiting: None,
             addr: "127.0.0.1:1".parse().unwrap(),
             stop: Some(stop),
             thread: Some(std::thread::spawn(move || {

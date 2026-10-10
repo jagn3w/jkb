@@ -89,6 +89,26 @@ fn read(resp: reqwest::blocking::Response) -> Read {
     (status, resp.bytes())
 }
 
+/// Whether a send failed writing its body because the peer had closed the connection — `EPIPE`,
+/// which only a write gets — so the daemon cannot have read the whole body, and so cannot have run
+/// the op: it parses and runs a request only once its body is read. What a `jkb serve` older than keys
+/// does to a large keyed request: it refuses the unknown route before reading the body, and a client
+/// still writing gets a broken pipe in place of the `no such endpoint` (measured over loopback with a
+/// 600 KB body: 8 of 40).
+fn body_write_broken(e: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 /// Whether jkb serve refused the keyed route as an endpoint it does not have — a daemon older than
 /// keys, which did not run the op.
 fn no_such_endpoint((status, bytes): &Read) -> bool {
@@ -118,6 +138,8 @@ pub struct RemoteBackend {
     op_timeout: Duration,
     /// [`ATTEMPT_TIMEOUT`], shortened by tests.
     attempt_timeout: Duration,
+    /// [`KEYED_PATH`]; a route the daemon lacks in tests, to stand for a daemon older than keys.
+    keyed_path: &'static str,
     down_marker: Option<PathBuf>,
 }
 
@@ -145,6 +167,7 @@ impl RemoteBackend {
             poll_wait: Duration::from_secs(2),
             op_timeout: Duration::from_secs(30),
             attempt_timeout: ATTEMPT_TIMEOUT,
+            keyed_path: KEYED_PATH,
             down_marker: None,
         })
     }
@@ -233,7 +256,8 @@ impl RemoteBackend {
     /// how long its first attempt may go unanswered before it is sent once more. The one place an op's
     /// budget is decided, so no call site can forget it.
     ///
-    /// Unkeyed, one attempt with the whole deadline: a **long** op — one given more than the plain
+    /// Unkeyed, one attempt with the whole deadline: a read (RBAC's `Read` class), which a resend could
+    /// not apply twice and whose answer is not worth recording; a **long** op — one given more than the plain
     /// [`RemoteBackend::with_deadlines`] total, `mq.poll`, which the daemon may hold for its wait, and
     /// `ingest.text`, whose capture of a body at the cap holds the writer about half a second and whose
     /// resend could only queue behind it — and a call whose whole deadline is no longer than the
@@ -245,10 +269,15 @@ impl RemoteBackend {
         };
         let total = wait + self.op_timeout;
         let long = total > self.op_timeout || matches!(request, Request::IngestText(_));
+        // A read is never keyed: resending it could not apply anything twice, so it needs no record,
+        // and its answers — up to a read's whole budget — would crowd the writes' out of the daemon's
+        // store. "Read" is the RBAC class (`Request::permission`), the one place ops are classed so.
+        let mutates = request.permission() != jkb_api::rbac::OpPermission::Read;
         Budget {
             wait,
             total,
-            resend_after: (!long && self.attempt_timeout < total).then_some(self.attempt_timeout),
+            resend_after: (mutates && !long && self.attempt_timeout < total)
+                .then_some(self.attempt_timeout),
         }
     }
 
@@ -289,7 +318,7 @@ impl RemoteBackend {
                 .body(body.clone())
                 .timeout(left)
         };
-        let keyed_url = format!("{}{KEYED_PATH}", self.base);
+        let keyed_url = format!("{}{}", self.base, self.keyed_path);
         let keyed = |key: &str, timeout: Duration| {
             self.client
                 .post(&keyed_url)
@@ -299,30 +328,11 @@ impl RemoteBackend {
                 .body(body.clone())
                 .timeout(timeout)
         };
-        // Whether an attempt reached the daemon: only a call none of whose attempts did marks it down.
-        let mut connected = false;
-        let sent = match (key, budget.resend_after) {
+        let (sent, connected) = match (key, budget.resend_after) {
             (Some(key), Some(after)) => {
-                match self.send_retrying_connect(left(), |left| keyed(key, left.min(after))) {
-                    // Connected and unanswered past the attempt budget: abandoned, and sent once more
-                    // under the same key. Whatever jkb serve answers that is final.
-                    Err(e) if e.is_timeout() && !e.is_connect() && !left().is_zero() => {
-                        connected = true;
-                        self.send_retrying_connect(left(), |left| keyed(key, left))
-                            .map(read)
-                    }
-                    Ok(resp) => match read(resp) {
-                        // A daemon older than keys, which did not run the op: one unkeyed attempt.
-                        answer if no_such_endpoint(&answer) => {
-                            connected = true;
-                            self.send_retrying_connect(left(), unkeyed).map(read)
-                        }
-                        answer => Ok(answer),
-                    },
-                    Err(e) => Err(e),
-                }
+                self.send_keyed(&left, after, |left| keyed(key, left), unkeyed)
             }
-            _ => self.send_retrying_connect(left(), unkeyed).map(read),
+            _ => (self.send_retrying_connect(left(), unkeyed).map(read), false),
         };
         sent.map_err(|e| {
             // Only a failed CONNECT means the daemon is out of reach — refused, or the connect
@@ -340,6 +350,43 @@ impl RemoteBackend {
                 format!("cannot reach jkb serve at {}: {e}", self.base),
             )
         })
+    }
+
+    /// A keyed call's attempts — `keyed` builds one with its timeout, `unkeyed` the fallback — and
+    /// whether any of them reached the daemon:
+    ///
+    /// 1. To the keyed route for at most `after`.
+    /// 2. If that connected and timed out — sending, or reading its answer's body — once more under the
+    ///    same key for the rest of the deadline. Whatever jkb serve answers it is final.
+    /// 3. If the keyed route is not there — `no such endpoint` from a `jkb serve` older than keys, on
+    ///    either attempt, or the first attempt's body cut off mid-write ([`body_write_broken`]), since
+    ///    such a daemon refuses an unknown route before reading the body — one unkeyed attempt for the
+    ///    rest of the deadline. Nothing ran: an endpoint the daemon does not have runs nothing.
+    fn send_keyed(
+        &self,
+        left: &dyn Fn() -> Duration,
+        after: Duration,
+        keyed: impl Fn(Duration) -> reqwest::blocking::RequestBuilder,
+        unkeyed: impl Fn(Duration) -> reqwest::blocking::RequestBuilder,
+    ) -> (reqwest::Result<Read>, bool) {
+        let fallback = || self.send_retrying_connect(left(), &unkeyed).map(read);
+        match self.send_retrying_connect(left(), |left| keyed(left.min(after))) {
+            Ok(resp) => match read(resp) {
+                answer if no_such_endpoint(&answer) => return (fallback(), true),
+                // Answered, and its body stalled: as a stalled answer, resent.
+                (_, Err(e)) if e.is_timeout() && !left().is_zero() => {}
+                answer => return (Ok(answer), true),
+            },
+            Err(e) if body_write_broken(&e) => return (fallback(), true),
+            Err(e) if e.is_timeout() && !e.is_connect() && !left().is_zero() => {}
+            Err(e) => return (Err(e), false),
+        }
+        // Connected and unanswered past the attempt budget: abandoned, and sent once more under the
+        // same key.
+        match self.send_retrying_connect(left(), &keyed).map(read) {
+            Ok(answer) if no_such_endpoint(&answer) => (fallback(), true),
+            other => (other, true),
+        }
     }
 
     /// Send the request `build` makes, building and sending it again after each of
@@ -409,15 +456,19 @@ enum Answered {
     Jkb,
     /// Something else — a proxy between here and the host saying the daemon is down, say.
     NotJkb,
+    /// An answer whose body could not be read — it stalled, or the connection dropped mid-way.
+    Cut,
 }
 
 fn decode<T: serde::de::DeserializeOwned>(
     (status, bytes): Read,
 ) -> Result<T, (ApiError, Answered)> {
+    // The answer began, so something was reached: not a daemon out of reach, and the down marker is
+    // left alone, like any slow answer.
     let bytes = bytes.map_err(|e| {
         (
             ApiError::with_code(ErrorCode::Unavailable, e.to_string()),
-            Answered::NotJkb,
+            Answered::Cut,
         )
     })?;
     if status.is_success() {
@@ -505,6 +556,10 @@ mod tests {
         Busy,
         /// A proxy's 502, not jkb serve's.
         Gateway,
+        /// The headers and the start of the body, then nothing.
+        HeadersThenStall,
+        /// `no such endpoint`, as a `jkb serve` older than keys answers the keyed route.
+        NoSuchEndpoint,
     }
 
     fn http(status: &str, body: &str) -> String {
@@ -562,6 +617,16 @@ mod tests {
                 }
                 match plan[i.min(plan.len() - 1)] {
                     Then::Swallow => held.push(stream),
+                    Then::HeadersThenStall => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                              Content-Length: 100\r\n\r\n{\"pos",
+                        );
+                        held.push(stream);
+                    }
+                    Then::NoSuchEndpoint => {
+                        let _ = stream.write_all(http("400 Bad Request", &no_such).as_bytes());
+                    }
                     Then::Gateway => {
                         let _ = stream.write_all(http("502 Bad Gateway", "Bad Gateway").as_bytes());
                     }
@@ -686,6 +751,115 @@ mod tests {
             std::thread::sleep(attempt * 2);
             assert_eq!(seen.lock().unwrap().len(), 2, "{name}");
         }
+    }
+
+    /// An answer whose headers came and whose body stalled is resent under the same key, as a stalled
+    /// answer is; and a body that will not read is not a daemon out of reach: no down marker.
+    #[test]
+    fn a_stalled_body_is_resent_and_never_marks_the_daemon_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = Duration::from_millis(200);
+        let (base, seen) = stub(
+            vec![Then::HeadersThenStall, Then::AnswerAfter(Duration::ZERO)],
+            false,
+        );
+        let c = client(&base, &dir, attempt);
+        assert_eq!(
+            c.call(Request::MqInspect {}).unwrap(),
+            Response::Position { position: 1 }
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].1.is_some() && seen[1].1 == seen[0].1, "{seen:?}");
+
+        let (base, _) = stub(vec![Then::HeadersThenStall], false);
+        let marker = dir.path().join("unreachable");
+        let c = client(&base, &dir, super::ATTEMPT_TIMEOUT)
+            .with_deadlines(Duration::from_millis(200), Duration::from_millis(500))
+            .unwrap()
+            .with_down_marker(marker.clone());
+        assert!(c.call(Request::NotifyOpenSessions {}).is_err());
+        assert!(!marker.exists(), "an answer began: reached, not down");
+    }
+
+    /// A daemon replaced by one older than keys between the attempts answers the resend `no such
+    /// endpoint`; the call falls back to one unkeyed attempt within the rest of its deadline.
+    #[test]
+    fn no_such_endpoint_on_the_resend_falls_back_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, seen) = stub(
+            vec![
+                Then::Swallow,
+                Then::NoSuchEndpoint,
+                Then::AnswerAfter(Duration::ZERO),
+            ],
+            false,
+        );
+        let c = client(&base, &dir, Duration::from_millis(200));
+        assert_eq!(
+            c.call(Request::MqInspect {}).unwrap(),
+            Response::Position { position: 1 }
+        );
+        let paths: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert_eq!(paths, ["/v1/op/keyed", "/v1/op/keyed", "/v1/op"]);
+    }
+
+    /// A read is never keyed, nor resent: one unkeyed attempt on `/v1/op`, however slow.
+    #[test]
+    fn a_read_is_never_keyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = Duration::from_millis(200);
+        let (base, seen) = stub(vec![Then::AnswerAfter(attempt * 3)], false);
+        let c = client(&base, &dir, attempt);
+        assert_eq!(
+            c.call(Request::KbLs {
+                path: None,
+                all: false,
+                recursive: false,
+            })
+            .unwrap(),
+            Response::Position { position: 1 }
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![("/v1/op".to_owned(), None)]
+        );
+    }
+
+    /// A large keyed write to a daemon without the keyed route — a real `jkb serve` over loopback,
+    /// asked for a route it lacks — is refused before its body is read: `no such endpoint`, or, for a
+    /// client still writing, a broken pipe (8 of 40 over loopback). Either way nothing ran, and the
+    /// call falls back to one unkeyed attempt, whose answer is the op's own.
+    #[test]
+    fn a_large_write_to_a_daemon_without_the_keyed_route_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        let token = dir.path().join("daemon/token");
+        let cfg = crate::server::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token.clone());
+        let daemon = crate::server::spawn(db, &cfg).unwrap();
+        let mut c = RemoteBackend::new(&format!("http://{}", daemon.addr), token).unwrap();
+        c.keyed_path = "/v1/op/not-here";
+        // Past the daemon's cap on a task's text, so each answer is the op's own verdict — reached
+        // only by the fallback on `/v1/op` — and nothing is written however often it is sent.
+        let big = "x".repeat(600 * 1024);
+        for i in 0..30 {
+            let request: Request = serde_json::from_value(
+                serde_json::json!({ "op": "task.add", "text": format!("{i} {big}") }),
+            )
+            .unwrap();
+            let err = c.call(request).unwrap_err();
+            assert_eq!(
+                (err.code, err.message.contains("task line")),
+                (jkb_api::ErrorCode::Invalid, true),
+                "round {i}: the op's verdict, from the fallback: {err:?}"
+            );
+        }
+        daemon.shutdown().unwrap();
     }
 
     /// A long-poll, an ingest and a hook's call are unkeyed and make one attempt: the long ops are

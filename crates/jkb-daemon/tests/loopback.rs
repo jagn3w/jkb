@@ -1578,24 +1578,28 @@ fn the_keyed_route_needs_a_key_and_refuses_a_long_poll() {
 
 /// A resend that arrives while the original is still running waits for it and gets its answer,
 /// rather than running the write a second time. The original is held up by a write transaction the
-/// test holds on the daemon's one writer.
+/// test holds on the daemon's one writer, released only once the daemon reports the resend waiting.
 ///
-/// A resend waits no longer than `duplicate_wait`: past it, it is told to retry, and the original
-/// still answers and is applied once.
+/// A resend waits no longer than `duplicate_wait`: past it, it is told `unavailable` — the original
+/// is still running and may yet apply, so not `busy`, which says nothing ran — and the original still
+/// answers and is applied once.
 ///
 /// With one op permit, held by the original, the resend still waits rather than being refused `busy`:
 /// a known key is looked up before the permit is asked, and a client told `busy` would retry under a
 /// fresh key.
 #[test]
 fn a_resend_while_the_original_runs_waits_for_its_answer() {
-    let send_twice = |f: &Fixture| {
+    // `outwait`: the resend's wait runs out before the original is released.
+    let send_twice = |f: &Fixture, outwait: bool| {
         let token = root_token(f);
+        let handle = f.handle.as_ref().unwrap();
         let (holding, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let db = f.db.clone();
         let writer = std::thread::spawn(move || {
             db.write_txn("test", move |_, _| {
                 holding.send(()).unwrap();
-                std::thread::sleep(Duration::from_millis(800));
+                let _ = released.recv();
                 Ok(())
             })
             .unwrap();
@@ -1604,25 +1608,60 @@ fn a_resend_while_the_original_runs_waits_for_its_answer() {
         let add = json!({ "op": "task.add", "text": "once" });
         let answers = std::thread::scope(|s| {
             let first = s.spawn(|| post(f, &token, Some("k"), &add));
-            wait_until(|| f.handle.as_ref().unwrap().keyed_in_progress() == 1);
+            wait_until(|| handle.keyed_in_progress() == 1);
             let second = s.spawn(|| post(f, &token, Some("k"), &add));
-            (first.join().unwrap(), second.join().unwrap())
+            wait_until(|| handle.keyed_waiting() == 1);
+            let second = if outwait {
+                let second = second.join().unwrap();
+                release.send(()).unwrap();
+                second
+            } else {
+                release.send(()).unwrap();
+                second.join().unwrap()
+            };
+            (first.join().unwrap(), second)
         });
         writer.join().unwrap();
         answers
     };
     let f = Fixture::with(|cfg| cfg.max_ops = 1);
-    let (first, second) = send_twice(&f);
+    let (first, second) = send_twice(&f, false);
     assert_eq!(first.0, 200, "{first:?}");
     assert_eq!(second, first, "the same answer");
     assert_eq!(tasks(&f), 1, "applied once");
 
     let f = Fixture::with(|cfg| cfg.duplicate_wait = Duration::from_millis(200));
-    let (first, second) = send_twice(&f);
+    let (first, second) = send_twice(&f, true);
     assert_eq!(first.0, 200, "{first:?}");
     assert_eq!(second.0, 503, "{second:?}");
-    assert!(second.1.contains("still running"), "{second:?}");
+    assert!(
+        second.1.contains("unavailable") && second.1.contains("may yet apply"),
+        "{second:?}"
+    );
     assert_eq!(tasks(&f), 1, "applied once");
+}
+
+/// A burst of keyed writes cannot evict a write's answer its client may still resend for: past the
+/// cap, the burst is refused `busy` — nothing ran — and the young answer is still replayed.
+#[test]
+fn a_burst_of_keyed_writes_does_not_evict_a_young_answer() {
+    let f = Fixture::with(|cfg| cfg.idempotency_entries = 2);
+    let token = root_token(&f);
+    let add = json!({ "op": "task.add", "text": "t" });
+    let first = post(&f, &token, Some("first"), &add);
+    assert_eq!(first.0, 200, "{first:?}");
+    let mut refused = 0;
+    for i in 0..8 {
+        let (status, body) = post(&f, &token, Some(&format!("burst-{i}")), &add);
+        if status == 503 {
+            assert!(body.contains("busy") && body.contains("full"), "{body}");
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "the store filled");
+    let tasks_before = tasks(&f);
+    assert_eq!(post(&f, &token, Some("first"), &add), first, "replayed");
+    assert_eq!(tasks(&f), tasks_before, "not run again");
 }
 
 /// Keys are scoped by the token presented: another caller sending the same key is served its own
@@ -1667,12 +1706,18 @@ fn expired_and_evicted_keys_run_again() {
     post(&f, &token, Some("k"), &add);
     assert_eq!(tasks(&f), 2, "expired: run again");
 
-    let f = Fixture::with(|cfg| cfg.idempotency_entries = 1);
+    // Past the cap, an answer old enough — past `idempotency_min_age` — goes for a new one.
+    let f = Fixture::with(|cfg| {
+        cfg.idempotency_entries = 1;
+        cfg.idempotency_min_age = Duration::from_millis(100);
+    });
     let token = root_token(&f);
     post(&f, &token, Some("a"), &add);
+    std::thread::sleep(Duration::from_millis(150));
     post(&f, &token, Some("b"), &add);
     post(&f, &token, Some("b"), &add);
     assert_eq!(tasks(&f), 2, "b's answer kept");
+    std::thread::sleep(Duration::from_millis(150));
     post(&f, &token, Some("a"), &add);
     assert_eq!(tasks(&f), 3, "a's answer was evicted for b's");
 }

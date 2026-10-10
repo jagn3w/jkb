@@ -39,6 +39,9 @@ pub enum Begin<V> {
     Wait(watch::Receiver<Option<V>>),
     /// The key was first used for a different request.
     Mismatch,
+    /// Nothing recorded, and no room to record it: the store is at a cap with every answer in it too
+    /// young to evict. The request must be refused (`busy`) without running.
+    Full,
 }
 
 /// The original of a key, while it runs.
@@ -61,14 +64,19 @@ struct Entry<V> {
 }
 
 /// The recorded requests. Answers expire [`Store::ttl`] after they were recorded, and past
-/// `max_entries` entries or `max_bytes` of answers the oldest answers go first. An entry still in
-/// progress is never evicted: its waiters would lose the answer, and a resend would run it again.
+/// `max_entries` entries or `max_bytes` of answers the oldest answers go first — but never one younger
+/// than `min_age`, the longest a client may still resend it (its whole deadline, with a margin):
+/// evicted then, the resend would run the write again. While nothing can be evicted the store is full,
+/// and new keyed work is refused ([`Begin::Full`]) rather than recorded at the cost of a young answer.
+/// An entry still in progress is never evicted: its waiters would lose the answer, and a resend would
+/// run it again.
 pub struct Store<V> {
     entries: HashMap<Key, Entry<V>>,
     next_id: u64,
     done_bytes: usize,
     /// How long an answer is kept.
     pub ttl: Duration,
+    min_age: Duration,
     max_entries: usize,
     max_bytes: usize,
 }
@@ -76,12 +84,13 @@ pub struct Store<V> {
 impl<V: Clone> Store<V> {
     /// An empty store.
     #[must_use]
-    pub fn new(ttl: Duration, max_entries: usize, max_bytes: usize) -> Self {
+    pub fn new(ttl: Duration, min_age: Duration, max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
             next_id: 0,
             done_bytes: 0,
             ttl,
+            min_age,
             max_entries,
             max_bytes,
         }
@@ -99,6 +108,9 @@ impl<V: Clone> Store<V> {
                 State::InProgress(rx) => Begin::Wait(rx.clone()),
             };
         }
+        if !self.evict(now, 1) {
+            return Begin::Full;
+        }
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = watch::channel(None);
@@ -110,7 +122,6 @@ impl<V: Clone> Store<V> {
                 state: State::InProgress(rx),
             },
         );
-        self.evict();
         Begin::Run(Running { id, tx })
     }
 
@@ -128,7 +139,9 @@ impl<V: Clone> Store<V> {
             at: now,
         };
         self.done_bytes += bytes;
-        self.evict();
+        // Kept even past the byte cap when nothing older may go: the op ran, and its answer is what a
+        // resend must get. New work is refused until there is room again.
+        self.evict(now, 0);
     }
 
     /// Forget the entry `id` under `key` without an answer: it was refused before it ran, so a resend
@@ -177,21 +190,30 @@ impl<V: Clone> Store<V> {
         self.done_bytes -= freed;
     }
 
-    /// Drop the oldest answers while over either cap. In-progress entries stay, even over the cap:
-    /// they are bounded by the daemon's op permits.
-    fn evict(&mut self) {
-        while self.entries.len() > self.max_entries || self.done_bytes > self.max_bytes {
+    /// Drop the oldest answers at least `min_age` old while the store, with room for `extra` more
+    /// entries, is over either cap. Whether it is then within them. In-progress entries and young
+    /// answers stay.
+    fn evict(&mut self, now: Instant, extra: usize) -> bool {
+        let min_age = self.min_age;
+        loop {
+            if self.entries.len() + extra <= self.max_entries && self.done_bytes <= self.max_bytes {
+                return true;
+            }
             let oldest = self
                 .entries
                 .iter()
                 .filter_map(|(k, e)| match &e.state {
-                    State::Done { at, bytes, .. } => Some((*at, *bytes, k)),
-                    State::InProgress(_) => None,
+                    State::Done { at, bytes, .. }
+                        if now.saturating_duration_since(*at) >= min_age =>
+                    {
+                        Some((*at, *bytes, k))
+                    }
+                    _ => None,
                 })
                 .min_by_key(|(at, _, _)| *at)
                 .map(|(_, bytes, k)| (bytes, k.clone()));
             let Some((bytes, key)) = oldest else {
-                return;
+                return false;
             };
             self.entries.remove(&key);
             self.done_bytes -= bytes;
@@ -215,10 +237,12 @@ mod tests {
         }
     }
 
+    const MIN_AGE: Duration = Duration::from_mins(1);
+
     #[test]
     fn an_answer_is_replayed_until_its_ttl_then_runs_again() {
         let t0 = Instant::now();
-        let mut s = Store::new(Duration::from_mins(10), 16, 1 << 20);
+        let mut s = Store::new(Duration::from_mins(10), MIN_AGE, 16, 1 << 20);
         let id = run(&mut s, "a", t0);
         assert!(matches!(s.begin(key("a"), 0, t0), Begin::Wait(_)));
         s.finish(&key("a"), id, 7, 1, t0);
@@ -232,51 +256,85 @@ mod tests {
         );
     }
 
+    /// Past a cap the oldest answer old enough to go goes first; one in progress never does.
     #[test]
     fn the_caps_evict_the_oldest_answers_and_never_one_in_progress() {
         let t0 = Instant::now();
-        let mut s = Store::new(Duration::from_mins(10), 3, 1 << 20);
+        let late = t0 + MIN_AGE * 2;
+        let mut s = Store::new(Duration::from_mins(10), MIN_AGE, 3, 1 << 20);
         let running = run(&mut s, "running", t0);
         for (k, secs) in [("a", 1), ("b", 2)] {
             let id = run(&mut s, k, t0);
             s.finish(&key(k), id, 1, 1, t0 + Duration::from_secs(secs));
         }
         // A fourth entry: "a", the oldest answer, goes — not "running", older still.
-        let id = run(&mut s, "c", t0 + Duration::from_secs(10));
+        let c = run(&mut s, "c", late);
         assert_eq!(s.len(), 3);
-        // Asking for "a" again starts it afresh, a fourth entry again: now "b" is the only answer,
-        // so it goes.
-        assert!(matches!(s.begin(key("a"), 0, t0), Begin::Run(_)), "a went");
-        assert!(matches!(s.begin(key("running"), 0, t0), Begin::Wait(_)));
-        assert!(matches!(s.begin(key("b"), 0, t0), Begin::Run(_)), "b went");
-        assert_eq!(
-            s.len(),
-            4,
-            "over the cap with nothing but entries in progress"
+        assert!(
+            matches!(s.begin(key("b"), 0, late), Begin::Replay(1)),
+            "b stays"
+        );
+        // "b" is the only answer left, so it is the one to go for the next.
+        assert!(
+            matches!(s.begin(key("a"), 0, late), Begin::Run(_)),
+            "a went"
+        );
+        assert!(matches!(s.begin(key("running"), 0, late), Begin::Wait(_)));
+        assert!(
+            matches!(s.begin(key("d"), 0, late), Begin::Full),
+            "nothing but entries in progress: full"
         );
         s.finish(&key("running"), running, 2, 1, t0);
-        s.finish(&key("c"), id, 3, 1, t0 + Duration::from_secs(11));
-        assert_eq!(s.len(), 3, "a finished answer is evicted down to the cap");
+        s.finish(&key("c"), c, 3, 1, late);
+        assert_eq!(s.len(), 3);
 
-        let mut s = Store::new(Duration::from_mins(10), 16, 10);
+        let mut s = Store::new(Duration::from_mins(10), MIN_AGE, 16, 10);
         let a = run(&mut s, "a", t0);
         s.finish(&key("a"), a, 1, 6, t0);
-        let b = run(&mut s, "b", t0);
-        s.finish(&key("b"), b, 2, 6, t0 + Duration::from_secs(1));
+        let b = run(&mut s, "b", late);
+        s.finish(&key("b"), b, 2, 6, late);
         assert!(
-            matches!(s.begin(key("b"), 0, t0), Begin::Replay(2)),
+            matches!(s.begin(key("b"), 0, late), Begin::Replay(2)),
             "the newer answer stays"
         );
         assert!(
-            matches!(s.begin(key("a"), 0, t0), Begin::Run(_)),
+            matches!(s.begin(key("a"), 0, late), Begin::Run(_)),
             "the byte cap evicted the older"
         );
+    }
+
+    /// A burst of answers cannot evict one younger than the client's whole deadline: the store fills,
+    /// and new keyed work is refused instead, until the young answer is old enough to go.
+    #[test]
+    fn a_young_answer_is_never_evicted_and_new_work_is_refused_instead() {
+        let t0 = Instant::now();
+        let mut s = Store::new(Duration::from_mins(10), MIN_AGE, 16, 100);
+        let write = run(&mut s, "write", t0);
+        s.finish(&key("write"), write, 1, 10, t0);
+        let soon = t0 + Duration::from_secs(1);
+        let big = run(&mut s, "big", soon);
+        s.finish(&key("big"), big, 2, 95, soon);
+        assert!(
+            matches!(s.begin(key("write"), 0, soon), Begin::Replay(1)),
+            "kept past the byte cap"
+        );
+        assert!(matches!(s.begin(key("next"), 0, soon), Begin::Full));
+        assert!(
+            matches!(s.begin(key("write"), 0, soon), Begin::Replay(1)),
+            "still kept"
+        );
+        let later = t0 + MIN_AGE;
+        assert!(
+            matches!(s.begin(key("next"), 0, later), Begin::Run(_)),
+            "the write's answer is old enough to go now"
+        );
+        assert!(matches!(s.begin(key("write"), 0, later), Begin::Run(_)));
     }
 
     #[test]
     fn an_abandoned_entry_runs_again_and_its_waiters_hear_no_answer() {
         let t0 = Instant::now();
-        let mut s = Store::<u32>::new(Duration::from_mins(10), 16, 1 << 20);
+        let mut s = Store::<u32>::new(Duration::from_mins(10), MIN_AGE, 16, 1 << 20);
         let Begin::Run(r) = s.begin(key("a"), 0, t0) else {
             panic!("run")
         };
