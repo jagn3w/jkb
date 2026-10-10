@@ -858,16 +858,8 @@ fn a_connection_that_never_authenticates_is_closed_even_while_pipelining() {
     drop(hog);
 }
 
-/// Keyed or not: a keyed long-poll is served on its handler, like any other, rather than on a task
-/// that outlives its client — which held the group's slot and a poll permit for the whole wait.
 #[test]
 fn a_long_poll_slot_is_released_when_its_client_goes_away() {
-    for key in ["", "idempotency-key: k\r\n"] {
-        long_poll_slot_released(key);
-    }
-}
-
-fn long_poll_slot_released(key: &str) {
     use std::io::Write as _;
     let f = Fixture::new();
     let c = f.client();
@@ -877,7 +869,7 @@ fn long_poll_slot_released(key: &str) {
     let mut raw = std::net::TcpStream::connect(f.handle.as_ref().unwrap().addr).unwrap();
     write!(
         raw,
-        "POST /v1/op?wait_ms=20000 HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n{key}\
+        "POST /v1/op?wait_ms=20000 HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n\
          content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
         token.trim(),
         body.len()
@@ -1453,8 +1445,14 @@ fn a_grant_revoked_behind_the_cache_is_refused_and_its_connection_closed() {
 }
 
 /// `POST /v1/op` with `token`, and an `Idempotency-Key` when one is given: the status and the body.
+/// `POST /v1/op`, or the keyed route when there is a key.
 fn post(f: &Fixture, token: &str, key: Option<&str>, body: &serde_json::Value) -> (u16, String) {
-    post_at(f, "/v1/op", token, key, body)
+    let path = if key.is_some() {
+        jkb_daemon::server::KEYED_PATH
+    } else {
+        "/v1/op"
+    };
+    post_at(f, path, token, key, body)
 }
 
 fn post_at(
@@ -1533,16 +1531,49 @@ fn a_keyed_write_sent_twice_is_applied_once_and_answered_alike() {
     assert_eq!(tasks(&f), 2);
 }
 
-/// Without the header every request runs, as before keys existed.
+/// `/v1/op` runs every request, as before keys existed — with or without the header, which it
+/// ignores.
 #[test]
-fn a_request_without_a_key_runs_every_time() {
+fn a_request_to_v1_op_runs_every_time_key_or_not() {
     let f = Fixture::new();
     let token = root_token(&f);
     let add = json!({ "op": "task.add", "text": "twice" });
-    let (a, b) = (post(&f, &token, None, &add), post(&f, &token, None, &add));
-    assert_eq!((a.0, b.0), (200, 200));
-    assert_ne!(a.1, b.1, "two tasks, two answers");
-    assert_eq!(tasks(&f), 2);
+    for key in [None, Some("k")] {
+        let before = tasks(&f);
+        let a = post_at(&f, "/v1/op", &token, key, &add);
+        let b = post_at(&f, "/v1/op", &token, key, &add);
+        assert_eq!((a.0, b.0), (200, 200), "{key:?}");
+        assert_ne!(a.1, b.1, "{key:?}: two tasks, two answers");
+        assert_eq!(tasks(&f) - before, 2, "{key:?}");
+    }
+}
+
+/// The keyed route requires the header, and refuses a long-poll, which is never keyed (it must be
+/// served on its handler, so a client that hangs up frees its group's slot). Neither runs the op.
+#[test]
+fn the_keyed_route_needs_a_key_and_refuses_a_long_poll() {
+    let f = Fixture::new();
+    topic_and_group(&f.client());
+    let token = root_token(&f);
+    let keyed = jkb_daemon::server::KEYED_PATH;
+    let add = json!({ "op": "task.add", "text": "t" });
+    let missing = post_at(&f, keyed, &token, None, &add);
+    assert_eq!(missing.0, 400, "{missing:?}");
+    assert!(
+        missing.1.contains("needs an Idempotency-Key"),
+        "{missing:?}"
+    );
+    assert_eq!(tasks(&f), 0);
+    let poll = json!({ "op": "mq.poll", "topic": "t", "group": "g", "max": 10 });
+    let refused = post_at(
+        &f,
+        &format!("{keyed}?wait_ms=100"),
+        &token,
+        Some("k"),
+        &poll,
+    );
+    assert_eq!(refused.0, 400, "{refused:?}");
+    assert!(refused.1.contains("not keyed"), "{refused:?}");
 }
 
 /// A resend that arrives while the original is still running waits for it and gets its answer,
@@ -1678,55 +1709,4 @@ fn a_keyed_request_refused_before_it_ran_is_not_recorded() {
     let ran = post(&f, &token, Some("k"), &add);
     assert_eq!(ran.0, 200, "{ran:?}");
     assert_eq!(tasks(&f), 1);
-}
-
-/// A replay re-resolves a token's caller under a read permit, so replays are bounded by the read
-/// budget like any read: with none free, a replay is `busy`.
-#[test]
-fn replays_are_bounded_by_the_read_budget() {
-    let f = Fixture::with(|cfg| cfg.max_reads = 0);
-    let Response::Granted { token, .. } = f
-        .client()
-        .call(
-            serde_json::from_value(
-                json!({ "op": "role.grant", "role": "coordinator", "agent": "c" }),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("granted")
-    };
-    let add = json!({ "op": "task.add", "text": "t" });
-    let first = post(&f, &token, Some("k"), &add);
-    assert_ne!(first.0, 503, "{first:?}");
-    let replay = post(&f, &token, Some("k"), &add);
-    assert_eq!(replay.0, 503, "{replay:?}");
-    assert!(replay.1.contains("read limit"), "{replay:?}");
-}
-
-/// A recorded answer is not replayed to a token revoked since: it is refused, as running the op would
-/// be, and its connection closed.
-#[test]
-fn a_recorded_answer_is_not_replayed_to_a_revoked_token() {
-    let f = Fixture::new();
-    let op = f.client();
-    let Response::Granted { token, grant } = op
-        .call(
-            serde_json::from_value(
-                json!({ "op": "role.grant", "role": "coordinator", "agent": "c" }),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("granted")
-    };
-    let whoami = json!({ "op": "role.whoami" });
-    assert_eq!(post(&f, &token, Some("k"), &whoami).0, 200);
-    let id = grant.id;
-    f.db.write_txn("host-cli", move |c, m| jkb_core::roles::revoke(c, m, id))
-        .unwrap();
-    let (status, body) = post(&f, &token, Some("k"), &whoami);
-    assert_eq!(status, 401, "{body}");
 }

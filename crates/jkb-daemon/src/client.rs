@@ -24,28 +24,28 @@ pub const UNREACHABLE_FOR: Duration = Duration::from_secs(5);
 /// attest hook among them — untried for [`UNREACHABLE_FOR`].
 ///
 /// A failed connect is retried whatever the request: no byte reached the daemon, so nothing can be
-/// applied twice. A request that connected is resent only when it carries an idempotency key, the
-/// daemon says it honours keys, and the request went unanswered past [`ATTEMPT_TIMEOUT`]. Retries and
-/// their pauses fit inside the request's own deadline, never beyond it (`send_attempts`).
+/// applied twice. A request that connected is resent at most once, and only when it carries an
+/// idempotency key ([`ATTEMPT_TIMEOUT`]). Retries and their pauses fit inside the request's own
+/// deadline, never beyond it (`send_retrying_connect`).
 pub const CONNECT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(100), Duration::from_millis(300)];
 
-/// How long one attempt of an ordinary op may go unanswered before it is resent, with the same
-/// `Idempotency-Key`, under the call's one deadline. The first attempt is not abandoned: it stays
-/// open beside the resend, and whichever is answered first is the answer.
-///
-/// **Only to a daemon that honours keys.** An older `jkb serve` ignores the header, and the container's
-/// `jkb` and the host's routinely differ between `setup.sh` runs, so a resend to one would apply a
-/// slow write twice. Before its first resend a client asks `GET /v1/hello`, whose `idempotency: true`
-/// says the daemon honours keys, and remembers the answer; to a daemon that does not say so the call
-/// keeps its one attempt, as before keys existed.
+/// How long the first attempt of a keyed call may go unanswered after connecting before it is
+/// abandoned and sent once more, with the same `Idempotency-Key`, for the rest of the call's deadline.
 ///
 /// Measured: Claude Code's sandbox proxy stalls about 1 in 200 requests to `jkb serve` for 10–30 s —
 /// the request connects and no answer comes back — while a warm answer takes milliseconds. Without a
-/// key a resend could apply a write twice, so the client waited out its whole 30 s op timeout. With
-/// one, the daemon runs the op once and answers every attempt with that one answer
-/// (`crate::idempotency`), so the resend is safe. A long op is never abandoned: see
-/// [`RemoteBackend::budget`].
+/// key a resend could apply a write twice, so the client waited out its whole 30 s op timeout. A keyed
+/// call goes to `POST /v1/op/keyed`, where the daemon runs the op once and answers every attempt of
+/// the key with that one answer (`crate::idempotency`), so the resend is safe.
+///
+/// - **At most two attempts.** Whatever jkb serve answers the second — a success, `busy`,
+///   `unauthorized`, anything — is the call's answer.
+/// - **Version skew by construction.** A `jkb serve` older than keys answers the keyed route
+///   `bad_request` "no such endpoint" without running the op; the call then makes one unkeyed attempt
+///   on `/v1/op`, as before keys existed, never resent.
+/// - **Not every call is keyed** ([`RemoteBackend::budget`]): a long op, and a call whose whole
+///   deadline is shorter than this (a hook's), make one unkeyed attempt.
 ///
 /// **Residual:** the daemon keeps keys in memory only, so an attempt applied just before a daemon
 /// restart and resent after it is applied twice.
@@ -54,13 +54,8 @@ pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The header naming a logical call (the daemon's `server::IDEMPOTENCY_KEY`).
 const IDEMPOTENCY_KEY: &str = crate::server::IDEMPOTENCY_KEY;
 
-/// How long the `GET /v1/hello` asking whether the daemon honours keys may take, connect retries
-/// included — within the call's own deadline.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// The pause before resending a keyed call whose resend got an answer that does not decide the op
-/// ([`decides`]) while an earlier attempt may still be running.
-const UNDECIDED_PAUSE: Duration = Duration::from_millis(200);
+/// The route a keyed call is sent to (the daemon's `server::KEYED_PATH`).
+const KEYED_PATH: &str = crate::server::KEYED_PATH;
 
 /// What one call may spend, from [`RemoteBackend::budget`] — the one place it is decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,18 +64,10 @@ struct Budget {
     wait: Duration,
     /// The whole call, every attempt and pause included.
     total: Duration,
-    /// How long an attempt may go unanswered before the call is resent; `None` for a call never resent
-    /// after it connected.
+    /// How long the first attempt may go unanswered before the call is sent once more, keyed; `None`
+    /// for a call that is not keyed, and never resent after it connected.
     resend_after: Option<Duration>,
-    /// Whether the call carries an `Idempotency-Key`. A long-poll does not: it is never resent, and the
-    /// daemon serves it on its own handler, so that a client that hangs up frees its group's slot.
-    keyed: bool,
 }
-
-/// Whether the daemon honours `Idempotency-Key`, as `GET /v1/hello` said: not asked yet, yes, no.
-const HONOURS_UNKNOWN: u8 = 0;
-const HONOURS_YES: u8 = 1;
-const HONOURS_NO: u8 = 2;
 
 /// A fresh 128-bit `Idempotency-Key`, hex. `None` when the system has no randomness to give, and the
 /// call is then sent without one — and so never resent after it connected.
@@ -94,47 +81,25 @@ fn idempotency_key() -> Option<String> {
     }))
 }
 
-/// A send that ran out: the last error, whether it was a failed connect, and whether any attempt
-/// connected — only a call none of whose attempts connected marks the daemon down.
-struct Failed {
-    error: String,
-    connect: bool,
-    connected: bool,
+/// An answer as read: its status, and its body or the error reading it.
+type Read = (reqwest::StatusCode, reqwest::Result<bytes::Bytes>);
+
+fn read(resp: reqwest::blocking::Response) -> Read {
+    let status = resp.status();
+    (status, resp.bytes())
 }
 
-impl From<(reqwest::Error, bool)> for Failed {
-    fn from((error, connected): (reqwest::Error, bool)) -> Self {
-        Self {
-            connect: error.is_connect(),
-            error: error.to_string(),
-            connected,
-        }
-    }
-}
-
-/// An attempt's outcome: the status and the whole body, or the transport's error.
-type Sent = Result<(reqwest::StatusCode, bytes::Bytes), reqwest::Error>;
-
-/// Whether an error code from jkb serve decides the op — says what became of it — rather than only
-/// that this attempt got no verdict. The one place the rule lives.
-///
-/// Not deciding: `busy` (refused at a permit, or a resend told its original is still running or was
-/// refused), `unavailable`, `internal` (the daemon failed, or the op did not finish), and
-/// `bad_request` (on a client that sends well-formed JSON, a body that did not arrive). Everything else
-/// — a success, `unauthorized`, `forbidden`, `not_found`, `invalid`, `schema_newer` and the like — is
-/// the op's verdict, which every attempt of the call would get.
-const fn code_decides(code: ErrorCode) -> bool {
-    !matches!(
-        code,
-        ErrorCode::Busy | ErrorCode::Unavailable | ErrorCode::Internal | ErrorCode::BadRequest
-    )
-}
-
-/// Whether an answer decides the op ([`code_decides`]): a success, or jkb serve's refusal with a
-/// deciding code. An answer from something other than jkb serve (a proxy's 502) decides nothing.
-fn decides((status, bytes): &(reqwest::StatusCode, bytes::Bytes)) -> bool {
-    status.is_success()
-        || serde_json::from_slice::<ApiError>(bytes).is_ok_and(|e| code_decides(e.code))
+/// Whether jkb serve refused the keyed route as an endpoint it does not have — a daemon older than
+/// keys, which did not run the op.
+fn no_such_endpoint((status, bytes): &Read) -> bool {
+    *status == reqwest::StatusCode::BAD_REQUEST
+        && bytes
+            .as_ref()
+            .ok()
+            .and_then(|b| serde_json::from_slice::<ApiError>(b).ok())
+            .is_some_and(|e| {
+                e.code == ErrorCode::BadRequest && e.message.starts_with("no such endpoint")
+            })
 }
 
 /// Serves requests by calling a `jkb serve` daemon over HTTP.
@@ -153,8 +118,6 @@ pub struct RemoteBackend {
     op_timeout: Duration,
     /// [`ATTEMPT_TIMEOUT`], shortened by tests.
     attempt_timeout: Duration,
-    /// Whether the daemon honours keys (`HONOURS_*`), asked once.
-    honours: std::sync::atomic::AtomicU8,
     down_marker: Option<PathBuf>,
 }
 
@@ -182,7 +145,6 @@ impl RemoteBackend {
             poll_wait: Duration::from_secs(2),
             op_timeout: Duration::from_secs(30),
             attempt_timeout: ATTEMPT_TIMEOUT,
-            honours: std::sync::atomic::AtomicU8::new(HONOURS_UNKNOWN),
             down_marker: None,
         })
     }
@@ -267,16 +229,15 @@ impl RemoteBackend {
         }
     }
 
-    /// What `request` may spend: its long-poll wait, its whole deadline, whether it carries a key, and
-    /// how long an attempt may go unanswered before it is resent. The one place an op's budget is
-    /// decided, so no call site can forget it.
+    /// What `request` may spend: its long-poll wait, its whole deadline, and whether it is keyed —
+    /// how long its first attempt may go unanswered before it is sent once more. The one place an op's
+    /// budget is decided, so no call site can forget it.
     ///
-    /// A **long** op is never resent: its one attempt has the whole deadline. Long is an op given more
-    /// than the plain [`RemoteBackend::with_deadlines`] total — `mq.poll`, which the daemon may hold for
-    /// its wait, and which carries no key at all — and `ingest.text`, whose capture of a body at the cap
-    /// holds the writer about half a second and whose resend could only queue behind it. Everything
-    /// else is resent after [`ATTEMPT_TIMEOUT`] — when that is inside the deadline, so a hook, whose
-    /// `TOTAL` is 1 s, makes one attempt.
+    /// Unkeyed, one attempt with the whole deadline: a **long** op — one given more than the plain
+    /// [`RemoteBackend::with_deadlines`] total, `mq.poll`, which the daemon may hold for its wait, and
+    /// `ingest.text`, whose capture of a body at the cap holds the writer about half a second and whose
+    /// resend could only queue behind it — and a call whose whole deadline is no longer than the
+    /// attempt budget (a hook's, whose `TOTAL` is 1 s), which would have no time to resend.
     fn budget(&self, request: &Request) -> Budget {
         let wait = match request {
             Request::MqPoll { .. } => self.poll_wait,
@@ -287,18 +248,18 @@ impl RemoteBackend {
         Budget {
             wait,
             total,
-            resend_after: (!long).then_some(self.attempt_timeout),
-            keyed: wait.is_zero(),
+            resend_after: (!long && self.attempt_timeout < total).then_some(self.attempt_timeout),
         }
     }
 
-    fn send(
-        &self,
-        request: &Request,
-        token: &str,
-        key: Option<&str>,
-    ) -> Result<(reqwest::StatusCode, bytes::Bytes), ApiError> {
+    /// Send `request`, keyed with `key` when it is one to resend ([`ATTEMPT_TIMEOUT`]): to the keyed
+    /// route for at most the attempt budget, and once more, with the same key, for the rest of the
+    /// deadline if that attempt connected and went unanswered. A daemon without the keyed route gets
+    /// one unkeyed attempt instead.
+    fn send(&self, request: &Request, token: &str, key: Option<&str>) -> Result<Read, ApiError> {
         let budget = self.budget(request);
+        let deadline = Instant::now() + budget.total;
+        let left = || deadline.saturating_duration_since(Instant::now());
         let url = if budget.wait.is_zero() {
             format!("{}/v1/op", self.base)
         } else {
@@ -320,196 +281,95 @@ impl RemoteBackend {
         }
         // Shared, so each attempt's copy is a reference count rather than the body again.
         let body = bytes::Bytes::from(body);
-        // Without a key nothing makes a resend safe.
-        let resend_after = key.and(budget.resend_after);
-        self.send_attempts(budget.total, resend_after, token, |left| {
-            let builder = self
-                .client
+        let unkeyed = |left: Duration| {
+            self.client
                 .post(&url)
                 .bearer_auth(token)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body.clone())
-                .timeout(left);
-            match key {
-                Some(key) => builder.header(IDEMPOTENCY_KEY, key),
-                None => builder,
+                .timeout(left)
+        };
+        let keyed_url = format!("{}{KEYED_PATH}", self.base);
+        let keyed = |key: &str, timeout: Duration| {
+            self.client
+                .post(&keyed_url)
+                .bearer_auth(token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY, key)
+                .body(body.clone())
+                .timeout(timeout)
+        };
+        // Whether an attempt reached the daemon: only a call none of whose attempts did marks it down.
+        let mut connected = false;
+        let sent = match (key, budget.resend_after) {
+            (Some(key), Some(after)) => {
+                match self.send_retrying_connect(left(), |left| keyed(key, left.min(after))) {
+                    // Connected and unanswered past the attempt budget: abandoned, and sent once more
+                    // under the same key. Whatever jkb serve answers that is final.
+                    Err(e) if e.is_timeout() && !e.is_connect() && !left().is_zero() => {
+                        connected = true;
+                        self.send_retrying_connect(left(), |left| keyed(key, left))
+                            .map(read)
+                    }
+                    Ok(resp) => match read(resp) {
+                        // A daemon older than keys, which did not run the op: one unkeyed attempt.
+                        answer if no_such_endpoint(&answer) => {
+                            connected = true;
+                            self.send_retrying_connect(left(), unkeyed).map(read)
+                        }
+                        answer => Ok(answer),
+                    },
+                    Err(e) => Err(e),
+                }
             }
-        })
-        .map_err(|failed| {
-            // Only a call none of whose attempts connected means the daemon is out of reach —
-            // refused, or the connect timeout, which reqwest reports as a connect error. A request
-            // that connected and then ran past its deadline reached a daemon that is busy (a write
-            // lock held by another process), and marking that down made every other client — a hook
-            // for a permission prompt among them — give up without trying for the next few seconds.
-            if failed.connect && !failed.connected {
+            _ => self.send_retrying_connect(left(), unkeyed).map(read),
+        };
+        sent.map_err(|e| {
+            // Only a failed CONNECT means the daemon is out of reach — refused, or the connect
+            // timeout, which reqwest reports as a connect error. A request that connected and
+            // then ran past its deadline reached a daemon that is busy (a write lock held by
+            // another process), and marking that down made every other client — a hook for a
+            // permission prompt among them — give up without trying for the next few seconds.
+            // A connect error here is the last attempt's: its retries ran out, or the deadline left
+            // no room for another — and it counts only if no earlier attempt connected.
+            if e.is_connect() && !connected {
                 self.mark_unreachable(true);
             }
             ApiError::with_code(
                 ErrorCode::Unavailable,
-                format!("cannot reach jkb serve at {}: {}", self.base, failed.error),
+                format!("cannot reach jkb serve at {}: {e}", self.base),
             )
         })
     }
 
-    /// Whether the daemon honours `Idempotency-Key`: asked of `GET /v1/hello` — through the same send
-    /// path as [`RemoteBackend::hello`], connect retries included, within `left` — and remembered.
-    /// `None` when the probe failed: nothing is remembered, and the caller asks again later.
-    fn honours_keys(&self, token: &str, left: Duration) -> Option<bool> {
-        use std::sync::atomic::Ordering;
-        match self.honours.load(Ordering::SeqCst) {
-            HONOURS_YES => return Some(true),
-            HONOURS_NO => return Some(false),
-            _ => {}
-        }
-        let url = format!("{}/v1/hello", self.base);
-        let (status, bytes) = self
-            .send_attempts(left.min(PROBE_TIMEOUT), None, token, |left| {
-                self.client.get(&url).bearer_auth(token).timeout(left)
-            })
-            .ok()?;
-        let hello = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .filter(|_| status.is_success())?;
-        let yes = hello["idempotency"] == serde_json::Value::Bool(true);
-        self.honours
-            .store(if yes { HONOURS_YES } else { HONOURS_NO }, Ordering::SeqCst);
-        Some(yes)
-    }
-
-    /// Forget whether the daemon honours keys: it may have been replaced — a token re-read after
-    /// `unauthorized`, or a failed connect, can mean a restart onto another `jkb serve`.
-    fn forget_honours(&self) {
-        self.honours
-            .store(HONOURS_UNKNOWN, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Send the request `build` makes, answer read whole. The one place the retry rule lives:
-    ///
-    /// - A failed connect, with nothing else in flight, is sent again after each of
-    ///   [`CONNECT_RETRY_DELAYS`].
-    /// - With `resend_after` (a keyed call), an attempt unanswered that long is resent with the same
-    ///   key — if the daemon honours keys ([`RemoteBackend::honours_keys`]) — and the earlier attempt
-    ///   stays open: whichever is answered first is the answer. So is an attempt that failed after
-    ///   connecting. A probe that fails is asked again one `resend_after` later.
-    /// - Once an earlier attempt may be running, only an answer that decides the op ([`decides`]) ends
-    ///   the call. Any other — `busy`, `unavailable`, a proxy's 502 — is kept as the call's answer if
-    ///   nothing better comes, and the call waits on for the attempts still open, or resends after
-    ///   [`UNDECIDED_PAUSE`] under the same key. Handed to the caller, it would be retried under a
-    ///   fresh key, and the write applied twice.
-    /// - Anything else ends the call.
+    /// Send the request `build` makes, building and sending it again after each of
+    /// [`CONNECT_RETRY_DELAYS`] while the failure is a failed connect — and only then: any other
+    /// error, a timeout after connecting among them, is returned at once. The one place the retry
+    /// rule lives.
     ///
     /// The whole of it, retries and their pauses included, is held to ONE deadline, `budget` from
-    /// now: `build` is handed the time left, for the attempt's own timeout, and a connect retry whose
-    /// pause and connect timeout would not fit before the deadline is not made. Each attempt given a
-    /// fresh budget ran a hook's request to about twice its `TOTAL` — past Claude Code's `SessionEnd`
+    /// now: `build` is handed the time left, for the attempt's own timeout, and a retry whose pause
+    /// and connect timeout would not fit before the deadline is not made. Each attempt given a fresh
+    /// budget ran a hook's request to about twice its `TOTAL` — past Claude Code's `SessionEnd`
     /// budget — when a failed connect was followed by a slow answer.
-    fn send_attempts(
+    fn send_retrying_connect(
         &self,
         budget: Duration,
-        resend_after: Option<Duration>,
-        token: &str,
         build: impl Fn(Duration) -> reqwest::blocking::RequestBuilder,
-    ) -> Result<(reqwest::StatusCode, bytes::Bytes), Failed> {
+    ) -> reqwest::Result<reqwest::blocking::Response> {
         let deadline = Instant::now() + budget;
-        let (tx, rx) = std::sync::mpsc::channel::<Sent>();
-        // Each attempt on a thread of its own, so an unanswered one can stay open beside its resend.
-        let launch = |left: Duration| {
-            let request = build(left);
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let sent = request.send().and_then(|resp| {
-                    let status = resp.status();
-                    resp.bytes().map(|bytes| (status, bytes))
-                });
-                let _ = tx.send(sent);
-            });
-        };
-        launch(budget);
-        let mut in_flight = 1usize;
-        let mut resend_at = resend_after.map(|after| Instant::now() + after);
         let mut delays = CONNECT_RETRY_DELAYS.iter();
-        let mut connected = false;
-        // Whether an attempt other than the latest may have reached the daemon and be running.
-        let mut may_run = false;
-        let mut last: Option<Result<(reqwest::StatusCode, bytes::Bytes), Failed>> = None;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            if in_flight == 0 && (resend_at.is_none() || left.is_zero()) {
-                return last.unwrap_or_else(|| {
-                    Err(Failed {
-                        error: "no attempt was made".to_owned(),
-                        connect: false,
-                        connected,
-                    })
-                });
-            }
-            let due = resend_at.map_or(deadline, |at| at.min(deadline));
-            let received = if left.is_zero() {
-                // Past the deadline: the attempts' own timeouts end them now.
-                rx.recv()
-                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
-            } else {
-                rx.recv_timeout(due.saturating_duration_since(Instant::now()))
-            };
-            let Ok(sent) = received else {
-                // A resend is due.
-                if resend_at.is_some_and(|at| at <= Instant::now()) {
-                    resend_at = None;
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    match (!left.is_zero()).then(|| self.honours_keys(token, left)) {
-                        None | Some(Some(false)) => {}
-                        Some(Some(true)) => {
-                            may_run |= in_flight > 0 || connected;
-                            launch(deadline.saturating_duration_since(Instant::now()));
-                            in_flight += 1;
-                            resend_at = resend_after.map(|after| Instant::now() + after);
-                        }
-                        // The probe failed: asked again one interval later.
-                        Some(None) => {
-                            resend_at = resend_after.map(|after| Instant::now() + after);
-                        }
+            match build(left).send() {
+                Err(e) if e.is_connect() => match delays.next() {
+                    Some(delay) if Instant::now() + *delay + self.connect <= deadline => {
+                        std::thread::sleep(*delay);
                     }
-                }
-                continue;
-            };
-            in_flight -= 1;
-            match sent {
-                Ok(answer) => {
-                    connected = true;
-                    if may_run && resend_after.is_some() && !decides(&answer) {
-                        // No verdict, and an earlier attempt may be running: waited out, or resent.
-                        last = Some(Ok(answer));
-                        if in_flight == 0 {
-                            resend_at = Some(Instant::now() + UNDECIDED_PAUSE);
-                        }
-                        continue;
-                    }
-                    return Ok(answer);
-                }
-                Err(error) if error.is_connect() => {
-                    self.forget_honours();
-                    last = Some(Err((error, connected).into()));
-                    if in_flight == 0 {
-                        match delays.next() {
-                            Some(delay) if Instant::now() + *delay + self.connect <= deadline => {
-                                std::thread::sleep(*delay);
-                                launch(deadline.saturating_duration_since(Instant::now()));
-                                in_flight += 1;
-                            }
-                            // Out of retries, or of room for one: later pauses are only longer.
-                            _ => resend_at = None,
-                        }
-                    }
-                }
-                Err(error) => {
-                    connected = true;
-                    may_run = true;
-                    last = Some(Err((error, true).into()));
-                    // Failed after connecting: resent at once, when resends are allowed at all.
-                    if in_flight == 0 && resend_after.is_some() {
-                        resend_at = Some(Instant::now());
-                    }
-                }
+                    // Out of retries, or of room for one: later pauses are only longer.
+                    _ => return Err(e),
+                },
+                other => return other,
             }
         }
     }
@@ -521,12 +381,12 @@ impl RemoteBackend {
     pub fn hello(&self) -> Result<serde_json::Value, ApiError> {
         let token = self.token(false)?;
         let url = format!("{}/v1/hello", self.base);
-        let answer = self
-            .send_attempts(Duration::from_secs(5), None, &token, |left| {
+        let resp = self
+            .send_retrying_connect(Duration::from_secs(5), |left| {
                 self.client.get(&url).bearer_auth(&token).timeout(left)
             })
-            .map_err(|f| ApiError::with_code(ErrorCode::Unavailable, f.error))?;
-        decode(answer).map_err(|(e, _)| e)
+            .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
+        decode(read(resp)).map_err(|(e, _)| e)
     }
 
     /// One request, decoded, with the down marker kept honest: set when jkb serve did not answer
@@ -552,8 +412,14 @@ enum Answered {
 }
 
 fn decode<T: serde::de::DeserializeOwned>(
-    (status, bytes): (reqwest::StatusCode, bytes::Bytes),
+    (status, bytes): Read,
 ) -> Result<T, (ApiError, Answered)> {
+    let bytes = bytes.map_err(|e| {
+        (
+            ApiError::with_code(ErrorCode::Unavailable, e.to_string()),
+            Answered::NotJkb,
+        )
+    })?;
     if status.is_success() {
         return serde_json::from_slice(&bytes).map_err(|e| {
             (
@@ -597,19 +463,19 @@ impl Backend for RemoteBackend {
                 ),
             ));
         }
-        // One key for the whole call, every attempt of it: the daemon answers a repeat from the first
-        // one's answer (`crate::idempotency`).
-        let key = self.budget(&request).keyed.then(idempotency_key).flatten();
-        let key = key.as_deref();
         // The token rotates each time the daemon starts: one retry with a freshly read token, and only
         // when jkb serve itself said `unauthorized` (not any 401), so a wrong token is never retried
         // in a loop.
+        // One key for the whole call, every attempt of it: the daemon answers a repeat from the first
+        // one's answer (`crate::idempotency`). Only a call that may be resent is keyed.
+        let key = self
+            .budget(&request)
+            .resend_after
+            .and_then(|_| idempotency_key());
+        let key = key.as_deref();
         match self.attempt(&request, &self.token(false)?, key) {
             // A fixed token does not rotate, so there is nothing fresher to retry with.
             Err(e) if e.code == ErrorCode::Unauthorized && self.fixed.is_none() => {
-                // A rotated token is a restarted daemon, which may not be the one that said it honours
-                // keys.
-                self.forget_honours();
                 self.attempt(&request, &self.token(true)?, key)
             }
             other => other,
@@ -628,7 +494,7 @@ mod tests {
 
     use super::RemoteBackend;
 
-    /// What a stub does with an op request it accepted, by its index.
+    /// What a stub does with a request it accepted, by its index.
     #[derive(Clone, Copy)]
     enum Then {
         /// Read the request and never answer.
@@ -649,46 +515,51 @@ mod tests {
         )
     }
 
-    /// A stub HTTP server. `GET /v1/hello` is answered at once, saying the daemon honours keys or not;
-    /// each op request gets what `plan` says by its index (the last for any past the list). Returns the
-    /// `Idempotency-Key` each op request carried.
-    fn stub(plan: Vec<Then>, honours: bool) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    /// One request a stub saw: its path, and its `Idempotency-Key`.
+    type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// A stub HTTP server. Each request gets what `plan` says by its index (the last for any past the
+    /// list) — except that an `old` stub, a `jkb serve` from before keys, answers the keyed route
+    /// `no such endpoint` as that daemon does.
+    fn stub(plan: Vec<Then>, old: bool) -> (String, Seen) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let keys = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&keys);
+        let seen = Seen::default();
+        let log = Arc::clone(&seen);
         let answer = serde_json::to_string(&Response::Position { position: 1 }).unwrap();
-        let busy = serde_json::to_string(&jkb_api::ApiError::with_code(
-            jkb_api::ErrorCode::Busy,
-            "the daemon is at its concurrency limit; retry",
-        ))
-        .unwrap();
-        let hello = if honours {
-            r#"{"protocol":1,"idempotency":true}"#
-        } else {
-            r#"{"protocol":1}"#
+        let refusal = |code, why: &str| {
+            serde_json::to_string(&jkb_api::ApiError::with_code(code, why)).unwrap()
         };
+        let busy = refusal(jkb_api::ErrorCode::Busy, "at its concurrency limit");
+        let no_such = refusal(
+            jkb_api::ErrorCode::BadRequest,
+            "no such endpoint: POST /v1/op/keyed",
+        );
         std::thread::spawn(move || {
             let mut held = Vec::new();
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
                 let mut buf = [0u8; 8192];
                 let n = stream.read(&mut buf).unwrap_or(0);
-                let request_text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
-                if request_text.starts_with("get /v1/hello") {
-                    let _ = stream.write_all(http("200 OK", hello).as_bytes());
+                let text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let path = text
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let key = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("idempotency-key:"))
+                    .map(|k| k.trim().to_owned());
+                let i = {
+                    let mut log = log.lock().unwrap();
+                    log.push((path.clone(), key));
+                    log.len() - 1
+                };
+                if old && path == "/v1/op/keyed" {
+                    let _ = stream.write_all(http("400 Bad Request", &no_such).as_bytes());
                     continue;
                 }
-                let i = {
-                    let mut seen = seen.lock().unwrap();
-                    seen.push(
-                        request_text
-                            .lines()
-                            .find_map(|l| l.strip_prefix("idempotency-key:"))
-                            .map(|k| k.trim().to_owned()),
-                    );
-                    seen.len() - 1
-                };
                 match plan[i.min(plan.len() - 1)] {
                     Then::Swallow => held.push(stream),
                     Then::Gateway => {
@@ -707,7 +578,7 @@ mod tests {
                 }
             }
         });
-        (base, keys)
+        (base, seen)
     }
 
     fn client(base: &str, dir: &tempfile::TempDir, attempt: Duration) -> RemoteBackend {
@@ -736,266 +607,113 @@ mod tests {
         }
     }
 
-    /// An ordinary op whose first attempt is swallowed is resent once its attempt budget runs out,
-    /// with the same key, and answered — well inside its deadline. A long op is not resent: its one
-    /// attempt is answered after the ordinary attempt budget has passed. A long-poll carries no key.
+    /// A stalled first attempt gets exactly one resend, on the keyed route under the same key, sent
+    /// once the attempt budget runs out.
     #[test]
-    fn an_ordinary_op_is_resent_with_its_key_and_a_long_op_is_not_abandoned() {
+    fn a_stall_gets_one_resend_with_the_same_key_on_the_keyed_route() {
         let dir = tempfile::tempdir().unwrap();
-        let attempt = Duration::from_millis(200);
-        let (base, keys) = stub(vec![Then::Swallow, Then::AnswerAfter(Duration::ZERO)], true);
-        let started = Instant::now();
+        let attempt = Duration::from_millis(300);
+        let (base, seen) = stub(
+            vec![Then::Swallow, Then::AnswerAfter(Duration::ZERO)],
+            false,
+        );
         let c = client(&base, &dir, attempt);
+        let started = Instant::now();
         assert_eq!(
             c.call(Request::MqInspect {}).unwrap(),
             Response::Position { position: 1 }
         );
+        let took = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
+            took >= attempt && took < attempt + Duration::from_secs(1),
+            "answered at about the attempt budget: {took:?}"
         );
-        let keys = keys.lock().unwrap().clone();
-        assert_eq!(keys.len(), 2, "resent once: {keys:?}");
-        let key = keys[0].clone().expect("the first attempt carried a key");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let key = seen[0].1.clone().expect("keyed");
         assert_eq!(key.len(), 32, "128 bits, hex: {key}");
-        assert_eq!(
-            keys[1].as_deref(),
-            Some(key.as_str()),
-            "the same key both times"
-        );
-
-        for (name, request) in [("ingest", ingest()), ("poll", poll())] {
-            let (base, keys) = stub(vec![Then::AnswerAfter(attempt * 3)], true);
-            let c = client(&base, &dir, attempt).with_poll_wait(Duration::from_secs(1));
+        for (path, k) in &seen {
             assert_eq!(
-                c.call(request).unwrap(),
-                Response::Position { position: 1 },
-                "{name}"
+                (path.as_str(), k.as_deref()),
+                ("/v1/op/keyed", Some(key.as_str()))
             );
-            let keys = keys.lock().unwrap().clone();
-            assert_eq!(keys.len(), 1, "{name}: one attempt, not resent");
-            assert_eq!(keys[0].is_none(), name == "poll", "{name}: {keys:?}");
         }
     }
 
-    /// A daemon that does not say it honours keys — an older `jkb serve`, which ignores the header —
-    /// is never sent a second attempt of a request that connected: a slow write would land twice. The
-    /// call waits for its one attempt, as before keys existed.
+    /// A daemon from before keys refuses the keyed route `no such endpoint` without running the op;
+    /// the call then makes one unkeyed attempt on `/v1/op`, never resent however slow.
     #[test]
-    fn a_daemon_that_ignores_keys_is_never_sent_a_second_connected_attempt() {
+    fn a_daemon_without_the_keyed_route_gets_one_unkeyed_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let attempt = Duration::from_millis(200);
-        let (base, keys) = stub(vec![Then::AnswerAfter(attempt * 4)], false);
+        let (base, seen) = stub(vec![Then::AnswerAfter(attempt * 3)], true);
         let c = client(&base, &dir, attempt);
         assert_eq!(
             c.call(Request::MqInspect {}).unwrap(),
             Response::Position { position: 1 }
         );
         std::thread::sleep(attempt * 2);
-        assert_eq!(keys.lock().unwrap().len(), 1, "sent once");
-    }
-
-    /// A resend refused `busy` while an earlier attempt may still be running is "not yet": resent under
-    /// the same key, not handed to the caller, who would retry under a fresh one and apply it twice.
-    #[test]
-    fn a_resend_refused_busy_is_resent_under_its_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let (base, keys) = stub(
-            vec![Then::Swallow, Then::Busy, Then::AnswerAfter(Duration::ZERO)],
-            true,
-        );
-        let c = client(&base, &dir, Duration::from_millis(200));
+        let seen = seen.lock().unwrap().clone();
         assert_eq!(
-            c.call(Request::MqInspect {}).unwrap(),
-            Response::Position { position: 1 }
+            seen.len(),
+            2,
+            "the refused keyed attempt and one fallback: {seen:?}"
         );
-        let keys = keys.lock().unwrap().clone();
-        assert_eq!(keys.len(), 3, "{keys:?}");
-        assert!(
-            keys.iter().all(|k| k.is_some() && *k == keys[0]),
-            "{keys:?}"
-        );
+        assert_eq!(seen[0].0, "/v1/op/keyed");
+        assert_eq!((seen[1].0.as_str(), seen[1].1.as_deref()), ("/v1/op", None));
     }
 
-    /// While an earlier attempt may be running, a resend's answer that does not decide the op — a
-    /// proxy's 502 — does not end the call: the original's success, arriving later, is the answer.
-    /// Ended on the 502, the caller would retry under a fresh key and apply the write twice.
+    /// Whatever jkb serve — or a proxy — answers the resend is final: `busy`, a 502. The call ends
+    /// at once, after exactly two requests.
     #[test]
-    fn an_undecided_answer_to_a_resend_waits_for_the_original() {
+    fn any_answer_to_the_resend_is_final() {
         let dir = tempfile::tempdir().unwrap();
-        let (base, keys) = stub(
-            vec![Then::AnswerAfter(Duration::from_millis(700)), Then::Gateway],
-            true,
-        );
-        let c = client(&base, &dir, Duration::from_millis(200));
-        assert_eq!(
-            c.call(Request::MqInspect {}).unwrap(),
-            Response::Position { position: 1 },
-            "the original's success, the only success the stub gave"
-        );
-        let keys = keys.lock().unwrap().clone();
-        assert!(keys.len() >= 2, "resent: {keys:?}");
-        assert!(
-            keys.iter().all(|k| k.is_some() && *k == keys[0]),
-            "{keys:?}"
-        );
+        let attempt = Duration::from_millis(200);
+        for (name, then, code) in [
+            ("busy", Then::Busy, jkb_api::ErrorCode::Busy),
+            ("502", Then::Gateway, jkb_api::ErrorCode::Unavailable),
+        ] {
+            let (base, seen) = stub(vec![Then::Swallow, then], false);
+            let c = client(&base, &dir, attempt);
+            let started = Instant::now();
+            let err = c.call(Request::MqInspect {}).unwrap_err();
+            assert_eq!(err.code, code, "{name}: {err:?}");
+            assert!(
+                started.elapsed() < attempt + Duration::from_secs(1),
+                "{name}: at once, {:?}",
+                started.elapsed()
+            );
+            std::thread::sleep(attempt * 2);
+            assert_eq!(seen.lock().unwrap().len(), 2, "{name}");
+        }
     }
 
-    /// "Honours keys" is forgotten when the daemon may have been replaced: here it restarts (its token
-    /// rotates, so the next call is refused `unauthorized` and re-reads it) as an older `jkb serve`
-    /// that does not honour keys. Its next stall is not resent.
+    /// A long-poll, an ingest and a hook's call are unkeyed and make one attempt: the long ops are
+    /// answered after the attempt budget, and the hook's deadline is shorter than it.
     #[test]
-    fn a_restarted_daemon_is_asked_again_whether_it_honours_keys() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    fn long_ops_and_hook_calls_are_unkeyed_with_one_attempt() {
         let dir = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let restarted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ops = Arc::new(AtomicUsize::new(0));
-        let (flag, count) = (Arc::clone(&restarted), Arc::clone(&ops));
-        let answer = serde_json::to_string(&Response::Position { position: 1 }).unwrap();
-        let unauthorized = serde_json::to_string(&jkb_api::ApiError::with_code(
-            jkb_api::ErrorCode::Unauthorized,
-            "rotated",
-        ))
-        .unwrap();
-        std::thread::spawn(move || {
-            let mut held = Vec::new();
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut buf = [0u8; 8192];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
-                let hello = text.starts_with("get /v1/hello");
-                let reply = if !flag.load(Ordering::SeqCst) {
-                    // Before: honours keys; the first op is swallowed, the resend answered.
-                    if hello {
-                        http("200 OK", r#"{"idempotency":true}"#)
-                    } else if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                        held.push(stream);
-                        continue;
-                    } else {
-                        http("200 OK", &answer)
-                    }
-                } else if text.contains("bearer t1") {
-                    http("401 Unauthorized", &unauthorized)
-                } else if hello {
-                    http("200 OK", r#"{"protocol":1}"#)
-                } else {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    let reply = http("200 OK", &answer);
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(600));
-                        let _ = stream.write_all(reply.as_bytes());
-                    });
-                    continue;
-                };
-                let _ = stream.write_all(reply.as_bytes());
-            }
-        });
-        let token = dir.path().join("token");
-        crate::token::write(&token, "t1").unwrap();
-        let mut c = RemoteBackend::new(&base, token.clone()).unwrap();
-        c.attempt_timeout = Duration::from_millis(200);
-        c.call(Request::MqInspect {}).unwrap();
-        assert_eq!(c.honours.load(Ordering::SeqCst), super::HONOURS_YES);
+        let attempt = Duration::from_millis(200);
+        for (name, request) in [("ingest", ingest()), ("poll", poll())] {
+            let (base, seen) = stub(vec![Then::AnswerAfter(attempt * 3)], false);
+            let c = client(&base, &dir, attempt).with_poll_wait(Duration::from_secs(1));
+            assert_eq!(
+                c.call(request).unwrap(),
+                Response::Position { position: 1 },
+                "{name}"
+            );
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{name}: one attempt");
+            assert!(
+                seen[0].0.starts_with("/v1/op") && seen[0].0 != "/v1/op/keyed",
+                "{name}"
+            );
+            assert_eq!(seen[0].1, None, "{name}: unkeyed");
+        }
 
-        crate::token::write(&token, "t2").unwrap();
-        restarted.store(true, Ordering::SeqCst);
-        let before = ops.load(Ordering::SeqCst);
-        c.call(Request::MqInspect {}).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            ops.load(Ordering::SeqCst) - before,
-            1,
-            "the restarted daemon does not honour keys: sent once"
-        );
-    }
-
-    /// A probe that fails — here its connects are refused, the daemon's port closed for a while — does
-    /// not settle the call: it is asked again one attempt later, and the call resends once it succeeds.
-    #[test]
-    fn a_failed_probe_is_asked_again_and_the_call_then_resent() {
-        let dir = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let answer = serde_json::to_string(&Response::Position { position: 1 }).unwrap();
-        std::thread::spawn(move || {
-            // The op: read and held. Then the port is closed for a second, so the probes' connects
-            // are refused, and opened again.
-            let (mut op, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let _ = op.read(&mut buf);
-            drop(listener);
-            std::thread::sleep(Duration::from_secs(1));
-            let listener = TcpListener::bind(addr).unwrap();
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let hello = buf[..n].starts_with(b"GET /v1/hello");
-                let reply = if hello {
-                    http("200 OK", r#"{"idempotency":true}"#)
-                } else {
-                    http("200 OK", &answer)
-                };
-                let _ = stream.write_all(reply.as_bytes());
-            }
-            drop(op);
-        });
-        let c = client(&format!("http://{addr}"), &dir, Duration::from_millis(200))
-            .with_deadlines(Duration::from_millis(200), Duration::from_secs(5))
-            .unwrap();
-        let started = Instant::now();
-        assert_eq!(
-            c.call(Request::MqInspect {}).unwrap(),
-            Response::Position { position: 1 }
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
-    /// A call one of whose attempts connected does not mark the daemon down, even when every later
-    /// attempt failed to connect: it reached a daemon, which is busy, not gone.
-    #[test]
-    fn a_call_that_connected_once_does_not_mark_the_daemon_down() {
-        let dir = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            // The op: read, and held unanswered.
-            let (mut op, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let _ = op.read(&mut buf);
-            // The probe: this daemon honours keys.
-            let (mut probe, _) = listener.accept().unwrap();
-            let _ = probe.read(&mut buf);
-            let _ = probe.write_all(http("200 OK", r#"{"idempotency":true}"#).as_bytes());
-            // Closed, so every later connect is refused; then the op's connection drops, so it is
-            // resent — and that resend, and its retries, fail to connect.
-            drop(listener);
-            drop(op);
-        });
-        let marker = dir.path().join("unreachable");
-        let c = client(&base, &dir, Duration::from_millis(200))
-            .with_deadlines(Duration::from_millis(200), Duration::from_secs(2))
-            .unwrap()
-            .with_down_marker(marker.clone());
-        assert!(c.call(Request::MqInspect {}).is_err());
-        server.join().unwrap();
-        assert!(!marker.exists(), "an attempt connected: busy, not down");
-    }
-
-    /// The hook's deadlines (`jkb-cli`'s `notify::CONNECT` 200 ms and `TOTAL` 1 s) still bound a call
-    /// whose attempt is swallowed: the default attempt budget is longer than the hook's whole
-    /// deadline, so the one attempt ends at the deadline, not after it.
-    #[test]
-    fn a_hook_call_ends_by_its_total_with_the_default_attempt_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let (base, keys) = stub(vec![Then::Swallow], true);
+        // The hook's deadlines (`jkb-cli`'s `notify::CONNECT` 200 ms and `TOTAL` 1 s) with the default
+        // attempt budget: unkeyed, one attempt, ended by the hook's TOTAL.
+        let (base, seen) = stub(vec![Then::Swallow], false);
         let total = Duration::from_secs(1);
         let c = client(&base, &dir, super::ATTEMPT_TIMEOUT)
             .with_deadlines(Duration::from_millis(200), total)
@@ -1007,7 +725,36 @@ mod tests {
             took < total + Duration::from_millis(250),
             "took {took:?}, past the hook's {total:?}"
         );
-        assert_eq!(keys.lock().unwrap().len(), 1);
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![("/v1/op".to_owned(), None)],
+            "the hook: one unkeyed attempt"
+        );
+    }
+
+    /// A call one of whose attempts connected does not mark the daemon down, even when its resend
+    /// failed to connect: it reached a daemon, which is busy, not gone.
+    #[test]
+    fn a_call_that_connected_once_does_not_mark_the_daemon_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            // The first attempt: read and held unanswered; then the port closes, so the resend and
+            // its retries fail to connect.
+            let (mut op, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = op.read(&mut buf);
+            drop(listener);
+            let _ = done_rx.recv();
+        });
+        let marker = dir.path().join("unreachable");
+        let c = client(&base, &dir, Duration::from_millis(200)).with_down_marker(marker.clone());
+        assert!(c.call(Request::MqInspect {}).is_err());
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert!(!marker.exists(), "an attempt connected: busy, not down");
     }
 
     /// End to end through a proxy that forwards the first attempt to a real `jkb serve` and loses its

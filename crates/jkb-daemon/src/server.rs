@@ -3,11 +3,12 @@
 //! ```text
 //! GET  /v1/hello                → {"protocol","schema_version","supported_schema","ops"}
 //! POST /v1/op[?wait_ms=N]       → a jkb_api::Response, or a jkb_api::ApiError with a 4xx/5xx status
+//! POST /v1/op/keyed             → the same, for a request carrying an Idempotency-Key (required)
 //! ```
 //!
-//! Both require `Authorization: Bearer <token>`. An op may carry an `Idempotency-Key`: a repeat of the
-//! key by the same caller is answered with the first one's answer rather than run again
-//! ([`crate::idempotency`]; keys live in memory, so a restart forgets them). `wait_ms` applies to `mq.poll` only (any other op
+//! All require `Authorization: Bearer <token>`. On `/v1/op/keyed` a repeat of a key by the same
+//! caller is answered with the first one's answer rather than run again ([`crate::idempotency`]; keys
+//! live in memory, so a restart forgets them); `/v1/op` ignores the header. `wait_ms` applies to `mq.poll` only (any other op
 //! ignores it): an empty answer is held until a message arrives or the wait (capped) runs out — woken
 //! at once by a send this daemon served, and at worst every 250 ms for one another process wrote
 //! (the host CLI opens the database directly). At most one long-poll per group is held at a time; a
@@ -676,10 +677,25 @@ async fn authenticate(state: &Arc<State>, given: &str) -> Result<Option<Caller>,
 /// The header a client names a logical call with, the same on each of its attempts.
 pub const IDEMPOTENCY_KEY: &str = "idempotency-key";
 
-/// The request's `Idempotency-Key`, if it has one: 1–128 visible ASCII characters.
-fn idempotency_key(req: &hyper::Request<Incoming>) -> Result<Option<String>, ApiError> {
-    let Some(value) = req.headers().get(IDEMPOTENCY_KEY) else {
+/// The route a keyed call is sent to: `/v1/op`'s, with an [`IDEMPOTENCY_KEY`] required
+/// ([`crate::idempotency`]). A route of its own so that a `jkb serve` older than keys refuses a keyed
+/// call `no such endpoint` without running it, rather than ignoring the header and running a resend
+/// twice — version skew is handled by construction. `/v1/op` ignores the header.
+pub const KEYED_PATH: &str = "/v1/op/keyed";
+
+/// The request's `Idempotency-Key` on the keyed route, where one is required: 1–128 visible ASCII
+/// characters. `None` on any other route, which ignores the header.
+fn idempotency_key(
+    req: &hyper::Request<Incoming>,
+    keyed_route: bool,
+) -> Result<Option<String>, ApiError> {
+    if !keyed_route {
         return Ok(None);
+    }
+    let Some(value) = req.headers().get(IDEMPOTENCY_KEY) else {
+        return Err(ApiError::bad_request(format!(
+            "{KEYED_PATH} needs an Idempotency-Key header"
+        )));
     };
     value
         .to_str()
@@ -1046,9 +1062,6 @@ async fn hello(db: &Db) -> hyper::Response<Full<Bytes>> {
                 "schema_version": schema,
                 "supported_schema": jkb_core::supported_schema_version(),
                 "ops": Request::OPS,
-                // This daemon answers a repeated `Idempotency-Key` from its first answer, so
-                // a client may resend a request that connected (`crate::idempotency`).
-                "idempotency": true,
             }),
         ),
         Err(e) => refuse(&e),
@@ -1065,7 +1078,7 @@ async fn handle(
     let route = (req.method().clone(), req.uri().path().to_owned());
     if !matches!(
         (&route.0, route.1.as_str()),
-        (&Method::GET, "/v1/hello") | (&Method::POST, "/v1/op")
+        (&Method::GET, "/v1/hello") | (&Method::POST, "/v1/op" | KEYED_PATH)
     ) {
         return Ok(refuse_and_close(&ApiError::bad_request(format!(
             "no such endpoint: {} {}",
@@ -1088,7 +1101,7 @@ async fn handle(
         Err(e) => return Ok(refuse_and_close(&e)),
     };
     authed.store(true, Ordering::SeqCst);
-    let key = idempotency_key(&req);
+    let key = idempotency_key(&req, route.1 == KEYED_PATH);
     let (backend, db) = match ready(&state).await {
         Ok(serving) => serving,
         Err(refusal) => return Ok(refuse(&refusal)),
@@ -1096,13 +1109,13 @@ async fn handle(
     // This request's backend: the caller it authenticated as, and the daemon's one ticket store.
     let backend = backend
         .with_tickets(Arc::clone(&state.tickets))
-        .with_caller(caller.clone());
+        .with_caller(caller);
     // Every request past authentication holds an op permit from here — through the schema read, the
     // body and the parse — so authenticated clients cannot pile up unbounded work before the budget
     // is asked. A long-poll trades it for a poll permit once it is known to be one. The one exemption
     // is a keyed request whose key this caller already has recorded (`admission`): it reads its body
-    // without a permit, then is replayed (its token re-resolved under a read permit), waits on its
-    // original holding none, or — if the record expired meanwhile — takes an op permit to run.
+    // without a permit, then is replayed or waits on its original holding none — or, if the record
+    // expired meanwhile, takes an op permit to run.
     let Ok(op_permit) = admission(&state, &route.0, &key, &given) else {
         return Ok(busy("the daemon is at its concurrency limit; retry"));
     };
@@ -1147,11 +1160,12 @@ async fn handle(
         asked_wait,
         admitted: op_permit,
         given,
-        caller,
     };
     Ok(match key {
         // A long-poll is never keyed: see `Op::is_long_poll`.
-        Ok(Some(_)) if op.is_long_poll() => op.serve(held).await,
+        Ok(Some(_)) if op.is_long_poll() => refuse(&ApiError::bad_request(format!(
+            "a long-poll is not keyed: send it to /v1/op, not {KEYED_PATH}"
+        ))),
         Ok(Some(key)) => serve_keyed(state, op, key, &body, held).await,
         Ok(None) => op.serve(held).await,
         Err(refusal) => refuse(&refusal),
@@ -1203,10 +1217,7 @@ async fn serve_keyed(
             ErrorCode::Internal,
             "idempotency store poisoned",
         )),
-        Some(Begin::Replay(answer)) => match op.still_resolves().await {
-            Ok(()) => answer.response(),
-            Err(e) => answer_of(&state, &op.given, e).response(),
-        },
+        Some(Begin::Replay(answer)) => answer.response(),
         Some(Begin::Mismatch) => refuse(&ApiError::bad_request(
             "this Idempotency-Key was first used for a different request",
         )),
@@ -1307,7 +1318,6 @@ struct Op {
     /// permit's `busy` ([`admission`]); taken now if it must run after all.
     admitted: Option<tokio::sync::OwnedSemaphorePermit>,
     given: String,
-    caller: Caller,
 }
 
 impl Op {
@@ -1323,7 +1333,6 @@ impl Op {
             asked_wait,
             admitted,
             given,
-            caller: _,
         } = self;
         let admitted = match admitted {
             Some(permit) => permit,
@@ -1343,38 +1352,11 @@ impl Op {
         }
     }
 
-    /// Whether it is a long-poll: served on its handler's own future, never keyed, so that a client
-    /// that hangs up frees its group's slot and its poll permit at once ([`PollSlot`]).
+    /// Whether it is a long-poll: never keyed — refused on the keyed route — so that it is served on
+    /// its handler's own future, and a client that hangs up frees its group's slot and its poll permit
+    /// at once ([`PollSlot`]).
     fn is_long_poll(&self) -> bool {
         is_long_poll(&self.request, self.asked_wait)
-    }
-
-    /// Whether the caller's token still names a live principal: asked before a recorded answer is
-    /// replayed, so a revoked token is refused, as it would be by running the op, not served the
-    /// answer it was given while it was live.
-    ///
-    /// The read runs under a read permit, held by the blocking thread as [`call`]'s is, so replays
-    /// cannot queue unbounded reads on the reader connection; with none free the replay is `busy`.
-    async fn still_resolves(&self) -> Result<(), ApiError> {
-        if self.caller == Caller::Operator {
-            return Ok(());
-        }
-        let Ok(permit) = Arc::clone(&self.state.reads).try_acquire_owned() else {
-            return Err(ApiError::with_code(
-                ErrorCode::Busy,
-                "the daemon is at its read limit; retry",
-            ));
-        };
-        let (caller, tickets) = (self.caller.clone(), self.backend.tickets().cloned());
-        let reads = self.backend.reads().clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            reads.read_with(move |c| {
-                jkb_api::rbac::resolve(c, &caller, tickets.as_deref()).map(|_| ())
-            })
-        })
-        .await
-        .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
     }
 
     /// Run it, as a request without a key is: `held` is left holding the permit it ran under.
@@ -1387,11 +1369,6 @@ impl Op {
             Err(refused) => refused.response(),
         }
     }
-}
-
-/// The refusal of `given`'s request with `e`, keeping the grant cache honest as [`answer`] does.
-fn answer_of(state: &State, given: &str, e: ApiError) -> Answer {
-    answer(state, given, Err(e))
 }
 
 /// The reply to a served op, keeping the grant cache honest on the way: a grant this daemon served
@@ -1600,7 +1577,7 @@ mod tests {
         let mut raw = std::net::TcpStream::connect(handle.addr).unwrap();
         write!(
             raw,
-            "POST /v1/op HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+            "POST /v1/op/keyed HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
              idempotency-key: k\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
              \r\n{body}",
             body.len()
@@ -1621,7 +1598,7 @@ mod tests {
         wait_until(|| tasks() == 1);
         wait_until(|| handle.keyed_in_progress() == 0);
         let resent = reqwest::blocking::Client::new()
-            .post(format!("http://{}/v1/op", handle.addr))
+            .post(format!("http://{}/v1/op/keyed", handle.addr))
             .bearer_auth(&token)
             .header("content-type", "application/json")
             .header("idempotency-key", "k")
@@ -1859,7 +1836,7 @@ mod tests {
         let token = crate::token::read(&token_path).unwrap();
         let http = reqwest::blocking::Client::new();
         let send = || {
-            http.post(format!("http://{}/v1/op", handle.addr))
+            http.post(format!("http://{}/v1/op/keyed", handle.addr))
                 .bearer_auth(&token)
                 .header("content-type", "application/json")
                 .header("idempotency-key", "k")
