@@ -33,6 +33,7 @@ mod service;
 mod session;
 mod session_cli;
 mod staging;
+mod stop;
 mod task_cli;
 mod transcripts;
 
@@ -1627,7 +1628,12 @@ fn run(cli: Cli) -> Result<()> {
     // The daemon opens the database itself, so that a database it cannot serve still gets a daemon
     // that says why rather than a supervisor restart-loop — see `cmd_serve`.
     if let Command::Serve { addr, token_file } = cli.command {
-        return cmd_serve(&db_path, addr, token_file);
+        // Its error too goes to serve.log under launchd, so it is stamped like every other line.
+        if let Err(err) = cmd_serve(&db_path, addr, token_file) {
+            jkb_daemon::log::err(&format!("error: {err:#}"));
+            std::process::exit(1);
+        }
+        return Ok(());
     }
     // `jkb service` writes and describes units; it reads no rows. Opened first, a database a newer jkb
     // migrated stopped setup.sh at `service install` — so it never started the daemon that would
@@ -2364,8 +2370,7 @@ fn cmd_sync(
     if watch {
         let stop = Arc::new(AtomicBool::new(false));
         let handler_stop = Arc::clone(&stop);
-        ctrlc::set_handler(move || handler_stop.store(true, Ordering::Relaxed))
-            .context("installing Ctrl-C handler")?;
+        stop::on_stop(move |_| handler_stop.store(true, Ordering::Relaxed))?;
         if let Some(ns) = ns_path {
             println!("watching {ns} (Ctrl-C to stop)…");
             jkb_sync::watch(db, ns, debounce, &stop)?;
@@ -3463,10 +3468,10 @@ fn cmd_task_reap(db_path: &Path, flags: ReapFlags, json: bool) -> Result<()> {
         report_reap(&report, dry_run, json, compaction.as_ref());
         return Ok(());
     }
-    // The service form. Ctrl-C stops it, the same shared-flag shape `sync --watch` uses.
+    // The service form. SIGINT or SIGTERM stops it, the same shared-flag shape `sync --watch` uses.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&stop);
-    let _ = ctrlc::set_handler(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+    let _ = stop::on_stop(move |_| flag.store(true, std::sync::atomic::Ordering::SeqCst));
     // Never zero: a sweep every 0 seconds is a busy loop that would keep a laptop awake.
     let interval = std::time::Duration::from_secs(interval_secs.max(60));
     // What the last sweep could only observe, so an unchanged observation is not re-printed. A
@@ -3741,6 +3746,19 @@ fn cmd_serve(
         std::env::var_os("JKB_NS_MARKER").is_some(),
         jkb_core::refuse_shared_filesystem,
     )?;
+    // A panic's report goes to serve.log too, so it is stamped like every other line.
+    jkb_daemon::log::install_panic_hook();
+    // The stop request is heard BEFORE the daemon starts, so "listening" also means a SIGINT or
+    // SIGTERM from then on is a clean stop — and one that comes while it starts is acted on as soon
+    // as it has. SIGHUP keeps its inherited disposition (src/stop.rs: ignored under `nohup`).
+    let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+    let held = tx.clone();
+    if let Err(e) = stop::on_stop(move |signal| {
+        let _ = tx.send(signal);
+    }) {
+        // The daemon serves regardless; a signal then ends it as its default disposition says.
+        jkb_daemon::log::err(&format!("jkb serve: no clean stop on a signal: {e:#}"));
+    }
     let cfg = jkb_daemon::server::ServeConfig::new(addr, token_path.clone());
     let path = db_path.to_path_buf();
     let open: jkb_daemon::server::Opener = Box::new(move || {
@@ -3753,24 +3771,38 @@ fn cmd_serve(
     });
     let handle = jkb_daemon::server::spawn_opening(open, &cfg).context("starting jkb serve")?;
     // One line, flushed, that a supervisor log and a test can both read: the address actually
-    // bound (a `:0` port is resolved) and where the token went.
-    println!(
+    // bound (a `:0` port is resolved) and where the token went. Every line is stamped
+    // (`jkb_daemon::log`); a reader finds the address as the word starting `http://`.
+    jkb_daemon::log::out(&format!(
         "jkb serve listening on http://{} (token: {})",
         handle.addr,
         token_path.display()
-    );
-    {
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _ = ctrlc::set_handler(move || {
-        let _ = tx.send(());
-    });
-    let _ = rx.recv();
-    handle.shutdown();
-    Ok(())
+    ));
+    // Wait for a signal — or for the server thread to end, which nothing here asked of it: a
+    // daemon that stopped serving must not sit on as a process launchd counts as up, nor exit 0.
+    // (`held` keeps the channel open when no handler could be installed.)
+    let signal = loop {
+        match rx.recv_timeout(SERVE_THREAD_CHECK) {
+            Ok(signal) => break signal,
+            Err(_) if !handle.has_ended() => {}
+            Err(_) => {
+                let why = match handle.join() {
+                    Ok(()) => "ended without a stop request".to_owned(),
+                    Err(panic) => format!("panicked: {panic}"),
+                };
+                anyhow::bail!("jkb serve: the server thread {why}; no longer serving");
+            }
+        }
+    };
+    drop(held);
+    jkb_daemon::log::out(&format!("jkb serve: stopping on {signal}"));
+    handle
+        .shutdown()
+        .map_err(|panic| anyhow::anyhow!("jkb serve: the server thread panicked: {panic}"))
 }
+
+/// How often `jkb serve` looks for a server thread that ended on its own, between signals.
+const SERVE_THREAD_CHECK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The token path `jkb serve` writes: the one it was given, or the default for its port.
 ///

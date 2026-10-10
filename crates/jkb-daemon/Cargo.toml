@@ -13,6 +13,9 @@ workspace = true
 # fetches nothing new — which matters because crates.io is unreachable from the agent sandbox.
 [dependencies]
 bytes = "1.12.0"
+# The RFC 3339 stamp on `jkb serve`'s log lines; the version rmcp already locks, without its clock
+# feature (a `SystemTime` is converted, never read from the time-zone database).
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 getrandom = "0.2.17"
 http-body-util = "0.1.3"
 hyper = { version = "1.10.1", features = ["http1", "server"] }

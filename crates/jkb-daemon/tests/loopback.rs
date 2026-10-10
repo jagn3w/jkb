@@ -50,7 +50,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
-            h.shutdown();
+            let _ = h.shutdown();
         }
     }
 }
@@ -245,7 +245,7 @@ fn a_wrong_or_missing_token_is_unauthorized_and_a_rotated_one_is_picked_up() {
     client_b
         .call(Request::MqInspect {})
         .expect("the cached stale token is replaced after the 401");
-    b.shutdown();
+    b.shutdown().unwrap();
 }
 
 #[test]
@@ -465,6 +465,200 @@ fn an_unreachable_daemon_is_remembered_briefly_across_clients() {
     );
 }
 
+/// A loopback port nothing listens on: bound, then released.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A connect that fails transiently — measured at about 0.5% through Docker Desktop's port forward,
+/// with the daemon up throughout — is retried, and does not mark the daemon down. Before the retry,
+/// the first refused connect failed the call and wrote the marker, and every client then failed
+/// untried for `UNREACHABLE_FOR`. Both send paths are held to it: `call` and `hello`.
+#[test]
+fn a_connect_refused_briefly_is_retried_and_does_not_mark_the_daemon_down() {
+    use std::io::{Read as _, Write as _};
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    let marker = dir.path().join("unreachable");
+    let body = serde_json::to_string(&Response::Position { position: 1 }).unwrap();
+    let hello: &dyn Fn(&RemoteBackend) -> serde_json::Value = &|c| c.hello().unwrap();
+    let call: &dyn Fn(&RemoteBackend) -> serde_json::Value =
+        &|c| serde_json::to_value(c.call(Request::MqInspect {}).unwrap()).unwrap();
+    for (name, ask) in [("call", call), ("hello", hello)] {
+        let port = free_port();
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n{body}",
+            body.len()
+        );
+        // Nothing listens when the call starts; the port is bound ~120 ms in, between the first
+        // retry (at 100 ms) and the second (at 400 ms).
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        let c = RemoteBackend::new(&format!("http://127.0.0.1:{port}"), token.clone())
+            .unwrap()
+            .with_down_marker(marker.clone());
+        assert_eq!(
+            ask(&c),
+            serde_json::to_value(Response::Position { position: 1 }).unwrap(),
+            "{name}"
+        );
+        server.join().unwrap();
+        assert!(
+            !marker.exists(),
+            "{name}: a retried connect is not remembered as down"
+        );
+    }
+}
+
+/// When every attempt fails to connect, the call fails after all the retries — and only then is the
+/// daemon remembered as down.
+#[test]
+fn a_daemon_refusing_every_connect_is_marked_down_after_the_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    let marker = dir.path().join("unreachable");
+    let c = RemoteBackend::new(&format!("http://127.0.0.1:{}", free_port()), token)
+        .unwrap()
+        .with_down_marker(marker.clone());
+    let started = Instant::now();
+    let err = c.call(Request::MqInspect {}).unwrap_err();
+    let took = started.elapsed();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
+    let retried: Duration = jkb_daemon::client::CONNECT_RETRY_DELAYS.iter().sum();
+    assert!(
+        took >= retried,
+        "gave up after {took:?}, before the {retried:?} of retries"
+    );
+    assert!(marker.exists(), "every attempt failed: remembered as down");
+}
+
+/// The retries live inside the request's own deadline. Two refused connects, then a daemon that
+/// accepts and never answers: the call ends by the deadline it started with. When each attempt got a
+/// fresh deadline of its own, this ran to ~400 ms of retries plus a whole second deadline — a hook's
+/// request past Claude Code's `SessionEnd` budget.
+#[test]
+fn connect_retries_and_a_slow_answer_finish_by_the_one_deadline() {
+    use std::io::Read as _;
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    let marker = dir.path().join("unreachable");
+    let port = free_port();
+    // Bound ~200 ms in: after the first retry (100 ms), before the second (400 ms).
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let _ = stream.read(&mut buf);
+        std::thread::sleep(Duration::from_secs(5));
+    });
+    let total = Duration::from_millis(700);
+    let c = RemoteBackend::new(&format!("http://127.0.0.1:{port}"), token)
+        .unwrap()
+        .with_deadlines(Duration::from_millis(200), total)
+        .unwrap()
+        .with_down_marker(marker.clone());
+    let started = Instant::now();
+    let err = c.call(Request::NotifyOpenSessions {}).unwrap_err();
+    let took = started.elapsed();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
+    // The second retry connected, so it was the slow answer that ended it, at the deadline.
+    assert!(
+        took < total + Duration::from_millis(200),
+        "took {took:?}, past the request's {total:?} deadline"
+    );
+    assert!(
+        !marker.exists(),
+        "the last attempt connected: busy, not down"
+    );
+}
+
+/// A retry whose pause and connect timeout would not fit before the request's deadline is not made:
+/// with 250 ms in all and 200 ms to connect, even the first (100 ms) pause leaves no room, so the
+/// refused connect is the only attempt — at once, and remembered as down.
+#[test]
+fn a_retry_that_would_not_fit_before_the_deadline_is_not_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    let marker = dir.path().join("unreachable");
+    let c = RemoteBackend::new(&format!("http://127.0.0.1:{}", free_port()), token)
+        .unwrap()
+        .with_deadlines(Duration::from_millis(200), Duration::from_millis(250))
+        .unwrap()
+        .with_down_marker(marker.clone());
+    let started = Instant::now();
+    let err = c.call(Request::NotifyOpenSessions {}).unwrap_err();
+    let took = started.elapsed();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
+    assert!(
+        took < Duration::from_millis(90),
+        "a retry was made: took {took:?}"
+    );
+    assert!(
+        marker.exists(),
+        "the only attempt failed to connect: remembered as down"
+    );
+}
+
+/// A request that CONNECTED and then ran past its deadline is not retried: it may have reached the
+/// daemon, so sending it again could apply a write twice. Exactly one connection is made.
+#[test]
+fn a_request_that_connected_and_timed_out_is_not_retried() {
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    jkb_daemon::token::write(&token, "t").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            held.push(stream);
+        }
+    });
+    let marker = dir.path().join("unreachable");
+    let c = RemoteBackend::new(&base, token)
+        .unwrap()
+        .with_deadlines(Duration::from_millis(200), Duration::from_millis(300))
+        .unwrap()
+        .with_down_marker(marker.clone());
+    let err = c.call(Request::NotifyOpenSessions {}).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{}", err.message);
+    // Long enough for a retry, had there been one, to have connected.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "sent once, never retried"
+    );
+    assert!(
+        !marker.exists(),
+        "a timeout after connecting is not a daemon down"
+    );
+}
+
 /// A stub HTTP server answering every request with `response`, counting the requests it saw.
 fn stub(response: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::io::{Read as _, Write as _};
@@ -554,7 +748,7 @@ fn a_daemon_whose_database_will_not_open_answers_why_and_recovers_when_it_does()
     std::thread::sleep(Duration::from_millis(400));
     c.call(Request::MqInspect {})
         .expect("served once the database opens, with no restart");
-    h.shutdown();
+    h.shutdown().unwrap();
 }
 
 /// The authentication deadline closes only connections that never authenticated: an authenticated
@@ -635,7 +829,7 @@ fn a_re_open_is_single_flight_even_when_its_request_is_cancelled() {
         ErrorCode::Unavailable
     );
     assert_eq!(most.load(Ordering::SeqCst), 1, "two re-opens ran at once");
-    h.shutdown();
+    h.shutdown().unwrap();
 }
 
 #[test]

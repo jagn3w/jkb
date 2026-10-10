@@ -518,7 +518,7 @@ fn a_hook_event_reaches_a_real_daemon_within_the_hook_deadlines() {
     };
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].kind, jkb_core::notify::KIND_POST);
-    handle_.shutdown();
+    handle_.shutdown().unwrap();
 }
 
 fn register(b: &dyn Backend, session: &str, pid: &str, instance: &str) {

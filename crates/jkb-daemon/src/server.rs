@@ -150,21 +150,41 @@ pub struct Handle {
 
 impl Handle {
     /// Stop accepting, and wait for the server thread to end.
-    pub fn shutdown(mut self) {
+    ///
+    /// # Errors
+    /// What the server thread panicked with, if it did.
+    pub fn shutdown(mut self) -> Result<(), String> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.join_thread()
     }
 
     /// Block until the server thread ends (it ends only on [`Handle::shutdown`] from elsewhere, or a
     /// fatal runtime error).
-    pub fn join(mut self) {
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+    ///
+    /// # Errors
+    /// What the server thread panicked with, if it did.
+    pub fn join(mut self) -> Result<(), String> {
+        self.join_thread()
+    }
+
+    /// Whether the server thread has ended. Nothing but [`Handle::shutdown`] asks it to, so while
+    /// this handle is held, an ended thread is a daemon that stopped serving on its own.
+    #[must_use]
+    pub fn has_ended(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    fn join_thread(&mut self) -> Result<(), String> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|panic| crate::log::panic_text(panic.as_ref()))
     }
 }
 
@@ -289,9 +309,9 @@ fn backend_for(db: &Db, read_budget_bytes: usize) -> LocalBackend {
     match db.reader() {
         Ok(reader) => backend.with_reader(reader),
         Err(e) => {
-            eprintln!(
+            crate::log::err(&format!(
                 "jkb serve: reads share the writer's connection, which a long read holds up: {e}"
-            );
+            ));
             backend
         }
     }
@@ -302,7 +322,7 @@ fn first_open(open: &Opener, read_budget_bytes: usize) -> Serving {
     match open() {
         Ok(db) => Serving::Ready(backend_for(&db, read_budget_bytes), db),
         Err(why) => {
-            eprintln!("jkb serve: {}; retrying on requests", why.message);
+            crate::log::err(&format!("jkb serve: {}; retrying on requests", why.message));
             Serving::Failed {
                 why,
                 at: std::time::Instant::now(),
@@ -686,7 +706,7 @@ async fn ready(state: &Arc<State>) -> Result<(LocalBackend, Db), ApiError> {
             .map_err(|_| ApiError::with_code(ErrorCode::Internal, "state lock poisoned"))?;
         match opened {
             Ok(db) => {
-                eprintln!("jkb serve: the database opened; serving");
+                crate::log::err("jkb serve: the database opened; serving");
                 let backend = backend_for(&db, opener_state.read_budget_bytes);
                 *serving = Serving::Ready(backend.clone(), db.clone());
                 Ok((backend, db))
@@ -1167,7 +1187,37 @@ async fn serve_op(
 mod tests {
     use rustix::io::Errno;
 
-    use super::{backend_for, call, connection_budget, out_of_resources, Held, WriteDeadline};
+    use super::{
+        backend_for, call, connection_budget, out_of_resources, Handle, Held, WriteDeadline,
+    };
+
+    /// A server thread that ended on its own is visible to the one holding its handle — ended, and
+    /// with what it panicked with — so `jkb serve` can exit non-zero instead of sitting on, or
+    /// reporting a clean stop, after it stopped serving.
+    #[test]
+    fn a_server_thread_that_ends_on_its_own_is_seen_and_its_panic_returned() {
+        let (stop, _) = tokio::sync::oneshot::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let handle = Handle {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            stop: Some(stop),
+            thread: Some(std::thread::spawn(move || {
+                let _ = go_rx.recv();
+                panic!("the accept loop broke");
+            })),
+        };
+        assert!(!handle.has_ended());
+        go_tx.send(()).unwrap();
+        let started = std::time::Instant::now();
+        while !handle.has_ended() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(handle.join(), Err("the accept loop broke".to_owned()));
+    }
 
     /// A writer the test opens and shuts.
     struct Gate(std::sync::Arc<std::sync::atomic::AtomicBool>);

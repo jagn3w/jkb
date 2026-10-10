@@ -17,6 +17,8 @@ workspace = true
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
+# SIGINT only. Its `termination` feature would add SIGTERM, but SIGHUP with it, installed over an
+# ignored one — `nohup` would stop the daemon on a hangup. SIGTERM is tokio's, below (src/stop.rs).
 ctrlc = "3.5.2"
 jkb-fsm = { version = "0.1.0", path = "../jkb-fsm" }
 jkb-rbac = { version = "0.1.0", path = "../jkb-rbac" }
@@ -37,6 +39,8 @@ rustix = { version = "1.1.4", features = ["process", "system"] }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
+# SIGTERM alone, safely (src/stop.rs); the tokio jkb-daemon already locks, these features of it.
+tokio = { version = "1.52.3", features = ["rt", "signal"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
