@@ -953,9 +953,12 @@ fn ids_json(ids: &[ItemId]) -> String {
 /// # Errors
 /// Returns an error if evaluation or the ordering query fails.
 pub fn ready_ids(conn: &Connection, query: Query, limit: Option<usize>) -> Result<Vec<ItemId>> {
+    // `limit` too: `evaluate` cuts by id before this orders by priority, so a caller's limit would
+    // keep the lowest ids rather than the top of the frontier. This function's own `limit` cuts.
     let ids = Query {
         kind: Some("task".to_owned()),
         ready: true,
+        limit: None,
         ..query
     }
     .evaluate(conn)?;

@@ -138,16 +138,27 @@ queue_outcome() {
 }
 # AN OUTCOME IS ONLY WHAT THE SCRIPT DECIDED. Bash runs the EXIT trap on a fatal signal with `$?`
 # still holding the last command's status — measured: TERM, PIPE, ALRM and USR1 mid-gate each printed
-# `merge-queue: landed (exit 0)` while the base never moved. Trapping signals one by one left the rest
-# reporting landings, so every deliberate exit goes through `finish`, which records its code, and an
-# exit that did not (a signal, a crash) is a stall whatever `$?` says.
+# `merge-queue: landed (exit 0)` while the base never moved. So every deliberate exit goes through
+# `finish`, which records its code, and an exit that did not is a stall whatever `$?` says.
+#
+# The signals a person or a timeout sends are still trapped by name, for two reasons: bash runs a
+# trapped signal's handler only once the foreground command returns, so the gate finishes instead of
+# being orphaned in the worktree the next run will check out (measured: untrapped, the script died at
+# once and its gate ran on), and the stall can name the signal. Any other signal ends it at once,
+# still as a stall.
 DECIDED=""
+SIGNAL=""
 finish() { DECIDED="$1"; exit "$1"; }
+trap 'SIGNAL=HUP; exit 129' HUP
+trap 'SIGNAL=INT; exit 130' INT
+trap 'SIGNAL=TERM; exit 143' TERM
 trap 'rc=$?
-if [ "$DECIDED" = "$rc" ]; then
+if [ -z "$SIGNAL" ] && [ "$DECIDED" = "$rc" ]; then
   echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"
+elif [ -n "$SIGNAL" ]; then
+  echo "merge-queue: stall: killed by $SIGNAL, after the step it was running finished"
 else
-  echo "merge-queue: stall: ended without an outcome (exit $rc)"
+  echo "merge-queue: stall: ended without an outcome"
 fi' EXIT
 
 # WHICH jkb, AND WHICH STORE. This script writes to the knowledge base (step 3 records the

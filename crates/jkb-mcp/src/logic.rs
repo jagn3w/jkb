@@ -289,7 +289,7 @@ pub fn run_view(tools: &Tools, args: &RunViewArgs) -> Result<Answer> {
     )
 }
 
-/// The ready-frontier tasks, optionally scoped/tag-filtered by the DSL in `query`.
+/// The ready-frontier tasks, narrowed by every predicate of the DSL in `query`.
 ///
 /// # Errors
 /// Returns an error if the DSL is malformed or a read fails.

@@ -321,9 +321,19 @@ struct WorkflowFinding {
     scenario: Option<String>,
     #[serde(default)]
     fix: Option<String>,
-    /// `introduced`, `aggravated` or `pre-existing`; absent reads as introduced.
+    /// Absent reads as introduced. A closed set, so a spelling it does not know (`pre_existing`,
+    /// `Pre-existing`) is refused as a malformed result rather than filed as the change's own.
     #[serde(default)]
-    scope: Option<String>,
+    scope: Option<FindingScope>,
+}
+
+/// Whose a finding is: this change's (`introduced`, `aggravated`) or not (`pre-existing`).
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum FindingScope {
+    Introduced,
+    Aggravated,
+    PreExisting,
 }
 
 /// Read a review result, refusing one that files a pre-existing finding as the change's own.
@@ -335,17 +345,19 @@ fn parse_result(text: &str, what: &str) -> Result<WorkflowResult> {
     let result: WorkflowResult = serde_json::from_str(text).with_context(|| {
         format!(
             "{what} is not a review result: a JSON object with a `findings` array of {{severity \
-             (must-fix|concern|nit), summary, file, line, scenario, fix}}"
+             (must-fix|concern|nit), scope (introduced|aggravated), summary, file, line, scenario, \
+             fix}}"
         )
     })?;
     if let Some(f) = result
         .findings
         .iter()
-        .find(|f| f.scope.as_deref() == Some("pre-existing"))
+        .find(|f| f.scope == Some(FindingScope::PreExisting))
     {
         anyhow::bail!(
             "{what} files a pre-existing finding (`{}`) as this change's own — nothing was filed. \
-             Pre-existing findings go to the backlog (`jkb task add --backlog`), not the round",
+             Leave pre-existing findings out of the round and report them to your coordinator, which \
+             files them to the backlog",
             f.summary
         );
     }
@@ -571,7 +583,9 @@ mod tests {
             .err()
             .expect("a pre-existing finding was accepted")
             .to_string();
-        assert!(refused.contains("--backlog"), "{refused}");
+        assert!(refused.contains("coordinator"), "{refused}");
+        // An unknown spelling is refused too, never read as the change's own.
+        assert!(super::parse_result(&result(r#""scope": "pre_existing""#), "r").is_err());
         for ok in [
             r#""scope": "introduced""#,
             r#""scope": "aggravated""#,
