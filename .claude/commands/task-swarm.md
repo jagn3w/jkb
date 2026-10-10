@@ -1,215 +1,111 @@
 ---
-description: SCHEDULER groups overlapping ready jkb tasks; one IMPLEMENTER builds each group; a fresh REVIEWER checks it; a deterministic merge queue (no agent) rebase/fast-forwards approved branches into one feature branch and records the landing, which closes the group when its strategy lets the coordinator land. Pipelined, claim-guarded, looping as dependents unblock.
-argument-hint: "<jkb-path | task-uids...>  [--branch <name>]  [--dry-run]  (prefix the message with +<N>k to cap token spend)"
+description: Make this session the COORDINATOR of a task swarm. It groups overlapping ready jkb tasks, starts one jkb-implementer per group and a fresh jkb-reviewer per pass, and runs the deterministic merge queue (no agent), which lands approved branches on one feature branch and records each landing. Claim-guarded, and it keeps going as dependents unblock.
+argument-hint: "<jkb-path | task-uids...>  [--branch <name>]  [--dry-run]  [--no-design-gate]"
 ---
 
-You are the **COORDINATOR** of a task swarm. Given a jkb path (a namespace with
-subtasks) or an explicit list of task uids, you drive a workflow whose roles are (design
-D27):
+This session becomes the **coordinator** of a task swarm. It works inside the tasks' lifecycle
+and RBAC: jkb holds every rule the coordinator follows. The swarm has four parts:
 
-- **SCHEDULER** — reads the ready frontier and clusters *overlapping* ready tasks into
-  small **work-groups** (≤~4 tasks; non-overlapping tasks stay singletons).
-- **IMPLEMENTER** — one per group, builds **all** the group's tasks on one clean branch,
-  and stays with the group through review/fix.
-- **REVIEWER** — a **fresh** reviewer per pass checks the branch against the **whole
-  group**; `approve` → merge queue, `request_changes` → back to the same implementer.
-- **merge queue** — *deterministic, no agent* (`scripts/merge-queue.sh`): rebase each
-  approved branch onto the feature branch, **run the gate on the rebased commit while it is
-  still detached**, and only on green fast-forward the feature branch onto it and record the
-  landing, which closes the group **`done`** when the task's strategy lets the coordinator land
-  (under the default `design-reviewed` only the operator lands, so the group stalls as "landed
-  but not closed" for you to record). The feature branch therefore never points at an ungated commit, not even
-  briefly. On conflict or red gate, **eject** back to the implementer to rebase; on a failure
-  that is not the branch's fault — the graft passed but the feature branch could not be
-  advanced — the group **stalls** for an operator rather than being handed back.
+- **Groups.** The coordinator reads the ready frontier and groups overlapping tasks, at most 4
+  per group.
+- **Implementer.** Each group gets one `jkb-implementer` subagent, which builds every task in the
+  group on one branch. It stays with the group through every review and fix.
+- **Reviewer.** Each pass gets a fresh `jkb-reviewer` subagent, which checks the branch against
+  the whole group.
+- **Merge queue.** `scripts/merge-queue.sh` is deterministic, not an agent. It runs the gate on the
+  rebased branch, lands it on the feature branch, records the landing, and names its own outcome.
 
-The pipeline runs Implement → Review → merge **without a per-round barrier**; the merge
-queue is the one serial stage; newly-ready groups feed in as dependents unblock.
+Each worker's prompt comes from `jkb workflow agent show`, so an operator copy saved in Code
+Factory's Workflows tab is what runs. The subagent types are installed by `jkb commands install`,
+which runs automatically.
 
 Argument: `$ARGUMENTS`
 
-This command *deliberately* opts into multi-agent orchestration: it launches the
-`task-swarm` **Workflow**, which spawns many sub-agents and can be expensive. Follow the
-steps in order and **do not spawn anything until after the cost preview and confirmation
-(steps 3–4).** Use `jkb` on PATH (fall back to `./target/debug/jkb`).
+This starts many subagents and can be expensive. Follow the steps in order, and **start nothing
+until after the cost preview and confirmation (steps 3–4).**
 
 ## 1. Parse the argument
 
 - If `$ARGUMENTS` is empty, stop and ask for a jkb path or task uids.
-- `--dry-run` present → do steps 2–3 only (preview, spawn nothing).
-- `--branch <name>` present → use `<name>` as the integration/feature branch (see step 5).
-- `--no-design-gate` present → set `GATE=""` (skip the design gate; see below). Otherwise
-  `GATE="tag:design=approved"`.
-- Otherwise interpret the non-flag argument as either:
-  - a **namespace/path** (no spaces, no `#`) → scope `SCOPE="ns:<path>/**"`, or
-  - one or more **task uids** (contain `:` or `#`, or a space-separated list) → collect them as `TASKS`.
+- `--dry-run` → steps 2–3 only.
+- `--branch <name>` → `<name>` is the integration branch (step 5).
+- `--no-design-gate` → `GATE=""`. Otherwise `GATE="tag:design=approved"`.
+- The rest is either a **namespace path** (no spaces, no `#`), giving `SCOPE="ns:<path>/**"`, or
+  one or more **task uids**, collected as `TASKS`.
 
-**Design gate (D28).** In **scope mode** the swarm only touches tasks whose design has been
-approved — tag `design=approved`, set by `/jkb-design-pass`. This keeps implementers from
-inventing architecture on undecided work (they run headless and can't ask you). So the
-scout and the workflow AND `GATE` into the scope. Un-triaged tasks are deliberately
-invisible to the swarm. Two bypasses: `--no-design-gate` (emergency), and **explicit-uid
-mode** (`TASKS`) — naming exact uids is a deliberate hand-pick, so the gate never applies
-there (but see the warning in step 3).
+**The design gate.** In scope mode the swarm touches only tasks tagged `design=approved` by
+`/jkb-design-pass`, so implementers never invent architecture they cannot ask you about. Naming
+exact uids is a deliberate hand-pick, so the gate does not apply to them (but see step 3).
 
 ## 2. Preflight
 
-- Confirm you're in a git repo: `git rev-parse --show-toplevel`. Record `REPO` (abs path)
-  and `BASE=$(git rev-parse --abbrev-ref HEAD)`.
-- If the working tree is dirty (`git status --porcelain` non-empty), warn the user — the
-  swarm branches off `BASE`; uncommitted changes won't be included and could confuse
-  merges. Suggest committing/stashing, and ask whether to continue.
+`git rev-parse --show-toplevel` gives `REPO`, and `git rev-parse --abbrev-ref HEAD` gives `BASE`. If
+the working tree is dirty, warn the user: the swarm branches off `BASE`, and uncommitted work is
+not in it. Ask whether to continue.
 
-## 3. Scout + cost preview (the guardrail)
-
-Fetch the frontier without changing anything (`<SCOPE> <GATE>` = the scope terms plus the
-design gate, e.g. `ns:foo/** tag:design=approved`; drop `<GATE>` when `--no-design-gate`):
+## 3. Scout and preview
 
 ```sh
-jkb task next --global --json '<SCOPE> <GATE>' --limit 100      # ready + design-approved
-jkb query    --global --json 'kind:task <SCOPE> <GATE>' --limit 1000   # all approved tasks in scope
+jkb task next --global --json '<SCOPE> <GATE>' --limit 100        # ready and approved
+jkb query    --global --json 'kind:task <SCOPE> <GATE>' --limit 1000
+jkb task next --global --json '<SCOPE>' --limit 100               # ready, ungated
 ```
 
-Also run the **ungated** ready query once (`jkb task next --global --json '<SCOPE>'`) so you
-can report how many ready tasks are held back by the gate — if that count is high, tell the
-user to run `/jkb-design-pass <path>` first. In **explicit-uid mode** the gate is bypassed; check
-each named uid for `design=approved` (`jkb task show <uid> --json`) and warn about any that
-lack it before proceeding (they'll be built with un-approved designs).
+Print:
+- the ready tasks, and how many are not yet terminal;
+- how many ready tasks the gate holds back (if many, suggest `/jkb-design-pass <path>` first);
+- for named uids, any that lack `design=approved`;
+- a rough agent count: about two per group per attempt (an implementer and a reviewer), with up to
+  3 attempts per group.
 
-(For a uid list, filter these to the given uids.) From the results, print:
-- the **ready** task count and titles, and the **total non-terminal** count (status not
-  `done`/`cancelled`) — the latter is how many the swarm will eventually work as deps clear;
-- a rough **agent estimate**: the SCHEDULER groups tasks (≤~4/group), so roughly
-  `~ groups × (implement + review + a few mechanical claim/status/merge steps) + 1 scheduler/pass`,
-  noting retries (up to 3/group) and re-reviews can raise it;
-- the **token budget**: if the user prefixed their message with a `+<N>k`/`+<N>` budget
-  directive, state it as the hard ceiling; otherwise note there is **no cap** and they can
-  re-run with one (e.g. start the message with `+500k`).
-
-If `--dry-run`, stop here.
+With `--dry-run`, stop here.
 
 ## 4. Confirm
 
-Show the preview and **ask the user to confirm** before spawning (e.g. "This will run a
-swarm over N ready / M total tasks, ~K agents, budget <…>. Proceed?"). Only continue on a
-clear yes.
+Ask the user to confirm before starting anything. Continue only on a clear yes.
 
-## 5. Set up the integration branch + worktree
+## 5. The integration branch and the run owner
 
-The integration/feature branch is an **ordinary feature branch** — **no** `swarm/` prefix,
-so the PR you eventually open and its branch name carry **no swarm artifact** (status,
-task ids, and the fact a swarm ran are all KB-local, D27.7). Default its name to
-`fleet/<BASE>` (or take `--branch <name>`); pick anything that reads like a normal branch.
+The integration branch is an ordinary feature branch with no swarm artifact in its name. It
+defaults to `fleet/<BASE>`.
 
 ```sh
-INTEG="${BRANCH:-fleet/$BASE}"          # a normal feature-branch name (override with --branch)
+INTEG="${BRANCH:-fleet/$BASE}"
 git show-ref --verify --quiet "refs/heads/$INTEG" || git branch "$INTEG" "$BASE"
-mkdir -p .swarm
-git worktree add .swarm/integration "$INTEG" 2>/dev/null || true   # reuse if present
+mkdir -p .swarm && git worktree add .swarm/integration "$INTEG" 2>/dev/null || true
 ```
 
-`.swarm/` is git-ignored. The merge queue does all its rebase/fast-forwards inside
-`.swarm/integration` (checked out to `$INTEG`), so your `BASE` checkout is never touched.
-Ephemeral per-group `swarm-task/*` branches are **local-only** — they never enter history
-(the merge queue rebase/fast-forwards, so no merge commits or branch-name artifacts) and
-**must not be pushed**; prune them after landing.
-
-### Run owner + the 60s reclaimer sidecar (the claim liveness authority)
-
-The periodic owner-existence reclaim (D27.1/D27.6.6b) is a **true wall-clock timer**, which
-the workflow JS engine can't provide (no clock, no background timer). So run it **here**, as
-a detached sidecar the command owns for the swarm's lifetime — this is the coordinator's
-liveness authority for *crashed prior runs*, independent of the workflow's scheduling cadence:
+Claims are owned by a live process, so a crashed run's claims can be told from this one's. Start a
+keepalive with the Bash tool's `run_in_background: true`, and use its pid:
 
 ```sh
-HOST="$(hostname)"
-RUN_OWNER_FILE="$(mktemp)"                 # the sidecar reads the run owner from here
-# Sidecar: every ~60s clear claims whose owner PROCESS is gone (crashed prior runs),
-# always --keep-ing THIS run's owner so it never touches our own in-flight claims.
-( while :; do sleep 60; jkb task reclaim --keep "$(cat "$RUN_OWNER_FILE")" >/dev/null 2>&1; done ) &
-RECLAIMER_PID=$!                           # a real, live pid for the whole run
-OWNER="$HOST:$RECLAIMER_PID"               # host:pid — liveness-checkable via `ps -p`
-printf '%s' "$OWNER" > "$RUN_OWNER_FILE"
+sleep 86400 & echo "OWNER=$(hostname):$!"
 ```
 
-Launch this with the Bash tool's **`run_in_background: true`** so it detaches and keeps
-running across turns. `OWNER = host:<sidecar pid>` is a genuinely alive process for the run,
-so an external `jkb doctor --fix` never mistakes this live run for a crashed one. Pass `OWNER`
-as `owner` below; the workflow's implementers claim with it and the sidecar keeps it.
+## 6. Become the coordinator
 
-## 6. Launch the workflow
-
-Locate the installed workflow script (first that exists): `"$CLAUDE_CONFIG_DIR/workflows/jkb-task-swarm.js"`,
-`"$HOME/.claude/workflows/jkb-task-swarm.js"`, or `./.claude/workflows/task-swarm.js`.
-
-Call the **Workflow** tool with `scriptPath` = that path (or `name: "jkb-task-swarm"` if your
-setup resolves saved workflows), and `args`.
-
-> **Gotcha:** pass `args` as an **actual JSON object**, not a JSON-encoded string. The
-> script does `const cfg = args || {}` and reads `cfg.integration` etc.; a stringified
-> value makes `cfg` a string, so every field is `undefined` and the script throws
-> `jkb-task-swarm requires args.integration and args.integrationWorktree` on launch.
-
-```json
-{
-  "jkb": "jkb",
-  "db": null,
-  "scope": "<SCOPE or empty when using tasks>",
-  "tasks": ["<uid>", "..."],
-  "global": true,
-  "repo": "<REPO abs path>",
-  "integration": "<INTEG>",
-  "integrationWorktree": "<REPO>/.swarm/integration",
-  "owner": "<OWNER, e.g. host:pid>",
-  "retryCap": 3,
-  "roundCap": 40,
-  "groupCap": 4,
-  "designGate": true
-}
-```
-
-Include only `scope` **or** `tasks` (whichever you resolved; omit the other). Set
-`"designGate": false` **only** when the user passed `--no-design-gate`; otherwise leave it
-`true` so the workflow re-applies `tag:design=approved` on every scheduler pass (the gate
-must live in the workflow too — new tasks can appear between passes). In explicit-uid mode
-`designGate` is ignored (the workflow bypasses the gate for `tasks`). If the user
-set a token budget, the workflow honors it (it stops feeding new groups when the remaining
-budget is low, then drains in-flight work). The workflow runs in the background and
-notifies on completion.
-
-## 7. Report + hand-off
-
-**Stop the reclaimer sidecar first** — it's no longer needed once the swarm is done:
+Fill the coordinator template and follow it as your instructions for the rest of this session:
 
 ```sh
-kill "$RECLAIMER_PID" 2>/dev/null; rm -f "$RUN_OWNER_FILE"
+jkb workflow agent show swarm-coordinator \
+  --var repo="$REPO" --var integration="$INTEG" --var integration_worktree="$REPO/.swarm/integration" \
+  --var owner="$OWNER" --var group_cap=4 --var retry_cap=3 \
+  --var scope_block="<see below>"
 ```
 
-When the workflow finishes, relay its result: which task uids **completed** (landed on the
-feature branch and marked `done`), which it **gave up** on (retry-capped), which **stalled**
-(`stalled_tasks`, with each `merge_queue.stalls[].why`: these need a person and nothing will
-retry them), how many groups and passes it ran, and the merge-queue **landed/eject** counts.
-A stall that reads "landed … but not closed in jkb" means the code IS on the feature branch but
-jkb refused or held the landing record, usually because the task's strategy does not let the
-coordinator land. The operator settles it with `jkb task landed <branch> --onto <feature
-branch>`, which needs that `swarm-task/*` branch, so keep it until then. Or pin a strategy whose
-`lands` toggle includes the coordinator before the next run. Each completed task was
-closed **`done`** in jkb by the merge queue's `jkb task landed` (`observed_landed`) once its
-group's branch landed — which also unblocked its dependents; a file-backed task's checkbox
-follows on the host's next sync. Nothing in the swarm runs `jkb task set --status done`: a group
-that landed but did not close is reported **stalled** ("landed but not closed in jkb") for you to
-settle, never closed by an agent. Nothing about the swarm reached git: commits are ordinary professional
-messages, history is linear, and no `swarm-task/*` branch entered it.
+`scope_block` says how to read the frontier:
+- **scope mode:** "Read the frontier with `jkb task next --global --json '<SCOPE> <GATE>' --limit 100`.
+  Only tasks it returns are yours."
+- **uid mode:** "Your tasks are exactly: <uids>. A task is ready when `jkb task show <uid> --json`
+  shows it open, unblocked and unclaimed."
 
-Then tell the user how to finish:
+## 7. When it is done
 
-- Review the integrated result: `git -C .swarm/integration log --oneline "$BASE".."$INTEG"`
-  and run the test suite there. Completed tasks are already `done`
-  (`jkb query --global 'kind:task status:done'`); revert any you reject.
-- When satisfied, merge/PR the feature branch normally: `git switch "$BASE" && git merge "$INTEG"`
-  (or open a PR from `$INTEG`). It looks like any other feature branch.
-- Clean up: `git worktree remove .swarm/integration`, `git worktree prune`, and delete the
-  local `swarm-task/*` branches (`git branch -D`), **except** those of stalled groups until the
-  operator has recorded their landing. Do **not** push them.
-- If a prior run crashed and left claims, `jkb doctor` reports orphaned claims and
-  `jkb doctor --fix` clears them (owner-existence reclaim, D27.2).
+Stop the keepalive (`kill <its pid>`) and relay the coordinator's report. Then tell the user how
+to finish:
+- **Check the result.** `git -C .swarm/integration log --oneline "$BASE".."$INTEG"`, and run the
+  tests there.
+- **Merge it.** Merge or open a PR from `$INTEG` as with any feature branch.
+- **Clean up.** `git worktree remove .swarm/integration`, then delete the local `swarm-task/*`
+  branches. Never push them.
+- **Leftover claims.** If a run crashed and left claims, `jkb doctor --fix` clears them.

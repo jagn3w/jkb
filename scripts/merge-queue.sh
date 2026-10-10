@@ -28,11 +28,14 @@
 #               here. Not the implementer's problem in any of the three, which is why it is not
 #               1: the swarm hands 1 back as "rebase and fix your branch".
 #
-# THIS LIST IS THE CONTRACT, and `.claude/workflows/task-swarm.js` is its only consumer. It reads
-# the raw code and classifies it in ONE function (`classifyMerge`); a code that list does not know
-# stalls rather than being sorted into the nearest bucket. Adding a code here means adding an arm
-# there — the mistake made once already, when 4 was added to this header and the workflow was
-# still enumerating 0/1/2/3 and asking an agent to guess.
+# THIS LIST IS THE CONTRACT, and `queue_outcome` below is its ONE classification: on every exit the
+# script prints `merge-queue: <landed|eject|stall> (exit <n>)` as its LAST line, and the swarm's
+# coordinator acts on that word, never on the code. A code the function does not know stalls rather
+# than being sorted into the nearest bucket. Adding a code here means adding an arm there — the
+# mistake made once already, when 4 was added to this header and its consumer still enumerated
+# 0/1/2/3 and asked an agent to guess. The classification lived in the swarm's workflow script
+# (`classifyMerge`) until coordinator sessions replaced it; a coordinator that is itself a model,
+# reading raw codes, would be that same guess, so the script names its own outcome.
 #
 # THE GATE RUNS BEFORE <base> MOVES, which is why 2 no longer says "reset to pre-graft": there is
 # nothing to reset. It used to fast-forward first and roll back on red, and the window between
@@ -122,6 +125,18 @@ _shell_suites_pass() {
 BRANCH="${1:?usage: merge-queue.sh <branch> <base> <worktree>}"
 BASE="${2:?missing <base>}"
 WT="${3:?missing <worktree>}"
+
+# The one reading of the codes above. Set after the arguments are read, so a usage error prints no
+# outcome line — which the coordinator treats as a stall, the same as an unknown code.
+queue_outcome() {
+  case "$1" in
+    0) echo landed ;;
+    1 | 2) echo eject ;;
+    3 | 4 | 5) echo stall ;;
+    *) echo "stall: unknown exit $1" ;;
+  esac
+}
+trap 'rc=$?; echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"' EXIT
 
 # WHICH jkb, AND WHICH STORE. This script writes to the knowledge base (step 3 records the
 # landing), and a swarm run can be configured with its own binary (`cfg.jkb`) and its own database
@@ -292,9 +307,9 @@ fi
 # would overwrite, and a held `index.lock`. An operator told the wrong cause runs `git worktree
 # list`, sees nothing, and concludes the queue is confused — while git's own sentence sits unread
 # in the log. So the causes are offered, not asserted, and git's first line is printed.
-# ONE LINE, LABEL FIRST. `.claude/workflows/task-swarm.js` defines `detail` as the script's LAST
-# line of output, so a message split across several `echo`s hands the workflow — and
-# `swarm-status.sh`, which truncates it to 60 characters — whichever fragment happened to be last.
+# ONE LINE, LABEL FIRST. The line before the outcome line is what a coordinator reports as the
+# queue's detail, so a message split across several `echo`s hands it — and `swarm-status.sh`, which
+# truncates it to 60 characters — whichever fragment happened to be last.
 # One of these arms ended on `git said: …`, with no label and no arm, so the sentence
 # `classifyMerge` was rewritten to defer to never reached a person at all.
 if ! git switch "$BASE" >/tmp/merge-queue-switch.log 2>&1; then

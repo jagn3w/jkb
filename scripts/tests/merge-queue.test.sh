@@ -8,10 +8,11 @@
 # verification you ran once and did not commit is a verification the next person does not have.
 #
 # The two questions asked of every case are the two the swarm acts on: WHAT CODE did it exit, and
-# DID $BASE MOVE. Those together are the whole contract — `.claude/workflows/task-swarm.js` reads
-# the code to decide whether a task group is marked done, and the base moving is what "done" is
-# supposed to mean. `dev-scripts.test.sh`'s case10 holds the other half of that seam, that every
-# code the header documents is one the workflow classifies.
+# DID $BASE MOVE. Those together are the whole contract — the swarm's coordinator reads the
+# script's outcome line to decide whether a task group landed, and the base moving is what "landed"
+# is supposed to mean. Every case also checks that the outcome line is printed, last, naming the
+# code the script exited with; `dev-scripts.test.sh`'s case10 holds the other half of that seam,
+# that every code the header documents is classified as this test expects.
 #
 # The gate is stubbed to exit codes we choose, because this suite is about the QUEUE, not about
 # cargo: `build.sh`, `test.sh` and the planted suites read BUILD_RC/TEST_RC/SUITE_RC. `jkb` is
@@ -73,6 +74,11 @@ check() {
     local got rc mv jkb
     got="$(queue "$r" "$@")"
     IFS='|' read -r rc mv jkb detail <<<"$got"
+    # THE OUTCOME LINE, ON EVERY PATH. The coordinator acts on it, so an exit that skips it (a
+    # trap lost, an `exec` added) leaves it nothing to act on but a guess.
+    if ! [[ "${detail% }" =~ ^merge-queue:\ (landed|eject|stall)\ \(exit\ $rc\)$ ]]; then
+        fail "queue: $label outcome line" "the last line is not \`merge-queue: <outcome> (exit $rc)\`: ${detail}"
+    fi
     if [ "$rc" = "$want_rc" ] && [ "$mv" = "$want_mv" ] && [ "$jkb" = "$want_jkb" ]; then
         ok "$label → exit $rc, base $mv, $jkb landing record(s)"
     else

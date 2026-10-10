@@ -1,11 +1,14 @@
-//! Install jkb's bundled Claude Code assets — slash commands and workflows — so they
-//! travel with the `jkb` binary and are available on any machine you install it on, not
-//! just inside this repo.
+//! Install jkb's bundled Claude Code assets — slash commands and the workers' subagent types — so
+//! they travel with the `jkb` binary and are available on any machine you install it on, not just
+//! inside this repo.
 //!
-//! The markdown/JS lives in the repo's `.claude/{commands,workflows}/` (committed so it
-//! ships across machines) and is embedded here at compile time, mirroring how
-//! `service.rs` ships its unit files. `jkb commands install` writes each asset into the
-//! user's Claude Code config directory; `uninstall` removes them; `list` is a dry run.
+//! The commands live in the repo's `.claude/commands/` (committed so they ship across machines) and
+//! are embedded here at compile time, mirroring how `service.rs` ships its unit files. The subagent
+//! types are rendered from the packaged agent templates
+//! ([`jkb_core::workflow::agents::subagent_definitions`]), so the definition a coordinator starts a
+//! worker as and the template the Workflows tab shows cannot disagree. `jkb commands install` writes
+//! each asset into the user's Claude Code config directory; `uninstall` removes them; `list` is a
+//! dry run.
 
 use std::path::{Path, PathBuf};
 
@@ -53,26 +56,61 @@ const BUNDLED_COMMANDS: &[(&str, &str)] = &[
         include_str!("../../../.claude/commands/review.md"),
     ),
     (
-        "review-log",
-        include_str!("../../../.claude/commands/review-log.md"),
-    ),
-    (
         "task-swarm",
         include_str!("../../../.claude/commands/task-swarm.md"),
     ),
 ];
 
-/// Bundled workflows as `(script stem, embedded JavaScript)`.
-const BUNDLED_WORKFLOWS: &[(&str, &str)] = &[
-    (
-        "code-review",
-        include_str!("../../../.claude/workflows/code-review.js"),
-    ),
-    (
-        "task-swarm",
-        include_str!("../../../.claude/workflows/task-swarm.js"),
-    ),
+fn bundled_commands() -> &'static [(&'static str, &'static str)] {
+    BUNDLED_COMMANDS
+}
+
+/// The workers' subagent types as `(stem, definition)`: each packaged `jkb-<stem>` template,
+/// rendered once. The packaged file is validated by a test before it can ship, so a failure here
+/// is an empty set rather than a panic in the auto-install that runs before every command.
+fn bundled_agents() -> &'static [(&'static str, &'static str)] {
+    static AGENTS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> =
+        std::sync::OnceLock::new();
+    AGENTS.get_or_init(|| {
+        jkb_core::workflow::agents::subagent_definitions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|d| {
+                let stem = d.name.strip_prefix(ASSET_PREFIX)?.to_owned();
+                Some((
+                    &*Box::leak(stem.into_boxed_str()),
+                    &*Box::leak(d.markdown.into_boxed_str()),
+                ))
+            })
+            .collect()
+    })
+}
+
+/// Assets an earlier jkb installed and this one no longer ships, as `(dir, installed file name)`.
+/// Each carries [`ASSET_PREFIX`], so jkb wrote it and removes it: the workflow scripts, retired when
+/// coordinator sessions replaced Claude Workflows, and `/jkb-review-log`, which `/jkb-review` now
+/// covers. Left behind, a retired workflow would still run its own copy of a prompt nothing
+/// maintains.
+const RETIRED: &[(&str, &str)] = &[
+    ("workflows", "jkb-code-review.js"),
+    ("workflows", "jkb-task-swarm.js"),
+    ("commands", "jkb-review-log.md"),
 ];
+
+/// Remove every [`RETIRED`] asset present in `base`, reporting each when `verbose`.
+fn remove_retired(base: &Path, verbose: bool) -> Result<()> {
+    for (dir, file) in RETIRED {
+        let path = base.join(dir).join(file);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing retired {}", path.display()))?;
+            if verbose {
+                println!("removed retired {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
 
 /// One kind of bundled asset: the config-directory subdirectory it installs into, the extension
 /// it carries there, and the set it ships. Iterating this is what keeps every verb — install,
@@ -80,10 +118,10 @@ const BUNDLED_WORKFLOWS: &[(&str, &str)] = &[
 struct Kind {
     dir: &'static str,
     ext: &'static str,
-    /// What a user types to reach one: `/` for a slash command, nothing for a workflow (named by
-    /// path or by `meta.name`). Display only.
+    /// What a user types to reach one: `/` for a slash command, nothing for a subagent type (named
+    /// by a coordinator). Display only.
     sigil: &'static str,
-    set: &'static [(&'static str, &'static str)],
+    set: fn() -> &'static [(&'static str, &'static str)],
 }
 
 const KINDS: &[Kind] = &[
@@ -91,13 +129,13 @@ const KINDS: &[Kind] = &[
         dir: "commands",
         ext: "md",
         sigil: "/",
-        set: BUNDLED_COMMANDS,
+        set: bundled_commands,
     },
     Kind {
-        dir: "workflows",
-        ext: "js",
+        dir: "agents",
+        ext: "md",
         sigil: "",
-        set: BUNDLED_WORKFLOWS,
+        set: bundled_agents,
     },
 ];
 
@@ -142,10 +180,10 @@ fn write_all(base: &Path, verbose: bool) -> Result<()> {
     for kind in KINDS {
         let dir = base.join(kind.dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        for (stem, body) in kind.set {
+        for (stem, body) in (kind.set)() {
             let path = asset_path(base, kind, stem);
-            // Atomic, via the shared seam: a running `/task-swarm` or `/review` workflow
-            // reads these very files, and this runs unattended — a `git pull` fires the
+            // Atomic, via the shared seam: a running session reads these very files, and this
+            // runs unattended — a `git pull` fires the
             // post-merge hook, which runs setup.sh, which reinstalls the binary, whose next
             // invocation reconciles the bundle. `fs::write` truncates in place, so a reader
             // in that window sees a half-written script.
@@ -155,6 +193,7 @@ fn write_all(base: &Path, verbose: bool) -> Result<()> {
             }
         }
     }
+    remove_retired(base, verbose)?;
     crate::atomic::write(&stamp_path(base), fingerprint().as_bytes())
         .context("writing asset stamp")?;
     Ok(())
@@ -167,7 +206,7 @@ fn stamp_path(base: &Path) -> PathBuf {
 }
 
 /// A stable fingerprint of the bundled asset set; changes whenever the binary ships different
-/// commands or workflows — **or writes the same ones under different names**.
+/// commands or subagent types — **or writes the same ones under different names**.
 fn fingerprint() -> String {
     hash_of_bundle(installed_name)
 }
@@ -185,7 +224,7 @@ fn hash_of_bundle(name: fn(&str) -> String) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for kind in KINDS {
-        for (stem, body) in kind.set {
+        for (stem, body) in (kind.set)() {
             format!("{}/{}.{}", kind.dir, name(stem), kind.ext).hash(&mut h);
             body.hash(&mut h);
         }
@@ -193,10 +232,11 @@ fn hash_of_bundle(name: fn(&str) -> String) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Remove every bundled asset from `base`, reporting each.
+/// Remove every bundled asset from `base`, and every retired one, reporting each.
 fn remove_all(base: &Path) -> Result<()> {
+    remove_retired(base, true)?;
     for kind in KINDS {
-        for (stem, _) in kind.set {
+        for (stem, _) in (kind.set)() {
             let path = asset_path(base, kind, stem);
             if path.exists() {
                 std::fs::remove_file(&path)
@@ -221,7 +261,7 @@ fn remove_all(base: &Path) -> Result<()> {
 fn legacy_siblings(base: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for kind in KINDS {
-        for (stem, _) in kind.set {
+        for (stem, _) in (kind.set)() {
             let path = legacy_path(base, kind, stem);
             if path.exists() {
                 found.push(path);
@@ -249,7 +289,7 @@ fn report_legacy(base: &Path) {
     }
 }
 
-/// Write every bundled command and workflow into the Claude Code config directory.
+/// Write every bundled command and subagent type into the Claude Code config directory.
 ///
 /// # Errors
 /// Returns an error if `HOME` is unset or an asset can't be written.
@@ -265,9 +305,9 @@ pub fn install() -> Result<()> {
 fn install_into(base: &Path) -> Result<()> {
     write_all(base, true)?;
     println!(
-        "installed {} command(s) and {} workflow(s).",
+        "installed {} command(s) and {} subagent type(s).",
         BUNDLED_COMMANDS.len(),
-        BUNDLED_WORKFLOWS.len(),
+        bundled_agents().len(),
     );
     println!(
         "commands: {}",
@@ -281,7 +321,7 @@ fn install_into(base: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove every bundled command and workflow from the Claude Code config directory.
+/// Remove every bundled command and subagent type from the Claude Code config directory.
 ///
 /// # Errors
 /// Returns an error if `HOME` is unset or an asset can't be removed.
@@ -344,7 +384,7 @@ pub fn list() -> Result<()> {
     println!("config directory: {}", base.display());
     for kind in KINDS {
         println!("{} ({}):", kind.dir, base.join(kind.dir).display());
-        for (stem, _) in kind.set {
+        for (stem, _) in (kind.set)() {
             let mark = mark(&asset_path(&base, kind, stem));
             println!("  {}{}  ({mark})", kind.sigil, installed_name(stem));
         }
@@ -368,8 +408,8 @@ fn mark(path: &Path) -> &'static str {
 mod tests {
 
     use super::{
-        asset_path, ensure_into, install_into, stamp_path, ASSET_PREFIX, BUNDLED_COMMANDS,
-        BUNDLED_WORKFLOWS, KINDS,
+        asset_path, bundled_agents, ensure_into, install_into, stamp_path, ASSET_PREFIX,
+        BUNDLED_COMMANDS, KINDS,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -398,11 +438,11 @@ mod tests {
         // tell a rename from a truncate-and-rewrite — it passed under `fs::write` when first
         // written, which is the failure mode this test exists to catch in other code.
         let kind = &KINDS[0];
-        let (stem, body) = kind.set[0];
+        let (stem, body) = (kind.set)()[0];
         let path = asset_path(base, kind, stem);
         std::fs::write(&path, PREVIOUS).expect("plant an older version");
 
-        // A running workflow holding its script open across the upgrade.
+        // A running session holding an asset open across the upgrade.
         let mut reader = std::fs::File::open(&path).expect("open an installed asset");
 
         std::fs::write(stamp_path(base), "stale").expect("stale the stamp");
@@ -503,10 +543,10 @@ mod tests {
     #[test]
     fn a_bundled_asset_names_no_workflow_or_command_the_bundle_omits() {
         let sets: [(&str, &str, BTreeSet<&str>); 2] = [
-            ("workflows", "js", stems(BUNDLED_WORKFLOWS)),
+            ("agents", "md", stems(bundled_agents())),
             ("commands", "md", stems(BUNDLED_COMMANDS)),
         ];
-        for (stem, body) in BUNDLED_COMMANDS.iter().chain(BUNDLED_WORKFLOWS.iter()) {
+        for (stem, body) in BUNDLED_COMMANDS.iter().chain(bundled_agents().iter()) {
             for (dir, ext, bundled) in &sets {
                 for (repo_local, named) in path_refs(body, dir, ext) {
                     let want = if repo_local {
@@ -551,7 +591,7 @@ mod tests {
             ours.contains("review"),
             "the repo's command directory was not found, so this test would pass vacuously: {ours:?}"
         );
-        for (stem, body) in BUNDLED_COMMANDS.iter().chain(BUNDLED_WORKFLOWS.iter()) {
+        for (stem, body) in BUNDLED_COMMANDS.iter().chain(bundled_agents().iter()) {
             for named in &ours {
                 assert!(
                     !names_command(body, named),
@@ -588,7 +628,7 @@ mod tests {
     /// overwrites it, `uninstall` deletes it, and a prefix dropped from only one still loses it.
     #[test]
     fn every_writer_prefixes_every_asset_and_none_touches_a_file_jkb_did_not_write() {
-        const MINE: &str = "// my own review workflow, not jkb's\n";
+        const MINE: &str = "my own reviewer agent, not jkb's\n";
         type Writer = fn(&std::path::Path) -> anyhow::Result<()>;
         // Both writers, named: `install` is the explicit one, `ensure` is the one that runs on
         // every non-`commands` invocation of the binary.
@@ -599,12 +639,12 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp config dir");
         let base = dir.path();
-        let workflows = base.join("workflows");
-        std::fs::create_dir_all(&workflows).unwrap();
-        // A name that collides with a bundled stem — likelier to be chosen for `code-review` than
-        // for anything else jkb ships, which is what makes this data loss rather than a naming
-        // preference.
-        let theirs = workflows.join("code-review.js");
+        let agents = base.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        // A name that collides with a bundled stem — `reviewer` is likelier to be a user's own
+        // agent than anything else jkb ships, which is what makes this data loss rather than a
+        // naming preference.
+        let theirs = agents.join("reviewer.md");
 
         // Read through a missing file rather than unwrapping it: `uninstall`'s failure mode is
         // deletion, so an unwrap here would panic on the read and never reach the sentence that
@@ -623,13 +663,13 @@ mod tests {
             assert_eq!(
                 survives(),
                 MINE,
-                "`{writer}` overwrote a workflow of the user's own that it never wrote"
+                "`{writer}` overwrote an agent of the user's own that it never wrote"
             );
 
             // …and that our own assets really are there under the installed name, so the
             // assertion above cannot be satisfied by a writer that writes nothing at all.
             for kind in super::KINDS {
-                for (stem, _) in kind.set {
+                for (stem, _) in (kind.set)() {
                     let path = super::asset_path(base, kind, stem);
                     assert!(
                         path.exists(),
@@ -643,11 +683,11 @@ mod tests {
             assert_eq!(
                 survives(),
                 MINE,
-                "`jkb commands uninstall` deleted a workflow of the user's own that it never \
+                "`jkb commands uninstall` deleted an agent of the user's own that it never \
                  wrote (installed by `{writer}`)"
             );
             for kind in super::KINDS {
-                for (stem, _) in kind.set {
+                for (stem, _) in (kind.set)() {
                     assert!(
                         !super::asset_path(base, kind, stem).exists(),
                         "uninstall left {stem} behind"
@@ -690,8 +730,8 @@ mod tests {
         const OLD: &str = "// installed by a jkb from before the rename\n";
         let dir = tempfile::tempdir().expect("temp config dir");
         let base = dir.path();
-        std::fs::create_dir_all(base.join("workflows")).unwrap();
-        let stale = super::legacy_path(base, &super::KINDS[1], "code-review");
+        std::fs::create_dir_all(base.join("commands")).unwrap();
+        let stale = super::legacy_path(base, &super::KINDS[0], "review");
         std::fs::write(&stale, OLD).unwrap();
 
         super::install_into(base).expect("install");
@@ -709,56 +749,58 @@ mod tests {
         );
     }
 
-    /// Every `name: "<value>"` / `name: '<value>'` in `body`. A `name:` whose value is not a
-    /// quoted literal — `name: { type: 'string' }`, `name: f.name` — is not a reference to
-    /// anything and is skipped.
-    fn name_refs(body: &str) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        let mut from = 0;
-        while let Some(offset) = body[from..].find("name:") {
-            let at = from + offset;
-            from = at + "name:".len();
-            let rest = body[from..].trim_start();
-            let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-                continue;
-            };
-            if let Some(end) = rest[1..].find(quote) {
-                out.insert(rest[1..=end].to_owned());
-            }
-        }
-        out
-    }
-
-    /// **A workflow's advertised identity is the name it is installed under.**
+    /// **A subagent type's advertised identity is the name it is installed under.**
     ///
-    /// The Workflow tool can be asked for a script by `meta.name` instead of by path, and
-    /// `/jkb-task-swarm` offers exactly that. Prefixing only the *filename* left both copies on a
-    /// machine that had upgraded — the stale `task-swarm.js` an older jkb wrote and the new
-    /// `jkb-task-swarm.js` — declaring the same `name: 'task-swarm'`, so resolving by name was
-    /// ambiguous and could run the outdated script. The filename rule is checked by the write
-    /// test above; this is the same rule in the one place a filename is not what identifies the
-    /// file.
+    /// A coordinator starts a worker by its frontmatter `name`, and the role map keys the role on
+    /// that name, so it must be the prefixed one the file is written as: a bare `reviewer` would
+    /// collide with a user's own agent of that name, and attestation would hand a user's agent the
+    /// reviewer role.
     #[test]
-    fn a_bundled_workflow_is_named_as_it_is_installed() {
-        let bare = stems(BUNDLED_WORKFLOWS);
-        for (stem, body) in BUNDLED_WORKFLOWS {
-            let want = format!("{ASSET_PREFIX}{stem}");
+    fn a_bundled_subagent_is_named_as_it_is_installed() {
+        assert!(!bundled_agents().is_empty(), "no subagent types rendered");
+        for (stem, body) in bundled_agents() {
+            let want = format!("---\nname: {ASSET_PREFIX}{stem}\n");
             assert!(
-                name_refs(body).contains(&want),
-                "workflow `{stem}` installs as `{want}.js` but does not declare \
-                 `name: '{want}'` — asked for by name it is either unfindable or ambiguous with \
-                 whatever else on the machine claims that name"
+                body.starts_with(&want),
+                "subagent `{stem}` installs as `{ASSET_PREFIX}{stem}.md` but its frontmatter does \
+                 not name it so:\n{body}"
             );
         }
-        for (stem, body) in BUNDLED_COMMANDS.iter().chain(BUNDLED_WORKFLOWS.iter()) {
-            for named in name_refs(body) {
+    }
+
+    /// **What an earlier jkb installed and this one retired is removed, by every writer and by
+    /// `uninstall`; a same-named file without the prefix is not.** The workflow scripts were
+    /// replaced by coordinator sessions; left installed, `/jkb-task-swarm` from an old session or a
+    /// saved launch would still run a prompt nobody maintains.
+    #[test]
+    fn a_retired_asset_is_removed_and_an_unprefixed_namesake_is_left_alone() {
+        type Writer = fn(&std::path::Path) -> anyhow::Result<()>;
+        let verbs: [(&str, Writer); 3] = [
+            ("jkb commands install", super::install_into),
+            ("auto-install (any jkb invocation)", super::ensure_into),
+            ("jkb commands uninstall", super::uninstall_from),
+        ];
+        for (verb, run) in verbs {
+            let dir = tempfile::tempdir().expect("temp config dir");
+            let base = dir.path();
+            for (sub, file) in super::RETIRED {
+                std::fs::create_dir_all(base.join(sub)).unwrap();
+                std::fs::write(base.join(sub).join(file), "old").unwrap();
+            }
+            let theirs = base.join("workflows").join("code-review.js");
+            std::fs::write(&theirs, "mine").unwrap();
+            run(base).unwrap_or_else(|e| panic!("{verb}: {e}"));
+            for (sub, file) in super::RETIRED {
                 assert!(
-                    !bare.contains(named.as_str()),
-                    "`{stem}` asks for the workflow by the name `{named}`, which is what a \
-                     pre-rename jkb installed — `jkb commands install` writes it as \
-                     `{ASSET_PREFIX}{named}`"
+                    !base.join(sub).join(file).exists(),
+                    "`{verb}` left the retired {sub}/{file} installed"
                 );
             }
+            assert_eq!(
+                std::fs::read_to_string(&theirs).unwrap_or_default(),
+                "mine",
+                "`{verb}` touched a file without jkb's prefix"
+            );
         }
     }
 
@@ -872,7 +914,7 @@ mod tests {
     fn no_message_the_binary_prints_names_a_command_only_this_checkout_has() {
         let ours = repo_stems("commands", "md");
         assert!(
-            ours.contains("review-log"),
+            ours.contains("review"),
             "the repo's command directory was not found, so this test would pass vacuously: \
              {ours:?}"
         );
@@ -904,15 +946,6 @@ mod tests {
         for (stem, body) in BUNDLED_COMMANDS {
             assert!(!stem.is_empty());
             assert!(body.contains("description:"), "{stem} missing frontmatter");
-        }
-    }
-
-    #[test]
-    fn bundled_workflows_export_meta() {
-        assert!(!BUNDLED_WORKFLOWS.is_empty());
-        for (stem, body) in BUNDLED_WORKFLOWS {
-            assert!(!stem.is_empty());
-            assert!(body.contains("export const meta"), "{stem} missing meta");
         }
     }
 }

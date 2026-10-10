@@ -5313,7 +5313,7 @@ fn workflow_agent_copy_set_show_and_export() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|a| a["name"] == "swarm-status" && a["source"] == "packaged"));
+        .any(|a| a["name"] == "swarm-coordinator" && a["source"] == "packaged"));
 
     // A placeholder left empty is refused rather than run with a hole in the prompt.
     jkb(&db)
@@ -5321,7 +5321,7 @@ fn workflow_agent_copy_set_show_and_export() {
             "workflow",
             "agent",
             "show",
-            "swarm-status",
+            "swarm-coordinator",
             "--var",
             "status=open",
         ])
@@ -5330,10 +5330,10 @@ fn workflow_agent_copy_set_show_and_export() {
         .stderr(predicate::str::contains("no value for"));
 
     jkb(&db)
-        .args(["workflow", "agent", "copy", "swarm-status"])
+        .args(["workflow", "agent", "copy", "swarm-coordinator"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("as swarm-status v1"));
+        .stdout(predicate::str::contains("as swarm-coordinator v1"));
     let template = dir.path().join("t.md");
     std::fs::write(&template, "Set {{status}} on {{commands}}.").unwrap();
     jkb(&db)
@@ -5341,20 +5341,20 @@ fn workflow_agent_copy_set_show_and_export() {
             "workflow",
             "agent",
             "set",
-            "swarm-status",
+            "swarm-coordinator",
             "--template-file",
         ])
         .arg(&template)
         .args(["--model", "session"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-status is now v2"));
+        .stdout(predicate::str::contains("swarm-coordinator is now v2"));
     jkb(&db)
         .args([
             "workflow",
             "agent",
             "show",
-            "swarm-status",
+            "swarm-coordinator",
             "--var",
             "status=open",
             "--var",
@@ -5372,18 +5372,18 @@ fn workflow_agent_copy_set_show_and_export() {
     )
     .unwrap();
     jkb(&db)
-        .args(["workflow", "agent", "export", "swarm-status", "--file"])
+        .args(["workflow", "agent", "export", "swarm-coordinator", "--file"])
         .arg(&file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-status packaged as v2"));
+        .stdout(predicate::str::contains("swarm-coordinator packaged as v2"));
     let text: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let entry = text["agents"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|a| a["name"] == "swarm-status")
+        .find(|a| a["name"] == "swarm-coordinator")
         .unwrap()
         .clone();
     assert_eq!(
@@ -5407,7 +5407,7 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
             "workflow",
             "agent",
             "copy",
-            "swarm-status",
+            "swarm-coordinator",
             "--template-file",
         ])
         .arg(&bad)
@@ -5415,7 +5415,7 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         .failure()
         .stderr(predicate::str::contains("{{"));
     jkb(&db)
-        .args(["--json", "workflow", "agent", "show", "swarm-status"])
+        .args(["--json", "workflow", "agent", "show", "swarm-coordinator"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"source\":\"packaged\""));
@@ -5424,7 +5424,7 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
             "workflow",
             "agent",
             "copy",
-            "swarm-status",
+            "swarm-coordinator",
             "--describe",
             "mine",
             "--model",
@@ -5432,9 +5432,9 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("as swarm-status v1"));
+        .stdout(predicate::str::contains("as swarm-coordinator v1"));
     let shown = jkb(&db)
-        .args(["--json", "workflow", "agent", "show", "swarm-status"])
+        .args(["--json", "workflow", "agent", "show", "swarm-coordinator"])
         .output()
         .unwrap();
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
@@ -5448,14 +5448,14 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
     // Exporting it would overwrite v2 with text that never saw it, so it is refused, naming both —
     // unless overridden.
     for a in upstream["agents"].as_array_mut().unwrap() {
-        if a["name"] == "swarm-status" {
+        if a["name"] == "swarm-coordinator" {
             a["version"] = serde_json::json!(2);
             a["template"] = serde_json::json!(["Set {{status}} upstream."]);
         }
     }
     std::fs::write(&file, serde_json::to_string_pretty(&upstream).unwrap()).unwrap();
     jkb(&db)
-        .args(["workflow", "agent", "export", "swarm-status", "--file"])
+        .args(["workflow", "agent", "export", "swarm-coordinator", "--file"])
         .arg(&file)
         .assert()
         .failure()
@@ -5469,14 +5469,14 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
             "workflow",
             "agent",
             "export",
-            "swarm-status",
+            "swarm-coordinator",
             "--override-base",
             "--file",
         ])
         .arg(&file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-status packaged as v3"));
+        .stdout(predicate::str::contains("swarm-coordinator packaged as v3"));
 }
 
 /// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use super::{
     copy, export, list, packaged, packaged_base, parse_file, placeholders, render, resolve, set,
-    validate_name, versions, write_file, AgentPermissions, Edit, ExportBase, Isolation, Pick,
-    Source, Writes, PACKAGED_JSON,
+    subagent_definitions, validate_name, versions, write_file, AgentPermissions, Edit, ExportBase,
+    Isolation, Pick, Source, Writes, PACKAGED_JSON,
 };
 use crate::roles::Role;
 use crate::Db;
@@ -38,7 +38,10 @@ fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 #[test]
 fn the_packaged_file_parses_validates_and_is_in_canonical_form() {
     let agents = packaged().unwrap();
-    assert!(agents.len() >= 20, "the swarm's and the reviewer's agents");
+    assert!(
+        agents.len() >= 9,
+        "the coordinators, their workers and the subagent types"
+    );
     // Canonical form is what `export` writes, so a contribution's diff is only its own change.
     let file = parse_file(PACKAGED_JSON).unwrap();
     assert_eq!(write_file(&file).unwrap(), PACKAGED_JSON);
@@ -60,7 +63,7 @@ fn every_packaged_hand_off_names_a_packaged_agent_of_the_same_workflow() {
 }
 
 #[test]
-fn the_packaged_templates_are_the_scripts_prompts() {
+fn the_packaged_templates_are_what_the_coordinators_fill() {
     let agents = packaged().unwrap();
     let get = |n: &str| agents.iter().find(|a| a.name == n).unwrap();
     let imp = get("swarm-implementer");
@@ -72,20 +75,99 @@ fn the_packaged_templates_are_the_scripts_prompts() {
         .template
         .starts_with("You are the IMPLEMENTER for ONE work-group in a task swarm"));
     let names = placeholders(&imp.def.template).unwrap();
-    for p in ["repo", "task_list", "branch_step", "jkb", "db"] {
+    for p in ["repo", "task_list", "branch_step", "feedback_block"] {
         assert!(names.contains(&p.to_owned()), "{p} in {names:?}");
     }
-    // A mechanical step runs on the small model, as the script runs it.
+    // Each session's coordinator is a template of its own, acting as the coordinator.
+    for c in ["swarm-coordinator", "review-coordinator"] {
+        assert_eq!(get(c).def.role, Role::Coordinator, "{c}");
+    }
+    // The shared reviewer contract is a fragment the round's reviewer and its children include.
+    assert!(get("review-contract").def.fragment);
+    for r in ["review-reviewer", "review-area"] {
+        assert!(
+            placeholders(&get(r).def.template)
+                .unwrap()
+                .contains(&"contract".to_owned()),
+            "{r} includes the contract"
+        );
+    }
+}
+
+/// The workers' subagent types: rendered from the packaged file, prefixed like everything the
+/// installer writes, and holding nothing a coordinator would have to fill.
+#[test]
+fn every_subagent_template_renders_as_an_agent_definition() {
+    let defs = subagent_definitions().unwrap();
+    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["jkb-implementer", "jkb-reviewer"]);
+    for d in &defs {
+        assert!(
+            d.markdown
+                .starts_with(&format!("---\nname: {}\ndescription: \"", d.name)),
+            "{}",
+            d.markdown
+        );
+        assert!(!d.markdown.contains("{{"), "{} holds a placeholder", d.name);
+    }
+    // A reviewer reads and runs; an implementer writes code, so it keeps every tool.
+    let tools = |n: &str| {
+        defs.iter()
+            .find(|d| d.name == n)
+            .unwrap()
+            .markdown
+            .lines()
+            .find(|l| l.starts_with("tools:"))
+            .map(str::to_owned)
+    };
     assert_eq!(
-        get("swarm-merge-runner").def.permissions.model.as_deref(),
-        Some("haiku")
+        tools("jkb-reviewer").as_deref(),
+        Some("tools: Read, Grep, Glob, Bash, Agent")
     );
-    // The shared reviewer contract is a fragment the finders include.
-    assert!(get("review-preamble").def.fragment);
-    assert!(get("review-lens-input")
-        .def
-        .template
-        .starts_with("{{preamble}}\n\nYOUR QUESTION: **what values break this?**"));
+    assert_eq!(tools("jkb-implementer"), None);
+}
+
+/// Every placeholder a coordinator template tells it to pass is one the target template has, and
+/// every placeholder the target has is passed: `show --var` refuses either mismatch, so a drift
+/// here is a coordinator that cannot start its workers.
+#[test]
+fn every_show_a_coordinator_template_spells_matches_its_target() {
+    let agents = packaged().unwrap();
+    for a in agents {
+        let t = &a.def.template;
+        let mut from = 0;
+        while let Some(at) = t[from..].find("jkb workflow agent show ") {
+            let start = from + at + "jkb workflow agent show ".len();
+            let target: String = t[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                .collect();
+            // The command runs to the first line that does not continue it with `\`.
+            let mut end = start;
+            for line in t[start..].split_inclusive('\n') {
+                end += line.len();
+                if !line.trim_end().ends_with('\\') {
+                    break;
+                }
+            }
+            let cmd = &t[start..end];
+            let passed: std::collections::BTreeSet<String> = cmd
+                .split("--var ")
+                .skip(1)
+                .map(|v| v.split('=').next().unwrap().trim().to_owned())
+                .collect();
+            let target_def = agents
+                .iter()
+                .find(|b| b.name == target)
+                .unwrap_or_else(|| panic!("{} shows unknown `{target}`", a.name));
+            let wanted: std::collections::BTreeSet<String> = placeholders(&target_def.def.template)
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(passed, wanted, "{} fills `{target}`", a.name);
+            from = end;
+        }
+    }
 }
 
 #[test]
@@ -226,14 +308,16 @@ fn a_packaged_template_is_read_only_and_a_copy_overrides_it() {
 #[test]
 fn an_edit_that_changes_nothing_writes_nothing() {
     let db = db();
-    db.write_txn("test", |c, m| copy(c, m, "swarm-status", false, None, None))
-        .unwrap();
+    db.write_txn("test", |c, m| {
+        copy(c, m, "swarm-coordinator", false, None, None)
+    })
+    .unwrap();
     let (same, wrote) = db
         .write_txn("test", |c, m| {
             set(
                 c,
                 m,
-                "swarm-status",
+                "swarm-coordinator",
                 Edit {
                     role: Some(Role::Coordinator),
                     ..Edit::default()
@@ -244,7 +328,9 @@ fn an_edit_that_changes_nothing_writes_nothing() {
     assert!(!wrote);
     assert_eq!(same.version, 1);
     let empty = db
-        .write_txn("test", |c, m| set(c, m, "swarm-status", Edit::default()))
+        .write_txn("test", |c, m| {
+            set(c, m, "swarm-coordinator", Edit::default())
+        })
         .unwrap_err()
         .to_string();
     assert!(empty.contains("nothing to change"), "{empty}");
@@ -298,8 +384,10 @@ fn a_copy_under_another_name_is_the_operators_own_but_never_another_packaged_nam
 #[test]
 fn an_invalid_edit_is_refused_and_writes_nothing() {
     let db = db();
-    db.write_txn("test", |c, m| copy(c, m, "swarm-status", false, None, None))
-        .unwrap();
+    db.write_txn("test", |c, m| {
+        copy(c, m, "swarm-reviewer", false, None, None)
+    })
+    .unwrap();
     for edit in [
         Edit {
             template: Some("open {{brace".into()),
@@ -323,10 +411,10 @@ fn an_invalid_edit_is_refused_and_writes_nothing() {
         },
     ] {
         assert!(db
-            .write_txn("test", move |c, m| set(c, m, "swarm-status", edit))
+            .write_txn("test", move |c, m| set(c, m, "swarm-reviewer", edit))
             .is_err());
     }
-    assert_eq!(db.read(|c| versions(c, "swarm-status")).unwrap().len(), 1);
+    assert_eq!(db.read(|c| versions(c, "swarm-reviewer")).unwrap().len(), 1);
 }
 
 #[test]
@@ -335,18 +423,18 @@ fn a_copy_taken_from_an_older_packaged_version_is_behind() {
     let pv = packaged()
         .unwrap()
         .iter()
-        .find(|a| a.name == "swarm-claim")
+        .find(|a| a.name == "review-area")
         .unwrap()
         .version;
     db.write_txn("test", |c, m| {
-        copy(c, m, "swarm-claim", false, None, Some(mine()))
+        copy(c, m, "review-area", false, None, Some(mine()))
     })
     .unwrap();
     // As if this copy had been taken before the packaged text moved on.
     db.write_txn("test", move |c, _| {
         c.execute(
-            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-claim'",
-            [format!("packaged:swarm-claim@{}", pv - 1)],
+            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'review-area'",
+            [format!("packaged:review-area@{}", pv - 1)],
         )?;
         Ok(())
     })
@@ -355,7 +443,7 @@ fn a_copy_taken_from_an_older_packaged_version_is_behind() {
     assert!(
         listing
             .iter()
-            .find(|l| l.agent.name == "swarm-claim")
+            .find(|l| l.agent.name == "review-area")
             .unwrap()
             .behind_packaged
     );
@@ -364,8 +452,10 @@ fn a_copy_taken_from_an_older_packaged_version_is_behind() {
 #[test]
 fn a_stored_permission_this_jkb_does_not_know_is_refused_not_dropped() {
     let db = db();
-    db.write_txn("test", |c, m| copy(c, m, "swarm-status", false, None, None))
-        .unwrap();
+    db.write_txn("test", |c, m| {
+        copy(c, m, "swarm-reviewer", false, None, None)
+    })
+    .unwrap();
     db.write_txn("test", |c, _| {
         c.execute(
             "UPDATE workflow_agents SET permissions = \
@@ -376,7 +466,7 @@ fn a_stored_permission_this_jkb_does_not_know_is_refused_not_dropped() {
     })
     .unwrap();
     let err = db
-        .read(|c| resolve(c, "swarm-status", Pick::Effective))
+        .read(|c| resolve(c, "swarm-reviewer", Pick::Effective))
         .unwrap_err()
         .to_string();
     assert!(err.contains("newer jkb"), "{err}");
@@ -385,18 +475,20 @@ fn a_stored_permission_this_jkb_does_not_know_is_refused_not_dropped() {
 #[test]
 fn export_replaces_an_entry_with_the_next_version_or_appends_a_new_one() {
     let db = db();
-    db.write_txn("test", |c, m| copy(c, m, "swarm-status", false, None, None))
-        .unwrap();
+    db.write_txn("test", |c, m| {
+        copy(c, m, "swarm-reviewer", false, None, None)
+    })
+    .unwrap();
     let before = packaged()
         .unwrap()
         .iter()
-        .find(|a| a.name == "swarm-status")
+        .find(|a| a.name == "swarm-reviewer")
         .unwrap()
         .version;
-    let base = db.read(|c| packaged_base(c, "swarm-status")).unwrap();
+    let base = db.read(|c| packaged_base(c, "swarm-reviewer")).unwrap();
     assert_eq!(base, Some(before));
     let unchanged = db
-        .read(|c| resolve(c, "swarm-status", Pick::Effective))
+        .read(|c| resolve(c, "swarm-reviewer", Pick::Effective))
         .unwrap();
     let base = installed_at(base);
     let same = export(PACKAGED_JSON, &unchanged, base, false)
@@ -409,7 +501,7 @@ fn export_replaces_an_entry_with_the_next_version_or_appends_a_new_one() {
             set(
                 c,
                 m,
-                "swarm-status",
+                "swarm-reviewer",
                 Edit {
                     template: Some("Set {{status}}.\nThen stop.".into()),
                     ..Edit::default()
@@ -419,7 +511,7 @@ fn export_replaces_an_entry_with_the_next_version_or_appends_a_new_one() {
         .unwrap();
     // An edit follows the version before it: still built on the same packaged version.
     assert_eq!(
-        db.read(|c| packaged_base(c, "swarm-status")).unwrap(),
+        db.read(|c| packaged_base(c, "swarm-reviewer")).unwrap(),
         Some(before)
     );
     let (text, version) = export(PACKAGED_JSON, &edited, base, false).unwrap();
@@ -428,7 +520,7 @@ fn export_replaces_an_entry_with_the_next_version_or_appends_a_new_one() {
     let entry = file
         .agents
         .iter()
-        .find(|e| e.name == "swarm-status")
+        .find(|e| e.name == "swarm-reviewer")
         .unwrap();
     assert_eq!(entry.template, vec!["Set {{status}}.", "Then stop."]);
     assert_eq!(entry.version, before + 1);
@@ -437,7 +529,7 @@ fn export_replaces_an_entry_with_the_next_version_or_appends_a_new_one() {
     assert_eq!(file.agents.len(), original.agents.len());
     for (i, (now, was)) in file.agents.iter().zip(&original.agents).enumerate() {
         assert_eq!(now.name, was.name, "entry {i} moved");
-        if now.name != "swarm-status" {
+        if now.name != "swarm-reviewer" {
             assert_eq!(
                 serde_json::to_string(now).unwrap(),
                 serde_json::to_string(was).unwrap(),
@@ -449,7 +541,7 @@ fn export_replaces_an_entry_with_the_next_version_or_appends_a_new_one() {
 
     let mine = db
         .write_txn("test", |c, m| {
-            copy(c, m, "swarm-status", false, Some("my-status"), None)
+            copy(c, m, "swarm-reviewer", false, Some("my-status"), None)
         })
         .unwrap();
     // Built on no packaged `my-status`, and the file has none: appended as v1.
@@ -467,7 +559,7 @@ fn export_refuses_a_copy_built_on_another_version_than_the_file_holds() {
         copy(
             c,
             m,
-            "swarm-status",
+            "swarm-reviewer",
             false,
             None,
             Some(Edit {
@@ -478,9 +570,9 @@ fn export_refuses_a_copy_built_on_another_version_than_the_file_holds() {
     })
     .unwrap();
     let copy_of = db
-        .read(|c| resolve(c, "swarm-status", Pick::Effective))
+        .read(|c| resolve(c, "swarm-reviewer", Pick::Effective))
         .unwrap();
-    let built_on = db.read(|c| packaged_base(c, "swarm-status")).unwrap();
+    let built_on = db.read(|c| packaged_base(c, "swarm-reviewer")).unwrap();
     let pv = built_on.unwrap();
     let base = installed_at(built_on);
     // Upstream has moved on: the target file holds the next version of the entry.
@@ -488,7 +580,7 @@ fn export_refuses_a_copy_built_on_another_version_than_the_file_holds() {
     let e = upstream
         .agents
         .iter_mut()
-        .find(|e| e.name == "swarm-status")
+        .find(|e| e.name == "swarm-reviewer")
         .unwrap();
     e.version = pv + 1;
     e.template.push("A line added upstream.".into());
@@ -517,7 +609,8 @@ fn export_refuses_a_copy_built_on_another_version_than_the_file_holds() {
     .unwrap_err()
     .to_string();
     assert!(
-        behind_only.contains("copy swarm-status --packaged") && !behind_only.contains("update jkb"),
+        behind_only.contains("copy swarm-reviewer --packaged")
+            && !behind_only.contains("update jkb"),
         "{behind_only}"
     );
     // A deliberate revert is allowed, and writes the version after the file's.
@@ -526,13 +619,13 @@ fn export_refuses_a_copy_built_on_another_version_than_the_file_holds() {
 
     // With no copy at all, the installed packaged template is the base: a file it is not is refused.
     let installed = db
-        .read(|c| resolve(c, "swarm-claim", Pick::Packaged))
+        .read(|c| resolve(c, "review-area", Pick::Packaged))
         .unwrap();
     let mut other = parse_file(PACKAGED_JSON).unwrap();
     other
         .agents
         .iter_mut()
-        .find(|e| e.name == "swarm-claim")
+        .find(|e| e.name == "review-area")
         .unwrap()
         .version = installed.version + 1;
     let refused = export(
@@ -623,30 +716,30 @@ fn a_recopy_of_a_copy_keeps_its_packaged_base() {
     let pv = packaged()
         .unwrap()
         .iter()
-        .find(|a| a.name == "swarm-claim")
+        .find(|a| a.name == "review-area")
         .unwrap()
         .version;
     db.write_txn("test", |c, m| {
-        copy(c, m, "swarm-claim", false, None, Some(mine()))
+        copy(c, m, "review-area", false, None, Some(mine()))
     })
     .unwrap();
     db.write_txn("test", move |c, _| {
         c.execute(
-            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-claim'",
-            [format!("packaged:swarm-claim@{}", pv - 1)],
+            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'review-area'",
+            [format!("packaged:review-area@{}", pv - 1)],
         )?;
         Ok(())
     })
     .unwrap();
-    // Copying the copy onto its own name records `swarm-claim@1`; the text is still built on the
+    // Copying the copy onto its own name records `review-area@1`; the text is still built on the
     // older packaged version, and the listing still says so.
     let again = db
-        .write_txn("test", |c, m| copy(c, m, "swarm-claim", false, None, None))
+        .write_txn("test", |c, m| copy(c, m, "review-area", false, None, None))
         .unwrap();
-    assert_eq!(again.based_on.as_deref(), Some("swarm-claim@1"));
+    assert_eq!(again.based_on.as_deref(), Some("review-area@1"));
     // ...and through another name and back.
     db.write_txn("test", |c, m| {
-        copy(c, m, "swarm-claim", false, Some("my-claim"), None)
+        copy(c, m, "review-area", false, Some("my-claim"), None)
     })
     .unwrap();
     assert_eq!(db.read(|c| packaged_base(c, "my-claim")).unwrap(), None);
@@ -654,14 +747,14 @@ fn a_recopy_of_a_copy_keeps_its_packaged_base() {
         db.read(list)
             .unwrap()
             .into_iter()
-            .find(|l| l.agent.name == "swarm-claim")
+            .find(|l| l.agent.name == "review-area")
             .unwrap()
     };
     let listed = row(&db);
     assert!(listed.behind_packaged);
     assert_eq!(listed.packaged_base, Some(pv - 1));
     // Back to the packaged text: current again, and nothing in it to contribute.
-    db.write_txn("test", |c, m| copy(c, m, "swarm-claim", true, None, None))
+    db.write_txn("test", |c, m| copy(c, m, "review-area", true, None, None))
         .unwrap();
     let listed = row(&db);
     assert!(!listed.behind_packaged);
@@ -681,17 +774,19 @@ fn a_copy_that_a_merged_contribution_made_current_is_built_on_the_installed_vers
     let pv = packaged()
         .unwrap()
         .iter()
-        .find(|a| a.name == "swarm-status")
+        .find(|a| a.name == "swarm-reviewer")
         .unwrap()
         .version;
-    db.write_txn("test", |c, m| copy(c, m, "swarm-status", false, None, None))
-        .unwrap();
+    db.write_txn("test", |c, m| {
+        copy(c, m, "swarm-reviewer", false, None, None)
+    })
+    .unwrap();
     // As if the copy had been taken from the version before, edited, contributed, merged as the
     // version this jkb packages, and installed: its text is the packaged text, its chain is old.
     db.write_txn("test", move |c, _| {
         c.execute(
-            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-status'",
-            [format!("packaged:swarm-status@{}", pv - 1)],
+            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-reviewer'",
+            [format!("packaged:swarm-reviewer@{}", pv - 1)],
         )?;
         Ok(())
     })
@@ -700,7 +795,7 @@ fn a_copy_that_a_merged_contribution_made_current_is_built_on_the_installed_vers
         db.read(list)
             .unwrap()
             .into_iter()
-            .find(|l| l.agent.name == "swarm-status")
+            .find(|l| l.agent.name == "swarm-reviewer")
             .unwrap()
     };
     let listed = row(&db);
@@ -712,7 +807,7 @@ fn a_copy_that_a_merged_contribution_made_current_is_built_on_the_installed_vers
             set(
                 c,
                 m,
-                "swarm-status",
+                "swarm-reviewer",
                 Edit {
                     describe: Some("the next edit".into()),
                     ..Edit::default()
@@ -735,21 +830,25 @@ fn a_copy_that_a_merged_contribution_made_current_is_built_on_the_installed_vers
     .unwrap();
     assert_eq!(version, pv + 1);
     // ...and a re-copy of that copy onto its own name keeps it too.
-    db.write_txn("test", |c, m| copy(c, m, "swarm-status", true, None, None))
-        .unwrap();
+    db.write_txn("test", |c, m| {
+        copy(c, m, "swarm-reviewer", true, None, None)
+    })
+    .unwrap();
     db.write_txn("test", move |c, _| {
         c.execute(
-            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-status'",
-            [format!("packaged:swarm-status@{}", pv - 1)],
+            "UPDATE workflow_agents SET based_on = ?1 WHERE name = 'swarm-reviewer'",
+            [format!("packaged:swarm-reviewer@{}", pv - 1)],
         )?;
         Ok(())
     })
     .unwrap();
     let again = db
-        .write_txn("test", |c, m| copy(c, m, "swarm-status", false, None, None))
+        .write_txn("test", |c, m| {
+            copy(c, m, "swarm-reviewer", false, None, None)
+        })
         .unwrap();
     assert_eq!(
         again.based_on.as_deref(),
-        Some(format!("packaged:swarm-status@{pv}").as_str())
+        Some(format!("packaged:swarm-reviewer@{pv}").as_str())
     );
 }

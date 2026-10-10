@@ -1388,72 +1388,66 @@ floor unreachable by the flat glob the gate actually runs, and every branch afte
     fi
 }
 
-# --- 10. the merge queue's exit contract has exactly one consumer, and it must know every code -
-# THE DEFECT THIS EXISTS FOR SHIPPED IN THIS BRANCH. `merge-queue.sh` grew exit 4; the only thing
-# that reads it — `.claude/workflows/task-swarm.js` — still enumerated 0/1/2/3 in a prompt and
-# asked an agent to map the result to a boolean. Both answers it could give were wrong: one marks
-# a whole task group done with the base never advanced, the other sends the implementer to fix a
-# branch the script's own header says is not at fault.
+# --- 10. the merge queue names its own outcome, and it must know every code it documents -------
+# THE DEFECT THIS EXISTS FOR SHIPPED ONCE. `merge-queue.sh` grew exit 4; the only thing that read
+# it — the swarm's workflow script — still enumerated 0/1/2/3 in a prompt and asked an agent to map
+# the result to a boolean. Both answers it could give were wrong: one marks a whole task group done
+# with the base never advanced, the other sends the implementer to fix a branch the script's own
+# header says is not at fault. Coordinator sessions replaced that script, and a coordinator is a
+# model too, so the classification now lives in the script (`queue_outcome`), printed as its last line.
 #
 # So the relation, not the function, is what is held here: every code the script DOCUMENTS must be
-# one the workflow CLASSIFIES, and a code it does not document must fall to the unknown arm. Both
-# sides are read from their home files — the header legend and the classifier source — so adding a
-# code to one without the other reddens this case. That is `_selection_vars` reading
-# `REPO_SELECTION_VARS` out of the Rust, applied across the shell/JS seam.
-#
-# Nothing else in this repository tests `.claude/workflows/*.js`, which is why the classifier was
-# introduced with no oracle at all — the same "guard with no oracle" the queue's own gate half was
-# just corrected for, one file over and in the same commit.
+# one `queue_outcome` CLASSIFIES, and a code it does not document must fall to the unknown arm. Both
+# sides are read from the one file — the header legend and the function — so adding a code to one
+# without the other reddens this case. That is `_selection_vars` reading `REPO_SELECTION_VARS` out of
+# the Rust, applied within one script.
 _queue_exit_codes() {
     sed -n '/^# Run inside the integration worktree/,/^set /p' "$repo_root/scripts/merge-queue.sh" \
         | grep -E '^#   [0-9]+ ' | sed -E 's/^#   ([0-9]+) .*/\1/'
 }
 
-_classify_merge_src() {
-    sed -n '/^function classifyMerge(/,/^}/p' "$repo_root/.claude/workflows/task-swarm.js"
+_queue_outcome_src() {
+    sed -n '/^queue_outcome() {/,/^}/p' "$repo_root/scripts/merge-queue.sh"
 }
 
 case10() {
     local codes src n bad="" out code
     codes="$(_queue_exit_codes)"
-    src="$(_classify_merge_src)"
+    src="$(_queue_outcome_src)"
     n="$(grep -c . <<<"$codes" || true)"
     if [ "$n" -lt 4 ] || [ -z "$src" ]; then
         fail "queue-contract: premise" "read $n exit code(s) from merge-queue.sh's header and \
-$( [ -n "$src" ] && echo "found" || echo "did NOT find") classifyMerge in task-swarm.js — one of \
-the two extractions is broken, and everything below would pass vacuously"
+$( [ -n "$src" ] && echo "found" || echo "did NOT find") queue_outcome in it — one of the two \
+extractions is broken, and everything below would pass vacuously"
         return
     fi
 
     # Every documented code must reach a real arm, not the default.
     while IFS= read -r code; do
         [ -n "$code" ] || continue
-        out="$(node -e "$src
-const v = classifyMerge($code)
-console.log(v.outcome + '|' + (v.why || ''))" 2>&1)"
+        out="$(bash -c "$src
+queue_outcome $code" 2>&1)"
         case "$out" in
             *unknown\ exit*) bad="$bad $code(falls-to-default)" ;;
-            landed\|*|eject\|*|stall\|*) ;;
+            landed|eject|stall) ;;
             *) bad="$bad $code(bad-shape:$out)" ;;
         esac
     done <<<"$codes"
 
     # ...and a code the script does NOT document must stall as unknown, rather than being sorted
     # into the nearest bucket. This is the arm that makes the next code safe.
-    out="$(node -e "$src
-const v = classifyMerge(99)
-console.log(v.outcome + '|' + (v.why || ''))" 2>&1)"
+    out="$(bash -c "$src
+queue_outcome 99" 2>&1)"
     case "$out" in
-        stall\|*unknown\ exit\ 99*) ;;
+        stall:\ unknown\ exit\ 99) ;;
         *) bad="$bad 99(undocumented-code-not-stalled:$out)" ;;
     esac
 
     if [ -n "$bad" ]; then
-        fail "queue-contract: codes" "merge-queue.sh documents $n exit codes and task-swarm.js \
-does not classify them all:$bad. A code the workflow has never heard of decides whether a task \
-group is marked done"
+        fail "queue-contract: codes" "merge-queue.sh documents $n exit codes and queue_outcome \
+does not classify them all:$bad. A code nobody has classified decides whether a task group lands"
     else
-        ok "every exit code the merge queue documents is classified by its consumer ($n), and an unknown one stalls"
+        ok "every exit code the merge queue documents is classified by queue_outcome ($n), and an unknown one stalls"
     fi
 
     # EVERY DOCUMENTED CODE HAS A NAMED EXPECTED OUTCOME, not just "reaches some arm". The first
@@ -1470,14 +1464,14 @@ group is marked done"
             routing_bad="$routing_bad $code(no-expectation-written-down)"
             continue
         fi
-        got="$(node -e "$src
-console.log(classifyMerge($code).outcome)" 2>&1)"
+        got="$(bash -c "$src
+queue_outcome $code" 2>&1)"
         [ "$got" = "$want" ] || routing_bad="$routing_bad $code(want=$want got=$got)"
     done <<<"$codes"
     if [ -z "$routing_bad" ]; then
         ok "and every documented code routes where this test says it must ($n checked)"
     else
-        fail "queue-contract: routing" "classifyMerge sends these codes somewhere this test does \
+        fail "queue-contract: routing" "queue_outcome sends these codes somewhere this test does \
 not expect:$routing_bad. A landing reported as an eject burns the group's retry budget; an eject \
 reported as a landing closes the group with nothing in the base; and a code with no expectation \
 here means the header grew one and nobody decided what it means"
@@ -1485,8 +1479,8 @@ here means the header grew one and nobody decided what it means"
 
     # ...AND THE SECOND COPY OF THE MAPPING. `swarm-status.sh` classifies the same exit codes in
     # its own embedded python, so the tree holds the rule twice and nothing compared them: a future
-    # edit to `classifyMerge` would leave the status view quietly reporting a different outcome
-    # than the workflow acted on, with case10 green. Both are driven from the same expectation
+    # edit to `queue_outcome` would leave the status view quietly reporting a different outcome
+    # than the coordinator acted on, with case10 green. Both are driven from the same expectation
     # here, which is the cross-file relation this case already holds for the header.
     local py bad2=""
     py="$(sed -n '/^def merge_outcome(r):/,/^    return "stall"/p' "$repo_root/scripts/swarm-status.sh")"
@@ -1503,10 +1497,10 @@ print(merge_outcome({'exit': $code, 'detail': ''}))" 2>&1)"
         [ "$got" = "$want" ] || bad2="$bad2 $code(want=$want got=$got)"
     done <<<"$codes"
     if [ -z "$bad2" ]; then
-        ok "and swarm-status.sh classifies every one of them the same way the workflow does"
+        ok "and swarm-status.sh classifies every one of them the same way the queue does"
     else
         fail "queue-contract: status-drift" "scripts/swarm-status.sh reports a different outcome \
-than task-swarm.js acts on, for:$bad2. The status view is how a person finds out a group stalled, \
+than the queue names, for:$bad2. The status view is how a person finds out a group stalled, \
 so a disagreement here is invisible exactly when it matters"
     fi
 }
@@ -1780,42 +1774,6 @@ link into $share — SQLite would create the database at the link's target"
 # ONE `run_cases`, because the harness requires the call to name every defined case — which is how
 # it catches a case written and never wired up.
 echo "==> scripts/*.sh: a reachable toolchain, and no pipe into a quiet grep"
-# The swarm's post-landing check (task-swarm.js unclosedTasks). The merge queue's landing record is
-# what closes a task; the workflow only checks. On 2026-10-08 an agent that "marked the group done"
-# instead closed the NEXT, unstarted task twice, so the check's one job is never to call unclosed
-# work closed. Every answer but "each task's own full-uid entry says done" must name the task.
-_unclosed_src() {
-    sed -n '/^function unclosedTasks(/,/^}/p' "$repo_root/.claude/workflows/task-swarm.js"
-}
-
-case12() {
-    local src out
-    src="$(_unclosed_src)"
-    if [ -z "$src" ]; then
-        fail "closed-check: premise" "did NOT find unclosedTasks in task-swarm.js — the cases below would pass vacuously"
-        return
-    fi
-    out="$(node -e "$src
-const g = { tasks: [{ uid: 'task:a-1' }, { uid: 'task:b-2' }] }
-const cases = [
-  ['no answer', null, 'task:a-1,task:b-2'],
-  ['empty answer', { tasks: [] }, 'task:a-1,task:b-2'],
-  ['a short uid', { tasks: [{ uid: 'a-1', status: 'done' }, { uid: 'task:b-2', status: 'done' }] }, 'task:a-1'],
-  ['an error', { tasks: [{ uid: 'task:a-1', status: 'unknown: bad_request' }, { uid: 'task:b-2', status: 'done' }] }, 'task:a-1'],
-  ['one not done', { tasks: [{ uid: 'task:a-1', status: 'done' }, { uid: 'task:b-2', status: 'needs_review' }] }, 'task:b-2'],
-  ['all done', { tasks: [{ uid: 'task:a-1', status: 'done' }, { uid: 'task:b-2', status: 'done' }] }, ''],
-]
-for (const [name, answer, want] of cases) {
-  const got = unclosedTasks(g, answer).map((n) => n.uid).join(',')
-  if (got !== want) console.log(name + ': got [' + got + '], want [' + want + ']')
-}" 2>&1)"
-    if [ -z "$out" ]; then
-        ok "the post-landing check names every task not shown done under its full uid, and passes only all-done"
-    else
-        fail "closed-check: verdicts" "$out"
-    fi
-}
-
-run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10 case11 case12
+run_cases case0 case1 case2 case3 case4 case5 case6 case7 case8 case9 case10 case11
 
 finish

@@ -36,7 +36,7 @@ pub struct AgentView {
     pub version: i64,
     /// `packaged` (read-only) or `operator` (an editable copy).
     pub source: Source,
-    /// The workflow script that runs it.
+    /// The workflow it belongs to.
     pub workflow: String,
     /// The D52 role its calls act as.
     pub role: String,
@@ -51,7 +51,7 @@ pub struct AgentView {
     pub template: String,
     /// The placeholders the prompt names.
     pub placeholders: Vec<String>,
-    /// Where it runs, on which model, and the most it may change: the half the workflow script
+    /// Where it runs, on which model, and the most it may change: the half the coordinator
     /// enforces.
     pub permissions: AgentPermissions,
     /// The agents it hands its result to.

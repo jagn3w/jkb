@@ -132,13 +132,13 @@ impl GateVerdict {
         match self {
             Self::Passed => None,
             Self::NeverReviewed => Some(
-                "No review has been recorded. Run /jkb-review-log in the session, or land with \
+                "No review has been recorded. Run /jkb-review in the session, or land with \
                  --no-review."
                     .to_owned(),
             ),
             Self::NoFindingsRecorded(nss) => Some(format!(
                 "Its review ({}) holds no findings at all, so they never reached the KB — this \
-                 is not a clean review. Re-run /jkb-review-log.",
+                 is not a clean review. Re-run /jkb-review.",
                 nss.join(", ")
             )),
             Self::OpenFindings(count, _) => Some(format!(
@@ -252,13 +252,13 @@ pub(crate) fn enforce(
     match verdict {
         GateVerdict::Passed => Ok(false),
         GateVerdict::NeverReviewed => anyhow::bail!(
-            "{uid} has no recorded review — run `/jkb-review-log` in the session (it records the \
+            "{uid} has no recorded review — run `/jkb-review` in the session (it records the \
              review itself), or land with --no-review to record a waiver instead"
         ),
         GateVerdict::NoFindingsRecorded(nss) => anyhow::bail!(
             "{uid} records a review of {} but that namespace holds no findings at all — so \
              the review's findings never reached the KB (a quarantined tasks.md, a typo'd \
-             --findings, or a namespace renamed since). Re-run `/jkb-review-log`, or land with \
+             --findings, or a namespace renamed since). Re-run `/jkb-review`, or land with \
              --no-review. This is NOT read as a clean review.",
             nss.join(", ")
         ),
@@ -276,7 +276,7 @@ pub(crate) fn enforce(
         }
         GateVerdict::LastRoundNotClean { ns, must_fix } => anyhow::bail!(
             "{uid}'s newest review round ({ns}) found {must_fix} must-fix finding(s). Fixing them is \
-             not a review of the fix: run another round (`/jkb-review-log`), which must come back \
+             not a review of the fix: run another round (`/jkb-review`), which must come back \
              with none — or land with --no-review to record a waiver instead"
         ),
         GateVerdict::RoundsUnknown => anyhow::bail!(
@@ -287,12 +287,13 @@ pub(crate) fn enforce(
     }
 }
 
-/// The reviewer workflow's result, as `jkb task review file` reads it: its `findings`, each with the
-/// fields the op files and whatever else the workflow reports (`kind`, `unverified`), which are ignored.
+/// A review round's result, as `jkb task review file` reads it: its `findings`, each with the fields
+/// the op files and whatever else the reviewer reports (`scope`, `kind`), which are ignored here —
+/// the reviewer files pre-existing findings to the backlog itself.
 #[derive(serde::Deserialize)]
 struct WorkflowResult {
     findings: Vec<WorkflowFinding>,
-    /// Set when the review did not run (`code-review.js`: a failed survey). Its empty `findings` are
+    /// Set when the review did not run (the reviewer could not read the change). Its empty `findings` are
     /// not a clean review, and filing them as one would let the land gate pass unreviewed work.
     #[serde(default)]
     error: Option<String>,
@@ -360,7 +361,7 @@ pub(crate) fn file_cmd(
         anyhow::bail!(
             "{what} does not say how many reviewers ran and came back (`reviewers`, `returned`), so a \
              review that read part of the change cannot be told from one that read all of it — \
-             nothing was filed; update `.claude/workflows/code-review.js`"
+             nothing was filed; say both in the result"
         );
     };
     let run = jkb_api::review::ReviewRun {
@@ -525,7 +526,7 @@ fn print_recording(
             ),
             skipped_unlanded,
         );
-        println!("  review each in its own session (`/jkb-review-log` there), or land first.");
+        println!("  review each in its own session (`/jkb-review` there), or land first.");
     }
 }
 

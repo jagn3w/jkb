@@ -284,7 +284,7 @@ fn fresh_round(f: &WorkflowFacts) -> Verdict<WorkflowEvent> {
     require_yes(f.new_round, || {
         Denial::new(
             "No review round has been filed since the work was submitted. Run one \
-             (`/jkb-review-log`), then observe again.",
+             (`/jkb-review`), then observe again.",
         )
     })
 }
