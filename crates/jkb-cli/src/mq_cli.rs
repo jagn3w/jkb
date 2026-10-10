@@ -5,7 +5,7 @@
 //! the daemon cannot disagree about what an operation does.
 //!
 //! `jkb mq subscribe` is the language-neutral consumer API: NDJSON events on stdout, one command per
-//! line on stdin. The protocol is specified in `docs/message-queue.md`, and pinned end to end by
+//! line on stdin. The protocol is specified in `docs/daemon-and-messaging.md`, and pinned end to end by
 //! `tests/cli.rs` driving a real `jkb` through pipes.
 
 use std::io::{BufRead as _, Write};

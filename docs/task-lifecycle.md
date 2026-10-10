@@ -1,1276 +1,1411 @@
-# The task lifecycle — subtasks, sessions, staging, landing
+<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 112.b_2I6IndsJEGAYGdu_yU_awDAYKo9cTruwUBgbCvyvXfvwIBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bh8rc4biU9QIB_dakx6mh3w0Bit-6l4Wprw0B_9yx8p6JmwoBjOSnvIrrzQ4BjdHWvb2O-A4Bjvz45fSu2A0Bj5fqg9GohQcBjcfDyc_llg8BkMil2eDEzAMBjLzKt5Cd2AUBkrivg62IuQ4Bk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWWksvI8uSYAQGWlPaCtJjSBAGZqdfqnNn-CAGX8pONqO27CQGYn8LK3t-nCwGPlMv7uIeDBgGa8eSp-v2-BAGe4NTBkYbyAwGXpeGpjb_VBAGg1bamxrlnAaH25Z3ihbgNAaKftbHfki4Bo4PB_PfpsAwBotCO-afV7wgBpdmYyJPIvgsBjdLbv9f-9wQBm4berKa5_gYBqImgkqXz8Q0BqOjc06jB-QIBqaOkiNPXpwoBqbGkpNyznAIBrJKai5vD2gIBrcLivemFyQQBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwGzvNf8sufoBQG02eeoz_eAAgG1_tTRkKm8DAG25o6mx7-gCQG32bXx-an3DAGyqqPxusaJDAG0yZ7Jn8PFCAG2yqOFramlBAG7kcGOj47YDgG2mIydl8-BCwG-pfjsvNPRAwG-9rHhkZbbBgG-9aO5xPbECwHB_NywyJvEDAHC5au0qq-dCAHDqtq2y9cIAcTUju2Aq-wOAcPo1bOl-6kJAcamob7b7MYJAb_Hr8rb67YOAcjJhK_2u_IOAcfkoqiMzCIBzMPftPCwyQgBzZHw3LGP4A0B0Iis5ryurwkB0Lu07_eSWAHUrJDtv9W8BQHVxoS9sZu3DwHVjsmlu4SCAwHan4mk1JWmBwHbht3ZyYi0BAHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHh2r2Nyo2bCwHi2qKqqc-iCQHg5ubBg-q1BwHgjs3o_5PNAgHlwZbF2s7CCwHljaWUkvyeCQHflfjBpdb3CwHqzM_yv_eFAQHqivWquYT5BgHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHw0vjVq-XJCwHzsrTDhuLeBAHz18zIqq7BCgH0tLer_qPwDQH1_q7ZrfrxBAH3196ovJTtCwH2osPmhaWADQH27JXrzch6AfiFw7jkwtkMAfjdwoL3kssCAfq3mcTenPAIAfLLiMue2qUKAf6569Hd14YJAfmPho6hqscHAQ, blake3 f78cadd481ecfdd42a25823d883f49b2f16bdbc0e351fa8b6bf18c3ce370de9e) -->
+# Task lifecycle
 
-How a task moves from the frontier to merged: subtasks and containment (D34/D35), the
-per-task git worktree (D36), the checkable state machine and the append-only transition
-log (D48), the superseded `branch_records` table (D46), review-gated landing (D38), and
-the design gate that keeps undecided work away from the swarm (D28).
+How a task moves from the frontier to merged. A task is decomposed into subtasks, so the
+frontier hands out leaves. Work on one runs in its own git worktree session, on a branch
+that lands on a staging branch before trunk. Landing is gated on a recorded review, and
+closing a task whose work reached trunk is automatic but conservative. Underneath all of it
+the lifecycle is a declared, checkable state machine (`crates/jkb-fsm`), and every move a
+task makes is appended to a transition log that never has to be reconciled with the world.
 
-Part of the jkb documentation set; see [CLAUDE.md](../CLAUDE.md) for the
-conventions every session is expected to know.
+Two rules run under every decision here. **Of the two ways to be wrong, the recoverable one
+wins**: a missed close costs one command, a wrong close buries unfinished work, so every
+inference about git degrades towards holding a task, never towards closing it. And **a fact
+git owns is asked of git**, never copied into the store and then reconciled.
 
-## Task branch lifecycle (D34) — subtasks, branch tags, merge-driven close
+Neighbouring subjects live in other designs. Roles, RBAC, task workflows, review rounds and
+the design gate that keeps undecided work away from the swarm are the agents-and-roles
+design. The land lock's lease rules are the daemon-and-messaging design. Installing the git
+hooks is the git-hooks-installer design. The sync journal's own rules are the file-sync
+design, and investigation units are the namespaces design; both appear here only as the
+second and third users of the state-machine library. The changelog and `jkb undo` are the
+foundation design.
 
-Two chores that were manual — re-running `setup.sh` after a pull, and closing tasks whose PR
-landed — are now automatic (design `openspec/changes/jkb-task-branch-lifecycle/`).
+## Subtasks and containment
 
-- **Subtasks are `parent_of` edges.** The edge type existed and the `tasks` serializer already
-  wrote it from indentation; nothing read it. Now **a task with a non-terminal child is off
-  the frontier** — you work the leaves, the parent is a container. One anti-join
-  (`SUBTASK_CLAUSE`), added to `is:ready` and `is:frontier` **identically**, because those two
-  must stay equivalent for tasks. `jkb task add --under <uid>` creates one (inheriting the
-  parent's home); `jkb task show` lists them and says why the parent is held. Deliberately no
-  status rollup: auto-close is a separate, git-triggered decision, and two mechanisms racing
-  to close one task is how it closes for the wrong reason.
-- **`jkb task start <uid>`** claims the task *and* records `branch=`/`repo=`, its land target and
-  its measured cut point, from the
-  ambient git repo — one moment, one command, so the tag is never missing on exactly the
-  tasks that needed it. It refuses the trunk branch (which would auto-close instantly).
-- **Merge detection is strategy-agnostic** (`jkb-cli/src/gitrepo.rs`). `--is-ancestor` and
-  `git cherry` both report *not merged* for **squash**, GitHub's most popular strategy, since
-  it rewrites the branch into one new commit. The check that works for all three asks a
-  different question — `git merge-tree --write-tree trunk branch` equalling trunk's own tree
-  means the branch **adds nothing**, however it landed. Falls back to `--is-ancestor` on git
-  <2.38 and *says so*. A recorded cut point exists because refs alone cannot separate a rebase-merged
-  branch (GitHub fast-forwards, leaving it byte-identical to trunk) from one just created.
-- **`jkb task close-merged`** closes a task only when its branch merged **and** every subtask
-  is terminal; anything else is reported. A merged branch is evidence, not proof — a missed
-  close costs one command, a wrong close buries unfinished work.
-- **Containment is a placement, not a derived view (D35).** `placements.parent_item_id`
-  (migration `V009`) says where a node lives: *in namespace N, contained by item P*. `NULL`
-  means directly in the namespace. Listing is then one query over one table —
-  `items_directly_in` for a namespace, `items_under` for a container — with **no filter, no
-  edge join and no de-duplication rule**. It previously simulated this at read time, placing
-  the child in its container's namespace and hiding it again on the way out.
-  `namespace_id` is deliberately kept alongside: `ns:tasks/**` scoping resolves through it,
-  so a contained item must stay findable by scope. `ON DELETE SET NULL`, never CASCADE —
-  deleting a container returns its children to the namespace rather than deleting their
-  placement rows, which would make them invisible rather than un-parented.
-- **The edges survive, carrying what a placement cannot** — `edge::link`'s cycle guard,
-  `jkb related` traversal, `derived_from` as provenance for search's `source_document`, and
-  the `tasks` serializer's indentation + three-way merge `Sig`. `task::add_subtask` writes
-  edge and placement in one call so they cannot drift.
-- **Containment is a relationship between items (D35).** `containment(child_item_id PRIMARY
-  KEY, parent_item_id, position)` — its own table, keyed on the **child**, because "X is
-  contained by Y" is a property of X and not of one of X's several placements (a home plus
-  the `tasks/<repo>` mirror). The PK makes *at most one container* structural. `placements`
-  is untouched and still carries `namespace_id`, so `ns:tasks/**` scoping still finds a
-  contained item: listing and scoping ask different questions and both stay right. A
-  contained item is listed under its container **and nowhere else**, even when homed in
-  another namespace — never unreachable, since expanding the container always reaches it.
-  Rejected alternatives are recorded in the design: a namespace per parent (derives a path
-  from a mutable title — the identity failure the sync prose bug already taught, and it grows
-  the organizational tree with content) and `placements.parent_item_id` (stores one fact once
-  per placement).
-- **Containment is a behaviour, not a node kind.** A *pure namespace* is a node that only
-  contains; a parent task both **is** a task and **contains** its subtasks; a document
-  **contains** its chunks. So `jkb ls <path-or-uid>` is the one container read — it resolves
-  a namespace first (the historical meaning) and falls back to an item uid — and `jkb tree`
-  descends into **any** child with `has_children`. `jkb task subtasks` is a thin alias for
-  discoverability, not a second implementation. The UI passes a node's address and does not
-  branch on kind. The two containment edges stay distinct where it matters: a task
-  *decomposes into* subtasks (`parent_of`, authored), a document is *fragmented into* chunks
-  (`derived_from`, generated and rebuildable).
-- **A contained node is listed once.** `--under` homes a subtask beside its parent, and
-  ingest places chunks beside their document, so either would otherwise appear both as a
-  namespace sibling and nested under its container. `ls` hides it **only where its container
-  is in the same listing** — one homed elsewhere keeps its own row, because hiding it there
-  would make it unreachable rather than merely un-duplicated.
-- **Chunks are nested, not flag-hidden.** They were previously dropped from listings unless
-  `--all`; now they are reached by expanding their document (`jkb ls <document-uid>`, in
-  document order via the `chunk` placement's `position`). `--all` no longer re-flattens them
-  — that would reintroduce the duplicate — it governs terminal tasks and whether chunks count
-  toward per-folder totals, which is a separate question from where they are listed.
-- **The explorer shows the hold.** A task carries `subtask_count`/`open_subtask_count` and
-  the row reads `2 of 4 subtasks open`, with a hover saying the parent is held. Without it a
-  container renders identically to the pickable tasks beside it, which is worse than having
-  no subtasks at all.
+Two chores were manual: re-running `setup.sh` after a pull, and closing the tasks whose pull
+request had landed. Both were forgotten, and the second silently rotted the backlog, since a
+task that shipped weeks earlier still sat on the frontier. Automating the close needs a task
+to know which branch would complete it, and automating it correctly needs a way to say "this
+branch only does part of this task". That is what subtasks are for, so the three landed
+together.
 
-## Parallel task sessions (D36) — driving tasks by hand, safely
+### A subtask is a `parent_of` edge, and the frontier hands out leaves
 
-The manual counterpart of `/task-swarm`: the same isolation and the same merge queue, driven
-by a human (design `openspec/changes/jkb-parallel-sessions/`). Before this, clicking "Work
-this task with Claude" twice gave two agents one checkout, and neither claimed its task.
+A subtask is a `parent_of` edge, parent to child. The edge type already existed and the
+`tasks` serializer already wrote it from indentation; nothing read it. The load-bearing rule:
+**a task with a non-terminal child is not on the frontier.** You work the leaves; the parent
+is a container, not a unit of work. This is one anti-join (`SUBTASK_CLAUSE`), the same shape
+as the existing `depends_on` one.
 
-- **A session is a git worktree** — `<repo>/.jkb/work/<session>` on branch `task/<session>`,
-  one per task. `.jkb/` is added to `.git/info/exclude` on first use (locally, not by editing
-  someone else's `.gitignore`), because otherwise the first session makes the tree dirty and
-  `land` refuses a dirty target.
-- **`jkb task work <uid>`** opens or *returns* the session — idempotent, so the button cannot
-  fork the work. **`land`** rebases detached (never checking the branch out, which git refuses
-  while the session holds it), fast-forwards the target, runs the gate on the integrated
-  result, and rolls the target back on red. **`abandon`** drops it; **`sessions`** lists what
-  is in flight; **`gate`** shows/sets the verify command.
-- **The land target** is the branch you started from — unless that is trunk, in which case a
-  branch is cut from trunk named after the first task and sessions hang off *that* (landing on
-  trunk would make every task read as merged, D34.3). Later sessions join the batch the live
-  ones share. Recorded as `branch_records.land_target`, beside the branch's measured cut point.
-- **The gate is remembered per repo** in `namespaces.metadata.gate` on `repos/<repo>`:
-  `--gate` wins, then the stored command, then autodetect (`scripts/check.sh`, `scripts/test.sh`,
-  `make test`) — and a flag or a detection is *stored*, so the guess is made once. The chosen
-  command is always printed; a gate that silently did not run is worse than none, because the
-  landing reads as verified.
-- **A session's claim is owned by the worktree; the pid is provenance, not liveness** (D36.6).
-  Owner ids gained the form `session:<pid>:<worktree>`, and `is_alive` judges a session owner
-  **only** by whether its worktree exists. `jkb task work` exits in a second, so a plain
-  `host:pid` owner would be dead on arrival and `doctor --fix` would free the task mid-session.
-  The pid is not consulted even as a fallback: it belongs to a process that has already exited,
-  so it can only ever be wrong — falsely dead (its original bug) or, once recycled, falsely
-  alive for a session `land` already removed. Only `land`/`abandon`, which remove the worktree,
-  free a claim. There is deliberately **no attended/unattended axis**: nothing observable can
-  tell a session you are sitting in from one you walked away from, and a flag built on that pid
-  labelled *every* session unattended and advised abandoning it. `sessions`/`doctor` report what
-  is observable — uncommitted work and commits ahead.
-- **A session owner names its worktree home-relative, and the Claude Code session that opened it**
-  (tasks S6.4, decision E; `openspec/changes/jkb-message-queue/design-s6-4.md`). The form is now
-  `session:<pid>[@<claude session>]:<worktree>`, and the worktree is written `~/repos/…` when it lies
-  under `~/repos` (only there; see below). The host and the dev container see the same `~/repos` under different homes, so an
-  absolute path named a directory only one side had, and the other side's probe answered `Unknown`
-  about every session it did not open. Each side now resolves `~` against its own home
-  (`owner::session_worktree`), and old absolute owners still parse and are judged as before. The
-  opener (`CLAUDE_CODE_SESSION_ID`) is provenance and never decides liveness. It does decide one
-  thing: `task work` refuses to take over a checkout when **both** its opener and the session
-  asking are `live` in the session registry and are different sessions. That is how two top-level
-  Claude sessions stop ending up in one worktree. Anything less established lets the takeover
-  through, as before: a process with no session, a session the registry does not know, an opener
-  that ended. The unknown-session case covers a subagent. It has its own
-  `CLAUDE_CODE_SESSION_ID` (measured), and `CLAUDE_CODE_CHILD_SESSION` is set in a top-level
-  session's shell as well, so nothing tells a subagent apart. Whether a subagent's start ever
-  reaches the registry is not measured; if it does, a subagent resuming its parent's checkout is
-  refused. Only a worktree under `~/repos`, the one directory both sides share, is written
-  home-relative. A checkout elsewhere under the home keeps its absolute path, because the other side's
-  `~/src` is a different directory where an absent checkout would read as proven gone.
-  A resume by something that is not itself a running, registered session keeps the opener
-  it found rather than clearing it; otherwise one terminal resume would have lifted the protection.
-  The refusal names `jkb task release` for an opener that is gone but was never recorded as such. A
-  home reached through a symlink still gives a `~/` owner: git reports the physical path, so the
-  mapping also compares the resolved paths. Pinned by `a_session_opened_by_a_running_claude_session_is_not_taken_over`,
-  `a_session_owner_names_its_worktree_under_the_home` and
-  `a_home_relative_owner_is_reclaimed_from_another_home`.
-- **The session verbs' database steps are ops** (tasks S6.4, `jkb_api::sessions`), and every write
-  they make is a compare-and-set on the owner the verb judged.
-  - `task.start` and `task.take` clear only the owner they were told about, and write nothing when a
-    claim appeared that the caller did not see. `task.start` keeping a claim writes only while that
-    claim is still there.
-  - `task.take` **judges** `task work`'s location before any git work: it writes the facets for
-    trial in a savepoint, checks the task's `tasks.md` line, and rolls the trial back. A refusal
-    (a line that could not carry the place) then leaves nothing to undo. `task.locate` records the
-    location once the worktree exists, and only while the run still holds the claim, so a displaced
-    run cannot overwrite what its successor recorded. The take's `start` entry carries no branch or
-    land target either; `task.locate` adds a `note` carrying them when they changed. A failed run
-    would otherwise leave the history naming a branch nobody made, which `close-merged` then waits
-    on for ever. Writing the location with the claim, as the first fix did, left a run that then
-    failed its git work pointing the task at a branch nobody made (stage-2 review, round 2).
-  - A run stopped between the claim and `task.locate` leaves a claim on a checkout with no
-    `branch=` naming it. `task work` and `task abandon` then find the session **through the claim**
-    (`session_cli::claimed_session`), so a re-run resumes that checkout rather than forking a
-    second one, and abandon can still remove it. A `task.locate` that fails keeps the claim for the
-    same reason (review, round 4). Both verbs use the one rule, whatever other branches the task
-    records. They accept the claimed checkout only when no other task records its branch: names are
-    minted from slugs, so two tasks can reach one path. Such a checkout's land target was never
-    recorded — one the task carries belongs to an earlier checkout — so `task work` always requires
-    `--onto` for it rather than guessing (rounds 5 and 6).
-  - An owner a claim is **taken** as (`task.claim`, `task.take`, `task.start`'s `take`) must already
-    be in `AgentId`'s spelling (`tasks::check_new_owner`): the claim is stored that way, so an owner
-    sent in another spelling would never match its own claim again (round 6). `task.abandon`
-    reports `released`, so a caller whose task was taken meanwhile says so instead of "abandoned".
-  - Claims are compared **as stored** (`claim::holder`): `task.facts` reports the stored string, so
-    an owner in a spelling `AgentId` would render differently still matches when it is sent back.
-  - `task.abandon` changes nothing when the claim is no longer the one observed before the git work.
-  - A failed worktree add, and a pending removal that could not be cancelled, release only the verb's
-    own claim, through `task.release`. The first used to clear the claim unconditionally; the second
-    left it held.
-  `task start` and `task gate` (show) run in the dev container through `jkb serve`. Storing a gate
-  never does (decision A): it is a shell command the host later runs, so only the host stores one.
-- **Branch existence counts the remote-tracking copy, and creating is not adopting.**
-  `gitrepo::branch_ref(dir, branch, prefer)` is the one answer to "does this branch exist, and
-  under what name" — `is_merged` and `close-merged` both ask it, because a branch living only on
-  `origin/` is the ordinary state after a merged PR deletes the local copy, and a bare
-  `refs/heads/` probe called that gone and advised deleting the tag tracking live work. The
-  create-side is deliberately **two** functions, chosen per caller: `ensure_branch` prefers an
-  existing remote copy (the caller is *referring to* a branch — an explicit `--onto <batch>`, a
-  session branch whose commits may be pushed), `create_branch` takes `start` literally (the caller
-  is *making* one, and a stale namesake on the remote must not be adopted in its place). Folding
-  both into the primitive made it ignore its own `start` argument.
-- **Location facets are set, not added.** `branch=`/`repo=` go through `set_facet`, which
-  clears the facet's other values first. `tag::apply` is additive, which is right for open-ended
-  facets and wrong here: a second `branch=` is a contradiction, not extra information, and readers
-  that collapse the multi-map pick one and mint a second session for a task that already has one.
-  `task_tags` therefore returns **all** values per facet, and the session lookup matches a task's
-  recorded branches against the worktrees that actually exist.
-- **`.jkb/base` is a reusable cache, released when its batch is spent.** It is switched to
-  whatever branch a land needs (`git worktree add` refuses an existing path, so a second one
-  would wedge landing until the directory was deleted by hand), and it is removed once its batch
-  has merged — otherwise it both attracts new sessions onto a dead branch and stops
-  `git branch -d` from deleting it.
-- **The land lock is taken before the checks, not just before the graft** (a database lease since
-  tasks S6.4 stage 4; its rules are in [message-queue.md](message-queue.md)) — which is what lets
-  "is the target checkout dirty?" be asked **once**, by `staging::target_dirty_reason`, the same
-  function the In Flight row renders. It used to be asked twice, in two wordings, on either side of
-  the lock; the second copy did not close the window it justified itself with (it has the same gap
-  to the graft) and, because both wordings shared a phrase, the test asserting on that phrase
-  stayed green with *either* one disabled. A redundant guard that reads as protection is worse than
-  none. `land_dir_for` keeps a dirty check of its own: that one guards the `git switch` it is about
-  to perform across branches, with its own remedy, and is not a second copy of the land rule.
-- **Which recorded branch a task's work is on is one rule** (`repo::work_branch`), shared by the In
-  Flight row and `jkb task land`. Sharing the existence *predicate* was not enough: the row
-  preferred a branch that resolves while the command took whichever `tag::applications` returned
-  first — the lexicographically smallest — so a task carrying a stale `a-gone` beside a live
-  `z-live` got two opposite explanations from the one shared blocker, and the command's advice for
-  the branch it picked (`jkb task work`) cuts a *second* branch and detaches the task from its
-  batch. A live session still wins outright: it is the branch with a checkout on disk.
-  **It is asked through `repo::work_for`**, which returns the session *and* the branch together, so
-  a caller cannot take one and pick the other for itself — which is what `jkb task abandon` did as
-  a third implementation, taking the first `branch=` value (`tag::applications` orders by value) and
-  deleting a stale sibling under `--delete-branch` while the row the user clicked named the live
-  one. The batched listing still calls `work_branch` directly with the sessions and refs it has
-  already read once: same rule, not a second one.
-- **A land target is a *branch*, not a revision that resolves** (`gitrepo::branch_name` →
-  `Is`/`Unknown`/`NotABranch`). `branch_ref` maps a branch name to a ref you may hand to git;
-  this maps an arbitrary string to the **key** `branch_refs` uses, and the two come apart on
-  exactly the values that hurt — `origin/<batch>` and a tag both `rev-parse` fine, and both were
-  accepted and stored, the first under a key `jkb staging ls` cannot look up. The canonicalization
-  and the refusal live at `repo::record_land_target`, the single writer, so the next flag that
-  accepts a branch cannot get it wrong; the CLI verbs ask the same question first only for the sake
-  of a sentence the user can act on. Trunk is compared against the canonical name, not against two
-  spellings guessed by hand.
-- `scripts/merge-queue.sh` is still the swarm's queue and still a git/gate runner. It makes
-  **one kind** of knowledge-base call — `jkb task landed <branch> --onto <target>`, recording the
-  landing event (D46) — from two arms: after a genuine fast-forward, and when `<target>` already
-  contains everything the branch adds. That makes it a jkb client, so its caller must export
-  `JKB` and `JKB_DB` — `.claude/workflows/task-swarm.js`'s `QUEUE_ENV` does, and the script header
-  states the contract. The CLI is the home of the human path because the UI calls it directly and
-  it must work in any repo.
-- **`jkb task land` is NO LONGER the same algorithm**, and the divergence is deliberate rather
-  than drift, so it is recorded here instead of only in a Rust comment. Two differences, both
-  introduced on 2026-09-12 when the queue was reworked:
-  - **Ordering.** The queue gates the rebased commit while it is still detached and only then
-    fast-forwards, so `<target>` never points at an ungated commit. `jkb task land` still
-    fast-forwards first and rewinds with `reset --hard` on red — the window is the whole gate,
-    and an implementer told to cut from the integration branch can carry ungated commits away
-    inside it. Filed, not fixed: reordering the human path changes `graft`'s contract and
-    `do_land`'s flow and wants its own change.
-  - **What "nothing to land" asks.** The queue asks the content question — a branch whose net
-    diff against its merge-base is empty is refused however many commits it carries — because it
-    closes whole task groups unattended, and a phantom landing there unblocks dependents with
-    nothing implemented. `gitrepo::graft` still asks the commit question (`ahead_count == 0`).
-  Both are tracked as their own tasks. Until they close, a reader comparing the two must expect
-  them to differ **here** and nowhere else.
+It is added to **both** `is:ready` and `is:frontier`, identically. Those two must stay
+equivalent for tasks (a task's `resolution` is always NULL, so the frontier clauses collapse
+to the ready clauses; see the namespaces design), and putting the rule in only one would break
+that the moment a task had a child. `jkb task add --under <uid>` creates a subtask, inheriting
+the parent's home; `jkb task show` lists the subtasks and says why the parent is held.
 
-## The lifecycle is a checkable state machine, and a landing is an event (D48)
+### No status rollup: closing is a separate, git-triggered decision
 
-**Reviewed in three ranges (`low`, ~18 agents): 36 findings, 8 must-fix, all fixed.** What the
-reviewer caught that the machine's own checks did not, recorded because the pattern repeats:
+A parent does not flip to `done` when its last child does. Auto-close is a separate,
+git-triggered decision (see "Auto-close is conservative by construction"), and two mechanisms
+racing to close one task is how a task closes for the wrong reason.
 
-- **Absorption discarded a plan.** The idempotence rule treated any event whose destination you
-  were already in as a no-op — but arriving there another way leaves the plan unapplied.
-  `abandon` on an operator-reopened task skipped its guard *and* its claim release, reported
-  success, and the surviving claim held the task off every frontier. A row with a guard or a plan
-  is never absorbed now; the domain declares the self-loop.
-- **Two of my own tests could not fail.** One asserted `stdout contains uid` where the failure
-  path prints the uid too; one asserted a defect that is structurally unreachable for its machine.
-  Both are why `jkb task landed` never credited a swarm group for a whole branch.
-- **A guard that only reports is not a guard.** The open-subtasks rule lived in the machine's
-  `land` plan, which is applied *last* — so it narrated a landing that had already grafted and
-  disposed of the session. It belongs in the preflight, beside every other precondition.
-- **`Unknown` spelled as `No`, in the probe that protects every claim.** `pid_exists` folded "`ps`
-  would not spawn" into "that process is gone" — the exact defect `Fact` exists to prevent.
-- **A choke point with a third door.** `jkb task claim`, the verb the swarm runs on every task,
-  still wrote the claim directly; swarm work had no `start` entry at all, and the two claim verbs
-  answered `needs_review` oppositely.
+### Containment is a relationship between items
 
+`containment(child_item_id PRIMARY KEY, parent_item_id, position)` is its own table, keyed on
+the **child**, because "X is contained by Y" is a property of X and not of one of X's several
+placements (a home plus the `tasks/<repo>` mirror). The primary key makes *at most one
+container* structural rather than conventional; the rows are sparse; a separate table keeps
+the hot `items` table narrow; and depth is free, since the same adjacency list nests three
+levels or thirty.
 
-The `staging-workflow` branch took 44 review passes and ~80 must-fix findings. Sorting the
-task-lifecycle ones by *cause* rather than by site gives six groups, and each maps to a property
-the code had no way to have. Design: `openspec/changes/jkb-state-machine/`.
+`placements` is untouched and still carries `namespace_id`, because namespace scoping
+(`ns:tasks/**`, which `task next` resolves through) must keep finding a contained item.
+Listing and scoping ask different questions and both stay right: a subtask **is** in
+`tasks/jkb`, but it is **listed** under its parent. Accepted deliberately: a contained item
+is listed under its container and nowhere else, even when it is homed in another namespace. It
+is never unreachable, since expanding the container always reaches it, and a test pins both
+halves of that.
 
-- **The lifecycle was written down nowhere**, so about a dozen sites each derived the part their
-  own question needed — `claim::claim`'s terminal pre-check, `staging::State::from_status`,
-  `land_blocker`, `land_preflight`, `close-merged`, `task abandon`, `review record`,
-  `merge-queue.sh`, the VS Code row. *Two of them answering one question differently* is the most
-  common finding shape in the corpus, and the standing fix — make the two share a function — never
-  reaches the thirteenth site.
-- **`crates/jkb-fsm` is a dependency-free library where a lifecycle is a `&'static` table**, so it
-  can be *walked*, and walking it is what makes these checkable at all: every state reaches a
-  terminal one (`Wedged`), every state is reachable, no two rows compete (`Nondeterministic`),
-  every reconciliation carries evidence (`UnguardedReconciliation`), every refusal's advice is an
-  event the machine really accepts (`UnreachableRemedy`), every verb can be run twice
-  (`Unrepeatable`), and under every observation something can still move the object (`DeadEnd`).
-  `Machine::dot()` renders it — the artifact whose absence is the first item on the list.
-- **`Unrepeatable` was found by the fix for the absorption bug below, and is the pair to it.**
-  Correcting absorption — a row with a guard or a plan is never absorbed implicitly, because the
-  object may have arrived by another route with that plan still owed — is right, and it silently
-  turned five destinations into refusals: `land` on an already-landed task among them. That is
-  S1.6's *the verb is re-runnable* lapsing, and a lapsed guarantee is worse than one never
-  claimed, because the retry advice everywhere else assumes it. The two rules together say: **a
-  verb you run is always answerable at its own destination, an observation only where somebody
-  wrote down what re-seeing it means.** Satisfying it does not mean "make it a no-op" — a domain
-  that wants the second run to fail declares a self-loop whose guard denies, and gets a sentence
-  and a remedy instead of the silent absence of a row. Two rows here keep their guards on purpose
-  (`abandon` from `open`, `observed_landed` from `done`): those verbs may still have work to do.
-- **`Fact` is three-valued and has no method that collapses `Unknown` to a `bool`.** Nine
-  must-fixes are one unobtainable answer spelled `false`: `ahead_count` returning `0` (which means
-  *nothing to land*) for a branch it could not resolve; `has_own_commits` answering *no* when
-  `rev-list` failed; a land gate that could not tell *no findings* from *the namespace resolved to
-  nothing*. `is_yes` and `is_no` **both** mean *proven*, so a guard states its polarity in code:
-  landing needs `work_dirty.is_no()` (an unreadable checkout refuses) and `has_commits.is_yes()`.
-- **A transition yields its effects as one value.** `settle_landing` wrote the status, cleared the
-  claim, then asked git to remove a worktree git refused — leaving a task `done`, unclaimed, with
-  a live session. `Outcome::Moved` carries a `Vec<TaskEffect>` produced *with* the move, and
-  `transition::perform` is the one seam that applies it. The ordering rule that makes a git
-  failure survivable is stated once: **apply the plan last**, after every fallible external step,
-  so a failure leaves the task where it was and the verb is re-runnable (which S1.6 guarantees is
-  a no-op once it has worked).
-- **A refusal names an *event*, not a sentence.** Passes 31 and 32 are the same finding one
-  message apart — a printed remedy whose obvious argument froze the task permanently — and the
-  fix each time was to reword. `Denial::remedy` holds a `TaskEvent`, and `Machine::audit`
-  validates every remedy the machine can produce over a whole context matrix. **It caught a bad
-  remedy in this change as it was written**, and a state passed beside the context that could
-  disagree with it (fixed by `Stateful`: the state is read *out of* the observation).
-- **`task::set_status` is not a hole beside the machine — it is the `override` event**, and a
-  synced file's checkbox is `set_from_file`, a *guarded reconciliation* (the file may only speak
-  for a task it backs). Both use `Dest::Stated`, a destination the caller names. One rule keeps
-  the checks honest: **a `Stated` edge is excluded from the liveness walks**, because a state
-  whose only exit is somebody naming a different state is still wedged.
+Rejected: the parent becoming a namespace. It derives a path from a mutable title, the
+identity failure the sync `prose` blocks had already taught ("that identity cannot survive an
+edit"). It grows the organizational tree with content: 607 ingested episodes would become 607
+namespaces, mixing folders a person chose with folders a parser produced. And the `tasks`
+serializer already turns `##` headers into namespaces, so parent tasks as namespaces would put
+two meanings in one file for the three-way merge to disentangle. The other rejected model,
+`placements.parent_item_id`, was built and replaced; see History.
 
-### `branch_records` is gone; the history replaced it (V015, V016)
+### The edges survive beside the containment row
 
-- **Two facts outlive git's memory**: where a branch was cut, and that it landed. `branch_records`
-  stored them as *properties of a branch* — a mutable projection of the past, keyed by a name git
-  lets you delete, recreate and reuse — so the row had to be kept in agreement with a moving
-  world. The supersede clause, `landed_head`, the reflog instance anchor, `--forget`: every one
-  was added after a defect, and all of them existed for that reconciliation.
-- **`task_transitions` is append-only**, so it makes no claim about the present and there is
-  nothing to reconcile. A name that changes hands appends a row rather than corrupting one;
-  superseding stops being an operation. Deliberately **not** changelogged (the `blobs` precedent):
-  it *is* an audit record, and a transition later reverted by `jkb undo` stays, which is the
-  honest reading of a history.
-- **Branch names became labels on events.** `land_target` is the last `onto` recorded — reset by
-  an `abandon`, because where work lands is a property of the session doing it. Two tasks told
-  different targets are two entries with timestamps, not one row keeping whichever wrote last.
-- **`jkb task why <uid>`** prints it: every transition, who applied it, and the evidence each guard
-  fired on. Fourteen must-fixes are "held for ever with no way to see why"; that is now one command.
+The `parent_of` and `derived_from` edges carry what a containment row cannot: `edge::link`'s
+cycle guard, `jkb related` traversal, `derived_from` as the provenance search reads for
+`source_document`, and the `tasks` serializer's indentation round-trip and three-way merge
+`Sig`. `task::add_subtask` writes the edge and the containment row in one call so they cannot
+drift.
 
-### Evidence of a landing is spent once the task is put back to work
+### Containment is a behaviour, not a node kind
 
-The log removed the reconciliation problem from **writing** — an append-only history makes no
-claim about the present, so nothing has to be kept in agreement. It moved it to **reading**. Every
-caller asks a present-tense question (*has this landed?*, *where does it land?*), and turning a
-history into a present-tense answer needs a rule for when an older row stops counting — which was
-written separately in each reader, and they disagreed. `land_target` stopped at `abandon`;
-`landed` stopped at nothing. Five findings across two review rounds are that one gap.
+A *pure namespace* is a node that only contains; a parent task both **is** a task and
+**contains** its subtasks; a document **contains** its chunks. So `jkb ls <path-or-uid>` is the
+one container read: it resolves a namespace first (the historical meaning) and falls back to
+an item uid. `jkb tree` descends into **any** child with `has_children`. `jkb task subtasks` is
+a thin alias for discoverability, not a second implementation, and the UI passes a node's
+address and does not branch on kind.
 
-- **The rule is asked of the status ORDER, not of a list of events.** `transition::resumed` is
-  the one statement: the newest row that moved the task **backwards** through
-  `open -> in_progress -> needs_review -> done` (`TaskStatus::stage`, the D27.7 lifecycle written
-  down as an order). The obvious repair — give `landed` the same stop-list its sibling has — is a
-  fourth private rule for a fifth reader to get wrong, and one a newly-added event has to be
-  *remembered* and added to. Every row already records where it moved the task.
-- **It took two goes, and the first was a narrower rule that looked identical.** *Moved out of a
-  terminal status* is the same answer for the case it was written against — a landed task
-  reopened — and misses the one that matters most: **`abandon` is `in_progress -> open`**, neither
-  side terminal. A landing recorded while a task was held by an open subtask survived the abandon
-  that destroyed its session, and the task auto-closed over live work. Asking the order covers
-  both, plus `request_changes` and a resume out of `needs_review`, with no special case.
-- **Nothing that stands still is a resumption**, which is what stops the row recording a held
-  landing (`in_progress -> in_progress`) superseding **itself** and freezing its own task for
-  ever. Found by running it.
-- **`jkb undo` had to start recording what it did.** It restores `items.status` straight from the
-  changelog, and `task_transitions` is deliberately not changelogged — so undoing a close left the
-  landing looking live and the next `git pull` closed the task again, a loop undo could not break.
-  It now appends an `undo` transition, from the statuses observed either side of the inversion
-  rather than from what the entry claimed, and **only for a task that still exists**: inverting an
-  insert deletes the item, and the history's foreign key onto `items` failed the whole undo.
-- **A superseded landing is context, never a verdict** — and getting that wrong in *both*
-  directions took two rounds. Spelling "spent" and "never landed" the same way sent `close-merged`
-  off to ask GitHub about a pull request a locally-grafted branch never had, and reported that as
-  the reason. Then treating "spent" as *the* answer, and returning on it, left a task whose work
-  was redone and merged as a pull request permanently unclosable — printing *it will close when
-  the new work lands* after the new work had landed. A stale local graft says nothing about
-  whether the work reached its destination another way, so it falls through to the other evidence
-  and only colours the reason when that proves nothing either.
-- **`Landing` carries all of it from one read** — the landing, the resumption, the pull request
-  number — because those three were fetched separately and the third re-derived a row the first
-  had already found and thrown away, three history scans per task per `git pull`.
-- **A review asks the present tense first, and the historical question only where it has no
-  answer** — and getting that order wrong is the sharpest hole in the area, because it ends in
-  landing unreviewed commits. `live()` credits; a task still aiming at this branch is *reported*,
-  never credited, whatever it grafted before; and only a task aiming nowhere falls through to
-  `recorded()`. That last case is what `abandon` leaves — it retires the land target — and a graft
-  does not un-happen, so a session abandoned after its work reached the branch is covered.
-  Asking `recorded()` first credited a task that landed, was reopened for a must-fix, and had its
-  fix committed in a session the branch had never seen — recording that a review read work it did
-  not read, and moving the task to `needs_review` under a live session. (It does **not** follow
-  that refusing the credit stops an unreviewed landing in general: `gate_with` checks only that a
-  `reviewed=` facet *exists*, never that it is current, and D38 declines to enforce staleness on
-  purpose. It stops one only where the task had never been reviewed at all.) Asking
-  `live()` alone dropped the abandoned case into `Credit::Unrelated`, which the loop discards. The
-  discard is right and stays: that loop walks every task in the repo, so reporting `Unrelated`
-  would list most of the backlog on every run.
-- **The order is pinned where it is declared**, over all twenty-five status pairs plus the
-  `None`/garbage cases. It had been rewritten twice, checked only through `close-merged`'s
-  behaviour, and the one arguable rank — whether `cancelled` shares `done`'s — is exactly the edit
-  a later reader would make.
-- **It reaches the pull-request path too** (`pr::spent`), which is where it matters most: a merge
-  reads as `MERGED` for ever, so reopening a landed task and running `git pull` closed it again —
-  unattended, from the `post-merge` hook, over every task at once. That half **predates** the
-  recorded-landing path and predates this branch.
-- **Where it cannot be told, the task is held.** A merge with a known resumption it cannot be
-  placed against is `Undecidable`, not "live" — closing there picks the burying direction on the
-  strength of a missing field. `Live` is the default because *no resumption* is the normal case,
-  not because a missed close is cheap: a missed close costs one command, a wrong one buries work
-  in flight (D34.4).
-- **The pure half is separated from the `gh` call** so it is testable at all — a rule exercisable
-  only by shelling out to an authenticated network client is a rule nothing checks.
+The two containment edges stay distinct where it matters: a task *decomposes into* subtasks
+(`parent_of`, authored), a document is *fragmented into* chunks (`derived_from`, generated and
+rebuildable). A chunk of a document is not a subtask of it.
+
+### A contained node is listed once
+
+`--under` homes a subtask beside its parent, and ingest places chunks beside their document,
+so either would otherwise appear both as a namespace sibling and nested under its container.
+`ls` hides it **only where its container is in the same listing**. One homed elsewhere keeps
+its own row, because hiding it there would make it unreachable rather than merely
+un-duplicated.
+
+### Chunks are nested, not flag-hidden
+
+Chunks used to be dropped from listings unless `--all`. Now they are reached by expanding
+their document (`jkb ls <document-uid>`, in document order via the `chunk` placement's
+`position`). `--all` no longer re-flattens them, which would reintroduce the duplicate; it
+governs terminal tasks and whether chunks count toward per-folder totals, a separate question
+from where they are listed.
+
+### The explorer shows the hold
+
+A task carries `subtask_count` and `open_subtask_count`, and the explorer row reads `2 of 4
+subtasks open`, with a hover saying the parent is held. Without it a container renders
+identically to the pickable tasks beside it, which is worse than having no subtasks at all.
+
+### Creating a task from the node you are standing on
+
+Filing a task used to mean leaving the tree, finding the namespace path and typing it back
+into `jkb task add +<path>`. Two explorer commands are thin calls to the `jkb task add` that
+already exists: **New Task Here** on a namespace runs `jkb task add "<text>" +<path> --json`,
+and **New Subtask** on a task runs `jkb task add "<text>" --under <uid> --json`. The input box
+takes the **raw quick-add line**, not just a title, so `!p1 @2026-08-12 #area=ui` work exactly
+as in the terminal. The UI is a client of the CLI, and a UI that accepted only a title would be
+a second, poorer task-creation grammar. `--json` returns the uid, so the tree refreshes and
+reveals the new node instead of leaving the user to find it.
+
+Offered on namespaces and tasks only. A document is a container, but `--under` writes a
+`parent_of` edge and a containment row, and a chunk is not a subtask.
+
+### Measured: the containment migration takes a second
+
+An early report that `ALTER TABLE` was pathologically slow on the 584 MB database was wrong:
+a measurement artifact from concurrent processes contending on copies, with a 584 MB `cp`
+counted inside the timing. Measured cleanly, every variant took about 3s and the final `V009`
+ran in **1s**. Recorded so the slow-migration claim is not re-made from the same mistake.
+
+## Where the work is happening
+
+A task records the branch and repo its work is on, so the system can find the session and
+later decide whether the work landed. This section is about how that location is written; how
+landing is detected is in "Auto-close".
+
+### A task's branch is a facet, not a column
+
+`branch=<name>` and `repo=<key>` are ordinary facet tags. The mechanism already existed, needed
+no migration, and is immediately queryable as `tag:branch=fix-embed-backfill`. `branch=` is
+genuinely item-keyed ("which branch is *this task* on"), legitimately multi-valued, and
+round-trips through a synced `tasks.md` line, which is a feature.
+
+The tag is a *hint about where the work is happening*, deliberately not a source of truth: git
+and the landing record decide what merged. A stale or wrong tag causes a task not to
+auto-close, never a wrong close.
+
+Rejected: dedicated `items` columns (a migration, and two columns meaningful only for tasks on
+a table shared by every item kind), and a first-class `branch` item with a typed edge (the
+most jkb-native, but it invents a lifecycle to manage for something whose authority lives in
+git). Moving `branch=` into table rows was rejected a second time, when the branch-record
+table was built (see History): the findings about it were choice-rule defects, and a table
+permits two rows just as a facet permits two values.
+
+### `jkb task start` records the location in one command
+
+`jkb task start <uid>` claims the task *and* records `branch=` and `repo=` from the ambient git
+repo, plus its land target when `--onto` is given. One moment, one command, so the tag is
+never missing on exactly the tasks that needed it. It refuses the trunk branch: a task on
+trunk would read as landed the moment it started. It is re-runnable: a second run on a task
+already started is a no-op, not a refusal.
+
+### Location facets are set, not added
+
+`branch=` and `repo=` go through `set_facet`, which clears the facet's other values first.
+`tag::apply` is additive, which is right for open-ended facets (`design=approved`,
+`size=small`) and wrong here: a task carrying two `branch=` values is not better described, it
+is contradictory, and readers that collapse the multi-map pick one and mint a second session
+for a task that already has one, after which `land` could find neither.
+
+Correspondingly `task_tags` returns **every** value per facet rather than collapsing to one
+(collapsing silently picked the lexicographically last), and the session lookup matches a
+task's recorded branches against the worktrees that actually exist on disk, so a task that
+picked up a stale branch tag still resolves to its real session.
+
+### `jkb task tag set` makes a value a facet's only one
+
+`set` is the sibling of `add` and `rm`. `add` stays additive, honest to its name, since an
+open-ended facet legitimately holds several values. `set` is for `branch=` and `repo=`, where a
+second value is a contradiction. It is load-bearing because `/task-swarm` re-tags a group on
+every pass.
+
+It **refuses `onto=`**, and so does quick-add's `#onto=`: where a branch lands is not a facet
+(it is the last `onto` the transition log recorded), so a facet of that name would reach no
+reader. Both redirect to `jkb task work --onto` and `jkb task start --onto`. A synced line's
+`#onto=` stays inert content on purpose: a stray `onto=` cannot close anything, and rebuilding a
+reserved-facet apparatus for it would recreate the machinery the branch-record work deleted.
+
+### The `post-merge` hook runs `setup.sh` only when it would change something
+
+A `post-merge` hook fires on every `git pull` that merges. `setup.sh` is idempotent but does a
+full `cargo install` (about 1 to 2 minutes), so running it unconditionally taxes every pull,
+including the many that touch only `openspec/` or docs. It runs when the merge touched
+`crates/`, `ui/` or `scripts/`, the things `setup.sh` installs; anything else skips it with a
+one-line note. The same hook runs `jkb task close-merged`.
+
+Installing the hook so that it actually fires (a global `core.hooksPath` bypasses `.git/hooks`
+entirely, and a repo-local hook with no chainer is silently dead) is the git-hooks-installer
+design.
+
+## Worktree sessions
+
+The manual counterpart of `/task-swarm`: the same isolation and the same merge queue, driven by
+a person instead of a coordinator. Before it, clicking "Work this task with Claude" twice gave
+two agents one checkout. They edited the same files, one switched branches under the other,
+whichever finished second committed a mixture of both, and neither claimed its task, so a
+swarm run or a third click could start the same task again. The swarm had already solved this
+for itself (a worktree per implementer, a claim before dispatch, `scripts/merge-queue.sh`
+integrating one branch at a time behind a gate), but as agent tooling a person could not use.
+
+### The CLI owns sessions, not a script
+
+A person driving tasks by hand is the ordinary way to use jkb, so sessions belong in the
+binary: the UI calls it directly (`jkb … --json`; the UI is a CLI client), it is tested in Rust
+with the rest of the CLI, and it works in any repo without copying scripts around. The git work
+shells out to `git`, as `gitrepo.rs` does everywhere: jkb does not link a git library, so `git`
+with the user's own config and refs stays the authority.
+
+### A session is a git worktree
+
+One task, one worktree, one branch: `<repo>/.jkb/work/<session>` on branch `task/<session>`,
+plus `<repo>/.jkb/base/`, a checkout of the land target when it lives nowhere else. Worktrees
+share the repo's object store, so a session costs a checkout, not a clone, and every branch is
+visible from the main copy. The session name is the task uid's slug, truncated and made
+path-safe, with a counter on collision; naming it after the task rather than a random id is
+what makes `jkb task sessions`, the directory listing and `git branch` all say the same thing.
+
+`.jkb/` is added to `.git/info/exclude` on first use: locally, not by editing someone else's
+`.gitignore`. Otherwise the first session makes the tree dirty, and `land` refuses a dirty
+target. Everything a session needs to be found again lives in git and the KB; there is no
+session state file to drift.
+
+### The session verbs
+
+`jkb task work <uid>` opens a session or *returns* the existing one. It is idempotent, so the
+button cannot fork the work. `jkb task land` integrates it (below). `jkb task abandon` drops it.
+`jkb task sessions` lists what is in flight. `jkb task gate` shows or sets the verify command.
+
+### The land target: the branch you started from, or one cut for the batch
+
+`land` fast-forwards a *target* branch, resolved in order:
+
+1. `--onto <branch>`, if given.
+2. The land target the task already has, if any: a resumed session lands where it was always
+   going to land.
+3. The branch checked out in `.jkb/base`, if that worktree exists. This is what makes a second
+   session started from trunk join the first one's batch instead of opening its own.
+4. Otherwise the branch you invoked from, **unless that is trunk**, in which case a branch is cut
+   from trunk, named after this task (the first of the batch), and the session branches off it.
+
+```
+main
+  └─ fix-ls-counts          ← cut from trunk, named for the first task; the land target
+       ├─ task/fix-ls-counts
+       └─ task/tree-descends
+```
+
+Landing onto trunk directly is refused for the reason `jkb task start` refuses trunk. Cutting
+the batch branch also keeps the eventual pull request ordinary: one feature branch, linear
+history, no evidence a fleet of sessions produced it. The land target is recorded as the `onto`
+of a transition (see "The transition log") and reset by an `abandon`, because where work lands
+is a property of the session doing it.
+
+### A land target is a branch, not a revision that resolves
+
+`gitrepo::branch_name` answers `Is`, `Unknown` or `NotABranch`. `branch_ref` maps a branch name
+to a ref you may hand to git; `branch_name` maps an arbitrary string to the **key**
+`branch_refs` uses, and the two come apart on exactly the values that hurt: `origin/<batch>`
+and a tag both `rev-parse` fine, and both were accepted and stored, the first under a key
+`jkb staging ls` cannot look up. The canonicalization and the refusal live at
+`repo::record_land_target`, the single writer, so the next flag that accepts a branch cannot get
+it wrong; the CLI verbs ask the same question first only to print a sentence the user can act
+on. Trunk is compared against the canonical name, not against two spellings guessed by hand.
+
+### Landing is the merge queue, one at a time
+
+`jkb task land` is the merge queue's algorithm in Rust, with the same reason for each step:
+
+1. **Rebase detached, never checked out.** `git rebase <onto> <branch>` checks the branch out
+   first, which git refuses while the session worktree holds it. Detaching at the branch commit
+   does not claim the ref, so it is allowed. `merge-queue.sh` carries the scar from getting this
+   wrong: the failure reported as a content conflict and ejected every group.
+2. **Fast-forward the target** to the rebased result: linear, no merge commit.
+3. **Run the gate on the integrated result.** This earns the whole design: two sessions each
+   green alone can break once both are in, and the only place that is visible is after the
+   second is grafted.
+4. **Red gate or conflict: roll the target back** to its pre-graft tip and eject, telling you to
+   rebase in your session worktree. Never resolve a conflict on the user's behalf; the person
+   with the context is the one who wrote the branch.
+
+Two sessions finishing at once must graft one after the other, or the second one's gate result
+is meaningless, so landing holds the land lock. On green the task is moved to `done` through
+the machine's `land` event, its claim released, the session worktree removed and the session
+branch deleted, since it has been rebased into the target and the ref is a duplicate.
+
+`graft` rebases a **detached HEAD**, so it never moves the session's branch ref. That is
+invisible in the normal path, which deletes the branch, but `--keep-worktree` must point the
+branch at the commit that landed, or the kept session reads as N commits ahead of a target that
+already contains its work, and landing again re-runs the whole graft.
+
+### The land lock is taken before the checks, not just before the graft
+
+The lock is a database lease (its rules are the daemon-and-messaging design). Taking it before
+the preflight is what lets "is the target checkout dirty?" be asked **once**, by
+`staging::target_dirty_reason`, the same function the In Flight row renders. It used to be
+asked twice, in two wordings, on either side of the lock. The second copy did not close the
+window it justified itself with (it had the same gap to the graft), and because both wordings
+shared a phrase, the test asserting on that phrase stayed green with *either* one disabled. A
+redundant guard that reads as protection is worse than none. `land_dir_for` keeps a dirty check
+of its own: it guards the `git switch` it is about to perform across branches, with its own
+remedy, and is not a second copy of the land rule.
+
+### `.jkb/base` is a reusable cache, released when its batch is spent
+
+The land happens in whichever worktree already holds the target, else in `.jkb/base`, which is
+switched to whatever branch a land needs. `git worktree add` refuses an existing path, so a
+second base checkout would wedge landing the moment a batch landed onto a different branch than
+the last, until the directory was deleted by hand. Once its batch has merged, `.jkb/base` is
+removed: holding a checkout of a dead branch both attracts new sessions onto it and stops
+`git branch -d` from deleting it.
+
+### The gate is remembered per repo
+
+jkb runs in any repo, so it cannot assume `./scripts/check.sh`. Resolution order: `--no-gate`
+(land unverified, deliberately); `--gate '<cmd>'` (run it, and remember it); the command stored
+for this repo; autodetect (`./scripts/check.sh`, `./scripts/test.sh`, `make test`, the first
+that exists, **and stored**, so the guess is made once and visible afterwards); nothing found,
+land with no gate, saying so. The chosen command is always printed. A gate that silently did not
+run is worse than none, because the landing reads as verified.
+
+Storage is `namespaces.metadata.gate` on `repos/<repo>`, via `ns::set_metadata`: jkb-native, no
+new table, no dotfile, and per-machine, which is what a build command is. `jkb task gate [cmd]
+[--clear]` shows, sets or clears it. Showing a gate runs in the dev container through
+`jkb serve`; storing one never does, because it is a shell command the host later runs, so only
+the host stores one.
+
+Rejected: a `.jkb/gate` file in the repo (a second source of truth that would want to be
+committed, at which point it is per-repo build config, which is not jkb's business), and asking
+interactively (the UI calls this non-interactively).
+
+### A session's claim is owned by the worktree; the pid is provenance
+
+A claim is stale when its owner no longer exists, and `jkb task work` exits in under a second,
+so a plain `host:pid` owner would be dead on arrival and `jkb doctor --fix` would free the task
+while you worked it. A session owner is therefore judged **only** by whether its worktree
+exists. Closing the terminal does not mean the task is finished: the half-written branch is
+still there, and freeing the claim then is how a swarm run or a second click starts the same
+task on a second branch, the exact collision sessions exist to prevent. A stale claim is one
+command to clear; a wrong un-claim costs a duplicated branch.
+
+The pid is not consulted, not even as a fallback. It belongs to a process that exited before
+anyone could read the claim, so it can only ever be wrong: falsely dead (the original bug) or,
+once the OS recycles it, falsely alive for a session `land` already removed. Only `land` and
+`abandon`, the two commands that remove the worktree, free a session's claim. Resuming (running
+`jkb task work` again on a live session) hands the claim over: the owner is matched on its
+worktree, and the claim is re-taken in one transaction. Any *other* live owner refuses, and says
+who holds it. `sessions` and `doctor` report what is observable: uncommitted work and commits
+ahead.
+
+### A session owner names its worktree home-relative, and the Claude session that opened it
+
+The owner form is `session:<pid>[@<claude session>]:<worktree>`, with the worktree written
+`~/repos/…` when it lies under `~/repos`, and only there. The host and the dev container see the
+same `~/repos` under different homes, so an absolute path named a directory only one side had,
+and the other side's probe answered `Unknown` about every session it did not open. Each side now
+resolves `~` against its own home (`owner::session_worktree`), and old absolute owners still
+parse and are judged as before. A checkout elsewhere under the home keeps its absolute path,
+because the other side's `~/src` is a different directory, where an absent checkout would read
+as proven gone. A home reached through a symlink still gives a `~/` owner: git reports the
+physical path, so the mapping also compares resolved paths.
+
+The opener (`CLAUDE_CODE_SESSION_ID`) is provenance and never decides liveness. It decides one
+thing: `task work` refuses to take over a checkout when **both** its opener and the session
+asking are `live` in the session registry and are different sessions. That is how two top-level
+Claude sessions stop ending up in one worktree. Anything less established lets the takeover
+through as before: a process with no session, a session the registry does not know, an opener
+that ended. The unknown-session case covers a subagent, which has its own
+`CLAUDE_CODE_SESSION_ID` (measured), while `CLAUDE_CODE_CHILD_SESSION` is set in a top-level
+session's shell as well, so nothing tells a subagent apart. Whether a subagent's start ever
+reaches the registry is not measured; if it does, a subagent resuming its parent's checkout is
+refused. A resume by something that is not itself a running, registered session keeps the opener
+it found rather than clearing it, or one terminal resume would lift the protection. The refusal
+names `jkb task release` for an opener that is gone but was never recorded as such. Pinned by
+`a_session_opened_by_a_running_claude_session_is_not_taken_over`,
+`a_session_owner_names_its_worktree_under_the_home` and
+`a_home_relative_owner_is_reclaimed_from_another_home`.
+
+### The session verbs' database steps are compare-and-set ops
+
+The session verbs' database steps are ops in `jkb_api::sessions`, and every write they make is
+a compare-and-set on the owner the verb judged. `task.start` and `task.take` clear only the owner
+they were told about, and write nothing when a claim appeared that the caller did not see.
+`task.start` keeping a claim writes only while that claim is still there. `task.abandon` changes
+nothing when the claim is no longer the one observed before the git work, and reports
+`released`, so a caller whose task was taken meanwhile says so instead of "abandoned". A failed
+worktree add, and a pending removal that could not be cancelled, release only the verb's own
+claim, through `task.release`; the first used to clear the claim unconditionally, the second
+left it held.
+
+`task.take` **judges** `task work`'s location before any git work: it writes the facets for trial
+in a savepoint, checks the task's `tasks.md` line, and rolls the trial back, so a refusal (a line
+that could not carry the place) leaves nothing to undo. `task.locate` records the location once
+the worktree exists, and only while the run still holds the claim, so a displaced run cannot
+overwrite what its successor recorded. The take's `start` entry carries no branch or land
+target; `task.locate` adds a `note` carrying them when they changed. Writing the location with
+the claim, as the first fix did, left a run that then failed its git work pointing the task at a
+branch nobody made, which `close-merged` would wait on for ever.
+
+### A run stopped between the claim and the location is found through the claim
+
+A run stopped between the claim and `task.locate` leaves a claim on a checkout with no `branch=`
+naming it. `task work` and `task abandon` then find the session **through the claim**
+(`session_cli::claimed_session`), so a re-run resumes that checkout rather than forking a second,
+and abandon can still remove it. A `task.locate` that fails keeps the claim for the same reason.
+Both verbs use the one rule, whatever other branches the task records, and accept the claimed
+checkout only when no other task records its branch: names are minted from slugs, so two tasks
+can reach one path. Such a checkout's land target was never recorded (one the task carries
+belongs to an earlier checkout), so `task work` always requires `--onto` for it rather than
+guessing.
+
+### Owners are taken in one spelling and compared as stored
+
+An owner a claim is **taken** as (`task.claim`, `task.take`, `task.start`'s `take`) must already
+be in `AgentId`'s spelling (`tasks::check_new_owner`): the claim is stored that way, so an owner
+sent in another spelling would never match its own claim again. Claims are compared **as stored**
+(`claim::holder`): `task.facts` reports the stored string, so an owner in a spelling `AgentId`
+would render differently still matches when it is sent back.
+
+### Branch existence counts the remote-tracking copy, and creating is not adopting
+
+`gitrepo::branch_ref(dir, branch, prefer)` is the one answer to "does this branch exist, and
+under what name". A branch living only on `origin/` is the ordinary state after a merged pull
+request deletes the local copy, and a bare `refs/heads/` probe called that gone and advised
+deleting the tag tracking live work. The create side is deliberately **two** functions, chosen
+per caller: `ensure_branch` prefers an existing remote copy (the caller is *referring to* a
+branch: an explicit `--onto <batch>`, a session branch whose commits may be pushed), and
+`create_branch` takes `start` literally (the caller is *making* one, and a stale namesake on the
+remote must not be adopted in its place). Folding both into the primitive made it ignore its own
+`start` argument.
+
+### Which recorded branch a task's work is on is one rule
+
+`repo::work_branch` is shared by the In Flight row and `jkb task land`. Sharing the existence
+*predicate* was not enough: the row preferred a branch that resolves while the command took
+whichever `tag::applications` returned first, the lexicographically smallest, so a task carrying
+a stale `a-gone` beside a live `z-live` got two opposite explanations from one shared blocker,
+and the command's advice for the branch it picked (`jkb task work`) cut a *second* branch and
+detached the task from its batch. A live session wins outright: it is the branch with a checkout
+on disk.
+
+It is asked through `repo::work_for`, which returns the session *and* the branch together, so a
+caller cannot take one and pick the other for itself. That is what `jkb task abandon` did as a
+third implementation, taking the first `branch=` value and deleting a stale sibling under
+`--delete-branch` while the row the user clicked named the live one. The batched listing calls
+`work_branch` directly with the sessions and refs it has already read once: the same rule, not a
+second one.
+
+### The explorer button launches a session
+
+`jkb.workTask` runs `jkb task work <uid> --json`, then opens a terminal whose cwd is the returned
+worktree and starts Claude there with a seeded prompt. The prompt says it is in an isolated
+worktree on a named branch, to commit there, and to leave landing to the person: an implementer
+that lands its own work has no reviewer. A second click on the same task returns the same
+worktree. `jkb: Land this task` sits beside it, and the tree labels claimed tasks so a session
+in flight is visible without running a command.
+
+### What sessions deliberately do not do
+
+No reviewer of their own: the swarm needs one because nothing human sees the branch, and here
+you are it (the land gate below still requires a recorded review). No automatic landing: landing
+is a decision, and driving by hand is making it. No cross-repo sessions: a session is a worktree
+in one repo. The batch branch is not pushed or turned into a pull request by jkb; it is an
+ordinary branch, finished the way you finish any other.
+
+### The disposal verdict, and when it earns a state machine
+
+Disposing of a spent session (`archive::observe_pending`, `verdict_pending`) took three review
+rounds in which each found a must-fix inside the previous round's fix. Twice the level was
+judged, and twice the answer was **no fourth `jkb-fsm` machine**, for the same argument, so it is
+written down rather than re-derived by feel.
+
+The class: the observation vocabulary was coarser than the remedy vocabulary keyed on it, and
+the collapse happened *upstream* of the pure seam. `verdict_pending` is pure and its whole
+product is walked by an audit, so its power is exactly the product space of `Observed`: any two
+world states needing different advice must be distinguishable there. Four were not
+(`worktree_head`'s `Ok(None)` covering wreck and absent; `worktrees`' `Ok(vec![])` covering a
+failed git; `deletions_only`'s `None` covering an unanswered probe; `Presence`'s single `Unknown`
+covering two causes). It is "one unobtainable answer spelled `false`" one level up: causes
+spelled as one value.
+
+A `Machine` table would not help. It would formalize `Observed -> Verdict`, which is already
+pure, already a choke point (`pending_verdict`) and already audited; `Machine::audit` would walk
+the *same* collapsed vocabulary and be exactly as blind. And these remedies are operator actions
+whose effects happen in git and the filesystem, so an effect model is needed either way, and the
+model is the weak joint either way. The table is earned when **any** of these holds: a second or
+third site independently re-derives the verdict rule (the task machine's motivation was about
+thirteen); remedies become events the machine itself applies, with effects on the record rather
+than the world; or the state set grows reconciliation paths between several writers. A rising
+*count* of findings is not a trigger; the finding **kind** is. Findings in `world -> Observed`
+or in the effect model are the kind a table does not catch.
+
+### Three audit properties guard the disposal verdict
+
+The exit audit ("every hold names a remedy that moves the verdict") cannot police the
+recoverable-wins rule: an operator deleting a live checkout is a perfectly good escape by its
+lights. So `nothing_irreversible_is_advised_on_an_unproven_observation` asserts separately that a
+destructive remedy is offered only where every licensing fact was **proven**.
+
+Both walks inspected only `Verdict::Hold`, so the guarantee was about *advice*. `RemoveByHand` is
+a sentence to a person who will look before acting, and was gated; `Verdict::Stow` renames a live
+checkout, force-deletes its branch and hands the tree to `remove_dir_all` after the retention
+window, unattended, from a service, and nothing gated it. **The stronger act had the weaker
+check.** Widening `Foreign` into an unconditional `Wreck => Stow` immediately put the module's
+most destructive outcome behind an observation nobody had established. The third property,
+`nothing_is_acted_on_without_the_facts_that_license_it`: an acting verdict requires the tree
+proven present, and its identity either proven (`Matches`) or unprovable in principle for a
+reason itself established (`Wreck`: git *answered* and named an enclosing repo). `DropRecord`
+asserts its own licence (`Presence::Gone`). With `worktree_identity` split last (its `Foreign`
+had covered "or it could not say"), the vocabulary split is complete across the family.
+
+### An honest effect model is a finder, not a formality
+
+`applied()` is a hand-written model of what each remedy achieves, and it twice granted a remedy
+an effect it does not have, which proved the property about the model rather than the code.
+Three rules: an arm may *settle* a fact only where that fact IS the remedy's success criterion,
+and must otherwise yield the **set** of answers the advice might produce, all of which must
+escape; each arm names the mechanism that delivers the effect, so a claim about another command
+is checkable; and the harness has a **negative control**, an inert remedy that must be reported
+as a dead end. The control found a defect in the harness on its first run, and applying the
+first rule to `FixGitAccess` (whose criterion is *git answers*) made the exit audit fail on a
+state that really was a permanent hold. The closed set of remedies is a macro, not a list:
+`remedies!` declares each variant beside a sample, so one without a sample does not parse, and
+`advice`, `is_destructive` and `applied` are exhaustive over it. Its doc had claimed the set was
+"made true rather than asserted" while being two hand-written lists, and the variant added in the
+same round skipped the audit.
+
+The round's remaining concerns were "a rule every call site must remember" one level out, and
+each moved into a callee: the identity fence into `deletions_only`, the head check into
+`delete_branch_if_any` (`DropRecord` deletes branches too), and `target_dirty_reason` took the
+`Option` instead of two call sites each carrying an argument for why collapsing it was safe,
+arguments that for that consumer were both wrong.
+
+## Staging branches and review-gated landing
+
+A staging branch is the branch a batch of tasks lands on before trunk. It is the **same thing**
+`/task-swarm` calls its integration branch (cut from trunk, sub-branches rebase and
+fast-forward into it linearly, the gate runs on the integrated result), reached by hand instead
+of by a coordinator. Sessions made landing work, but left three things invisible and one
+unenforced. The land target was resolved by a fallback chain the user never saw, with no way to
+ask which staging branches existed or to say "put this one on that batch". What was in flight was
+a flat `jkb task sessions` list that could not show a staging branch whose sessions had all
+landed, which is precisely the branch you open a pull request from. And nothing required a
+review: you could run `/review-log`, ignore every must-fix it filed, and land.
+
+### A staging branch is derived, never stored
+
+A staging branch is any git branch some task's land target names that still exists in git.
+There is no `kind='staging'` item and nothing to reconcile. Which branches exist comes from git;
+which tasks are on them comes from the transition log; sessions live in git worktrees; whether a
+session has work to land is `gitrepo::ahead_count`; what state a task is in is `items.status`.
+A staging *item* would add a title and a pull request URL and would then need reconciling
+against git: a branch deleted by hand leaves a stale item claiming to be live, and the UI shows
+work that does not exist. Sessions refused a session state file for the same reason.
+
+What this rule actually protects is narrower than its first wording, which forbade any table: a
+stored entity that **copies a fact git owns** (branch existence) needs reconciling. Facts git
+does not own (where a branch lands, that jkb landed it, whether a review ran) have to be stored
+somewhere, and storing them is not a violation. The branch-record episode in History is what
+that distinction cost to learn.
+
+### `jkb staging ls` is the one read
+
+`jkb staging ls [--all] [--json]` is the one read behind both the explorer's branch picker and
+its In Flight view, so the two cannot disagree about what is live. Each row is a staging branch
+with its tasks nested; each task carries its session, `dirty`, `commits`, its review, and a
+derived `state`:
+
+- **`implementing`**: a session worktree exists and the task is not `needs_review`.
+- **`review`**: the status is `needs_review`.
+- **`landed`**: the task is `done` and its work landed on the staging branch.
+- **`dropped`**: a **cancelled** task that was on the branch, kept apart from `landed` because
+  reporting the two as one would say a dropped task shipped.
+
+Spent batches are omitted unless `--all`: joining one both attracts new work onto a dead branch
+and blocks `git branch -d`. Spent-ness is read from the tasks' statuses and the transition log,
+not inferred from refs. A branch adding nothing to trunk is either landed *or* freshly cut and
+still empty, and refs cannot tell those apart, so **live work is the tie-break**; otherwise the
+branch cut by the very first `task work` is hidden from the picker that exists to offer it.
+
+**One database pass.** `tasks_by_branch` used to issue a query, then a `tag::applications` read
+*and* an `item::get` per task, each a round-trip serialized on the writer thread, over
+`kind:task tag:repo=<key>`, which grows with every task ever worked in the repo. Fine at three
+sessions; not fine for a view that redraws on every database write. The read fetches items and
+tags in one pass and filters in Rust. The git calls stay per staging branch, of which there are
+a handful.
+
+### "Does this branch exist" is answered with a ref, not a boolean
+
+`gitrepo::branch_refs` is one `for-each-ref` over `refs/heads` and `refs/remotes/origin`, local
+winning. Counting the remote-tracking copy admitted a pruned batch to the listing, and every
+count was then still taken with its bare short name, which resolves to nothing: `rev-list`
+exited non-zero, the failure read as **zero commits**, and the row refused a landing the command
+performed. Membership answers "may I show this", not "may I ask git about it", and the second
+was the question every consumer had. So `ahead_count` **refuses** an operand it cannot resolve
+rather than returning zero, since zero is a load-bearing answer ("nothing to land") and a count
+that could not be taken must not be spelled the same way. `land_preflight` asks `branch_ref` for
+the same reason: it asked `has_branch` while the row asked remote-inclusively, so one shared
+blocker printed two opposite explanations of the same task.
+
+### The staging branch is chosen, not inferred
+
+"Work this task with Claude" is two steps: pick the staging branch, then open the session, with
+the picker built from `jkb staging ls`. It offers each live staging branch, described by what is
+on it (`3 tasks · 7 commits ahead`); **New staging branch…**, which prompts for a name and cuts it
+from trunk; and **Let jkb decide**, which passes no `--onto` and keeps the fallback chain
+exactly. "Let jkb decide" is listed first when there is already a batch to join, because the
+chain is usually right: the point is that the choice is *visible and overridable*, not that it
+becomes mandatory. A picker with no default turns a one-click action into a decision made every
+time, which is how people stop using it. Cancelling the picker opens no session.
+
+`resolve_onto` is unchanged; the picker only feeds it a value it could always take. Rejected:
+folding the picker into `resolve_onto` as a prompt. The CLI must stay non-interactive, since the
+UI, workflows and `setup.sh` all call it; the choice belongs to the caller.
+
+### Review state belongs to the task, keyed by branch
+
+A review records the branch HEAD it ran against and the folder of its findings, so the findings
+are one `jkb ls` away. It is the one fact here with nowhere authoritative to live: git does not
+know, and the reviewer is a Claude workflow the CLI cannot run, so the CLI can only *require a
+record*. `jkb task review record [--branch <b>] [--sha <s>] --findings <ns>` writes it, and
+`/review-log` calls it after mounting and syncing its findings, so they exist before anything
+points at them, then says whether the branch can now land and names the open must-fixes if not.
+
+Recording is keyed by **branch**, since that is what a review knows; the task is found through
+the `branch=` index. A staging-branch-wide review records against every task on it. A review run
+on trunk, or on a branch no task claims, matches nothing and says so: a note, not an error,
+because reviewing an arbitrary range is legitimate.
+
+It lives on the task, not on the review folder's namespace. `/review-log` mounts each run at
+`repos/<repo>/codereviews/<folder>`, and that namespace's `metadata` is *owned by the sync
+engine* (`layout`, `header_line`, `position`, `prose`); a second writer there is the class of bug
+that collapsed `openspec/`. Nor is it derived from the folder name: `/review-log` names folders
+`<datetime>-<branch>-<N>`, but the branch is `tr '/' '-'`-mangled on the way in, so `task/fix-ls`
+and `task-fix-ls` are one folder, and the SHA is not there at all. A boolean instead of a SHA was
+rejected: the SHA costs nothing more, and without it staleness could never even be reported.
+
+The record was first two facets, `reviewed=<sha>` and `review=<ns>`, written with `set_facet`.
+It is now an append-only `reviews` table, with review rounds snapshotted when recorded, because a
+tag is content any writer may set (see History; the round rules are the agents-and-roles
+design). `task.facts`, `task.staging` and `task.show` carry it as a `review` field.
+
+### The land gate: reviewed, and no open must-fix
+
+`jkb task land` refuses a task with no recorded review, or whose review has a `!p1` finding that
+is neither `done` nor `cancelled`. Open must-fixes are counted with `kind:task
+ns:<review_ns>/** priority<=1`, filtering terminal statuses in Rust: the DSL has `status:<s>` but
+no `-status:`, and `is:ready` is the wrong instrument because a *blocked* must-fix must still
+block landing. The gate later gained a last-round clause (the newest round must itself be clean),
+recorded in the agents-and-roles design.
+
+The check runs **before the graft**, beside the dirty and ahead checks, so a refusal has moved
+nothing. Concerns and nits never block: a gate everything trips is a gate nobody keeps, and a
+previous run put 34 of 45 findings on `concern`, so blocking on those would make the override the
+normal path within a week.
+
+`--no-review` overrides and is recorded as a waiver at the reviewed SHA, surfaced by `staging ls`
+and the In Flight view. An override nobody can see is indistinguishable from a rule that does not
+exist; one that leaves a mark is a decision someone made, readable as such afterwards.
+
+### `needs_review` is the display state; the findings are the gate
+
+Recording a review moves the task `in_progress` to `needs_review`, and is the **only** author of
+that transition (in the machine, `submit_for_review`). The status and the gate are deliberately
+not fused: a task in `needs_review` with nothing outstanding lands, and one moved back to
+`in_progress` with an open must-fix does not. Fusing them would make `jkb task set --status`, an
+ordinary bookkeeping command, the bypass. The status tells a person where the work is; the
+findings decide whether it may land.
+
+### Review staleness is recorded, not enforced
+
+Commits after the reviewed SHA do not invalidate the review. The SHA is provenance (it lets
+`staging ls` say "reviewed, 3 commits ago"), and promoting it to a hard rule is a one-line change
+once it is known whether that is annoying. Doing it now would make every post-review fixup force
+a full re-review, the fastest way to make people reach for `--no-review` by reflex. Likewise
+`-status:` was not added to the query DSL for the gate's sake: filtering two statuses in Rust is
+not worth an operator; if a second caller wants it, that is the time.
+
+### The In Flight view
+
+A second tree view in the `jkb` container, beside the explorer. It is separate because it is a
+different axis: the explorer organizes by *where things live*, this by *what is being worked*,
+and the same task legitimately appears in both.
+
+```
+▾ ui-and-staging            7 commits · 3 tasks
+    ● Create tasks from the tree      implementing · 3 commits
+    ◐ Staging branch picker           review · 2 must-fix open
+    ✓ jkb staging ls                  landed
+▾ code-review-workflow      merged
+```
+
+Backed entirely by `jkb staging ls --json`, refreshed on the database-write signal the explorer
+uses. Row actions are the ones that exist: land, abandon, open the session's terminal, open the
+review's findings. A task held by must-fix findings says so in its row, because a held row that
+looks identical to a landable one is worse than no row at all. The portable part, deriving the
+row label and state from the JSON, lives in `ui/core` beside `summary.ts`, so a future web host
+renders the same thing.
+
+### The swarm records where it is working
+
+`/task-swarm` sets `repo=` at claim, and runs `jkb task start --branch <group-branch> --onto
+<integration>` once the implementer has a branch, recording `branch=`, `repo=` and the land
+target in one write, so the swarm supplies no value it could get wrong. The land target cannot be
+recorded at claim, because the group has no branch yet and the target is a fact about a branch.
+`staging ls` then shows swarm work and hand-driven work in one view rather than the half it was
+told about.
+
+### The merge queue has no review gate, and is a jkb client for one call
+
+`scripts/merge-queue.sh` is still the swarm's queue and still a git and gate runner. It has no
+review gate, deliberately: the swarm runs a fresh REVIEWER before a group reaches the queue, and
+that *is* its gate, stricter than this one, because no branch reaches the queue without an
+approving reviewer. Requiring a recorded review there would make the REVIEWER write review
+records to satisfy a check its own approval already answered. Each path keeps its own gate, and
+each design note points at the other.
+
+It makes **one kind** of knowledge-base call, `jkb task landed <branch> --onto <target>`, which
+records the landing and closes every task on that branch, from two arms: after a genuine
+fast-forward, and when `<target>` already contains everything the branch adds. That makes it a
+jkb client, so its caller must export `JKB` and `JKB_DB`; `.claude/workflows/task-swarm.js`'s
+`QUEUE_ENV` does, and the script header states the contract. The CLI is the home of the human
+path because the UI calls it directly and it must work in any repo.
+
+### `jkb task land` and the merge queue deliberately differ in two places
+
+They are no longer the same algorithm, and the divergence is deliberate rather than drift, so it
+is recorded here and not only in a Rust comment. Both differences date from the 2026-09-12 queue
+rework.
+
+- **Ordering.** The queue gates the rebased commit while it is still detached and only then
+  fast-forwards, so `<target>` never points at an ungated commit. `jkb task land` still
+  fast-forwards first and rewinds with `reset --hard` on red: the window is the whole gate, and an
+  implementer told to cut from the integration branch can carry ungated commits away inside it.
+  Filed, not fixed: reordering the human path changes `graft`'s contract and `do_land`'s flow and
+  wants its own change.
+- **What "nothing to land" asks.** The queue asks the content question (a branch whose net diff
+  against its merge-base is empty is refused however many commits it carries), because it closes
+  whole task groups unattended, and a phantom landing there unblocks dependents with nothing
+  implemented. `gitrepo::graft` still asks the commit question (`ahead_count == 0`).
+
+Both are tracked as their own tasks. Until they close, a reader comparing the two must expect them
+to differ **here** and nowhere else.
+
+## Auto-close
+
+`jkb task close-merged`, run by the `post-merge` hook on every pull, closes tasks whose work
+reached its destination. The inference this needed was the hardest problem in the area: a squash
+or rebase merge rewrites the commits, so containment cannot be tested, and the weaker question
+(*does this branch add anything to trunk?*) cannot tell a branch squashed away from one that never
+started. Making that answerable took a stored cut point per branch and an instance anchor to
+protect it, and produced roughly a quarter of the review corpus's must-fixes (see History). The
+decisions below replaced it.
+
+### Auto-close is conservative by construction
+
+`close-merged` closes an open task only when **both** hold: its work is proven to have reached its
+destination, and every subtask is terminal (`done` or `cancelled`). Anything failing the second is
+*reported, not closed*: the branch landed but the task is not finished, which is precisely the
+case subtasks exist to express, and what makes them load-bearing rather than decorative. A merged
+branch is evidence, not proof. A missed auto-close costs one `jkb task set --status done`; a wrong
+one silently buries unfinished work. The open-subtask rule is checked in the preflight, beside
+every other precondition, not in the `land` plan, which is applied last and would only narrate a
+landing that had already grafted.
+
+### What jkb performs, jkb records
+
+Where jkb itself grafts a branch, the landing is an event, not an inference. `jkb task land`
+appends a `land` transition after its gate is green, so a rolled-back land leaves no event.
+`scripts/merge-queue.sh`, which is bash, records through `jkb task landed <branch> --onto
+<target>`. `jkb task review record` credits a task whose work jkb *grafted* onto the reviewed
+branch: a recorded event, where it used to be a containment probe that could not tell an empty
+session from a landed one.
 
 ### Auto-close is a lookup on an id that is never reused
 
-- **The inference was hard for one reason**: a squash or rebase merge rewrites the commits, so
-  containment cannot be tested, and the weaker question `is_merged` asked — *does this branch add
-  anything to trunk?* — cannot tell a branch squashed away from one that never started. Making
-  that answerable needed the whole cut-point/anchor apparatus, and it produced roughly a quarter
-  of the corpus's must-fixes.
-- **A pull request number is minted by GitHub and never reused**, so there is nothing to
-  disambiguate. `jkb task pr <uid> [number]` records or discovers it (refusing to guess when a
-  reused branch name matches two); after that the branch name is never consulted. `close-merged`
-  asks `gh`, and **everything degrades to `Fact::Unknown`, never to a `no`** — no `gh`, no
-  network, no GitHub remote, an unrecognized state — so the task is *held with the reason printed*.
-  It also produces an answer the inference could not: *closed without merging*. The field names,
-  the flags and the **uppercase** state values are verified against `gh` itself rather than from
-  memory (`gh pr view --json`'s own field list, `gh pr list --help`, and `gh`'s `display.go`); the
-  one live call is an `#[ignore]` test beside the ollama and Chrome smokes.
-- **Deleted:** `jkb-cli/src/base.rs` (932 lines), `jkb_core::branch`, `gitrepo::is_merged` /
-  `MergeState` / `merge_base` / `has_own_commits` / `is_ancestor` / the reflog-anchor plumbing,
-  `repo::landed_for_action` / `credited` / `clear_land_targets` / `measure_root_for`,
-  `jkb task base`, and ~35 tests that pinned the mechanics rather than the rules. `V016` drops
-  `branch_records` and migrates nothing, for `V013`'s own reason: importing values whose
-  reliability was the problem defeats the store they are imported into.
-- **What jkb performs, jkb records.** `jkb task land` writes a `land` transition after its gate is
-  green; `scripts/merge-queue.sh` calls `jkb task landed <branch> --onto <target>`, which now
-  closes every task on that branch. `jkb task review record` credits a task whose work jkb
-  *grafted* onto the reviewed branch — a recorded event, where it used to be a containment probe
-  that could not tell an empty session from a landed one.
+A pull request number is minted by GitHub and never reused, so there is nothing to disambiguate.
+`jkb task pr <uid> [number]` records it or discovers it (refusing to guess when a reused branch
+name matches two: `Discovery::Ambiguous`); after that the branch name is never consulted.
+`close-merged` asks `gh`, and **everything degrades to `Fact::Unknown`, never to a no**: no `gh`,
+no network, no GitHub remote, an unrecognized state, a parse failure (which is `Unavailable`
+rather than an empty list, since an empty list reads as *no pull request* and would let a task
+close on the strength of a schema change). The task is then *held with the reason printed*. It
+also gives an answer the inference never could: *closed without merging*. `close-merged` reports
+two buckets where it had six, each held task carrying the guard's own reason, and `--trunk` is
+gone.
 
-### The second machine: the sync journal, and what it moved
+### `gh`'s interface is verified against `gh`, not memory
 
-`jkb-sync/src/lifecycle.rs` declares the per-file journal on the same library — a **reconciler**,
-not a lifecycle: nothing finishes, every event is `Reconciled`, and the question is never *what
-may I do next* but *which condition applies to what I just saw*. It moved the library three
-times, which is the evidence that "it generalizes" is a claim worth making:
+The field names, the flags and the **uppercase** state values were checked against `gh` itself:
+`gh` 2.97.0, without auth, against `gh pr view --json`'s and `gh pr list --json`'s own field
+lists, `gh pr list --help` (including that `--state` takes `all`), and `gh`'s `display.go`, which
+switches on `"OPEN"`, `"CLOSED"` and `"MERGED"`. The whole failure path ran against a real
+unauthenticated `gh`: `close-merged` holds the task and `task pr --json` reports `merged:
+"unknown"` with `gh`'s message as the reason. Found by running it: `gh`'s errors are multi-line,
+and reasons print one task per line, so they are collapsed where the string is built. The one
+live call, a real merged pull request reading `MERGED`, is
+`pr::live::live_a_merged_pull_request_reads_as_merged`, an `#[ignore]` test beside the ollama and
+Chrome smokes; it needs `gh auth login` and names the auth failure without it.
 
-- **`is_terminal` → `is_settled`.** A synced file is never finished; it settles and is edited
-  again. Under the old name the machine either had no terminal state — making `Wedged` vacuous —
-  or had to lie about one. What the checks want is *rest*: the object owes the system nothing.
-- **`State::awaits_input`** (default `false`). A conflicted file is waiting on a person, so no
-  observation moves it; without this, `DeadEnd` fired on every such observation. A lifecycle
-  keeps the default because an operator escape (`cancel`) is always available.
-- **The initial state may be at rest.** A file an export-only mount holds no items for is nobody's
-  business.
-- What did **not** move is what carries the value — and `reconcile` refusing ambiguity turns out
-  to be the *central* property here rather than a corner case, because evaluating every
-  candidate's guard against one observation is exactly D45.5's *"a route is not a cause; the
-  condition must dominate every arm"*.
-- **The modelling found that `needs_attention` is two states** — a quarantine wants the file
-  fixed, a blocked write wants the store fixed — which `Outcome::Refused`'s own doc already
-  warned about in prose. And that a flag whose cause has gone is not always cleared (an
-  import-only mount with a store-side-only change writes no row): modelled faithfully, filed, not
-  fixed.
-- `sync_state.status` now has **one writer** (`lifecycle::status_for`), replacing four
-  hand-written spellings.
+### The pure half is separated from the `gh` call
 
-### The third machine: investigation units, where the rules are strategy-supplied
+The rule that turns a pull request's state and the task's history into a verdict is pure, and the
+`gh` call only gathers its input. A rule exercisable only by shelling out to an authenticated
+network client is a rule nothing checks.
 
-`jkb-core/src/nstype/lifecycle.rs` declares `items.resolution` on the same library — **two tables
-over one state set**, which is the axis neither earlier machine had. It moved the library twice
-more and found two rules that existed only in the shape of a function:
+### Where it cannot be told, the task is held
 
-- **`debugging` concludes differently, twice.** A settled result can go **stale** and return to
-  the frontier (an observation about a mutable system carries a `commit-range=`); and a tombstone
-  is **not** revived by fresh evidence, where the base table's is. Both were already true — the
-  first is one `if` in `debugging::resolution_rollup`, the second is that rollup's early return
-  versus `default_rollup`'s fall-through — and neither was discoverable from anywhere else.
-- **The strategy supplies the facts; the machine supplies the rules.** `resolution_rollup` (which
-  returned a *conclusion*) became `unit_facts`. A rollup that concludes has to encode the priority
-  of contradictory evidence in the order of its `if`s, where nothing can see it and nothing would
-  notice a reorder. As guard clauses the priority is arguable and `audit` proves it exclusive. A
-  strategy that merely *observes* differently — a `debugging` symptom is confirmed by a verified
-  fix, not a `confirms` edge — now needs no table of its own.
-- **Reachability counts a `Dest::Stated` edge; liveness still does not.** *Can the object be here*
-  is answered yes by an operator override; *can the lifecycle get it out of here* is not.
-  Collapsing them reported `abandoned` — which only a person ever sets — as unreachable dead code.
-- **`Resolution::Unresolved` declares `awaits_input`.** Nothing the system can do moves it;
-  evidence arrives from outside as an edge somebody links. Unlike a task's `open`, which always
-  has `cancel`.
-- **`UnusedEvent` is a per-machine statement**, and this is the first place two machines share one
-  event enum. The domain filters it only where *another* machine in the family declares the event,
-  and asserts the union separately — a narrow filter, so an event no table uses is still a defect.
+A merge with a known resumption it cannot be placed against is `Undecidable`, not "live": closing
+there picks the burying direction on the strength of a missing field. `Live` is the default
+because *no resumption* is the normal case, not because a missed close is cheap.
 
-### Claim keying: an owner id is a type, and `Unknown` is not `dead`
+### A landing jkb did not perform and no pull request records is not detected
 
-- **`jkb_types::AgentId`** replaces `split(':').nth(1)`: `Process { host, pid, run }` /
-  `Session { pid, worktree }` / **`Agent { id }`** (new — an externally-minted identity from
-  `JKB_AGENT_ID`, for a caller whose process and checkout are not the thing that persists) /
-  `Unrecognized`. Each declares what would prove it via `Liveness`, a **closed enum**, so a new
-  shape cannot be added without the compiler demanding a probe for it.
-- **`owner::is_alive` returns `Fact`.** An `agent:` id and an id we cannot read are
-  `Fact::Unknown` — *unestablished*, never *dead*. `jkb doctor` and `jkb task reclaim` probe each
-  owner where they run (`crates/jkb-cli/src/doctor.rs`, `probe`) and send only the owners **proven**
-  gone to `task.reclaim`; the rest are the `unverifiable` bucket they report but never clear.
-  That is a behaviour change: the old predicate treated an unreadable owner as reclaimable, which silently frees a live agent's task. Of the two ways to
-  be wrong, the one that costs a command wins (D34.4).
-- **The old objection to session ids answered a different question** — whether jkb could go and
-  *ask* an agent something. A claim needs only a value stable for the life of the work; it does
-  not need to be reachable. There is still no TTL and no heartbeat.
-- **Reclaiming is a lifecycle transition** (`observed_owner_gone`, an effect-only self-loop), so it
-  appears in the task's history and obeys the same evidence rule as everything else. Its effect is
-  `ReclaimFrom(agent)`, distinct from `ReleaseClaim`, because the audit trail distinguishes the
-  holder letting go from somebody else deciding it had.
+Stated rather than covered over. Such a task is *reported*, not guessed at: `close-merged` names
+it and says it has no proof, and the repair is one command. Given that a missed close costs a
+command while a wrong one buries work in flight, that is the right side to fail on.
 
-## A branch is a record, not a tag value (D46) — SUPERSEDED by D48
+### Three identities exist already, and a branch name is none of them
 
-**The `branch_records` table is gone** (`V016`), and with it the cut point, the instance anchor
-and the landing columns. What survives is the *diagnosis* — an item-keyed, multi-valued, untyped,
-open-write store cannot hold a per-branch fact — and the rule it produced: prefer an invariant the
-schema enforces over one every caller must uphold. D48 applies it one level further, to the
-question the table existed to answer. `branch=`/`repo=` stay facets, for the reasons below.
+The task uid identifies the subject (jkb mints it); the agent id identifies who is acting (the
+caller's `JKB_AGENT_ID`, or a pid, or a worktree); the pull request number identifies that work
+reached its target (GitHub mints it). None is ever reused. A branch name is not a fourth
+identity; it is a **label on an event**. Recycle one and nothing breaks, because nothing is keyed
+by it. A jkb-minted `attempts` table, with the branch as an attribute, was proposed first: a
+better shape than keying by `(repo, branch)`, and still unnecessary once the pull request answers
+the question directly.
 
+## The lifecycle is a checkable state machine
 
-- **Re-founded by the B-series.** "Branch X was cut
-  from commit Y", "X lands on Y", and "jkb merged X into Y" are facts about a *branch*. They lived
-  as tag applications on whichever tasks happened to name the branch, and tag applications are
-  **item-keyed, multi-valued, untyped and writable from any route**. Each of those four properties
-  produced its own family of defects across fifteen review passes — 47 findings, 100 in the wider
-  cluster, 20 must-fix:
-  - item-keyed → the per-branch fact had to be encoded into the value (`base=<branch>:<sha>`), and
-    that encoding leaked to ~12 sites with their own attribution rules;
-  - multi-valued → the documented repair (`jkb task tag set base=`) **deleted other branches'
-    records**, and records otherwise accumulated;
-  - untyped → `HEAD` stored verbatim; a 40-hex string that is no commit accepted;
-  - open-write → five write routes had to be taught the rule one at a time, the fifth found *after*
-    a store-side reservation was added for the other four, and the reservation's own asymmetry was
-    itself a must-fix.
-  Six ascending choke points did not close it. The fix is the one D40 and D45 already made twice:
-  **prefer an invariant the schema enforces over one every caller must uphold.** `branch_records`
-  (migration `V013`, `jkb_core::branch`) is keyed `(repo, branch)`, so the encoding, the
-  attribution rules and the question *"which branch does this value belong to?"* stop existing.
-  Design: `openspec/changes/jkb-branch-records/`.
-  - **D38.1's "no table" clause is repealed, openly — its *argument* is kept.** Branch **existence**
-    is still derived from refs (`gitrepo::branch_ref(s)`), and no row is ever evidence a branch
-    exists. What is stored is only the facts git does not own. The argument against a stored entity
-    was always about copying a git-owned fact and then needing to reconcile it.
-  - **`branch=` deliberately does **not** move.** "Which branch is this task on" is genuinely
-    item-keyed, legitimately multi-valued, and round-trips through a synced `tasks.md` line. The
-    findings there (`work_branch`, `close-merged`'s picker, `task abandon`) are **choice-rule**
-    defects; a table permits two rows just as a facet permits two values and fixes none of them.
-    `repo=` stays too, and is also the row's key column — that duplicates a *value*, not a fact.
-  - **`onto=` does move**, to `land_target`. It was branch-keyed by accident of having one writer:
-    two tasks on one branch could record different targets, and `None` could not be told from
-    "never recorded". Now NULL on an existing row means *lands on trunk / on no batch* and a
-    missing row means *unknown*. `reviewed=`/`review=` stay facets — nothing in the corpus is about
-    their cardinality.
-  - **Measurement is unchanged, and `jkb-cli/src/base.rs` still owns all of it.** Core owns storage
-    and the CHECK; core does not shell out to git. Every rule below survives verbatim.
-    - **The tip is a measurement result under exactly one condition, and never a fallback.** A
-      branch with no commits of its own forked at its own tip, provably (`untouched_tip`, the one
-      place that is turned into a value). Everywhere else a failed measurement records **nothing**
-      and says why (`base::Missing` → `base_missing_because`, `close-merged`'s `undecidable`
-      bucket): nothing is *reported and repairable*, a tip is silent and permanent.
-    - **What is measured is a merge-base, not a tip** — the same commit whenever it is taken, which
-      is why there is no longer a right moment to call the writer. `/task-swarm` can only name a
-      group's branch after an implementer has committed on it.
-    - **The parent is what the caller states in the call**, never a stored land target, which
-      records an earlier moment.
-    - **"Has this branch done anything?" is asked of git** (`has_own_commits`), so a stale, wrong,
-      unresolvable or *grandparent* parent cannot change the one thing readers ask of the record.
-      It answers `Option<bool>`, and the third state is load-bearing: `rev-list` exits non-zero on
-      a broken ref anywhere under `refs/heads`/`refs/remotes`, and "git could not answer" spelled
-      as *no* is the single worst value available — "untouched" is exactly the state in which the
-      tip becomes storable. Same rule as `ahead_count`. It is **not** safe by construction and
-      `base::rejected` is not its backstop, since `rejected` re-asks the same predicate and so
-      agrees with a wrong answer; what covers a mis-exclusion is a test that fails loudly.
-    - **The backstop:** the fork point is the later of `merge-base(branch, onto)` and
-      `merge-base(branch, trunk)`. Every way of getting the parent wrong degrades towards **holding
-      the task, never towards closing it**.
-  - **The staleness rule is the write's *shape*, not a step in it.** A branch name outlives the
-    branch that held it, so a recorded value on an untouched branch that is not its tip belongs to
-    whatever had the name before. That is no longer `forget` ∘ insert: it is the `WHERE` clause of
-    `branch::record_cut_point`'s single `INSERT … ON CONFLICT DO UPDATE`, which clears the
-    predecessor's `landed_*` in the same statement. A port cannot drop it by omission or
-    mis-sequence it — there is no sequence. What `base.rs` contributes is the *evidence*:
-    `Cut::UntouchedTip` versus `Cut::Fork`, constructed only from `untouched_tip`'s answer.
-  - **The instance anchor is the one sound read-time check, because it is not a signature.** Three
-    states present one identical observable signature — no commits of its own, record ≠ tip, adds
-    nothing to trunk: rebase-ff-merged externally, merge-commit-merged externally, and a recycled
-    name. D34.2 requires closing the first and D34.4 forbids closing the last, so **no signature
-    predicate evaluated at read time can be right**. A branch's *creation reflog entry* separates
-    them: written once per instance, destroyed by the deletion that ends it, forged by no verb
-    (`branch -f`/`checkout -B` append `Reset`-class entries), and its loss is structurally
-    detectable because expiry removes oldest-first and only a creation entry has `old = zeros`.
-    Stored as `(anchor_sha, anchor_ts)` — the pair, because recreating a branch from the same start
-    point yields the same sha. **Not the message text**, which varies (`from main` / `from HEAD` /
-    `from main~0`), and not `git log -g --format=%ct`, which prints the *commit's* time.
-    - A **mismatch** is positive proof of recycling: it supersedes on the write side and refuses to
-      act on the read side (`base::stale_instance`, `close-merged` and `review record`).
-    - A **match plus a `commit`-class-only journal** licenses *retaining* a record on an untouched
-      branch — the merged-away case, whose fork point discard-and-hold used to throw away. That
-      relaxes a previously pinned direction, knowingly; unknown entry classes fail **closed**.
-    - **Absent or truncated declines**, degrading to the untouched-tip predicate. Every failure
-      mode lands on the old behaviour, never on a new close. Coverage is *established*, not
-      assumed: `gc.refs/heads/<branch>.reflogExpire = never` is written beside the record (exact
-      ref, so no naming scheme is needed) and removed when the branch is forgotten; `jkb doctor`
-      reports entries for branches nothing records.
-    - Residual, stated rather than guaranteed over: recycling where the anchor is unverifiable
-      (reflogs off, hand-expired, or read in a different checkout), plus the remote-only path.
-  - **Landing is an event where jkb performs it** — `jkb task land` after its gate is green, and
-    `jkb task landed <branch> --onto <target>` for the merge queue, which is bash. It does not
-    replace the inference, it *shrinks its domain*: from one branch per task to one per batch, and
-    the survivor is the branch whose cut point is provable. `landed_head` — the branch's own tip at
-    that moment — is what stops the event re-creating the same name-staleness one column over; the
-    event is credited only while the branch still points there **or is gone**. The queue's verb is
-    a new write route for a trusted fact, so it refuses unless the work really is in the target,
-    judged by the same predicate readers use (**not** by ancestry: the queue rebases a detached
-    HEAD, so every entry after the first has rewritten commits and its tip is no ancestor of the
-    target).
-    - **A landing onto the branch you are asking about *is* the answer** — `landed_for_action`
-      stops there rather than walking on to ask "and is `S` contained in `S`?", which needs `S`'s
-      own cut point. `jkb task review record` passes the *reviewed branch*, so without this it
-      declined to credit work jkb had itself just grafted onto that branch. It is not the "landed
-      onto a batch with no record" state, which is still **held**: there the target is a different
-      branch, and whether it in turn reached trunk is a question the record genuinely cannot
-      answer.
-    - **The queue's verb reports, and deliberately does not measure.** The obvious fix for a
-      landing onto a target with no cut point is to record one there — and it is wrong: a cut point
-      is provable only while a branch is untouched, and a landing is exactly the moment the target
-      stops being one. The queue's first entry fast-forwards the target onto commits its source
-      branch still holds, so `has_own_commits` truthfully says "nothing of its own" and the **tip**
-      gets stored for the whole batch, which is permanent. The record has to be made when the batch
-      is *cut* (`--onto <batch>`); `jkb task landed` says so, on stderr and as `creditable: false`,
-      and `merge-queue.sh` no longer swallows that.
-  - **No verb anywhere accepts a commit id.** `jkb task base <uid> <branch> <sha>` produced three
-    findings across three passes, all the same shape — the sha nearest a user's hand is the branch
-    tip, and a cut point equal to the tip freezes the task at `NothingToMerge` with no repair path.
-    Each was fixed by rewording a message; there are only so many messages. It is now
-    **`jkb task base --forget <branch>`**, which drops the cut point (not the row: the branch still
-    exists, and taking its land target with it would drop the task out of `jkb staging ls` as a
-    side effect of repairing a commit id). `branch::forget` — the row delete — is
-    `abandon --delete-branch`'s verb, where the branch really is gone.
-  - **The transition deleted and back-filled nothing.** Back-filling imports exactly the values
-    five passes proved unreliable; leaving them inert was unsafe once the reserved-facet apparatus
-    went, since a surviving `base=` on a file-backed task would start exporting `#base=…` into
-    synced files. The rows and the reservation had to go together.
-  - **`V013` locks older binaries out of the global `~/.jkb/jkb.db`.** Accepted: `V012` already did
-    on this branch, so anything that can open the database today is built from `staging-workflow`.
-  - **A git ref (`refs/jkb/base/<branch>`) is still rejected.** jkb runs inside other people's
-    professional repositories and must not decorate them with refs the user never asked for.
-    Writing `.git/config` locally is judged differently — like `.git/info/exclude` (D36) it is
-    local, unpushed, and cannot leak via push.
+The `staging-workflow` branch took 44 review passes and about 80 must-fix findings. Every one
+names a file and a line and every fix is in the tree, so "the same defect recurred" could be
+checked rather than asserted; the 44 `.codereviews/*staging-workflow-*` folders were read in full.
+Sorting the task-lifecycle must-fixes by *cause* rather than by site gives six groups, and each
+maps to a property the code had no way to have. `crates/jkb-fsm` and the task machine declared in
+it are the answer.
 
-## Staging branches and review-gated landing (D38)
+### The lifecycle was written down nowhere
 
-The branch a batch of tasks lands on before trunk. It is the **same thing** `/task-swarm`
-calls its integration branch — cut from trunk, sub-branches rebase and fast-forward into it
-linearly, the gate runs on the integrated result — reached by hand instead of by a
-coordinator. Design in `openspec/changes/jkb-staging-workflow/`.
+No artifact said which states a task has, which transitions exist, and what each requires. About
+a dozen sites each derived the part their own question needed: `claim::claim`'s terminal
+pre-check, `task::set_status`, `staging::State::from_status`, `land_blocker`, `land_preflight`,
+`close-merged`, `task abandon`, `task work`, `review record`, `merge-queue.sh`, the VS Code row.
+*Two sites answering one question differently* is the most common finding shape in the corpus
+(the In Flight row offering Abandon on a landed task that `task abandon` then reopened;
+`land_preflight`'s own terminal bail shadowing `land_blocker`'s arm). Each was fixed by making the
+two sites share a function, which works and does not generalize: the thirteenth site is written by
+whoever adds the next verb, and nothing tells them the list exists.
 
-- **A staging branch is derived, never stored.** It is any git branch named by some task's
-  branch's `land_target` that still exists. There is no `kind='staging'` item: which branches
-  exist comes from git and which tasks are on them comes from the records, sessions live in git
-  worktrees, merge state comes from `gitrepo::is_merged` (squash-safe, D34.2). A staging
-  *item* would copy facts git owns and then need reconciling — the failure D36.2 avoided by
-  refusing a session state file.
-- **`jkb staging ls [--all]` is the ONE read** behind both the explorer's branch picker and
-  its In Flight view, so the two cannot disagree about what is live. Each task carries a
-  derived `state`: `implementing` / `review` / `landed` / `dropped` — `dropped` being a
-  **cancelled** task that was on the branch, kept apart from `landed` because reporting the two
-  as one would say a dropped task shipped. A branch adding nothing to trunk is
-  either landed *or* freshly cut and still empty, and refs cannot tell those apart — **live
-  work is the tie-break**, or the branch cut by the very first `task work` is hidden from the
-  picker that exists to offer it.
-- **"Does this branch exist" is answered with a ref, not a boolean** (`gitrepo::branch_refs`, one
-  `for-each-ref` over `refs/heads` + `refs/remotes/origin`, local winning). Counting the
-  remote-tracking copy admitted a pruned batch to the listing, and then every count was still taken
-  with its bare short name, which resolves to nothing: `rev-list` exited non-zero, the failure read
-  as **zero commits**, and the row refused a landing the command performed. Membership answers "may
-  I show this" but not "may I ask git about it", and the second question is the one every consumer
-  actually had. So `ahead_count` now **refuses** an operand it cannot resolve rather than returning
-  zero — zero is a load-bearing answer here ("nothing to land"), and a count that could not be
-  taken must not be spelled the same way. `land_preflight` asks `branch_ref` for the same reason:
-  it asked `has_branch` while the row asked remote-inclusively, so the one shared blocker printed
-  two opposite explanations of the same task.
-- **Review state is two facets on the task**: `reviewed=<sha>` and `review=<ns>`. It is the
-  one fact here with nowhere authoritative to live — git does not know, and the reviewer is a
-  Claude workflow the CLI cannot run, so the CLI can only *require a record*. It deliberately
-  does **not** live on the review folder's namespace metadata, which the sync engine owns
-  (`layout`, `header_line`, `prose`); a second writer there is the class of bug that collapsed
-  `openspec/`. Recording is keyed by **branch** — that is what a review knows — and a branch
-  no task claims is a note, not an error.
-- **The gate: reviewed, and no open must-fix.** `jkb task land` refuses a task with no
-  `reviewed=`, or whose review has a `!p1` finding that is neither `done` nor `cancelled`
-  (counted with `priority<=1`, terminal statuses filtered in Rust — `is:ready` is wrong
-  because a *blocked* must-fix must still block). Checked **before the graft**, so a refusal
-  has moved nothing. Concerns and nits never block: a previous run put 34 of 45 findings on
-  `concern`, and blocking on those would make the override the normal path within a week.
-  `--no-review` overrides and records `review-waived=<sha>` — an override nobody can see is
-  indistinguishable from a rule that does not exist.
-- **Status and the gate are not fused.** A task in `needs_review` with nothing outstanding
-  lands; one moved back to `in_progress` with an open must-fix does not. Fusing them would
-  make `jkb task set --status` the bypass. `needs_review` is the display state (D27.7);
-  the findings decide landing. Recording a review is the **only** author of that transition.
-- **`jkb task tag set`** is the sibling of `add`/`rm` that makes a value a facet's only one.
-  `add` stays additive, honest to its name — an open-ended facet legitimately holds several
-  values. `set` is for `branch=`/`repo=`, where a second value is a contradiction and a reader
-  collapsing the multi-map picks one at random (D36.6). Load-bearing because `/task-swarm` re-tags
-  a group on every pass. **It refuses `onto=`** — where a branch lands is a fact about the branch
-  and lives in its record, so a facet of that name would reach no reader; use
-  `jkb task work --onto` / `task start --onto`.
-- **The swarm records where it is working.** `/task-swarm` sets `repo=` at claim, and runs
-  `jkb task start --branch <group-branch> --onto <integration>` once the implementer has one —
-  which records `branch=`/`repo=`, the land target and the *measured* cut point in one write, so
-  the swarm supplies no value it could get wrong (see the measurement rules under D46). The land
-  target cannot be recorded at claim, because at that point the group has no branch and the target
-  is a fact about a branch. `staging ls` then shows swarm work and
-  hand-driven work in one view rather than the half it was told about. `/review-log` calls
-  `jkb task review record` after filing its findings, and says whether the branch can land. It
-  mounts them today; its switch to `jkb task review file` (tasks, never a mounted file — see
-  `docs/message-queue.md`) is pending.
-- **No review gate in `scripts/merge-queue.sh`** — deliberately, and that is the only sense in
-  which D38 left it alone (it gained a `jkb task landed` call under D46).
-  The swarm already runs a fresh REVIEWER before a group reaches the queue (D27.6) — that *is* its
-  gate, and stricter.
-  Requiring `reviewed=` there would make the REVIEWER write facets to satisfy a check its own
-  approval already answered. **Review staleness** is recorded (`reviewed=<sha>`) but not
-  enforced: making every post-review fixup force a re-review is the fastest way to make people
-  reach for `--no-review` by reflex.
+### A lifecycle is a walkable static table
 
-## Design gate (D28) — human design, swarm implementation
+`crates/jkb-fsm` is a dependency-free library (`serde` optional and off, no `std::process`, no
+I/O): `fact.rs`, `machine.rs`, `check.rs`. A `Machine<S, E, C, X>` is a `&'static` table of
+`Transition { from, event, to, kind, guard, plan }` plus an initial state, where `S` is states, `E`
+events, `C` the observation a guard reads and `X` the effect the domain performs. Because the table
+is data it can be printed, checked, exhaustively tested and drawn: `Machine::dot()` renders it as
+Graphviz, reconciliations dashed and stated destinations to a `*` node, the artifact whose absence
+was the first item on the list. Twelve sites deriving a lifecycle become twelve sites asking one.
 
-The swarm implementers run headless (Workflow sub-agents) and **cannot ask the user** about
-undecided design. So design is separated from implementation by a tag gate (D28):
+Rejected: a `statig`, `sm` or typestate crate. Those model states as types and transitions as
+consuming methods, right for a protocol whose state is in memory and wrong here: the state is a
+database column known only at runtime, the transition set must be **walkable** for the checks, and
+a guard must refuse *with a reason*, where a typestate machine simply does not offer the method.
+The table would end up maintained separately in order to check it. Also rejected: generating the
+table from a macro (the `db_enum!` precedent): the table is about 20 rows and its value is being
+*read* by a reviewer, which a macro invocation obstructs.
 
-- A task is swarm-eligible only when tagged **`design=approved`**. `/task-swarm` (scout +
-  every SCHEDULER pass) ANDs `tag:design=approved` into its `task next`/`query` selection in
-  scope mode, so un-triaged tasks are invisible to the swarm. Bypasses: `--no-design-gate`
-  and explicit-uid mode.
-- **`/design-pass <path>`** is the interactive counterpart: it walks open, un-triaged tasks,
-  settles each design *with the user* (via `AskUserQuestion`), records it, and only then runs
-  `jkb task tag add <uid> design=approved`.
-- Decisions are recorded in an openspec change's `design.md` under `openspec/changes/<name>/`
-  (one folder per group of related tasks), keyed by `Governs: <uid>` so the implementer greps
-  it by uid — **not** in a running `design-notes.md` log. A small, standalone design can instead
-  live only as the inline `Design:` note on the task. Either way the decision is also stamped
-  into the task body (`jkb task edit --append` for managed tasks; the source-file line for
-  file-backed ones); trivial tasks skip the write-up and are fast-tracked straight to the tag.
-  The IMPLEMENTER reads the approved design first and follows it rather than re-deciding.
-- **Gate DSL gotcha:** use `tag:design=approved` (the query DSL). The `#facet=value` form is
-  quick-add-only, and `task next` silently drops non-`tag:`/`ns:` terms — so `#design=approved`
-  in a `task next` scope is ignored (parsed as dropped free text).
+### `Fact` is three-valued, and nothing collapses `Unknown`
 
-## Roles, RBAC and task workflows (D52)
+Nine must-fixes were one unobtainable answer spelled `false`: `ahead_count` returning `0` (which
+means *nothing to land*) for a branch it could not resolve; `has_own_commits` answering *no* when
+`rev-list` failed; a land gate that could not tell *no findings* from *the namespace resolved to
+nothing*; `base_is_usable` asking git the non-verifying question, so any 40-hex string read as a
+commit. Each was fixed at its site; the type system was never enlisted, and the next fact would
+have been a `bool` too.
 
-The pattern `/task-swarm` and hand-driven sessions converged on — a **coordinator** that spawns a
-**designer**, then **implementers**, then **reviewers**, and a **systemic reviewer** when review
-keeps finding the same areas — lived only in prompts, so the operator typed "continue" and "run
-another review round", and nothing stopped an agent skipping a step. D52 makes the path forward a
-fact jkb states, holds each agent to the steps its role allows — **including an agent trying not
-to** — and lands only on a clean *last* round. Design: `openspec/changes/jkb-rbac-workflows/`
-(local), which also holds the probes and their raw results.
+`Fact { Yes, No, Unknown }` has `is_yes` and `is_no`, **both** meaning *proven*, and no method that
+collapses `Unknown` to a `bool` in either direction. So a guard states its polarity in code:
+landing needs `work_dirty.is_no()` (an unreadable checkout refuses) and `has_commits.is_yes()`; a
+close needs `merged.is_yes()` (a failed git holds). Kleene `and`, `or` and `not` keep a composite
+three-valued, and the constructors `observed(Result)` and `maybe(Option<bool>)` turn "I ran git and
+it failed" into `Unknown` at the boundary, not three lines later.
 
-**The pieces, and where they live.**
+### A transition yields its effects as one value, applied last
 
-- **`crates/jkb-rbac`** — RBAC as a checkable table, the sibling of `jkb-fsm` and as
-  dependency-free. `RoleTable` (static) and `OwnedTable` (built at runtime) share one `Grants`
-  trait: `check()` finds a role granted nothing, a permission nobody holds, a duplicate row;
-  `matrix()` renders it. `Authorizer` composes (`RoleBased`, `AllowAll`, `Both`, `FnAuthorizer`),
-  and a refusal names the roles that *would* be allowed. Nothing in it is about jkb.
-- **`jkb-core/src/roles.rs`** — the six roles (operator, coordinator, designer, implementer,
-  reviewer, `systemic_reviewer`); who may grant whom (a `RoleTable<Role, Role>`: a coordinator
-  grants a designer or an implementer, scoped inside its own scope — never a reviewer, since a token
-  it mints is one it holds (review round 4) — and the table is checked when a grant **resolves**,
-  not only when it is minted, so a grant minted before a tightening neither resolves nor lists as live
-  (rounds 5–6) — it stays unrevoked, and `role ls --all` shows it marked `NOT GRANTABLE` (round 7));
-  grants stored as **blake3 hashes** of 256-bit
-  tokens, revoked recursively, **not changelogged** (`jkb undo` reviving a revoked grant would
-  re-arm a credential); the operator's `agent_type → role` map; first-bind-wins agent bindings.
-- **`jkb-core/src/workflow/`** — one phase set (design, `design_review`, implement, review,
-  `systemic_review`, landable, landed, cancelled), two graphs as `jkb-fsm` tables that pass
-  `check()` and an `audit()` over every combination of facts. **A strategy is a composition**
-  (operator's clarification): a graph, permission **toggles** (`approves_design`, `lands`, each
-  bounded by a domain so none can hand an operator power to a worker) and **attributes**
-  (`repeated_area`). Presets `design-reviewed` (default), `coordinated`, `autonomous`; operator
-  definitions are versioned, and a task **pins a snapshot** so a redefinition never changes it
-  mid-flight — at its **first move**, whatever it runs then, including the default: pinning only
-  on `workflow set` let a redefined `default` change a task already in `landable` (review round 1).
-  An unreadable stored `default` is refused, never replaced by the preset. The log is append-only;
-  permission is checked **in the callee** (`store::fire`). A workflow `reopen` is the
-  operator's, and **follows** the task's lifecycle rather than leading it: it needs the task back
-  to work first (`jkb task set <uid> --status open`), or the next observe would put it straight
-  back. Nothing reconciles a reopen — a lifecycle reopened by a coordinator or a synced checkbox
-  leaves the workflow parked where the operator acts next — `workflow show` names the operator's
-  `reopen` — and nobody but the operator lands a task whose workflow is parked (round 3: reopening
-  the status and landing again re-landed it with its workflow never reopened. A **landing parks
-  the workflow at `landed` in the lifecycle's own transaction** (`store::follow_landing`, called from
-  `transition::perform` on `land`/`observed_landed`, a pull request merging included): round 4 found
-  it moved only on an explicit `workflow observe`, so a really landed task sat at `landable` and this
-  refusal never fired; round 5 found a PR close — a landing with no destination — still never
-  parked. A **cancellation still parks on `observe`**: parking it (and revoking the task's workers)
-  inside the cancel, as round 4 first did, made it one-way for all but the operator when `jkb undo` or
-  a `tasks.md` line that came back restored the status. Neither restores a parked landing; the
-  operator's `reopen` does. The same landing again is not refused — the queue re-running a branch
-  gets the lifecycle's no-op, not "held" (round 5) — but only a workflow parked at `landed`, and the branch, destination
-  and head its live landing records: a cancelled task ticked `done`, or a landing somewhere else,
-  recorded a landing it never had (round 6); a workflow the operator landed while it stayed parked at
-  `cancelled` has a live landing too, and new commits on the branch are new work (round 7). `jkb task landed` reports a task it may not
-  land again but that is already `done` as **already landed**, not refused: `task land
-  --keep-worktree` records the branch's tip from before the graft, so the queue's own advice for a
-  branch already in its base otherwise failed (round 8) — only where its live landing records the
-  same branch onto the same destination, which `task.facts` now reports (round 9), or a pull request
-  that merged it, which records no destination (round 10) — the newer of the two, and neither once
-  the task was put back to work (`transition::current_landing`, round 11). On such a task the answer is true
-  whoever asks; on any other, a caller's own refusal stays a refusal. `jkb task landed` reports a refused task held and
-  records the branch's others (round 4: the refusal aborted the loop), and fails when this caller
-  may land none of them rather than printing `recorded:` over nothing (round 5).) A task landed before D52 has no workflow rows, reads `design`,
-  and is not held by this. *Superseded (round 2):* an
-  `observed_reopened` reconciliation let any observe follow a lifecycle reopen, so a coordinator
-  could reopen a landed task. Deleting a task revokes its grants and keeps its workflow history (V022 has no cascade
-  from `items`, which is AUTOINCREMENT), so `item rm` + `undo` gives back a task still pinned.
-- **`jkb-core/src/reviews.rs`** (V023) — the land gate's review facts, **out of tags**.
-- **`jkb-api/src/rbac.rs`** — `Request::permission` (exhaustive), `OP_GRANTS`, principals,
-  the in-memory ticket store, `authorize` at the top of `LocalBackend::call` — the one dispatch
-  the daemon, the MCP server and host-local mode share — and the `role.*`, `workflow.*` and
-  `attest.*` ops.
-- **`jkb-cli/src/rbac_cli.rs`** — `jkb role`, `jkb workflow`, and `jkb attest hook`.
+`settle_landing` wrote `done`, cleared the claim, then asked git to remove a worktree git refused,
+leaving a task `done`, unclaimed, with a live session. `task start` wrote `branch=` without the
+rest of the location for a whole feature's life. "Two independent writes that must agree will
+eventually not, so there is one write" was learned at three sites and enforced at none.
 
-**The loop is a graph, and only a clean round leaves it.** A review round that finds a must-fix
-sends the task back to an implementer (`review_failed`), through a systemic review first when
-must-fixes repeat an area (`review_repeated`, default: the same file in two consecutive rounds).
-The systemic reviewer ends it one of two ways, with a required written reason: `systemic_redesign`
-back to design (the fix changes how the operator understands the system — under the default, that
-is back to the operator) or `submit_systemic` back to implementation (a difficult code pattern).
-`jkb workflow observe` takes the one reconciliation the facts call for, so after a round the task
-moves with no human prompt; `jkb workflow next --stop-hook` sends a Stop back, **once per stop**,
-while the next actor is one the session drives — **in a session that opted in** with `JKB_DRIVE`
-(`1`, or a task uid) where it was launched. The hook is managed, so it fires in every container
-session, and without the opt-in it told an interactive session in a task worktree to "continue"
-implementing on every turn.
+`Machine::apply` returns `Outcome::Moved { from, event, to, effects }`: the state change and
+everything that must accompany it as one value. `transition::perform` is the one seam: ask the
+machine, apply the whole plan or none of it in one `write_txn`, append one history row;
+`apply_effects` is private, so a caller cannot apply half a transition. `TaskEffect` is
+`SetStatus`, `Claim`, `ReclaimFrom` and `ReleaseClaim`: the two fields `settle_landing`
+desynchronized, both on one row, and nothing else.
 
-**The land gate gained its last-round clause.** The newest round must itself have found no
-must-fix: fixing a round's findings is not a review of the fix, and `must_fix` counts at **any**
-status. A daemon too old to report rounds refuses rather than skipping the clause.
+The graft, worktree removal and branch deletion stay **outside** the plan. They are git operations
+that can fail after the transaction commits, and pretending a `Vec<TaskEffect>` could hold them
+would recreate the bug with more ceremony. What the machine gives those callers is the ordering
+rule, stated once: **apply the plan last**, after every fallible external step, so a git failure
+leaves the task where it was and the verb is re-runnable. A test that the gate leaves the checkout
+dirty caught this change applying the plan before the disposal. Rejected: effects as trait objects
+that perform themselves, which reads well and makes it natural to put the graft in the plan.
 
-**A round is what it was when it was recorded** (`review_rounds`, `review_round_findings`, V023).
-The first recording of a namespace snapshots its findings — which are must-fix, and the file each
-names — and rounds are ordered by recording. *Superseded:* a round was first read live, ordered by
-the highest item id among its findings, and review round 1 showed why that fails: a finding's
-priority, placement and `area=` are ordinary task content, so the implementer under review could
-lower its own last round's must-fix, or file a line into an older clean round so it sorted newest.
-The gate's open-must-fix count is the snapshot's must-fixes not yet finished — and nothing live
-under a recorded round: *round 2* found the live half (anything now at `p1` under the namespace)
-reachable by a line synced into a mounted round's `tasks.md` and by a task placed beside the
-findings. A finding that matters after a round is recorded is another round. A round a
-**non-operator** records must be a namespace **it** filed with `task.review_file`
-(`review_filings.filed_by`), and holds exactly what it filed: naming `tasks` as a round would put
-every task in the recording task's scope, and recording another worker's filing would pull that
-round's findings into its own. The operator's `/review-log`, whose findings arrive through a mount,
-still records any namespace — on the host: from the container, a mounted folder is recorded with
-`jkb task review record --branch <b> --findings <ns>` run there. **A coordinator neither files nor
-records a round** (round 3): it drives the work, and one that could file an empty round and record it
-against the branch it drove satisfied the gate with no reviewer involved. A round is a reviewer's — a
-`reviewer`-typed subagent recording its own filing — or the operator's. Nor may a coordinator
-**mint** a reviewer (round 4): the token it minted is one it holds, so round 3's refusal was undone
-by `role grant reviewer` to itself. Reviewers come only from the operator — a grant, or the
-`agent_type → role` map an attested subagent resolves through. A round's namespace is any filed or
-recorded one, any `repos/<repo>/codereviews/<folder>` (a `/review-log` mount before it is recorded,
-round 4), and each through its `tasks/<repo>/…` mirror (round 5). **A recorded round is recorded
-under one name**: recording another name for it, or a namespace in or around it, is refused rather
-than snapshotted as a newer round, which read today's priorities and turned the land gate's
-last-round verdict either way (round 8). Still not protected: a
-coordinator telling a reviewer it spawned to file a clean round, the "genuine worker told to lie"
-case below. A filing is refused into, above or below any recorded round; a
-principal held to one task files only under `repos/<repo>/codereviews/` of its task's repository
-(the nearest `repo=` up its parents) — findings are ordinary open tasks on the shared frontier —
-and an attested subagent binds before it files.
+### A refusal names an event, and the machine checks it
 
-**Review facts are not tags (hole H3).** `reviewed=`, `review=` and `review-waived=` decided the
-gate, and a tag is content any writer may set — the sync engine included, applying a `tasks.md`
-line an agent in the dev container edited: `#review-waived=x` waived the gate. The answer is
-**not** a reserved facet: `tag.rs` records that apparatus being tried for `base` and six choke
-points failing to close it. The facts moved to an append-only `reviews` table (the live KB held 11
-`reviewed=`, 35 `review=` and 28 `review-waived=` tags, measured), and the gate reads only that, so
-a `reviewed=` tag is ordinary content nothing trusts. V023 migrates a `review=` **only beside a
-`reviewed=`**: `/review-log` tags a backlog finding `review=<ns>` as a trail, with no head, and
-migrating those made tasks the old gate called never-reviewed pass as reviewed. Those trails stay,
-as the ordinary tags they always were. No database had applied V022/V023 when round 1 edited them
-(the live KB was at version 21, and no other branch carries them), so they were edited in place.
-`task.facts`, `task.staging` and `task.show` carry it as a `review` field. Likewise **`landed`
-reads the landing transition, never `status = done`**, which a synced checkbox can write (H4).
+Review passes 31 and 32 were the same finding one message apart: a printed remedy
+(`jkb task base <uid> <branch> <sha>`) whose obvious argument, the branch tip, froze the task
+permanently. Another refusal told the user to edit a file, and the edit routed it into an arm with
+no guard. The fix each time was to reword, and there are only so many messages.
 
-**Who is asking (D52.3).** One bearer per request: the root token (the operator — host only), the
-dev container's credential (a coordinator grant, its ceiling), a role grant, or a harness
-**ticket**. No credential no longer means operator. `remote::client` is the one place a client
-chooses: a command its ticket or role token, else the container credential if it can read it
-(a person at a container terminal can; the model's sandboxed tools cannot); a hook the container
-credential; `jkb mcp` only an operator-configured role token — never the container's ceiling on
-behalf of every agent it serves. The daemon caches grant hashes so a wrong token costs at most
-one read a second — claimed under the lock, on the reader connection, and released if the read
-fails — lets a grant it mints refresh at once, and re-resolves every call from the database so a
-revocation is never served stale; a call that then fails `Unauthorized` evicts its hash and closes
-the connection, so a grant revoked behind the daemon's back cannot hold slots open. *Round 2:*
-emptying the whole cache on every grant or revocation made every live token miss at once, and the
-misses during the refresh were refused — the container credential's attestation calls among them. The container credential is marked in its
-own column, set only by rotation — a grant the operator merely labelled `container` mints no
-tickets. A session holds at most 256 live tickets, the daemon 4096, expired in mint order.
+`Denial { reason, remedy }` holds a `Remedy { event, how }`: a guard that refuses says what to do in
+the machine's own vocabulary. If the named event is neither accepted nor idempotent from the
+refused state, the outcome carries `Defect::UnreachableRemedy`. `Machine::audit(&[C])` validates
+every remedy the machine can produce over a context matrix, and the task machine's matrix is
+generated from the cross-product of its facts. It caught a bad remedy in this change as it was
+written: `land`'s "no work to land" refusal offered `start`, which is not accepted from
+`needs_review`. It also caught the state being passed beside the context, free to disagree with it;
+`Stateful` now reads the state *out of* the observation.
 
-**Harness attestation (D52.9) — the harness vouches, the agent holds no secret.** An in-process
-subagent cannot keep a secret from its parent (one process, one sandbox, one transcript), so
-instead Claude Code's hook — which the harness, not the model, feeds — mints a ticket per `jkb`
-tool call with the container credential, carrying the `session_id`, `agent_id` and `agent_type`
-the harness reported, and rewrites the command to export it. Measured on Claude Code 2.1.276:
-`agent_id`/`agent_type` appear for Agent-tool **and** Workflow-tool subagents and not for the main
-session; `updatedInput` reaches the shell; `PostToolUseFailure`, timed-out commands and
-`SubagentStop` all fire; one command cannot read another's `/proc/*/environ`; deny rules held from
-Bash, `Read`, a symlink and a subagent. Two measurements changed the design: **a workflow agent
-reports `workflow-subagent` unless its script passes `agentType`**, so roles come from explicit
-types and the generic ones map to nothing; and **a `PreToolUse` can be followed by no post-hook**
-(a permission refusal after the hook ran), so tickets are also released at `SubagentStop` and
-`SessionEnd`, with a 10-minute backstop.
+### No wedges: `check` and `audit`
 
-**What the hook decides: it never asks.** The hook mints the ticket and approves or stays out of
-the way; it never forces a prompt. What a ticketed `jkb` may DO is the daemon's RBAC, held against
-the ticket on every request. Three answers:
+The words *permanently*, *forever* and *unrepairable* appear in 14 must-fix summaries. Nothing had
+asked "from this state, can the user still get anywhere?". `Machine::check()` is the static pass,
+run in a test: `Nondeterministic` (two rows for one `(from, event)`, never last-one-wins),
+`UnreachableState`, `Wedged` (no path to a settled state), `NoSettledState`,
+`UnguardedReconciliation`, `UnusedEvent`. An undeclared pair is `Outcome::Undefined`, a named
+refusal, so no arm falls through to "do nothing quietly", which is how `--onto` was once silently
+ignored. `Machine::audit` is the dynamic half: `UnreachableRemedy`, `DeadEnd` (under some
+observable context a non-settled state accepts nothing: "held for ever", which static liveness
+cannot see because every path out is guarded), `AmbiguousReconciliation` and `UncoveredState`.
 
-- **`allow`** for a line whose every command is `jkb` itself — the command word literally `jkb` —
-  or one of a short `HARMLESS` allowlist (`cd`, `true`, `false`, `:`, `echo` — shell builtins with
-  no path to run other code, read or write a file, or repoint `jkb`). So `jkb task show x` and
-  `cd repo && jkb workflow next` never prompt, in any mode. No reader is on the list, by the user's
-  decision (2026-10-02): with `cat`, `grep`, `head`, `tail`, `wc` and `jq` on it, `jkb ls; cat
-  ~/repos/other/.env` was approved and read a file past any rule the person had for reads. So
-  `jkb … | jq .status` is deferred — under the auto posture still unprompted, under stricter rules
-  theirs. The same decision covers `jkb` itself where it reads a file the caller *names* and sends
-  the daemon only the text — `jkb ingest <path>` (a URL is rendered, and stays approved), `jkb mcp`
-  (its `ingest_path` tool), `jkb task review file --from <file>` (from `-` stays approved). RBAC
-  judges the op, never which file fed it, so `jkb ingest ~/repos/other/.env` approved would read
-  past a read rule exactly as `cat` did; the container sees every project under `~/repos`. An
-  inline gate is deferred for the same reason and more: `jkb task land x --gate '<cmd>'` runs a
-  command the caller wrote with `sh -c`, so `--gate 'cat ~/repos/other/.env'` is `cat` again
-  (review round 2 of this change). `jkb task land x` with the gate the host stored stays approved.
-  Which commands these are is `remote::beyond_rbac`, an exhaustive match beside `remote::support`,
-  asked of the words as `jkb`'s own clap parser reads them; words that parser refuses are deferred
-  too, except help and the version, which it reports as errors but which read nothing.
-- **no `permissionDecision`** for any other line that mentions `jkb`: one that also runs something
-  else (`jkb ls && git status`), one the classifier cannot model (a redirect, `$`, a glob, a bare
-  tilde), one that reaches `jkb` by a path, a prefix or a wrapper (`~/.cargo/bin/jkb`, `FOO=1 jkb`,
-  `sh -c "jkb …"`). The line is ticketed and the session's own rules judge it, against the command as
-  the model wrote it, not the rewritten one carrying `export JKB_ATTEST=…` (measured, below) —
-  approving it would approve the rest of the line past whatever rule the person set for that.
-- **nothing at all**, no ticket either, for a line that only *mentions* jkb as a harmless command's
-  argument (`echo jkb`). A reader's mention (`grep -rn jkb src`) is now deferred and ticketed, since a
-  reader is not on the list; the unused ticket costs nothing.
+`tests/machine.rs` has a working toy lifecycle plus **one deliberately broken machine per defect**,
+so every check is shown to fire rather than merely to exist.
 
-Only an `allow` overrides the session's rules, so only an approved line has to be understood, and
-the property the tests hold is that one: an approved line runs nothing but `jkb` and harmless
-commands. `cd` is harmless only because `PATH` holds no relative or empty entry, so the directory
-cannot change which `jkb` runs — measured on the container's real `PATH`, eleven entries, all
-absolute. (A first measurement, ten entries, was of the Mac's `PATH`, which a stray `env.PATH` in
-the shared `.claude/settings.local.json` had substituted for the image's; same conclusion, wrong
-`PATH`. That substitution is what a session sees when `jkb` will not resolve by name.) `sort`, `printf`, `sed`, `awk` and `uniq` are deliberately off the list
-(`--compress-program`, `printf -v PATH`, `e`, `system()`, `uniq IN OUT` overwriting a binary).
+### `Dest::Stated` counts for reachability and never for liveness
 
-**Superseded: the forced prompts, 2026-10-02.** The hook used to answer `ask` — on `task land` and
-`task gate`, on lines it could not model, and on lines where a `jkb` might run out of sight — and a
-`PreToolUse` `ask` overrides an allow rule, so a mechanism meant to be invisible kept putting
-prompts in front of the person, including on commands that only mentioned the repo's path
-(`cd /home/vscode/repos/jkb && … 2>&1`, which an unmodellable-line rule asked). The user's rule
-reversed it: the ticket is authorization, and RBAC decides. Each prompt was standing in for
-something already covered. *Who* may land is `may_land`, asked before the graft moves the
-target, the gate runs or the session is archived (`task.land_check`) — though not before every
-side effect: the `.git/info/exclude` entry, the land lease and adopting the target from its remote
-come first. *What* a landing's gate runs is `sh -c` inside the same Bash sandbox as every
-agent command, so it reaches nothing the agent could not reach itself — and the default gate is a
-repo script the agent can edit anyway, so a prompt on `--gate` guarded nothing. (That held against
-a *prompt*, not against an *approval*: "nothing the agent could not reach itself" is the sandbox's
-reach, the very bar the reader decision rejected, so an inline `--gate` is now deferred to the
-person's rules — never asked — as recorded above.) A stored gate cannot
-be set from the container at all (`remote.rs` refuses it); `--gate-on-host` needs `task.ran_on_host`,
-operator-only. And `main` changes only through a PR, whose CI is the verification that counts — the
-in-sandbox gate is a fast pre-check a session can weaken only for itself. A ticket inherited by
-another program on the line can do only what its role may.
+Some events take a destination the caller names (`Dest::Stated`): an operator override, a synced
+file's checkbox. Such an edge is excluded from the liveness walks, because a state whose only exit
+is somebody naming a different state is still wedged; an escape hatch is not an exit. It does count
+for reachability: *can the object be here* is answered yes by an override. Collapsing the two
+reported `abandoned` investigation units, which only a person sets, as unreachable dead code.
 
-**The earlier answers, kept for the diagnosis.** Before that reversal, `land` kept a prompt because
-`--gate` runs a caller-supplied command and `may_land` decides who lands, not what the gate runs;
-the reversal answers that with the sandbox and CI rather than a prompt. Round 7 found a ticket
-inherited by a `jkb` the model never saw run — `sh -c "jkb task land x"`, `… | xargs jkb task`,
-`env -S "…"` — and round 8 measured that whether such a `jkb` exists cannot be read off the text (a
-glob inside quotes, a script file, `make`, `jkb ls | ./evil.sh`, `LD_PRELOAD=`/`PATH=` prefixes,
-`hash -p`, `printf -v PATH`); naming the dangerous cases kept falling short, naming the safe ones did
-not, which is why the approval rule is an allowlist. Those lines are now deferred rather than asked,
-and the bash-backed tests still run them — 
-`run_through_bash_a_line_that_runs_jkb_out_of_sight_is_never_approved`, whose oracle puts a fake `jkb` *program* on `PATH` as well as the shell function,
-and `run_through_bash_a_redirect_comment_or_heredoc_is_never_approved` for round 6's shapes — to
-hold that none of them is ever approved. `HARMLESS` is pinned as a literal list, since growing it is
-the dangerous direction.
+### Every verb is answerable at its own destination
 
-**Superseded, twice: `ask` for anything that is not one plain invocation.** That was the whole of the
-over-prompting, and it was a design error rather than a tuning problem. A `PreToolUse` `ask`
-*overrides* an allow rule, so adding attestation quietly took a decision that belonged to the
-user's settings and made it more conservatively than they had: every `cd repo && jkb …` and
-`jkb … | jq` began prompting for a mechanism whose whole purpose is to be invisible. Returning
-`allow` there is not the alternative — it would approve whatever rode along with the `jkb`
-(`jkb ls && rm -rf …`). Declining to answer is — but only where nothing else on the line can use
-the ticket. It was first applied to every non-plain line, on the reasoning that it "costs nothing
-on the security axis" because a ticket is an authorization fact rather than a permission grant.
-Rounds 7 and 8 refuted that: the ticket is exported for the whole line, so any other program on it
-inherits the authorization, and `jkb ls && rm -rf …` — the very example above — was asked again
-for that reason, until the 2026-10-02 reversal above: it is now deferred, ticketed, with RBAC
-bounding what the inherited ticket may do.
+The destination of a transition accepts that transition's own event as a no-op
+(`Outcome::Idempotent`), unless the table declares otherwise. Pass 4's must-fix was `jkb task start`
+refusing its own second run: not a verb that forgot a check, a machine rule that did not exist.
 
-The rewrite still goes out for every ticketed class, because that is how the ticket reaches `jkb`
-and it is a genuine per-tool-call secret: **each Bash tool call runs in its own PID namespace**
-(measured — from a second call, the first call's processes are invisible to `ps` and its
-`/proc/*/environ` unreadable). So the ticket cannot instead be left in a file for `jkb` to find: any
-Bash call could read that file, and an in-process subagent would be able to steal one minted for a
-different `agent_type` — which is exactly what the harness vouching exists to prevent, since
-ancestry cannot tell a subagent from its parent.
+Absorption is never applied to a row with a guard or a plan. The first rule absorbed any event whose
+destination you were already in, but arriving there another way leaves the plan unapplied: `abandon`
+on an operator-reopened task skipped its guard *and* its claim release, reported success, and the
+surviving claim held the task off every frontier. Correcting that silently turned five destinations
+into refusals, `land` on an already-landed task among them, which is the re-run guarantee lapsing,
+worse than one never claimed because the retry advice everywhere assumes it. `Unrepeatable` is the
+check that found it, and the pair of rules is: **a verb you run is always answerable at its own
+destination; an observation only where somebody wrote down what re-seeing it means.** That does not
+mean "make it a no-op": a domain that wants the second run to fail declares a self-loop whose guard
+denies, and gets a sentence and a remedy instead of a missing row. Two rows keep their guards on
+purpose (`abandon` from `open`, `observed_landed` from `done`): those verbs may still have work to do.
 
-**Measured on Claude Code 2.1.283, with the hook rebuilt from this change and re-pinned.** Two
-questions gated it, and until they were measured this paragraph said so rather than asserting
-either answer.
+### Applied versus reconciled events
 
-*`updatedInput` is applied with no `permissionDecision`.* `cd /tmp && ~/.cargo/bin/jkb role
-whoami` — a two-command list, deferred at the time, for which the hook then emitted no decision
-(a path to `jkb` was later asked, and is now deferred again; the mechanism measured holds) —
-arrived with `JKB_ATTEST` set, and the daemon answered `coordinator` rather than `Unauthorized`.
-The schema had marked the field optional, but that was read out of the installed bundle; this is
-the observation. Had it gone the other way, every deferred call would have lost its ticket.
+**Applied** events are somebody asking (`jkb task land`, `abandon`, the merge queue).
+**Reconciled** events are the world moving and the system detecting it (the work reached trunk, the
+holder no longer exists). A reconciled transition must be guarded, fires only through
+`Machine::reconcile(state, &C)`, and **refuses ambiguity**: if two are allowed at once, `reconcile`
+returns `Ambiguous` and does nothing rather than taking the first in declaration order. The
+reconciliation paths existed before (`close-merged`, `doctor --fix`, `review record`) but as
+commands, not a modelled kind, so nobody had asked whether two could fire on one task at once.
 
-*The over-prompting is gone for the shape that caused it.* In an interactive session, `cd /tmp &&
-jkb role whoami` ran with **no** permission prompt, where the old hook forced one. The open risk
-here had been that the rules match the rewritten command (`export JKB_ATTEST=…; cd … && jkb …`), in
-which case the `export` part would match no rule and prompt anyway. The deny-rule probe
-(`Bash(export:*)` in `permissions.deny`, then one deferred call) produced an approval prompt rather
-than a refusal, so the rules see the original text: a `Bash(jkb:*)` rule is matched against the
-text the model wrote. (That once mattered for locating `land` behind a prefix; the classifier no
-longer looks for `land` at all.)
+### The state is `items.status`, and nothing else
 
-A trap met while measuring, worth keeping: a probe that itself contains `$` — `echo
-${JKB_ATTEST:+present}` — was asked by design at the time, because a command the classifier cannot
-model could not be cleared of `land`. It looked like the fix failing and was the guard working.
-(It is now deferred: an unmodellable line is simply not approved.)
+The states are exactly `TaskStatus`: `open`, `in_progress`, `needs_review`, `done`, `cancelled`.
+`jkb_fsm::State` is implemented for `TaskStatus` itself in `jkb-types` (the orphan rule, and a
+parallel enum would be a fourth list over the same five strings); `staging::State` became a
+rendering of it. The richer set that folds in the claim (`Unstarted`, `Claimed`, `Implementing`) is
+wrong: claim and status were split precisely because "is anyone holding this" and "how far along is
+the work" are different questions (the agents-and-roles design). The claim is **context**, and a
+claim change is an **effect**. `blocked` stays derived and absent, and so do subtasks: both are
+properties of the graph, and a task's machine must not carry a state another task's status changes
+under it. Storing the machine's history as items and edges was rejected as scope.
 
-**Rollback**: `JKB_ATTEST_DECISION=ask` forces the prompt on every ticketed class
-with no rebuild — the hook binary is pinned and root-owned, so a rollback that needs one is not a
-rollback. It is read from the hook process's environment, and the hook is spawned by the harness,
-so on the host it goes in the environment Claude Code is started with; **inside the dev container
-the only place is `containerEnv` in `.container/container.json`, which is fixed at create, so it
-needs a recreate.** Worth knowing before the moment it is needed.
+### Events
 
-**Superseded: "no separators, pipes, redirects, substitutions or expansions", refused even inside
-quotes.** That rule was reversed by a measurement — it put a permission prompt on jkb's own
-quick-add syntax. `!p<n>`, `#<facet>=<value>` and `?` are spelled in the very characters it refused,
-so `jkb query 'status!=done'` and `jkb task add 'Fix it !p1 #area=hook'` were asked, and because a
-`PreToolUse` `ask` overrides an allow rule, anyone with `Bash(jkb:*)` newly saw a prompt on the most
-ordinary calls there are. The rule now turns on whether the shell would read a character as syntax:
+Applied: `start`, `submit_for_review`, `request_changes`, `land`, `abandon`, `cancel`, `reopen`,
+`override`. Reconciled: `set_from_file`, `observed_owner_gone`, `observed_landed`.
 
-- `$`, a backtick and a backslash keep a line from being approved **anywhere**, quoted or not
-  (they were "refused" when this was written; such a line is now deferred). They are what the word
-  reader cannot model — the first two substitute inside double quotes, the third escapes the quoting
-  itself — so with any of them present its output is not a model of anything.
-- Every other metacharacter matters only when it appears **bare**; inside either kind of quote the
-  shell passes it through as text. Bare, the separators `; & |` and a line break SPLIT the line into
-  commands, each judged on its own; `< > ( ) { } # * ? [ ]` leave nothing the classifier can model,
-  and `!` and a carriage return are read as word breaks — a line carrying any of these is not
-  approved (it was "refused" when this was written; it is now deferred).
-- A `~` is in neither list, because it has no quoted spelling that still expands. A word holding an
-  unquoted `~` anywhere is accepted only when it also carries a `/`, so that whatever the tilde
-  expands to, the `/` survives. "Anywhere" is load-bearing: bash expands a tilde after an
-  assignment's `=` and after a `:` in the value too, so `a=~` becomes `a=$HOME`.
+| event | from → to | fired by |
+| --- | --- | --- |
+| `start` | open → in_progress | `task work`, `task start`, `task claim` |
+| `submit_for_review` | in_progress → needs_review | `jkb task review record` |
+| `request_changes` | needs_review → in_progress | a review with open must-fix findings |
+| `land` | in_progress, needs_review → done | `jkb task land` |
+| `abandon` | in_progress, needs_review → open | `jkb task abandon` |
+| `cancel` | non-terminal → cancelled | `jkb task set --status cancelled`, sync `[-]` |
+| `reopen` | done, cancelled → open | `jkb task set --status open` |
+| `observed_landed` | in_progress, needs_review → done | `close-merged`, `jkb task landed` |
+| `observed_owner_gone` | self-loop | `task reclaim`, `doctor --fix` |
 
-Two measurements paid for that last clause, and both are the reason the property is stated as the
-command word rather than as PATH. **A word separator is a blank, not Unicode whitespace** — bash's
-lexer breaks a command line on space, tab and newline, and the caller's `IFS` does not change that
-(`IFS` splits the result of an expansion; measured on GNU bash, `IFS=x` still passes `axb` whole).
-While the reader split on `char::is_whitespace`, `jkb<NBSP>./x` read as the two words `jkb ./x` and
-was approved, while bash ran the single relative path `jkb<NBSP>./x` — a command word containing `/`
-is never searched on `PATH`, so a writable working directory was enough to run an arbitrary program.
-And **a bare tilde is an ordinary variable**: `~` is `$HOME`, `~+` is `$PWD`, `~-` is `$OLDPWD`, so
-under `HOME=land` a bare `~` expands to exactly `land`, which would have carried `task land` and its
-`--gate` past the hook. Note the residual: the hook checks the command *word*, so a `jkb` shell
-function or alias in the invoking shell still shadows the binary, and neither the hook nor its
-tests can see that.
-Only a ticketed call is released at `PostToolUse`, and every hook client carries the hooks'
-deadlines and down marker (`remote::client`). **The hooks run a pinned binary**,
-`/usr/local/lib/jkb-hook/jkb`, root-owned: they run outside the sandbox with the credential
-readable, and `~/.cargo/bin` is writable from inside it (measured). `pin-jkb-hook.sh` copies
-setup's build there through `sudo`, which a sandboxed command cannot use (measured:
-`NoNewPrivs: 1`, `sudo -n` exits 1). The residual: it pins whatever `~/.cargo/bin/jkb` is when it
-runs.
+`jkb task claim`, the verb the swarm runs on every task, wrote the claim directly until review
+found it: a choke point with a third door, so swarm work had no `start` entry at all and the two
+claim verbs answered `needs_review` oppositely. It now goes through `start`.
 
-**The host must not run container-written code (H5, H6).** Git on the host runs what a repository's
-own `.git/config` names, and the container writes that file. Three layers, measured on Docker
-Desktop 29.7.2 and git 2.51.1. **The audit is what holds; the binds are a speed bump.**
+### `set_status` is the `override` event, and a checkbox is `set_from_file`
 
-1. `run.sh` binds each repo's `.git/config` and `.git/hooks` read-only (a rename over the bind fails
-   with EBUSY). *Corrected by review round 1:* this does not make writes fail closed. `.git/` itself
-   is writable around the binds, so the container can rename `.git` away and put a writable copy in
-   its place, or plant `.git/commondir`, which redirects git's config **and hooks** to any directory
-   (measured: `rev-parse --git-common-dir` then answers the planted one). An empty directory there
-   is no defence either — git dies on it (measured). Submodule configs (`.git/modules/*/config`) are
-   not bound at all.
-2. Every jkb git call audits the repository **fresh, before every call**, runs hooks-off, and
-   **never enters a submodule**: `-c diff.ignoreSubmodules=dirty` and friends, and
-   `--ignore-submodules=dirty` on every `status` and `diff` — on the command line because a tracked
-   `.gitmodules` can set `submodule.<name>.ignore=none`, which outranks the `-c` (measured on git
-   2.51.1: a superproject `status` ran a filter planted in `.git/modules/sub/config`, and with the
-   option it did not, still reporting a moved submodule commit). `checkout` and `switch` run
-   `--quiet` too: their report of local changes enters every populated submodule, and a branch can
-   bring a submodule only the target tree's `.gitmodules` names (round 3, measured: the planted filter
-   ran on `checkout --detach` and `switch`, not with `--quiet`). And jkb's git runs **only** the
-   subcommands measured not to enter a submodule (`SAFE_SUBCOMMANDS`: `add -A`, `stash`,
-   `cherry-pick` and `diff-index` did), refused at runtime otherwise, so a new one arrives with its
-   own measurement. The cost: a submodule's uncommitted edits no longer make a checkout read dirty —
-   a graft carries only the submodule's commit anyway.
-   It judges every key of the repository's own config — local, worktree and included — against an
-   **allowlist** of repository-shape keys (`git config --list
-   --show-origin --show-scope` executes nothing; `-c core.fsmonitor=false -c core.hooksPath=/dev/null`
-   does *not* stop a planted filter, so the audit is what holds). It refuses a git directory that
-   takes its config and hooks from anywhere but its repository: a main repository's git directory is
-   its own common directory, a linked worktree's is `<common>/worktrees/<name>`, and a jkb session's
-   common directory is its repository's `.git` — or, for a repository nested in the session, one
-   of that repository's own submodules. The allowlist names keys, not sections: `core.worktree`
-   points checkout at any directory (`$HOME` included, measured) and
-   `status.showUntrackedFiles=no` hides what a landing left, so both are refused — except a
-   submodule git directory's own `core.worktree` landing inside its repository, which git writes.
-   Only the repository's own scopes are judged — `local`, `worktree`, and an `unknown` one whose file
-   lies in the repository. Apple's git reads an extra, Xcode-owned layer
-   (`/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig`, `credential.helper=osxkeychain`)
-   and lists it as `unknown` (measured on git 2.50.1, Apple Git-155): judged as the repository's, it
-   refused every repository on a Mac, found by the land gate's tests on the host before anything
-   landed. *Also corrected:* the audit was once per directory per process, so the reap service, one long
-   process, never re-read a config it had passed. *Superseded (round 2):* round 1 walked every file
-   named `config` under `.git/modules` in the blocking audit — which read loose refs as configs,
-   missed per-worktree `modules/` and redirected submodule `.git` files, and was fooled by symlinks.
-   jkb's git no longer reads a submodule at all, so what a submodule's git directory holds is the
-   reap scan's to report (below).
-3. The reap service runs the same check on every repo and session worktree each pass, plus what
-   only your git reaches — each submodule git directory's own config (real git directories only,
-   top-level `config` only, symlinks reported, `core.worktree` judged through symlinks) and each
-   submodule checkout's `.git` link — and posts a sticky notification. The only layer that covers
-   **your** git, run by hand. It follows what your git follows (round 4, measured on git 2.51.1): a
-   symlinked `.git` is reported, each submodule's own `.gitmodules` is read in turn to
-   `MAX_MODULE_DEPTH` (deeper is reported), and an un-absorbed git directory's own `modules/` is
-   walked. The `.gitmodules` it follows is hostile input (round 5): a path at or above its own
-   checkout is reported, not followed — `path = .` twenty times grew the scan as 20^depth — each
-   checkout is read once, and a `.git` file naming a git directory the walk does not reach
-   (`modules/<a>/<b>` under `modules/<a>`) has that directory judged directly. A `commondir` in a
-   submodule's git directory is reported, not read past (round 6, measured on git 2.51.1: a filter
-   planted in the directory it named ran on `git -C sub add`) — the same redirect `check_layout`
-   refuses for a repository jkb runs git in. So is any hook in a submodule git directory's own
-   `hooks/` but git's `*.sample` files (round 7: a planted `pre-commit` ran on `git -C sub commit`)
-   and those byte-identical to your `init.templateDir`'s, which git copied in — read from the
-   environment or the global or system config (`[include]`s followed, as git follows them), never the
-   repository's. Each template hook is judged where it really is, through every symlink: one that
-   resolves beside the repositories is the container's to write, so it does not vouch for a
-   submodule hook (rounds 9–10 — first the whole template was judged, which a single hook
-   symlinked into `~/repos` stepped around, and the standing finding it raised against every
-   repository hid any real one behind an unchanged summary). Such a hook's finding says it matches
-   your template and where that template really lies, so the fix reads as moving the template, not
-   deleting your hook (round 11); a `hooks/` the scan cannot
-   list is reported too, since git needs only to search it to run a hook by name (round 8).
-   **Not covered: the repository's own `.git/hooks`.** The container sees it read-only through the
-   bind; a container that replaced `.git` wholesale could plant a hook there that neither layer
-   reports, because nothing can tell a planted hook from one you or `setup.sh` installed when the
-   container writes both the hook and anything it could be compared with (round 8).
+`task::set_status` is not a hole beside the machine. An operator stating a status is `override`
+(applied, unguarded, since status and the land gate are not fused); a synced file's checkbox is
+`set_from_file` (reconciled, guarded on the task actually being backed by that file;
+`task::set_status_from_file`, used by `jkb-sync`). Both use `Dest::Stated`, and being rows they
+carry every transition's obligations, including the claim release a terminal status entails, which
+had been a hidden tail on one function that a second writer of the column silently skipped. Wiring
+the sync path exposed a latent ordering bug: `create_item` wrote a task's columns before its
+binding, so a new file-backed task's first status came from an authority the store could not yet
+see. The binding now goes first.
 
-And the land gate — the candidate's own code — runs in the container through `docker exec` (exit
-status and output measured intact), settled before the graft, for a repository under `~/repos`,
-decided on **canonical** paths: git reports a checkout by its physical path, so with `~/repos` a
-symlink the old textual prefix test never matched and every gate ran on the host. A landing checkout
-the container cannot see, of a repository it shares, is refused rather than run here.
-`--gate-on-host` is recorded.
+### `TaskFacts` is the only input to a guard
 
-**Scope is enforced in the callee, not only at the target.** A principal held to one task writes
-only that task, its subtasks and its findings. `Request::target` is **exhaustive, with no
-wildcard**: each op writes one named task, or writes nothing a scope protects (its callee holds it —
-filing, recording, revoking, attesting), or writes **shared** state — a namespace, a lease, a
-worktree removal, an item outside the task tree — which a scoped principal is refused. *Superseded:*
-a `_ => None` arm admitted `removal.add` naming another task's worktree and `lease.take` displacing
-the merge queue as unscoped (round 1). A scoped caller adds tasks only `--under` its task, and places
-tasks (`task.add`'s home and mirrors, `task.place`) only where its task itself is placed — and
-never at or under a filed or recorded review namespace, even when its task is a finding placed
-there (round 3); a subtask added under a finding falls back to the caller's own task's home. `review::record` credits only in-scope tasks for a scoped caller. An attested
-subagent binds to its task on its first task-targeted write, or explicitly with `jkb role bind
-<uid>` — a binding its first op made is undone if that op then fails, and one subagent's calls are
-serialized from admission to that undo, so it never undoes a binding a concurrent call of its own
-relied on — and a reviewer must be bound before it records or files a review. `--no-review` asks who the client is before anything moves, whatever
-credential it presents.
+Every outside-world field is a `Fact`: whether the claimant is alive, a branch is recorded and
+resolves, a session checkout exists, it is dirty, it has commits the target lacks, the target
+checkout is ready, a review is recorded and clean or waived, a subtask is open, the work landed.
+`task::observe` gathers the database facts; the CLI gathers the git and review facts. Filling the
+struct is where the git reads live, and the machine performs none, which keeps `jkb-core` free of
+git and the *rules* testable without a repository (the same rules had been exercisable only by
+string-matching `assert_cmd` output against a scratch checkout).
 
-**So does the Land permission itself.** It used to be asked first by `task.land` — the record,
-the last step of `jkb task land` — so a caller the strategy does not let land got its branch
-grafted onto the target, its gate run (a caller-supplied `sh -c`) and its session archived, and was
-refused only the record: landed in git, not in jkb. Measured, not inferred: with the new check
-removed, the regression test's target moves and its worktree is archived. Who could reach it is
-narrower than first reported — a task-scoped grant is refused the repo's land lease (`lease.take`
-writes state no one task owns) before the graft — but an unscoped caller who may not land reaches
-it, and under the default `design-reviewed` that is the coordinator, the role a main session is
-attested as. `task.land_check` now asks it as soon as the branch, target and
-head are known, before the review gate, the graft and the gate. It carries the same payload as
-`task.land` and is answered by the same `authorize`, so there is one rule rather than a copy, and a
-merge queue re-landing a branch its live landing already records is admitted here exactly as it is
-there. Pinned by `a_caller_who_may_not_land_is_refused_before_the_target_moves`, which makes the task
-otherwise landable — a clean review round, no gate — because without that the review gate refuses
-first, before the graft, under the old code too, and the test would pass for the wrong reason.
-**Deploy order:** `task.land_check` is a new op, so a container client is ahead of a host
-`jkb serve` that has not been rebuilt, and that daemon answers it `bad_request` — "unknown variant".
-It fails closed, but no `jkb task land` works until `./scripts/setup.sh` runs on the host. `op_error`
-reports exactly that rather than the old daemon's list of every op it knows, for any op a stale
-daemon lacks, keyed on the op actually sent (serde words an unknown value inside a request the same
-way). Update the host before, or with, the container.
+### The regression set and the generated audit
 
-**Swarm landings follow the task's strategy.** `scripts/merge-queue.sh` records a landing with
-`jkb task landed`, and under the default `design-reviewed` only the operator lands — so a batch
-the swarm lands on its own runs under a strategy whose `lands` toggle includes the coordinator
-(`jkb workflow set <uid> autonomous`, or a defined one), or the operator lands it.
+`tests.rs` runs `check()` clean and `audit()` over a generated matrix (11 three-valued facts, 5
+statuses, 3 claim shapes, walked as a base-3 counter on a coprime stride), plus one test per real
+must-fix from the corpus: `apply(done, abandon)` is refused with remedy `reopen`; `apply(in_progress,
+start)` is idempotent; `land`'s plan is one vector applied last; a zero-commit branch cannot read
+as landed; every produced remedy is accepted where produced; no context leaves a non-settled state
+accepting nothing; an `Unknown` review does not pass the gate; one `land` guard serves both callers;
+two simultaneous reconciliations are `Ambiguous`. If a guard cannot express one of these, the model
+is wrong.
 
-**The swarm closes a task only by landing it.** The swarm's merge queue closes a landed group
-itself (`jkb task landed`, `observed_landed`). Behind it the workflow ran a second, `haiku`-model
-agent told to "mark every task in the group done" with a free `jkb task set --status done`.
-Measured on 2026-10-08, twice in one chain: each time that agent ran after the queue had already
-closed its group, and it set the NEXT task `done` (`open -> done`, an `override`, 42 s and 75 s
-after the landing). The swarm then started that task's dependents on work that did not exist. A
-later implementer caught the second one only because a note on its task told it to stop and say
-`BLOCKED:`. The step after a landing now only *checks* the group's tasks (`unclosedTasks`,
-pinned by `dev-scripts.test.sh` case12). It reports the ones that did not close as a stall, with
-the remedy, and never closes anything. Under the default `design-reviewed` strategy, where only
-the operator lands, that is every group: the queue's `jkb task landed` is refused and only prints
-a note. The old agent's `task set --status done` had been quietly closing them past that rule.
+### What review caught that the machine's own checks did not
 
-*Rejected for now, with the reason:* a guard in `rbac::authorize` refusing a non-operator
-`task.set --status done` on an `open` task, so that no prompt could reintroduce this. Built, then
-dropped after review round 3. It cannot tell a swarm agent closing an untouched task from
-`/next-task` closing the task it just worked: both are a coordinator's `open -> done`, because
-`/next-task` never claims its task. Making `/next-task` claim first drew a must-fix of its own
-in each of the next two rounds (a release matching a per-process owner, no reopen on give-back,
-a `[~]` checkbox the close step no longer matches). So nothing in jkb yet stops a non-operator
-closing an unstarted task. The swarm simply no longer asks one to. The guard is a design task,
-`task:guard-in-jkb-against-a-non-opera-18dc8d24f389a8d8`: tie a `done` to whoever claimed or started the task.
+The change was reviewed in three ranges (about 18 agents): 36 findings, 8 must-fix, all fixed.
+Recorded because the pattern repeats. The absorption bug above. Two tests that could not fail: one
+asserted `stdout contains uid` where the failure path prints the uid too, one asserted a defect
+structurally unreachable for its machine; both are why `jkb task landed` never credited a swarm
+group for a whole branch. A guard that only reports is not a guard: the open-subtasks rule sat in
+`land`'s plan. `pid_exists` folded "`ps` would not spawn" into "that process is gone", in the probe
+that protects every claim. And `jkb task claim` as a third door.
 
-**Rejected, and why.**
+### Cost, and why the library is worth one user
 
-- *A role header beside the root bearer* (first draft): omitting it made the caller the operator.
-- *Workers as separate `claude -p` processes* (second draft): attestation holds in-process
-  subagents to their role without restructuring the swarm.
-- *A single-use ticket that expires in seconds*: breaks multi-op commands; bound to its tool
-  call's lifetime instead.
-- *Protecting the review facets with a check in `task.tag`*: sync, quick-add and MCP write tags
-  too — H3 at one door of four.
-- *A per-daemon-start container credential*: kills in-flight workers on every `setup.sh`;
-  `setup.sh` passes `--keep-live` instead.
-- *Phases folded into `TaskStatus`*: the status is the claim/land axis every frontier and synced
-  checkbox reads; the workflow is a second axis over it.
+`jkb-fsm` was new code with one caller, and a library justified by one user is usually a premature
+abstraction. What answers it is that the *checks*, not the abstraction, are the deliverable, and they
+cannot be written against a hand-rolled `match`: a `match` has no table to walk, no place to hang a
+remedy validation, and no way to be audited over a context matrix. 44 review passes was the price of
+not having them. The second and third machines below are the evidence that it generalizes.
 
-**Not protected, stated.** Agents on the host run as the operator. A genuine worker told to lie by
-a hostile coordinator (a real reviewer filing a clean review on instruction) — mitigated by
-operator-owned agent definitions, rounds recording the attested reviewer, and landing staying the
-operator's under the default strategy. Git run *by hand* in a repository planted between reap
-passes. The hooks' binary as it was when last pinned. `/task-swarm`'s workflow agents hold no role until its script passes `agentType` (its
-`.claude/workflows` file was read-only to the session that built this); until then
-`jkb role map workflow-subagent coordinator` is the explicit, visible way to keep it working with
-worker isolation off.
+### The second machine: the sync journal
+
+`jkb-sync/src/lifecycle.rs` declares the per-file journal on the same library: `FileState`
+(`Untracked`, `Settled`, `Conflicted`, `Quarantined`, `Blocked`), ten events, **all** reconciled,
+since a file has no applied events. It is a reconciler, not a lifecycle: nothing finishes, and the
+question is never *what may I do next* but *which condition applies to what I just saw*. `Policy` is
+a plain enum, not a `Fact`: stored configuration is never unestablished, and spelling it
+three-valued would make the discipline decorative. The guards are a **partition** of the observation
+space rather than ordered arms, so two that both apply are `Ambiguous`, which is the file-sync
+design's "a route is not a cause; the condition must dominate every arm" stated as a rule.
+`lifecycle::status_for` is now the one writer of `sync_state.status`, replacing four hand-written
+spellings; deleting a table row made `malformed_file_is_quarantined_then_recovers` fail. Audited
+over 7,488 **modelled** observations, derived from what a pass really varies.
+
+It moved the library three times. `is_terminal` became `is_settled`: a synced file settles and is
+edited again, and under the old name the machine either had no terminal state (making `Wedged`
+vacuous) or lied about one. `State::awaits_input` (default `false`): a conflicted file waits on a
+person, and without it `DeadEnd` fired on every such observation and would have trained its reader
+to ignore the check. And the initial state may be at rest. The modelling found that
+`needs_attention` is two states (a quarantine wants the file fixed, a blocked write the store), now
+separated in the model and collapsed only at the column boundary; and that a flag whose cause has
+gone is not always cleared (an import-only mount with a store-side-only change writes no row),
+modelled faithfully, filed, not fixed.
+
+### The third machine: investigation units, with strategy-supplied rules
+
+`jkb-core/src/nstype/lifecycle.rs` declares `items.resolution` as **two tables over one state set**
+(`BASE` and `DEBUGGING`), the axis neither earlier machine had. `debugging` differs twice, and both
+differences already existed only in the shape of a function: a settled result can go **stale** and
+return to the frontier, and a tombstone is **not** revived by fresh evidence, where the base
+table's is (that asymmetry is modelled as found, `default_rollup` lacking an early return, and filed
+for a design pass). The strategy supplies the facts, the machine the rules: `resolution_rollup`,
+which returned a *conclusion* and encoded the priority of contradictory evidence in the order of its
+`if`s, became `unit_facts`, and `investigation::roll_up` drives `machine.reconcile`, so the rules
+have one derivation. As guard clauses the priority is arguable and `audit` proves it exclusive.
+Both tables are audited over the whole 5 × 3⁴ space, each strategy difference asserted in both
+directions. `Resolution::Unresolved` declares `awaits_input`: evidence arrives from outside, unlike a
+task's `open`, which always has `cancel`. `UnusedEvent` became a per-machine statement, filtered
+only where another machine in the family declares the event, with the union asserted separately.
+The machine's semantics are the namespaces design.
+
+### What the checks cannot do, stated
+
+`DeadEnd` is a lifecycle check: both reconcilers mark the states it would fire on `awaits_input`, so
+for them it is vacuous and `Wedged` does the work; it remains a regression guard for the task
+machine, where an operator escape always exists. The remedy check caught one bad remedy in **each**
+of the three machines, every time the same mistake, a remedy named from the *reader's* point of view
+rather than the machine's: `land` from `needs_review` offering `start`; `adopted` from `untracked`
+offering `exported`, which was not declared there and whose premise was false anyway; `confirmed`
+refused for staleness offering `went_stale`, which only `debugging`'s table has. Twice the bad remedy
+was the symptom of a bad rule underneath, the more useful half.
+
+## The transition log
+
+### `task_transitions` is append-only, and makes no claim about the present
+
+`V015__task_transitions.sql` is an append-only history: one row per transition, with the actor and
+the evidence each guard fired on, indexed by item and by branch, `ON DELETE CASCADE`. Two facts
+outlive git's memory, where a branch landed and that it landed, and an append-only history makes no
+claim about the present, so there is nothing to reconcile: a branch name that changes hands appends
+a row rather than corrupting one, and superseding stops being an operation. `transition::note`
+records a fact that is not a transition (learning a pull request number), spelled `note` in the
+`event` column. Reads: `history`, `latest_with_branch`, `land_target`, `landed`, `pull_request`.
+
+It is deliberately **not** changelogged (the `blobs` precedent): it *is* an audit record, and a
+transition later reverted by `jkb undo` stays, which is the honest reading of a history.
+
+### Branch names are labels on events
+
+`land_target` is the last `onto` recorded, reset by an `abandon`, because where work lands is a
+property of the session doing it. Two tasks told different targets are two entries with timestamps,
+not one row keeping whichever wrote last.
+
+### `jkb task why` prints the history
+
+`jkb task why <uid>` prints every transition, who applied it, and the evidence each guard fired on.
+Fourteen must-fixes were "held for ever with no way to see why"; that is now one command.
+
+### Evidence of a landing is spent once the task is put back to work
+
+The log removed reconciliation from **writing** and moved it to **reading**. Every caller asks a
+present-tense question (*has this landed?*, *where does it land?*), and turning a history into one
+needs a rule for when an older row stops counting. Each reader wrote its own, and they disagreed:
+`land_target` stopped at `abandon`, `landed` stopped at nothing. Five findings across two rounds were
+that one gap.
+
+The rule is asked of the status **order**, not a list of events. `transition::resumed` is the one
+statement: the newest row that moved the task **backwards** through `open -> in_progress ->
+needs_review -> done` (`TaskStatus::stage`). Giving `landed` its sibling's stop-list would be a
+fourth private rule for a fifth reader to get wrong, and one each new event would have to be
+*remembered* into; every row already records where it moved the task. It took two goes: the first,
+*moved out of a terminal status*, answered the reopened-task case and missed that **`abandon` is
+`in_progress -> open`**, neither side terminal, so a landing recorded while an open subtask held the
+task survived the abandon that destroyed its session, and the task auto-closed over live work.
+Asking the order covers both, plus `request_changes` and a resume out of `needs_review`.
+
+### Nothing that stands still is a resumption
+
+A row recording a held landing (`in_progress -> in_progress`) would otherwise supersede **itself**
+and freeze its own task for ever. Found by running it.
+
+### `jkb undo` appends an `undo` transition
+
+`jkb undo` restores `items.status` from the changelog, and the log is not changelogged, so undoing a
+close left the landing looking live and the next `git pull` closed the task again, a loop undo could
+not break. It now appends an `undo` transition, from the statuses observed either side of the
+inversion rather than what the entry claimed, and **only for a task that still exists**: inverting
+an insert deletes the item, and the history's foreign key failed the whole undo.
+
+### A superseded landing is context, never a verdict
+
+Getting this wrong in both directions took two rounds. Spelling "spent" and "never landed" the same
+way sent `close-merged` to ask GitHub about a pull request a locally-grafted branch never had, and
+reported that as the reason. Then treating "spent" as *the* answer left a task whose work was redone
+and merged as a pull request permanently unclosable, printing *it will close when the new work
+lands* after it had. A stale local graft says nothing about whether the work reached its destination
+another way, so it falls through to the other evidence and only colours the reason when that proves
+nothing either. `Landing` carries the landing, the resumption and the pull request number from one
+read; they had been fetched separately, three history scans per task per pull.
+
+### A review asks the present tense first
+
+`live()` credits; a task still aiming at this branch is *reported*, never credited, whatever it
+grafted before; and only a task aiming nowhere falls through to `recorded()`. That last case is what
+`abandon` leaves (it retires the land target), and a graft does not un-happen, so a session abandoned
+after its work reached the branch is covered. Asking `recorded()` first credited a task that landed,
+was reopened for a must-fix and had its fix committed in a session the branch had never seen:
+recording that a review read work it did not read, and moving the task to `needs_review` under a live
+session. Asking `live()` alone dropped the abandoned case into `Credit::Unrelated`, which the loop
+discards; the discard stays, since the loop walks every task in the repo. Refusing the credit does
+not stop unreviewed landings in general (the gate does not enforce staleness, on purpose); it stops
+one only where the task had never been reviewed.
+
+### The order is pinned where it is declared
+
+All twenty-five status pairs plus the `None` and garbage cases. It had been rewritten twice, checked
+only through `close-merged`'s behaviour, and the one arguable rank (whether `cancelled` shares
+`done`'s) is exactly the edit a later reader would make. The rule reaches the pull-request path too
+(`pr::spent`), where it matters most: a merge reads `MERGED` for ever, so reopening a landed task and
+pulling closed it again, unattended, from the `post-merge` hook, over every task at once. That half
+predated the recorded-landing path.
+
+## Claims
+
+### An owner id is a type
+
+`jkb_types::AgentId` replaced `split(':').nth(1)`: `Process { host, pid, run }`, `Session { pid,
+worktree }`, `Agent { id }` and `Unrecognized`, round-tripping every stored value. `Agent` is an
+externally-minted identity from `JKB_AGENT_ID`, for a caller whose process and checkout are not the
+thing that persists (a subagent, a resumed session, a cloud run); `owner::preferred_owner` prefers
+it, so a subagent's claim outlives the process that took it. Each variant declares what would prove
+it through `Liveness` (`Process`, `Worktree`, `External`), a closed enum, so a new shape cannot be
+added without the compiler demanding a probe.
+
+### `is_alive` returns `Fact`, and `Unknown` is not dead
+
+`Process` is `Yes` or `No` from `ps -p`; `Session` from whether the worktree exists; `Agent` is always
+`Unknown`, since nothing local can know; an unreadable id is `Unknown`. Every takeover site refuses
+unless the holder is **proven** gone. `jkb doctor` and `jkb task reclaim` probe each owner where they
+run (`crates/jkb-cli/src/doctor.rs`, `probe`) and send only owners proven gone to `task.reclaim`; the
+rest form the `unverifiable` bucket they report and never clear (`jkb task reclaim --force` is the
+explicit escape). This was a behaviour change: the old predicate treated an unreadable owner as
+reclaimable so a malformed claim could never wedge a task, which silently freed live agents' tasks.
+Wedging is now checkable and the escape explicit; of the two ways to be wrong, the one that costs a
+command wins.
+
+The old objection to session ids answered a different question: whether jkb could go and *ask* an
+agent something. A claim needs only a value stable for the life of the work. There is still no TTL
+and no heartbeat.
+
+### Reclaiming is a lifecycle transition
+
+`reclaim_dead` moved from `claim.rs` into the transition seam as `observed_owner_gone`, an
+effect-only self-loop, so a reclaim appears in the task's history and obeys the same evidence rule;
+it writes only the claim columns, so it can never clash with a status transition. Its effect is
+`ReclaimFrom(agent)`, distinct from `ReleaseClaim`, because the audit trail distinguishes the holder
+letting go from somebody else deciding it had. It returns `Reclaimed { cleared, unverifiable }`.
+
+## History
+
+Superseded and reversed decisions, with what replaced them and why. The largest is the branch-record
+table, whose design ran to more than a thousand lines and five audits; it is compressed here to its
+lesson.
+
+### Containment as `placements.parent_item_id`
+
+Containment was first simulated at read time, placing a child in its container's namespace and
+hiding it again on the way out. It was then stored as `placements.parent_item_id` (migration `V009`,
+`ON DELETE SET NULL` so deleting a container returned children to the namespace), which made listing
+one query over one table. Replaced by the `containment` table keyed on the child, because an item
+has several placements, so the parent was stored once per placement: one fact, N rows, free to
+disagree, with `subtasks()` needing `SELECT DISTINCT` to paper over it. The justification for
+per-placement containment (the mirror index should list subtasks flat) turned out to be invented.
+
+### Merge detection by asking whether a branch adds anything
+
+A task closed when its `branch=` named a branch merged into trunk. Ancestry is wrong for two of
+GitHub's three strategies; measured on a scratch repo exercising all three:
+
+| method | merge commit | squash | rebase | unmerged |
+| --- | --- | --- | --- | --- |
+| `git merge-base --is-ancestor` | yes | **no** | yes | no |
+| `git cherry` (patch-id) | yes | **no** | yes | no |
+| `git merge-tree --write-tree` | yes | **yes** | yes | no |
+
+So `gitrepo::is_merged` asked instead whether re-merging the branch produced trunk's own tree
+(`merge-tree --write-tree trunk branch == trunk^{tree}`), on git 2.38 or later, falling back to
+`--is-ancestor` and saying so. It could not tell a branch squashed away from one just created, nor
+a rebase-merged branch (GitHub fast-forwards, leaving it byte-identical to trunk) from a fresh one,
+which forced a recorded cut point per branch and everything below. Replaced by recorded landings
+and the pull request lookup; `is_merged`, `MergeState`, `merge_base`, `has_own_commits`,
+`is_ancestor` and `supports_merge_tree` were deleted.
+
+### Cut points, land targets and landings as facets, then as `branch_records`
+
+"Branch X was cut from Y", "X lands on Y" and "jkb merged X into Y" were stored as tag applications
+(`base=<branch>:<sha>`, `onto=`) on whichever tasks named the branch. Tag applications are
+item-keyed, multi-valued, untyped and writable from any route, and each property produced its own
+defect family across fifteen review passes (47 storage findings, 100 in the wider cluster, 20
+must-fix): the encoding leaked to about 12 sites; the documented repair `jkb task tag set base=`
+deleted other branches' records; `HEAD` and 40-hex non-commits were stored; and five write routes
+were found one at a time, the fifth after a reserved-facet guard was added for the other four, with
+the guard's own asymmetry a must-fix. Six ascending choke points did not close it.
+
+The response applied the rule other clusters had converged on (vector id reuse, the sync document
+structure): **prefer an invariant the schema enforces over one every caller must uphold.**
+`branch_records` (`V013`, `jkb_core::branch`), keyed `(repo, branch)`, with CHECKs on the cut point's
+form and on paired columns. `branch=` deliberately did not move (its defects were choice rules);
+`onto=` did, to `land_target`; existing `base=` and `onto=` values were deleted, not back-filled,
+since back-filling imports exactly the values proven unreliable. The staleness rule (a name outlives
+the branch that held it) became the `WHERE` of one `INSERT … ON CONFLICT DO UPDATE` rather than a
+forget-then-insert sequence. Because three states (rebase-merged externally, merge-commit-merged
+externally, a recycled name) present one identical git signature, and the first must close while the
+last must not, an **instance anchor** was added: the branch's creation reflog entry, `(anchor_sha,
+anchor_ts)`, verified on git 2.50 as written once per instance and forged by no verb, with exact-ref
+`gc.refs/heads/<branch>.reflogExpire = never` retention. `landed_head` stopped a landing event
+re-creating the staleness one column over. The audits predicted the table would remove about 10 of
+20 must-fixes and cost 2 or 3 of its own.
+
+Replaced whole by the transition log and the pull request lookup (`V016` drops the table and
+migrates nothing, for `V013`'s reason). The diagnosis survives: an item-keyed, multi-valued,
+untyped, open-write store cannot hold a per-branch fact, and a schema invariant beats a choke point.
+The state machine applied it one level further, to the question the table existed to answer: keyed
+by a name, the record still had to be kept in agreement with a moving world, and every column added
+after a defect (the supersede clause, `landed_head`, the anchor, `--forget`) existed for that
+reconciliation. An append-only history and a never-reused pull request number leave nothing to
+reconcile. Deleted with it: `jkb-cli/src/base.rs` (932 lines), `jkb_core::branch` (974), the reflog
+plumbing, `repo::landed_for_action`, `credited`, `clear_land_targets`, `measure_root_for`, `jkb task
+base`, and about 35 tests that pinned mechanics rather than rules (five were rewritten where the rule
+survived). `V013` and `V012` had locked older binaries out of `~/.jkb/jkb.db`, accepted at the time.
+
+### A merge-queue verb that refused unless the branch tip was an ancestor of the target
+
+The queue's landing verb was specified to refuse unless the branch's tip was an ancestor of the
+target, so it could not fabricate a landing. The queue rebases a **detached** HEAD and never moves
+the branch ref, so after the first entry every branch's commits are rewritten and the check would
+have refused every entry but the first, the case a serial queue exists for. Replaced by asking the
+content question readers asked. A related lesson: recording a cut point for a batch at the moment of
+a landing is wrong, because a landing is exactly when the target stops being provably untouched;
+measuring there stored the tip and froze the whole batch.
+
+### A hand-repair verb that accepted a commit id
+
+`jkb task base <uid> <branch> <sha>` produced three findings across three passes, all one shape: the
+sha nearest a user's hand is the branch tip, and a cut point equal to the tip froze the task with no
+repair path. Each was fixed by rewording a message. Replaced by `jkb task base --forget <branch>`
+(dropping the cut point, not the row, so the task stayed in `staging ls`), then deleted with the
+table. The general rule it taught is the refusal-names-an-event rule of the state machine.
+
+### Refs and git hooks as stores of branch facts
+
+A git ref per branch (`refs/jkb/base/<branch>`) was rejected and stays rejected: jkb runs inside
+other people's professional repositories and must not decorate them with refs, notes or tags the
+user never asked for. A `reference-transaction` hook calling `forget` was rejected on four grounds
+verified on git 2.50: a repo-local `core.hooksPath` (husky's standard install) silently masks the
+global hook; a missed firing loses the event permanently; libgit2 and JGit tools bypass CLI hooks;
+and a pruned-then-repushed `origin/<branch>` arrives as a creation. A git shim blocking deletion was
+rejected as silently evadable. A `.git/config` instance witness (`branch.<name>.<key>`, which
+`branch -m` moves, `branch -D` removes, a recreated branch lacks, and `branch -f` keeps; local and
+unpushed like `.git/info/exclude`) was verified and judged better than the reflog anchor on four
+counts, but not built, since with the cut point gone there is no per-branch record to protect.
+Recorded so none is re-proposed.
+
+### Review facts as tags
+
+`reviewed=<sha>`, `review=<ns>` and `review-waived=<sha>` were facets on the task, written with
+`set_facet`. A tag is content any writer may set, the sync engine included, so a `tasks.md` line
+edited in the dev container to carry `#review-waived=x` waived the gate. A reserved facet was not the
+answer (the branch-record episode had six choke points fail). Replaced by an append-only `reviews`
+table that the gate alone reads; the migration and the round rules are the agents-and-roles design.
+Likewise `landed` now reads the landing transition, never `status = done`, which a synced checkbox
+can write.
+
+### Staging state from `is_merged`
+
+`staging ls` derived `merged` and a task's `landed` state from `gitrepo::is_merged` against trunk,
+and its staging set from `onto=` facets, then from `branch_records.land_target`. Replaced by batches
+from the transition log and spent-ness from task status, when the inference was deleted.
+
+### The `land.lock` pid file
+
+Landing was serialized by `.jkb/land.lock` holding the holder's pid, a lock whose pid was gone being
+stale and taken over. Replaced by a database lease (the daemon-and-messaging design), which the host
+and the dev container can both see.
+
+### Absolute session owners
+
+The session owner was `session:<pid>:<abs-worktree-path>`, with `owner_pid` reading field 1 so every
+existing probe parsed it unchanged. Replaced by the home-relative form with the opener, because the
+host and the dev container mount `~/repos` under different homes and each answered `Unknown` about
+the other's sessions. Old absolute owners still parse.
+
+### An attended/unattended axis
+
+A flag built on the session owner's pid reported *every* session as unattended, including the one
+being sat in, and advised abandoning it. Removed: nothing observable distinguishes a session being
+worked from one walked away from, so the honest report is the observable facts, uncommitted work and
+commits ahead. A real attendance signal would need a process living as long as the session (the
+terminal `exec`ing the agent), a separate change rather than a flag.
+
+### Unreadable owners reclaimed automatically
+
+Claim liveness was a `bool`, and an owner id that could not be parsed was treated as reclaimable, so
+a malformed claim could never wedge a task. Replaced by `Fact`-valued liveness, where `Unknown` is
+reported and cleared only with `--force`: an automatic sweep that frees a live agent's task is a
+silent wrong action, and a reported hold is a visible one. `pid_exists` had also spelled "`ps` would
+not spawn" as "gone".
+
+### The changelog and undo findings met along the way
+
+Rounds 4 to 8 of the branch-record work produced a must-fix family in the changelog and `jkb undo`:
+a typed entity with an untyped op, upserts logged as `insert`, `undo_last` skipping what it could not
+invert and reverting an unrelated older transaction instead, and inverses that failed only at apply
+time. Its resolution (ops derived, never chosen; undo refuses rather than retargets; any apply-time
+error becomes a named refusal) belongs to the foundation design, which records it.

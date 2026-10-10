@@ -72,7 +72,7 @@ implementation checklist and the **source of truth for what's done**.
   `render(&SyncDoc) -> bytes` (`SyncDoc { sections, items, edges }`), split into
   `serializers/{mod,document,tasks}.rs`. Ships the **`tasks` serializer** (one `tasks.md`
   ⇄ many `kind='task'` items): `##` headers → namespaces, prose/legend → `SyncProse` blocks
-  stored as namespace `metadata.prose` (**never items** — see [docs/namespaces-and-sync.md](docs/namespaces-and-sync.md)),
+  stored as namespace `metadata.prose` (**never items** — see [docs/file-sync.md](docs/file-sync.md)),
   checkbox status (`[ ]/[x]/[~]/[-]`), quick-add modifiers (`!p @ #f=v +ns`), `needs:^id`
   → `depends_on`, indentation → `parent_of`, and a **visible trailing `^id`** stable
   identity (minted deterministically when absent; write-back stamps it). The engine
@@ -84,7 +84,7 @@ implementation checklist and the **source of truth for what's done**.
   `document` path and its tests are unchanged (one mechanical test rename). See
   `openspec/changes/jkb-v2-file-sync/`.
 - Remaining work is the explicitly-deferred items in
-  [docs/subsystems.md](docs/subsystems.md), not a numbered section.
+  [docs/foundation.md](docs/foundation.md), not a numbered section.
 - **Workspace `unsafe_code` is now `deny` (was `forbid`)** so `vector.rs` can carry
   one commented `#[allow(unsafe_code)]` for the `sqlite-vec` FFI registration; every
   other crate is still unsafe-free.
@@ -92,7 +92,7 @@ implementation checklist and the **source of truth for what's done**.
   (closure error type `E: From<jkb_core::Error>`) so `jkb-ingest` can `?` across
   `jkb_core` + `jkb_index` errors inside one transaction. `rusqlite` is now a single
   `[workspace.dependencies]` pin (all crates use `{ workspace = true }`).
-- **Next (deferred, not a section; full detail in [docs/subsystems.md](docs/subsystems.md)):** the per-file serializer override
+- **Next (deferred, not a section; full detail in [docs/foundation.md](docs/foundation.md)):** the per-file serializer override
   (`bindings.serializer`) is now **wired** (Section 15 reads it in `engine::resolve_serializer`);
   still deferred are the `spec` serializer (OpenSpec `spec.md` ⇄ requirement items),
   remote *bindings* (`https://`/`git://`), and an optional MCP `sync_status` tool. Live
@@ -102,7 +102,7 @@ implementation checklist and the **source of truth for what's done**.
   (`jkb-core/src/claim.rs`, migration `V005`), the full CLI mutate surface + `doctor`/`task`
   reclaim, the no-raw-sqlite hook, the four-state lifecycle (`needs_review` no longer
   unblocks), and the SCHEDULER-groups + REVIEWER + deterministic-merge-queue swarm pipeline.
-  See `openspec/changes/jkb-fleet-hardening/` and [docs/subsystems.md](docs/subsystems.md).
+  See `openspec/changes/jkb-fleet-hardening/` and [docs/foundation.md](docs/foundation.md).
 - **Roles, RBAC and task workflows (D52) — built on `task/rbac-and-task-transitions`.** New crate
   `jkb-rbac` (RBAC as checkable tables); `jkb-core` `roles.rs` (roles, hashed grant tokens, the
   agent-type map), `workflow/` (one phase set, graphs as `jkb-fsm` tables; a strategy = graph +
@@ -275,17 +275,24 @@ rest of the project's decision record lives beside it and is read **on demand** 
 whose subject you are about to touch. Each is written the same way: what was decided, what it
 cost to learn, and which alternatives were rejected and why.
 
+These nine files are **generated from jkb designs** (`designs/jkb`, shown in Code Factory's Design
+tab): each starts with a header naming its design, and holds only that design's approved text. **Edit
+the design, never the file** — `jkb design edit`, approval, then `jkb design export --all` — and
+`jkb design export --check` (in `check.sh` and CI) fails on a hand-edited file. The designs carry no
+D-numbers, so a `D<N>` cited in code is a pointer into the retired openspec record (still on disk
+under `openspec/changes/`), not into these files.
+
 | Read this | Before you touch | Why it exists |
 |---|---|---|
-| [docs/git-hooks-installer.md](docs/git-hooks-installer.md) | `scripts/lib.sh`, `scripts/setup.sh`, `scripts/hooks/post-merge`, `scripts/tests/*.test.sh`, and the repository-selection scrub in `gitrepo.rs`/`pr.rs`/`session.rs` | The longest defect cluster in the repo. Seventeen review rounds on one installer, and nearly every lesson generalizes. |
-| [docs/task-lifecycle.md](docs/task-lifecycle.md) | `jkb task *`, `jkb staging *`, `jkb role *`, `jkb workflow *`, `jkb attest`, `crates/jkb-fsm`, `crates/jkb-rbac`, `crates/jkb-core/src/{roles,reviews}.rs`, `crates/jkb-core/src/workflow/`, `crates/jkb-api/src/rbac.rs`, `crates/jkb-cli/src/{gitrepo,git_audit,session,repo,archive,pr,rbac_cli}.rs`, `scripts/merge-queue.sh` | Subtasks and containment (D34/D35), per-task worktrees (D36), the checkable state machine and transition log (D48), review-gated landing (D38), the design gate (D28), roles, RBAC, task workflows and harness attestation (D52). |
-| [docs/sandbox-and-container.md](docs/sandbox-and-container.md) | `scripts/auto-mode*`, and the boundary questions about `.container/` | The unattended-agent boundary (D48) and the container nested inside it (D49), plus the egress firewall and its verdict (D50/D51). The container's OWN internals — what each layer is for, the measurements under them, the mount list, how to run and verify it — are in [.container/README.md](.container/README.md), and that is the file which grows when `.container/` changes. |
-| [docs/namespaces-and-sync.md](docs/namespaces-and-sync.md) | `jkb-sync`, `jkb-core`'s namespace/item/undo code | The namespace layout (D32), typed namespaces (D33), investigations (Dmem), and the file-sync data-loss cluster (D45/D39/D40/D42/D47). |
-| [docs/subsystems.md](docs/subsystems.md) | a crate you need to orient in | What each finished subsystem is and how it is put together. Reference, not live decisions — so it is the *last* row to check, never the first: if another row names your file, that row governs. |
-| [docs/ui-and-review.md](docs/ui-and-review.md) | `ui/`, `.claude/workflows/code-review.js` | The explorer is a CLI client, never a bespoke backend (D31); our reviewer returns structured findings (D37). |
-| [docs/notifications.md](docs/notifications.md) | `.claude/hooks/notify-sticky.sh`, `crates/jkb-cli/src/notify.rs`, `crates/jkb-core/src/notify.rs`, `crates/jkb-core/src/claude_session.rs`, the `notify.*` and `session.*` ops, `macos/notifier/`, `scripts/build-notifier.sh` | Sticky, self-clearing permission notifications: the hook → daemon → queue → `jkb-notifier serve` path and why it moved there, the producer-side sweep, why the notifier is ours, the three facts measured about it, and what no installer can do. |
-| [docs/code-factory.md](docs/code-factory.md) | `ui/app`, the `design.*` ops and `jkb design`, `workflow_agents`, any app built on jkb | The Code Factory desktop app (D53): apps are clients of the op set, the installed-copy trust rule, designs as CRDT documents with span states, and the subtask order. |
-| [docs/message-queue.md](docs/message-queue.md) | `crates/jkb-core/src/mq.rs`, `crates/jkb-api`, `crates/jkb-daemon` (`jkb serve`), `jkb mq` and remote mode (`crates/jkb-cli/src/{mq_cli,remote}.rs`), the reap service's compaction | The queue's rules (reaping, caps, TTL, idle groups — the user's), its typed operations, and the `jkb mq subscribe` NDJSON protocol a consumer in any language speaks. |
+| [docs/foundation.md](docs/foundation.md) | a crate you need to orient in; `jkb-core`'s store, changelog, undo and migrations; `jkb-index`/`jkb-embed`/`jkb-search`; CI and the dev scripts | The SQLite substrate, the crate layout, the ways of working, the CI gate, and what the store guarantees (ids never reused, vectors die with their items, changelog vs undo). Its reference section on finished subsystems is the *last* place to check, never the first: if another row names your file, that row governs. |
+| [docs/namespaces.md](docs/namespaces.md) | namespace layout and moves, typed namespaces, task homing, `jkb inv` and `memory/` | The global layout, typed roots, where tasks live, and investigations. |
+| [docs/file-sync.md](docs/file-sync.md) | `jkb-sync`, mounts and serializers | Serializers, the three-way merge, one file per namespace, prose kept as namespace metadata (never items), and the file-sync data-loss cluster. |
+| [docs/task-lifecycle.md](docs/task-lifecycle.md) | `jkb task *`, `jkb staging *`, `crates/jkb-fsm`, `crates/jkb-cli/src/{gitrepo,session,repo,archive,pr}.rs`, `scripts/merge-queue.sh` | Subtasks and containment, per-task worktree sessions, staging branches, the checkable state machine and transition log, review-gated landing. |
+| [docs/agents-and-roles.md](docs/agents-and-roles.md) | the swarm and `.claude/workflows/`, `.claude/workflows/code-review.js`, `jkb role *`, `jkb workflow *`, `jkb attest`, `crates/jkb-rbac`, `crates/jkb-core/src/{roles,reviews,claim}.rs`, `crates/jkb-core/src/workflow/`, `crates/jkb-api/src/rbac.rs`, `crates/jkb-cli/src/{git_audit,rbac_cli}.rs` | How agents take, build and review work (claims, scheduler, reviewer, merge queue, the composable code reviewer, the design gate) and who may do what (roles, grant tokens, workflow strategies, harness attestation, hooks-off git). |
+| [docs/sandbox-and-container.md](docs/sandbox-and-container.md) | `scripts/auto-mode*`, and the boundary questions about `.container/` | The unattended-agent boundary, the container nested inside it, the egress firewall and its verdict, and how the container is verified. The container's OWN internals are in [.container/README.md](.container/README.md), and that is the file which grows when `.container/` changes. |
+| [docs/daemon-and-messaging.md](docs/daemon-and-messaging.md) | `crates/jkb-core/src/mq.rs`, `crates/jkb-api`, `crates/jkb-daemon` (`jkb serve`), `jkb mq` and remote mode, `.claude/hooks/notify-sticky.sh`, `crates/jkb-{cli,core}/src/notify.rs`, `crates/jkb-core/src/claude_session.rs`, `macos/notifier/` | Who may open `jkb.db`, the daemon and its typed ops, remote mode, the message queue and its `jkb mq subscribe` NDJSON protocol, the session registry, and sticky notifications. |
+| [docs/code-factory.md](docs/code-factory.md) | `ui/`, the `design.*` ops and `jkb design`, `workflow_agents`, any app built on jkb | The Code Factory desktop app and the explorer before it: apps are clients of the op set, the installed-copy trust rule, designs as CRDT documents with span states, plans, export, and the migration that produced this table. |
+| [docs/git-hooks-installer.md](docs/git-hooks-installer.md) | `scripts/lib.sh`, `scripts/setup.sh`, `scripts/hooks/post-merge`, `scripts/tests/*.test.sh`, and the repository-selection scrub in `gitrepo.rs`/`pr.rs`/`session.rs` | The longest defect cluster in the repo: at least twenty-eight review rounds on one installer, and nearly every lesson generalizes. |
 
 Some rules about this set, because a split decision record fails in predictable ways:
 

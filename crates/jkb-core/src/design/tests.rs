@@ -1789,7 +1789,7 @@ fn target_and_source_rows_record_their_writing_transaction() {
 
 /// Undoing a design's creation would cascade its doc target and sources away with the item, so it
 /// is refused while a later transaction wrote either (`DESIGN_OWNED`; the rule is D47's in
-/// docs/namespaces-and-sync.md). Each case on its own design, with no later text edit, so only the
+/// docs/foundation.md). Each case on its own design, with no later text edit, so only the
 /// export table can be what refuses it.
 #[test]
 fn undoing_a_designs_creation_is_refused_once_a_target_or_source_was_written_since() {

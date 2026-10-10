@@ -26,7 +26,7 @@
 //! Alerts-style notification — which waits for ever by design — comes down.
 //!
 //! **It also feeds the session registry** (tasks S6.4, [`jkb_core::claude_session`];
-//! docs/notifications.md, "The session registry"): `SessionStart` sends `session.started`,
+//! docs/daemon-and-messaging.md, "The session registry"): `SessionStart` sends `session.started`,
 //! `SessionEnd` sends `session.ended`, every `notify.event` marks its process running, and the same
 //! sweep ends the processes it proves gone (`session.list`, `session.gone`) — the only way a killed
 //! `claude` or a restarted container, which send no `SessionEnd` (measured), is ever recorded as ended.
@@ -54,7 +54,7 @@ pub const TOTAL: Duration = Duration::from_secs(1);
 /// requests: the second starts only this soon after the hook began (measured from [`hook`]'s first
 /// line, so the shim's and this binary's start-up come on top), because it may itself take a full
 /// [`TOTAL`] — 0.3 + 1.0 s leaves 200 ms for start-up inside the budget. That margin is assumed, not
-/// measured (docs/notifications.md). A warm round trip on the host is a few milliseconds. A hook killed at the budget logs nothing, so this is what keeps a slow end
+/// measured (docs/daemon-and-messaging.md). A warm round trip on the host is a few milliseconds. A hook killed at the budget logs nothing, so this is what keeps a slow end
 /// visible in the log instead.
 pub const SESSION_END_SECOND_REQUEST: Duration = Duration::from_millis(300);
 
@@ -130,7 +130,7 @@ fn sessions(all: bool, live_ids: bool, json: bool) -> Result<()> {
 }
 
 /// The rows of every page, each once. A row written between two pages can come back on a later one
-/// (docs/notifications.md): its later copy is kept, in its later place. One pass, so a registry of many
+/// (docs/daemon-and-messaging.md): its later copy is kept, in its later place. One pass, so a registry of many
 /// pages costs linear time.
 fn keep_latest(rows: Vec<jkb_api::ClaudeSession>) -> Vec<jkb_api::ClaudeSession> {
     let mut seen = std::collections::HashSet::new();

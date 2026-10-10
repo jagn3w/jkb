@@ -916,7 +916,7 @@ fn blocker(
     // `design::undo_would_lose` finds no later work: no compaction, and no row in a design-owned
     // table (`design::DESIGN_OWNED`) whose `txn_id` is a later transaction not itself undone and not
     // an `undo`. Design-only on purpose — the rule and the generic guard tried and dropped are under
-    // D47 in docs/namespaces-and-sync.md. Every other item's insert undoes as it always has.
+    // docs/foundation.md. Every other item's insert undoes as it always has.
     if op == Op::Insert.as_str() && table == Entity::Items.as_str() {
         if let Some(why) = entity_id.parse::<i64>().ok().and_then(|row| {
             crate::design::undo_would_lose(conn, ItemId::new(row), txn_id).transpose()
@@ -976,7 +976,7 @@ fn watermark(conn: &Connection) -> Result<i64> {
 ///
 /// Three callers need it against different operands — [`select_work_txn`] correlates it with each
 /// row it scans, [`already_undone`] asks it of one bound id, and `design::undo_would_lose` correlates
-/// it with each design-owned row's `txn_id` (D47, docs/namespaces-and-sync.md) — so the operand is
+/// it with each design-owned row's `txn_id` (docs/foundation.md) — so the operand is
 /// the only hole, and it is an identifier or a placeholder this module writes, never a value. Written out twice
 /// the copies would answer differently, and the answer decides whether `DeleteRow` runs a second
 /// time against row ids `SQLite` has since reissued.

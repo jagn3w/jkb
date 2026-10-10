@@ -1494,7 +1494,7 @@ checkpoints and truncates a WAL the host is still writing.
 So **the host owns `jkb.db`** and the container reaches it through the host daemon over one allowed
 TCP port, sending typed database operations (never whole CLI commands, which would run gates and git
 on the host, outside this sandbox). What a command cannot do that way is refused in remote mode —
-`docs/message-queue.md` lists the host-only commands.
+`docs/daemon-and-messaging.md` lists the host-only commands.
 
 **Enforced, not just configured.** Remote mode refuses `--db` and a non-empty `JKB_DB` before
 anything opens, and `check-config.sh` / `verify.sh` fail on `JKB_DB` being set or the old volume
@@ -1600,7 +1600,7 @@ alone used it, through a `JKB_DAEMON_ADDR` that is gone. Without it the hook wou
 container's own loopback — every notification lost with nothing to say so — and every other command
 would look for a database. `check-config.sh` holds the value to `DAEMON_HOST`/`DAEMON_PORT` and the
 variable's name to `remote.rs`'s `REMOTE_VAR`, and `mutate-config.sh` drifts and drops each. Changing
-it needs a rebuild, like the rest of `containerEnv`. See [docs/notifications.md](../docs/notifications.md).
+it needs a rebuild, like the rest of `containerEnv`. See [docs/daemon-and-messaging.md](../docs/daemon-and-messaging.md).
 
 **What `verify.sh` asks.** The kernel's answer above, at the address the *image* names; then the
 daemon's own answer (`/v1/hello` with the container credential from the read-only `~/.jkb-container`
