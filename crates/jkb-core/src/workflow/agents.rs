@@ -489,7 +489,10 @@ pub const SUBAGENTS_WORKFLOW: &str = "subagents";
 
 /// The prefix every subagent type carries: the installer's own (`jkb commands install` writes
 /// `jkb-<stem>`), so the type a coordinator names, the file it is installed as and the role map's
-/// key are one spelling, and none can collide with a user's own agent.
+/// key are one spelling, and a user's own `reviewer` agent is never mapped to a role. It does not
+/// stop a repository from defining an agent of the same name, which Claude Code would prefer and
+/// attestation would map by name; that is the role map's trust in agent-type names, recorded in the
+/// agents-and-roles design.
 pub const SUBAGENT_PREFIX: &str = "jkb-";
 
 /// A packaged subagent template rendered as a Claude Code agent definition (`.claude/agents/*.md`).
@@ -505,9 +508,11 @@ pub struct SubagentDef {
 ///
 /// Packaged only: the installer runs without a database, and a definition is the worker's
 /// standing contract, not its task — the task prompt a coordinator passes is the template it
-/// fills with `jkb workflow agent show`, which does honour an operator copy. A worker that may
-/// write nothing beyond the KB gets a read-and-run tool list (no `Edit`/`Write`); one that writes
-/// code or git gets every tool.
+/// fills with `jkb workflow agent show`, which does honour an operator copy (and why a copy of a
+/// subagent template is refused: it would be shown as in effect and never installed). A worker that
+/// may write nothing beyond the KB gets a read-and-run tool list (no `Edit`/`Write`), with `Agent` so
+/// a reviewer can split a large change across children; one that writes code or git gets the editing
+/// tools and **no** `Agent`, so an implementer cannot start a reviewer of its own branch.
 ///
 /// # Errors
 /// [`Error::Types`] for a subagent template without the `jkb-` prefix, with a placeholder (a
@@ -534,9 +539,12 @@ pub fn subagent_definitions() -> Result<Vec<SubagentDef>> {
             let describe =
                 serde_json::to_string(&a.def.describe).map_err(|e| invalid(e.to_string()))?;
             let mut md = format!("---\nname: {}\ndescription: {describe}\n", a.name);
-            if matches!(a.def.permissions.writes, Writes::Nothing | Writes::Kb) {
-                md.push_str("tools: Read, Grep, Glob, Bash, Agent\n");
-            }
+            md.push_str(match a.def.permissions.writes {
+                Writes::Nothing | Writes::Kb => "tools: Read, Grep, Glob, Bash, Agent\n",
+                Writes::Git | Writes::Code => {
+                    "tools: Read, Grep, Glob, Edit, Write, NotebookEdit, Bash, TodoWrite\n"
+                }
+            });
             if let Some(model) = &a.def.permissions.model {
                 md.push_str("model: ");
                 md.push_str(model);
@@ -894,6 +902,16 @@ fn base_if_packaged(name: &str, def: &AgentDef) -> Result<Option<String>> {
 
 fn append(conn: &Connection, name: &str, def: &AgentDef, based_on: Option<&str>) -> Result<Agent> {
     def.validate()?;
+    // A subagent type is installed from the packaged file, never from a copy: one stored here would
+    // be listed as in effect and never run. The one writer refuses it, so neither `copy` nor `set`
+    // can make one.
+    if def.workflow == SUBAGENTS_WORKFLOW {
+        return Err(invalid(format!(
+            "`{name}` would be a `{SUBAGENTS_WORKFLOW}` template: subagent types are installed from \
+             the packaged file by `jkb commands install`, so a copy would never run — contribute the \
+             change to the packaged template instead"
+        )));
+    }
     let permissions =
         serde_json::to_string(&def.permissions).map_err(|e| invalid(e.to_string()))?;
     let hands = serde_json::to_string(&def.hands_off_to).map_err(|e| invalid(e.to_string()))?;

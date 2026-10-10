@@ -1549,6 +1549,12 @@ fn run(cli: Cli) -> Result<()> {
     // `jkb serve`, with the container's credential.
     if let Command::Attest { cmd } = &cli.command {
         rbac_cli::attest(cmd);
+        // ...and the one jkb the dev container runs outside the agent's sandbox, from the operator's
+        // kit, on every tool call. So it is where the bundled commands and subagent types reach the
+        // container's Claude config: remote mode below never installs them, and the sandbox denies
+        // the agent's own writes there. A stamp read when nothing changed; silent, so the hook's
+        // stdout stays its protocol.
+        commands::ensure_installed();
         return Ok(());
     }
 

@@ -153,11 +153,19 @@ fn asset_path(base: &Path, kind: &Kind, stem: &str) -> PathBuf {
         .join(format!("{}.{}", installed_name(stem), kind.ext))
 }
 
-/// Where a `jkb` from before the prefix rename wrote the same asset. Read-only: see
-/// [`legacy_siblings`].
-fn legacy_path(base: &Path, kind: &Kind, stem: &str) -> PathBuf {
-    base.join(kind.dir).join(format!("{stem}.{}", kind.ext))
-}
+/// What a `jkb` from before the prefix rename installed, as `(dir, file)`: its own fixed list, not
+/// the current bundle's stems with the prefix taken off. Derived from the bundle, it named a user's
+/// own `agents/reviewer.md` as jkb's (no jkb ever wrote one) and stopped naming the workflows an old
+/// jkb really did write once the bundle stopped shipping them. Read-only: see [`legacy_siblings`].
+const LEGACY: &[(&str, &str)] = &[
+    ("commands", "design-pass.md"),
+    ("commands", "next-task.md"),
+    ("commands", "review.md"),
+    ("commands", "review-log.md"),
+    ("commands", "task-swarm.md"),
+    ("workflows", "code-review.js"),
+    ("workflows", "task-swarm.js"),
+];
 
 /// The Claude Code config base: `$CLAUDE_CONFIG_DIR` if set, else `$HOME/.claude`.
 fn base_dir() -> Result<PathBuf> {
@@ -259,16 +267,11 @@ fn remove_all(base: &Path) -> Result<()> {
 /// state both permanent and invisible — `list` shows only prefixed names and `uninstall` prints
 /// "removed." — so they are named, with what is known about them, and the user decides.
 fn legacy_siblings(base: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for kind in KINDS {
-        for (stem, _) in (kind.set)() {
-            let path = legacy_path(base, kind, stem);
-            if path.exists() {
-                found.push(path);
-            }
-        }
-    }
-    found
+    LEGACY
+        .iter()
+        .map(|(dir, file)| base.join(dir).join(file))
+        .filter(|path| path.exists())
+        .collect()
 }
 
 /// Print [`legacy_siblings`], if any. Silent when there are none.
@@ -731,8 +734,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp config dir");
         let base = dir.path();
         std::fs::create_dir_all(base.join("commands")).unwrap();
-        let stale = super::legacy_path(base, &super::KINDS[0], "review");
+        let stale = base.join("commands").join("review.md");
         std::fs::write(&stale, OLD).unwrap();
+        // A user's own agent under a name jkb now ships prefixed: no jkb ever wrote it unprefixed,
+        // so it is not reported as one.
+        std::fs::create_dir_all(base.join("agents")).unwrap();
+        std::fs::write(base.join("agents").join("reviewer.md"), "mine").unwrap();
 
         super::install_into(base).expect("install");
         super::uninstall_from(base).expect("uninstall");

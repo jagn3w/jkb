@@ -5658,3 +5658,34 @@ fn task_move_reparents_under_a_step_refuses_a_plan_and_undoes() {
         .success()
         .stdout(predicate::str::contains(&child).not());
 }
+
+/// The attestation hook is the jkb the dev container runs outside the agent's sandbox, and remote
+/// mode never installs the bundled assets, so the hook is what puts the subagent types a coordinator
+/// starts its workers as into the container's Claude config — without a word on its stdout, which
+/// is the hook protocol.
+#[test]
+fn the_attest_hook_installs_the_subagent_types() {
+    let dir = TempDir::new().unwrap();
+    let claude = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+    let out = cmd
+        .env("HOME", dir.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("JKB_NO_AUTO_COMMANDS")
+        .args(["attest", "hook"])
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "the install wrote to the hook's stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    for name in ["jkb-implementer", "jkb-reviewer"] {
+        let def = std::fs::read_to_string(claude.join("agents").join(format!("{name}.md")))
+            .unwrap_or_else(|e| panic!("{name} was not installed: {e}"));
+        assert!(def.starts_with(&format!("---\nname: {name}\n")), "{def}");
+    }
+}

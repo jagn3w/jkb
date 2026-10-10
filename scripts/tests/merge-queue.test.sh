@@ -186,7 +186,20 @@ echo "==> scripts/merge-queue.sh: what it exits, and whether the base moved"
 mkdir -p "$work/bin"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$JKB_CALLS"\nexit 0\n' >"$work/bin/jkb"
 chmod +x "$work/bin/jkb"
-run_cases case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
+case_locked() {      # a second run in the same worktree stalls, and leaves the holder's lock
+    local r lock; r="$(mkrepo locked)"
+    git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
+    git -C "$r" checkout -q trunk
+    lock="$(git -C "$r" rev-parse --absolute-git-dir)/jkb-merge-queue.lock"
+    mkdir "$lock"
+    check "a run while another holds the worktree stalls" "$r" 3 still 0
+    [ -d "$lock" ] || fail "queue: lock" "the stalled run removed a lock it did not take"
+    rmdir "$lock"
+    check "the same branch lands once the lock is free" "$r" 0 moved 1
+    [ -d "$lock" ] && fail "queue: lock" "a finished run left its lock behind" || true
+}
+
+run_cases case_locked case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
           case_conflict case_already_landed case_wedged case_already_merged
 
 finish

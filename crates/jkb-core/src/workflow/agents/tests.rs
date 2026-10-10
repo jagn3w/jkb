@@ -110,7 +110,7 @@ fn every_subagent_template_renders_as_an_agent_definition() {
         );
         assert!(!d.markdown.contains("{{"), "{} holds a placeholder", d.name);
     }
-    // A reviewer reads and runs; an implementer writes code, so it keeps every tool.
+    // A reviewer reads and runs, and may start children.
     let tools = |n: &str| {
         defs.iter()
             .find(|d| d.name == n)
@@ -124,7 +124,9 @@ fn every_subagent_template_renders_as_an_agent_definition() {
         tools("jkb-reviewer").as_deref(),
         Some("tools: Read, Grep, Glob, Bash, Agent")
     );
-    assert_eq!(tools("jkb-implementer"), None);
+    // ...and no `Agent`: an implementer that could start a `jkb-reviewer` could review its own branch.
+    let imp = tools("jkb-implementer").unwrap();
+    assert!(imp.contains("Edit") && !imp.contains("Agent"), "{imp}");
 }
 
 /// Every placeholder a coordinator template tells it to pass is one the target template has, and
@@ -851,4 +853,49 @@ fn a_copy_that_a_merged_contribution_made_current_is_built_on_the_installed_vers
         again.based_on.as_deref(),
         Some(format!("packaged:swarm-reviewer@{pv}").as_str())
     );
+}
+
+/// A copy of a subagent type would be listed as in effect and never installed, so none is made:
+/// not under its own name, and not under a new one. (An edit cannot move a template between
+/// workflows, so `copy` is the only way in, and `append` refuses it there.)
+#[test]
+fn a_subagent_template_cannot_be_copied() {
+    let db = db();
+    for as_name in [None, Some("my-reviewer")] {
+        let refused = db
+            .write_txn("test", move |c, m| {
+                copy(c, m, "jkb-reviewer", false, as_name, None)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("never run"), "{refused}");
+    }
+    assert!(db.read(|c| versions(c, "jkb-reviewer")).unwrap().is_empty());
+    assert!(db.read(|c| versions(c, "my-reviewer")).unwrap().is_empty());
+}
+
+/// The role a subagent type's calls act as is mapped by `setup.sh`, apart from this file: a type
+/// added here with no line there would attest as no role at all, and a line naming another role
+/// would attest as the wrong one. Read from the script, so the two cannot drift.
+#[test]
+fn setup_maps_every_subagent_type_to_its_templates_role() {
+    let setup = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/setup.sh"),
+    )
+    .unwrap();
+    let defs = packaged().unwrap();
+    let subagents: Vec<_> = defs
+        .iter()
+        .filter(|a| a.def.workflow == super::SUBAGENTS_WORKFLOW)
+        .collect();
+    assert!(!subagents.is_empty());
+    for a in subagents {
+        let line = format!("role map {} {} ", a.name, a.def.role.as_str());
+        assert!(
+            setup.contains(&line),
+            "scripts/setup.sh does not map `{}` to `{}` (`{line}`)",
+            a.name,
+            a.def.role.as_str()
+        );
+    }
 }

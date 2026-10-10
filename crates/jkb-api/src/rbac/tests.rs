@@ -438,6 +438,21 @@ fn a_scoped_caller_adds_only_under_its_task_and_records_only_its_own_review() {
         Response::WhoAmI { whoami } => assert_eq!(whoami.task.as_deref(), Some(a.as_str())),
         other => panic!("{other:?}"),
     }
+    // ...and once bound it files the round, as `/jkb-review`'s reviewer does after `jkb role bind`.
+    // Under its repository's codereviews, which the task names: `jkb task start` records `repo=`.
+    ok(
+        &kb.op,
+        json!({ "op": "task.tag", "uid": a, "facet_value": "repo=r", "mode": "set" }),
+    );
+    match ok(
+        &rev,
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+                "ns": "repos/r/codereviews/x",
+                "findings": [{ "severity": "nit", "summary": "a nit" }] }),
+    ) {
+        Response::ReviewFiled { filed } => assert_eq!(filed.uids.len(), 1),
+        other => panic!("{other:?}"),
+    }
     let other = add(&kb.op, "task b");
     refused(&rev, json!({ "op": "role.bind", "uid": other }));
 }
