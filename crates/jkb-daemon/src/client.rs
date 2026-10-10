@@ -23,11 +23,60 @@ pub const UNREACHABLE_FOR: Duration = Duration::from_secs(5);
 /// daemon stays up, and marking it down on the first one failed every client — the per-tool-call
 /// attest hook among them — untried for [`UNREACHABLE_FOR`].
 ///
-/// Only a connect failure is retried: then no byte reached the daemon, so a write cannot be applied
-/// twice. A request that connected and then failed or timed out is never retried. Retries and their
-/// pauses fit inside the request's own deadline, never beyond it (`send_retrying_connect`).
+/// A failed connect is retried whatever the request: no byte reached the daemon, so nothing can be
+/// applied twice. A request that connected is resent only when it carries an idempotency key and went
+/// unanswered past its attempt budget ([`ATTEMPT_TIMEOUT`]). Retries and their pauses fit inside the
+/// request's own deadline, never beyond it (`send_attempts`).
 pub const CONNECT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(100), Duration::from_millis(300)];
+
+/// How long one attempt of an ordinary op may go unanswered before it is abandoned and resent, with
+/// the same `Idempotency-Key`, under the call's one deadline.
+///
+/// Measured: Claude Code's sandbox proxy stalls about 1 in 200 requests to `jkb serve` for 10–30 s —
+/// the request connects and no answer comes back — while a warm answer takes milliseconds. Without a
+/// key a resend could apply a write twice, so the client waited out its whole 30 s op timeout. With
+/// one, the daemon runs the op once and answers every attempt with that one answer
+/// (`crate::idempotency`), so the resend is safe. A long op is never abandoned: see
+/// [`RemoteBackend::budget`].
+///
+/// **Residual:** the daemon keeps keys in memory only, so an attempt applied just before a daemon
+/// restart and resent after it is applied twice.
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The header naming a logical call (the daemon's `server::IDEMPOTENCY_KEY`).
+const IDEMPOTENCY_KEY: &str = crate::server::IDEMPOTENCY_KEY;
+
+/// What one call may spend, from [`RemoteBackend::budget`] — the one place it is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Budget {
+    /// How long the daemon may hold an `mq.poll` with nothing to hand over.
+    wait: Duration,
+    /// The whole call, every attempt and pause included.
+    total: Duration,
+    /// One attempt, before it is abandoned and resent; never more than the time left. Equal to `total`
+    /// when the call is never abandoned.
+    attempt: Duration,
+}
+
+/// A fresh 128-bit `Idempotency-Key`, hex. `None` when the system has no randomness to give, and the
+/// call is then sent without one — and so never resent after it connected.
+fn idempotency_key() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).ok()?;
+    Some(bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    }))
+}
+
+/// A send that ran out: the last error, and whether any attempt connected — only a call none of whose
+/// attempts connected marks the daemon down.
+struct Failed {
+    error: reqwest::Error,
+    connected: bool,
+}
 
 /// Serves requests by calling a `jkb serve` daemon over HTTP.
 pub struct RemoteBackend {
@@ -43,6 +92,8 @@ pub struct RemoteBackend {
     poll_wait: Duration,
     /// How long a request may take beyond any long-poll wait.
     op_timeout: Duration,
+    /// [`ATTEMPT_TIMEOUT`], shortened by tests.
+    attempt_timeout: Duration,
     down_marker: Option<PathBuf>,
 }
 
@@ -69,6 +120,7 @@ impl RemoteBackend {
             connect: Duration::from_secs(1),
             poll_wait: Duration::from_secs(2),
             op_timeout: Duration::from_secs(30),
+            attempt_timeout: ATTEMPT_TIMEOUT,
             down_marker: None,
         })
     }
@@ -153,19 +205,46 @@ impl RemoteBackend {
         }
     }
 
-    fn send(
-        &self,
-        request: &Request,
-        token: &str,
-    ) -> Result<reqwest::blocking::Response, ApiError> {
+    /// What `request` may spend: its long-poll wait, its whole deadline, and how long one attempt may
+    /// go unanswered before it is abandoned and resent. The one place an op's budget is decided, so
+    /// no call site can forget it.
+    ///
+    /// A **long** op is never abandoned: its one attempt has the whole deadline. Long is an op given
+    /// more than the plain [`RemoteBackend::with_deadlines`] total — `mq.poll`, which the daemon may
+    /// hold for its wait — and `ingest.text`, whose capture of a body at the cap holds the writer
+    /// about half a second and whose resend could only queue behind it. Nor is a call without a key
+    /// (`keyed` false): nothing makes its resend safe. Everything else gets [`ATTEMPT_TIMEOUT`] per
+    /// attempt — cut to the time left by `send_attempts`, so a hook, whose `TOTAL` is 1 s, makes one.
+    fn budget(&self, request: &Request, keyed: bool) -> Budget {
         let wait = match request {
             Request::MqPoll { .. } => self.poll_wait,
             _ => Duration::ZERO,
         };
-        let url = if wait.is_zero() {
+        let total = wait + self.op_timeout;
+        let long = total > self.op_timeout || matches!(request, Request::IngestText(_));
+        let attempt = if keyed && !long {
+            self.attempt_timeout
+        } else {
+            total
+        };
+        Budget {
+            wait,
+            total,
+            attempt,
+        }
+    }
+
+    fn send(
+        &self,
+        request: &Request,
+        token: &str,
+        key: Option<&str>,
+    ) -> Result<(reqwest::StatusCode, bytes::Bytes), ApiError> {
+        let budget = self.budget(request, key.is_some());
+        let url = if budget.wait.is_zero() {
             format!("{}/v1/op", self.base)
         } else {
-            format!("{}/v1/op?wait_ms={}", self.base, wait.as_millis())
+            format!("{}/v1/op?wait_ms={}", self.base, budget.wait.as_millis())
         };
         // Refused here, before any of it is sent: the daemon refuses a body past its cap by closing the
         // connection mid-upload, and a body many times the cap then read as a daemon out of reach.
@@ -183,60 +262,82 @@ impl RemoteBackend {
         }
         // Shared, so each attempt's copy is a reference count rather than the body again.
         let body = bytes::Bytes::from(body);
-        self.send_retrying_connect(wait + self.op_timeout, |left| {
-            self.client
+        self.send_attempts(budget.total, budget.attempt, |left| {
+            let builder = self
+                .client
                 .post(&url)
                 .bearer_auth(token)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body.clone())
-                .timeout(left)
+                .timeout(left);
+            match key {
+                Some(key) => builder.header(IDEMPOTENCY_KEY, key),
+                None => builder,
+            }
         })
-        .map_err(|e| {
-            // Only a failed CONNECT means the daemon is out of reach — refused, or the connect
-            // timeout, which reqwest reports as a connect error. A request that connected and
-            // then ran past its deadline reached a daemon that is busy (a write lock held by
-            // another process), and marking that down made every other client — a hook for a
-            // permission prompt among them — give up without trying for the next few seconds.
-            // A connect error here is the last attempt: the retries ran out, or the deadline left
-            // no room for another.
-            if e.is_connect() {
+        .map_err(|Failed { error, connected }| {
+            // Only a call none of whose attempts connected means the daemon is out of reach —
+            // refused, or the connect timeout, which reqwest reports as a connect error. A request
+            // that connected and then ran past its deadline reached a daemon that is busy (a write
+            // lock held by another process), and marking that down made every other client — a hook
+            // for a permission prompt among them — give up without trying for the next few seconds.
+            if error.is_connect() && !connected {
                 self.mark_unreachable(true);
             }
             ApiError::with_code(
                 ErrorCode::Unavailable,
-                format!("cannot reach jkb serve at {}: {e}", self.base),
+                format!("cannot reach jkb serve at {}: {error}", self.base),
             )
         })
     }
 
-    /// Send the request `build` makes, building and sending it again after each of
-    /// [`CONNECT_RETRY_DELAYS`] while the failure is a failed connect — and only then: any other
-    /// error, a timeout after connecting among them, is returned at once. The one place the retry
-    /// rule lives.
+    /// Send the request `build` makes, answer read whole, building and sending it again:
+    ///
+    /// - after each of [`CONNECT_RETRY_DELAYS`] while the failure is a failed connect;
+    /// - at once when an attempt went unanswered for `attempt` — shorter than `budget` only for a call
+    ///   that carries an idempotency key, which makes the resend safe.
+    ///
+    /// Any other error, a timeout of an attempt that had the rest of the deadline among them, is
+    /// returned at once. The one place the retry rule lives.
     ///
     /// The whole of it, retries and their pauses included, is held to ONE deadline, `budget` from
-    /// now: `build` is handed the time left, for the attempt's own timeout, and a retry whose pause
-    /// and connect timeout would not fit before the deadline is not made. Each attempt given a fresh
-    /// budget ran a hook's request to about twice its `TOTAL` — past Claude Code's `SessionEnd`
-    /// budget — when a failed connect was followed by a slow answer.
-    fn send_retrying_connect(
+    /// now: `build` is handed the attempt's own timeout — `attempt`, or the time left if less — and a
+    /// connect retry whose pause and connect timeout would not fit before the deadline is not made.
+    /// Each attempt given a fresh budget ran a hook's request to about twice its `TOTAL` — past Claude
+    /// Code's `SessionEnd` budget — when a failed connect was followed by a slow answer.
+    fn send_attempts(
         &self,
         budget: Duration,
+        attempt: Duration,
         build: impl Fn(Duration) -> reqwest::blocking::RequestBuilder,
-    ) -> reqwest::Result<reqwest::blocking::Response> {
+    ) -> Result<(reqwest::StatusCode, bytes::Bytes), Failed> {
         let deadline = Instant::now() + budget;
         let mut delays = CONNECT_RETRY_DELAYS.iter();
+        let mut connected = false;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match build(left).send() {
-                Err(e) if e.is_connect() => match delays.next() {
+            let this = attempt.min(left);
+            let sent = build(this).send().and_then(|resp| {
+                let status = resp.status();
+                resp.bytes().map(|bytes| (status, bytes))
+            });
+            match sent {
+                Ok(answer) => return Ok(answer),
+                Err(error) if error.is_connect() => match delays.next() {
                     Some(delay) if Instant::now() + *delay + self.connect <= deadline => {
                         std::thread::sleep(*delay);
                     }
                     // Out of retries, or of room for one: later pauses are only longer.
-                    _ => return Err(e),
+                    _ => return Err(Failed { error, connected }),
                 },
-                other => return other,
+                // Abandoned short of the deadline: resent, with the same key, at once.
+                Err(error) if error.is_timeout() && this < left => connected = true,
+                Err(error) => {
+                    return Err(Failed {
+                        error,
+                        connected: true,
+                    })
+                }
             }
         }
     }
@@ -248,18 +349,24 @@ impl RemoteBackend {
     pub fn hello(&self) -> Result<serde_json::Value, ApiError> {
         let token = self.token(false)?;
         let url = format!("{}/v1/hello", self.base);
-        let resp = self
-            .send_retrying_connect(Duration::from_secs(5), |left| {
+        let budget = Duration::from_secs(5);
+        let answer = self
+            .send_attempts(budget, budget, |left| {
                 self.client.get(&url).bearer_auth(&token).timeout(left)
             })
-            .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
-        decode(resp).map_err(|(e, _)| e)
+            .map_err(|f| ApiError::with_code(ErrorCode::Unavailable, f.error.to_string()))?;
+        decode(answer).map_err(|(e, _)| e)
     }
 
     /// One request, decoded, with the down marker kept honest: set when jkb serve did not answer
     /// (no connection, or something in the way answered instead), cleared when it did.
-    fn attempt(&self, request: &Request, token: &str) -> Result<Response, ApiError> {
-        let result = decode(self.send(request, token)?);
+    fn attempt(
+        &self,
+        request: &Request,
+        token: &str,
+        key: Option<&str>,
+    ) -> Result<Response, ApiError> {
+        let result = decode(self.send(request, token, key)?);
         self.mark_unreachable(matches!(result, Err((_, Answered::NotJkb))));
         result.map_err(|(e, _)| e)
     }
@@ -274,15 +381,8 @@ enum Answered {
 }
 
 fn decode<T: serde::de::DeserializeOwned>(
-    resp: reqwest::blocking::Response,
+    (status, bytes): (reqwest::StatusCode, bytes::Bytes),
 ) -> Result<T, (ApiError, Answered)> {
-    let status = resp.status();
-    let bytes = resp.bytes().map_err(|e| {
-        (
-            ApiError::with_code(ErrorCode::Unavailable, e.to_string()),
-            Answered::NotJkb,
-        )
-    })?;
     if status.is_success() {
         return serde_json::from_slice(&bytes).map_err(|e| {
             (
@@ -326,15 +426,254 @@ impl Backend for RemoteBackend {
                 ),
             ));
         }
+        // One key for the whole call, every attempt of it: the daemon answers a repeat from the first
+        // one's answer (`crate::idempotency`).
+        let key = idempotency_key();
+        let key = key.as_deref();
         // The token rotates each time the daemon starts: one retry with a freshly read token, and only
         // when jkb serve itself said `unauthorized` (not any 401), so a wrong token is never retried
         // in a loop.
-        match self.attempt(&request, &self.token(false)?) {
+        match self.attempt(&request, &self.token(false)?, key) {
             // A fixed token does not rotate, so there is nothing fresher to retry with.
             Err(e) if e.code == ErrorCode::Unauthorized && self.fixed.is_none() => {
-                self.attempt(&request, &self.token(true)?)
+                self.attempt(&request, &self.token(true)?, key)
             }
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use jkb_api::{Backend as _, Request, Response};
+
+    use super::RemoteBackend;
+
+    /// What a stub does with the connection it accepted, by its index.
+    #[derive(Clone, Copy)]
+    enum Then {
+        /// Read the request and never answer.
+        Swallow,
+        /// Answer after this long.
+        AnswerAfter(Duration),
+    }
+
+    /// A stub HTTP server: what each connection gets, by its index (the last for any past the list),
+    /// and the `Idempotency-Key` each connection's request carried.
+    fn stub(plan: Vec<Then>) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&keys);
+        let body = serde_json::to_string(&Response::Position { position: 1 }).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request_text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                seen.lock().unwrap().push(
+                    request_text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("idempotency-key:"))
+                        .map(|k| k.trim().to_owned()),
+                );
+                match plan[i.min(plan.len() - 1)] {
+                    Then::Swallow => held.push(stream),
+                    Then::AnswerAfter(after) => {
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                             {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        std::thread::spawn(move || {
+                            std::thread::sleep(after);
+                            let _ = stream.write_all(reply.as_bytes());
+                        });
+                    }
+                }
+            }
+        });
+        (base, keys)
+    }
+
+    fn client(base: &str, dir: &tempfile::TempDir, attempt: Duration) -> RemoteBackend {
+        let token = dir.path().join("token");
+        crate::token::write(&token, "t").unwrap();
+        let mut c = RemoteBackend::new(base, token).unwrap();
+        c.attempt_timeout = attempt;
+        c
+    }
+
+    fn ingest() -> Request {
+        Request::IngestText(jkb_api::ingest::IngestAsk {
+            text: "t".into(),
+            mime: "text/plain".into(),
+            namespace: "inbox".into(),
+            raw: None,
+        })
+    }
+
+    fn poll() -> Request {
+        Request::MqPoll {
+            topic: "t".into(),
+            group: "g".into(),
+            max: 1,
+            after: None,
+        }
+    }
+
+    /// An ordinary op whose first attempt is swallowed is resent once its attempt budget runs out,
+    /// with the same key, and answered — well inside its deadline. A long op is not abandoned: its one
+    /// attempt is answered after the ordinary attempt budget has passed.
+    #[test]
+    fn an_ordinary_op_is_resent_with_its_key_and_a_long_op_is_not_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = Duration::from_millis(200);
+        let (base, keys) = stub(vec![Then::Swallow, Then::AnswerAfter(Duration::ZERO)]);
+        let started = Instant::now();
+        let c = client(&base, &dir, attempt);
+        assert_eq!(
+            c.call(Request::MqInspect {}).unwrap(),
+            Response::Position { position: 1 }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let keys = keys.lock().unwrap().clone();
+        assert_eq!(keys.len(), 2, "resent once: {keys:?}");
+        let key = keys[0].clone().expect("the first attempt carried a key");
+        assert_eq!(key.len(), 32, "128 bits, hex: {key}");
+        assert_eq!(
+            keys[1].as_deref(),
+            Some(key.as_str()),
+            "the same key both times"
+        );
+
+        for (name, request) in [("ingest", ingest()), ("poll", poll())] {
+            let (base, keys) = stub(vec![Then::AnswerAfter(attempt * 3)]);
+            let c = client(&base, &dir, attempt).with_poll_wait(Duration::from_secs(1));
+            assert_eq!(
+                c.call(request).unwrap(),
+                Response::Position { position: 1 },
+                "{name}"
+            );
+            assert_eq!(
+                keys.lock().unwrap().len(),
+                1,
+                "{name}: one attempt, not abandoned"
+            );
+        }
+    }
+
+    /// A call one of whose attempts connected does not mark the daemon down, even when every later
+    /// attempt failed to connect: it reached a daemon, which is busy, not gone.
+    #[test]
+    fn a_call_that_connected_once_does_not_mark_the_daemon_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let swallowed = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            // The listener closes with this thread, so every later connect is refused.
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        let marker = dir.path().join("unreachable");
+        let c = client(&base, &dir, Duration::from_millis(200)).with_down_marker(marker.clone());
+        assert!(c.call(Request::MqInspect {}).is_err());
+        swallowed.join().unwrap();
+        assert!(!marker.exists(), "an attempt connected: busy, not down");
+    }
+
+    /// The hook's deadlines (`jkb-cli`'s `notify::CONNECT` 200 ms and `TOTAL` 1 s) still bound a call
+    /// whose attempt is swallowed: the default attempt budget is longer than the hook's whole
+    /// deadline, so the one attempt ends at the deadline, not after it.
+    #[test]
+    fn a_hook_call_ends_by_its_total_with_the_default_attempt_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, keys) = stub(vec![Then::Swallow]);
+        let total = Duration::from_secs(1);
+        let c = client(&base, &dir, super::ATTEMPT_TIMEOUT)
+            .with_deadlines(Duration::from_millis(200), total)
+            .unwrap();
+        let started = Instant::now();
+        assert!(c.call(Request::NotifyOpenSessions {}).is_err());
+        let took = started.elapsed();
+        assert!(
+            took < total + Duration::from_millis(250),
+            "took {took:?}, past the hook's {total:?}"
+        );
+        assert_eq!(keys.lock().unwrap().len(), 1);
+    }
+
+    /// End to end through a proxy that forwards the first attempt to a real `jkb serve` and loses its
+    /// answer — the stall measured in the sandbox proxy, after the daemon applied the write. The
+    /// resend gets the first attempt's answer, and the task exists once.
+    #[test]
+    fn a_write_whose_answer_was_lost_is_resent_and_applied_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        let token = dir.path().join("daemon/token");
+        let cfg = crate::server::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token.clone());
+        let daemon = crate::server::spawn(db.clone(), &cfg).unwrap();
+        let upstream = daemon.addr;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(Mutex::new(0usize));
+        let counted = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            for (i, client) in listener.incoming().enumerate() {
+                let Ok(client) = client else { return };
+                *counted.lock().unwrap() += 1;
+                let up = TcpStream::connect(upstream).unwrap();
+                let (mut client_r, mut up_w) =
+                    (client.try_clone().unwrap(), up.try_clone().unwrap());
+                std::thread::spawn(move || std::io::copy(&mut client_r, &mut up_w));
+                let (mut up_r, mut client_w) = (up, client);
+                std::thread::spawn(move || {
+                    if i == 0 {
+                        // The answer is lost; the client's connection is kept open, unanswered.
+                        let _ = std::io::copy(&mut up_r, &mut std::io::sink());
+                        drop(client_w);
+                    } else {
+                        let _ = std::io::copy(&mut up_r, &mut client_w);
+                    }
+                });
+            }
+        });
+
+        let mut c = RemoteBackend::new(&proxy, token).unwrap();
+        c.attempt_timeout = Duration::from_millis(300);
+        let request: Request =
+            serde_json::from_value(serde_json::json!({ "op": "task.add", "text": "once" }))
+                .unwrap();
+        let answer = c.call(request).unwrap();
+        assert!(matches!(answer, Response::Added { .. }), "{answer:?}");
+        assert!(
+            *connections.lock().unwrap() >= 2,
+            "the first attempt was resent"
+        );
+        let tasks: i64 = db
+            .read(|c| {
+                Ok(
+                    c.query_row("SELECT count(*) FROM items WHERE kind = 'task'", [], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .unwrap();
+        assert_eq!(tasks, 1, "applied once");
+        daemon.shutdown().unwrap();
     }
 }

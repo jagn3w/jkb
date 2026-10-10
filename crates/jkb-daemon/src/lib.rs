@@ -14,9 +14,12 @@
 //!   token rotated per start, `GET /v1/hello`, `POST /v1/op`, long-poll for `mq.poll`, body and
 //!   concurrency limits, and a refusal to serve a database migrated past what this build knows.
 //! - [`client`]: [`client::RemoteBackend`], the same [`jkb_api::Backend`] the host CLI uses locally.
+//! - `idempotency`: what the daemon remembers of keyed requests, so a client may resend one that went
+//!   unanswered — a write included — without it being applied twice.
 //! - [`log`]: the stamp on every line `jkb serve` prints (its `serve.log` under launchd).
 
 pub mod client;
+mod idempotency;
 pub mod log;
 pub mod server;
 pub mod token;

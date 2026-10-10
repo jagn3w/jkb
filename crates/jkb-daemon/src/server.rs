@@ -5,7 +5,9 @@
 //! POST /v1/op[?wait_ms=N]       → a jkb_api::Response, or a jkb_api::ApiError with a 4xx/5xx status
 //! ```
 //!
-//! Both require `Authorization: Bearer <token>`. `wait_ms` applies to `mq.poll` only (any other op
+//! Both require `Authorization: Bearer <token>`. An op may carry an `Idempotency-Key`: a repeat of the
+//! key by the same caller is answered with the first one's answer rather than run again
+//! ([`crate::idempotency`]; keys live in memory, so a restart forgets them). `wait_ms` applies to `mq.poll` only (any other op
 //! ignores it): an empty answer is held until a message arrives or the wait (capped) runs out — woken
 //! at once by a send this daemon served, and at worst every 250 ms for one another process wrote
 //! (the host CLI opens the database directly). At most one long-poll per group is held at a time; a
@@ -25,7 +27,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
@@ -38,8 +40,9 @@ use jkb_api::rbac::Caller;
 use jkb_api::{ApiError, Backend as _, ErrorCode, LocalBackend, Request, Response};
 use jkb_core::Db;
 use serde_json::json;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 
+use crate::idempotency::{Begin, Key, Running, Store};
 use crate::token;
 
 /// How a daemon is configured.
@@ -85,6 +88,16 @@ pub struct ServeConfig {
     /// write timeout of its own — so without this a client that stopped reading kept a permit until
     /// the daemon restarted, and enough of them refused the notification hook's every request.
     pub write_stall: Duration,
+    /// How long the answer to a request that carried an `Idempotency-Key` is kept for a resend of it
+    /// ([`crate::idempotency`]).
+    pub idempotency_ttl: Duration,
+    /// How many keyed requests are remembered at most; past it the oldest answers go first.
+    pub idempotency_entries: usize,
+    /// How many bytes of keyed answers are kept at most; past it the oldest go first.
+    pub idempotency_bytes: usize,
+    /// Longest a resend waits for its original, still running, to answer. Its client's own deadline
+    /// is usually shorter; this bounds a waiter whose client went away unnoticed.
+    pub duplicate_wait: Duration,
 }
 
 impl ServeConfig {
@@ -106,6 +119,10 @@ impl ServeConfig {
             read_timeout: Duration::from_secs(10),
             reopen_every: Duration::from_secs(5),
             write_stall: Duration::from_secs(10),
+            idempotency_ttl: Duration::from_mins(10),
+            idempotency_entries: 4096,
+            idempotency_bytes: 64 * 1024 * 1024,
+            duplicate_wait: Duration::from_mins(1),
         }
     }
 }
@@ -226,6 +243,9 @@ struct State {
     tickets: jkb_api::rbac::SharedTickets,
     /// Which bearer tokens name a live grant, for authenticating before the body is read.
     grants: Mutex<GrantCache>,
+    /// The keyed requests' answers, for a resend ([`crate::idempotency`]).
+    idem: Arc<Mutex<Store<Answer>>>,
+    duplicate_wait: Duration,
 }
 
 /// The live grants' token hashes, so a bearer that is neither the root token nor a ticket is
@@ -405,6 +425,12 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         read_timeout: cfg.read_timeout,
         tickets: Arc::default(),
         grants: Mutex::default(),
+        idem: Arc::new(Mutex::new(Store::new(
+            cfg.idempotency_ttl,
+            cfg.idempotency_entries,
+            cfg.idempotency_bytes,
+        ))),
+        duplicate_wait: cfg.duplicate_wait,
     });
     let connections = Arc::new(Semaphore::new(connection_budget(cfg.max_connections)));
     let read_timeout = cfg.read_timeout;
@@ -453,12 +479,43 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
     })
 }
 
+/// An answer as it goes back to the client — what a keyed request's resend is sent again.
+#[derive(Clone)]
+struct Answer {
+    status: StatusCode,
+    body: Bytes,
+    /// Close the connection after it.
+    close: bool,
+}
+
+impl Answer {
+    fn json(status: StatusCode, body: &serde_json::Value) -> Self {
+        Self {
+            status,
+            body: Bytes::from(body.to_string()),
+            close: false,
+        }
+    }
+
+    fn refusal(e: &ApiError) -> Self {
+        Self::json(status_for(e.code), &json!(e))
+    }
+
+    fn response(self) -> hyper::Response<Full<Bytes>> {
+        let mut builder = hyper::Response::builder()
+            .status(self.status)
+            .header("content-type", "application/json");
+        if self.close {
+            builder = builder.header(hyper::header::CONNECTION, "close");
+        }
+        builder
+            .body(Full::new(self.body))
+            .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::new())))
+    }
+}
+
 fn reply(status: StatusCode, body: &serde_json::Value) -> hyper::Response<Full<Bytes>> {
-    hyper::Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::new())))
+    Answer::json(status, body).response()
 }
 
 /// A request body as read: whole, or past the limit.
@@ -502,16 +559,15 @@ async fn read_body(mut body: Incoming, max: usize) -> Result<Body, hyper::Error>
 /// A refusal before authentication: the answer, and the connection closed after it, so an
 /// unauthenticated client cannot hold a slot by sending refused requests down a kept-alive connection.
 fn refuse_and_close(e: &ApiError) -> hyper::Response<Full<Bytes>> {
-    let mut response = refuse(e);
-    response.headers_mut().insert(
-        hyper::header::CONNECTION,
-        hyper::header::HeaderValue::from_static("close"),
-    );
-    response
+    Answer {
+        close: true,
+        ..Answer::refusal(e)
+    }
+    .response()
 }
 
 fn refuse(e: &ApiError) -> hyper::Response<Full<Bytes>> {
-    reply(status_for(e.code), &json!(e))
+    Answer::refusal(e).response()
 }
 
 /// The HTTP status for an error code. The body always carries the code, so a client decides on the
@@ -602,6 +658,34 @@ async fn authenticate(state: &Arc<State>, given: &str) -> Result<Option<Caller>,
         .hashes
         .contains(&hash)
         .then(|| Caller::Token(given.to_owned())))
+}
+
+/// The header a client names a logical call with, the same on each of its attempts.
+pub const IDEMPOTENCY_KEY: &str = "idempotency-key";
+
+/// The request's `Idempotency-Key`, if it has one: 1–128 visible ASCII characters.
+fn idempotency_key(req: &hyper::Request<Incoming>) -> Result<Option<String>, ApiError> {
+    let Some(value) = req.headers().get(IDEMPOTENCY_KEY) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && k.len() <= 128 && k.bytes().all(|b| b.is_ascii_graphic()))
+        .map(|k| Some(k.to_owned()))
+        .ok_or_else(|| {
+            ApiError::bad_request("an Idempotency-Key must be 1 to 128 visible ASCII characters")
+        })
+}
+
+/// The request body's hash, so a key reused for a different request is refused rather than answered
+/// with the first one's result. Within one process `DefaultHasher::new` is the same function each time.
+fn fingerprint(body: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::hash::DefaultHasher::new();
+    body.hash(&mut h);
+    h.finish()
 }
 
 fn wait_ms(req: &hyper::Request<Incoming>) -> u64 {
@@ -972,6 +1056,7 @@ async fn handle(
         Err(e) => return Ok(refuse_and_close(&e)),
     };
     authed.store(true, Ordering::SeqCst);
+    let key = idempotency_key(&req);
     let (backend, db) = match ready(&state).await {
         Ok(serving) => serving,
         Err(refusal) => return Ok(refuse(&refusal)),
@@ -980,7 +1065,6 @@ async fn handle(
     let backend = backend
         .with_tickets(Arc::clone(&state.tickets))
         .with_caller(caller);
-    let (backend, db) = (&backend, &db);
     // Every request past authentication holds an op permit from here — through the schema read, the
     // body and the parse — so authenticated clients cannot pile up unbounded work before the budget
     // is asked. A long-poll trades it for a poll permit once it is known to be one.
@@ -989,7 +1073,7 @@ async fn handle(
     };
     if route.0 == Method::GET {
         return Ok(
-            match blocking_read(db, jkb_core::applied_schema_version).await {
+            match blocking_read(&db, jkb_core::applied_schema_version).await {
                 Ok(schema) => reply(
                     StatusCode::OK,
                     &json!({
@@ -1033,27 +1117,180 @@ async fn handle(
         Ok(r) => r,
         Err(e) => return Ok(refuse(&ApiError::bad_request(e.to_string()))),
     };
-    let (permit, _slot, wait) = match permit_for(&state, &request, asked_wait, op_permit) {
-        Ok(granted) => granted,
-        Err(refusal) => return Ok(refuse(&refusal)),
+    let op = Op {
+        state: Arc::clone(&state),
+        backend,
+        db,
+        request,
+        asked_wait,
+        admitted: op_permit,
+        given,
     };
-    let permit: Permit = Arc::new(permit);
-    *held = Some(Arc::clone(&permit));
-    Ok(answer(
-        &state,
-        &given,
-        serve_op(&state, backend, db, request, wait, &permit).await,
-    ))
+    Ok(match key {
+        Ok(Some(key)) => serve_keyed(state, op, key, &body, held).await,
+        Ok(None) => op.serve(held).await,
+        Err(refusal) => refuse(&refusal),
+    })
+}
+
+/// Serve a request that carried an `Idempotency-Key` ([`crate::idempotency`]): run it once, and
+/// answer a resend of it from what that run answered.
+async fn serve_keyed(
+    state: Arc<State>,
+    op: Op,
+    key: String,
+    body: &[u8],
+    held: &mut Option<Permit>,
+) -> hyper::Response<Full<Bytes>> {
+    // Scoped by the token presented, hashed, so one caller's key never returns another's answer.
+    let key = (jkb_core::roles::token_hash(&op.given), key);
+    let begun = state
+        .idem
+        .lock()
+        .ok()
+        .map(|mut idem| idem.begin(key.clone(), fingerprint(body), Instant::now()));
+    match begun {
+        None => refuse(&ApiError::with_code(
+            ErrorCode::Internal,
+            "idempotency store poisoned",
+        )),
+        Some(Begin::Replay(answer)) => answer.response(),
+        Some(Begin::Mismatch) => refuse(&ApiError::bad_request(
+            "this Idempotency-Key was first used for a different request",
+        )),
+        Some(Begin::Wait(original)) => {
+            // Waiting is no work: the permit goes back for others.
+            drop(op.admitted);
+            await_original(original, state.duplicate_wait)
+                .await
+                .response()
+        }
+        Some(Begin::Run(running)) => {
+            // Spawned, so the answer is recorded and its waiters woken even if this client goes away
+            // mid-op — dropped with the handler, the entry would stay in progress for good.
+            let recording = Recording {
+                idem: Arc::clone(&state.idem),
+                key,
+                running: Some(running),
+            };
+            let ran = tokio::spawn(async move {
+                let ran = op.run().await;
+                // Refused before it ran: `recording` is dropped unfinished, so a resend runs it.
+                if let Ok((answer, _)) = &ran {
+                    recording.finish(answer);
+                }
+                ran
+            })
+            .await;
+            match ran {
+                Ok(Ok((answer, permit))) => {
+                    *held = Some(permit);
+                    answer.response()
+                }
+                Ok(Err(refused)) => refused.response(),
+                Err(e) => refuse(&ApiError::with_code(ErrorCode::Internal, e.to_string())),
+            }
+        }
+    }
+}
+
+/// A keyed request's entry while its op runs. Finished, it records the answer and hands it to the
+/// waiters. Dropped unfinished — refused before the op ran, or the task running it panicked — the entry
+/// is forgotten, so a resend runs the op, and the waiters hear there is no answer to share: left in
+/// progress, every resend of the key would wait on an answer that never comes.
+struct Recording {
+    idem: Arc<Mutex<Store<Answer>>>,
+    key: Key,
+    running: Option<Running<Answer>>,
+}
+
+impl Recording {
+    fn finish(mut self, answer: &Answer) {
+        let Some(running) = self.running.take() else {
+            return;
+        };
+        if let Ok(mut idem) = self.idem.lock() {
+            idem.finish(
+                &self.key,
+                running.id,
+                answer.clone(),
+                answer.body.len(),
+                Instant::now(),
+            );
+        }
+        let _ = running.tx.send(Some(answer.clone()));
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        if let Some(running) = self.running.take() {
+            if let Ok(mut idem) = self.idem.lock() {
+                idem.abandon(&self.key, running.id);
+            }
+        }
+    }
+}
+
+/// The answer of a keyed request's original, for a resend that arrived while it ran: waited for up to
+/// `limit`. An original refused before it ran shares nothing, and the resend is told to retry.
+async fn await_original(mut original: watch::Receiver<Option<Answer>>, limit: Duration) -> Answer {
+    let busy = |why: &str| Answer::refusal(&ApiError::with_code(ErrorCode::Busy, why));
+    match tokio::time::timeout(limit, original.wait_for(Option::is_some)).await {
+        Ok(Ok(answer)) => answer.clone().unwrap_or_else(|| busy("no answer")),
+        Ok(Err(_)) => busy("the first attempt with this Idempotency-Key was refused; retry"),
+        Err(_) => busy("the first attempt with this Idempotency-Key is still running; retry"),
+    }
+}
+
+/// A parsed op, authenticated and admitted, ready to run.
+struct Op {
+    state: Arc<State>,
+    backend: LocalBackend,
+    db: Db,
+    request: Request,
+    asked_wait: Duration,
+    /// The op permit it was admitted under, traded by [`permit_for`] for the one it runs under.
+    admitted: tokio::sync::OwnedSemaphorePermit,
+    given: String,
+}
+
+impl Op {
+    /// Run it: its answer and the permit it ran under, for the response body to keep — or the refusal
+    /// when it was not run at all (a busy budget), which a keyed request does not record.
+    async fn run(self) -> Result<(Answer, Permit), Answer> {
+        let Self {
+            state,
+            backend,
+            db,
+            request,
+            asked_wait,
+            admitted,
+            given,
+        } = self;
+        let (permit, _slot, wait) = permit_for(&state, &request, asked_wait, admitted)
+            .map_err(|refusal| Answer::refusal(&refusal))?;
+        let permit: Permit = Arc::new(permit);
+        let served = serve_op(&state, &backend, &db, request, wait, &permit).await;
+        Ok((answer(&state, &given, served), permit))
+    }
+
+    /// Run it, as a request without a key is: `held` is left holding the permit it ran under.
+    async fn serve(self, held: &mut Option<Permit>) -> hyper::Response<Full<Bytes>> {
+        match self.run().await {
+            Ok((answer, permit)) => {
+                *held = Some(permit);
+                answer.response()
+            }
+            Err(refused) => refused.response(),
+        }
+    }
 }
 
 /// The reply to a served op, keeping the grant cache honest on the way: a grant this daemon served
 /// lets the next miss refresh at once, and a token admitted from the cache that then failed to resolve
 /// is evicted and its connection closed.
-fn answer(
-    state: &State,
-    given: &str,
-    served: Result<Response, ApiError>,
-) -> hyper::Response<Full<Bytes>> {
+fn answer(state: &State, given: &str, served: Result<Response, ApiError>) -> Answer {
     match served {
         Ok(response) => {
             // A grant this daemon just minted must authenticate on the very next request: its miss
@@ -1065,7 +1302,7 @@ fn answer(
                     cache.refreshed = None;
                 }
             }
-            reply(StatusCode::OK, &json!(response))
+            Answer::json(StatusCode::OK, &json!(response))
         }
         // The token was admitted and then did not resolve: revoked since the cache last read,
         // or a ticket released. Its hash goes, and so does the connection.
@@ -1073,9 +1310,12 @@ fn answer(
             if let Ok(mut cache) = state.grants.lock() {
                 cache.hashes.remove(&jkb_core::roles::token_hash(given));
             }
-            refuse_and_close(&e)
+            Answer {
+                close: true,
+                ..Answer::refusal(&e)
+            }
         }
-        Err(e) => refuse(&e),
+        Err(e) => Answer::refusal(&e),
     }
 }
 
