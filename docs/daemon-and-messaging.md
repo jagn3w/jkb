@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:daemon-and-messaging-18dcdf2a2d45d6f884c253, edit there (version 159.ngGE1J7o0dOTCwGFvsnWyuvJDAGGqJ7W_pWzCQGIoufM5rfTCgGI2LH6w6vJAgGLzITutqDlCAGN3vaWl6OcCQGP8reJgdCwDQGQ6N7RiM3zCAGS6JPyh53sAgGUoJSTyLi_DgGW3ITWkL_ZBQGXvpP-ha-RBQGY7ICV-PWdAQGaqKnX7YWJBAGborff9vTKCQGe0o-5-LurCAGfjJ7LqOWLAgGg5LK1x-_-BgGhuNjwgcluAZ_g_Y2r9roHAaPu2cDny8QDAaPKmZTN7pYEAaW84Z3OkqQEAaaY-rv9mFQBp-i--8iXrgcBp8LY3aegjwgBqaC6sf3xpQcBqabF84LyWwGetM-4t6H9DwGj6M7VnYm_AQGt8MLNoKLlDAGvgLyph8ZBAa-yqeWUqJQJAbHC1-W6ub0GAbH2qbSdnfgFAbbi_oLm-dkDAbfg5sLdvMYBAbrm9Mqu9LUOAbuq1PuNpeoGAbzewJHE6ewBAbzKntKX394LAbyw-P_is9IBAbuuyMiGo8wPAcDw2vOytoMLAcL6gK2ClvkNAcaGiJqCndEJAcbA1t3O1_gEAciawd_k5-8MAcjSoLuKuYUIAcaMmIaN0L4PAcqA27eH8J8CAc3W-cCvmasDAc6ov--e_8kOAdDwrc7mkSUB0cb42fOQuQMB0qbxvvW4sAsB06zrvaiwGgHV2JS6g_25BQHYiruKrMCJAQHYmNOHjJPzDwHa4J-FzLVG-cYI2vTZ89Sb0AkB3ObV3o3w0wgB3Oqdn4_jKwHe_JfJuPypCAHfjNbSsfeSDQHg6NeLrcyjCQHhvK_Z2u-tDgHgzoK8s9u8BgHfzqToh_urBwHo1Pb08fzYCAHovPuw3OLlAgHq0oXT1MW3AQHq3sLC8rX-AgHv7MPKkOLxBwHwsNeyzujHAgHylqD9-ZqDAgHz2PDKmvWzCQH0qv3g2evsAgHyquP20cSjA0z6us3fxb6fCgH7sKCauvOADQH6_Kemz7PHCwGFrZulp-ZsAYXrm8XNnfMHAYfJp5e18MYLAYnb5bT0qC8Bicul5dWkkAYBi7e0kOT15A8Bj9-0lYuc6wMBkPWcjd7ZuQIBmNevt_fduA4BnOPOlbGn7AoBncuemvWPkQkBnvGkyYqXowEBnu3xormPqQ0Bo6npr9e0sA4Bo6ubjffrtQkBo7fZyeiU5gYBpe2d6I_XmwYBo6WSxoD75wwBo93GwMjo9wMBqdvdxIbD0w8Bo4Xr9LPLuw8Br8HUhJfx4Q0BsJHmr4bd5woBr638rcaA4wgBr-_G3JmH-QUBto_tk-CtOwG258DcyIf0BAG46c_Z0tHECwG99avG_sTaAQHChcec-IqODQHDndPo0efVDwHDxbi-rY-TDgHF_aP9u4_VDAHFwd-I74jUAgHHybL_yNv1AwHF9bXe_a7UBQHH26ObrKbHAQHLpZX3uf4iAcvLna-0nuUDAc2pvN78j2MB0fWNisGpiwoB05fd3MXdmgwB1_eo5YTxgQgB2JX2-dHpmwIB2uXuw6PrqwMB29vb6M35sAMB3deQgMj_-QcB3a3D4N6M8goB3pm5zNDhtAIB4I3uupicqAIB4Jnnr-rHqQYB49Ojksu2kwkB5P_MwsyR-gsB5bmQ6LGAjAEB5oeHlIuSxgkB6NnB2JOs_AsB6f334MD4zgwB6oftzr2a-A4B64ft6eXJxgUB69P95Nej1A4B6_fr9pPqwgkB64eGlYS-kw0B6PGeo7GW-QMB8JWanqqx7AgB9pOApsv1lgoB9rGTrfXn8wQB-MO_lovJ6QgB98_8mMCo_QsB-v3T-s3mvg0B-q3qspid_QEB_PWbh4LP9wEB_O-FvsmT7QoB98fKxtup1AUB___bz7TN5QgB, blake3 e4f83384d980d900bc37897f3eaa65d63fbba628e5c0dd059e772de1bc6b1b7f) -->
+<!-- generated from jkb design design:daemon-and-messaging-18dcdf2a2d45d6f884c253, edit there (version 167.pgGE1J7o0dOTCwGFvsnWyuvJDAGGqJ7W_pWzCQGIoufM5rfTCgGI2LH6w6vJAgGLzITutqDlCAGN3vaWl6OcCQGP8reJgdCwDQGQ6N7RiM3zCAGS6JPyh53sAgGUoJSTyLi_DgGW3ITWkL_ZBQGXvpP-ha-RBQGY7ICV-PWdAQGYto-Wu72vCIICmqip1-2FiQQBm6K33_b0ygkBntKPufi7qwgBn4yey6jliwIBoOSytcfv_gYBobjY8IHJbgGf4P2Nq_a6BwGj7tnA58vEAwGjypmUze6WBAGlvOGdzpKkBAGmmPq7_ZhUAafovvvIl64HAafC2N2noI8IAamgurH98aUHAammxfOC8lsBnrTPuLeh_Q8Bo-jO1Z2JvwEBrfDCzaCi5QwBr4C8qYfGQQGvsqnllKiUCQGxwtflurm9BgGx9qm0nZ34BQG24v6C5vnZAwG34ObC3bzGAQG65vTKrvS1DgG7qtT7jaXqBgG83sCRxOnsAQG8yp7Sl9_eCwG8sPj_4rPSAQG7rsjIhqPMDwHA8NrzsraDCwHC-oCtgpb5DQHGhoiagp3RCQHGwNbdztf4BAHImsHf5OfvDAHI0qC7irmFCAHGjJiGjdC-DwHKgNu3h_CfAgHN1vnAr5mrAwHOqL_vnv_JDgHQ8K3O5pElAdHG-NnzkLkDAdKm8b71uLALAdOs672osBoB06aptKjozwrUHdXYlLqD_bkFAdiKu4qswIkBAdiY04eMk_MPAdrgn4XMtUb5xgja9Nnz1JvQCQHc5tXejfDTCAHc6p2fj-MrAd78l8m4_KkIAd-M1tKx95INAeDo14utzKMJAeG8r9na760OAeDOgryz27wGAd_OpOiH-6sHAdnuw_Hty-cGAejU9vTx_NgIAei8-7Dc4uUCAerShdPUxbcBAerewsLytf4CAe_sw8qQ4vEHAfCw17LO6McCAfKWoP35moMCAfPY8Mqa9bMJAfSq_eDZ6-wCAfKq4_bRxKMDTPKY7eGv1kf2Avq6zd_Fvp8KAfuwoJq684ANAfr8p6bPs8cLAfq6ucSYztECxiWFrZulp-ZsAYXrm8XNnfMHAYfJp5e18MYLAYnb5bT0qC8Bicul5dWkkAYBi7e0kOT15A8Bj9-0lYuc6wMBkPWcjd7ZuQIBmNevt_fduA4BnOPOlbGn7AoBncuemvWPkQkBnvGkyYqXowEBnu3xormPqQ0Bo6npr9e0sA4Bo6ubjffrtQkBo7fZyeiU5gYBpe2d6I_XmwYBo6WSxoD75wwBo93GwMjo9wMBqdvdxIbD0w8Bo4Xr9LPLuw8Br8HUhJfx4Q0BsJHmr4bd5woBr638rcaA4wgBr-_G3JmH-QUBto_tk-CtOwG258DcyIf0BAG46c_Z0tHECwG488qY7b6NBGq99avG_sTaAQG-4d7XwNSsA54BwoXHnPiKjg0Bw53T6NHn1Q8Bw8W4vq2Pkw4Bxf2j_buP1QwBxcHfiO-I1AIBx8my_8jb9QMBxfW13v2u1AUBx9ujm6ymxwEBy6WV97n-IgHLy52vtJ7lAwHNqbze_I9jAc-_xMfcnrsMKdH1jYrBqYsKAdOX3dzF3ZoMAdf3qOWE8YEIAdiV9vnR6ZsCAdrl7sOj66sDAdvb2-jN-bADAd3XkIDI__kHAd2tw-DejPIKAd6ZuczQ4bQCAeCN7rqYnKgCAeCZ56_qx6kGAePTo5LLtpMJAeT_zMLMkfoLAeW5kOixgIwBAeaHh5SLksYJAejZwdiTrPwLAen99-DA-M4MAeqH7c69mvgOAeuH7enlycYFAevT_eTXo9QOAev36_aT6sIJAeuHhpWEvpMNAejxnqOxlvkDAfCVmp6qsewIAfaTgKbL9ZYKAfaxk6315_MEAfjDv5aLyekIAffP_JjAqP0LAfr90_rN5r4NAfqt6rKYnf0BAfz1m4eCz_cBAfzvhb7Jk-0KAffHysbbqdQFAf__28-0zeUIAQ, blake3 70d91b8f609185b66ecd49dd9534f5d05a982abfe9e7811a805bb9655c4a0d56) -->
 # Daemon and messaging
 
 This design records how processes that must not open `jkb.db` still reach the knowledge base, and
@@ -210,14 +210,15 @@ macOS under the land gate's load. Pinned by `an_oversized_body_is_drained_before
 `RemoteBackend` checks the cap before sending any op, because a body many times the cap was
 otherwise cut off mid-upload and reported as a daemon that could not be reached.
 
-### The wire is two endpoints
+### The wire is three endpoints
 
-Both need `Authorization: Bearer <token>`. The body is always JSON; clients branch on its `code`,
+All need `Authorization: Bearer <token>`. The body is always JSON; clients branch on its `code`,
 and the HTTP status is for people and proxies.
 
 ```
 GET  /v1/hello            → {"protocol":1,"schema_version":…,"supported_schema":…,"ops":[…]}
 POST /v1/op[?wait_ms=N]   → a response object ({"result":…}), or an error object ({"code","message"})
+POST /v1/op/keyed         → the same, run at most once per Idempotency-Key (a write resent after a stall)
 ```
 
 `hello` returns the protocol version, the schema versions and the op list, so a client can refuse
@@ -225,6 +226,65 @@ early with "rebuild the host `jkb`" instead of failing mid-command. `wait_ms` (c
 turns an empty `mq.poll` into a long-poll; any other op ignores it. **One long-poll per group at a
 time**: a second, while the first is held, is answered `busy`, so a burst of subscribes to one
 group cannot occupy the poll budget, and the slot is released when the client goes away.
+
+### A stalled write is resent once, safely, under an idempotency key
+
+**Measured cause (2026-10-10).** The same burst of 600 sequential `jkb design ls` calls, one TCP
+connection each, was run from three places. From the host straight to `127.0.0.1:7117`, and from a
+dev-container terminal outside Claude Code's sandbox, it saw no failures and no call over 2 s. From
+inside Claude Code's Bash sandbox, whose egress all passes through its filtering network proxy, it
+saw 2–3 failures and several 10–20 s calls per 600: requests that connect and then get no answer
+until the 30 s op timeout. The daemon, the container's egress firewall and Docker's port forwarding
+are clean; the proxy stalls about 1 in 200 agent requests. Nothing can route around it: the sandbox's
+only bypass, `excludedCommands`, runs a command wholly outside the sandbox, and the auto-mode posture
+forbids it.
+
+**The keyed route.** `POST /v1/op/keyed` serves the same ops as `/v1/op` but requires an
+`Idempotency-Key` header and runs each key at most once; `/v1/op` is unchanged and ignores the header.
+The daemon keeps an in-memory store from (blake3 of the presented bearer token, key) to *running* or
+the answer bytes it sent. A repeat of a finished key gets those bytes back; a repeat of a running key
+waits for it (`duplicate_wait`), and one that outwaits it gets `unavailable` saying the original may
+yet apply. The key is looked up before the op permit, so a repeat never meets a concurrency `busy`. A
+key reused with a different body, a missing header and a long-poll on this route are `bad_request`.
+The op runs detached from the connection, so a client that gives up does not abandon it mid-write. A
+refusal before the op ran records nothing, so a resend runs it; an original that fails after it
+started tells its waiters `unavailable` (it may have applied). Answers are kept 10 minutes; over the
+entry or byte cap the oldest finished answers are evicted, never a running one. An answer over
+`idempotency_max_answer` (1 MiB) is served but not kept: its key replays `unavailable` ("the op ran,
+its answer was too large to record").
+
+**The client.** Only ops that change state are keyed (`Request::mutates`, beside the op definitions
+in jkb-api: every op outside the agent read set and the reads served on the writer; a new op counts
+as mutating until it is named a read). A read, a long-poll, `ingest.text` and every hook call (a
+hook's 1 s deadline is shorter than one attempt) is one unkeyed attempt on `/v1/op`. A keyed call
+makes at most two attempts under one key: the first is abandoned after `ATTEMPT_TIMEOUT` (5 s) if it
+connected and got no answer, or its body stalled; the second gets the rest of the deadline. Failed
+connects keep the separate connect retry, and only a call where no attempt connected marks the
+daemon down. An older daemon answers the first keyed attempt `no such endpoint` without running
+anything (or, for a large body, breaks the pipe before reading it), and the client then makes one
+unkeyed `/v1/op` attempt: version skew is handled by the route, with no probe and no cache. **Once
+the first attempt is unaccounted for, the second answer never claims nothing ran**: a `busy`, a `no
+such endpoint` or a cut-off body on the resend becomes `unavailable` ("the first attempt may have
+applied"), with no fallback.
+
+**Accepted residuals.** If the first attempt applies and the second also fails (a second stall,
+about 1 in 40 000, or a proxy 5xx), the call reports `unavailable` and a caller that retries under a
+fresh key applies the write twice. Keys live only in memory: if the daemon restarts between the two
+attempts, the resend runs on an empty store, so the write applies twice **and the call reports
+success**. An `unauthorized` answer makes the client re-read its token and retry with the same key,
+so "two attempts" is two per token. Eviction of a still-live answer needs over 4 096 keyed writes
+inside one client's 30 s deadline (about 140 writes a second sustained), or 64 MiB of recorded
+answers in that time; no single recorded answer exceeds 1 MiB.
+
+
+**Rejected on the way, and why.** A client that raced both attempts, probed `hello` for key support
+and cached the answer, and kept a table of which error codes "decide" an op went through three review
+rounds, each finding new defects in the mechanism the last round added: a cached answer outliving a
+daemon downgrade, a recorded `busy` that the client resent every 200 ms for 30 s, replays bypassing
+the read budget. The separate route and the one rule for the second answer remove each by
+construction. A store-wide minimum answer age was also tried and dropped: it refused every caller's
+writes while one caller's burst filled the store, which was worse than the eviction it replaced.
+Connect retry alone (the first fix) did not help: the stalls are on connections that succeeded.
 
 ### Long-poll wake is driven by the database, not by the daemon's own sends
 
@@ -420,6 +480,11 @@ HTTP, the daemon is at a concurrency limit or the group already has a long-poll 
 re-read and retry), `internal`, and `schema_newer`. Over HTTP two more: `unauthorized` (a missing or
 stale token) and `unavailable` (the daemon cannot be reached, something other than the daemon
 answered, or the daemon cannot open its database).
+
+On `/v1/op/keyed`, `unavailable` also covers a write that may have applied: a resend that outwaited
+its still-running original, an original that failed after it started, a resend after an
+unaccounted first attempt, and a replay of an answer too large to record. `bad_request` there also
+covers a missing `Idempotency-Key`, a long-poll, or a key reused with a different body.
 
 Under `--json`, every `jkb mq` verb except `subscribe` (whose stdout is its event stream) prints any
 failure to stdout as `{"error":{"code":…,"message":…}}` as well as exiting 1: a refusal with its own

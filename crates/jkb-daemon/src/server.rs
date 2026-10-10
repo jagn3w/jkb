@@ -3,9 +3,12 @@
 //! ```text
 //! GET  /v1/hello                → {"protocol","schema_version","supported_schema","ops"}
 //! POST /v1/op[?wait_ms=N]       → a jkb_api::Response, or a jkb_api::ApiError with a 4xx/5xx status
+//! POST /v1/op/keyed             → the same, for a request carrying an Idempotency-Key (required)
 //! ```
 //!
-//! Both require `Authorization: Bearer <token>`. `wait_ms` applies to `mq.poll` only (any other op
+//! All require `Authorization: Bearer <token>`. On `/v1/op/keyed` a repeat of a key by the same
+//! caller is answered with the first one's answer rather than run again ([`crate::idempotency`]; keys
+//! live in memory, so a restart forgets them); `/v1/op` ignores the header. `wait_ms` applies to `mq.poll` only (any other op
 //! ignores it): an empty answer is held until a message arrives or the wait (capped) runs out — woken
 //! at once by a send this daemon served, and at worst every 250 ms for one another process wrote
 //! (the host CLI opens the database directly). At most one long-poll per group is held at a time; a
@@ -23,9 +26,9 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
@@ -38,8 +41,9 @@ use jkb_api::rbac::Caller;
 use jkb_api::{ApiError, Backend as _, ErrorCode, LocalBackend, Request, Response};
 use jkb_core::Db;
 use serde_json::json;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 
+use crate::idempotency::{Begin, Key, Running, Store};
 use crate::token;
 
 /// How a daemon is configured.
@@ -85,6 +89,20 @@ pub struct ServeConfig {
     /// write timeout of its own — so without this a client that stopped reading kept a permit until
     /// the daemon restarted, and enough of them refused the notification hook's every request.
     pub write_stall: Duration,
+    /// How long the answer to a request that carried an `Idempotency-Key` is kept for a resend of it
+    /// ([`crate::idempotency`]).
+    pub idempotency_ttl: Duration,
+    /// How many keyed requests are remembered at most; past it the oldest answers go first.
+    pub idempotency_entries: usize,
+    /// How many bytes of keyed answers are kept at most; past it the oldest go first.
+    pub idempotency_bytes: usize,
+    /// The largest answer recorded for a resend. A larger one is served, and its key recorded as done
+    /// with no answer: a resend is told `unavailable`, "the op ran", rather than the store holding an
+    /// answer of up to a read's whole budget.
+    pub idempotency_max_answer: usize,
+    /// Longest a resend waits for its original, still running, to answer. Its client's own deadline
+    /// is usually shorter; this bounds a waiter whose client went away unnoticed.
+    pub duplicate_wait: Duration,
 }
 
 impl ServeConfig {
@@ -106,6 +124,11 @@ impl ServeConfig {
             read_timeout: Duration::from_secs(10),
             reopen_every: Duration::from_secs(5),
             write_stall: Duration::from_secs(10),
+            idempotency_ttl: Duration::from_mins(10),
+            idempotency_entries: 4096,
+            idempotency_bytes: 64 * 1024 * 1024,
+            idempotency_max_answer: 1024 * 1024,
+            duplicate_wait: Duration::from_mins(1),
         }
     }
 }
@@ -146,6 +169,10 @@ pub struct Handle {
     pub addr: SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    idem: Option<Arc<Mutex<Store<Answer>>>>,
+    waiting: Option<Arc<AtomicUsize>>,
+    /// The ingest budget and its size, for [`Handle::ingests_running`].
+    ingests: Option<(Arc<Semaphore>, usize)>,
 }
 
 impl Handle {
@@ -167,6 +194,34 @@ impl Handle {
     /// What the server thread panicked with, if it did.
     pub fn join(mut self) -> Result<(), String> {
         self.join_thread()
+    }
+
+    /// How many keyed requests are running now ([`crate::idempotency`]) — for tests that must order
+    /// a resend after its original by what the daemon has seen, not by a sleep.
+    #[must_use]
+    pub fn keyed_in_progress(&self) -> usize {
+        self.idem
+            .as_ref()
+            .and_then(|idem| idem.lock().ok().map(|idem| idem.in_progress()))
+            .unwrap_or(0)
+    }
+
+    /// How many resends are waiting on their original now — for tests, as
+    /// [`Handle::keyed_in_progress`].
+    #[must_use]
+    pub fn keyed_waiting(&self) -> usize {
+        self.waiting
+            .as_ref()
+            .map_or(0, |waiting| waiting.load(Ordering::SeqCst))
+    }
+
+    /// How many `ingest.text` requests hold an ingest permit now — for tests, as
+    /// [`Handle::keyed_in_progress`].
+    #[must_use]
+    pub fn ingests_running(&self) -> usize {
+        self.ingests
+            .as_ref()
+            .map_or(0, |(budget, size)| size - budget.available_permits())
     }
 
     /// Whether the server thread has ended. Nothing but [`Handle::shutdown`] asks it to, so while
@@ -226,6 +281,12 @@ struct State {
     tickets: jkb_api::rbac::SharedTickets,
     /// Which bearer tokens name a live grant, for authenticating before the body is read.
     grants: Mutex<GrantCache>,
+    /// The keyed requests' answers, for a resend ([`crate::idempotency`]).
+    idem: Arc<Mutex<Store<Answer>>>,
+    /// How many resends are waiting on their original ([`Handle::keyed_waiting`]).
+    waiting: Arc<AtomicUsize>,
+    max_recorded_answer: usize,
+    duplicate_wait: Duration,
 }
 
 /// The live grants' token hashes, so a bearer that is neither the root token nor a ticket is
@@ -386,6 +447,13 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
     };
     let token = token::mint()?;
     token::write(&cfg.token_path, &token)?;
+    let idem = Arc::new(Mutex::new(Store::new(
+        cfg.idempotency_ttl,
+        cfg.idempotency_entries,
+        cfg.idempotency_bytes,
+    )));
+    let waiting = Arc::new(AtomicUsize::new(0));
+    let ingests = Arc::new(Semaphore::new(cfg.max_ingests));
     let state = Arc::new(State {
         serving: Mutex::new(serving),
         opener,
@@ -395,7 +463,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         ops: Arc::new(Semaphore::new(cfg.max_ops)),
         polls: Arc::new(Semaphore::new(cfg.max_polls)),
         reads: Arc::new(Semaphore::new(cfg.max_reads)),
-        ingests: Arc::new(Semaphore::new(cfg.max_ingests)),
+        ingests: Arc::clone(&ingests),
         read_budget_bytes: cfg.read_budget_bytes,
         polling: Mutex::new(HashSet::new()),
         sent: Notify::new(),
@@ -405,6 +473,10 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         read_timeout: cfg.read_timeout,
         tickets: Arc::default(),
         grants: Mutex::default(),
+        idem: Arc::clone(&idem),
+        waiting: Arc::clone(&waiting),
+        max_recorded_answer: cfg.idempotency_max_answer,
+        duplicate_wait: cfg.duplicate_wait,
     });
     let connections = Arc::new(Semaphore::new(connection_budget(cfg.max_connections)));
     let read_timeout = cfg.read_timeout;
@@ -447,18 +519,52 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
             });
         })?;
     Ok(Handle {
+        idem: Some(idem),
+        waiting: Some(waiting),
+        ingests: Some((ingests, cfg.max_ingests)),
         addr,
         stop: Some(stop_tx),
         thread: Some(thread),
     })
 }
 
+/// An answer as it goes back to the client — what a keyed request's resend is sent again.
+#[derive(Clone)]
+struct Answer {
+    status: StatusCode,
+    body: Bytes,
+    /// Close the connection after it.
+    close: bool,
+}
+
+impl Answer {
+    fn json(status: StatusCode, body: &serde_json::Value) -> Self {
+        Self {
+            status,
+            body: Bytes::from(body.to_string()),
+            close: false,
+        }
+    }
+
+    fn refusal(e: &ApiError) -> Self {
+        Self::json(status_for(e.code), &json!(e))
+    }
+
+    fn response(self) -> hyper::Response<Full<Bytes>> {
+        let mut builder = hyper::Response::builder()
+            .status(self.status)
+            .header("content-type", "application/json");
+        if self.close {
+            builder = builder.header(hyper::header::CONNECTION, "close");
+        }
+        builder
+            .body(Full::new(self.body))
+            .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::new())))
+    }
+}
+
 fn reply(status: StatusCode, body: &serde_json::Value) -> hyper::Response<Full<Bytes>> {
-    hyper::Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::new())))
+    Answer::json(status, body).response()
 }
 
 /// A request body as read: whole, or past the limit.
@@ -502,16 +608,15 @@ async fn read_body(mut body: Incoming, max: usize) -> Result<Body, hyper::Error>
 /// A refusal before authentication: the answer, and the connection closed after it, so an
 /// unauthenticated client cannot hold a slot by sending refused requests down a kept-alive connection.
 fn refuse_and_close(e: &ApiError) -> hyper::Response<Full<Bytes>> {
-    let mut response = refuse(e);
-    response.headers_mut().insert(
-        hyper::header::CONNECTION,
-        hyper::header::HeaderValue::from_static("close"),
-    );
-    response
+    Answer {
+        close: true,
+        ..Answer::refusal(e)
+    }
+    .response()
 }
 
 fn refuse(e: &ApiError) -> hyper::Response<Full<Bytes>> {
-    reply(status_for(e.code), &json!(e))
+    Answer::refusal(e).response()
 }
 
 /// The HTTP status for an error code. The body always carries the code, so a client decides on the
@@ -602,6 +707,49 @@ async fn authenticate(state: &Arc<State>, given: &str) -> Result<Option<Caller>,
         .hashes
         .contains(&hash)
         .then(|| Caller::Token(given.to_owned())))
+}
+
+/// The header a client names a logical call with, the same on each of its attempts.
+pub const IDEMPOTENCY_KEY: &str = "idempotency-key";
+
+/// The route a keyed call is sent to: `/v1/op`'s, with an [`IDEMPOTENCY_KEY`] required
+/// ([`crate::idempotency`]). A route of its own so that a `jkb serve` older than keys refuses a keyed
+/// call `no such endpoint` without running it, rather than ignoring the header and running a resend
+/// twice — version skew is handled by construction. `/v1/op` ignores the header.
+pub const KEYED_PATH: &str = "/v1/op/keyed";
+
+/// The request's `Idempotency-Key` on the keyed route, where one is required: 1–128 visible ASCII
+/// characters. `None` on any other route, which ignores the header.
+fn idempotency_key(
+    req: &hyper::Request<Incoming>,
+    keyed_route: bool,
+) -> Result<Option<String>, ApiError> {
+    if !keyed_route {
+        return Ok(None);
+    }
+    let Some(value) = req.headers().get(IDEMPOTENCY_KEY) else {
+        return Err(ApiError::bad_request(format!(
+            "{KEYED_PATH} needs an Idempotency-Key header"
+        )));
+    };
+    value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && k.len() <= 128 && k.bytes().all(|b| b.is_ascii_graphic()))
+        .map(|k| Some(k.to_owned()))
+        .ok_or_else(|| {
+            ApiError::bad_request("an Idempotency-Key must be 1 to 128 visible ASCII characters")
+        })
+}
+
+/// The request body's hash, so a key reused for a different request is refused rather than answered
+/// with the first one's result. Within one process `DefaultHasher::new` is the same function each time.
+fn fingerprint(body: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::hash::DefaultHasher::new();
+    body.hash(&mut h);
+    h.finish()
 }
 
 fn wait_ms(req: &hyper::Request<Incoming>) -> u64 {
@@ -939,6 +1087,22 @@ async fn respond(
     Ok(response.map(|body| Held::new(body, permit)))
 }
 
+/// `GET /v1/hello`'s answer.
+async fn hello(db: &Db) -> hyper::Response<Full<Bytes>> {
+    match blocking_read(db, jkb_core::applied_schema_version).await {
+        Ok(schema) => reply(
+            StatusCode::OK,
+            &json!({
+                "protocol": crate::PROTOCOL_VERSION,
+                "schema_version": schema,
+                "supported_schema": jkb_core::supported_schema_version(),
+                "ops": Request::OPS,
+            }),
+        ),
+        Err(e) => refuse(&e),
+    }
+}
+
 /// `held` is left holding the permit the request ran under, for the response body to keep.
 async fn handle(
     state: Arc<State>,
@@ -949,7 +1113,7 @@ async fn handle(
     let route = (req.method().clone(), req.uri().path().to_owned());
     if !matches!(
         (&route.0, route.1.as_str()),
-        (&Method::GET, "/v1/hello") | (&Method::POST, "/v1/op")
+        (&Method::GET, "/v1/hello") | (&Method::POST, "/v1/op" | KEYED_PATH)
     ) {
         return Ok(refuse_and_close(&ApiError::bad_request(format!(
             "no such endpoint: {} {}",
@@ -972,6 +1136,9 @@ async fn handle(
         Err(e) => return Ok(refuse_and_close(&e)),
     };
     authed.store(true, Ordering::SeqCst);
+    // Scoped by the token presented, hashed, so one caller's key never returns another's answer.
+    let key = idempotency_key(&req, route.1 == KEYED_PATH)
+        .map(|key| key.map(|key| (jkb_core::roles::token_hash(&given), key)));
     let (backend, db) = match ready(&state).await {
         Ok(serving) => serving,
         Err(refusal) => return Ok(refuse(&refusal)),
@@ -980,28 +1147,17 @@ async fn handle(
     let backend = backend
         .with_tickets(Arc::clone(&state.tickets))
         .with_caller(caller);
-    let (backend, db) = (&backend, &db);
     // Every request past authentication holds an op permit from here — through the schema read, the
     // body and the parse — so authenticated clients cannot pile up unbounded work before the budget
-    // is asked. A long-poll trades it for a poll permit once it is known to be one.
-    let Ok(op_permit) = Arc::clone(&state.ops).try_acquire_owned() else {
+    // is asked. A long-poll trades it for a poll permit once it is known to be one. The one exemption
+    // is a keyed request whose key this caller already has recorded (`admission`): it reads its body
+    // without a permit, then is replayed or waits on its original holding none — or, if the record
+    // expired meanwhile, takes an op permit to run.
+    let Ok(op_permit) = admission(&state, &route.0, &key) else {
         return Ok(busy("the daemon is at its concurrency limit; retry"));
     };
     if route.0 == Method::GET {
-        return Ok(
-            match blocking_read(db, jkb_core::applied_schema_version).await {
-                Ok(schema) => reply(
-                    StatusCode::OK,
-                    &json!({
-                        "protocol": crate::PROTOCOL_VERSION,
-                        "schema_version": schema,
-                        "supported_schema": jkb_core::supported_schema_version(),
-                        "ops": Request::OPS,
-                    }),
-                ),
-                Err(e) => refuse(&e),
-            },
-        );
+        return Ok(hello(&db).await);
     }
     let asked_wait = Duration::from_millis(wait_ms(&req)).min(state.max_wait);
     let body = match tokio::time::timeout(
@@ -1033,27 +1189,268 @@ async fn handle(
         Ok(r) => r,
         Err(e) => return Ok(refuse(&ApiError::bad_request(e.to_string()))),
     };
-    let (permit, _slot, wait) = match permit_for(&state, &request, asked_wait, op_permit) {
-        Ok(granted) => granted,
-        Err(refusal) => return Ok(refuse(&refusal)),
+    let op = Op {
+        state: Arc::clone(&state),
+        backend,
+        db,
+        request,
+        asked_wait,
+        admitted: op_permit,
+        given,
     };
-    let permit: Permit = Arc::new(permit);
-    *held = Some(Arc::clone(&permit));
-    Ok(answer(
-        &state,
-        &given,
-        serve_op(&state, backend, db, request, wait, &permit).await,
-    ))
+    Ok(match key {
+        // A long-poll is never keyed: see `Op::is_long_poll`.
+        Ok(Some(_)) if op.is_long_poll() => refuse(&ApiError::bad_request(format!(
+            "a long-poll is not keyed: send it to /v1/op, not {KEYED_PATH}"
+        ))),
+        Ok(Some(key)) => serve_keyed(state, op, key, &body, held).await,
+        Ok(None) => op.serve(held).await,
+        Err(refusal) => refuse(&refusal),
+    })
+}
+
+/// The op permit a request is admitted under — or none, for a resend of a key this caller already has
+/// recorded, which is answered from that record or waits on it and so must never be refused `busy`
+/// here: a client told `busy` retries under a fresh key, and the write lands twice. `Err` is `busy`.
+fn admission(
+    state: &State,
+    method: &Method,
+    key: &Result<Option<Key>, ApiError>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    if let (&Method::POST, Ok(Some(key))) = (method, key) {
+        let known = state.idem.lock().is_ok_and(|idem| idem.contains(key));
+        if known {
+            return Ok(None);
+        }
+    }
+    Arc::clone(&state.ops)
+        .try_acquire_owned()
+        .map(Some)
+        .map_err(|_| ())
+}
+
+/// Serve a request that carried an `Idempotency-Key` ([`crate::idempotency`]): run it once, and
+/// answer a resend of it from what that run answered.
+async fn serve_keyed(
+    state: Arc<State>,
+    op: Op,
+    key: Key,
+    body: &[u8],
+    held: &mut Option<Permit>,
+) -> hyper::Response<Full<Bytes>> {
+    let begun = state
+        .idem
+        .lock()
+        .ok()
+        .map(|mut idem| idem.begin(key.clone(), fingerprint(body), Instant::now()));
+    match begun {
+        None => refuse(&ApiError::with_code(
+            ErrorCode::Internal,
+            "idempotency store poisoned",
+        )),
+        Some(Begin::Replay(answer)) => answer.response(),
+        Some(Begin::Mismatch) => refuse(&ApiError::bad_request(
+            "this Idempotency-Key was first used for a different request",
+        )),
+        Some(Begin::Wait(original)) => {
+            // Waiting is no work: the permit goes back for others.
+            drop(op);
+            await_original(original, state.duplicate_wait, &state.waiting)
+                .await
+                .response()
+        }
+        Some(Begin::Run(running)) => {
+            // Spawned, so the answer is recorded and its waiters woken even if this client goes away
+            // mid-op — dropped with the handler, the entry would stay in progress for good.
+            let recording = Recording {
+                idem: Arc::clone(&state.idem),
+                key,
+                running: Some(running),
+                started: AtomicBool::new(false),
+                max_answer: state.max_recorded_answer,
+            };
+            let ran = tokio::spawn(async move {
+                let ran = op
+                    .run(|| recording.started.store(true, Ordering::SeqCst))
+                    .await;
+                // Refused before it ran: `recording` is dropped unfinished, so a resend runs it.
+                if let Ok((answer, _)) = &ran {
+                    recording.finish(answer);
+                }
+                ran
+            })
+            .await;
+            match ran {
+                Ok(Ok((answer, permit))) => {
+                    *held = Some(permit);
+                    answer.response()
+                }
+                Ok(Err(refused)) => refused.response(),
+                Err(e) => refuse(&ApiError::with_code(ErrorCode::Internal, e.to_string())),
+            }
+        }
+    }
+}
+
+/// A keyed request's entry while its op runs. Finished, it records the answer — or, past
+/// `max_answer`, a refusal saying the op ran — and hands the answer to the waiters. Dropped unfinished
+/// — refused before the op ran, or the op did not finish — the entry is forgotten, so a resend runs the
+/// op: left in progress, every resend of the key would wait on an answer that never comes. Its
+/// waiters hear `busy` when the op never `started`, and `unavailable` when it did: it may have applied.
+struct Recording {
+    idem: Arc<Mutex<Store<Answer>>>,
+    key: Key,
+    running: Option<Running<Answer>>,
+    /// Set once the op has its permit and begins.
+    started: AtomicBool,
+    max_answer: usize,
+}
+
+impl Recording {
+    fn finish(mut self, answer: &Answer) {
+        let Some(running) = self.running.take() else {
+            return;
+        };
+        let recorded = if answer.body.len() > self.max_answer {
+            Answer::refusal(&ApiError::with_code(
+                ErrorCode::Unavailable,
+                "the op ran, but its answer was too large to record, so it cannot be replayed",
+            ))
+        } else {
+            answer.clone()
+        };
+        if let Ok(mut idem) = self.idem.lock() {
+            let bytes = recorded.body.len();
+            idem.finish(&self.key, running.id, recorded, bytes, Instant::now());
+        }
+        let _ = running.tx.send(Some(answer.clone()));
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        if let Some(running) = self.running.take() {
+            if let Ok(mut idem) = self.idem.lock() {
+                idem.abandon(&self.key, running.id);
+            }
+            if self.started.load(Ordering::SeqCst) {
+                let _ = running.tx.send(Some(Answer::refusal(&ApiError::with_code(
+                    ErrorCode::Unavailable,
+                    "the first attempt with this Idempotency-Key started and did not finish; it \
+                     may have applied",
+                ))));
+            }
+        }
+    }
+}
+
+/// The answer of a keyed request's original, for a resend that arrived while it ran: waited for up to
+/// `limit`. An original refused before it ran shares nothing, and the resend is told to retry.
+///
+/// Counted in `waiting` while it waits. Out of time, the answer is `unavailable`, not `busy`: the
+/// original is still running and may yet apply, which `busy` — nothing ran — would deny.
+async fn await_original(
+    mut original: watch::Receiver<Option<Answer>>,
+    limit: Duration,
+    waiting: &AtomicUsize,
+) -> Answer {
+    struct Waiting<'a>(&'a AtomicUsize);
+    impl Drop for Waiting<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    waiting.fetch_add(1, Ordering::SeqCst);
+    let _waiting = Waiting(waiting);
+    let refusal = |code, why: &str| Answer::refusal(&ApiError::with_code(code, why));
+    match tokio::time::timeout(limit, original.wait_for(Option::is_some)).await {
+        Ok(Ok(answer)) => answer
+            .clone()
+            .unwrap_or_else(|| refusal(ErrorCode::Internal, "no answer")),
+        Ok(Err(_)) => refusal(
+            ErrorCode::Busy,
+            "the first attempt with this Idempotency-Key was refused before it ran; retry",
+        ),
+        Err(_) => refusal(
+            ErrorCode::Unavailable,
+            "the first attempt with this Idempotency-Key is still running and may yet apply; its \
+             answer did not come in time",
+        ),
+    }
+}
+
+/// A parsed op, authenticated and admitted, ready to run.
+struct Op {
+    state: Arc<State>,
+    backend: LocalBackend,
+    db: Db,
+    request: Request,
+    asked_wait: Duration,
+    /// The op permit it was admitted under, traded by [`permit_for`] for the one it runs under. `None`
+    /// for a resend of a key already known, admitted without one so that it never meets the op
+    /// permit's `busy` ([`admission`]); taken now if it must run after all.
+    admitted: Option<tokio::sync::OwnedSemaphorePermit>,
+    given: String,
+}
+
+impl Op {
+    /// Run it: its answer and the permit it ran under, for the response body to keep — or the refusal
+    /// when it was not run (a busy budget, a newer schema) or did not finish (it panicked), which a
+    /// keyed request does not record.
+    ///
+    /// `started` is called once the op has its permit and begins.
+    async fn run(self, started: impl FnOnce()) -> Result<(Answer, Permit), Answer> {
+        let Self {
+            state,
+            backend,
+            db,
+            request,
+            asked_wait,
+            admitted,
+            given,
+        } = self;
+        let admitted = match admitted {
+            Some(permit) => permit,
+            None => Arc::clone(&state.ops).try_acquire_owned().map_err(|_| {
+                Answer::refusal(&ApiError::with_code(
+                    ErrorCode::Busy,
+                    "the daemon is at its concurrency limit; retry",
+                ))
+            })?,
+        };
+        let (permit, _slot, wait) = permit_for(&state, &request, asked_wait, admitted)
+            .map_err(|refusal| Answer::refusal(&refusal))?;
+        let permit: Permit = Arc::new(permit);
+        started();
+        match serve_op(&state, &backend, &db, request, wait, &permit).await {
+            Ok(served) => Ok((answer(&state, &given, served), permit)),
+            Err(NotRun(e)) => Err(answer(&state, &given, Err(e))),
+        }
+    }
+
+    /// Whether it is a long-poll: never keyed — refused on the keyed route — so that it is served on
+    /// its handler's own future, and a client that hangs up frees its group's slot and its poll permit
+    /// at once ([`PollSlot`]).
+    fn is_long_poll(&self) -> bool {
+        is_long_poll(&self.request, self.asked_wait)
+    }
+
+    /// Run it, as a request without a key is: `held` is left holding the permit it ran under.
+    async fn serve(self, held: &mut Option<Permit>) -> hyper::Response<Full<Bytes>> {
+        match self.run(|| {}).await {
+            Ok((answer, permit)) => {
+                *held = Some(permit);
+                answer.response()
+            }
+            Err(refused) => refused.response(),
+        }
+    }
 }
 
 /// The reply to a served op, keeping the grant cache honest on the way: a grant this daemon served
 /// lets the next miss refresh at once, and a token admitted from the cache that then failed to resolve
 /// is evicted and its connection closed.
-fn answer(
-    state: &State,
-    given: &str,
-    served: Result<Response, ApiError>,
-) -> hyper::Response<Full<Bytes>> {
+fn answer(state: &State, given: &str, served: Result<Response, ApiError>) -> Answer {
     match served {
         Ok(response) => {
             // A grant this daemon just minted must authenticate on the very next request: its miss
@@ -1065,7 +1462,7 @@ fn answer(
                     cache.refreshed = None;
                 }
             }
-            reply(StatusCode::OK, &json!(response))
+            Answer::json(StatusCode::OK, &json!(response))
         }
         // The token was admitted and then did not resolve: revoked since the cache last read,
         // or a ticket released. Its hash goes, and so does the connection.
@@ -1073,10 +1470,18 @@ fn answer(
             if let Ok(mut cache) = state.grants.lock() {
                 cache.hashes.remove(&jkb_core::roles::token_hash(given));
             }
-            refuse_and_close(&e)
+            Answer {
+                close: true,
+                ..Answer::refusal(&e)
+            }
         }
-        Err(e) => refuse(&e),
+        Err(e) => Answer::refusal(&e),
     }
+}
+
+/// Whether `request` is a long-poll: an `mq.poll` asked to wait.
+fn is_long_poll(request: &Request, asked_wait: Duration) -> bool {
+    matches!(request, Request::MqPoll { .. }) && !asked_wait.is_zero()
 }
 
 /// The permit a parsed request runs under, traded for its `op_permit` once its class is known, with
@@ -1099,7 +1504,7 @@ fn permit_for<'s>(
 > {
     let busy = |why: String| ApiError::with_code(ErrorCode::Busy, why);
     match request {
-        Request::MqPoll { topic, group, .. } if !asked_wait.is_zero() => {
+        Request::MqPoll { topic, group, .. } if is_long_poll(request, asked_wait) => {
             let Ok(poll_permit) = Arc::clone(&state.polls).try_acquire_owned() else {
                 return Err(busy(
                     "the daemon is at its long-poll limit; retry".to_owned(),
@@ -1136,19 +1541,27 @@ fn permit_for<'s>(
 /// future: hyper drops that when its client goes away, and a permit released then let a client that
 /// connects, asks for a long read and hangs up grow the reader's queue without bound while the
 /// budget read empty.
+///
+/// The outer error is an op that did not finish — it panicked — which a keyed request does not record,
+/// so a resend runs it again rather than being answered with the panic for the key's lifetime.
 async fn call(
     backend: &LocalBackend,
     request: Request,
     permit: Permit,
-) -> Result<Response, ApiError> {
+) -> Result<Result<Response, ApiError>, NotRun> {
     let backend = backend.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        #[cfg(test)]
+        tests::maybe_panic(&request);
         backend.call(request)
     })
     .await
-    .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?
+    .map_err(|e| NotRun(ApiError::with_code(ErrorCode::Internal, e.to_string())))
 }
+
+/// A refusal of an op that did not run, or did not finish: a keyed request does not record it.
+struct NotRun(ApiError);
 
 async fn serve_op(
     state: &Arc<State>,
@@ -1157,7 +1570,7 @@ async fn serve_op(
     request: Request,
     wait: Duration,
     permit: &Permit,
-) -> Result<Response, ApiError> {
+) -> Result<Result<Response, ApiError>, NotRun> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         // Registered BEFORE the poll, so a send that lands between the poll and the wait still wakes
@@ -1166,14 +1579,17 @@ async fn serve_op(
         let woken = state.sent.notified();
         tokio::pin!(woken);
         woken.as_mut().enable();
-        current_schema(db).await?;
-        let response = call(backend, request.clone(), Arc::clone(permit)).await?;
+        current_schema(db).await.map_err(NotRun)?;
+        let response = match call(backend, request.clone(), Arc::clone(permit)).await? {
+            Ok(response) => response,
+            Err(e) => return Ok(Err(e)),
+        };
         if response.announces_a_send() {
             state.sent.notify_waiters();
         }
         let empty = matches!(&response, Response::Messages { messages } if messages.is_empty());
         if !empty || tokio::time::Instant::now() >= deadline || wait.is_zero() {
-            return Ok(response);
+            return Ok(Ok(response));
         }
         tokio::select! {
             () = woken => {}
@@ -1187,6 +1603,97 @@ async fn serve_op(
 mod tests {
     use rustix::io::Errno;
 
+    /// A `task.add` with this text panics on the daemon's blocking thread, counted in [`PANICS`].
+    const PANIC_TEXT: &str = "__jkb_serve_test_panic__";
+    static PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// A `task.add` with this text is held on the daemon's blocking thread, once there, for
+    /// [`SLOW_FOR`] (and then panics, if it says so too); [`STARTED`] records its text when it gets
+    /// there, so each test waits on its own request.
+    const SLOW_TEXT: &str = "__jkb_serve_test_slow__";
+    const SLOW_FOR: std::time::Duration = std::time::Duration::from_millis(600);
+    static STARTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Whether a request whose text holds `marker` has reached the blocking thread.
+    fn started(marker: &str) -> bool {
+        STARTED.lock().unwrap().iter().any(|t| t.contains(marker))
+    }
+
+    /// The test hook in [`super::call`].
+    pub(super) fn maybe_panic(request: &jkb_api::Request) {
+        let text = format!("{request:?}");
+        if text.contains(SLOW_TEXT) {
+            STARTED.lock().unwrap().push(text.clone());
+            std::thread::sleep(SLOW_FOR);
+        }
+        if text.contains(PANIC_TEXT) {
+            PANICS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("the op panicked, as the test asked");
+        }
+    }
+
+    /// Wait, up to 5 s, for `done`.
+    fn wait_until(done: impl Fn() -> bool) {
+        let started = std::time::Instant::now();
+        while !done() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "never happened"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A keyed write whose client hangs up while the op runs is still recorded — it runs on a task of
+    /// its own, not the handler hyper drops — so a resend gets its answer rather than applying the
+    /// write again.
+    #[test]
+    fn a_keyed_write_whose_client_hung_up_is_answered_to_its_resend() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        let token_path = dir.path().join("token");
+        let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
+        let handle = super::spawn(db.clone(), &cfg).unwrap();
+        let token = crate::token::read(&token_path).unwrap();
+        let body = serde_json::json!({ "op": "task.add", "text": format!("{SLOW_TEXT} hung-up") })
+            .to_string();
+        let mut raw = std::net::TcpStream::connect(handle.addr).unwrap();
+        write!(
+            raw,
+            "POST /v1/op/keyed HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+             idempotency-key: k\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             \r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        wait_until(|| started("hung-up"));
+        drop(raw);
+        let tasks = || -> i64 {
+            db.read(|c| {
+                Ok(
+                    c.query_row("SELECT count(*) FROM items WHERE kind = 'task'", [], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .unwrap()
+        };
+        wait_until(|| tasks() == 1);
+        wait_until(|| handle.keyed_in_progress() == 0);
+        let resent = reqwest::blocking::Client::new()
+            .post(format!("http://{}/v1/op/keyed", handle.addr))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k")
+            .body(body)
+            .send()
+            .unwrap();
+        assert_eq!(resent.status().as_u16(), 200);
+        assert!(resent.text().unwrap().contains("added"));
+        assert_eq!(tasks(), 1, "applied once");
+        handle.shutdown().unwrap();
+    }
+
     use super::{
         backend_for, call, connection_budget, out_of_resources, Handle, Held, WriteDeadline,
     };
@@ -1199,6 +1706,9 @@ mod tests {
         let (stop, _) = tokio::sync::oneshot::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let handle = Handle {
+            idem: None,
+            waiting: None,
+            ingests: None,
             addr: "127.0.0.1:1".parse().unwrap(),
             stop: Some(stop),
             thread: Some(std::thread::spawn(move || {
@@ -1396,6 +1906,76 @@ mod tests {
             })
             .unwrap_err();
         assert!(refused.to_string().contains("readonly"), "{refused}");
+    }
+
+    /// A keyed op that panics records nothing: a resend runs it again, rather than waiting forever on
+    /// an entry left in progress or being answered with the panic for the key's lifetime.
+    #[test]
+    fn a_keyed_op_that_panics_runs_again_on_its_resend() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        let token_path = dir.path().join("token");
+        let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
+        let handle = super::spawn(db, &cfg).unwrap();
+        let token = crate::token::read(&token_path).unwrap();
+        let http = reqwest::blocking::Client::new();
+        let send = || {
+            http.post(format!("http://{}/v1/op/keyed", handle.addr))
+                .bearer_auth(&token)
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k")
+                .body(serde_json::json!({ "op": "task.add", "text": PANIC_TEXT }).to_string())
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .unwrap()
+                .status()
+                .as_u16()
+        };
+        let before = PANICS.load(Ordering::SeqCst);
+        assert_eq!(send(), 500);
+        assert_eq!(handle.keyed_in_progress(), 0, "nothing left running");
+        assert_eq!(send(), 500);
+        assert_eq!(PANICS.load(Ordering::SeqCst) - before, 2, "the resend ran");
+        handle.shutdown().unwrap();
+    }
+
+    /// A resend waiting on an original that started and then did not finish — it panicked — is told
+    /// `unavailable`, "may have applied", not `busy`: something ran.
+    #[test]
+    fn a_waiter_on_an_original_that_started_and_failed_is_told_it_may_have_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        let token_path = dir.path().join("token");
+        let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
+        let handle = super::spawn(db, &cfg).unwrap();
+        let token = crate::token::read(&token_path).unwrap();
+        let text = format!("{SLOW_TEXT} {PANIC_TEXT} started-then-failed");
+        let send = || {
+            let resp = reqwest::blocking::Client::new()
+                .post(format!("http://{}/v1/op/keyed", handle.addr))
+                .bearer_auth(&token)
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k")
+                .body(serde_json::json!({ "op": "task.add", "text": text }).to_string())
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .unwrap();
+            (resp.status().as_u16(), resp.text().unwrap())
+        };
+        let (first, second) = std::thread::scope(|s| {
+            let first = s.spawn(send);
+            wait_until(|| started("started-then-failed"));
+            let second = s.spawn(send);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(first.0, 500, "{first:?}");
+        assert_eq!(second.0, 503, "{second:?}");
+        assert!(
+            second.1.contains("unavailable") && second.1.contains("may have applied"),
+            "{second:?}"
+        );
+        handle.shutdown().unwrap();
     }
 
     #[test]

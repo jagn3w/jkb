@@ -615,8 +615,9 @@ fn a_retry_that_would_not_fit_before_the_deadline_is_not_made() {
     );
 }
 
-/// A request that CONNECTED and then ran past its deadline is not retried: it may have reached the
-/// daemon, so sending it again could apply a write twice. Exactly one connection is made.
+/// A request that CONNECTED and then ran past its deadline is not retried: its one attempt had the
+/// whole deadline (a hook's is shorter than the attempt budget), and nothing is left for another.
+/// Exactly one connection is made.
 #[test]
 fn a_request_that_connected_and_timed_out_is_not_retried() {
     use std::io::Read as _;
@@ -1441,4 +1442,310 @@ fn a_grant_revoked_behind_the_cache_is_refused_and_its_connection_closed() {
         Some("close"),
         "refused like any unauthenticated request, not served on a kept-alive connection"
     );
+}
+
+/// `POST /v1/op` with `token`, and an `Idempotency-Key` when one is given: the status and the body.
+/// `POST /v1/op`, or the keyed route when there is a key.
+fn post(f: &Fixture, token: &str, key: Option<&str>, body: &serde_json::Value) -> (u16, String) {
+    let path = if key.is_some() {
+        jkb_daemon::server::KEYED_PATH
+    } else {
+        "/v1/op"
+    };
+    post_at(f, path, token, key, body)
+}
+
+fn post_at(
+    f: &Fixture,
+    path: &str,
+    token: &str,
+    key: Option<&str>,
+    body: &serde_json::Value,
+) -> (u16, String) {
+    let http = reqwest::blocking::Client::new();
+    let mut req = http
+        .post(format!("{}{path}", f.base))
+        .bearer_auth(token)
+        .header("content-type", "application/json")
+        .body(body.to_string());
+    if let Some(key) = key {
+        req = req.header("idempotency-key", key);
+    }
+    let resp = req.send().unwrap();
+    (resp.status().as_u16(), resp.text().unwrap())
+}
+
+/// Wait, up to 5 s, for `done`.
+fn wait_until(done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < Duration::from_secs(5), "never happened");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn root_token(f: &Fixture) -> String {
+    jkb_daemon::token::read(&f.token).unwrap()
+}
+
+fn tasks(f: &Fixture) -> i64 {
+    f.db.read(|c| {
+        Ok(
+            c.query_row("SELECT count(*) FROM items WHERE kind = 'task'", [], |r| {
+                r.get(0)
+            })?,
+        )
+    })
+    .unwrap()
+}
+
+/// A write sent twice with one key is applied once, and both sends get the same answer. A key reused
+/// for a different request is refused; a request refused before it ran (a body that does not parse)
+/// records nothing, so its key then runs the real request.
+#[test]
+fn a_keyed_write_sent_twice_is_applied_once_and_answered_alike() {
+    let f = Fixture::new();
+    let token = root_token(&f);
+    let add = json!({ "op": "task.add", "text": "once" });
+    let first = post(&f, &token, Some("k1"), &add);
+    assert_eq!(first.0, 200, "{first:?}");
+    assert_eq!(post(&f, &token, Some("k1"), &add), first, "replayed");
+    assert_eq!(tasks(&f), 1, "applied once");
+
+    let other = post(
+        &f,
+        &token,
+        Some("k1"),
+        &json!({ "op": "task.add", "text": "other" }),
+    );
+    assert_eq!(other.0, 400, "{other:?}");
+    assert!(other.1.contains("different request"), "{other:?}");
+
+    let malformed = post(&f, &token, Some("k2"), &json!({ "op": "no.such.op" }));
+    assert_eq!(malformed.0, 400, "{malformed:?}");
+    assert_eq!(
+        post(&f, &token, Some("k2"), &add).0,
+        200,
+        "the key was not spent"
+    );
+    assert_eq!(tasks(&f), 2);
+}
+
+/// `/v1/op` runs every request, as before keys existed — with or without the header, which it
+/// ignores.
+#[test]
+fn a_request_to_v1_op_runs_every_time_key_or_not() {
+    let f = Fixture::new();
+    let token = root_token(&f);
+    let add = json!({ "op": "task.add", "text": "twice" });
+    for key in [None, Some("k")] {
+        let before = tasks(&f);
+        let a = post_at(&f, "/v1/op", &token, key, &add);
+        let b = post_at(&f, "/v1/op", &token, key, &add);
+        assert_eq!((a.0, b.0), (200, 200), "{key:?}");
+        assert_ne!(a.1, b.1, "{key:?}: two tasks, two answers");
+        assert_eq!(tasks(&f) - before, 2, "{key:?}");
+    }
+}
+
+/// The keyed route requires the header, and refuses a long-poll, which is never keyed (it must be
+/// served on its handler, so a client that hangs up frees its group's slot). Neither runs the op.
+#[test]
+fn the_keyed_route_needs_a_key_and_refuses_a_long_poll() {
+    let f = Fixture::new();
+    topic_and_group(&f.client());
+    let token = root_token(&f);
+    let keyed = jkb_daemon::server::KEYED_PATH;
+    let add = json!({ "op": "task.add", "text": "t" });
+    let missing = post_at(&f, keyed, &token, None, &add);
+    assert_eq!(missing.0, 400, "{missing:?}");
+    assert!(
+        missing.1.contains("needs an Idempotency-Key"),
+        "{missing:?}"
+    );
+    assert_eq!(tasks(&f), 0);
+    let poll = json!({ "op": "mq.poll", "topic": "t", "group": "g", "max": 10 });
+    let refused = post_at(
+        &f,
+        &format!("{keyed}?wait_ms=100"),
+        &token,
+        Some("k"),
+        &poll,
+    );
+    assert_eq!(refused.0, 400, "{refused:?}");
+    assert!(refused.1.contains("not keyed"), "{refused:?}");
+}
+
+/// A resend that arrives while the original is still running waits for it and gets its answer,
+/// rather than running the write a second time. The original is held up by a write transaction the
+/// test holds on the daemon's one writer, released only once the daemon reports the resend waiting.
+///
+/// A resend waits no longer than `duplicate_wait`: past it, it is told `unavailable` — the original
+/// is still running and may yet apply, so not `busy`, which says nothing ran — and the original still
+/// answers and is applied once.
+///
+/// With one op permit, held by the original, the resend still waits rather than being refused `busy`:
+/// a known key is looked up before the permit is asked, and a client told `busy` would retry under a
+/// fresh key.
+#[test]
+fn a_resend_while_the_original_runs_waits_for_its_answer() {
+    // `outwait`: the resend's wait runs out before the original is released.
+    let send_twice = |f: &Fixture, outwait: bool| {
+        let token = root_token(f);
+        let handle = f.handle.as_ref().unwrap();
+        let (holding, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let db = f.db.clone();
+        let writer = std::thread::spawn(move || {
+            db.write_txn("test", move |_, _| {
+                holding.send(()).unwrap();
+                let _ = released.recv();
+                Ok(())
+            })
+            .unwrap();
+        });
+        held.recv().unwrap();
+        let add = json!({ "op": "task.add", "text": "once" });
+        let answers = std::thread::scope(|s| {
+            let first = s.spawn(|| post(f, &token, Some("k"), &add));
+            wait_until(|| handle.keyed_in_progress() == 1);
+            let second = s.spawn(|| post(f, &token, Some("k"), &add));
+            // Or already answered: a resend that outwaited its original is no longer counted.
+            wait_until(|| handle.keyed_waiting() == 1 || second.is_finished());
+            let second = if outwait {
+                let second = second.join().unwrap();
+                release.send(()).unwrap();
+                second
+            } else {
+                release.send(()).unwrap();
+                second.join().unwrap()
+            };
+            (first.join().unwrap(), second)
+        });
+        writer.join().unwrap();
+        answers
+    };
+    let f = Fixture::with(|cfg| cfg.max_ops = 1);
+    let (first, second) = send_twice(&f, false);
+    assert_eq!(first.0, 200, "{first:?}");
+    assert_eq!(second, first, "the same answer");
+    assert_eq!(tasks(&f), 1, "applied once");
+
+    let f = Fixture::with(|cfg| cfg.duplicate_wait = Duration::from_millis(200));
+    let (first, second) = send_twice(&f, true);
+    assert_eq!(first.0, 200, "{first:?}");
+    assert_eq!(second.0, 503, "{second:?}");
+    assert!(
+        second.1.contains("unavailable") && second.1.contains("may yet apply"),
+        "{second:?}"
+    );
+    assert_eq!(tasks(&f), 1, "applied once");
+}
+
+/// Keys are scoped by the token presented: another caller sending the same key is served its own
+/// answer, not the first caller's.
+#[test]
+fn another_caller_s_key_is_not_answered_from_mine() {
+    let f = Fixture::new();
+    let token = root_token(&f);
+    let (status, granted) = post(
+        &f,
+        &token,
+        None,
+        &json!({ "op": "role.grant", "role": "reviewer", "agent": "rev" }),
+    );
+    assert_eq!(status, 200, "{granted}");
+    let granted: Response = serde_json::from_str(&granted).unwrap();
+    let Response::Granted {
+        token: reviewer, ..
+    } = granted
+    else {
+        panic!("granted")
+    };
+    let whoami = json!({ "op": "role.whoami" });
+    let mine = post(&f, &token, Some("shared"), &whoami);
+    let theirs = post(&f, &reviewer, Some("shared"), &whoami);
+    assert_eq!((mine.0, theirs.0), (200, 200), "{mine:?} {theirs:?}");
+    assert_ne!(theirs.1, mine.1, "served the operator's answer");
+    assert!(theirs.1.contains("reviewer"), "{theirs:?}");
+}
+
+/// An answer is kept for the configured time and within the configured count: past either, the key
+/// runs its request again.
+#[test]
+fn expired_and_evicted_keys_run_again() {
+    let add = json!({ "op": "task.add", "text": "t" });
+    let f = Fixture::with(|cfg| cfg.idempotency_ttl = Duration::from_millis(300));
+    let token = root_token(&f);
+    post(&f, &token, Some("k"), &add);
+    post(&f, &token, Some("k"), &add);
+    assert_eq!(tasks(&f), 1, "within the TTL");
+    std::thread::sleep(Duration::from_millis(400));
+    post(&f, &token, Some("k"), &add);
+    assert_eq!(tasks(&f), 2, "expired: run again");
+
+    let f = Fixture::with(|cfg| cfg.idempotency_entries = 1);
+    let token = root_token(&f);
+    post(&f, &token, Some("a"), &add);
+    post(&f, &token, Some("b"), &add);
+    post(&f, &token, Some("b"), &add);
+    assert_eq!(tasks(&f), 2, "b's answer kept");
+    post(&f, &token, Some("a"), &add);
+    assert_eq!(tasks(&f), 3, "a's answer was evicted for b's");
+}
+
+/// A keyed request refused before it ran — here an `ingest.text` refused `busy` while another
+/// ingest holds the one ingest permit, a refusal on the keyed path — records nothing: once the permit
+/// is free, a resend with the same key runs, rather than being answered with the refusal.
+#[test]
+fn a_keyed_request_refused_before_it_ran_is_not_recorded() {
+    let f = Fixture::new();
+    let token = root_token(&f);
+    let handle = f.handle.as_ref().unwrap();
+    // The writer held, so the first ingest keeps the ingest permit until the test lets it go.
+    let (holding, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let db = f.db.clone();
+    let writer = std::thread::spawn(move || {
+        db.write_txn("test", move |_, _| {
+            holding.send(()).unwrap();
+            let _ = released.recv();
+            Ok(())
+        })
+        .unwrap();
+    });
+    held.recv().unwrap();
+    let ingest = |text: &str| json!({ "op": "ingest.text", "text": text, "mime": "text/plain", "namespace": "inbox" });
+    let (refused, first) = std::thread::scope(|s| {
+        let first = s.spawn(|| post_at(&f, "/v1/op", &token, None, &ingest("first")));
+        wait_until(|| handle.ingests_running() == 1);
+        let refused = post(&f, &token, Some("k"), &ingest("second"));
+        release.send(()).unwrap();
+        (refused, first.join().unwrap())
+    });
+    writer.join().unwrap();
+    assert_eq!(first.0, 200, "{first:?}");
+    assert_eq!(refused.0, 503, "{refused:?}");
+    assert!(refused.1.contains("ingest limit"), "{refused:?}");
+    let ran = post(&f, &token, Some("k"), &ingest("second"));
+    assert_eq!(ran.0, 200, "the resend ran: {ran:?}");
+    assert!(ran.1.contains("ingested"), "{ran:?}");
+}
+
+/// An answer past `idempotency_max_answer` is served but not recorded: a resend of its key is told
+/// `unavailable` — the op ran, its answer cannot be replayed — and the op is not run again.
+#[test]
+fn an_answer_too_large_to_record_is_not_replayed_and_not_rerun() {
+    let f = Fixture::with(|cfg| cfg.idempotency_max_answer = 10);
+    let token = root_token(&f);
+    let add = json!({ "op": "task.add", "text": "t" });
+    let first = post(&f, &token, Some("k"), &add);
+    assert_eq!(first.0, 200, "{first:?}");
+    let resent = post(&f, &token, Some("k"), &add);
+    assert_eq!(resent.0, 503, "{resent:?}");
+    assert!(
+        resent.1.contains("unavailable") && resent.1.contains("too large"),
+        "{resent:?}"
+    );
+    assert_eq!(tasks(&f), 1, "not run again");
 }
