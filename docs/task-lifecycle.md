@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 112.b_2I6IndsJEGAYGdu_yU_awDAYKo9cTruwUBgbCvyvXfvwIBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bh8rc4biU9QIB_dakx6mh3w0Bit-6l4Wprw0B_9yx8p6JmwoBjOSnvIrrzQ4BjdHWvb2O-A4Bjvz45fSu2A0Bj5fqg9GohQcBjcfDyc_llg8BkMil2eDEzAMBjLzKt5Cd2AUBkrivg62IuQ4Bk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWWksvI8uSYAQGWlPaCtJjSBAGZqdfqnNn-CAGX8pONqO27CQGYn8LK3t-nCwGPlMv7uIeDBgGa8eSp-v2-BAGe4NTBkYbyAwGXpeGpjb_VBAGg1bamxrlnAaH25Z3ihbgNAaKftbHfki4Bo4PB_PfpsAwBotCO-afV7wgBpdmYyJPIvgsBjdLbv9f-9wQBm4berKa5_gYBqImgkqXz8Q0BqOjc06jB-QIBqaOkiNPXpwoBqbGkpNyznAIBrJKai5vD2gIBrcLivemFyQQBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwGzvNf8sufoBQG02eeoz_eAAgG1_tTRkKm8DAG25o6mx7-gCQG32bXx-an3DAGyqqPxusaJDAG0yZ7Jn8PFCAG2yqOFramlBAG7kcGOj47YDgG2mIydl8-BCwG-pfjsvNPRAwG-9rHhkZbbBgG-9aO5xPbECwHB_NywyJvEDAHC5au0qq-dCAHDqtq2y9cIAcTUju2Aq-wOAcPo1bOl-6kJAcamob7b7MYJAb_Hr8rb67YOAcjJhK_2u_IOAcfkoqiMzCIBzMPftPCwyQgBzZHw3LGP4A0B0Iis5ryurwkB0Lu07_eSWAHUrJDtv9W8BQHVxoS9sZu3DwHVjsmlu4SCAwHan4mk1JWmBwHbht3ZyYi0BAHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHh2r2Nyo2bCwHi2qKqqc-iCQHg5ubBg-q1BwHgjs3o_5PNAgHlwZbF2s7CCwHljaWUkvyeCQHflfjBpdb3CwHqzM_yv_eFAQHqivWquYT5BgHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHw0vjVq-XJCwHzsrTDhuLeBAHz18zIqq7BCgH0tLer_qPwDQH1_q7ZrfrxBAH3196ovJTtCwH2osPmhaWADQH27JXrzch6AfiFw7jkwtkMAfjdwoL3kssCAfq3mcTenPAIAfLLiMue2qUKAf6569Hd14YJAfmPho6hqscHAQ, blake3 f78cadd481ecfdd42a25823d883f49b2f16bdbc0e351fa8b6bf18c3ce370de9e) -->
+<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 114.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 bc41123353c2a29111f65499e08d67dde3bef5a07247a4e10033aeb549ecb044) -->
 # Task lifecycle
 
 How a task moves from the frontier to merged. A task is decomposed into subtasks, so the
@@ -131,6 +131,23 @@ reveals the new node instead of leaving the user to find it.
 
 Offered on namespaces and tasks only. A document is a container, but `--under` writes a
 `parent_of` edge and a containment row, and a chunk is not a subtask.
+
+### Moving an existing task under a new parent
+
+`jkb task move <uid> --under <parent>` (op `task.move`, granted as `task.place` and scoped to the
+moved task) puts an existing task under another task or an execution plan's step. Until it existed
+the only way under a parent was `task add --under`, which makes a new task, so filing existing work
+under a plan meant copying it and leaving two live copies. In one transaction the move removes the
+task's old `parent_of` edge and attaches it through `task::add_subtask`, so a moved task meets every
+rule a new subtask meets: a plan or span is never a parent; a parent bound to a synced `file://` line
+takes only children filed in that same file (its indentation owns them, and the next sync would
+unlink anything else); and no task becomes its own ancestor, which `edge::link` refuses for
+`parent_of` edges and `containment::contain` for containment rows. Placements and binding are
+untouched: a move changes what the task is part of, not where it is filed. A task bound to a synced
+file is refused (edit the file instead); moving to the current parent writes nothing and answers
+*unchanged*; a scoped caller may move only under a parent inside its scope, and an attested subagent
+not yet bound to a task is told to `jkb role bind` first. One `jkb undo` restores the previous parent,
+or none. Built for the design migration, which filed 195 open tasks under their designs' plans with it.
 
 ### Measured: the containment migration takes a second
 
