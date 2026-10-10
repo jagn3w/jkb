@@ -1610,7 +1610,8 @@ fn a_resend_while_the_original_runs_waits_for_its_answer() {
             let first = s.spawn(|| post(f, &token, Some("k"), &add));
             wait_until(|| handle.keyed_in_progress() == 1);
             let second = s.spawn(|| post(f, &token, Some("k"), &add));
-            wait_until(|| handle.keyed_waiting() == 1);
+            // Or already answered: a resend that outwaited its original is no longer counted.
+            wait_until(|| handle.keyed_waiting() == 1 || second.is_finished());
             let second = if outwait {
                 let second = second.join().unwrap();
                 release.send(()).unwrap();
@@ -1639,29 +1640,6 @@ fn a_resend_while_the_original_runs_waits_for_its_answer() {
         "{second:?}"
     );
     assert_eq!(tasks(&f), 1, "applied once");
-}
-
-/// A burst of keyed writes cannot evict a write's answer its client may still resend for: past the
-/// cap, the burst is refused `busy` — nothing ran — and the young answer is still replayed.
-#[test]
-fn a_burst_of_keyed_writes_does_not_evict_a_young_answer() {
-    let f = Fixture::with(|cfg| cfg.idempotency_entries = 2);
-    let token = root_token(&f);
-    let add = json!({ "op": "task.add", "text": "t" });
-    let first = post(&f, &token, Some("first"), &add);
-    assert_eq!(first.0, 200, "{first:?}");
-    let mut refused = 0;
-    for i in 0..8 {
-        let (status, body) = post(&f, &token, Some(&format!("burst-{i}")), &add);
-        if status == 503 {
-            assert!(body.contains("busy") && body.contains("full"), "{body}");
-            refused += 1;
-        }
-    }
-    assert!(refused > 0, "the store filled");
-    let tasks_before = tasks(&f);
-    assert_eq!(post(&f, &token, Some("first"), &add), first, "replayed");
-    assert_eq!(tasks(&f), tasks_before, "not run again");
 }
 
 /// Keys are scoped by the token presented: another caller sending the same key is served its own
@@ -1706,18 +1684,12 @@ fn expired_and_evicted_keys_run_again() {
     post(&f, &token, Some("k"), &add);
     assert_eq!(tasks(&f), 2, "expired: run again");
 
-    // Past the cap, an answer old enough — past `idempotency_min_age` — goes for a new one.
-    let f = Fixture::with(|cfg| {
-        cfg.idempotency_entries = 1;
-        cfg.idempotency_min_age = Duration::from_millis(100);
-    });
+    let f = Fixture::with(|cfg| cfg.idempotency_entries = 1);
     let token = root_token(&f);
     post(&f, &token, Some("a"), &add);
-    std::thread::sleep(Duration::from_millis(150));
     post(&f, &token, Some("b"), &add);
     post(&f, &token, Some("b"), &add);
     assert_eq!(tasks(&f), 2, "b's answer kept");
-    std::thread::sleep(Duration::from_millis(150));
     post(&f, &token, Some("a"), &add);
     assert_eq!(tasks(&f), 3, "a's answer was evicted for b's");
 }
@@ -1754,4 +1726,22 @@ fn a_keyed_request_refused_before_it_ran_is_not_recorded() {
     let ran = post(&f, &token, Some("k"), &add);
     assert_eq!(ran.0, 200, "{ran:?}");
     assert_eq!(tasks(&f), 1);
+}
+
+/// An answer past `idempotency_max_answer` is served but not recorded: a resend of its key is told
+/// `unavailable` — the op ran, its answer cannot be replayed — and the op is not run again.
+#[test]
+fn an_answer_too_large_to_record_is_not_replayed_and_not_rerun() {
+    let f = Fixture::with(|cfg| cfg.idempotency_max_answer = 10);
+    let token = root_token(&f);
+    let add = json!({ "op": "task.add", "text": "t" });
+    let first = post(&f, &token, Some("k"), &add);
+    assert_eq!(first.0, 200, "{first:?}");
+    let resent = post(&f, &token, Some("k"), &add);
+    assert_eq!(resent.0, 503, "{resent:?}");
+    assert!(
+        resent.1.contains("unavailable") && resent.1.contains("too large"),
+        "{resent:?}"
+    );
+    assert_eq!(tasks(&f), 1, "not run again");
 }

@@ -3449,3 +3449,27 @@ fn task_add_under_a_task_filed_in_a_synced_file_takes_only_a_line_of_that_file()
         [filed]
     );
 }
+
+/// What a `jkb serve` client keys and may resend: an op that mutates, and never a read — the queue's
+/// and the hooks' reads included, though RBAC classes them with the writes as `Hook`.
+#[test]
+fn mutates_names_the_writes_and_not_the_reads() {
+    let op = |v: serde_json::Value| -> Request { serde_json::from_value(v).unwrap() };
+    for read in [
+        serde_json::json!({ "op": "mq.tail", "topic": "t", "limit": 1 }),
+        serde_json::json!({ "op": "mq.inspect" }),
+        serde_json::json!({ "op": "notify.open_sessions" }),
+        serde_json::json!({ "op": "kb.ls" }),
+        serde_json::json!({ "op": "role.whoami" }),
+    ] {
+        assert!(!op(read.clone()).mutates(), "{read}");
+    }
+    for write in [
+        serde_json::json!({ "op": "task.add", "text": "t" }),
+        serde_json::json!({ "op": "mq.send", "topic": "t", "key": "k", "kind": "k.m", "payload": 1, "producer": "p" }),
+        serde_json::json!({ "op": "mq.poll", "topic": "t", "group": "g", "max": 1 }),
+        serde_json::json!({ "op": "mq.ack", "topic": "t", "group": "g", "seq": 1 }),
+    ] {
+        assert!(op(write.clone()).mutates(), "{write}");
+    }
+}

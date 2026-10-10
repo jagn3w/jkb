@@ -109,6 +109,33 @@ fn body_write_broken(e: &reqwest::Error) -> bool {
     false
 }
 
+/// Whether jkb serve refused a request `busy`: nothing ran.
+fn is_busy((status, bytes): &Read) -> bool {
+    *status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && bytes
+            .as_ref()
+            .ok()
+            .and_then(|b| serde_json::from_slice::<ApiError>(b).ok())
+            .is_some_and(|e| e.code == ErrorCode::Busy)
+}
+
+/// The answer a keyed call gives when its resend was refused as if nothing ran — while its first
+/// attempt, which connected, is unaccounted for. `unavailable`, never `busy`: a caller told `busy`
+/// retries under a fresh key, and the write lands twice.
+fn first_may_have_applied() -> Read {
+    let refusal = ApiError::with_code(
+        ErrorCode::Unavailable,
+        "jkb serve did not answer the first attempt, and refused the resend; the first attempt may \
+         have applied",
+    );
+    (
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        Ok(bytes::Bytes::from(
+            serde_json::to_vec(&refusal).unwrap_or_default(),
+        )),
+    )
+}
+
 /// Whether jkb serve refused the keyed route as an endpoint it does not have — a daemon older than
 /// keys, which did not run the op.
 fn no_such_endpoint((status, bytes): &Read) -> bool {
@@ -256,7 +283,7 @@ impl RemoteBackend {
     /// how long its first attempt may go unanswered before it is sent once more. The one place an op's
     /// budget is decided, so no call site can forget it.
     ///
-    /// Unkeyed, one attempt with the whole deadline: a read (RBAC's `Read` class), which a resend could
+    /// Unkeyed, one attempt with the whole deadline: an op that does not mutate, which a resend could
     /// not apply twice and whose answer is not worth recording; a **long** op — one given more than the plain
     /// [`RemoteBackend::with_deadlines`] total, `mq.poll`, which the daemon may hold for its wait, and
     /// `ingest.text`, whose capture of a body at the cap holds the writer about half a second and whose
@@ -269,10 +296,10 @@ impl RemoteBackend {
         };
         let total = wait + self.op_timeout;
         let long = total > self.op_timeout || matches!(request, Request::IngestText(_));
-        // A read is never keyed: resending it could not apply anything twice, so it needs no record,
-        // and its answers — up to a read's whole budget — would crowd the writes' out of the daemon's
-        // store. "Read" is the RBAC class (`Request::permission`), the one place ops are classed so.
-        let mutates = request.permission() != jkb_api::rbac::OpPermission::Read;
+        // Only an op that mutates is keyed (`Request::mutates`, the one place ops are classed so): a
+        // resent read could not apply anything twice, and its answer — up to a read's whole budget —
+        // would crowd the writes' out of the daemon's store.
+        let mutates = request.mutates();
         Budget {
             wait,
             total,
@@ -356,12 +383,16 @@ impl RemoteBackend {
     /// whether any of them reached the daemon:
     ///
     /// 1. To the keyed route for at most `after`.
-    /// 2. If that connected and timed out — sending, or reading its answer's body — once more under the
-    ///    same key for the rest of the deadline. Whatever jkb serve answers it is final.
-    /// 3. If the keyed route is not there — `no such endpoint` from a `jkb serve` older than keys, on
-    ///    either attempt, or the first attempt's body cut off mid-write ([`body_write_broken`]), since
-    ///    such a daemon refuses an unknown route before reading the body — one unkeyed attempt for the
-    ///    rest of the deadline. Nothing ran: an endpoint the daemon does not have runs nothing.
+    /// 2. If the keyed route is not there — `no such endpoint` from a `jkb serve` older than keys, or
+    ///    the body cut off mid-write ([`body_write_broken`]), since such a daemon refuses an unknown
+    ///    route before reading the body — one unkeyed attempt for the rest of the deadline. Nothing
+    ///    ran: an endpoint the daemon does not have runs nothing.
+    /// 3. If it connected and timed out — sending, or reading its answer's body — once more under the
+    ///    same key for the rest of the deadline. From here the first attempt is unaccounted for: it
+    ///    may have applied. So an answer to the resend that would say "nothing ran" — `busy`, `no such
+    ///    endpoint` (a daemon replaced by an older one), a body cut off mid-write — is not relayed, and
+    ///    nothing falls back: the call is `unavailable`, "the first attempt may have applied"
+    ///    ([`first_may_have_applied`]). Any other answer is final.
     fn send_keyed(
         &self,
         left: &dyn Fn() -> Duration,
@@ -384,7 +415,10 @@ impl RemoteBackend {
         // Connected and unanswered past the attempt budget: abandoned, and sent once more under the
         // same key.
         match self.send_retrying_connect(left(), &keyed).map(read) {
-            Ok(answer) if no_such_endpoint(&answer) => (fallback(), true),
+            Ok(answer) if no_such_endpoint(&answer) || is_busy(&answer) => {
+                (Ok(first_may_have_applied()), true)
+            }
+            Err(e) if body_write_broken(&e) => (Ok(first_may_have_applied()), true),
             other => (other, true),
         }
     }
@@ -663,6 +697,15 @@ mod tests {
         })
     }
 
+    /// An op that mutates, so a call of it is keyed.
+    fn write() -> Request {
+        Request::MqAck {
+            topic: "t".into(),
+            group: "g".into(),
+            seq: 1,
+        }
+    }
+
     fn poll() -> Request {
         Request::MqPoll {
             topic: "t".into(),
@@ -684,10 +727,7 @@ mod tests {
         );
         let c = client(&base, &dir, attempt);
         let started = Instant::now();
-        assert_eq!(
-            c.call(Request::MqInspect {}).unwrap(),
-            Response::Position { position: 1 }
-        );
+        assert_eq!(c.call(write()).unwrap(), Response::Position { position: 1 });
         let took = started.elapsed();
         assert!(
             took >= attempt && took < attempt + Duration::from_secs(1),
@@ -713,10 +753,7 @@ mod tests {
         let attempt = Duration::from_millis(200);
         let (base, seen) = stub(vec![Then::AnswerAfter(attempt * 3)], true);
         let c = client(&base, &dir, attempt);
-        assert_eq!(
-            c.call(Request::MqInspect {}).unwrap(),
-            Response::Position { position: 1 }
-        );
+        assert_eq!(c.call(write()).unwrap(), Response::Position { position: 1 });
         std::thread::sleep(attempt * 2);
         let seen = seen.lock().unwrap().clone();
         assert_eq!(
@@ -726,31 +763,6 @@ mod tests {
         );
         assert_eq!(seen[0].0, "/v1/op/keyed");
         assert_eq!((seen[1].0.as_str(), seen[1].1.as_deref()), ("/v1/op", None));
-    }
-
-    /// Whatever jkb serve — or a proxy — answers the resend is final: `busy`, a 502. The call ends
-    /// at once, after exactly two requests.
-    #[test]
-    fn any_answer_to_the_resend_is_final() {
-        let dir = tempfile::tempdir().unwrap();
-        let attempt = Duration::from_millis(200);
-        for (name, then, code) in [
-            ("busy", Then::Busy, jkb_api::ErrorCode::Busy),
-            ("502", Then::Gateway, jkb_api::ErrorCode::Unavailable),
-        ] {
-            let (base, seen) = stub(vec![Then::Swallow, then], false);
-            let c = client(&base, &dir, attempt);
-            let started = Instant::now();
-            let err = c.call(Request::MqInspect {}).unwrap_err();
-            assert_eq!(err.code, code, "{name}: {err:?}");
-            assert!(
-                started.elapsed() < attempt + Duration::from_secs(1),
-                "{name}: at once, {:?}",
-                started.elapsed()
-            );
-            std::thread::sleep(attempt * 2);
-            assert_eq!(seen.lock().unwrap().len(), 2, "{name}");
-        }
     }
 
     /// An answer whose headers came and whose body stalled is resent under the same key, as a stalled
@@ -764,10 +776,7 @@ mod tests {
             false,
         );
         let c = client(&base, &dir, attempt);
-        assert_eq!(
-            c.call(Request::MqInspect {}).unwrap(),
-            Response::Position { position: 1 }
-        );
+        assert_eq!(c.call(write()).unwrap(), Response::Position { position: 1 });
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert!(seen[0].1.is_some() && seen[1].1 == seen[0].1, "{seen:?}");
@@ -782,53 +791,70 @@ mod tests {
         assert!(!marker.exists(), "an answer began: reached, not down");
     }
 
-    /// A daemon replaced by one older than keys between the attempts answers the resend `no such
-    /// endpoint`; the call falls back to one unkeyed attempt within the rest of its deadline.
-    #[test]
-    fn no_such_endpoint_on_the_resend_falls_back_too() {
-        let dir = tempfile::tempdir().unwrap();
-        let (base, seen) = stub(
-            vec![
-                Then::Swallow,
-                Then::NoSuchEndpoint,
-                Then::AnswerAfter(Duration::ZERO),
-            ],
-            false,
-        );
-        let c = client(&base, &dir, Duration::from_millis(200));
-        assert_eq!(
-            c.call(Request::MqInspect {}).unwrap(),
-            Response::Position { position: 1 }
-        );
-        let paths: Vec<String> = seen
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(p, _)| p.clone())
-            .collect();
-        assert_eq!(paths, ["/v1/op/keyed", "/v1/op/keyed", "/v1/op"]);
-    }
-
-    /// A read is never keyed, nor resent: one unkeyed attempt on `/v1/op`, however slow.
+    /// A read is never keyed, nor resent: one unkeyed attempt on `/v1/op`, however slow — the queue's
+    /// and the hooks' reads included (`mq.tail` answers up to a read's whole budget).
     #[test]
     fn a_read_is_never_keyed() {
         let dir = tempfile::tempdir().unwrap();
         let attempt = Duration::from_millis(200);
-        let (base, seen) = stub(vec![Then::AnswerAfter(attempt * 3)], false);
-        let c = client(&base, &dir, attempt);
-        assert_eq!(
-            c.call(Request::KbLs {
+        for read in [
+            Request::KbLs {
                 path: None,
                 all: false,
                 recursive: false,
-            })
-            .unwrap(),
-            Response::Position { position: 1 }
-        );
-        assert_eq!(
-            seen.lock().unwrap().clone(),
-            vec![("/v1/op".to_owned(), None)]
-        );
+            },
+            Request::MqInspect {},
+            Request::MqTail {
+                topic: "t".into(),
+                limit: 1,
+            },
+        ] {
+            let (base, seen) = stub(vec![Then::AnswerAfter(attempt * 3)], false);
+            let c = client(&base, &dir, attempt);
+            let name = format!("{read:?}");
+            assert_eq!(
+                c.call(read).unwrap(),
+                Response::Position { position: 1 },
+                "{name}"
+            );
+            assert_eq!(
+                seen.lock().unwrap().clone(),
+                vec![("/v1/op".to_owned(), None)],
+                "{name}"
+            );
+        }
+    }
+
+    /// Once the first attempt connected and went unanswered, it is unaccounted for: it may have
+    /// applied. A resend answered as if nothing ran — `busy`, or `no such endpoint` from a daemon
+    /// replaced by an older one — is not relayed as such, and nothing falls back: the call is
+    /// `unavailable`, after exactly two requests.
+    #[test]
+    fn a_resend_refused_as_if_nothing_ran_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = Duration::from_millis(200);
+        for (name, then, says) in [
+            ("busy", Then::Busy, "may have applied"),
+            ("old daemon", Then::NoSuchEndpoint, "may have applied"),
+            // A proxy's 502 never said "nothing ran": relayed as the unavailable it is.
+            ("502", Then::Gateway, "other than jkb serve"),
+        ] {
+            let (base, seen) = stub(
+                vec![Then::Swallow, then, Then::AnswerAfter(Duration::ZERO)],
+                false,
+            );
+            let c = client(&base, &dir, attempt);
+            let err = c.call(write()).unwrap_err();
+            assert_eq!(err.code, jkb_api::ErrorCode::Unavailable, "{name}: {err:?}");
+            assert!(err.message.contains(says), "{name}: {err:?}");
+            std::thread::sleep(attempt * 2);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{name}: no third request: {seen:?}");
+            assert!(
+                seen.iter().all(|(p, _)| p == "/v1/op/keyed"),
+                "{name}: {seen:?}"
+            );
+        }
     }
 
     /// A large keyed write to a daemon without the keyed route — a real `jkb serve` over loopback,
@@ -925,7 +951,7 @@ mod tests {
         });
         let marker = dir.path().join("unreachable");
         let c = client(&base, &dir, Duration::from_millis(200)).with_down_marker(marker.clone());
-        assert!(c.call(Request::MqInspect {}).is_err());
+        assert!(c.call(write()).is_err());
         done_tx.send(()).unwrap();
         server.join().unwrap();
         assert!(!marker.exists(), "an attempt connected: busy, not down");

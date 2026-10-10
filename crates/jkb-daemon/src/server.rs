@@ -92,14 +92,14 @@ pub struct ServeConfig {
     /// How long the answer to a request that carried an `Idempotency-Key` is kept for a resend of it
     /// ([`crate::idempotency`]).
     pub idempotency_ttl: Duration,
-    /// The youngest an answer may be evicted at, past the caps: longer than a keyed call's whole
-    /// client deadline (the 30 s op timeout), so an answer its client may still resend for is never
-    /// the one that goes. While nothing older can go, new keyed work is refused `busy`.
-    pub idempotency_min_age: Duration,
     /// How many keyed requests are remembered at most; past it the oldest answers go first.
     pub idempotency_entries: usize,
     /// How many bytes of keyed answers are kept at most; past it the oldest go first.
     pub idempotency_bytes: usize,
+    /// The largest answer recorded for a resend. A larger one is served, and its key recorded as done
+    /// with no answer: a resend is told `unavailable`, "the op ran", rather than the store holding an
+    /// answer of up to a read's whole budget.
+    pub idempotency_max_answer: usize,
     /// Longest a resend waits for its original, still running, to answer. Its client's own deadline
     /// is usually shorter; this bounds a waiter whose client went away unnoticed.
     pub duplicate_wait: Duration,
@@ -125,9 +125,9 @@ impl ServeConfig {
             reopen_every: Duration::from_secs(5),
             write_stall: Duration::from_secs(10),
             idempotency_ttl: Duration::from_mins(10),
-            idempotency_min_age: Duration::from_mins(1),
             idempotency_entries: 4096,
             idempotency_bytes: 64 * 1024 * 1024,
+            idempotency_max_answer: 1024 * 1024,
             duplicate_wait: Duration::from_mins(1),
         }
     }
@@ -274,6 +274,7 @@ struct State {
     idem: Arc<Mutex<Store<Answer>>>,
     /// How many resends are waiting on their original ([`Handle::keyed_waiting`]).
     waiting: Arc<AtomicUsize>,
+    max_recorded_answer: usize,
     duplicate_wait: Duration,
 }
 
@@ -437,7 +438,6 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
     token::write(&cfg.token_path, &token)?;
     let idem = Arc::new(Mutex::new(Store::new(
         cfg.idempotency_ttl,
-        cfg.idempotency_min_age,
         cfg.idempotency_entries,
         cfg.idempotency_bytes,
     )));
@@ -463,6 +463,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         grants: Mutex::default(),
         idem: Arc::clone(&idem),
         waiting: Arc::clone(&waiting),
+        max_recorded_answer: cfg.idempotency_max_answer,
         duplicate_wait: cfg.duplicate_wait,
     });
     let connections = Arc::new(Semaphore::new(connection_budget(cfg.max_connections)));
@@ -1238,11 +1239,6 @@ async fn serve_keyed(
         Some(Begin::Mismatch) => refuse(&ApiError::bad_request(
             "this Idempotency-Key was first used for a different request",
         )),
-        // Nothing ran, so `busy` is true: a retry under any key may run it.
-        Some(Begin::Full) => busy(
-            "the daemon's record of keyed requests is full of answers still within their clients' \
-             deadlines; retry",
-        ),
         Some(Begin::Wait(original)) => {
             // Waiting is no work: the permit goes back for others.
             drop(op);
@@ -1257,9 +1253,13 @@ async fn serve_keyed(
                 idem: Arc::clone(&state.idem),
                 key,
                 running: Some(running),
+                started: AtomicBool::new(false),
+                max_answer: state.max_recorded_answer,
             };
             let ran = tokio::spawn(async move {
-                let ran = op.run().await;
+                let ran = op
+                    .run(|| recording.started.store(true, Ordering::SeqCst))
+                    .await;
                 // Refused before it ran: `recording` is dropped unfinished, so a resend runs it.
                 if let Ok((answer, _)) = &ran {
                     recording.finish(answer);
@@ -1279,14 +1279,18 @@ async fn serve_keyed(
     }
 }
 
-/// A keyed request's entry while its op runs. Finished, it records the answer and hands it to the
-/// waiters. Dropped unfinished — refused before the op ran, or the task running it panicked — the entry
-/// is forgotten, so a resend runs the op, and the waiters hear there is no answer to share: left in
-/// progress, every resend of the key would wait on an answer that never comes.
+/// A keyed request's entry while its op runs. Finished, it records the answer — or, past
+/// `max_answer`, a refusal saying the op ran — and hands the answer to the waiters. Dropped unfinished
+/// — refused before the op ran, or the op did not finish — the entry is forgotten, so a resend runs the
+/// op: left in progress, every resend of the key would wait on an answer that never comes. Its
+/// waiters hear `busy` when the op never `started`, and `unavailable` when it did: it may have applied.
 struct Recording {
     idem: Arc<Mutex<Store<Answer>>>,
     key: Key,
     running: Option<Running<Answer>>,
+    /// Set once the op has its permit and begins.
+    started: AtomicBool,
+    max_answer: usize,
 }
 
 impl Recording {
@@ -1294,14 +1298,17 @@ impl Recording {
         let Some(running) = self.running.take() else {
             return;
         };
+        let recorded = if answer.body.len() > self.max_answer {
+            Answer::refusal(&ApiError::with_code(
+                ErrorCode::Unavailable,
+                "the op ran, but its answer was too large to record, so it cannot be replayed",
+            ))
+        } else {
+            answer.clone()
+        };
         if let Ok(mut idem) = self.idem.lock() {
-            idem.finish(
-                &self.key,
-                running.id,
-                answer.clone(),
-                answer.body.len(),
-                Instant::now(),
-            );
+            let bytes = recorded.body.len();
+            idem.finish(&self.key, running.id, recorded, bytes, Instant::now());
         }
         let _ = running.tx.send(Some(answer.clone()));
     }
@@ -1312,6 +1319,13 @@ impl Drop for Recording {
         if let Some(running) = self.running.take() {
             if let Ok(mut idem) = self.idem.lock() {
                 idem.abandon(&self.key, running.id);
+            }
+            if self.started.load(Ordering::SeqCst) {
+                let _ = running.tx.send(Some(Answer::refusal(&ApiError::with_code(
+                    ErrorCode::Unavailable,
+                    "the first attempt with this Idempotency-Key started and did not finish; it \
+                     may have applied",
+                ))));
             }
         }
     }
@@ -1370,7 +1384,9 @@ impl Op {
     /// Run it: its answer and the permit it ran under, for the response body to keep — or the refusal
     /// when it was not run (a busy budget, a newer schema) or did not finish (it panicked), which a
     /// keyed request does not record.
-    async fn run(self) -> Result<(Answer, Permit), Answer> {
+    ///
+    /// `started` is called once the op has its permit and begins.
+    async fn run(self, started: impl FnOnce()) -> Result<(Answer, Permit), Answer> {
         let Self {
             state,
             backend,
@@ -1392,6 +1408,7 @@ impl Op {
         let (permit, _slot, wait) = permit_for(&state, &request, asked_wait, admitted)
             .map_err(|refusal| Answer::refusal(&refusal))?;
         let permit: Permit = Arc::new(permit);
+        started();
         match serve_op(&state, &backend, &db, request, wait, &permit).await {
             Ok(served) => Ok((answer(&state, &given, served), permit)),
             Err(NotRun(e)) => Err(answer(&state, &given, Err(e))),
@@ -1407,7 +1424,7 @@ impl Op {
 
     /// Run it, as a request without a key is: `held` is left holding the permit it ran under.
     async fn serve(self, held: &mut Option<Permit>) -> hyper::Response<Full<Bytes>> {
-        match self.run().await {
+        match self.run(|| {}).await {
             Ok((answer, permit)) => {
                 *held = Some(permit);
                 answer.response()
@@ -1577,21 +1594,27 @@ mod tests {
     const PANIC_TEXT: &str = "__jkb_serve_test_panic__";
     static PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     /// A `task.add` with this text is held on the daemon's blocking thread, once there, for
-    /// [`SLOW_FOR`]; [`SLOW_STARTED`] says it got there.
+    /// [`SLOW_FOR`] (and then panics, if it says so too); [`STARTED`] records its text when it gets
+    /// there, so each test waits on its own request.
     const SLOW_TEXT: &str = "__jkb_serve_test_slow__";
     const SLOW_FOR: std::time::Duration = std::time::Duration::from_millis(600);
-    static SLOW_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static STARTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Whether a request whose text holds `marker` has reached the blocking thread.
+    fn started(marker: &str) -> bool {
+        STARTED.lock().unwrap().iter().any(|t| t.contains(marker))
+    }
 
     /// The test hook in [`super::call`].
     pub(super) fn maybe_panic(request: &jkb_api::Request) {
         let text = format!("{request:?}");
+        if text.contains(SLOW_TEXT) {
+            STARTED.lock().unwrap().push(text.clone());
+            std::thread::sleep(SLOW_FOR);
+        }
         if text.contains(PANIC_TEXT) {
             PANICS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             panic!("the op panicked, as the test asked");
-        }
-        if text.contains(SLOW_TEXT) {
-            SLOW_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
-            std::thread::sleep(SLOW_FOR);
         }
     }
 
@@ -1619,7 +1642,8 @@ mod tests {
         let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
         let handle = super::spawn(db.clone(), &cfg).unwrap();
         let token = crate::token::read(&token_path).unwrap();
-        let body = serde_json::json!({ "op": "task.add", "text": SLOW_TEXT }).to_string();
+        let body = serde_json::json!({ "op": "task.add", "text": format!("{SLOW_TEXT} hung-up") })
+            .to_string();
         let mut raw = std::net::TcpStream::connect(handle.addr).unwrap();
         write!(
             raw,
@@ -1629,7 +1653,7 @@ mod tests {
             body.len()
         )
         .unwrap();
-        wait_until(|| SLOW_STARTED.load(std::sync::atomic::Ordering::SeqCst));
+        wait_until(|| started("hung-up"));
         drop(raw);
         let tasks = || -> i64 {
             db.read(|c| {
@@ -1899,6 +1923,44 @@ mod tests {
         assert_eq!(handle.keyed_in_progress(), 0, "nothing left running");
         assert_eq!(send(), 500);
         assert_eq!(PANICS.load(Ordering::SeqCst) - before, 2, "the resend ran");
+        handle.shutdown().unwrap();
+    }
+
+    /// A resend waiting on an original that started and then did not finish — it panicked — is told
+    /// `unavailable`, "may have applied", not `busy`: something ran.
+    #[test]
+    fn a_waiter_on_an_original_that_started_and_failed_is_told_it_may_have_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        let token_path = dir.path().join("token");
+        let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
+        let handle = super::spawn(db, &cfg).unwrap();
+        let token = crate::token::read(&token_path).unwrap();
+        let text = format!("{SLOW_TEXT} {PANIC_TEXT} started-then-failed");
+        let send = || {
+            let resp = reqwest::blocking::Client::new()
+                .post(format!("http://{}/v1/op/keyed", handle.addr))
+                .bearer_auth(&token)
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k")
+                .body(serde_json::json!({ "op": "task.add", "text": text }).to_string())
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .unwrap();
+            (resp.status().as_u16(), resp.text().unwrap())
+        };
+        let (first, second) = std::thread::scope(|s| {
+            let first = s.spawn(send);
+            wait_until(|| started("started-then-failed"));
+            let second = s.spawn(send);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(first.0, 500, "{first:?}");
+        assert_eq!(second.0, 503, "{second:?}");
+        assert!(
+            second.1.contains("unavailable") && second.1.contains("may have applied"),
+            "{second:?}"
+        );
         handle.shutdown().unwrap();
     }
 

@@ -1920,6 +1920,35 @@ impl Request {
             | Self::DesignCompact { .. } => false,
         }
     }
+
+    /// Whether this op changes anything — the database, or the daemon's own state (its tickets) — so
+    /// that running it twice is not the same as running it once. The one place that says so: a
+    /// `jkb serve` client keys, and may resend, only an op that mutates
+    /// (`jkb_daemon::client::RemoteBackend`); a resent read needs no record of its first answer, and
+    /// its answer (up to a read's whole budget) would only crowd the writes' out of the daemon's.
+    ///
+    /// The agent read set ([`Request::is_agent_read`]) does not mutate — the daemon serves it on a
+    /// `query_only` connection — and neither do the reads it leaves on the writer, named here. Not RBAC's
+    /// `Read` class: its `Hook` class mixes the queue's and the hooks' reads with their writes.
+    /// `mq.poll` records the poll, so it mutates. A new op outside the read set counts as mutating
+    /// until it is named here: keying a read only costs a recorded answer, while not keying a write
+    /// could apply it twice.
+    #[must_use]
+    pub const fn mutates(&self) -> bool {
+        !self.is_agent_read()
+            && !matches!(
+                self,
+                Self::MqInspect {}
+                    | Self::MqTail { .. }
+                    | Self::NotifyOpenSessions {}
+                    | Self::SessionList { .. }
+                    | Self::SessionState { .. }
+                    | Self::RemovalList { .. }
+                    | Self::LeaseGet { .. }
+                    // An FTS5 integrity check: an `INSERT` that changes nothing.
+                    | Self::KbHealth {}
+            )
+    }
 }
 
 /// The answer to a [`Request`]. Serialized with a `"result"` tag.
