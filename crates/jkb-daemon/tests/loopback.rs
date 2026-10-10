@@ -858,8 +858,16 @@ fn a_connection_that_never_authenticates_is_closed_even_while_pipelining() {
     drop(hog);
 }
 
+/// Keyed or not: a keyed long-poll is served on its handler, like any other, rather than on a task
+/// that outlives its client — which held the group's slot and a poll permit for the whole wait.
 #[test]
 fn a_long_poll_slot_is_released_when_its_client_goes_away() {
+    for key in ["", "idempotency-key: k\r\n"] {
+        long_poll_slot_released(key);
+    }
+}
+
+fn long_poll_slot_released(key: &str) {
     use std::io::Write as _;
     let f = Fixture::new();
     let c = f.client();
@@ -869,7 +877,7 @@ fn a_long_poll_slot_is_released_when_its_client_goes_away() {
     let mut raw = std::net::TcpStream::connect(f.handle.as_ref().unwrap().addr).unwrap();
     write!(
         raw,
-        "POST /v1/op?wait_ms=20000 HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n\
+        "POST /v1/op?wait_ms=20000 HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {}\r\n{key}\
          content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
         token.trim(),
         body.len()
@@ -1469,6 +1477,15 @@ fn post_at(
     (resp.status().as_u16(), resp.text().unwrap())
 }
 
+/// Wait, up to 5 s, for `done`.
+fn wait_until(done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < Duration::from_secs(5), "never happened");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn root_token(f: &Fixture) -> String {
     jkb_daemon::token::read(&f.token).unwrap()
 }
@@ -1534,6 +1551,10 @@ fn a_request_without_a_key_runs_every_time() {
 ///
 /// A resend waits no longer than `duplicate_wait`: past it, it is told to retry, and the original
 /// still answers and is applied once.
+///
+/// With one op permit, held by the original, the resend still waits rather than being refused `busy`:
+/// a known key is looked up before the permit is asked, and a client told `busy` would retry under a
+/// fresh key.
 #[test]
 fn a_resend_while_the_original_runs_waits_for_its_answer() {
     let send_twice = |f: &Fixture| {
@@ -1552,14 +1573,14 @@ fn a_resend_while_the_original_runs_waits_for_its_answer() {
         let add = json!({ "op": "task.add", "text": "once" });
         let answers = std::thread::scope(|s| {
             let first = s.spawn(|| post(f, &token, Some("k"), &add));
-            std::thread::sleep(Duration::from_millis(150));
+            wait_until(|| f.handle.as_ref().unwrap().keyed_in_progress() == 1);
             let second = s.spawn(|| post(f, &token, Some("k"), &add));
             (first.join().unwrap(), second.join().unwrap())
         });
         writer.join().unwrap();
         answers
     };
-    let f = Fixture::new();
+    let f = Fixture::with(|cfg| cfg.max_ops = 1);
     let (first, second) = send_twice(&f);
     assert_eq!(first.0, 200, "{first:?}");
     assert_eq!(second, first, "the same answer");
@@ -1647,4 +1668,30 @@ fn a_keyed_request_refused_before_it_ran_is_not_recorded() {
     assert_eq!(refused.0, 503, "{refused:?}");
     assert!(refused.1.contains("already has a long-poll"), "{refused:?}");
     assert_eq!(again.0, 200, "{again:?}");
+}
+
+/// A recorded answer is not replayed to a token revoked since: it is refused, as running the op would
+/// be, and its connection closed.
+#[test]
+fn a_recorded_answer_is_not_replayed_to_a_revoked_token() {
+    let f = Fixture::new();
+    let op = f.client();
+    let Response::Granted { token, grant } = op
+        .call(
+            serde_json::from_value(
+                json!({ "op": "role.grant", "role": "coordinator", "agent": "c" }),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    let whoami = json!({ "op": "role.whoami" });
+    assert_eq!(post(&f, &token, Some("k"), &whoami).0, 200);
+    let id = grant.id;
+    f.db.write_txn("host-cli", move |c, m| jkb_core::roles::revoke(c, m, id))
+        .unwrap();
+    let (status, body) = post(&f, &token, Some("k"), &whoami);
+    assert_eq!(status, 401, "{body}");
 }

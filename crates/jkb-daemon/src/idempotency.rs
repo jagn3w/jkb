@@ -143,6 +143,22 @@ impl<V: Clone> Store<V> {
         }
     }
 
+    /// Whether anything is recorded under `key`, running or answered. An answer past its time may be
+    /// counted until the next [`Store::begin`] expires it; that one then runs.
+    #[must_use]
+    pub fn contains(&self, key: &Key) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// How many entries are running.
+    #[must_use]
+    pub fn in_progress(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|e| matches!(e.state, State::InProgress(_)))
+            .count()
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
