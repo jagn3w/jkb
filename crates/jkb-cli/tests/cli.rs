@@ -3654,6 +3654,62 @@ impl Daemon {
     }
 }
 
+/// The first three words of a `jkb serve` line — its stamp, `pid`, the pid — checked, and the rest.
+fn serve_line_message(line: &str, pid: u32) -> &str {
+    let mut words = line.splitn(4, ' ');
+    let stamp = words.next().unwrap_or_default();
+    // `2026-10-10T08:15:02.317Z`: RFC 3339, UTC, milliseconds.
+    assert!(
+        stamp.len() == 24
+            && stamp.as_bytes()[10] == b'T'
+            && stamp.ends_with('Z')
+            && stamp[..4].bytes().all(|b| b.is_ascii_digit()),
+        "no RFC 3339 UTC stamp: {line}"
+    );
+    assert_eq!(words.next(), Some("pid"), "{line}");
+    assert_eq!(words.next(), Some(pid.to_string().as_str()), "{line}");
+    words.next().unwrap_or_default()
+}
+
+/// Every line `jkb serve` prints lands in launchd's serve.log beside every earlier daemon's, so each
+/// says when and which process; and SIGTERM — launchd's and systemd's stop — is a clean stop that
+/// says so, not a death by signal.
+#[test]
+fn serve_stamps_its_lines_and_stops_cleanly_on_sigterm() {
+    use std::io::BufRead as _;
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb/jkb.db");
+    let token = tmp.path().join("daemon/token");
+    let mut cmd = jkb(&db);
+    cmd.args(["serve", "--addr", "127.0.0.1:0", "--token-file"])
+        .arg(&token)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut serve = Daemon(cmd.spawn().unwrap());
+    let pid = serve.0.id();
+    let mut lines = std::io::BufReader::new(serve.0.stdout.take().unwrap()).lines();
+    let banner = lines.next().unwrap().unwrap();
+    assert!(
+        serve_line_message(&banner, pid).starts_with("jkb serve listening on http://127.0.0.1:"),
+        "{banner}"
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let stopping = lines
+        .next()
+        .expect("a line saying why it stopped, not a death by SIGTERM")
+        .unwrap();
+    assert_eq!(
+        serve_line_message(&stopping, pid),
+        "jkb serve: stopping on a termination signal (SIGINT, SIGTERM or SIGHUP)"
+    );
+    let status = serve.0.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+}
+
 /// `jkb service units` and `jkb service token-path` are what setup.sh activates and waits for, so they
 /// are checked against the real thing: every unit `install` wrote is listed at the path it was written
 /// to, and `jkb serve` with no `--token-file` writes its token exactly where `token-path` says.

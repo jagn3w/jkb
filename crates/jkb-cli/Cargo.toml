@@ -17,7 +17,9 @@ workspace = true
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
-ctrlc = "3.5.2"
+# `termination`: SIGTERM and SIGHUP too, so launchd/systemd stopping `jkb serve` (and `sync --watch`,
+# the reap service) is the same clean stop as Ctrl-C.
+ctrlc = { version = "3.5.2", features = ["termination"] }
 jkb-fsm = { version = "0.1.0", path = "../jkb-fsm" }
 jkb-rbac = { version = "0.1.0", path = "../jkb-rbac" }
 jkb-api = { version = "0.1.0", path = "../jkb-api" }

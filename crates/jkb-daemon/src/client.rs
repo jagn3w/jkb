@@ -13,6 +13,21 @@ use crate::token;
 /// per tool call) pays one connect timeout rather than one each.
 pub const UNREACHABLE_FOR: Duration = Duration::from_secs(5);
 
+/// The pauses before each retry of a request whose CONNECT failed: two more tries, about 100 ms and
+/// then about 300 ms apart, before the daemon is counted unreachable.
+///
+/// Measured: the dev container reaching the host daemon at `host.docker.internal:7117`, one TCP
+/// connection per call, saw 1–3 isolated connect failures in each of two bursts of 400 and 600
+/// sequential `jkb design ls` — every one followed at once by successes, the daemon's pid unchanged.
+/// About 0.5% of connects fail transiently (most likely Docker Desktop's port forwarding) while the
+/// daemon stays up, and marking it down on the first one failed every client — the per-tool-call
+/// attest hook among them — untried for [`UNREACHABLE_FOR`].
+///
+/// Only a connect failure is retried: then no byte reached the daemon, so a write cannot be applied
+/// twice. A request that connected and then failed or timed out is never retried.
+pub const CONNECT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(100), Duration::from_millis(300)];
+
 /// Serves requests by calling a `jkb serve` daemon over HTTP.
 pub struct RemoteBackend {
     base: String,
@@ -161,27 +176,31 @@ impl RemoteBackend {
                 ),
             ));
         }
-        self.client
-            .post(url)
-            .bearer_auth(token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .timeout(wait + self.op_timeout)
-            .send()
-            .map_err(|e| {
-                // Only a failed CONNECT means the daemon is out of reach — refused, or the connect
-                // timeout, which reqwest reports as a connect error. A request that connected and
-                // then ran past its deadline reached a daemon that is busy (a write lock held by
-                // another process), and marking that down made every other client — a hook for a
-                // permission prompt among them — give up without trying for the next few seconds.
-                if e.is_connect() {
-                    self.mark_unreachable(true);
-                }
-                ApiError::with_code(
-                    ErrorCode::Unavailable,
-                    format!("cannot reach jkb serve at {}: {e}", self.base),
-                )
-            })
+        // Shared, so each attempt's copy is a reference count rather than the body again.
+        let body = bytes::Bytes::from(body);
+        send_retrying_connect(|| {
+            self.client
+                .post(&url)
+                .bearer_auth(token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone())
+                .timeout(wait + self.op_timeout)
+        })
+        .map_err(|e| {
+            // Only a failed CONNECT means the daemon is out of reach — refused, or the connect
+            // timeout, which reqwest reports as a connect error. A request that connected and
+            // then ran past its deadline reached a daemon that is busy (a write lock held by
+            // another process), and marking that down made every other client — a hook for a
+            // permission prompt among them — give up without trying for the next few seconds.
+            // A connect error here is the last of [`CONNECT_RETRY_DELAYS`]' attempts.
+            if e.is_connect() {
+                self.mark_unreachable(true);
+            }
+            ApiError::with_code(
+                ErrorCode::Unavailable,
+                format!("cannot reach jkb serve at {}: {e}", self.base),
+            )
+        })
     }
 
     /// `GET /v1/hello`: the daemon's protocol, schema and op list.
@@ -190,13 +209,14 @@ impl RemoteBackend {
     /// [`ErrorCode::Unavailable`] when unreachable, or the daemon's refusal.
     pub fn hello(&self) -> Result<serde_json::Value, ApiError> {
         let token = self.token(false)?;
-        let resp = self
-            .client
-            .get(format!("{}/v1/hello", self.base))
-            .bearer_auth(token)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
+        let url = format!("{}/v1/hello", self.base);
+        let resp = send_retrying_connect(|| {
+            self.client
+                .get(&url)
+                .bearer_auth(&token)
+                .timeout(Duration::from_secs(5))
+        })
+        .map_err(|e| ApiError::with_code(ErrorCode::Unavailable, e.to_string()))?;
         decode(resp).map_err(|(e, _)| e)
     }
 
@@ -206,6 +226,24 @@ impl RemoteBackend {
         let result = decode(self.send(request, token)?);
         self.mark_unreachable(matches!(result, Err((_, Answered::NotJkb))));
         result.map_err(|(e, _)| e)
+    }
+}
+
+/// Send the request `build` makes, building and sending it again after each of
+/// [`CONNECT_RETRY_DELAYS`] while the failure is a failed connect — and only then: any other error,
+/// a timeout after connecting among them, is returned at once. The one place the retry rule lives.
+fn send_retrying_connect(
+    build: impl Fn() -> reqwest::blocking::RequestBuilder,
+) -> reqwest::Result<reqwest::blocking::Response> {
+    let mut delays = CONNECT_RETRY_DELAYS.iter();
+    loop {
+        match build().send() {
+            Err(e) if e.is_connect() => match delays.next() {
+                Some(delay) => std::thread::sleep(*delay),
+                None => return Err(e),
+            },
+            other => return other,
+        }
     }
 }
 
