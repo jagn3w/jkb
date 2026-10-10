@@ -12,7 +12,7 @@ use jkb_daemon::server::{spawn, ServeConfig, ServeError};
 use serde_json::json;
 
 struct Fixture {
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     db: Db,
     token: PathBuf,
     handle: Option<jkb_daemon::server::Handle>,
@@ -34,7 +34,7 @@ impl Fixture {
         let handle = spawn(db.clone(), &cfg).unwrap();
         let base = format!("http://{}", handle.addr);
         Self {
-            dir,
+            _dir: dir,
             db,
             token,
             handle: Some(handle),
@@ -1694,38 +1694,42 @@ fn expired_and_evicted_keys_run_again() {
     assert_eq!(tasks(&f), 3, "a's answer was evicted for b's");
 }
 
-/// A keyed request refused before it ran — here a write refused `schema_newer` by the check ahead of
-/// every op, which goes through the keyed path — records nothing: once the database is servable again,
-/// a resend with the same key runs, rather than being answered with the refusal.
+/// A keyed request refused before it ran — here an `ingest.text` refused `busy` while another
+/// ingest holds the one ingest permit, a refusal on the keyed path — records nothing: once the permit
+/// is free, a resend with the same key runs, rather than being answered with the refusal.
 #[test]
 fn a_keyed_request_refused_before_it_ran_is_not_recorded() {
     let f = Fixture::new();
     let token = root_token(&f);
-    let future = jkb_core::supported_schema_version() + 1;
-    f.db.write_txn("test", move |conn, _| {
-        conn.execute(
-            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
-                 VALUES (?1, 'from_the_future', '2030-01-01T00:00:00Z', '0')",
-            [future],
-        )?;
-        Ok(())
-    })
-    .unwrap();
-    let add = json!({ "op": "task.add", "text": "once" });
-    let refused = post(&f, &token, Some("k"), &add);
-    assert_eq!(refused.0, 503, "{refused:?}");
-    assert!(refused.1.contains("schema_newer"), "{refused:?}");
-    // Undone behind the daemon's back: every write through it now refuses the newer schema.
-    rusqlite::Connection::open(f.dir.path().join("jkb.db"))
-        .unwrap()
-        .execute(
-            "DELETE FROM refinery_schema_history WHERE version = ?1",
-            [future],
-        )
+    let handle = f.handle.as_ref().unwrap();
+    // The writer held, so the first ingest keeps the ingest permit until the test lets it go.
+    let (holding, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let db = f.db.clone();
+    let writer = std::thread::spawn(move || {
+        db.write_txn("test", move |_, _| {
+            holding.send(()).unwrap();
+            let _ = released.recv();
+            Ok(())
+        })
         .unwrap();
-    let ran = post(&f, &token, Some("k"), &add);
-    assert_eq!(ran.0, 200, "{ran:?}");
-    assert_eq!(tasks(&f), 1);
+    });
+    held.recv().unwrap();
+    let ingest = |text: &str| json!({ "op": "ingest.text", "text": text, "mime": "text/plain", "namespace": "inbox" });
+    let (refused, first) = std::thread::scope(|s| {
+        let first = s.spawn(|| post_at(&f, "/v1/op", &token, None, &ingest("first")));
+        wait_until(|| handle.ingests_running() == 1);
+        let refused = post(&f, &token, Some("k"), &ingest("second"));
+        release.send(()).unwrap();
+        (refused, first.join().unwrap())
+    });
+    writer.join().unwrap();
+    assert_eq!(first.0, 200, "{first:?}");
+    assert_eq!(refused.0, 503, "{refused:?}");
+    assert!(refused.1.contains("ingest limit"), "{refused:?}");
+    let ran = post(&f, &token, Some("k"), &ingest("second"));
+    assert_eq!(ran.0, 200, "the resend ran: {ran:?}");
+    assert!(ran.1.contains("ingested"), "{ran:?}");
 }
 
 /// An answer past `idempotency_max_answer` is served but not recorded: a resend of its key is told

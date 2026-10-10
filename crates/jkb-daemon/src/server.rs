@@ -171,6 +171,8 @@ pub struct Handle {
     thread: Option<std::thread::JoinHandle<()>>,
     idem: Option<Arc<Mutex<Store<Answer>>>>,
     waiting: Option<Arc<AtomicUsize>>,
+    /// The ingest budget and its size, for [`Handle::ingests_running`].
+    ingests: Option<(Arc<Semaphore>, usize)>,
 }
 
 impl Handle {
@@ -211,6 +213,15 @@ impl Handle {
         self.waiting
             .as_ref()
             .map_or(0, |waiting| waiting.load(Ordering::SeqCst))
+    }
+
+    /// How many `ingest.text` requests hold an ingest permit now — for tests, as
+    /// [`Handle::keyed_in_progress`].
+    #[must_use]
+    pub fn ingests_running(&self) -> usize {
+        self.ingests
+            .as_ref()
+            .map_or(0, |(budget, size)| size - budget.available_permits())
     }
 
     /// Whether the server thread has ended. Nothing but [`Handle::shutdown`] asks it to, so while
@@ -442,6 +453,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         cfg.idempotency_bytes,
     )));
     let waiting = Arc::new(AtomicUsize::new(0));
+    let ingests = Arc::new(Semaphore::new(cfg.max_ingests));
     let state = Arc::new(State {
         serving: Mutex::new(serving),
         opener,
@@ -451,7 +463,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
         ops: Arc::new(Semaphore::new(cfg.max_ops)),
         polls: Arc::new(Semaphore::new(cfg.max_polls)),
         reads: Arc::new(Semaphore::new(cfg.max_reads)),
-        ingests: Arc::new(Semaphore::new(cfg.max_ingests)),
+        ingests: Arc::clone(&ingests),
         read_budget_bytes: cfg.read_budget_bytes,
         polling: Mutex::new(HashSet::new()),
         sent: Notify::new(),
@@ -509,6 +521,7 @@ fn start(source: Source, cfg: &ServeConfig) -> Result<Handle, ServeError> {
     Ok(Handle {
         idem: Some(idem),
         waiting: Some(waiting),
+        ingests: Some((ingests, cfg.max_ingests)),
         addr,
         stop: Some(stop_tx),
         thread: Some(thread),
@@ -1695,6 +1708,7 @@ mod tests {
         let handle = Handle {
             idem: None,
             waiting: None,
+            ingests: None,
             addr: "127.0.0.1:1".parse().unwrap(),
             stop: Some(stop),
             thread: Some(std::thread::spawn(move || {
