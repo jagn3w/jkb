@@ -142,9 +142,10 @@
         "Never run two at once, across all groups, and never in the background: the script takes no lock, so",
         "two runs in one worktree would gate each other's trees. Run exactly:",
         "  cd {{integration_worktree}} && {{repo}}/scripts/merge-queue.sh <branch> {{integration}} {{integration_worktree}}",
-        "Its LAST line is `merge-queue: <outcome> (exit <n>)`, and the line before it is its detail. Act on",
-        "the outcome word and nothing else: the script classifies its own exit codes, and you do not",
-        "reinterpret them. No such line (it failed before it could classify) is a stall.",
+        "Its LAST line is `merge-queue: <outcome> (exit <n>)`, and the line before it is its detail; killed,",
+        "it is `merge-queue: stall: <why>`, and the why says what to check. Act on the outcome word and nothing",
+        "else: the script classifies its own exit codes, and you do not reinterpret them. No such line (it",
+        "failed before it could classify) is a stall.",
         "- landed: the queue recorded the landing, and that is what closes the tasks. Check it: `jkb task show",
         "  <uid> --json` for every task of the group. A task is closed only if its status is exactly `done`.",
         "  Report any that are not as STALLED with their status, and tell the operator to run `jkb task landed",
@@ -273,7 +274,7 @@
       "permissions": {
         "isolation": "none",
         "model": null,
-        "writes": "nothing"
+        "writes": "kb"
       },
       "hands_off_to": [
         "review-reviewer",
@@ -313,8 +314,10 @@
         "     per area, in the background, each with",
         "       jkb workflow agent show review-area --var contract=\"$(cat \"$TMPDIR/review-contract-$(basename {{findings_ns}}).txt\")\" --var area_name=<a name> \\",
         "         --var area_files=<its files> --var others=<the other areas and their files>",
-        "     Each returns its findings as JSON. Merge them (the same defect twice is one finding, at the more",
-        "     severe) and set the pre-existing ones aside for step 3. If a task works this change, start ONE",
+        "     Each returns its findings as JSON. Merge them: the same defect twice is one finding, at the more",
+        "     severe of the two and at the scope that holds the change responsible (introduced over aggravated",
+        "     over pre-existing), so a disagreement never drops a defect out of the round. Set the",
+        "     pre-existing ones aside for step 3. If a task works this change, start ONE",
         "     more `jkb-reviewer` to file the rest; if none does, file nothing and report them yourself:",
         "       jkb workflow agent show review-file --var findings_ns={{findings_ns}} \\",
         "         --var bind_step=<as above> --var record_step=<as above> \\",

@@ -29,7 +29,8 @@
 #               1: the swarm hands 1 back as "rebase and fix your branch".
 #
 # THIS LIST IS THE CONTRACT, and `queue_outcome` below is its ONE classification: on every exit the
-# script prints `merge-queue: <landed|eject|stall> (exit <n>)` as its LAST line, and the swarm's
+# script prints `merge-queue: <landed|eject|stall> (exit <n>)` as its LAST line (or, killed or ended
+# without deciding, `merge-queue: stall: <why>`), and the swarm's
 # coordinator acts on that word, never on the code. A code the function does not know stalls rather
 # than being sorted into the nearest bucket. Adding a code here means adding an arm there — the
 # mistake made once already, when 4 was added to this header and its consumer still enumerated
@@ -156,7 +157,7 @@ trap 'rc=$?
 if [ -z "$SIGNAL" ] && [ "$DECIDED" = "$rc" ]; then
   echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"
 elif [ -n "$SIGNAL" ]; then
-  echo "merge-queue: stall: killed by $SIGNAL, after the step it was running finished"
+  echo "merge-queue: stall: killed by $SIGNAL, after the step it was running finished — check \`git -C $WT status\` and \`git log -1 $BASE\` before anything else: $BASE may already have advanced (owing \`jkb task landed\`), or this worktree may be detached at a commit the gate never passed; never fast-forward onto that"
 else
   echo "merge-queue: stall: ended without an outcome"
 fi' EXIT

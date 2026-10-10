@@ -210,7 +210,7 @@ case_signalled() {   # killed mid-gate by any signal: never `landed`, and the ba
             TERM | HUP) want="merge-queue: stall: killed by $sig, after the step it was running finished" ;;
             *) want="merge-queue: stall: ended without an outcome" ;;
         esac
-        if [ "$out" != "$want" ]; then
+        if [ "${out#"$want"}" = "$out" ]; then
             bad=1; fail "queue: signalled $sig" "a $sig mid-gate ended with: $out"; continue
         fi
         case "$sig" in TERM | HUP)
