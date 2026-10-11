@@ -100,14 +100,24 @@ fn install_units(manager: Manager, units: Vec<Unit>) -> Result<()> {
         // binary, and a daemon older than the database refuses every request (schema_newer). The
         // same rule as setup.sh's `activate_services`.
         match manager {
-            Manager::Launchd => println!(
-                "activate with: launchctl unload {path} 2>/dev/null; launchctl load {path}",
-                path = path.display()
-            ),
-            Manager::Systemd => println!(
-                "activate with: systemctl --user daemon-reload && systemctl --user enable {label} \
-                 && systemctl --user restart {label}"
-            ),
+            Manager::Launchd => {
+                println!(
+                    "activate with: launchctl unload {path} 2>/dev/null; launchctl load {path}",
+                    path = path.display()
+                );
+                // launchd discards a job's output unless the plist names a file, and the watcher's
+                // reports (REFUSED, RESOLVED, CONFLICT) are the only record of what it decided.
+                if let Some(log) = launchd_log(&unit) {
+                    println!("logs: {log}");
+                }
+            }
+            Manager::Systemd => {
+                println!(
+                    "activate with: systemctl --user daemon-reload && systemctl --user enable \
+                     {label} && systemctl --user restart {label}"
+                );
+                println!("logs: journalctl --user -u {label}");
+            }
         }
     }
     Ok(())
@@ -233,6 +243,15 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
+}
+
+/// The file a launchd plist sends the job's stderr to (`StandardErrorPath`), as written by this
+/// module's own plists: what `service install` tells the user to read.
+fn launchd_log(plist: &str) -> Option<&str> {
+    let rest = plist.split_once("<key>StandardErrorPath</key>")?.1;
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = rest[start..].find("</string>")?;
+    Some(&rest[start..start + end])
 }
 
 /// A launchd agent plist running the all-mounts watcher, kept alive across restarts.
@@ -473,8 +492,9 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        install_units, launchd_plist, launchd_reap_plist, launchd_serve_plist, systemd_reap_unit,
-        systemd_serve_unit, systemd_unit, xml_escape, Manager, LABEL, REAP_LABEL, SERVE_LABEL,
+        install_units, launchd_log, launchd_plist, launchd_reap_plist, launchd_serve_plist,
+        systemd_reap_unit, systemd_serve_unit, systemd_unit, xml_escape, Manager, LABEL,
+        REAP_LABEL, SERVE_LABEL,
     };
     use std::path::Path;
 
@@ -494,6 +514,18 @@ mod tests {
         // `kb_wins` resolution is reported — and nowhere else.
         assert!(plist.contains("<key>StandardErrorPath</key>"));
         assert!(plist.contains("sync.log"));
+    }
+
+    /// `service install` names the file the watcher's reports go to, read back from the plist it
+    /// wrote, so the message cannot drift from the unit.
+    #[test]
+    fn install_names_the_log_the_plist_writes_to() {
+        let plist = launchd_plist(
+            Path::new("/usr/local/bin/jkb"),
+            Path::new("/Users/u/.jkb/jkb.db"),
+        );
+        assert_eq!(launchd_log(&plist), Some("/Users/u/.jkb/sync.log"));
+        assert_eq!(launchd_log("<plist/>"), None);
     }
 
     #[test]
