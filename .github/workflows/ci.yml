@@ -15,6 +15,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # A CI build is thrown away, so incremental compilation's bookkeeping is pure cost (and bloats
+  # the cache), and full debuginfo only slows the link and the cache upload: keep line tables, so
+  # a panic's backtrace still names the line.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   check:
@@ -26,14 +32,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
-      # The SAME code check.sh runs, not a second copy of the list: the two hand-written
-      # copies drifted by a `*.md` skip within one commit of each other — green locally, red
-      # here, on the same tree. A broken PreToolUse hook is the sharp case: bash exits 2 on a
-      # syntax error and a PreToolUse hook exiting 2 reads as DENY, so it does not fail open
-      # the way its header promises.
-      - name: shell syntax
-        run: bash -c '. scripts/lib.sh; check_shell_syntax "$PWD"'
 
       # The workspace pulls heavy transitive deps (fastembed/ONNX, headless_chrome,
       # rav1e/image) and builds them twice (default + --features fastembed) plus a
@@ -60,15 +58,13 @@ jobs:
           rustup show
           rustup component add rustfmt clippy
 
-      - name: Cache cargo registry, git, and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+      # rust-cache, not a hand-keyed actions/cache: keyed on Cargo.lock alone, the cache was written
+      # once per lockfile and never again (a key hit skips the save), so every build after it
+      # recompiled whatever had changed since, from a target/ that only grew. rust-cache keys on the
+      # toolchain and lockfile, saves after each run on the default branch, and prunes the workspace's
+      # own crates so what is restored is the dependencies a build actually reuses.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -76,14 +72,17 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The `fastembed` feature exists only in jkb-embed (its one `cfg(feature)`), so linting and
+      # testing that crate with it is the whole of what the feature changes. Across the workspace it
+      # rebuilt every crate that depends on jkb-embed to lint and test code identical to the run above.
       - name: clippy (fastembed)
-        run: cargo clippy --all-targets --features fastembed -- -D warnings
+        run: cargo clippy -p jkb-embed --all-targets --features fastembed -- -D warnings
 
       - name: test
         run: cargo test --all
 
       - name: test (fastembed)
-        run: cargo test --all --features fastembed
+        run: cargo test -p jkb-embed --features fastembed
 
       # setup.sh's installs are not reachable from a Rust test, and one of them replaces the
       # very hook that runs it. No `-e` guard on the glob, unlike check.sh: here, finding no
@@ -130,6 +129,24 @@ jobs:
       # a runner with no jkb store judges it exactly as a developer's machine does.
       - name: generated docs (jkb design export --check)
         run: cargo run -q -p jkb-cli --bin jkb -- design export --check
+
+  # Everything that needs no Rust build, in parallel with `check` rather than after its tests: the
+  # shell and container checks take seconds but waited behind the whole compile, and fail fast here.
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The SAME code check.sh runs, not a second copy of the list: the two hand-written
+      # copies drifted by a `*.md` skip within one commit of each other — green locally, red
+      # here, on the same tree. A broken PreToolUse hook is the sharp case: bash exits 2 on a
+      # syntax error and a PreToolUse hook exiting 2 reads as DENY, so it does not fail open
+      # the way its header promises.
+      - name: shell syntax
+        run: bash -c '. scripts/lib.sh; check_shell_syntax "$PWD"'
 
       # The auto-mode posture's tests (design D48). Hermetic and seconds-long: no Rust, no
       # session, no network — they only exercise the JSON merge/subset logic against a temp
@@ -192,6 +209,16 @@ jobs:
       # build, and the two are repaired by looking at different diffs.
       - name: vendored policies are reproducible from upstream
         run: ./.container/check-drift.sh
+
+  # The dependency audit reads Cargo.lock and the advisory database; it builds nothing, so it does
+  # not wait for `check`'s compile either.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
