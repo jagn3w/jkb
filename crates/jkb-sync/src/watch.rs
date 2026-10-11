@@ -312,9 +312,11 @@ where
             // A pass can fail AFTER per-file transactions have committed — the trailing
             // `ensure_all_mirrors` is its own transaction — so the batch's remaining paths and
             // the mirror derivation are lost while the files read as settled. Returning `true`
-            // makes the next tick a full re-scan, so the work is picked up rather than waiting
-            // for someone to touch those files again.
-            eprintln!("sync {mount_ns}: pass failed ({e}); re-scanning on the next event");
+            // owes a full re-scan, run once the retry backoff has elapsed, so the work is picked up
+            // rather than waiting for someone to touch those files again.
+            eprintln!(
+                "sync {mount_ns}: pass failed ({e}); re-scanning the mount after the retry backoff"
+            );
             // A pass-level error says nothing about which files are healthy, so the debt is
             // owed unconditionally. The caller decides *when* to settle it: a dropped-event
             // rescan runs immediately, a retry waits for the backoff.
