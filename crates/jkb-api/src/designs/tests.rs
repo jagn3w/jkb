@@ -987,7 +987,7 @@ fn the_operator_starts_threads_and_approves_selections_and_a_designer_replies() 
     );
     assert_eq!(thread_of(ok(&kb.op, resolve)).status, "resolved");
     match ok(&kb.op, json!({ "op": "design.threads", "uid": uid })) {
-        Response::DesignThreadList { threads } => assert_eq!(threads.len(), 1),
+        Response::DesignThreadList { threads, .. } => assert_eq!(threads.len(), 1),
         other => panic!("{other:?}"),
     }
     let approve = json!({ "op": "design.approve_selection", "uid": uid,

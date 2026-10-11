@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import {
   decodeDesignSpan,
@@ -68,14 +68,12 @@ export function useThreads(
   const [draft, setDraft] = useState<Selected | undefined>(undefined);
   const [busy, setBusy] = useState(false);
 
-  const shownRef = useRef(shownVersion);
-  shownRef.current = shownVersion;
   const load = useCallback(async () => {
-    // Read for the version on screen when asked; an answer that comes back after the screen moved
-    // on is kept but not fresh, and the move itself asks again (below).
-    const at = shownRef.current;
+    // The answer names the version its offsets are into: fresh only while that is the screen's.
+    // Comparing with the version on screen when asked was wrong whenever the server had moved on
+    // and the session had not yet pulled (review round 2).
     const answer = decodeThreads(await op(threadOps.list(design.uid)));
-    if (answer.ok) setListed({ threads: answer.value, at });
+    if (answer.ok) setListed({ threads: answer.value.threads, at: answer.value.version });
   }, [design.uid]);
 
   // Re-read whenever the text on screen reaches a new version — a local edit saved and read back, or

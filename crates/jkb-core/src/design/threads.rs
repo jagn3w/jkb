@@ -377,8 +377,17 @@ pub fn show(conn: &Connection, thread: &str) -> Result<Thread> {
 /// # Errors
 /// An unknown design, or a database error.
 pub fn list(conn: &Connection, uid: &str) -> Result<Vec<Thread>> {
+    Ok(list_at(conn, uid)?.0)
+}
+
+/// [`list`], with the version the offsets are into: a reader holding another version must not
+/// place or select by them.
+///
+/// # Errors
+/// An unknown design, or a database error.
+pub fn list_at(conn: &Connection, uid: &str) -> Result<(Vec<Thread>, Version)> {
     let design = design_id(conn, uid)?;
-    let (doc, _) = load(conn, design)?;
+    let (doc, version) = load(conn, design)?;
     let mut stmt = conn.prepare_cached(
         "SELECT i.id, i.uid, i.metadata FROM containment c JOIN items i ON i.id = c.child_item_id
           WHERE c.parent_item_id = ?1 AND i.kind = ?2 ORDER BY c.position, i.id",
@@ -399,7 +408,7 @@ pub fn list(conn: &Connection, uid: &str) -> Result<Vec<Thread>> {
         out.push(view(conn, ItemId::new(id), thread, &metadata, uid, &doc)?);
     }
     out.sort_by_key(|t| (!t.anchored, t.start, t.end));
-    Ok(out)
+    Ok((out, version))
 }
 
 /// The designs whose threads the changelog `entries` (as `undo` reads them: op, table, entity id,

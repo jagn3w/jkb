@@ -2627,6 +2627,8 @@ pub enum Response {
     DesignThreadList {
         /// The threads, in text order.
         threads: Vec<designs::Thread>,
+        /// The version their offsets are into.
+        version: String,
     },
     /// A `design.apply`, `design.edit` or `design.span`.
     DesignWritten {
@@ -4161,9 +4163,10 @@ impl LocalBackend {
                     version: version.token(),
                 }
             }
-            Request::DesignThreads { uid } => Response::DesignThreadList {
-                threads: db.read_with(move |c| designs::threads(c, &uid))?,
-            },
+            Request::DesignThreads { uid } => {
+                let (threads, version) = db.read_with(move |c| designs::threads(c, &uid))?;
+                Response::DesignThreadList { threads, version }
+            }
             Request::DesignThreadStart {
                 uid,
                 base,

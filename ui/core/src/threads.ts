@@ -76,14 +76,21 @@ function isThread(v: unknown): v is Thread {
   );
 }
 
-/** `design.threads`' answer. */
-export function decodeThreads(o: Outcome<OpResponse>): Outcome<readonly Thread[]> {
+/** `design.threads`' answer: the threads, and the version their offsets are into. */
+export interface ThreadList {
+  readonly threads: readonly Thread[];
+  readonly version: string;
+}
+
+export function decodeThreads(o: Outcome<OpResponse>): Outcome<ThreadList> {
   if (!o.ok) return o;
-  const threads = o.value.result === "design_thread_list" ? o.value["threads"] : undefined;
-  if (!Array.isArray(threads) || !threads.every(isThread)) {
+  const ok = o.value.result === "design_thread_list";
+  const threads = ok ? o.value["threads"] : undefined;
+  const version = ok ? o.value["version"] : undefined;
+  if (!Array.isArray(threads) || !threads.every(isThread) || !isString(version)) {
     return failed("internal", "jkb serve did not answer with a well-formed `design_thread_list`");
   }
-  return { ok: true, value: threads };
+  return { ok: true, value: { threads, version } };
 }
 
 /** A thread write's answer: the thread after it. */

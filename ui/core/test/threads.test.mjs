@@ -19,8 +19,10 @@ const thread = (over = {}) => ({
 });
 
 test("threads decode from their answers, and a malformed one is refused", () => {
-  const list = decodeThreads({ ok: true, value: { result: "design_thread_list", threads: [thread()] } });
-  assert.equal(list.ok && list.value[0].comments[0].by, "operator");
+  const list = decodeThreads({ ok: true, value: { result: "design_thread_list", threads: [thread()], version: "3.AA" } });
+  assert.equal(list.ok && list.value.threads[0].comments[0].by, "operator");
+  assert.equal(list.ok && list.value.version, "3.AA");
+  assert.equal(decodeThreads({ ok: true, value: { result: "design_thread_list", threads: [] } }).ok, false, "no version");
   const one = decodeThread({ ok: true, value: { result: "design_thread", thread: thread({ status: "resolved" }) } });
   assert.equal(one.ok && one.value.status, "resolved");
   const bad = decodeThread({ ok: true, value: { result: "design_thread", thread: { uid: "x" } } });

@@ -659,11 +659,12 @@ fn author(principal: &Principal) -> String {
 ///
 /// # Errors
 /// An unknown design.
-pub fn threads(conn: &Connection, uid: &str) -> Result<Vec<Thread>, ApiError> {
-    Ok(design::threads::list(conn, uid)?
-        .into_iter()
-        .map(Thread::from)
-        .collect())
+pub fn threads(conn: &Connection, uid: &str) -> Result<(Vec<Thread>, String), ApiError> {
+    let (threads, version) = design::threads::list_at(conn, uid)?;
+    Ok((
+        threads.into_iter().map(Thread::from).collect(),
+        version.token(),
+    ))
 }
 
 /// `design.thread_start`.

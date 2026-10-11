@@ -29,12 +29,18 @@ function Composer({
   readonly onCancel?: () => void;
 }): React.JSX.Element {
   const [text, setText] = useState("");
+  // Held from the press until the save answers: a second press while the first waits for the edits
+  // to settle would start a second, identical thread (review round 2).
+  const [sending, setSending] = useState(false);
   const send = (): void => {
-    if (text.trim() === "") return;
+    if (text.trim() === "" || sending) return;
+    setSending(true);
     // Cleared only once it is saved: a refused or failed send keeps what was typed (review round 1).
-    void onSend(text).then((saved) => {
-      if (saved) setText("");
-    });
+    void onSend(text)
+      .then((saved) => {
+        if (saved) setText("");
+      })
+      .finally(() => setSending(false));
   };
   return (
     <form
@@ -48,7 +54,7 @@ function Composer({
         value={text}
         rows={2}
         placeholder={placeholder}
-        disabled={busy}
+        disabled={busy || sending}
         aria-label={placeholder}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
@@ -66,7 +72,7 @@ function Composer({
             Cancel
           </button>
         )}
-        <button type="submit" className="bar-button" disabled={busy || text.trim() === ""}>
+        <button type="submit" className="bar-button" disabled={busy || sending || text.trim() === ""}>
           {onCancel !== undefined ? "Comment" : "Reply"}
         </button>
       </div>
@@ -140,8 +146,11 @@ export function ThreadMargin({
   // Placed again only from offsets into the text on screen; while a re-read catches up with an edit,
   // each card keeps the place it had, rather than jumping to wherever its old offset now falls.
   const placed = useRef(new Map<string, number>());
-  const topOf = fresh ? new Map(items.map((i, k) => [i.key, tops[k] ?? 0])) : placed.current;
-  if (fresh) placed.current = topOf;
+  const live = new Map(items.map((i, k) => [i.key, tops[k] ?? 0]));
+  // A draft's offsets are the editor's own, live; and a card with no earlier place has nowhere to
+  // stay, so both take the live placement (review round 2).
+  const topOf = fresh ? live : new Map([...live].map(([k, v]) => [k, k === "draft" ? v : (placed.current.get(k) ?? v)]));
+  if (fresh) placed.current = live;
 
   // Measure after each render; place again only when a height actually changed.
   useLayoutEffect(() => {

@@ -198,7 +198,7 @@ fn thread_cmd(ops: &Ops<'_>, what: DesignThreadCmd) -> Result<()> {
     };
     match what {
         DesignThreadCmd::Ls { uid } => match ops.call(Request::DesignThreads { uid })? {
-            Response::DesignThreadList { threads } => {
+            Response::DesignThreadList { threads, .. } => {
                 if ops.json {
                     println!("{}", serde_json::to_string_pretty(&threads)?);
                 } else if threads.is_empty() {
