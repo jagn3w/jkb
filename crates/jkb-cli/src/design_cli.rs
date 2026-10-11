@@ -417,11 +417,12 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             } else {
                 for d in designs {
                     println!(
-                        "{}  {}  [{}] seq={}{}",
+                        "{}  {}  [{}] seq={}{}{}",
                         d.uid,
                         d.title,
                         d.namespace.unwrap_or_default(),
                         d.seq,
+                        d.parent.map(|p| format!("  under {p}")).unwrap_or_default(),
                         d.doc_target
                             .map(|t| format!("  exports to {t}"))
                             .unwrap_or_default()
@@ -535,6 +536,44 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
         DesignCmd::Approve { span, base } => {
             let s = span_answer(ops, "design.approve", Request::DesignApprove { span, base })?;
             print_span(ops, &s)
+        }
+        DesignCmd::Mv { uid, under } => match ops.call(Request::DesignMove { uid, under })? {
+            Response::DesignMeta { design } => {
+                if ops.json {
+                    println!("{}", serde_json::to_string_pretty(&design)?);
+                } else {
+                    println!(
+                        "{}  {}  now under {}",
+                        design.uid,
+                        design.title,
+                        design.parent.as_deref().unwrap_or("(top)")
+                    );
+                }
+                Ok(())
+            }
+            other => unexpected("design.move", &other),
+        },
+        DesignCmd::Split { uid, base, level } => {
+            match ops.call(Request::DesignSplit { uid, base, level })? {
+                Response::DesignSplit { split } => {
+                    if ops.json {
+                        println!("{}", serde_json::to_string_pretty(&split)?);
+                    } else {
+                        println!(
+                            "split {} into {} designs; {} spans moved, {} approvals carried",
+                            split.parent.uid,
+                            split.children.len(),
+                            split.moved,
+                            split.carried
+                        );
+                        for c in &split.children {
+                            println!("  {}  {}", c.uid, c.title);
+                        }
+                    }
+                    Ok(())
+                }
+                other => unexpected("design.split", &other),
+            }
         }
         DesignCmd::Stage { span, step } => {
             let s = span_answer(ops, "design.stage", Request::DesignStage { span, step })?;

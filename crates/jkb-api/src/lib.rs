@@ -824,6 +824,26 @@ pub enum Request {
         #[serde(default)]
         body: String,
     },
+    /// Nest a design under another design of its repo ([`designs::nest`]).
+    #[serde(rename = "design.move")]
+    DesignMove {
+        /// The design to nest.
+        uid: String,
+        /// The design it goes under.
+        under: String,
+    },
+    /// Split a design's sections into child designs, carrying their approvals
+    /// ([`designs::split`]).
+    #[serde(rename = "design.split")]
+    DesignSplit {
+        /// The design.
+        uid: String,
+        /// The version token the caller read.
+        base: String,
+        /// The heading level to split at (2: `##`).
+        #[serde(default = "designs::default_split_level")]
+        level: usize,
+    },
     /// A design's text, spans and version token ([`designs::cat`]).
     #[serde(rename = "design.cat")]
     DesignCat {
@@ -1587,6 +1607,8 @@ impl Request {
         "workflow.agent_set",
         "design.list",
         "design.create",
+        "design.move",
+        "design.split",
         "design.cat",
         "design.export",
         "design.target",
@@ -1724,6 +1746,8 @@ impl Request {
             Self::WorkflowAgentSet { .. } => "workflow.agent_set",
             Self::DesignList { .. } => "design.list",
             Self::DesignCreate { .. } => "design.create",
+            Self::DesignMove { .. } => "design.move",
+            Self::DesignSplit { .. } => "design.split",
             Self::DesignCat { .. } => "design.cat",
             Self::DesignExport { .. } => "design.export",
             Self::DesignTarget { .. } => "design.target",
@@ -1908,6 +1932,8 @@ impl Request {
             | Self::TaskCloseMerged { .. }
             | Self::NsMv { .. }
             | Self::DesignCreate { .. }
+            | Self::DesignMove { .. }
+            | Self::DesignSplit { .. }
             | Self::DesignApply { .. }
             | Self::DesignEdit { .. }
             | Self::DesignSpan { .. }
@@ -2486,7 +2512,12 @@ pub enum Response {
         /// The rendered designs, by uid.
         exports: Vec<designs::Export>,
     },
-    /// A `design.target` or `design.sources`: the design after it.
+    /// A `design.split`.
+    DesignSplit {
+        /// What it made.
+        split: designs::Split,
+    },
+    /// A `design.target`, `design.sources` or `design.move`: the design after it.
     DesignMeta {
         /// The design.
         design: designs::Design,
@@ -2666,6 +2697,7 @@ impl Response {
             | Self::TicketsReleased { .. }
             | Self::Designs { .. }
             | Self::DesignCreated { .. }
+            | Self::DesignSplit { .. }
             | Self::DesignExports { .. }
             | Self::DesignMeta { .. }
             | Self::DesignText { .. }
@@ -2697,8 +2729,9 @@ impl Response {
     pub const fn announces_a_send(&self) -> bool {
         match self {
             // An approval or a staging is announced on its design's topic (`kind = "span"`); an
-            // approval that already held writes nothing, and costs subscribers one spare poll.
-            Self::Sent { .. } | Self::DesignSpan { .. } => true,
+            // approval that already held writes nothing, and costs subscribers one spare poll. A
+            // split stores updates to the design and each child, each announced on its topic.
+            Self::Sent { .. } | Self::DesignSpan { .. } | Self::DesignSplit { .. } => true,
             Self::Notified { sent, .. } => *sent > 0,
             // Every stored design update is announced on `design/<uid>` (D53.4).
             Self::DesignWritten { written } => written.seq.is_some(),
@@ -4002,6 +4035,13 @@ impl LocalBackend {
                 design: db.write_txn_with(actor, move |c, m| {
                     designs::create(c, m, &repo, &title, &body)
                 })?,
+            },
+            Request::DesignMove { uid, under } => Response::DesignMeta {
+                design: db.write_txn_with(actor, move |c, m| designs::nest(c, m, &uid, &under))?,
+            },
+            Request::DesignSplit { uid, base, level } => Response::DesignSplit {
+                split: db
+                    .write_txn_with(actor, move |c, m| designs::split(c, m, &uid, &base, level))?,
             },
             Request::DesignExport { uid, repo } => Response::DesignExports {
                 exports: db

@@ -441,6 +441,15 @@ fn samples() -> Vec<Request> {
             title: "t".into(),
             body: "b".into(),
         },
+        Request::DesignMove {
+            uid: "design:x".into(),
+            under: "design:y".into(),
+        },
+        Request::DesignSplit {
+            uid: "design:x".into(),
+            base: "1.AA".into(),
+            level: 2,
+        },
         Request::DesignCat {
             uid: "design:x".into(),
         },

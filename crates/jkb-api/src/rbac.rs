@@ -283,6 +283,8 @@ impl Request {
             Self::WorkflowFire { .. } | Self::WorkflowObserve { .. } => OpPermission::Workflow,
             Self::RoleGrant { .. } | Self::RoleRevoke { .. } => OpPermission::Grant,
             Self::DesignCreate { .. }
+            | Self::DesignMove { .. }
+            | Self::DesignSplit { .. }
             | Self::DesignApply { .. }
             | Self::DesignEdit { .. }
             | Self::DesignSpan { .. }
@@ -374,6 +376,8 @@ impl Request {
             | Self::WorkflowAgentSet { .. }
             // A design is no one task's.
             | Self::DesignCreate { .. }
+            | Self::DesignMove { .. }
+            | Self::DesignSplit { .. }
             | Self::DesignApply { .. }
             | Self::DesignEdit { .. }
             | Self::DesignSpan { .. }

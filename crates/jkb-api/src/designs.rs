@@ -48,6 +48,9 @@ pub struct Design {
     /// The files it was made from, each with the blake3 of its content then (D55.5).
     #[serde(default)]
     pub sources: Vec<Source>,
+    /// The design it is nested under, or `None` at the top level.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 impl From<DesignRow> for Design {
@@ -60,6 +63,7 @@ impl From<DesignRow> for Design {
             seq: d.seq,
             doc_target: d.meta.doc_target,
             sources: d.meta.sources.into_iter().map(Source::from).collect(),
+            parent: d.parent,
         }
     }
 }
@@ -345,6 +349,58 @@ pub fn create(
     body: &str,
 ) -> Result<Design, ApiError> {
     Ok(design::create(conn, meta, repo, title, body)?.into())
+}
+
+/// What `design.split` made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Split {
+    /// The design split, as it lists now.
+    pub parent: Design,
+    /// One child design per section, in order.
+    pub children: Vec<Design>,
+    /// Spans moved into a child.
+    pub moved: usize,
+    /// Of those, the ones whose approval was carried over.
+    pub carried: usize,
+}
+
+/// The heading level `design.split` splits at when none is named: `##`.
+#[must_use]
+pub const fn default_split_level() -> usize {
+    2
+}
+
+/// `design.move`: nest a design under another design of its repo.
+///
+/// # Errors
+/// An unknown design, a parent in another repo, or a cycle (`design::tree::nest`).
+pub fn nest(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    under: &str,
+) -> Result<Design, ApiError> {
+    Ok(design::tree::nest(conn, meta, uid, under)?.into())
+}
+
+/// `design.split`: one child design per heading of `level`, approvals carried.
+///
+/// # Errors
+/// As `design::tree::split`.
+pub fn split(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    level: usize,
+) -> Result<Split, ApiError> {
+    let s = design::tree::split(conn, meta, uid, base, level)?;
+    Ok(Split {
+        parent: s.parent.into(),
+        children: s.children.into_iter().map(Design::from).collect(),
+        moved: s.moved,
+        carried: s.carried,
+    })
 }
 
 /// `design.export`: one design rendered for its doc target, or — with no `uid` — every design (of

@@ -27,6 +27,7 @@ mod discuss;
 pub mod export;
 pub mod plan;
 pub mod prompts;
+pub mod tree;
 
 use std::collections::BTreeSet;
 
@@ -46,6 +47,7 @@ pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 pub use export::{DesignMeta, Exported, Source};
 pub use plan::{PlanTask, PlanView, Plans, StepView, TaskPlace, PLAN_KIND};
 pub use prompts::{Launch, PromptRecord, RecordPrompt, Recorded, PROMPT_KIND};
+pub use tree::Split;
 use yrs::Text as _;
 
 /// The item kind of a design.
@@ -214,6 +216,8 @@ pub struct DesignRow {
     pub seq: i64,
     /// Where its export is written, and the files it was made from (D55.5–6).
     pub meta: DesignMeta,
+    /// The design it is nested under ([`tree`]), or `None` at the top level.
+    pub parent: Option<String>,
 }
 
 /// One piece of a span's text and the state it is in.
@@ -432,6 +436,7 @@ pub fn create(
         namespace: Some(path),
         seq,
         meta: DesignMeta::default(),
+        parent: None,
     })
 }
 
@@ -467,6 +472,7 @@ pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
         out.push(DesignRow {
             seq: newest_seq(conn, id)?,
             meta: export::meta_of(conn, id)?,
+            parent: parent_uid(conn, id)?,
             uid,
             title,
             namespace,
@@ -489,7 +495,16 @@ pub fn row(conn: &Connection, uid: &str) -> Result<DesignRow> {
         namespace: item::primary_namespace(conn, id)?,
         seq: newest_seq(conn, id)?,
         meta: export::meta_of(conn, id)?,
+        parent: parent_uid(conn, id)?,
     })
+}
+
+/// The uid of the design `design` is nested under, if any.
+fn parent_uid(conn: &Connection, design: ItemId) -> Result<Option<String>> {
+    match tree::parent_of(conn, design)? {
+        Some(p) => Ok(item::get(conn, p)?.map(|m| m.uid)),
+        None => Ok(None),
+    }
 }
 
 /// The newest seq a design holds, counting its compaction.
@@ -601,14 +616,31 @@ fn append_row(
     uid: &str,
     update: &[u8],
 ) -> Result<i64> {
+    append_row_as(conn, meta, design, uid, update, false)
+}
+
+/// [`append_row`], marking the row as a [`tree::split`]'s when `split`, which [`unrevertable`]
+/// refuses by name.
+fn append_row_as(
+    conn: &Connection,
+    meta: &WriteMeta,
+    design: ItemId,
+    uid: &str,
+    update: &[u8],
+    split: bool,
+) -> Result<i64> {
     let (rowid, seq) = store_row(conn, meta, design, uid, update)?;
+    let mut after = json!({ "design": uid, "seq": seq, "bytes": update.len() });
+    if split {
+        after["split"] = json!(true);
+    }
     changelog::upsert(
         conn,
         meta,
         Entity::DesignUpdates,
         &rowid.to_string(),
         None,
-        Some(&json!({ "design": uid, "seq": seq, "bytes": update.len() })),
+        Some(&after),
     )?;
     compact_if_due(conn, meta, design)?;
     Ok(seq)
@@ -1180,9 +1212,10 @@ fn span_items(conn: &Connection, design: ItemId) -> Result<Vec<SpanItem>> {
 
 /// The state a span's approved words are in: APPROVED, or STAGED / IMPLEMENTED from the graph.
 ///
-/// Only `stages` edges into a step of the span's **own** design count ([`plan::design_of_step`]),
-/// the same rule [`stage`] refuses by: an edge written another way (`jkb inv link <span> stages
-/// <step>`) into another design's plan does not make the span STAGED. IMPLEMENTED needs every
+/// Only `stages` edges into a step of the span's **own** design's tree count
+/// ([`plan::design_of_step`], [`tree::root_of`]), the same rule [`stage`] refuses by: an edge
+/// written another way (`jkb inv link <span> stages <step>`) into another tree's plan does not make
+/// the span STAGED. IMPLEMENTED needs every
 /// counted step to be implemented ([`plan::StepTasks::implemented`]).
 fn approved_state(
     conn: &Connection,
@@ -1200,9 +1233,17 @@ fn approved_state(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut steps = Vec::new();
+    let root = if edges.is_empty() {
+        design
+    } else {
+        tree::root_of(conn, design)?
+    };
     for (step, uid) in edges {
-        if plan::design_of_step(conn, step, &uid).ok() == Some(design) {
-            steps.push((step, uid));
+        let owner = plan::design_of_step(conn, step, &uid).ok();
+        if let Some(owner) = owner {
+            if tree::root_of(conn, owner)? == root {
+                steps.push((step, uid));
+            }
         }
     }
     if steps.is_empty() {
@@ -1461,10 +1502,12 @@ pub fn stage(
             "`{step_uid}` is a {kind}, not a plan step ({STEP_KIND})"
         )));
     }
-    if plan::design_of_step(conn, step, step_uid)? != design {
+    if tree::root_of(conn, plan::design_of_step(conn, step, step_uid)?)?
+        != tree::root_of(conn, design)?
+    {
         return Err(invalid(format!(
             "plan step {step_uid} belongs to another design's plan: a span is staged only into a \
-             step of its own design ({design_uid})"
+             step of its own design's tree ({design_uid})"
         )));
     }
     let current = span_now(conn, &span, design)?;
@@ -1644,11 +1687,30 @@ pub(crate) fn unrevertable(conn: &Connection, rowid: i64) -> Result<Option<Strin
     let exists: bool = conn
         .prepare_cached("SELECT EXISTS (SELECT 1 FROM design_updates WHERE id = ?1)")?
         .query_row([rowid], |r| r.get(0))?;
-    Ok((!exists).then(|| {
-        format!(
+    if !exists {
+        return Ok(Some(format!(
             "design update {rowid} is gone — folded into its design's snapshot by a compaction, \
              or removed with its design — so what it changed can no longer be told apart from the \
              rest"
+        )));
+    }
+    // A split's undo would put the text back as new characters, and the spans it moved back on
+    // anchors that cover none of them: half a restore, with spans no one can approve again.
+    let split: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM changelog WHERE entity_type = ?1 AND entity_id = ?2
+                AND json_extract(after, '$.split') = 1)",
+        )?
+        .query_row(
+            params![Entity::DesignUpdates.as_str(), rowid.to_string()],
+            |r| r.get(0),
+        )?;
+    Ok(split.then(|| {
+        format!(
+            "design update {rowid} split its design into child designs, and undo cannot put the \
+             moved spans back on the words they covered (undone text is new text to the CRDT) — \
+             so a split is not undone. To take one back, copy each child's text into the design \
+             with `jkb design edit`, then span and approve it again"
         )
     }))
 }

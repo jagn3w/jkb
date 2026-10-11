@@ -548,6 +548,28 @@ enum DesignCmd {
         #[arg(long)]
         base: String,
     },
+    /// Nest a design under another design of its repo: the sidebar shows it there, and the
+    /// parent's export inlines it.
+    Mv {
+        /// The design to nest.
+        uid: String,
+        /// The design it goes under.
+        #[arg(long)]
+        under: String,
+    },
+    /// Split a design into child designs, one per heading of `--level` (2: `##`), against the
+    /// version you read. Approved spans keep their approval and their plan steps; the parent's
+    /// export still writes the whole text to its one `docs/` file.
+    Split {
+        /// The design.
+        uid: String,
+        /// The version token `jkb design cat` printed.
+        #[arg(long)]
+        base: String,
+        /// The heading level to split at.
+        #[arg(long, default_value_t = 2)]
+        level: usize,
+    },
     /// Stage an approved span into an execution plan's step.
     Stage {
         /// The span.
