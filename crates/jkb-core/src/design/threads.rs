@@ -8,7 +8,7 @@
 //! may cover the same words); its comments are items (`kind = 'design_comment'`) contained by it, in
 //! order. Each write is announced on the design's topic (`kind = "thread"`).
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use jkb_types::ItemId;
@@ -120,7 +120,7 @@ fn item_of(conn: &Connection, uid: &str, kind: &str, what: &str) -> Result<(Item
     let row: Option<(i64, String, String)> = conn
         .prepare_cached("SELECT id, kind, metadata FROM items WHERE uid = ?1")?
         .query_row([uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .ok();
+        .optional()?;
     let Some((id, found, metadata)) = row else {
         return Err(not_found(format!("no {what} `{uid}`")));
     };
@@ -400,4 +400,58 @@ pub fn list(conn: &Connection, uid: &str) -> Result<Vec<Thread>> {
     }
     out.sort_by_key(|t| (!t.anchored, t.start, t.end));
     Ok(out)
+}
+
+/// The designs whose threads the changelog `entries` (as `undo` reads them: op, table, entity id,
+/// before) touch — a thread or a comment item written — read before the inversion, while the items
+/// are still there to say which design they are on.
+///
+/// # Errors
+/// A database error.
+pub(crate) fn designs_touched(
+    conn: &Connection,
+    entries: &[(String, String, String, Option<String>)],
+) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, table, entity_id, _) in entries {
+        if table != crate::changelog::Entity::Items.as_str() {
+            continue;
+        }
+        let Ok(id) = entity_id.parse::<i64>() else {
+            continue;
+        };
+        let Some(meta) = item::get(conn, ItemId::new(id))? else {
+            continue;
+        };
+        let thread = match meta.kind.as_str() {
+            THREAD_KIND => Some(ItemId::new(id)),
+            COMMENT_KIND => containment::parent(conn, ItemId::new(id))?,
+            _ => None,
+        };
+        let Some(thread) = thread else { continue };
+        let Some(design) = containment::parent(conn, thread)? else {
+            continue;
+        };
+        if let Some(d) = item::get(conn, design)?.filter(|m| m.kind == KIND) {
+            if !out.contains(&d.uid) {
+                out.push(d.uid);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Tell each design's subscribers its threads changed under an undo (`kind = "thread"`).
+///
+/// # Errors
+/// A database error.
+pub(crate) fn announce_undone(
+    conn: &Connection,
+    meta: &WriteMeta,
+    designs: &[String],
+) -> Result<()> {
+    for design in designs {
+        announce(conn, meta, design, "", "undone")?;
+    }
+    Ok(())
 }

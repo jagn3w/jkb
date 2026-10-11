@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   decodeDesignSpan,
@@ -28,12 +28,19 @@ interface Selected extends Draft {
 /** What the thread margin and the selection's actions need: the threads, and each action. */
 export interface Threads {
   readonly threads: readonly Thread[];
+  /**
+   * Whether the threads' offsets are into the text on screen: they were read at the version the
+   * editor shows. Until a re-read catches up with an edit, cards keep their place and select nothing.
+   */
+  readonly fresh: boolean;
   readonly draft: Draft | undefined;
   readonly busy: boolean;
   readonly comment: (from: number, to: number, shown: string) => void;
   readonly cancelDraft: () => void;
-  readonly start: (text: string) => void;
-  readonly reply: (thread: Thread, text: string) => void;
+  /** Resolves true once the thread is started: the composer clears only then. */
+  readonly start: (text: string) => Promise<boolean>;
+  /** Resolves true once the reply is in. */
+  readonly reply: (thread: Thread, text: string) => Promise<boolean>;
   readonly resolve: (thread: Thread) => void;
   readonly approve: (from: number, to: number, shown: string) => void;
   readonly askClaude: (thread: Thread) => void;
@@ -52,18 +59,30 @@ export function useThreads(
   onNotice: (message: string) => void,
 ): Threads {
   const terminals = useTerminals();
-  const [threads, setThreads] = useState<readonly Thread[]>([]);
+  const [listed, setListed] = useState<{ readonly threads: readonly Thread[]; readonly at: string | undefined }>({
+    threads: [],
+    at: undefined,
+  });
+  // The version on screen: a thread's offsets are good only against the text they were read for.
+  const shownVersion = session?.onScreen()?.version;
   const [draft, setDraft] = useState<Selected | undefined>(undefined);
   const [busy, setBusy] = useState(false);
 
+  const shownRef = useRef(shownVersion);
+  shownRef.current = shownVersion;
   const load = useCallback(async () => {
+    // Read for the version on screen when asked; an answer that comes back after the screen moved
+    // on is kept but not fresh, and the move itself asks again (below).
+    const at = shownRef.current;
     const answer = decodeThreads(await op(threadOps.list(design.uid)));
-    if (answer.ok) setThreads(answer.value);
+    if (answer.ok) setListed({ threads: answer.value, at });
   }, [design.uid]);
 
+  // Re-read whenever the text on screen reaches a new version — a local edit saved and read back, or
+  // another editor's merged — not only when a thread message arrives: offsets move with every edit.
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, shownVersion]);
   useEffect(
     () =>
       window.jkb.design.onEvent((event) => {
@@ -72,11 +91,30 @@ export function useThreads(
     [design.topic, load],
   );
 
-  /** The version whose text is `shown`, or `undefined` (and a notice) when it moved. */
+  /**
+   * The version whose text is `shown`, or `undefined` with a notice saying why not — each way a
+   * session can fail to settle said as *Discuss* says it, never all as "the text changed".
+   */
   const versionOf = useCallback(
     async (shown: string, doing: string): Promise<string | undefined> => {
       if (session === undefined) return undefined;
       const settled = await session.settledVersion();
+      if (!settled.ok) {
+        const why = settled.why;
+        switch (why.kind) {
+          case "closed":
+            onNotice(`The design was left before its edits were saved, while ${doing} — select the text again.`);
+            return undefined;
+          case "failed":
+            onNotice(`${why.message} — reopen the design.`);
+            return undefined;
+          case "unread":
+            onNotice(`Cannot read the design: ${why.message}`);
+            return undefined;
+          case "moved":
+            break;
+        }
+      }
       if (!settled.ok || settled.doc.text !== shown) {
         onNotice(`The text changed while ${doing} — select it again.`);
         return undefined;
@@ -104,25 +142,25 @@ export function useThreads(
   );
 
   const start = useCallback(
-    (text: string) => {
+    async (text: string): Promise<boolean> => {
       const d = draft;
-      if (d === undefined) return;
-      void (async () => {
-        const base = await versionOf(d.shown, "the comment was being started");
-        if (base === undefined) return;
-        const made = await run(op(threadOps.start(design.uid, base, d.from, d.to, text)).then(decodeThread));
-        if (made !== undefined) {
-          setDraft(undefined);
-          void load();
-        }
-      })();
+      if (d === undefined) return false;
+      const base = await versionOf(d.shown, "the comment was being started");
+      if (base === undefined) return false;
+      const made = await run(op(threadOps.start(design.uid, base, d.from, d.to, text)).then(decodeThread));
+      if (made === undefined) return false;
+      setDraft(undefined);
+      void load();
+      return true;
     },
     [draft, versionOf, run, design.uid, load],
   );
 
   const reply = useCallback(
-    (thread: Thread, text: string) => {
-      void run(op(threadOps.reply(thread.uid, text)).then(decodeThread)).then(() => load());
+    async (thread: Thread, text: string): Promise<boolean> => {
+      const done = await run(op(threadOps.reply(thread.uid, text)).then(decodeThread));
+      void load();
+      return done !== undefined;
     },
     [run, load],
   );
@@ -180,7 +218,8 @@ export function useThreads(
   );
 
   return {
-    threads,
+    threads: listed.threads,
+    fresh: shownVersion !== undefined && listed.at === shownVersion,
     draft,
     busy,
     comment: (from, to, shown) => setDraft({ from, to, shown }),

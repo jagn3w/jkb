@@ -379,6 +379,20 @@ pub fn split(
     }
     let before = before_write(conn, id, &now)?;
     let (bounds, moving) = assign(&now, &text, &sections, span_items(conn, id)?)?;
+    // A thread is not carried: its anchors would be left on deleted characters, detached for good
+    // (a split cannot be undone). An open one on a section refuses the split; resolve it first.
+    for t in super::threads::list(conn, uid)? {
+        if t.status == "open"
+            && t.anchored
+            && bounds.iter().any(|(a, b)| t.start < *b && t.end > *a)
+        {
+            return Err(invalid(format!(
+                "open thread {} is on text the split would move, and threads are not carried — \
+                 resolve it first",
+                t.uid
+            )));
+        }
+    }
 
     // Take the sections out of the parent, last first so earlier offsets hold, with the anchors of
     // the spans leaving it.

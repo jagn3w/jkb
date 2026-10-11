@@ -298,6 +298,7 @@ function DesignView({
                 />
                 <ThreadMargin
                   threads={threads.threads}
+                  fresh={threads.fresh}
                   view={getView}
                   layout={layout}
                   draft={threads.draft}

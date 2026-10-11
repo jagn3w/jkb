@@ -24,14 +24,17 @@ function Composer({
 }: {
   readonly placeholder: string;
   readonly busy: boolean;
-  readonly onSend: (text: string) => void;
+  /** Resolves true once what was typed is saved; only then is the box cleared. */
+  readonly onSend: (text: string) => Promise<boolean>;
   readonly onCancel?: () => void;
 }): React.JSX.Element {
   const [text, setText] = useState("");
   const send = (): void => {
     if (text.trim() === "") return;
-    onSend(text);
-    setText("");
+    // Cleared only once it is saved: a refused or failed send keeps what was typed (review round 1).
+    void onSend(text).then((saved) => {
+      if (saved) setText("");
+    });
   };
   return (
     <form
@@ -81,6 +84,7 @@ function Composer({
  */
 export function ThreadMargin({
   threads,
+  fresh,
   view,
   layout,
   draft,
@@ -92,15 +96,17 @@ export function ThreadMargin({
   onAskClaude,
 }: {
   readonly threads: readonly Thread[];
+  /** Whether the threads' offsets are into the text on screen (`Threads.fresh`). */
+  readonly fresh: boolean;
   /** The editor the threads' offsets are into. */
   readonly view: () => EditorView | undefined;
   /** Changes whenever the editor's geometry may have: the cards are placed again. */
   readonly layout: number;
   readonly draft: Draft | undefined;
   readonly busy: boolean;
-  readonly onStart: (text: string) => void;
+  readonly onStart: (text: string) => Promise<boolean>;
   readonly onCancelDraft: () => void;
-  readonly onReply: (thread: Thread, text: string) => void;
+  readonly onReply: (thread: Thread, text: string) => Promise<boolean>;
   readonly onResolve: (thread: Thread) => void;
   readonly onAskClaude: (thread: Thread) => void;
 }): React.JSX.Element {
@@ -131,7 +137,11 @@ export function ThreadMargin({
   const tops = stackCards(
     items.map((i) => ({ want: i.want === Number.MAX_SAFE_INTEGER ? floor : i.want, height: heights.get(i.key) ?? UNMEASURED })),
   );
-  const topOf = new Map(items.map((i, k) => [i.key, tops[k] ?? 0]));
+  // Placed again only from offsets into the text on screen; while a re-read catches up with an edit,
+  // each card keeps the place it had, rather than jumping to wherever its old offset now falls.
+  const placed = useRef(new Map<string, number>());
+  const topOf = fresh ? new Map(items.map((i, k) => [i.key, tops[k] ?? 0])) : placed.current;
+  if (fresh) placed.current = topOf;
 
   // Measure after each render; place again only when a height actually changed.
   useLayoutEffect(() => {
@@ -150,7 +160,8 @@ export function ThreadMargin({
   const select = (t: Thread): void => {
     setOpen(t.uid);
     const ed = view();
-    if (ed === undefined || !t.anchored || t.end > ed.state.doc.length) return;
+    // Stale offsets would select other words — which the Approve icon would then approve.
+    if (ed === undefined || !fresh || !t.anchored || t.end > ed.state.doc.length) return;
     ed.dispatch({ selection: { anchor: t.start, head: t.end } });
   };
   const ref = (key: string) => (el: HTMLElement | null) => {

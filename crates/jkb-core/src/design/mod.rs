@@ -1554,10 +1554,25 @@ pub fn approve_selection(
             )));
         }
     }
+    let selected = read.ids(s, e);
     let written = span_over(conn, meta, uid, base, words, Reviewer::Operator)?;
     let span = written
         .span
         .ok_or_else(|| invalid("making the span over the selection wrote no span"))?;
+    // The approval is made at the version the span was written in, so check here what `approve`'s
+    // read-version rule would have: the span covers exactly the characters selected at `base`. A
+    // word inserted inside the selection since would otherwise land in the span and be approved
+    // unread (review round 1). Refused, the transaction takes the span back with it.
+    let (after, _) = load(conn, id)?;
+    let covered = after
+        .range(&span)
+        .map(|(a, b)| after.ids(a, b))
+        .unwrap_or_default();
+    if covered != selected {
+        return Err(invalid(
+            "the selected words changed after the version you read — re-read and select them again",
+        ));
+    }
     approve(conn, meta, &span, &written.version.token(), approver)
 }
 

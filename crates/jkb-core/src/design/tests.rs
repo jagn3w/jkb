@@ -3067,3 +3067,81 @@ fn approving_a_selection_approves_its_span_or_makes_one_and_never_cuts_one() {
     assert!(err.to_string().contains("operator's"), "{err}");
     assert_eq!(cat(&db, &uid).spans.len(), 2, "a refusal makes no span");
 }
+
+/// Approving a selection read at an old version never approves words written inside it since.
+#[test]
+fn approving_a_selection_refuses_words_inserted_inside_it_since_it_was_read() {
+    let db = db();
+    let uid = create(&db, "alpha beta gamma");
+    let read = token(&db, &uid);
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("beta", " EVIL")).unwrap();
+    let (u, r) = (uid.clone(), read.clone());
+    let err = db
+        .write_txn("t", move |c, m| {
+            approve_selection(c, m, &u, &r, &quote("beta gamma"), &Approver::Operator)
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("changed after the version you read"),
+        "{err}"
+    );
+    assert!(
+        cat(&db, &uid).spans.is_empty(),
+        "the refusal takes the span back"
+    );
+    // Selected at that old version, words nobody touched since are still approvable.
+    let (u, r) = (uid.clone(), read);
+    let v = db
+        .write_txn("t", move |c, m| {
+            approve_selection(c, m, &u, &r, &quote("alpha"), &Approver::Operator)
+        })
+        .unwrap();
+    assert_eq!((v.text.as_str(), v.state), ("alpha", SpanState::Approved));
+}
+
+#[test]
+fn a_split_is_refused_while_an_open_thread_sits_on_text_it_would_move() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let t = start_thread(&db, &uid, quote("Alpha text."), "why?").unwrap();
+    let err = split_at(&db, &uid, &token(&db, &uid), 2).unwrap_err();
+    assert!(err.to_string().contains(&t.uid), "{err}");
+    let tid = t.uid.clone();
+    db.write_txn("t", move |c, m| threads::resolve(c, m, &tid, "operator"))
+        .unwrap();
+    assert_eq!(
+        split_at(&db, &uid, &token(&db, &uid), 2)
+            .unwrap()
+            .children
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn undoing_a_reply_is_announced_on_the_designs_topic() {
+    let db = db();
+    let uid = create(&db, "Some words.");
+    let t = start_thread(&db, &uid, quote("words"), "why?").unwrap();
+    let tid = t.uid.clone();
+    db.write_txn("t", move |c, m| {
+        threads::reply(c, m, &tid, "claude", "because")
+    })
+    .unwrap();
+    undo_last(&db);
+    let name = topic(&uid);
+    let msgs = db
+        .read(move |c| crate::mq::tail(c, &name, 50, crate::mq::now_ms()))
+        .unwrap();
+    let last = msgs.last().unwrap();
+    assert_eq!(
+        (last.kind.as_str(), last.payload["what"].as_str()),
+        ("thread", Some("undone"))
+    );
+    assert_eq!(
+        threads_of(&db, &uid)[0].comments.len(),
+        1,
+        "the reply is gone"
+    );
+}
