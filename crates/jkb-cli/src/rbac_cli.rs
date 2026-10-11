@@ -1340,6 +1340,43 @@ mod tests {
         }
     }
 
+    /// A bash new enough for every fixture (4+: `&>>` is bash-4 syntax), else `/bin/bash`, with
+    /// whether it is. macOS ships bash 3.2 as `/bin/bash`, where `jkb task &>>out land x` is a syntax
+    /// error that never reaches `jkb`: the row then measured nothing and failed `check.sh` on every Mac.
+    /// Homebrew's bash and one on the caller's `PATH` are tried after it; the test's own run of bash
+    /// still clears its environment, so which bash is found is the only thing taken from the caller.
+    fn test_bash() -> &'static (std::path::PathBuf, bool) {
+        static FOUND: std::sync::OnceLock<(std::path::PathBuf, bool)> = std::sync::OnceLock::new();
+        FOUND.get_or_init(|| {
+            let modern = |bash: &std::path::Path| {
+                std::process::Command::new(bash)
+                    .args(["-c", "[ \"${BASH_VERSINFO[0]}\" -ge 4 ]"])
+                    .env_clear()
+                    .status()
+                    .is_ok_and(|s| s.success())
+            };
+            let mut candidates: Vec<std::path::PathBuf> = [
+                "/bin/bash",
+                "/opt/homebrew/bin/bash",
+                "/usr/local/bin/bash",
+                "/usr/bin/bash",
+            ]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+            if let Some(path) = std::env::var_os("PATH") {
+                candidates.extend(std::env::split_paths(&path).map(|d| d.join("bash")));
+            }
+            candidates
+                .into_iter()
+                .find(|b| b.is_file() && modern(b))
+                .map_or_else(
+                    || (std::path::PathBuf::from("/bin/bash"), false),
+                    |b| (b, true),
+                )
+        })
+    }
+
     /// The words bash passes for a command, and how many times it ran `jkb`. `jkb` is installed as
     /// a shell FUNCTION: bash resolves a command word function -> builtin -> `PATH`, so the function
     /// fires only when the word is exactly `jkb`, and -- unless `executable` -- nothing is executed.
@@ -1392,7 +1429,7 @@ mod tests {
             // And one in the working directory, for a row that reaches jkb by a relative glob.
             std::fs::copy(&fake, cwd.join("jkb")).expect("fake jkb in cwd");
         }
-        let mut c = Command::new("/bin/bash");
+        let mut c = Command::new(&test_bash().0);
         c.arg("-c").arg(&script).current_dir(cwd);
         // Nothing is inherited, so -- unless `executable` -- "nothing is executed" is a property of
         // this function rather than of whatever `ALLOWED` happens to hold. `bash -c` sources `$BASH_ENV`, which would let the
@@ -1577,6 +1614,13 @@ mod tests {
                 Attestation::Defer,
                 "{cmd:?} may run differently from how it is read, so it is not approved"
             );
+            if cmd.contains("&>>") && !test_bash().1 {
+                // Classified above all the same; only bash's own run needs bash 4.
+                eprintln!(
+                    "skipped bash's run of {cmd:?}: no bash 4+ here (macOS's /bin/bash is 3.2)"
+                );
+                continue;
+            }
             let (calls, _, _) = bash_argv(cmd, &[], cwd, false);
             // At least one: a comment or here-doc fixture spans lines and can run jkb on each. A row
             // bash never ran jkb in is not a line the hook would ticket, and checks nothing.
