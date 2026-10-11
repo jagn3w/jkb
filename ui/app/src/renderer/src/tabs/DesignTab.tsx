@@ -344,6 +344,9 @@ export function DesignTab(): React.JSX.Element {
   const terminals = useTerminals();
   const [listing, setListing] = useState<Listing>(INITIAL_LISTING);
   const [uid, setUid] = useState<string | undefined>(() => remembered(LAST_DESIGN_KEY));
+  // The selection as of the latest render, for an async step to see whether it changed meanwhile.
+  const uidNow = useRef(uid);
+  uidNow.current = uid;
   const [notice, setNotice] = useState<string | undefined>(undefined);
   /** The design *Next* moved to, whose first unreviewed passage is shown once it is read. */
   const [revealIn, setRevealIn] = useState<string | undefined>(undefined);
@@ -546,9 +549,12 @@ export function DesignTab(): React.JSX.Element {
                 // Counts can be stale (an edit to a design no window has open is announced nowhere
                 // this window hears), so they are read again before choosing where to go.
                 void (async () => {
+                  const from = design.uid;
                   const fresh = await load();
+                  // The operator picked another design while the listing was read: theirs stands.
+                  if (uidNow.current !== from) return;
                   const all = fresh === undefined ? order : treeOrder(designTree(fresh));
-                  const here = all.findIndex((d) => d.uid === design.uid);
+                  const here = all.findIndex((d) => d.uid === from);
                   const next = here >= 0 ? all.slice(here + 1).find(hasUnreviewed) : undefined;
                   if (next === undefined) return;
                   setRevealIn(next.uid);
