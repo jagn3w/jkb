@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 132.gwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBnJKttYj_OQGdwP-1quLfAwGdwI68ouLDAwGftsCloubBBwGgwLas1JHhAwGh6Lrm866CCgGgrsi-v8yyBwGk_urW7pfnAwGqhLytiocMAa-0qZqRw_oMAbaWxOOy_PsKAbaO4bOUtyIBtqzipKThtgkBuuSovNqj3gUBwLCLqMiNhQwBwfa32su3jAgBwubmgvLeqgIBwsa6246T9A4Bw9Lu6ZTxxwoBwr6am6aLuwEBxKCk_-yYwg0BxcaJ9PLPrwoByIjH8aHB3AoBybyak4mEdwHHnrqX__2HCQHNtN-W1LzQAQHOzIy1jL2BBQHPxNPf4fe-CAHOutK83ITNCgHUhPDx18n9AgHWiqyb0fnYCAHX0IaJwe7CBAHYjOfaoJxYAdbM0O6Ao4oBAdrW8aD3rMQGAdvyoK-P8bwDAd2qiZmUrYcMAeGcmJbXrvILAeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB88CwgJbqMgHzpsDtvJLWDwH53qLj4-fHBwH5mujYn9zXBwGA78b5lb2BBAGB_cfJ74zXBAGB3_XPxLmIBwGDp6jb0dyABwGD0cGIl5iqDwGC38ekieSZCgGFwfH5zeCDDAGC29eU6ZLTCwGIm42Qmo3iBQGKo5uujcmDBgGPqbL2z_vrDgGR3-Lu9fmNBwGTy8jDjrDIDgGYocLnpefUDQGatZOtnZakDLvsBZvX8-OF69YHAZz_gZ6C9fULAZutj_KlzPEPAaLtseyy0oACAaPDrfub2-QIAaSVmbSOmOkBAaPX1sTuwO4BAafX86W1o5oBAanz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbSDtdvp8s8LAbjn9L_o4JEMAbnbhOGZ-K8EAbvPv-_DnZAPAb3Xz9vtrL4IAcC9q62dp20ByenWzqWqww0ByqmdydTJzQgBy8_MidOWnAkBy-uk8s-wvAUBz4OWyIvI9A0Bz52PhrKM5wUB0enr2bPxkwwBz_v8veSLlgkB0tGNztyhuAcB1OeqqofxrQgB1aXvmMDJ-w8B1tPf6sDO7wQB14fhhPijyAMB1vOBpOOXnggB2oHy_OK24AwB3N2ZxueX1wcB3pmchp7e1gQB3_meg7eQ6AsB3_Hft6zzmAQB4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHrxbTZl5wOAey9gMffwrAPAfCPp9Tl5dYCAfGz1LuDov4CAfPxh56U41UB9bPctv_PBQH198zSturhBQH34aC_1c2aBQH1ha7W37zyCQH5gcD8kfzhCwH7nfWK4r7jAgH9n9-HrbbzDgE, blake3 a5da2731675af853a241ca9e0f82800ca18ce15d5cdee71f3cc243b98ffbde32) -->
+<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 159.ngGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 cca35d2a71086a5b5ea30e8c4ae3eda6027f969f7af1630c507da2432af1dfde) -->
 # Agents and roles
 
 jkb is driven by agents as much as by people: a task swarm that schedules, implements, reviews
@@ -19,6 +19,142 @@ Four rules thread through everything below. A claim is not a status. Each swarm 
 one task status. Task status, task ids and the fact that a swarm ran are KB-local and never
 appear in git. And enforcement never precedes capability: a guard is switched on only once the
 sanctioned path covers every need it would block.
+
+## Coordinator sessions replace Claude Workflows
+
+Proposed 2026-10-10 (operator). jkb had two ways to run agents: Claude Code's Workflow tool driving
+`.claude/workflows/task-swarm.js` and `code-review.js`, and interactive coordinator sessions working
+inside a task's strategy. This keeps the second and retires the first.
+
+It supersedes, below: in the swarm, "Three agent roles and one deterministic integrator" and
+"Implement, review and merge are pipelined", whose SCHEDULER and mechanical agents are now the
+coordinator's own steps, with the script's `finally` release and its sidecar's 60-second reclaim,
+and the merge queue's serialisation, which was the script's own promise chain and is now the
+coordinator's rule (claims, the four-state lifecycle, gate-before-fast-forward and the closing rules
+stand); and in the code reviewer, "One workflow, two thin callers", the scout, the lenses as
+separate agents, the tiers, verification and its skeptics, consolidation, end-of-run severity and
+verification cost. Severity and scope as two axes, the burden of proof on a finding, and acceptance
+being measured and never fed back all stand, now in the one reviewer's contract.
+
+### One orchestration model: a coordinator session inside a lifecycle
+
+Every agent run is a Claude Code session whose main agent is a coordinator working inside the
+task's strategy, its lifecycle and its RBAC; its workers are Agent-tool subagents with typed
+definitions. Three facts made the scripts the wrong layer. Their determinism mostly re-enforced
+rules the lifecycle and `jkb serve` already hold (no landing without a clean last round, no
+self-approved design, no transition the strategy does not grant). A workflow script cannot run a
+command or read a file, so six of the swarm's nine agents (reclaim, claim, branch-tag, status,
+merge-runner, closed-check) existed only to run one `jkb` command and report it, and the scripts
+could not read their prompts from `jkb workflow agent show` (the host-only rewiring, 7b, had no
+good mechanism). And a workflow agent reports `agent_type` `workflow-subagent` unless the script
+passes `agentType`; neither did, so every swarm implementer and reviewer and every review finder
+held `coordinator` through the stopgap mapping, and the worker roles were not enforced.
+
+### A session's kind is a coordinator template
+
+`swarm-coordinator` and `review-coordinator` are templates in `agents.json`, beside the workers'.
+A skill, Code Factory's play button or a `jkb` command starts a session with one, filled for its
+scope. The coordinator asks `jkb workflow next` what to do at each step rather than carrying the
+plan in its context, so a compaction loses nothing: claims, transitions and review rounds are
+already in the KB, and a restarted coordinator resumes from them.
+
+### Workers are typed subagents, rendered from the templates and installed by jkb
+
+The workers' types are templates of the `subagents` workflow in `agents.json`: `jkb-implementer` and
+`jkb-reviewer`. `jkb_core::workflow::agents::subagent_definitions` renders each as a Claude Code agent
+definition (the template is its system prompt). A reviewer gets `Read, Grep, Glob, Bash`; an
+implementer gets the editing tools. **Neither gets `Agent`**: a subagent can start subagents
+(measured 2026-10-10 on Claude Code 2.1.293 in the dev container: a subagent's nested start returned), and each
+child attests as its own type, so a reviewer holding `Agent` could start a `jkb-implementer` and edit
+code, and an implementer could start a reviewer of its own branch. Workers never start workers; a
+coordinator splits work.
+
+`jkb commands install`, which runs automatically, writes the definitions to `~/.claude/agents/`
+beside the `/jkb-*` commands, so they reach every repository without a commit under `.claude/`. In
+the dev container remote mode never runs that auto-install and the sandbox denies the agent's writes
+there, so the attestation hook runs it: the one jkb the container runs outside the sandbox, from the
+operator's kit, on every tool call. The `jkb-` prefix is the installer's: the type a coordinator
+names, the file and the role map's key are one spelling. `setup.sh` maps both types to their roles,
+and clears the bare `implementer` and `reviewer` they replace and the `workflow-subagent` stopgap, so a
+user's own agent of those names holds no role; a test holds its lines to the templates' roles. It
+does not stop a repository from defining a `jkb-reviewer` of its own, which attestation would map by
+name; that trust in names is follow-up work. A copy of a subagent template is refused: it would be
+listed as in effect and never installed.
+
+A coordinator runs commands, so it fills a worker's task prompt with `jkb workflow agent show <name>
+--var …` and passes it to the Agent tool: an operator copy saved in the Workflows tab is what runs. A
+test holds every `show` a coordinator template spells to the target's placeholders, since `show`
+refuses a missing or a stray one.
+
+### The swarm is a coordinator loop; the merge queue stays a script and names its outcome
+
+The swarm coordinator (`swarm-coordinator`, started by `/jkb-task-swarm`) reads the ready frontier,
+groups overlapping tasks, and per group starts a `jkb-implementer` (in a worktree) and then a fresh
+`jkb-reviewer`, sending request-changes and ejects back to the same implementer with SendMessage.
+Claiming, status moves, branch records and the post-landing check are its own `jkb` calls, not
+agents. What the script kept in memory is now in jkb, so a compaction loses none of it: a settled
+group's tasks (landed, given up or stalled) are tagged `swarm-settled=<run owner>` and every frontier
+read excludes them with `-tag:` (released, they are ready again, and the run would never end); keyed
+on the run, so a later run takes them up afresh. Attempts are counted in `swarm-attempt=`. That
+exclusion needed `task.ready` to honour the whole query: it took only the scope and tags, and dropped
+every other predicate without a word. Startup reclaim is the operator's (`task reclaim` is
+operator-only), so the coordinator reports stuck claims rather than clearing them.
+
+`scripts/merge-queue.sh` stays the one deterministic integrator, and now classifies its own exit
+codes: `queue_outcome` maps them, and an EXIT trap prints `merge-queue: <landed|eject|stall> (exit
+<n>)` as the last line. The coordinator acts on that word. The classification used to live in the
+workflow script (`classifyMerge`) because an agent once guessed at a new exit code; a coordinator is a
+model too, so the script names the outcome itself. Every deliberate exit goes through `finish`, which
+records its code, and an exit that did not (a signal, a crash) prints a stall whatever `$?` says: bash
+runs the EXIT trap with the last command's status, and TERM, PIPE, ALRM and USR1 mid-gate each printed
+`landed (exit 0)` with the base unmoved (measured), so trapping signals by name left the rest
+reporting landings. HUP, INT and TERM are still trapped by name: bash runs a trapped handler only once
+the foreground step returns, so the gate finishes rather than running on, orphaned, in the worktree the
+next run checks out (measured), and the stall names the signal. `dev-scripts.test.sh` case 10 holds `queue_outcome` to the header's codes;
+`merge-queue.test.sh` checks the line on every path (removing the trap fails all its cases) and kills
+a run mid-gate with TERM, HUP, PIPE and USR1. One run at a time is the coordinator's rule; a
+per-worktree lock in the script was tried and reverted (a bare lock stalled busy groups and freed
+itself under orphaned gates), and is follow-up work.
+
+### Code review is one reviewer, and the coordinator splits a large change
+
+`/jkb-review` makes the session the review coordinator (`review-coordinator`). Every reviewer holds
+the shared contract (`review-contract`, a fragment). Under roughly 1,000 changed lines the coordinator
+starts one `jkb-reviewer` with `review-reviewer`, which reviews, files and records. Above that it
+splits the change into at most three areas, starts one `jkb-reviewer` per area with `review-area`
+(each returns findings as JSON), merges them, and starts one more `jkb-reviewer` with `review-file`
+to file and record the merged round: workers never start workers, so nothing nests below the
+coordinator. The contract is rendered once into a file, since a shell variable does not survive
+between the coordinator's commands and a reviewer handed an empty contract would file a clean round.
+Pre-existing findings are reported, not filed as review findings; the coordinator, which holds
+task-write, files them with `jkb task add --backlog`, and `task review file` refuses one (the rule is
+in the callee, not only in the coordinator's prompt). A finding's `scope` is a closed set
+(`introduced`, `aggravated`, `pre-existing`; absent reads as introduced), so an unknown spelling is
+refused rather than filed as the change's own; merged duplicates keep the scope that holds the change
+responsible. A reviewer files with `jkb task review
+file --from -` and records with `jkb task review record`; an attested reviewer files only once bound
+to the task it reviews, so the coordinator finds the task working the branch and the reviewer runs
+`jkb role bind <uid>` first (a test drives that path as an attested reviewer). With no such task (an
+ad-hoc range, the working tree) nothing is filed, and the findings live in the report. So the
+container needs no workaround to record, and `/jkb-review-log` is folded into `/jkb-review`.
+
+There are no scouts, lens fan-out, consolidation agent, skeptics or ranker, and no tiers. Why: only
+about 6% of findings were ever refuted, the operator observed that `low` catches what `medium` did,
+and the ranker and verifiers re-read the change to restate what the reviewers already knew. To watch:
+quality on large changes; if real misses appear, add back one targeted step, not the tiers.
+
+### What goes
+
+`.claude/workflows/` (both scripts), deleted in a host commit because the container's managed
+settings deny edits there; their installs, `~/.claude/workflows/jkb-*.js`, which `jkb commands
+install` and `uninstall` now remove (they carry jkb's prefix, so jkb wrote them), with
+`~/.claude/commands/jkb-review-log.md`; the `.claude/workflows` line in `.gitignore`; the
+workflow-only templates in `agents.json` (the seven mechanical and scheduling swarm agents, and
+eighteen of the twenty review templates); and `classifyMerge`'s and `unclosedTasks`' tests, which
+read the script. Code Factory 7b is superseded. Kept: the container's managed-settings deny on
+`.claude/workflows/**` (a rebuild to drop a rule that guards an empty path buys nothing), and
+`scripts/swarm-status.sh`, which still reads past runs' workflow journals and is retired with the
+container's transcript sweep, which names it, as follow-up work.
 
 ## The swarm: claims, roles and the merge queue
 
