@@ -23,6 +23,8 @@ import { PromptsPane } from "../design/PromptsPane";
 import { SessionRegistry, type RegistryNotice } from "../design/registry";
 import { ReviewBar } from "../design/ReviewBar";
 import { TasksView } from "../design/TasksView";
+import { ThreadMargin } from "../design/ThreadMargin";
+import { useThreads } from "../design/useThreads";
 import { usePlans } from "../design/usePlans";
 import type { DesignSession, SessionBridge, SyncStatus } from "../design/session";
 import { useNavigation } from "../navigation";
@@ -168,6 +170,19 @@ function DesignView({
   const [task, setTask] = useState<string | undefined>(undefined);
   const [prompts, setPrompts] = useState<number | undefined>(undefined);
   const plans = usePlans(design.uid, repo, onNotice);
+  const threads = useThreads(design, session, repo, onNotice);
+  // Bumped when the editor's lines may have moved, so the thread margin is placed again; one bump
+  // per frame at most.
+  const [layout, setLayout] = useState(0);
+  const pending = useRef(false);
+  const onGeometry = useCallback(() => {
+    if (pending.current) return;
+    pending.current = true;
+    requestAnimationFrame(() => {
+      pending.current = false;
+      setLayout((n) => n + 1);
+    });
+  }, []);
 
   const editor = useRef<EditorView | undefined>(undefined);
   const [editorReady, setEditorReady] = useState(false);
@@ -270,7 +285,30 @@ function DesignView({
             {session === undefined ? (
               <p className="design-empty muted">Opening…</p>
             ) : (
-              <DocumentEditor key={design.uid} session={session} onDiscuss={onDiscuss} onView={onView} onCursor={setHead} />
+              <div className="document-with-margin">
+                <DocumentEditor
+                  key={design.uid}
+                  session={session}
+                  onDiscuss={onDiscuss}
+                  onComment={threads.comment}
+                  onApprove={threads.approve}
+                  onView={onView}
+                  onCursor={setHead}
+                  onGeometry={onGeometry}
+                />
+                <ThreadMargin
+                  threads={threads.threads}
+                  view={getView}
+                  layout={layout}
+                  draft={threads.draft}
+                  busy={threads.busy}
+                  onStart={threads.start}
+                  onCancelDraft={threads.cancelDraft}
+                  onReply={threads.reply}
+                  onResolve={threads.resolve}
+                  onAskClaude={threads.askClaude}
+                />
+              </div>
             )}
           </div>
         </div>

@@ -226,6 +226,11 @@ export function decodeDesignWritten(o: Outcome<OpResponse>): Outcome<DesignWritt
   );
 }
 
+/** A span op's answer (`design.approve`, `design.approve_selection`, `design.stage`): the span after it. */
+export function decodeDesignSpan(o: Outcome<OpResponse>): Outcome<Span> {
+  return field(o, "design_span", (r) => r["span"], isSpan);
+}
+
 export function decodeDesignPrompt(o: Outcome<OpResponse>): Outcome<DesignPrompt> {
   return field(
     o,

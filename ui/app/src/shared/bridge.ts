@@ -18,6 +18,7 @@ import type {
   Outcome,
   PromptAnnouncement,
   SpanAnnouncement,
+  ThreadAnnouncement,
 } from "@jkb/core";
 
 import type { TerminalEnd, TerminalEvent, TerminalInfo, TerminalResult, TerminalRoots, TerminalSpec } from "./terminal";
@@ -83,11 +84,13 @@ export interface TerminalBridge {
  * - `error`: the feed cannot reach the daemon and is retrying; informational.
  * - `live`: the feed is back after an `error`; nothing was missed (its place was kept).
  * - `prompt`: a launch recorded (or moved) one of the design's prompts; re-read the Prompts pane (D53.6).
+ * - `thread`: a comment thread was started, replied to or resolved; re-read the thread margin.
  */
 export type DesignFeedEvent =
   | ({ readonly topic: string; readonly kind: "update" } & DesignAnnouncement)
   | ({ readonly topic: string; readonly kind: "prompt" } & PromptAnnouncement)
   | ({ readonly topic: string; readonly kind: "span" } & SpanAnnouncement)
+  | ({ readonly topic: string; readonly kind: "thread" } & ThreadAnnouncement)
   | { readonly topic: string; readonly kind: "gap"; readonly message: string }
   | { readonly topic: string; readonly kind: "error"; readonly message: string }
   | { readonly topic: string; readonly kind: "live" };

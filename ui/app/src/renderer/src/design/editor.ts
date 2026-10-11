@@ -290,29 +290,51 @@ export const spanStates: Extension = [
 
 // ---- Discuss ----------------------------------------------------------------------------------
 
+/** What a selection offers, beside it: each action gets the selection as UTF-16 offsets. */
+export interface SelectionActions {
+  readonly comment: (from: number, to: number) => void;
+  /** Present only for a viewer who may approve: the operator. */
+  readonly approve?: (from: number, to: number) => void;
+  readonly discuss: (from: number, to: number) => void;
+}
+
+const ICONS: Record<keyof SelectionActions, { readonly glyph: string; readonly title: string }> = {
+  comment: { glyph: "💬", title: "Comment: start a thread on the selected words" },
+  approve: { glyph: "✓", title: "Approve exactly the selected words" },
+  discuss: { glyph: "✦", title: "Discuss the selected text with Claude" },
+};
+
 /**
- * *Discuss* on a selection (D53.5): a small button over the selected text, which hands the range
- * (UTF-16 offsets, as the editor and Yjs count) to `onDiscuss`. Not offered while `enabled()` is
- * false — before the design has loaded, and once its session has stopped.
+ * The selection's actions (operator feedback, 2026-10-11): a short column of icons at the right end
+ * of the selection's first line, like Google Docs — *Comment*, *Approve* (the operator's) and
+ * *Discuss*, which used to be a button floating over the selection. Not offered while `enabled()`
+ * is false — before the design has loaded, and once its session has stopped.
  */
-export function discussOnSelection(onDiscuss: (from: number, to: number) => void, enabled: () => boolean = () => true): Extension {
+export function selectionActions(actions: () => SelectionActions, enabled: () => boolean = () => true): Extension {
   const tooltip = (state: EditorState): Tooltip | null => {
     const sel = state.selection.main;
     if (sel.empty || !enabled()) return null;
     return {
-      pos: sel.from,
-      above: true,
+      pos: state.doc.lineAt(sel.from).to,
+      above: false,
       create: () => {
         const dom = document.createElement("div");
-        dom.className = "cm-discuss";
-        const button = document.createElement("button");
-        button.type = "button";
-        button.textContent = "Discuss";
-        button.title = "Discuss the selected text with Claude";
-        // Keep the selection: a press on the button must not move the cursor first.
-        button.addEventListener("mousedown", (e) => e.preventDefault());
-        button.addEventListener("click", () => onDiscuss(sel.from, sel.to));
-        dom.appendChild(button);
+        dom.className = "cm-selection-actions";
+        const now = actions();
+        for (const key of ["comment", "approve", "discuss"] as const) {
+          const run = now[key];
+          if (run === undefined) continue;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.dataset["action"] = key;
+          button.textContent = ICONS[key].glyph;
+          button.title = ICONS[key].title;
+          button.setAttribute("aria-label", ICONS[key].title);
+          // Keep the selection: a press on the button must not move the cursor first.
+          button.addEventListener("mousedown", (e) => e.preventDefault());
+          button.addEventListener("click", () => run(sel.from, sel.to));
+          dom.appendChild(button);
+        }
         return { dom };
       },
     };
