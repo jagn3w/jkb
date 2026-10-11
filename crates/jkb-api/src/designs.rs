@@ -564,6 +564,172 @@ pub fn approve(
     Ok(design::approve(conn, meta, span, base, &approver)?.into())
 }
 
+/// One comment in a thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Comment {
+    /// Its uid.
+    pub uid: String,
+    /// Who wrote it: `operator`, or the Claude principal's label.
+    pub by: String,
+    /// When.
+    pub at: String,
+    /// What it says.
+    pub text: String,
+}
+
+/// A comment thread as it reads now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Thread {
+    /// Its uid.
+    pub uid: String,
+    /// The design it is on.
+    pub design: String,
+    /// Whether its words are still in the text.
+    pub anchored: bool,
+    /// UTF-16 start of its words now.
+    pub start: u32,
+    /// UTF-16 end.
+    pub end: u32,
+    /// Its words now.
+    pub quote: String,
+    /// The words it was started on.
+    pub started_on: String,
+    /// `open` or `resolved`.
+    pub status: String,
+    /// Its comments, in order.
+    pub comments: Vec<Comment>,
+}
+
+impl From<design::threads::Thread> for Thread {
+    fn from(t: design::threads::Thread) -> Self {
+        Self {
+            uid: t.uid,
+            design: t.design,
+            anchored: t.anchored,
+            start: t.start,
+            end: t.end,
+            quote: t.quote,
+            started_on: t.started_on,
+            status: t.status,
+            comments: t
+                .comments
+                .into_iter()
+                .map(|c| Comment {
+                    uid: c.uid,
+                    by: c.by,
+                    at: c.at,
+                    text: c.text,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The words a thread or a selection's approval names: a quote, or a UTF-16 range — exactly one.
+///
+/// # Errors
+/// Both or neither given, or half a range.
+pub fn words(
+    find: Option<String>,
+    occurrence: Option<usize>,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<design::threads::Words, ApiError> {
+    match (find, start, end) {
+        (Some(find), None, None) => Ok(design::threads::Words::Quote { find, occurrence }),
+        (None, Some(start), Some(end)) if occurrence.is_none() => {
+            Ok(design::threads::Words::Range { start, end })
+        }
+        _ => Err(invalid(
+            "name the words once: `find` (with an optional `occurrence`), or `start` and `end`",
+        )),
+    }
+}
+
+/// Who a comment is by: `operator`, or the principal's label.
+fn author(principal: &Principal) -> String {
+    if principal.is_operator() {
+        "operator".to_owned()
+    } else {
+        principal.label.clone()
+    }
+}
+
+/// `design.threads`.
+///
+/// # Errors
+/// An unknown design.
+pub fn threads(conn: &Connection, uid: &str) -> Result<Vec<Thread>, ApiError> {
+    Ok(design::threads::list(conn, uid)?
+        .into_iter()
+        .map(Thread::from)
+        .collect())
+}
+
+/// `design.thread_start`.
+///
+/// # Errors
+/// The engine's refusal.
+pub fn thread_start(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    words: &design::threads::Words,
+    principal: &Principal,
+    text: &str,
+) -> Result<Thread, ApiError> {
+    Ok(design::threads::start(conn, meta, uid, base, words, &author(principal), text)?.into())
+}
+
+/// `design.thread_reply`.
+///
+/// # Errors
+/// The engine's refusal.
+pub fn thread_reply(
+    conn: &Connection,
+    meta: &WriteMeta,
+    thread: &str,
+    principal: &Principal,
+    text: &str,
+) -> Result<Thread, ApiError> {
+    Ok(design::threads::reply(conn, meta, thread, &author(principal), text)?.into())
+}
+
+/// `design.thread_resolve`.
+///
+/// # Errors
+/// The engine's refusal.
+pub fn thread_resolve(
+    conn: &Connection,
+    meta: &WriteMeta,
+    thread: &str,
+    principal: &Principal,
+) -> Result<Thread, ApiError> {
+    Ok(design::threads::resolve(conn, meta, thread, &author(principal))?.into())
+}
+
+/// `design.approve_selection`: the operator's alone (RBAC holds it to `Admin`, and the engine to
+/// the operator approver).
+///
+/// # Errors
+/// The engine's refusal.
+pub fn approve_selection(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    words: &design::threads::Words,
+    principal: &Principal,
+) -> Result<Span, ApiError> {
+    let approver = if principal.is_operator() {
+        Approver::Operator
+    } else {
+        Approver::Claude(principal.label.clone())
+    };
+    Ok(design::approve_selection(conn, meta, uid, base, words, &approver)?.into())
+}
+
 /// `design.stage`.
 ///
 /// # Errors

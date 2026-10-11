@@ -2927,3 +2927,143 @@ fn a_move_that_takes_away_one_of_two_stagings_is_refused() {
     assert!(err.to_string().contains(&sp), "{err}");
     assert_eq!(view_of(&db, &child, &sp).steps.len(), 2, "nothing moved");
 }
+
+// ---- comment threads and approving a selection (operator feedback, 2026-10-11) -----------------
+
+fn quote(find: &str) -> threads::Words {
+    threads::Words::Quote {
+        find: find.to_owned(),
+        occurrence: None,
+    }
+}
+
+fn start_thread(db: &Db, uid: &str, words: threads::Words, text: &str) -> Result<threads::Thread> {
+    let (uid, base, text) = (uid.to_owned(), token(db, uid), text.to_owned());
+    db.write_txn("t", move |c, m| {
+        threads::start(c, m, &uid, &base, &words, "operator", &text)
+    })
+}
+
+fn threads_of(db: &Db, uid: &str) -> Vec<threads::Thread> {
+    let uid = uid.to_owned();
+    db.read(move |c| threads::list(c, &uid)).unwrap()
+}
+
+#[test]
+fn a_thread_follows_its_words_and_takes_replies_until_resolved() {
+    let db = db();
+    let uid = create(&db, "Intro.\n\nThe disputed claim.\n");
+    let t = start_thread(&db, &uid, quote("disputed claim"), "Is this measured?").unwrap();
+    assert_eq!(
+        (t.quote.as_str(), t.status.as_str()),
+        ("disputed claim", "open")
+    );
+    // Text written before it moves the anchor, not the words.
+    edit_at(
+        &db,
+        &uid,
+        &token(&db, &uid),
+        insert_after("Intro.", " More intro."),
+    )
+    .unwrap();
+    let (tid, u) = (t.uid.clone(), uid.clone());
+    db.write_txn("t", move |c, m| {
+        threads::reply(c, m, &tid, "claude", "Yes, see the test.")
+    })
+    .unwrap();
+    let ts = threads_of(&db, &u);
+    assert_eq!(ts.len(), 1);
+    assert_eq!(ts[0].quote, "disputed claim");
+    assert_eq!(
+        ts[0]
+            .comments
+            .iter()
+            .map(|c| (c.by.as_str(), c.text.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("operator", "Is this measured?"),
+            ("claude", "Yes, see the test.")
+        ]
+    );
+    let tid = t.uid.clone();
+    db.write_txn("t", move |c, m| threads::resolve(c, m, &tid, "operator"))
+        .unwrap();
+    let tid = t.uid.clone();
+    let err = db
+        .write_txn("t", move |c, m| {
+            threads::reply(c, m, &tid, "claude", "late")
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("resolved"), "{err}");
+    // A thread is never a span: the text's states are untouched, and spans may cover its words.
+    assert!(cat(&db, &uid).spans.is_empty());
+    span(&db, &uid, "The disputed claim.", Reviewer::Operator).unwrap();
+}
+
+#[test]
+fn a_thread_on_deleted_words_reads_detached_and_undo_takes_a_thread_back() {
+    let db = db();
+    let uid = create(&db, "Keep. Drop this. Keep.");
+    let t = start_thread(
+        &db,
+        &uid,
+        threads::Words::Range { start: 6, end: 16 },
+        "why?",
+    )
+    .unwrap();
+    assert_eq!(t.quote, "Drop this.");
+    edit_at(&db, &uid, &token(&db, &uid), replace(" Drop this.", "")).unwrap();
+    let ts = threads_of(&db, &uid);
+    assert!(!ts[0].anchored);
+    assert_eq!(ts[0].started_on, "Drop this.");
+    let other = start_thread(&db, &uid, quote("Keep."), "x");
+    assert!(
+        other.is_err(),
+        "an ambiguous quote is refused like an edit's"
+    );
+    let t2 = start_thread(
+        &db,
+        &uid,
+        threads::Words::Range { start: 0, end: 5 },
+        "fine",
+    )
+    .unwrap();
+    assert_eq!(threads_of(&db, &uid).len(), 2);
+    undo_last(&db);
+    let left: Vec<String> = threads_of(&db, &uid).into_iter().map(|t| t.uid).collect();
+    assert_eq!(left, vec![t.uid]);
+    let _ = t2;
+}
+
+fn approve_sel(db: &Db, uid: &str, words: threads::Words, who: Approver) -> Result<SpanView> {
+    let (uid, base) = (uid.to_owned(), token(db, uid));
+    db.write_txn("t", move |c, m| {
+        approve_selection(c, m, &uid, &base, &words, &who)
+    })
+}
+
+#[test]
+fn approving_a_selection_approves_its_span_or_makes_one_and_never_cuts_one() {
+    let db = db();
+    let uid = create(&db, "First words. Second words. Third words.");
+    let s = span(&db, &uid, "Second words.", Reviewer::Operator).unwrap();
+    let v = approve_sel(&db, &uid, quote("Second words."), Approver::Operator).unwrap();
+    assert_eq!((v.uid.as_str(), v.state), (s.as_str(), SpanState::Approved));
+    let made = approve_sel(&db, &uid, quote("First words."), Approver::Operator).unwrap();
+    assert_eq!(
+        (made.text.as_str(), made.state),
+        ("First words.", SpanState::Approved)
+    );
+    assert_eq!(made.reviewer, Reviewer::Operator);
+    let err = approve_sel(&db, &uid, quote("words. Third"), Approver::Operator).unwrap_err();
+    assert!(err.to_string().contains("crosses the edge"), "{err}");
+    let err = approve_sel(
+        &db,
+        &uid,
+        quote("Third words."),
+        Approver::Claude("c".into()),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("operator's"), "{err}");
+    assert_eq!(cat(&db, &uid).spans.len(), 2, "a refusal makes no span");
+}

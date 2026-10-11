@@ -891,6 +891,68 @@ pub enum Request {
         /// The design.
         uid: String,
     },
+    /// A design's comment threads, in text order ([`designs::threads`]).
+    #[serde(rename = "design.threads")]
+    DesignThreads {
+        /// The design.
+        uid: String,
+    },
+    /// Start a comment thread on selected words — the operator's ([`designs::thread_start`]).
+    #[serde(rename = "design.thread_start")]
+    DesignThreadStart {
+        /// The design.
+        uid: String,
+        /// The version token the words were selected in.
+        base: String,
+        /// The words, by quote …
+        #[serde(default)]
+        find: Option<String>,
+        /// … and which match.
+        #[serde(default)]
+        occurrence: Option<usize>,
+        /// Or by UTF-16 start, as an editor's selection is.
+        #[serde(default)]
+        start: Option<u32>,
+        /// And end.
+        #[serde(default)]
+        end: Option<u32>,
+        /// The first comment.
+        text: String,
+    },
+    /// Reply in a thread ([`designs::thread_reply`]).
+    #[serde(rename = "design.thread_reply")]
+    DesignThreadReply {
+        /// The thread.
+        thread: String,
+        /// The reply.
+        text: String,
+    },
+    /// Resolve a thread — the operator's ([`designs::thread_resolve`]).
+    #[serde(rename = "design.thread_resolve")]
+    DesignThreadResolve {
+        /// The thread.
+        thread: String,
+    },
+    /// Approve exactly the selected words — the operator's ([`designs::approve_selection`]).
+    #[serde(rename = "design.approve_selection")]
+    DesignApproveSelection {
+        /// The design.
+        uid: String,
+        /// The version token the words were selected in.
+        base: String,
+        /// The words, by quote …
+        #[serde(default)]
+        find: Option<String>,
+        /// … and which match.
+        #[serde(default)]
+        occurrence: Option<usize>,
+        /// Or by UTF-16 start.
+        #[serde(default)]
+        start: Option<u32>,
+        /// And end.
+        #[serde(default)]
+        end: Option<u32>,
+    },
     /// Merge an editor's Yjs v1 update ([`designs::apply`]).
     #[serde(rename = "design.apply")]
     DesignApply {
@@ -1615,6 +1677,11 @@ impl Request {
         "design.sources",
         "design.state",
         "design.spans",
+        "design.threads",
+        "design.thread_start",
+        "design.thread_reply",
+        "design.thread_resolve",
+        "design.approve_selection",
         "design.apply",
         "design.edit",
         "design.span",
@@ -1754,6 +1821,11 @@ impl Request {
             Self::DesignSources { .. } => "design.sources",
             Self::DesignState { .. } => "design.state",
             Self::DesignSpans { .. } => "design.spans",
+            Self::DesignThreads { .. } => "design.threads",
+            Self::DesignThreadStart { .. } => "design.thread_start",
+            Self::DesignThreadReply { .. } => "design.thread_reply",
+            Self::DesignThreadResolve { .. } => "design.thread_resolve",
+            Self::DesignApproveSelection { .. } => "design.approve_selection",
             Self::DesignApply { .. } => "design.apply",
             Self::DesignEdit { .. } => "design.edit",
             Self::DesignSpan { .. } => "design.span",
@@ -1851,6 +1923,7 @@ impl Request {
             | Self::DesignExport { .. }
             | Self::DesignState { .. }
             | Self::DesignSpans { .. }
+            | Self::DesignThreads { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
@@ -1934,6 +2007,10 @@ impl Request {
             | Self::DesignCreate { .. }
             | Self::DesignMove { .. }
             | Self::DesignSplit { .. }
+            | Self::DesignThreadStart { .. }
+            | Self::DesignThreadReply { .. }
+            | Self::DesignThreadResolve { .. }
+            | Self::DesignApproveSelection { .. }
             | Self::DesignApply { .. }
             | Self::DesignEdit { .. }
             | Self::DesignSpan { .. }
@@ -2541,6 +2618,16 @@ pub enum Response {
         /// The spans, in text order.
         spans: Vec<designs::Span>,
     },
+    /// A `design.thread_start`, `design.thread_reply` or `design.thread_resolve`: the thread after it.
+    DesignThread {
+        /// The thread.
+        thread: Box<designs::Thread>,
+    },
+    /// A `design.threads`.
+    DesignThreadList {
+        /// The threads, in text order.
+        threads: Vec<designs::Thread>,
+    },
     /// A `design.apply`, `design.edit` or `design.span`.
     DesignWritten {
         /// What it did.
@@ -2703,6 +2790,8 @@ impl Response {
             | Self::DesignText { .. }
             | Self::DesignUpdate { .. }
             | Self::DesignSpans { .. }
+            | Self::DesignThread { .. }
+            | Self::DesignThreadList { .. }
             | Self::DesignWritten { .. }
             | Self::DesignSpan { .. }
             | Self::DesignPrompt { .. }
@@ -2726,12 +2815,16 @@ impl Response {
     /// must say so; one the daemon did not announce is delivered only by its slower `data_version`
     /// floor.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one arm per answer, like `Request::permission`
     pub const fn announces_a_send(&self) -> bool {
         match self {
             // An approval or a staging is announced on its design's topic (`kind = "span"`); an
             // approval that already held writes nothing, and costs subscribers one spare poll. A
             // split stores updates to the design and each child, each announced on its topic.
-            Self::Sent { .. } | Self::DesignSpan { .. } | Self::DesignSplit { .. } => true,
+            Self::Sent { .. }
+            | Self::DesignSpan { .. }
+            | Self::DesignSplit { .. }
+            | Self::DesignThread { .. } => true,
             Self::Notified { sent, .. } => *sent > 0,
             // Every stored design update is announced on `design/<uid>` (D53.4).
             Self::DesignWritten { written } => written.seq.is_some(),
@@ -2822,6 +2915,7 @@ impl Response {
             | Self::DesignText { .. }
             | Self::DesignUpdate { .. }
             | Self::DesignSpans { .. }
+            | Self::DesignThreadList { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignWorkPrompt { .. }
             | Self::DesignNewPrompt { .. }
@@ -4065,6 +4159,58 @@ impl LocalBackend {
                     update,
                     seq: version.seq,
                     version: version.token(),
+                }
+            }
+            Request::DesignThreads { uid } => Response::DesignThreadList {
+                threads: db.read_with(move |c| designs::threads(c, &uid))?,
+            },
+            Request::DesignThreadStart {
+                uid,
+                base,
+                find,
+                occurrence,
+                start,
+                end,
+                text,
+            } => {
+                let words = designs::words(find, occurrence, start, end)?;
+                let who = principal.clone();
+                Response::DesignThread {
+                    thread: Box::new(db.write_txn_with(actor, move |c, m| {
+                        designs::thread_start(c, m, &uid, &base, &words, &who, &text)
+                    })?),
+                }
+            }
+            Request::DesignThreadReply { thread, text } => {
+                let who = principal.clone();
+                Response::DesignThread {
+                    thread: Box::new(db.write_txn_with(actor, move |c, m| {
+                        designs::thread_reply(c, m, &thread, &who, &text)
+                    })?),
+                }
+            }
+            Request::DesignThreadResolve { thread } => {
+                let who = principal.clone();
+                Response::DesignThread {
+                    thread: Box::new(db.write_txn_with(actor, move |c, m| {
+                        designs::thread_resolve(c, m, &thread, &who)
+                    })?),
+                }
+            }
+            Request::DesignApproveSelection {
+                uid,
+                base,
+                find,
+                occurrence,
+                start,
+                end,
+            } => {
+                let words = designs::words(find, occurrence, start, end)?;
+                let who = principal.clone();
+                Response::DesignSpan {
+                    span: Box::new(db.write_txn_with(actor, move |c, m| {
+                        designs::approve_selection(c, m, &uid, &base, &words, &who)
+                    })?),
                 }
             }
             Request::DesignSpans { uid } => Response::DesignSpans {

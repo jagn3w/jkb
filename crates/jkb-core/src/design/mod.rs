@@ -27,6 +27,7 @@ mod discuss;
 pub mod export;
 pub mod plan;
 pub mod prompts;
+pub mod threads;
 pub mod tree;
 
 use std::collections::BTreeSet;
@@ -1050,12 +1051,28 @@ pub fn add_span(
     occurrence: Option<usize>,
     reviewer: Reviewer,
 ) -> Result<Written> {
+    let words = threads::Words::Quote {
+        find: find.to_owned(),
+        occurrence,
+    };
+    span_over(conn, meta, uid, base, &words, reviewer)
+}
+
+/// [`add_span`] over `words`, a quote or a selection's range.
+fn span_over(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    words: &threads::Words,
+    reviewer: Reviewer,
+) -> Result<Written> {
     let id = design_id(conn, uid)?;
     let base = Version::parse(base)?;
     let (now, _) = load(conn, id)?;
     let before = before_write(conn, id, &now)?;
     let doc = load_base(conn, id, &base, &now)?;
-    let (s, e) = locate(&doc.text(), find, occurrence)?;
+    let (s, e) = words.resolve(&doc.text())?;
     let ids = doc.ids(s, e);
     if !now.all_present(&ids) {
         return Err(invalid(
@@ -1494,6 +1511,54 @@ pub fn approve(
     set_metadata(conn, meta, span.id, &span.metadata)?;
     announce_span(conn, meta, &design_uid, &signed)?;
     Ok(signed)
+}
+
+/// Approve exactly the words `words` names in design `uid` as read at `base` — the operator's
+/// alone. A selection that is exactly one span's text in `base` approves that span; any other makes
+/// a span over it (naming the operator) and approves it in the same write. A selection crossing an
+/// existing span's edge is refused rather than split: spans do not overlap.
+///
+/// # Errors
+/// A non-operator approver, an unknown design, a token that is not one of its versions, words not in
+/// that version or deleted since, a selection crossing a span's edge, or a database error.
+pub fn approve_selection(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    words: &threads::Words,
+    approver: &Approver,
+) -> Result<SpanView> {
+    if *approver != Approver::Operator {
+        return Err(invalid(
+            "approving a selection is the operator's — approve a span that names you instead",
+        ));
+    }
+    let id = design_id(conn, uid)?;
+    let version = Version::parse(base)?;
+    let (now, _) = load(conn, id)?;
+    let read = load_base(conn, id, &version, &now)?;
+    let (s, e) = words.resolve(&read.text())?;
+    for span in span_items(conn, id)? {
+        let Some((a, b)) = read.range(&span.uid).filter(|(a, b)| a < b) else {
+            continue;
+        };
+        if (a, b) == (s, e) {
+            return approve(conn, meta, &span.uid, base, approver);
+        }
+        if a < e && s < b {
+            return Err(invalid(format!(
+                "the selection crosses the edge of span {} — select exactly its text to approve \
+                 it, or only text outside every span",
+                span.uid
+            )));
+        }
+    }
+    let written = span_over(conn, meta, uid, base, words, Reviewer::Operator)?;
+    let span = written
+        .span
+        .ok_or_else(|| invalid("making the span over the selection wrote no span"))?;
+    approve(conn, meta, &span, &written.version.token(), approver)
 }
 
 /// Stage an approved span into a plan step: a `stages` edge (D53.6). STAGED is derived from it.
