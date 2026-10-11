@@ -755,7 +755,8 @@ pub fn children(conn: &Connection, path: Option<&str>, all: bool) -> jkb_core::R
 /// row naming the namespace it was listed under — until a row does not fit `budget`.
 ///
 /// # Errors
-/// Returns an error if a read fails.
+/// `NotFound` for a path that is neither a namespace nor an item uid ([`children`]), or an error
+/// if a read fails.
 pub fn ls(
     conn: &Connection,
     path: Option<&str>,
@@ -799,7 +800,8 @@ pub fn ls(
 /// not fit `budget` or past [`MAX_TREE_NODES`]; the returned [`TreeCut`] says which, if either.
 ///
 /// # Errors
-/// Returns an error if a read fails.
+/// `NotFound` for a path that is neither a namespace nor an item uid ([`children`]), or an error
+/// if a read fails.
 pub fn tree(
     conn: &Connection,
     path: Option<&str>,
