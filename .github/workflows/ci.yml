@@ -34,9 +34,9 @@ jobs:
           persist-credentials: false
 
       # The workspace pulls heavy transitive deps (fastembed/ONNX, headless_chrome,
-      # rav1e/image) and builds them twice (default + --features fastembed) plus a
-      # --all-features cargo-deny graph, which overflows the runner's ~14 GB free disk
-      # ("No space left on device"). Reclaim ~25 GB from preinstalled SDKs first.
+      # rav1e/image) and checks them twice (default, and the fastembed clippy and tests), which
+      # overflowed the runner's ~14 GB free disk ("No space left on device"). Reclaim ~25 GB from
+      # preinstalled SDKs first. (cargo-deny now runs in its own job.)
       - name: Free disk space
         run: |
           df -h /
@@ -58,13 +58,16 @@ jobs:
           rustup show
           rustup component add rustfmt clippy
 
-      # rust-cache, not a hand-keyed actions/cache: keyed on Cargo.lock alone, the cache was written
-      # once per lockfile and never again (a key hit skips the save), so every build after it
-      # recompiled whatever had changed since, from a target/ that only grew. rust-cache keys on the
-      # toolchain and lockfile, saves after each run on the default branch, and prunes the workspace's
-      # own crates so what is restored is the dependencies a build actually reuses.
+      # rust-cache rather than a hand-keyed actions/cache of the whole target/: it keys on the
+      # toolchain as well as the lockfile (a toolchain bump no longer restores artifacts it cannot
+      # use) and prunes the workspace's own crates before saving, so the cache is the dependencies a
+      # build reuses rather than a target/ that only grows. Like actions/cache it does not re-save on
+      # an exact key hit. Saved from `main` only: a branch restores main's cache, and a branch that
+      # changes Cargo.lock does not spend the repository's 10 GB quota on a multi-GB cache of its own.
       - name: Cache cargo registry and dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -72,15 +75,17 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # The `fastembed` feature exists only in jkb-embed (its one `cfg(feature)`), so linting and
-      # testing that crate with it is the whole of what the feature changes. Across the workspace it
-      # rebuilt every crate that depends on jkb-embed to lint and test code identical to the run above.
+      # Workspace-wide, because the feature changes jkb-embed's public API (it adds an
+      # `EmbedderConfig` variant), so a dependent can fail to compile only with it on.
       - name: clippy (fastembed)
-        run: cargo clippy -p jkb-embed --all-targets --features fastembed -- -D warnings
+        run: cargo clippy --all-targets --features fastembed -- -D warnings
 
       - name: test
         run: cargo test --all
 
+      # The tests, though, are jkb-embed's alone: its one `cfg(feature)` is the only code the feature
+      # turns on, and the clippy above has already compiled every dependent's tests with it.
+      # Workspace-wide, this re-ran every other crate's tests against identical code.
       - name: test (fastembed)
         run: cargo test -p jkb-embed --features fastembed
 
