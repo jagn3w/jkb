@@ -71,7 +71,11 @@ pub fn print(db: &Path) -> Result<()> {
 /// # Errors
 /// Returns an error on an unsupported platform, or if a file can't be written.
 pub fn install(db: &Path) -> Result<()> {
-    install_units(manager()?, units_for_platform(db)?)
+    install_units(
+        manager()?,
+        units_for_platform(db)?,
+        &mut std::io::stdout().lock(),
+    )
 }
 
 /// Write each unit to its own path and say how to activate it.
@@ -85,7 +89,7 @@ pub fn install(db: &Path) -> Result<()> {
 ///
 /// # Errors
 /// Returns an error if a unit's directory cannot be created or the unit cannot be written.
-fn install_units(manager: Manager, units: Vec<Unit>) -> Result<()> {
+fn install_units(manager: Manager, units: Vec<Unit>, out: &mut dyn std::io::Write) -> Result<()> {
     for (label, path, unit) in units {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -95,28 +99,30 @@ fn install_units(manager: Manager, units: Vec<Unit>) -> Result<()> {
         // replace it (`launchctl load` / `systemctl daemon-reload`), and setup.sh re-runs
         // `service install` on every pull that touched `scripts/`.
         crate::atomic::write(&path, unit.as_bytes())?;
-        println!("wrote {}", path.display());
+        writeln!(out, "wrote {}", path.display())?;
         // A RESTART, not `load` / `enable --now`: those leave an already-running unit on the old
         // binary, and a daemon older than the database refuses every request (schema_newer). The
         // same rule as setup.sh's `activate_services`.
         match manager {
             Manager::Launchd => {
-                println!(
+                writeln!(
+                    out,
                     "activate with: launchctl unload {path} 2>/dev/null; launchctl load {path}",
                     path = path.display()
-                );
+                )?;
                 // launchd discards a job's output unless the plist names a file, and the watcher's
                 // reports (REFUSED, RESOLVED, CONFLICT) are the only record of what it decided.
                 if let Some(log) = launchd_log(&unit) {
-                    println!("logs: {log}");
+                    writeln!(out, "logs: {log}")?;
                 }
             }
             Manager::Systemd => {
-                println!(
+                writeln!(
+                    out,
                     "activate with: systemctl --user daemon-reload && systemctl --user enable \
                      {label} && systemctl --user restart {label}"
-                );
-                println!("logs: journalctl --user -u {label}");
+                )?;
+                writeln!(out, "logs: journalctl --user -u {label}")?;
             }
         }
     }
@@ -247,11 +253,20 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 
 /// The file a launchd plist sends the job's stderr to (`StandardErrorPath`), as written by this
 /// module's own plists: what `service install` tells the user to read.
-fn launchd_log(plist: &str) -> Option<&str> {
+fn launchd_log(plist: &str) -> Option<String> {
     let rest = plist.split_once("<key>StandardErrorPath</key>")?.1;
     let start = rest.find("<string>")? + "<string>".len();
     let end = rest[start..].find("</string>")?;
-    Some(&rest[start..start + end])
+    Some(xml_unescape(&rest[start..start + end]))
+}
+
+/// [`xml_escape`]'s inverse: the path a reader opens, not the plist's spelling of it.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// A launchd agent plist running the all-mounts watcher, kept alive across restarts.
@@ -524,8 +539,20 @@ mod tests {
             Path::new("/usr/local/bin/jkb"),
             Path::new("/Users/u/.jkb/jkb.db"),
         );
-        assert_eq!(launchd_log(&plist), Some("/Users/u/.jkb/sync.log"));
+        assert_eq!(
+            launchd_log(&plist).as_deref(),
+            Some("/Users/u/.jkb/sync.log")
+        );
         assert_eq!(launchd_log("<plist/>"), None);
+        // The path a reader opens, not the plist's escaped spelling of it.
+        let odd = launchd_plist(
+            Path::new("/usr/local/bin/jkb"),
+            Path::new("/Users/o'b & co/jkb.db"),
+        );
+        assert_eq!(
+            launchd_log(&odd).as_deref(),
+            Some("/Users/o'b & co/sync.log")
+        );
     }
 
     #[test]
@@ -643,7 +670,13 @@ mod tests {
             )]
         };
 
-        install_units(Manager::Launchd, unit()).expect("first install");
+        let mut said = Vec::new();
+        install_units(Manager::Launchd, unit(), &mut said).expect("first install");
+        let said = String::from_utf8(said).expect("utf-8");
+        assert!(
+            said.contains("logs: /home/u/sync.log"),
+            "install names the log: {said}"
+        );
         assert!(path.is_file(), "install_units created no unit");
         // Stand the installed unit in for an older version of itself. The generators are
         // deterministic, so a second install writes identical bytes and the assertion below
@@ -651,7 +684,7 @@ mod tests {
         std::fs::write(&path, PREVIOUS).expect("plant an older version");
 
         let mut supervisor = std::fs::File::open(&path).expect("open the installed unit");
-        install_units(Manager::Launchd, unit()).expect("reinstall");
+        install_units(Manager::Launchd, unit(), &mut std::io::sink()).expect("reinstall");
 
         let mut seen = String::new();
         supervisor
