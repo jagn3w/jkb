@@ -348,13 +348,19 @@ export function DesignTab(): React.JSX.Element {
   /** The design *Next* moved to, whose first unreviewed passage is shown once it is read. */
   const [revealIn, setRevealIn] = useState<string | undefined>(undefined);
 
-  const load = useCallback(async () => {
+  /** The listing, with review counts — or without, from a daemon that predates them. */
+  const load = useCallback(async (): Promise<readonly Design[] | undefined> => {
     setListing(listingLoading);
     try {
-      const answer = decodeDesigns(await window.jkb.op(designOps.list(undefined, true)));
+      let answer = decodeDesigns(await window.jkb.op(designOps.list(undefined, true)));
+      // A daemon older than the counts refuses the field it does not know: list without them, so
+      // the tab still works and the sidebar simply draws no bars.
+      if (!answer.ok && answer.error.code === "bad_request") answer = decodeDesigns(await window.jkb.op(designOps.list()));
       setListing((prev) => (answer.ok ? listingLoaded(answer.value) : listingFailed(prev, answer.error.message)));
+      return answer.ok ? answer.value : undefined;
     } catch (e) {
       setListing((prev) => listingFailed(prev, e instanceof Error ? e.message : String(e)));
+      return undefined;
     }
   }, []);
 
@@ -362,14 +368,15 @@ export function DesignTab(): React.JSX.Element {
     void load();
   }, [load]);
 
-  // The sidebar's counts follow approvals and stagings: a `span` message on any open design's topic
-  // re-reads the listing, a second after the last one, rather than once per message.
+  // The sidebar's counts follow approvals and stagings (`span`) and edits (`update`, which can add or
+  // demote text) on any open design: re-read a few seconds after the last such message, not once per
+  // keystroke. A design no window has open is caught by the re-read *Next* makes before it moves.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const off = window.jkb.design.onEvent((event) => {
-      if (event.kind !== "span") return;
+      if (event.kind !== "span" && event.kind !== "update") return;
       if (timer !== undefined) clearTimeout(timer);
-      timer = setTimeout(() => void load(), 1000);
+      timer = setTimeout(() => void load(), 3000);
     });
     return () => {
       off();
@@ -536,9 +543,17 @@ export function DesignTab(): React.JSX.Element {
               repo={repo}
               nextDesign={nextDesign}
               onNextDesign={() => {
-                if (nextDesign === undefined) return;
-                setRevealIn(nextDesign.uid);
-                pickDesign(nextDesign.uid);
+                // Counts can be stale (an edit to a design no window has open is announced nowhere
+                // this window hears), so they are read again before choosing where to go.
+                void (async () => {
+                  const fresh = await load();
+                  const all = fresh === undefined ? order : treeOrder(designTree(fresh));
+                  const here = all.findIndex((d) => d.uid === design.uid);
+                  const next = here >= 0 ? all.slice(here + 1).find(hasUnreviewed) : undefined;
+                  if (next === undefined) return;
+                  setRevealIn(next.uid);
+                  pickDesign(next.uid);
+                })();
               }}
               revealFirst={revealIn === design.uid}
               onRevealed={onRevealed}

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { DesignNode, RepoNode, ReviewCounts } from "@jkb/core";
 
 /** A thin bar of the design's span states, and how much of it is unreviewed. */
-function ReviewBar({ counts }: { readonly counts: ReviewCounts }): React.JSX.Element | null {
+function StateBar({ counts }: { readonly counts: ReviewCounts }): React.JSX.Element | null {
   const total = counts.proposed + counts.approved + counts.staged + counts.implemented;
   if (total === 0) return null;
   const pct = (n: number): string => `${(100 * n) / total}%`;
@@ -100,7 +100,7 @@ function DesignRow({
         >
           {design.title}
         </button>
-        {design.review !== undefined && <ReviewBar counts={design.review} />}
+        {design.review !== undefined && <StateBar counts={design.review} />}
       </div>
       {children.length > 0 && open && (
         <ul role="group">

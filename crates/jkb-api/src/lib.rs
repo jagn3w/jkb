@@ -812,8 +812,9 @@ pub enum Request {
         /// Only this repo's (`designs/<repo>`).
         #[serde(default)]
         repo: Option<String>,
-        /// Each design's characters per span state too (reads every document).
-        #[serde(default)]
+        /// Each design's characters per span state too (reads every document). Never sent when
+        /// false, so a client newer than the daemon still lists against one that predates it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         review: bool,
     },
     /// Create a design under `designs/<repo>` ([`designs::create`]).

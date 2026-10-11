@@ -14,7 +14,8 @@ function typing(target: EventTarget | null): boolean {
  * *See next* (operator feedback, 2026-10-11): *Previous* and *Next* over the open design's
  * unreviewed passages, with an "n of m" counter, and the `n` and `p` keys whenever nothing that
  * takes text is focused. A passage is selected and scrolled to the middle of the editor. Past the
- * last one, *Next* moves on to the next design in the sidebar's order, when there is one.
+ * last one, *Next* moves on to the next design in the sidebar's order that still has unreviewed
+ * text, by counts read again at the press.
  */
 export function ReviewBar({
   passages,

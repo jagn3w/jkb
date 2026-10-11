@@ -1017,3 +1017,21 @@ fn the_listing_carries_review_counts_only_when_asked() {
     let r = listed(true).review.unwrap();
     assert_eq!((r.proposed, r.approved), (10, 0));
 }
+
+/// A client newer than the daemon still lists: `review` is never sent unless asked, so a daemon
+/// that predates it (and refuses unknown fields) reads the same request it always did.
+#[test]
+fn a_listing_that_asks_no_counts_sends_no_review_field() {
+    let plain = serde_json::to_value(crate::Request::DesignList {
+        repo: None,
+        review: false,
+    })
+    .unwrap();
+    assert!(plain.get("review").is_none(), "{plain}");
+    let asked = serde_json::to_value(crate::Request::DesignList {
+        repo: None,
+        review: true,
+    })
+    .unwrap();
+    assert_eq!(asked["review"], json!(true));
+}
