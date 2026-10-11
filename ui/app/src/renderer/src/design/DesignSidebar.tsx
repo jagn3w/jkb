@@ -1,6 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 
-import type { DesignNode, RepoNode } from "@jkb/core";
+import type { DesignNode, RepoNode, ReviewCounts } from "@jkb/core";
+
+/** A thin bar of the design's span states, and how much of it is unreviewed. */
+function ReviewBar({ counts }: { readonly counts: ReviewCounts }): React.JSX.Element | null {
+  const total = counts.proposed + counts.approved + counts.staged + counts.implemented;
+  if (total === 0) return null;
+  const pct = (n: number): string => `${(100 * n) / total}%`;
+  const unreviewed = Math.round((100 * counts.proposed) / total);
+  return (
+    <span className="tree-review" title={`${unreviewed}% unreviewed`}>
+      <span className="tree-bar" aria-hidden="true">
+        <span data-state="IMPLEMENTED" style={{ width: pct(counts.implemented) }} />
+        <span data-state="STAGED" style={{ width: pct(counts.staged) }} />
+        <span data-state="APPROVED" style={{ width: pct(counts.approved) }} />
+        <span data-state="PROPOSED" style={{ width: pct(counts.proposed) }} />
+      </span>
+      {counts.proposed > 0 && <span className="tree-unreviewed">{unreviewed === 0 ? "<1" : unreviewed}%</span>}
+    </span>
+  );
+}
 
 /** Which repos and designs are folded: per window, like the pane sizes (D53.1). */
 const FOLDED_KEY = "jkb.app.design.folded";
@@ -81,6 +100,7 @@ function DesignRow({
         >
           {design.title}
         </button>
+        {design.review !== undefined && <ReviewBar counts={design.review} />}
       </div>
       {children.length > 0 && open && (
         <ul role="group">

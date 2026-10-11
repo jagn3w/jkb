@@ -1004,3 +1004,16 @@ fn the_operator_starts_threads_and_approves_selections_and_a_designer_replies() 
                        "find": "x", "start": 0, "end": 1 });
     assert_eq!(call(&kb.op, both).unwrap_err().code, ErrorCode::Invalid);
 }
+
+#[test]
+fn the_listing_carries_review_counts_only_when_asked() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "Some words.");
+    let listed = |review: bool| match ok(&kb.op, json!({ "op": "design.list", "review": review })) {
+        Response::Designs { designs } => designs.into_iter().find(|d| d.uid == uid).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(listed(false).review, None);
+    let r = listed(true).review.unwrap();
+    assert_eq!((r.proposed, r.approved), (10, 0));
+}

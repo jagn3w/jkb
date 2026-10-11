@@ -812,6 +812,9 @@ pub enum Request {
         /// Only this repo's (`designs/<repo>`).
         #[serde(default)]
         repo: Option<String>,
+        /// Each design's characters per span state too (reads every document).
+        #[serde(default)]
+        review: bool,
     },
     /// Create a design under `designs/<repo>` ([`designs::create`]).
     #[serde(rename = "design.create")]
@@ -4124,8 +4127,8 @@ impl LocalBackend {
                     wrote,
                 }
             }
-            Request::DesignList { repo } => Response::Designs {
-                designs: db.read_with(move |c| designs::list(c, repo.as_deref()))?,
+            Request::DesignList { repo, review } => Response::Designs {
+                designs: db.read_with(move |c| designs::list(c, repo.as_deref(), review))?,
             },
             Request::DesignCreate { repo, title, body } => Response::DesignCreated {
                 design: db.write_txn_with(actor, move |c, m| {

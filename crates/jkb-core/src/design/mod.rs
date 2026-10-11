@@ -284,6 +284,61 @@ pub struct DesignText {
     pub spans: Vec<SpanView>,
 }
 
+/// How much of a design's text is in each state: non-whitespace characters (UTF-16 units), so a
+/// blank line between two spans weighs nothing. What the design list's review bar draws.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateCounts {
+    /// Uncovered text and every span that reads PROPOSED (demoted ones included).
+    pub proposed: u64,
+    /// Approved, not staged.
+    pub approved: u64,
+    /// Staged into a step whose tasks are not all done.
+    pub staged: u64,
+    /// Staged and built.
+    pub implemented: u64,
+}
+
+impl DesignText {
+    /// How much of the text is in each state, by the spans' derived states — the same reading the
+    /// editor colours and the export keeps (a span reading PROPOSED counts whole as PROPOSED).
+    #[must_use]
+    pub fn state_counts(&self) -> StateCounts {
+        let units = |s: &str| -> u64 {
+            s.chars()
+                .filter(|c| !c.is_whitespace())
+                .map(|c| u64::try_from(c.len_utf16()).unwrap_or(0))
+                .sum()
+        };
+        let mut covered: Vec<(u32, u32, SpanState)> = self
+            .spans
+            .iter()
+            .filter(|s| s.anchored && s.end > s.start && s.state != SpanState::Proposed)
+            .map(|s| (s.start, s.end, s.state))
+            .collect();
+        covered.sort_unstable_by_key(|c| (c.0, c.1));
+        let mut out = StateCounts::default();
+        let mut at = 0;
+        // Spans do not overlap; were they to, each unit is counted once.
+        for (start, end, state) in covered {
+            let start = start.max(at);
+            if end <= start {
+                continue;
+            }
+            let n = units(&slice(&self.text, start, end));
+            match state {
+                SpanState::Approved => out.approved += n,
+                SpanState::Staged => out.staged += n,
+                SpanState::Implemented => out.implemented += n,
+                SpanState::Proposed => {}
+            }
+            at = end;
+        }
+        out.proposed =
+            units(&self.text).saturating_sub(out.approved + out.staged + out.implemented);
+        out
+    }
+}
+
 /// What a write did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Written {

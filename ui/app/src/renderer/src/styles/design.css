@@ -654,3 +654,32 @@
   gap: var(--space-1);
   margin-top: var(--space-1);
 }
+
+/* The sidebar row's review bar: the design's span states, and its unreviewed share. */
+.tree-review {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+}
+
+.tree-bar {
+  display: inline-flex;
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--hairline);
+}
+
+.tree-bar > span[data-state="PROPOSED"] { background: var(--accent-proposed); }
+.tree-bar > span[data-state="APPROVED"] { background: var(--accent-approved); }
+.tree-bar > span[data-state="STAGED"] { background: var(--accent-staged); }
+.tree-bar > span[data-state="IMPLEMENTED"] { background: var(--accent-implemented); }
+
+.tree-unreviewed {
+  font-size: var(--text-xs);
+  color: var(--accent-proposed);
+  min-width: 2.5em;
+  text-align: right;
+}

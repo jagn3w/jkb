@@ -3145,3 +3145,24 @@ fn undoing_a_reply_is_announced_on_the_designs_topic() {
         "the reply is gone"
     );
 }
+
+/// The review bar's counts: non-whitespace characters per span state, a demoted span counted whole
+/// as PROPOSED, blank space between spans weighing nothing.
+#[test]
+fn state_counts_weigh_each_state_by_its_non_whitespace_characters() {
+    let db = db();
+    let uid = create(&db, "Alpha.\n\nBeta words.\n\nLoose");
+    let a = span(&db, &uid, "Alpha.", Reviewer::Operator).unwrap();
+    approve_as(&db, &a, Approver::Operator).unwrap();
+    let b = span(&db, &uid, "Beta words.", Reviewer::Operator).unwrap();
+    approve_as(&db, &b, Approver::Operator).unwrap();
+    let c = cat(&db, &uid).state_counts();
+    assert_eq!(
+        (c.approved, c.proposed, c.staged, c.implemented),
+        (16, 5, 0, 0)
+    );
+    // Editing Beta demotes it: its words count as PROPOSED now.
+    edit_at(&db, &uid, &token(&db, &uid), replace("words", "texts")).unwrap();
+    let c = cat(&db, &uid).state_counts();
+    assert_eq!((c.approved, c.proposed), (6, 15));
+}

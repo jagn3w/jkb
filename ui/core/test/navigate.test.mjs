@@ -111,3 +111,14 @@ test("stepping moves to the next or previous passage, and stops at the ends", ()
   assert.equal(passageAt(ps, 35), 1);
   assert.equal(passageAt(ps, 25), undefined);
 });
+
+test("a design with unknown counts, or any PROPOSED text, has something to review", async () => {
+  const { hasUnreviewed, designOps, decodeDesigns } = await import("../dist/index.js");
+  const d = (review) => ({ uid: "d", title: "D", namespace: "designs/jkb", seq: 1, topic: "design/d", ...(review ? { review } : {}) });
+  assert.equal(hasUnreviewed(d()), true);
+  assert.equal(hasUnreviewed(d({ proposed: 3, approved: 0, staged: 0, implemented: 9 })), true);
+  assert.equal(hasUnreviewed(d({ proposed: 0, approved: 2, staged: 0, implemented: 9 })), false);
+  assert.deepEqual(designOps.list(undefined, true), { op: "design.list", review: true });
+  const bad = decodeDesigns({ ok: true, value: { result: "designs", designs: [d({ proposed: "x" })] } });
+  assert.equal(bad.ok, false, "malformed counts are refused");
+});

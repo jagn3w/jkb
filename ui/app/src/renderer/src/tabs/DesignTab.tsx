@@ -6,6 +6,7 @@ import {
   decodeDesigns,
   designOps,
   designTree,
+  hasUnreviewed,
   repoOf,
   SPAN_STATES,
   treeOrder,
@@ -350,7 +351,7 @@ export function DesignTab(): React.JSX.Element {
   const load = useCallback(async () => {
     setListing(listingLoading);
     try {
-      const answer = decodeDesigns(await window.jkb.op(designOps.list()));
+      const answer = decodeDesigns(await window.jkb.op(designOps.list(undefined, true)));
       setListing((prev) => (answer.ok ? listingLoaded(answer.value) : listingFailed(prev, answer.error.message)));
     } catch (e) {
       setListing((prev) => listingFailed(prev, e instanceof Error ? e.message : String(e)));
@@ -359,6 +360,21 @@ export function DesignTab(): React.JSX.Element {
 
   useEffect(() => {
     void load();
+  }, [load]);
+
+  // The sidebar's counts follow approvals and stagings: a `span` message on any open design's topic
+  // re-reads the listing, a second after the last one, rather than once per message.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const off = window.jkb.design.onEvent((event) => {
+      if (event.kind !== "span") return;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = setTimeout(() => void load(), 1000);
+    });
+    return () => {
+      off();
+      if (timer !== undefined) clearTimeout(timer);
+    };
   }, [load]);
 
   const pickDesign = useCallback((next: string): void => {
@@ -394,7 +410,8 @@ export function DesignTab(): React.JSX.Element {
   const order = useMemo(() => (tree === undefined ? [] : treeOrder(tree)), [tree]);
   const design = order.find((d) => d.uid === uid) ?? order[0];
   const at = design === undefined ? -1 : order.indexOf(design);
-  const nextDesign = at >= 0 ? order[at + 1] : undefined;
+  // *Next* past the last passage skips designs with nothing left to review.
+  const nextDesign = at >= 0 ? order.slice(at + 1).find(hasUnreviewed) : undefined;
   const repo = repoOf(design?.namespace);
   const opened = useSession(design);
   // Until the effect has swapped sessions, the one open is the previous design's: never show it

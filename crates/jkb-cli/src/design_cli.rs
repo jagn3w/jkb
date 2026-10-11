@@ -478,7 +478,10 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
                     None => ops.ambient_repo()?,
                 }
             };
-            let designs = match ops.call(Request::DesignList { repo })? {
+            let designs = match ops.call(Request::DesignList {
+                repo,
+                review: false,
+            })? {
                 Response::Designs { designs } => designs,
                 other => return unexpected("design.list", &other),
             };

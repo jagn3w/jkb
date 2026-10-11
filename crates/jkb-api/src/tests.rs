@@ -435,7 +435,10 @@ fn samples() -> Vec<Request> {
                 ..crate::workflows::AgentEdit::default()
             },
         },
-        Request::DesignList { repo: None },
+        Request::DesignList {
+            repo: None,
+            review: true,
+        },
         Request::DesignCreate {
             repo: "jkb".into(),
             title: "t".into(),

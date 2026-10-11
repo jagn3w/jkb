@@ -51,6 +51,22 @@ pub struct Design {
     /// The design it is nested under, or `None` at the top level.
     #[serde(default)]
     pub parent: Option<String>,
+    /// How much of its text is in each state, when the listing was asked for it (`review`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewCounts>,
+}
+
+/// Non-whitespace characters per span state (`jkb_core::design::StateCounts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCounts {
+    /// Uncovered or PROPOSED.
+    pub proposed: u64,
+    /// APPROVED.
+    pub approved: u64,
+    /// STAGED.
+    pub staged: u64,
+    /// IMPLEMENTED.
+    pub implemented: u64,
 }
 
 impl From<DesignRow> for Design {
@@ -64,6 +80,7 @@ impl From<DesignRow> for Design {
             doc_target: d.meta.doc_target,
             sources: d.meta.sources.into_iter().map(Source::from).collect(),
             parent: d.parent,
+            review: None,
         }
     }
 }
@@ -330,11 +347,23 @@ impl From<EditAsk> for Edit {
 ///
 /// # Errors
 /// A database error.
-pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<Design>, ApiError> {
-    Ok(design::list(conn, repo)?
-        .into_iter()
-        .map(Design::from)
-        .collect())
+pub fn list(conn: &Connection, repo: Option<&str>, review: bool) -> Result<Vec<Design>, ApiError> {
+    let mut out = Vec::new();
+    for row in design::list(conn, repo)? {
+        let mut d = Design::from(row);
+        // Opt-in: it reads every design's document and derives every span's state.
+        if review {
+            let c = design::read(conn, &d.uid)?.state_counts();
+            d.review = Some(ReviewCounts {
+                proposed: c.proposed,
+                approved: c.approved,
+                staged: c.staged,
+                implemented: c.implemented,
+            });
+        }
+        out.push(d);
+    }
+    Ok(out)
 }
 
 /// `design.create`.
