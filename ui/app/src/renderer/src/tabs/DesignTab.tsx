@@ -158,7 +158,9 @@ function DesignView({
   readonly onDiscuss: (from: number, to: number, shown: string) => void;
   readonly onNotice: (message: string) => void;
 }): React.JSX.Element {
-  const [view, setViewState] = useState<View>(() => rememberedView(design.uid));
+  // Arriving by *Next* is a review walk: it lands on the Design view whatever was last shown here,
+  // or the passage it reveals would be off screen and `n` dead.
+  const [view, setViewState] = useState<View>(() => (revealFirst ? "design" : rememberedView(design.uid)));
   const setView = (v: View): void => {
     setViewState(v);
     rememberView(design.uid, v);
@@ -175,8 +177,11 @@ function DesignView({
   }, []);
   const getView = useCallback(() => editor.current, []);
 
-  const current = session?.current;
+  // Offsets only from an answer whose text is what the editor shows (`DesignSession.onScreen`):
+  // after a local edit, until the next read, there are no passages rather than wrong ones.
+  const current = session?.onScreen();
   const passages = useMemo(() => (current === undefined ? undefined : unreviewedPassages(current.text, current.spans)), [current]);
+  const [head, setHead] = useState(0);
 
   useEffect(() => {
     if (!revealFirst || passages === undefined || !editorReady) return;
@@ -256,6 +261,7 @@ function DesignView({
           <ReviewBar
             passages={passages}
             view={getView}
+            head={head}
             shown={view === "design"}
             nextDesign={nextDesign?.title}
             onNextDesign={onNextDesign}
@@ -264,7 +270,7 @@ function DesignView({
             {session === undefined ? (
               <p className="design-empty muted">Opening…</p>
             ) : (
-              <DocumentEditor key={design.uid} session={session} onDiscuss={onDiscuss} onView={onView} />
+              <DocumentEditor key={design.uid} session={session} onDiscuss={onDiscuss} onView={onView} onCursor={setHead} />
             )}
           </div>
         </div>

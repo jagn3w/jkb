@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { DesignNode, RepoNode } from "@jkb/core";
 
@@ -21,6 +21,23 @@ function writeFolded(folded: ReadonlySet<string>): void {
   } catch {
     // Storage unavailable: everything opens unfolded next time.
   }
+}
+
+/** The fold keys above design `uid`: its repo's and each ancestor design's. */
+function pathTo(tree: readonly RepoNode[], uid: string): string[] | undefined {
+  const walk = (nodes: readonly DesignNode[], above: string[]): string[] | undefined => {
+    for (const n of nodes) {
+      if (n.design.uid === uid) return above;
+      const found = walk(n.children, [...above, n.design.uid]);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+  for (const r of tree) {
+    const found = walk(r.designs, [`repo:${r.repo}`]);
+    if (found !== undefined) return found;
+  }
+  return undefined;
 }
 
 function DesignRow({
@@ -105,6 +122,20 @@ export function DesignSidebar({
   readonly onRefresh: () => void;
 }): React.JSX.Element {
   const [folded, setFolded] = useState<ReadonlySet<string>>(readFolded);
+  // The open design is always visible: its repo and every design above it unfold when it opens,
+  // however it was opened (*Next*, *Jump to context*), or no row would say which design it is.
+  useEffect(() => {
+    if (tree === undefined || active === undefined) return;
+    const path = pathTo(tree, active);
+    if (path === undefined) return;
+    setFolded((prev) => {
+      if (!path.some((k) => prev.has(k))) return prev;
+      const next = new Set(prev);
+      for (const k of path) next.delete(k);
+      writeFolded(next);
+      return next;
+    });
+  }, [tree, active]);
   const toggle = (key: string): void => {
     setFolded((prev) => {
       const next = new Set(prev);

@@ -542,11 +542,12 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
                 if ops.json {
                     println!("{}", serde_json::to_string_pretty(&design)?);
                 } else {
+                    // A move always names a parent; there is no un-nesting yet (`--top` is not built).
                     println!(
-                        "{}  {}  now under {}",
+                        "{}  {}  nested under {}",
                         design.uid,
                         design.title,
-                        design.parent.as_deref().unwrap_or("(top)")
+                        design.parent.unwrap_or_default()
                     );
                 }
                 Ok(())

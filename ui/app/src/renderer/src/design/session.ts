@@ -121,6 +121,16 @@ export class DesignSession {
   readonly text: Y.Text;
   /** The latest `design.cat` answer whose text was this document's, or `undefined` before one. */
   current: DesignDoc | undefined;
+
+  /**
+   * `current` while its text is still the document's, else `undefined`: the one answer anything
+   * on screen may take offsets from. A local edit moves the document past the answer until the
+   * next read, and offsets from the old text then select the wrong words, or past the end.
+   */
+  onScreen(): DesignDoc | undefined {
+    const c = this.current;
+    return c !== undefined && c.text === this.text.toString() ? c : undefined;
+  }
   status: SyncStatus = { kind: "connecting" };
   /**
    * Why other editors' changes are not arriving, when they are not: the feed is down (and retrying)

@@ -1,9 +1,5 @@
 /* The Design tab's Prompts pane (D53.6): the sessions that worked a design, and New prompt. */
 
-.prompts-pane {
-  border-top: var(--hairline-width) solid var(--hairline-strong);
-}
-
 .prompt-new {
   display: flex;
   flex-direction: column;

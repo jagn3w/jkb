@@ -10,12 +10,12 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::Value;
 
-use jkb_types::ItemId;
+use jkb_types::{EdgeType, ItemId};
 
 use super::{
     append_row, append_row_as, before_write, crdt, create, design_id, export, finish, invalid,
-    item, load, set_metadata, span_items, view, Before, Crdt, DesignRow, SpanItem, SpanState,
-    Version, KIND,
+    item, load, plan, set_metadata, span_items, view, Before, Crdt, DesignRow, SpanItem, SpanState,
+    Version, KIND, STEP_KIND,
 };
 use crate::store::WriteMeta;
 use crate::{containment, Result};
@@ -78,9 +78,14 @@ pub fn descendants(conn: &Connection, design: ItemId) -> Result<Vec<(ItemId, Str
 
 /// Nest design `uid` under design `under`, after its existing children.
 ///
+/// Refused when the move would change what a span reads or where text is exported: a span below
+/// `uid` staged into a plan of its current tree would leave that tree, and its STAGED/IMPLEMENTED
+/// would silently read APPROVED ([`root_of`]); and a design below `uid` with a doc target of its
+/// own would be exported twice, to its file and inlined into the new parent's (review round 1).
+///
 /// # Errors
-/// An unknown design, a parent in another repo, a parent inside `uid` (a cycle), or a database
-/// error.
+/// An unknown design, a parent in another repo, a parent inside `uid` (a cycle), a staged span the
+/// move would strand, a moved design with its own doc target, or a database error.
 pub fn nest(conn: &Connection, meta: &WriteMeta, uid: &str, under: &str) -> Result<DesignRow> {
     let child = design_id(conn, uid)?;
     let parent = design_id(conn, under)?;
@@ -104,9 +109,62 @@ pub fn nest(conn: &Connection, meta: &WriteMeta, uid: &str, under: &str) -> Resu
     if parent_of(conn, child)? == Some(parent) {
         return super::row(conn, uid);
     }
-    let position = i64::try_from(children_of(conn, parent)?.len()).unwrap_or(i64::MAX);
-    containment::contain(conn, meta, child, parent, position)?;
+    let mut moved = vec![(child, uid.to_owned())];
+    moved.extend(descendants(conn, child)?);
+    let new_root = root_of(conn, parent)?;
+    for (design, design_uid) in &moved {
+        if export::meta_of(conn, *design)?.doc_target.is_some() {
+            return Err(invalid(format!(
+                "design {design_uid} has a doc target of its own, so nested it would be exported \
+                 twice — to its file and inside its new parent's"
+            )));
+        }
+        let stranded = staged_outside(conn, *design, new_root)?;
+        if !stranded.is_empty() {
+            return Err(invalid(format!(
+                "spans of design {design_uid} are staged into plans of its current tree, which the \
+                 move would leave, and would read APPROVED: {}",
+                stranded.join(", ")
+            )));
+        }
+    }
+    containment::contain(conn, meta, child, parent, next_position(conn, parent)?)?;
     super::row(conn, uid)
+}
+
+/// The spans of `design` with a `stages` edge into a plan step whose design's tree is not `root`.
+fn staged_outside(conn: &Connection, design: ItemId, root: ItemId) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for span in span_items(conn, design)? {
+        let mut stmt = conn.prepare_cached(
+            "SELECT i.id, i.uid FROM edges e JOIN items i ON i.id = e.dst_item_id
+              WHERE e.src_item_id = ?1 AND e.type = ?2 AND i.kind = ?3",
+        )?;
+        let steps = stmt
+            .query_map(
+                rusqlite::params![span.id.get(), EdgeType::Stages.as_str(), STEP_KIND],
+                |r| Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (step, step_uid) in steps {
+            if let Ok(owner) = plan::design_of_step(conn, step, &step_uid) {
+                if root_of(conn, owner)? != root {
+                    out.push(span.uid.clone());
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The position after every child `parent` holds, so a new child sorts last even after a sibling
+/// was moved away (counting the children ties with a remaining one).
+fn next_position(conn: &Connection, parent: ItemId) -> Result<i64> {
+    let max: Option<i64> = conn
+        .prepare_cached("SELECT MAX(position) FROM containment WHERE parent_item_id = ?1")?
+        .query_row([parent.get()], |r| r.get(0))?;
+    Ok(max.map_or(0, |m| m.saturating_add(1)))
 }
 
 /// What [`split`] made.
@@ -279,6 +337,24 @@ pub fn split(
         .ok_or_else(|| invalid(format!("design {uid} is not under designs/<repo>")))?;
     let text = now.text();
     let sections = sections_of(&text, level, uid)?;
+    // The export appends a design's children after its own text (`export::tree_text`), so a split
+    // keeps the export unchanged only when the sections are the design's tail: contiguous, running
+    // to the end, and the design has no children whose text would come before them. Anything else
+    // would reorder the docs/ file, and a split cannot be undone (review round 1).
+    let contiguous = sections.windows(2).all(|w| w[0].1 == w[1].0);
+    if !contiguous || sections.last().map(|s| s.1) != Some(text.len()) {
+        return Err(invalid(format!(
+            "design {uid} has text after a level-{level} section (a higher-level heading), which \
+             its export would move after the split-out sections — split at a level whose \
+             sections run to the end of the design"
+        )));
+    }
+    if !children_of(conn, id)?.is_empty() {
+        return Err(invalid(format!(
+            "design {uid} already has child designs, whose text its export places after its own — \
+             a split would put the new sections after them; split a design before nesting under it"
+        )));
+    }
     let before = before_write(conn, id, &now)?;
     let (bounds, moving) = assign(&now, &text, &sections, span_items(conn, id)?)?;
 
@@ -301,7 +377,7 @@ pub fn split(
     let update = update.ok_or_else(|| invalid("the split removed nothing"))?;
     let seq = append_row_as(conn, meta, id, uid, &update, true)?;
 
-    let first = i64::try_from(children_of(conn, id)?.len()).unwrap_or(i64::MAX);
+    let first = next_position(conn, id)?;
     let mut children = Vec::new();
     let mut carried = 0;
     for (i, ((s, e, title), spans)) in sections.iter().zip(moving).enumerate() {

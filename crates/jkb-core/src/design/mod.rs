@@ -1163,12 +1163,26 @@ fn span_item(conn: &Connection, uid: &str) -> Result<(SpanItem, ItemId, String)>
     }
     let metadata: Value = serde_json::from_str(&metadata)
         .map_err(|e| invalid(format!("span {uid} has unreadable metadata: {e}")))?;
-    let design_uid = metadata
-        .get("design")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid(format!("span {uid} names no design")))?
-        .to_owned();
-    let design = design_id(conn, &design_uid)?;
+    // The design a span belongs to is the one containing it — the row `span_items` lists it by,
+    // and the one `tree::split` moves. `metadata.design` is a copy for readers of the item, never
+    // the authority: `jkb undo` of an older metadata write (an approval) restores an old copy, and
+    // reading it then sent `approve` to a design the span had left (review round 1).
+    let contained = match containment::parent(conn, ItemId::new(id))? {
+        Some(parent) => item::get(conn, parent)?
+            .filter(|m| m.kind == KIND)
+            .map(|m| (parent, m.uid)),
+        None => None,
+    };
+    let (design, design_uid) = if let Some(found) = contained {
+        found
+    } else {
+        let named = metadata
+            .get("design")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid(format!("span {uid} names no design")))?
+            .to_owned();
+        (design_id(conn, &named)?, named)
+    };
     Ok((
         SpanItem {
             id: ItemId::new(id),

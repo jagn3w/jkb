@@ -198,3 +198,16 @@ test("a Save names the text its draft started from; a stale one is told apart an
   const refused = async () => ({ ok: false, error: { code: "invalid", message: "would not round-trip" } });
   assert.deepEqual(await saveDraft(refused, "task:a", kept), { kind: "failed", message: "would not round-trip" });
 });
+
+test("a finished parent of an open subtask stays in the list, muted, so the subtask keeps its place", async () => {
+  const { visibleTasks } = await import("../dist/index.js");
+  const t = (uid, status, depth) => ({ uid, title: uid, status, priority: null, depth, claimed_by: null, strategy: "default:x" });
+  const rows = [t("A", "in_progress", 0), t("B", "done", 0), t("B1", "open", 1), t("C", "done", 0), t("C1", "done", 1)];
+  const open = (x) => x.status !== "done";
+  assert.deepEqual(
+    visibleTasks(rows, open).map((l) => `${l.task.uid}${l.muted ? "~" : ""}`),
+    ["A", "B~", "B1"],
+  );
+  assert.deepEqual(visibleTasks(rows, () => true).length, 5);
+  assert.deepEqual(visibleTasks([t("X", "done", 0), t("X1", "done", 1), t("X2", "open", 2)], open).map((l) => `${l.task.uid}${l.muted ? "~" : ""}`), ["X~", "X1~", "X2"]);
+});

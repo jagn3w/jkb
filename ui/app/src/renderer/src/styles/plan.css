@@ -318,3 +318,8 @@
   font-size: var(--text-xs);
   color: var(--ink-muted);
 }
+
+/* A finished task kept only as the parent of an open one below it. */
+.plan-tasks li[data-muted] .plan-task {
+  opacity: 0.55;
+}

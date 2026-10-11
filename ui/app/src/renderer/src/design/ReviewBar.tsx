@@ -1,5 +1,5 @@
 import { EditorView } from "@codemirror/view";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 
 import { passageAt, stepPassage, type Passage } from "@jkb/core";
 
@@ -19,6 +19,7 @@ function typing(target: EventTarget | null): boolean {
 export function ReviewBar({
   passages,
   view,
+  head,
   shown,
   nextDesign,
   onNextDesign,
@@ -26,20 +27,18 @@ export function ReviewBar({
   readonly passages: readonly Passage[] | undefined;
   /** The editor the passages are offsets into. */
   readonly view: () => EditorView | undefined;
+  /** Where the cursor is now: the counter and the end are read from it, never remembered. */
+  readonly head: number;
   /** Whether the bar is on screen: its keys are live only then. */
   readonly shown: boolean;
   /** The design *Next* opens past the last passage, by title. */
   readonly nextDesign: string | undefined;
   readonly onNextDesign: () => void;
 }): React.JSX.Element {
-  const [current, setCurrent] = useState<number | undefined>(undefined);
   const bar = useRef<HTMLDivElement>(null);
-
-  // A new answer can move or drop passages: the counter follows the selection, never a stale index.
-  useEffect(() => {
-    const v = view();
-    setCurrent(passages === undefined || v === undefined ? undefined : passageAt(passages, v.state.selection.main.head));
-  }, [passages, view]);
+  // Read from the cursor every render, so a click elsewhere moves the counter and the end with it:
+  // a remembered index once promised "Next design" while the click stepped within the text.
+  const current = passages === undefined ? undefined : passageAt(passages, head);
 
   const go = (dir: 1 | -1): void => {
     const v = view();
@@ -56,8 +55,9 @@ export function ReviewBar({
       return;
     }
     const p = passages[i];
-    if (p === undefined) return;
-    setCurrent(i);
+    // The passages are offsets into the text on screen (`DesignSession.onScreen`); the bound is the
+    // last line of defence, never the rule.
+    if (p === undefined || p.to > v.state.doc.length) return;
     v.dispatch({ selection: { anchor: p.from, head: p.to }, effects: EditorView.scrollIntoView(p.from, { y: "center" }) });
   };
   const latest = useRef(go);
@@ -79,7 +79,8 @@ export function ReviewBar({
   }, [shown]);
 
   const count = passages?.length;
-  const atEnd = passages !== undefined && (current === undefined ? count === 0 : current >= passages.length - 1);
+  const from = current === undefined ? head - 1 : (passages?.[current]?.from ?? head);
+  const atEnd = passages !== undefined && stepPassage(passages, from, 1) === undefined;
   return (
     <div className="review-bar" ref={bar} role="toolbar" aria-label="Unreviewed passages">
       {count === undefined ? (

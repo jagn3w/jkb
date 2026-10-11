@@ -19,17 +19,22 @@ export function DocumentEditor({
   session,
   onDiscuss,
   onView,
+  onCursor,
 }: {
   readonly session: DesignSession;
   readonly onDiscuss: (from: number, to: number, text: string) => void;
   /** The editor once it exists, and `undefined` once it is gone: what *See next* moves. */
   readonly onView?: (view: EditorView | undefined) => void;
+  /** Where the cursor is, each time it moves: the place *See next* walks from. */
+  readonly onCursor?: (head: number) => void;
 }): React.JSX.Element {
   const host = useRef<HTMLDivElement>(null);
   const discuss = useRef(onDiscuss);
   discuss.current = onDiscuss;
   const viewed = useRef(onView);
   viewed.current = onView;
+  const cursor = useRef(onCursor);
+  cursor.current = onCursor;
 
   useEffect(() => {
     const parent = host.current;
@@ -50,6 +55,9 @@ export function DocumentEditor({
           yCollab(session.text, null, { undoManager: undo }),
           editable.of([EditorView.editable.of(writable()), EditorState.readOnly.of(!writable())]),
           EditorView.contentAttributes.of({ "aria-label": "Design document", spellcheck: "true" }),
+          EditorView.updateListener.of((u) => {
+            if (u.selectionSet || u.docChanged) cursor.current?.(u.state.selection.main.head);
+          }),
         ],
       }),
     });
@@ -57,10 +65,10 @@ export function DocumentEditor({
     let drawn: DesignDoc | undefined;
     let wasWritable = writable();
     const sync = (): void => {
-      const current = session.current;
-      // The session keeps an answer only when its text was the document's, and the editor shows
-      // the document, so the answer's offsets are the editor's.
-      if (current !== undefined && current !== drawn && current.text === view.state.doc.toString()) {
+      // Only an answer whose text is still the document's (`onScreen`): the editor shows the
+      // document, so that answer's offsets are the editor's.
+      const current = session.onScreen();
+      if (current !== undefined && current !== drawn) {
         drawn = current;
         view.dispatch({ effects: setStateMap.of(stateRuns(view.state.doc.length, current.spans)) });
       }

@@ -2759,3 +2759,99 @@ fn undoing_a_nest_puts_the_design_back_at_the_top() {
     let rows = listed(&db);
     assert_eq!(rows.iter().find(|r| r.uid == b).unwrap().parent, None);
 }
+
+fn last_txn(db: &Db) -> i64 {
+    db.read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+/// A split keeps the export only when its sections are the design's tail; text after them (a
+/// higher heading) or existing children would come out reordered, so both are refused.
+#[test]
+fn a_split_is_refused_where_the_export_would_come_out_reordered() {
+    let db = db();
+    let body = "## X\n\nx intro\n\n### X1\n\nx1\n\n## Y\n\ny intro\n\n### Y1\n\ny1\n";
+    let uid = create(&db, body);
+    let err = split_at(&db, &uid, &token(&db, &uid), 3).unwrap_err();
+    assert!(
+        err.to_string().contains("text after a level-3 section"),
+        "{err}"
+    );
+    let parent = create_in(&db, "jkb", "P", SPLIT_BODY);
+    let kid = create_in(&db, "jkb", "K", "k");
+    nest_under(&db, &kid, &parent).unwrap();
+    let err = split_at(&db, &parent, &token(&db, &parent), 2).unwrap_err();
+    assert!(
+        err.to_string().contains("already has child designs"),
+        "{err}"
+    );
+    assert_eq!(text(&db, &uid), body);
+}
+
+#[test]
+fn a_nest_never_strands_a_staged_span_or_exports_a_design_twice() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let alpha = span(&db, &uid, "## Alpha\n\nAlpha text.", Reviewer::Operator).unwrap();
+    approve_as(&db, &alpha, Approver::Operator).unwrap();
+    let step = new_plan(&db, &uid, &["build"]).unwrap().steps[0]
+        .uid
+        .clone();
+    stage_into(&db, &alpha, &step).unwrap();
+    let s = split_at(&db, &uid, &token(&db, &uid), 2).unwrap();
+    let other = create_in(&db, "jkb", "Other", "o");
+    let err = nest_under(&db, &s.children[0].uid, &other).unwrap_err();
+    assert!(err.to_string().contains(&alpha), "{err}");
+    let targeted = create_in(&db, "jkb", "T", "t");
+    let t = targeted.clone();
+    db.write_txn("t", move |c, m| {
+        export::set_doc_target(c, m, &t, "docs/t.md")
+    })
+    .unwrap();
+    let err = nest_under(&db, &targeted, &other).unwrap_err();
+    assert!(err.to_string().contains("doc target of its own"), "{err}");
+}
+
+/// A span's design is the one containing it: undoing an approval made before a split restores the
+/// old `metadata.design`, and the span must still be approvable in the design it now lives in.
+#[test]
+fn undoing_an_approval_made_before_a_split_leaves_the_span_in_its_new_design() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let alpha = span(&db, &uid, "## Alpha\n\nAlpha text.", Reviewer::Operator).unwrap();
+    approve_as(&db, &alpha, Approver::Operator).unwrap();
+    let approved_in = last_txn(&db);
+    let s = split_at(&db, &uid, &token(&db, &uid), 2).unwrap();
+    db.write_txn("t", move |c, m| crate::undo::undo(c, m, approved_in))
+        .unwrap();
+    let child = &s.children[0].uid;
+    assert_eq!(design_of_span(&db, &alpha), *child);
+    assert_eq!(view_of(&db, child, &alpha).state, SpanState::Proposed);
+    approve_as(&db, &alpha, Approver::Operator).unwrap();
+    assert_eq!(view_of(&db, child, &alpha).state, SpanState::Approved);
+}
+
+#[test]
+fn a_nested_design_sorts_after_every_existing_child() {
+    let db = db();
+    let pa = create_in(&db, "jkb", "P", "p");
+    let qa = create_in(&db, "jkb", "Q", "q");
+    let da = create_in(&db, "jkb", "D", "d");
+    let ba = create_in(&db, "jkb", "B", "b");
+    let ca = create_in(&db, "jkb", "C", "c");
+    nest_under(&db, &ba, &pa).unwrap();
+    nest_under(&db, &ca, &pa).unwrap();
+    nest_under(&db, &ba, &qa).unwrap();
+    nest_under(&db, &da, &pa).unwrap();
+    let pid = {
+        let pa = pa.clone();
+        db.read(move |x| design_id(x, &pa)).unwrap()
+    };
+    let kids: Vec<String> = db
+        .read(move |x| tree::children_of(x, pid))
+        .unwrap()
+        .into_iter()
+        .map(|(_, u)| u)
+        .collect();
+    assert_eq!(kids, vec![ca, da]);
+}

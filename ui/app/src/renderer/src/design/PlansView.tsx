@@ -22,13 +22,16 @@ export function TaskRow({
   task,
   selected,
   onSelect,
+  muted = false,
 }: {
   readonly task: PlanTask;
   readonly selected: boolean;
   readonly onSelect: (uid: string) => void;
+  /** Drawn only as the parent of a row below it (`visibleTasks`). */
+  readonly muted?: boolean;
 }): React.JSX.Element {
   return (
-    <li>
+    <li data-muted={muted || undefined}>
       <button
         type="button"
         className="plan-task"

@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-import { isTerminal } from "@jkb/core";
+import { isTerminal, visibleTasks, type PlanTask } from "@jkb/core";
 
 import { StrategyPicker, TaskRow } from "./PlansView";
 import { TaskPane } from "./TaskPane";
@@ -26,14 +26,19 @@ export function TasksView({
   const [showDone, setShowDone] = useState(false);
   const { listing, live, archived, oneOff, tasks, busy } = plans;
   const task = tasks.find((t) => t.uid === selected);
-  const shown = (status: string | null): boolean => showDone || !isTerminal(status);
+  // A finished task chosen elsewhere (the Plans tab's history) is listed, not shown with no row.
+  const chosenFinished = task !== undefined && isTerminal(task.status);
+  useEffect(() => {
+    if (chosenFinished) setShowDone(true);
+  }, [chosenFinished, selected]);
+  const shown = (t: PlanTask): boolean => showDone || !isTerminal(t.status);
   const groups = (showDone ? [...live, ...archived] : live).flatMap((plan) =>
     plan.steps
-      .map((step) => ({ key: step.uid, plan: plan.title, step: step.text, tasks: step.tasks.filter((t) => shown(t.status)) }))
-      .filter((g) => g.tasks.length > 0),
+      .map((step) => ({ key: step.uid, plan: plan.title, step: step.text, lines: visibleTasks(step.tasks, shown) }))
+      .filter((g) => g.lines.length > 0),
   );
-  const loose = oneOff.filter((t) => shown(t.status));
-  const hidden = tasks.length - tasks.filter((t) => shown(t.status)).length;
+  const loose = visibleTasks(oneOff, shown);
+  const hidden = tasks.length - tasks.filter(shown).length;
 
   return (
     <section className="view tasks-view" aria-label="Tasks">
@@ -64,8 +69,8 @@ export function TasksView({
                     <span className="muted">{g.plan} ›</span> {g.step}
                   </h3>
                   <ul className="plan-tasks">
-                    {g.tasks.map((t) => (
-                      <TaskRow key={t.uid} task={t} selected={t.uid === selected} onSelect={onSelect} />
+                    {g.lines.map(({ task: t, muted }) => (
+                      <TaskRow key={t.uid} task={t} muted={muted} selected={t.uid === selected} onSelect={onSelect} />
                     ))}
                   </ul>
                 </div>
@@ -74,8 +79,8 @@ export function TasksView({
                 <div className="task-group">
                   <h3>One-off tasks</h3>
                   <ul className="plan-tasks">
-                    {loose.map((t) => (
-                      <TaskRow key={t.uid} task={t} selected={t.uid === selected} onSelect={onSelect} />
+                    {loose.map(({ task: t, muted }) => (
+                      <TaskRow key={t.uid} task={t} muted={muted} selected={t.uid === selected} onSelect={onSelect} />
                     ))}
                   </ul>
                 </div>
