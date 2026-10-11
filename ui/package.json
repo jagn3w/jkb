@@ -7,6 +7,7 @@
   "scripts": {
     "build": "pnpm -r run build",
     "typecheck": "pnpm --filter @jkb/core run build && pnpm -r run typecheck",
-    "test": "pnpm -r run test"
+    "test": "pnpm -r run test",
+    "postinstall": "node scripts/pty-helper-exec.mjs"
   }
 }
