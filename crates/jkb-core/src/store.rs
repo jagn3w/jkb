@@ -2,8 +2,14 @@
 //!
 //! `SQLite` allows many readers but only one writer. Rather than juggle locks, all
 //! database access goes through one background thread that owns the write
-//! `Connection` (design D8). Writes are therefore serialized — callers never see
-//! `SQLITE_BUSY` — and no `unsafe` or lock management is needed.
+//! `Connection` (design D8). Writes within a process are therefore serialized, and no `unsafe`
+//! or lock management is needed.
+//!
+//! **Across processes they are not**: the `jkb sync --watch` service, `jkb serve` and interactive
+//! commands each have their own writer. Every write transaction is IMMEDIATE (see `write_txn_with`),
+//! so contention surfaces as `SQLITE_BUSY` on `BEGIN`, which the connection's 5 s `busy_timeout`
+//! (`db::configure`) waits out. That timeout is therefore load-bearing: a write held longer than
+//! it by another process fails with `SQLITE_BUSY` rather than waiting.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
