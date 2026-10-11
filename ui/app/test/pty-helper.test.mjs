@@ -15,6 +15,11 @@ test("every spawn-helper node-pty can load is executable", () => {
   );
   for (const helper of helpers) {
     const mode = statSync(helper).mode & 0o777;
-    assert.equal(mode & 0o111, 0o111, `${helper} is ${mode.toString(8)}: node-pty cannot run it`);
+    assert.equal(
+      mode & 0o111,
+      0o111,
+      `${helper} is ${mode.toString(8)}: node-pty cannot run it. Run \`pnpm install\` in ui/ (its ` +
+        `postinstall sets the bit), or \`node ui/scripts/pty-helper-exec.mjs\`.`,
+    );
   }
 });

@@ -2,10 +2,11 @@
 // prebuilds node-pty 1.1.0 publishes ship it WITHOUT its execute bit (measured: `-rw-r--r--` in the
 // pnpm store). Every terminal Code Factory opened on a Mac then failed with `posix_spawnp failed`,
 // while Linux, which needs no helper, was fine — so CI never saw it. Run as the workspace's
-// postinstall (a dev checkout, CI) AND first in the app's `package` script: build-app.sh reuses its
-// clone, and pnpm skips lifecycle scripts for an install it finds up to date, so the postinstall
-// alone could leave a packaged app with the helper it had. Idempotent; pinned by
-// ui/app/test/pty-helper.test.mjs.
+// postinstall (a dev checkout, CI, build-app.sh's clone) AND first in the app's `package` script,
+// so a packaged app has an executable helper whatever its install did: pnpm 11.17 does run the root
+// postinstall on an up-to-date install (measured), but an install with `--ignore-scripts` leaves the
+// bit unset and a later up-to-date install did not restore it here (also measured). Idempotent;
+// pinned by ui/app/test/pty-helper.test.mjs.
 import { chmodSync, existsSync, readdirSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -35,7 +36,16 @@ export function ptyDir() {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  for (const helper of spawnHelpers(ptyDir())) {
+  // A filtered install (`pnpm install --filter ./vscode`) has no node-pty, and nothing to fix:
+  // failing here would fail that whole install.
+  let dir;
+  try {
+    dir = ptyDir();
+  } catch {
+    console.log("node-pty is not installed here; no spawn-helper to fix");
+    process.exit(0);
+  }
+  for (const helper of spawnHelpers(dir)) {
     const mode = statSync(helper).mode;
     if ((mode & 0o111) !== 0o111) {
       chmodSync(helper, mode | 0o755);
