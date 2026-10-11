@@ -211,7 +211,8 @@ test("the Design tab says why it has no designs when the daemon is unreachable",
   await page.getByRole("tab", { name: "Design", exact: true }).click();
   const pane = page.locator("#pane-design");
   await pane.locator(".design-empty", { hasText: "Cannot list designs" }).waitFor();
-  assert.equal(await pane.getByRole("combobox", { name: "Repo" }).isDisabled(), true);
+  // The design tree says so too, rather than offering an empty list.
+  await pane.locator(".design-sidebar .sidebar-hint", { hasText: "Cannot list designs" }).waitFor();
 });
 
 // The Workflows tab (D53.7): with no daemon there are no templates to draw, and the pane says why.

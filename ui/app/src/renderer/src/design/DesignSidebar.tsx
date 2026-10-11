@@ -151,7 +151,7 @@ export function DesignSidebar({
   return (
     <nav className="design-sidebar" aria-label="Designs">
       <header className="sidebar-bar">
-        <h2>Designs</h2>
+        <h1>Design</h1>
         <span className="spacer" />
         <button type="button" className="bar-button" onClick={onRefresh} disabled={loading} aria-label="Refresh designs">
           ↻

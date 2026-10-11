@@ -35,7 +35,7 @@
   padding: var(--space-2) var(--space-3);
 }
 
-.sidebar-bar h2 {
+.sidebar-bar h1 {
   margin: 0;
   font-size: var(--text-sm);
   font-weight: 600;
@@ -154,7 +154,7 @@
   flex-wrap: wrap;
 }
 
-.design-title-row h1 {
+.design-title-row h2 {
   margin: 0;
   font-size: var(--text-xl, 1.35rem);
   font-weight: 650;

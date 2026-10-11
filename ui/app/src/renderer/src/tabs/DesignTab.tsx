@@ -225,7 +225,7 @@ function DesignView({
     <div className="design-view">
       <header className="design-head">
         <div className="design-title-row">
-          <h1 title={design.uid}>{design.title}</h1>
+          <h2 title={design.uid}>{design.title}</h2>
           <span className="spacer" />
           <ul className="state-legend" aria-label="Span states">
             {SPAN_STATES.map((s) => (
