@@ -373,6 +373,9 @@ pub fn set_doc_target(
     uid: &str,
     path: &str,
 ) -> Result<()> {
+    if super::tree::parent_of(conn, design_id(conn, uid)?)?.is_some() {
+        return Err(super::tree::exported_twice(uid));
+    }
     let path = repo_path(path, "a doc target")?;
     if !path.starts_with(DOCS_DIR) || path.len() == DOCS_DIR.len() {
         return Err(invalid(format!(

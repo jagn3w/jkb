@@ -10,12 +10,14 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::Value;
 
-use jkb_types::{EdgeType, ItemId};
+use std::collections::BTreeMap;
+
+use jkb_types::ItemId;
 
 use super::{
     append_row, append_row_as, before_write, crdt, create, design_id, export, finish, invalid,
-    item, load, plan, set_metadata, span_items, view, Before, Crdt, DesignRow, SpanItem, SpanState,
-    Version, KIND, STEP_KIND,
+    item, load, set_metadata, span_items, view, Before, Crdt, DesignRow, SpanItem, SpanState,
+    Version, KIND,
 };
 use crate::store::WriteMeta;
 use crate::{containment, Result};
@@ -111,47 +113,60 @@ pub fn nest(conn: &Connection, meta: &WriteMeta, uid: &str, under: &str) -> Resu
     }
     let mut moved = vec![(child, uid.to_owned())];
     moved.extend(descendants(conn, child)?);
-    let new_root = root_of(conn, parent)?;
     for (design, design_uid) in &moved {
         if export::meta_of(conn, *design)?.doc_target.is_some() {
-            return Err(invalid(format!(
-                "design {design_uid} has a doc target of its own, so nested it would be exported \
-                 twice — to its file and inside its new parent's"
-            )));
-        }
-        let stranded = staged_outside(conn, *design, new_root)?;
-        if !stranded.is_empty() {
-            return Err(invalid(format!(
-                "spans of design {design_uid} are staged into plans of its current tree, which the \
-                 move would leave, and would read APPROVED: {}",
-                stranded.join(", ")
-            )));
+            return Err(exported_twice(design_uid));
         }
     }
+    // Whether a staged span keeps its plan is measured, not predicted: every span of the tree the
+    // design leaves is read before and after the move, in this transaction, and a span that was
+    // STAGED or IMPLEMENTED and reads APPROVED after refuses it. Predicting it from the edges took
+    // two rounds to get wrong both ways (refusing a design that brings its own plan along, and
+    // missing a root's span staged into a plan of the child that leaves) — review rounds 1 and 2.
+    let old_root = root_of(conn, child)?;
+    let mut tree = vec![(old_root, String::new())];
+    tree.extend(descendants(conn, old_root)?);
+    let before = staged_spans(conn, &tree)?;
     containment::contain(conn, meta, child, parent, next_position(conn, parent)?)?;
+    let after = staged_spans(conn, &tree)?;
+    let lost: Vec<&str> = before
+        .keys()
+        .filter(|span| !after.contains_key(*span))
+        .map(String::as_str)
+        .collect();
+    if !lost.is_empty() {
+        return Err(invalid(format!(
+            "the move would take these spans out of the tree of the plans they are staged into, \
+             and they would read APPROVED: {}",
+            lost.join(", ")
+        )));
+    }
     super::row(conn, uid)
 }
 
-/// The spans of `design` with a `stages` edge into a plan step whose design's tree is not `root`.
-fn staged_outside(conn: &Connection, design: ItemId, root: ItemId) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for span in span_items(conn, design)? {
-        let mut stmt = conn.prepare_cached(
-            "SELECT i.id, i.uid FROM edges e JOIN items i ON i.id = e.dst_item_id
-              WHERE e.src_item_id = ?1 AND e.type = ?2 AND i.kind = ?3",
-        )?;
-        let steps = stmt
-            .query_map(
-                rusqlite::params![span.id.get(), EdgeType::Stages.as_str(), STEP_KIND],
-                |r| Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?)),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (step, step_uid) in steps {
-            if let Ok(owner) = plan::design_of_step(conn, step, &step_uid) {
-                if root_of(conn, owner)? != root {
-                    out.push(span.uid.clone());
-                    break;
-                }
+/// Why a design with a doc target of its own may not sit inside another design's tree: the root's
+/// export inlines it ([`export::tree_text`]), so it would be written twice. The one wording for
+/// both ways in — nesting such a design, and giving a nested one a target.
+pub(super) fn exported_twice(design_uid: &str) -> crate::Error {
+    invalid(format!(
+        "design {design_uid} would be exported twice — to its own doc target and inside its root \
+         design's — so a nested design has no doc target of its own; give the root one instead"
+    ))
+}
+
+/// The spans of `designs` that read STAGED or IMPLEMENTED now, by uid.
+fn staged_spans(
+    conn: &Connection,
+    designs: &[(ItemId, String)],
+) -> Result<BTreeMap<String, SpanState>> {
+    let mut out = BTreeMap::new();
+    for (design, _) in designs {
+        let (doc, _) = load(conn, *design)?;
+        let text = doc.text();
+        for span in span_items(conn, *design)? {
+            let state = view(conn, &span, &doc, &text)?.state;
+            if matches!(state, SpanState::Staged | SpanState::Implemented) {
+                out.insert(span.uid, state);
             }
         }
     }

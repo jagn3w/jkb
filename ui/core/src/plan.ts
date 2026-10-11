@@ -150,7 +150,6 @@ export function partitionPlans(plans: readonly ExecPlan[]): { live: ExecPlan[]; 
   return { live, archived };
 }
 
-/** Every task of a plan, in step order. */
 /** A task row the Tasks list draws, and whether it is there only as an ancestor of one shown. */
 export interface TaskLine {
   readonly task: PlanTask;
@@ -181,6 +180,7 @@ export function visibleTasks(tasks: readonly PlanTask[], shown: (t: PlanTask) =>
   return out.reverse();
 }
 
+/** Every task of a plan, in step order. */
 export function planTasks(plan: ExecPlan): PlanTask[] {
   return plan.steps.flatMap((s) => s.tasks);
 }

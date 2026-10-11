@@ -2855,3 +2855,55 @@ fn a_nested_design_sorts_after_every_existing_child() {
         .collect();
     assert_eq!(kids, vec![ca, da]);
 }
+
+/// A design that brings its own plan along keeps its staged spans: the plan moves with it.
+#[test]
+fn a_design_nests_with_its_own_plan_and_its_spans_stay_staged() {
+    let db = db();
+    let parent = create_in(&db, "jkb", "P", "p");
+    let b = create_in(&db, "jkb", "B", "b words");
+    let sp = span(&db, &b, "b words", Reviewer::Operator).unwrap();
+    approve_as(&db, &sp, Approver::Operator).unwrap();
+    let step = new_plan(&db, &b, &["build"]).unwrap().steps[0].uid.clone();
+    stage_into(&db, &sp, &step).unwrap();
+    nest_under(&db, &b, &parent).unwrap();
+    assert_eq!(view_of(&db, &b, &sp).state, SpanState::Staged);
+}
+
+/// A root's span staged into a plan of a child is stranded when that child leaves: refused.
+#[test]
+fn a_child_carrying_a_plan_its_root_stages_into_cannot_leave() {
+    let db = db();
+    let root = create_in(&db, "jkb", "R", "root words");
+    let child = create_in(&db, "jkb", "C", "c");
+    let other = create_in(&db, "jkb", "P", "p");
+    nest_under(&db, &child, &root).unwrap();
+    let sp = span(&db, &root, "root words", Reviewer::Operator).unwrap();
+    approve_as(&db, &sp, Approver::Operator).unwrap();
+    let step = new_plan(&db, &child, &["build"]).unwrap().steps[0]
+        .uid
+        .clone();
+    stage_into(&db, &sp, &step).unwrap();
+    let err = nest_under(&db, &child, &other).unwrap_err();
+    assert!(err.to_string().contains(&sp), "{err}");
+    assert_eq!(
+        view_of(&db, &root, &sp).state,
+        SpanState::Staged,
+        "nothing moved"
+    );
+}
+
+#[test]
+fn a_nested_design_takes_no_doc_target_of_its_own() {
+    let db = db();
+    let root = create_in(&db, "jkb", "R", "r");
+    let child = create_in(&db, "jkb", "C", "c");
+    nest_under(&db, &child, &root).unwrap();
+    let c = child.clone();
+    let err = db
+        .write_txn("t", move |x, m| {
+            export::set_doc_target(x, m, &c, "docs/c.md")
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("exported twice"), "{err}");
+}

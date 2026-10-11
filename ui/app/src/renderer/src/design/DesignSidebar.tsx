@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { DesignNode, RepoNode } from "@jkb/core";
 
@@ -123,11 +123,14 @@ export function DesignSidebar({
 }): React.JSX.Element {
   const [folded, setFolded] = useState<ReadonlySet<string>>(readFolded);
   // The open design is always visible: its repo and every design above it unfold when it opens,
-  // however it was opened (*Next*, *Jump to context*), or no row would say which design it is.
+  // however it was opened (*Next*, *Jump to context*), or no row would say which design it is. Once
+  // per design opened, not on every reload of the listing, so a fold the reader makes stays put.
+  const revealed = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (tree === undefined || active === undefined) return;
+    if (tree === undefined || active === undefined || revealed.current === active) return;
     const path = pathTo(tree, active);
     if (path === undefined) return;
+    revealed.current = active;
     setFolded((prev) => {
       if (!path.some((k) => prev.has(k))) return prev;
       const next = new Set(prev);
